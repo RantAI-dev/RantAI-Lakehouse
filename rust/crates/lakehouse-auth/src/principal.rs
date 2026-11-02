@@ -125,6 +125,24 @@ impl Principal {
             PrincipalId::Service(_) => "service",
         }
     }
+
+    /// The `app_user.id` behind this principal, when it is a HUMAN —
+    /// `None` for a service identity.
+    ///
+    /// Used wherever a row names the person behind an action rather than
+    /// the credential they authenticated with: `approval_item.
+    /// requested_by_user_id` (`SEC-57`) names the human who asked for a
+    /// tool call, so the API can refuse them deciding their own request.
+    /// That column's foreign key points at `app_user`, so a service
+    /// identity's id can NEVER be written there — this helper is the one
+    /// place that decides "is there a human here?".
+    #[must_use]
+    pub const fn user_id(&self) -> Option<Uuid> {
+        match self.id {
+            PrincipalId::User(id) => Some(id),
+            PrincipalId::Service(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -183,6 +201,16 @@ mod tests {
         service.id = PrincipalId::Service(Uuid::nil());
         service.provider = "local".to_owned(); // deliberately the wrong-vocabulary value
         assert_eq!(service.kind_for_audit(), "service");
+    }
+
+    #[test]
+    fn user_id_is_the_app_user_id_for_a_human_and_none_for_a_service_identity() {
+        let user = sample_principal();
+        assert_eq!(user.user_id(), Some(Uuid::nil()));
+
+        let mut service = sample_principal();
+        service.id = PrincipalId::Service(Uuid::nil());
+        assert_eq!(service.user_id(), None);
     }
 
     #[test]

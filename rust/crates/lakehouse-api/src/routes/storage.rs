@@ -48,6 +48,7 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::support::{num_or_zero, upstream_message};
 use crate::state::AppState;
 
@@ -65,6 +66,18 @@ pub async fn get(State(state): State<AppState>) -> Response {
     }
 }
 
+/// The warm tier's row count and asset count.
+///
+/// DATA-42 D1/D3: the primary registry wins (the secondary branch drops
+/// the slugs the primary holds — see
+/// [`crate::routes::catalog::NOT_IN_PRIMARY`]), and every registry table
+/// is read with `FINAL`: the registry is a `ReplacingMergeTree ORDER BY
+/// slug` that every run of a connector writes again, and `ClickHouse`
+/// merges the copies only in the background.
+///
+/// Without the two, a slug that is in both registries had its row count
+/// summed TWICE and its asset count one too high, and a slug a second run
+/// registered was counted twice.
 async fn get_body(ch: &ChClient) -> Result<Value, ChError> {
     let hot_rows = ch
         .rows(
@@ -75,9 +88,12 @@ async fn get_body(ch: &ChClient) -> Result<Value, ChError> {
         .await?;
     let warm_rows = ch
         .rows(
-            "SELECT toString(sum(total)) rows, toString(count()) assets FROM (
-           SELECT total FROM lake.`bronze_meta.dataset_sync`
-           UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync`)",
+            &format!(
+                "SELECT toString(sum(total)) rows, toString(count()) assets FROM (
+           SELECT total FROM lake.`bronze_meta.dataset_sync` FINAL
+           UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync` FINAL
+           WHERE slug {NOT_IN_PRIMARY})"
+            ),
             None,
         )
         .await?;
@@ -243,5 +259,133 @@ mod tests {
     fn savings_matches_storage_get_corpus() {
         // hot=11701 warm=55779460 -> 100 (rounds up from 99.97...%).
         assert_eq!(savings_vs_all_hot(11_701, 55_779_460), 100);
+    }
+
+    // ── DATA-42 D1/D3: the primary registry wins. ────────────────────────
+    //
+    // The warm tier's row count and asset count come from BOTH Bronze
+    // registries: a slug that is in both had its row count summed TWICE
+    // and its asset count one too high.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), because the fix is a
+    // statement: `FINAL` and the `NOT IN (SELECT slug FROM ...)` clause
+    // are the engine's, and a fake that answered them would only prove
+    // that this module asks for what it means to ask for.
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_clickhouse::ChClient;
+
+        use super::*;
+        use crate::routes::bronze_registry_fixture::{clickhouse, pinned, seed_catalog, seed_sync};
+
+        /// A slug the two registries both hold: the PRIMARY's row count,
+        /// not the sum of both, and one asset, not two.
+        #[tokio::test]
+        async fn a_clashing_dataset_is_summed_once_from_the_primary() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_storage",
+                "Primary storage",
+                "clash_storage_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "clash_storage",
+                "Primary storage",
+                "clash_storage_raw",
+                10,
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_storage",
+                "Secondary storage",
+                "clash_storage_sec_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta_sec",
+                "clash_storage",
+                "Secondary storage",
+                "clash_storage_sec_raw",
+                99,
+            )
+            .await;
+
+            let body = get_body(&ch).await.unwrap();
+            assert_eq!(
+                body["byTier"]["warm"]["assets"],
+                json!(1),
+                "one dataset, counted once: {body:?}"
+            );
+            assert_eq!(
+                body["byTier"]["warm"]["bytes"],
+                json!(10 * 220),
+                "the primary's row count, not the sum of both: {body:?}"
+            );
+        }
+
+        /// A slug a second run wrote again is summed once, from the newer
+        /// row.
+        ///
+        /// DATA-42 D3: without `FINAL` the two copies of the row are two
+        /// rows, so the row count is the sum of both.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_is_summed_once() {
+            let (url, _container) = clickhouse().await;
+            // `max_threads=1` pins the engine's read order, so WHICH of
+            // the two copies `FINAL` keeps is one thing and not a coin
+            // toss (a URL setting, so the statement the module sends is
+            // the statement that runs).
+            let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+
+            // The two copies of the row stay apart: no merge may collapse
+            // them before the statement reads them.
+            ch.exec("SYSTEM STOP MERGES lake.`bronze_meta.dataset_sync`", None)
+                .await
+                .expect("stop the merges of the sync table");
+
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_storage",
+                "Twice storage",
+                "twice_storage_raw",
+                10,
+            )
+            .await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_storage",
+                "Twice storage again",
+                "twice_storage_raw",
+                20,
+            )
+            .await;
+
+            let body = get_body(&ch).await.unwrap();
+            assert_eq!(
+                body["byTier"]["warm"]["assets"],
+                json!(1),
+                "one dataset, counted once: {body:?}"
+            );
+            assert_eq!(
+                body["byTier"]["warm"]["bytes"],
+                json!(20 * 220),
+                "the newer row count, not the sum of both: {body:?}"
+            );
+        }
     }
 }

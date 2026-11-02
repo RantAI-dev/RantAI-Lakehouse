@@ -9,6 +9,11 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
+// `DATA-42` D7: the `ClickHouse` registry fixture the readers' tests share
+// (`governance`, `overview`, `storage`, `lineage`, `catalog_profile`).
+// Test-only, so it is declared `#[cfg(test)]` and never reaches a build.
+#[cfg(test)]
+pub(crate) mod bronze_registry_fixture;
 mod chart_alerts;
 // `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
 // `authored_pipelines::job_name` to name the job a lag run launches, and

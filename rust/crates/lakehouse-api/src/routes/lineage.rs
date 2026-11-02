@@ -40,6 +40,7 @@ use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use serde_json::{Map, Value, json};
 
+use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::state::AppState;
 
 // One more record: what each table was last built from (see the module).
@@ -244,14 +245,26 @@ async fn add_catalog(ch: &lakehouse_clickhouse::ChClient, g: &mut Graph) {
             "the Bronze catalog registry could not be read, so datasets are not shown".to_owned(),
         ),
     }
-    let publishers = ch
-        .rows(
-            "SELECT slug, author FROM lake.`bronze_meta.dataset_sync` \
-             UNION ALL SELECT slug, author FROM lake.`bronze_meta_sec.dataset_sync`",
-            None,
-        )
-        .await
-        .unwrap_or_default();
+    // DATA-42 D1/D3: the primary registry wins, and every registry table
+    // this reader touches is read with `FINAL`.
+    //
+    // D1: the secondary branch drops the slugs the primary registry holds
+    // (see [`crate::routes::catalog::NOT_IN_PRIMARY`]), so a dataset that
+    // is in both registries gets ONE publisher edge — the graph used to
+    // draw one per registry, so two publishers for one dataset whenever
+    // the two registries named different authors.
+    //
+    // D3: `FINAL`, for the reason the catalog's reads give (`DATA-40` D4):
+    // the registry is a `ReplacingMergeTree ORDER BY slug` that every run
+    // of a connector writes again, and `ClickHouse` merges the copies
+    // only in the background. Without it a slug a second run registered
+    // got a second publisher edge.
+    let publishers_sql = format!(
+        "SELECT slug, author FROM lake.`bronze_meta.dataset_sync` FINAL
+         UNION ALL SELECT slug, author FROM lake.`bronze_meta_sec.dataset_sync` FINAL
+         WHERE slug {NOT_IN_PRIMARY}"
+    );
+    let publishers = ch.rows(&publishers_sql, None).await.unwrap_or_default();
     for row in &publishers {
         let (slug, author) = (text(row, "slug"), text(row, "author"));
         if author.is_empty() {
@@ -1085,5 +1098,146 @@ mod tests {
             &"connectors, pipelines and uploads are not shown: you belong to no tenant".to_owned()
         ));
         Ok(())
+    }
+
+    // ── DATA-42 D1/D3: the primary registry wins. ────────────────────────
+    //
+    // The publisher edges are drawn from the Bronze sync registries. A slug
+    // that is in both got ONE edge per registry, so a dataset had two
+    // publishers whenever the two registries named different authors.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), because the fix is a
+    // statement: `FINAL` and the `NOT IN (SELECT slug FROM ...)` clause
+    // are the engine's, and a fake that answered them would only prove
+    // that this module asks for what it means to ask for.
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_clickhouse::ChClient;
+
+        use super::*;
+        use crate::routes::bronze_registry_fixture::{
+            clickhouse, seed_catalog, seed_sync_with_author,
+        };
+
+        /// The publisher edges that point at `dataset:<slug>`.
+        fn publishers_of<'a>(
+            g: &'a Graph,
+            slug: &str,
+        ) -> Vec<&'a (String, String, &'static str, String)> {
+            let dataset = format!("dataset:{slug}");
+            g.edges
+                .iter()
+                .filter(|(_, to, kind, _)| to == &dataset && *kind == "publisher")
+                .collect()
+        }
+
+        /// A slug the two registries both hold: one dataset, one publisher,
+        /// and the PRIMARY's author.
+        #[tokio::test]
+        async fn a_clashing_dataset_has_one_publisher_edge_from_the_primary() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_lineage",
+                "Primary lineage",
+                "clash_lineage_raw",
+            )
+            .await;
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta",
+                "clash_lineage",
+                "Primary lineage",
+                "clash_lineage_raw",
+                10,
+                "primary_team",
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_lineage",
+                "Secondary lineage",
+                "clash_lineage_sec_raw",
+            )
+            .await;
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta_sec",
+                "clash_lineage",
+                "Secondary lineage",
+                "clash_lineage_sec_raw",
+                99,
+                "secondary_team",
+            )
+            .await;
+
+            let mut g = Graph::default();
+            add_catalog(&ch, &mut g).await;
+
+            let publishers = publishers_of(&g, "clash_lineage");
+            assert_eq!(
+                publishers.len(),
+                1,
+                "one dataset, one publisher: {publishers:?}"
+            );
+            assert_eq!(
+                publishers[0].0, "source:primary_team",
+                "the primary's publisher, not the secondary's: {publishers:?}"
+            );
+        }
+
+        /// A slug a second run wrote again has one publisher edge, not two.
+        ///
+        /// DATA-42 D3: without `FINAL` the two copies of the row are two
+        /// rows, so the graph draws the edge twice.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_has_one_publisher_edge() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            // The two copies of the row stay apart: no merge may collapse
+            // them before the graph reads them.
+            ch.exec("SYSTEM STOP MERGES lake.`bronze_meta.dataset_sync`", None)
+                .await
+                .expect("stop the merges of the sync table");
+
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta",
+                "twice_lineage",
+                "Twice lineage",
+                "twice_lineage_raw",
+                10,
+                "primary_team",
+            )
+            .await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta",
+                "twice_lineage",
+                "Twice lineage again",
+                "twice_lineage_raw",
+                20,
+                "primary_team",
+            )
+            .await;
+
+            let mut g = Graph::default();
+            add_catalog(&ch, &mut g).await;
+
+            let publishers = publishers_of(&g, "twice_lineage");
+            assert_eq!(
+                publishers.len(),
+                1,
+                "one dataset, one publisher: {publishers:?}"
+            );
+        }
     }
 }

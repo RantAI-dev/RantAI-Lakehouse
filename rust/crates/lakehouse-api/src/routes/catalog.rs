@@ -563,7 +563,14 @@ fn order_results(rows: &mut [Value], searched: bool, sort: &[catalog_query::Sort
 ///
 /// A constant clause — never caller input — so it can be spliced into a
 /// statement with `format!`.
-const NOT_IN_PRIMARY: &str = "NOT IN (SELECT slug FROM lake.`bronze_meta.dataset_catalog` FINAL)";
+///
+/// `DATA-42` D2: `pub(crate)`, because the rule is not the catalog's
+/// alone. The readers `DATA-42` fixes — `governance`, `overview`,
+/// `storage`, `lineage` and `catalog_profile` — carry this same clause, so
+/// the primary registry wins in ALL of them from ONE definition. The
+/// clause is not copied and the string is not re-typed.
+pub(crate) const NOT_IN_PRIMARY: &str =
+    "NOT IN (SELECT slug FROM lake.`bronze_meta.dataset_catalog` FINAL)";
 
 /// DATA-40 D5: the slugs BOTH registries hold — the clash the reads above
 /// resolve in favour of the primary.
@@ -3820,6 +3827,9 @@ type DecideAccessRequestBody = crate::routes::agents::DecideApprovalBody;
 /// - `403` [`ApiError::PermissionDenied`] if the deciding principal is the SAME
 ///   person who requested this access — self-approval is refused, proven
 ///   by a real test (WS7 plan's own acceptance criterion for this task).
+///   The check is `routes::agents::refuse_own_request` (`SEC-57`), the one
+///   rule a `kind = "tool_call"` approval obeys too; it runs BEFORE the
+///   store call, so a refused decision writes nothing.
 /// - `403` [`ApiError::PermissionDenied`] if the decision is an approval and
 ///   the deciding principal does NOT hold the permission the request asks
 ///   for (`SEC-45`) — an approver may only approve a permission they hold
@@ -3857,13 +3867,12 @@ pub async fn decide_access_request(
     }
     // Self-approval refused: the deciding principal must not be the same
     // human who requested this access — the SERVER-SIDE enforcement of
-    // Hard Requirement 3, not merely a client-side hint.
-    if existing.requested_by_user_id == Some(principal.id.uuid()) {
-        return Err(ApiError::PermissionDenied(
-            "tidak boleh menyetujui permintaan akses milik sendiri".to_owned(),
-        )
-        .into());
-    }
+    // Hard Requirement 3, not merely a client-side hint. The check itself
+    // moved to `routes::agents::refuse_own_request` in `SEC-57`, so a
+    // tool-call approval and an access request are refused by ONE rule
+    // (AGENTS.md rule 4) — this route calls it in place of its own
+    // inline comparison.
+    crate::routes::agents::refuse_own_request(&existing, &principal)?;
     // SEC-45: an approver may only approve a permission they hold
     // themselves — the same rule `routes::catalog_grants::create` applies
     // to a direct grant (`PR #106 review R1 BLOCKER 4`), so holding
@@ -7261,155 +7270,15 @@ mod tests {
         #![allow(clippy::unwrap_used, clippy::expect_used)]
 
         use lakehouse_auth::{PermissionSet, PrincipalId};
-        use testcontainers::ImageExt;
-        use testcontainers::runners::AsyncRunner;
-        use testcontainers_modules::clickhouse::ClickHouse;
         use uuid::Uuid;
 
         use super::*;
-        use crate::config::Config;
-
-        /// A `ClickHouse` for one test: its address, and the container it
-        /// runs in.
-        async fn clickhouse() -> (String, testcontainers::ContainerAsync<ClickHouse>) {
-            // The compose service's env trio; all three are required, see
-            // `tests/gold_publication.rs`.
-            let container = ClickHouse::default()
-                .with_env_var("CLICKHOUSE_USER", "default")
-                .with_env_var("CLICKHOUSE_PASSWORD", "")
-                .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
-                .with_tag("26.8")
-                .start()
-                .await
-                .expect("start the ClickHouse testcontainer");
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(8123)
-                .await
-                .expect("container HTTP port");
-            let url = format!("http://{host}:{port}");
-            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
-            wait_until_ready(&ch).await;
-            create_registry(&ch).await;
-            (url, container)
-        }
-
-        /// The container is running when `start` returns; the server inside
-        /// it may still be booting.
-        async fn wait_until_ready(ch: &ChClient) {
-            for _ in 0..60 {
-                if ch.rows("SELECT 1", None).await.is_ok() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            panic!("the ClickHouse testcontainer did not answer");
-        }
-
-        /// The six registry tables, with the shapes their owner declares
-        /// (`dagster/dispar_orchestrate/bronze_catalog.py`'s
-        /// `_registry_schemas`): `ReplacingMergeTree ORDER BY slug`, and
-        /// `ORDER BY (slug, key_asli)` for the columns.
-        async fn create_registry(ch: &ChClient) {
-            ch.exec("CREATE DATABASE IF NOT EXISTS lake", None)
-                .await
-                .expect("create the lake database");
-            for registry in ["bronze_meta", "bronze_meta_sec"] {
-                for (table, columns, order_by) in [
-                    (
-                        "dataset_catalog",
-                        "slug String, title String, description String, tier String, updated_at String, table_name String",
-                        "slug",
-                    ),
-                    (
-                        "dataset_sync",
-                        "slug String, title String, description String, table_name String, total UInt64, author String, frekuensi String, satuan String, klasifikasi String",
-                        "slug",
-                    ),
-                    (
-                        "dataset_column",
-                        "slug String, key_asli String, tipe String, deskripsi String",
-                        "(slug, key_asli)",
-                    ),
-                ] {
-                    let sql = format!(
-                        "CREATE TABLE IF NOT EXISTS lake.`{registry}.{table}` ({columns}) \
-                         ENGINE = ReplacingMergeTree ORDER BY {order_by}"
-                    );
-                    ch.exec(&sql, None)
-                        .await
-                        .expect("create the registry table");
-                }
-            }
-        }
-
-        /// One catalog row: the registry's own row for a dataset.
-        async fn seed_catalog(
-            ch: &ChClient,
-            registry: &str,
-            slug: &str,
-            title: &str,
-            table_name: &str,
-        ) {
-            let slug = SqlLiteral::from(slug);
-            let title = SqlLiteral::from(title);
-            let table_name = SqlLiteral::from(table_name);
-            let sql = format!(
-                "INSERT INTO lake.`{registry}.dataset_catalog` \
-                 (slug, title, description, tier, updated_at, table_name) \
-                 VALUES ({slug}, {title}, 'the dataset', 'primer', '2026-11-01T00:00:00Z', {table_name})"
-            );
-            ch.exec(&sql, None).await.expect("seed the catalog row");
-        }
-
-        /// One sync row: the registry's own row for a dataset's rows.
-        async fn seed_sync(
-            ch: &ChClient,
-            registry: &str,
-            slug: &str,
-            title: &str,
-            table_name: &str,
-            total: u64,
-        ) {
-            let slug = SqlLiteral::from(slug);
-            let title = SqlLiteral::from(title);
-            let table_name = SqlLiteral::from(table_name);
-            let sql = format!(
-                "INSERT INTO lake.`{registry}.dataset_sync` \
-                 (slug, title, description, table_name, total, author, frekuensi, satuan, klasifikasi) \
-                 VALUES ({slug}, {title}, 'the dataset', {table_name}, {total}, 'team', 'daily', '', '')"
-            );
-            ch.exec(&sql, None).await.expect("seed the sync row");
-        }
-
-        /// One column row.
-        async fn seed_column(ch: &ChClient, registry: &str, slug: &str, key: &str) {
-            let slug = SqlLiteral::from(slug);
-            let key = SqlLiteral::from(key);
-            let sql = format!(
-                "INSERT INTO lake.`{registry}.dataset_column` (slug, key_asli, tipe, deskripsi) \
-                 VALUES ({slug}, {key}, 'UInt64', 'the column')"
-            );
-            ch.exec(&sql, None).await.expect("seed the column row");
-        }
-
-        /// The state the detail page reads with: this deployment's
-        /// `ClickHouse` and no store. A deployment without a store sees the
-        /// page's governance and annotation reads empty, which is what these
-        /// tests are about.
-        fn state_for(ch_url: &str) -> AppState {
-            let mut env = HashMap::new();
-            env.insert("CH_URL".to_owned(), ch_url.to_owned());
-            AppState::new(Config::from_map(&env).expect("a valid test Config"))
-        }
-
-        /// The same `ClickHouse`, with the setting that pins the engine's
-        /// read order: `max_threads=1` makes it read one part at a time, in
-        /// the order the parts were written. A URL setting, so the
-        /// statement the module sends is the statement that runs.
-        fn pinned(ch_url: &str) -> String {
-            format!("{ch_url}/?max_threads=1")
-        }
+        // `DATA-42` D7: the registry fixture is the crate's own now, so
+        // this module and the four readers `DATA-42` fixes seed the same
+        // registry the same way.
+        use crate::routes::bronze_registry_fixture::{
+            clickhouse, pinned, seed_catalog, seed_column, seed_sync, state_for,
+        };
 
         /// An Analyst in the catalog tenant, with the permissions the page
         /// asks for.
