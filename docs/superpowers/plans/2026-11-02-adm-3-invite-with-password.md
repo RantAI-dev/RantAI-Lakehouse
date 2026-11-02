@@ -206,3 +206,30 @@ new route returns fixed strings, never one).
   before this work started; nothing new was started.
 
 ## 6. Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-02, at `d087ba1b`)
+
+Read: `routes/identity.rs` (`create_user`, `reset_user_password`), `lakehouse-auth/src/password.rs`
+(the generator, `create_local_identity_in_tx`, `set_temporary_password_in_tx`),
+`session::revoke_all_sessions_for_user_in_tx`, and the console's shown-once dialog.
+
+- **D1 holds.**
+  - The password is 24 characters from `rand::rng()` (OS-seeded CSPRNG) with uniform
+    `random_range`, over an alphabet with no look-alikes.
+  - It is carried in `lakehouse_auth::Secret`, whose `Debug` and `Display` are redacted. It is
+    exposed only by the response serializer.
+  - The user, the memberships and the credential are written in one transaction. A bad name
+    leaves nothing behind, which is tested.
+- **D2 and D3 hold.**
+  - A reset writes the credential and revokes every session in one transaction.
+  - A self-reset is a 400.
+  - A non-`*:*` caller resetting a `*:*` target gets the same 404 as an unknown user, and the
+    test asserts byte equality.
+- **D5.** The audit rows name the actor and the target and carry no password. An audit insert that
+  fails is logged and does not fail the request. That matches the existing identity routes.
+- **D6.** Contract, client, services, then feature. The dialog shows the password once, and the
+  tests assert it is gone after closing.
+- The developer ran: `identity` 76, `route_auth` 67, `security_regressions` 11, `sec11_guard` 4,
+  `lakehouse-auth` 147 and `lakehouse-store` 840, all passing, and admin console tests 51 passing.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI.
