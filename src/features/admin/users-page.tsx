@@ -6,16 +6,19 @@ import { PlusIcon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
@@ -28,13 +31,17 @@ import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
-import type { User } from "@/services/contracts/identity"
+import type { Role, Tenant, User } from "@/services"
 import { getUserColumns, PillList, UserStatusPill } from "./user-columns"
 
 export function UsersPage() {
   const { hasPermission } = useAuth()
   const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listUsers(s), [])
+  // ADM-4 D7: the role editor needs the roles that exist, and the tenant
+  // remover needs the tenant ids behind the tenant NAMES a user carries.
+  const rolesState = useService((s) => identityService.listRoles(s), [])
+  const tenantsState = useService((s) => identityService.listTenants(s), [])
   const [selected, setSelected] = React.useState<User | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [name, setName] = React.useState("")
@@ -48,6 +55,15 @@ export function UsersPage() {
   // so a re-render of the table (a filter keystroke, a refetch landing)
   // cannot leak it through a hook that stores its argument.
   const [revealedPassword, setRevealedPassword] = React.useState<string | null>(null)
+  // ADM-4 D7: the user whose roles are being edited, and the role names
+  // the editor currently has ticked.
+  const [rolesTarget, setRolesTarget] = React.useState<User | null>(null)
+  const [roleSelection, setRoleSelection] = React.useState<string[]>([])
+  // ADM-4 D7: the user a tenant is being taken away from.
+  const [tenantTarget, setTenantTarget] = React.useState<User | null>(null)
+  // ADM-4 D7: the user whose status is being switched, and the dialog
+  // that asks for confirmation first.
+  const [statusTarget, setStatusTarget] = React.useState<User | null>(null)
   const tableUrlState = useTableUrlState()
 
   const create = useServiceAction(
@@ -58,6 +74,28 @@ export function UsersPage() {
   const reset = useServiceAction(
     (signal, id: string) => identityService.resetPassword(id, signal)
   )
+
+  // ADM-4 D1: replace the user's local role set.
+  const setRolesAction = useServiceAction(
+    (signal, id: string, roleNames: string[]) =>
+      identityService.setUserRoles(id, roleNames, signal)
+  )
+
+  // ADM-4 D2: take a user out of a tenant.
+  const removeTenant = useServiceAction(
+    (signal, id: string, tenantId: string) =>
+      identityService.removeUserFromTenant(id, tenantId, signal)
+  )
+
+  // ADM-4 D3: switch a user off, and back on again.
+  const setStatus = useServiceAction((signal, id: string, active: boolean) =>
+    active ? identityService.reactivateUser(id, signal) : identityService.deactivateUser(id, signal)
+  )
+
+  // `state.reload` is stable (it is a `useCallback` inside `useService`),
+  // so it can be a dependency without re-creating the callbacks below on
+  // every render.
+  const reloadUsers = state.reload
 
   const handleResetPassword = React.useCallback(
     async (user: User) => {
@@ -73,14 +111,22 @@ export function UsersPage() {
     [reset]
   )
 
+  const openRoleEditor = React.useCallback((user: User) => {
+    setRolesTarget(user)
+    setRoleSelection([...user.roles])
+  }, [])
+
   const columns = React.useMemo(
     () =>
       getUserColumns({
         onSelect: setSelected,
         canWrite,
         onResetPassword: (user) => void handleResetPassword(user),
+        onEditRoles: openRoleEditor,
+        onRemoveFromTenant: (user) => setTenantTarget(user),
+        onToggleStatus: (user) => setStatusTarget(user),
       }),
-    [canWrite, handleResetPassword]
+    [canWrite, handleResetPassword, openRoleEditor]
   )
 
   const filteredData = React.useMemo(() => {
@@ -148,6 +194,35 @@ export function UsersPage() {
       state.reload()
     }
   }
+
+  async function handleSaveRoles() {
+    if (!rolesTarget) return
+    // A failed save leaves the dialog open with the selection intact, so
+    // the admin can try again without re-picking every role.
+    const result = await setRolesAction.run(rolesTarget.id, roleSelection)
+    if (!result) return
+    setRolesTarget(null)
+    reloadUsers()
+  }
+
+  async function handleRemoveFromTenant(user: User, tenant: Tenant) {
+    const result = await removeTenant.run(user.id, tenant.id)
+    if (!result) return
+    setTenantTarget(null)
+    reloadUsers()
+  }
+
+  async function handleToggleStatus() {
+    if (!statusTarget) return
+    const active = statusTarget.status !== "active"
+    const result = await setStatus.run(statusTarget.id, active)
+    if (!result) return
+    setStatusTarget(null)
+    reloadUsers()
+  }
+
+  const availableRoles: Role[] = rolesState.status === "success" ? rolesState.data : []
+  const knownTenants: Tenant[] = tenantsState.status === "success" ? tenantsState.data : []
 
   return (
     <div className="flex flex-col gap-4">
@@ -292,6 +367,142 @@ export function UsersPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* ADM-4 D1/D7: the role editor. The ticked roles ARE the user's
+          whole local role set — a role left unticked is a role the user
+          no longer holds. */}
+      <Dialog
+        open={rolesTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setRolesTarget(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Edit roles</DialogTitle>
+            <DialogDescription>
+              The roles {rolesTarget?.name ?? "this user"} holds. A role left
+              unticked is a role the user no longer holds.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-64 overflow-y-auto">
+            {rolesState.status === "loading" ? (
+              <p className="text-sm text-muted-foreground">Loading roles…</p>
+            ) : null}
+            {rolesState.status === "success" && availableRoles.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No roles are defined yet.</p>
+            ) : null}
+            <ul className="grid gap-1">
+              {availableRoles.map((role) => (
+                <li
+                  key={role.id}
+                  className="flex items-center gap-2 rounded-md border border-border px-2 py-1.5 text-sm"
+                >
+                  <Checkbox
+                    checked={roleSelection.includes(role.name)}
+                    aria-label={role.name}
+                    onCheckedChange={(checked) =>
+                      setRoleSelection((current) =>
+                        checked === true
+                          ? [...current, role.name]
+                          : current.filter((name) => name !== role.name)
+                      )
+                    }
+                  />
+                  <span className="min-w-0 flex-1 truncate">{role.name}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setRolesTarget(null)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={setRolesAction.status === "pending"}
+              onClick={() => void handleSaveRoles()}
+            >
+              {setRolesAction.status === "pending" ? "Saving…" : "Save roles"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ADM-4 D2/D7: taking a user out of a tenant. The user's tenant
+          NAMES are what the directory shows, so the id behind each one
+          is looked up in the tenant list. */}
+      <Dialog
+        open={tenantTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setTenantTarget(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Remove from tenant</DialogTitle>
+            <DialogDescription>
+              The tenant {tenantTarget?.name ?? "this user"} should leave.
+            </DialogDescription>
+          </DialogHeader>
+          {tenantTarget !== null && tenantTarget.tenants.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              This user is in no tenant.
+            </p>
+          ) : null}
+          <ul className="grid gap-1">
+            {(tenantTarget?.tenants ?? []).map((tenantName) => {
+              const tenant = knownTenants.find((candidate) => candidate.name === tenantName)
+              return (
+                <li
+                  key={tenantName}
+                  className="flex items-center justify-between gap-2 rounded-md border border-border px-2 py-1.5 text-sm"
+                >
+                  <span className="min-w-0 flex-1 truncate">{tenantName}</span>
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="outline"
+                    disabled={!tenant || removeTenant.status === "pending"}
+                    onClick={() => {
+                      if (!tenant || !tenantTarget) return
+                      void handleRemoveFromTenant(tenantTarget, tenant)
+                    }}
+                  >
+                    Remove
+                  </Button>
+                </li>
+              )
+            })}
+          </ul>
+        </DialogContent>
+      </Dialog>
+
+      {/* ADM-4 D3/D7: switching a user off ends every session they hold,
+          so the console asks first. */}
+      <ConfirmActionDialog
+        open={statusTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setStatusTarget(null)
+        }}
+        title={
+          statusTarget?.status === "active" ? "Deactivate this user?" : "Reactivate this user?"
+        }
+        description={
+          statusTarget?.status === "active"
+            ? `${statusTarget?.name ?? "This user"} will not be able to sign in.`
+            : `${statusTarget?.name ?? "This user"} will be able to sign in again.`
+        }
+        impact={
+          statusTarget?.status === "active"
+            ? "Every session they hold ends now. Their data, dashboards and audit history stay."
+            : undefined
+        }
+        confirmLabel={statusTarget?.status === "active" ? "Deactivate" : "Reactivate"}
+        destructive={statusTarget?.status === "active"}
+        confirming={setStatus.status === "pending"}
+        onConfirm={() => void handleToggleStatus()}
+      />
     </div>
   )
 }

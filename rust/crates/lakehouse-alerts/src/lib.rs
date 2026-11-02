@@ -4638,6 +4638,7 @@ mod tests {
             user: None,
             pass: String::new(),
             from: String::new(),
+            ca_bundle: None,
         })
     }
 
