@@ -79,14 +79,23 @@ async fn create_pending_delete_chart_approval(
 /// underlying tool's permission, executes it exactly once through the
 /// real dispatch, flips the run to a terminal status, and audits both the
 /// `approved` decision and the execution outcome.
+///
+/// SEC-57: the decision is made by a SECOND principal. The approval was
+/// requested by `fajar@meridian.example`, and the requester may not decide
+/// their own request — the test encoded the OLD rule (the requester
+/// decided it), so it now decides as somebody else. Nothing else about it
+/// changed.
 #[tokio::test]
 async fn approve_executes_the_tool_and_flips_run_status() {
     let TestApp { router, pool } = spin_up().await;
     let approval_id = create_pending_delete_chart_approval(&router, &pool).await;
 
-    // Approve as Fajar (Platform Admin: `*:*`, holds both `agent:approve`
-    // and the tool's own `dashboard:write`).
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    // A second principal, holding both `agent:approve` and the tool's own
+    // `dashboard:write` — the requester cannot do this any more.
+    let approver_id =
+        create_principal_with_permissions(&pool, "dashboard:write, dashboard:read, agent:approve")
+            .await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
     let resp = post(
         &router,
         &format!("/api/agents/approvals/{approval_id}/decide"),
@@ -133,12 +142,18 @@ async fn approve_executes_the_tool_and_flips_run_status() {
 
 /// Rejecting a pending approval executes nothing: the run flips to
 /// `rejected`, never `succeeded`/`failed`, and is audited `rejected`.
+///
+/// SEC-57: the decision is made by a SECOND principal — the requester may
+/// not decide their own request.
 #[tokio::test]
 async fn reject_executes_nothing_and_flips_run_to_rejected() {
     let TestApp { router, pool } = spin_up().await;
     let approval_id = create_pending_delete_chart_approval(&router, &pool).await;
 
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let approver_id =
+        create_principal_with_permissions(&pool, "dashboard:write, dashboard:read, agent:approve")
+            .await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
     let resp = post(
         &router,
         &format!("/api/agents/approvals/{approval_id}/decide"),
@@ -176,16 +191,21 @@ async fn reject_executes_nothing_and_flips_run_to_rejected() {
 /// Double-decide: approving an already-decided approval a second time is
 /// a 409, and the tool is never executed twice (proven by the run only
 /// ever carrying ONE execution step, not two).
+///
+/// SEC-57: both decisions are made by a SECOND principal — the requester
+/// may not decide their own request.
 #[tokio::test]
 async fn double_decide_does_not_execute_twice() {
     let TestApp { router, pool } = spin_up().await;
     let approval_id = create_pending_delete_chart_approval(&router, &pool).await;
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let approver_id =
+        create_principal_with_permissions(&pool, "dashboard:write, dashboard:read, agent:approve")
+            .await;
 
     let first = post(
         &router,
         &format!("/api/agents/approvals/{approval_id}/decide"),
-        Some(&cookie),
+        Some(&session_cookie_for_user(&pool, approver_id).await),
         json!({ "decision": "approved" }),
     )
     .await;
@@ -199,7 +219,7 @@ async fn double_decide_does_not_execute_twice() {
     // A fresh session for the second request — approving twice with the
     // SAME cookie is fine too, but a fresh one matches how a second
     // browser tab / a retried request would actually look.
-    let cookie2 = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let cookie2 = session_cookie_for_user(&pool, approver_id).await;
     let second = post(
         &router,
         &format!("/api/agents/approvals/{approval_id}/decide"),
@@ -803,12 +823,18 @@ async fn delete_board_creates_a_pending_approval_and_does_not_execute() {
 /// dispatch. The dead `ClickHouse` upstream forces the run to `failed`,
 /// the same shape `delete_chart` produces — the point is that the
 /// approval-decision path executed, not that the board was deleted.
+///
+/// SEC-57: the decision is made by a SECOND principal — the requester may
+/// not decide their own request.
 #[tokio::test]
 async fn approve_delete_board_executes_the_dispatch_and_audits_it() {
     let TestApp { router, pool } = spin_up().await;
     let approval_id = create_pending_delete_board_approval(&router, &pool).await;
 
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let approver_id =
+        create_principal_with_permissions(&pool, "dashboard:write, dashboard:read, agent:approve")
+            .await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
     let resp = post(
         &router,
         &format!("/api/agents/approvals/{approval_id}/decide"),
@@ -843,12 +869,18 @@ async fn approve_delete_board_executes_the_dispatch_and_audits_it() {
 }
 
 /// Rejecting a pending `delete_board` approval executes nothing.
+///
+/// SEC-57: the decision is made by a SECOND principal — the requester may
+/// not decide their own request.
 #[tokio::test]
 async fn reject_delete_board_executes_nothing() {
     let TestApp { router, pool } = spin_up().await;
     let approval_id = create_pending_delete_board_approval(&router, &pool).await;
 
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let approver_id =
+        create_principal_with_permissions(&pool, "dashboard:write, dashboard:read, agent:approve")
+            .await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
     let resp = post(
         &router,
         &format!("/api/agents/approvals/{approval_id}/decide"),
@@ -897,4 +929,181 @@ async fn create_pending_delete_board_approval(
         .as_str()
         .expect("approval_id present")
         .to_owned()
+}
+
+// ── SEC-57: the requester may not decide their own request ───────────────
+//
+// The rule the catalog access route already obeyed (`WS7 item E3`) now
+// covers a tool call too: the person whose chat asked for a high-risk
+// action may not approve it. The approval row names its requester
+// (`approval_item.requested_by_user_id`), and the API refuses the
+// self-decision with 403 BEFORE it writes anything.
+
+/// The `app_user.id` the given approval names as its requester.
+async fn requester_of(approval_id: &str, pool: &sqlx::PgPool) -> Option<uuid::Uuid> {
+    let (requester,): (Option<uuid::Uuid>,) =
+        sqlx::query_as("SELECT requested_by_user_id FROM approval_item WHERE id = $1")
+            .bind(approval_id)
+            .fetch_one(pool)
+            .await
+            .expect("the approval row exists");
+    requester
+}
+
+/// SEC-57: the person who asked for a high-risk tool call may not approve
+/// it. The requester here is `fajar@meridian.example` — a Platform Admin
+/// (`*:*`), so he holds `agent:approve` AND the tool's own `dashboard:write`:
+/// without the rule he could approve his own deletion.
+///
+/// The refusal is 403 and writes NOTHING: the approval stays `pending`,
+/// the run stays `waiting_approval`, and the chart still exists (the
+/// delete tool never ran — there is no execution step and no `executed`
+/// audit row for the run).
+#[tokio::test]
+async fn agent_decide_route_refuses_the_requester_approving_their_own_tool_call() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_chart_approval(&router, &pool).await;
+
+    // The approval really names its requester — the column the rule reads.
+    let (fajar_id,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind("fajar@meridian.example")
+        .fetch_one(&pool)
+        .await
+        .expect("seeded user fajar@meridian.example must exist");
+    assert_eq!(
+        requester_of(&approval_id, &pool).await,
+        Some(fajar_id),
+        "SEC-57: a tool call asked for by a person names that person as its requester"
+    );
+
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: tidak boleh menyetujui permintaan milik sendiri")
+    );
+
+    // NOTHING changed: the approval is still pending, the run is still
+    // waiting for a decision, and the chart still exists.
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the approval")
+        .expect("the approval exists");
+    assert_eq!(approval.status, "pending");
+
+    let run_id = approval.run_id.clone().expect("run_id present");
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_eq!(run.status, "waiting_approval");
+    assert_eq!(
+        run.steps.len(),
+        1,
+        "only the pending step — the delete tool never ran, so the chart still exists"
+    );
+
+    let events = list(&pool, AuditFilter::default())
+        .await
+        .expect("list audit events");
+    let for_this_run: Vec<_> = events
+        .iter()
+        .filter(|e| e.run_id.as_deref() == Some(run_id.as_str()))
+        .collect();
+    assert!(
+        !for_this_run.iter().any(|e| e.outcome == "executed"),
+        "a refused self-approval executes nothing"
+    );
+}
+
+/// SEC-57: the rule refuses BOTH decisions — the requester may not
+/// approve and may not reject their own request either (the same rule
+/// the catalog access route obeys, where the check runs before the
+/// `decision` is looked at). Nothing is written: the approval stays
+/// `pending` and the run stays `waiting_approval`.
+#[tokio::test]
+async fn agent_decide_route_refuses_the_requester_rejecting_their_own_tool_call() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_chart_approval(&router, &pool).await;
+
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "rejected" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: tidak boleh menyetujui permintaan milik sendiri")
+    );
+
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the approval")
+        .expect("the approval exists");
+    assert_eq!(approval.status, "pending");
+
+    let run_id = approval.run_id.clone().expect("run_id present");
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_eq!(run.status, "waiting_approval");
+}
+
+/// SEC-57: a DIFFERENT approver may still decide the request — the rule
+/// refuses the requester, it does not block the approval. The second
+/// principal holds both `agent:approve` and the tool's own
+/// `dashboard:write`, so the decision goes through the real dispatch.
+#[tokio::test]
+async fn agent_decide_route_allows_a_different_approver() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_chart_approval(&router, &pool).await;
+
+    let approver_id =
+        create_principal_with_permissions(&pool, "dashboard:write, dashboard:read, agent:approve")
+            .await;
+    assert_ne!(
+        Some(approver_id),
+        requester_of(&approval_id, &pool).await,
+        "the second approver is not the requester"
+    );
+
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
+    let resp = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(true));
+    assert_eq!(body["approval"]["status"], json!("approved"));
+
+    let run_id = body["approval"]["runId"]
+        .as_str()
+        .expect("runId present")
+        .to_owned();
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_ne!(
+        run.status, "waiting_approval",
+        "a different approver's decision moves the run on"
+    );
 }

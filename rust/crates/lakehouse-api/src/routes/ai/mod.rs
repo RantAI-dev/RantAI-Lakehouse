@@ -1393,6 +1393,13 @@ async fn request_approval(
                 &stored,
                 &redacted,
                 resource_id,
+                // SEC-57: the approval records the HUMAN who asked for it,
+                // so the API can refuse them deciding their own request
+                // (`routes::agents::refuse_own_request`). `None` for a
+                // service identity and for a call with no principal at
+                // all: `approval_item.requested_by_user_id` points at
+                // `app_user`, and no human asked in those cases.
+                principal.and_then(Principal::user_id),
             )
             .await
         }
