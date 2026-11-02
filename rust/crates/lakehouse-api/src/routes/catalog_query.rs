@@ -400,18 +400,24 @@ fn compare_op(asset: &Value, field: &str, operator: &str, operand: &str) -> bool
 
 /// Combine `filters` with `join`. No filters means no filtering, for
 /// either operator — an empty `or` must not reject every row.
-pub fn apply_filters(assets: &[Value], filters: &[Filter], join: JoinOperator) -> Vec<Value> {
+///
+/// The rows that match are kept, in their order, and the rows that do not
+/// are dropped.
+///
+/// `DATA-41` D6: the rows are filtered in place, and with no filters
+/// nothing is touched at all. This used to return a copy of every row,
+/// and the caller threw that copy away when there was nothing to filter:
+/// on a catalog of 10,000 tables a search copied the whole catalog for
+/// nothing, which was about 150 ms of every request to
+/// `GET /api/catalog/query?search=` (`docs/plans/DATA-11-RESULT.md`).
+pub fn apply_filters(assets: &mut Vec<Value>, filters: &[Filter], join: JoinOperator) {
     if filters.is_empty() {
-        return assets.to_vec();
+        return;
     }
-    assets
-        .iter()
-        .filter(|asset| match join {
-            JoinOperator::And => filters.iter().all(|f| matches_filter(asset, f)),
-            JoinOperator::Or => filters.iter().any(|f| matches_filter(asset, f)),
-        })
-        .cloned()
-        .collect()
+    assets.retain(|asset| match join {
+        JoinOperator::And => filters.iter().all(|f| matches_filter(asset, f)),
+        JoinOperator::Or => filters.iter().any(|f| matches_filter(asset, f)),
+    });
 }
 
 /// Multi-column sort, applied left to right, with `id` as a final
@@ -605,12 +611,22 @@ mod tests {
         }
     }
 
+    /// The rows that match `filters`.
+    ///
+    /// `DATA-41` D6: [`apply_filters`] filters the rows in place, so this
+    /// helper owns them and hands back the ones that matched.
+    fn filter_rows(assets: Vec<Value>, filters: &[Filter], join: JoinOperator) -> Vec<Value> {
+        let mut rows = assets;
+        apply_filters(&mut rows, filters, join);
+        rows
+    }
+
     // --- filter operators -------------------------------------------
 
     #[test]
     fn eq_ignores_case_and_ne_includes_missing_fields() {
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("layer", "eq", &["silver"])],
             JoinOperator::And,
         );
@@ -618,8 +634,8 @@ mod tests {
 
         // `dim_negara` has no `owner` key at all; `ne` must still return it,
         // otherwise a negative filter quietly hides incomplete rows.
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("owner", "ne", &["Dinas Ekraf"])],
             JoinOperator::And,
         );
@@ -640,8 +656,8 @@ mod tests {
     }
 
     fn tag_hits(operator: &str, values: &[&str]) -> Vec<String> {
-        apply_filters(
-            &tagged(),
+        filter_rows(
+            tagged(),
             &[filter("tags", operator, values)],
             JoinOperator::And,
         )
@@ -689,8 +705,8 @@ mod tests {
             json!({ "id": "c" }),
         ];
         let hits = |operator: &str, values: &[&str]| -> Vec<String> {
-            apply_filters(
-                &assets,
+            filter_rows(
+                assets.clone(),
                 &[filter("tags", operator, values)],
                 JoinOperator::And,
             )
@@ -737,14 +753,14 @@ mod tests {
             json!({ "id": "c", "certification": "certified" }),
             json!({ "id": "d", "certification": "certified" }),
         ];
-        let certified = apply_filters(
-            &rows,
+        let certified = filter_rows(
+            rows.clone(),
             &[filter("certification", "eq", &["certified"])],
             JoinOperator::And,
         );
         assert_eq!(ids(&certified), vec!["c", "d"]);
-        let marked = apply_filters(
-            &rows,
+        let marked = filter_rows(
+            rows.clone(),
             &[filter(
                 "certification",
                 "inArray",
@@ -780,8 +796,8 @@ mod tests {
 
     #[test]
     fn is_empty_covers_both_missing_and_blank() {
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("owner", "isEmpty", &[])],
             JoinOperator::And,
         );
@@ -790,8 +806,8 @@ mod tests {
 
     #[test]
     fn in_array_matches_any_listed_value() {
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("tier", "inArray", &["gold", "bronze"])],
             JoinOperator::And,
         );
@@ -803,8 +819,8 @@ mod tests {
     fn numeric_operators_compare_as_numbers_not_strings() {
         // Lexicographically "900" > "20000"; numerically it is not. This is
         // the case that catches a string-comparison regression.
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("sizeBytes", "gt", &["1000"])],
             JoinOperator::And,
         );
@@ -813,8 +829,8 @@ mod tests {
 
     #[test]
     fn is_between_is_inclusive_at_both_ends() {
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("sizeBytes", "isBetween", &["900", "1024"])],
             JoinOperator::And,
         );
@@ -825,8 +841,8 @@ mod tests {
     fn unknown_operator_matches_nothing_rather_than_everything() {
         // Failing open would widen the result set — the wrong direction for
         // a governed catalog.
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("layer", "bogusOperator", &["Silver"])],
             JoinOperator::And,
         );
@@ -842,20 +858,43 @@ mod tests {
             filter("tier", "eq", &["gold"]),
         ];
         assert_eq!(
-            ids(&apply_filters(&fixture(), &filters, JoinOperator::And)),
+            ids(&filter_rows(fixture(), &filters, JoinOperator::And)),
             vec!["silver.mart_wisman"]
         );
-        assert_eq!(
-            apply_filters(&fixture(), &filters, JoinOperator::Or).len(),
-            3
-        );
+        assert_eq!(filter_rows(fixture(), &filters, JoinOperator::Or).len(), 3);
     }
 
     #[test]
     fn empty_filter_list_is_a_no_op_for_both_join_operators() {
         // An empty `or` must not reject every row.
-        assert_eq!(apply_filters(&fixture(), &[], JoinOperator::Or).len(), 4);
-        assert_eq!(apply_filters(&fixture(), &[], JoinOperator::And).len(), 4);
+        assert_eq!(filter_rows(fixture(), &[], JoinOperator::Or).len(), 4);
+        assert_eq!(filter_rows(fixture(), &[], JoinOperator::And).len(), 4);
+    }
+
+    // `DATA-41` D6`: the rows are filtered in place, so the caller's own
+    // rows are the ones that are kept, and a call with no filters copies
+    // nothing.
+    #[test]
+    fn the_filters_are_applied_to_the_rows_the_caller_holds() {
+        let mut rows = fixture();
+        apply_filters(
+            &mut rows,
+            &[filter("layer", "eq", &["silver"])],
+            JoinOperator::And,
+        );
+        assert_eq!(ids(&rows), vec!["silver.mart_wisman", "silver.dim_negara"]);
+
+        let mut untouched = fixture();
+        apply_filters(&mut untouched, &[], JoinOperator::Or);
+        assert_eq!(
+            ids(&untouched),
+            vec![
+                "silver.mart_wisman",
+                "bronze.event_2026",
+                "silver.dim_negara",
+                "gold.restoran",
+            ]
+        );
     }
 
     #[test]
@@ -1111,8 +1150,8 @@ mod tests {
         // runs before this pipeline (DATA-11 F1), so this test starts at the
         // filter and its expected answer is unchanged.
         let assets = fixture();
-        let mut filtered = apply_filters(
-            &assets,
+        let mut filtered = filter_rows(
+            assets,
             &[filter("tier", "inArray", &["gold", "silver"])],
             JoinOperator::And,
         );

@@ -110,6 +110,16 @@ describe("CommandPalette catalog search", () => {
     expect(screen.queryByText("Table 9")).toBeNull()
   })
 
+  it("asks the server for the eight results it shows (DATA-41 D3)", async () => {
+    // The server ranks every match and returns the first `limit` of them:
+    // the box must not be served a catalog of ten thousand tables to throw
+    // all but eight away.
+    stubCatalog({ assets: [asset(1)] })
+    await search("table")
+    await screen.findByText("Table 1")
+    expect(requested[0]).toContain("limit=8")
+  })
+
   it("opens the Data Explorer with the typed words from See all results", async () => {
     stubCatalog({ assets: [asset(1)] })
     await search("customer revenue")

@@ -405,6 +405,15 @@ export type AssetProfile =
 
 export type AssetFilter = {
   search?: string
+  /**
+   * At most how many assets the server returns (`DATA-41` D3).
+   *
+   * The server ranks every match and returns the first `limit` of them,
+   * and says how many matched in all. The command palette shows eight
+   * results, so it asks for eight instead of being sent the whole
+   * catalog to throw all but eight away.
+   */
+  limit?: number
   tier?: StorageTier | "all"
   layer?: DataLayer | "all"
   type?: AssetType | "all"
