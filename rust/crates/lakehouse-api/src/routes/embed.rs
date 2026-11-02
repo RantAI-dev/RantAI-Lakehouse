@@ -962,19 +962,39 @@ pub async fn public_dashboard(
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
-    let board = match crate::routes::public_links::resolve(&state, &token).await {
-        Ok(crate::routes::public_links::Resolved::Open(open)) => {
-            if let Some(refusal) =
-                crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
-            {
-                return refusal;
-            }
-            open.board
-        }
+    let open = match crate::routes::public_links::resolve(&state, &token).await {
+        Ok(crate::routes::public_links::Resolved::Open(open)) => open,
         Ok(crate::routes::public_links::Resolved::Gone) => {
             return crate::routes::public_links::not_found();
         }
         Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    if let Some(refusal) =
+        crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
+    {
+        return refusal;
+    }
+    let board = open.board;
+    // `SEC-50` slice 2 D4/M8: the link acts as the tenant that made it.
+    // The creator is read as they are now; a link with no creator (or with a
+    // creator who is gone) has no owner and reaches nothing.
+    let creator = match crate::routes::public_links::creator_of(&state, &open.link).await {
+        Ok(creator) => creator,
+        Err(response) => return response,
+    };
+    // The creator's own headers: a public link is read by nobody in
+    // particular, so the tenant is the creator's first tenant (D4).
+    let no_headers = HeaderMap::new();
+    let actor = match (&creator, open.link.tenant_id) {
+        (Some(principal), Some(tenant_id)) => crate::routes::query::GateActor::AsTenant {
+            principal,
+            tenant_id: Some(tenant_id),
+        },
+        (Some(principal), None) => crate::routes::query::GateActor::Caller {
+            principal,
+            headers: &no_headers,
+        },
+        (None, _) => crate::routes::query::GateActor::Ownerless,
     };
 
     let filters = board.filters.clone().unwrap_or_default();
@@ -999,13 +1019,7 @@ pub async fn public_dashboard(
         render_board_payload(
             &state.clickhouse,
             &PolicyEngineObligations::from_state(&state),
-            // `SEC-50` slice 2 D3: a public link is read by nobody in
-            // particular, so it acts as the deployment's catalog tenant
-            // until T6 gives it the tenant that made it (D4, M8).
-            &crate::routes::query::StatementGate::clickhouse(
-                &state,
-                crate::routes::query::GateActor::CatalogTenant,
-            ),
+            &crate::routes::query::StatementGate::clickhouse(&state, actor),
             &board,
             &board_id,
             &filters,

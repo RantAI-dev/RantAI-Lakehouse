@@ -21,7 +21,7 @@ fn in_days(days: i64) -> OffsetDateTime {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_dashboard_has_one_link_and_a_new_one_ends_the_old(pool: PgPool) -> sqlx::Result<()> {
-    let first = replace(&pool, "b_1", "p_first_token", in_days(30), None, None)
+    let first = replace(&pool, "b_1", "p_first_token", in_days(30), None, None, None)
         .await
         .unwrap();
     assert_eq!(first.token, "p_first_token");
@@ -33,6 +33,7 @@ async fn a_dashboard_has_one_link_and_a_new_one_ends_the_old(pool: PgPool) -> sq
         "p_second_token",
         in_days(7),
         Some("hash"),
+        None,
         None,
     )
     .await
@@ -63,7 +64,7 @@ async fn a_dashboard_has_one_link_and_a_new_one_ends_the_old(pool: PgPool) -> sq
 async fn an_expired_link_is_not_returned_by_the_live_lookup_but_is_still_listed_for_its_board(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    replace(&pool, "b_1", "p_old_token_x", in_days(30), None, None)
+    replace(&pool, "b_1", "p_old_token_x", in_days(30), None, None, None)
         .await
         .unwrap();
     sqlx::query("UPDATE dashboard_public_link SET expires_at = now() - interval '1 second'")
@@ -94,7 +95,7 @@ async fn an_expired_link_is_not_returned_by_the_live_lookup_but_is_still_listed_
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn updating_keeps_the_token_and_refuses_an_expired_link(pool: PgPool) -> sqlx::Result<()> {
-    replace(&pool, "b_1", "p_keep_token", in_days(1), None, None)
+    replace(&pool, "b_1", "p_keep_token", in_days(1), None, None, None)
         .await
         .unwrap();
     let later = in_days(90);
@@ -129,9 +130,17 @@ async fn updating_keeps_the_token_and_refuses_an_expired_link(pool: PgPool) -> s
 async fn a_password_change_bumps_the_version_and_kills_the_tickets(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let link = replace(&pool, "b_1", "p_pw_token_1", in_days(30), Some("h1"), None)
-        .await
-        .unwrap();
+    let link = replace(
+        &pool,
+        "b_1",
+        "p_pw_token_1",
+        in_days(30),
+        Some("h1"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     issue_ticket(&pool, "b_1", link.password_version, "t_hash_a")
         .await
         .unwrap()
@@ -181,7 +190,7 @@ async fn a_ticket_never_outlives_its_link_and_ending_the_link_deletes_the_ticket
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let soon = OffsetDateTime::now_utc() + Duration::hours(2);
-    replace(&pool, "b_1", "p_short_link", soon, Some("h"), None)
+    replace(&pool, "b_1", "p_short_link", soon, Some("h"), None, None)
         .await
         .unwrap();
     let ends = issue_ticket(&pool, "b_1", 0, "t_hash_c")
@@ -199,9 +208,17 @@ async fn a_ticket_never_outlives_its_link_and_ending_the_link_deletes_the_ticket
         .await?;
     assert!(!ticket_is_live(&pool, "b_1", "t_hash_c").await.unwrap());
 
-    replace(&pool, "b_2", "p_other_link", in_days(30), Some("h"), None)
-        .await
-        .unwrap();
+    replace(
+        &pool,
+        "b_2",
+        "p_other_link",
+        in_days(30),
+        Some("h"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     issue_ticket(&pool, "b_2", 0, "t_hash_d")
         .await
         .unwrap()
@@ -218,16 +235,32 @@ async fn a_ticket_never_outlives_its_link_and_ending_the_link_deletes_the_ticket
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_replaced_link_takes_its_tickets_with_it(pool: PgPool) -> sqlx::Result<()> {
-    replace(&pool, "b_1", "p_first_aaaa", in_days(30), Some("h"), None)
-        .await
-        .unwrap();
+    replace(
+        &pool,
+        "b_1",
+        "p_first_aaaa",
+        in_days(30),
+        Some("h"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     issue_ticket(&pool, "b_1", 0, "t_hash_e")
         .await
         .unwrap()
         .unwrap();
-    replace(&pool, "b_1", "p_second_aaa", in_days(30), Some("h"), None)
-        .await
-        .unwrap();
+    replace(
+        &pool,
+        "b_1",
+        "p_second_aaa",
+        in_days(30),
+        Some("h"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(!ticket_is_live(&pool, "b_1", "t_hash_e").await.unwrap());
     Ok(())
 }
@@ -275,7 +308,7 @@ async fn an_ended_link_does_not_come_back_when_the_copy_is_asked_again(
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_copy_leaves_a_link_a_board_already_has(pool: PgPool) -> sqlx::Result<()> {
-    replace(&pool, "b_1", "p_made_after", in_days(7), None, None)
+    replace(&pool, "b_1", "p_made_after", in_days(7), None, None, None)
         .await
         .unwrap();
     let old = vec![("b_1".to_owned(), "p_legacy_one".to_owned())];
@@ -294,15 +327,104 @@ async fn a_deleted_user_leaves_the_link_in_place(pool: PgPool) -> sqlx::Result<(
     )
     .fetch_one(&pool)
     .await?;
-    replace(&pool, "b_1", "p_owned_link", in_days(7), None, Some(user))
-        .await
-        .unwrap();
+    replace(
+        &pool,
+        "b_1",
+        "p_owned_link",
+        in_days(7),
+        None,
+        Some(user),
+        None,
+    )
+    .await
+    .unwrap();
     sqlx::query("DELETE FROM app_user WHERE id = $1")
         .bind(user)
         .execute(&pool)
         .await?;
     let link = get_for_board(&pool, "b_1").await.unwrap().unwrap();
     assert_eq!(link.created_by, None);
+    Ok(())
+}
+
+/// `SEC-50` slice 2 D4: a link records the tenant of the person who made
+/// it, and keeps it when its expiry or its password changes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_link_records_its_tenant_and_keeps_it(pool: PgPool) -> sqlx::Result<()> {
+    let tenant: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenant (name, slug, plan, residency) \
+         VALUES ('T', 't-tenant', 'standard', 'id') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let user: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO app_user (name, email) VALUES ('a', 'a@example.com') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    let link = replace(
+        &pool,
+        "b_1",
+        "p_tenant_token",
+        in_days(30),
+        None,
+        Some(user),
+        Some(tenant),
+    )
+    .await
+    .unwrap();
+    assert_eq!(link.tenant_id, Some(tenant));
+    assert_eq!(
+        get_for_board(&pool, "b_1")
+            .await
+            .unwrap()
+            .unwrap()
+            .tenant_id,
+        Some(tenant)
+    );
+    assert_eq!(
+        get_live_by_token(&pool, "p_tenant_token")
+            .await
+            .unwrap()
+            .unwrap()
+            .tenant_id,
+        Some(tenant)
+    );
+
+    // A change of the expiry or the password keeps the tenant: the link
+    // still acts as the tenant it was made in.
+    let updated = update(&pool, "b_1", in_days(60), &PasswordChange::Keep)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.tenant_id, Some(tenant));
+    Ok(())
+}
+
+/// `SEC-50` slice 2 D4/M8: a link with no tenant (the links that predate
+/// the column, and the links a service identity made) reads as the
+/// creator's first tenant at view time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_link_without_a_tenant_names_none(pool: PgPool) -> sqlx::Result<()> {
+    let user: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO app_user (name, email) VALUES ('a', 'a@example.com') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let link = replace(
+        &pool,
+        "b_1",
+        "p_no_tenant_token",
+        in_days(30),
+        None,
+        Some(user),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(link.tenant_id, None);
+    assert_eq!(link.created_by, Some(user));
     Ok(())
 }
 
@@ -315,6 +437,7 @@ fn a_debug_render_shows_neither_the_token_nor_the_hash() {
         password_hash: Some("$argon2id$secret".to_owned()),
         password_version: 0,
         created_by: None,
+        tenant_id: None,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -342,6 +465,7 @@ async fn simultaneous_new_links_for_one_dashboard_all_succeed_and_leave_one(
                 "b_1",
                 &format!("p_concurrent_{i}"),
                 in_days(7),
+                None,
                 None,
                 None,
             )

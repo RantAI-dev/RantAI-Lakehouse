@@ -742,6 +742,7 @@ async fn the_public_link_ignores_every_new_check() {
         time::OffsetDateTime::now_utc() + time::Duration::days(30),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1061,6 +1062,7 @@ async fn the_frame_answer_is_the_boards_sites_for_a_good_token_and_empty_for_eve
         time::OffsetDateTime::now_utc() + time::Duration::days(30),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1171,6 +1173,7 @@ async fn the_frame_answer_carries_only_the_sites_of_this_boards_cards() {
         BOARD,
         &format!("p_{BOARD}"),
         time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
         None,
         None,
     )

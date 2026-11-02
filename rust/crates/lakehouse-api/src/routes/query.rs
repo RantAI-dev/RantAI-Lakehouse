@@ -309,16 +309,6 @@ pub(crate) enum GateActor<'a> {
     /// The tenant count is the same one [`GateActor::CatalogTenant`] reads,
     /// and the no-database rule is R5's: a deployment that cannot count its
     /// tenants refuses (a 503, with `SEC-20`'s own sentence).
-    ///
-    /// `SEC-50` slice 2 T1: the actor lands with the gate carrier; its
-    /// first site — the public link's view (T6) — is what constructs it.
-    /// Until then the lint says it is never constructed, which is true and
-    /// harmless: the reach it names is covered by the tests beside it.
-    #[allow(
-        dead_code,
-        reason = "the actor lands with the carrier (`SEC-50` slice 2 T1); its \
-                  first construction is the public link's view (T6)"
-    )]
     Ownerless,
     /// `SEC-50` slice 2 T1: the unrestricted gate, for the unit tests
     /// that run a statement against a mock engine.
