@@ -282,3 +282,15 @@ step's own comparison (`if [ "$landing_status" != "404" ]`): a 404 passes, a 200
 ### Proposed BACKLOG.md row
 
 | `WEB-2` | Task | An installed Lakehouse serves the landing page: `/landing` is a public route of the console app (`src/app/landing`, `PUBLIC_PREFIXES`), and every console image (release, staging, compose) builds it in. Product owner decided 2026-11-02: it is a separate product page, not available on an install. Leave `src/app/landing` and `src/features/landing` out of the console image (`.dockerignore`), and prove `/landing` is a 404 in the release's install proof. Where the page lives instead is the owner's decision | Business | P2 | Todo |  | `features/landing-page.md` QA-1 decisions, owner 2026-11-02 |
+
+### Review round 1 (planner, 2026-11-02, at `788cf49d`)
+
+- **T1.** The two `.dockerignore` lines carry their why-comment, and the source comments say where the page is served. Nothing outside the two folders imports them (`git grep` checked). The developer built the image: `find .next/server/app -maxdepth 1 -name "landing*"` printed nothing, `/landing` answered 404 and `/` answered 200.
+- **T2.**
+  - `.dockerignore` is in the release workflow's `pull_request.paths`, so this PR runs the dry run itself.
+  - The install proof fails on anything but 404.
+  - The unit test reads `.dockerignore` rather than pinning a copy. That is the right choice, since the file is the one owner of the list (rule 4).
+- **T3** is docs only.
+- **Counts quoted in the handoff:** ops/release 194, console 3136 pass, dagster 2411, clippy on the workspace exit 0. `cargo test --workspace` is *not verified*, and no Rust changed.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI and its `Release · dry run` (install proof).
