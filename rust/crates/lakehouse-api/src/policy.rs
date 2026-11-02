@@ -718,6 +718,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/identity/users",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/users",                  Policy::RequiresPermission("identity:write")),
     ("PUT",  "/api/identity/users/{id}/tenants/{tenant_id}", Policy::RequiresPermission("identity:write")),
+    // ADM-3 D2: an admin password reset is a credential write, so it
+    // reuses `identity:write` exactly the way every other write-side
+    // identity route does (AGENTS.md rule 4: no new permission token
+    // minted for a route that already has a well-grounded one). The
+    // handler adds the escalation rule on top (D3): only an unrestricted
+    // `"*:*"` caller may reset a user who holds `"*:*"`.
+    ("POST", "/api/identity/users/{id}/reset-password", Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/roles",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/roles",                  Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
