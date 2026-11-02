@@ -9,6 +9,8 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-02
+
 ### Security
 
 - A calculated-field name read back from storage is checked again before it reaches a statement (backlog `SEC-34`). The name is checked when the field is saved, but `console.bi_field` can also be written directly, and the name reaches the statement as a plain alias (`SELECT *, <expression> AS <name>`). A stored row whose name is not an identifier, or is longer than 64 characters, is now left out of every read, so it never reaches a statement. Such a row can also not be opened or deleted through the API - the route answers "not found" - which is acceptable, because the API never wrote it. No migration.
@@ -751,5 +753,6 @@ the CI/security work done to prepare the repository for its first release.
   line; enforced further by a `check-no-secrets.sh` CI script after a
   secret was leaked once during development.
 
-[Unreleased]: https://github.com/RantAI-dev/RantAI-Lakehouse/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/RantAI-dev/RantAI-Lakehouse/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/RantAI-dev/RantAI-Lakehouse/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/RantAI-dev/RantAI-Lakehouse/releases/tag/v0.1.0
