@@ -12,7 +12,7 @@ mock.module("next/navigation", () => ({
   usePathname: () => "/dashboards/main-board",
 }));
 
-const { CopilotProvider, useCopilot, continuationText } = await import("./use-copilot");
+const { CopilotProvider, useCopilot, useCopilotStream, continuationText } = await import("./use-copilot");
 
 /** A draft the model made and the person still has to confirm. */
 type Draft = { tool: string; args: Record<string, unknown>; summary: string };
@@ -497,5 +497,94 @@ describe("the open conversation's title and its load errors (AI-24)", () => {
     expect(copilot!.sessionId).toBeNull();
     expect(copilot!.sessionTitle).toBeNull();
     expect(copilot!.messages).toEqual([]);
+  });
+});
+
+/** A chat stream the test pushes events into, one macrotask apart. */
+function controlledChatStream() {
+  const encoder = new TextEncoder();
+  let push!: (chunk: Uint8Array) => void;
+  let close!: () => void;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      push = (chunk) => controller.enqueue(chunk);
+      close = () => controller.close();
+    },
+  });
+  return {
+    response: { ok: true, status: 200, json: async () => ({}), body } as unknown as Response,
+    async send(line: string) {
+      push(encoder.encode(`${line}\n`));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+    end() {
+      close();
+    },
+  };
+}
+
+describe("streaming does not re-render the whole Copilot (AI-24 D6)", () => {
+  it("leaves a useCopilot() consumer alone while 50 deltas arrive", async () => {
+    const stream = controlledChatStream();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.startsWith("/api/ai/chat")) return stream.response;
+      if (url.startsWith("/api/ai/sessions")) {
+        return fakeJson(200, init?.method === "POST" ? sessionSave : sessionList);
+      }
+      return fakeJson(200, {});
+    }) as typeof fetch;
+
+    // Counted in an effect, after each commit: a memory write during render
+    // would itself be what the count is meant to catch.
+    const mainRenders = { current: 0 };
+    const streamRenders = { current: 0 };
+    function Main() {
+      const api = useCopilot();
+      React.useEffect(() => {
+        copilot = api;
+        mainRenders.current += 1;
+      });
+      return null;
+    }
+    function StreamConsumer() {
+      useCopilotStream();
+      React.useEffect(() => {
+        streamRenders.current += 1;
+      });
+      return null;
+    }
+
+    render(
+      <CopilotProvider>
+        <Main />
+        <StreamConsumer />
+      </CopilotProvider>,
+    );
+
+    let sending: Promise<void> = Promise.resolve();
+    act(() => {
+      sending = copilot!.send("Show me revenue");
+    });
+    await act(async () => {
+      await stream.send(JSON.stringify({ type: "delta", text: "The " }));
+    });
+
+    const mainBefore = mainRenders.current;
+    const streamBefore = streamRenders.current;
+    await act(async () => {
+      for (let i = 0; i < 50; i += 1) {
+        await stream.send(JSON.stringify({ type: "delta", text: `piece ${i} ` }));
+      }
+    });
+
+    expect(streamRenders.current).toBeGreaterThan(streamBefore);
+    expect(mainRenders.current).toBe(mainBefore);
+
+    await act(async () => {
+      await stream.send(JSON.stringify({ type: "done", body: { answer: "The answer." } }));
+      stream.end();
+      await sending;
+    });
   });
 });

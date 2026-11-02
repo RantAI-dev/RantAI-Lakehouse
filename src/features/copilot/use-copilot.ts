@@ -36,6 +36,12 @@ export type Msg = {
   reasoning?: string;
   /** How long the model reasoned, from its first reasoning piece to its first answer text or the end. */
   reasoningMs?: number;
+  /**
+   * This browser just streamed this answer, so the reveal finishes from what
+   * was on screen (`AI-24` D5). Never saved: a conversation reopened later
+   * shows its answers whole.
+   */
+  streamed?: boolean;
 };
 export type SessionMeta = {
   id: string;
@@ -146,6 +152,15 @@ export const MAX_CONTINUATIONS = 3;
  * (save/load sessions from console.chat_session). One instance means every
  * view stays consistent.
  */
+/**
+ * The messages as the server stores them. `streamed` is this browser's
+ * marker for the answer it just watched arrive (`AI-24` D5); `undefined` is
+ * left out of the JSON, so a reopened conversation shows its answers whole.
+ */
+function savedMessages(msgs: Msg[]): Msg[] {
+  return msgs.map((m) => ({ ...m, streamed: undefined }));
+}
+
 /** A copy of `messages` with one tool step swapped out; `null` if it no longer exists. */
 function replaceToolStep(
   messages: Msg[],
@@ -279,7 +294,7 @@ function useCopilotState() {
 
   const persist = React.useCallback(async (msgs: Msg[], m: Mode, id: string | null) => {
     try {
-      const saved = await chatSessionService.save({ id: id ?? undefined, mode: m, messages: msgs });
+      const saved = await chatSessionService.save({ id: id ?? undefined, mode: m, messages: savedMessages(msgs) });
       if (saved.id) setSessionId(saved.id);
       if (saved.title) setSessionTitle(saved.title);
       void refreshSessions();
@@ -404,6 +419,7 @@ function useCopilotState() {
           ...(result.nextStep ? { nextStep: result.nextStep } : {}),
           elapsedMs: Date.now() - startedAt,
           at: new Date().toISOString(),
+          streamed: true,
           ...(reasoning.trim()
             ? { reasoning: reasoning.trim(), reasoningMs: (reasoningEnd ?? Date.now()) - (reasoningStart ?? startedAt) }
             : {}),
@@ -616,25 +632,57 @@ function useCopilotState() {
     return true;
   }, [sessionId, refreshSessions]);
 
-  return {
-    sessionTitle,
-    mode, setMode, messages, busy, error, askNotice, sessionId, sessions,
-    enabledCaps, toggleCap, pageContext, setPageContext,
-    send, newChat, loadSession, removeSession, renameSession, refreshSessions,
-    progress, draft, liveReasoning, stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
-    confirmTool, cancelTool, completeToolStep, confirmingKey,
-    dockPosition, setDockPosition, expanded, setExpanded,
-    sidebarWidth, setSidebarWidth,
-  };
+  // AI-24 D6: what the answer is writing changes on every delta, and only
+  // the message list and its status pill show it. It gets its own memoized
+  // value, so a piece of text does not re-render every `useCopilot()`
+  // consumer (the navbar, the dock, the sidebar, a dashboard with charts —
+  // BI-32's moving label was this).
+  const stream = React.useMemo(
+    () => ({ draft, liveReasoning, progress }),
+    [draft, liveReasoning, progress],
+  );
+
+  const main = React.useMemo(
+    () => ({
+      sessionTitle,
+      mode, setMode, messages, busy, error, askNotice, sessionId, sessions,
+      enabledCaps, toggleCap, pageContext, setPageContext,
+      send, newChat, loadSession, removeSession, renameSession, refreshSessions,
+      stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
+      confirmTool, cancelTool, completeToolStep, confirmingKey,
+      dockPosition, setDockPosition, expanded, setExpanded,
+      sidebarWidth, setSidebarWidth,
+    }),
+    [
+      sessionTitle, mode, messages, busy, error, askNotice, sessionId, sessions,
+      enabledCaps, toggleCap, pageContext, setPageContext,
+      send, newChat, loadSession, removeSession, renameSession, refreshSessions,
+      stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
+      confirmTool, cancelTool, completeToolStep, confirmingKey,
+      dockPosition, setDockPosition, expanded, setExpanded,
+      sidebarWidth, setSidebarWidth,
+    ],
+  );
+
+  return { main, stream };
 }
 
-type CopilotValue = ReturnType<typeof useCopilotState>;
+type CopilotValue = ReturnType<typeof useCopilotState>["main"];
+
+/** The part of the Copilot that changes while an answer streams (AI-24 D6). */
+export type CopilotStreamValue = ReturnType<typeof useCopilotState>["stream"];
+
 const CopilotContext = React.createContext<CopilotValue | null>(null);
+const CopilotStreamContext = React.createContext<CopilotStreamValue | null>(null);
 
 /** A single provider — wraps the app so dock/page/sidebar share one conversation. */
 export function CopilotProvider({ children }: { children: React.ReactNode }) {
-  const value = useCopilotState();
-  return React.createElement(CopilotContext.Provider, { value }, children);
+  const { main, stream } = useCopilotState();
+  return React.createElement(
+    CopilotContext.Provider,
+    { value: main },
+    React.createElement(CopilotStreamContext.Provider, { value: stream }, children),
+  );
 }
 
 /** Access the shared Copilot brain. */
@@ -642,4 +690,26 @@ export function useCopilot(): CopilotValue {
   const ctx = React.useContext(CopilotContext);
   if (!ctx) throw new Error("useCopilot must be used within a CopilotProvider");
   return ctx;
+}
+
+/**
+ * The answer text, reasoning and progress being written right now. Read by
+ * the message list and its status pill only (AI-24 D6): every other
+ * consumer takes `useCopilot()`, whose value does not change per piece.
+ */
+export function useCopilotStream(): CopilotStreamValue {
+  const ctx = React.useContext(CopilotStreamContext);
+  if (!ctx) throw new Error("useCopilotStream must be used within a CopilotProvider");
+  return ctx;
+}
+
+/** A stream value for a test or a story that renders the message list alone. */
+export function CopilotStreamProvider({
+  value,
+  children,
+}: {
+  value: CopilotStreamValue;
+  children: React.ReactNode;
+}) {
+  return React.createElement(CopilotStreamContext.Provider, { value }, children);
 }
