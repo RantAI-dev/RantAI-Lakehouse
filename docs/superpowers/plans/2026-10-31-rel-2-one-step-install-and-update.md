@@ -3304,3 +3304,36 @@ unreachable under load before the handoff was written. The commits are all pushe
   - Cite `REL-2 S4b review round 3 BLOCKER 3` and D22.
 
 **Open: BLOCKER 3.**
+
+### Review S4b round 4 (planner, 2026-11-02, at `a8ac63cf`): D22 and the port
+
+- **BLOCKER 3 is fixed as D22 says** (`12f34f3c`, `befabf5f`).
+  - A fresh install writes `COMPOSE_PROFILES=dagster`, and `update` adds it to an older `.env`
+    while keeping an operator's value.
+  - `status` lists every profile's services.
+  - Both proofs assert that `dagster-daemon` and `dagster-code-location` run after the install,
+    after the update, and after the rollback.
+  - The tests fail with the fix reverted.
+- **The port clash the developer measured is real.** With the profile on, `console` and
+  `dagster-webserver` both publish host port 3000, and `up` exits 1. The developer's answer is a
+  free port the tool picks. It is replaced by D23, because the deeper problem is not the number:
+  **`dagster-webserver` publishes `0.0.0.0:3000`, and Dagster's UI has no sign-in**, so anyone
+  who can reach the host can launch runs. Nothing needs that port from outside. The API reaches
+  Dagster on the Compose network (`http://dagster-webserver:3000/graphql`).
+
+**Decision D23 (planner):**
+- `dagster-webserver` is published on the host's loopback only:
+  `"127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000"` in `docker-compose.yml`. That gives
+  every stack the same rule, release or development, and no clash with the console's 3000.
+  An operator reaches it through an SSH tunnel.
+- `lakehousectl` picks no port. Remove the free-port logic added in this round, and its
+  tests.
+- Update every reference to the Dagster UI's host port: `README.md`, `docs/OPERATIONS.md`,
+  the `ops/` gates and the `.env.example` comment. List them in the handoff. Check that no gate
+  reaches the webserver through the host port from outside the Compose network. If one does,
+  say so rather than change it silently.
+- Prove it with `docker compose --profile '*' config --quiet`, a real `up` of the default plus
+  `dagster` profile on a clean project (rule 8), `curl` on `127.0.0.1:3001/server_info`, and
+  the console still on 3000.
+
+**Open: D23 (BLOCKER 4).**
