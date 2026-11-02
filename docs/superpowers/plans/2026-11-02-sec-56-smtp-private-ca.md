@@ -399,3 +399,20 @@ tag's documentation, <https://mailpit.axllent.org/docs/configuration/smtp/>:
 
 
 **Owner to confirm (planner, 2026-11-02):** D4. Planner default: no plaintext mode, not even to loopback. The `SMTP_PASS` Debug leak is backlog `SEC-59`.
+
+### Review round 1 (planner, 2026-11-02, at `f11e813a`)
+
+- **T1–T4** match D1–D9.
+  - The CA bundle is ADDED to the built-in roots (D2) through `TlsParameters::builder(..).add_root_certificate`, and the hostname check stays on (D3).
+  - A bundle that cannot be read stops the API at start, naming `SMTP_CA_FILE` (D5).
+  - No certificate or key is committed: `ops/smtp-ca/` holds only `.gitkeep`, `.gitignore` covers the rest, and the test CA is minted with `rcgen` at run time.
+- **The developer report on D7 is accepted.** `lettre` 0.11.23's `is_tls()` covers only a TLS config that could not be built. A failed handshake arrives as a connection error wrapping a `rustls::Error`. `smtp_tls::is_failure` checks both shapes, so D7's outcome holds: an untrusted certificate or a wrong name reads "a secure connection to the mail server could not be made". The reason is at the site.
+- **Dependencies.** `rustls` comes from the workspace (one `rustls`, `ring`). `rustls-pki-types` was already in the lock. `rcgen` and `testcontainers` are dev-only, with the features `lakehouse-api` already pins.
+- **Counts (the developer's):**
+  - `lakehouse-notify`: 32 unit tests and 6 container tests;
+  - `lakehouse-api` `config::`: 107, and `report_runner`: 16;
+  - clippy and fmt: clean;
+  - `compose config`: ok.
+  - The full workspace is left to CI.
+
+**Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI.
