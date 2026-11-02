@@ -2843,3 +2843,26 @@ D14's rule rather than its list, which is right, and the tooling test pins all t
 
 **Open: no BLOCKER, no SHOULD-FIX.** Merge waits for #332's CI, including `Release · dry run`
 and `install-proof`, which now install the shipped files.
+
+### Review S4b round 1 (planner, 2026-11-02, at `1f9095c0`)
+
+Read: `update.rs`, `rollback.rs`, `runner.rs`, `pause.rs` and `status.rs`, plus the outline of
+`self_update.rs` and the `update-proof` job. The developer's machine (bluefin) went
+unreachable under load before the handoff was written. The commits are all pushed: `42fa7b6b`
+(T4), `ac095fc2` (T5), `11a43698` (T6), `d625454a` (T7) and `1f9095c0` (a fix).
+
+- **BLOCKER 1. A failure in step 4 or step 5 leaves the install stopped and paused.**
+  `update::run` sets `MAINTENANCE_PAUSED` and stops the writers (step 4), then backs up
+  (step 5). If `stop_writers` or `backup` fails, for example on a full disk, it returns the
+  error with the writers still stopped and the pause still set. No file has been swapped yet, so
+  the old release is intact. *Fix:* on a failure in step 4 or 5, start the stack again on the
+  OLD files (`up -d --pull never`), wait for ready on the old version, clear the pause, and
+  report that the update stopped before it changed anything. Add unit tests with the fake
+  runner, one for a failed stop and one for a failed backup: the stack is up on the old
+  version, the pause is cleared, and the error says so. D17 named only "from step 6 on", which
+  was the planner's miss.
+- **Missing: the handoff of S4b.** The fix's developer writes it: the commits, the counts on
+  the final commit, and what was not verified.
+
+**Open: BLOCKER 1.** Merge waits for the fix and for the PR's dry run, including
+`update-proof`.
