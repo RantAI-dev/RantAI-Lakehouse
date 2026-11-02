@@ -37,6 +37,68 @@ Any other dependency, and the other dependabot PRs.
 
 ## 4. Handoff (developer appends below)
 
+### Handoff (2026-11-02, round 1)
+
+#### 1. Commits
+- `ac681a5e` fix(deps): rust_xlsxwriter 0.102, so zip 8.6.0 leaves the tree (RUSTSEC-2026-0429) — T1.
+- `b5bc0488` docs(plan): addendum, parquet 58.4.1 for RUSTSEC-2026-0435 (thrift 0.17.0), same PR — the planner's addendum (D4/T2).
+- `f88616f5` fix(deps): parquet 58.4.1, so thrift 0.17.0 leaves the tree (RUSTSEC-2026-0435) — T2, this round.
+
+Pushed to `origin/fix/deps-rust-xlsxwriter-0102` as `b5bc0488..f88616f5`, fast-forward, no force-push.
+
+#### 2. T2 lock update, actual output
+
+`cargo update -p parquet --precise 58.4.1` from `rust/`:
+
+```
+    Updating crates.io index
+    Updating arrow-array v58.4.0 -> v58.4.1 (available: v60.1.0)
+    Updating arrow-buffer v58.4.0 -> v58.4.1
+    Updating arrow-data v58.4.0 -> v58.4.1
+    Updating arrow-ipc v58.4.0 -> v58.4.1
+    Updating arrow-schema v58.4.0 -> v58.4.1 (available: v60.1.0)
+    Updating arrow-select v58.4.0 -> v58.4.1
+    Updating ordered-float v2.10.1 -> v3.9.2
+    Updating parquet v58.4.0 -> v58.4.1
+    Updating thrift v0.17.0 -> v0.23.0
+```
+
+`cargo tree -i thrift@0.17.0` (exit 101, which is the accept condition — the package is gone):
+
+```
+error: package ID specification `thrift@0.17.0` did not match any packages
+help: there are similar package ID specifications:
+
+  thrift@0.23.0
+```
+
+`Cargo.lock` now pins `thrift` 0.23.0 and `parquet` 58.4.1, and `cargo tree -i thrift@0.23.0` shows the same path as before the fix minus the vulnerable version: `thrift` → `parquet` → `iceberg` 0.10.1, `lakehouse-iceberg`, `lakehouse-api`. So the advisory leaves the tree without changing who pulls it in.
+
+#### 3. Lock scope
+
+`git diff --stat origin/main -- rust/Cargo.lock`: `1 file changed, 33 insertions(+), 52 deletions(-)`.
+
+Comparing `name`/`version` of every package in `origin/main`'s lock with this branch's, the complete set of differences is:
+
+- `parquet` 58.4.0 → 58.4.1, with its own `arrow-array`, `arrow-buffer`, `arrow-data`, `arrow-ipc`, `arrow-schema`, `arrow-select` 58.4.0 → 58.4.1 (the patch release moves the arrow crates in lockstep).
+- `thrift` 0.17.0 → 0.23.0 and `ordered-float` 2.10.1 → 3.9.2 (`thrift` 0.23's own dependency; the workspace's separate `ordered-float` 4.6.0 is untouched).
+- `rust_xlsxwriter` 0.99.1 → 0.102.0, with `zip` 8.6.0 and `typed-path` 0.12.3 removed — these three are T1's, already on `main`'s lock diff for this branch.
+
+Nothing else moved. No direct dependency in any `Cargo.toml` changed in T2.
+
+#### 4. Verification commands and counts
+
+- `bin/cargo-locked check -p lakehouse-iceberg -p lakehouse-api --all-targets -j 2` → exit 0, `Finished dev profile … in 2m 30s`, 15 crates checked, no errors or warnings. (`cargo-locked` touches this worktree's `rust/` files first when the shared `CARGO_TARGET_DIR` was last built by another worktree; that changes mtimes only, not content — `git status` was clean apart from `rust/Cargo.lock`.)
+- `bin/cargo-locked test -p lakehouse-api upload_parquet -j 2` → exit 0; **82 passed, 0 failed** (41 in `unittests src/lib.rs`, 41 in `unittests src/main.rs`; no integration binary had a matching test).
+- `bin/cargo-locked test -p lakehouse-api export -j 2` → exit 0; **194 passed, 0 failed** over 10 binaries: `src/lib.rs` 84, `src/main.rs` 88, `ai_export_tools` 3, `dashboard_access_routes` 1, `dashboard_export` 4, `dashboard_import` 1, `gold_export_auth` 3, `gold_publication` 6, `render_data` 1, `route_auth` 3.
+
+#### 5. Not verified (this round, with the reason)
+
+- `cargo fmt --check` and `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: not run, because T2 touched only `rust/Cargo.lock` and no source file changed.
+- The full PR-slice block (`cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`, the TypeScript, Python and compose lines): not run in this round; left to the reviewer's run and CI, as the build-time rule intends.
+- `cargo audit` / `cargo deny` with the workflow's ignore list: not run here, so RUSTSEC-2026-0435 being *reported green* by the scanners is not claimed — only that `thrift` 0.17.0 is absent from the lock and the tree, which is the condition those scanners key on.
+- T1's own acceptance lines (`cargo tree -i zip@8.6.0`, `cargo test -p lakehouse-api --test dashboard_export`, the audit run with the ignore list): run by the T1 round on `ac681a5e`, not re-run by this round. `dashboard_export` did execute here as part of the `export` filter (4 passed).
+
 ## 5. Review (planner appends below)
 
 ## Addendum (planner, 2026-11-02): a second advisory published the same day, RUSTSEC-2026-0435 (`thrift` 0.17.0)
