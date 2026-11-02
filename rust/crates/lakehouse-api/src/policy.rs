@@ -783,6 +783,24 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/identity/users",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/users",                  Policy::RequiresPermission("identity:write")),
     ("PUT",  "/api/identity/users/{id}/tenants/{tenant_id}", Policy::RequiresPermission("identity:write")),
+    // ADM-4 D2: the counterpart of the PUT above — taking a user out of
+    // a tenant. Same permission, because it is the same act of
+    // administration on the same table; the "who may" rule (an
+    // unrestricted caller, or a member of that tenant) lives in the
+    // handler, exactly as the add's does.
+    ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}", Policy::RequiresPermission("identity:write")),
+    // ADM-4 D1: replacing a user's role set. Same permission as every
+    // other identity write: the route's own guard (only an unrestricted
+    // caller may change an unrestricted user, or grant a role that holds
+    // `*:*`) is in the handler, next to the escalation rules it shares
+    // with the reset route.
+    ("PUT",  "/api/identity/users/{id}/roles",      Policy::RequiresPermission("identity:write")),
+    // ADM-4 D3: switching a user off and back on again. Same permission
+    // as every other identity write — the handler adds the escalation
+    // rule on top (D5): only an unrestricted caller may switch an
+    // unrestricted user off or on.
+    ("POST", "/api/identity/users/{id}/deactivate", Policy::RequiresPermission("identity:write")),
+    ("POST", "/api/identity/users/{id}/reactivate", Policy::RequiresPermission("identity:write")),
     // ADM-3 D2: an admin password reset is a credential write, so it
     // reuses `identity:write` exactly the way every other write-side
     // identity route does (AGENTS.md rule 4: no new permission token

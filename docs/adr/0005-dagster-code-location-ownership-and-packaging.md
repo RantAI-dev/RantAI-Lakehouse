@@ -178,7 +178,8 @@ regardless of which phase added which function to it.
   deliberately NOT in the stack" posture) — an operator who brings up the
   `dagster` profile overrides `DAGSTER_URL` to
   `http://dagster-webserver:3000/graphql` (in-network) or
-  `http://localhost:3000/graphql` (host) themselves.
+  `http://localhost:3001/graphql` (host; the webserver is published on the host's loopback
+  only, at 3001, since REL-2 S4b decision D23) themselves.
 - A future P4 (maintenance job) and P5 (Debezium/CDC config generation)
   add modules under the same `dispar_orchestrate` package and the same
   image, not new top-level directories or new ADRs about where Python
