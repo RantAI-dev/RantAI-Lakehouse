@@ -133,8 +133,12 @@ pub(crate) async fn rewrite_sql_for_principal_with_headers(
 /// `sql_rewrite`'s own `generic_dialect_parses_a_representative_trino_shape`
 /// test); every other engine value (including the `"clickhouse"` default)
 /// uses `ClickHouseDialect`, matching `run`'s own engine dispatch.
+///
+/// The ONE place that decides which engine a request names — the same
+/// decision `sql_rewrite::Engine::from_name` makes, so the rewrite and the
+/// dispatch can never disagree about the engine (`DATA-21` D1).
 fn is_trino_engine(engine: &str) -> bool {
-    engine == "trino"
+    crate::sql_rewrite::Engine::from_name(engine) == crate::sql_rewrite::Engine::Trino
 }
 
 async fn rewrite_sql_for_principal_inner(
@@ -144,6 +148,21 @@ async fn rewrite_sql_for_principal_inner(
     principal: &Principal,
     headers: &HeaderMap,
 ) -> Result<String, ApiError> {
+    let engine_kind = crate::sql_rewrite::Engine::from_name(engine);
+    // DATA-21 D2: `Trino`'s own past-version clause (`FOR VERSION AS OF
+    // <id>`) is not a form `sqlparser` parses — it reads `VERSION AS OF
+    // <id>`, and only in a dialect whose `supports_table_versioning()` is
+    // true. The token pass turns the one into the other BEFORE the gate
+    // (so the tenant gate sees the tables the statement reads) and the
+    // reverse pass restores `Trino`'s own form AFTER the rewrite (so the
+    // engine reads the form it wrote).
+    let sql = match engine_kind {
+        crate::sql_rewrite::Engine::ClickHouse => sql.to_owned(),
+        crate::sql_rewrite::Engine::Trino => crate::sql_rewrite::normalize_past_version_clause(sql)
+            .map_err(|err| {
+                ApiError::Unprocessable(crate::policy_engine::refusal_message(&err).to_owned())
+            })?,
+    };
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -166,10 +185,22 @@ async fn rewrite_sql_for_principal_inner(
     // has no targets at all: the policy rewrite refuses it with a 422 of
     // its own, so there is nothing here to gate.
     let actor = GateActor::Caller { principal, headers };
-    if is_trino_engine(engine) {
-        gate_statement(state, sql, &sqlparser::dialect::GenericDialect {}, actor).await?;
+    if engine_kind == crate::sql_rewrite::Engine::Trino {
+        gate_statement(
+            state,
+            &sql,
+            &crate::sql_rewrite::TrinoDialect::default(),
+            actor,
+        )
+        .await?;
     } else {
-        gate_statement(state, sql, &sqlparser::dialect::ClickHouseDialect {}, actor).await?;
+        gate_statement(
+            state,
+            &sql,
+            &sqlparser::dialect::ClickHouseDialect {},
+            actor,
+        )
+        .await?;
     }
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
@@ -178,12 +209,13 @@ async fn rewrite_sql_for_principal_inner(
     // `routes::support::run_spec_sql` (dashboards/embeds) and
     // `gold_export::export_batch_sql` (Gold export), never a parallel
     // copy of this logic. Only the per-engine dialect *selection*
-    // (`ClickHouseDialect` vs. `GenericDialect`) stays here, since the
+    // (`ClickHouseDialect` vs. `TrinoDialect`) stays here, since the
     // two are different concrete types.
-    if is_trino_engine(engine) {
+    if engine_kind == crate::sql_rewrite::Engine::Trino {
         crate::policy_engine::rewrite_sql_for_roles(
-            sql,
-            &sqlparser::dialect::GenericDialect {},
+            &sql,
+            &crate::sql_rewrite::TrinoDialect::default(),
+            crate::sql_rewrite::Engine::Trino,
             &principal.role_names,
             &placeholders,
             &obligations_source,
@@ -191,8 +223,9 @@ async fn rewrite_sql_for_principal_inner(
         .await
     } else {
         crate::policy_engine::rewrite_sql_for_roles(
-            sql,
+            &sql,
             &sqlparser::dialect::ClickHouseDialect {},
+            crate::sql_rewrite::Engine::ClickHouse,
             &principal.role_names,
             &placeholders,
             &obligations_source,
@@ -200,24 +233,33 @@ async fn rewrite_sql_for_principal_inner(
         .await
     }
     .map_err(|err| {
-        // DATA-16 F3: on Trino a past-version clause makes the parse fail
-        // (`GenericDialect` reads no table version), and the generic
-        // answer talks about policies. Say what is actually wrong. This
-        // runs only after a parse failure, so a query that parses is
-        // never affected, and it is a message, not a gate: the query was
-        // already refused.
-        if is_trino_engine(engine)
+        // DATA-16 F3, narrowed by `DATA-21` D4: on Trino a past version
+        // BY TIMESTAMP makes the parse fail (no engine reads a timestamp
+        // form), and the generic answer talks about policies. Say what is
+        // actually wrong. This runs only after a parse failure, so a
+        // query that parses is never affected, and it is a message, not a
+        // gate: the query was already refused. A past version by its id
+        // parses on Trino now, and never reaches here.
+        if engine_kind == crate::sql_rewrite::Engine::Trino
             && matches!(
                 err,
                 crate::policy_engine::EnforcementError::Engine(
                     crate::policy_engine::PolicyEngineError::Unparseable
                 )
             )
-            && uses_past_version_clause(sql)
+            && uses_past_timestamp_clause(&sql)
         {
             return ApiError::Unprocessable(PAST_VERSION_TRINO_MESSAGE.to_owned());
         }
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+    })
+    // DATA-21 D2: the statement the engine reads is `Trino`'s own form
+    // again — the reverse of the pass that made it parseable.
+    .map(|rewritten| match engine_kind {
+        crate::sql_rewrite::Engine::ClickHouse => rewritten,
+        crate::sql_rewrite::Engine::Trino => {
+            crate::sql_rewrite::denormalize_past_version_clause(&rewritten)
+        }
     })
 }
 
@@ -862,27 +904,38 @@ fn first_unreachable(reach: TenantReach, claims: &[TableClaim]) -> Option<usize>
 /// A statement that does not parse has no table list: the policy rewrite
 /// refuses it with a 422 of its own, so there is nothing here to gate.
 fn referenced_table_names(sql: &str, trino: bool) -> Vec<String> {
-    let dialect: &dyn sqlparser::dialect::Dialect = if trino {
-        &sqlparser::dialect::GenericDialect {}
+    // `DATA-21` D2: a `Trino` statement is read with `TrinoDialect` (the
+    // one that reads a table version) and in the form that dialect
+    // parses, so the tables it names are the tables it reads.
+    let mut tables = if trino {
+        let normalized = crate::sql_rewrite::normalize_past_version_clause(sql)
+            .unwrap_or_else(|_| sql.to_owned());
+        crate::sql_rewrite::referenced_tables(
+            &normalized,
+            &crate::sql_rewrite::TrinoDialect::default(),
+        )
     } else {
-        &sqlparser::dialect::ClickHouseDialect {}
-    };
-    let mut tables = crate::sql_rewrite::referenced_tables(sql, dialect).unwrap_or_default();
+        crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::ClickHouseDialect {})
+    }
+    .unwrap_or_default();
     tables.sort();
     tables
 }
 
-/// Fixed text for `DATA-16` F3: past versions are queried on `ClickHouse`
-/// only (the `Trino` side is `DATA-21`).
+/// Fixed text for `DATA-16` F3, narrowed by `DATA-21` D4: a past version
+/// BY TIMESTAMP is still refused on `Trino` — no engine has a timestamp
+/// form, `ClickHouse` included — while a past version by its id runs on
+/// both engines now.
 const PAST_VERSION_TRINO_MESSAGE: &str =
     "Querying a past version of a table is available on the ClickHouse engine only.";
 
-/// Whether `sql`'s tokens contain the keyword run `VERSION AS OF` or
-/// `TIMESTAMP AS OF`. Reads tokens (not the raw text) so the same words in
-/// a string literal, a quoted identifier or a comment are not mistaken for
-/// the clause. A tokenizer failure answers `false`: the caller then keeps
-/// today's message.
-fn uses_past_version_clause(sql: &str) -> bool {
+/// Whether `sql`'s tokens contain the keyword run `TIMESTAMP AS OF` —
+/// the one past-version form no engine has (`DATA-21` D2/D4). Reads
+/// tokens (not the raw text) so the same words in a string literal, a
+/// quoted identifier or a comment are not mistaken for the clause. A
+/// tokenizer failure answers `false`: the caller then keeps today's
+/// message.
+fn uses_past_timestamp_clause(sql: &str) -> bool {
     use sqlparser::tokenizer::{Token, Tokenizer};
 
     let dialect = sqlparser::dialect::GenericDialect {};
@@ -901,7 +954,7 @@ fn uses_past_version_clause(sql: &str) -> bool {
         .collect();
     words
         .windows(3)
-        .any(|w| (w[0] == "VERSION" || w[0] == "TIMESTAMP") && w[1] == "AS" && w[2] == "OF")
+        .any(|w| w[0] == "TIMESTAMP" && w[1] == "AS" && w[2] == "OF")
 }
 
 /// The one answer to a statement the settings rule refuses. It names no word
@@ -1060,7 +1113,7 @@ async fn execute_query_against_engine(
                 let mut out = Map::new();
                 for c in &columns {
                     let v = row.get(c);
-                    out.insert(c.clone(), Value::String(stringify_cell(v)));
+                    out.insert(c.clone(), cell_value(v));
                 }
                 Value::Object(out)
             })
@@ -1564,15 +1617,24 @@ fn query_run_audit_event(principal: &Principal, query_id: &str, sql: &str) -> Ne
     }
 }
 
-/// Coerce one cell to the string-everything shape both `run_result_json`
-/// row shapes use, matching the `TypeScript`'s implicit stringification.
-fn stringify_cell(v: Option<&Value>) -> String {
+/// One cell of a result row, in the shape the run result carries it.
+///
+/// `DATA-29`: a `NULL` cell is JSON `null`, not an empty string — a
+/// missing value and an empty text are told apart, which is what the
+/// console's `QueryCell` contract (`string | number | boolean | null`)
+/// already expects. Every other value keeps the text it had before this
+/// change (decision D1), so a non-null cell does not change.
+///
+/// A cell the engine left out entirely is a `NULL` as well (`None` and
+/// `Some(Value::Null)` answer the same): the engine said nothing, so
+/// there is no value to report.
+fn cell_value(v: Option<&Value>) -> Value {
     match v {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(other) => other.to_string(),
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::String(s)) => Value::String(s.clone()),
+        Some(Value::Bool(b)) => Value::String(b.to_string()),
+        Some(Value::Number(n)) => Value::String(n.to_string()),
+        Some(other) => Value::String(other.to_string()),
     }
 }
 
@@ -1587,7 +1649,7 @@ fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
         .map(|row| {
             let mut out = Map::new();
             for (i, c) in columns.iter().enumerate() {
-                out.insert(c.clone(), Value::String(stringify_cell(row.get(i))));
+                out.insert(c.clone(), cell_value(row.get(i)));
             }
             Value::Object(out)
         })
@@ -1628,6 +1690,12 @@ fn map_trino_error(err: TrinoError) -> ApiError {
 /// The byte cost of one cell: the length of its text — a JSON string's own
 /// bytes without the quotes, any other value's compact JSON text — plus one
 /// byte for the separator (`QS-2`).
+///
+/// `DATA-29` (decision D2): a `null` cell is charged its compact JSON text
+/// (`null`, four bytes) and the separator, so five bytes a cell. The rule
+/// already said that; what this change changed is that a `NULL` cell is
+/// sent as `null` and no longer as the empty string, so the cap now counts
+/// the bytes the answer really carries.
 fn cell_byte_cost(cell: &Value) -> usize {
     let text = match cell {
         Value::String(text) => text.len(),
@@ -3272,8 +3340,88 @@ mod tests {
     use lakehouse_auth::{PermissionSet, PrincipalId};
     use uuid::Uuid;
 
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
     use crate::sql_guard::strip_sql_noise;
+
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// The shared catalog belongs to one tenant, and the query path
+    /// is scoped to the tenant: this fixture principal is the
+    /// catalog's own member, so the shared tables stay reachable.
+    const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
+    fn analyst_principal() -> Extension<Principal> {
+        Extension(Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
+            display_name: "alice".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: vec!["Analyst".to_owned()],
+        })
+    }
+
+    async fn mount_governed_table_responses(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                {"name": "name", "type": "String"},
+                {"name": "default_kind", "type": "String"},
+                {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                {"name": "id", "default_kind": "", "default_expression": ""},
+                {"name": "email", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 2,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+        .and(body_string_contains("system.tables"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+            {"name": "database", "type": "String"},
+            {"name": "name", "type": "String"},
+            {"name": "engine", "type": "String"},
+            {"name": "create_table_query", "type": "String"},
+            ],
+            "data": [
+            {"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""},
+            ],
+            "rows": 1,
+        })))
+        .mount(server)
+        .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpOne"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                {"name": "id", "type": "UInt64"},
+                {"name": "email", "type": "String"},
+                ],
+                "data": [{"id": "1", "email": "***"}],
+                "rows": 1,
+            })))
+            .mount(server)
+            .await;
+    }
 
     /// A logged-in human principal — `PrincipalId::User`.
     fn fixture_user_principal() -> Principal {
@@ -3417,36 +3565,39 @@ mod tests {
         assert_eq!(strip_sql_noise("SELECT 'unterminated"), "SELECT  ");
     }
 
+    /// `DATA-21` D2/D4: only the TIMESTAMP form is refused now — a past
+    /// version by its id runs on `Trino` too.
     #[test]
-    fn a_past_version_clause_is_found_in_the_tokens() {
-        // DATA-16 F3.
-        assert!(uses_past_version_clause(
+    fn a_past_timestamp_clause_is_found_in_the_tokens() {
+        assert!(uses_past_timestamp_clause(
+            "SELECT * FROM iceberg.bronze.orders FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'"
+        ));
+        assert!(uses_past_timestamp_clause(
+            "select * from t timestamp\n/* c */ as of 1"
+        ));
+        // A past version by its id is not a timestamp clause.
+        assert!(!uses_past_timestamp_clause(
             "SELECT * FROM iceberg.bronze.orders FOR VERSION AS OF 1"
         ));
-        assert!(uses_past_version_clause(
-            "SELECT * FROM t FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'"
-        ));
-        assert!(uses_past_version_clause(
-            "select * from t version\n/* c */ as of 1"
-        ));
-        assert!(uses_past_version_clause("SELECT * FROM t VERSION AS OF 1"));
     }
 
     #[test]
     fn the_same_words_in_a_string_or_comment_are_not_a_clause() {
-        assert!(!uses_past_version_clause(
-            "SELECT 'FOR VERSION AS OF 1' FROM t WHERE ("
+        assert!(!uses_past_timestamp_clause(
+            "SELECT 'FOR TIMESTAMP AS OF 1' FROM t WHERE ("
         ));
-        assert!(!uses_past_version_clause(
-            "SELECT 1 -- VERSION AS OF 1\nWHERE ("
+        assert!(!uses_past_timestamp_clause(
+            "SELECT 1 -- TIMESTAMP AS OF 1\nWHERE ("
         ));
-        assert!(!uses_past_version_clause(
-            "SELECT \"version\" AS of_x FROM t"
+        assert!(!uses_past_timestamp_clause(
+            "SELECT \"timestamp\" AS of_x FROM t"
         ));
-        assert!(!uses_past_version_clause("SELECT version, x AS of FROM t"));
-        assert!(!uses_past_version_clause("SELECT FROM WHERE ("));
+        assert!(!uses_past_timestamp_clause(
+            "SELECT timestamp, x AS of FROM t"
+        ));
+        assert!(!uses_past_timestamp_clause("SELECT FROM WHERE ("));
         // An unterminated literal fails to tokenize: today's message stays.
-        assert!(!uses_past_version_clause("SELECT 'VERSION AS OF"));
+        assert!(!uses_past_timestamp_clause("SELECT 'TIMESTAMP AS OF"));
     }
 
     #[test]
@@ -3530,6 +3681,31 @@ mod tests {
         assert_eq!(v["metrics"]["engine"], json!("hot-store"));
     }
 
+    // ── `DATA-29`: a NULL cell is `null`, not an empty string ───────────
+
+    #[test]
+    fn a_null_cell_is_null_and_every_other_cell_keeps_its_text() {
+        // The two halves of the rule: a cell the engine left out and a cell
+        // it reported as NULL are both `null`, and a cell with a value
+        // keeps the text it had before this change (decision D1).
+        assert_eq!(cell_value(None), Value::Null);
+        assert_eq!(cell_value(Some(&Value::Null)), Value::Null);
+        assert_eq!(cell_value(Some(&json!(""))), json!(""));
+        assert_eq!(cell_value(Some(&json!("abc"))), json!("abc"));
+        assert_eq!(cell_value(Some(&json!(5))), json!("5"));
+        assert_eq!(cell_value(Some(&json!(true))), json!("true"));
+        // A value the engines never send (an object, an array) keeps the
+        // compact JSON text it had before as well.
+        assert_eq!(cell_value(Some(&json!({"a": 1}))), json!(r#"{"a":1}"#));
+    }
+
+    #[test]
+    fn a_null_cell_and_an_empty_cell_are_told_apart() {
+        // The point of the change: a missing value and an empty text are
+        // two different answers, not one empty string.
+        assert_ne!(cell_value(Some(&Value::Null)), cell_value(Some(&json!(""))));
+    }
+
     // ── The server-side byte cap (`QS-2`) ────────────────────────────────
 
     #[test]
@@ -3539,13 +3715,28 @@ mod tests {
         // Any other value's compact JSON text.
         assert_eq!(cell_byte_cost(&json!(5)), 2);
         assert_eq!(cell_byte_cost(&json!(true)), 5);
+        // A null cell costs its compact JSON text (`null`, four bytes) and
+        // the separator (`DATA-29`, decision D2): the rule already said
+        // that, and a NULL cell is now sent as `null` and not as the empty
+        // string, so the cap counts the bytes the answer carries.
         assert_eq!(cell_byte_cost(&json!(null)), 5);
+    }
+
+    #[test]
+    fn a_null_cell_costs_more_than_an_empty_one() {
+        // The empty string is one byte (its own text plus the separator);
+        // a null cell is five. A result of null cells is therefore bigger
+        // than the same result of empty strings — as it is on the wire.
+        assert_eq!(cell_byte_cost(&json!(null)), 5);
+        assert_eq!(cell_byte_cost(&json!("")), 1);
     }
 
     #[test]
     fn a_row_costs_the_sum_of_its_cells() {
         assert_eq!(row_byte_cost(&json!({"a": "xx", "b": "yyy"})), 3 + 4);
         assert_eq!(row_byte_cost(&json!(["xx", "yyy"])), 3 + 4);
+        // A row with a null cell costs the null's five bytes (`DATA-29`).
+        assert_eq!(row_byte_cost(&json!({"a": null})), 5);
     }
 
     #[test]
@@ -3924,6 +4115,7 @@ mod tests {
         use std::collections::HashMap;
 
         use lakehouse_auth::{PermissionSet, PrincipalId};
+        use lakehouse_store::governance::CreatePolicyInput;
         use uuid::Uuid;
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4072,6 +4264,172 @@ mod tests {
 
             assert_eq!(value["engine"], json!("trino"));
             assert_eq!(value["rows"], json!([{"n": "1"}]));
+        }
+
+        /// The state a `Trino` test runs against: the seeded deployment's
+        /// database (the policy engine reads a principal's obligations
+        /// from Postgres), the mock `ClickHouse` (the policy engine asks
+        /// it for a table's real columns and for its views) and the mock
+        /// `Trino`.
+        fn state_with_trino(pool: &PgPool, ch_url: &str, trino_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert("TRINO_URL".to_owned(), trino_uri.to_owned());
+            env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+            AppState::new(Config::from_map(&env).expect("valid config from a plain map"))
+        }
+
+        /// `DATA-21` S1-T3: a masked table reads on `Trino` — the mask is
+        /// `Trino`'s own form, and the answer is `***`.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_masked_table_on_trino_answers_with_stars(pool: PgPool) -> sqlx::Result<()> {
+            lakehouse_store::governance::create_policy(
+                &pool,
+                &CreatePolicyInput {
+                    name: "query-run-trino-masking-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "serving.mart_x".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+
+            // The policy engine asks `ClickHouse` for the table's real
+            // columns and for its views.
+            let ch = MockServer::start().await;
+            mount_governed_table_responses(&ch).await;
+            let trino = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [
+                        {"name": "id", "type": "bigint"},
+                        {"name": "email", "type": "varchar"}
+                    ],
+                    "data": [[1, "***"]],
+                })))
+                .mount(&trino)
+                .await;
+
+            let state = state_with_trino(&pool, &ch.uri(), &trino.uri());
+            let ApiJson(value) = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                trino_body("SELECT * FROM serving.mart_x"),
+            )
+            .await
+            .expect("a masked run on Trino must succeed");
+
+            assert_eq!(value["engine"], json!("trino"));
+            assert_eq!(value["rows"], json!([{"id": "1", "email": "***"}]));
+            let requests = trino
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests.iter().any(|r| String::from_utf8_lossy(&r.body)
+                    .contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\"")),
+                "the statement Trino received must be the masked one: {:?}",
+                requests
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(&r.body).to_string())
+                    .collect::<Vec<_>>()
+            );
+            Ok(())
+        }
+
+        /// `DATA-21` D2/D4: a past version runs on `Trino` — the clause
+        /// is `Trino`'s own form, and the engine receives it back in that
+        /// form.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_past_version_on_trino_runs(pool: PgPool) -> sqlx::Result<()> {
+            let ch = MockServer::start().await;
+            mount_governed_table_responses(&ch).await;
+            let trino = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [{"name": "id", "type": "bigint"}],
+                    "data": [[1]],
+                })))
+                .mount(&trino)
+                .await;
+
+            let state = state_with_trino(&pool, &ch.uri(), &trino.uri());
+            let ApiJson(value) = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                trino_body("SELECT * FROM serving.mart_x FOR VERSION AS OF 12345"),
+            )
+            .await
+            .expect("a past-version run on Trino must succeed");
+
+            assert_eq!(value["engine"], json!("trino"));
+            let requests = trino
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| String::from_utf8_lossy(&r.body).contains("FOR VERSION AS OF 12345")),
+                "the statement Trino received must carry the version: {:?}",
+                requests
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(&r.body).to_string())
+                    .collect::<Vec<_>>()
+            );
+            Ok(())
+        }
+
+        /// `DATA-29`: the Trino branch answers a `NULL` cell as JSON `null`
+        /// and an empty text as `""`, so the two are told apart in the very
+        /// same row — the answer says "no value" and "an empty value", not
+        /// two empty values.
+        #[tokio::test]
+        async fn a_null_cell_is_null_and_an_empty_cell_is_an_empty_string() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [
+                        {"name": "maybe", "type": "varchar"},
+                        {"name": "text", "type": "varchar"},
+                    ],
+                    "data": [[null, ""]],
+                })))
+                .mount(&server)
+                .await;
+
+            let state = test_state_with_trino(&server.uri());
+            let ApiJson(value) = run(
+                State(state),
+                Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
+                trino_body("SELECT 1"),
+            )
+            .await
+            .expect("ok");
+
+            assert_eq!(
+                value["rows"],
+                json!([{"maybe": null, "text": ""}]),
+                "a NULL cell must be null and an empty cell must stay an empty string"
+            );
         }
 
         #[tokio::test]
@@ -4569,27 +4927,10 @@ mod tests {
 
         use std::collections::HashMap;
 
-        use lakehouse_auth::{PermissionSet, PrincipalId};
         use lakehouse_store::governance::CreatePolicyInput;
-        use uuid::Uuid;
-        use wiremock::matchers::{body_string_contains, method};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         use super::*;
         use crate::config::Config;
-
-        fn database_url_for(pool: &PgPool) -> String {
-            let options = pool.connect_options();
-            format!(
-                "postgres://{}:postgres@{}:{}/{}",
-                options.get_username(),
-                options.get_host(),
-                options.get_port(),
-                options
-                    .get_database()
-                    .expect("#[sqlx::test] always targets a named database"),
-            )
-        }
 
         /// The state these tests run against: the seeded deployment's
         /// database, the mock engine, and the shared catalog's own
@@ -4601,70 +4942,6 @@ mod tests {
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
             env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
             AppState::new(Config::from_map(&env).expect("valid config from a map"))
-        }
-
-        /// The shared catalog belongs to one tenant, and the query path
-        /// is scoped to the tenant: this fixture principal is the
-        /// catalog's own member, so the shared tables stay reachable.
-        const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
-
-        fn analyst_principal() -> Extension<Principal> {
-            Extension(Principal {
-                id: PrincipalId::User(Uuid::nil()),
-                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
-                display_name: "alice".to_owned(),
-                permissions: PermissionSet::parse("query:read"),
-                provider: "session".to_owned(),
-                must_change_password: false,
-                role_names: vec!["Analyst".to_owned()],
-            })
-        }
-
-        async fn mount_governed_table_responses(server: &MockServer) {
-            Mock::given(method("POST"))
-                .and(body_string_contains("system.columns"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "meta": [
-                        {"name": "name", "type": "String"},
-                        {"name": "default_kind", "type": "String"},
-                        {"name": "default_expression", "type": "String"},
-                    ],
-                    "data": [
-                        {"name": "id", "default_kind": "", "default_expression": ""},
-                        {"name": "email", "default_kind": "", "default_expression": ""},
-                    ],
-                    "rows": 2,
-                })))
-                .mount(server)
-                .await;
-            Mock::given(method("POST"))
-                .and(body_string_contains("system.tables"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "meta": [
-                        {"name": "database", "type": "String"},
-                        {"name": "name", "type": "String"},
-                        {"name": "engine", "type": "String"},
-                        {"name": "create_table_query", "type": "String"},
-                    ],
-                    "data": [
-                        {"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""},
-                    ],
-                    "rows": 1,
-                })))
-                .mount(server)
-                .await;
-            Mock::given(method("POST"))
-                .and(body_string_contains("replaceRegexpOne"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "meta": [
-                        {"name": "id", "type": "UInt64"},
-                        {"name": "email", "type": "String"},
-                    ],
-                    "data": [{"id": "1", "email": "***"}],
-                    "rows": 1,
-                })))
-                .mount(server)
-                .await;
         }
 
         /// Failing-test-first for WS7 item C2: before this task wired

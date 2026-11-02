@@ -644,6 +644,7 @@ impl SqlGate for ApiSqlGate<'_> {
         crate::policy_engine::rewrite_sql_for_roles(
             sql,
             &sqlparser::dialect::ClickHouseDialect {},
+            crate::sql_rewrite::Engine::ClickHouse,
             &[crate::routes::embed::EMBED_VIEWER_ROLE.to_owned()],
             &crate::sql_rewrite::PlaceholderValues::none(),
             &obligations,

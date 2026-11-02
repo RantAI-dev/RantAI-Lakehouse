@@ -1029,6 +1029,28 @@ def _blocks(handle: BinaryIO) -> Iterator[bytes]:
 
 REPORT_SUFFIX = ".bad-values.json"
 
+# The name of a converted sheet, with the position of the sheet in the
+# workbook's list, and the legacy one without a position: the API's own
+# (`converted_text_key` and `converted_key` in `routes/uploads.rs`).
+_CONVERTED_SUFFIX = re.compile(r"\.converted(?:\.\d+)?\.csv$")
+
+
+def _report_key(storage_key: str) -> str:
+    """The key the report of values that did not fit belongs under: beside the
+    ORIGINAL of the upload, never beside the object the job read.
+
+    Plan AD6 (`docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md`, the
+    bad-value report) puts the report next to the upload, and the API reads it
+    there (`routes/uploads/columns.rs`). A workbook's load reads the converted
+    sheet the API wrote (`<storage_key>.converted.<n>.csv`), so a report written
+    beside it is never read and the person sees no bad values (`DATA-31`).
+
+    The legacy converted text, without a position, belongs to an upload made
+    before `SEC-22`. A key that is not a converted one is already the
+    original's, and is kept as it is.
+    """
+    return _CONVERTED_SUFFIX.sub("", storage_key)
+
 
 def write_stored_report(
     config: SinkConfig, key: str, payload: bytes | None, *, filesystem_factory: Callable[..., Any] | None = None
@@ -1232,18 +1254,24 @@ def _register(
 
 
 def _keep_report(
-    stream: Any, key: str, config: SinkConfig, write_report: Callable[..., None], log: Any, params: FileIngestParams
+    stream: Any,
+    report_key: str,
+    config: SinkConfig,
+    write_report: Callable[..., None],
+    log: Any,
+    params: FileIngestParams,
 ) -> None:
     """Write the report when the load found values that did not fit, whatever became of
     the load, and remove an earlier one when it found none. A typed stream only: a load
-    with no column list has nothing to report. Never raises."""
+    with no column list has nothing to report. `report_key` is the original's key
+    ([`_report_key`]), the one the API reads the report at. Never raises."""
     if not isinstance(stream, TypedStream):
         return
     payload = None
     if stream.report.count:
         payload = json.dumps(stream.report.as_json(), ensure_ascii=False).encode("utf-8")
     try:
-        write_report(config, key, payload)
+        write_report(config, report_key, payload)
     except Exception as exc:  # noqa: BLE001 -- the load's outcome stands; the report is lost, which the run log says
         log.warning(f"upload {params.upload_id}: the report of values that did not fit could not be kept ({type(exc).__name__}: {exc})")
 
@@ -1259,7 +1287,10 @@ def _load(
 ) -> LoadSummary:
     _check_settings(params)
     keys = [_checked_key(key) for key in params.storage_keys]
-    key = keys[0]
+    # The report belongs beside the ORIGINAL of the upload, not beside the
+    # object this load read: a workbook's load reads the converted sheet
+    # (`DATA-31`).
+    report_key = _report_key(keys[0])
     try:
         sink_config = load_config()
     except Exception as exc:  # noqa: BLE001 -- e.g. an unreadable token file; nothing was read or written
@@ -1284,7 +1315,7 @@ def _load(
         try:
             result = _write(stream, params, sink_config, load)
         finally:
-            _keep_report(stream, key, sink_config, write_report, log, params)
+            _keep_report(stream, report_key, sink_config, write_report, log, params)
     log.info(f"upload {params.upload_id}: {stream.row_count} rows read")
     if result.rows is not None and result.rows != stream.row_count:
         log.warning(

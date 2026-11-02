@@ -17,7 +17,7 @@
 Everything merged since `v0.1.0` is unreleased. There is no written release
 procedure.
 
-## Proposed policy (needs product-owner sign-off, `REL-2`)
+## Policy (signed by the product owner on 2026-10-31, `REL-2`)
 
 ### Version numbers
 
@@ -73,8 +73,10 @@ the database.
 | The release is bad and no migration ran | Redeploy the previous images |
 | The release is bad and a migration ran | Restore the application database from the pre-upgrade backup, then redeploy the previous images. Data written since the backup is lost. |
 
-A tested, timed restore does not exist yet (checklist item 4.4). Until it
-does, rollback after a migration is a procedure on paper.
+A tested, timed restore exists (`OPS-7`, `docs/OPERATIONS.md`), and REL-2
+adds a complete local-disk backup (#295). `lakehousectl update` (REL-2
+slice 4) takes that backup before every update and restores it by itself
+when the new release does not become ready.
 
 ## Supported versions
 

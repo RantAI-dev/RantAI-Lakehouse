@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::super::catalog_source::iceberg_source;
-use super::{Conversion, IngestRequest, PreviewQuery, not_found, pool, preview_with_sample};
+use super::{
+    Conversion, IngestRequest, PreviewQuery, not_found, pool, preview_with_sample, report_key,
+};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -432,10 +434,6 @@ const fn date_format_word(format: crate::upload_types::DateFormat) -> &'static s
 
 // ── the load's report ────────────────────────────────────────────────────
 
-/// The suffix of the object the job writes its report to, beside the upload
-/// (`file_ingest.REPORT_SUFFIX`).
-const REPORT_SUFFIX: &str = ".bad-values.json";
-
 /// The most bytes of a report the API reads: 100 values of 200 characters and the
 /// counts of up to 1,000 columns fit in a few tens of KiB; a larger object is not
 /// the job's.
@@ -496,7 +494,7 @@ pub(super) async fn keep_report(
     let Ok(store) = crate::upload_store::UploadStore::connect(&state.config).await else {
         return row;
     };
-    let key = format!("{}{REPORT_SUFFIX}", row.storage_key);
+    let key = report_key(&row.storage_key);
     let Ok(bytes) = store.head_bytes(&key, MAX_REPORT_BYTES).await else {
         return row;
     };

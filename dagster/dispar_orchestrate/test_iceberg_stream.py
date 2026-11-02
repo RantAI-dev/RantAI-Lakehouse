@@ -64,17 +64,25 @@ def test_a_replace_of_several_groups_is_one_commit_with_every_row(lab: Lab, monk
     assert _ids(lab) == [str(n) for n in range(400)]
     assert len(cut) > 1, "the load went through the streamed path, in several groups"
     first = lab.commits("streamed")
+    snapshots = lab.snapshots("streamed")
 
     load_via_sink(_resource(250), "streamed", lab.config, LoadPlan(mode="replace"))
 
     assert _ids(lab) == [str(n) for n in range(250)], "the earlier rows are replaced, not kept"
     assert lab.commits("streamed") - first == 1, "all the groups of a load are one commit"
+    # `DATA-36`: one snapshot, not one per group. Every snapshot of a table is a state a
+    # reader can pick (the time-travel picker), so a snapshot per group offered the
+    # half-loaded table to whoever picked one.
+    assert lab.snapshots("streamed") - snapshots == 1, "the load leaves one snapshot, not one per group"
 
 
 def test_an_append_of_several_groups_adds_to_what_the_table_holds(lab: Lab) -> None:
     load_via_sink(_resource(300), "streamed", lab.config, LoadPlan(mode="append"))
+    snapshots = lab.snapshots("streamed")
     load_via_sink(_resource(300), "streamed", lab.config, LoadPlan(mode="append"))
     assert len(lab.rows("streamed")) == 600
+    # `DATA-36`: one snapshot, not one per group.
+    assert lab.snapshots("streamed") - snapshots == 1, "the load leaves one snapshot, not one per group"
 
 
 def test_a_load_that_fails_after_some_groups_leaves_the_table_as_it_was(lab: Lab) -> None:
@@ -194,7 +202,9 @@ def test_a_load_whose_later_file_has_a_new_column_writes_it(lab: Lab) -> None:
 
 def test_a_load_of_no_rows_still_commits_one_snapshot_as_dlt_did(lab: Lab) -> None:
     """`history.ensure_columns` adds a column with a zero-row load and a scan reads the schema
-    of the current snapshot, so the empty commit is part of the contract."""
+    of the current snapshot, so the empty commit is part of the contract.
+
+    `DATA-36`: that commit is the ONE snapshot of the load, not one per group."""
     load_via_sink(_resource(10), "streamed", lab.config, LoadPlan(mode="append"))
     before = lab.snapshots("streamed")
 

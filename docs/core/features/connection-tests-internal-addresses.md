@@ -58,3 +58,8 @@ choices below are the planner's, where the spec leaves room.
 **Acceptor** (not the Owner): product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date: none.
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- These forms all count as internal and are refused: IPv6 loopback, link-local (`fe80::/10`, `169.254.0.0/16`, including the cloud metadata address `169.254.169.254`), IPv4 written in decimal or octal, IPv4-mapped IPv6, and `localhost` or any name that resolves to an internal address.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

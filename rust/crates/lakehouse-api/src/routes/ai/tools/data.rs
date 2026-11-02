@@ -143,6 +143,11 @@ const MAX_RESULT_ROWS: usize = 100;
 /// A result the run route cut carries a second note, under `truncated`,
 /// that names the limit which cut it — the route names it in `cutBy` — so
 /// the model is never told the wrong limit did it.
+///
+/// `DATA-29`: the cells are handed over as the route built them, so a
+/// `NULL` cell reaches the model as `null` and an empty cell as `""` — the
+/// two are told apart, and this tool does not flatten them again on the way
+/// to the model.
 fn compact_query_result(result: Value) -> Value {
     let Value::Object(mut body) = result else {
         return result;
@@ -1152,6 +1157,48 @@ mod run_sql_delegation {
         assert!(bodies[0].contains("EXPLAIN AST"), "{bodies:?}");
         assert!(!bodies[1].contains("EXPLAIN AST"), "{bodies:?}");
         Ok(())
+    }
+
+    /// `DATA-29`: a `NULL` cell reaches the model as `null`, and an empty
+    /// cell stays `""` — the tool must not flatten the two again on the way
+    /// to the model.
+    ///
+    /// The tool forwards the run route's rows, so the shape is the route's:
+    /// the engine's answer carries one column as `null` and the other as an
+    /// empty string, and the model sees both as they came.
+    #[tokio::test]
+    async fn run_sql_hands_the_model_a_null_cell_as_null() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("EXPLAIN AST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("SelectWithUnionQuery (children 1)\n"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "maybe", "type": "Nullable(String)"},
+                    {"name": "text", "type": "String"},
+                ],
+                "data": [{"maybe": null, "text": ""}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!("SELECT 1"));
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        assert_eq!(
+            result["rows"],
+            json!([{"maybe": null, "text": ""}]),
+            "a NULL cell must reach the model as null, and an empty cell as an empty string"
+        );
     }
 
     /// SEC-9-AC4: a statement that fails in the engine comes back to the

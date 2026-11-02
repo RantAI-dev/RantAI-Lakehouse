@@ -143,8 +143,8 @@ use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
 use lakehouse_store::upload_folders;
 use lakehouse_store::uploads::{
-    self, ClaimFolder, FolderFilter, ListFilter, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
-    NewUpload, TableClaim, Upload,
+    self, ClaimFolder, FolderFilter, LimitOutcome, ListFilter, LoadClaim, LoadLimits, LoadMode,
+    MarkOutcome, NewUpload, TableClaim, Upload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -163,7 +163,7 @@ use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::state::AppState;
 use crate::upload_convert::{self, Answer, ConversionError, FileKind, Operation, Source};
 use crate::upload_formats::{self, ByName, Compression, Format, Layout, Refusal};
-use crate::upload_limits::{RETRY_AFTER_SECS, too_many_uploads};
+use crate::upload_limits::{RETRY_AFTER_SECS, too_many_large_loads, too_many_uploads};
 use crate::upload_parquet::{self, ParquetFooter, ParquetInfo};
 use crate::upload_parquet_parts::Part;
 use crate::upload_parquet_range::RangeReader;
@@ -609,6 +609,17 @@ fn converted_text_key(storage_key: &str, position: usize) -> String {
 /// is and whether it was empty (`SEC-22` D5).
 fn converted_answer_key(storage_key: &str, position: usize) -> String {
     format!("{storage_key}.converted.{position}.json")
+}
+
+/// The suffix of the object the job writes its report of values that did not fit
+/// to (`file_ingest.REPORT_SUFFIX`, plan AD6).
+const REPORT_SUFFIX: &str = ".bad-values.json";
+
+/// The key the job's report of values that did not fit is stored under, beside
+/// the ORIGINAL of the upload: the API reads it there (`DATA-31`), and the job
+/// writes it there too, whatever object it read.
+fn report_key(storage_key: &str) -> String {
+    format!("{storage_key}{REPORT_SUFFIX}")
 }
 
 /// The answer a conversion failure gets.
@@ -2725,6 +2736,10 @@ fn load_limits(state: &AppState) -> LoadLimits {
     LoadLimits {
         per_user: i64::from(state.config.upload_max_concurrent_per_user),
         total: i64::from(state.config.upload_max_concurrent),
+        // `DATA-37` decision D2: how many large loads may run at once in the
+        // installation. A load that is not large never counts against it and
+        // is never refused by it (decision D3).
+        large: i64::from(state.config.upload_max_concurrent_large),
     }
 }
 
@@ -2738,9 +2753,11 @@ fn load_limits(state: &AppState) -> LoadLimits {
 /// # Errors
 ///
 /// 429 (`Retry-After: 5`) when the `uploaded_by` already has the configured
-/// number of loads running, or the installation has; 400 when the header
-/// has more than 1,000 columns under the confirmed reading; 503 when the
-/// object store cannot serve the head.
+/// number of loads running, or the installation has; 429 with the
+/// large-load sentence when the installation already runs the configured
+/// number of large loads and this one is large too (`DATA-37`); 400 when the
+/// header has more than 1,000 columns under the confirmed reading; 503 when
+/// the object store cannot serve the head.
 async fn check_within_limits_and_column_cap(
     state: &AppState,
     pool: &PgPool,
@@ -2749,8 +2766,13 @@ async fn check_within_limits_and_column_cap(
     layout: Option<Layout>,
 ) -> ApiResult<LoadLimits> {
     let limits = load_limits(state);
-    if !uploads::loads_under_limits(pool, &row.id, limits).await? {
-        return Err(too_many_uploads().into());
+    match uploads::loads_under_limits(pool, &row.id, &request.also_uploads, limits).await? {
+        LimitOutcome::Under => {}
+        LimitOutcome::LimitReached => return Err(too_many_uploads().into()),
+        // `DATA-37` decision D4: the refusal of the large-load limit has a
+        // sentence of its own, so the person can tell it from the per-user
+        // one.
+        LimitOutcome::LargeLimitReached => return Err(too_many_large_loads().into()),
     }
     let store = UploadStore::connect(&state.config).await?;
     if let Some(layout) = layout {
@@ -2943,8 +2965,10 @@ async fn convert_upload(
 ///
 /// # Errors
 ///
-/// 429 when a limit is reached; 409 when this upload was claimed by another request, or one of
-/// the other files was taken or went away since the checks; 404 when this upload went away.
+/// 429 when a limit is reached (each with its own sentence: the per-user and
+/// the installation-wide one, and the large-load one of `DATA-37`); 409 when
+/// this upload was claimed by another request, or one of the other files was
+/// taken or went away since the checks; 404 when this upload went away.
 async fn claim_load(
     pool: &PgPool,
     row: &Upload,
@@ -2986,6 +3010,10 @@ async fn claim_load(
     Ok(match outcome {
         MarkOutcome::Marked(claimed) => *claimed,
         MarkOutcome::LimitReached => return Err(too_many_uploads().into()),
+        // `DATA-37` decision D4: the refusal of the large-load limit has a
+        // sentence of its own. The early read above answers it too, so the
+        // person sees the same sentence whichever check refused the load.
+        MarkOutcome::LargeLimitReached => return Err(too_many_large_loads().into()),
         MarkOutcome::GroupNotMarked => {
             // One of the other files was taken, or went away, since the checks.
             return Err(ApiError::Conflict(OTHER_BUSY.to_owned()).into());
@@ -3166,8 +3194,11 @@ async fn load_keys_of(
 /// # Errors
 ///
 /// 429 (`Retry-After: 5`) when the person who uploaded the file already has
-/// the configured number of loads running, or the installation has (`SEC-17`);
-/// 400 for a body that is not valid (each field has its own sentence), for a
+/// the configured number of loads running, or the installation has
+/// (`SEC-17`); 429 with the large-load sentence when the installation
+/// already runs the configured number of large loads and this one is large
+/// too (`DATA-37`); 400 for a body that is not valid (each field has its own
+/// sentence), for a
 /// workbook or Parquet file that cannot be read, a sheet a workbook does not
 /// have, a sheet or file over the cell limit, an empty sheet or a Parquet
 /// file with no rows, and for a header with more than 1,000 columns under the
@@ -3337,8 +3368,9 @@ async fn finish_launch_and_audit(
 // ── Delete ───────────────────────────────────────────────────────────────
 
 /// `DELETE /api/uploads/{id}` — remove the object (and the converted text of a
-/// workbook or Parquet file), then the row. 204. For an upload still being
-/// received (`DATA-17`) it aborts the multipart upload first. The
+/// workbook or Parquet file, and the report of values that did not fit), then
+/// the row. 204. For an upload still being received (`DATA-17`) it aborts the
+/// multipart upload first. The
 /// table the upload became is not touched, and neither is the claim on its
 /// name: that is a record of its own ([`uploads::claim_table`]) and is never
 /// released, so a later upload of the tenant can still load into the table and
@@ -3409,6 +3441,10 @@ pub async fn delete(
         store.delete(&converted_key(&row.storage_key)).await?;
     }
     store.delete(&row.storage_key).await?;
+    // The report of values that did not fit belongs to the upload: it is
+    // beside the original (`DATA-31`), and a delete takes it with it. A
+    // missing object is a no-op, as for the others.
+    store.delete(&report_key(&row.storage_key)).await?;
     if !uploads::delete(pool, &row.id).await? {
         // Refused because a load was claimed after the check above, or the
         // row was deleted by another request meanwhile.

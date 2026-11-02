@@ -94,11 +94,18 @@ export function DataTableSettingsMenu<TData>({
 
   // Leaf columns, not `getAllColumns()` — only the leaf list is run through the
   // column order, so this keeps both lists in step after a reorder.
+  //
+  // A column the page hides for its own reasons (the Data Explorer hides what
+  // does not fit the window) is left out: it is not the user's to toggle,
+  // and it comes back with the width.
+  const hiddenByPage = table.options.meta?.hiddenColumns ?? [];
   const hideableColumns = table
     .getAllLeafColumns()
     .filter(
       (column) =>
-        typeof column.accessorFn !== "undefined" && column.getCanHide()
+        typeof column.accessorFn !== "undefined" &&
+        column.getCanHide() &&
+        !hiddenByPage.includes(column.id)
     );
 
   // Pinned columns are held against the edges and are not part of the run being

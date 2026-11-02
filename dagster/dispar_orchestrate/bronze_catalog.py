@@ -60,6 +60,16 @@ class SchemaDriftError(RuntimeError):
     """
 
 
+class SlugConflictError(RuntimeError):
+    """Raised when the slug of a Bronze dataset is already registered in the
+    SECONDARY registry (`lake.bronze_meta_sec.dataset_catalog`) — DATA-40 D2:
+    one slug names one dataset (D1), so a slug the secondary registry holds
+    cannot be registered in the primary one. The write is refused BEFORE any
+    row is inserted, so the two registries never end up holding the same
+    slug and the console never shows one dataset with two answers.
+    """
+
+
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name, "").strip()
     return value if value else default
@@ -289,6 +299,42 @@ def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def _assert_slug_is_free(target: ClickHouseTarget, slug: str) -> None:
+    """DATA-40 D2: refuse to write a slug the SECONDARY registry holds.
+
+    The secondary registry (`lake.bronze_meta_sec.*`) is the older,
+    hand-filled one; the product's own writer (`register_bronze_table`)
+    only ever writes `lake.bronze_meta.*`. A slug in both registries is one
+    dataset with two answers: the console's list showed a column count that
+    varied between runs, and its detail page counted both registries'
+    columns (DATA-40 §0). This check therefore runs BEFORE the first insert
+    and refuses the whole registration.
+
+    `FINAL` for the reason the reads use it: the registry is a
+    `ReplacingMergeTree ORDER BY slug` that a re-run writes again, and
+    `ClickHouse` merges the copies only in the background — without it a
+    slug the secondary registry holds could slip through until the merge.
+
+    The slug is bound through `_sql_string_literal`, like every other value
+    this module sends; it is a server-controlled dataset name, never
+    end-user input.
+    """
+    rows = _ch_query_json(
+        target,
+        "SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` FINAL "
+        f"WHERE slug = {_sql_string_literal(slug)}",
+    )
+    if not rows:
+        return
+    raise SlugConflictError(
+        f"DATA-40: the slug {slug!r} is already registered in "
+        "lake.`bronze_meta_sec.dataset_catalog` — a secondary dataset already "
+        "uses it. One slug names one dataset, so nothing was registered in "
+        "lake.`bronze_meta.dataset_catalog`; this load needs another table "
+        "name."
+    )
+
+
 def register_bronze_table(
     *,
     slug: str,
@@ -307,9 +353,16 @@ def register_bronze_table(
     is a genuine upsert once ClickHouse merges parts, matching the
     existing tables' own replace semantics — not something this module
     invents.
+
+    DATA-40 D2: a slug the SECONDARY registry (`lake.bronze_meta_sec.*`)
+    holds is refused with [`SlugConflictError`] and nothing is inserted —
+    one slug names one dataset. The check runs after the schema bootstrap
+    (the secondary table has to exist before it can be read) and before the
+    first insert, so a refused write leaves the primary registry untouched.
     """
     ch = target or ClickHouseTarget.from_env()
     _assert_or_create_all(ch, EXPECTED_SCHEMAS)
+    _assert_slug_is_free(ch, slug)
 
     updated_at = _utc_now_iso()
     catalog_values = (

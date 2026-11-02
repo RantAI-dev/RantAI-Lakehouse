@@ -312,6 +312,7 @@ pub(crate) async fn try_run_spec_sql(
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         sql,
         &sqlparser::dialect::ClickHouseDialect {},
+        crate::sql_rewrite::Engine::ClickHouse,
         roles,
         placeholders,
         obligations,

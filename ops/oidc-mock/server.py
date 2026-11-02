@@ -105,6 +105,16 @@ PRINCIPALS = [
     # independently auditable/revocable, same rationale as every other
     # entry in this list.
     "lakehouse-api-reader",
+    # DATA-5 / ADR 0016 — the read-only principal the API forwards an
+    # outside tool's Iceberg REST call with. The tool never talks to
+    # Lakekeeper itself (ADR 0016: the catalog trusts exactly one issuer,
+    # and that issuer is this development stand-in), so the door needs a
+    # catalog identity of its own: `describe` on the warehouse, and (from
+    # the first export that creates the `gold` namespace) `select` on that
+    # one namespace. A separate principal so this identity is
+    # independently auditable/revocable, the same rationale as every other
+    # entry in this list.
+    "outside-readers",
     "unauthorized-test",
 ]
 

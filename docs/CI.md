@@ -12,11 +12,10 @@ This repo's CI is split into workflows under `.github/workflows/`:
   full-git-history `history-scan` job, which reports only findings outside
   the `.gitleaksignore` baseline (see below) and is deliberately excluded from
   required checks.
-- **`docker.yml`** — runs on `v*` tag pushes only: builds `rust/Dockerfile`
-  to check that a release tag still builds. A GHCR push job exists but is
-  gated on tag pushes and is currently inert (no registry login
-  configured). The `/health` smoke test that used to live here is the
-  `image-smoke` job in `ci.yml`.
+- **`release.yml`** — the release pipeline (REL-2 S2). On a `v*` tag push it
+  builds, signs and packages a release; on a pull request that touches the
+  pipeline, or on demand, it runs the same pipeline as a dry run against a
+  throwaway registry and a throwaway key. See "Release pipeline" below.
 - **`coverage.yml`** — `cargo llvm-cov` (lcov, uploaded as a workflow
   artifact) and a CycloneDX SBOM per crate (also uploaded as an artifact,
   for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
@@ -271,11 +270,6 @@ remains true).
 
 ## Docker
 
-`docker.yml` runs on `v*` tag pushes only and builds `rust/Dockerfile` with the same build
-arguments as the `images` job, reading (never writing) its `api-image` layer cache. It no
-longer runs on pushes to `main` or on pull requests: the API image is built, shared and smoke
-tested by `ci.yml` (`images`, `image-smoke`).
-
 `image-smoke` runs the image standalone (no Postgres/ClickHouse containers), because
 `lakehouse-api` is designed to boot and serve its DB-independent routes — including
 `/health` — without either dependency (`entrypoint.api.sh` skips migrations when
@@ -283,10 +277,146 @@ tested by `ci.yml` (`images`, `image-smoke`).
 smoke test of the container's own boot path, not a substitute for `docker compose up`
 against the full stack.
 
-The `push-ghcr` job is gated on `startsWith(github.ref, 'refs/tags/')` and,
-even when that condition is met, does not actually push anywhere — there is
-no `docker/login-action` step and no registry credential configured. Wiring
-up real publishing is an explicit, separate decision for a later phase.
+The build that used to live here — `docker.yml`, which built `rust/Dockerfile` on a tag
+push and never published anything — is now the release pipeline below. It builds the same
+image, with the same build arguments, and then does the rest.
+
+## Release pipeline
+
+`release.yml` builds, signs and packages a release (REL-2 S2). One file holds the whole
+release, and everything else is checked through it: `release.json`, the release manifest,
+signed with the release key. The signature is a **Sigstore bundle**,
+`release.json.sigstore.json`: cosign v3 writes the signature and the manifest's digest into
+one JSON file, and that is what `lakehousectl` reads (REL-2 S2 D3a).
+
+| Trigger | What runs |
+|---|---|
+| `push` of a `v*` tag | The real release: the four images go to `ghcr.io/rantai-dev`, the manifest is signed with the release key, and a **draft** GitHub Release is created |
+| `workflow_dispatch` | The dry run |
+| `pull_request` on `.github/workflows/release.yml`, `ops/release/**`, `Dockerfile.frontend`, `rust/Dockerfile`, `dagster/Dockerfile`, `ops/oidc-mock/**` | The dry run |
+
+The real job never runs for a pull request: it is gated on a tag push, and it is the only
+job in this repository that can see the release key.
+
+### The dry run
+
+The dry run is the whole pipeline with two things changed, so that a change to the pipeline
+can be proved before it can cut a release:
+
+- its images go to a `registry:2` service container of the job, so the digests it records
+  are real digests of a real registry;
+- its key is generated in the job, in the runner's working directory, and thrown away
+  with the job: the file leaves the working directory with the step that generated it,
+  and the PEM travels on as that step's output. It reaches the three steps that sign,
+  and no other step — the same shape as the real job, where the release key comes
+  from the `release` environment's secrets (REL-2 S2 review round 4 SHOULD-FIX 1).
+  It is never the release key and it never leaves the runner.
+
+Nothing is published. The bundle, the manifest, its Sigstore bundle, the rendered Compose
+file, the installer and the SBOMs are uploaded as a workflow artifact (`release-dry-run`),
+and the run's summary prints the bundle's size — the number the release notes quote.
+
+### The installer
+
+Both jobs build `lakehousectl` — the operator's install and update tool (REL-2 S3) — as a
+**static** binary for `x86_64-unknown-linux-musl`, so it runs on a host that has nothing but
+a Linux kernel: that is the air-gapped host. The binary joins the offline bundle and the
+release's assets, and the signed manifest names its checksum, so the bundle's copy is the
+file the release published.
+
+The build is **without** the `test-key` feature: a release build verifies a manifest against
+the release key compiled into it and against no other. The feature exists for the CI dry
+run's own proof, whose bundle is signed with the throwaway key the job generates — and that
+proof builds its own binary with the feature, in the proof's own job.
+
+### The real release
+
+The real job runs in the `release` **environment**, so the owner's approval (a required
+reviewer on that environment) stands between the tag and the signing key. The key is a
+secret of that environment and of no other:
+
+| Secret | What it is |
+|---|---|
+| `COSIGN_PRIVATE_KEY` | the cosign private key PEM (ECDSA P-256) |
+| `COSIGN_PASSWORD` | the password that opens it, if the key is encrypted |
+
+The secret holds the private key as the PEM text — what `cosign generate-key-pair`
+writes — and `env://` reads it as it is: not base64 of it, and not a path to a file
+(REL-2 S2 review BLOCKER 1).
+
+The public key is committed at `ops/release/release.pub`, and it is the one
+`lakehousectl` compiles in — so a signature made in this pipeline verifies on an air-gapped
+host with nothing but the key and the manifest. The pipeline verifies every signature it
+makes before it publishes anything: each image with `cosign sign`, the manifest with
+`cosign sign-blob` and then `cosign verify-blob` against the committed public key.
+
+**Nothing is uploaded to the public transparency log (Rekor), in either job** (REL-2 S2
+D3a). The dry run would publish throwaway entries signed with a key that is thrown away
+with the job, and the manifest's signature has to verify on an air-gapped host, where no log
+is reachable. The mechanism is cosign v3's `--tlog-upload=false`, which v3 accepts only
+together with `--use-signing-config=false`: on its own, v3 refuses the flag, because the
+signing config it would otherwise use names the public log service ("`--tlog-upload=false`
+is not supported with --signing-config or --use-signing-config`"). With both flags cosign
+signs from the key alone, contacts no log and no timestamp service, and writes a bundle
+that carries the signature and the digest and nothing else. The verification right after
+signing therefore skips the log check (`--insecure-ignore-tlog`) and runs offline
+(`--offline`).
+
+The images carry the same consequence: their signatures are in the registry, with no log
+entry, so an operator verifying one by hand passes `--insecure-ignore-tlog` too —
+`cosign verify --key ops/release/release.pub --insecure-ignore-tlog <image>@<digest>`. The
+key is what the check is about; the log was never the identity here, because the images are
+signed with the release key and not with a keyless identity.
+
+cosign v3 prints `--tlog-upload has been deprecated, prefer using a signing-config file with
+no transparency log services`. The flag still works, so the pipeline keeps it and the
+proxy-logged proof stands; replacing it with a `--signing-config` file is left for when the
+flag is removed (REL-2 S2 review round 5).
+
+The release is created as a **draft**. The product owner publishes it.
+
+### The one manual step after the first real release
+
+GHCR packages are private by default, so after the first real release the four published
+images have to be made public — or the operators have to be given read access another way.
+The documented way is the package's own page:
+
+1. open <https://github.com/orgs/RantAI-dev/packages> (or the package's page);
+2. for each of `rantai-lakehouse-api`, `rantai-lakehouse-console`,
+   `rantai-lakehouse-dagster` and `rantai-lakehouse-oidc-mock`: **Package settings** →
+   **Change visibility** → **Public**.
+
+Until that is done, `docker pull ghcr.io/rantai-dev/rantai-lakehouse-api:<version>` answers
+`401` for an operator who is not logged in to GHCR.
+
+### What the pipeline runs, in order
+
+1. `ops/release/check_version.py` — the tag, `package.json`, the API crate's
+   `Cargo.toml` and the changelog must name the same version;
+2. the four images are built and pushed (`lakehouse-api`, the Dagster image, `oidc-mock`,
+   the console), each by digest;
+3. each image is signed with cosign, and a CycloneDX SBOM is written for it and attested
+   to it;
+4. the release's Compose file is RENDERED from the template
+   (`ops/release/render_compose.py`): every image the repository builds names the
+   published image at its digest, and the gate and test services are gone;
+5. the THIRD-PARTY images the rendered file runs (Postgres, ClickHouse, Lakekeeper,
+   OpenFGA, RustFS, Gotenberg, the init images, and the `trino`, `seaweedfs` and
+   `backups` profiles) are pulled by digest, and a CycloneDX SBOM is written for each of
+   them with the same syft the SBOM action installs. They are **not** signed: we cannot
+   sign another project's image in its own registry, so their integrity comes from the
+   digest in the signed manifest (`ops/release/compose_images.py` says which images are
+   whose);
+6. `ops/release/make_manifest.py` writes `release.json` — the version, every image's
+   digest (ours from the published digests, the third-party ones from the rendered
+   Compose file), the Compose file's checksum, and the upgrade path;
+7. the manifest is signed into `release.json.sigstore.json` and the bundle verified at once,
+   offline;
+8. `ops/release/make_bundle.sh` writes the offline bundle and prints its size;
+9. the release is created as a draft (the real run only).
+
+The tooling is under `ops/release/`, and its own tests run in the `Repo lints` job of
+`ci.yml` (`python -m pytest ops/release`) and at the start of both pipeline jobs.
 
 ## Dependency review: now works, verified on a real PR
 
@@ -340,8 +470,9 @@ The check names above reflect the real `name:` values from
 guessed. `ci-required` consolidates and enforces all scope-dependent tests
 in `ci.yml`, including the image build and `/health` smoke test
 (`images`, `image-smoke`). The check `Build lakehouse-api image · smoke test
-/health` that used to be listed here no longer reports on PRs (`docker.yml` is
-tag-only), so it must NOT be required: a required check that never reports
+/health` that used to be listed here no longer reports on PRs (it lived in
+`docker.yml`, which was tag-only, and `docker.yml` is now the release
+pipeline), so it must NOT be required: a required check that never reports
 blocks every merge under `strict` mode. If a workflow's job names change, this list needs to be updated to
 match, or `strict` mode will block merges on a check that no longer reports.
 

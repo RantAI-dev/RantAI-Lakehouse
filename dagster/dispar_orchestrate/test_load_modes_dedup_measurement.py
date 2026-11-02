@@ -64,8 +64,13 @@ class _Failure:
             # PR #186 review BLOCKER 6: the write of a `replace` or `append` is now staged in
             # one `pyiceberg` transaction (`adapters/iceberg_stream.py`), and `Table.append`
             # and `Table.overwrite` are only a transaction around the same two calls, so the
-            # failure is injected where both paths meet. The failure it injects is the same.
-            owner = Transaction
+            # failure is injected where both paths meet.
+            # `DATA-36`: the groups of a load are written into ONE snapshot producer
+            # (`adapters/iceberg_snapshot.py`), so neither `Transaction.append` nor
+            # `Transaction.overwrite` is called any more; the paths meet now in the one call
+            # that opens the producer of the load's one snapshot. The failure it injects is
+            # the same.
+            owner, name = Transaction, "update_snapshot"
         original = getattr(owner, name)
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:

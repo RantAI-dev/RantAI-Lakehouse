@@ -71,7 +71,6 @@ Each default was the planner's recommendation.
 - Replacing an uploaded table with different types can break a pipeline that reads it; its next run fails and says why.
 - Adding to an existing table keeps that table's names and types.
 - The size of a typed load is the same as for any upload: 2 GB, one load at a time measured (`docs/plans/DATA-17-RESULT.md`); the harness sends no column list, so no typed load was measured at full size.
-- For an Excel workbook loaded with types, the report of values that did not fit is written but not read back, so the person sees no list of them (`DATA-31`).
 - A query through the console shows a NULL as an empty string (`DATA-29`); use `IS NULL` to tell them apart.
 
 ## Spec targets, row by row
@@ -82,7 +81,7 @@ Against `docs/core/specs/data-18.md`, as built in #186. "Met" means built and co
 | --- | --- | --- |
 | Type detection | Integer, decimal, boolean, date, timestamp, text from a sample of 10,000 rows *(proposed)* | Met (decision 1; the sample is also cut at 16 MB) |
 | Edit before loading | Name and type per column in the preview | Met (decision 8) |
-| Bad values | Counted, first 100 listed, choose null or stop | Met for the load, with the gap for workbooks above (`DATA-31`) |
+| Bad values | Counted, first 100 listed, choose null or stop | Met for the load, workbooks included since `DATA-31` |
 | Date formats | ISO, dd/mm/yyyy, mm/dd/yyyy; ask when ambiguous | Met (decision 4) |
 
 No spec target is left unmet, so there is no "Spec targets this feature does not meet" section.

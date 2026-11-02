@@ -29,6 +29,7 @@ import { useService } from "@/hooks/use-service"
 import { notificationsService } from "@/services"
 import { TenantSwitcher } from "./tenant-switcher"
 import { useCopilot } from "@/features/copilot/use-copilot"
+import { CONSOLE_VERSION } from "@/features/version/console-version"
 
 /**
  * Sticky top navbar rendered on every page.
@@ -169,8 +170,15 @@ function ThemeIcon({
   return <Sun className="size-4" />
 }
 
-/** Who's signed in, with a logout affordance and theme selection. Renders once `AuthProvider` has resolved a user (see `AppFrame`). */
-function UserMenu({
+/**
+ * Who's signed in, with a logout affordance and theme selection. Renders once `AuthProvider` has resolved a user (see `AppFrame`).
+ *
+ * Exported for its own test: the account menu's version line (REL-2
+ * S1-T5) is the one thing here that says which build the console is, and
+ * rendering the whole navbar around it would need the auth, copilot and
+ * sidebar providers the menu does not use.
+ */
+export function UserMenu({
   userName,
   userEmail,
   onLogout,
@@ -244,6 +252,12 @@ function UserMenu({
           </DropdownMenuSubContent>
         </DropdownMenuSub>
         <DropdownMenuSeparator />
+        {/* REL-2 S1-T5: the console's own version, so a person can say
+            which build they are looking at. Disabled — it is a fact, not
+            an action. */}
+        <DropdownMenuItem disabled>
+          Version {CONSOLE_VERSION}
+        </DropdownMenuItem>
         <DropdownMenuItem variant="destructive" onClick={() => void onLogout()}>
           <LogOut />
           Sign out

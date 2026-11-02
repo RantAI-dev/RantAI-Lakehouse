@@ -67,7 +67,7 @@ dependencies = [
     # release carries.
     # `oracledb` and `paramiko` stay as they are: out of `SEC-52`'s scope,
     # and `paramiko` 3.5.0's low advisory has no fixed release to move to.
-    "pymongo==4.18.2",
+    "pymongo==4.18.3",
     "oracledb==2.5.1",
     # adapters/sql.py builds mysql+pymysql / mssql+pyodbc connection
     # strings for the mysql/mariadb/mssql drivers, but neither driver

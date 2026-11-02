@@ -2973,6 +2973,7 @@ async fn run_records(
         crate::policy_engine::rewrite_sql_for_roles(
             &statement,
             &sqlparser::dialect::ClickHouseDialect {},
+            crate::sql_rewrite::Engine::ClickHouse,
             roles,
             placeholders,
             obligations,
@@ -3672,6 +3673,7 @@ pub(crate) async fn build_chart_file(
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &statement,
         &sqlparser::dialect::ClickHouseDialect {},
+        crate::sql_rewrite::Engine::ClickHouse,
         &principal.role_names,
         &placeholders,
         &obligations,
@@ -4043,6 +4045,7 @@ pub(crate) async fn values_with_limit(
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &sql,
         &sqlparser::dialect::ClickHouseDialect {},
+        crate::sql_rewrite::Engine::ClickHouse,
         roles,
         placeholders,
         obligations,
@@ -5605,6 +5608,7 @@ mod values_enforcement {
         let out = crate::policy_engine::rewrite_sql_for_roles(
             sql,
             &sqlparser::dialect::ClickHouseDialect {},
+            crate::sql_rewrite::Engine::ClickHouse,
             &["Analyst".to_owned()],
             &PlaceholderValues::none(),
             &obligations,

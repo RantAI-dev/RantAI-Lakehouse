@@ -669,41 +669,80 @@ pub async fn exports(
     ))
 }
 
-/// `GET /api/gold/export/{mart}/consumers` — WS6 ships this as an honest
-/// stub. Correlating a Gold mart's exported Iceberg table against
-/// `Trino`'s `system.runtime.queries` needs code that runs a query
-/// through a `Trino` client and matches its result against the mart's
-/// table name — **no such code exists in this build**. This is NOT
-/// because the `lakehouse-trino` crate is unavailable: it already exists
-/// on this branch and `AppState::trino` already wires a live
-/// [`lakehouse_trino::TrinoClient`] for `routes::query::run`'s
-/// `engine: "trino"` path. `lakehouse-trino`'s own crate doc comment
-/// says its surface was kept deliberately small "so a future 'consumers'
-/// route can depend on it" — this route is that future route, not yet
-/// written; the crate being present is exactly what makes writing it a
-/// small follow-up rather than a new dependency. Until that correlation
-/// logic exists, this route unconditionally reports `supported: false`
-/// rather than guessing — never a silently-empty list, which would read
-/// as "this mart has zero consumers" (a different, false claim).
+/// `GET /api/gold/export/{mart}/consumers` — who read this mart's
+/// published table, and how often (DATA-5, ADR 0016, plan D7).
+///
+/// The count is the API's own: every table load through the door
+/// (`routes::iceberg_door`) is counted, and this route reads those
+/// counts back. It answers:
+///
+/// - when outside reading is set up on this deployment:
+///   `{ mart, supported: true, windowDays: 7, consumers: [{ identityId,
+///   name, reads, lastReadAt }] }`, with the reads summed over the last
+///   seven calendar days and the list ordered by reads descending;
+/// - when it is not: `{ mart, supported: false, consumers: null, reason:
+///   <the door's own reason> }` — the SAME sentence the door's own 503
+///   carries, so the console says exactly what a tool would be told.
+///   Never a count of zero: "not measured" and "measured, and nobody
+///   read it" are different answers (principle 2).
+///
+/// The mart is looked up under the name the EXPORT gave its table in the
+/// `gold` namespace (`lakehouse_iceberg::gold::sanitize_mart_name`), so
+/// the count is found under exactly that name.
 ///
 /// # Errors
 ///
-/// Returns 400 if `mart` is not a valid identifier; otherwise always
-/// `200` with `supported: false` — this route never calls `Trino`, so it
-/// never fails on the `Trino` side.
-pub async fn consumers(Path(mart): Path<String>) -> ApiResult<ApiJson<Value>> {
+/// Returns 400 if `mart` is not a valid identifier; 503 when this
+/// deployment has no Postgres pool; 500 when the count cannot be read.
+pub async fn consumers(
+    State(state): State<AppState>,
+    Path(mart): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let mart_name = mart_ident.as_str();
+
+    // The door's own readiness decides whether the count is measured at
+    // all (D4, D7). Its refusal text is the door's own, so the console
+    // and a tool are told the same thing.
+    if let Err(problem) = crate::routes::iceberg_door::setup(&state).await {
+        return Ok(ApiJson(json!({
+            "mart": mart_name,
+            "supported": false,
+            "consumers": Value::Null,
+            "reason": problem.reason(),
+        })));
+    }
+
+    // The published table's name in the `gold` namespace — the export
+    // names it this way (`gold::sanitize_mart_name`), so the count is
+    // looked up under exactly that name.
+    let table = lakehouse_iceberg::gold::sanitize_mart_name(mart_name)
+        .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    let pool = pool(&state)?;
+    // Seven calendar days, today included: the window the page shows.
+    let since = time::OffsetDateTime::now_utc().date() - time::Duration::days(WINDOW_DAYS - 1);
+    let consumers = lakehouse_store::outside_reads::outside_readers_of(
+        pool,
+        crate::routes::iceberg_door::GOLD_NAMESPACE,
+        &table,
+        since,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
     Ok(ApiJson(json!({
-        "mart": mart_ident.as_str(),
-        "consumers": Value::Null,
-        "supported": false,
-        "reason": "Trino query-history correlation for Gold marts is not implemented: this \
-                   route has no code that queries system.runtime.queries or matches it \
-                   against a mart's exported table, even though the lakehouse-trino client \
-                   crate already exists and is wired into this build for other routes",
+        "mart": mart_name,
+        "supported": true,
+        "windowDays": WINDOW_DAYS,
+        "consumers": consumers,
     })))
 }
+
+/// How many days of reads the consumers route reports (DATA-5's spec:
+/// "the page shows the last 7 days"; the history itself is kept for 90).
+const WINDOW_DAYS: i64 = 7;
 
 // ── Per-mart publication switches (DATA-1) ──────────────────────────────
 //
@@ -1065,8 +1104,14 @@ mod tests {
         AppState::new(Config::from_map(&env).unwrap())
     }
 
+    /// The consumers route is registered and policy-gated: with no
+    /// credential the auth gate answers before the handler body, so this
+    /// proves routing + policy wiring (never a 404, which would mean the
+    /// route was not registered). What it answers for an AUTHENTICATED
+    /// caller needs a Postgres pool, so it is proven in
+    /// `tests/iceberg_door.rs` instead.
     #[tokio::test]
-    async fn consumers_route_reports_unsupported_without_a_trino_client() {
+    async fn the_gold_consumers_route_is_registered_and_gated() {
         let app = crate::routes::router(state_without_pool());
         let response = app
             .oneshot(

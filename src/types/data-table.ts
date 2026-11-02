@@ -19,6 +19,12 @@ declare module "@tanstack/react-table" {
     paginationMode?: TablePaginationMode;
     /** Extra URL keys Reset should clear (page-specific filters). */
     memoryKeys?: string[];
+    /**
+     * Columns the page hides for its own reasons (the Data Explorer hides
+     * what does not fit the window). They stay in the column list, so their
+     * filters keep working.
+     */
+    hiddenColumns?: string[];
   }
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars

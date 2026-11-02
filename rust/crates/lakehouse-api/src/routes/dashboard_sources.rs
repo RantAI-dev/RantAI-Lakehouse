@@ -145,6 +145,7 @@ async fn check_and_rewrite(
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &normalized,
         &sqlparser::dialect::ClickHouseDialect {},
+        crate::sql_rewrite::Engine::ClickHouse,
         roles,
         placeholders,
         obligations,

@@ -1279,13 +1279,17 @@ async fn preview_policy_impl(state: &AppState, body: &PreviewPolicyBody) -> Valu
         .filter(|f| !f.is_empty())
     {
         Some(filter) => {
-            let expanded = crate::sql_rewrite::validate_row_filter_expr(filter, &real_columns)
-                .and_then(|expr| {
-                    crate::sql_rewrite::expand_placeholders(
-                        &expr,
-                        &crate::sql_rewrite::PlaceholderValues::none(),
-                    )
-                });
+            let expanded = crate::sql_rewrite::validate_row_filter_expr(
+                filter,
+                &real_columns,
+                crate::sql_rewrite::Engine::ClickHouse,
+            )
+            .and_then(|expr| {
+                crate::sql_rewrite::expand_placeholders(
+                    &expr,
+                    &crate::sql_rewrite::PlaceholderValues::none(),
+                )
+            });
             match expanded {
                 Ok(expanded) => format!(" WHERE {expanded}"),
                 // Same "conditions do not parse" shape Step 1's own test

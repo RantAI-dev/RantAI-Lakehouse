@@ -1,0 +1,1425 @@
+name: Release
+
+# REL-2 S2-T4: the release pipeline.
+#
+# Three ways in:
+#
+#   - a `v*` tag push: the REAL release. The job runs in the `release`
+#     environment, so the owner's approval gates the signing key, and the
+#     release it creates is a DRAFT the owner publishes.
+#   - `workflow_dispatch`: a dry run, on demand.
+#   - a pull request that touches the pipeline: a dry run, so a change to
+#     the release pipeline is proved before it can cut a release.
+#
+# The dry run never publishes: its images go to a registry that dies with
+# the job, its key is generated in the job and thrown away with it, and
+# what it builds is uploaded as a workflow artifact.
+#
+# The real job never runs for a pull request — it is gated on a tag push,
+# and it holds the only secrets in this repository.
+#
+# Every third-party action is pinned to a COMMIT SHA, with the release in
+# a trailing comment. A tag can move under the pipeline's feet — `v0` of
+# the SBOM action is a moving tag today — and a commit cannot, so the
+# release is built and signed by the code that was reviewed. The pins are
+# checked by `ops/release/test_release_workflow.py`, which runs in both
+# jobs below (REL-2 S2 review BLOCKER 2).
+#
+# Nothing in this pipeline uploads to the public transparency log (Rekor),
+# in either job (REL-2 S2 D3a): the dry run would publish throwaway
+# entries, and the manifest's signature must verify on an air-gapped host
+# with nothing but the committed public key. The mechanism is cosign v3's
+# `--tlog-upload=false`, which v3 accepts only together with
+# `--use-signing-config=false` — see the signing steps below.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "ops/release/**"
+      - "Dockerfile.frontend"
+      - "rust/Dockerfile"
+      - "dagster/Dockerfile"
+      - "ops/oidc-mock/**"
+
+# Least privilege. Nothing may write to the repository or to a package
+# unless the job that does it says so; the dry run may not write at all.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  # A release is not cancelled half-way: the signing key is in use and the
+  # bundle is being written.
+  cancel-in-progress: false
+
+jobs:
+  # ── The dry run ────────────────────────────────────────────────────
+  dry-run:
+    name: Release · dry run
+    # Never for a tag push: that is the real release, and it must not be
+    # preceded by a second full build of the same four images.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    # 150 minutes: the bundle now holds EVERY image the release runs
+    # (REL-2 S2 review round 6 BLOCKER 1), so the job pulls the
+    # third-party images, describes each of them, saves each of them and
+    # compresses the lot.
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      # The throwaway registry: a container of this job, so the digests
+      # the pipeline records are real digests of a real registry. It is
+      # STARTED by a step below, and not declared as a service container:
+      # a service container is started before the first step, and the
+      # step that turns the containerd store on restarts Docker, which
+      # stops it (REL-2 S3 review round 4 BLOCKER 1).
+      RELEASE_REGISTRY: localhost:5000
+      # The signer reads the key from the environment, by this
+      # reference — the same reference the real job uses, so the dry
+      # run proves the real job's wiring.
+      COSIGN_KEY: env://COSIGN_PRIVATE_KEY
+      # The public key of the throwaway key: written by the step that
+      # generates it. The real job's public key is committed.
+      COSIGN_PUBLIC_KEY: cosign.pub
+      # An empty password, so cosign asks for nothing: it encrypts the
+      # throwaway key with that empty password — which the signing steps
+      # hand it again — and never prompts. The key is thrown away with
+      # the job, so there is nothing to protect. It stays in the job's
+      # environment because it is empty: the KEY itself is in the `env:`
+      # of the three signing steps and of no other step (REL-2 S2 review
+      # round 4 SHOULD-FIX 1).
+      COSIGN_PASSWORD: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Free disk first: the runner image carries toolchains this job
+      # never uses, and the bundle holds EVERY image the release runs
+      # (REL-2 S2 review round 6 BLOCKER 1) — the images themselves,
+      # their `docker save` tars and the compressed bundle. The step is
+      # the one `g9-upload-large.yml` uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      #
+      # The bundle holds `docker save` archives, and the air-gapped host
+      # finds its images by the DIGEST the signed manifest pins: on
+      # Docker's classic store no `docker load` registers a repo digest,
+      # so the pinned reference never resolves there. The store is turned
+      # on BEFORE this job's first pull or build, so the images the job
+      # pulls back by digest land in the store the bundle is saved from.
+      #
+      # buildx builds in a builder container of its own, so the images it
+      # pushes are not in the runner's store: the job pulls them back by
+      # digest, and THAT pull is the one that has to happen on the
+      # containerd store.
+      #
+      # The daemon's own configuration is MERGED, not replaced: the
+      # runner's file may hold settings of its own.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: a bundle built on the
+          # classic store cannot be installed on an air-gapped host.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
+
+      # The throwaway registry, started HERE and not declared as a
+      # service container (REL-2 S3 review round 4 BLOCKER 1).
+      #
+      # A service container is started before the FIRST step, and the
+      # step above restarts Docker to turn the containerd store on: that
+      # restart stops the service container, and the store switch hides
+      # the image it ran from — the classic store's images are not in the
+      # containerd one. The image builds that push to `localhost:5000`
+      # would then have no registry to push to, and the dry run would
+      # fail on its first build.
+      #
+      # So the registry is a container of this job, started on the store
+      # the job uses. Its image is PINNED by digest, the way every other
+      # image in this repository is pinned: the digest was read from the
+      # registry's own `docker-content-digest` header for the tag
+      # `registry:2` on 2026-11-01.
+      - name: Start the throwaway registry
+        run: |
+          set -euo pipefail
+          docker run -d --name release-registry --restart always \
+            -p 5000:5000 \
+            registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          # The registry is WAITED FOR: the first build may start before
+          # the registry answers, and a push to a registry that is not up
+          # yet fails. The loop is bounded: a registry that never
+          # answers fails the job instead of hanging it.
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:5000/v2/ >/dev/null; then
+              echo "the throwaway registry is up (attempt $attempt)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the throwaway registry did not answer on http://localhost:5000/v2/"
+          docker logs release-registry || true
+          exit 1
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # The pipeline's own tests first: a change to the pipeline that
+      # breaks the tooling must not reach the image builds. They include
+      # this workflow's own (`ops/release/test_release_workflow.py`: no
+      # signing secret in a job-level `env:`, every action pinned to a
+      # commit SHA), so a change that only the pipeline would suffer from
+      # is caught here. `cryptography` is here for the Sigstore bundle's
+      # test (REL-2 S2 D3a), which verifies the manifest's signature the
+      # way `lakehousectl` will.
+      - name: The release tooling's own tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest==8.3.4 pyyaml==6.0.3 cryptography==50.0.2
+          python -m pytest ops/release -q
+
+      # The version, the package, the crate and the changelog must agree
+      # (S2-T1). The dry run has no tag, so it uses the repository's own
+      # version — the one the next release will be cut from.
+      - name: The version, the package, the crate and the changelog must agree
+        id: version
+        run: |
+          set -euo pipefail
+          tag="v$(jq -r .version package.json)"
+          python3 ops/release/check_version.py "$tag"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # `network=host` so the builder can reach the registry the job
+      # started: a buildx builder runs in a container of its own, and
+      # `localhost` inside it is the builder, not the runner. With the
+      # host's network namespace, `localhost:5000` is the registry
+      # container's published port.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: network=host
+
+      # The four images a release publishes. `GIT_SHA` is the commit the
+      # release is built from: the API serves an op's source only when
+      # the op's stamped commit is its own, and without the arg both
+      # stamp "unknown" and the console's source view answers 409 (see
+      # docker-compose.yml's `dagster-code-location` build block). The
+      # `ARG GIT_SHA` sits near the END of rust/Dockerfile, so the
+      # expensive cargo layers still come from the cache `ci.yml` wrote.
+      - name: Build and push the API image
+        id: image-api
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+            GIT_SHA=${{ github.sha }}
+            PIPELINE_PACKAGE=dispar_orchestrate
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:${{ steps.version.outputs.version }}
+          push: true
+          cache-from: type=gha,scope=api-image
+
+      - name: Build and push the Dagster image
+        id: image-dagster
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: dagster
+          file: dagster/Dockerfile
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}
+          push: true
+          cache-from: type=gha,scope=dagster-image
+
+      - name: Build and push the oidc-mock image
+        id: image-oidc
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ops/oidc-mock
+          file: ops/oidc-mock/Dockerfile
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}
+          push: true
+
+      - name: Build and push the console image
+        id: image-console
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.frontend
+          build-args: |
+            RUST_API_URL=http://lakehouse-api:8080
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}
+          push: true
+
+      # The digests the release is pinned to. The builder runs in a
+      # container, so the pushed images are NOT in the runner's image
+      # store: they are pulled back here, by digest, which is also the
+      # proof that the digest is pullable.
+      - name: The published images, by digest
+        id: images
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            case "$name" in
+              rantai-lakehouse-api) digest="${{ steps.image-api.outputs.digest }}" ;;
+              rantai-lakehouse-dagster) digest="${{ steps.image-dagster.outputs.digest }}" ;;
+              rantai-lakehouse-oidc-mock) digest="${{ steps.image-oidc.outputs.digest }}" ;;
+              rantai-lakehouse-console) digest="${{ steps.image-console.outputs.digest }}" ;;
+            esac
+            echo "::group::$name"
+            echo "digest: $digest"
+            docker pull "${{ env.RELEASE_REGISTRY }}/$name:$version@$digest"
+            echo "::endgroup::"
+          done
+          {
+            echo "api=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:${{ steps.version.outputs.version }}@${{ steps.image-api.outputs.digest }}"
+            echo "dagster=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}@${{ steps.image-dagster.outputs.digest }}"
+            echo "oidc=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}@${{ steps.image-oidc.outputs.digest }}"
+            echo "console=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}@${{ steps.image-console.outputs.digest }}"
+          } >> "$GITHUB_OUTPUT"
+
+      # The digests, and the services that run them: the mapping is the
+      # checked-in one, so the pipeline and the CI check cannot drift.
+      - name: The images the services run
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg api "${{ steps.images.outputs.api }}" \
+            --arg dagster "${{ steps.images.outputs.dagster }}" \
+            --arg oidc "${{ steps.images.outputs.oidc }}" \
+            --arg console "${{ steps.images.outputs.console }}" \
+            '{"rantai-lakehouse-api": $api, "rantai-lakehouse-dagster": $dagster,
+              "rantai-lakehouse-oidc-mock": $oidc, "rantai-lakehouse-console": $console}' > digests.json
+          jq -n --argjson digests "$(cat digests.json)" \
+            --slurpfile map ops/release/release-images.json '
+              reduce ($map[0] | to_entries[]) as $entry
+                ({}; reduce ($entry.value[]) as $service (.; .[$service] = $digests[$entry.key]))' > images.json
+
+      # The signer. Pinned to a commit SHA, the release in the comment:
+      # the signer of a release must not change under the release's feet.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # The throwaway key. It signs this job's images and this job's
+      # manifest, and it is verified against its own public key below —
+      # the same shape as the real run, with a key that costs nothing.
+      - name: Generate a throwaway signing key
+        id: throwaway-key
+        run: |
+          set -euo pipefail
+          cosign generate-key-pair
+          cosign public-key --key cosign.key > cosign.pub
+          # The PEM is masked in the log, line by line, so the dry run's
+          # log looks like the real job's, where the release key is
+          # `***`: a private key should not be readable in a log.
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              echo "::add-mask::$line"
+            fi
+          done < cosign.key
+          # The private key goes into this step's OUTPUT, and not into the
+          # environment of the job: a variable written to `$GITHUB_ENV` is
+          # in the environment of EVERY later step of the job — the runner
+          # prints it in each step's environment block, and the SBOM
+          # step's log showed the PEM (REL-2 S2 review round 4
+          # SHOULD-FIX 1). An output is read only by the steps that name
+          # it, so the three signing steps below take the key from here,
+          # into their own `env:`, the way the real job takes the release
+          # key from its secrets (REL-2 S2 review BLOCKER 1).
+          #
+          # The key is generated here and thrown away with the job: it is
+          # never the release key and it never leaves the runner.
+          {
+            echo 'private_key<<COSIGN_PRIVATE_KEY_EOF'
+            cat cosign.key
+            echo 'COSIGN_PRIVATE_KEY_EOF'
+          } >> "$GITHUB_OUTPUT"
+          # The key file leaves the workspace with this step: the PEM
+          # travels in the output now, and nowhere else.
+          rm -f cosign.key
+
+      # Sign each image (decision D3). The images are signed for the
+      # operators who pull them by hand; the manifest is what
+      # `lakehousectl` verifies. The key is read from the environment
+      # (`env://COSIGN_PRIVATE_KEY`), the same way the real job reads
+      # the release key (REL-2 S2 review BLOCKER 1).
+      #
+      # `--use-signing-config=false --tlog-upload=false` is cosign v3's
+      # way to sign with a key and NO transparency log (REL-2 S2 D3a).
+      # Both flags are needed: v3 refuses `--tlog-upload=false` on its
+      # own, because the signing config it would otherwise use names the
+      # public log service ("--tlog-upload=false is not supported with
+      # --signing-config or --use-signing-config"). With them, cosign
+      # signs from the key alone, contacts no log and no timestamp
+      # service, and uploads nothing to Rekor — measured: the same
+      # commands against a proxy that refuses rekor.sigstore.dev make no
+      # connection at all, while the default v3 command posts to
+      # rekor.sigstore.dev and gets "Forbidden".
+      - name: Sign each image
+        # The throwaway key, for THIS step only (REL-2 S2 review round 4
+        # SHOULD-FIX 1): the same shape as the real job's signing steps,
+        # which take the release key from the `release` environment's
+        # secrets. The job's environment holds no key, so no other step
+        # of this job — a third-party action included — can read it.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ steps.throwaway-key.outputs.private_key }}
+        run: |
+          set -euo pipefail
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
+            echo "signing $ref"
+            cosign sign --key "$COSIGN_KEY" \
+              --use-signing-config=false --tlog-upload=false "$ref"
+          done
+
+      # A CycloneDX SBOM per image, and the attestation that binds it to
+      # the image's digest.
+      #
+      # The format is CycloneDX **JSON** (`cyclonedx-json`): syft writes the
+      # action's plain `cyclonedx` format as XML, and `cosign attest --type
+      # cyclonedx` reads a JSON predicate — with the XML the attestation
+      # failed with "invalid character '<' looking for beginning of value"
+      # (REL-2 S2 review round 5 BLOCKER 1). The `.cdx.json` names are
+      # therefore true.
+      #
+      # The folder comes first: the SBOM action writes into `sbom/` and
+      # does not create it, so without this step it fails with ENOENT
+      # (REL-2 S2 review round 4 BLOCKER 1).
+      - name: The SBOM folder
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+
+      - name: The SBOM of the API image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.images.outputs.api }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-api.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the Dagster image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.images.outputs.dagster }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-dagster.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the oidc-mock image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.images.outputs.oidc }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-oidc-mock.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the console image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.images.outputs.console }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-console.cdx.json
+          upload-artifact: false
+
+      - name: Attest each SBOM to its image
+        # The throwaway key, for THIS step only (REL-2 S2 review round 4
+        # SHOULD-FIX 1): see the "Sign each image" step.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ steps.throwaway-key.outputs.private_key }}
+        run: |
+          set -euo pipefail
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
+            echo "attesting $name"
+            cosign attest --key "$COSIGN_KEY" --type cyclonedx \
+              --predicate "sbom/$name.cdx.json" \
+              --use-signing-config=false --tlog-upload=false "$ref"
+          done
+
+      # The release's Compose file: the template, rendered, with every
+      # image pinned by digest (S2-T2).
+      - name: Render the release's Compose file
+        run: |
+          set -euo pipefail
+          python3 ops/release/render_compose.py \
+            --images "$(cat images.json)" -o docker-compose.release.yml
+
+      # The THIRD-PARTY images the rendered Compose file runs: Postgres,
+      # ClickHouse, Lakekeeper, OpenFGA, RustFS, Gotenberg, the init
+      # images, and the `trino`, `seaweedfs` and `backups` profiles.
+      #
+      # They are NOT signed and NOT attested: we cannot sign another
+      # project's image in its own registry. Their integrity comes from
+      # the digest in the SIGNED manifest, and the bundle holds the
+      # image that digest names (REL-2 S2 review round 6 BLOCKER 1).
+      - name: The third-party images, by digest
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml \
+            --published-images images.json > third-party-images.txt
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            echo "pulling $reference"
+            docker pull "$reference"
+          done < third-party-images.txt
+
+      # syft, the version the SBOM action installs: the action's own
+      # `download-syft` mode, at the SAME commit, so the SBOMs of the
+      # third-party images come from the same scanner as the SBOMs of
+      # ours (v1.42.3).
+      - name: Install syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          run: download-syft
+
+      # One CycloneDX JSON SBOM per third-party image, under the name the
+      # bundle looks for (`ops/release/image_name.sh`): the bundle
+      # refuses an image that has none.
+      - name: The SBOM of each third-party image
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            name="$(ops/release/image_name.sh "$reference")"
+            echo "scanning $reference"
+            "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
+          done < third-party-images.txt
+
+      # The installer (REL-2 S3-T4): a STATIC binary, so it runs on a
+      # host that has nothing but a Linux kernel — the air-gapped host
+      # installs the stack with it.
+      #
+      # The build is WITHOUT the `test-key` feature: a release build
+      # verifies against the release key compiled into it and against no
+      # other (REL-2 S3-T1). The dry run's own proof builds its own
+      # binary with the feature, because the dry run signs its bundle
+      # with a throwaway key.
+      - name: Build lakehousectl (static, musl)
+        run: |
+          set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" \
+            ../lakehousectl-linux-x86_64
+          cd ..
+          file lakehousectl-linux-x86_64 || true
+          ls -la lakehousectl-linux-x86_64
+
+      # The image IDs: the config digest of every image the release
+      # runs.
+      #
+      # `docker save` of a pulled image DROPS its registry manifest
+      # digest: after `docker load` the host knows only the image ID,
+      # which is the config digest. So the signed manifest has to carry
+      # it, and an air-gapped install compares the loaded image's ID
+      # with the manifest's (REL-2 S3-T0).
+      - name: The image ids
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml > all-images.txt
+          echo '{}' > image-ids.json
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            id="$(docker image inspect --format '{{.Id}}' "$reference")"
+            digest="${reference##*@}"
+            if [ "$id" = "$digest" ]; then
+              # The containerd image store reports the image INDEX digest
+              # as the image's ID; the classic store reports the CONFIG
+              # digest. An air-gapped host compares the ID of the image
+              # it LOADED, and that is the config digest on both stores
+              # — so the manifest names the config digest, read from the
+              # image's own saved tar (REL-2 S3-T0).
+              id="$(docker save "$reference" \
+                | tar -xO manifest.json \
+                | jq -r '.[0].Config' \
+                | sed 's|^blobs/sha256/|sha256:|')"
+            fi
+            echo "$reference -> $id"
+            jq --arg reference "$reference" --arg id "$id" \
+              '. + {($reference): $id}' image-ids.json > image-ids.json.next
+            mv image-ids.json.next image-ids.json
+          done < all-images.txt
+
+      # The manifest, and the checksum of the Compose file it ships
+      # (S2-T3).
+      - name: Write the release manifest
+        run: |
+          set -euo pipefail
+          python3 ops/release/make_manifest.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --git-sha "$GITHUB_SHA" \
+            --published-images "$(cat images.json)" \
+            --image-ids image-ids.json \
+            --compose docker-compose.release.yml \
+            --lakehousectl lakehousectl-linux-x86_64 \
+            --out release.json
+
+      # Sign the manifest, and verify it at once: a signature that does
+      # not verify is a release that cannot be installed.
+      #
+      # The signature is a Sigstore bundle, `release.json.sigstore.json`
+      # (REL-2 S2 D3a): cosign v3 writes the signature and the digest of
+      # the manifest into one JSON file, and that is what
+      # `lakehousectl` reads in REL-2 S3. v3 ignores `--output-signature`
+      # (it is deprecated, and the v3 form writes the bundle instead), so
+      # the bundle is what `--bundle` names.
+      #
+      # No transparency log, in either job (REL-2 S2 D3a): the same two
+      # flags as the image signing above, so nothing is uploaded to
+      # Rekor and the dry run publishes no throwaway entry. The
+      # verification below therefore skips the log check
+      # (`--insecure-ignore-tlog`) and runs offline (`--offline`): the
+      # bundle carries the signature and the key's hint, so nothing
+      # else is needed.
+      - name: Sign the manifest and verify the signature
+        # The throwaway key, for THIS step only (REL-2 S2 review round 4
+        # SHOULD-FIX 1): see the "Sign each image" step.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ steps.throwaway-key.outputs.private_key }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --key "$COSIGN_KEY" \
+            --bundle release.json.sigstore.json \
+            --use-signing-config=false --tlog-upload=false release.json
+          cosign verify-blob --key "$COSIGN_PUBLIC_KEY" \
+            --bundle release.json.sigstore.json \
+            --offline --insecure-ignore-tlog release.json
+
+      # The bundle (decision D11): the Compose file, the manifest, its
+      # Sigstore bundle, one `docker save` per image, the SBOMs and the
+      # checksums.
+      #
+      # `df -h` before and after: the bundle holds every image the
+      # release runs now (REL-2 S2 review round 6 BLOCKER 1), so the
+      # runner's disk is part of the release's facts.
+      - name: Build the offline bundle
+        run: |
+          set -euo pipefail
+          df -h /
+          ops/release/make_bundle.sh \
+            --manifest release.json \
+            --compose docker-compose.release.yml \
+            --sigstore-bundle release.json.sigstore.json \
+            --sbom-dir sbom \
+            --lakehousectl lakehousectl-linux-x86_64 \
+            --out dist
+          df -h /
+
+      # The rendered Compose file must be a file compose accepts: the
+      # env values are throwaway, because the template has no default
+      # credentials (SEC-18) and compose refuses to interpolate a missing
+      # `${VAR:?}` before it will parse the file at all.
+      - name: The rendered Compose file must be a valid one
+        env:
+          POSTGRES_PASSWORD: ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY: ci-only-rustfs-access-0001
+          RUSTFS_SECRET_KEY: ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY: ci-only-lakekeeper-key-0001
+          CONNECTOR_SECRETS_KEY: ci-only-connector-secrets-key-0001
+        run: |
+          set -euo pipefail
+          env_file="$RUNNER_TEMP/release-check.env"
+          {
+            echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD"
+            echo "RUSTFS_ACCESS_KEY=$RUSTFS_ACCESS_KEY"
+            echo "RUSTFS_SECRET_KEY=$RUSTFS_SECRET_KEY"
+            echo "LAKEKEEPER_ENCRYPTION_KEY=$LAKEKEEPER_ENCRYPTION_KEY"
+            echo "CONNECTOR_SECRETS_KEY=$CONNECTOR_SECRETS_KEY"
+          } > "$env_file"
+          docker compose --env-file "$env_file" \
+            -f docker-compose.release.yml --profile '*' config --quiet
+
+      # The bundle's size, in the run's summary: it is the number the
+      # release notes quote.
+      - name: The bundle's size
+        run: |
+          set -euo pipefail
+          bundle="dist/rantai-lakehouse-${{ steps.version.outputs.version }}-linux-x86_64.tar.zst"
+          size="$(wc -c < "$bundle")"
+          {
+            echo "## Release pipeline · dry run"
+            echo ""
+            echo "- version: ${{ steps.version.outputs.version }}"
+            echo "- bundle: \`$(basename "$bundle")\`"
+            echo "- size: $size bytes ($((size / 1024 / 1024)) MiB)"
+            echo "- images: $(jq '.images | length' release.json) in the manifest, $(jq 'length' digests.json) of them ours, each signed and attested"
+            echo ""
+            echo "Nothing was published: the images went to a throwaway registry and the"
+            echo "key was generated in this job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # The bundle and the manifest, as artifacts: this is what the
+          # dry run produces.
+      - name: Upload the bundle and the manifest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dry-run
+          path: |
+            dist/*.tar.zst
+            dist/*.sha256
+            release.json
+            release.json.sigstore.json
+            docker-compose.release.yml
+            lakehousectl-linux-x86_64
+            sbom/*.cdx.json
+            # The PUBLIC half of the throwaway key: the proof job
+            # verifies the manifest against it, because the dry run
+            # signed the manifest with the key that generated it
+            # (REL-2 S3-T5). The private half was thrown away with the
+            # job.
+            cosign.pub
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── The real release ───────────────────────────────────────────────
+  release:
+    name: Release · draft
+    # The real release, and only the real release: a tag push, never a
+    # pull request. The `release` environment's protection rules (a
+    # required reviewer) are what stand between a tag and a signed
+    # release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # 150 minutes: the bundle now holds EVERY image the release runs
+    # (REL-2 S2 review round 6 BLOCKER 1), so the job pulls the
+    # third-party images, describes each of them, saves each of them and
+    # compresses the lot.
+    timeout-minutes: 150
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+    env:
+      RELEASE_REGISTRY: ghcr.io/rantai-dev
+      # The signer reads the key from the environment, by this
+      # reference. The reference is not the key: the key itself is in
+      # the environment of the three steps that sign, and of no other
+      # step of this job (REL-2 S2 review BLOCKER 2).
+      COSIGN_KEY: env://COSIGN_PRIVATE_KEY
+      # The public key, committed: the same one `lakehousectl` compiles
+      # in, so a signature made here verifies on an air-gapped host.
+      COSIGN_PUBLIC_KEY: ops/release/release.pub
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Free disk first: the runner image carries toolchains this job
+      # never uses, and the bundle holds EVERY image the release runs
+      # (REL-2 S2 review round 6 BLOCKER 1) — the images themselves,
+      # their `docker save` tars and the compressed bundle. The step is
+      # the one `g9-upload-large.yml` uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      # See the dry run's step of the same name for why: the bundle is
+      # made of `docker save` archives, and only the containerd store
+      # registers the digest an air-gapped host looks the image up by.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: a bundle built on the
+          # classic store cannot be installed on an air-gapped host.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # The pipeline's own tests, here too: the release job signs with
+      # the real key, so it is the last place a mistake in the tooling
+      # can be caught before it publishes something. `cryptography` is
+      # here for the Sigstore bundle's test (REL-2 S2 D3a).
+      - name: The release tooling's own tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest==8.3.4 pyyaml==6.0.3 cryptography==50.0.2
+          python -m pytest ops/release -q
+
+      # The tag names the version, and the version must be the same in
+      # the package, the crate and the changelog (S2-T1).
+      - name: The version, the package, the crate and the changelog must agree
+        id: version
+        run: |
+          set -euo pipefail
+          python3 ops/release/check_version.py "$GITHUB_REF_NAME"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The same four images as the dry run, with the same arguments;
+      # see the dry run for why each one is what it is.
+      - name: Build and push the API image
+        id: image-api
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+            GIT_SHA=${{ github.sha }}
+            PIPELINE_PACKAGE=dispar_orchestrate
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:${{ steps.version.outputs.version }}
+          push: true
+          cache-from: type=gha,scope=api-image
+
+      - name: Build and push the Dagster image
+        id: image-dagster
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: dagster
+          file: dagster/Dockerfile
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}
+          push: true
+          cache-from: type=gha,scope=dagster-image
+
+      - name: Build and push the oidc-mock image
+        id: image-oidc
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ops/oidc-mock
+          file: ops/oidc-mock/Dockerfile
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}
+          push: true
+
+      - name: Build and push the console image
+        id: image-console
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.frontend
+          build-args: |
+            RUST_API_URL=http://lakehouse-api:8080
+          tags: ${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}
+          push: true
+
+      # Pull the pushed images back by digest: the builder runs in a
+      # container, so they are not in the runner's image store, and
+      # `docker save` needs them there.
+      - name: The published images, by digest
+        id: images
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            case "$name" in
+              rantai-lakehouse-api) digest="${{ steps.image-api.outputs.digest }}" ;;
+              rantai-lakehouse-dagster) digest="${{ steps.image-dagster.outputs.digest }}" ;;
+              rantai-lakehouse-oidc-mock) digest="${{ steps.image-oidc.outputs.digest }}" ;;
+              rantai-lakehouse-console) digest="${{ steps.image-console.outputs.digest }}" ;;
+            esac
+            echo "::group::$name"
+            echo "digest: $digest"
+            docker pull "${{ env.RELEASE_REGISTRY }}/$name:$version@$digest"
+            echo "::endgroup::"
+          done
+          {
+            echo "api=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-api:${{ steps.version.outputs.version }}@${{ steps.image-api.outputs.digest }}"
+            echo "dagster=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-dagster:${{ steps.version.outputs.version }}@${{ steps.image-dagster.outputs.digest }}"
+            echo "oidc=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-oidc-mock:${{ steps.version.outputs.version }}@${{ steps.image-oidc.outputs.digest }}"
+            echo "console=${{ env.RELEASE_REGISTRY }}/rantai-lakehouse-console:${{ steps.version.outputs.version }}@${{ steps.image-console.outputs.digest }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: The images the services run
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg api "${{ steps.images.outputs.api }}" \
+            --arg dagster "${{ steps.images.outputs.dagster }}" \
+            --arg oidc "${{ steps.images.outputs.oidc }}" \
+            --arg console "${{ steps.images.outputs.console }}" \
+            '{"rantai-lakehouse-api": $api, "rantai-lakehouse-dagster": $dagster,
+              "rantai-lakehouse-oidc-mock": $oidc, "rantai-lakehouse-console": $console}' > digests.json
+          jq -n --argjson digests "$(cat digests.json)" \
+            --slurpfile map ops/release/release-images.json '
+              reduce ($map[0] | to_entries[]) as $entry
+                ({}; reduce ($entry.value[]) as $service (.; .[$service] = $digests[$entry.key]))' > images.json
+
+      # The signer. Pinned to a commit SHA, the release in the comment:
+      # the signer of a release must not change under the release's feet.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign each image
+        # The release key, for THIS step only (REL-2 S2 review BLOCKER 2):
+        # the job's environment holds no secret, so no other step of this
+        # job — a third-party action included — can read it. The secret
+        # holds the private key PEM — the text `cosign generate-key-pair`
+        # writes — which `env://` reads as it is, NOT base64 of it.
+        # `COSIGN_PASSWORD` opens it if the key is encrypted.
+        #
+        # `--use-signing-config=false --tlog-upload=false` is cosign v3's
+        # way to sign with a key and NO transparency log (REL-2 S2 D3a);
+        # see the dry run's "Sign each image" step for why both flags are
+        # needed. Nothing is uploaded to Rekor.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
+            echo "signing $ref"
+            cosign sign --key "$COSIGN_KEY" \
+              --use-signing-config=false --tlog-upload=false "$ref"
+          done
+
+      # The SBOM folder, before the action that writes into it: the
+      # action does not create it (REL-2 S2 review round 4 BLOCKER 1).
+      #
+      # The format is CycloneDX **JSON** (`cyclonedx-json`): syft writes the
+      # action's plain `cyclonedx` format as XML, and `cosign attest --type
+      # cyclonedx` reads a JSON predicate — with the XML the attestation
+      # failed with "invalid character '<' looking for beginning of value"
+      # (REL-2 S2 review round 5 BLOCKER 1). The `.cdx.json` names are
+      # therefore true.
+      - name: The SBOM folder
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+
+      - name: The SBOM of the API image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.images.outputs.api }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-api.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the Dagster image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.images.outputs.dagster }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-dagster.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the oidc-mock image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.images.outputs.oidc }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-oidc-mock.cdx.json
+          upload-artifact: false
+
+      - name: The SBOM of the console image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.images.outputs.console }}
+          format: cyclonedx-json
+          output-file: sbom/rantai-lakehouse-console.cdx.json
+          upload-artifact: false
+
+      - name: Attest each SBOM to its image
+        # The release key, for THIS step only (REL-2 S2 review BLOCKER 2):
+        # see the "Sign each image" step.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in rantai-lakehouse-api rantai-lakehouse-dagster rantai-lakehouse-oidc-mock rantai-lakehouse-console; do
+            ref="$(jq -r --arg name "$name" '.[$name]' digests.json)"
+            echo "attesting $name"
+            cosign attest --key "$COSIGN_KEY" --type cyclonedx \
+              --predicate "sbom/$name.cdx.json" \
+              --use-signing-config=false --tlog-upload=false "$ref"
+          done
+
+      - name: Render the release's Compose file
+        run: |
+          set -euo pipefail
+          python3 ops/release/render_compose.py \
+            --images "$(cat images.json)" -o docker-compose.release.yml
+
+      # The THIRD-PARTY images the rendered Compose file runs: Postgres,
+      # ClickHouse, Lakekeeper, OpenFGA, RustFS, Gotenberg, the init
+      # images, and the `trino`, `seaweedfs` and `backups` profiles.
+      #
+      # They are NOT signed and NOT attested: we cannot sign another
+      # project's image in its own registry. Their integrity comes from
+      # the digest in the SIGNED manifest, and the bundle holds the
+      # image that digest names (REL-2 S2 review round 6 BLOCKER 1).
+      - name: The third-party images, by digest
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml \
+            --published-images images.json > third-party-images.txt
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            echo "pulling $reference"
+            docker pull "$reference"
+          done < third-party-images.txt
+
+      # syft, the version the SBOM action installs: the action's own
+      # `download-syft` mode, at the SAME commit, so the SBOMs of the
+      # third-party images come from the same scanner as the SBOMs of
+      # ours (v1.42.3).
+      - name: Install syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          run: download-syft
+
+      # One CycloneDX JSON SBOM per third-party image, under the name the
+      # bundle looks for (`ops/release/image_name.sh`): the bundle
+      # refuses an image that has none.
+      - name: The SBOM of each third-party image
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            name="$(ops/release/image_name.sh "$reference")"
+            echo "scanning $reference"
+            "$SYFT" scan "docker:$reference" -o "cyclonedx-json=sbom/$name.cdx.json"
+          done < third-party-images.txt
+
+      # The installer (REL-2 S3-T4): a STATIC binary, so it runs on a
+      # host that has nothing but a Linux kernel — the air-gapped host
+      # installs the stack with it.
+      #
+      # The build is WITHOUT the `test-key` feature: a release build
+      # verifies against the release key compiled into it and against no
+      # other (REL-2 S3-T1). The CI dry run's own proof builds its own
+      # binary with the feature, because the dry run signs its bundle
+      # with a throwaway key.
+      - name: Build lakehousectl (static, musl)
+        run: |
+          set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release --target x86_64-unknown-linux-musl -p lakehousectl
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" \
+            ../lakehousectl-linux-x86_64
+          cd ..
+          file lakehousectl-linux-x86_64 || true
+          ls -la lakehousectl-linux-x86_64
+
+      # The image IDs: the config digest of every image the release
+      # runs. See the dry run's step of the same name (REL-2 S3-T0).
+      - name: The image ids
+        run: |
+          set -euo pipefail
+          python3 ops/release/compose_images.py \
+            --compose docker-compose.release.yml > all-images.txt
+          echo '{}' > image-ids.json
+          while read -r reference; do
+            [ -n "$reference" ] || continue
+            id="$(docker image inspect --format '{{.Id}}' "$reference")"
+            digest="${reference##*@}"
+            if [ "$id" = "$digest" ]; then
+              # The containerd image store reports the image INDEX digest
+              # as the image's ID; the classic store reports the CONFIG
+              # digest. An air-gapped host compares the ID of the image
+              # it LOADED, and that is the config digest on both stores
+              # — so the manifest names the config digest, read from the
+              # image's own saved tar (REL-2 S3-T0).
+              id="$(docker save "$reference" \
+                | tar -xO manifest.json \
+                | jq -r '.[0].Config' \
+                | sed 's|^blobs/sha256/|sha256:|')"
+            fi
+            echo "$reference -> $id"
+            jq --arg reference "$reference" --arg id "$id" \
+              '. + {($reference): $id}' image-ids.json > image-ids.json.next
+            mv image-ids.json.next image-ids.json
+          done < all-images.txt
+
+      - name: Write the release manifest
+        run: |
+          set -euo pipefail
+          python3 ops/release/make_manifest.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --git-sha "$GITHUB_SHA" \
+            --published-images "$(cat images.json)" \
+            --image-ids image-ids.json \
+            --compose docker-compose.release.yml \
+            --lakehousectl lakehousectl-linux-x86_64 \
+            --out release.json
+
+      # Sign the manifest with the RELEASE key, and verify it with the
+      # committed public key — the one `lakehousectl` holds. A signature
+      # that does not verify against the committed key is not a release.
+      #
+      # The signature is a Sigstore bundle, `release.json.sigstore.json`
+      # (REL-2 S2 D3a), and nothing is uploaded to the transparency log:
+      # see the dry run's "Sign the manifest and verify the signature"
+      # step for the flags and why both are needed.
+      - name: Sign the manifest and verify the signature
+        # The release key, for THIS step only (REL-2 S2 review BLOCKER 2):
+        # see the "Sign each image" step.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --key "$COSIGN_KEY" \
+            --bundle release.json.sigstore.json \
+            --use-signing-config=false --tlog-upload=false release.json
+          cosign verify-blob --key "$COSIGN_PUBLIC_KEY" \
+            --bundle release.json.sigstore.json \
+            --offline --insecure-ignore-tlog release.json
+
+      - name: Build the offline bundle
+        run: |
+          set -euo pipefail
+          df -h /
+          ops/release/make_bundle.sh \
+            --manifest release.json \
+            --compose docker-compose.release.yml \
+            --sigstore-bundle release.json.sigstore.json \
+            --sbom-dir sbom \
+            --lakehousectl lakehousectl-linux-x86_64 \
+            --out dist
+          df -h /
+
+      # The release's own assets, and their checksums: the operator who
+      # downloads them can check them against the release page.
+      - name: The release's assets
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p release-assets
+          cp "dist/rantai-lakehouse-$version-linux-x86_64.tar.zst" release-assets/
+          cp "dist/rantai-lakehouse-$version-linux-x86_64.tar.zst.sha256" release-assets/
+          cp release.json release-assets/
+          cp release.json.sigstore.json release-assets/
+          cp sbom/*.cdx.json release-assets/
+          # The installer, as the release asset `install.sh` downloads
+          # (REL-2 S3-T4).
+          cp lakehousectl-linux-x86_64 release-assets/
+          # `install.sh` joins the release in REL-2 S3, when it exists.
+          if [ -f ops/release/install.sh ]; then
+            cp ops/release/install.sh release-assets/
+          fi
+          # The files the release ships (REL-2 S4 decision D14): the
+          # relative bind-mount sources of the release's Compose file,
+          # and the two tools under `tools/`. The ONLINE install fetches
+          # each of them by its own name, so each is published as an
+          # asset of its own. The list comes from the script that wrote
+          # the manifest, and the tooling refuses two shipped files with
+          # the same name — so no asset name is ambiguous here.
+          python3 ops/release/make_manifest.py --print-shipped-files \
+            --compose docker-compose.release.yml > shipped-files.txt
+          : > shipped-assets.txt
+          while IFS=$'\t' read -r install_path source_path; do
+            [ -n "$install_path" ] || continue
+            name="$(basename "$install_path")"
+            cp "$source_path" "release-assets/$name"
+            printf '%s\n' "$name" >> shipped-assets.txt
+          done < shipped-files.txt
+          (
+            cd release-assets
+            sha256sum ./*.tar.zst ./release.json ./release.json.sigstore.json ./*.cdx.json \
+              ./lakehousectl-linux-x86_64 > SHA256SUMS
+            while read -r name; do
+              [ -n "$name" ] || continue
+              sha256sum "./$name" >> SHA256SUMS
+            done < ../shipped-assets.txt
+          )
+
+      # The release is a DRAFT: the product owner publishes it, after
+      # checking that the bundle, the manifest and the images are what
+      # the release should be. Nothing is public until then.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          bundle="dist/rantai-lakehouse-$version-linux-x86_64.tar.zst"
+          # The bundle's measured size, in the notes: the spec says
+          # "measured, never assumed", and the size grew when the bundle
+          # began to hold every image the release runs (REL-2 S2 review
+          # round 6 BLOCKER 1).
+          size="$(wc -c < "$bundle")"
+          {
+            echo "RantAI Lakehouse v$version."
+            echo ""
+            echo "Attached: the offline bundle and its checksum, the release manifest"
+            echo "and its Sigstore bundle, and the CycloneDX SBOM of each image. The upgrade"
+            echo "notes are written in REL-2 S5 (docs/core/reference/release-policy.md)."
+            echo ""
+            echo "The offline bundle is $size bytes ($((size / 1024 / 1024)) MiB) compressed."
+            echo "It holds every image the release runs — the four published ones and the"
+            echo "third-party ones, each by digest."
+            echo ""
+            echo "This release is a draft. The product owner publishes it."
+          } > release-notes.md
+          gh release create "v$version" \
+            --draft \
+            --title "RantAI Lakehouse v$version" \
+            --notes-file release-notes.md \
+            release-assets/*
+
+  # ── The proof: the bundle installs ──────────────────────────────────
+  install-proof:
+    name: Proof · the bundle installs on a fresh host
+    # REL-2 S3-T5: the end-to-end proof that what the pipeline builds
+    # can be installed.
+    #
+    # The job takes the dry run's bundle — the same bytes an air-gapped
+    # host would be handed — and installs it on a clean runner. It is
+    # the only place the whole path is exercised: the manifest's
+    # signature, the images' IDs, the secrets, the layout and the
+    # readiness of the stack.
+    #
+    # It never runs for a tag push: the dry run does not run then, and
+    # a job that needs it is skipped with it.
+    needs: dry-run
+    runs-on: ubuntu-latest
+    # 90 minutes: the bundle is unpacked, every image is loaded, and
+    # the stack is started and waited for.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Free disk first: the runner image carries toolchains this job
+      # never uses, and the job unpacks the bundle and loads every image
+      # in it.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /usr/local/share/powershell /usr/local/share/chromium /usr/local/share/pip /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Download the dry run's bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dry-run
+          path: dry-run
+
+      # The installer, built WITH the `test-key` feature: the dry run
+      # signed its manifest with the throwaway key the job generated, so
+      # the proof has to verify against THAT key. A release build never
+      # has the feature — the release job's own build is checked for
+      # that by `ops/release/test_release_workflow.py` — so a release
+      # can never accept another key (REL-2 S3-T1).
+      - name: Build lakehousectl (the dry run's key)
+        run: |
+          set -euo pipefail
+          # The musl target goes on the PINNED toolchain, so `rustup` has
+          # to run where the pin is: inside `rust/`, next to
+          # `rust-toolchain.toml` (1.99.1). At the repository root it
+          # installed the target for the runner's DEFAULT toolchain, and
+          # the build — which runs on the pinned toolchain — failed with
+          # "can't find crate for core ... the x86_64-unknown-linux-musl
+          # target may not be installed" (PR #313 dry run).
+          #
+          # The target is NOT added to `rust-toolchain.toml`: every
+          # developer reads that file, and a target in it is a download
+          # every developer pays for a build they do not make.
+          cd rust
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p lakehousectl --features test-key
+          cp "target/x86_64-unknown-linux-musl/release/lakehousectl" ../lakehousectl
+          cd ..
+          ./lakehousectl --version
+
+      # The containerd image store, and nothing else (REL-2 S3 D13).
+      #
+      # The bundle's images are loaded from `docker save` archives, and on
+      # Docker's classic store a loaded image registers no repo digest:
+      # the release's pinned references would not resolve, and the
+      # install would stop with "the image ... is not in the local
+      # store". The store is turned on BEFORE the install.
+      - name: Turn on the containerd image store
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/docker
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+              /etc/docker/daemon.json > "$RUNNER_TEMP/daemon.json"
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' > "$RUNNER_TEMP/daemon.json"
+          fi
+          sudo cp "$RUNNER_TEMP/daemon.json" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # The store is ASSERTED, not assumed: the installer refuses a
+          # classic store for a bundle install, and the proof has to
+          # prove the install, not the refusal.
+          store="$(docker info --format '{{json .DriverStatus}}')"
+          case "$store" in
+            *io.containerd.snapshotter.v1*) echo "the containerd image store is on: $store" ;;
+            *)
+              echo "::error::the containerd image store is not on: $store"
+              exit 1
+              ;;
+          esac
+
+      # The proof is AIR-GAPPED IN FACT (REL-2 S3 D13).
+      #
+      # A runner that can still reach the registries would hide the bug
+      # this proof exists for: Compose pulls silently when it may, so
+      # the install would pass with a FETCHED image instead of the
+      # LOADED one, and the air-gapped host would still be broken. The
+      # registries are cut off here, and the cut is PROVED before the
+      # install runs — a pull that still works means the runner has a
+      # way to the registries, and the proof is not air-gapped.
+      #
+      # The hosts are the ones the registries answer on: Docker Hub's
+      # registry, its authentication and its index, GHCR, Quay, and the
+      # CDN the Docker Hub layers come from.
+      - name: Cut the runner off from the registries
+        run: |
+          set -euo pipefail
+          for host in registry-1.docker.io auth.docker.io index.docker.io \
+            ghcr.io quay.io production.cloudflare.docker.com; do
+            echo "0.0.0.0 $host" | sudo tee -a /etc/hosts
+          done
+          if docker pull alpine:3.20; then
+            echo "::error::the runner can still pull from a registry: the proof is not air-gapped"
+            exit 1
+          fi
+          echo "the runner cannot pull from a registry any more."
+
+      - name: Install the bundle
+        env:
+          # The PUBLIC half of the throwaway key the dry run signed the
+          # manifest with. The private half was thrown away with the
+          # dry run's job.
+          #
+          # `cosign.pub` is at the ROOT of the artifact, so this path is
+          # right: the artifact keeps every file at its path relative
+          # to the repository root (see the step below).
+          LAKEHOUSECTL_PUBLIC_KEY_FILE: ${{ github.workspace }}/dry-run/cosign.pub
+        run: |
+          set -euo pipefail
+          mkdir -p bundle install
+          # The bundle is at `dry-run/dist/`, NOT at `dry-run/`:
+          # `upload-artifact` stores every file at its path relative to
+          # the least common ancestor of the upload list — the
+          # repository root, because that list names files from `dist/`,
+          # from `sbom/` and from the root itself — and the dry run
+          # wrote the bundle into `dist/`. Reading it from the root of
+          # the download failed with "tar (child):
+          # dry-run/rantai-lakehouse-*.tar.zst: Cannot open: No such
+          # file or directory" (PR #313 install-proof).
+          tar --zstd -xf dry-run/dist/rantai-lakehouse-*.tar.zst -C bundle
+          # The runner's disk and memory are below the release's
+          # minimums, so the two checks are skipped — and the install
+          # says which checks it skipped. The minimums themselves are
+          # proved by the operator's acceptance checklist (REL-2-AC3),
+          # not by a runner.
+          ./lakehousectl install --bundle bundle --dir install \
+            --ignore-preflight disk --ignore-preflight memory
+
+      - name: The stack is ready and the console answers
+        run: |
+          set -euo pipefail
+          echo "the readiness route:"
+          curl -fsS http://127.0.0.1:8080/health/ready | jq .
+          echo "the console:"
+          curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/
+
+      - name: The stack's state
+        if: always()
+        run: |
+          docker compose -p rantai-lakehouse ps || true

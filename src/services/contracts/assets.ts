@@ -106,6 +106,9 @@ export type Asset = {
    * `"description"` or `"columnDescription"`; `value` is the tag or column
    * name and `""` for the rest; `approximate` is true when the match
    * forgave a typo.
+   * `"name"` is the one field outside that list (`DATA-32` D1): the server
+   * reports it when the name forgave a typo and no other field explains the
+   * hit, so `value` is `""` and `approximate` is true.
    */
   matchedOn?: { field: string; value: string; approximate: boolean }
 }
@@ -402,6 +405,15 @@ export type AssetProfile =
 
 export type AssetFilter = {
   search?: string
+  /**
+   * At most how many assets the server returns (`DATA-41` D3).
+   *
+   * The server ranks every match and returns the first `limit` of them,
+   * and says how many matched in all. The command palette shows eight
+   * results, so it asks for eight instead of being sent the whole
+   * catalog to throw all but eight away.
+   */
+  limit?: number
   tier?: StorageTier | "all"
   layer?: DataLayer | "all"
   type?: AssetType | "all"

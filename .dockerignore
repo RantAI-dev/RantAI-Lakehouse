@@ -1,0 +1,52 @@
+# What the console image's build context may contain.
+#
+# The console is built from the repository ROOT
+# (`docker-compose.yml`'s `console` service, and the staging deploy's
+# `docker build -f Dockerfile.frontend .`), so this file decides what
+# that build sees. It applies to a build whose context is the repository
+# root only — the API image's context is `./rust` and the Dagster
+# image's is `./dagster`, and neither reads this file (Docker looks for
+# `.dockerignore` at the root of the context it was given).
+#
+# What the frontend build MUST see, and therefore what this file must
+# not exclude: `package.json`, `bun.lock`, `bunfig.toml`, `src/`,
+# `public/`, `design-system/` (the `@rantai/design-system` path alias in
+# `tsconfig.json`), `design-kit/`, `GTM/`, `next.config.ts`,
+# `tsconfig.json`, `postcss.config.mjs`, `eslint.config.mjs`,
+# `components.json`, `happydom.ts`, `testing-cleanup.ts`, and
+# `rust/crates/lakehouse-api/tests/fixtures/` (a fixture the frontend's
+# own type check imports — see below).
+#
+# Everything below is a secret, a build artifact, or a part of the
+# product this image does not serve.
+
+# Secrets and local settings. `.env` holds generated credentials
+# (POSTGRES_PASSWORD, RUSTFS keys, the encryption key); baking it into
+# an image would publish them to whoever pulls that image.
+.env
+.env.*
+!.env.example
+
+# Dependencies and build artifacts of the host checkout.
+node_modules
+.next
+next-env.d.ts
+*.tsbuildinfo
+
+# The git history and the CI configuration: neither is part of the
+# console.
+.git
+.github
+
+# The parts of the repository this image does not serve.
+#
+# `rust/` is NOT excluded: the frontend's own type check reads a fixture
+# the API's tests own (`src/lib/connectors/secret-reference.test.ts`
+# imports `rust/crates/lakehouse-api/tests/fixtures/secret_manager_refs.json`),
+# so the build fails without it. Only the API's build output is excluded —
+# it is gigabytes, and it is never part of an image.
+rust/target
+dagster
+docs
+ops
+scripts

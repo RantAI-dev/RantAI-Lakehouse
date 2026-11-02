@@ -546,4 +546,59 @@ impl LakekeeperAdminClient {
         }
         Ok(())
     }
+
+    /// Grant the `select` relation on ONE namespace to `principal`.
+    ///
+    /// ADR 0016 point 3: the `outside-readers` principal must be able to
+    /// READ the `gold` namespace — and only that namespace, so the
+    /// catalog itself refuses anything outside `gold` even if the API had
+    /// a bug. This is the FIRST namespace-scoped grant in this stack:
+    /// every other grant here is warehouse-scoped, because every other
+    /// principal here needs its reach across the whole warehouse.
+    ///
+    /// `Lakekeeper` 0.13's namespace assignments endpoint is
+    /// `POST /management/v1/permissions/namespace/{id}/assignments`,
+    /// where `{id}` is the namespace's UUID — the catalog's own namespace
+    /// load answers it as the `namespace_id` property. The relation set
+    /// a namespace accepts is `ownership`, `pass_grants`,
+    /// `manage_grants`, `describe`, `select`, `create`, `modify`;
+    /// `select` is the one an outside reader needs.
+    ///
+    /// Idempotent: `204` granted, `409` an identical tuple already
+    /// exists (a re-run against an already-granted stack) — both fine,
+    /// exactly as [`Self::grant_machine_principals`] treats them.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if a request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx` (our request
+    /// was refused — an unknown namespace, a principal the catalog does
+    /// not know); [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn grant_namespace_select(
+        &self,
+        namespace_id: &str,
+        principal: &str,
+    ) -> Result<(), OpenfgaError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/management/v1/permissions/namespace/{namespace_id}/assignments",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .json(&json!({
+                "writes": [{ "type": "select", "user": format!("oidc~{principal}") }]
+            }))
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        let status = response.status();
+        if status.as_u16() == 409 {
+            // An identical tuple already exists (a re-run against an
+            // already-granted stack) — the same shape
+            // `grant_machine_principals` treats as success.
+            return Ok(());
+        }
+        classify_status(status)
+    }
 }

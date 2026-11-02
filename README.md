@@ -88,19 +88,14 @@ fixes).
 
 ## Quickstart
 
-Assumes you have **Docker** and **Bun** (`>= 1.3.0`) installed and nothing
-else.
+Assumes you have **Docker** installed and nothing else.
 
 ```bash
-# 1. Install Bun, if you don't have it
-curl -fsSL https://bun.sh/install | bash
-
-# 2. Clone and install frontend dependencies
+# 1. Clone
 git clone https://github.com/RantAI-dev/RantAI-Lakehouse.git
 cd RantAI-Lakehouse
-bun install
 
-# 3. Configure the backend stack. Copy the example env file and set (at
+# 2. Configure the stack. Copy the example env file and set (at
 #    minimum) AUTH_BOOTSTRAP_EMAIL / AUTH_BOOTSTRAP_PASSWORD — without
 #    those there is deliberately no way to log in. SEC-18: there are NO
 #    default credentials. docker-compose.yml refuses to start while
@@ -115,17 +110,16 @@ sh ops/init-env.sh
 $EDITOR .env    # set AUTH_BOOTSTRAP_EMAIL; see .env.example and the
                 # Configuration table below
 
-# 4. Bring up Postgres, ClickHouse, and the Rust API (built from
-#    rust/Dockerfile). Dagster and a real LLM are NOT part of this stack —
-#    see docs/OPERATIONS.md for what that means and how to add them.
+# 3. Bring up Postgres, ClickHouse, the Rust API (built from
+#    rust/Dockerfile) and the console (built from Dockerfile.frontend).
+#    Dagster and a real LLM are NOT part of this stack — see
+#    docs/OPERATIONS.md for what that means and how to add them.
 #    scripts/compose.sh is `docker compose` with GIT_SHA set from this
 #    checkout, which the pipeline page's source view needs (see the script).
 scripts/compose.sh up --build
 # lakehouse-api listens on :8080 once postgres and clickhouse report
-# healthy. Check with: curl -sf localhost:8080/health
-
-# 5. In a separate terminal, point the frontend at the backend and run it
-RUST_API_URL=http://localhost:8080 bun --bun next dev
+# healthy (check with: curl -sf localhost:8080/health), and the console
+# listens on :3000 once the API reports healthy.
 ```
 
 Open [http://localhost:3000](http://localhost:3000). Sign in with the
@@ -139,13 +133,20 @@ compose stack, what `/health` actually checks, the Lakehouse backup and restore
 procedure, and the biggest operational trap in this codebase (Postgres
 being down fails quietly, not loudly).
 
-Prefer running the Rust API directly instead of in a container (e.g. for
-faster iteration)? The old path still works:
+### Developing: the console and the API on the host
+
+Prefer running the console and the API on the host (e.g. for faster
+iteration)? The old path still works — it needs **Bun** (`>= 1.3.0`) and
+Node 20.9 or newer for the build, which the operator path above does not:
 
 ```bash
 # Bring up just the data stores from compose, then run the API on the host
 docker compose up postgres clickhouse
 cd rust && cargo run -p lakehouse-api
+
+# And the console, in another terminal
+bun install
+RUST_API_URL=http://localhost:8080 bun --bun next dev
 ```
 
 ### Runtime: Bun
@@ -341,6 +342,8 @@ usage share the same documented source docker-compose already uses:
 | `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` | File path to the `gold-export` Lakekeeper principal's pre-minted static bearer token (ADR 0011), read at export-request time — not a `secretRef`, see the field's doc comment for why | `/tokens/gold-export.jwt` | No |
 | `LAKEKEEPER_READ_TOKEN_FILE` | File path to the read-only `lakehouse-api-reader` Lakekeeper principal's pre-minted static bearer token (ADR 0011, WS2 amendment A0), read by `/api/lakehouse/*`'s catalog routes at (re)connect time — same not-a-`secretRef` shape as `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE`, and the same no-refresh caveat: the file is re-read on each (re)connect, but nothing re-mints it before its 30-day expiry | `/tokens/lakehouse-api-reader.jwt` | No |
 | `LAKEKEEPER_ADMIN_TOKEN_FILE` | File path to an ADMIN-scoped Lakekeeper principal's pre-minted static bearer token, read by `AppState::lakekeeper_admin` (`POST /api/identity/tenants`'s provisioning path — the only caller able to create warehouses/grants via Lakekeeper's `management/v1/*` API). A missing/unreadable file leaves `lakekeeper_admin` at `None`, degrading provisioning to unavailable rather than failing boot | `/tokens/admin.jwt` | No |
+| `LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE` | File path to the read-only `outside-readers` Lakekeeper principal's pre-minted static bearer token (DATA-5, ADR 0016), read by the API's `/api/iceberg/*` door on every call. The outside tool's OWN key never reaches Lakekeeper — the door forwards the call under this principal instead. Same not-a-`secretRef` shape and the same no-refresh caveat as `LAKEKEEPER_READ_TOKEN_FILE` | `/tokens/outside-readers.jwt` | No |
+| `OUTSIDE_S3_ENDPOINT` | The storage address an operator PUBLISHES for outside readers (DATA-5, ADR 0016 point 4). Lakekeeper vends the deployment's internal name (`http://rustfs:9000`), which resolves only inside the network, so the API swaps it for this one in a table-load and a credentials response. Unset means outside reading is OFF: every door route answers 503 naming the missing setting, and the "Readers (7 days)" panel says "Not measured" with that reason — never zero | unset | No |
 | `TENANT_WAREHOUSE_S3_ENDPOINT` | S3-compatible endpoint `POST /api/identity/tenants` creates a tenant's Lakekeeper warehouse against (`storage-profile.endpoint`). DEDICATED, not `RUSTFS_S3_ENDPOINT` (ADR 0002 Addendum 2's "never the process's own secret" rule applied to this config too). Unset, together with the access/secret key below, makes tenant provisioning refuse honestly (`tenant warehouse storage is not configured`) instead of sending Lakekeeper a request the endpoint of which was never set | unset | No |
 | `TENANT_WAREHOUSE_S3_BUCKET` | Bucket every tenant warehouse is created under (`storage-profile.bucket`). MUST NOT equal `LAKEHOUSE_WAREHOUSE_BUCKET`: `lakekeeper-warehouse-init` creates the shared `default` warehouse at that bucket's storage-profile ROOT (no `key-prefix`), and Lakekeeper refuses any other warehouse anywhere inside a bucket a root-level profile already claims (`CreateWarehouseStorageProfileOverlap`) — `routes::identity::tenant_warehouse_storage` refuses honestly (503) rather than send a request that always 400s | `lakehouse-tenant-warehouses` | No |
 | `TENANT_WAREHOUSE_S3_REGION` | Region string sent for a tenant warehouse's `storage-profile.region` | `us-east-1` | No |

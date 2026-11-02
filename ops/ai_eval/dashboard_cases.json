@@ -644,6 +644,38 @@
     "expect_state": [
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.cache.mode": "fresh"}, "count": 1}
     ]
+  },
+  {
+    "id": "chart_forecast",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Visitors Forecast", "sql": "SELECT makeDate(tahun, bulan_no, 1) AS bulan, jumlah FROM serving.mart_wisman"}, "id_at": "source.id"}
+    ],
+    "turns": ["Add a line of foreign visitors per month from the saved source \"Eval Visitors Forecast\", with a forecast for the next 6 months."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}", "kind": "line", "referenceLines": "forecast"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "line", "def.grain": "month", "def.referenceLines[].kind": "forecast", "def.referenceLines[].horizon": 6}, "count": 1}
+    ]
+  },
+  {
+    "id": "deprecated_mart_warned",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"method": "PUT", "path": "/api/catalog/serving.mart_kunjungan_dtw/certification", "body": {"status": "deprecated", "note": "This mart is no longer maintained.", "replacementAssetId": "serving.mart_wisman"}}
+    ],
+    "cleanup": [
+      {"method": "PUT", "path": "/api/catalog/serving.mart_kunjungan_dtw/certification", "body": {"status": null}}
+    ],
+    "turns": ["Add a bar chart of foreign visitors by country from mart_kunjungan_dtw."],
+    "facts": [
+      {"label": "replacement", "kind": "text", "values": ["mart_wisman"]}
+    ],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "bar"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "bar"}, "count": 1}
+    ]
   }
   ,{
     "id": "calc_distance_to_bandung",

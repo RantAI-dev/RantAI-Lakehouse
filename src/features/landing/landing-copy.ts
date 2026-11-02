@@ -15,6 +15,11 @@ export const LINKS = {
   talk: "mailto:contact@rantai.dev?subject=RantAI%20Lakehouse",
   email: "mailto:contact@rantai.dev",
   source: "https://github.com/RantAI-dev/RantAI-Lakehouse",
+  /**
+   * DOC-2: the step-by-step user guide. It lives in the public repository, so
+   * the public landing page can link to it without the console serving it.
+   */
+  guide: "https://github.com/RantAI-dev/RantAI-Lakehouse/blob/main/docs/core/reference/user-guide.md",
   rantai: "https://rantai.dev",
   agents: "https://agents.rantai.dev",
   llmops: "https://llmops.rantai.dev",
@@ -191,6 +196,7 @@ export const FOOTER = {
     { label: "RantAI LLMOps", href: LINKS.llmops },
   ],
   connect: [
+    { label: "User guide", href: LINKS.guide },
     { label: "GitHub", href: LINKS.source },
     { label: "contact@rantai.dev", href: LINKS.email },
   ],

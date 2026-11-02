@@ -30,7 +30,7 @@ use sqlparser::dialect::ClickHouseDialect;
 
 use crate::routes::support::{effective_chart, stored_chart_sql};
 use crate::sql_rewrite::{
-    NoViews, ObligationsSource, PlaceholderValues, TableObligations, enforce,
+    Engine, NoViews, ObligationsSource, PlaceholderValues, TableObligations, enforce,
 };
 
 const POINTS: &str = "mart_demo_map_points";
@@ -141,6 +141,7 @@ fn rewrite(label: &str, sql: &str, policy: &Governed) -> String {
     let out = enforce(
         sql,
         &ClickHouseDialect {},
+        Engine::ClickHouse,
         &["analyst".to_owned()],
         &PlaceholderValues::none(),
         policy,
