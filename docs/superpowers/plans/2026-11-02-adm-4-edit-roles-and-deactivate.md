@@ -91,4 +91,74 @@ profile editing. Syncing users from SSO.
 
 ## 4. Handoff (developer appends below)
 
+### Handoff (developer, 2026-11-02)
+
+Branch `feat/adm-4-edit-roles-and-deactivate`, off `bed964fa` (the plan's docs merge on top of
+ADM-3's merge `c5663c02`). T1 was already committed by the previous session; this session
+recovered its ~1,300 uncommitted lines (backed up at
+`/home/shiro/rantai/review/adm4-wip-2026-11-02.patch`), finished them, and committed T2–T4.
+
+Commits, in plan order:
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1 | `a090f1b4` | `feat(adm-4): change a user's roles and take a user out of a tenant` (previous session) |
+| T2 | `e578347a` | `feat(adm-4): deactivate and reactivate a user, enforced on every path` |
+| T3 | `af98a958` | `feat(adm-4): edit roles, remove from tenant, and deactivate in the console` |
+| T4 | `3f188418` | `docs(adm-4): how to change a user's access, and a checklist QA can run` |
+
+What the recovered work was: T2's routes, `set_user_status_in_tx`, the `load_principal_for_user`
+and OIDC-JIT refusals, `identity_deactivate.rs`, the OIDC and store tests, the console changes of
+T3, and the two T4 documents. It did not compile as found — `users-page.test.tsx`'s `ROW` fixture
+had `status: "active" as const`, so the new inactive-user test could not set
+`status: "inactive"`; it is now typed as the contract's `User`. That is the only code change made
+to the recovered work beyond rustfmt.
+
+One deliberate difference from the plan's wording, for the reviewer: `ADM-4-AC14` on the feature
+page now says the three actions are **shown disabled** to a caller without `identity:write`,
+because that is what the console does and what the page's existing reset action already does (the
+server refuses the write either way). The plan did not decide hidden-versus-disabled.
+
+`docs/core/BACKLOG.md` has no `ADM-4` row yet: adding it with its Status/PR is the planner's step
+6, not this slice's. `PRODUCT.md` is likewise untouched (step 7).
+
+Commands run, on the final commit of each slice, from `rust/` through
+`/home/shiro/rantai/bin/cargo-locked` (shared `CARGO_TARGET_DIR`, `-j 2`):
+
+- `cargo fmt --check` — clean (also re-run at HEAD).
+- `cargo clippy -j 2 -p lakehouse-api -p lakehouse-auth -p lakehouse-store --all-targets -- -D warnings` — clean.
+- `cargo test -j 2 -p lakehouse-store --test identity` — 25 passed, 0 failed.
+- `cargo test -j 2 -p lakehouse-auth --test oidc` — 28 passed, 0 failed.
+- `cargo test -j 2 -p lakehouse-api --test identity_deactivate` — 9 passed, 0 failed (8 ADM-4
+  tests plus the TLS-proxy unit test that binary carries).
+- `cargo test -j 2 -p lakehouse-api --test identity_roles` — 10 passed, 0 failed.
+- `cargo test -j 2 -p lakehouse-api --test route_auth` — 74 passed, 0 failed.
+- `cargo test -j 2 -p lakehouse-api --test identity_password` — 8 passed; `--test
+  identity_user_tenants` — 6 passed; `--test login_throttle` — 8 passed; `--test
+  security_regressions` — 11 passed. All 0 failed. (Chosen because they exercise sign-in, the
+  auth gate and identity writes, which D4/D5 touch.)
+- `cargo test -j 2 -p lakehouse-api --lib` — 2928 passed, 0 failed, 18 ignored.
+- `cargo test -j 2 -p lakehouse-auth` (whole crate) — 0 failed: lib 63 passed, then the seven
+  integration binaries 28, 15, 5, 8, 8, 9 and 14 passed; doc-tests 1 ignored (existing).
+- `cargo test -j 2 -p lakehouse-store` (whole crate) — 41 `test result: ok` lines (the lib, the 39
+  integration binaries, and doc-tests), 0 failed; the `tests/identity.rs` binary is the 25 above.
+
+Console, from the repository root:
+
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 10 warnings, all pre-existing in files this slice does not touch.
+- `bun test src/features/admin` — 56 passed, 0 failed, 178 `expect()` calls across 8 files.
+
+**Not verified, with the reason:**
+
+- The full `lakehouse-api` integration suite (96 test binaries, each starting its own Postgres)
+  was **not** run end to end; the binaries listed above are the ones that exercise the routes and
+  paths this slice changes, plus the crate's library tests. This machine runs other jobs and the
+  full workspace block is the reviewer's run (AGENTS.md "Keep build time down"). The reviewer
+  should expect CI to be the first full run.
+- `bun run test` over the whole console was not run, only `src/features/admin` (the plan's accept
+  line for T3).
+- No compose file changed, so no `docker compose up` was needed. No test container was left
+  behind: `docker ps` before and after this session lists the same three pre-existing containers.
+
 ## 5. Review (planner appends below)
