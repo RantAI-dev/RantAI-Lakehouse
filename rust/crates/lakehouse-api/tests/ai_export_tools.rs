@@ -201,7 +201,7 @@ async fn export_dashboard_defaults_to_a4_portrait_and_refuses_a_bad_word_or_a_mi
         ),
         (
             json!({ "board": BOARD, "format": "pptx" }),
-            "A dashboard exports as a PDF: format must be pdf.",
+            "format must be pdf or file.",
         ),
         (
             json!({ "board": "nobody" }),
@@ -270,7 +270,7 @@ async fn export_chart_returns_a_link_for_excel_or_csv_and_refuses_what_has_no_da
         ),
         (
             json!({ "chart": "c_visits", "format": "pdf" }),
-            "format must be xlsx or csv.",
+            "format must be xlsx, csv or png.",
         ),
         (
             json!({ "chart": "c_visits", "format": "csv", "values": "rounded" }),
@@ -322,6 +322,113 @@ async fn without_dashboard_read_the_tools_are_refused_by_the_gate() {
     .await;
     assert_eq!(body["outcome"], "refused", "{body}");
     assert_eq!(body["result"]["required"], "dashboard:read");
+}
+
+/// `BI-37` D6: a chart as an image is a link to the renderer's own branch —
+/// `format=png`, the page's filters, parameters and grain, and no `values`
+/// (an image has no rows). With the renderer unset the console's own sentence.
+#[tokio::test]
+async fn a_chart_as_a_png_is_a_link_without_values_and_needs_the_renderer() {
+    let (without_renderer, _ch, cookie) = app(false).await;
+    let body = call(
+        &without_renderer,
+        &cookie,
+        "export_chart",
+        json!({ "chart": "c_visits", "format": "png" }),
+        "ask",
+    )
+    .await;
+    assert_eq!(
+        body["result"]["error"], "Images are not set up on this deployment.",
+        "{body}"
+    );
+
+    let (app, _ch, cookie) = app(true).await;
+    let filters = json!([{ "column": "region", "values": ["north"] }]);
+    let body = call(
+        &app,
+        &cookie,
+        "export_chart",
+        json!({
+            "chart": "c_visits", "format": "png", "values": "raw",
+            "filters": filters, "params": { "top": 5 }, "grain": "month",
+        }),
+        "ask",
+    )
+    .await;
+    assert_eq!(body["outcome"], "executed", "{body}");
+    let url = body["result"]["url"].as_str().unwrap();
+    let parsed = url::Url::parse(&format!("http://x{url}")).unwrap();
+    let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs["chart"], "c_visits");
+    assert_eq!(pairs["format"], "png");
+    assert!(
+        !pairs.contains_key("values"),
+        "an image has no values: {url}"
+    );
+    assert_eq!(pairs["filters"], filters.to_string());
+    assert_eq!(pairs["params"], r#"{"top":5}"#);
+    assert_eq!(pairs["grain"], "month");
+    assert_eq!(body["result"]["fileName"], "Visits-by-place.png");
+    assert!(
+        body["result"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("`values` does not apply to an image"),
+        "{body}"
+    );
+}
+
+/// `BI-37` D7: a dashboard as the importable file is its own link, and it does
+/// not need the PDF renderer (a file is not a rendered page).
+#[tokio::test]
+async fn export_dashboard_as_a_file_gives_the_file_link() {
+    let (app, _ch, cookie) = app(false).await;
+    let body = call(
+        &app,
+        &cookie,
+        "export_dashboard",
+        json!({ "board": BOARD, "format": "file" }),
+        "ask",
+    )
+    .await;
+    assert_eq!(body["outcome"], "executed", "{body}");
+    assert_eq!(
+        body["result"]["url"], "/api/dashboard/export?format=file&board=b_ai",
+        "{body}"
+    );
+    assert_eq!(body["result"]["format"], "file");
+    let name = body["result"]["fileName"].as_str().unwrap();
+    assert!(
+        name.starts_with("Sales-Q3-report-")
+            && std::path::Path::new(name)
+                .extension()
+                .is_some_and(|e| e == "json"),
+        "{name}"
+    );
+}
+
+/// A format the console does not make is refused with the tool's own sentence,
+/// not a link that fails when the person opens it.
+#[tokio::test]
+async fn a_format_the_console_does_not_make_is_refused_with_the_tools_sentence() {
+    let (app, _ch, cookie) = app(true).await;
+    for (tool, args, sentence) in [
+        (
+            "export_chart",
+            json!({ "chart": "c_visits", "format": "bmp" }),
+            "format must be xlsx, csv or png.",
+        ),
+        (
+            "export_dashboard",
+            json!({ "board": BOARD, "format": "markdown" }),
+            "format must be pdf or file.",
+        ),
+    ] {
+        let body = call(&app, &cookie, tool, args.clone(), "ask").await;
+        assert_eq!(body["result"]["error"], sentence, "{args}: {body}");
+        assert!(body["result"].get("url").is_none(), "{body}");
+    }
 }
 
 /// `BI-1` review fix (SHOULD-FIX) R7: the link carries the page's filters,

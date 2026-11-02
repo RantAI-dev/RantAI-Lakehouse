@@ -5443,7 +5443,7 @@
     "type": "function",
     "function": {
       "name": "export_dashboard",
-      "description": "Give a link that downloads a dashboard as a PDF, every tab with the filters applied. Nothing is made until the person opens the link, and it is made with their permissions. Use the board id from list_boards.",
+      "description": "Give a link that downloads a dashboard as a PDF, every tab with the filters applied, or (format=file, BI-37) as a JSON file that can be imported as a new dashboard. Nothing is made until the person opens the link, and it is made with their permissions. Use the board id from list_boards.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -5478,9 +5478,10 @@
           "format": {
             "type": "string",
             "enum": [
-              "pdf"
+              "pdf",
+              "file"
             ],
-            "description": "pdf, the default"
+            "description": "pdf (the default) every tab as a PDF; file one dashboard as a JSON file to import elsewhere"
           },
           "paper": {
             "type": "string",
@@ -5488,7 +5489,7 @@
               "a4",
               "letter"
             ],
-            "description": "default a4"
+            "description": "default a4, for a PDF"
           },
           "orientation": {
             "type": "string",
@@ -5496,7 +5497,7 @@
               "portrait",
               "landscape"
             ],
-            "description": "default portrait"
+            "description": "default portrait, for a PDF"
           }
         },
         "required": [
@@ -5509,7 +5510,7 @@
     "type": "function",
     "function": {
       "name": "export_chart",
-      "description": "Give a link that downloads one chart's data as Excel or CSV (up to 1,000,000 rows). Nothing is made until the person opens the link, and it is made with their permissions. Use the chart id from list_charts.",
+      "description": "Give a link that downloads one chart's data as Excel or CSV (up to 1,000,000 rows), or the chart as a PNG image (format=png, BI-37). Nothing is made until the person opens the link, and it is made with their permissions. Use the chart id from list_charts.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -5545,8 +5546,10 @@
             "type": "string",
             "enum": [
               "xlsx",
-              "csv"
-            ]
+              "csv",
+              "png"
+            ],
+            "description": "xlsx or csv for the data, png for the chart as an image"
           },
           "values": {
             "type": "string",
@@ -5554,7 +5557,7 @@
               "formatted",
               "raw"
             ],
-            "description": "formatted as on the chart (default) or the raw values"
+            "description": "formatted as on the chart (default) or the raw values; the data formats only, an image has no values"
           }
         },
         "required": [
