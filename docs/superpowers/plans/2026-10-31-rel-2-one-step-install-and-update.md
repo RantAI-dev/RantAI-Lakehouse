@@ -3535,3 +3535,20 @@ unreachable under load before the handoff was written. The commits are all pushe
   the console still on 3000.
 
 **Open: D23 (BLOCKER 4).**
+
+### Review S4b round 5 (planner, 2026-11-02, at `ecd71a15`)
+
+- **D23 is done** (`e86cf6f2`). `dagster-webserver` publishes `127.0.0.1:3001` only, with the
+  reason at the site. The free-port logic is gone. The docs are updated.
+- The proof is a real `up` of the default and `dagster` profiles from a clean project, with these
+  results:
+  - `127.0.0.1:3001/server_info` answered;
+  - the console answered on 3000;
+  - `ss -ltn` showed 3001 bound to loopback only, and the host's own address was refused on it.
+- Every gate reaches the webserver on the Compose network (`dagster-webserver:3000`), so none
+  depended on the host port.
+- ADR 0005's host URL for Dagster still said `localhost:3000`. The planner corrected it in this
+  commit, because an ADR is the planner's document.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for #335's CI, including `Release · dry run`,
+`install-proof` and `update-proof`, which now also assert that Dagster runs.
