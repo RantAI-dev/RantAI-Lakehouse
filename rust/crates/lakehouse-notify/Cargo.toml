@@ -10,6 +10,16 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 lettre = { workspace = true }
+# `SEC-56` D2: the CA bundle is read with the same PEM parser `lettre`
+# itself uses (`rustls-pki-types`), so a bundle of several certificates is
+# counted and validated one certificate at a time. Already in `Cargo.lock`
+# (1.15.1, through `rustls`), so this adds a dependency edge, not a crate.
+rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
+# `SEC-56` D7: a handshake that fails reaches us as a `rustls` error inside
+# the transport's error chain, and that is how a TLS failure is told apart
+# from a refused message. This is the workspace's ONE `rustls` entry, so
+# the provider story stays the one `SEC-41` decision 7 describes (`ring`).
+rustls = { workspace = true }
 
 [features]
 # `MappedResolver`, a permissive webhook resolver for other crates' tests.
@@ -19,6 +29,14 @@ test-support = []
 [dev-dependencies]
 wiremock = { workspace = true }
 tokio = { workspace = true }
+# `SEC-56` T1/T2: the test CA and the test certificates are minted at run
+# time, never committed -- `.gitleaksignore`'s history (`SEC-36`) reads a
+# committed key as a leak. `rcgen` with EXACTLY the features
+# `lakehouse-api` pins (no `pem`: the test writes the PEM armour itself,
+# and the `pem` feature would unify into `lakehouse-api`'s tests).
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+# The PEM armour around a minted DER certificate (`SEC-56` T1).
+base64 = { workspace = true }
 
 [lints]
 workspace = true
