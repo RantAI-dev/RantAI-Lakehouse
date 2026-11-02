@@ -249,17 +249,17 @@ step's own comparison (`if [ "$landing_status" != "404" ]`): a 404 passes, a 200
   environment (SEC-18: compose has no default credentials).
 - `cd rust && cargo fmt --check` — clean.
 - `cd rust && CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target cargo clippy --workspace --all-targets
-  --all-features -- -D warnings` — **not verified**: it did not finish inside the session on this
-  machine, and this branch touches no Rust code (`git diff origin/main...HEAD -- rust/` is empty),
-  so a Rust change cannot have broken it. The reviewer runs it.
+  --all-features -- -D warnings` — exit 0, no warnings and no errors (`Finished dev profile in
+  4m 28s` on the first run; the second run, from the warm cache, exited 0 in 1.06s).
 
 **Not verified**
 
 - The PR's own `Release` dry run and install proof must be green on the PR (the plan's T2 accept).
   The PR is not open yet, so there are no run ids to quote: the dry run runs once the planner
   opens the PR, and its run id goes in the review.
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo test
-  --workspace`, for the reason above.
+- `cargo test --workspace`, **not verified**: it did not finish inside the session on this
+  machine. This branch touches no Rust code (`git diff origin/main...HEAD -- rust/` is empty), so a
+  Rust test cannot have broken because of it. The reviewer runs it.
 - A green `bun run lint` on this machine, for the reason above.
 
 **Notes for the reviewer**
