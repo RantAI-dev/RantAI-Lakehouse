@@ -453,6 +453,51 @@ pub struct DecideApprovalBody {
     pub(crate) comment: Option<String>,
 }
 
+/// The ONE self-approval check both decide routes call (`SEC-57`).
+///
+/// The person who asked for an approval may not decide it — the same rule
+/// for a `kind = "tool_call"` approval as for a `kind = "access"` one. It
+/// was already the rule for access requests (WS7 item E3), where the check
+/// lived inline in `routes::catalog::decide_access_request`; `SEC-57`
+/// moves that comparison here, next to [`DecideApprovalBody`] — the body
+/// type both routes already share — so there is ONE check, not two
+/// (AGENTS.md rule 4: duplicated guards are a finding).
+///
+/// The refusal is `403 permission_denied`, and NOTHING is written when it
+/// fires: both routes call this BEFORE their store call, so a refused
+/// decision leaves the approval `pending`, writes no audit row and grants
+/// nothing.
+///
+/// The message is one sentence for BOTH kinds — the access route's own
+/// wording minus the word "akses", which would not fit a tool call
+/// (`SEC-57` decision D3). The body stays `permission_denied: …`
+/// (`lakehouse_core::error::ApiError::PermissionDenied`), so the shape the
+/// console reads does not change.
+///
+/// Only a HUMAN principal can be "the requester":
+/// `approval_item.requested_by_user_id` points at `app_user`, and a
+/// service identity's id is never an `app_user.id` — so a service
+/// identity is never refused here, exactly as a scheduled run (no
+/// requester at all) is decidable by anyone holding `agent:approve`.
+///
+/// # Errors
+///
+/// `Err(ApiError::PermissionDenied)` when `principal` IS the human who
+/// requested this approval; `Ok(())` otherwise.
+pub(crate) fn refuse_own_request(
+    existing: &ApprovalItem,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    match (existing.requested_by_user_id, principal.user_id()) {
+        (Some(requester), Some(decider)) if requester == decider => {
+            Err(ApiError::PermissionDenied(
+                "tidak boleh menyetujui permintaan milik sendiri".to_owned(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `POST /api/agents/approvals/{id}/decide` — approve or reject a pending
 /// approval.
 ///
@@ -494,6 +539,9 @@ pub struct DecideApprovalBody {
 /// been decided (mirrors `mock/agents.ts`'s "already {status}" guard — a
 /// state conflict, not a bad request, hence 409 rather than the mock's
 /// 400: see `lakehouse_store::agents::decide_approval`'s doc comment);
+/// 403 if the approver IS the human who requested this approval
+/// (`SEC-57`: the requester may not decide their own request — refused
+/// BEFORE any write, so the approval stays `pending` and nothing runs);
 /// 403 if the approval was approved but the approver lacks the underlying
 /// tool's own permission (the tool is never executed in that case);
 /// 503/500 as above.
@@ -572,9 +620,18 @@ pub async fn decide_approval(
     // it, even though `agents::decide_approval`'s own UPDATE would happily
     // transition it too. A 404, not 403: from THIS route's point of view
     // the resource simply does not exist as something it can decide.
+    //
+    // SEC-57: the requester of a tool call may not decide their own
+    // request. The check runs HERE — after the kind check, before the store
+    // call — so a refused decision writes nothing at all: the approval
+    // stays `pending`, the run stays `waiting_approval`, the tool never
+    // runs.
     match agents::get_approval(pg, &id).await {
         Ok(Some(existing)) if existing.kind != "tool_call" => {
             return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
+        }
+        Ok(Some(existing)) => {
+            refuse_own_request(&existing, &principal)?;
         }
         Ok(_) => {}
         Err(err) => return Err(ApiError::from(err).into()),
@@ -1460,6 +1517,15 @@ async fn run_headless_loop_inner(
                         risk: "High-risk action (WriteHigh): cannot be undone once \
                                executed.",
                         redacted_args: &redacted,
+                        // SEC-57: the approval names the HUMAN who started
+                        // this run, when a person started it — so the API
+                        // can refuse them deciding their own request. A
+                        // scheduled run (`RunAuth::Token`) has no
+                        // principal at all, and a service identity's id
+                        // is never an `app_user.id`, so both record NULL:
+                        // nobody asked in person, so nobody is refused as
+                        // "the requester".
+                        requested_by: principal.and_then(Principal::user_id),
                     },
                 )
                 .await;

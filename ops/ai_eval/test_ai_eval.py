@@ -18,6 +18,7 @@ compares every score with the values the code printed before the change
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -1774,6 +1775,41 @@ class DashboardCasesTests(unittest.TestCase):
             self.assertIs(case.get("confirm"), True, case_id)
             self.assertEqual(case["expect_tool"], expect_tool, case_id)
             self.assertEqual(len(case["expect_state"]), 2, case_id)
+
+    def test_the_distance_case_brings_its_own_source_with_coordinates_and_names_it(self) -> None:
+        # The eval stack has no mart with coordinates, and `mart_demo_map_points`
+        # exists only in Rust tests, so the case creates a SQL source with
+        # latitude and longitude and asks for the field on that source.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["calc_distance_to_bandung"]
+        setup = {step["name"]: step for step in case["setup"]}
+        self.assertEqual(setup["src"]["path"], "/api/dashboard/sources")
+        sql = setup["src"]["body"]["sql"]
+        self.assertIn("latitude", sql)
+        self.assertIn("longitude", sql)
+        # The only mart the case may mention is one its own setup SQL reads.
+        everything = json.dumps(
+            {k: case[k] for k in ("turns", "expect_tool", "expect_state")}
+        )
+        self.assertNotIn("mart_demo_map_points", everything)
+        for mart in set(re.findall(r"mart_[a-z_]+", everything)):
+            self.assertIn(mart, sql)
+        # The turn, the tool arguments and the state check all use the
+        # source the setup created.
+        self.assertIn("{src}", case["turns"][0])
+        self.assertEqual(case["expect_tool"]["args_contains"]["sqlSource"], "{src}")
+        self.assertEqual(case["expect_tool"]["args_contains"]["name"], "km_from_bandung")
+        self.assertEqual(
+            case["expect_state"][0]["path"], "/api/dashboard/calc-fields?source={src}"
+        )
+
+    def test_the_view_filter_year_case_tells_the_assistant_which_dashboard_is_open(self) -> None:
+        # The console always sends the open dashboard with its board id; a
+        # case without that context never tells the assistant which board to
+        # name in `set_board_view_filters`.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["view_filter_year"]
+        self.assertIn("{board}", case.get("context", ""))
 
 
 class ForecastAndDeprecationCaseTests(unittest.TestCase):
