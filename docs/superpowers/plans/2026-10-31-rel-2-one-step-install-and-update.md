@@ -4199,3 +4199,34 @@ unreachable under load before the handoff was written. The commits are all pushe
 
 **Open: no BLOCKER, no SHOULD-FIX.** Merge waits for #335's CI, including `Release · dry run`,
 `install-proof` and `update-proof`, which now also assert that Dagster runs.
+
+### Review S4b round 6 (planner, 2026-11-02, at `c9ebf505`): the rollback restores onto live data
+
+The PR's update proof failed in run `41413261515`, in the step "The update to bundle C fails and rolls back". Updating to bundle B passed. Bundle C failed as intended, but its rollback did not complete:
+
+```
+Code: 608. DB::Exception: Cannot restore the table default.s4_update_marker because it already contains some data.
+(query: RESTORE DATABASE `default` FROM Disk('backups', 'clickhouse/…/default'))
+Error: the ClickHouse database 'default' could not be restored.
+```
+
+**BLOCKER 1. The local restore assumes an empty instance, but the rollback runs it on the install's own volumes.**
+- `compose_stop_all` stops the stack. The volumes keep the data the failed update left behind.
+- The local branch of `scripts/restore-from-backup.sh` then restores on top of that data.
+- **ClickHouse:** `RESTORE DATABASE` refuses a table that holds rows. That is this failure.
+- **Postgres:** the same flaw is hidden there. `psql < postgres.dump` (a `pg_dumpall`) runs on a populated instance, and psql carries on past errors. Every `CREATE DATABASE` and `CREATE TABLE` fails, and every `COPY` either adds rows to existing tables or fails on a key. The rollback then reports success with mixed data. That would be a fabricated success (principle 2).
+
+**Decision D24 (planner).** A local restore REPLACES the data the backup holds. It never merges.
+1. **ClickHouse.** Before each `RESTORE DATABASE`, run `DROP DATABASE IF EXISTS` on the same database (`SYNC`), exactly as the S3 branch already does at `restore-from-backup.sh` ~613. One rule for both branches (rule 4).
+2. **Postgres.**
+   - Before `psql < postgres.dump`, drop every database the dump creates, using `DROP DATABASE IF EXISTS … WITH (FORCE)`. Read the names from the dump's own `CREATE DATABASE` lines and skip `postgres`, `template0` and `template1`.
+   - If the dump has data for `postgres` itself, the restore must start from an empty `postgres` schema set. Measure whether `pg_dumpall` emits it. If it does, recreate it as well, and say how in the comment.
+   - Run the psql restore with `-v ON_ERROR_STOP=0`, as now, because the role-exists errors are expected. Afterwards, check that every database the dump names now exists. A missing one makes the restore fail with its name.
+3. **The comment at the top of the script** says the local restore replaces the databases it restores, on a fresh instance and on a populated one (the rollback).
+4. **Proof.**
+   - After the bundle C rollback, the update proof asserts that the Postgres and the ClickHouse `s4_update_marker` each have EXACTLY ONE row (`count() = 1`), not just that the row is there.
+   - The fresh-instance restore test that already exists must still pass.
+   - `test_release_workflow.py` pins the new assertion.
+5. **Out of scope:** the S3 branch, which already drops before restoring, and any change to `lakehousectl`.
+
+Accept: `bash -n scripts/restore-from-backup.sh`, `shellcheck` on the script if it is installed, `python3 -m pytest ops/release -q`, and the PR's own `Release · dry run` and `Proof · the update moves the stack, and rolls back` green. Quote their run ids in the handoff.
