@@ -69,6 +69,66 @@ describe("pinSnapshot", () => {
   })
 })
 
+// `DATA-21` D5: on Trino a version belongs to ONE table, so the pin is
+// written on that table's own reference.
+describe("pinSnapshot on Trino", () => {
+  const T = "SELECT * FROM iceberg.bronze.orders"
+
+  it("writes the version after the table the caller picked", () => {
+    expect(pinSnapshot(T, "trino", "123", "bronze.orders")).toBe(
+      "SELECT * FROM iceberg.bronze.orders FOR VERSION AS OF 123"
+    )
+  })
+
+  it("finds the table inside a catalog-qualified reference", () => {
+    expect(pinSnapshot(T, "trino", "123", "bronze.orders")).toContain(
+      "iceberg.bronze.orders FOR VERSION AS OF 123"
+    )
+  })
+
+  it("does not match a longer table that shares the prefix", () => {
+    expect(pinSnapshot("SELECT * FROM bronze.orders_archive", "trino", "123", "bronze.orders")).toBeNull()
+  })
+
+  it("replaces an earlier pin instead of stacking a second one", () => {
+    const once = pinSnapshot(T, "trino", "1", "bronze.orders") as string
+    expect(pinSnapshot(once, "trino", "2", "bronze.orders")).toBe(
+      "SELECT * FROM iceberg.bronze.orders FOR VERSION AS OF 2"
+    )
+  })
+
+  it("writes nothing when the statement does not read that table", () => {
+    expect(pinSnapshot("SELECT * FROM bronze.invoices", "trino", "123", "bronze.orders")).toBeNull()
+  })
+
+  it("writes nothing inside a ClickHouse-style quoted table name", () => {
+    expect(
+      pinSnapshot("SELECT * FROM icecat_api.`bronze.orders`", "trino", "123", "bronze.orders")
+    ).toBeNull()
+  })
+
+  it("writes the version after a double-quoted table reference", () => {
+    expect(pinSnapshot('SELECT * FROM iceberg."bronze"."orders"', "trino", "123", "bronze.orders")).toBe(
+      'SELECT * FROM iceberg."bronze"."orders" FOR VERSION AS OF 123'
+    )
+  })
+
+  it("writes nothing without a table to pin", () => {
+    expect(pinSnapshot(T, "trino", "123")).toBeNull()
+  })
+
+  it("writes nothing for an id that is not a plain number", () => {
+    expect(pinSnapshot(T, "trino", "1; DROP TABLE x", "bronze.orders")).toBeNull()
+  })
+
+  it("keeps a 19-digit id digit for digit", () => {
+    const bigId = "7539123456789012345"
+    expect(pinSnapshot(T, "trino", bigId, "bronze.orders")).toContain(
+      `FOR VERSION AS OF ${bigId}`
+    )
+  })
+})
+
 function snap(id: string, timestampMs: number): LakehouseSnapshot {
   return {
     id,

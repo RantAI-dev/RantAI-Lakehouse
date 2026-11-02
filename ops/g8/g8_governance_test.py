@@ -41,6 +41,34 @@ masked-Analyst assertion also proves the OTHER column in the same row
 comes back in clear text — a bug that masked the whole row (not just the
 named column) would still fail this gate.
 
+# The engine this run proves (DATA-21 S2)
+
+This gate takes an ENGINE argument and proves the same three masking
+assertions on that engine: `--engine trino` (or `G8_ENGINE=trino`) proves
+them on `Trino`, and the default — no argument at all — proves them on
+`ClickHouse`, which is exactly what this gate always did.
+
+The two engines cannot read the same table, and that is the whole reason
+the Trino leg has a table of its own:
+
+- `ClickHouse` reads the gate's own `MergeTree` table
+  `serving.g8_gate_subjects`, which this script seeds.
+- `Trino` has NO `ClickHouse` connector in this stack; its only catalog is
+  Lakekeeper's Iceberg REST catalog (`iceberg`). So the Trino leg
+  publishes the SAME seeded rows into an Iceberg table first — through
+  the Gold export (`POST /api/gold/export/g8_gate_subjects`, the only
+  write path to Lakekeeper's Iceberg tables) — and reads
+  `iceberg.gold.g8_gate_subjects` there. The export carries the mart's own
+  columns (`email`, `region`) across, so the masked column and its
+  unmasked sibling are the same two columns the ClickHouse leg proves.
+
+The two legs therefore govern two different tables and so carry two
+different policy names (`g8-mask-email` and `g8-mask-email-trino`): a
+policy's name is unique, and one policy must not silently start applying
+to a table the other leg owns. Each policy names its own table's CANONICAL
+name (`gold.g8_gate_subjects` — the catalog is not part of it), which is
+what the policy engine matches a rewritten statement's table against.
+
 # What this gate cannot prove
 
 This script only ever observes `lakehouse-api`'s HTTP responses — it
@@ -65,12 +93,20 @@ against it — see the commit body for the exact commands.
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 
 import requests
 from argon2 import PasswordHasher  # argon2-cffi — gate-only dependency, installed by g8-test-runner's command (WS7 item H2)
+
+# The one readiness wait for `Trino`, shared with the other G8 gate
+# (`ops/g8/trino_ready.py`) — DATA-21 S2 review BLOCKER 1. It lives in
+# its own module on purpose: this gate's ASSERTIONS stay independent of
+# the time-travel gate's, and only the wait is shared.
+import trino_ready
 
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
 CH_URL = os.environ.get("CH_URL", "http://clickhouse:8123")
@@ -106,10 +142,91 @@ GATE_REGION_VALUE = "g8-fixture-region"
 
 POLICY_NAME = "g8-mask-email"
 
+# DATA-21 S2 — the Trino leg. `Trino` reads Lakekeeper's Iceberg catalog
+# and has no `ClickHouse` connector, so the Trino leg reads the SAME rows
+# through an Iceberg table: the Gold export publishes this gate's own
+# ClickHouse mart into the `gold` namespace, and the Trino leg reads
+# `iceberg.gold.g8_gate_subjects` there.
+#
+# The policy names the table's CANONICAL name (`gold.g8_gate_subjects`):
+# the catalog is not part of it, and it is the canonical name the policy
+# engine matches a rewritten statement's table against. The policy's NAME
+# differs from the ClickHouse leg's because a policy's name is unique and
+# the two legs govern two different tables.
+TRINO_GOLD_MART = "g8_gate_subjects"
+TRINO_POLICY_TABLE = "gold.g8_gate_subjects"
+TRINO_POLICY_NAME = "g8-mask-email-trino"
+TRINO_TABLE = "iceberg.gold.g8_gate_subjects"
+
+# The engines this gate knows how to prove.
+ENGINE_CLICKHOUSE = "clickhouse"
+ENGINE_TRINO = "trino"
+
 
 class G8Failure(Exception):
     """Raised for any acceptance-criterion violation or infrastructure
     failure this gate cannot proceed past."""
+
+
+@dataclass(frozen=True)
+class Target:
+    """What this run proves: the engine, and the table the gate reads and
+    governs on it."""
+
+    engine: str
+    # The table the gate's own SQL reads.
+    table: str
+    # The canonical name the authored policy names.
+    policy_table: str
+    # The policy's own (unique) name.
+    policy_name: str
+
+
+def parse_engine(argv: list[str]) -> str:
+    """The engine this run proves.
+
+    `--engine` on the command line beats the `G8_ENGINE` environment
+    variable, which beats the `clickhouse` default — so a run with no
+    argument at all is exactly the ClickHouse leg this gate always was.
+    The environment variable is what CI uses (`docker compose run -e
+    G8_ENGINE=trino ...`), because the compose runner's own command line
+    is fixed.
+
+    # Errors
+
+    Raises [`G8Failure`] for an engine this gate cannot prove.
+    """
+    parser = argparse.ArgumentParser(description="G8 governance acceptance test")
+    parser.add_argument(
+        "--engine",
+        choices=[ENGINE_CLICKHOUSE, ENGINE_TRINO],
+        default=None,
+        help="the engine to prove (default: $G8_ENGINE, else clickhouse)",
+    )
+    args, _unknown = parser.parse_known_args(argv)
+    engine = (args.engine or os.environ.get("G8_ENGINE") or ENGINE_CLICKHOUSE).strip().lower()
+    if engine not in (ENGINE_CLICKHOUSE, ENGINE_TRINO):
+        raise G8Failure(
+            f"unknown engine {engine!r}: this gate proves {ENGINE_CLICKHOUSE} or {ENGINE_TRINO}"
+        )
+    return engine
+
+
+def target_for(engine: str) -> Target:
+    """The table the gate reads and governs on `engine`."""
+    if engine == ENGINE_TRINO:
+        return Target(
+            engine=ENGINE_TRINO,
+            table=TRINO_TABLE,
+            policy_table=TRINO_POLICY_TABLE,
+            policy_name=TRINO_POLICY_NAME,
+        )
+    return Target(
+        engine=ENGINE_CLICKHOUSE,
+        table=GATE_TABLE,
+        policy_table=GATE_TABLE,
+        policy_name=POLICY_NAME,
+    )
 
 
 def psql(sql: str) -> str:
@@ -257,9 +374,9 @@ def step_login_as_analyst() -> requests.Session:
     return session
 
 
-def step_author_masking_policy(admin_session: requests.Session) -> None:
-    """Authors a `status = 'ready'` policy masking `email` on `GATE_TABLE`
-    for role `Analyst`, via the real `POST /api/governance/policies`
+def step_author_masking_policy(admin_session: requests.Session, target: Target) -> None:
+    """Authors a `status = 'ready'` policy masking `email` on the target's
+    table for role `Analyst`, via the real `POST /api/governance/policies`
     route (`rust/crates/lakehouse-api/src/routes/governance.rs::
     create_policy`) — never inserted directly into Postgres, so this gate
     also exercises `create_policy_body`'s own validation
@@ -267,7 +384,7 @@ def step_author_masking_policy(admin_session: requests.Session) -> None:
     shape it authors.
 
     Idempotent by checking `GET /api/governance/policies` first and
-    skipping the `POST` if a policy named `POLICY_NAME` already exists —
+    skipping the `POST` if a policy of that name already exists —
     `lakehouse_store::governance::create_policy` enforces a unique name
     and returns 409 on a repeat, so re-POSTing unconditionally would not
     be idempotent (`policy:name_unique`, `rust/crates/lakehouse-store/
@@ -278,21 +395,21 @@ def step_author_masking_policy(admin_session: requests.Session) -> None:
     of being silently treated as success.
     """
     conditions = (
-        '{"roles":["Analyst"],"table":"' + GATE_TABLE + '","mask":["email"]}'
+        '{"roles":["Analyst"],"table":"' + target.policy_table + '","mask":["email"]}'
     )
     existing = admin_session.get(f"{API_URL}/api/governance/policies", timeout=10)
     if not existing.ok:
         raise G8Failure(f"failed to list policies: {existing.status_code} {existing.text}")
-    if any(p.get("name") == POLICY_NAME for p in existing.json()):
-        print(f"[g8] policy {POLICY_NAME!r} already authored; skipping POST")
+    if any(p.get("name") == target.policy_name for p in existing.json()):
+        print(f"[g8] policy {target.policy_name!r} already authored; skipping POST")
         return
     resp = admin_session.post(
         f"{API_URL}/api/governance/policies",
         json={
-            "name": POLICY_NAME,
+            "name": target.policy_name,
             "kind": "Row filter",
             "subjects": "Analyst (g8 gate)",
-            "resources": GATE_TABLE,
+            "resources": target.policy_table,
             "effect": "Permit with obligation",
             "conditions": conditions,
             "activate": True,
@@ -301,21 +418,81 @@ def step_author_masking_policy(admin_session: requests.Session) -> None:
     )
     if not resp.ok:
         raise G8Failure(f"failed to author masking policy: {resp.status_code} {resp.text}")
-    print(f"[g8] authored policy {POLICY_NAME!r}")
+    print(f"[g8] authored policy {target.policy_name!r}")
 
 
-def _run_query(session: requests.Session, sql: str) -> requests.Response:
-    return session.post(f"{API_URL}/api/query/run", json={"sql": sql}, timeout=15)
+def step_publish_gate_table_to_iceberg(admin_session: requests.Session) -> None:
+    """Publishes this gate's own ClickHouse mart to Lakekeeper's Iceberg
+    `gold` namespace, so the Trino leg has a table to read at all:
+    `Trino` has no `ClickHouse` connector in this stack, and its only
+    catalog is Lakekeeper's Iceberg REST catalog.
+
+    The Gold export route (`POST /api/gold/export/{mart}`) is the only
+    write path to that catalog, and it publishes the mart's OWN columns
+    (`email`, `region`) beside the export's own `_exported_at` — so the
+    masked column and the unmasked sibling the gate checks are the same
+    two columns the ClickHouse leg proves.
+
+    The bootstrap admin holds the seeded `*:*` grant, which satisfies the
+    route's `gold:export` permission check without a run token
+    (`routes::gold::check_export_token`'s own doc comment).
+    """
+    resp = admin_session.post(f"{API_URL}/api/gold/export/{TRINO_GOLD_MART}", timeout=180)
+    if not resp.ok:
+        raise G8Failure(
+            f"the Gold export of {TRINO_GOLD_MART} failed: {resp.status_code} {resp.text}"
+        )
+    print(f"[g8] published {GATE_TABLE} to Iceberg as {TRINO_POLICY_TABLE}")
 
 
-def step_analyst_sees_masked_column(analyst_session: requests.Session) -> None:
+def step_wait_for_trino() -> None:
+    """Waits until `Trino` can answer, before this leg's first query.
+
+    DATA-21 S2 review BLOCKER 1: the coordinator answers HTTP while it
+    is still starting, so a statement sent in that window comes back as
+    a 422 ("The server is still starting up"). This gate sent its first
+    analyst query in that window and CI caught it (run 41285813391), after
+    an earlier run had passed by luck — a gate that passes by timing is a
+    flaky gate.
+
+    The wait itself is ONE shared helper (`ops/g8/trino_ready.py`), used
+    by both G8 gates, so this leg and the time-travel leg cannot drift
+    apart (`AGENTS.md` rule 4: a duplicated guard is a finding).
+    """
+    try:
+        trino_ready.wait_for_trino()
+    except trino_ready.TrinoNotReady as exc:
+        raise G8Failure(f"Trino never became ready: {exc}") from exc
+
+
+def _run_query(session: requests.Session, sql: str, engine: str) -> requests.Response:
+    """The gate's own query, on the engine this run proves.
+
+    The ClickHouse leg sends exactly what it always sent (`{"sql": ...}` —
+    `POST /api/query/run`'s own default engine), and the Trino leg names
+    its engine, because the route reads the engine from the request body.
+    Trino's own timeout is generous: its first query pays for the
+    connector's metadata round trip to Lakekeeper.
+    """
+    body: dict[str, str] = {"sql": sql}
+    if engine == ENGINE_TRINO:
+        body["engine"] = ENGINE_TRINO
+    timeout = 15 if engine == ENGINE_CLICKHOUSE else 120
+    return session.post(f"{API_URL}/api/query/run", json=body, timeout=timeout)
+
+
+def step_analyst_sees_masked_column(
+    analyst_session: requests.Session, target: Target
+) -> None:
     """The load-bearing assertion: if enforcement regressed to a
     no-op (Phase C/D's wiring reverted, or the policy's `conditions`
     stopped being read), `email` comes back as `GATE_EMAIL_VALUE` and
     this fails. `region` (never named by the policy) must stay in clear
     text — a masking bug that redacted the entire row, not just the
     named column, also fails here."""
-    resp = _run_query(analyst_session, f"SELECT email, region FROM {GATE_TABLE} LIMIT 1")
+    resp = _run_query(
+        analyst_session, f"SELECT email, region FROM {target.table} LIMIT 1", target.engine
+    )
     if not resp.ok:
         raise G8Failure(f"Analyst query failed: {resp.status_code} {resp.text}")
     rows = resp.json().get("rows", [])
@@ -328,13 +505,13 @@ def step_analyst_sees_masked_column(analyst_session: requests.Session) -> None:
         raise G8Failure(f"unmasked sibling column was altered too — masking is not column-scoped: {row}")
 
 
-def step_admin_sees_clear_text(admin_session: requests.Session) -> None:
+def step_admin_sees_clear_text(admin_session: requests.Session, target: Target) -> None:
     """No authored policy names role `Platform Admin`, so the bootstrap
     admin's own read of the SAME table/column must come back in clear
     text. Fails if a regression over-masks (applies the Analyst
     obligation to every principal) as loudly as `step_analyst_sees_
     masked_column` fails an under-masking regression."""
-    resp = _run_query(admin_session, f"SELECT email FROM {GATE_TABLE} LIMIT 1")
+    resp = _run_query(admin_session, f"SELECT email FROM {target.table} LIMIT 1", target.engine)
     if not resp.ok:
         raise G8Failure(f"admin query failed: {resp.status_code} {resp.text}")
     rows = resp.json().get("rows", [])
@@ -344,7 +521,9 @@ def step_admin_sees_clear_text(admin_session: requests.Session) -> None:
         raise G8Failure(f"admin's own read must not be masked (no policy names Platform Admin): {rows[0]}")
 
 
-def step_bypass_attempts_still_masked(analyst_session: requests.Session) -> None:
+def step_bypass_attempts_still_masked(
+    analyst_session: requests.Session, target: Target
+) -> None:
     """Three syntactic shapes that `sql_rewrite`'s own test suite
     (`rust/crates/lakehouse-api/src/sql_rewrite.rs`) names as substitution
     targets, run as the Analyst: a `SELECT *`, and that same `SELECT *`
@@ -362,10 +541,10 @@ def step_bypass_attempts_still_masked(analyst_session: requests.Session) -> None
     this gate must not have.
     """
     for sql in [
-        f"SELECT * FROM {GATE_TABLE} LIMIT 1",
-        f"WITH x AS (SELECT * FROM {GATE_TABLE}) SELECT email FROM x LIMIT 1",
+        f"SELECT * FROM {target.table} LIMIT 1",
+        f"WITH x AS (SELECT * FROM {target.table}) SELECT email FROM x LIMIT 1",
     ]:
-        resp = _run_query(analyst_session, sql)
+        resp = _run_query(analyst_session, sql, target.engine)
         if resp.status_code in (401, 403):
             raise G8Failure(
                 f"bypass check itself failed to authenticate for {sql!r}: "
@@ -389,14 +568,27 @@ def step_bypass_attempts_still_masked(analyst_session: requests.Session) -> None
 
 def main() -> int:
     try:
+        engine = parse_engine(sys.argv[1:])
+        target = target_for(engine)
+        print(f"[g8] proving masking on the {engine} engine")
         step_seed_gate_table()
         step_seed_analyst_login()
         admin = step_login_as_bootstrap_admin()
-        step_author_masking_policy(admin)
+        if engine == ENGINE_TRINO:
+            # `Trino` reads Lakekeeper's Iceberg catalog, so the rows this
+            # gate seeds have to be published there first.
+            step_publish_gate_table_to_iceberg(admin)
+        step_author_masking_policy(admin, target)
         analyst = step_login_as_analyst()
-        step_analyst_sees_masked_column(analyst)
-        step_admin_sees_clear_text(admin)
-        step_bypass_attempts_still_masked(analyst)
+        if engine == ENGINE_TRINO:
+            # DATA-21 S2 review BLOCKER 1: the coordinator must be ready
+            # before this leg's FIRST query on it. Everything above is
+            # engine-independent (seeding, the Gold export, the policy),
+            # so it runs while the coordinator boots.
+            step_wait_for_trino()
+        step_analyst_sees_masked_column(analyst, target)
+        step_admin_sees_clear_text(admin, target)
+        step_bypass_attempts_still_masked(analyst, target)
     except G8Failure as exc:
         print(f"[g8] FAILED: {exc}", file=sys.stderr)
         return 1

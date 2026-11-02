@@ -162,6 +162,13 @@ async fn run() -> anyhow::Result<()> {
     // serve) and retries loudly. See that function's doc comment.
     bring_database_up(&state).await?;
 
+    // DATA-41 D4: build the catalog search copy once, in the background,
+    // now that the application database is up. On a catalog of 10,000
+    // tables the build takes about five seconds, and the first person to
+    // search should not pay for it. A search that arrives first builds the
+    // copy inline, single-flight, as before.
+    routes::catalog::spawn_startup_search_copy(&state);
+
     // Task 3.2: idempotently seed the one bootstrap admin, from
     // `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD` — see
     // `bootstrap_admin`'s doc comment for what happens when either is unset.

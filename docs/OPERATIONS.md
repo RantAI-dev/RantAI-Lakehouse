@@ -1981,3 +1981,24 @@ services only.
   copy — see "Gold export: growth and background merges" above.
 - The read history is kept for 90 days; the page shows 7.
 
+## Releases: where a release comes from
+
+A release is produced by the pipeline in `release.yml`, not by hand: the four images are
+built and pushed, signed, and given a CycloneDX SBOM; the Compose file an operator
+deploys is RENDERED from this repository's template with every image pinned by digest;
+and one signed manifest, `release.json`, names the version, every image's digest, the
+Compose file's checksum and the upgrade path. Everything an installer needs is checked
+through that one file.
+
+What that means for an operator:
+
+- the Compose file in a release is NOT this repository's `docker-compose.yml`. It is the
+  rendered one, and it names published images instead of building them;
+- the images are signed, and the manifest is signed with the release key. The public key
+  is `ops/release/release.pub`;
+- the offline bundle holds the Compose file, the manifest, its signature, one image per
+  file, the SBOMs and the checksums.
+
+The pipeline itself, the key, the draft release and the one manual step after the first
+release are documented in [CI.md](CI.md#release-pipeline). The tooling is in
+`ops/release/`.

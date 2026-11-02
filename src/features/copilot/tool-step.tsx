@@ -27,7 +27,11 @@ import { cn } from "@/lib/utils";
 import { encodeFilters } from "@/lib/dashboard-filter-state";
 import { ErrorWithReference } from "@/components/error-reference";
 
-export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown };
+/**
+ * One step of a turn. `confirmed` says the person confirmed it, so it saved
+ * an object; it is optional because steps saved before it existed carry none.
+ */
+export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown; confirmed?: boolean };
 
 export const TOOL_LABEL: Record<string, string> = {
   run_sql: "SQL query",
