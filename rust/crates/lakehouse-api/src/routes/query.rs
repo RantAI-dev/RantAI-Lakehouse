@@ -31,9 +31,10 @@ use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::routes::saved_queries::{
-    FolderField, NOT_READ_ONLY, QUERY_STRING_UNREADABLE, SavedQueryListQuery,
-    TITLE_AND_SQL_REQUIRED, parse_folder_filter, parse_folder_reference, require_query_placement,
+    FolderField, NOT_READ_ONLY, SavedQueryListQuery, TITLE_AND_SQL_REQUIRED, parse_folder_filter,
+    parse_folder_reference, require_query_placement,
 };
 use crate::sql_guard::{is_read_only, is_trino_safe};
 use crate::state::AppState;
@@ -2135,7 +2136,7 @@ pub async fn list_saved(
 /// fixed message in [`parse_history_query`] — never `serde_urlencoded`'s
 /// rendering of a serde error. A query string the extractor itself cannot
 /// read (a parameter sent twice) never reaches this struct: it is refused
-/// with the fixed sentence of [`HISTORY_QUERY_UNREADABLE`].
+/// with the fixed sentence of [`QUERY_STRING_UNREADABLE`].
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryQueryRaw {
@@ -2156,14 +2157,6 @@ const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "blocke
 
 /// The engines [`run`] records.
 const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
-
-/// What a query string the route cannot read is told.
-///
-/// The twin of this sentence lives in `routes/uploads.rs`
-/// (`QUERY_UNREADABLE`). The two cannot be one constant yet: the place
-/// both could share is `routes/mod.rs`, and that file is held by another
-/// open pull request.
-const HISTORY_QUERY_UNREADABLE: &str = "The query string could not be read.";
 
 /// Parse the history query string into a [`HistoryFilter`], refusing a
 /// bad value with a fixed 400 before the store sees it.
@@ -2243,7 +2236,7 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 /// no sensible answer for "everyone's". 400 for a bad filter value, with a
 /// fixed message naming the field, and for a query string the route cannot
 /// read (a parameter sent twice), with the fixed sentence of
-/// [`HISTORY_QUERY_UNREADABLE`]. 503 if no pool is configured; 500 on a
+/// [`QUERY_STRING_UNREADABLE`]. 503 if no pool is configured; 500 on a
 /// database failure.
 pub async fn list_history(
     State(state): State<AppState>,
@@ -2257,7 +2250,7 @@ pub async fn list_history(
     // carries a library's rendering of the caller's request.
     let Query(raw) = query.map_err(|err| {
         tracing::warn!(%err, "a query history query string could not be read");
-        ApiError::BadRequest(HISTORY_QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let filter = parse_history_query(&raw)?;
     Ok(ApiJson(
@@ -2481,15 +2474,6 @@ const DOWNLOAD_BYTE_CAP: u64 = 5 * 1024 * 1024 * 1024;
 const DOWNLOAD_TOO_LARGE: &str =
     "This result is larger than 5 GB. Add a filter or download it as CSV.";
 
-/// What a query string the download route cannot read is told.
-///
-/// The twin of this sentence lives in `routes/uploads.rs`
-/// (`QUERY_UNREADABLE`), and this file's history route has its own copy of
-/// it (`HISTORY_QUERY_UNREADABLE`). The three cannot be one constant yet:
-/// the place they could share is `routes/mod.rs`, and that file is held by
-/// another open pull request.
-const DOWNLOAD_QUERY_UNREADABLE: &str = "The query string could not be read.";
-
 /// The name the download's query carries on the engine: the caller's own id,
 /// the run, and what the query is. Stop's pattern
 /// (`<caller uuid>:<runId>:%`) finds it, so Stop reaches the download's
@@ -2614,21 +2598,7 @@ async fn download_engine_file<S: crate::export::ByteSource>(
     match crate::export::write_bytes_file(source, Some(byte_cap)).await {
         Ok(Some(file)) => Ok(file),
         Ok(None) => Err(ApiError::Unprocessable(DOWNLOAD_TOO_LARGE.to_owned())),
-        Err(err) => Err(download_failure(&err)),
-    }
-}
-
-/// A failure of the file itself, reported under a reference with a fixed
-/// sentence (`SEC-11`).
-///
-/// The dashboard's own export has the same mapping in
-/// `routes::dashboard::export_failure`, which is private to that module.
-fn download_failure(err: &crate::export::ExportError) -> ApiError {
-    match err {
-        crate::export::ExportError::Source(ch) => {
-            upstream_error::ch_error(&upstream_error::DATABASE, ch)
-        }
-        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+        Err(err) => Err(super::export_failure(&upstream_error::DATABASE, &err)),
     }
 }
 
@@ -2741,7 +2711,7 @@ fn download_response(
 ///   match the `query_history.id` shape (`q-<digits>` or
 ///   `q-<digits>-<32 lowercase hex>`), or when the query string cannot be
 ///   read at all — a repeated parameter, or no `format` — with the fixed
-///   sentence of [`DOWNLOAD_QUERY_UNREADABLE`].
+///   sentence of [`QUERY_STRING_UNREADABLE`].
 /// - 403 [`ApiError::PermissionDenied`] when every role of the caller is
 ///   switched off from downloading.
 /// - 404 [`ApiError::NotFound`] when no history row matches `id`, or when
@@ -2769,7 +2739,7 @@ pub async fn download(
     // never carries a library's rendering of the caller's request.
     let Query(query) = query.map_err(|err| {
         tracing::warn!(%err, "a download query string could not be read");
-        ApiError::BadRequest(DOWNLOAD_QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let Some(format) = DownloadFormat::parse(&query.format) else {
         return Err(
@@ -2877,7 +2847,7 @@ pub async fn download(
         .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
     let written = write_download_rows(&mut rows, row_format, &locale, DOWNLOAD_BYTE_CAP)
         .await
-        .map_err(|err| download_failure(&err))?;
+        .map_err(|err| super::export_failure(&upstream_error::DATABASE, &err))?;
     // Which limit cut the file: the rows the format allows, or the bytes the
     // cap allows. A file that was not cut names no limit.
     let cut_by = written.cut.then(|| cut_by(format, written.rows));
@@ -4494,9 +4464,12 @@ mod tests {
         /// caller gets a fixed sentence and a reference id.
         #[test]
         fn an_engine_failure_answers_a_fixed_sentence_with_a_reference() {
-            let err = download_failure(&crate::export::ExportError::Source(ChError::Server(
-                "Code: 47. Unknown identifier: nope".to_owned(),
-            )));
+            let err = crate::routes::export_failure(
+                &upstream_error::DATABASE,
+                &crate::export::ExportError::Source(ChError::Server(
+                    "Code: 47. Unknown identifier: nope".to_owned(),
+                )),
+            );
             assert_eq!(err.status(), 422);
             let text = err.to_string();
             assert!(
@@ -4508,7 +4481,10 @@ mod tests {
 
         #[test]
         fn an_unreachable_engine_answers_503() {
-            let err = download_failure(&crate::export::ExportError::Source(ChError::Cancelled));
+            let err = crate::routes::export_failure(
+                &upstream_error::DATABASE,
+                &crate::export::ExportError::Source(ChError::Cancelled),
+            );
             assert_eq!(err.status(), 503);
         }
 

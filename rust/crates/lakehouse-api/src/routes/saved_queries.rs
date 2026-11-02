@@ -65,6 +65,7 @@ use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::routes::quality::pool;
 use crate::routes::query::{saved_query_scope, saved_query_viewer};
 use crate::sql_guard::is_read_only;
@@ -116,9 +117,6 @@ pub(crate) const FOLDER_CYCLE: &str = "A folder cannot be moved into itself.";
 /// The sentence a caller that acts for no organisation is refused with
 /// when it asks for a folder.
 pub(crate) const FOLDER_NEEDS_TENANT: &str = "A folder belongs to an organisation.";
-
-/// The sentence a query string the route cannot read is told.
-pub(crate) const QUERY_STRING_UNREADABLE: &str = "The query string could not be read.";
 
 /// The sentence a folder reference that is neither an id nor the root is
 /// refused with.

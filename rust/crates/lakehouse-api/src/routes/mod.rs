@@ -94,11 +94,34 @@ use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
+use lakehouse_core::ApiError;
 use serde::Serialize;
 
 use crate::json::ApiJson;
 use crate::policy::auth_gate;
 use crate::state::AppState;
+use crate::upstream_error;
+
+/// The sentence a query string the route cannot read is told.
+///
+/// One sentence for every route that refuses a query string its extractor
+/// could not read — the saved-query list, the query history, the result
+/// download and the uploads. The route's own words, never the extractor's:
+/// a response never carries a library's rendering of the caller's request.
+pub(crate) const QUERY_STRING_UNREADABLE: &str = "The query string could not be read.";
+
+/// A failure of an exported file, reported under a reference with a fixed
+/// sentence (`SEC-11`). The `ctx` names the operation in the log and the
+/// words the caller reads, so each surface keeps its own.
+pub(crate) fn export_failure(
+    ctx: &upstream_error::Context,
+    err: &crate::export::ExportError,
+) -> ApiError {
+    match err {
+        crate::export::ExportError::Source(ch) => upstream_error::ch_error(ctx, ch),
+        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+    }
+}
 
 /// The `/api/auth/*` sub-router (Task 3.2), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
@@ -178,6 +201,7 @@ const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
 /// | `/api/alerts/run`               | 60               |
 /// | `/api/query/run`                | 60 (BI-5: the longest configured limit + 15, see [`deadline_for`]) |
 /// | board routes (`/api/dashboard`, `/api/embed/*`, `/api/public/dashboard/*`, `/api/render/data`) | 60 (BI-5: an outer cap of 35 minutes, see [`deadline_for`]) |
+/// | `/api/query/run/{id}/download`   | no TS handler (QS-2: an outer cap of 35 minutes, see [`crate::query_limits::BOARD_DEADLINE_CAP`]) |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
 ///
 /// `/api/uploads` has no TypeScript handler to mirror and takes
@@ -194,6 +218,11 @@ fn route_timeout(path: &str) -> Duration {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/uploads" | "/api/maps" => UPLOAD_REQUEST_TIMEOUT,
         "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
+        // QS-2: a download of a whole result writes a file that can be
+        // gigabytes, so it gets the same outer bound as a board.
+        other if other.starts_with("/api/query/run/") && other.ends_with("/download") => {
+            crate::query_limits::BOARD_DEADLINE_CAP
+        }
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
         // RPT-1: "Send now" makes the PDF and the chart files in the request,
         // so it gets the longest export deadline.
@@ -1641,6 +1670,67 @@ mod tests {
             route_timeout("/api/dashboard/export"),
             DEFAULT_REQUEST_TIMEOUT
         );
+    }
+
+    /// `QS-2`: a download of a whole result writes a file that can be
+    /// gigabytes, so it gets the same outer bound as a board. The run route
+    /// itself keeps the default, and a path that has nothing to do with a
+    /// download keeps it too.
+    #[test]
+    fn a_result_download_gets_the_board_outer_bound() {
+        assert_eq!(
+            route_timeout("/api/query/run/q-1750000000/download"),
+            crate::query_limits::BOARD_DEADLINE_CAP
+        );
+        assert_eq!(route_timeout("/api/query/run"), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(route_timeout("/api/catalog"), DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /// The sentence a query string the route cannot read is told is written
+    /// down once in the crate (`QS-2`): one constant, so the routes that
+    /// answer with it cannot drift apart. The scan counts the quoted
+    /// sentence over the crate's own sources, so a second copy of it fails
+    /// this test.
+    #[test]
+    fn the_unreadable_query_string_is_written_down_once() -> std::io::Result<()> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files)?;
+        // The quoted sentence, so a prose mention of it in a doc comment is
+        // not counted: only a copy of the words themselves is.
+        let quoted = format!("{QUERY_STRING_UNREADABLE:?}");
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path)?;
+            let count = text.matches(&quoted).count();
+            if count > 0 {
+                let name = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path.as_path())
+                    .display()
+                    .to_string();
+                found.push((name, count));
+            }
+        }
+        assert_eq!(
+            found,
+            vec![("routes/mod.rs".to_owned(), 1)],
+            "the sentence must be written down once, in routes/mod.rs"
+        );
+        Ok(())
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                rust_files(&path, out)?;
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        Ok(())
     }
 
     /// `BI-5` plan D4: the query route follows the longest configured limit
