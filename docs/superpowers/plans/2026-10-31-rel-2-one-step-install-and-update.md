@@ -4273,3 +4273,121 @@ the backup tool failed: …/install/tools/restore-from-backup.sh exited with exi
 - The fix is cited at its site as round 8 BLOCKER 3.
 
 Accept: `bash -n` on both scripts, `shellcheck -S warning` on both, `python3 -m pytest ops/release -q`, and then the PR's `Proof · the update moves the stack, and rolls back` green.
+
+### Handoff S4b round 8 (developer, 2026-11-02)
+
+**Commits** (branch `feat/rel-2-s4b-lakehousectl-update`, on top of `9ebb4f67`), TWO commits:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `fix(release): the backup and the restore say what failed (BLOCKER 2)` | BLOCKER 2 | both scripts get `set -E` and the `ERR` trap right after `set -euo pipefail`, and the test file gains three cases for it |
+| `fix(release): a stack that does not start is not a failed restore (BLOCKER 3)` | BLOCKER 3 | the restore's last step — the stack bring-up — is reported instead of killing the restore, and the test file gains two cases for it |
+
+**BLOCKER 2 — done.** `scripts/restore-from-backup.sh` and `ops/backups/backup-local.sh` carry, right
+after `set -euo pipefail`:
+
+```bash
+set -E
+trap 'echo "Error: ${BASH_SOURCE[0]##*/} line ${LINENO}: \`${BASH_COMMAND}\` exited with $?" >&2' ERR
+```
+
+The restore's own `EXIT` trap (`trap cleanup EXIT`) stays where it was. The comment above the trap
+cites `REL-2 S4b review round 8 BLOCKER 2`. `ops/release/test_backup_scripts.py` gains three cases:
+a script with the same trap that runs `false` prints `the-script.sh line 5: \`false\` exited with 1`
+on its error stream; both scripts carry the trap (and the `set -E` beside it, with the comment that
+cites the finding); and the restore keeps its `EXIT` trap.
+
+**BLOCKER 3 — the failure is found, and it is NOT where the review suspected.**
+
+The proof's own log says what failed. Run `41424695520`, job `125240342643`, the step "The update to
+bundle C fails and rolls back":
+
+```
+lakehousectl: the update to 0.1.0-update-proof.2 failed, and the ROLLBACK failed too: the stack did
+not start: the stack did not start: docker exited with exit status: 1
+ Container rantai-lakehouse-lakekeeper-authz-init-1  Waiting
+ …
+ Container rantai-lakehouse-lakehouse-api-1  Error
+dependency failed to start: container rantai-lakehouse-lakehouse-api-1 is unhealthy. The rollback said:
+the backup tool failed: …/install/tools/restore-from-backup.sh exited with exit status: 1
+ Container rantai-lakehouse-clickhouse-1  Waiting
+ …
+ Container rantai-lakehouse-lakehouse-api-1  Error
+dependency failed to start: container rantai-lakehouse-lakehouse-api-1 is unhealthy
+```
+
+The update's message is `{the update's error}. The rollback said: {the rollback's error}`
+(`rust/crates/lakehousectl/src/update.rs:639`). So the FIRST compose block is the update's own
+`docker compose up -d`, and the SECOND block is the RESTORE SCRIPT'S ERROR STREAM — it is the
+restore's step 5/5, `docker compose up -d`, and it is the command that stopped the script.
+
+**The premise of the review is wrong, and it matters.** The restore did NOT print nothing: the
+nineteen lines of compose output above ARE the restore's error stream — they are its LAST lines (the
+tool shows the last `STDERR_LINES = 20` of them, `rust/crates/lakehousectl/src/sys.rs:16`, `:118`).
+What the restore could not say was WHICH command failed — and that is what the `ERR` trap of BLOCKER 2
+now says. The restore's error stream ends with compose's own words and no line of the script's own;
+the exit status was exactly `1`, which is `docker compose up -d`'s status and not one of the script's
+own `exit 1`s (each of those prints a line first).
+
+**The restore reached its LAST step.** Those compose lines are what step 5/5 prints, and step 5/5 is
+the last thing the local restore does — so the manifest's check, the Postgres step, the ClickHouse
+step, the connector secrets and the configuration all ran, and the restore stopped at the very end.
+Everything the restore said BEFORE that — the dump restore's `ERROR: role "lakehouse" already
+exists`, and the rest — is older than the last twenty lines, so the log does not show it: the log
+shows the END of the stream, not its whole length.
+
+**Why the restore's stack bring-up fails there.** The rollback restores onto the stack the FAILED
+update left behind, and the release that failed runs an API image that sleeps
+(`sleep 86400`, bundle C of the proof). That API never becomes healthy, and the console depends on it
+with `condition: service_healthy` (`docker-compose.yml:818-820`). So `docker compose up -d` waits for
+an API that will never answer, and fails — with the data already restored.
+
+**The suspects of the review, checked and ruled out.** The round 6 code was measured against a real
+`pg_dumpall` of Postgres 16.15 (the image the deployment pins) and a real `psql`:
+
+| Suspect | What it does | Verdict |
+| --- | --- | --- |
+| `pg_dump_databases` under the runner's `awk` | the dump's `CREATE DATABASE` lines name `dagster`, `lakehouse`, `lakekeeper`, `openfga` — NOT `postgres`, NOT `template1` | the same four names under `gawk 5.2.1`, `mawk 1.3.4` and `busybox awk`: the awk is not the cause |
+| the `while … done < <(…)` read | `[[ -z "${db}" ]] && continue` is not the last command of an `&&` list | measured: bash 5.2 exits 0 on it under `set -euo pipefail`; it is not fatal |
+| the `present="$(…)"` check | a `psql` that fails is loud (it prints), and an empty result prints `Error: the database '…' was not restored.` | neither is silent |
+| the duration arithmetic | `x=$(( 5 - 5 ))` | measured: bash returns 0 for an assignment whose arithmetic is 0 — it does not stop the script |
+
+And the whole Postgres step of the local restore — the drop loop, the re-creation of `postgres`, the
+dump restore with `ON_ERROR_STOP=0`, the check of every database — was run against a real Postgres
+16.15 container: it completes, with exit status 0. The round 6 code is not what stopped the restore.
+
+**The fix.** The restore's job is the DATA, and the data is restored. The stack bring-up is the last
+step of the local restore, and it is now reported instead of killing the restore:
+
+- the compose output is captured, and on a failure it is printed (the tool prints the script's
+  STANDARD output, and the reason the stack did not start is the one thing the operator needs);
+- the operator is told: `Warning: the stack did not start. The data is restored; …`;
+- the summary says `Stack bring-up: the stack did not start`;
+- the restore exits 0, so the rollback does what D18 says it does: the `*.previous` files go back, and
+  the stack starts with the release it goes back to.
+
+**What the reviewer may still want (NOT done here).** D18's order is "stop the stack; restore the
+backup; put the `*.previous` files back, and `up -d --pull never`". The restore's stack bring-up is
+therefore redundant in a rollback — and it waits about ninety seconds for an API that cannot answer.
+The tool should pass `--skip-stack-up` to the restore in the rollback: the flag is already in the
+script (`scripts/restore-from-backup.sh:119`) and the tool never passes it
+(`rust/crates/lakehousectl/src/backup.rs:115`). That change is in Rust, and this session was told to
+use no cargo, so it was NOT made here — it is the reviewer's to make. The script's change above
+makes the rollback work either way.
+
+**Commands run, with their counts.**
+
+| Command | Result |
+| --- | --- |
+| `bash -n scripts/restore-from-backup.sh` | clean |
+| `bash -n ops/backups/backup-local.sh` | clean |
+| `uvx --from shellcheck-py shellcheck -S warning scripts/restore-from-backup.sh` | clean (no output) |
+| `uvx --from shellcheck-py shellcheck -S warning ops/backups/backup-local.sh` | clean (no output) |
+| `uvx --with pyyaml --with cryptography pytest ops/release -q` | **244 passed** |
+
+The two commits touch two shell scripts and one Python test file. No Rust, no TypeScript and no
+compose file changed, so no cargo, bun or compose check was in scope; the Rust crate is untouched and
+its tests are unaffected.
+
+**NOT verified here.** The PR's own `Proof · the update moves the stack, and rolls back` did not run
+in this session — it runs in the PR's CI, and that is what decides whether the rollback is green now.
