@@ -161,6 +161,26 @@ REGISTRY_API = "http://localhost:5000/v2/"
 # The step that cuts the proof runner off from the registries.
 AIR_GAP_STEP = "Cut the runner off from the registries"
 
+# The Dagster services a release install runs, and the steps that prove
+# it (REL-2 S4b review round 3 BLOCKER 3, decision D22).
+#
+# The Dagster services carry the `dagster` profile, and a stack that
+# does not run it runs no pipelines at all: no upload loads, no
+# connector runs, no maintenance jobs. The proof asserts that the
+# daemon and the code location run — after the install, after the
+# update, and after the rollback.
+DAGSTER_SERVICES = ("dagster-daemon", "dagster-code-location")
+DAGSTER_STEP = "The Dagster services run"
+DAGSTER_STEPS = (
+    "The Dagster services run after the install",
+    "The Dagster services run after the update",
+    "The Dagster services run after the rollback",
+)
+
+# The install's own `.env`: the file that names the profiles the
+# install runs, and the file the proof's compose call reads.
+INSTALL_ENV = "--env-file install/.env"
+
 # The registries the proof cuts the runner off from: Docker Hub's
 # registry, its authentication and its index, GHCR, Quay, and the CDN
 # the Docker Hub layers come from.
@@ -357,6 +377,36 @@ jobs:
       - name: Cut the runner off from the registries
         run: |
           echo "0.0.0.0 ghcr.io" | sudo tee -a /etc/hosts
+"""
+
+# A workflow whose proof does not assert that the Dagster services run:
+# an install that runs no profile runs no pipeline at all (REL-2 S4b
+# review round 3 BLOCKER 3, decision D22).
+SYNTHETIC_NO_DAGSTER_ASSERTION = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The Dagster services run
+        run: |
+          docker compose -p rantai-lakehouse ps
+"""
+
+# A workflow whose proof asserts the Dagster services, but reads the
+# stack without the install's own `.env`: the file that names the
+# profiles the install runs.
+SYNTHETIC_DAGSTER_WITHOUT_THE_INSTALL_ENV = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The Dagster services run
+        run: |
+          docker compose -p rantai-lakehouse ps --format json
 """
 
 # A workflow with a SERVICE container in a job that restarts Docker: the
@@ -806,6 +856,41 @@ def air_gap_problems(document: dict[str, Any]) -> list[str]:
     return problems
 
 
+def dagster_assertion_problems(
+    document: dict[str, Any], job_name: str, step_name: str
+) -> list[str]:
+    """Every way the job's Dagster assertion can be missing.
+
+    The assertion is what proves the release install runs the Dagster
+    services: they carry the `dagster` profile, and a stack without it
+    runs no pipelines at all (REL-2 S4b review round 3 BLOCKER 3,
+    decision D22).
+
+    The stack is read with Compose's own JSON, and with the install's
+    own `.env`: that file names the profiles the install runs, and
+    without it the Dagster services are not part of the deployment the
+    command reads.
+    """
+    try:
+        step = step_named(document, job_name, step_name)
+    except AssertionError:
+        return [f"{job_name}: the job has no step named {step_name!r}"]
+    run = str(step.get("run") or "")
+    problems: list[str] = []
+    for service in DAGSTER_SERVICES:
+        if service not in run:
+            problems.append(f"{job_name}: {step_name}: it does not assert {service}")
+    if "ps --format json" not in run:
+        problems.append(
+            f"{job_name}: {step_name}: it does not read the stack's own JSON"
+        )
+    if INSTALL_ENV not in run:
+        problems.append(
+            f"{job_name}: {step_name}: it does not read the install's own .env"
+        )
+    return problems
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     """The release workflow's own properties."""
 
@@ -1190,6 +1275,55 @@ class ReleaseWorkflowTest(unittest.TestCase):
         """The proof installs what the dry run built."""
         job = self.document["jobs"]["install-proof"]
         self.assertEqual(job["needs"], "dry-run")
+
+    def test_the_proof_asserts_that_the_dagster_services_run(self) -> None:
+        """REL-2 S4b review round 3 BLOCKER 3, decision D22.
+
+        The Dagster services carry the `dagster` profile, and a stack
+        that does not run it runs no pipelines at all. The proof asserts
+        that the daemon and the code location run after the install.
+        """
+        self.assertEqual(
+            dagster_assertion_problems(self.document, "install-proof", DAGSTER_STEP),
+            [],
+        )
+
+    def test_the_proof_reads_the_stack_with_the_installs_own_env(self) -> None:
+        """The install's `.env` names the profiles the install runs.
+
+        The compose call reads the stack with that file, so the Dagster
+        services are part of the deployment the command reads.
+        """
+        step = step_named(self.document, "install-proof", DAGSTER_STEP)
+        self.assertIn(INSTALL_ENV, str(step.get("run")))
+
+    def test_a_proof_without_the_dagster_assertion_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_NO_DAGSTER_ASSERTION)
+        self.assertNotEqual(
+            dagster_assertion_problems(document, "install-proof", DAGSTER_STEP),
+            [],
+        )
+
+    def test_a_proof_that_reads_the_stack_without_the_installs_env_is_reported(
+        self,
+    ) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_DAGSTER_WITHOUT_THE_INSTALL_ENV)
+        problems = dagster_assertion_problems(
+            document, "install-proof", DAGSTER_STEP
+        )
+        self.assertTrue(
+            any("does not assert dagster-daemon" in problem for problem in problems),
+            problems,
+        )
+        self.assertTrue(
+            any(
+                "does not read the install's own .env" in problem
+                for problem in problems
+            ),
+            problems,
+        )
 
     def test_the_image_ids_are_the_config_digests_on_every_docker_store(self) -> None:
         """The two Docker stores identify an image differently.
@@ -1593,6 +1727,44 @@ class UpdateProofTest(unittest.TestCase):
         exists (REL-2 S5), and the reason is written in the job."""
         text = WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("joins this job once 0.2.0 exists", text)
+
+    def test_the_update_proof_asserts_that_the_dagster_services_run(self) -> None:
+        """REL-2 S4b review round 3 BLOCKER 3, decision D22.
+
+        The three points of the proof: after the install, after the
+        update, and after the rollback. A stack that stops running the
+        Dagster services runs no pipelines at all, and the rollback is
+        the point where that is most likely to happen.
+        """
+        for name in DAGSTER_STEPS:
+            self.assertEqual(
+                dagster_assertion_problems(self.document, "update-proof", name),
+                [],
+                name,
+            )
+
+    def test_the_dagster_assertions_come_after_the_three_points(self) -> None:
+        """The assertion is worth nothing before the thing it asserts."""
+        for point, assertion in (
+            ("Install bundle A", DAGSTER_STEPS[0]),
+            ("The update to bundle B succeeds", DAGSTER_STEPS[1]),
+            ("The update to bundle C fails and rolls back", DAGSTER_STEPS[2]),
+        ):
+            self.assertLess(
+                step_index(self.document, "update-proof", point),
+                step_index(self.document, "update-proof", assertion),
+                assertion,
+            )
+
+    def test_the_update_proof_reads_the_stack_with_the_installs_own_env(self) -> None:
+        """The install's `.env` names the profiles the install runs.
+
+        The compose call reads the stack with that file, so the Dagster
+        services are part of the deployment the command reads.
+        """
+        for name in DAGSTER_STEPS:
+            step = step_named(self.document, "update-proof", name)
+            self.assertIn(INSTALL_ENV, str(step.get("run")), name)
 
     # ── The rules the job runs on ────────────────────────────────────
 

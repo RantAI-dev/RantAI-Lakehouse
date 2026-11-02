@@ -1419,6 +1419,33 @@ jobs:
           echo "the console:"
           curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/
 
+      # A release install runs the `dagster` profile (REL-2 S4b review
+      # round 3 BLOCKER 3, decision D22): the Dagster services carry
+      # that profile, and a stack without it runs no pipelines at all —
+      # no upload loads, no connector runs, no maintenance jobs.
+      #
+      # The compose call is made with the install's own `.env`: that
+      # file names the profiles the install runs, and without it the
+      # Dagster services are not part of the deployment the command
+      # reads.
+      - name: The Dagster services run
+        run: |
+          set -euo pipefail
+          compose=(docker compose -p rantai-lakehouse
+            -f install/docker-compose.yml --env-file install/.env)
+          services="$("${compose[@]}" ps --format json)"
+          echo "$services"
+          for service in dagster-daemon dagster-code-location; do
+            state="$(printf '%s\n' "$services" | jq -s -r --arg service "$service" \
+              '[.[] | (if type == "array" then .[] else . end)
+                | select(.Service == $service) | .State] | (first // "absent")')"
+            if [ "$state" != "running" ]; then
+              echo "::error::$service is not running (state: $state)"
+              exit 1
+            fi
+            echo "$service is running."
+          done
+
       - name: The stack's state
         if: always()
         run: |
@@ -1844,6 +1871,32 @@ jobs:
           echo "the console:"
           curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/
 
+      # A release install runs the `dagster` profile (REL-2 S4b review
+      # round 3 BLOCKER 3, decision D22): the Dagster services carry
+      # that profile, and a stack without it runs no pipelines at all.
+      #
+      # The compose call is made with the install's own `.env`: that
+      # file names the profiles the install runs, and without it the
+      # Dagster services are not part of the deployment the command
+      # reads.
+      - name: The Dagster services run after the install
+        run: |
+          set -euo pipefail
+          compose=(docker compose -p rantai-lakehouse
+            -f install/docker-compose.yml --env-file install/.env)
+          services="$("${compose[@]}" ps --format json)"
+          echo "$services"
+          for service in dagster-daemon dagster-code-location; do
+            state="$(printf '%s\n' "$services" | jq -s -r --arg service "$service" \
+              '[.[] | (if type == "array" then .[] else . end)
+                | select(.Service == $service) | .State] | (first // "absent")')"
+            if [ "$state" != "running" ]; then
+              echo "::error::$service is not running (state: $state)"
+              exit 1
+            fi
+            echo "$service is running."
+          done
+
       # Step 2 of D21: the three markers.
       #
       #   - a row in a marker table in the application database;
@@ -1927,6 +1980,27 @@ jobs:
             echo "::error::the stack runs $version, and it must run ${{ steps.versions.outputs.b }}"
             exit 1
           fi
+
+      # The update starts the stack again, and the stack must still run
+      # the Dagster services: they are what run the pipelines (REL-2 S4b
+      # review round 3 BLOCKER 3, decision D22).
+      - name: The Dagster services run after the update
+        run: |
+          set -euo pipefail
+          compose=(docker compose -p rantai-lakehouse
+            -f install/docker-compose.yml --env-file install/.env)
+          services="$("${compose[@]}" ps --format json)"
+          echo "$services"
+          for service in dagster-daemon dagster-code-location; do
+            state="$(printf '%s\n' "$services" | jq -s -r --arg service "$service" \
+              '[.[] | (if type == "array" then .[] else . end)
+                | select(.Service == $service) | .State] | (first // "absent")')"
+            if [ "$state" != "running" ]; then
+              echo "::error::$service is not running (state: $state)"
+              exit 1
+            fi
+            echo "$service is running."
+          done
 
       # The three markers, read back. The proof runs this after the
       # update to bundle B and after the rollback of bundle C.
@@ -2014,6 +2088,29 @@ jobs:
             exit 1
           fi
           echo "every marker is still there."
+
+      # The rollback starts the stack again, and the stack must still
+      # run the Dagster services: they are what run the pipelines, and a
+      # rollback that leaves them stopped leaves an install that runs no
+      # pipeline at all (REL-2 S4b review round 3 BLOCKER 3, decision
+      # D22).
+      - name: The Dagster services run after the rollback
+        run: |
+          set -euo pipefail
+          compose=(docker compose -p rantai-lakehouse
+            -f install/docker-compose.yml --env-file install/.env)
+          services="$("${compose[@]}" ps --format json)"
+          echo "$services"
+          for service in dagster-daemon dagster-code-location; do
+            state="$(printf '%s\n' "$services" | jq -s -r --arg service "$service" \
+              '[.[] | (if type == "array" then .[] else . end)
+                | select(.Service == $service) | .State] | (first // "absent")')"
+            if [ "$state" != "running" ]; then
+              echo "::error::$service is not running (state: $state)"
+              exit 1
+            fi
+            echo "$service is running."
+          done
 
       - name: The stack's state
         if: always()
