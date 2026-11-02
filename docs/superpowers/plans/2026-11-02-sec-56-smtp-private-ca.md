@@ -221,6 +221,180 @@ with the reason.
 
 ## 6. Handoff (developer appends below)
 
+### Developer report (developer, 2026-11-02)
+
+One mismatch between the plan and the code, in D7's MECHANISM (the decision
+itself is implemented as written). The plan says the new reason is "chosen
+when `lettre`'s error says `is_tls()`". In `lettre` 0.11.23 that is true
+only for a TLS *configuration* that could not be built:
+
+- `lettre-0.11.23/src/transport/smtp/error.rs:76` — `is_tls()` is
+  `matches!(self.inner.kind, Kind::Tls)`;
+- `Kind::Tls` is produced only by `error::tls(...)`
+  (`lettre-0.11.23/src/transport/smtp/error.rs:202`), and the only callers
+  are in `transport/smtp/client/tls.rs` — every one of them a CONFIG build
+  step (`build_rustls`, `from_der`, `from_pem`, ...);
+- a handshake that FAILS — an untrusted certificate, or a name that is not
+  on the certificate — is reported by `lettre` as a CONNECTION error:
+  `lettre-0.11.23/src/transport/smtp/client/async_net.rs:362`
+  (`map_err(error::connection)`), the same for the STARTTLS upgrade at
+  `async_net.rs:296`. `tokio-rustls` puts the `rustls` error inside an
+  `io::Error` (`tokio-rustls-0.26.6/src/common/mod.rs:115`).
+
+So `is_tls()` alone would classify every case the plan's T2 cases 1, 3 and
+4 name as `MailServerUnreachable`, and D7's own words ("It covers an
+untrusted certificate and a hostname mismatch") would not hold.
+
+What the code does instead: `lakehouse_notify::smtp_tls::is_failure` checks
+`is_tls()` AND walks the error's source chain for a `rustls::Error` (the
+`io::Error`'s `get_ref()`), so BOTH shapes are "a secure connection to the
+mail server could not be made". The decision D7 states is what the code
+does; only the detection differs, and the reason is at the site
+(`rust/crates/lakehouse-notify/src/smtp_tls.rs`).
+
+Two smaller things the plan does not name, both forced by the code:
+
+1. `SmtpCaBundle` holds each certificate's DER rather than the transport's
+   own `lettre::transport::smtp::client::Certificate`. That type has no
+   `PartialEq` (and `Config` derives `PartialEq`), and its `Debug` is
+   useless for D9; the DER bytes are what the transport is given either
+   way. D9 is implemented as stated (the bundle's `Debug` prints its count
+   and nothing else).
+2. `lakehouse-notify` gained two direct dependencies: `rustls-pki-types`
+   (the PEM parser `lettre` itself uses, so a bundle of several
+   certificates is counted and validated one at a time) and `rustls` (the
+   error type the TLS failure is recognised by). Both are already in
+   `Cargo.lock`; the lock gained no new crate VERSION, only dependency
+   edges.
+
+Also noted for the record: the plan's D9 says "lettre's `Certificate` has
+no `Debug`" — it has one
+(`lettre-0.11.23/src/transport/smtp/client/tls.rs:701`), but it prints
+`Certificate { }`, which is why the bundle's own `Debug` prints the count
+instead.
+
+Two things in the tests and the start-up path that the plan leaves open,
+written down so a reviewer does not read them as scope changes:
+
+3. T2 says "a `Mailpit` container", but its case 5 needs implicit TLS while
+   the other cases need `STARTTLS`, and `Mailpit`'s
+   `MP_SMTP_REQUIRE_STARTTLS` and `MP_SMTP_REQUIRE_TLS` cannot share a
+   port. Each case therefore starts its own `axllent/mailpit:v1.33.0`
+   container, and `testcontainers` removes it when the test's `Relay` is
+   dropped (checked after the run: no relay container left).
+4. A `SMTP_CA_FILE` whose PEM block does not decode is reported as
+   `EmptySmtpCaFile` ("found none in ..."), not as a separate "invalid"
+   variant. That wording is inherited, not new: `CONNECTOR_TLS_CA_FILE` has
+   always reported a broken block the same way, and D5 asks for the same
+   checks and the same messages. `SmtpCaBundle::from_pem` itself does tell
+   the two apart (`CaBundleError::Empty` / `Invalid`) for a caller that
+   wants it; the start-up path keeps the connector's wording on purpose.
+
+### Handoff (developer, 2026-11-02)
+
+The plan has no task after T4, so this handoff closes T1-T4.
+
+**Commits** (branch `fix/sec-56-smtp-private-ca`, from `main` at `9c066426`,
+merged with `main` at `bd76a56f`; nothing force-pushed, no PR opened):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `a9379ee3` | T1 | `SmtpCaBundle`, `DeliveryFailure::MailServerTlsFailed`, the transport's TLS parameters |
+| `cf8d8faf` | T2 | `tests/smtp_private_ca.rs`: a real `Mailpit` behind a private CA |
+| `57802e27` | T3 | `SMTP_CA_FILE` in `Config`, the report runner's sentence, the `ring` comment |
+| `59b64463` | T4 | Compose, `.env.example`, `docs/OPERATIONS.md`, `ops/smtp-ca/` |
+
+**Run on the final commit (`59b64463`), all cargo through
+`/home/shiro/rantai/bin/cargo-locked`:**
+
+```bash
+cd rust
+cargo fmt --check
+# exit 0. `-j 2` is not accepted by `cargo fmt` (cargo-fmt has no --jobs):
+# it ran without it; the clippy and test runs below used `-j 2`.
+cargo clippy -j 2 -p lakehouse-notify -p lakehouse-api --all-targets -- -D warnings
+# exit 0, "Finished `dev` profile ... target(s) in 1m 31s"
+cargo test -j 2 -p lakehouse-notify --locked
+# 32 passed (unit, 0.01 s) + 6 passed (`tests/smtp_private_ca.rs`, 7.58 s)
+#   + 0 doc-tests; exit 0
+cargo test -j 2 -p lakehouse-api --lib config::
+# 107 passed, 0 failed, 2843 filtered out; exit 0
+cargo test -j 2 -p lakehouse-api --lib report_runner
+# 16 passed, 0 failed, 2934 filtered out; exit 0
+docker compose --profile '*' config --quiet
+# exit 0
+```
+
+The six container tests were also run three times in a row in T2's
+session, on `cf8d8faf` (that file is unchanged since): 6 passed in 7.4 s,
+31.5 s and 26.7 s. Today's re-run is the 7.58 s above. `docker ps -a`
+afterwards shows no `mailpit` container left behind.
+
+**T4's three real `up`s (rule 8), run in T4's session from the clean project
+`sec56` on the tree committed as `59b64463`; not re-run today, because
+nothing in Compose, `.env.example`, `docs/OPERATIONS.md` or `ops/` has
+changed since, and today's only change is this plan file.**
+
+1. `SMTP_CA_FILE` unset — the API is healthy:
+   `lakehouse-api running Up 26 seconds (healthy)`, and `GET /health` answers
+   `{"status":"ok","database":"ok","version":"0.1.0"}`.
+2. `SMTP_CA_FILE=/run/certs/smtp/ca.pem`, a bundle in `ops/smtp-ca/` — the
+   API is healthy: `lakehouse-api running Up 15 seconds (healthy)`, the
+   container's env carries `SMTP_CA_FILE=/run/certs/smtp/ca.pem`, and the
+   file is there (`/run/certs/smtp/ca.pem` →
+   `subject=CN=RantAI SEC-56 local relay CA`).
+3. `SMTP_CA_FILE=/run/certs/smtp/missing.pem` — the API EXITS and its log
+   names the setting:
+   `lakehouse-api restarting Restarting (1) 3 seconds ago`, and
+   `Error: failed to resolve configuration from environment` /
+   `Caused by: SMTP_CA_FILE must name a readable file, cannot read
+   "/run/certs/smtp/missing.pem"`.
+
+Then `docker compose -p sec56 down -v` (project and volumes gone) and the
+test certificate was deleted.
+
+**Dependency check (`AGENTS.md` step 6; this PR touches dependencies).**
+`git diff bd76a56f..HEAD -- rust/Cargo.lock` is ONE hunk, 5 added lines, all
+of them dependency edges in `lakehouse-notify`'s own entry (`base64
+0.23.1`, `rcgen`, `rustls`, `rustls-pki-types`, `testcontainers`). No
+package block and no crate version was added. `cargo tree -p
+lakehouse-notify -e dev --locked` names base64 0.23.1, rcgen 0.14.10,
+testcontainers 0.27.3, tokio 1.54.1 and wiremock 0.6.5 — every one already
+in the lock at the base commit.
+
+**T2's relay tag and the variables it was read for (T2's accept).** The
+image is `axllent/mailpit`, pinned to the exact tag `v1.33.0`. From that
+tag's documentation, <https://mailpit.axllent.org/docs/configuration/smtp/>:
+
+- `MP_SMTP_TLS_CERT` — "the certificate" the SMTP server serves (the test
+  copies the minted server certificate in and points this at it);
+- `MP_SMTP_TLS_KEY` — the matching private key (minted in the test too);
+- `MP_SMTP_REQUIRE_STARTTLS=true` — "require STARTTLS": a plaintext session
+  is refused and the client must upgrade;
+- `MP_SMTP_REQUIRE_TLS=true` — "require SSL/TLS": the session is implicit TLS
+  from the first byte (and, as report item 3 says, a separate container
+  from the STARTTLS mode, since the two cannot share a port).
+
+**Not verified, with the reason.**
+
+- The full workspace block of `AGENTS.md` and plan §5 — `cargo clippy
+  --workspace --all-targets --all-features`, `cargo test --workspace`,
+  `cargo test -p lakehouse-alerts` — was not run locally: "Keep build time
+  down" scopes a commit to its crates, and plan §5 leaves the workspace run
+  to CI under the owner's rule of 2026-10-30. `cargo check -p
+  lakehouse-alerts -p lakehouse-api --tests` was run in T1's session (the
+  struct literals compile); today's `clippy -p lakehouse-api --all-targets`
+  compiled the API's tests again, but not `lakehouse-alerts`' tests.
+- `docker compose up` was not re-run today; only `config --quiet` (above).
+  The real `up`s are T4's, quoted above.
+- No TypeScript, Python, Dagster or ops-lint command was run: this PR
+  touches none of those languages (its only non-Rust files are Compose,
+  `.env.example`, markdown and `ops/smtp-ca/.gitkeep`), and T4's session ran
+  `ops/lint/check_compose_init_readiness.py` and
+  `ops/lint/check_image_digests.py` (both exit 0).
+- The owner's acceptance checklist (step 7) and the D4 confirmation the
+  planner flagged are the owner's and the planner's, not the developer's.
+
 ## 7. Review (planner appends below)
 
 
