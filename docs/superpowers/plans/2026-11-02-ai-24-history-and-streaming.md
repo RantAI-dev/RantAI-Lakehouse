@@ -262,6 +262,75 @@ lines. No Python, no compose change.
 
 ## 5. Handoff (developer appends below)
 
+### Handoff (developer, 2026-11-02)
+
+Branch `fix/ai-24-history-and-streaming`, based on the branch's head, merged
+with `origin/main` (`9be176a1`) before the first task. One commit per task, in
+plan order, each pushed:
+
+| Task | Commit | What landed |
+| --- | --- | --- |
+| T1 | `a5b7a65a` | `X-Accel-Buffering: no` and `Cache-Control: no-cache, no-transform` (D8), a header test in `ai_chat_stream.rs`, and `tests/ai_sessions.rs` |
+| T2 | `364a3cb4` | `fit_messages` (D4): oldest-first drop of `result`/`reasoning`, every step keeps `tool`, `ok`, `args` and `resultDropped`; the old trim only as the last resort |
+| T3 | `13da92aa` | `sessionTitle` (D2), plain load sentences (D3), `resultDropped` on the tool card (D4 console half), and `chatSessionService` (`contracts/chat-sessions.ts` → `clients/chat-sessions.ts` → `services/index.ts`) used by `use-copilot.ts` and the History page |
+| T4 | `87716472` | `smooth-text.ts` (D5: backlog-proportional pace, handover from draft to checked answer), `CopilotStreamContext`/`useCopilotStream` with a memoized `useCopilot` value (D6), and a scroll keyed on the shown length that follows instantly while text arrives (D7) |
+| T5 | `6e3c7f3b` | `docs/plans/AI-24-STREAM-RESULT.md`: the console hop measured, no batching |
+
+No migration this plan needed. No tool schema changed, so
+`tests/fixtures/tool_schemas.json` was not regenerated.
+
+#### Commands run, with their counts
+
+Rust, all through `~/rantai/bin/cargo-locked` with `-j 2`, crate-scoped (the
+"Keep build time down" rule):
+
+- `cargo fmt --check` — clean, before every commit.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean after
+  T1 and again after T2, and no Rust changed after that.
+- `cargo test -p lakehouse-api --test ai_chat_stream` — 4 passed, 0 failed.
+- `cargo test -p lakehouse-api --test ai_sessions` — 6 passed, 0 failed
+  (run after T1 and again after T2).
+- `cargo test -p lakehouse-api --lib "routes::ai::tests::"` — 54 passed,
+  0 failed.
+- `cargo test -p lakehouse-api --lib` (the whole crate's unit tests, before
+  handoff) — 2932 passed, 18 ignored, 0 failed.
+
+TypeScript:
+
+- `bun test src/features/copilot src/services` — 246 passed at T3, 253 at T4,
+  0 failed.
+- `bun run typecheck` — clean.
+- `bunx eslint src` — 0 errors, 10 warnings (all pre-existing).
+- `bun test src` (the whole console, before handoff) — 3164 passed, 1
+  skipped, 0 failed.
+
+T5's measurement (details and all six runs in `AI-24-STREAM-RESULT.md`): a
+stub origin in place of the API, the console built against it
+(`RUST_API_URL=… bun run build`) and served on `:3000`. Direct: 51 chunks,
+first 1–7 ms, largest gap 51–53 ms. Through the console: 51 chunks, first
+3–29 ms, largest gap 50–53 ms. The console path does not batch, so D9's
+stop-and-report did not trigger and Next.js compression was not touched. The
+stub and the console were stopped, and the two ClickHouse test containers
+this task started were removed.
+
+#### Not verified
+
+- **The full Rust workspace block** (`cargo clippy --workspace --all-targets
+  --all-features` and `cargo test --workspace`). This session's budget rule
+  was crate-scoped runs only; `lakehouse-api` (the only crate this branch
+  touches) is green, and no other crate's source changed.
+- **`bun run lint` at the repository root.** On this machine it lints an
+  untracked local `dagster/.venv` and reports 649 errors, every one in that
+  virtualenv; `bunx eslint src` on the console's own source is 0 errors and
+  10 pre-existing warnings. Not a branch change.
+- **The real API process and one real answer through a browser** (T5's
+  second half). Both need the full Postgres/ClickHouse/session stack and a
+  model call; not run in this session. The reveal's pace and its
+  end-of-stream handover are covered by `smooth-text.test.tsx` with
+  controlled frames. See `AI-24-STREAM-RESULT.md` "Not verified".
+- No Python line and no compose line were run: neither the orchestrator nor
+  `docker-compose.yml` changed.
+
 ## 6. Review (planner appends below)
 
 
