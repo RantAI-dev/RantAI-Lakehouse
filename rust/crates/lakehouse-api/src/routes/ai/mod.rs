@@ -1219,7 +1219,15 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     (
         [
             (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            // AI-24 D8: a reverse proxy in front of the API buffers a
+            // proxied response by default, which would hold the whole
+            // answer until the model finished. nginx honours this header,
+            // and `no-transform` asks any proxy not to re-encode the body.
+            (axum::http::header::CACHE_CONTROL, "no-cache, no-transform"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
         ],
         axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
     )
