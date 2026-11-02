@@ -9,8 +9,9 @@
 # `.dockerignore` at the root of the context it was given).
 #
 # What the frontend build MUST see, and therefore what this file must
-# not exclude: `package.json`, `bun.lock`, `bunfig.toml`, `src/`,
-# `public/`, `design-system/` (the `@rantai/design-system` path alias in
+# not exclude: `package.json`, `bun.lock`, `bunfig.toml`, `src/` (apart
+# from the landing page's two folders, below), `public/`,
+# `design-system/` (the `@rantai/design-system` path alias in
 # `tsconfig.json`), `design-kit/`, `GTM/`, `next.config.ts`,
 # `tsconfig.json`, `postcss.config.mjs`, `eslint.config.mjs`,
 # `components.json`, `happydom.ts`, `testing-cleanup.ts`, and
@@ -50,3 +51,13 @@ dagster
 docs
 ops
 scripts
+
+# The landing page (WEB-1) is not served by an installed Lakehouse: the
+# product owner decided on 2026-11-02 that it is a separate product page
+# and that an install must not offer it. Both folders are excluded, so no
+# console image — the release's, the staging deploy's, compose's — carries
+# the route or the bundles it pulls in, and `/landing` answers with the
+# console's page-not-found. The source stays in the repository and is
+# served by the dev server (`bun run dev`) only.
+src/app/landing
+src/features/landing
