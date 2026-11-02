@@ -114,3 +114,48 @@ async fn a_page_that_raises_an_exception_fails_the_conversion_on_the_real_gotenb
         "an exception in the page must fail the conversion: {result:?}"
     );
 }
+
+/// `BI-19` part D (plan D13): a chart image against the real container. The
+/// bytes start with the PNG signature, and the picture is the box the selector
+/// names at the asked width and scale (1200 CSS px at 2x is 2400 px across).
+#[tokio::test]
+#[ignore = "needs a Gotenberg container, see the module notes"]
+async fn render_png_against_real_gotenberg() {
+    const CHART: &str = "<!doctype html><html><body style=\"margin:0\">\
+<div data-render-chart style=\"width:1200px;height:300px;background:#369\"><h1>Chart image proof</h1></div>\
+<script>setTimeout(function () { window.__lakehouseRenderReady = true; }, 300);</script></body></html>";
+    let gotenberg = std::env::var("GOTENBERG_TEST_URL").expect("GOTENBERG_TEST_URL");
+    let host = std::env::var("GOTENBERG_TEST_PAGE_HOST")
+        .unwrap_or_else(|_| "host.docker.internal".to_owned());
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{CHART}",
+                CHART.len()
+            );
+        }
+    });
+    let png = lakehouse_api::pdf::screenshot_url(
+        &gotenberg,
+        &format!("http://{host}:{port}/"),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("Gotenberg made a PNG");
+    assert!(
+        png.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "not a PNG: {:?}",
+        &png[..png.len().min(16)]
+    );
+    // IHDR: width and height are the big-endian u32s at bytes 16..24.
+    let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+    assert_eq!(width, 2400, "1200 CSS px at a scale of 2");
+    assert_eq!(height, 600, "the box is 300 CSS px tall");
+}
