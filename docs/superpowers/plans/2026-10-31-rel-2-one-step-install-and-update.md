@@ -4230,3 +4230,19 @@ Error: the ClickHouse database 'default' could not be restored.
 5. **Out of scope:** the S3 branch, which already drops before restoring, and any change to `lakehousectl`.
 
 Accept: `bash -n scripts/restore-from-backup.sh`, `shellcheck` on the script if it is installed, `python3 -m pytest ops/release -q`, and the PR's own `Release · dry run` and `Proof · the update moves the stack, and rolls back` green. Quote their run ids in the handoff.
+
+### Review S4b round 7 (planner, 2026-11-02, at `f31566d0`): BLOCKER 1 fixed, the proof decides
+
+- **`c89fa48f`:** the local restore now drops before it restores.
+  - **ClickHouse:** `DROP DATABASE … SYNC` runs before each `RESTORE DATABASE`.
+  - **Postgres:** every database the dump's `CREATE DATABASE` lines name is dropped `WITH (FORCE)`. `postgres` is dropped and recreated from `template0`, because, as measured, the dump carries its objects but no `CREATE DATABASE` for it. Afterwards every database is checked by name.
+  - Both the comment and the header cite D24.
+- **`f31566d0`:** the proof asserts `count = 1` for both markers after the bundle C rollback, `test_release_workflow.py` pins that, and `test_backup_scripts.py` tests the name parsing.
+- **The planner checked one more thing:** whether `clickhouse-client` still connects after `default` is dropped, since every later call uses `default` as its database. It does, on `clickhouse-server:26.8`: the `DROP` succeeds, and `SELECT 1` answers both with no `-d` and with `-d system`.
+- **Re-run by the planner on `f31566d0`:**
+  - `bash -n scripts/restore-from-backup.sh`: ok.
+  - `shellcheck -S warning scripts/restore-from-backup.sh`: clean.
+  - `uvx --with pyyaml --with cryptography pytest ops/release -q`: 239 passed.
+- **Handoff:** the developer's session ended before writing the round 6 handoff. The commands above stand in for it.
+
+**Open:** no BLOCKER on the code. The merge waits for the PR's `Release · dry run` and `Proof · the update moves the stack, and rolls back` on this head.
