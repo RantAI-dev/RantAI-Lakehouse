@@ -192,8 +192,8 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | Released | #165 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-35` | Feature | Folders for uploaded files on Sources: a grouping only (a file's table keeps its name), chosen while uploading or moved later, folders inside folders, empty folders allowed and deletable, a folder with files cannot be deleted. Uploaded files only, for now. Feature page `features/upload-folders.md` | Data | P2 | In Acceptance | [#259](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/259) | Product owner, 2026-10-26; [spec](specs/data-35.md) |
 | `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | In Acceptance | #237 | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. | Query Studio | P2 | In Acceptance | #275 | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Blocked by `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. Follow-ups from the `QS-2` review, delivered by the `QS-3` change: the download route's own outer timeout (the 35-minute cap); one shared sentence for a query string that cannot be read; one shared export-failure mapping. | Query Studio | P2 | In Acceptance | #275 | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Blocked by `SEC-20`** | Query Studio | P2 | Building |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-4` | Feature | Query history page with filters, and a query profile | Query Studio | P2 | In Acceptance | #254, #263 | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-5` | Feature | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `AI-16` | Task | Hand-off to the AI team: AI features for the Data module. Remaining: plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building. The AI team plans these | AI Copilot | P2 | In Progress | #79, #95, #96, #109, #110, #111, #112, #118 | `docs/core/features/semantic-layer.md` |
@@ -331,7 +331,7 @@ parity), built after it.
 | `AI-8` | Building | `BI-17` | — |
 | `AI-9` | Building | `BI-18` (templates part) | — |
 | `DATA-3` | Planned | `DATA-4` | — |
-| `QS-3` | Planned | `SEC-20` | — |
+| `QS-3` | Building | `SEC-20` | — |
 | `REL-6` | Blocked | `BLD-1` | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
@@ -347,6 +347,7 @@ set by the product owner and are left empty until they are.
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
 | `QS-2` | 2026-10-28 | 2026-10-30 | |
+| `QS-3` | 2026-10-30 | | |
 | `SEC-20` | 2026-10-24 | | |
 | `QS-4` | 2026-10-24 | 2026-10-27 | |
 | `DATA-1` | 2026-10-02 | 2026-10-03 | |
