@@ -371,3 +371,33 @@ gate goes red, read why before changing a harness, and quote the failure.
 
 
 **Migration number and order (planner, 2026-11-02):** the public-link migration is `0120` (`0118` is SEC-57 and `0119` is AI-23). Owner to confirm: M7. Planner default: yes, saving a mart or metric rule is gated as the person saving it.
+
+### Developer report
+
+**T7, the M7 half (rule save): stopped and reported, as the plan says.** The rest of T7
+(the gate on the run, D3 and M6) is implemented and pushed as `ea0e8703`.
+
+The plan's T7 says, for rule create and update: "build the statement with the same
+`lakehouse-alerts` builder the run uses, do not write a second one (rule 4); if the crate does
+not expose it, stop and report." It does not expose it:
+
+- `current_value` (`rust/crates/lakehouse-alerts/src/lib.rs:1779`) builds the mart rule's
+  statement inline, `let sql = format!("SELECT {expr} AS v FROM serving.{mart_ident}");`
+  (`:1798`), and is private.
+- `metric_value` (`:1813`) builds a metric rule's statement from `lakehouse_bi::builder`
+  inside itself (`:1861-1877`) and is private.
+- `lakehouse-alerts` exports no builder: its `pub` items are the rule types, the store
+  functions, the evaluators and the `SqlGate` trait (`:2117`); nothing returns a rule's
+  statement.
+
+So saving a mart or metric rule is **not** gated as the saving person, and the acceptance case
+"saving a mart rule as a member of `OTHER_TENANT` → 404 with `SEC-20`'s sentence and no
+`INSERT INTO console.alert_rule`" has no code to test and is **not implemented**. M7's hole
+(a person of a non-catalog tenant who holds `alert:write` can save a rule over `serving.*` that
+the scheduled run, acting as the catalog's tenant, then delivers) is therefore still open.
+
+What would close it, for the planner to decide (I did not choose for the plan): either a
+`pub fn mart_statement(mart, measure, agg) -> Result<String, AlertError>` (and the metric
+equivalent) extracted from `current_value`/`metric_value` and called by both the run and the
+save path — one builder, shared, no second copy — or a plan change that gates the save another
+way. A second inline copy in `routes::alerts` is what the plan forbids, so I did not write one.
