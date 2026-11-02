@@ -852,7 +852,7 @@ describe("Activity tab: usage and history", () => {
     stubApi()
     url.search = "tab=activity"
     renderTabs({ ...BRONZE, usage: usageOf({ queries: 0, users: 0, avgLatencyMs: 0 }) })
-    expect(screen.getByText("No Query Studio or copilot query in the last 30 days")).toBeTruthy()
+    expect(screen.getByText("No Query Studio or AI Copilot query in the last 30 days")).toBeTruthy()
     expect(screen.queryByText(/Not counted/)).toBeNull()
   })
 

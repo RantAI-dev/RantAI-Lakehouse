@@ -1349,7 +1349,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 setCopilotExpanded(true);
               }}
             >
-              <Sparkles className="size-4" /> Ask Copilot
+              <Sparkles className="size-4" /> Ask AI Copilot
             </Button>
           </EmptyContent>
         </Empty>

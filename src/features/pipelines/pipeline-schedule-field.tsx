@@ -93,7 +93,7 @@ export function PipelineScheduleField({
       ) : (
         <p className="text-xs text-muted-foreground">
           {parsed.kind === "manual"
-            ? "Runs only when someone clicks Run now or the Copilot launches it."
+            ? "Runs only when someone clicks Run now or AI Copilot launches it."
             : `Cron ${value}; times are UTC, the orchestrator's schedule timezone.`}
         </p>
       )}

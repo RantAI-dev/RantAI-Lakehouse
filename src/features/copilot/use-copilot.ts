@@ -69,7 +69,7 @@ function newMsgId(): string {
  */
 export function chatErrorText(body: unknown): string {
   const b = (body ?? {}) as { error?: string; detail?: string; hint?: string; errorId?: string };
-  const text = b.detail ?? b.error ?? "Copilot couldn't answer. Try again.";
+  const text = b.detail ?? b.error ?? "AI Copilot couldn't answer. Try again.";
   return b.errorId ? `${text} Reference: ${b.errorId}` : text;
 }
 
@@ -379,7 +379,7 @@ function useCopilotState() {
           throw new Error(chatErrorText(event.body));
         }
       }
-      if (!result) throw new Error("Copilot's answer was cut off. Try again.");
+      if (!result) throw new Error("AI Copilot's answer was cut off. Try again.");
 
       const chartCreated = Boolean(
         result.chartCreated &&
@@ -394,7 +394,7 @@ function useCopilotState() {
         {
           id: assistantId,
           role: "assistant",
-          content: result.answer || (tools.length ? "" : "Copilot didn't return an answer."),
+          content: result.answer || (tools.length ? "" : "AI Copilot didn't return an answer."),
           tools,
           buildRunId: result.buildRunId,
           chartCreated,

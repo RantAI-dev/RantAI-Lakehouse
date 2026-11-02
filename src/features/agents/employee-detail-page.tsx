@@ -214,7 +214,7 @@ export function EmployeeDetailPage() {
   const isCopilot = employeeId === "emp-copilot"
   const hasPrompt = Boolean(e.prompt?.trim())
   const runDisabledReason = isCopilot
-    ? "emp-copilot is the interactive-chat row and can't be run headlessly."
+    ? "AI Copilot's chat row can't be run headlessly."
     : !canRun
       ? "You don't have permission to run digital employees (requires agent:manage)."
       : isRevoked
@@ -376,7 +376,7 @@ export function EmployeeDetailPage() {
       </ConfirmActionDialog>
       <SectionCard
         title="Run configuration"
-        description="What a headless run (Run now, or a schedule) sends to the copilot and what it's allowed to do."
+        description="What a headless run (Run now, or a schedule) sends to AI Copilot and what it's allowed to do."
       >
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
