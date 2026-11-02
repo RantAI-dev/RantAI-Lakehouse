@@ -1052,6 +1052,14 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users/{id}/tenants/{tenant_id}",
             axum::routing::put(identity::add_user_to_tenant),
         )
+        // ADM-3 D2: hand an existing user a new temporary password. The
+        // password is generated server-side and returned once; `{id}` is
+        // validated inside the handler (400 when malformed, 404 when
+        // unknown or when the caller may not reset that user).
+        .route(
+            "/api/identity/users/{id}/reset-password",
+            axum::routing::post(identity::reset_user_password),
+        )
         .route(
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),
