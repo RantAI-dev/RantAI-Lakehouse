@@ -93,7 +93,23 @@ export type AlertRule = {
   asset?: string
   /** Pipeline id or `*` for pipeline rules. */
   pipeline?: string
+  /**
+   * `BI-19` part C: the chart a chart alert watches. Omitted for a rule that
+   * watches a mart column or a metric.
+   */
+  chart?: string
+  /** The series of a line, bar or combo chart whose latest point is read. */
+  series?: string
+  /** The dashboard filters the chart is read with (the shape the dashboard takes). */
+  filters?: unknown[]
+  /** `above`, `below` or `any_rows` on a chart alert; absent on a legacy rule. */
+  condition?: AlertCondition | string
+  /** The person the chart alert reads its data as. */
+  ownerId?: string
 }
+
+/** The conditions of a chart alert (`BI-19` D12). */
+export type AlertCondition = "above" | "below" | "any_rows"
 
 /**
  * Body accepted by `POST`/`PUT /api/alerts`, mirroring `AlertRuleInput`.
@@ -121,6 +137,11 @@ export type SaveAlertRuleInput = {
   /** Table or `*`; see [`AlertRule.asset`]. */
   asset?: string
   pipeline?: string
+  /** `BI-19` part C: see [`AlertRule.chart`]. */
+  chart?: string
+  series?: string
+  filters?: unknown[]
+  condition?: string
 }
 
 /** Body of `GET /api/alerts/status`. */
@@ -149,6 +170,8 @@ export type AlertRunResult = {
   value?: number
   delivered?: AlertDeliverResult
   skipped?: string
+  /** `BI-19` D11: the value is back under the line and the recovery was sent. */
+  recovered?: boolean
 }
 
 export interface AlertRuleService {

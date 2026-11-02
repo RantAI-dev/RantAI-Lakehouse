@@ -20,9 +20,9 @@ import { PDF_NOT_SET_UP } from "./chart-download";
 
 /** The dashboard's ⋯ menu: refresh, view, auto-refresh, and board actions. */
 export function DashboardActionsMenu({
-  isDefault, canWrite, isPrivate, onHistory, onTheme, onFreshness, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
+  isDefault, canWrite, canManage = canWrite, isPrivate, onHistory, onTheme, onFreshness, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
-  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions,
+  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions, onExportFile,
 }: {
   readonly isDefault: boolean;
   /**
@@ -31,6 +31,11 @@ export function DashboardActionsMenu({
    * (SHOULD-FIX) R18); Share keeps its own rule.
    */
   readonly canWrite: boolean;
+  /**
+   * The caller manages the dashboard (`BI-19` part B2): only then are Share and
+   * Delete offered. Absent: as `canWrite`, the answer before levels existed.
+   */
+  readonly canManage?: boolean;
   /** In somebody's personal space: it cannot be shared until it is moved to a folder. */
   readonly isPrivate?: boolean;
   /** Opens the version history; the item is left out when absent. */
@@ -64,6 +69,8 @@ export function DashboardActionsMenu({
   readonly canDownload?: boolean;
   /** Opens "Subscriptions…" (`RPT-1`); left out when absent or when downloads are switched off for the viewer. */
   readonly onSubscriptions?: () => void;
+  /** Downloads the dashboard as a file to import elsewhere (`BI-19` part D); left out when absent. */
+  readonly onExportFile?: () => void;
   readonly onDuplicate: () => void;
   readonly onDelete: () => void;
 }) {
@@ -147,7 +154,7 @@ export function DashboardActionsMenu({
                 </TooltipContent>
               </Tooltip>
             ) : null}
-            {!isDefault && !isPrivate ? (
+            {!isDefault && !isPrivate && canManage ? (
               <DropdownMenuItem onClick={onShare}>
                 <Share2 className="size-4" /> Share…
               </DropdownMenuItem>
@@ -195,16 +202,24 @@ export function DashboardActionsMenu({
             <DropdownMenuItem onClick={onExportPdf}>
               <Printer className="size-4" /> Print…
             </DropdownMenuItem>
-            <DropdownMenuItem render={<a href="/api/dashboard/export" download />}>
-              <Download className="size-4" /> Export YAML
-            </DropdownMenuItem>
+            {/* BI-19 Q-D1 (owner decision 2026-10-27): both exports follow the per-role download switch. */}
+            {canDownload ? (
+              <DropdownMenuItem render={<a href="/api/dashboard/export" download />}>
+                <Download className="size-4" /> Export YAML
+              </DropdownMenuItem>
+            ) : null}
+            {canDownload && !isDefault && onExportFile ? (
+              <DropdownMenuItem onClick={onExportFile}>
+                <Download className="size-4" /> Export dashboard file
+              </DropdownMenuItem>
+            ) : null}
             {canWrite ? (
               <DropdownMenuItem onClick={onDuplicate}>
                 <Copy className="size-4" /> Duplicate
               </DropdownMenuItem>
             ) : null}
           </DropdownMenuGroup>
-          {!isDefault && canWrite ? (
+          {!isDefault && canManage ? (
             <>
               <DropdownMenuSeparator />
               <DropdownMenuGroup>

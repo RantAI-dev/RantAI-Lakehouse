@@ -734,3 +734,38 @@ pub async fn search_active_users(
     .fetch_all(pool)
     .await?)
 }
+
+/// Active people whose **name** contains `needle`, as `(id, name)`, inside the
+/// tenants of the caller (the rule of [`search_active_users`]).
+///
+/// `BI-19` E review E-2: the `@` picker of dashboard comments must not be a way
+/// to learn who has which address, so unlike [`search_active_users`] this never
+/// looks at the email column: typing part of an address matches nobody.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn search_active_user_names(
+    pool: &PgPool,
+    needle: &str,
+    limit: i64,
+    tenant_ids: &[Uuid],
+) -> Result<Vec<(Uuid, String)>, StoreError> {
+    let escaped = needle
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    Ok(sqlx::query_as(
+        "SELECT id, name FROM app_user \
+         WHERE status = 'active' AND name ILIKE $1 \
+         AND (cardinality($3::uuid[]) = 0 \
+              OR EXISTS (SELECT 1 FROM app_user_tenant ut \
+                         WHERE ut.user_id = app_user.id AND ut.tenant_id = ANY($3::uuid[]))) \
+         ORDER BY name, id LIMIT $2",
+    )
+    .bind(format!("%{escaped}%"))
+    .bind(limit)
+    .bind(tenant_ids.to_vec())
+    .fetch_all(pool)
+    .await?)
+}
