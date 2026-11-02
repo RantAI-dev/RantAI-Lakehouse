@@ -1,26 +1,62 @@
 # Committed fonts
 
-These are the dashboard and landing-page faces the console loads through
-`next/font/local` (OPS-16, decision D1), so they need no network at build or at
-runtime: `src/app/fonts.ts` (dashboard fonts) and
-`src/features/landing/landing-fonts.ts` (the landing page's display face). The
-ids, weights and CSS variables are the ones `next/font`'s Google loader
-produced before, so `lakehouse_bi::formatting::SHIPPED_FONTS` and
-`lib/dashboard-look.ts` need no change.
-
-The root layout's Geist and Geist Mono are **not** here yet: they still come
-from `next/font`'s Google loader in `design-system/fonts/fonts.ts`. An offline
-build therefore still fails on those two faces; OPS-16's T1 is blocked on that
-and the plan's Developer report records it.
+These are the fonts the console loads through `next/font/local` (OPS-16,
+decisions D1 and D5), so they need no network at build or at runtime:
+`src/app/fonts.ts` loads the dashboard faces, `src/features/landing/landing-fonts.ts`
+the landing page's display face, and `design-system/fonts/fonts.ts` the root
+layout's Geist and Geist Mono. The ids, weights and CSS variables are the ones
+`next/font`'s Google loader produced before, so
+`lakehouse_bi::formatting::SHIPPED_FONTS` and `lib/dashboard-look.ts` need no
+change.
 
 Before this, `next/font`'s Google loader fetched at build time; when that fetch
 failed the build failed with `Module not found: Can't resolve
 '@vercel/turbopack-next/internal/font/google/font'` (CI runs `41446159405`,
 `41449722905`, `41480029356` on 2026-11-02).
 
+## Geist and Geist Mono (decision D5)
+
+`design-system/fonts/fonts.ts` used to import `Geist` and `Geist_Mono` from
+`next/font`'s Google loader, which kept a build-time fetch in place for every
+page that renders the root layout (Developer report, `6a5e266a`). D5 moves both
+faces to committed files and `next/font/local`, keeping `--font-sans`,
+`--font-mono`, `display: "swap"` and `preload: true` as they were.
+
+**Where, and why.** D5 names `src/app/fonts/geist/` but allows
+`design-system/fonts/geist/` if the design system must stay self-contained. It
+must: `design-system/README.md` describes the folder as plug-and-play, "siap
+copy ke repo Next.js lain" (ready to copy into another Next.js repo), and a
+module there cannot reach into `src/` without breaking that. The two faces
+therefore sit in `design-system/fonts/geist/` and
+`design-system/fonts/geist-mono/`, next to the loader that uses them, and travel
+with the design system.
+
+**Source.** vercel/geist-font's GitHub release `v1.9.0` (`geist-font-v1.9.0.zip`,
+retrieved 2026-11-02 with `curl -fL`): `Geist/webfonts/Geist[wght].woff2` ->
+`geist/Geist-wght.woff2` and `GeistMono/webfonts/GeistMono[wght].woff2` ->
+`geist-mono/GeistMono-wght.woff2`, byte for byte. Both are variable fonts
+(`wght` 100–900) and `file` reports `Web Open Font Format (Version 2)`.
+
+**Not a `latin` subset.** The release ships one webfont per face covering the
+full character set (728 `cmap` entries for Geist, 889 for Geist Mono), and no
+latin-only file; the Google Fonts `latin` subset would have come from a
+different download than the one D5 names. The files are therefore the release's
+full fonts, a superset of what the Google loader used. The loader declares
+`weight: "100 900"` — the axis the file carries — and has no `subsets` option,
+which only the Google loader has.
+
+| Family | File | Source | Version | SHA-256 | Face |
+| --- | --- | --- | --- | --- | --- |
+| Geist | `design-system/fonts/geist/Geist-wght.woff2` | <https://github.com/vercel/geist-font/releases/download/v1.9.0/geist-font-v1.9.0.zip> (`Geist/webfonts/Geist[wght].woff2`) | `v1.9.0` | `5c5588027e59e74e205b9d6c7fd877b261091cee367f6bb3a8d505da14cae512` | variable, `wght` 100–900, full charset |
+| Geist Mono | `design-system/fonts/geist-mono/GeistMono-wght.woff2` | same release (`GeistMono/webfonts/GeistMono[wght].woff2`) | `v1.9.0` | `cf5bf55f69e043b1ecf04b0719119b7298e94add67ebcaa709a925b945b46b25` | variable, `wght` 100–900, full charset |
+
+Both directories carry the release's root `OFL.txt` (SIL Open Font License 1.1,
+"Copyright 2024 The Geist Project Authors"), which covers both families.
+
 ## Files
 
-Each file is the `latin` block of the Google Fonts CSS 2 request below,
+The five files under `src/app/fonts/` are each the `latin` block of the Google
+Fonts CSS 2 request below,
 retrieved on 2026-11-02 with a Chrome user agent. That is Google Fonts' own
 download of the version it served that day, so the subset and the outlines are
 exactly what `next/font`'s Google loader used. The `vNN` in the URL is Google
@@ -63,9 +99,13 @@ code did not use.
 - **JetBrains Mono**: `wght` 100–800, as before.
 - **Instrument Serif**: the landing page uses italic 400 only, and that is a
   static face.
+- **Geist** and **Geist Mono**: `wght` 100–900, the axis the release's variable
+  files carry; the old Google loader requested the same 100–900 range.
 
 ## Licenses
 
-`OFL.txt` in each directory is the upstream license file from Google Fonts'
-copy of the family (<https://github.com/google/fonts/tree/main/ofl>): `inter`,
-`ibmplexsans`, `sourceserif4`, `jetbrainsmono`, `instrumentserif`.
+For the five Google-served families, `OFL.txt` in each directory is the
+upstream license file from Google Fonts' copy of the family
+(<https://github.com/google/fonts/tree/main/ofl>): `inter`, `ibmplexsans`,
+`sourceserif4`, `jetbrainsmono`, `instrumentserif`. The Geist and Geist Mono
+directories carry the `OFL.txt` from the geist-font release, described above.
