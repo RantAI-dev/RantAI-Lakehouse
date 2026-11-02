@@ -38,3 +38,17 @@ Any other dependency, and the other dependabot PRs.
 ## 4. Handoff (developer appends below)
 
 ## 5. Review (planner appends below)
+
+## Addendum (planner, 2026-11-02): a second advisory published the same day, RUSTSEC-2026-0435 (`thrift` 0.17.0)
+
+The PR's first CI run (`41440534170`) shows that `zip` 8.6.0 is gone. `cargo audit` and `cargo deny` still fail, now on **RUSTSEC-2026-0435**, published 2026-11-02 (CVE-2026-43868). The advisory is about an unbounded allocation in `thrift`'s binary protocol, `TBinaryInputProtocol::read_bytes` and `read_string`, below 0.23.0.
+
+- **Path:** `cargo tree -i thrift@0.17.0` on `main` shows `thrift` 0.17.0 → `parquet` 58.4.0 → `iceberg` 0.10.1, `lakehouse-iceberg` and `lakehouse-api`.
+- **Fix available:** `parquet` 58.4.1, a patch release, depends on `thrift ^0.23`.
+- **Exposure:** `parquet` 58.4.0's library code reads metadata with its own compact-protocol reader. The binary protocol shows up only in its `parquet-layout` binary, which we do not build. So the exposure is low, but D1 still applies: upgrade, do not ignore.
+
+**D4.** Run `cargo update -p parquet --precise 58.4.1` (and let `thrift` follow), in the same PR, because both advisories block the same required checks.
+
+**T2.** That lock update and nothing else.
+- *Accept:* `cargo tree -i thrift@0.17.0` reports that the package is not in the tree, and `git diff origin/main -- rust/Cargo.lock` changes only `rust_xlsxwriter`, `zip`, `parquet`, `thrift` and their own dependencies.
+- Then `cargo check -p lakehouse-iceberg -p lakehouse-api --all-targets` and `cargo test -p lakehouse-api upload_parquet`.
