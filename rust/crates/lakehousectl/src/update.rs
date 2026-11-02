@@ -24,6 +24,16 @@
 //!    (D18) and exits non-zero, saying what failed and what the
 //!    rollback did.
 //!
+//! # A failure in step 4 or step 5
+//!
+//! Nothing has been swapped when the writers cannot be stopped or the
+//! backup cannot be taken, so the install still holds the OLD release's
+//! files. The update starts the stack again on those files, waits for
+//! it on the OLD version, clears the pause and exits non-zero, saying
+//! that it stopped before it changed anything. A stack that does not
+//! come back is reported as it is: the install may need a hand
+//! (REL-2 S4b review round 1 BLOCKER 1).
+//!
 //! # The route (D10)
 //!
 //! The route comes from the manifest's `minFrom` (the lowest release
@@ -245,7 +255,9 @@ fn preflight_failures(args: &UpdateArgs, compose: &str) -> Vec<preflight::Failur
 /// # Errors
 ///
 /// Returns the error that stopped the update. A failure from step 6 on
-/// is reported WITH what the rollback did.
+/// is reported WITH what the rollback did (REL-2 S4 decision D17). A
+/// failure in step 4 or step 5 is reported WITH what the stack was put
+/// back to (REL-2 S4b review round 1 BLOCKER 1).
 pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), ToolError> {
     let old_version = facts.state.current_version.clone().ok_or_else(|| {
         ToolError::Failed(
@@ -275,17 +287,54 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
 
     // Step 4 — the pause, and the writers. Postgres, ClickHouse, RustFS
     // and Lakekeeper keep running: they are what the backup is made of.
-    pause::set(dir)?;
+    //
+    // A failure from here on leaves the install with the writers
+    // stopped and the pause set, and NOTHING has been swapped: the
+    // files in the install's own directory are still the old ones. The
+    // stack is put back the way it was, and the error says so
+    // (REL-2 S4b review round 1 BLOCKER 1).
+    if let Err(error) = pause::set(dir) {
+        return Err(stopped_before_the_swap(
+            dir,
+            facts,
+            runner,
+            &old_version,
+            &format!("the pause could not be set: {error}"),
+        ));
+    }
     println!("lakehousectl: stopping the writers.");
     if let Err(error) = runner.stop_writers() {
-        return Err(ToolError::Failed(format!(
-            "the writers could not be stopped, so the update stops here: {error}"
-        )));
+        return Err(stopped_before_the_swap(
+            dir,
+            facts,
+            runner,
+            &old_version,
+            &format!("the writers could not be stopped: {error}"),
+        ));
     }
 
     // Step 5 — the backup, named after the release it belongs to.
-    let backup = runner.backup(&old_version).map_err(ToolError::Failed)?;
-    state::set_last_backup(dir, &backup)?;
+    let backup = match runner.backup(&old_version) {
+        Ok(backup) => backup,
+        Err(error) => {
+            return Err(stopped_before_the_swap(
+                dir,
+                facts,
+                runner,
+                &old_version,
+                &format!("the backup could not be taken: {error}"),
+            ));
+        }
+    };
+    if let Err(error) = state::set_last_backup(dir, &backup) {
+        return Err(stopped_before_the_swap(
+            dir,
+            facts,
+            runner,
+            &old_version,
+            &format!("the backup was taken, but the install's state could not record it: {error}"),
+        ));
+    }
     println!("lakehousectl: the backup is at {}", backup.display());
 
     // Step 6 — the new files in place, and the stack up. A failure from
@@ -320,6 +369,68 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
     state::set_versions(dir, &new_version, Some(&old_version))?;
     println!("lakehousectl: the stack runs {new_version}.");
     Ok(())
+}
+
+/// The error of an update that stopped before it swapped anything.
+///
+/// Nothing has been swapped, so the files in the install's own
+/// directory are still the OLD ones. The stack is started again on
+/// those files, it is waited for on the OLD version, and the pause is
+/// cleared: the update restored nothing, so nothing must stay paused.
+///
+/// The error says that the update stopped before it changed anything,
+/// and what the stack runs now. A stack that does not come back is
+/// reported as it is — the install may need a hand (REL-2 S4b review
+/// round 1 BLOCKER 1).
+///
+/// # Errors
+///
+/// Never: the failure is returned as the error, and it says what the
+/// stack was put back to.
+fn stopped_before_the_swap(
+    dir: &Path,
+    facts: &Facts,
+    runner: &mut dyn Runner,
+    old_version: &str,
+    cause: &str,
+) -> ToolError {
+    let timeout = Duration::from_secs(facts.ready_timeout);
+    let mut problems: Vec<String> = Vec::new();
+
+    // The stack is started again on the OLD files: the Compose file and
+    // the manifest in the install's own directory are the old ones, and
+    // nothing else was written.
+    match runner.up() {
+        Ok(()) => {
+            if let Err(error) = runner::wait_for_ready(runner, old_version, timeout) {
+                problems.push(format!(
+                    "the stack did not become ready on {old_version} again: {error}"
+                ));
+            }
+        }
+        Err(error) => problems.push(format!("the stack could not be started again: {error}")),
+    }
+
+    // The pause is cleared even when the stack did not come back: the
+    // update restored nothing, so the jobs that delete files must not
+    // stay paused.
+    if let Err(error) = pause::clear(dir) {
+        problems.push(format!("the pause could not be cleared: {error}"));
+    }
+
+    if problems.is_empty() {
+        return ToolError::Failed(format!(
+            "the update to {} stopped before it changed anything: {cause}. The stack was started \
+             again on the old files and runs {old_version} again.",
+            facts.manifest.version
+        ));
+    }
+    ToolError::Failed(format!(
+        "the update to {} stopped before it changed anything: {cause}. Putting the install back \
+         the way it was did not finish: {}. The install may need a hand.",
+        facts.manifest.version,
+        problems.join("; ")
+    ))
 }
 
 /// Write the files the release ships into the staging directory.
@@ -566,8 +677,8 @@ mod tests {
     struct Fake {
         /// The calls, in order.
         calls: Vec<String>,
-        /// The step that fails, when it is set.
-        failing: Option<String>,
+        /// The steps that fail, when they are set.
+        failing: Vec<String>,
         /// The time the fake thinks it is.
         now: Instant,
         /// What the API reports after each `up`: the version, and
@@ -587,7 +698,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 calls: Vec::new(),
-                failing: None,
+                failing: Vec::new(),
                 now: Instant::now(),
                 after_up: vec![("0.2.0".to_string(), true)],
                 api_version: "0.2.0".to_string(),
@@ -597,7 +708,15 @@ mod tests {
 
         fn failing_at(step: &str) -> Self {
             Self {
-                failing: Some(step.to_string()),
+                failing: vec![step.to_string()],
+                ..Self::new()
+            }
+        }
+
+        /// The fake fails at each of these steps, once each.
+        fn failing_at_steps(steps: &[&str]) -> Self {
+            Self {
+                failing: steps.iter().map(|step| (*step).to_string()).collect(),
                 ..Self::new()
             }
         }
@@ -609,8 +728,8 @@ mod tests {
         /// broken, not the old one.
         fn call(&mut self, step: &str) -> Result<(), String> {
             self.calls.push(step.to_string());
-            if self.failing.as_deref() == Some(step) {
-                self.failing = None;
+            if let Some(position) = self.failing.iter().position(|failing| failing == step) {
+                self.failing.remove(position);
                 return Err(format!("the {step} failed"));
             }
             Ok(())
@@ -846,6 +965,145 @@ mod tests {
             state.current_version.as_deref(),
             Some("0.1.0"),
             "the state was changed"
+        );
+    }
+
+    #[test]
+    fn a_failure_to_stop_the_writers_starts_the_old_stack_again() {
+        // REL-2 S4b review round 1 BLOCKER 1: a failure in step 4 leaves
+        // the writers stopped and the pause set, and NOTHING has been
+        // swapped. The stack is started again on the OLD files, the
+        // pause is cleared, and the error says what happened.
+        let (_directory, path) = install_with_state("0.1.0");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let state_before = std::fs::read(state::path(&path)).expect("the state is readable");
+        let mut runner = Fake::failing_at("stop-writers");
+        // The stack comes back on the old release.
+        runner.after_up = vec![("0.1.0".to_string(), true)];
+
+        let error = run(&path, &facts, &mut runner).expect_err("the update fails");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("stopped before it changed anything"),
+            "the error says the update changed nothing: {message}"
+        );
+        assert!(
+            message.contains("the writers could not be stopped"),
+            "the error says what failed: {message}"
+        );
+        assert!(
+            message.contains("runs 0.1.0 again"),
+            "the error says what the stack runs: {message}"
+        );
+        assert_eq!(
+            runner.steps(),
+            vec![
+                "fetch-images".to_string(),
+                "stop-writers".to_string(),
+                "up".to_string(),
+                "console-ready".to_string(),
+            ],
+            "the stack was not put back the way it was: {:?}",
+            runner.steps()
+        );
+        assert_eq!(
+            runner.api_version, "0.1.0",
+            "the stack does not run the old release"
+        );
+        let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
+        assert!(
+            !env.contains("MAINTENANCE_PAUSED"),
+            "the pause was not cleared: {env}"
+        );
+        let state_after = std::fs::read(state::path(&path)).expect("the state is readable");
+        assert_eq!(state_after, state_before, "the state was changed");
+    }
+
+    #[test]
+    fn a_failure_to_take_the_backup_starts_the_old_stack_again() {
+        // REL-2 S4b review round 1 BLOCKER 1: the same for step 5. The
+        // writers ARE stopped by then, so the stack has to be started
+        // again — on the OLD files, for nothing has been swapped.
+        let (_directory, path) = install_with_state("0.1.0");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let state_before = std::fs::read(state::path(&path)).expect("the state is readable");
+        let mut runner = Fake::failing_at("backup");
+        // The stack comes back on the old release.
+        runner.after_up = vec![("0.1.0".to_string(), true)];
+
+        let error = run(&path, &facts, &mut runner).expect_err("the update fails");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("stopped before it changed anything"),
+            "the error says the update changed nothing: {message}"
+        );
+        assert!(
+            message.contains("the backup could not be taken"),
+            "the error says what failed: {message}"
+        );
+        assert!(
+            message.contains("runs 0.1.0 again"),
+            "the error says what the stack runs: {message}"
+        );
+        assert_eq!(
+            runner.steps(),
+            vec![
+                "fetch-images".to_string(),
+                "stop-writers".to_string(),
+                "backup".to_string(),
+                "up".to_string(),
+                "console-ready".to_string(),
+            ],
+            "the stack was not put back the way it was: {:?}",
+            runner.steps()
+        );
+        assert_eq!(
+            runner.api_version, "0.1.0",
+            "the stack does not run the old release"
+        );
+        let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
+        assert!(
+            !env.contains("MAINTENANCE_PAUSED"),
+            "the pause was not cleared: {env}"
+        );
+        let state_after = std::fs::read(state::path(&path)).expect("the state is readable");
+        assert_eq!(state_after, state_before, "the state was changed");
+    }
+
+    #[test]
+    fn a_stack_that_does_not_come_back_is_reported_as_it_is() {
+        // REL-2 S4b review round 1 BLOCKER 1: the error must not claim
+        // the stack runs the old release when it does not.
+        let (_directory, path) = install_with_state("0.1.0");
+        let manifest = manifest_of("0.2.0", Some("0.0.0"), &[]);
+        let facts = facts_of(&path, &manifest);
+        let mut runner = Fake::failing_at_steps(&["stop-writers", "up"]);
+        // The stack does not come back at all: the writers cannot be
+        // stopped, and the start that follows fails too.
+
+        let error = run(&path, &facts, &mut runner).expect_err("the update fails");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("stopped before it changed anything"),
+            "the error says the update changed nothing: {message}"
+        );
+        assert!(
+            message.contains("could not be started again"),
+            "the error says the stack did not come back: {message}"
+        );
+        assert!(
+            !message.contains("runs 0.1.0 again"),
+            "the error claims a stack that is not there: {message}"
+        );
+        let env = std::fs::read_to_string(path.join(".env")).expect("the env file is readable");
+        assert!(
+            !env.contains("MAINTENANCE_PAUSED"),
+            "the pause was not cleared: {env}"
         );
     }
 
