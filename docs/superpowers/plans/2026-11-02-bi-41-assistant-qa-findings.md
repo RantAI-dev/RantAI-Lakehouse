@@ -164,4 +164,93 @@ Full verification block of `AGENTS.md` once before handoff (Rust, TypeScript).
 
 ## 5. Handoff (developer appends below)
 
+### Handoff (developer, 2026-11-02)
+
+Branch `fix/bi-41-assistant-qa-findings`, off `origin/main` merged into the
+branch before T1 (merge commit `f3869ca3`). One commit per task, each pushed
+to `origin` after it was made; no PR opened.
+
+Commits:
+
+- `ae463666` **T1** — `BI-41 D1`: `NEXT:` also covers a change to the
+  drafted object; test clause and the two `never` clauses; AI-15 case
+  `dash_new_chart_then_fresh`; the runner fills `{created:<kind>}` in
+  `expect_tool.args_contains` (new `fill_created_ids`, shared with
+  `fill_created`) and two unit tests for it.
+- `6a6a48cf` **T2** — `BI-41 D2`: the build suffix's `set_cache_rule`
+  sentence and the tool's description; `tests/fixtures/tool_schemas.json`
+  regenerated, only the `set_cache_rule` entry moved; prompt and registry
+  tests; AI-15 cases `dash_this_chart_fresh_asks` and
+  `dash_this_chart_fresh_one_tile`. The runner already sent a case's
+  `context` with every turn (`TurnOptionsTests`), so it needed no change.
+- `9ef558ac` **T3** — `BI-41 D3`: exported pure `chatHistory` replaces the
+  empty-message filter; `STOPPED_ANSWER_TEXT`; tests in
+  `use-copilot.test.tsx` and `chat-messages.test.tsx`.
+- T4 **not done**: Q1 was not answered; the plan's default is D3 (the
+  chat's Stop), and D4 says `stop_query`'s wording is not changed here.
+  The Ask-mode pin `tests/ai_sql_help.rs:384` is untouched.
+- T5 **not verified**: `LLM_KEY` is not set in this environment, so
+  `ops/ai_eval/run_dashboard_eval.sh` exits 2 before it starts a stack
+  ("LLM_KEY must be set"). No score is recorded and no case was run; the
+  new cases are unmeasured, as is any case that changed.
+
+Design notes:
+
+- The harness scores one `expect_tool` per case. T1's `create_chart` is
+  asserted by the created chart the later `set_cache_rule` names
+  (`{created:chart}`) and by `expect_state` finding exactly one chart with
+  `def.cache.mode = fresh`; a run without the chart cannot pass.
+- `dash_this_chart_fresh_asks` uses `expect_no_tool: ["set_cache_rule"]`
+  rather than only "no `set_cache_rule` with `board`": with two tiles the
+  suffix says to ask in that turn, and `ask_user`'s own schema says to run
+  nothing else then. That is the board-rule finding and a stricter check,
+  not a looser one.
+- The two new page contexts copy the dashboard page's shape (board id,
+  `Tiles and the data they currently show`, `- "title" (kind, id <id>;
+  mart): rows: …`). The setup board and the created chart are removed by
+  the harness's own cleanup (`collect_created` from setup plus confirms),
+  which runs in its `finally`.
+
+Commands run (scoped per the machine rule: no full-workspace cargo run, no
+`cargo clean`; `CARGO_TARGET_DIR` is the shared one via `cargo-locked`):
+
+| command | result |
+| --- | --- |
+| `cargo fmt --check` | pass |
+| `cargo clippy -j 2 -p lakehouse-api --all-targets -- -D warnings` | pass, 0 warnings |
+| `cargo test -j 2 -p lakehouse-api` | 7021 passed, 0 failed, 43 ignored, 97 suites (lib `2941 passed, 18 ignored`; `main.rs` `2979 passed, 18 ignored`; the rest are integration suites, all ok) |
+| `cargo test -j 2 -p lakehouse-api --lib ai::prompt` | 34 passed, 0 failed |
+| `cargo test -j 2 -p lakehouse-api --lib ai::registry` | 29 passed, 0 failed, 1 ignored (the fixture writer) |
+| `cargo test -j 2 -p lakehouse-api --lib write_tool_schema_fixture -- --ignored` | 1 passed; the fixture diff is the one `set_cache_rule` line |
+| `(cd ops/ai_eval && python3 -m unittest test_ai_eval)` | 186 tests, OK |
+| `bun run typecheck` | pass |
+| `bun run lint` | 0 errors, 10 warnings (all pre-existing, none in this diff) |
+| `bun test src` | 3153 pass, 1 skip, 0 fail, 321 files |
+| `python3 ops/lint/check_intra_package_imports.py` | OK |
+| `python3 ops/lint/check_bare_iceberg_count.py` | OK |
+
+Not run: `cargo clippy/test --workspace` (the machine rule scopes cargo to
+the touched crate), dagster pytest and `docker compose config` (no Python
+under `dagster/`, no compose change), and a `docker compose up` (none
+needed).
+
+**`bun test src/features/copilot` is not green on this machine, and was
+not before this branch's changes.** It reports 63 pass, 3 fail, 3 errors:
+`chart-draft-card.test.tsx`, `chart-draft-preview.test.tsx` and
+`chat-messages.test.tsx` fail with `Export named 'useRouter' not found in
+module .../next/navigation.js`. The cause is `mock.module("next/navigation",
+…)` in `use-copilot.test.tsx` replacing the whole module with only
+`usePathname`, and Bun applying it across the folder's files. It reproduces
+with the T3 changes stashed (58 pass, 3 fail, 3 errors), and with the same
+folder in another worktree on unrelated code; `bun test src` (the full
+suite) is green with all 3153 tests, including the new ones. This file
+alone (`bun test src/features/copilot/chat-messages.test.tsx`) is 10 pass,
+and `use-copilot.test.tsx` alone is 15 pass. Not fixed here because the
+mock is outside BI-41; it needs its own backlog item.
+
+Environment note: this worktree had no `node_modules`. I copied one from
+another worktree whose `bun.lock` is byte-identical to this branch's (Bun
+1.4.2 locally; CI pins 1.3.12, and `bunx bun@1.3.12` gave the same
+folder-only result).
+
 ## 6. Review (planner appends below)
