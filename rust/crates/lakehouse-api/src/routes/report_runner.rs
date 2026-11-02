@@ -983,7 +983,24 @@ impl Collected<'_> {
             (&wanted.format, &wanted.values),
             self.values,
         );
-        let file = match build_chart_file(self.state, self.owner, &query, false).await {
+        let file = match build_chart_file(
+            self.state,
+            self.owner,
+            &query,
+            false,
+            // `SEC-50` slice 2 S6: the report runner acts as the
+            // subscription's owner, so the file shows the owner's own data —
+            // their first tenant, because the runner sends no `X-Tenant`.
+            &crate::routes::query::StatementGate::clickhouse(
+                self.state,
+                crate::routes::query::GateActor::Caller {
+                    principal: self.owner,
+                    headers: &HeaderMap::new(),
+                },
+            ),
+        )
+        .await
+        {
             Ok(file) => file,
             Err(ApiError::NotFound(_) | ApiError::BadRequest(_)) => {
                 self.files.left_out.push(

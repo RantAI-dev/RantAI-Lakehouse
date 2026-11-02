@@ -569,6 +569,12 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
             &time,
         ),
         crate::routes::dashboard::EMBED_VALUES_LIMIT,
+        // `SEC-50` slice 2 D3: an embed is read by nobody in particular, so
+        // it acts as the deployment's catalog tenant.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::CatalogTenant,
+        ),
     )
     .await
     {

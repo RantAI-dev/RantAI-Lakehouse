@@ -373,6 +373,7 @@ async fn a_records_request_for_a_hidden_tile_is_not_found() {
         chart: Some(chart.to_owned()),
         ..RecordsQuery::default()
     };
+    let state = crate::state::AppState::without_a_database();
     let refusal = records_for_roles(
         &ch,
         query("c_private"),
@@ -380,6 +381,7 @@ async fn a_records_request_for_a_hidden_tile_is_not_found() {
         &PlaceholderValues::none(),
         &obligations,
         &lakehouse_bi::grain::TimeContext::default(),
+        &crate::routes::query::StatementGate::unrestricted(&state),
     )
     .await
     .unwrap_err();
@@ -408,6 +410,7 @@ async fn the_csv_export_of_a_hidden_tile_is_not_found() {
         State(state_for(&server)),
         Extension(person(ME, "dashboard:read")),
         Query(query),
+        axum::http::HeaderMap::new(),
     )
     .await;
     let Err(rejection) = outcome else {
@@ -435,6 +438,7 @@ async fn the_filter_values_of_a_board_come_only_from_charts_the_caller_may_see()
     let (roles, viewer) = roles_and_viewer(&Viewer::user(id_of(ME), false));
     let query: ValuesQuery =
         serde_json::from_value(json!({ "column": "kab", "board": "all" })).unwrap();
+    let state = crate::state::AppState::without_a_database();
     let _ = values_for_roles(
         &ch,
         query,
@@ -442,6 +446,7 @@ async fn the_filter_values_of_a_board_come_only_from_charts_the_caller_may_see()
         &PlaceholderValues::none(),
         &obligations,
         &lakehouse_bi::grain::TimeContext::default(),
+        &crate::routes::query::StatementGate::unrestricted(&state),
     )
     .await;
     for read in sent(&server, "FROM console.bi_chart FINAL").await {

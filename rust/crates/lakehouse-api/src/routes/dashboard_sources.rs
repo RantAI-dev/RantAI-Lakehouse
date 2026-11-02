@@ -122,6 +122,7 @@ async fn checked_and_rewritten(
     state: &AppState,
     principal: &Principal,
     sql: &str,
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> Result<(String, String), ApiError> {
     let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
     check_and_rewrite(
@@ -129,6 +130,7 @@ async fn checked_and_rewritten(
         &principal.role_names,
         &placeholders_for(principal),
         &obligations,
+        gate,
     )
     .await
 }
@@ -140,9 +142,14 @@ async fn check_and_rewrite(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> Result<(String, String), ApiError> {
     let normalized =
         check_sql_source(sql).map_err(|r| ApiError::Unprocessable(r.message().to_owned()))?;
+    // `SEC-50` slice 2 M4: the tenant gate runs BEFORE the rewrite, so a
+    // source over a table the caller may not read is refused before the
+    // engine is asked about it at all.
+    gate.check(&normalized).await?;
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &normalized,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -256,6 +263,7 @@ async fn save(
     principal: &Principal,
     body: SourceBody,
     id: String,
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> Result<SqlSource, ApiError> {
     let title = clean_title(&body.title)?;
     let folder_id = body.folder_id.unwrap_or_default().trim().to_owned();
@@ -266,7 +274,7 @@ async fn save(
     if !folder_id.is_empty() && !viewer.sees_folder(&folder_id, "") {
         return Err(ApiError::BadRequest("folder not found.".to_owned()));
     }
-    let (normalized, rewritten) = checked_and_rewritten(state, principal, &body.sql).await?;
+    let (normalized, rewritten) = checked_and_rewritten(state, principal, &body.sql, gate).await?;
     let columns = probe_columns(&state.clickhouse, &rewritten).await?;
     let source = SqlSource {
         id,
@@ -296,10 +304,26 @@ async fn save(
 pub async fn create(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let body: SourceBody = parse(&body)?;
-    let source = save(&state, &principal, body, sources::new_source_id()).await?;
+    let source = save(
+        &state,
+        &principal,
+        body,
+        sources::new_source_id(),
+        // `SEC-50` slice 2 M4: the source is saved as the caller, so it is
+        // gated as the caller — with the request's headers.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::Caller {
+                principal: &principal,
+                headers: &headers,
+            },
+        ),
+    )
+    .await?;
     Ok(ApiJson(json!({ "ok": true, "source": source })))
 }
 
@@ -313,6 +337,7 @@ pub async fn create(
 pub async fn update(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let body: SourceBody = parse(&body)?;
@@ -327,7 +352,22 @@ pub async fn update(
     // unknown to them as one that does not exist, for a change as for a read.
     let viewer = crate::routes::dashboard_access::viewer_for_write(&state, &principal).await?;
     visible_source(&state.clickhouse, &viewer, &id).await?;
-    let source = save(&state, &principal, body, id).await?;
+    let source = save(
+        &state,
+        &principal,
+        body,
+        id,
+        // `SEC-50` slice 2 M4: the source is saved as the caller, so it is
+        // gated as the caller — with the request's headers.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::Caller {
+                principal: &principal,
+                headers: &headers,
+            },
+        ),
+    )
+    .await?;
     Ok(ApiJson(json!({ "ok": true, "source": source })))
 }
 
@@ -452,7 +492,7 @@ async fn preview_for_roles(
     time: &lakehouse_bi::grain::TimeContext,
 ) -> Result<Value, ApiError> {
     let (normalized, rewritten) =
-        check_and_rewrite(&body.sql, roles, placeholders, obligations).await?;
+        check_and_rewrite(&body.sql, roles, placeholders, obligations, gate).await?;
     let columns = probe_columns(ch, &rewritten).await?;
     let chart = match &body.chart {
         Some(input) => Some(

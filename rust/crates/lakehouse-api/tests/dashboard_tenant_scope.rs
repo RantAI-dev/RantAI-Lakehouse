@@ -56,12 +56,19 @@ const REFUSAL: &str = "Table not found or not available to your organisation: se
 /// statement it is sent.
 #[derive(Clone)]
 struct FakeCh {
+    charts: Arc<Vec<Value>>,
     statements: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeCh {
     fn new() -> Self {
+        Self::with_charts(vec![chart_row()])
+    }
+
+    /// A fake serving `charts` instead of the default tile.
+    fn with_charts(charts: Vec<Value>) -> Self {
         Self {
+            charts: Arc::new(charts),
             statements: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -106,7 +113,17 @@ impl Respond for FakeCh {
         if sql.contains("FROM console.bi_chart") {
             return rows(
                 &["id", "board", "created_by", "created_at", "spec_json"],
-                &[chart_row()],
+                &self.charts,
+            );
+        }
+        // The column probe of a SQL source (`DESCRIBE (SELECT * FROM ...)`).
+        if sql.contains("DESCRIBE") {
+            return rows(
+                &["name", "type"],
+                &[
+                    json!({ "name": "kab", "type": "String" }),
+                    json!({ "name": "visitors", "type": "UInt32" }),
+                ],
             );
         }
         // The board itself: the built-in one, which has no stored row.
@@ -116,10 +133,18 @@ impl Respond for FakeCh {
         // The columns of the mart the tile reads.
         if sql.contains("FROM system.columns") {
             return rows(
-                &["table", "name", "type"],
                 &[
-                    json!({ "table": MART, "name": "kab", "type": "String" }),
-                    json!({ "table": MART, "name": "visitors", "type": "UInt32" }),
+                    "table",
+                    "name",
+                    "type",
+                    "default_kind",
+                    "default_expression",
+                ],
+                &[
+                    json!({ "table": MART, "name": "kab", "type": "String",
+                            "default_kind": "", "default_expression": "" }),
+                    json!({ "table": MART, "name": "visitors", "type": "UInt32",
+                            "default_kind": "", "default_expression": "" }),
                 ],
             );
         }
@@ -133,6 +158,16 @@ impl Respond for FakeCh {
                 })],
             );
         }
+        // The rows of a download: they arrive as a stream (the names, the
+        // types, then one array a row).
+        if sql.contains("JSONCompactEachRowWithNamesAndTypes") {
+            return ResponseTemplate::new(200)
+                .set_body_string("[\"kab\",\"visitors\"]\n[\"String\",\"UInt32\"]\n[\"a\",1]\n");
+        }
+        // The total of a page of rows.
+        if sql.contains("count() AS n") {
+            return rows(&["n"], &[json!({ "n": 1 })]);
+        }
         // The tile's own query.
         if sql.contains(&format!("serving.{MART}")) {
             return rows(
@@ -140,10 +175,32 @@ impl Respond for FakeCh {
                 &[json!({ "kab": "a", "visitors": 1 })],
             );
         }
-        // Anything else (the store's table checks, the sources, the catalog
-        // fields): success, no rows.
-        ResponseTemplate::new(200).set_body_string("Ok.\n")
+        // The store's own table checks.
+        if sql.starts_with("CREATE") || sql.starts_with("ALTER") || sql.starts_with("DROP") {
+            return ResponseTemplate::new(200).set_body_string("Ok.\n");
+        }
+        // Anything else (the sources, the catalog fields): success, no rows.
+        rows(&[], &[])
     }
+}
+
+/// A `console.bi_chart` row for a raw table: a tile in rows mode, which is
+/// what the table export reads.
+fn table_chart_row() -> Value {
+    let spec = json!({
+        "id": "c_table", "title": "Table", "kind": "table", "mart": MART,
+        "sql": "SELECT kab, visitors FROM serving.mart_x",
+        "x": "kab", "y": "visitors"
+    });
+    let def = json!({
+        "title": "Table", "mart": MART, "kind": "table",
+        "dimension": "kab", "measures": ["visitors"],
+        "tableMode": "rows", "columns": ["kab", "visitors"]
+    });
+    json!({
+        "id": "c_table", "board": "", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+        "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+    })
 }
 
 /// A `console.bi_chart` row: one bar tile on the mart, on the built-in board.
@@ -189,7 +246,12 @@ async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
 
 /// A person who may read dashboards and belongs to `tenant` and to no other.
 async fn member_of(pool: &PgPool, tenant: &str) -> Uuid {
-    let user = create_principal_with_permissions(pool, "dashboard:read").await;
+    member_with(pool, tenant, "dashboard:read").await
+}
+
+/// A person holding `permissions` who belongs to `tenant` and to no other.
+async fn member_with(pool: &PgPool, tenant: &str, permissions: &str) -> Uuid {
+    let user = create_principal_with_permissions(pool, permissions).await;
     sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
         .bind(user)
         .bind(tenant.parse::<Uuid>().expect("a seeded tenant id"))
@@ -419,4 +481,253 @@ async fn a_refused_reader_is_not_served_from_the_remembered_tile() {
         asked_before,
         "the refusal precedes the cache lookup and the engine: nothing more may be asked"
     );
+}
+
+// ── the other signed-in sites (SEC-50 slice 2 T3) ───────────────────────────
+
+/// The three callers of the matrix: the tenant that owns the shared catalog,
+/// a member of another tenant, and an unrestricted principal.
+struct Callers {
+    owner: String,
+    other: String,
+    admin: String,
+}
+
+/// The three callers, each holding `permissions` and each in its own tenant.
+async fn callers(pool: &PgPool, permissions: &str) -> Callers {
+    let owner = member_with(pool, OWNER_TENANT, permissions).await;
+    let other = member_with(pool, OTHER_TENANT, permissions).await;
+    let admin = create_principal_with_permissions(pool, "*:*").await;
+    Callers {
+        owner: session_cookie_for_user(pool, owner).await,
+        other: session_cookie_for_user(pool, other).await,
+        admin: session_cookie_for_user(pool, admin).await,
+    }
+}
+
+/// One request, as the console sends it.
+async fn call(
+    router: &axum::Router,
+    cookie: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("cookie", cookie);
+    let body = match body {
+        Some(value) => {
+            request = request.header("content-type", "application/json");
+            Body::from(value.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = router
+        .clone()
+        .oneshot(request.body(body).expect("build request"))
+        .await
+        .expect("router never fails a request outright");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let parsed = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, parsed)
+}
+
+/// The matrix of `SEC-50` slice 2 T3: the tenant that owns the shared
+/// catalog is served, an unrestricted principal is served, and a member of
+/// another tenant is refused with `SEC-20`'s sentence — and the refusal
+/// reaches neither the engine nor the result cache.
+///
+/// `served` says what a served answer looks like; the refusal is the same
+/// everywhere.
+async fn assert_matrix<F>(
+    router: &axum::Router,
+    fake: &FakeCh,
+    callers: &Callers,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    served: F,
+) where
+    F: Fn(StatusCode, &Value) -> bool,
+{
+    // The catalog's own tenant reads it.
+    let (status, answer) = call(router, &callers.owner, method, uri, body.clone()).await;
+    assert!(
+        served(status, &answer),
+        "the owning tenant: {status} {answer}"
+    );
+
+    // So does an unrestricted principal.
+    let (status, answer) = call(router, &callers.admin, method, uri, body.clone()).await;
+    assert!(
+        served(status, &answer),
+        "the unrestricted: {status} {answer}"
+    );
+
+    // How many statements the engine was asked for, so far.
+    let asked = fake.tile_statements().len();
+
+    // A member of another tenant is refused, and nothing more is asked.
+    let (status, answer) = call(router, &callers.other, method, uri, body).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_eq!(answer["error"], REFUSAL, "{answer}");
+    assert_eq!(
+        fake.tile_statements().len(),
+        asked,
+        "the refusal precedes the engine: nothing more may be asked"
+    );
+}
+
+/// `SEC-50` slice 2 T3: the drill-down reads as the caller's own tenant.
+#[tokio::test]
+async fn the_records_of_another_tenant_are_refused() {
+    let fake = FakeCh::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&server.uri()).await;
+    let callers = callers(&pool, "dashboard:read").await;
+
+    assert_matrix(
+        &router,
+        &fake,
+        &callers,
+        "GET",
+        "/api/dashboard/records?mart=mart_x&column=kab&value=a",
+        None,
+        |status, answer| status == StatusCode::OK && answer["rows"].is_array(),
+    )
+    .await;
+}
+
+/// `SEC-50` slice 2 T3/M9: the filter values (no board) read as the caller's
+/// own tenant.
+#[tokio::test]
+async fn the_filter_values_of_another_tenant_are_refused() {
+    let fake = FakeCh::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&server.uri()).await;
+    let callers = callers(&pool, "dashboard:read").await;
+
+    assert_matrix(
+        &router,
+        &fake,
+        &callers,
+        "GET",
+        "/api/dashboard/values?column=kab",
+        None,
+        |status, answer| status == StatusCode::OK && answer["values"].is_array(),
+    )
+    .await;
+}
+
+/// `SEC-50` slice 2 T3/M9: the filter values of a board read as the caller's
+/// own tenant.
+#[tokio::test]
+async fn the_filter_values_of_a_board_of_another_tenant_are_refused() {
+    let fake = FakeCh::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&server.uri()).await;
+    let callers = callers(&pool, "dashboard:read").await;
+
+    assert_matrix(
+        &router,
+        &fake,
+        &callers,
+        "GET",
+        "/api/dashboard/values?column=kab&board=default",
+        None,
+        |status, answer| status == StatusCode::OK && answer["values"].is_array(),
+    )
+    .await;
+}
+
+/// `SEC-50` slice 2 T3: the chart download reads as the caller's own tenant.
+#[tokio::test]
+async fn the_chart_download_of_another_tenant_is_refused() {
+    let fake = FakeCh::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&server.uri()).await;
+    let callers = callers(&pool, "dashboard:read").await;
+
+    for sql in fake.statements() {
+        eprintln!("STATEMENT: {sql}");
+    }
+    assert_matrix(
+        &router,
+        &fake,
+        &callers,
+        "GET",
+        "/api/dashboard/chart-export?chart=c_a&format=csv",
+        None,
+        |status, _| status == StatusCode::OK,
+    )
+    .await;
+}
+
+/// `SEC-50` slice 2 T3: the table download reads as the caller's own tenant.
+#[tokio::test]
+async fn the_table_download_of_another_tenant_is_refused() {
+    let fake = FakeCh::with_charts(vec![table_chart_row()]);
+    let server = fake.serve().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&server.uri()).await;
+    let callers = callers(&pool, "dashboard:read").await;
+
+    assert_matrix(
+        &router,
+        &fake,
+        &callers,
+        "GET",
+        "/api/dashboard/table-export?chart=c_table",
+        None,
+        |status, _| status == StatusCode::OK,
+    )
+    .await;
+}
+
+/// `SEC-50` slice 2 T3: a SQL source's preview reads as the caller's own
+/// tenant.
+#[tokio::test]
+async fn the_sql_source_preview_of_another_tenant_is_refused() {
+    let fake = FakeCh::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&server.uri()).await;
+    let callers = callers(&pool, "dashboard:read,dashboard:sql").await;
+
+    assert_matrix(
+        &router,
+        &fake,
+        &callers,
+        "POST",
+        "/api/dashboard/sources/preview",
+        Some(json!({ "sql": "SELECT kab, visitors FROM serving.mart_x" })),
+        |status, answer| status == StatusCode::OK && answer["columns"].is_array(),
+    )
+    .await;
+}
+
+/// `SEC-50` slice 2 T3: a SQL source is saved as the caller's own tenant, so
+/// a source over a table another tenant owns is refused.
+#[tokio::test]
+async fn the_sql_source_of_another_tenant_is_refused() {
+    let fake = FakeCh::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&server.uri()).await;
+    let callers = callers(&pool, "dashboard:read,dashboard:sql").await;
+
+    assert_matrix(
+        &router,
+        &fake,
+        &callers,
+        "POST",
+        "/api/dashboard/sources",
+        Some(json!({
+            "title": "A source",
+            "sql": "SELECT kab, visitors FROM serving.mart_x",
+        })),
+        |status, answer| status == StatusCode::OK && answer["source"].is_object(),
+    )
+    .await;
 }
