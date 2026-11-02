@@ -98,21 +98,38 @@ pub fn take(dir: &Path, version: Option<&str>) -> Result<PathBuf, ToolError> {
 /// does not ship, or a script that failed.
 pub fn command_restore(args: &RestoreArgs) -> Result<(), ToolError> {
     let dir = &args.dir;
-    restore(dir, &args.backup)
+    // The operator's own restore has nobody after it to start the
+    // stack, so it starts the stack itself: a standalone restore that
+    // left a stack down and said it was done would be a fabricated
+    // success (REL-2 S4b review round 9 BLOCKER 4, decision D25).
+    restore(dir, &args.backup, true)
 }
 
 /// Restore a backup of the stack.
+///
+/// `start_stack` says whether the restore starts the stack when it is
+/// done. The rollback of an update passes `false`: it runs while the
+/// FAILED release's `docker-compose.yml` is still in place, so a stack
+/// start here waits on a release that never becomes healthy. The
+/// rollback puts the old files back and starts the stack itself
+/// (REL-2 S4 decision D18), and the restore is told not to start
+/// anything (REL-2 S4b review round 9 BLOCKER 4, decision D25).
 ///
 /// # Errors
 ///
 /// Returns the error that stopped the restore: a script the release
 /// does not ship, or a script that failed.
-pub fn restore(dir: &Path, backup: &Path) -> Result<(), ToolError> {
+pub fn restore(dir: &Path, backup: &Path, start_stack: bool) -> Result<(), ToolError> {
     let dir = absolute(dir)?;
     let script = restore_script(&dir);
     require_script(&script)?;
-    let backup = backup.to_string_lossy().to_string();
-    run(&script, &["--local".to_string(), backup], &dir, None)?;
+    let mut args = Vec::new();
+    if !start_stack {
+        args.push("--skip-stack-up".to_string());
+    }
+    args.push("--local".to_string());
+    args.push(backup.to_string_lossy().to_string());
+    run(&script, &args, &dir, None)?;
     Ok(())
 }
 
@@ -385,6 +402,50 @@ mod tests {
         assert!(
             written.contains("ARGS=--local /backups/one"),
             "the tool was not given the backup directory: {written}"
+        );
+        assert!(
+            !written.contains("--skip-stack-up"),
+            "the operator's own restore was told not to start the stack: {written}"
+        );
+    }
+
+    #[test]
+    fn the_rollbacks_restore_does_not_start_the_stack_and_the_operators_does() {
+        // REL-2 S4b review round 9 BLOCKER 4, decision D25: the rollback
+        // restores while the FAILED release's files are still in place,
+        // so the restore must not start that release's stack. The
+        // rollback starts the stack itself, with the old files (D18).
+        // The operator's own restore has nobody after it, and starts
+        // the stack itself.
+        use crate::runner::{Local, Runner};
+
+        let rollback = tempfile::tempdir().expect("a temporary directory");
+        fake_tool(rollback.path(), "restore-from-backup.sh", "restore");
+        let mut runner = Local::new(rollback.path());
+        runner
+            .restore(Path::new("/backups/one"))
+            .expect("the rollback's restore runs");
+        let written = record(rollback.path());
+        assert!(
+            written.contains("ARGS=--skip-stack-up --local /backups/one"),
+            "the rollback's restore was not told to leave the stack alone: {written}"
+        );
+
+        let operator = tempfile::tempdir().expect("a temporary directory");
+        fake_tool(operator.path(), "restore-from-backup.sh", "restore");
+        command_restore(&RestoreArgs {
+            backup: PathBuf::from("/backups/one"),
+            dir: operator.path().to_path_buf(),
+        })
+        .expect("the operator's restore runs");
+        let written = record(operator.path());
+        assert!(
+            written.contains("ARGS=--local /backups/one"),
+            "the operator's restore was not given the backup directory: {written}"
+        );
+        assert!(
+            !written.contains("--skip-stack-up"),
+            "the operator's restore was told not to start the stack: {written}"
         );
     }
 

@@ -219,7 +219,12 @@ impl Runner for Local {
     }
 
     fn restore(&mut self, backup: &Path) -> Result<(), String> {
-        backup::restore(&self.dir, backup).map_err(|error| error.to_string())
+        // The rollback puts the old files back and starts the stack
+        // itself (REL-2 S4 decision D18). The restore runs while the
+        // FAILED release's files are still in place, so starting the
+        // stack here waits on a release that never becomes healthy
+        // (REL-2 S4b review round 9 BLOCKER 4, decision D25).
+        backup::restore(&self.dir, backup, false).map_err(|error| error.to_string())
     }
 
     fn up(&mut self) -> Result<(), String> {
