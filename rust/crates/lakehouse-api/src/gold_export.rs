@@ -513,6 +513,7 @@ pub(crate) async fn export_batch_sql(
     crate::policy_engine::rewrite_sql_for_roles(
         &batch_sql,
         &sqlparser::dialect::ClickHouseDialect {},
+        crate::sql_rewrite::Engine::ClickHouse,
         roles,
         placeholders,
         obligations,

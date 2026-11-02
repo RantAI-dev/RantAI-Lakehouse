@@ -1432,9 +1432,9 @@ fn chat_response_body(
 
 /// The `NEXT:` line the model ends a turn with when the request still has
 /// steps left (`AI-15`). The console sends the step back as a message
-/// ("Confirmed. Continue: ...") once the person has confirmed the draft, so
-/// a request that needs two dependent writes finishes in one conversation
-/// instead of stopping at the first draft.
+/// ("Confirmed and saved: ...; Continue: ...") once the person has confirmed
+/// the draft, so a request that needs two dependent writes finishes in one
+/// conversation instead of stopping at the first draft.
 ///
 /// Only the last non-empty line counts, and only when the turn really has a
 /// pending confirmation: a `NEXT:` line in the middle of an answer is the

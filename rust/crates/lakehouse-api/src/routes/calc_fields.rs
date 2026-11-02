@@ -613,7 +613,8 @@ mod tests {
 
     use super::*;
     use crate::sql_rewrite::{
-        NoViews, ObligationsSource, PlaceholderValues, RewriteError, TableObligations, enforce,
+        Engine, NoViews, ObligationsSource, PlaceholderValues, RewriteError, TableObligations,
+        enforce,
     };
 
     /// One governed table, `serving.<table>`, with a fixed obligation set for
@@ -658,6 +659,7 @@ mod tests {
         enforce(
             sql,
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &["analyst".to_owned()],
             &PlaceholderValues::none(),
             policy,
@@ -972,6 +974,7 @@ mod tests {
                 let free = enforce(
                     &sql,
                     &ClickHouseDialect {},
+                    Engine::ClickHouse,
                     &["analyst".to_owned()],
                     &PlaceholderValues::none(),
                     &NoObligations,

@@ -313,8 +313,21 @@ can be proved before it can cut a release:
   It is never the release key and it never leaves the runner.
 
 Nothing is published. The bundle, the manifest, its Sigstore bundle, the rendered Compose
-file and the SBOMs are uploaded as a workflow artifact (`release-dry-run`), and the run's
-summary prints the bundle's size — the number the release notes quote.
+file, the installer and the SBOMs are uploaded as a workflow artifact (`release-dry-run`),
+and the run's summary prints the bundle's size — the number the release notes quote.
+
+### The installer
+
+Both jobs build `lakehousectl` — the operator's install and update tool (REL-2 S3) — as a
+**static** binary for `x86_64-unknown-linux-musl`, so it runs on a host that has nothing but
+a Linux kernel: that is the air-gapped host. The binary joins the offline bundle and the
+release's assets, and the signed manifest names its checksum, so the bundle's copy is the
+file the release published.
+
+The build is **without** the `test-key` feature: a release build verifies a manifest against
+the release key compiled into it and against no other. The feature exists for the CI dry
+run's own proof, whose bundle is signed with the throwaway key the job generates — and that
+proof builds its own binary with the feature, in the proof's own job.
 
 ### The real release
 

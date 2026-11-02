@@ -6,13 +6,16 @@ import { IcebergTimeTravelControls } from "./time-travel-controls"
 
 // DATA-16 F5/F7/F8: the picker writes the ClickHouse pin, says the pin is
 // query-wide, shows a version's time (not just its id), and is switched off
-// with a reason on Trino, where the API refuses past versions.
+// with a reason on an engine that has no past versions. DATA-21 D5: Trino
+// has them too — the pin is written on the table the user picked.
 afterEach(() => {
   cleanup()
   mock.restore()
 })
 
 const SQL = "SELECT * FROM icecat_api.`bronze.orders`"
+/** The Trino form of the same read: the catalog, the schema, the table. */
+const TRINO_SQL = "SELECT * FROM iceberg.bronze.orders"
 
 function stubLakehouse() {
   spyOn(lakehouseService, "listNamespaces").mockResolvedValue([{ name: "bronze" }] as never)
@@ -55,13 +58,29 @@ describe("IcebergTimeTravelControls", () => {
     expect(onApply.mock.calls[0][0]).toBe(`${SQL}\nSETTINGS iceberg_snapshot_id = 7539123456789012345`)
   })
 
-  it("on Trino switches the controls off and says past versions are ClickHouse-only", () => {
+  it("on Trino pins the version on the table the user picked", async () => {
     stubLakehouse()
     const onApply = mock<(next: string) => void>(() => {})
-    render(<IcebergTimeTravelControls sql={SQL} engine="trino" onApply={onApply} />)
+    render(<IcebergTimeTravelControls sql={TRINO_SQL} engine="trino" onApply={onApply} />)
 
-    expect(screen.getByText("Past versions can be queried on ClickHouse only.")).toBeTruthy()
-    expect(screen.queryByText(/One version applies/)).toBeNull()
+    expect(screen.getByText(/The version applies to the table you picked\./)).toBeTruthy()
+    await pick("Namespace", /^bronze$/)
+    await pick("Table", /^orders$/)
+    await pick("Version", /2026.* · append/)
+    fireEvent.click(screen.getByText("Query this version"))
+
+    await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1))
+    expect(onApply.mock.calls[0][0]).toBe(
+      "SELECT * FROM iceberg.bronze.orders FOR VERSION AS OF 7539123456789012345"
+    )
+  })
+
+  it("says so when the engine has no past versions", () => {
+    stubLakehouse()
+    const onApply = mock<(next: string) => void>(() => {})
+    render(<IcebergTimeTravelControls sql={SQL} engine="duckdb" onApply={onApply} />)
+
+    expect(screen.getByText("Past versions can be queried on ClickHouse and Trino.")).toBeTruthy()
     expect((screen.getByText("Query this version") as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByText("Namespace").closest("button") as HTMLButtonElement).disabled).toBe(true)
     expect(onApply).not.toHaveBeenCalled()

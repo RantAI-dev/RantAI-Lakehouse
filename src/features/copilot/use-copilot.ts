@@ -107,11 +107,12 @@ export function continuationText(messages: Msg[], index: number, nextStep: strin
 
 /**
  * The item that names one saved object, or null when the step is not one:
- * a step that failed, or one that still waits for the person to confirm
- * it, has saved nothing.
+ * a step that failed, one the person never confirmed, or one that still
+ * waits for the person to confirm it has saved nothing.
  */
 function savedItem(step: ToolStep): string | null {
   if (step.ok !== true) return null;
+  if (step.confirmed !== true) return null;
   const result = (step.result ?? {}) as {
     id?: unknown;
     title?: unknown;
@@ -496,7 +497,7 @@ function useCopilotState() {
         setError(String(json.result?.error || json.error || "Failed to execute tool"));
       }
       const updated = replaceToolStep(messagesRef.current, messageIndex, stepIndex, (msg, step) => ({
-        step: { ...step, ok: toolOk, result: json.result ?? json },
+        step: { ...step, ok: toolOk, result: json.result ?? json, confirmed: toolOk },
         chartCreated: Boolean(msg.chartCreated || created),
       }));
       if (updated) {
@@ -546,7 +547,7 @@ function useCopilotState() {
   const completeToolStep = React.useCallback(
     (messageIndex: number, stepIndex: number, result: Record<string, unknown>) => {
       const updated = replaceToolStep(messagesRef.current, messageIndex, stepIndex, (_msg, step) => ({
-        step: { ...step, ok: true, result },
+        step: { ...step, ok: true, result, confirmed: true },
         chartCreated: true,
       }));
       if (updated) {

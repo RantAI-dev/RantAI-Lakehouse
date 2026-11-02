@@ -73,10 +73,39 @@ use crate::tenant::{
 /// search term the command palette sends (WS2 §13) — moved here from
 /// `src/services/clients/assets.ts`'s browser-side filter so there is one
 /// implementation of the term match, not two (`AGENTS.md` rule 4).
+///
+/// `limit` is how many assets the caller wants (`DATA-41` D3): the
+/// command palette shows eight, so it asks for eight instead of being
+/// sent a catalog of ten thousand tables to throw away all but eight.
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     #[serde(default)]
     q: Option<String>,
+    /// At most how many assets the answer carries. `None` is every match,
+    /// as before `DATA-41` D3.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// The `limit` a caller asked for, and whether this route serves it.
+///
+/// `DATA-41` D3: the limit is 1 to 200 — the Data Explorer's own page size
+/// ([`MAX_PAGE_SIZE`]) — and anything else is a 400 with a plain message.
+/// A limit the server does not serve is the caller's mistake, and rounding
+/// it silently would answer a different question than the one that was
+/// asked.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] when the limit is outside 1..=[`MAX_PAGE_SIZE`].
+fn requested_limit(limit: Option<u32>) -> Result<Option<usize>, ApiError> {
+    match limit {
+        None => Ok(None),
+        Some(value) if (1..=MAX_PAGE_SIZE).contains(&value) => Ok(Some(value as usize)),
+        Some(_) => Err(ApiError::BadRequest(format!(
+            "`limit` must be between 1 and {MAX_PAGE_SIZE}"
+        ))),
+    }
 }
 
 // ── CATALOG_TENANT_ID: this deployment's single shared, no-tenant-column
@@ -214,6 +243,13 @@ pub(crate) async fn catalog_tenant_refusal(
 /// `"columnSearch": "partial"`. Without a term nothing changes: the
 /// registry is assembled live.
 ///
+/// # `limit` (`DATA-41` D3)
+///
+/// With `?limit=N` the answer carries at most `N` assets and says how many
+/// matched in all (`total`). The limit is applied AFTER the ranking, so the
+/// assets that come back are the best ones. Without a limit the answer is
+/// as it was: every match, and no `total`.
+///
 /// # Tenant scoping
 ///
 /// [`catalog_tenant_refusal`] runs first — see its doc comment and the
@@ -243,16 +279,24 @@ pub async fn list(
         Ok(None) => {}
         Err(err) => return ApiRejection(err).into_response(),
     }
+    // `DATA-41` D3: a limit outside 1..=200 is a 400 with a plain message.
+    let limit = match requested_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(err) => return ApiRejection(err).into_response(),
+    };
     if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         return match search_snapshot(&state).await {
             Ok(snapshot) => {
-                let assets = catalog_search::search(
-                    &snapshot.assets,
-                    &snapshot.columns,
-                    &snapshot.usage,
-                    term,
-                );
-                let mut body = json!({ "assets": assets, "namespaces": snapshot.namespaces });
+                let outcome = catalog_search::search(&snapshot.index, &snapshot.usage, term, limit);
+                let mut body = json!({
+                    "assets": outcome.assets,
+                    "namespaces": snapshot.namespaces,
+                });
+                // `DATA-41` D3: the count of every match, so a caller that
+                // asked for a few of them still knows how many there are.
+                if limit.is_some() {
+                    body["total"] = json!(outcome.total);
+                }
                 if snapshot.column_search_partial {
                     body["columnSearch"] = json!("partial");
                 }
@@ -262,7 +306,21 @@ pub async fn list(
         };
     }
     match assemble_catalog(&state).await {
-        Ok((body, _bronze_pairs)) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok((mut body, _bronze_pairs)) => {
+            // `DATA-41` D3: the same limit on the live registry, and the
+            // same count of what it held.
+            if let Some(limit) = limit {
+                let total = body
+                    .get("assets")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
+                    assets.truncate(limit);
+                }
+                body["total"] = json!(total);
+            }
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => list_unavailable(err),
     }
 }
@@ -405,10 +463,10 @@ pub async fn query(
         )
             .into_response())
     };
-    let (searched, column_search_partial) = if let Some(term) = term {
+    let (mut filtered, column_search_partial) = if let Some(term) = term {
         match search_snapshot(&state).await {
             Ok(snapshot) => (
-                catalog_search::search(&snapshot.assets, &snapshot.columns, &snapshot.usage, term),
+                catalog_search::search(&snapshot.index, &snapshot.usage, term, None).assets,
                 snapshot.column_search_partial,
             ),
             Err(err) => return unavailable(err),
@@ -426,8 +484,14 @@ pub async fn query(
         (assets, false)
     };
 
-    let mut filtered = catalog_query::apply_filters(&searched, &filters, join);
+    // The sort runs over the rows the route holds, before the filters:
+    // sorting the whole set and keeping the matches leaves them in the
+    // same order as keeping the matches and sorting them would
+    // (`apply_sort` is a total order, `id` included), and it lets the
+    // filters run over the rows the route already owns.
     order_results(&mut filtered, term.is_some(), &sort);
+    // `DATA-41` D6: with no filters the rows are not copied at all.
+    catalog_query::apply_filters(&mut filtered, &filters, join);
 
     let (ordered, summaries) = match group_by.as_deref() {
         Some(field) => catalog_query::apply_grouping(&filtered, field),
@@ -483,6 +547,41 @@ fn order_results(rows: &mut [Value], searched: bool, sort: &[catalog_query::Sort
     }
 }
 
+/// DATA-40 D3: the predicate every read of the SECONDARY registry carries.
+///
+/// The catalog reads two registries — `lake.bronze_meta.*` (primary) and
+/// `lake.bronze_meta_sec.*` (secondary) — and one slug names one dataset
+/// (D1). A slug the primary registry holds is therefore not read again
+/// from the secondary one: the primary wins, everywhere, and a slug that
+/// is in both registries has ONE answer instead of one that varies between
+/// runs (the list's column count came from whichever registry answered
+/// first, and the detail page counted both registries' columns).
+///
+/// `FINAL` inside the clause, for the reason the registry reads give: the
+/// registry is a `ReplacingMergeTree ORDER BY slug` that a re-run writes
+/// again, and `ClickHouse` merges the copies only in the background.
+///
+/// A constant clause — never caller input — so it can be spliced into a
+/// statement with `format!`.
+const NOT_IN_PRIMARY: &str = "NOT IN (SELECT slug FROM lake.`bronze_meta.dataset_catalog` FINAL)";
+
+/// DATA-40 D5: the slugs BOTH registries hold — the clash the reads above
+/// resolve in favour of the primary.
+///
+/// The count is exact and the sample is capped at five rows, so a
+/// deployment with many clashes still answers in one bounded read. Nothing
+/// here reaches the response: a clash is an operator's problem, and the
+/// log is where it belongs.
+const CLASH_SQL: &str = "SELECT toString((SELECT count() FROM (
+    SELECT slug FROM lake.`bronze_meta.dataset_catalog` FINAL
+    INTERSECT
+    SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` FINAL))) n,
+  (SELECT groupArray(slug) FROM (
+    SELECT slug FROM lake.`bronze_meta.dataset_catalog` FINAL
+    INTERSECT
+    SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
+    LIMIT 5)) slugs";
+
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line port of a single TS handler; splitting it up \
@@ -504,84 +603,75 @@ async fn list_body(
     ch: &ChClient,
     bronze_is_readable: bool,
 ) -> Result<(Value, Vec<(String, String)>), ChError> {
-    let cat = ch
-        .rows(
-            "SELECT slug, title, description, tier, updated_at, table_name,
+    // DATA-40 D3/D4: the primary registry wins everywhere, and every read
+    // asks for the merged row.
+    //
+    // D4: `FINAL` on the catalog and sync reads, for the reason the column
+    // read already gives (`DATA-24 T2` D2): the registry is a
+    // `ReplacingMergeTree ORDER BY slug` that every run of a connector
+    // writes again (`register_bronze_table`), and `ClickHouse` merges the
+    // copies only in the background. Without it a slug a second run
+    // registered was listed twice.
+    //
+    // D3: the secondary branch of every union drops the slugs the primary
+    // holds (see [`NOT_IN_PRIMARY`]), so a slug that is in both registries
+    // is read once, from the primary.
+    let catalog_sql = format!(
+        "SELECT slug, title, description, tier, updated_at, table_name,
               toString(dateDiff('second', parseDateTimeBestEffortOrNull(updated_at), now())) lag
-       FROM lake.`bronze_meta.dataset_catalog`
+       FROM lake.`bronze_meta.dataset_catalog` FINAL
        UNION ALL
        SELECT slug, title, description, tier, updated_at, table_name,
               toString(dateDiff('second', parseDateTimeBestEffortOrNull(updated_at), now())) lag
-       FROM lake.`bronze_meta_sec.dataset_catalog`",
-            None,
-        )
-        .await?;
-    let sync_rows = ch
-        .rows(
-            "SELECT slug, toString(total) total, author, frekuensi FROM lake.`bronze_meta.dataset_sync`
-       UNION ALL SELECT slug, toString(total) total, author, frekuensi FROM lake.`bronze_meta_sec.dataset_sync`",
-            None,
-        )
-        .await?;
-    let col_rows = ch
-        .rows(
-            "SELECT slug, toString(count()) n FROM lake.`bronze_meta.dataset_column` GROUP BY slug
-       UNION ALL SELECT slug, toString(count()) n FROM lake.`bronze_meta_sec.dataset_column` GROUP BY slug",
-            None,
-        )
-        .await?;
+       FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
+       WHERE slug {NOT_IN_PRIMARY}"
+    );
+    let sync_sql = format!(
+        "SELECT slug, toString(total) total, author, frekuensi FROM lake.`bronze_meta.dataset_sync` FINAL
+       UNION ALL SELECT slug, toString(total) total, author, frekuensi FROM lake.`bronze_meta_sec.dataset_sync` FINAL
+       WHERE slug {NOT_IN_PRIMARY}"
+    );
+    // `DATA-24 T2` (D2): `FINAL`, for the reason the asset-detail query
+    // gives (`bronze_asset_detail_body`): the registry is a
+    // `ReplacingMergeTree ORDER BY (slug, key_asli)` that every run of a
+    // connector writes again (`register_bronze_table`), and `ClickHouse`
+    // merges the copies only in the background. Without it a column a
+    // second run registered was counted twice, and `columnCount` said twice
+    // the columns the table has.
+    let col_sql = format!(
+        "SELECT slug, toString(count()) n FROM lake.`bronze_meta.dataset_column` FINAL GROUP BY slug
+       UNION ALL SELECT slug, toString(count()) n FROM lake.`bronze_meta_sec.dataset_column` FINAL
+       WHERE slug {NOT_IN_PRIMARY} GROUP BY slug"
+    );
+    let (cat, sync_rows, col_rows, clash) = tokio::try_join!(
+        ch.rows(&catalog_sql, None),
+        ch.rows(&sync_sql, None),
+        ch.rows(&col_sql, None),
+        ch.rows(CLASH_SQL, None),
+    )?;
 
-    let total_of = |slug: &str| -> i64 {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .map_or(0, |s| num_or_zero(Some(s), "total"))
-    };
-    let author_of = |slug: &str| -> String {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .map(|s| str_col(s, "author").to_owned())
-            .unwrap_or_default()
-    };
-    let col_of = |slug: &str| -> i64 {
-        col_rows
-            .iter()
-            .find(|c| str_col(c, "slug") == slug)
-            .map_or(0, |c| num_or_zero(Some(c), "n"))
-    };
-    let frequency_of = |slug: &str| -> Option<i64> {
-        sync_rows
-            .iter()
-            .find(|s| str_col(s, "slug") == slug)
-            .and_then(|s| catalog_governance::frequency_target_seconds(str_col(s, "frekuensi")))
-    };
+    // DATA-40 D5: a clash is reported, never answered differently. The
+    // number of slugs both registries hold and the first few of them go to
+    // the log; the response is not changed by them.
+    let clash_count = num_or_zero(clash.first(), "n");
+    if clash_count > 0 {
+        let sample: Vec<&str> = clash
+            .first()
+            .and_then(|row| row.get("slugs"))
+            .and_then(Value::as_array)
+            .map(|slugs| slugs.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        tracing::warn!(
+            slugs = clash_count,
+            first = ?sample,
+            "DATA-40: the primary and the secondary Bronze registry hold the same slug; \
+             the primary wins"
+        );
+    }
 
-    let mut assets: Vec<Value> = cat
-        .iter()
-        .map(|c| {
-            let slug = str_col(c, "slug");
-            let rows = total_of(slug);
-            let sekunder = str_col(c, "tier") == "sekunder";
-            let owner = author_of(slug);
-            let description = str_col(c, "description");
-            let updated_at = str_col(c, "updated_at");
-            let mut row = bronze_catalog_row(
-                slug,
-                str_col(c, "title"),
-                sekunder,
-                owner.as_str(),
-                description,
-                rows,
-                col_of(slug),
-                updated_at,
-            );
-            if let Some(seconds) = frequency_of(slug) {
-                set_freshness_target(&mut row, seconds, "frequency");
-            }
-            row
-        })
-        .collect();
+    // `DATA-41` D1: the registry reads are indexed by slug, once per
+    // assembly, and the assets are read out of the index.
+    let mut assets: Vec<Value> = assemble_bronze_rows(&cat, &sync_rows, &col_rows);
 
     let bronze_table_names: HashSet<&str> = cat.iter().map(|c| str_col(c, "table_name")).collect();
     // Handed back to `list` for `enrich_bronze_assets` — taken from `cat`
@@ -667,11 +757,133 @@ async fn list_body(
     ))
 }
 
+/// The Bronze registry's rows, keyed by slug.
+///
+/// `DATA-41` D1: the four registry lookups used to scan every row of
+/// every read, once per asset. On a catalog of 10,000 tables that is
+/// quadratic — the copy build took about 9.2 seconds, and the no-term
+/// list paid it on every request. One map per read, built once per
+/// assembly, is linear.
+///
+/// A slug with several rows answers with the FIRST row in read order:
+/// that is what the `.find()` this replaces returned, and the assembled
+/// rows must not change because the lookup got faster.
+struct BronzeRegistry<'a> {
+    /// The sync rows — `total`, `author` and `frekuensi` — by slug.
+    sync: HashMap<&'a str, &'a Map<String, Value>>,
+    /// The column-count rows by slug.
+    columns: HashMap<&'a str, &'a Map<String, Value>>,
+}
+
+impl<'a> BronzeRegistry<'a> {
+    /// Indexes the two reads, keyed by slug.
+    ///
+    /// `or_insert`, not `insert`: a slug with several rows keeps the
+    /// first one in read order, which is what the `.find()` this
+    /// replaces returned.
+    fn new(sync_rows: &'a [Map<String, Value>], col_rows: &'a [Map<String, Value>]) -> Self {
+        /// One read, keyed by slug, keeping the first row of a slug.
+        fn by_slug<'a>(rows: &'a [Map<String, Value>]) -> HashMap<&'a str, &'a Map<String, Value>> {
+            let mut map: HashMap<&'a str, &'a Map<String, Value>> =
+                HashMap::with_capacity(rows.len());
+            for row in rows {
+                map.entry(str_col(row, "slug")).or_insert(row);
+            }
+            map
+        }
+        Self {
+            sync: by_slug(sync_rows),
+            columns: by_slug(col_rows),
+        }
+    }
+
+    /// The row count the sync row reports; `0` when it has none.
+    fn total_of(&self, slug: &str) -> i64 {
+        match self.sync.get(slug).copied() {
+            Some(s) => num_or_zero(Some(s), "total"),
+            None => 0,
+        }
+    }
+
+    /// The author the sync row names; `""` when it names none.
+    fn author_of(&self, slug: &str) -> &'a str {
+        match self.sync.get(slug).copied() {
+            Some(s) => str_col(s, "author"),
+            None => "",
+        }
+    }
+
+    /// The number of columns the column read counts for the slug; `0`
+    /// when it counts none.
+    fn column_count_of(&self, slug: &str) -> i64 {
+        match self.columns.get(slug).copied() {
+            Some(c) => num_or_zero(Some(c), "n"),
+            None => 0,
+        }
+    }
+
+    /// The freshness target the sync row's frequency names; `None` when
+    /// it names none.
+    fn frequency_of(&self, slug: &str) -> Option<i64> {
+        self.sync
+            .get(slug)
+            .copied()
+            .and_then(|s| catalog_governance::frequency_target_seconds(str_col(s, "frekuensi")))
+    }
+}
+
+/// The Bronze assets the catalog rows and the registry reads assemble
+/// into.
+///
+/// `DATA-41` D1: the registry's sync and column rows are looked up by
+/// key (see [`BronzeRegistry`]), not by scanning every row per asset.
+/// The rows are the same rows the scan produced: a slug with no sync row
+/// reads as zero rows and no author, and a slug with no column row
+/// reads as no columns.
+fn assemble_bronze_rows(
+    cat: &[Map<String, Value>],
+    sync_rows: &[Map<String, Value>],
+    col_rows: &[Map<String, Value>],
+) -> Vec<Value> {
+    let registry = BronzeRegistry::new(sync_rows, col_rows);
+    cat.iter()
+        .map(|c| {
+            let slug = str_col(c, "slug");
+            let rows = registry.total_of(slug);
+            let sekunder = str_col(c, "tier") == "sekunder";
+            let owner = registry.author_of(slug);
+            let description = str_col(c, "description");
+            let updated_at = str_col(c, "updated_at");
+            let mut row = bronze_catalog_row(
+                slug,
+                str_col(c, "title"),
+                sekunder,
+                owner,
+                description,
+                rows,
+                registry.column_count_of(slug),
+                updated_at,
+            );
+            if let Some(seconds) = registry.frequency_of(slug) {
+                set_freshness_target(&mut row, seconds, "frequency");
+            }
+            row
+        })
+        .collect()
+}
+
 /// How long the search copy is trusted before one request rebuilds it
 /// (`DATA-11` D2). Thirty seconds is the age a new table or a fresh row
 /// count may lag in a search result; the list a person opens without a
 /// term is still live. A console annotation edit does not wait for it
 /// (`put_annotation` drops the copy).
+///
+/// `DATA-38` D1: a copy older than this is no longer rebuilt under the
+/// person who is searching. It is served at once, and the rebuild runs
+/// behind it, so nobody waits for the five seconds the rebuild takes on a
+/// catalog of 10,000 tables. A copy older than
+/// [`crate::catalog_search_cache::MAX_STALE`] is not served at all: that
+/// read builds a new one and waits for it.
 const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
 /// The search copy: what `list` assembles for a request, plus the columns
@@ -682,6 +894,9 @@ const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 /// shared [`AppState`] and no `Principal`, and the tenant check runs per
 /// request before this is called.
 ///
+/// `DATA-38` D3: the builder owns a clone of the state, so the cache can
+/// move it into the background task that rebuilds the copy.
+///
 /// # Errors
 ///
 /// Returns the [`ChError`] of the catalog read, like [`list_body`]; the
@@ -689,12 +904,55 @@ const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 async fn search_snapshot(
     state: &AppState,
 ) -> Result<Arc<crate::catalog_search_cache::CatalogSearchSnapshot>, ChError> {
+    let owner = Arc::new(state.clone());
     state
         .catalog_search_cache
-        .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || {
-            build_search_snapshot(state)
+        .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || {
+            let owner = Arc::clone(&owner);
+            async move { build_search_snapshot(&owner).await }
         })
         .await
+}
+
+/// Builds the search copy once at start-up, in the background.
+///
+/// `DATA-41` D4: on a catalog of 10,000 tables the copy takes about five
+/// seconds to build, and the first person to search should not pay for
+/// it. The API builds it once the application database is up, so a search
+/// that arrives later is answered from the copy at once.
+///
+/// A search that arrives before this task runs builds the copy inline,
+/// single-flight, as before: the two share the one build.
+///
+/// The builder owns a clone of the state, so the copy can be moved into
+/// the task (`DATA-38` D3). The task's handle is returned so a caller can
+/// wait for it; the API drops it, and the task runs on.
+///
+/// A build that fails is logged and the first search builds the copy
+/// instead — a copy that cannot be built is no worse than no copy at all.
+#[allow(
+    dead_code,
+    reason = "the binary starts the copy at start-up (`main.rs`); the library \
+              target compiles this module too and has no start-up path of its own"
+)]
+pub fn spawn_startup_search_copy(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let owner = Arc::new(state.clone());
+    tokio::spawn(async move {
+        let owner_for_build = Arc::clone(&owner);
+        let result = owner
+            .catalog_search_cache
+            .warm(Instant::now(), SEARCH_SNAPSHOT_TTL, move || {
+                let owner = Arc::clone(&owner_for_build);
+                async move { build_search_snapshot(&owner).await }
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                %err,
+                "the start-up build of the catalog search copy failed; the first search builds it instead"
+            );
+        }
+    })
 }
 
 /// The rebuild behind [`search_snapshot`]: [`assemble_catalog`], exactly
@@ -714,8 +972,11 @@ async fn build_search_snapshot(
         .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     let usage = catalog_governance::use_by_asset(state, &ids, &bronze_pairs).await;
+    // `DATA-41` D2: the index is prepared here, with the copy, so a search
+    // reads it and allocates nothing per candidate.
+    let index = catalog_search::SearchIndex::build(assets, &columns);
     Ok(crate::catalog_search_cache::CatalogSearchSnapshot {
-        assets,
+        index,
         namespaces: body.get("namespaces").cloned().unwrap_or(Value::Null),
         columns,
         usage,
@@ -746,11 +1007,24 @@ async fn search_column_index(
     ch: &ChClient,
 ) -> Result<(crate::routes::catalog_search::ColumnIndex, bool), ChError> {
     // `SEARCH_COLUMN_ROWS_MAX` is a constant integer, not caller input.
+    //
+    // `DATA-24 T2` (D2): `FINAL`, for the reason the asset-detail query
+    // gives (`bronze_asset_detail_body`): the registry is a
+    // `ReplacingMergeTree ORDER BY (slug, key_asli)` that every run of a
+    // connector writes again (`register_bronze_table`), and `ClickHouse`
+    // merges the copies only in the background. Without it a column a
+    // second run registered was in the index twice, and every search that
+    // matched its name matched it twice.
+    //
+    // DATA-40 D3: the secondary branch drops the slugs the primary
+    // registry holds (see [`NOT_IN_PRIMARY`]), so a slug that is in both
+    // registries is indexed once, from the primary.
     let bronze_sql = format!(
         "SELECT slug, key_asli, deskripsi FROM (
-           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta.dataset_column`
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta.dataset_column` FINAL
            UNION ALL
-           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta_sec.dataset_column`
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta_sec.dataset_column` FINAL
+             WHERE slug {NOT_IN_PRIMARY}
          ) LIMIT {SEARCH_COLUMN_ROWS_MAX}"
     );
     let system_sql = format!(
@@ -1764,7 +2038,7 @@ async fn mark_annotation_and_history(
         // the name absent; it never fails the page.
         let replacement_name = match annotation.replacement_asset_id.as_deref().map(str::trim) {
             Some(replacement) if !replacement.is_empty() => match search_snapshot(state).await {
-                Ok(snapshot) => asset_name_in(&snapshot.assets, replacement).map(str::to_owned),
+                Ok(snapshot) => asset_name_in(snapshot.assets(), replacement).map(str::to_owned),
                 Err(err) => {
                     tracing::warn!(%err, "catalog read failed; the deprecation notice shows the replacement id");
                     None
@@ -2312,6 +2586,24 @@ async fn bronze_asset_detail_body(
 ) -> Result<Option<Value>, ChError> {
     let ch = &state.clickhouse;
     let escaped_id = SqlLiteral::from(id);
+    // DATA-40 D3: the secondary branch drops the slugs the primary
+    // registry holds (see [`NOT_IN_PRIMARY`]), so a slug that is in both
+    // registries has ONE header row — the primary's — instead of one that
+    // varies between runs (`LIMIT 1` over the union, no order).
+    //
+    // DATA-40 review round 1 SHOULD-FIX 1: `FINAL` on BOTH tables of
+    // BOTH branches of this read. The registries are
+    // `ReplacingMergeTree ORDER BY slug` and a re-run writes the slug's
+    // row again (`register_bronze_table`), so before `ClickHouse` merges
+    // the copies in the background the slug has two sync rows — the older
+    // `total` and the newer one — and this read is a `LIMIT 1` over the
+    // union with no order, so it showed whichever row the engine answered
+    // first: the page could report the row count of the run before the
+    // last one.
+    //
+    // The alias comes BEFORE `FINAL` (`table AS s FINAL`, not `table FINAL
+    // AS s`): the engine takes the alias as part of the table expression
+    // and `FINAL` as the table's modifier.
     let sync_sql = format!(
         "SELECT slug, title, description, tier, table_name, toString(total) total,
                 author, frekuensi, satuan, klasifikasi, updated_at,
@@ -2319,13 +2611,14 @@ async fn bronze_asset_detail_body(
            SELECT s.slug slug, s.title title, s.description description, 'primer' tier, s.table_name table_name,
                   s.total total, s.author author, s.frekuensi frekuensi, s.satuan satuan, s.klasifikasi klasifikasi,
                   c.updated_at updated_at
-             FROM lake.`bronze_meta.dataset_sync` s
-             LEFT JOIN lake.`bronze_meta.dataset_catalog` c ON c.slug = s.slug
+             FROM lake.`bronze_meta.dataset_sync` AS s FINAL
+             LEFT JOIN lake.`bronze_meta.dataset_catalog` AS c FINAL ON c.slug = s.slug
            UNION ALL
            SELECT s.slug, s.title, s.description, 'sekunder', s.table_name,
                   s.total, s.author, s.frekuensi, s.satuan, s.klasifikasi, c.updated_at
-             FROM lake.`bronze_meta_sec.dataset_sync` s
-             LEFT JOIN lake.`bronze_meta_sec.dataset_catalog` c ON c.slug = s.slug
+             FROM lake.`bronze_meta_sec.dataset_sync` AS s FINAL
+             LEFT JOIN lake.`bronze_meta_sec.dataset_catalog` AS c FINAL ON c.slug = s.slug
+             WHERE s.slug {NOT_IN_PRIMARY}
          ) WHERE slug = {escaped_id} LIMIT 1"
     );
     let sync_rows = ch.rows(&sync_sql, None).await?;
@@ -2333,9 +2626,14 @@ async fn bronze_asset_detail_body(
         return Ok(None);
     };
 
+    // DATA-40 D3: the primary registry's columns, and only those: the
+    // secondary branch drops the slugs the primary holds, so the page's
+    // column count and its columns are the primary's (the detail page used
+    // to count both registries' columns, and disagreed with the list).
     let cols_sql = format!(
         "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` FINAL WHERE slug={escaped_id}
-       UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` FINAL WHERE slug={escaped_id}"
+       UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` FINAL
+       WHERE slug={escaped_id} AND slug {NOT_IN_PRIMARY}"
     );
     // `PR #101 CI run 2` (G6, SRC-8 step 4): `FINAL`, because the registry is a
     // `ReplacingMergeTree ORDER BY (slug, key_asli)` that every run of a
@@ -2594,6 +2892,11 @@ async fn bronze_upstream(ch: &ChClient, table: &str) -> Vec<Value> {
 /// asks it to decide whether a name is taken, where an error must not read
 /// as "free", so it gets the error.
 ///
+/// DATA-40 D3: the secondary branch drops the slugs the primary registry
+/// holds (see [`NOT_IN_PRIMARY`]), so a slug that is in both registries is
+/// answered from the primary — one slug names one dataset (D1), and the
+/// answer does not depend on which registry the engine read first.
+///
 /// # Errors
 ///
 /// Returns [`ChError`] when `ClickHouse` cannot answer, including when a
@@ -2604,6 +2907,7 @@ pub(crate) async fn registered_slug(ch: &ChClient, table: &str) -> Result<Option
         "SELECT slug FROM lake.`bronze_meta.dataset_catalog` WHERE table_name = {name}
          UNION ALL
          SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` WHERE table_name = {name}
+           AND slug {NOT_IN_PRIMARY}
          LIMIT 1"
     );
     Ok(ch
@@ -3314,7 +3618,7 @@ pub async fn put_certification(
             )
         })?;
         let exists = snapshot
-            .assets
+            .assets()
             .iter()
             .any(|a| a.get("id").and_then(Value::as_str) == Some(replacement));
         if !exists {
@@ -3682,6 +3986,20 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), json!(v)))
             .collect()
+    }
+
+    /// The table a statement READS: the first registry table its
+    /// `FROM` clause names (the name ends at the next backtick).
+    ///
+    /// DATA-40 D3's filter names the primary catalog table inside every
+    /// secondary branch, so a read of the sync or the column registry
+    /// mentions `dataset_catalog` as well — the table a statement READS
+    /// is what decides what the engine answers.
+    fn table_read(sql: &str) -> &str {
+        sql.find("FROM lake.`")
+            .map(|at| &sql[at + "FROM lake.`".len()..])
+            .and_then(|rest| rest.split('`').next())
+            .unwrap_or_default()
     }
 
     // DATA-11 R2: the three id shapes the row builders give.
@@ -4744,7 +5062,10 @@ mod tests {
                 State(state),
                 Extension(member),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4768,7 +5089,10 @@ mod tests {
                 State(state),
                 Extension(outsider),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4799,6 +5123,7 @@ mod tests {
                 HeaderMap::new(),
                 Query(ListQuery {
                     q: Some("revenue".to_owned()),
+                    limit: None,
                 }),
             )
             .await;
@@ -4848,7 +5173,10 @@ mod tests {
                 State(state),
                 Extension(analyst),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4896,7 +5224,10 @@ mod tests {
                 State(state),
                 Extension(analyst),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -4919,7 +5250,10 @@ mod tests {
                 State(state),
                 Extension(admin),
                 HeaderMap::new(),
-                Query(ListQuery { q: None }),
+                Query(ListQuery {
+                    q: None,
+                    limit: None,
+                }),
             )
             .await;
             let (status, body) = response_json(resp).await;
@@ -5049,11 +5383,13 @@ mod tests {
         /// Puts a search copy in the cache that lists `ids` as assets, so a
         /// replacement can be checked without a catalog behind the mock.
         async fn prime_search_copy_with(state: &AppState, ids: &[&str]) {
+            let assets: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
             let mut copy = empty_copy();
-            copy.assets = ids.iter().map(|id| json!({ "id": id })).collect();
+            copy.index =
+                catalog_search::SearchIndex::build(assets, &catalog_search::ColumnIndex::new());
             state
                 .catalog_search_cache
-                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || async move {
                     Ok::<_, String>(copy)
                 })
                 .await
@@ -5450,7 +5786,10 @@ mod tests {
 
         fn empty_copy() -> crate::catalog_search_cache::CatalogSearchSnapshot {
             crate::catalog_search_cache::CatalogSearchSnapshot {
-                assets: Vec::new(),
+                index: catalog_search::SearchIndex::build(
+                    Vec::new(),
+                    &catalog_search::ColumnIndex::new(),
+                ),
                 namespaces: Value::Null,
                 columns: std::collections::HashMap::new(),
                 usage: std::collections::HashMap::new(),
@@ -5471,16 +5810,29 @@ mod tests {
         }
 
         /// Whether the next read of the copy runs its build.
+        ///
+        /// `DATA-38` D1: a read of an expired copy runs the build in the
+        /// background, so the helper waits for the build to report itself
+        /// before it reads the flag.
         async fn next_read_rebuilds(state: &AppState) -> bool {
-            let rebuilt = std::sync::atomic::AtomicBool::new(false);
+            let (built, build_ran) = tokio::sync::oneshot::channel::<()>();
+            let rebuilt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let builder_flag = Arc::clone(&rebuilt);
             state
                 .catalog_search_cache
-                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
-                    rebuilt.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok::<_, String>(empty_copy())
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || {
+                    let builder_flag = Arc::clone(&builder_flag);
+                    async move {
+                        builder_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = built.send(());
+                        Ok::<_, String>(empty_copy())
+                    }
                 })
                 .await
                 .unwrap();
+            // A dropped sender means the build never ran; a send means it
+            // did. Either way the flag is read after that.
+            let _build_ran = tokio::time::timeout(Duration::from_secs(1), build_ran).await;
             rebuilt.load(std::sync::atomic::Ordering::SeqCst)
         }
 
@@ -6640,6 +6992,1323 @@ mod tests {
             mark_inactive_columns(&state, "orders_raw", &mut schema).await;
 
             assert!(schema.iter().all(|c| c["inactiveSince"].is_null()));
+        }
+    }
+
+    // ── DATA-24 T2 (D2): the Bronze column registry is read with `FINAL`.
+    //
+    // The registry is a `ReplacingMergeTree ORDER BY (slug, key_asli)` that
+    // every run of a connector writes again, so the engine holds one copy
+    // of a column per run until it merges the parts in the background. The
+    // two reads below (`search_column_index`'s index and `list_body`'s
+    // per-slug count) must ask for the merged copy.
+    //
+    // The fake below is the engine for those two reads only: it holds the
+    // registry as two runs of a connector left it, and it answers the way
+    // `ClickHouse` answers — every copy when the read does not ask for the
+    // merged one, one row per `ORDER BY` key when it does. So a read that
+    // dropped `FINAL` sees the copies and the assertions below fail.
+    mod registry_final {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use super::*;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        /// The registry as two runs of a connector left it: `bronze_meta`
+        /// holds the slug `orders`, whose column `total` the second run
+        /// registered again, and `bronze_meta_sec` holds the slug
+        /// `returns`. The rows are `(registry, slug, column, description)`.
+        const REGISTRY_ROWS: [(&str, &str, &str, &str); 4] = [
+            ("bronze_meta", "orders", "total", "Order total"),
+            ("bronze_meta", "orders", "buyer", "The buyer"),
+            ("bronze_meta", "orders", "total", "Order total"),
+            ("bronze_meta_sec", "returns", "total", "Return total"),
+        ];
+
+        /// The two registries the reads name.
+        const REGISTRIES: [&str; 2] = ["bronze_meta", "bronze_meta_sec"];
+
+        /// A `ClickHouse` answer in the `FORMAT JSON` shape the client
+        /// parses.
+        fn answer(meta: &[(&str, &str)], data: &[Value]) -> ResponseTemplate {
+            let rows = data.len();
+            let meta: Vec<Value> = meta
+                .iter()
+                .map(|(name, ty)| json!({"name": name, "type": ty}))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "meta": meta,
+                "data": data,
+                "rows": rows,
+            }))
+        }
+
+        /// The rows the engine returns for one registry: every copy when
+        /// the read does not ask for the merged copy, one row per
+        /// `(slug, key_asli)` — the last one written — when it does.
+        fn registry_rows(registry: &str, merged: bool) -> Vec<Value> {
+            let rows: Vec<Value> = REGISTRY_ROWS
+                .iter()
+                .filter(|(r, ..)| *r == registry)
+                .map(|(_, slug, key, description)| {
+                    json!({"slug": slug, "key_asli": key, "deskripsi": description})
+                })
+                .collect();
+            if !merged {
+                return rows;
+            }
+            let mut seen: HashSet<(String, String)> = HashSet::new();
+            rows.into_iter()
+                .filter(|row| {
+                    seen.insert((
+                        row["slug"].as_str().unwrap_or_default().to_owned(),
+                        row["key_asli"].as_str().unwrap_or_default().to_owned(),
+                    ))
+                })
+                .collect()
+        }
+
+        /// The per-slug counts the engine returns for one registry.
+        fn registry_counts(registry: &str, merged: bool) -> Vec<Value> {
+            let mut counts: Vec<(String, usize)> = Vec::new();
+            for row in registry_rows(registry, merged) {
+                let slug = row["slug"].as_str().unwrap_or_default().to_owned();
+                match counts.iter_mut().find(|(s, _)| *s == slug) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((slug, 1)),
+                }
+            }
+            counts
+                .into_iter()
+                .map(|(slug, n)| json!({"slug": slug, "n": n.to_string()}))
+                .collect()
+        }
+
+        /// The engine the two reads talk to.
+        struct RegistryEngine;
+
+        impl Respond for RegistryEngine {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let sql = String::from_utf8_lossy(&request.body).into_owned();
+                // `FINAL` is the merged copy; without it the engine answers
+                // with the copies the runs wrote.
+                let merged = sql.contains("FINAL");
+                // DATA-40 D5: the clash read. This fixture holds no slug in
+                // both registries, so the answer is an empty clash.
+                if sql.contains("INTERSECT") {
+                    return answer(
+                        &[("n", "String"), ("slugs", "Array(String)")],
+                        &[json!({"n": "0", "slugs": []})],
+                    );
+                }
+                // The table a statement READS decides what it answers --
+                // not every table it mentions: DATA-40 D3's filter names
+                // the primary catalog table inside every secondary branch,
+                // so a read of the sync or the column registry mentions
+                // `dataset_catalog` too.
+                let table = table_read(&sql);
+                if table.ends_with("dataset_catalog") {
+                    return answer(
+                        &[
+                            ("slug", "String"),
+                            ("title", "String"),
+                            ("description", "String"),
+                            ("tier", "String"),
+                            ("updated_at", "String"),
+                            ("table_name", "String"),
+                            ("lag", "String"),
+                        ],
+                        &[
+                            json!({
+                                "slug": "orders", "title": "Orders",
+                                "description": "The orders", "tier": "primer",
+                                "updated_at": "2026-10-01T00:00:00Z",
+                                "table_name": "orders", "lag": "0",
+                            }),
+                            json!({
+                                "slug": "returns", "title": "Returns",
+                                "description": "The returns", "tier": "sekunder",
+                                "updated_at": "2026-10-01T00:00:00Z",
+                                "table_name": "returns", "lag": "0",
+                            }),
+                        ],
+                    );
+                }
+                if table.ends_with("dataset_sync") {
+                    return answer(
+                        &[
+                            ("slug", "String"),
+                            ("total", "String"),
+                            ("author", "String"),
+                            ("frekuensi", "String"),
+                        ],
+                        &[
+                            json!({
+                                "slug": "orders", "total": "10",
+                                "author": "team", "frekuensi": "daily",
+                            }),
+                            json!({
+                                "slug": "returns", "total": "5",
+                                "author": "team", "frekuensi": "daily",
+                            }),
+                        ],
+                    );
+                }
+                if table.ends_with("dataset_column") {
+                    // The two shapes the reads ask for: the rows of the
+                    // index, and the count per slug.
+                    let aggregate = sql.contains("count()");
+                    let mut data = Vec::new();
+                    for registry in REGISTRIES {
+                        if !sql.contains(&format!("lake.`{registry}.dataset_column`")) {
+                            continue;
+                        }
+                        if aggregate {
+                            data.extend(registry_counts(registry, merged));
+                        } else {
+                            data.extend(registry_rows(registry, merged));
+                        }
+                    }
+                    let meta: &[(&str, &str)] = if aggregate {
+                        &[("slug", "String"), ("n", "String")]
+                    } else {
+                        &[
+                            ("slug", "String"),
+                            ("key_asli", "String"),
+                            ("deskripsi", "String"),
+                        ]
+                    };
+                    return answer(meta, &data);
+                }
+                // `system.tables`, `system.columns` and `system.parts`: this
+                // fixture has no Silver and no Gold table.
+                answer(&[], &[])
+            }
+        }
+
+        async fn engine() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(RegistryEngine)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn client(server: &MockServer) -> ChClient {
+            ChClient::new(server.uri(), "default".to_owned(), String::new())
+        }
+
+        /// The search copy's column index holds the column a second run
+        /// registered once, not once per run.
+        #[tokio::test]
+        async fn the_search_column_index_counts_a_re_registered_column_once() {
+            let server = engine().await;
+            let (index, partial) = search_column_index(&client(&server)).await.unwrap();
+            assert!(!partial, "the fixture is far below the row limit");
+
+            let orders = index.get("orders").expect("the Bronze slug is indexed");
+            assert_eq!(
+                orders.iter().filter(|(name, _)| name == "total").count(),
+                1,
+                "the column a second run registered is one column: {orders:?}"
+            );
+            assert_eq!(orders.len(), 2, "the two columns of the table: {orders:?}");
+        }
+
+        /// The list's `columnCount` is the number of columns the table has,
+        /// not the number of copies the runs wrote.
+        #[tokio::test]
+        async fn the_column_count_of_a_slug_is_not_inflated_by_a_second_run() {
+            let server = engine().await;
+            let (body, _) = list_body(&client(&server), false).await.unwrap();
+
+            let assets = body["assets"].as_array().expect("the list has assets");
+            let orders = assets
+                .iter()
+                .find(|asset| asset["id"] == json!("orders"))
+                .expect("the Bronze slug is listed");
+            assert_eq!(
+                orders["columnCount"],
+                json!(2),
+                "two columns, not one per run: {orders:?}"
+            );
+        }
+    }
+
+    // ── DATA-40 D3/D4/D5: one slug names one dataset. ────────────────────
+    //
+    // The catalog is read from BOTH registries: `lake.bronze_meta.*` (the
+    // primary one) and `lake.bronze_meta_sec.*` (the secondary one). A
+    // slug that is in both is ONE dataset with two answers: the list's
+    // column count came from whichever registry answered first — which one
+    // varied between runs — and the detail page counted both registries'
+    // columns, so the two pages disagreed.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), because the fix is a
+    // statement: `FINAL` and the `NOT IN (SELECT slug FROM ...)` clause
+    // are the engine's, and a fake that answered them would only prove
+    // that this module asks for what it means to ask for.
+    //
+    // ONE container per TEST, not per test binary: the container is a
+    // local, so it is dropped — and removed — when the test ends, on a
+    // panic too. A container in a `static` is never dropped: the test
+    // harness exits the process, which skips the drop of a static
+    // (`tests/gold_publication.rs` leaves its container running for that
+    // reason).
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use testcontainers::ImageExt;
+        use testcontainers::runners::AsyncRunner;
+        use testcontainers_modules::clickhouse::ClickHouse;
+        use uuid::Uuid;
+
+        use super::*;
+        use crate::config::Config;
+
+        /// A `ClickHouse` for one test: its address, and the container it
+        /// runs in.
+        async fn clickhouse() -> (String, testcontainers::ContainerAsync<ClickHouse>) {
+            // The compose service's env trio; all three are required, see
+            // `tests/gold_publication.rs`.
+            let container = ClickHouse::default()
+                .with_env_var("CLICKHOUSE_USER", "default")
+                .with_env_var("CLICKHOUSE_PASSWORD", "")
+                .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
+                .with_tag("26.8")
+                .start()
+                .await
+                .expect("start the ClickHouse testcontainer");
+            let host = container.get_host().await.expect("container host");
+            let port = container
+                .get_host_port_ipv4(8123)
+                .await
+                .expect("container HTTP port");
+            let url = format!("http://{host}:{port}");
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+            wait_until_ready(&ch).await;
+            create_registry(&ch).await;
+            (url, container)
+        }
+
+        /// The container is running when `start` returns; the server inside
+        /// it may still be booting.
+        async fn wait_until_ready(ch: &ChClient) {
+            for _ in 0..60 {
+                if ch.rows("SELECT 1", None).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            panic!("the ClickHouse testcontainer did not answer");
+        }
+
+        /// The six registry tables, with the shapes their owner declares
+        /// (`dagster/dispar_orchestrate/bronze_catalog.py`'s
+        /// `_registry_schemas`): `ReplacingMergeTree ORDER BY slug`, and
+        /// `ORDER BY (slug, key_asli)` for the columns.
+        async fn create_registry(ch: &ChClient) {
+            ch.exec("CREATE DATABASE IF NOT EXISTS lake", None)
+                .await
+                .expect("create the lake database");
+            for registry in ["bronze_meta", "bronze_meta_sec"] {
+                for (table, columns, order_by) in [
+                    (
+                        "dataset_catalog",
+                        "slug String, title String, description String, tier String, updated_at String, table_name String",
+                        "slug",
+                    ),
+                    (
+                        "dataset_sync",
+                        "slug String, title String, description String, table_name String, total UInt64, author String, frekuensi String, satuan String, klasifikasi String",
+                        "slug",
+                    ),
+                    (
+                        "dataset_column",
+                        "slug String, key_asli String, tipe String, deskripsi String",
+                        "(slug, key_asli)",
+                    ),
+                ] {
+                    let sql = format!(
+                        "CREATE TABLE IF NOT EXISTS lake.`{registry}.{table}` ({columns}) \
+                         ENGINE = ReplacingMergeTree ORDER BY {order_by}"
+                    );
+                    ch.exec(&sql, None)
+                        .await
+                        .expect("create the registry table");
+                }
+            }
+        }
+
+        /// One catalog row: the registry's own row for a dataset.
+        async fn seed_catalog(
+            ch: &ChClient,
+            registry: &str,
+            slug: &str,
+            title: &str,
+            table_name: &str,
+        ) {
+            let slug = SqlLiteral::from(slug);
+            let title = SqlLiteral::from(title);
+            let table_name = SqlLiteral::from(table_name);
+            let sql = format!(
+                "INSERT INTO lake.`{registry}.dataset_catalog` \
+                 (slug, title, description, tier, updated_at, table_name) \
+                 VALUES ({slug}, {title}, 'the dataset', 'primer', '2026-11-01T00:00:00Z', {table_name})"
+            );
+            ch.exec(&sql, None).await.expect("seed the catalog row");
+        }
+
+        /// One sync row: the registry's own row for a dataset's rows.
+        async fn seed_sync(
+            ch: &ChClient,
+            registry: &str,
+            slug: &str,
+            title: &str,
+            table_name: &str,
+            total: u64,
+        ) {
+            let slug = SqlLiteral::from(slug);
+            let title = SqlLiteral::from(title);
+            let table_name = SqlLiteral::from(table_name);
+            let sql = format!(
+                "INSERT INTO lake.`{registry}.dataset_sync` \
+                 (slug, title, description, table_name, total, author, frekuensi, satuan, klasifikasi) \
+                 VALUES ({slug}, {title}, 'the dataset', {table_name}, {total}, 'team', 'daily', '', '')"
+            );
+            ch.exec(&sql, None).await.expect("seed the sync row");
+        }
+
+        /// One column row.
+        async fn seed_column(ch: &ChClient, registry: &str, slug: &str, key: &str) {
+            let slug = SqlLiteral::from(slug);
+            let key = SqlLiteral::from(key);
+            let sql = format!(
+                "INSERT INTO lake.`{registry}.dataset_column` (slug, key_asli, tipe, deskripsi) \
+                 VALUES ({slug}, {key}, 'UInt64', 'the column')"
+            );
+            ch.exec(&sql, None).await.expect("seed the column row");
+        }
+
+        /// The state the detail page reads with: this deployment's
+        /// `ClickHouse` and no store. A deployment without a store sees the
+        /// page's governance and annotation reads empty, which is what these
+        /// tests are about.
+        fn state_for(ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// The same `ClickHouse`, with the setting that pins the engine's
+        /// read order: `max_threads=1` makes it read one part at a time, in
+        /// the order the parts were written. A URL setting, so the
+        /// statement the module sends is the statement that runs.
+        fn pinned(ch_url: &str) -> String {
+            format!("{ch_url}/?max_threads=1")
+        }
+
+        /// An Analyst in the catalog tenant, with the permissions the page
+        /// asks for.
+        fn analyst() -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::nil()),
+                tenant_ids: vec![
+                    "11111111-1111-4111-8111-000000000001"
+                        .parse()
+                        .expect("a tenant id"),
+                ],
+                display_name: "alice".to_owned(),
+                permissions: PermissionSet::parse("catalog:read, query:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: vec!["Analyst".to_owned()],
+            }
+        }
+
+        /// The rows of the list that carry `id`.
+        fn assets_with_id<'a>(body: &'a Value, id: &str) -> Vec<&'a Value> {
+            body["assets"]
+                .as_array()
+                .expect("the list has assets")
+                .iter()
+                .filter(|asset| asset["id"] == json!(id))
+                .collect()
+        }
+
+        /// A slug the two registries both hold: one dataset, one answer.
+        #[tokio::test]
+        async fn the_list_shows_a_slug_that_is_in_both_registries_once_with_the_primary_count() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_list",
+                "Primary clash",
+                "clash_list_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "clash_list",
+                "Primary clash",
+                "clash_list_raw",
+                10,
+            )
+            .await;
+            seed_column(&ch, "bronze_meta", "clash_list", "id").await;
+            seed_column(&ch, "bronze_meta", "clash_list", "amount").await;
+
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_list",
+                "Secondary clash",
+                "clash_list_sec_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta_sec",
+                "clash_list",
+                "Secondary clash",
+                "clash_list_sec_raw",
+                99,
+            )
+            .await;
+            seed_column(&ch, "bronze_meta_sec", "clash_list", "id").await;
+            seed_column(&ch, "bronze_meta_sec", "clash_list", "amount").await;
+            seed_column(&ch, "bronze_meta_sec", "clash_list", "note").await;
+
+            // Several reads: the answer does not depend on which registry
+            // the engine read first.
+            for _ in 0..3 {
+                let (body, _) = list_body(&ch, false).await.unwrap();
+                let rows = assets_with_id(&body, "clash_list");
+                assert_eq!(rows.len(), 1, "one dataset, one row: {rows:?}");
+                assert_eq!(
+                    rows[0]["columnCount"],
+                    json!(2),
+                    "the primary's two columns, not the secondary's three: {rows:?}"
+                );
+                assert_eq!(
+                    rows[0]["name"],
+                    json!("Primary clash"),
+                    "the primary's row: {rows:?}"
+                );
+                assert_eq!(
+                    rows[0]["rows"],
+                    json!(10),
+                    "the primary's row count, not the secondary's: {rows:?}"
+                );
+            }
+
+            // The search copy's column index is a read of the same
+            // registries, and holds the primary's columns too.
+            let (index, partial) = search_column_index(&ch).await.unwrap();
+            assert!(!partial, "the fixture is far below the row limit");
+            let columns = index.get("clash_list").expect("the Bronze slug is indexed");
+            let mut names: Vec<&str> = columns.iter().map(|(name, _)| name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                vec!["amount", "id"],
+                "the primary's columns, not the secondary's three: {columns:?}"
+            );
+        }
+
+        /// The detail page's header and columns are the primary's.
+        #[tokio::test]
+        async fn the_detail_page_shows_the_primary_header_and_only_the_primary_columns() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_detail",
+                "Primary detail",
+                "clash_detail_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "clash_detail",
+                "Primary detail",
+                "clash_detail_raw",
+                10,
+            )
+            .await;
+            seed_column(&ch, "bronze_meta", "clash_detail", "id").await;
+            seed_column(&ch, "bronze_meta", "clash_detail", "amount").await;
+
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_detail",
+                "Secondary detail",
+                "clash_detail_sec_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta_sec",
+                "clash_detail",
+                "Secondary detail",
+                "clash_detail_sec_raw",
+                99,
+            )
+            .await;
+            seed_column(&ch, "bronze_meta_sec", "clash_detail", "id").await;
+            seed_column(&ch, "bronze_meta_sec", "clash_detail", "amount").await;
+            seed_column(&ch, "bronze_meta_sec", "clash_detail", "note").await;
+
+            let body = bronze_asset_detail_body(
+                &state_for(&url),
+                &analyst(),
+                &HeaderMap::new(),
+                "clash_detail",
+            )
+            .await
+            .unwrap()
+            .expect("the dataset has a page");
+
+            assert_eq!(
+                body["name"],
+                json!("Primary detail"),
+                "the primary's header, whichever registry answers first: {body:?}"
+            );
+            assert_eq!(body["rows"], json!(10), "the primary's row count: {body:?}");
+            assert_eq!(
+                body["columnCount"],
+                json!(2),
+                "the primary's two columns, not the secondary's three: {body:?}"
+            );
+            let schema = body["schema"].as_array().expect("the page has a schema");
+            let mut names: Vec<&str> = schema
+                .iter()
+                .filter_map(|column| column["name"].as_str())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                vec!["amount", "id"],
+                "the primary's columns, not the secondary's three: {schema:?}"
+            );
+        }
+
+        /// The registry lookup answers the primary's slug, and a dataset
+        /// that is only in the secondary registry is still found.
+        #[tokio::test]
+        async fn the_registered_slug_answers_the_primary_slug() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(&ch, "bronze_meta", "clash_slug", "Clash", "clash_slug_raw").await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_slug",
+                "Clash",
+                "clash_slug_sec_raw",
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "only_sec",
+                "Only secondary",
+                "only_sec_raw",
+            )
+            .await;
+
+            assert_eq!(
+                registered_slug(&ch, "clash_slug_raw").await.unwrap(),
+                Some("clash_slug".to_owned()),
+                "the primary's slug"
+            );
+            // DATA-40 D3: the primary wins, so the secondary's row for a
+            // slug the primary holds is not answered at all.
+            assert_eq!(
+                registered_slug(&ch, "clash_slug_sec_raw").await.unwrap(),
+                None,
+                "the secondary's row for a slug the primary holds is not read"
+            );
+            // A dataset that is only in the secondary registry is still
+            // found: the fix does not hide it.
+            assert_eq!(
+                registered_slug(&ch, "only_sec_raw").await.unwrap(),
+                Some("only_sec".to_owned()),
+                "the secondary registry's own dataset"
+            );
+        }
+
+        /// A slug a second run wrote again is listed once, not twice.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_is_listed_once() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(&ch, "bronze_meta", "twice_list", "Twice", "twice_list_raw").await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_list",
+                "Twice",
+                "twice_list_raw",
+                5,
+            )
+            .await;
+            seed_column(&ch, "bronze_meta", "twice_list", "id").await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_list",
+                "Twice again",
+                "twice_list_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_list",
+                "Twice again",
+                "twice_list_raw",
+                6,
+            )
+            .await;
+            seed_column(&ch, "bronze_meta", "twice_list", "id").await;
+
+            let (body, _) = list_body(&ch, false).await.unwrap();
+            let rows = assets_with_id(&body, "twice_list");
+            assert_eq!(rows.len(), 1, "one dataset, one row: {rows:?}");
+            assert_eq!(
+                rows[0]["columnCount"],
+                json!(1),
+                "the column the second run wrote again is one column: {rows:?}"
+            );
+        }
+
+        /// The detail page's header shows the NEWER row count of a slug a
+        /// second run wrote again.
+        ///
+        /// DATA-40 review round 1 SHOULD-FIX 1: the header read is a
+        /// `LIMIT 1` over the union with no order, so without `FINAL` it
+        /// shows whichever of the slug's sync rows the engine answers
+        /// first. The engine answers the parts of a `ReplacingMergeTree` in
+        /// the order they were written, so the OLDER row count (10) is the
+        /// answer, not the newer one (20).
+        ///
+        /// The test pins that state, so that the answer is one thing and
+        /// not a coin toss:
+        ///
+        /// - `SYSTEM STOP MERGES` on the sync table keeps the two copies
+        ///   apart — "before any merge", the state the finding is about.
+        /// - `max_threads=1` on the client's URL (a URL setting, so the
+        ///   statement the module sends is the statement that runs) makes
+        ///   the engine read one part at a time, in the order the parts
+        ///   were written.
+        #[tokio::test]
+        async fn the_detail_header_shows_the_newer_total_of_a_slug_written_twice() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            // The two copies of the row stay apart: no merge may collapse
+            // them before the page reads them.
+            ch.exec("SYSTEM STOP MERGES lake.`bronze_meta.dataset_sync`", None)
+                .await
+                .expect("stop the merges of the sync table");
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_detail",
+                "Twice detail",
+                "twice_detail_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_detail",
+                "Twice detail",
+                "twice_detail_raw",
+                10,
+            )
+            .await;
+            seed_column(&ch, "bronze_meta", "twice_detail", "id").await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_detail",
+                "Twice detail",
+                "twice_detail_raw",
+                20,
+            )
+            .await;
+
+            let body = bronze_asset_detail_body(
+                &state_for(&pinned(&url)),
+                &analyst(),
+                &HeaderMap::new(),
+                "twice_detail",
+            )
+            .await
+            .unwrap()
+            .expect("the dataset has a page");
+
+            assert_eq!(
+                body["rows"],
+                json!(20),
+                "the newer row count, not the older one: {body:?}"
+            );
+        }
+    }
+
+    // ── `GET /api/catalog?limit=` (`DATA-41` D3) ────────────────────
+    //
+    // The command palette shows eight results and used to be served the
+    // whole catalog — ten thousand tables, 6.6 MB — to throw all but eight
+    // away. These are the route's own tests: the limit is applied AFTER
+    // the ranking, the count says how many matched in all, and a limit
+    // outside 1..=200 is a 400 with a plain message.
+    mod search_limit {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use uuid::Uuid;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        /// The three tables the mock catalog holds, each with the word
+        /// `revenue` in a different place, so the ranking has an order:
+        ///
+        /// | table | where the word is | score |
+        /// | --- | --- | --- |
+        /// | `bronze.one` | the name | 120 |
+        /// | `bronze.three` | a column name | 60 |
+        /// | `bronze.two` | the description | 30 |
+        fn catalog_rows() -> Vec<Value> {
+            vec![
+                json!({
+                    "slug": "bronze.one", "title": "Revenue", "description": "the ledger",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+                json!({
+                    "slug": "bronze.two", "title": "Ledger", "description": "revenue by month",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+                json!({
+                    "slug": "bronze.three", "title": "Orders", "description": "orders by day",
+                    "tier": "public", "updated_at": "2026-01-01T00:00:00Z", "table_name": "",
+                }),
+            ]
+        }
+
+        /// The engine the catalog's reads talk to.
+        ///
+        /// The table a statement READS decides what it answers — not
+        /// every table it mentions: DATA-40 D3's filter names the
+        /// primary catalog table inside every secondary branch, so a read
+        /// of the sync or the column registry mentions `dataset_catalog`
+        /// too.
+        struct CatalogEngine;
+
+        impl Respond for CatalogEngine {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let sql = String::from_utf8_lossy(&request.body).into_owned();
+                let answer = |data: Vec<Value>| {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "meta": [],
+                        "data": data,
+                        "rows": data.len(),
+                    }))
+                };
+                // DATA-40 D5's clash read: this fixture holds no slug in
+                // both registries.
+                if sql.contains("INTERSECT") {
+                    return answer(vec![json!({"n": "0", "slugs": []})]);
+                }
+                let table = table_read(&sql);
+                if table.ends_with("dataset_catalog") {
+                    return answer(catalog_rows());
+                }
+                if table.ends_with("dataset_sync") {
+                    return answer(
+                        catalog_rows()
+                            .iter()
+                            .map(|row| {
+                                json!({
+                                    "slug": row["slug"], "total": "10",
+                                    "author": "bench", "frekuensi": "daily",
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                if table.ends_with("dataset_column") {
+                    // The two shapes the reads ask for: the count per
+                    // slug, and the rows of the index. One answer holds
+                    // both, and each read picks the columns it named.
+                    return answer(vec![
+                        json!({
+                            "slug": "bronze.one", "n": "20",
+                            "key_asli": "revenue_amount", "deskripsi": "the amount",
+                        }),
+                        json!({
+                            "slug": "bronze.two", "n": "20",
+                            "key_asli": "total", "deskripsi": "the total",
+                        }),
+                        json!({
+                            "slug": "bronze.three", "n": "20",
+                            "key_asli": "revenue_amount", "deskripsi": "the amount",
+                        }),
+                    ]);
+                }
+                // `system.tables`, `system.columns` and `system.parts`:
+                // this fixture is about the Bronze registry.
+                answer(Vec::new())
+            }
+        }
+
+        /// A `ClickHouse` that answers the catalog's own queries: the
+        /// registry rows above, one column each, and no Silver or Gold
+        /// table.
+        async fn mock_catalog() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(CatalogEngine)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// An `AppState` with no Postgres: the caller below is
+        /// unrestricted, so the tenant gate lets it through without
+        /// counting tenants, and the enrichment steps that read Postgres
+        /// have nothing to read.
+        fn catalog_state(ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// A principal that holds everything (`"*:*"`), so the tenant gate
+        /// lets it through without a database.
+        fn admin() -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: Vec::new(),
+                display_name: "Platform Admin".to_owned(),
+                permissions: PermissionSet::parse("*:*"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        async fn body_of(resp: Response) -> (StatusCode, Value) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        async fn search_with(
+            state: &AppState,
+            q: Option<&str>,
+            limit: Option<u32>,
+        ) -> (StatusCode, Value) {
+            let resp = list(
+                State(state.clone()),
+                Extension(admin()),
+                HeaderMap::new(),
+                Query(ListQuery {
+                    q: q.map(str::to_owned),
+                    limit,
+                }),
+            )
+            .await;
+            body_of(resp).await
+        }
+
+        /// `DATA-41` D3: the limit is applied after the ranking, so the
+        /// assets that come back are the best ones, and `total` says how
+        /// many matched in all.
+        #[tokio::test]
+        async fn a_limit_takes_the_best_matches_and_the_count_says_how_many_matched() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            let (status, body) = search_with(&state, Some("revenue"), Some(2)).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 2, "the limit is what the caller asked for");
+            assert_eq!(assets[0]["id"], "bronze.one", "the name that is the word");
+            assert_eq!(assets[1]["id"], "bronze.three", "the column name");
+            assert_eq!(body["total"], json!(3), "every match is counted");
+        }
+
+        /// `DATA-41` D3: without a limit the answer is every match, in the
+        /// same order, and there is no count — the answer is as it was.
+        #[tokio::test]
+        async fn without_a_limit_the_answer_is_every_match_and_no_count() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            let (status, body) = search_with(&state, Some("revenue"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 3);
+            assert_eq!(assets[0]["id"], "bronze.one");
+            assert!(
+                body.get("total").is_none(),
+                "without a limit the answer is as it was: {body}"
+            );
+        }
+
+        /// `DATA-41` D3: a limit outside 1..=200 is a 400 with a plain
+        /// message — the caller's mistake, not something to round
+        /// silently.
+        #[tokio::test]
+        async fn a_limit_outside_the_range_is_a_bad_request() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            for limit in [0, 201] {
+                let (status, body) = search_with(&state, Some("revenue"), Some(limit)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "limit {limit}");
+                let message = body["error"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains("limit"),
+                    "the message names the limit: {body}"
+                );
+            }
+        }
+
+        /// `DATA-41` D3: the limit is a number the route serves, and the
+        /// boundary itself is served.
+        #[test]
+        fn the_served_limits_are_one_to_two_hundred() {
+            assert!(requested_limit(None).unwrap().is_none());
+            assert_eq!(requested_limit(Some(1)).unwrap(), Some(1));
+            assert_eq!(requested_limit(Some(200)).unwrap(), Some(200));
+            assert!(requested_limit(Some(0)).is_err());
+            assert!(requested_limit(Some(201)).is_err());
+        }
+
+        /// `DATA-41` D4: the copy is built at start-up, in the background,
+        /// and the first search is served from it: the search reads no
+        /// catalog of its own.
+        #[tokio::test]
+        async fn the_start_up_build_leaves_a_copy_the_first_search_is_served_from() {
+            let ch = mock_catalog().await;
+            let state = catalog_state(&ch.uri());
+
+            // The start-up build, waited for so the assertion below is
+            // about the copy and not about a race.
+            spawn_startup_search_copy(&state).await.unwrap();
+            let before = ch
+                .received_requests()
+                .await
+                .map_or(0, |requests| requests.len());
+
+            let (status, body) = search_with(&state, Some("revenue"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let assets = body["assets"].as_array().expect("the answer has assets");
+            assert_eq!(assets.len(), 3, "the copy's assets are the answer");
+            let after = ch
+                .received_requests()
+                .await
+                .map_or(0, |requests| requests.len());
+            assert_eq!(
+                after, before,
+                "the search was served from the copy: it read no catalog"
+            );
+        }
+    }
+
+    // ── `DATA-41` D1: the registry reads are looked up by key. ───────────
+    //
+    // The old code scanned every row of every read once per asset, which
+    // is quadratic in the size of the catalog: on 10,000 tables the copy
+    // build took about 9.2 seconds, and the no-term list paid it on
+    // every request. The keyed lookup must assemble the SAME rows the
+    // scan did, so the scan is kept here as the reference and the two
+    // are compared over a fixture of several hundred assets with
+    // duplicate slugs and with slugs whose sync or column row is
+    // missing.
+    mod keyed_lookup {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use super::*;
+
+        /// How many assets the fixture holds: several hundred, so the
+        /// comparison is over a catalog big enough for the quadratic
+        /// scan to be worth replacing.
+        const ASSETS: usize = 400;
+
+        /// One read's row: the columns the read named, as the engine
+        /// rendered them.
+        fn map_of(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
+            pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+        }
+
+        /// The three reads of the fixture: the catalog rows, the sync
+        /// rows and the column rows.
+        struct Fixture {
+            cat: Vec<Map<String, Value>>,
+            sync: Vec<Map<String, Value>>,
+            columns: Vec<Map<String, Value>>,
+        }
+
+        /// The fixture: `ASSETS` catalog rows, and the sync and column
+        /// reads that go with them.
+        ///
+        /// The awkward rows are in it on purpose:
+        /// - a slug with NO sync row (`index % 10 == 3`): no rows
+        ///   counted and no author,
+        /// - a slug with TWO sync rows (`index % 10 == 7`): the first
+        ///   one in read order is the one that answers,
+        /// - a slug with NO column row (`index % 7 == 2`): no columns
+        ///   counted,
+        /// - a slug with TWO column rows (`index % 7 == 4`): the first
+        ///   one in read order is the one that answers,
+        /// - a slug whose row count is not a number (`index % 13 == 1`):
+        ///   it reads as zero, because a value that is not a number is
+        ///   not a number,
+        /// - a sync row for a slug no catalog row holds: it changes
+        ///   nothing.
+        fn fixture() -> Fixture {
+            let mut cat = Vec::with_capacity(ASSETS);
+            let mut sync = Vec::with_capacity(ASSETS);
+            let mut columns = Vec::with_capacity(ASSETS);
+
+            for index in 0..ASSETS {
+                let slug = format!("asset_{index:04}");
+                cat.push(map_of(vec![
+                    ("slug", json!(slug)),
+                    ("title", json!(format!("Asset {index}"))),
+                    ("description", json!(format!("the asset {index}"))),
+                    (
+                        "tier",
+                        json!(if index % 3 == 0 { "sekunder" } else { "primer" }),
+                    ),
+                    ("updated_at", json!("2026-11-01T00:00:00Z")),
+                    ("table_name", json!(format!("asset_{index:04}_raw"))),
+                ]));
+
+                if index % 10 != 3 {
+                    let total = if index % 13 == 1 {
+                        "not-a-number".to_owned()
+                    } else {
+                        (index * 7).to_string()
+                    };
+                    sync.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("total", json!(total)),
+                        ("author", json!(format!("team_{index}"))),
+                        (
+                            "frekuensi",
+                            json!(if index % 3 == 0 { "harian" } else { "bulanan" }),
+                        ),
+                    ]));
+                }
+                if index % 10 == 7 {
+                    // A SECOND sync row for the same slug, later in read
+                    // order than the first one.
+                    sync.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("total", json!("999999")),
+                        ("author", json!("the later team")),
+                        ("frekuensi", json!("mingguan")),
+                    ]));
+                }
+
+                if index % 7 != 2 {
+                    columns.push(map_of(vec![
+                        ("slug", json!(slug)),
+                        ("n", json!((index % 5).to_string())),
+                    ]));
+                }
+                if index % 7 == 4 {
+                    // A SECOND column row for the same slug, later in
+                    // read order than the first one.
+                    columns.push(map_of(vec![("slug", json!(slug)), ("n", json!("4242"))]));
+                }
+            }
+
+            // A sync row for a slug no catalog row holds.
+            sync.push(map_of(vec![
+                ("slug", json!("asset_not_in_the_catalog")),
+                ("total", json!("1")),
+                ("author", json!("nobody")),
+                ("frekuensi", json!("harian")),
+            ]));
+
+            Fixture { cat, sync, columns }
+        }
+
+        /// The assembly as it was before `DATA-41` D1: the four
+        /// `.find()` scans. Kept here as the reference the keyed
+        /// lookup is compared with.
+        fn scanned_rows(
+            cat: &[Map<String, Value>],
+            sync_rows: &[Map<String, Value>],
+            col_rows: &[Map<String, Value>],
+        ) -> Vec<Value> {
+            let total_of = |slug: &str| -> i64 {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .map_or(0, |s| num_or_zero(Some(s), "total"))
+            };
+            let author_of = |slug: &str| -> String {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .map(|s| str_col(s, "author").to_owned())
+                    .unwrap_or_default()
+            };
+            let col_of = |slug: &str| -> i64 {
+                col_rows
+                    .iter()
+                    .find(|c| str_col(c, "slug") == slug)
+                    .map_or(0, |c| num_or_zero(Some(c), "n"))
+            };
+            let frequency_of = |slug: &str| -> Option<i64> {
+                sync_rows
+                    .iter()
+                    .find(|s| str_col(s, "slug") == slug)
+                    .and_then(|s| {
+                        catalog_governance::frequency_target_seconds(str_col(s, "frekuensi"))
+                    })
+            };
+
+            cat.iter()
+                .map(|c| {
+                    let slug = str_col(c, "slug");
+                    let rows = total_of(slug);
+                    let sekunder = str_col(c, "tier") == "sekunder";
+                    let owner = author_of(slug);
+                    let description = str_col(c, "description");
+                    let updated_at = str_col(c, "updated_at");
+                    let mut row = bronze_catalog_row(
+                        slug,
+                        str_col(c, "title"),
+                        sekunder,
+                        owner.as_str(),
+                        description,
+                        rows,
+                        col_of(slug),
+                        updated_at,
+                    );
+                    if let Some(seconds) = frequency_of(slug) {
+                        set_freshness_target(&mut row, seconds, "frequency");
+                    }
+                    row
+                })
+                .collect()
+        }
+
+        /// The keyed lookup assembles the rows the scan assembled.
+        #[test]
+        fn the_keyed_lookup_assembles_the_rows_the_scan_assembled() {
+            let fixture = fixture();
+            let scanned = scanned_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+            let keyed = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            assert_eq!(
+                keyed.len(),
+                ASSETS,
+                "every catalog row is one asset, in both"
+            );
+            assert_eq!(
+                keyed, scanned,
+                "the keyed lookup assembles exactly the rows the scan did"
+            );
+        }
+
+        /// A slug with several rows answers with the FIRST one in read
+        /// order — what the `.find()` the keyed lookup replaced
+        /// returned.
+        #[test]
+        fn a_slug_with_several_rows_answers_with_the_first_one_in_read_order() {
+            let fixture = fixture();
+            let rows = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            // `asset_0007` has two sync rows and one column row.
+            let seven = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0007"))
+                .expect("the asset is listed");
+            assert_eq!(seven["rows"], json!(49), "the FIRST sync row's count");
+            assert_eq!(
+                seven["owner"],
+                json!("team_7"),
+                "the FIRST sync row's author"
+            );
+            assert_eq!(
+                seven["freshnessTargetSeconds"],
+                json!(31 * 86_400 * 3 / 2),
+                "the FIRST sync row's frequency"
+            );
+
+            // `asset_0018` has one sync row and two column rows.
+            let eighteen = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0018"))
+                .expect("the asset is listed");
+            assert_eq!(
+                eighteen["columnCount"],
+                json!(3),
+                "the FIRST column row's count"
+            );
+        }
+
+        /// A slug the registry has no row for reads as nothing: no rows,
+        /// no author, no columns, and no freshness target.
+        #[test]
+        fn a_slug_with_no_registry_row_reads_as_nothing() {
+            let fixture = fixture();
+            let rows = assemble_bronze_rows(&fixture.cat, &fixture.sync, &fixture.columns);
+
+            // `asset_0003` has no sync row and one column row.
+            let three = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0003"))
+                .expect("the asset is listed");
+            assert_eq!(three["rows"], json!(0), "no sync row, no rows");
+            assert_eq!(
+                three["owner"],
+                json!(*TENANT_OWNER),
+                "no sync row, so the tenant's own owner"
+            );
+            assert!(
+                three.get("freshnessTargetSeconds").is_none(),
+                "no sync row, so no freshness target: {three:?}"
+            );
+
+            // `asset_0002` has one sync row and no column row.
+            let two = rows
+                .iter()
+                .find(|r| r["id"] == json!("asset_0002"))
+                .expect("the asset is listed");
+            assert_eq!(two["columnCount"], json!(0), "no column row, no columns");
         }
     }
 }

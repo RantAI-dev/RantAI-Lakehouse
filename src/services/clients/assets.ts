@@ -39,11 +39,22 @@ function errorFor(status: number, message: string): ServiceError {
  * (`tier`/`layer`/`type`/`classification`) stay client-side, applied to the
  * returned list below.
  */
+/**
+ * Loads the catalog, or the search results for `q`.
+ *
+ * `limit` is how many assets the caller wants (`DATA-41` D3): the server
+ * ranks every match, returns the first `limit` of them, and says how many
+ * matched in all. Without it the answer is every match, as it was.
+ */
 async function loadCatalog(
   q: string | undefined,
+  limit: number | undefined,
   signal?: AbortSignal,
 ): Promise<{ assets: Asset[]; namespaces: CatalogNamespace[] }> {
-  const url = q ? `/api/catalog?q=${encodeURIComponent(q)}` : "/api/catalog";
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (limit !== undefined) params.set("limit", String(limit));
+  const url = params.size > 0 ? `/api/catalog?${params}` : "/api/catalog";
   const res = await apiFetch(url, { signal });
   const json = await res.json();
   // DATA-11 review SHOULD-FIX 4: a refusal (`403`) keeps its own code so the
@@ -64,7 +75,7 @@ async function loadCatalog(
 export const clickhouseAssetService: AssetService = {
   async listAssets(filter: AssetFilter, signal) {
     const term = (filter.search ?? "").trim();
-    const { assets } = await loadCatalog(term || undefined, signal);
+    const { assets } = await loadCatalog(term || undefined, filter.limit, signal);
     return assets.filter((a) => {
       if (filter.tier && filter.tier !== "all" && a.tier !== filter.tier) return false;
       if (filter.layer && filter.layer !== "all" && a.layer !== filter.layer) return false;
@@ -142,7 +153,7 @@ export const clickhouseAssetService: AssetService = {
     if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save the certification");
   },
   async listNamespaces(signal) {
-    return (await loadCatalog(undefined, signal)).namespaces;
+    return (await loadCatalog(undefined, undefined, signal)).namespaces;
   },
   async requestAccess(catalogId, input: RequestAccessInput, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(catalogId)}/access-request`, {

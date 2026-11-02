@@ -100,6 +100,7 @@ from dagster import (
 )
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, record_maintenance_run
+from dispar_orchestrate.maintenance import maintenance_paused
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 
@@ -632,6 +633,35 @@ def run_trim_for_mart(
     """Execute trim logic for a single Gold mart (DATA-2 D1, D3, D5, A1)."""
     started_at = datetime.datetime.now(datetime.timezone.utc)
     log = context.log if context else None
+
+    # The pause (REL-2 S4 decision D16): the trim expires snapshots and
+    # removes orphan files, and both DELETE files. While the maintenance
+    # is paused they do not run: the trim is recorded as skipped, with
+    # the reason, and the run does not fail. The local backup does not
+    # hold the warehouse files, so a restore brings the catalogs back
+    # to the moment of the backup — and a trim that deleted a file the
+    # restored catalog still names would break the table.
+    if maintenance_paused():
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        reason = "maintenance_paused"
+        if log:
+            log.info(
+                "the Gold trim is paused (MAINTENANCE_PAUSED=true): no snapshot was expired and "
+                "no orphan file was removed."
+            )
+        try:
+            record_gold_trim_run(
+                cfg.ch,
+                mart=mart,
+                status="skipped",
+                reason=reason,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        except Exception as e:
+            if log:
+                log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+        return {"status": "skipped", "reason": reason}
 
     # 1. Parse keep_copies (D4) and orphan_min_age_seconds (DATA-2 review BLOCKER 1)
     try:

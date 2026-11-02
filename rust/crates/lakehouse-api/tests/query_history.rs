@@ -276,7 +276,7 @@ mod recording {
     use sqlx::PgPool;
     use tower::ServiceExt;
     use uuid::Uuid;
-    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
@@ -315,6 +315,16 @@ mod recording {
     async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
         let mut overrides = HashMap::new();
         overrides.insert("CH_URL".to_owned(), ch_uri.to_owned());
+        overrides.insert("CATALOG_TENANT_ID".to_owned(), OWNER_TENANT.to_owned());
+        spin_up_with_env(&overrides).await
+    }
+
+    /// The caller acts in a deployment whose shared catalog the owner tenant
+    /// holds (`CATALOG_TENANT_ID`), with `ClickHouse` and `Trino` at mocks.
+    async fn spin_up_with_clickhouse_and_trino(ch_uri: &str, trino_uri: &str) -> TestApp {
+        let mut overrides = HashMap::new();
+        overrides.insert("CH_URL".to_owned(), ch_uri.to_owned());
+        overrides.insert("TRINO_URL".to_owned(), trino_uri.to_owned());
         overrides.insert("CATALOG_TENANT_ID".to_owned(), OWNER_TENANT.to_owned());
         spin_up_with_env(&overrides).await
     }
@@ -623,11 +633,74 @@ mod recording {
         );
     }
 
-    /// A past-version clause cannot run on Trino: the rewrite cannot parse
-    /// it, and the refusal is recorded as `blocked` — with the sentence
-    /// the caller was told, and without the engine ever being asked.
+    /// A past version by its id runs on `Trino` now (`DATA-21` D4), so
+    /// the run is recorded as `ok` — the test changes because the
+    /// behaviour it guarded (the refusal of a past version on `Trino`)
+    /// is supported now.
     #[tokio::test]
-    async fn a_past_version_clause_on_trino_records_blocked() {
+    async fn a_past_version_clause_on_trino_runs_and_records_ok() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok(&ch).await;
+        let trino = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "q1",
+                "columns": [{"name": "n", "type": "bigint"}],
+                "data": [[1]],
+            })))
+            .mount(&trino)
+            .await;
+
+        let TestApp { router, pool } =
+            spin_up_with_clickhouse_and_trino(&ch.uri(), &trino.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_json(
+            &router,
+            &cookie,
+            json!({
+                "sql": "SELECT * FROM bronze.group_orders FOR VERSION AS OF 1",
+                "engine": "trino",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The statement `Trino` received carries the version, in `Trino`'s
+        // own form.
+        assert!(
+            trino
+                .received_requests()
+                .await
+                .expect("mock records requests")
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("FOR VERSION AS OF 1")),
+            "the statement Trino received must carry the version"
+        );
+        let (recorded_status, message, tables_read) =
+            the_recorded_run(&pool, "rina@meridian.example").await;
+        // The store's word for a successful run (`completed`); the plan's
+        // "records `ok`" is that, not a status of its own.
+        assert_eq!(recorded_status, "completed");
+        assert_eq!(message.as_deref(), None);
+        assert_eq!(
+            tables_read,
+            vec!["bronze.group_orders".to_owned()],
+            "{tables_read:?}"
+        );
+        assert_eq!(
+            the_recorded_engine(&pool, "rina@meridian.example").await,
+            "trino",
+            "the row carries the engine the request named"
+        );
+    }
+
+    /// A past version by TIMESTAMP is still refused on `Trino` (`DATA-21`
+    /// D2/D4): no engine has a timestamp form, `ClickHouse` included. The
+    /// sentence the caller is told is the one they already know.
+    #[tokio::test]
+    async fn a_past_timestamp_clause_on_trino_is_refused_with_the_fixed_sentence() {
         let ch = MockServer::start().await;
         let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
         let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
@@ -636,7 +709,7 @@ mod recording {
             &router,
             &cookie,
             json!({
-                "sql": "SELECT * FROM bronze.group_orders VERSION AS OF 1",
+                "sql": "SELECT * FROM bronze.group_orders FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00 UTC'",
                 "engine": "trino",
             }),
         )
@@ -644,24 +717,9 @@ mod recording {
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"], PAST_VERSION_REFUSAL, "{body}");
-        assert_eq!(
-            engine_requests(&ch).await,
-            0,
-            "the statement never reaches an engine"
-        );
-        let (recorded_status, message, tables_read) =
-            the_recorded_run(&pool, "rina@meridian.example").await;
+        let (recorded_status, message, _) = the_recorded_run(&pool, "rina@meridian.example").await;
         assert_eq!(recorded_status, "blocked");
         assert_eq!(message.as_deref(), Some(PAST_VERSION_REFUSAL));
-        assert!(
-            tables_read.is_empty(),
-            "a statement that does not parse names no table: {tables_read:?}"
-        );
-        assert_eq!(
-            the_recorded_engine(&pool, "rina@meridian.example").await,
-            "trino",
-            "the row carries the engine the request named"
-        );
     }
 
     /// A Trino statement the keyword check refuses is refused before the

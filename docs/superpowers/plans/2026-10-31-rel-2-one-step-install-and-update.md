@@ -317,6 +317,255 @@ signed decisions and `ops/release/release.pub`. One commit per task.
     handoff.
   - The developer cannot run the real release; the planner and the owner do that in S5.
 
+## 4b. S3 plan check (planner, 2026-11-01, at `main` `2c110ebc`): `lakehousectl install`
+
+Read today:
+- **`release.json`** (`ops/release/make_manifest.py`) holds `schemaVersion`, `version`, `gitSha`,
+  `createdAt`, `minFrom`, `stops`, `images` (service → `ref@sha256:<manifest digest>`, every
+  service of the rendered Compose file) and `files`. `files` covers only `docker-compose.yml`
+  today.
+- **Signature:** `release.json.sigstore.json`, a Sigstore bundle with no tlog. The recipe that
+  verifies it is proven in `ops/release/test_sigstore_bundle.py`: `messageSignature.signature` is
+  an ECDSA P-256 DER signature over SHA-256 of `release.json`, and `messageDigest` is that
+  SHA-256. The fixture is `ops/release/fixtures/sigstore/` (bundle, manifest, throwaway public
+  key).
+- **The bundle** (`make_bundle.sh`) holds `docker-compose.yml`, `release.json`,
+  `release.json.sigstore.json`, `images/<name>.tar` (`docker save` by reference), `sbom/` and
+  `SHA256SUMS`, as a `.tar.zst`.
+- **Secrets:** `ops/init-env.sh:64-90` lists what a fresh `.env` needs, and `.env.example` is the
+  list of keys.
+- **The release key:** `ops/release/release.pub`.
+- **Workspace:** `rust/Cargo.toml` members `crates/*`.
+
+**The gap S3 must close first (T0).** `docker save` of a pulled image drops its registry manifest
+digest. After `docker load`, the host knows only the image **ID**, which is the config digest. So
+an air-gapped install cannot compare a loaded image against `images` (manifest digests). The
+manifest must also carry each image's ID.
+
+Branch `feat/rel-2-s3-lakehousectl-install` off `main`. One commit per task.
+
+- **S3-T0. The manifest carries image IDs.**
+  - `make_manifest.py` gains `imageIds`: unique image reference → `sha256:<config digest>`. The
+    pipeline fills it after pulling or building each image (`docker image inspect --format
+    '{{.Id}}' <ref>`), in both jobs of `release.yml`.
+  - `files` gains `SHA256SUMS`'s own entries? No: keep `files` as it is. The bundle's
+    `SHA256SUMS` is checked against the tar contents, and the signed manifest is the root of
+    trust.
+  - Tests in `test_make_manifest.py`.
+  - *Accept:* `pytest ops/release -q`, and `actionlint`.
+- **S3-T1. The crate.** `rust/crates/lakehousectl`, a binary, built with `clap` (derive).
+  - `verify` module: parse the Sigstore bundle, then check
+    `messageDigest == sha256(release.json)` and the ECDSA P-256 signature against the key built
+    in with `include_bytes!("../../../../ops/release/release.pub")`. Use the `p256` and `ecdsa`
+    crates (pin minors, and pass `cargo deny`).
+  - Test against the S2 fixture (throwaway key, injected in tests) and against a tampered
+    manifest.
+  - *Accept:* `cargo fmt --check`; `cargo clippy -p lakehousectl --all-targets -- -D warnings`;
+    `cargo test -p lakehousectl`; `cargo deny check`.
+- **S3-T2. Pre-flight** (spec minimums). Each check is its own function, testable with injected
+  facts:
+  - Linux on x86_64;
+  - Docker 24 or newer, and Compose 2.24 or newer (from `docker version` and
+    `docker compose version`);
+  - 4 or more CPUs, and 16 GiB or more of memory (`/proc/meminfo`);
+  - 50 GiB or more free under `--dir`;
+  - the published ports free: `CONSOLE_HOST_PORT` (3000), `API_HOST_PORT` (8080) and the
+    others the rendered Compose file publishes.
+
+  `--ignore-preflight <name>` skips one check and logs it. Every failure says what to fix.
+- **S3-T3. `lakehousectl install [--bundle <dir>] [--dir /opt/rantai-lakehouse]`** (D5, D6):
+  - **verify** the manifest;
+  - **online:** read the release assets from GitHub Releases (latest, or `--version`), then
+    `docker pull` each `images` reference by digest;
+  - **offline:** check `SHA256SUMS`, run `docker load` on each `images/*.tar`, and check every
+    loaded image ID against `imageIds`, refusing any mismatch;
+  - **write the layout** of D5, with `.env` mode 0600;
+  - **generate secrets** following D6, only when missing; port `init-env.sh`'s list into Rust,
+    and test that a second run changes nothing;
+  - **start the stack** with `docker compose -p rantai-lakehouse up -d`, then wait for
+    `/health/ready` (`ready: true`, version = the manifest's) and for the console, both with
+    bounded waits;
+  - **print** the console address and the first administrator's email and password (generated,
+    shown once, must be changed at first sign-in).
+- **S3-T4. `install.sh`** (`ops/release/install.sh`):
+  - detect the architecture (x86_64 only, with a clear refusal otherwise);
+  - download `lakehousectl-linux-x86_64` and `SHA256SUMS` from the release, check the checksum,
+    and run `lakehousectl install "$@"`;
+  - use `set -euo pipefail` and pass shellcheck.
+
+  The release pipeline builds `lakehousectl` (static musl) and adds it to the bundle, the
+  release assets, `files` in the manifest and `install.sh`.
+- **S3-T5. The CI proof.** The dry run gains a job that, on a fresh runner:
+  1. downloads the dry run's bundle artifact;
+  2. runs `lakehousectl install --bundle` with the throwaway key, which a test-only build flag or
+     environment variable may point to, **never in a release build**;
+  3. asserts that `/health/ready` reports ready and the console answers.
+
+**S3 verification:** the scoped cargo commands, `pytest ops/release`, `shellcheck`, `actionlint`.
+The PR's dry run is the end-to-end proof.
+
+## 4c. S4 plan check (planner, 2026-11-01, at `main` `5661a043`): update, backup, rollback
+
+Read today:
+- **The CLI** (`rust/crates/lakehousectl/src/cli.rs`) has `verify`, `preflight` and `install`.
+  `install` writes the D5 layout, including `state.json` with `currentVersion`,
+  `previousVersion: null` and `lastBackup: null` (`install.rs`, `write_layout`).
+- **Backup and restore exist as repo scripts**: `ops/backups/backup-local.sh` (D8: Postgres
+  `pg_dumpall`, ClickHouse `BACKUP … TO Disk('backups')`, the connector-secrets volume, `.env`,
+  and a `manifest.json` of checksums) and `scripts/restore-from-backup.sh --local` (checks the
+  checksums first).
+  - Both `cd` to the repository root and run `docker compose -p <project>` there
+    (`backup-local.sh:60-75`).
+  - An installed host has neither script.
+- **Gap found by this check: the release's Compose file bind-mounts files the install does not
+  write.**
+  - `clickhouse` mounts `./ops/backups/clickhouse/backups.xml` (`docker-compose.yml:143`), which
+    is the backup disk `Disk('backups')` needs.
+  - `trino-maintenance-cron` (profile `trino`) mounts `./ops/trino/optimize_bronze.sh` (`:3266`).
+  - On an installed host Docker creates an empty directory in their place. ClickHouse still
+    starts, which is why the install proof passed, but a backup cannot run.
+  - The other relative mounts are test runners in test profiles, which a release does not run.
+- **`MAINTENANCE_PAUSED` (D9) is not implemented anywhere.** `git grep` finds it only in this
+  plan.
+- **The local backup does not hold the warehouse files** (`RustFS`). D8 never said it did. A
+  restore therefore returns the catalogs, Postgres with Lakekeeper's tables and ClickHouse, to
+  the moment of the backup, while data files written after it stay as orphans. That is safe
+  only while no expiry or orphan-file job deletes files that the restored catalog still names.
+  This is why D9 pauses them.
+- **No earlier release exists to update from.** 0.2.0 is the first (D4). So the S4 proof cannot
+  install "the previous release". It builds a second candidate in the job instead (D21).
+
+**Decisions (planner):**
+- **D14. The release ships every file its Compose file mounts.**
+  - The pipeline adds each relative bind-mount source used by a service that a release runs
+    (no test-runner profile) to the bundle and to the manifest's `files`, with its SHA-256.
+    Today that is `ops/backups/clickhouse/backups.xml` and `ops/trino/optimize_bronze.sh`.
+  - `install` and `update` write them into `--dir` at the same relative path, after checking
+    each against the signed manifest.
+  - A release-tooling test fails when the rendered Compose file mounts a relative source that
+    `files` does not list.
+- **D15. One backup and one restore, shipped as tools.**
+  - `backup-local.sh` and `restore-from-backup.sh` gain `LAKEHOUSE_DIR`: the directory holding
+    `docker-compose.yml` and `.env`, defaulting to the repository root, so a developer's
+    behaviour is unchanged. With it they run `docker compose -p <project> -f
+    "$LAKEHOUSE_DIR/docker-compose.yml" --env-file "$LAKEHOUSE_DIR/.env"`, plus `override.yml`
+    when it exists.
+  - The two scripts ship as release files (D14 mechanism) under `tools/`.
+  - `lakehousectl backup` and `lakehousectl restore <dir>` run them with `LAKEHOUSE_DIR=--dir`
+    and `COMPOSE_PROJECT=rantai-lakehouse`. There is no Rust port, so the steps have one
+    source.
+  - The backup set also gets `release.json` and `state.json`, which now exist. That closes the
+    gap `backup-local.sh`'s header admits.
+  - `lakehousectl backup` writes `state.json`'s `lastBackup`.
+- **D16. `MAINTENANCE_PAUSED`.**
+  - The Dagster services get `MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}`.
+  - The snapshot-expiry and orphan-file jobs read it with `== "true"`. When it is set, they skip
+    and record the reason in `skipped_verbs`; they do not fail.
+  - `lakehousectl` sets it in `.env` before the backup of an update, and clears it after a
+    success or after a rollback. The services that read it are recreated by `up -d`.
+- **D17. `lakehousectl update [--bundle <dir>] [--version <v>] [--ready-timeout <secs>]`.**
+  The steps run in this order, and nothing running is touched before step 4:
+  1. Obtain and verify the new release, as `install` does.
+  2. Compute the path (D10) from `state.json`'s `currentVersion`:
+     - the same version: nothing to do;
+     - older: refused, pointing to `rollback`;
+     - below `minFrom`, or with a `stops` entry between: online, each hop runs in turn; offline,
+       it is refused, naming the bundles of the stops.
+  3. Run the pre-flight checks (including `image-store` for a bundle), write the D14 files to a
+     staging directory, and pull or load every image of the new release. A failure here leaves
+     the running stack as it was.
+  4. Set `MAINTENANCE_PAUSED=true`. Stop the writers: `lakehouse-api`, `console`, and
+     `dagster-daemon`, `dagster-code-location` and `dagster-webserver` when they run. Postgres,
+     ClickHouse, RustFS and Lakekeeper keep running.
+  5. Take a backup (D15) to `backups/<stamp>-<old version>/`, and record it in `state.json`.
+  6. Keep the old `docker-compose.yml` and `release.json` as `*.previous`. Put the new ones and
+     the D14 files in place, then `up -d --pull never`.
+  7. Wait up to `--ready-timeout` (default 600 s, D9) for `/health/ready` to report the new
+     version as ready, and for the console.
+  8. On success: clear the pause, and set `state.json`'s `currentVersion` to the new version and
+     `previousVersion` to the old one.
+  9. On a timeout or a failure from step 6 on, roll back by itself (D18), and exit non-zero.
+     It reports both what failed and what the rollback did.
+- **D18. `lakehousectl rollback [--yes]`**, and the automatic rollback:
+  - stop the stack;
+  - `restore` the update's backup (`state.json`'s `lastBackup`);
+  - put the `*.previous` files back, and `up -d --pull never`;
+  - wait for ready on the old version;
+  - clear the pause, and set `state.json` back.
+  - By hand it first says that data written since the update is lost, and it needs `--yes` or an
+    interactive "yes".
+  - It refuses when there is no previous release or no backup.
+- **D19. `lakehousectl status`.** It shows:
+  - the installed version (`state.json`);
+  - each service's state (`docker compose ps --format json`);
+  - the API's `/health/ready`;
+  - the backups (newest first, with size);
+  - online, whether a newer release exists. Offline it says that it did not check.
+- **D20. `lakehousectl self-update`** (online).
+  1. Read the newest release's `release.json` and its signature, and verify them with the
+     compiled-in key.
+  2. Download `lakehousectl-linux-x86_64`, and check it against that manifest's
+     `files["lakehousectl"]`.
+  3. Replace the running binary atomically (a write to a temporary file, then a rename), and
+     say which version it now is.
+  - Offline, the bundle's own `lakehousectl` is the new tool, and the help text says so.
+- **D21. The proof, `update-proof`, a new job in the dry run, after `install-proof`.** On a fresh
+  runner, air-gapped as `install-proof` is:
+  1. Install the dry run's bundle A, version `V`.
+  2. Seed markers: a row in a marker table in the application database, a row in a ClickHouse
+     marker table, and a stored connector credential through the API.
+  3. Build bundle B: the API image rebuilt with its version set to `V-update-proof.1`, every
+     other image reused from A, and the manifest signed with the job's throwaway key.
+     `lakehousectl update --bundle B` must report B ready, and every marker must still be
+     there.
+  4. Build bundle C, version `V-update-proof.2`, whose API image never becomes ready (it sleeps).
+     `lakehousectl update --bundle C --ready-timeout 180` must exit non-zero and report the
+     rollback. Afterwards `/health/ready` must say B and ready, and every marker must still be
+     there.
+  - The real "previous release" test, installing 0.2.0 and then updating, joins this job once
+    0.2.0 exists (S5), with the reason written in the job.
+
+**PR slicing:**
+- **S4a** (one PR): T1–T3 (D14, D15, D16) and `backup` and `restore`.
+- **S4b** (one PR, after S4a merges): T4–T7 (D17–D21).
+
+Branch `feat/rel-2-s4-lakehousectl-update` off `main`, one commit per task.
+
+- **S4-T1 (D14). The release ships its mounted files.**
+  - Change `render_compose.py` or `make_manifest.py` (whichever owns `files`), `make_bundle.sh`
+    and `release.yml`'s assets, and the new release-tooling test.
+  - `install` writes and checks the files, with a Rust test.
+  - *Accept:* `pytest ops/release -q`, `actionlint`, `cargo test -p lakehousectl`.
+- **S4-T2 (D15). The scripts take `LAKEHOUSE_DIR`, ship as tools, and gain `release.json` and
+  `state.json` in the set.** Add `lakehousectl backup` and `restore <dir>`, with tests that a
+  backup and a restore call the shipped scripts with the right environment, using fakes.
+  - *Accept:* `shellcheck` on both scripts, `pytest ops/release -q`, `cargo test -p
+    lakehousectl`.
+  - Then one real run on bluefin: install a small bundle, `lakehousectl backup`, destroy the
+    volumes, `lakehousectl restore`, and the data is back. Quote it.
+- **S4-T3 (D16). `MAINTENANCE_PAUSED`.** Change the compose environment of the Dagster services,
+  and the two jobs' skip.
+  - Python tests with full-sentence names, and no network.
+  - *Accept:* `(cd dagster && python -m pytest dispar_orchestrate -q -k "maintenance or
+    expiry or orphan")`, `docker compose --profile '*' config --quiet`.
+- **S4-T4 (D17, D18).** `update` and `rollback`, with every step a function that takes
+  injected facts and a fake docker runner, as `preflight` is.
+  - Unit tests:
+    - the path rules;
+    - the order of the steps;
+    - a failure at step 3 touches nothing;
+    - a failure at step 7 rolls back;
+    - `rollback` refuses when there is no backup.
+  - *Accept:* `cargo test -p lakehousectl`, clippy.
+- **S4-T5 (D19). `status`**, with tests.
+- **S4-T6 (D20). `self-update`**, with tests using a fake download, including a refusal on a
+  wrong checksum.
+- **S4-T7 (D21). `update-proof`**, with workflow tests in `test_release_workflow.py`. The PR's dry
+  run is its proof.
+
+**Out of scope for S4:** a `lakehousectl` backup to S3 (the `backups` profile remains the S3
+path, and `status` names it), a backup of the warehouse files, and zero-downtime updates.
+
 ## 5. Out of scope
 
 Kubernetes or Helm, multi-host, zero-downtime updates, Windows and macOS hosts, automatic
@@ -642,6 +891,992 @@ allowed):
   cosign's `env://` provider expects. The plan does not state the encoding; the workflow
   says so in a comment. The FIRST real release is where that assumption is proven, and it
   fails loudly (cosign cannot decrypt) if it is wrong.
+
+### Handoff S3 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s3-lakehousectl-install`, base `main` at `2c110ebc`), one per
+task, in plan order:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `87f2c13b` | S3-T0 | `release.json` carries each image's id |
+| `4ccdc14b` | S3-T1 | the crate, and the verification of a release |
+| `b5c3932b` | S3-T2 | the pre-flight checks |
+| `6c2efe98` | S3-T3 | `lakehousectl install` |
+| `6d7ed009` | S3-T4 | the installer in the release, and `install.sh` |
+| `aa6b5e7a` | S3-T5 | the CI proof that the bundle installs |
+| `3fe050ab` | (fix) | the image id is the config digest on every Docker store |
+
+**Commands, with their results.** Every cargo command went through `bin/cargo-locked`, in the
+foreground, on the shared `CARGO_TARGET_DIR`; no `cargo clean`; no workspace build.
+
+The crate:
+
+- `cargo fmt --check` — clean (the whole workspace, and `-p lakehousectl`).
+- `cargo clippy -p lakehousectl --all-targets -- -D warnings` — clean, no warning and no error.
+- `cargo test -p lakehousectl` — **43 passed, 0 failed**.
+- `cargo deny check all` — **advisories ok, bans ok, licenses ok, sources ok**.
+
+The release tooling:
+
+- `pytest ops/release -q` — **130 passed, 0 failed** (107 before this slice, 23 new).
+- `actionlint .github/workflows/release.yml` — clean, exit 0 (actionlint v1.7.7, with
+  shellcheck 0.10.0 on the PATH, so the `run:` blocks were checked too).
+- `bash -n` and `shellcheck` (0.10.0) on `ops/release/make_bundle.sh`,
+  `ops/release/image_name.sh` and `ops/release/install.sh` — clean, exit 0.
+- `python3 ops/lint/check_intra_package_imports.py` — OK.
+- `python3 ops/lint/check_bare_iceberg_count.py` — no violation.
+
+**The tool, run.** The binary was built and run here (the native build; the static musl build
+is CI-side, see below):
+
+- `lakehousectl verify --dir ops/release/fixtures/sigstore`, with the `test-key` build and
+  `LAKEHOUSECTL_PUBLIC_KEY_FILE=ops/release/fixtures/sigstore/throwaway.pub` → "the manifest
+  in ops/release/fixtures/sigstore verifies against the release key", exit 0.
+- The same binary on a **tampered** manifest → "the signature is over a different file: the
+  bundle names the digest 1d4e1a9e…, the manifest beside it hashes to 555308cb…", exit 1.
+- A **release** build (no `test-key`) with the same variable set → "LAKEHOUSECTL_PUBLIC_KEY_FILE
+  is set and ignored: this build verifies against the release key compiled into it." and "the
+  release key did not sign this manifest", exit 1. That is the "a release build never accepts
+  another key" property, proved on the binary.
+- `lakehousectl install --bundle <a bundle whose manifest was tampered with>` → refused with
+  the digest mismatch, and **nothing was written**: the install directory did not exist
+  afterwards. The manifest is verified before anything is written.
+- `lakehousectl preflight --compose docker-compose.yml --dir /tmp` → "memory: this host has
+  13 GiB of memory, and the release needs 16 GiB or more" and "disk: there are 5 GiB free
+  under the install directory, and the release needs 50 GiB or more" — **this machine is below
+  the spec's minimums**, so both checks fired. The ports check read the repository's own
+  Compose file and found the console's 3000, the API's 8080 and Postgres' 5432 (a unit test
+  holds that against the real file).
+
+**A finding, and the fix (`3fe050ab`).** The plan's recipe for the image id —
+`docker image inspect --format '{{.Id}}'` — is the **config digest** on Docker's classic
+image store and the **image index digest** on the containerd store. Measured here (Docker
+29.9.2, the containerd store): the image's `.Id` is `sha256:d9e853e8…` (the index digest)
+while its config digest is `sha256:bf8527eb…` — the blob the saved tar names as `Config`.
+A manifest built on one store and loaded on the other would compare two different identities,
+and the install would refuse a good bundle. So:
+
+- the pipeline names the **config digest** in `imageIds` (the identity a LOADED image carries
+  on both stores): when the store reports the index digest — it equals the reference's
+  registry digest — the config digest is read from the image's own saved tar;
+- the installer accepts the loaded image's ID when it is **either** the config digest
+  (`imageIds`) **or** the registry digest (`images`). Both are covered by the release key, and
+  they are the two identities Docker's stores give the same image.
+
+**Not verified, with the reason:**
+
+- **The dry run and the proof job are not verified.** They need a GitHub runner: the four
+  images, the throwaway registry, cosign, syft, a ~3 GiB bundle, and the whole stack started
+  on it. The PR's own CI is the proof, and its summary is where the bundle's size appears.
+- **The static musl build is not verified here.** The `x86_64-unknown-linux-musl` target and
+  `musl-tools` are not installed on this machine, and the pipeline installs both. The binary
+  was built and run natively — the same source, the same features, the same dependencies.
+- **The whole install was not run end to end here.** It needs a manifest signed with the
+  release key, and that key is in the `release` environment's secrets. The proof job does it
+  with the dry run's throwaway key, which is the only key this slice may touch.
+- **The full workspace run** (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this slice's machine rules say CI runs them; the
+  crate was clipped with `--all-targets` and tested, and `cargo deny check all` covered the
+  whole dependency graph.
+- **No bun command and no Dagster command ran**: this slice changes no TypeScript and no code
+  location. `docker compose --profile '*' config --quiet` was not run either: this slice
+  changes no Compose file (the release's Compose file is RENDERED by the pipeline from the
+  unchanged template).
+- The `install.sh` script was tested against a fake `curl` and a fake `uname`, not against
+  GitHub: the script's own logic (the refusal, the checksum check, the hand-over) is what
+  those tests cover.
+
+**Where the plan left room, and what was decided** (for the reviewer):
+
+- **The command surface.** The plan gives the crate a `verify` module and the pre-flight
+  checks, but no command for them. They became `lakehousectl verify` and
+  `lakehousectl preflight` — the modules' own CLI surface, so each module is reachable and
+  testable on its own, and the install runs the same checks.
+- **The pre-flight's ports** come from the release's own Compose file, not from a list in the
+  tool: the release publishes more than the console and the API, and the operator's `.env`
+  may move any of them. The `.env` is read for the values it sets.
+- **The install's HTTP client is written here** (a plain GET on the loopback), so the binary
+  carries no TLS stack: the offline path needs no network at all, and the online path
+  downloads the release's assets with `curl`, the tool `install.sh` already uses. A static
+  musl binary with a TLS stack would need a C toolchain in the pipeline.
+- **The secrets are the Rust port of `ops/init-env.sh`** (D6): the repository's
+  `.env.example` is the list of keys, COMPILED INTO the binary (the installer has to work on
+  a host that has never seen this repository), the values are generated only when they are
+  missing, an existing `.env` is never overwritten, and a second run changes nothing. The
+  first administrator's password is printed once — on a re-install the tool says where the
+  password is instead of printing it again.
+- **`state.json`** (D5) carries `schemaVersion`, `currentVersion`, `previousVersion` and
+  `lastBackup`. `previousVersion` and `lastBackup` are null until REL-2 S4 fills them.
+- **The bundle carries the installer** as `lakehousectl`, and the signed manifest names its
+  checksum in `files` — so the bundle's copy is the file the release published, checked
+  against the signature and not only against the bundle's own `SHA256SUMS`.
+- **`install.sh` is a bash script** (`set -euo pipefail`, as the plan asks), so the documented
+  command is `curl -fsSL https://get.rantai.dev/lakehouse | bash`. The spec's example says
+  `| sh`, which dash cannot run (`pipefail` is bash). The reviewer may want the spec's
+  wording changed, or the script rewritten in POSIX sh.
+- **The CI proof skips two pre-flight checks** (`disk` and `memory`): a GitHub runner has
+  neither the 50 GiB of free disk nor the 16 GiB of memory the release asks for. The skips are
+  said out loud by the tool, and the minimums themselves are proved by the operator's
+  acceptance checklist (REL-2-AC3), not by a runner.
+
+**Known gaps in this slice** (not fixed here; the reviewer decides):
+
+- **The bundle's images are verified against the manifest by ID, and the ID is checked
+  against the tar's own content only through that.** The bundle's `SHA256SUMS` covers the
+  image tars, and the signed manifest names the images' digests and ids — but the tar's
+  config blob is not hashed against the manifest's `imageIds` by the installer itself. An
+  air-gapped install would be stronger if the installer read the config digest out of each
+  tar (the tar's `manifest.json` names it) and compared it with the signed manifest, which
+  needs a tar reader in the tool. The plan's own check (the loaded image's ID) is what is
+  implemented.
+- **The offline path trusts the bundle's `SHA256SUMS`, which is not signed.** The signed
+  manifest names the images' digests and ids, so the two chains meet at the image's ID; a
+  bundle whose tars were rewritten would need the manifest's ids to match too.
+- **The online path downloads the release's assets with `curl`**, so the online install needs
+  `curl` on the host. The pre-flight does not check for it (the plan's list does not name
+  it); the offline path needs nothing but Docker.
+- **The install does not roll back.** REL-2 S4 adds `update` with the automatic rollback
+  (D9); this slice only installs.
+- **The proof job starts the whole stack on a runner** (35 services in the rendered Compose
+  file, default profile). Whether a GitHub runner has the memory and the disk for it is a
+  runner fact, and the PR's own CI answers it.
+
+### Fixes for review S3 round 1 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s3-lakehousectl-install`, base `b0855ae8`), one per finding:
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `a5f49eca` | REL-2 S3 review round 1 BLOCKER 1 | the online install reads the release into memory |
+| `f34f19e2` | REL-2 S3 review round 1 SHOULD-FIX 2 | the bundle's image tars are hashed, not just named |
+| `5757949d` | REL-2 S3 review round 1 SHOULD-FIX 3 | a second install does not overwrite the first one's state |
+| `bf0f7c43` | REL-2 S3 review round 1 SHOULD-FIX 4 | the administrator's email is the one the `.env` holds |
+| `38ccc6f4` | REL-2 S3 review round 1 SHOULD-FIX 5 | the installer script leaves nothing behind |
+
+**BLOCKER 1 (`a5f49eca`).** The online install wrote the release's three assets into
+`temp_dir()/lakehousectl-release-<version>`, with `create_dir_all` and `curl --output`. The
+installer runs as root, and that name is a name anybody can guess: a local user who creates the
+directory first, with a symlink at `release.json`, has root write the file it points at, and a
+directory an earlier run left behind was reused as it was.
+
+The assets are small text files, so they are read into memory and nothing is written at all:
+
+- `sys::output_bytes` runs a command and returns its standard output byte for byte — not trimmed,
+  because the manifest's signature is over its exact bytes (`sys::output` is now that plus the
+  trimming it always did, and its doc says what it always did);
+- `install::download` reads one asset with `curl` to its standard output, and `install::asset_url`
+  names the three URLs;
+- the temporary directory is not touched any more: there is no path of the tool's own for another
+  local user to own.
+
+The download is injected (`obtain_with`), so a test drives the online path with no network: it
+holds the three assets that are asked for, and that the temporary directory holds nothing of the
+tool's own before and after. A second test holds `sys::output_bytes` to the exact bytes (a
+trailing newline is part of the answer).
+
+**SHOULD-FIX 2 (`f34f19e2`).** `checksums_cover()` asked whether a line of the bundle's
+`SHA256SUMS` named the tar, and never hashed it: a copy damaged on its way to the host was loaded
+as it was, and `docker load` was the first thing that noticed. Each `images/<name>.tar` is now
+hashed with SHA-256 and compared with its own line BEFORE the load:
+
+- `checksum_of` reads the digest the list names for a file (the paths are relative to the bundle's
+  root, as `sha256sum` writes them);
+- `sha256_of` hashes the file in pieces — an image tar is hundreds of megabytes, and the installer
+  has no reason to hold one in memory;
+- `verify_checksum` refuses a file the list does not name, and a file whose digest differs, with
+  the message that says what does not match.
+
+The bundle's `SHA256SUMS` is not signed, and the code says so: this check catches damage, and the
+TRUST check stays the image's ID against the SIGNED manifest's `imageIds`. Three tests: a file
+that matches its checksum is accepted, a damaged one is refused with the file named, and a file
+the list does not name is refused.
+
+**SHOULD-FIX 3 (`5757949d`).** `write_layout()` always rewrote `state.json` — `previousVersion:
+null`, `lastBackup: null` — so a second install over the first one's directory threw away the
+state of the install that was there, for ANY release and with nothing said. The install now reads
+the state before it writes anything:
+
+- the SAME release may be installed again, and `state.json` is kept as it is: the previous version
+  and the last backup of the first install survive a re-run;
+- any OTHER release is refused, and the refusal names the release that is there and points at
+  `lakehousectl update`, the command that installs another release (REL-2 S4);
+- a `state.json` that names no release is refused rather than overwritten: the tool cannot tell
+  what is installed, and it fails closed.
+
+The release's own files — the Compose file, the manifest and its signature — are written again:
+they are the bytes of the release, checked against the signed manifest, so a re-install of the
+same release writes the same bytes. Three tests: the state survives a re-install of the same
+release, another release is refused with the update named, and a state that names no release is
+refused and left alone.
+
+**SHOULD-FIX 4 (`bf0f7c43`).** With an existing `.env`, `secrets::write_env()` read
+`AUTH_BOOTSTRAP_EMAIL` from the compiled-in template, so a re-install printed
+`admin@example.com` while the stack was configured with the address the operator had put in the
+file. The email is now read from the `.env` that is there. Two tests: a fresh `.env` takes the
+email from the template, and an existing `.env` gives back the email it holds.
+
+**SHOULD-FIX 5 (`38ccc6f4`).** `install.sh` ended with `exec "$work/$BINARY" install "$@"`.
+`exec` replaces the shell, so the `EXIT` trap that removes `$work` never ran, and the downloaded
+binary stayed on the host after every install. The installer is run instead of exec'd, and the
+script exits with the installer's own status. Two tests: the files the script downloaded are gone
+when it ends, and the script's status is the installer's status. The first was checked against the
+OLD script, where it fails with "the binary was left behind".
+
+**Commands run, in the foreground, on the final commit `38ccc6f4`:**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (the whole workspace, through `bin/cargo-locked`) | clean, no diff |
+| `cargo clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error |
+| `cargo test -p lakehousectl` | **53 passed, 0 failed** (43 before this round, 10 new) |
+| `bash -n ops/release/install.sh` | clean, exit 0 |
+| `shellcheck ops/release/install.sh` (0.10.0) | clean, exit 0 |
+| `python -m pytest ops/release -q` | **132 passed, 0 failed** (130 before this round, 2 new) |
+| `python3 -m unittest discover -s ops/release -p 'test_*.py'` | **132 tests, OK** |
+| `python3 ops/lint/check_intra_package_imports.py` | OK |
+| `python3 ops/lint/check_bare_iceberg_count.py` | no violation |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the `bin/cargo-locked` of
+the earlier rounds is not in the repository), in the foreground, on the shared
+`CARGO_TARGET_DIR`; no `cargo clean`; no workspace build. The pytest run used a virtualenv's
+interpreter (`/tmp/opencode/relvenv/bin/python -m pytest ops/release -q`): the system Python is
+externally managed (PEP 668), so `pip install --user pytest` is refused, and the virtualenv
+carries `pytest==8.3.4` over the system site packages (PyYAML, cryptography). `shellcheck`
+(0.10.0) is not installed on this machine; it was already downloaded to `/tmp/opencode/bin` by
+the earlier rounds of this slice.
+
+**Not verified, with the reason:**
+
+- **The PR's dry run and the `install-proof` job are not verified.** They need a GitHub runner:
+  the four images, the throwaway registry, cosign, syft, a multi-GiB bundle, and the whole stack
+  started on it. The PR's own CI is the proof.
+- **The online download was not exercised against GitHub.** The test drives the online path with
+  an injected fetch, and the `curl` call is the same one `install.sh` uses, but no real release
+  was downloaded here: the release key and the releases are not on this machine.
+- **The whole install was not run end to end.** It needs a manifest signed with the release key,
+  and that key is in the `release` environment's secrets.
+- **The static musl build is not verified here.** The `x86_64-unknown-linux-musl` target and
+  `musl-tools` are not installed on this machine, and the pipeline installs both. The binary was
+  built and tested natively — the same source, the same features, the same dependencies.
+- **The full workspace run** (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this slice's machine rules say CI runs them; the crate
+  was clipped with `--all-targets` and tested.
+- **No bun command, no Dagster command and no Compose command ran**: this round changes no
+  TypeScript, no code location and no Compose file.
+- **`cargo deny check all` was not run** in this round: no dependency changed (the crate's
+  `Cargo.toml` is untouched), and the earlier round of this slice ran it green.
+
+### Fix for the PR #313 dry run (developer, 2026-11-01)
+
+**Commit `3a004234`** (branch `feat/rel-2-s3-lakehousectl-install`): the musl target goes on the
+PINNED toolchain.
+
+The dry run failed in "Build lakehousectl (static, musl)" with `error[E0463]: can't find crate
+for core ... the x86_64-unknown-linux-musl target may not be installed`. `rustup target add` ran
+at the repository root, so it installed the target for the runner's DEFAULT toolchain, and the
+build that followed ran inside `rust/`, on the toolchain pinned by `rust/rust-toolchain.toml`
+(1.99.1) — which has no musl target.
+
+All THREE steps that build `lakehousectl` for musl (the dry run, the release job and the install
+proof) now change to `rust/` BEFORE `rustup target add`, so `rustup` reads the pin and adds the
+target to it. The target is NOT added to `rust-toolchain.toml`: every developer reads that file,
+and a target in it is a download every developer pays for a build they do not make.
+
+**Commands run** (from the repository root, on `3a004234`):
+
+- `actionlint .github/workflows/release.yml` — no findings, exit 0.
+- `python3 -m pytest ops/release -q` — **135 passed**, 1 warning (the system pytest's `anyio`
+  plugin `PytestRemovedIn10Warning`; it is there before this commit too, at 132 passed).
+- `python3 ops/lint/check_intra_package_imports.py` — `OK: all intra-package dispar_orchestrate
+  imports resolve`.
+- `python3 ops/lint/check_bare_iceberg_count.py` — `R11 guard: no bare count() against a Bronze
+  Iceberg table found.`
+
+The three new tests in `ops/release/test_release_workflow.py`:
+
+- `test_every_musl_target_is_added_on_the_pinned_toolchain` — every step that adds the musl
+  target adds it AFTER `cd rust`, in the same step;
+- `test_a_musl_target_added_outside_rust_is_reported` — the check was run against a synthetic
+  workflow with the old order, and it fails there;
+- `test_the_toolchain_pin_does_not_ask_for_the_musl_target` — `rust/rust-toolchain.toml` does
+  not name the musl target.
+
+The first check was also run against the OLD `release.yml` (the file at `3e24eeca`): it fails
+there with "the musl target is added before `cd rust`".
+
+**Not verified:** the dry run itself — it needs the `release` environment's key and a runner, so
+the fix is proved here by the workflow's own checks and by the test that fails against the old
+file, and the dry run is what proves it end to end. **No cargo ran**: this commit touches no
+Rust.
+
+### Fix for the PR #313 install-proof (developer, 2026-11-01)
+
+**Commit `f9d00a2b`** (branch `feat/rel-2-s3-lakehousectl-install`): the proof reads the bundle from
+`dry-run/dist/`, the folder the artifact actually keeps it in.
+
+The dry run failed in "Install the bundle" with `tar (child): dry-run/rantai-lakehouse-*.tar.zst:
+Cannot open: No such file or directory`.
+
+`actions/upload-artifact` stores every file at its path relative to the ROOT of the upload list —
+the least common ancestor of the search paths. That list names files from `dist/`, from `sbom/`
+and from the repository root itself, so the root is the repository root and the folders survive.
+The proof's `download-artifact` step unpacks the artifact into `dry-run/`, so the bundle is at
+`dry-run/dist/rantai-lakehouse-*.tar.zst` and `cosign.pub` is at `dry-run/cosign.pub`. The
+`cosign.pub` path was right; the bundle's path was not.
+
+The layout was not guessed: the central directory of the artifact of the failed run (PR #313,
+run `41300418587`, artifact `release-dry-run`) was read over HTTP range requests, and it holds
+24 entries — `dist/rantai-lakehouse-0.1.0-linux-x86_64.tar.zst`,
+`dist/rantai-lakehouse-0.1.0-linux-x86_64.tar.zst.sha256`, `release.json`,
+`release.json.sigstore.json`, `docker-compose.release.yml`, `lakehousectl-linux-x86_64`,
+`cosign.pub` and the 16 `sbom/*.cdx.json` files. Every file the proof reads is now on that list
+under the same relative path.
+
+**Commands run** (from the repository root, on the commit above):
+
+- `actionlint .github/workflows/release.yml` — no findings, exit 0.
+- `python3 -m pytest ops/release -q` — **139 passed**, 1 warning (the system pytest's `anyio`
+  plugin `PytestRemovedIn10Warning`; it is there before this commit too, at 135 passed).
+- `python3 ops/lint/check_intra_package_imports.py` — `OK: all intra-package dispar_orchestrate
+  imports resolve`.
+- `python3 ops/lint/check_bare_iceberg_count.py` — `R11 guard: no bare count() against a Bronze
+  Iceberg table found.`
+
+The four new tests in `ops/release/test_release_workflow.py`:
+
+- `test_every_file_the_proof_reads_is_on_the_upload_list` — every path the proof job reads under
+  `dry-run/` is on the dry run's upload list, under the SAME relative path (the folder is
+  compared, not just the glob, so `dist/*.tar.zst` cannot stand for a file read from the
+  artifact's root);
+- `test_a_proof_reading_a_file_the_dry_run_does_not_upload_is_reported` — the check above was run
+  against a synthetic workflow whose proof reads the bundle from the artifact's root, and it
+  fails there with `dry-run/rantai-lakehouse-*.tar.zst`;
+- `test_the_proof_downloads_the_artifact_the_dry_run_uploaded` — the upload step and the
+  download step name the SAME artifact;
+- `test_the_proof_unpacks_the_artifact_where_it_reads_it` — the proof reads from the folder it
+  unpacked the artifact into.
+
+The first check was also run against the OLD `release.yml` (the file at `ab70ff2f`): it fails
+there with `dry-run/rantai-lakehouse-*.tar.zst`, and passes against the fixed file.
+
+**Not verified:** the dry run itself — it needs the `release` environment's key and a runner, so
+the fix is proved here by the workflow's own checks, by the test that fails against the old file
+and by the artifact's own central directory. **No cargo ran**: this commit touches no Rust.
+
+### Fixes for review S3 round 3, D13 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s3-lakehousectl-install`), one per item, each pushed:
+
+| Commit | Item | What |
+| --- | --- | --- |
+| `7c2b171f` | 1 — `ops/release/make_bundle.sh` | the bundle is built on the containerd image store, from tags |
+| `4737eabc` | 2 — `.github/workflows/release.yml` | the containerd image store in three jobs, and an air-gapped install proof |
+| `0c181076` | 3 — `rust/crates/lakehousectl` | the `image-store` pre-flight check, and `docker compose up --pull never` |
+
+**Item 1 (`7c2b171f`).** `make_bundle.sh` refuses to run unless Docker's containerd image store
+is on: `docker info --format '{{json .DriverStatus}}'` must name `io.containerd.snapshotter.v1`.
+The refusal says how to switch (`{"features": {"containerd-snapshotter": true}}` in
+`/etc/docker/daemon.json`, then a restart of Docker) and that the classic store's images are
+hidden while the containerd store is on. For each image the script now pulls the digest
+reference, TAGS it (`docker tag <ref@digest> <ref-without-digest>`) and saves the TAG — never
+`--platform`, and never the digest reference. The header says why, and the site's comment says
+why.
+
+The three new tests in `ops/release/test_make_bundle.py` use the fake `docker` (no network): the
+bundle saves each image by its tag and not by the digest reference, it never passes `--platform`,
+and it is refused on a classic store with the daemon.json snippet in the message.
+
+**Item 2 (`4737eabc`).** Three jobs, one step each, named "Turn on the containerd image store":
+the daemon's own `daemon.json` is MERGED with `jq` (not replaced), Docker is restarted with
+`systemctl restart docker`, and the store is ASSERTED with `docker info` — the step fails the
+job when the store is not on. The step sits before the job's first image pull or build: the dry
+run's step 3 (its first build is step 8), the release job's step 3 (its first build is step 9).
+buildx builds in a builder container of its own, so the images it pushes come back through the
+registry: the pull that has to happen on the containerd store is the "The published images, by
+digest" step, and the step's comment says so.
+
+`install-proof` gains the same step (before the install) and a second one, "Cut the runner off
+from the registries": `/etc/hosts` sends `registry-1.docker.io`, `auth.docker.io`,
+`index.docker.io`, `ghcr.io`, `quay.io` and `production.cloudflare.docker.com` to `0.0.0.0`, and
+`docker pull alpine:3.20` must FAIL before the install runs. The proof is air-gapped in fact: a
+runner that can still pull would let Compose fetch the images the bundle should have loaded.
+
+The six new tests in `ops/release/test_release_workflow.py` check the ORDER (the store is on
+before the first pull or build, in each of the three jobs; the store is on before the install;
+the cut is before the install) and the air-gap step itself (the six hosts, `/etc/hosts`, and the
+proof of the cut). Two synthetic workflows make the checks fail: one pulls an image with no
+containerd step, the other installs before the cut. The checks were also run against the OLD
+`release.yml` (the file at `7c2b171f`): they report `dry-run`, `release` and "the proof has no
+air-gap step" there, and nothing against the fixed file.
+
+**Item 3 (`0c181076`).** A new pre-flight check, `image-store`, is a function of the injected
+facts like the others; the facts come from `docker info --format '{{json .DriverStatus}}'`. It
+runs for a BUNDLE install only (`preflight::run(facts, ignored, bundle)`), because an online
+install pulls every image by its digest and a pull registers the digest on either store. On the
+classic store it refuses, with the D13 text: the daemon.json snippet, the restart of Docker, and
+the warning that the classic store's images are hidden while the containerd store is on. A host
+whose store could not be read is refused too — an air-gapped install does not guess.
+`lakehousectl preflight --bundle` runs the check on its own.
+
+`docker compose up` is now `docker compose up -d --pull never`, online and offline: a missing
+image is an error, never a silent fetch. The arguments are built apart from the call
+(`compose_up_args`), so a test can read them.
+
+Eight new Rust tests: the containerd store passes the check, the classic store is refused with
+the fix text, an unreadable store is refused, the check does not run for an online install, it
+runs for a bundle install, it can be skipped by name, and the Compose arguments end with
+`--pull never`.
+
+**Commands run, in the foreground, on the final commit `0c181076`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **61 passed, 0 failed** (53 before this round, 8 new) |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `shellcheck ops/release/*.sh` (0.10.0) | clean, exit 0 |
+| `python -m pytest ops/release -q` | **148 passed** (139 before this round, 9 new) |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `docker compose --profile '*' config --quiet` (throwaway env values) | clean, exit 0 |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the `bin/cargo-locked` of
+the earlier rounds is not in the repository), in the foreground, on the shared
+`CARGO_TARGET_DIR`; no `cargo clean`; no workspace build. The pytest run used the virtualenv's
+interpreter (`/tmp/opencode/relvenv/bin/python -m pytest ops/release -q`, pytest 8.3.4 over the
+system site packages). `shellcheck` (0.10.0) is not installed on this machine; it was downloaded
+to `/tmp/opencode/d13/shellcheck` for this round.
+
+**The measurement (item 4), on bluefin.** Docker 29.9.2, Compose v5.6.1, the host's own
+containerd store (`io.containerd.snapshotter.v1`). `lakehousectl` was built with
+`--features test-key` (a native debug build) and pointed at a THROWAWAY cosign key: cosign
+v3.1.4 generated the key, signed the manifest into a Sigstore bundle
+(`--use-signing-config=false --tlog-upload=false`, no transparency log), and the binary read the
+throwaway public key through `LAKEHOUSECTL_PUBLIC_KEY_FILE`. The S2 fixture was NOT reused: its
+private half is not in the repository, and the manifest of a real install has to name real images
+and their IDs.
+
+The bundle was made by the NEW `make_bundle.sh`, from a two-service Compose file
+(`alpine/socat:1.8.1.3@sha256:466c8a03…` and `alpine:3.20@sha256:d9e853e8…`, both pinned by
+digest), with the manifest written by `ops/release/make_manifest.py` and the image IDs read the
+way the pipeline reads them (the config digest out of the image's own saved tar, because the
+containerd store reports the index digest as the image's ID). The bundle is 9 823 287 bytes
+(9 MiB). Its archives carry what D13 says they must: `index.json` names
+`io.containerd.image.name: docker.io/alpine/socat:1.8.1.3` (and
+`docker.io/library/alpine:3.20`) with the registry digest beside it, and `manifest.json` carries
+the tag and the config digest the signed manifest names.
+
+Then, in this order:
+
+1. `docker rmi alpine/socat:1.8.1.3 alpine:3.20` — and both digest-pinned references stopped
+   resolving (`No such image`), which is the state PR #313's install proof was in.
+2. **The air gap, in fact.** `/etc/hosts` was given the six registry entries pointing at
+   `0.0.0.0` (the same entries the proof job now writes), and the cut was PROVED:
+   `docker pull alpine:3.20` failed with `dial tcp 0.0.0.0:443: connect: connection refused`,
+   and `curl https://registry-1.docker.io/v2/` failed too.
+3. `lakehousectl install --bundle unpacked --dir install --ignore-preflight disk
+   --ignore-preflight memory` (the memory and disk checks are skipped because this host has
+   13 GiB of RAM and `/tmp` is a 5 GB tmpfs — the same two skips the CI proof uses). It printed:
+
+   ```
+   lakehousectl: the manifest of release 0.2.0 verifies against the release key.
+   lakehousectl: the disk check was skipped, as asked.
+   lakehousectl: the memory check was skipped, as asked.
+   lakehousectl: loading unpacked/images/socat.tar
+   lakehousectl: loading unpacked/images/alpine.tar
+   lakehousectl: starting the stack.
+   ```
+
+   The `image-store` check ran and passed (the containerd store is on). Both images loaded, and
+   their IDs matched the SIGNED manifest — the tool would have stopped otherwise. The stack
+   started: `docker compose -p rantai-lakehouse ps` showed
+   `rantai-lakehouse-alpine-1  alpine:3.20@sha256:d9e853e8…  Up` and
+   `rantai-lakehouse-socat-1  alpine/socat:1.8.1.3@sha256:466c8a03…  Restarting (1)` — socat
+   exits because the port it connects to refuses, and the restart policy brings it back. The
+   digest-pinned references RESOLVED after the load, and the loaded images' IDs are the registry
+   digests the manifest pins (`sha256:466c8a03…`, `sha256:d9e853e8…`).
+4. **How far it got:** through the signature, the pre-flight, the layout, both loads, the image
+   ID check and the stack start — and it stopped at the READINESS PROBE, which cannot answer:
+   neither socat nor alpine serves `/health/ready`. The tool waits 10 minutes for it; the run
+   above was stopped by a 200-second timeout at that wait, so the tool's own "did not become
+   ready within 10 minutes" message was NOT seen here.
+
+**The buildx question (the order against the job).** Measured too, because the pipeline builds
+with buildx and pulls the images back by digest: a tiny image (`FROM alpine:3.20`) was built by
+`docker buildx build` in a builder container of its own and pushed to a local registry
+(`localhost:5000/d13-probe:0.1.0@sha256:07295677…`); the runner pulled it back by digest (the
+pipeline's "The published images, by digest" step), tagged it and saved the tag (the bundle's
+path); after `docker rmi` and `docker load` the digest-pinned reference RESOLVED and the image's
+ID was the pushed digest. So the images buildx pushes can still be pulled, tagged, saved and
+loaded afterwards.
+
+**The counterfactual.** The same image, saved from the DIGEST reference (what `make_bundle.sh`
+did before this round): the archive's `index.json` carries NO `io.containerd.image.name`, and
+after `docker rmi` + `docker load` the digest-pinned reference does NOT resolve
+(`No such image`) — the image lands as a dangling `<none>`. That is the BLOCKER, reproduced and
+then fixed.
+
+**Everything created was removed afterwards.** The compose project, its containers and its
+network (`docker compose -p rantai-lakehouse down -v`); the images this round pulled
+(`alpine/socat:1.8.1.3`, `registry:2`, `moby/buildkit`, the probe image); the registry container
+and the buildx builder; the temporary directories. `/etc/hosts` was restored from its backup and
+the two files hash the same (`34237b3f095501aac5a64024e4ad4b7c`). `alpine:3.20` and
+`localhost:5000/probe` were on the machine before the measurement and were left as they were.
+
+**Not verified, with the reason:**
+
+- **The PR's dry run and the `install-proof` job.** They need a GitHub runner: the four images,
+  the throwaway registry, cosign, syft, a multi-GiB bundle and the whole stack. The workflow's
+  own checks, and the checks run against the OLD workflow, are what stands in for them here.
+- **The release build's own images** (`ghcr.io/rantai-dev/…`) were not in the measurement: the
+  bundle's path does not care which registry an image comes from, and the release key is in the
+  `release` environment's secrets. The measurement used third-party images and a throwaway key,
+  as the task allowed.
+- **The static musl build** was not verified here: the `x86_64-unknown-linux-musl` target is not
+  installed on this machine. The measurement used the native debug build — the same source, the
+  same features.
+- **The readiness probe was not allowed to finish** (see item 4, step 4): the measurement's
+  images do not serve `/health/ready`, so the run was stopped at the wait. The stack start is
+  what was measured.
+- **The SBOMs in the measurement bundle were stand-ins** (a minimal CycloneDX JSON per image),
+  not syft's: the bundle only copies them, and the measurement is about the images and the
+  install.
+- **The full workspace run** (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this round changes one crate, and the crate's rules
+  say the scoped run is what a commit runs. CI runs the full one on the PR.
+- **No bun command and no Dagster command ran**: this round changes no TypeScript and no code
+  location.
+- **`cargo deny check`** was not run: no dependency changed (the crate's `Cargo.toml` is
+  untouched).
+- **An observation, not fixed:** `sys::output` captures a command's standard error and drops it,
+  so `docker compose`'s own output never reaches the operator — and `compose_up`'s message says
+  "The output above says why" while nothing is printed above. It is pre-existing and outside
+  D13's decision; the review may want it as a separate finding.
+
+### Fixes for review S3 round 4 (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s3-lakehousectl-install`), one per finding, each pushed:
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `d92af2e2` | BLOCKER 1 — `.github/workflows/release.yml` | the dry run starts its throwaway registry itself, after the store switch |
+| `19ac61cf` | SHOULD-FIX 2 — `rust/crates/lakehousectl` | a failed docker command carries Docker's own error output into the error |
+
+**BLOCKER 1 (`d92af2e2`).** The dry run's registry was a `services:` container. GitHub starts a
+service container before the job's first step, and the "Turn on the containerd image store" step
+restarts Docker and switches the image store: the restart stops the registry container, and the
+switch hides the image it ran from — the classic store's images are not in the containerd one. The
+image builds that push to `localhost:5000` had no registry to push to.
+
+The `services:` block is gone. The dry run starts the registry itself, in a step AFTER the switch:
+`docker run -d --name release-registry --restart always -p 5000:5000 registry:2@sha256:a3d8…`, and
+the step waits until `curl -fsS http://localhost:5000/v2/` answers — in a bounded loop (30 attempts,
+2 seconds apart), so a registry that never answers fails the job instead of hanging it.
+
+The image is PINNED by digest: `sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373`
+is the `docker-content-digest` the registry answered for the tag `registry:2` on 2026-11-01
+(measured, not assumed). The job's `RELEASE_REGISTRY` is unchanged (`localhost:5000`), and the
+buildx builder still runs with `network=host`, so it reaches the registry's published port.
+
+No other job of the workflow holds a service container: the `release` job and the `install-proof`
+job have none, and the check below says so.
+
+Six new tests in `ops/release/test_release_workflow.py`: no job that restarts Docker holds a
+service container (a service that a step starts AFTER the switch is not reported), the dry run's
+registry is started after the switch, is pinned by digest, is waited for with a bounded loop, and
+is the registry the job pushes to. Two synthetic workflows make the check fail and pass: one with
+a service container across the restart (reported), one that starts its service after the switch
+(not reported). The check was also run against the OLD `release.yml` (the file at `02048fac`): it
+reports `dry-run: registry` there, and nothing against the fixed file.
+
+**SHOULD-FIX 2 (`19ac61cf`).** This is the observation the round-3 handoff left open. A new
+`sys::output_or_stderr` carries the LAST 20 lines of what a command said on its error stream into
+the error, on their own lines under the exit status. `sys::output` is unchanged: the `curl` calls
+of `install.rs` and the pre-flight facts keep their own messages.
+
+The docker calls use it: `pull`, `load`, `image_id` and `compose_up`. The messages are worded to
+match what is printed: the advice ("Is this host online?") comes BEFORE the reason, and
+`compose_up` no longer says "The output above says why" — the error IS the answer now.
+
+No secret reaches that error output, and the module says so: the docker commands name images,
+image files and the Compose file, and Docker's own error output names the same things back. The
+signing key and the stack's secrets are never in a docker command's arguments, and Docker never
+prints them.
+
+Four new Rust tests: a failing command's error output is in the error; the error output is capped
+at 20 lines — the LAST twenty of forty, not the first; a command that says nothing on its error
+stream is an error of one line; and the stack error is the whole answer (it does not point at an
+output that nothing prints).
+
+**Commands run, in the foreground, on the final commit `19ac61cf`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **65 passed, 0 failed** (61 before this round, 4 new) |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `python3 -m pytest ops/release -q` | **154 passed** (148 before this round, 6 new) |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the `bin/cargo-locked` of
+the earlier rounds is not in the repository), in the foreground, on the shared `CARGO_TARGET_DIR`;
+no `cargo clean`; no workspace build.
+
+**Not verified, with the reason:**
+
+- **The PR's dry run.** It needs a GitHub runner: the four images, the throwaway registry, cosign,
+  syft, a multi-GiB bundle and the whole stack. The workflow's own checks, and the check run
+  against the OLD workflow, are what stands in for it here.
+- **The registry container itself** was not started on this machine: the step needs a runner whose
+  Docker has the containerd store on, and the digest of the image was read from the registry's own
+  header rather than from a pull.
+- **The `curl` calls of `install.rs`** keep their own messages: the finding named the docker
+  calls, and `curl --show-error` already says why it failed next to the exit status.
+- **The full workspace run** (`cargo clippy --workspace --all-targets --all-features` and
+  `cargo test --workspace`): not run here — this round changes one crate, and the crate's rules
+  say the scoped run is what a commit runs. CI runs the full one on the PR.
+- **No bun command, no Dagster command and no compose command ran**: this round changes no
+  TypeScript, no code location and no compose file.
+- **`cargo deny check`** was not run: no dependency changed (the crate's `Cargo.toml` is
+  untouched).
+
+### Handoff S4a (developer, 2026-11-01)
+
+**Commits** (branch `feat/rel-2-s4-lakehousectl-update`), one per task, each pushed:
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `fd25c005` | S4-T1 (D14) | the release ships every file its Compose file mounts |
+| `5d659f66` | S4-T2 (D15) | one backup and one restore, shipped as tools |
+| `ff9c334b` | S4-T3 (D16) | `MAINTENANCE_PAUSED` stops the jobs that delete files |
+
+**S4-T1 (`fd25c005`, D14).** A relative bind-mount source
+(`./ops/backups/clickhouse/backups.xml`) is a file the deployment needs NEXT TO its Compose file:
+on a host that does not have it, Docker creates an empty DIRECTORY in its place — the service
+starts, and it runs against nothing. The release now ships every relative mount of a service a
+release runs, and the signed manifest names the checksum of each of them.
+
+The rule lives in ONE place: `render_compose.relative_mount_sources` answers "which relative
+mounts does this Compose file have", with the SAME `services_to_drop` the renderer drops the
+acceptance harnesses by — so the answer is the same whether it is read from the template or from
+the rendered file (rule 4). `make_manifest.py` asks that module for the answer instead of parsing
+the file a second way, hashes each mounted file, and REFUSES a release that mounts a file it does
+not carry. That refusal is the release-tooling check D14 asks for: the tooling fails when the
+rendered Compose file mounts a relative source that `files` does not list. Two shipped files with
+the same name are refused too, and so is a shipped file named after a release asset of its own
+(the online install fetches a shipped file by its own name).
+
+The install writes them. `files.rs` fetches every shipped file (from the bundle offline, from the
+release's assets online), checks it against the SIGNED manifest, and writes it at the relative
+path the release ships it at — the path the Compose file mounts it at. The bundle carries them
+too: `make_bundle.sh` asks the manifest's own script for the list, checks each file against the
+signed manifest, and puts it in the bundle at the path the install writes it at. The release job
+publishes each of them as an asset of its own.
+
+**S4-T2 (`5d659f66`, D15).** `lakehousectl backup` and `lakehousectl restore <dir>` run the two
+scripts the release ships, under `tools/`. There is no Rust port of the steps: they have ONE
+source. The two scripts gain `LAKEHOUSE_DIR` — the deployment's own directory, the one holding
+`docker-compose.yml` and `.env`. It defaults to the repository's root, so a developer's behaviour
+is unchanged; the scripts run `docker compose -p <project> -f "$LAKEHOUSE_DIR/docker-compose.yml"
+--env-file "$LAKEHOUSE_DIR/.env"`, plus `override.yml` when there is one. The `.env` is named
+only when it is there: a repository without one is a normal thing, and compose refuses to start on
+a file that is not there.
+
+The backup set gets `release.json` and `state.json` (D15): a restore that brings the data back
+brings the release it was taken from back with it. The restore puts them back and keeps the ones
+it replaces beside the new ones, so a restore never destroys the only copy. `lakehousectl backup`
+records the backup it took in the install's state (`state.json`'s `lastBackup`) — the rollback of
+an update reads that pointer (D18). The state's shape has ONE owner now (`state.rs`): the
+install and the backup both read and write it there.
+
+**S4-T3 (`ff9c334b`, D16).** The three Dagster services of the `dagster` profile get
+`MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}`. The jobs run in the code location, so that is the
+service that reads the value; the daemon and the webserver carry it too, because `lakehousectl`
+sets it in the install's `.env` and the services that read it are recreated by `up -d`.
+
+While `MAINTENANCE_PAUSED=true` is set, the two verbs that DELETE files — the snapshot expiry and
+the orphan-file removal — skip, the reason is recorded in `skipped_verbs`, and the run does not
+fail. The value is read as `== "true"`: anything else, and an unset variable, is not a pause. The
+Gold export's trim deletes files too, so it reads the same variable and records its own skip
+(`console.gold_trim_run`, status `skipped`, reason `maintenance_paused`).
+
+**The real run (S4-T2), on bluefin.** Docker 29.9.2, Compose v5.6.1, the host's own containerd
+store (`io.containerd.snapshotter.v1`). `lakehousectl` was built with `--features test-key` (a
+native debug build) and pointed at a THROWAWAY cosign key: cosign v3.1.4 generated the key and
+signed the manifest into a Sigstore bundle (`--use-signing-config=false --tlog-upload=false`, no
+transparency log), and the binary read the throwaway public key through
+`LAKEHOUSECTL_PUBLIC_KEY_FILE`.
+
+The bundle was made by the NEW `make_bundle.sh`, from a small Compose file of its own — Postgres
+and ClickHouse, and nothing else — with the manifest written by `ops/release/make_manifest.py`
+and the image ids read the way the pipeline reads them (the config digest out of the image's own
+saved tar, because the containerd store reports the index digest as the image's id). The bundle
+is 437 640 170 bytes (417 MiB) and it holds what D14 says it must: the mounted file
+(`ops/backups/clickhouse/backups.xml`) and the two tools (`tools/backup-local.sh`,
+`tools/restore-from-backup.sh`), each with its SHA-256 in the bundle's own `SHA256SUMS`.
+
+Then, in this order:
+
+1. `lakehousectl install --bundle bundle --dir install --ignore-preflight disk
+   --ignore-preflight memory`. It wrote the layout, and the layout held the shipped files:
+
+   ```
+   install/docker-compose.yml
+   install/.env
+   install/ops/backups/clickhouse/backups.xml
+   install/release.json
+   install/release.json.sigstore.json
+   install/state.json
+   install/tools/backup-local.sh
+   install/tools/restore-from-backup.sh
+   ```
+
+   Both images loaded and their ids matched the SIGNED manifest. The stack started, and
+   `docker compose -p rantai-lakehouse ps` showed both services `Up (healthy)`. The install then
+   waited for `/health/ready`, which this small stack cannot answer — there is no API in it — and
+   the run was stopped at that wait (the same place the D13 measurement stopped). The tool's own
+   "did not become ready within 10 minutes" message was NOT seen here.
+2. The markers, one row in each database: `the postgres marker` in Postgres, `the clickhouse
+   marker` in ClickHouse.
+3. `lakehousectl backup --dir install` ran the SHIPPED script, and it said:
+
+   ```
+   ==> Backing up compose project 'rantai-lakehouse' to .../install/backups/20261101T192513Z-unknown
+   --> Postgres: pg_dumpall
+   --> ClickHouse: BACKUP DATABASE ... TO Disk('backups', ...)
+       default
+   --> ClickHouse: copying the backup files out of rantai-lakehouse_lakehouse_clickhouse_backups
+   --> Configuration: .env
+   --> Release: release.json
+   --> State: state.json
+   --> Manifest: manifest.json
+
+   ==> Backup complete: .../install/backups/20261101T192513Z-unknown
+       parts:     18
+       size:      64631 bytes
+   lakehousectl: the backup is recorded in the install's state.
+   ```
+
+   The ClickHouse `BACKUP DATABASE ... TO Disk('backups', ...)` worked BECAUSE the release
+   shipped `ops/backups/clickhouse/backups.xml` and the install wrote it next to the Compose
+   file: without D14 the disk does not exist and the backup cannot run at all. The install's
+   `state.json` held `"lastBackup": ".../backups/20261101T192513Z-unknown"` afterwards.
+4. The volumes were destroyed: `docker compose -p rantai-lakehouse down -v` removed the three
+   volumes and the network, and `docker volume ls --filter "name=^rantai-lakehouse_"` was empty.
+5. `lakehousectl restore .../backups/20261101T192513Z-unknown --dir install` ran the SHIPPED
+   restore script: the checksums were checked first, Postgres was restored with `pg_dumpall`,
+   ClickHouse was restored with `RESTORE DATABASE ... FROM Disk('backups', ...)` (it needed a
+   second attempt, which the script retries), the `.env`, `release.json` and `state.json` were put
+   back, and the stack came up again. It reported `Total restore time: 12s`.
+6. **The markers are back in both databases:**
+
+   ```
+   $ docker compose -p rantai-lakehouse ... exec -T postgres psql -U lakehouse -d lakehouse \
+       -tAc "SELECT id, note FROM s4_marker;"
+   1|the postgres marker
+   $ docker compose -p rantai-lakehouse ... exec -T clickhouse clickhouse-client \
+       -q "SELECT id, note FROM s4_marker"
+   1	the clickhouse marker
+   ```
+
+**Everything created was removed afterwards.** The compose project, its containers, its network
+and its three volumes (`docker compose -p rantai-lakehouse down -v`); the `postgres:16.15` TAG
+the bundle's `docker tag` added (the image itself was already on the machine, as `postgres:16`,
+and the tag was removed — `docker rmi postgres:16.15` untagged it and the image stayed); the
+temporary directories and the 417 MiB bundle. The ClickHouse image was LEFT on the machine: a
+container that predates this measurement (`charming_yonath`, `intelligent_easley`) uses it, and
+removing an image a stopped container holds would break that container's ability to start. The
+throwaway cosign key went with the temporary directory.
+
+**Commands run, in the foreground, on the final commit `ff9c334b`:**
+
+| Command | Result |
+| --- | --- |
+| `/home/shiro/rantai/bin/cargo-locked fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings` | clean, no warning and no error, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test --workspace` | **8848 passed, 0 failed**, 51 ignored, in 164 test binaries |
+| `/home/shiro/rantai/bin/cargo-locked clippy -p lakehousectl --all-targets -- -D warnings` | clean, exit 0 |
+| `/home/shiro/rantai/bin/cargo-locked test -p lakehousectl` | **89 passed, 0 failed** (65 before this slice, 24 new) |
+| `python3 -m pytest ops/release -q` | **177 passed** (158 before this slice, 19 new) |
+| `(cd dagster && python -m pytest dispar_orchestrate -q -k "maintenance or expiry or orphan")` | **60 passed**, 2349 deselected, 7 subtests passed (9 new) |
+| `(cd dagster && python -m pytest dispar_orchestrate/test_gold_export.py -q)` | **45 passed** |
+| `(cd dagster && python -m pytest dispar_orchestrate -q)` (the whole code location) | **2408 passed, 1 skipped**, 40 subtests passed, in 18m30s |
+| `actionlint .github/workflows/release.yml` | no findings, exit 0 |
+| `shellcheck ops/release/*.sh ops/backups/backup-local.sh scripts/restore-from-backup.sh` (0.10.0) | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `docker compose --profile '*' config --quiet` (throwaway env values) | clean, exit 0 |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command went through `/home/shiro/rantai/bin/cargo-locked` (the `bin/cargo-locked` of
+the earlier rounds is not in the repository), in the foreground, on the shared
+`CARGO_TARGET_DIR`; no `cargo clean`. The pytest run used the system interpreter
+(`python3 -m pytest ops/release -q`); the Dagster runs used the repository's own virtualenv
+(`dagster/.venv/bin/python`, pytest 9.2.0). `shellcheck` (0.10.0) is not installed on this
+machine; the copy in `/tmp/opencode/bin/shellcheck` was used.
+
+(The `cargo test -p lakehousectl` count in the S4-T1 commit message says "66 before this commit,
+10 new"; the real counts are 65 before the slice and 76 after S4-T1 — the message is off by one.
+The table above is the count.)
+
+**One thing in the plan is wrong against the code, and it is reported rather than improvised.**
+D14's list of "today's" relative mounts names TWO files —
+`ops/backups/clickhouse/backups.xml` and `ops/trino/optimize_bronze.sh` — and the "Gap found by
+this check" says "The other relative mounts are test runners in test profiles". That is not what
+the code says: the release's Compose file mounts a THIRD relative source, and it is not a test
+runner:
+
+```
+ops/seaweedfs/iam.template.json   (the `seaweedfs-iam-init` service, profile `seaweedfs`)
+```
+
+`seaweedfs-iam-init` renders `ops/seaweedfs/iam.template.json` into the `lakehouse_seaweedfs_iam`
+volume, so on a host without the file Docker creates an empty directory in its place and the
+service renders nothing. D14's RULE — "each relative bind-mount source used by a service that a
+release runs (no test-runner profile)" — covers it, so the release ships all THREE and the new
+tooling test asserts exactly that set. The plan's enumeration should be corrected by the planner;
+the decision itself was not changed.
+
+**Not verified, with the reason:**
+
+- **The PR's dry run and the `install-proof` job.** They need a GitHub runner: the images, the
+  throwaway registry, cosign, syft, a multi-GiB bundle and the whole stack. The workflow's own
+  checks, and the checks run against the OLD workflow, are what stands in for them here.
+- **The ONLINE path of the shipped files.** The measurement installed from a BUNDLE (the offline
+  path). The online path — the release publishing one asset per shipped file and the install
+  fetching it by its own name — is covered by a Rust test with a fake fetch, not by a real
+  download from a GitHub release: the release does not exist yet.
+- **The static musl build** was not verified here: the `x86_64-unknown-linux-musl` target is not
+  installed on this machine. The measurement used the native debug build — the same source, the
+  same features.
+- **The readiness probe was not allowed to finish**: the measurement's stack holds no API, so
+  `/health/ready` cannot answer. The stack start, the backup and the restore are what was
+  measured.
+- **The release build's own images** (`ghcr.io/rantai-dev/…`) were not in the measurement: the
+  bundle's path does not care which registry an image comes from, and the release key is in the
+  `release` environment's secrets. The measurement used third-party images and a throwaway key,
+  as the task allowed.
+- **The SBOMs in the measurement bundle were stand-ins** (a minimal CycloneDX JSON per image),
+  not syft's: the bundle only copies them, and the measurement is about the files and the
+  backup/restore.
+- **No bun command ran**: this slice changes no TypeScript.
+- **`lakehousectl update` and `lakehousectl rollback`** are NOT in this slice (S4-T4, D17 and
+  D18). With them comes the third bullet of D16 — `lakehousectl` setting the pause in the
+  install's `.env` before the backup of an update and clearing it after a success or a rollback
+  — because there is no `update` to set it for yet.
+- **`cargo deny check`** was not run: no dependency changed (no crate's `Cargo.toml` is touched).
+
+### Fixes for review S4a round 1 (developer, 2026-11-01)
+
+The reviewer's three SHOULD-FIX findings, one commit each, in the order the review names them. Every
+commit is on `feat/rel-2-s4-lakehousectl-update` — the review commit `f34f28e0` is the base — and was
+pushed as it was made.
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `e11abbf6` | SHOULD-FIX 1 | a shipped file's path may not escape the install's own directory |
+| `4b6ca96c` | SHOULD-FIX 2 | two files of the same name are not published as two assets |
+| `4e61a122` | SHOULD-FIX 3 | the repository's own compose command is the one it always was |
+
+**SHOULD-FIX 1 (`e11abbf6`).** `files::write` joins the install's own directory with the manifest's
+key. The manifest is signed, but a key that is absolute, or that holds a `..` component, would
+write OUTSIDE the directory the install owns — and a Compose file can really mount such a path:
+`render_compose.relative_mount_sources` accepts a `../` source and hands it over as it is.
+
+Both sides now refuse it, with the SAME rule: the path must be relative and must hold normal
+components only — no leading `/`, no `.`, no `..`, no empty component.
+
+- `make_manifest.py`: `check_install_path` refuses such a path. `shipped_files` calls it for every
+  mount and every tool, and `build_manifest` calls it for every path the manifest names.
+- `lakehousectl`'s `files.rs`: `check_install_path` refuses it BEFORE the file is read from the
+  bundle or downloaded, and before it is written. A path that escapes is neither fetched nor
+  written.
+
+**SHOULD-FIX 2 (`4b6ca96c`).** The release publishes one asset per file, and the asset's name is
+the file's own name — its LAST path component (`files::asset_name`). Two files whose last component
+is the same are two assets with the same name, and the online install fetches a shipped file by that
+name: it could not tell them apart. `make_manifest.py` now owns the rule in ONE place:
+`check_file_names` refuses two paths whose last component is the same; `check_shipped_names` (the
+rule for the shipped files) calls it, and `build_manifest` calls it over the WHOLE `files` mapping
+of the manifest, so the manifest's own entries are part of the same rule.
+
+**SHOULD-FIX 3 (`4e61a122`).** Before S4, both scripts ran `docker compose -p <project>` in the
+repository root, and compose found the Compose file — and a developer's own
+`docker-compose.override.yml` — by itself. S4 made them always pass `-f docker-compose.yml`, which
+stopped that. Both scripts now name the Compose file, the `.env` and `override.yml` ONLY when
+`LAKEHOUSE_DIR` is set — that is, when the deployment is somewhere else than the repository. When it
+is not set, the command is exactly the old one. `lakehousectl backup` and `lakehousectl restore`
+both set `LAKEHOUSE_DIR` (`backup.rs`), so an installed host is unaffected. The scripts read the
+deployment's own directory from `DEPLOYMENT_DIR`, which is `LAKEHOUSE_DIR` when it is set and the
+repository's root when it is not.
+
+**Commands run, in the foreground, on the final commit `4e61a122`:**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (the whole workspace) | clean, no diff, exit 0 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean, no warning and no error, exit 0 |
+| `cargo test --workspace` | **8854 passed, 0 failed**, 51 ignored, in 164 test binaries (8848 before these fixes, 6 new) |
+| `cargo clippy -p lakehousectl --all-targets -- -D warnings` | clean, exit 0 |
+| `cargo test -p lakehousectl` | **95 passed, 0 failed** (89 before these fixes, 6 new) |
+| `python3 -m pytest ops/release -q` | **187 passed** (177 at the review commit `f34f28e0`, 10 new) |
+| `shellcheck ops/backups/backup-local.sh scripts/restore-from-backup.sh` (0.10.0) | clean, exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `(cd dagster && .venv/bin/python -m pytest dispar_orchestrate -q)` | **2411 passed, 1 skipped**, 40 subtests passed, in 18m13s (on the merged tree; 2408 before `main` came in) |
+| `bun run typecheck` | clean, exit 0 |
+| `bun run test` | **3082 pass, 1 skip, 0 fail**, 8372 expect() calls, in 313 files, 73.8s |
+| `bun run lint` | **12356 problems (649 errors, 11707 warnings)** — red on `main` already, and this branch changes no TypeScript (see below) |
+| `docker compose --profile '*' config --quiet` (throwaway env values) | clean, exit 0 |
+| `git status` | clean (nothing generated staged) |
+
+Every cargo command ran in the foreground on the shared `CARGO_TARGET_DIR`
+(`/home/shiro/rantai/cargo-target`); no `cargo clean`. The pytest run used the system interpreter
+(`python3 -m pytest ops/release -q`); the Dagster run used the repository's own virtualenv
+(`dagster/.venv/bin/python`). `shellcheck` (0.10.0) is not installed on this machine under that
+name; the copy in `/tmp/opencode/tools/shellcheck-v0.10.0/shellcheck` was used, as in the S4a
+handoff. There is no `bin/cargo-locked` in the repository, so plain `cargo` was used.
+
+**`main` was merged into this branch while the fixes were in.** `699798ed` ("Merge branch 'main'
+into feat/rel-2-s4-lakehousectl-update") was pushed to the branch after the three fix commits, and
+this handoff sits on top of it. The merge touches NONE of the files these fixes touch
+(`ops/release/make_manifest.py`, `ops/release/test_release_files.py`,
+`ops/release/test_backup_scripts.py`, `ops/backups/backup-local.sh`, `scripts/restore-from-backup.sh`,
+`rust/crates/lakehousectl/src/files.rs`), and the checks for what was touched were re-run on the
+merged tree: `cargo fmt --check` clean, `cargo clippy -p lakehousectl --all-targets -- -D warnings`
+clean, `cargo test -p lakehousectl` **95 passed**, `python3 -m pytest ops/release -q` **187 passed**,
+`shellcheck` on both scripts clean, the two `ops/lint` scripts OK, and the Dagster code location
+**2411 passed, 1 skipped** (main's own code came with the merge — it is not this slice's). The
+whole-workspace run in the table above was measured on `4e61a122`, BEFORE that merge, and the
+reviewer runs the full block on the PR head anyway.
+
+**The tests of the developer's path are real.** The three tests of the repository's own command (the
+backup, the backup with an override of its own, and the restore) were run against the PRE-FIX
+scripts — the two scripts were stashed, and the three tests failed — and pass against the fixed
+ones.
+
+**`bun run lint` is red on `main`, and this branch does not cause it.** This branch changes no
+TypeScript: `git diff origin/main --stat -- src/ design-system/ design-kit/ components.json
+package.json bun.lock` is empty, so the lint's count is the count on `main`. It is named here for
+the reviewer (AGENTS.md, step 6).
+
+**Not verified, with the reason:**
+
+- **No PR is opened**: the developer never opens or merges one (AGENTS.md, step 6).
+- **The real run on bluefin was not repeated.** The three fixes are two refusals and one shell
+  command: the refusals are covered by the tests above, and the command by the two scripts' own
+  tests with `docker` and `curl` as stand-ins. A real stack run would show what the S4a
+  measurement already showed, and the release a real install needs does not exist yet.
+- **The ONLINE path of the shipped files** is still covered by a Rust test with a fake fetch, not by
+  a real download from a GitHub release (as in the S4a handoff).
+- **The static musl build** was not verified here (as in the S4a handoff): the
+  `x86_64-unknown-linux-musl` target is not installed on this machine.
+- **`cargo deny check`** was not run: no dependency changed (no crate's `Cargo.toml` is touched).
 
 ## 7. Review (planner appends below)
 
@@ -1406,3 +2641,205 @@ VERSION` for both paths, with `src/SyftVersion.ts` = `v1.42.3`.
 
 **Open: no BLOCKER, no SHOULD-FIX.** The real release (S5) needs a `v*` tag and the owner's
 approval in the `release` environment.
+
+### Review S3 round 1 (planner, 2026-11-01, at `04dbae2f`)
+
+Read: the whole `lakehousectl` crate, the `release.yml` diff, `install.sh`, `make_bundle.sh` and
+`make_manifest.py`. The verification of the manifest (`verify.rs`) is right: the digest is
+checked before the signature, the key is the compiled-in one unless the `test-key` feature is
+on, and a release build says when it ignores `LAKEHOUSECTL_PUBLIC_KEY_FILE`. The `p256` 0.14 /
+`ecdsa` 0.17 pin and its reason check out (`RUSTSEC-2026-0387` is in the advisory database, and
+the lock has `crypto-bigint` 0.7.10). The finding on the two Docker image stores is good work.
+
+- **BLOCKER 1. The online install downloads into a predictable shared directory.**
+  `install.rs` `obtain()` writes to `std::env::temp_dir().join("lakehousectl-release-<version>")`
+  with `create_dir_all` and `curl --output`. The installer runs as root. Any local user can
+  create that directory first and put a symlink at `release.json`, and root's `curl` then writes
+  through it into any file on the host. A directory left by an earlier run is also reused.
+  *Fix:* read the three assets into memory (curl to stdout; they are small text files), or
+  create a fresh private directory (`nix::unistd::mkdtemp`, mode 0700) and remove it at the
+  end. Add a test that the download path is not a fixed name.
+- **SHOULD-FIX 2. `SHA256SUMS` is checked for the name only.** `checksums_cover()` asks whether
+  a line names the tar, and never hashes the tar. The plan says "check `SHA256SUMS`". *Fix:*
+  hash each `images/<name>.tar` and compare it with its `SHA256SUMS` line before
+  `docker load`, so a damaged copy fails with a clear message. Say in the comment that
+  `SHA256SUMS` is not signed, so the image-id check against the signed manifest stays the
+  trust check, and this one catches damage.
+- **SHOULD-FIX 3. A second install overwrites the state of the first.** `write_layout()`
+  always rewrites `state.json` (`previousVersion: null`), `docker-compose.yml` and
+  `release.json`. *Fix:* when `--dir` already holds a `state.json`, install the same version
+  again only (keep `state.json` as it is), and refuse any other version, pointing to
+  `lakehousectl update` (S4). Test both.
+- **SHOULD-FIX 4. With an existing `.env`, the email shown is the template's.**
+  `secrets::write_env()` reads `AUTH_BOOTSTRAP_EMAIL` from `ENV_EXAMPLE` when the `.env`
+  exists. *Fix:* read it from the existing file. Test it.
+- **SHOULD-FIX 5. `install.sh` leaves the binary behind.** `exec` replaces the shell, so the
+  `EXIT` trap never removes `$work`. *Fix:* run `"$work/$BINARY" install "$@"` without
+  `exec`, and exit with its status.
+
+**Proven by the PR's dry run, not by reading:** after `docker load` of a tar that
+`docker save` wrote from a digest reference, both `docker image inspect <ref@digest>` and
+`docker compose up` must find the image with no registry. The `install-proof` job is that test.
+It must be green before merge.
+
+**Open: BLOCKER 1, SHOULD-FIX 2–5.**
+
+### Review S3 round 2 (planner, 2026-11-01, at `55173176`)
+
+- **BLOCKER 1 is fixed** (`a5f49eca`). The three assets are read into memory with `curl` to
+  stdout, and nothing is written under the temporary directory. `obtain_with` takes the fetch as
+  a parameter, so the test proves it without a network.
+- **SHOULD-FIX 2 is fixed** (`f34f19e2`). Each tar is hashed in 64 KiB reads and compared with
+  its `SHA256SUMS` line before `docker load`. A missing line and a damaged file are both refused
+  and tested, and the comment says what this check is for.
+- **SHOULD-FIX 3 is fixed** (`5757949d`). The same version installs again and keeps
+  `state.json`. Another version is refused and pointed at `lakehousectl update`. A `state.json`
+  that names no version is refused rather than overwritten.
+- **SHOULD-FIX 4 is fixed** (`bf0f7c43`). **SHOULD-FIX 5 is fixed** (`38ccc6f4`), and its test
+  fails against the old script.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for the PR's CI on this head: the required
+checks, the workspace cargo run, `Release · dry run`, and the `install-proof` job that installs
+the bundle on a fresh runner.
+
+### Review S3 round 3 (planner, 2026-11-01): the PR's install proof, at `9339179`
+
+The dry run is green, and `install-proof` now runs the installer: it unpacks the bundle,
+verifies the manifest against the dry run's key, logs the skipped pre-flight checks and loads
+the first image. Then it stops:
+
+```
+lakehousectl: loading bundle/images/socat.tar
+lakehousectl: the image alpine/socat:1.8.1.3@sha256:466c8a03… is not in the local store
+```
+
+- **BLOCKER 1 (planner's miss in 4b). After `docker load`, nothing resolves a digest-pinned
+  reference.** `docker save` of a pulled image does not carry its registry digest on Docker's
+  classic image store. After `docker load` the host has the image, but not under
+  `name:tag@sha256:<registry digest>`. Both the installer's check (`docker image inspect
+  <ref@digest>`) and the release's Compose file pin images that way. So an air-gapped install
+  cannot start even when the right image is loaded. Section 4b's T0 gave the installer a way to
+  CHECK a loaded image (`imageIds`), but no way for Compose to FIND it. Round 1 named this as
+  the one thing only the dry run could prove, and the dry run has disproved it.
+- **Next.** The fix is a design choice, so it waits for a measurement on bluefin. On both image
+  stores, it covers which `docker save` form, if any, lets a digest-pinned reference resolve
+  offline after `docker load`, for `docker image inspect` and for `docker compose up --pull
+  never`. The planner then writes the decision here (S3 D-amend) before any code changes.
+
+**Open: BLOCKER 1.**
+
+### S3 D-amend (planner, 2026-11-01): how an air-gapped host finds a loaded image
+
+The measurement is on bluefin: Docker 29.9.2, with each image store tried. The containerd
+store is the host's own, and the classic store was run in `docker:29-dind` with
+`containerd-snapshotter=false`. The image was `alpine/socat:1.8.1.3@sha256:466c8a03…`.
+
+- **Classic store:** no `docker load` of any archive form registers a repo digest. This
+  includes an archive whose `manifest.json` carries `RepoDigests`. So a digest-pinned reference
+  never resolves offline there. With a network, `docker compose up -d` silently pulls the image
+  from the registry instead, which would hide the bug on a CI runner.
+- **Containerd store:**
+  - An archive saved from the TAG (`docker save name:tag`) carries `io.containerd.image.name` in
+    `index.json`. After `docker load`, `name:tag@sha256:<list digest>` resolves, and
+    `docker compose up --pull never` starts from it with no network. The image's `Id` is then
+    the list digest the manifest pins.
+  - An archive saved from the digest reference (what `make_bundle.sh` does today) loads as a
+    dangling `<none>` image.
+  - `docker save --platform` rewrites the archive's digest to the per-platform manifest, so it
+    must never be used.
+
+**Decision D13 (planner):**
+1. **An air-gapped install requires Docker's containerd image store.** A new pre-flight check,
+   `image-store`, runs only for `--bundle`. It refuses a classic-store host and says how to
+   switch: `"features": {"containerd-snapshotter": true}` in `/etc/docker/daemon.json`, then a
+   restart of Docker. It also says that images held by the classic store are hidden while the
+   containerd store is on. An online install works on either store, because `docker pull` by
+   digest registers the digest.
+2. **The bundle is made on the containerd store, from tags.** Every job that builds a bundle
+   (the dry run and the release) turns the containerd store on before its first pull or build,
+   and asserts it is on. `make_bundle.sh` refuses to run on another store. For each image it
+   pulls by digest, tags `name:tag`, and saves the TAG, never with `--platform`.
+3. **Compose never pulls.** `lakehousectl` starts the stack with `docker compose … up -d --pull
+   never`. A missing image is then an error, never a silent fetch.
+4. **The image check after `docker load` stays.** On the containerd store, the loaded `Id` is
+   the registry digest the signed manifest pins (`install.rs`'s existing comparison).
+5. **`install-proof` turns the containerd store on before it installs.** It also gains a step
+   that cuts the runner off from the registries (no `docker pull` possible) before
+   `lakehousectl install --bundle`, so the proof is air-gapped in fact, not just in name.
+6. **Air-gapped install on the classic store is not supported, and says so.** The pre-flight
+   check is the honest refusal. If a customer needs it, it becomes a backlog item: a
+   tag-pinned Compose file with the digests verified by the installer.
+
+**Open: BLOCKER 1, to be fixed per D13.**
+
+### Review S3 round 4 (planner, 2026-11-01, at `02048fac`): D13
+
+D13 is implemented as decided. On bluefin, with an actual air gap, `make_bundle.sh` saves
+each image by its tag, the installer's `image-store` check passes, both images load and are
+found by their pinned digest, and the stack starts with `--pull never`. The counterfactual (the
+old save from the digest reference) reproduced the blocker, so the measurement proves the fix.
+
+- **BLOCKER 1. The dry run's registry does not survive the store switch.** `dry-run` runs its
+  registry as a `services:` container. GitHub starts service containers before the first step,
+  and "Turn on the containerd image store" then restarts Docker and hides the classic store's
+  images. The registry the image builds push to is then gone. The bluefin measurement ran no
+  service container, so it could not see this. *Fix:* start the registry as a step after the
+  switch, and test the order.
+- **SHOULD-FIX 2. The errors promise output the tool hides.** `sys::output` keeps stderr to
+  itself, so a failed `docker compose up`, `docker load` or `docker pull` reaches the operator
+  without its reason. Yet `compose_up` says "The output above says why". The developer reported
+  this; it predates D13. *Fix:* carry the last lines of stderr into the error, and word the
+  message to match.
+
+**Open: BLOCKER 1, SHOULD-FIX 2.**
+
+### Review S3 round 5 (planner, 2026-11-01, at `d0a64a7b`)
+
+- **BLOCKER 1 is fixed** (`d92af2e2`). The registry is a step after the store switch, pinned
+  by digest, and waited for with a bounded loop that prints its logs on failure. The service
+  container is gone, and the tests check the order in every job that restarts Docker.
+- **SHOULD-FIX 2 is fixed** (`19ac61cf`). A failed docker call now carries the last 20 lines of
+  its stderr into the error, and `compose_up` no longer promises output it does not print.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for this head's CI: the required checks, the
+workspace cargo run, `Release · dry run`, and `install-proof`, which is now air-gapped and on
+the containerd store.
+
+### Review S4a round 1 (planner, 2026-11-01, at `ba9115a3`)
+
+S4-T1 to T3 match D14–D16. The real run on bluefin is the proof that matters: the shipped
+`backups.xml` made `BACKUP … TO Disk('backups')` work, and a backup, a `down -v` and a restore
+brought both markers back. D14's list was the planner's miss, since
+`ops/seaweedfs/iam.template.json` (profile `seaweedfs`) is a third mount. The developer followed
+D14's rule rather than its list, which is right, and the tooling test pins all three.
+
+- **SHOULD-FIX 1. A shipped file's path is written as the manifest names it.**
+  `files::write` joins `dir` with the manifest's key. The manifest is signed, but a key that is
+  absolute or holds a `..` component would write outside `--dir`. *Fix:* `make_manifest.py` and
+  `files.rs` both refuse a name that is absolute or has a `..` component, or anything but
+  normal components, with tests.
+- **SHOULD-FIX 2. Release assets are named by the file's last component**
+  (`files::asset_name`). Two shipped files with the same file name in different folders would
+  collide on GitHub Releases. *Fix:* `make_manifest.py` refuses two `files` entries with the
+  same last component, with a test.
+- **SHOULD-FIX 3. The developer path of the backup scripts changed.** Before, they ran
+  `docker compose -p <project>` in the repository root, which also loads a developer's
+  `docker-compose.override.yml`. They now always pass `-f docker-compose.yml`, which stops
+  that. *Fix:* pass `-f` (and `--env-file`, `override.yml`) only when `LAKEHOUSE_DIR` is set,
+  so the unset case is exactly the old command. Test both cases in `test_backup_scripts.py`.
+
+**Open: SHOULD-FIX 1–3.**
+
+### Review S4a round 2 (planner, 2026-11-01, at `cd4aba65`)
+
+- **SHOULD-FIX 1 is fixed** (`e11abbf6`). The path rule is checked when the manifest is made
+  and again before a file is fetched and before it is written, on both the Python and the Rust
+  side.
+- **SHOULD-FIX 2 is fixed** (`4b6ca96c`). Two `files` entries whose last component is the same
+  are refused when the manifest is made.
+- **SHOULD-FIX 3 is fixed** (`4e61a122`). With `LAKEHOUSE_DIR` unset, the scripts run exactly
+  the old `docker compose -p <project>` in the repository root. The developer ran the new
+  tests against the old scripts, and they failed there.
+
+**Open: no BLOCKER, no SHOULD-FIX.** Merge waits for #332's CI, including `Release · dry run`
+and `install-proof`, which now install the shipped files.

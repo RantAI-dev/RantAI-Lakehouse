@@ -1569,6 +1569,7 @@ pub async fn enforce_pipeline_sql(
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &sql,
         &sqlparser::dialect::ClickHouseDialect {},
+        crate::sql_rewrite::Engine::ClickHouse,
         &author.role_names,
         &placeholders,
         &obligations_source,

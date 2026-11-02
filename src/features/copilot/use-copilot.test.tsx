@@ -17,6 +17,16 @@ const { CopilotProvider, useCopilot, continuationText } = await import("./use-co
 /** A draft the model made and the person still has to confirm. */
 type Draft = { tool: string; args: Record<string, unknown>; summary: string };
 
+/** A step the model ran before its draft, when a case needs one. */
+type ReadStep = { tool: string; args: Record<string, unknown>; result: Record<string, unknown> };
+
+/** The draft the answer holds when a case names no other. */
+const defaultDraft: Draft = {
+  tool: "create_board",
+  args: { name: "Overview" },
+  summary: "Creates the board Overview.",
+};
+
 /** The requests the hook sent to the chat, so a test can read what it asked. */
 const chatRequests: { body: string }[] = [];
 /** What the tool route answers: a run that succeeded, or one that failed. */
@@ -25,6 +35,10 @@ let toolResult: Record<string, unknown> = { outcome: "ok", result: { created: tr
 let toolResults: Record<string, Record<string, unknown>> = {};
 /** A second draft in the same answer, when a case needs two steps to confirm. */
 let extraDraft: Draft | null = null;
+/** The drafts in the same answer, when a case needs other drafts than the default one. */
+let drafts: Draft[] = [defaultDraft];
+/** The steps the model ran before its draft, when a case needs them. */
+let readSteps: ReadStep[] = [];
 /** The steps the model says the request still has. */
 let nextStep: string | null = "add two charts";
 
@@ -49,27 +63,29 @@ function fakeResponse(body: string, json: unknown): Response {
 }
 
 /**
- * The chat's answer: a draft that waits for a Confirm, and the steps the
- * request still has. `extraDraft` adds a second draft to the same answer.
+ * The chat's answer: the steps the model ran before its draft, a draft that
+ * waits for a Confirm, and the steps the request still has. `extraDraft`
+ * adds a second draft to the same answer.
  */
 function chatBody(): string {
-  const drafts: Draft[] = [
-    { tool: "create_board", args: { name: "Overview" }, summary: "Creates the board Overview." },
-  ];
-  if (extraDraft) drafts.push(extraDraft);
+  const list = [...drafts];
+  if (extraDraft) list.push(extraDraft);
   const body: Record<string, unknown> = {
     answer: "The board draft is ready.",
-    toolTrace: drafts.map((d) => ({
-      tool: d.tool,
-      args: d.args,
-      ok: true,
-      result: {
-        needs_confirmation: true,
+    toolTrace: [
+      ...readSteps.map((s) => ({ tool: s.tool, args: s.args, ok: true, result: s.result })),
+      ...list.map((d) => ({
         tool: d.tool,
         args: d.args,
-        summary: d.summary,
-      },
-    })),
+        ok: true,
+        result: {
+          needs_confirmation: true,
+          tool: d.tool,
+          args: d.args,
+          summary: d.summary,
+        },
+      })),
+    ],
   };
   if (nextStep) body.nextStep = nextStep;
   return `${JSON.stringify({ type: "done", body })}\n`;
@@ -82,6 +98,8 @@ beforeEach(() => {
   toolResult = { outcome: "ok", result: { created: true, id: "b1", name: "Overview" } };
   toolResults = {};
   extraDraft = null;
+  drafts = [defaultDraft];
+  readSteps = [];
   nextStep = "add two charts";
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : String(input);
@@ -252,6 +270,63 @@ describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
     );
   });
 
+  it("names only the step the person confirmed, not the steps that only read", async () => {
+    readSteps = [
+      { tool: "list_boards", args: {}, result: { boards: [{ id: "b1" }] } },
+      { tool: "describe_mart", args: { mart: "sales" }, result: { name: "sales" } },
+    ];
+    drafts = [
+      { tool: "create_chart", args: { title: "Visitors", kind: "bar" }, summary: "Creates the chart Visitors." },
+    ];
+    toolResults = {
+      create_chart: { outcome: "ok", result: { created: true, id: "c1", title: "Visitors" } },
+    };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.send("Build me a dashboard about events.");
+    });
+    // The chart is the third step of the answer: the two reads came first.
+    await act(async () => {
+      await copilot!.confirmTool(1, 2);
+    });
+
+    expect(chatRequests.length).toBe(2);
+    expect(sentMessages(1).at(-1)?.content).toBe(
+      'Confirmed and saved: create_chart c1 "Visitors". Do not draft these again. Continue: add two charts',
+    );
+  });
+
+  it("names a draft saved through the chart builder as well", async () => {
+    extraDraft = {
+      tool: "create_chart",
+      args: { title: "Visitors", kind: "bar" },
+      summary: "Creates the chart Visitors.",
+    };
+    toolResults = {
+      create_chart: { outcome: "ok", result: { created: true, id: "c1", title: "Visitors" } },
+    };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.send("Build me a dashboard about events.");
+    });
+    // The chart was saved through the chart builder, so no Confirm ran for
+    // it; the board still waits for its own Confirm.
+    await act(async () => {
+      copilot!.completeToolStep(1, 1, { created: true, id: "c1", title: "Visitors" });
+    });
+
+    await act(async () => {
+      await copilot!.confirmTool(1, 0);
+    });
+
+    expect(chatRequests.length).toBe(2);
+    expect(sentMessages(1).at(-1)?.content).toBe(
+      'Confirmed and saved: create_board b1 "Overview"; create_chart c1 "Visitors". Do not draft these again. Continue: add two charts',
+    );
+  });
+
   it("leaves out the id and the title the result does not carry", async () => {
     toolResult = { outcome: "ok", result: { created: true } };
     renderCopilot();
@@ -279,6 +354,7 @@ describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
             tool: "create_calculated_field",
             args: {},
             ok: true,
+            confirmed: true,
             result: { field: { id: "f1", name: "Margin" } },
           },
         ],

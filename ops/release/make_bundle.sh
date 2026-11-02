@@ -15,16 +15,27 @@
 #                             manifest's digest in one JSON file.
 #                             `lakehousectl` verifies the manifest through
 #                             it and trusts nothing else.
-#   images/<name>.tar         one `docker save` per image, BY DIGEST
-#                             REFERENCE, so the host needs no registry:
-#                             `docker load` reads the file and the loaded
-#                             image is the one the manifest names.
+#   images/<name>.tar         one `docker save` per image, BY TAG, so
+#                             the host needs no registry: `docker load`
+#                             reads the file and the loaded image is the
+#                             one the manifest names.
 #                             EVERY image the release runs is here, the
 #                             third-party ones included: the manifest
 #                             names them all, and an image the manifest
 #                             does not name is an image the air-gapped
 #                             host cannot run.
 #   sbom/<name>.cdx.json      the CycloneDX SBOM of each image
+#   lakehousectl              the installer: the tool that installs this
+#                             bundle on an air-gapped host, and the file
+#                             the signed manifest names a checksum for
+#   ops/…, tools/…            every other file the release ships: the
+#                             relative bind-mount sources of the release's
+#                             Compose file (REL-2 S4 decision D14) and the
+#                             two tools `lakehousectl backup` and
+#                             `lakehousectl restore` run (D15). They are
+#                             at the SAME relative path the install
+#                             writes them at, so a mount finds its file
+#                             and a tool finds its script.
 #   SHA256SUMS                every file's checksum, so an operator can
 #                             check the bundle before installing it
 #
@@ -40,12 +51,23 @@
 # manifest names, the bundle is a different release wearing the same
 # name — so the script refuses to build it.
 #
+# # Which files the release ships
+#
+# The signed manifest names them: `files` holds the checksum of every
+# file the release carries. The list of the files themselves comes from
+# `make_manifest.py --print-shipped-files` — the SAME script that wrote
+# the manifest, so the bundle and the manifest cannot drift apart (rule
+# 4: one rule, one place). The manifest's checksum is what the bundle
+# checks the bytes against: the list is a hint, the signed manifest is
+# the truth.
+#
 # # Usage
 #
 #   ops/release/make_bundle.sh --manifest <release.json> \
 #                              --compose <docker-compose.yml> \
 #                              --sigstore-bundle <release.json.sigstore.json> \
 #                              --sbom-dir <dir> \
+#                              [--lakehousectl <file>] \
 #                              --out <dir>
 #
 #   manifest         the release manifest the pipeline wrote
@@ -53,18 +75,36 @@
 #   sigstore-bundle  the manifest's Sigstore bundle: the file cosign
 #                    wrote, with the signature and the digest
 #   sbom-dir         the directory holding `<image name>.cdx.json` per image
+#   lakehousectl     the installer the release ships (REL-2 S3-T4). It is
+#                    optional here, and the pipeline always passes it:
+#                    a bundle without it cannot be installed on an
+#                    air-gapped host.
 #   out              the directory the bundle is written to
 #
 # # What it needs
 #
-# Docker (for `docker save`), `jq`, `zstd`, `tar` and `sha256sum`.
+# Docker (for `docker save`), `jq`, `zstd`, `tar`, `sha256sum` and
+# `python3` (for the list of the files the release ships).
+#
+# # The image store it needs
+#
+# Docker's CONTAINERD image store, and nothing else (REL-2 S3 D13). The
+# bundle is a set of `docker save` archives, and the air-gapped host
+# finds its images by the DIGEST the signed manifest pins: `docker load`
+# of an archive saved from a digest reference leaves a dangling
+# `<none>` image, and an archive saved from a TAG carries the
+# repository and the tag, so the loaded image resolves under the
+# digest-pinned reference the manifest names — but only on the
+# containerd store. On the classic store no `docker load` registers a
+# repo digest at all, so a bundle built there is a bundle no air-gapped
+# host can install. The script refuses rather than build one.
 set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
 usage: make_bundle.sh --manifest <release.json> --compose <docker-compose.yml> \
                        --sigstore-bundle <release.json.sigstore.json> \
-                       --sbom-dir <dir> --out <dir>
+                       --sbom-dir <dir> [--lakehousectl <file>] --out <dir>
 EOF
 }
 
@@ -90,6 +130,7 @@ manifest=""
 compose=""
 sigstore_bundle=""
 sbom_dir=""
+lakehousectl=""
 out_dir=""
 
 while [ "$#" -gt 0 ]; do
@@ -98,6 +139,7 @@ while [ "$#" -gt 0 ]; do
         --compose) compose="${2:-}"; shift 2 ;;
         --sigstore-bundle) sigstore_bundle="${2:-}"; shift 2 ;;
         --sbom-dir) sbom_dir="${2:-}"; shift 2 ;;
+        --lakehousectl) lakehousectl="${2:-}"; shift 2 ;;
         --out) out_dir="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; fail "unknown argument: $1" ;;
@@ -114,12 +156,28 @@ done
 [ -f "$compose" ] || fail "the Compose file $compose does not exist."
 [ -f "$sigstore_bundle" ] || fail "the Sigstore bundle $sigstore_bundle does not exist."
 [ -d "$sbom_dir" ] || fail "the SBOM directory $sbom_dir does not exist."
+if [ -n "$lakehousectl" ]; then
+    [ -f "$lakehousectl" ] || fail "the installer $lakehousectl does not exist."
+fi
 
 require_command docker
 require_command jq
 require_command zstd
 require_command tar
 require_command sha256sum
+require_command python3
+
+# The image store the daemon runs. `docker info` prints the store as
+# `Driver Status`; the containerd one names `io.containerd.snapshotter.v1`
+# and the classic one does not. The check is a REFUSAL, not a warning:
+# a bundle built on the classic store cannot be installed on an
+# air-gapped host (REL-2 S3 D13).
+image_store="$(docker info --format '{{json .DriverStatus}}' 2>/dev/null || true)"
+if ! printf '%s' "$image_store" | grep -q 'io.containerd.snapshotter.v1'; then
+    fail "this host's Docker does not run the containerd image store, and a bundle cannot be built on it: after \`docker load\` the classic store registers no repo digest, so the air-gapped host cannot resolve the digest-pinned references the manifest names.
+Turn the containerd image store on — in /etc/docker/daemon.json put {\"features\": {\"containerd-snapshotter\": true}}, then restart Docker (\`systemctl restart docker\`).
+The images the classic store holds are hidden while the containerd store is on."
+fi
 
 version="$(jq -er '.version' "$manifest")" || fail "the manifest has no version."
 jq -e '.images | length > 0' "$manifest" > /dev/null \
@@ -135,16 +193,70 @@ if [ "$expected_compose_sha" != "$actual_compose_sha" ]; then
     fail "the Compose file does not match the manifest's checksum: expected $expected_compose_sha, got $actual_compose_sha."
 fi
 
+# The installer, when the release ships one: it is a file the bundle
+# carries, so the signed manifest names its checksum too, and the
+# bundle refuses to carry a file the manifest does not name (REL-2
+# S3-T4).
+if [ -n "$lakehousectl" ]; then
+    expected_installer_sha="$(jq -er '.files["lakehousectl"]' "$manifest")" \
+        || fail "the manifest names no checksum for the installer."
+    actual_installer_sha="$(sha256sum "$lakehousectl" | awk '{print $1}')"
+    if [ "$expected_installer_sha" != "$actual_installer_sha" ]; then
+        fail "the installer does not match the manifest's checksum: expected $expected_installer_sha, got $actual_installer_sha."
+    fi
+fi
+
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/images" "$stage/sbom"
 cp "$compose" "$stage/docker-compose.yml"
 cp "$manifest" "$stage/release.json"
 cp "$sigstore_bundle" "$stage/release.json.sigstore.json"
+if [ -n "$lakehousectl" ]; then
+    cp "$lakehousectl" "$stage/lakehousectl"
+    chmod +x "$stage/lakehousectl"
+fi
 
-# One `docker save` per image, by digest reference: the host that loads
-# the bundle gets the exact image the manifest names, with no registry to
-# ask. `unique` because several services run the same image.
+# The files the release ships (REL-2 S4 decision D14): the relative
+# bind-mount sources of the release's Compose file, and the two tools
+# under `tools/`. The list comes from the script that wrote the
+# manifest, and the CHECKSUM comes from the signed manifest: the bytes
+# that land in the bundle are the bytes the manifest names, or the
+# bundle is not built.
+#
+# The install writes each of them at the same relative path, so a
+# Compose mount finds its file and `lakehousectl backup` finds its
+# script.
+shipped_list="$stage/.shipped-files"
+shipped_paths="$stage/.shipped-paths"
+: > "$shipped_paths"
+python3 "$script_dir/make_manifest.py" --print-shipped-files --compose "$compose" \
+    > "$shipped_list" \
+    || fail "the files the release ships could not be listed."
+while IFS=$'\t' read -r install_path source_path; do
+    [ -n "$install_path" ] || continue
+    if [ ! -f "$source_path" ]; then
+        fail "the file $source_path, which the release ships as $install_path, does not exist."
+    fi
+    expected_shipped_sha="$(jq -er --arg name "$install_path" '.files[$name]' "$manifest")" \
+        || fail "the manifest names no checksum for $install_path."
+    actual_shipped_sha="$(sha256sum "$source_path" | awk '{print $1}')"
+    if [ "$expected_shipped_sha" != "$actual_shipped_sha" ]; then
+        fail "$install_path does not match the manifest's checksum: expected $expected_shipped_sha, got $actual_shipped_sha."
+    fi
+    mkdir -p "$stage/$(dirname "$install_path")"
+    cp "$source_path" "$stage/$install_path"
+    # A script the install RUNS has to be executable; a file the
+    # Compose file mounts only has to be there.
+    case "$install_path" in
+        *.sh) chmod +x "$stage/$install_path" ;;
+    esac
+    printf '%s\n' "$install_path" >> "$shipped_paths"
+done < "$shipped_list"
+
+# One `docker save` per image, BY TAG (REL-2 S3 D13). The host that
+# loads the bundle gets the exact image the manifest names, with no
+# registry to ask. `unique` because several services run the same image.
 #
 # The image must be in the local store: ours are (the pipeline pulled
 # them back by digest after it pushed them), and the third-party ones
@@ -168,8 +280,21 @@ while read -r reference; do
         echo "make_bundle: pulling $reference"
         docker pull "$reference"
     fi
+    # The archive is saved from the TAG, never from the digest
+    # reference: an archive saved from a digest reference loads as a
+    # dangling `<none>` image, and the air-gapped host would then not
+    # resolve the digest-pinned reference the manifest names. The tag
+    # carries the repository and the tag, so the loaded image resolves
+    # under that reference (REL-2 S3 D13).
+    #
+    # `--platform` is never used: it rewrites the archive's digest to
+    # the per-platform manifest, and the loaded image would no longer
+    # be the one the manifest pins.
+    tag="${reference%%@*}"
+    echo "make_bundle: tagging $tag"
+    docker tag "$reference" "$tag"
     echo "make_bundle: saving $name"
-    docker save -o "$stage/images/$name.tar" "$reference"
+    docker save -o "$stage/images/$name.tar" "$tag"
     if [ ! -f "$sbom_dir/$name.cdx.json" ]; then
         fail "no SBOM for $name: $sbom_dir/$name.cdx.json does not exist. Every image in a release carries one."
     fi
@@ -183,12 +308,29 @@ done < <(jq -er '.images | to_entries | map(.value) | unique | .[]' "$manifest")
     cd "$stage"
     sha256sum docker-compose.yml release.json release.json.sigstore.json \
         images/*.tar sbom/*.cdx.json > SHA256SUMS
+    if [ -f lakehousectl ]; then
+        sha256sum lakehousectl >> SHA256SUMS
+    fi
+    if [ -s .shipped-paths ]; then
+        while read -r install_path; do
+            [ -n "$install_path" ] || continue
+            sha256sum "$install_path" >> SHA256SUMS
+        done < .shipped-paths
+    fi
 )
 
 bundle="rantai-lakehouse-${version}-linux-x86_64.tar.zst"
 mkdir -p "$out_dir"
-tar -C "$stage" -cf - docker-compose.yml release.json release.json.sigstore.json \
-    images sbom SHA256SUMS | zstd -19 -T0 -o "$out_dir/$bundle"
+contents=(docker-compose.yml release.json release.json.sigstore.json images sbom SHA256SUMS)
+if [ -n "$lakehousectl" ]; then
+    contents+=(lakehousectl)
+fi
+# The files the release ships, at the path the install writes them at.
+while read -r install_path; do
+    [ -n "$install_path" ] || continue
+    contents+=("$install_path")
+done < "$shipped_paths"
+tar -C "$stage" -cf - "${contents[@]}" | zstd -19 -T0 -o "$out_dir/$bundle"
 
 size="$(wc -c < "$out_dir/$bundle")"
 (
