@@ -4391,3 +4391,32 @@ its tests are unaffected.
 
 **NOT verified here.** The PR's own `Proof · the update moves the stack, and rolls back` did not run
 in this session — it runs in the PR's CI, and that is what decides whether the rollback is green now.
+
+### Review S4b round 9 (planner, 2026-11-02, at `1c7e366d`)
+
+**The planner's round 8 premise was wrong.** The developer is right: the restore did say what failed. The compose error after "The rollback said:" IS the restore's stderr. The cause is the restore's step 5/5.
+- `rollback.rs` (~118) calls `runner.restore` while the FAILED release's `docker-compose.yml` is still in place, and puts the `*.previous` files back only afterwards.
+- So `restore-from-backup.sh` runs `docker compose up -d` with the failed release, whose API never turns healthy.
+- BLOCKER 2 (the `ERR` trap, `8d7cbf78`) is kept: a silent stop is still possible elsewhere, and the trap costs nothing.
+
+**BLOCKER 4. `1c7e366d` turns a stack that did not start into exit 0.**
+- For a standalone `lakehousectl restore` on a broken host, that is a fabricated success (principle 2, rule 14).
+- It also does not fix the order. The rollback still waits on the failed release's stack before it puts the old files back.
+- **Decision D25.** The rollback asks the restore NOT to start the stack, and starts it itself with the old files, as D18 already says.
+  1. In `lakehousectl`, `backup::restore` gains a `start_stack: bool`. When `start_stack` is false, it passes the script's existing `--skip-stack-up`.
+  2. `Runner::restore`, used by the update's `roll_back` and by `rollback.rs`, passes `false`. Both call `runner.up()` after the old files are back.
+  3. `command_restore`, the operator's own `lakehousectl restore`, passes `true`.
+  4. `restore-from-backup.sh` step 5 goes back to FAILING when the stack does not start, with exit 1.
+     - Keep `1c7e366d`'s captured compose output, but print it to **stderr** with one line first: "the data is restored, and the stack did not start".
+     - The summary line stays honest.
+  5. Tests:
+     - a unit test in `lakehousectl` that the rollback's restore passes `--skip-stack-up` and the standalone restore does not. Use the fake-tool pattern in `backup.rs` tests (~365).
+     - `test_backup_scripts.py`: a stack that does not start makes the script exit non-zero, with the reason on stderr.
+
+Accept:
+- `cargo fmt --check`
+- `cargo clippy -p lakehousectl --all-targets -- -D warnings`
+- `cargo test -p lakehousectl`
+- `bash -n` and `shellcheck -S warning` on the script
+- `pytest ops/release -q`
+- the PR's `Proof · the update moves the stack, and rolls back`, green.
