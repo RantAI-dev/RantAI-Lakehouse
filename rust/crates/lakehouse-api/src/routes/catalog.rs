@@ -3820,6 +3820,9 @@ type DecideAccessRequestBody = crate::routes::agents::DecideApprovalBody;
 /// - `403` [`ApiError::PermissionDenied`] if the deciding principal is the SAME
 ///   person who requested this access — self-approval is refused, proven
 ///   by a real test (WS7 plan's own acceptance criterion for this task).
+///   The check is `routes::agents::refuse_own_request` (`SEC-57`), the one
+///   rule a `kind = "tool_call"` approval obeys too; it runs BEFORE the
+///   store call, so a refused decision writes nothing.
 /// - `403` [`ApiError::PermissionDenied`] if the decision is an approval and
 ///   the deciding principal does NOT hold the permission the request asks
 ///   for (`SEC-45`) — an approver may only approve a permission they hold
@@ -3857,13 +3860,12 @@ pub async fn decide_access_request(
     }
     // Self-approval refused: the deciding principal must not be the same
     // human who requested this access — the SERVER-SIDE enforcement of
-    // Hard Requirement 3, not merely a client-side hint.
-    if existing.requested_by_user_id == Some(principal.id.uuid()) {
-        return Err(ApiError::PermissionDenied(
-            "tidak boleh menyetujui permintaan akses milik sendiri".to_owned(),
-        )
-        .into());
-    }
+    // Hard Requirement 3, not merely a client-side hint. The check itself
+    // moved to `routes::agents::refuse_own_request` in `SEC-57`, so a
+    // tool-call approval and an access request are refused by ONE rule
+    // (AGENTS.md rule 4) — this route calls it in place of its own
+    // inline comparison.
+    crate::routes::agents::refuse_own_request(&existing, &principal)?;
     // SEC-45: an approver may only approve a permission they hold
     // themselves — the same rule `routes::catalog_grants::create` applies
     // to a direct grant (`PR #106 review R1 BLOCKER 4`), so holding
