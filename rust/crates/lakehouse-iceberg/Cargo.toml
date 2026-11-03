@@ -18,7 +18,7 @@ iceberg-catalog-rest = "=0.10.1"
 # `storage.rs`. Never a vendor SDK (`aws-sdk-s3`), never RustFS/MinIO admin
 # APIs: only the plain S3 API surface `object_store::aws` speaks.
 object_store = { version = "0.14", features = ["aws"] }
-arrow-array = "58"
+arrow-array = "60"
 arrow-schema = "58"
 parquet = "58"
 typetag = "0.2"
