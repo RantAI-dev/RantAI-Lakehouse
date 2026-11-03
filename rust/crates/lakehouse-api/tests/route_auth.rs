@@ -47,7 +47,7 @@ use tower::ServiceExt;
 
 use common::{
     TestApp, create_principal_with_permissions, create_zero_permission_principal,
-    session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
+    session_cookie_for_seeded_user, session_cookie_for_user, spin_up, spin_up_with_env,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -249,7 +249,19 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
 /// refused by the auth gate; with no session the router answers 401.
 #[tokio::test]
 async fn the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right() {
-    let TestApp { router, pool } = spin_up().await;
+    // `SEC-50` slice 2 review round 2 BLOCKER 1, the same fixture rule as
+    // `tests/dashboard_export.rs`: the mart rule below reads the shared
+    // catalog, and the tenant gate runs before the `alert:write` check this
+    // test is about. Without a catalog tenant the gate answers `SEC-20`'s
+    // 404 for `serving.m` and the Analyst never reaches the 403. The
+    // deployment names the catalog's tenant and both seeded readers are in
+    // it, so the only refusal left is the permission.
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     for method in ["POST", "PUT", "DELETE"] {
         assert_eq!(
             POLICY_TABLE
@@ -274,6 +286,14 @@ async fn the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_t
             StatusCode::UNAUTHORIZED,
             "{method} with no session"
         );
+    }
+    for email in ["sari@meridian.example", "bayu@meridian.example"] {
+        let (id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind(email)
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded reader (0002_seed_identity.sql)");
+        common::in_the_catalog_tenant(&pool, id).await;
     }
     let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
     let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
@@ -3546,6 +3566,53 @@ async fn the_door_needs_the_iceberg_read_scope_and_a_service_identity() {
             ),
             "{method} {path}: a service identity holding iceberg:read must pass the gate, got {}",
             resp.status()
+        );
+    }
+}
+
+/// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
+/// as `identity:write`, and the gate agrees both ways: no session is 401,
+/// a principal without `identity:write` is 403, and one holding it gets
+/// past the gate (what follows is the handler's own answer — 400 for the
+/// concretized ids used here — never 401 or 403).
+#[tokio::test]
+async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    for (method, path) in [
+        ("PUT", "/api/identity/users/{id}/roles"),
+        ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
+        ("POST", "/api/identity/users/{id}/deactivate"),
+        ("POST", "/api/identity/users/{id}/reactivate"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("identity:write")),
+            "{method} {path}"
+        );
+        let concrete = concretize(path);
+        let anonymous = request_with_cookie(&router, method, &concrete, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+        let plain = create_principal_with_permissions(&pool, "query:read").await;
+        let cookie = session_cookie_for_user(&pool, plain).await;
+        let refused = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let writer = create_principal_with_permissions(&pool, "identity:write").await;
+        let cookie = session_cookie_for_user(&pool, writer).await;
+        let allowed = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert!(
+            !matches!(
+                allowed.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a caller holding identity:write must get past the gate, got {}",
+            allowed.status()
         );
     }
 }

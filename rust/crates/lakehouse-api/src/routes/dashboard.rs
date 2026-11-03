@@ -198,8 +198,9 @@ pub async fn get(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<DashboardQuery>,
+    headers: HeaderMap,
 ) -> Response {
-    match payload_for(&state, &principal, &q).await {
+    match payload_for(&state, &principal, &q, &headers).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(response) => response,
     }
@@ -233,6 +234,7 @@ pub(crate) async fn payload_for(
     state: &AppState,
     principal: &Principal,
     q: &DashboardQuery,
+    headers: &HeaderMap,
 ) -> Result<Value, Response> {
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -278,6 +280,10 @@ pub(crate) async fn payload_for(
         cache_scope,
         get_body(
             &state.clickhouse,
+            &crate::routes::query::StatementGate::clickhouse(
+                state,
+                crate::routes::query::GateActor::Caller { principal, headers },
+            ),
             q,
             param_filters,
             &principal.role_names,
@@ -338,6 +344,7 @@ pub(crate) async fn payload_for(
 )]
 async fn get_body(
     ch: &ChClient,
+    gate: &crate::routes::query::StatementGate<'_>,
     q: &DashboardQuery,
     param_filters: Option<Vec<FilterDef>>,
     roles: &[String],
@@ -497,6 +504,7 @@ async fn get_body(
         crate::routes::layers::layer_sources(ch, stored_for_board.iter().copied()).await;
     let layer_runner = crate::routes::layers::RoleRunner {
         ch,
+        gate,
         roles,
         placeholders,
         obligations,
@@ -534,7 +542,7 @@ async fn get_body(
                 let sql = lakehouse_bi::builder::apply_builtin_year_filter(
                     sql_text, mart, years_ref, cols_ref,
                 );
-                run_spec_sql(ch, id, &sql, roles, placeholders, obligations).await
+                run_spec_sql(ch, gate, id, &sql, roles, placeholders, obligations).await
             }));
         }
     }
@@ -583,6 +591,7 @@ async fn get_body(
                     &filtered.sql,
                     run_spec_sql(
                         ch,
+                        gate,
                         &c.spec.id,
                         &filtered.sql,
                         roles,
@@ -596,6 +605,7 @@ async fn get_body(
                 crate::routes::support::annotate_grain(&mut val, &filtered, c);
                 crate::routes::support::annotate_table(
                     ch,
+                    gate,
                     &mut val,
                     &filtered,
                     (roles, placeholders, obligations),
@@ -1047,6 +1057,7 @@ async fn preview_sources_visible(
 pub async fn specs_preview(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     // BI-10: a drill request names a saved chart and a level; the server builds
@@ -1091,12 +1102,23 @@ pub async fn specs_preview(
             .collect(),
     };
     let obligations = PolicyEngineObligations::from_state(&state);
+    // `SEC-50` slice 2 M4: the preview is the caller's own read, so it is
+    // gated as the caller — with the request's headers, so an `X-Tenant`
+    // header selects the tenant the preview reads as.
+    let gate = crate::routes::query::StatementGate::clickhouse(
+        &state,
+        crate::routes::query::GateActor::Caller {
+            principal: &principal,
+            headers: &headers,
+        },
+    );
     // BI-5 review B1: the preview reads as many rows as the tile will.
     let (_, mut result) = crate::routes::support::with_tile_rows(
         spec.spec.kind,
         &spec.spec.sql,
         run_spec_sql(
             &state.clickhouse,
+            &gate,
             &spec.spec.id,
             &spec.spec.sql,
             &principal.role_names,
@@ -1124,6 +1146,7 @@ pub async fn specs_preview(
     // BI-13: the chart's other questions, each as the viewer.
     let layer_runner = crate::routes::layers::RoleRunner {
         ch: &state.clickhouse,
+        gate: &gate,
         roles: &principal.role_names,
         placeholders: &placeholders,
         obligations: &obligations,
@@ -1140,6 +1163,7 @@ pub async fn specs_preview(
         crate::routes::support::preview_bin_reads(&state.clickhouse, &spec, &time).await;
     crate::routes::support::annotate_bins(
         &state.clickhouse,
+        &gate,
         &mut result,
         &bin_reads,
         (&principal.role_names, &placeholders, &obligations),
@@ -1148,6 +1172,7 @@ pub async fn specs_preview(
     // BI-6 part 2: the last result's rows for the table beside the chart.
     let rows = crate::routes::support::preview_rows(
         &state.clickhouse,
+        &gate,
         &spec,
         &result,
         (&principal.role_names, &placeholders, &obligations),
@@ -2745,6 +2770,7 @@ pub async fn records(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<RecordsQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<ApiJson<Value>> {
     // BI-19 part B1 (plan D8): the entry check and the caller's rules first.
     let viewer = viewer_for(&state, &principal).await?;
@@ -2776,6 +2802,15 @@ pub async fn records(
         &placeholders,
         &obligations,
         &time,
+        // `SEC-50` slice 2 M4: the rows are the caller's own read, so they
+        // are gated as the caller — with the request's headers.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::Caller {
+                principal: &principal,
+                headers: &headers,
+            },
+        ),
     )
     .await
     .map(ApiJson)
@@ -3212,6 +3247,7 @@ async fn records_for_roles(
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> Result<Value, ApiError> {
     let limit = u32::try_from(records_number(
         q.limit.as_deref(),
@@ -3272,6 +3308,7 @@ async fn records_for_roles(
             (limit, offset),
             None,
             (roles, placeholders, obligations),
+            gate,
         )
         .await;
     }
@@ -3310,6 +3347,7 @@ async fn records_for_roles(
         (limit, offset),
         drill.as_ref().map(|(c, v)| (c.as_str(), *v)),
         (roles, placeholders, obligations),
+        gate,
     )
     .await
 }
@@ -3328,6 +3366,7 @@ async fn run_records(
         &crate::sql_rewrite::PlaceholderValues,
         &PolicyEngineObligations<'_>,
     ),
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> Result<Value, ApiError> {
     let rewrite = |statement: String| async move {
         crate::policy_engine::rewrite_sql_for_roles(
@@ -3347,6 +3386,11 @@ async fn run_records(
             )
         })
     };
+    // `SEC-50` slice 2 M1/M4: the tenant gate runs BEFORE the rewrite, so a
+    // drill-down that may not read its table is refused before the engine is
+    // asked about it at all.
+    gate.check(&sql.rows).await?;
+    gate.check(&sql.count).await?;
     let rows_sql = rewrite(sql.rows).await?;
     let count_sql = rewrite(sql.count).await?;
     let result = ch
@@ -3864,13 +3908,30 @@ pub async fn chart_export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<ChartExportQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     // BI-19 part D (plan D13): an image is made by the renderer, not by a row
     // stream, so it has its own path (and its own audit action).
     if q.format.as_deref() == Some("png") {
         return crate::routes::pdf_export::export_chart_png(&state, &principal, &q).await;
     }
-    export_chart(&state, &principal, &q, "dashboard.chart_export", false).await
+    export_chart(
+        &state,
+        &principal,
+        &q,
+        "dashboard.chart_export",
+        false,
+        // `SEC-50` slice 2 M4: the download is the caller's own read, so it
+        // is gated as the caller — with the request's headers.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::Caller {
+                principal: &principal,
+                headers: &headers,
+            },
+        ),
+    )
+    .await
 }
 
 /// `GET /api/dashboard/table-export?chart=` — [`chart_export`] fixed to a raw
@@ -3883,6 +3944,7 @@ pub async fn table_export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<TableExportQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     export_chart(
         &state,
@@ -3890,6 +3952,15 @@ pub async fn table_export(
         &q.into(),
         "dashboard.table_export",
         true,
+        // `SEC-50` slice 2 M4: the download is the caller's own read, so it
+        // is gated as the caller — with the request's headers.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::Caller {
+                principal: &principal,
+                headers: &headers,
+            },
+        ),
     )
     .await
 }
@@ -4003,6 +4074,7 @@ pub(crate) async fn build_chart_file(
     principal: &Principal,
     q: &ChartExportQuery,
     rows_only: bool,
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> Result<ChartFile, ApiError> {
     use crate::export::{FileFormat, Values};
 
@@ -4027,6 +4099,10 @@ pub(crate) async fn build_chart_file(
             .collect(),
     };
     let obligations = PolicyEngineObligations::from_state(state);
+    // `SEC-50` slice 2 M4: the tenant gate runs BEFORE the rewrite, so a
+    // download of a table the caller may not read is refused before the
+    // engine is asked about it at all.
+    gate.check(&statement).await?;
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &statement,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -4078,6 +4154,7 @@ async fn export_chart(
     q: &ChartExportQuery,
     action: &'static str,
     rows_only: bool,
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> ApiResult<Response> {
     crate::routes::settings::require_download(state, principal).await?;
     let ChartFile {
@@ -4085,7 +4162,7 @@ async fn export_chart(
         written,
         format,
         values,
-    } = build_chart_file(state, principal, q, rows_only).await?;
+    } = build_chart_file(state, principal, q, rows_only, gate).await?;
     let cap = crate::export::EXPORT_ROW_CAP;
 
     record_export_audit(
@@ -4168,6 +4245,7 @@ pub async fn values(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<ValuesQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<ApiJson<Value>> {
     // BI-19 part B1 (plan D8): the entry check and the caller's rules first.
     let viewer = viewer_for(&state, &principal).await?;
@@ -4209,6 +4287,15 @@ pub async fn values(
         &placeholders,
         &obligations,
         &time,
+        // `SEC-50` slice 2 M4/M9: the values are the caller's own read, so
+        // they are gated as the caller — with the request's headers.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::Caller {
+                principal: &principal,
+                headers: &headers,
+            },
+        ),
     )
     .await
     .map(ApiJson)
@@ -4347,6 +4434,7 @@ async fn values_for_roles(
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> Result<Value, ApiError> {
     values_with_limit(
         ch,
@@ -4354,6 +4442,7 @@ async fn values_for_roles(
         (roles, viewer),
         (placeholders, obligations, time),
         VALUES_LIMIT,
+        gate,
     )
     .await
 }
@@ -4370,6 +4459,7 @@ pub(crate) async fn values_with_limit(
         &TimeContext,
     ),
     limit: usize,
+    gate: &crate::routes::query::StatementGate<'_>,
 ) -> Result<Value, ApiError> {
     let column = strip_non_ident(q.column.as_deref().unwrap_or(""));
     if column.is_empty() {
@@ -4422,6 +4512,11 @@ pub(crate) async fn values_with_limit(
         return Ok(empty());
     }
     let sql = values_statement(&selects, settings, limit);
+    // `SEC-50` slice 2 M9: the FINAL statement is the gated one — it names
+    // every `serving.*` table it reads, so the gate sees them all. The table
+    // names the `system.columns` read found never reach the response when
+    // the statement is refused.
+    gate.check(&sql).await?;
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &sql,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -5611,6 +5706,7 @@ mod records_enforcement {
             .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let state = crate::state::AppState::without_a_database();
 
         let body = records_for_roles(
             &ch,
@@ -5622,6 +5718,7 @@ mod records_enforcement {
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
         )
         .await
         .expect("a masked drill-down still answers");
@@ -5700,6 +5797,7 @@ mod records_enforcement {
             .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let state = crate::state::AppState::without_a_database();
         let q = RecordsQuery {
             mart: Some("mart_x".to_owned()),
             columns: Some("id,email".to_owned()),
@@ -5718,6 +5816,7 @@ mod records_enforcement {
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
         )
         .await
         .expect("a masked raw-table page still answers");
@@ -5756,6 +5855,7 @@ mod records_enforcement {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
 
+        let state = crate::state::AppState::without_a_database();
         let err = records_for_roles(
             &ch,
             drill("mart_x", "region", "north"),
@@ -5763,6 +5863,7 @@ mod records_enforcement {
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
         )
         .await
         .expect_err("a failing row query is an error");
@@ -5857,6 +5958,7 @@ mod values_enforcement {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
 
+        let state = crate::state::AppState::without_a_database();
         let body = values_for_roles(
             &ch,
             ValuesQuery {
@@ -5870,6 +5972,7 @@ mod values_enforcement {
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
         )
         .await
         .expect("masked values still answer");
@@ -5954,6 +6057,7 @@ mod values_enforcement {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
 
+        let state = crate::state::AppState::without_a_database();
         let body = values_for_roles(
             &ch,
             ValuesQuery {
@@ -5968,6 +6072,7 @@ mod values_enforcement {
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
         )
         .await
         .expect("masked values still answer");
@@ -6235,8 +6340,10 @@ mod typed_filters {
             fresh: None,
         };
         let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
+        let state = crate::state::AppState::without_a_database();
         get_body(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             parsed,
             &[],
@@ -6595,6 +6702,7 @@ mod typed_filters {
     async fn run_values(server: &MockServer, q: ValuesQuery) -> Result<Value, ApiError> {
         let ch = client(server);
         let obligations = PolicyEngineObligations::new(None, &ch);
+        let state = crate::state::AppState::without_a_database();
         values_for_roles(
             &ch,
             q,
@@ -6602,6 +6710,7 @@ mod typed_filters {
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
         )
         .await
     }
@@ -6915,6 +7024,7 @@ mod records_pages {
     async fn run(server: &MockServer, q: RecordsQuery) -> Result<Value, ApiError> {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(None, &ch);
+        let state = crate::state::AppState::without_a_database();
         records_for_roles(
             &ch,
             q,
@@ -6922,6 +7032,7 @@ mod records_pages {
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
         )
         .await
     }
@@ -7508,8 +7619,10 @@ mod time_grain {
             params: None,
             fresh: None,
         };
+        let state = crate::state::AppState::without_a_database();
         get_body(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             None,
             &[],
@@ -7629,8 +7742,10 @@ mod time_grain {
             params: None,
             fresh: None,
         };
+        let state = crate::state::AppState::without_a_database();
         let body = get_body(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             None,
             &[],
@@ -7744,6 +7859,7 @@ mod time_grain {
     ) -> Result<Value, ApiError> {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(None, &ch);
+        let state = crate::state::AppState::without_a_database();
         records_for_roles(
             &ch,
             q,
@@ -7751,6 +7867,7 @@ mod time_grain {
             &PlaceholderValues::none(),
             &obligations,
             time,
+            &crate::routes::query::StatementGate::unrestricted(&state),
         )
         .await
     }
@@ -8021,8 +8138,10 @@ mod table_tiles {
             params: None,
             fresh: None,
         };
+        let state = crate::state::AppState::without_a_database();
         get_body(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             None,
             &[],

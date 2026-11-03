@@ -194,13 +194,7 @@ async fn rewrite_sql_for_principal_inner(
         )
         .await?;
     } else {
-        gate_statement(
-            state,
-            &sql,
-            &sqlparser::dialect::ClickHouseDialect {},
-            actor,
-        )
-        .await?;
+        gate_statement(state, &sql, &CLICKHOUSE_DIALECT, actor).await?;
     }
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
@@ -263,6 +257,15 @@ async fn rewrite_sql_for_principal_inner(
     })
 }
 
+/// `SEC-50` slice 2 M1: the dialect every site of slice 2 reads its
+/// statement with — the engine they all run (`ClickHouse`).
+///
+/// A `static`, so the carrier can hold the dialect without borrowing a
+/// temporary: the sites that run `ClickHouse` statements share one dialect,
+/// exactly as the policy rewrite does.
+pub(crate) static CLICKHOUSE_DIALECT: sqlparser::dialect::ClickHouseDialect =
+    sqlparser::dialect::ClickHouseDialect {};
+
 /// `SEC-50`: who a gated statement acts as.
 ///
 /// The gate is ONE rule with three actors, not three rules: every site
@@ -300,6 +303,28 @@ pub(crate) enum GateActor<'a> {
     /// The deployment's own catalog tenant: a job with no user (an
     /// alert, the scheduled Gold export, an embed token).
     CatalogTenant,
+    /// `SEC-50` slice 2 M8: a site whose owner is gone — a public link
+    /// whose creator was deleted, disabled or never existed.
+    ///
+    /// The reach is `All` when the deployment holds a single tenant (there
+    /// is no other tenant's table to reach, so the link behaves as it did
+    /// before the gate) and `NoTenant` otherwise: a deployment with
+    /// several tenants has no owner to act as, and failing closed is the
+    /// only honest answer.
+    ///
+    /// The tenant count is the same one [`GateActor::CatalogTenant`] reads,
+    /// and the no-database rule is R5's: a deployment that cannot count its
+    /// tenants refuses (a 503, with `SEC-20`'s own sentence).
+    Ownerless,
+    /// `SEC-50` slice 2 T1: the unrestricted gate, for the unit tests
+    /// that run a statement against a mock engine.
+    ///
+    /// A `*:*` principal reaches everything without a database (`SEC-20`'s
+    /// own rule), so a test that is about the runner and not about the
+    /// gate needs no database at all. It exists only under `#[cfg(test)]`:
+    /// no production path may act as it.
+    #[cfg(test)]
+    Unrestricted,
 }
 
 /// `SEC-50`: the ONE gate every statement passes before it is rewritten.
@@ -339,13 +364,11 @@ pub(crate) async fn gate_statement<D>(
 where
     D: sqlparser::dialect::Dialect + Sync,
 {
-    let Some(targets) = crate::sql_rewrite::gate_targets(sql, dialect) else {
-        // A statement that does not parse has no targets: the policy
-        // rewrite refuses it with a 422 of its own, so there is nothing
-        // here to gate.
-        return Ok(());
-    };
-    refuse_unreachable_tables(state, actor, &targets).await
+    // `SEC-50` slice 2 M1: the one-shot entry point and the carrier are the
+    // SAME gate — one copy of the reach logic (D1). The carrier keeps the
+    // reach for a whole request; here the request is one statement, so the
+    // cell is used once and thrown away.
+    StatementGate::new(state, actor, dialect).check(sql).await
 }
 
 /// `SEC-50`: the reach of an actor — whose tables the statement may
@@ -406,7 +429,40 @@ async fn reach_for_actor(state: &AppState, actor: GateActor<'_>) -> Result<Tenan
             let tenant_count = deployment_tenant_count(state).await?;
             catalog_tenant_reach(tenant_count, state.config.catalog_tenant_id)
         }
+        GateActor::Ownerless => {
+            // `SEC-50` slice 2 M8: the same count the job-with-no-user
+            // actor reads, and the same no-database rule (R5).
+            let tenant_count = deployment_tenant_count(state).await?;
+            ownerless_reach(tenant_count)
+        }
+        #[cfg(test)]
+        GateActor::Unrestricted => Ok(TenantReach::All),
     }
+}
+
+/// `SEC-50` slice 2 M8: the reach of a site whose owner is gone, as a pure
+/// function of the one answer it needs.
+///
+/// A deployment with a single tenant holds no other tenant's table to reach,
+/// so the link behaves exactly as it did before the gate — D2's "one tenant
+/// behaves as before". A deployment with several tenants has no owner to act
+/// as, and the site reaches nothing: failing closed is the only honest
+/// answer, and it is the same one a caller in no tenant gets.
+///
+/// `None` means there is no database to count in, so the deployment cannot
+/// say that it holds a single tenant — and cannot say that it holds several
+/// either. That is R5's rule: the deployment refuses, with `SEC-20`'s own
+/// sentence for that state.
+fn ownerless_reach(tenant_count: Option<i64>) -> Result<TenantReach, ApiError> {
+    let Some(tenant_count) = tenant_count else {
+        return Err(ApiError::Unavailable(
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT.to_owned(),
+        ));
+    };
+    if tenant_count <= 1 {
+        return Ok(TenantReach::All);
+    }
+    Ok(TenantReach::NoTenant)
 }
 
 /// `SEC-50` D3: the reach of a job with no user, as a pure function of
@@ -808,80 +864,233 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
         })
 }
 
-/// `SEC-20`/`SEC-50`: refuse a statement the actor's tenant may not run.
+/// `SEC-50` slice 2 M1/M2: the tables a statement names, checked against a
+/// reach that is already resolved.
 ///
-/// The targets are what the statement means to the gate: the tables it
-/// names — canonicalised the way the policy rewrite canonicalises them
+/// This is the half of the gate that decides about NAMED tables. The
+/// targets are what the statement means to the gate: the tables it names —
+/// canonicalised the way the policy rewrite canonicalises them
 /// ([`crate::sql_rewrite::canonicalize`]), so a `CTE`'s own name is not a
-/// table — or the fact that it lists objects without naming one table.
+/// table.
 ///
 /// A named table is checked one by one, and the first table out of reach
-/// is the one the refusal names. A listing names no table, so there is
-/// nothing to check table by table: it passes for the catalog's own
-/// tenant (and for a deployment with one tenant) and is refused
-/// otherwise.
-///
-/// The actor's reach is resolved only when there is something to check:
-/// a statement that names no table reads nothing, so it is let through
-/// without asking the deployment anything (`SEC-20`'s behaviour, kept).
+/// is the one the refusal names.
 ///
 /// # Errors
 ///
-/// 404 with the fixed sentence of [`table_not_available`] for a table the
-/// actor may not read; 422 with the fixed sentence of
-/// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
-/// actor may not list them; the errors of [`reach_for_actor`] — 404 for a
-/// tenant the actor may not act as, 422 for a job with no user in a
-/// deployment with several tenants and no `CATALOG_TENANT_ID`; 503 when
-/// a claim cannot be read.
-async fn refuse_unreachable_tables(
+/// 404 with the fixed sentence of [`table_not_available`] for the first
+/// table out of reach; 503 when a claim cannot be read.
+async fn check_tables_against_reach(
     state: &AppState,
-    actor: GateActor<'_>,
-    targets: &crate::sql_rewrite::GateTargets,
+    reach: TenantReach,
+    tables: &[String],
 ) -> Result<(), ApiError> {
-    match targets {
-        crate::sql_rewrite::GateTargets::Tables(tables) => {
-            if tables.is_empty() {
-                return Ok(());
+    let tenant_id = match reach {
+        TenantReach::All => return Ok(()),
+        TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
+        TenantReach::Tenant { tenant_id, .. } => tenant_id,
+    };
+    let mut claims = Vec::with_capacity(tables.len());
+    for table in tables {
+        claims.push(claim_on(state, tenant_id, table).await?);
+    }
+    match first_unreachable(reach, &claims) {
+        Some(at) => Err(table_not_available(&tables[at])),
+        None => Ok(()),
+    }
+}
+
+/// `SEC-50` slice 2 M1/M2: a statement that lists objects, checked against a
+/// reach that is already resolved.
+///
+/// This is the half of the gate that decides about LISTINGS. A listing names
+/// no table, so there is nothing to check table by table: it passes for the
+/// catalog's own tenant (and for a deployment with one tenant) and is refused
+/// otherwise.
+///
+/// The reach is resolved BEFORE this check, so a header naming a tenant the
+/// caller does not belong to is a 404 everywhere else, and it must not be
+/// answered with the listing's own 422.
+///
+/// # Errors
+///
+/// 422 with the fixed sentence of [`LISTING_NOT_AVAILABLE`].
+fn check_listing_against_reach(reach: TenantReach) -> Result<(), ApiError> {
+    match reach {
+        // Every permission, or a deployment with one tenant: there
+        // is no other tenant's listing to keep. The catalog's own
+        // tenant may list the shared catalog.
+        TenantReach::All
+        | TenantReach::Tenant {
+            owns_catalog: true, ..
+        } => Ok(()),
+        // A member of another tenant, or a caller in no tenant.
+        TenantReach::Tenant {
+            owns_catalog: false,
+            ..
+        }
+        | TenantReach::NoTenant => Err(ApiError::Unprocessable(LISTING_NOT_AVAILABLE.to_owned())),
+    }
+}
+
+/// `SEC-50` slice 2 M1: a refusal the gate keeps, so every statement of one
+/// request is refused the same way.
+///
+/// [`ApiError`] is not `Clone`, so the gate's cell keeps the refusal as its
+/// status and its sentence and rebuilds the error for each statement. The
+/// sentence is one this code base wrote (a fixed refusal, never upstream
+/// text), so nothing about the deployment's data is kept here.
+#[derive(Debug, Clone)]
+struct GateRefusal {
+    status: u16,
+    message: String,
+}
+
+impl GateRefusal {
+    /// The refusal as it is kept.
+    fn of(err: &ApiError) -> Self {
+        Self {
+            status: err.status(),
+            message: err.to_string(),
+        }
+    }
+
+    /// The refusal as the error a caller sees, rebuilt from what was kept.
+    fn into_error(self) -> ApiError {
+        match self.status {
+            404 => ApiError::NotFound(self.message),
+            422 => ApiError::Unprocessable(self.message),
+            503 => ApiError::Unavailable(self.message),
+            _ => ApiError::Internal(self.message),
+        }
+    }
+}
+
+/// `SEC-50` slice 2 M1/M2: the ONE gate every statement passes, carried by
+/// the site that runs it.
+///
+/// The sites of slice 2 take a `&ChClient` (and sometimes a pool), never
+/// the whole state — but the gate needs the state: the pool (the tenant
+/// count, the claims) and the `CATALOG_TENANT_ID` setting. This carrier
+/// holds both, so a site can ask the gate without being rewritten to take
+/// a state it does not need.
+///
+/// The reach is resolved ONCE per request (M2): a board's tiles run side by
+/// side, and the reach is the same answer for all of them. The cell keeps a
+/// refusal too, so every tile of a refused request is refused the same way.
+///
+/// The gate is still ONE rule: [`gate_statement`] (the one-shot entry point
+/// the query path uses) and this carrier share the same internals — the
+/// reach ([`reach_for_actor`]) and the check ([`check_tables_against_reach`]
+/// and [`check_listing_against_reach`]) — so nobody writes a second copy of
+/// the reach logic (D1).
+///
+/// Every site of slice 2 runs a `ClickHouse` statement, so the targets are
+/// read with the `ClickHouse` dialect — the same choice the policy rewrite
+/// makes for those statements.
+pub(crate) struct StatementGate<'a> {
+    state: &'a AppState,
+    actor: GateActor<'a>,
+    dialect: &'a (dyn sqlparser::dialect::Dialect + Sync),
+    reach: tokio::sync::OnceCell<Result<TenantReach, GateRefusal>>,
+}
+
+impl<'a> StatementGate<'a> {
+    /// A gate that asks as `actor`, reading the statement with `dialect`.
+    ///
+    /// The dialect is the one the engine the statement runs uses — the same
+    /// choice the policy rewrite makes for that statement.
+    pub(crate) fn new(
+        state: &'a AppState,
+        actor: GateActor<'a>,
+        dialect: &'a (dyn sqlparser::dialect::Dialect + Sync),
+    ) -> Self {
+        Self {
+            state,
+            actor,
+            dialect,
+            reach: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// `SEC-50` slice 2 M2: a gate that asks as `actor` and reads the
+    /// statement as `ClickHouse` does — the engine every site of slice 2
+    /// runs.
+    pub(crate) fn clickhouse(state: &'a AppState, actor: GateActor<'a>) -> Self {
+        Self::new(state, actor, &CLICKHOUSE_DIALECT)
+    }
+
+    /// The gate's answer for `sql`: nothing to refuse, or the refusal.
+    ///
+    /// The statement is read for its targets before the reach is resolved
+    /// (M2): a statement that names no table reads nothing, so it is let
+    /// through without asking the deployment anything — the same laziness
+    /// the query path has always had.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`check_tables_against_reach`] and
+    /// [`check_listing_against_reach`], and the errors of
+    /// [`reach_for_actor`] (404 for a tenant the actor may not act as, 422
+    /// for a job with no user in a deployment with several tenants and no
+    /// `CATALOG_TENANT_ID`, 503 when the deployment cannot count its
+    /// tenants).
+    pub(crate) async fn check(&self, sql: &str) -> Result<(), ApiError> {
+        let Some(targets) = crate::sql_rewrite::gate_targets(sql, self.dialect) else {
+            // A statement that does not parse has no targets: the policy
+            // rewrite refuses it with a 422 of its own, so there is nothing
+            // here to gate.
+            return Ok(());
+        };
+        match &targets {
+            crate::sql_rewrite::GateTargets::Tables(tables) => {
+                if tables.is_empty() {
+                    return Ok(());
+                }
+                let reach = self.reach().await?;
+                check_tables_against_reach(self.state, reach, tables).await
             }
-            let reach = reach_for_actor(state, actor).await?;
-            let tenant_id = match reach {
-                TenantReach::All => return Ok(()),
-                TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
-                TenantReach::Tenant { tenant_id, .. } => tenant_id,
-            };
-            let mut claims = Vec::with_capacity(tables.len());
-            for table in tables {
-                claims.push(claim_on(state, tenant_id, table).await?);
-            }
-            match first_unreachable(reach, &claims) {
-                Some(at) => Err(table_not_available(&tables[at])),
-                None => Ok(()),
+            crate::sql_rewrite::GateTargets::ListsObjects => {
+                let reach = self.reach().await?;
+                check_listing_against_reach(reach)
             }
         }
-        crate::sql_rewrite::GateTargets::ListsObjects => {
-            // The reach is resolved FIRST: a header naming a tenant the
-            // caller does not belong to is a 404 everywhere else, and it
-            // must not be answered with the listing's own 422.
-            let reach = reach_for_actor(state, actor).await?;
-            match reach {
-                // Every permission, or a deployment with one tenant: there
-                // is no other tenant's listing to keep. The catalog's own
-                // tenant may list the shared catalog.
-                TenantReach::All
-                | TenantReach::Tenant {
-                    owns_catalog: true, ..
-                } => Ok(()),
-                // A member of another tenant, or a caller in no tenant.
-                TenantReach::Tenant {
-                    owns_catalog: false,
-                    ..
-                }
-                | TenantReach::NoTenant => {
-                    Err(ApiError::Unprocessable(LISTING_NOT_AVAILABLE.to_owned()))
-                }
-            }
+    }
+
+    /// The reach of this gate's actor, resolved once and kept.
+    async fn reach(&self) -> Result<TenantReach, ApiError> {
+        let refusal = self
+            .reach
+            .get_or_init(|| async {
+                reach_for_actor(self.state, self.actor)
+                    .await
+                    .map_err(|err| GateRefusal::of(&err))
+            })
+            .await
+            .clone();
+        match refusal {
+            Ok(reach) => Ok(reach),
+            Err(refusal) => Err(refusal.into_error()),
         }
+    }
+
+    /// Whether the reach has been resolved already — for the tests that
+    /// prove it is read once per request (M2).
+    #[cfg(test)]
+    pub(crate) fn reach_resolved(&self) -> bool {
+        self.reach.get().is_some()
+    }
+}
+
+#[cfg(test)]
+impl<'a> StatementGate<'a> {
+    /// A gate that reaches everything, for the unit tests that run a
+    /// statement against a mock engine.
+    ///
+    /// It exists only under `#[cfg(test)]`: no production path may act as
+    /// it.
+    pub(crate) fn unrestricted(state: &'a AppState) -> Self {
+        Self::new(state, GateActor::Unrestricted, &CLICKHOUSE_DIALECT)
     }
 }
 
@@ -5475,8 +5684,8 @@ mod sec50_gate_tests {
     use uuid::Uuid;
 
     use super::{
-        GateActor, JOB_NEEDS_CATALOG_TENANT, TenantReach, catalog_tenant_reach, gate_statement,
-        reach_for_actor,
+        CLICKHOUSE_DIALECT, GateActor, JOB_NEEDS_CATALOG_TENANT, StatementGate, TenantReach,
+        catalog_tenant_reach, gate_statement, ownerless_reach, reach_for_actor,
     };
     use crate::config::Config;
     use crate::state::AppState;
@@ -5524,7 +5733,7 @@ mod sec50_gate_tests {
     /// A state with no pool at all: the deployment's own answers are
     /// missing, so the gate must fail closed rather than guess.
     fn state_without_a_database() -> AppState {
-        AppState::new(Config::from_map(&HashMap::new()).expect("a config with no pool"))
+        AppState::without_a_database()
     }
 
     /// The pool's own URL, for a state that reads it.
@@ -5755,6 +5964,124 @@ mod sec50_gate_tests {
         .await;
         assert!(allowed.is_ok(), "the owning tenant reads its own upload");
         Ok(())
+    }
+
+    /// `SEC-50` slice 2 M8: a site whose owner is gone reaches everything
+    /// in a deployment with one tenant — there is no other tenant's table
+    /// to reach — and nothing at all in a deployment with several.
+    #[test]
+    fn an_ownerless_site_reaches_everything_in_a_one_tenant_deployment() {
+        assert_eq!(
+            ownerless_reach(Some(1)).expect("a deployment with one tenant"),
+            TenantReach::All
+        );
+    }
+
+    #[test]
+    fn an_ownerless_site_reaches_nothing_in_a_deployment_with_several_tenants() {
+        assert_eq!(
+            ownerless_reach(Some(4)).expect("a deployment with several tenants"),
+            TenantReach::NoTenant
+        );
+    }
+
+    /// `SEC-50` slice 2 M8 with R5: a deployment that cannot count its
+    /// tenants refuses, with `SEC-20`'s own sentence for that state (a
+    /// 503) — not D6's, which names a setting to set.
+    #[test]
+    fn an_ownerless_site_is_refused_in_a_deployment_that_cannot_count_its_tenants() {
+        let err = ownerless_reach(None)
+            .expect_err("a deployment that cannot say how many tenants it holds");
+        assert_eq!(err.status(), 503);
+        assert_eq!(
+            err.to_string(),
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT
+        );
+    }
+
+    /// `SEC-50` slice 2 M8, over a real deployment: the ownerless actor
+    /// refuses another tenant's upload table, and lets a deployment with
+    /// one tenant through.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_ownerless_site_is_refused_for_another_tenants_upload_table(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_string());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+        let claimed = claim_table(&pool, OTHER_TENANT, CLAIMED_TABLE, "upload-other")
+            .await
+            .expect("claim the upload table for the other tenant");
+        assert!(claimed, "the other tenant must hold the claim");
+
+        let refused = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::Ownerless,
+        )
+        .await
+        .expect_err("another tenant's upload table");
+        assert_eq!(refused.to_string(), REFUSAL);
+        Ok(())
+    }
+
+    /// `SEC-50` slice 2 T1: the unrestricted gate reaches everything without
+    /// a database — a `*:*` principal passes `SEC-20`'s own rule — so a test
+    /// that is about the runner and not about the gate needs no deployment.
+    #[tokio::test]
+    async fn the_unrestricted_gate_reaches_everything() {
+        let state = state_without_a_database();
+        let gate = StatementGate::unrestricted(&state);
+        gate.check(STATEMENT)
+            .await
+            .expect("an unrestricted principal reads every table");
+    }
+
+    /// `SEC-50` slice 2 M2: the carrier resolves the reach ONCE for a
+    /// request and keeps it, so a board's tiles do not each read it.
+    ///
+    /// The count is the carrier's own state, which is what the plan asks
+    /// for ("count the Postgres reads or the `OnceCell` state"): a second
+    /// statement does not resolve the reach again.
+    #[tokio::test]
+    async fn the_gate_resolves_the_reach_once_for_a_request() {
+        let state = state_without_a_database();
+        let gate = StatementGate::new(&state, GateActor::Ownerless, &CLICKHOUSE_DIALECT);
+        assert!(!gate.reach_resolved(), "the reach is resolved lazily");
+        // A statement that names no table asks the deployment nothing.
+        gate.check("SELECT 1")
+            .await
+            .expect("a statement that names no table");
+        assert!(
+            !gate.reach_resolved(),
+            "a statement that names no table reads nothing, so nothing is resolved"
+        );
+        // One that names a table resolves it, and the next one reuses it.
+        gate.check(STATEMENT).await.expect_err("the owner's table");
+        assert!(gate.reach_resolved(), "the reach is resolved once");
+    }
+
+    /// `SEC-50` slice 2 M2: a refused request is refused the same way for
+    /// every statement of it — the refusal is kept, not re-decided.
+    #[tokio::test]
+    async fn a_refused_gate_refuses_the_next_statement_the_same_way() {
+        let state = state_without_a_database();
+        let gate = StatementGate::new(&state, GateActor::Ownerless, &CLICKHOUSE_DIALECT);
+        let first = gate
+            .check(STATEMENT)
+            .await
+            .expect_err("a deployment that cannot count its tenants");
+        let second = gate
+            .check(STATEMENT)
+            .await
+            .expect_err("the same refusal for the next statement");
+        assert_eq!(first.status(), second.status());
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(first.status(), 503);
     }
 }
 

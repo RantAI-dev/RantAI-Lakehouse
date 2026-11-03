@@ -502,6 +502,20 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
         )
         run_resp.raise_for_status()
         results = run_resp.json()["results"]
+        # SEC-50 slice 2 review round 3 BLOCKER 3: `/api/alerts/run` is a job
+        # with no user, so it acts as the tenant that OWNS the shared catalog
+        # (`routes::query::GateActor::CatalogTenant`), and this rule reads
+        # `serving.replication_slot_health` there. A stack that holds several
+        # tenants (migration 0002 seeds four) and names none of them as the
+        # owner (the job's `.env`: `CATALOG_TENANT_ID`) makes the run SKIP
+        # the rule, and D6's own sentence in `skipped` names the setting.
+        # Report a skip as itself, never as "expected a fired result": that
+        # message is what hid the cause of a real CI failure.
+        skipped = next((r.get("skipped") for r in results if r.get("skipped")), None)
+        if skipped:
+            raise G4Failure(
+                f"the alert run skipped {WAL_ALERT_RULE_ID} instead of evaluating it: {skipped}"
+            )
         fired = next((r for r in results if r.get("id") == WAL_ALERT_RULE_ID and r.get("fired")), None)
         if fired is None:
             raise G4Failure(f"expected a fired result for {WAL_ALERT_RULE_ID}, got: {results}")

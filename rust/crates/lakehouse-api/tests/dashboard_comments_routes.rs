@@ -10,7 +10,7 @@ mod common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use lakehouse_api::routes::dashboard_comments::SERVICE_REFUSED;
+use lakehouse_api::routes::dashboard_comments::{SERVICE_REFUSED, TOO_MANY_POSTS};
 use lakehouse_store::dashboard_access::{NewRule, replace_item};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -77,13 +77,13 @@ async fn app() -> (axum::Router, PgPool, MockServer) {
     (router, pool, ch)
 }
 
-async fn call(
+async fn call_full(
     router: &axum::Router,
     cookie: &str,
     method: &str,
     uri: &str,
     body: Option<Value>,
-) -> (StatusCode, Value) {
+) -> (StatusCode, axum::http::HeaderMap, Value) {
     let resp = router
         .clone()
         .oneshot(
@@ -98,11 +98,24 @@ async fn call(
         .await
         .unwrap();
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     (
         status,
+        headers,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+async fn call(
+    router: &axum::Router,
+    cookie: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let (status, _headers, body) = call_full(router, cookie, method, uri, body).await;
+    (status, body)
 }
 
 fn rule(user: Uuid, level: &str) -> NewRule {
@@ -599,4 +612,189 @@ async fn a_service_token_is_refused_in_a_sentence_on_post_edit_delete_and_the_pi
             "{method} {uri}"
         );
     }
+}
+
+/// `BI-38` D1 to D3: the eleventh post in five minutes is a 429 with a
+/// `Retry-After` header and the one fixed sentence, and nothing is written (the
+/// list still holds ten, and the refused post's mention is not in the bell).
+#[tokio::test]
+async fn the_eleventh_post_is_a_429_with_retry_after_and_writes_nothing() {
+    let (router, pool, _ch) = app().await;
+    let author = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let friend = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, author).await;
+    let friend_cookie = session_cookie_for_user(&pool, friend).await;
+
+    for n in 0..10 {
+        let (status, body) = post(&router, &cookie, "b1", &format!("post {n}"), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, headers, body) = call_full(
+        &router,
+        &cookie,
+        "POST",
+        "/api/dashboard/comments",
+        Some(json!({ "board": "b1", "body": "one too many", "mentions": [friend] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"], json!(TOO_MANY_POSTS));
+    let retry: u64 = headers
+        .get("retry-after")
+        .expect("a 429 says when to retry")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=300).contains(&retry), "Retry-After {retry}");
+
+    let (_, listed) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/dashboard/comments?board=b1",
+        None,
+    )
+    .await;
+    assert_eq!(listed["comments"].as_array().unwrap().len(), 10);
+    let (_, bell) = call(&router, &friend_cookie, "GET", "/api/notifications", None).await;
+    assert_eq!(
+        bell["unreadMentions"].as_array().unwrap().len(),
+        0,
+        "a refused post records no mention"
+    );
+}
+
+/// `BI-38` D4: access is checked before the limit, so a dashboard the caller
+/// cannot see is the same 404 for somebody at the limit as for anybody else.
+#[tokio::test]
+async fn a_post_to_a_hidden_dashboard_by_a_person_at_the_limit_is_still_a_404() {
+    let (router, pool, _ch) = app().await;
+    let author = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let listed = create_principal_with_permissions(&pool, "dashboard:read").await;
+    restricted(&pool, &[listed]).await;
+    let cookie = session_cookie_for_user(&pool, author).await;
+    for n in 0..10 {
+        post(&router, &cookie, "b1", &format!("post {n}"), &[]).await;
+    }
+    let hidden = post(&router, &cookie, "b_secret", "hi", &[]).await;
+    let unknown = post(&router, &cookie, "nope", "hi", &[]).await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{}", hidden.1);
+    assert_eq!(hidden, unknown);
+}
+
+/// `BI-38` D5: a board named in the mark-read body is resolved like any other
+/// comment route, so one the caller cannot see answers exactly as an unknown
+/// board does.
+#[tokio::test]
+async fn marking_read_with_a_board_the_caller_cannot_see_is_the_same_404_as_an_unknown_board() {
+    let (router, pool, _ch) = app().await;
+    let caller = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let listed = create_principal_with_permissions(&pool, "dashboard:read").await;
+    restricted(&pool, &[listed]).await;
+    let cookie = session_cookie_for_user(&pool, caller).await;
+    let hidden = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/dashboard/comments/mentions/read",
+        Some(json!({ "board": "b_secret" })),
+    )
+    .await;
+    let unknown = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/dashboard/comments/mentions/read",
+        Some(json!({ "board": "nope" })),
+    )
+    .await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{}", hidden.1);
+    assert_eq!(hidden, unknown);
+}
+
+/// `BI-38` D5, D6: marking one dashboard read leaves another dashboard's mention
+/// unread; `{}` then reads both.
+#[tokio::test]
+async fn marking_one_boards_mentions_read_leaves_another_boards_unread() {
+    let (router, pool, _ch) = app().await;
+    let author = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let friend = create_principal_with_permissions(&pool, "dashboard:read").await;
+    restricted(&pool, &[author, friend]).await;
+    let author_cookie = session_cookie_for_user(&pool, author).await;
+    let friend_cookie = session_cookie_for_user(&pool, friend).await;
+    post(
+        &router,
+        &author_cookie,
+        "b1",
+        "on the open board",
+        &[friend],
+    )
+    .await;
+    post(
+        &router,
+        &author_cookie,
+        "b_secret",
+        "on the restricted board",
+        &[friend],
+    )
+    .await;
+
+    let (status, marked) = call(
+        &router,
+        &friend_cookie,
+        "POST",
+        "/api/dashboard/comments/mentions/read",
+        Some(json!({ "board": "b1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{marked}");
+    assert_eq!(marked["marked"], 1);
+    let (_, bell) = call(&router, &friend_cookie, "GET", "/api/notifications", None).await;
+    let lines = bell["unreadMentions"].as_array().unwrap();
+    assert_eq!(lines.len(), 1, "{bell}");
+    assert_eq!(lines[0]["board"], "b_secret");
+
+    let (status, marked) = call(
+        &router,
+        &friend_cookie,
+        "POST",
+        "/api/dashboard/comments/mentions/read",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(marked["marked"], 1);
+    let (_, empty) = call(&router, &friend_cookie, "GET", "/api/notifications", None).await;
+    assert_eq!(empty["unreadMentions"].as_array().unwrap().len(), 0);
+}
+
+/// `BI-38` D5: a body of another shape is our 400, not the extractor's text, and
+/// it marks nothing.
+#[tokio::test]
+async fn a_mark_read_body_of_another_shape_is_a_400() {
+    let (router, pool, _ch) = app().await;
+    let author = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let friend = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let author_cookie = session_cookie_for_user(&pool, author).await;
+    post(&router, &author_cookie, "b1", "hi", &[friend]).await;
+    let friend_cookie = session_cookie_for_user(&pool, friend).await;
+
+    for body in [json!({ "board": 1 }), json!({ "unexpected": true })] {
+        let (status, answer) = call(
+            &router,
+            &friend_cookie,
+            "POST",
+            "/api/dashboard/comments/mentions/read",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {answer}");
+    }
+    let (_, bell) = call(&router, &friend_cookie, "GET", "/api/notifications", None).await;
+    assert_eq!(
+        bell["unreadMentions"].as_array().unwrap().len(),
+        1,
+        "a refused body marks nothing"
+    );
 }

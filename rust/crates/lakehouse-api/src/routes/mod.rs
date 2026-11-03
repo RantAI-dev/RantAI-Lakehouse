@@ -9,6 +9,11 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
+// `DATA-42` D7: the `ClickHouse` registry fixture the readers' tests share
+// (`governance`, `overview`, `storage`, `lineage`, `catalog_profile`).
+// Test-only, so it is declared `#[cfg(test)]` and never reaches a build.
+#[cfg(test)]
+pub(crate) mod bronze_registry_fixture;
 mod chart_alerts;
 // `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
 // `authored_pipelines::job_name` to name the job a lag run launches, and
@@ -1080,6 +1085,29 @@ fn identity_router() -> Router<AppState> {
         .route(
             "/api/identity/users/{id}/tenants/{tenant_id}",
             axum::routing::put(identity::add_user_to_tenant),
+        )
+        // ADM-4 D2: take a user out of a tenant — the counterpart of the
+        // PUT above, under the same "who may" rule. `{id}` and
+        // `{tenant_id}` are validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/tenants/{tenant_id}",
+            axum::routing::delete(identity::remove_user_from_tenant),
+        )
+        // ADM-4 D1: replace a user's local role set. The body names the
+        // user's COMPLETE role set; `{id}` is validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/roles",
+            axum::routing::put(identity::set_user_roles),
+        )
+        // ADM-4 D3: switch a user off, and back on again. Both take no
+        // body; `{id}` is validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/deactivate",
+            axum::routing::post(identity::deactivate_user),
+        )
+        .route(
+            "/api/identity/users/{id}/reactivate",
+            axum::routing::post(identity::reactivate_user),
         )
         // ADM-3 D2: hand an existing user a new temporary password. The
         // password is generated server-side and returned once; `{id}` is

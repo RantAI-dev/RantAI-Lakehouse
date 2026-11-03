@@ -8,9 +8,15 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { readableErrorMessage } from "@/lib/notify-message";
+import { notifyMentionsRead } from "@/lib/mention-events";
 import { useService } from "@/hooks/use-service";
 // BI-19 part E: features import `@/services` only.
-import { dashboardService, type CommentPerson, type DashboardComment } from "@/services";
+import {
+  dashboardService,
+  notificationsService,
+  type CommentPerson,
+  type DashboardComment,
+} from "@/services";
 
 /** `BI-19` part E, decision D15: a comment is 1 to 2000 characters. */
 export const MAX_COMMENT_CHARS = 2000;
@@ -69,6 +75,20 @@ export function CommentsPanel({ board }: { readonly board: string }) {
   const [busy, setBusy] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
   const [editing, setEditing] = React.useState<{ id: string; text: string } | null>(null);
+
+  // BI-38 D6: opening this dashboard's comments marks its mentions read once
+  // the list has loaded (the component is mounted by the open, and a reload
+  // after posting is not a second open). The bell is told to reload; a failed
+  // mark is silent because the mentions then stay unread, which is the truth.
+  const markedRead = React.useRef(false);
+  React.useEffect(() => {
+    if (list.status !== "success" || markedRead.current) return;
+    markedRead.current = true;
+    notificationsService
+      .markMentionsRead(board)
+      .then(() => notifyMentionsRead())
+      .catch(() => undefined);
+  }, [board, list.status]);
 
   const word = pendingMention(text);
   // BI-19 E review E-3: each lookup costs a read of every candidate's access on

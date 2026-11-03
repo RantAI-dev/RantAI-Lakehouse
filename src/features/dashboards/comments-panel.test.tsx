@@ -89,8 +89,10 @@ describe("CommentsPanel", () => {
     fireEvent.click(await screen.findByText("Bob"))
     expect(box.value).toBe("hi @Bob ")
     fireEvent.click(screen.getByText("Post"))
-    await waitFor(() => expect(calls.some((c) => c.method === "POST")).toBe(true))
-    const post = calls.find((c) => c.method === "POST")!
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === "POST" && c.url.endsWith("/api/dashboard/comments"))).toBe(true),
+    )
+    const post = calls.find((c) => c.method === "POST" && c.url.endsWith("/api/dashboard/comments"))!
     expect(post.body).toEqual({ board: "b_1", body: "hi @Bob", mentions: ["u2"] })
     expect(calls.find((c) => c.url.includes("/people"))!.url).toContain("board=b_1")
   })
@@ -164,6 +166,44 @@ describe("CommentsPanel", () => {
     render(<CommentsPanel board="b_1" />)
     await screen.findByText(COMMENT.body)
     expect(screen.queryByText("Older comments are not shown.")).toBeNull()
+  })
+
+  it("marks this dashboard's mentions read once, after the list has loaded (BI-38 D6)", async () => {
+    const calls = stub([COMMENT])
+    render(<CommentsPanel board="b_1" />)
+    await screen.findByText(COMMENT.body)
+    await waitFor(() => expect(calls.filter((c) => c.url.includes("/mentions/read"))).toHaveLength(1))
+    const mark = calls.find((c) => c.url.includes("/mentions/read"))!
+    expect(mark.method).toBe("POST")
+    expect(mark.body).toEqual({ board: "b_1" })
+
+    // A reload after posting is not a second open: the mark is not sent again.
+    const box = screen.getByLabelText("Write a comment")
+    fireEvent.change(box, { target: { value: "hello" } })
+    fireEvent.click(screen.getByText("Post"))
+    await waitFor(() =>
+      expect(calls.filter((c) => c.method === "GET" && c.url.includes("/comments?board=b_1"))).toHaveLength(2),
+    )
+    expect(calls.filter((c) => c.url.includes("/mentions/read"))).toHaveLength(1)
+  })
+
+  it("says nothing when the mentions could not be marked read (BI-38 D6)", async () => {
+    const calls = stub([COMMENT], () => json({ error: "The mentions could not be marked as read" }, 500))
+    render(<CommentsPanel board="b_1" />)
+    await screen.findByText(COMMENT.body)
+    await waitFor(() => expect(calls.filter((c) => c.url.includes("/mentions/read"))).toHaveLength(1))
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("shows the server's 429 sentence and keeps the typed text (BI-38 D3)", async () => {
+    const tooMany = "You have posted many comments in a few minutes. Try again in a moment."
+    stub([], () => json({ error: tooMany }, 429))
+    render(<CommentsPanel board="b_1" />)
+    const box = (await screen.findByLabelText("Write a comment")) as HTMLTextAreaElement
+    fireEvent.change(box, { target: { value: "one more" } })
+    fireEvent.click(screen.getByText("Post"))
+    expect(await screen.findByText(tooMany)).toBeTruthy()
+    expect(box.value).toBe("one more")
   })
 
   it("deletes through the service", async () => {

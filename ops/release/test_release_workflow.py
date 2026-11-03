@@ -60,6 +60,13 @@ And three more since REL-2 S3 D13, from the review round 3 BLOCKER 1
     hide the bug the proof exists for, because Compose pulls silently
     when it may.
 
+And one more since PR #335's `update-proof` job, from the marker check that
+failed after the REAL update to bundle B:
+
+  - every call to the API in the `update-proof` job carries a session: the
+    authenticated helper (`ops/release/proof_api.sh`) signs in and keeps the
+    session in a cookie jar, and a call with no session answers 401.
+
 And two more since REL-2 S3 review round 4 BLOCKER 1, from the dry run
 that lost its registry:
 
@@ -68,6 +75,16 @@ that lost its registry:
     stops it — so the dry run starts its throwaway registry itself,
     after the store switch;
   - the dry run's registry is pinned by digest and is waited for.
+
+And two more since WEB-2, from the product owner's decision of
+2026-11-02 that an installed Lakehouse does not serve the landing
+page:
+
+  - the console image's build context (`.dockerignore`) keeps the
+    landing page's two folders out, so no console image carries the
+    route; and
+  - the install proof asks for `/landing`'s status and fails the job
+    unless it is 404.
 
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
@@ -79,6 +96,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import sys
 import unittest
 from pathlib import Path
 from typing import Any
@@ -87,6 +105,13 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+# The rules of the update proof live in a module of their own, so they
+# can be tested with no Docker and no network (REL-2 S4 decision D21).
+RELEASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(RELEASE_DIR))
+
+import update_proof  # noqa: E402  (the path is set above)
 
 # The toolchain pin: `rustup` reads it from inside `rust/`.
 TOOLCHAIN_PATH = REPO_ROOT / "rust" / "rust-toolchain.toml"
@@ -153,6 +178,98 @@ REGISTRY_API = "http://localhost:5000/v2/"
 # The step that cuts the proof runner off from the registries.
 AIR_GAP_STEP = "Cut the runner off from the registries"
 
+# The Dagster services a release install runs, and the steps that prove
+# it (REL-2 S4b review round 3 BLOCKER 3, decision D22).
+#
+# The Dagster services carry the `dagster` profile, and a stack that
+# does not run it runs no pipelines at all: no upload loads, no
+# connector runs, no maintenance jobs. The proof asserts that the
+# daemon and the code location run — after the install, after the
+# update, and after the rollback.
+DAGSTER_SERVICES = ("dagster-daemon", "dagster-code-location")
+DAGSTER_STEP = "The Dagster services run"
+DAGSTER_STEPS = (
+    "The Dagster services run after the install",
+    "The Dagster services run after the update",
+    "The Dagster services run after the rollback",
+)
+
+# The install's own `.env`: the file that names the profiles the
+# install runs, and the file the proof's compose call reads.
+INSTALL_ENV = "--env-file install/.env"
+
+# The API the proof talks to, and the part of it that is authenticated.
+#
+# The proof's third marker is a stored connector credential, and it is
+# read back through the API: `GET /api/connectors/{id}` needs the
+# `connector:manage` permission, and a call with NO session answers
+# 401. The marker check that ran after the real update to bundle B
+# failed exactly there — "curl: (22) The requested URL returned error:
+# 401" — because it called the API with no session at all (PR #335
+# update-proof, marker check 401).
+API_BASE_URL = "http://127.0.0.1:8080"
+API_PATH = "/api/"
+
+# The helper that signs in and makes the call: every API call of the
+# proof goes through it, so that no step can forget the sign-in.
+PROOF_API_HELPER = "ops/release/proof_api.sh"
+
+# A call that carries the session ITSELF: the cookie jar of the
+# sign-in, or a bearer token.
+SESSION_CARRYING = re.compile(
+    r"(?:^|\s)(?:-b\b|--cookie\b)|authorization:\s*bearer",
+    re.IGNORECASE,
+)
+
+# The two steps that read the three markers back.
+MARKER_STEPS = (
+    "The markers are still there after the update to bundle B",
+    "The stack runs bundle B again, and the markers are still there",
+)
+
+# The connector route the proof's third marker is read through, and the
+# tenant every call of the proof acts as.
+#
+# The API's connector routes are TENANT-SCOPED (`SEC-50`, `rust/crates/
+# lakehouse-api/src/tenant_scope.rs`): a connector belongs to a tenant,
+# and `GET /api/connectors/{id}` answers 404 for a caller that does not
+# belong to that tenant. The read of the marker connector answered 404
+# after the real update to bundle B, because the connector had NO tenant
+# at all: the bootstrap administrator belongs to no tenant, so the create
+# fell back to the typed name and the row's `tenant_id` stayed NULL — a
+# row no tenant-scoped read can see (PR #335 update-proof, connector
+# 404).
+#
+# The API reads the tenant from the `X-Tenant` header, and the console
+# sends the active tenant on EVERY request (`src/services/http.ts`
+# attaches it), so the proof's calls carry it too — every one of them
+# naming the SAME tenant.
+CONNECTOR_PATH = "/api/connectors"
+
+# The call that names the tenant, in the helper's own environment
+# variable. The value is the tenant's id; the API reads a UUID there and
+# answers 404 for anything else.
+TENANT_NAMED = re.compile(r'PROOF_TENANT="(?P<tenant>[^"]+)"')
+
+# The file the seeding step writes the tenant's id to, and every step
+# that calls the API reads it back from there: the steps of a job are
+# separate shells, so a variable of one step is not in the next.
+TENANT_FILE = "tenant-id.txt"
+
+# The digest reference the proof's own steps pull, and the commands the
+# check below reads.
+#
+# Docker's CONTAINERD image store does NOT register the TAG when the
+# pull is by digest: the digest reference and the tag are two names for
+# one image, and only the digest one is registered (REL-2 S3 D13). A
+# `docker save` of the tag then fails with "No such image", and the
+# bundle's archive is never written — PR #335's `update-proof` job,
+# bundle B.
+DIGEST_REFERENCE = "$reference"
+PULL = re.compile(r'docker pull\s+"(?P<argument>[^"]*)"')
+SAVE = re.compile(r"docker save\b(?P<argument>.*)$")
+TAG = re.compile(r'docker tag\s+"(?P<argument>[^"]*)"')
+
 # The registries the proof cuts the runner off from: Docker Hub's
 # registry, its authentication and its index, GHCR, Quay, and the CDN
 # the Docker Hub layers come from.
@@ -164,6 +281,25 @@ REGISTRIES = (
     "quay.io",
     "production.cloudflare.docker.com",
 )
+
+# The console image's build context: `.dockerignore` decides what the
+# console build sees, because the console is built from the repository
+# ROOT (WEB-2).
+DOCKERIGNORE_PATH = REPO_ROOT / ".dockerignore"
+
+# The landing page's two folders. The product owner decided on
+# 2026-11-02 that the page is a separate product page and that an
+# installed Lakehouse must not serve it, so no console image carries
+# them (WEB-2).
+LANDING_PATHS = ("src/app/landing", "src/features/landing")
+
+# The step of the proof job that asks the console what it answers.
+CONSOLE_STEP = "The stack is ready and the console answers"
+
+# The path the landing page is served at, and the status it must answer
+# on an install: the console's page-not-found.
+LANDING_PATH = "/landing"
+LANDING_NOT_FOUND = "404"
 
 # A workflow with a signing secret in a job-level `env:`.
 SYNTHETIC_JOB_SECRET = """
@@ -351,6 +487,36 @@ jobs:
           echo "0.0.0.0 ghcr.io" | sudo tee -a /etc/hosts
 """
 
+# A workflow whose proof does not assert that the Dagster services run:
+# an install that runs no profile runs no pipeline at all (REL-2 S4b
+# review round 3 BLOCKER 3, decision D22).
+SYNTHETIC_NO_DAGSTER_ASSERTION = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The Dagster services run
+        run: |
+          docker compose -p rantai-lakehouse ps
+"""
+
+# A workflow whose proof asserts the Dagster services, but reads the
+# stack without the install's own `.env`: the file that names the
+# profiles the install runs.
+SYNTHETIC_DAGSTER_WITHOUT_THE_INSTALL_ENV = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The Dagster services run
+        run: |
+          docker compose -p rantai-lakehouse ps --format json
+"""
+
 # A workflow with a SERVICE container in a job that restarts Docker: the
 # service is started before the job's first step, so the restart stops it
 # and the store switch hides the image it ran from (REL-2 S3 review round
@@ -387,6 +553,159 @@ jobs:
         run: sudo systemctl restart docker
       - name: Start the registry
         run: docker run -d --name registry -p 5000:5000 registry:2
+"""
+
+# A workflow whose install proof asks the console what it answers, but
+# never asks about the landing page (WEB-2).
+SYNTHETIC_PROOF_WITHOUT_THE_LANDING_PAGE = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  install-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The stack is ready and the console answers
+        run: |
+          set -euo pipefail
+          curl -fsS -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:3000/
+"""
+
+# A workflow whose pull-request trigger does not run for a change to the
+# console image's build context (WEB-2).
+SYNTHETIC_WITHOUT_THE_BUILD_CONTEXT_IN_THE_PATHS = """
+name: Synthetic
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free runner disk
+        run: docker image prune -af
+"""
+
+# A workflow whose proof pulls an image by its digest and then saves it
+# BY ITS TAG, with no `docker tag` in between: on Docker's containerd
+# image store the pull does not create the tag, so the save fails with
+# "No such image" (REL-2 S3 D13; PR #335 update-proof, bundle B).
+SYNTHETIC_PROOF_SAVES_A_TAG_WITHOUT_TAGGING_IT = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The bundle B is assembled and signed
+        run: |
+          set -euo pipefail
+          digest="sha256:0123"
+          reference="localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@$digest"
+          docker pull "$reference"
+          docker save -o bundle-b/images/rantai-lakehouse-api.tar \\
+            "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1"
+"""
+
+# The same workflow, with the tag made before the save: the way
+# `ops/release/make_bundle.sh` does it (REL-2 S3 D13).
+SYNTHETIC_PROOF_TAGS_BEFORE_IT_SAVES = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The bundle B is assembled and signed
+        run: |
+          set -euo pipefail
+          digest="sha256:0123"
+          reference="localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@$digest"
+          docker pull "$reference"
+          docker tag "$reference" \\
+            "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1"
+          docker save -o bundle-b/images/rantai-lakehouse-api.tar \\
+            "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1"
+"""
+
+
+# A workflow whose proof reads the stored connector credential with a
+# bare `curl`: the call carries no session, and the API answers 401
+# (PR #335 update-proof, marker check 401).
+SYNTHETIC_PROOF_CALLS_THE_API_WITHOUT_A_SESSION = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The markers are still there after the update to bundle B
+        run: |
+          detail="$(curl -fsS "http://127.0.0.1:8080/api/connectors/$connector")"
+"""
+
+# The same call with the sign-in's cookie jar: the API answers it.
+SYNTHETIC_PROOF_CALLS_THE_API_WITH_THE_COOKIE_JAR = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The markers are still there after the update to bundle B
+        run: |
+          detail="$(curl -fsS -b cookies.txt "http://127.0.0.1:8080/api/connectors/$connector")"
+"""
+
+# A helper that signs in and then makes the call with NO session: the
+# call it makes is the one the API refuses with 401.
+SYNTHETIC_HELPER_WITHOUT_A_SESSION = """
+#!/usr/bin/env bash
+set -euo pipefail
+curl -fsS -c "$COOKIE_JAR" -X POST "$API_URL/api/auth/login" -d "$payload" > /dev/null
+curl -fsS "$API_URL$path"
+"""
+
+# A proof whose create and whose read act as two DIFFERENT tenants: the
+# read lands in a tenant the connector is not in, and the API answers 404
+# (PR #335 update-proof, connector 404).
+SYNTHETIC_PROOF_CALLS_THE_CONNECTORS_IN_TWO_TENANTS = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Seed the markers
+        run: |
+          connector="$(PROOF_TENANT="$tenant" ops/release/proof_api.sh post /api/connectors '{}')"
+      - name: The markers are still there after the update to bundle B
+        run: |
+          detail="$(PROOF_TENANT="$other" ops/release/proof_api.sh get "/api/connectors/$connector")"
+"""
+
+# A proof whose connector call names no tenant at all: the call then
+# acts as the caller's FIRST tenant, which is not the connector's.
+SYNTHETIC_PROOF_CALLS_THE_CONNECTOR_WITHOUT_A_TENANT = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  update-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The markers are still there after the update to bundle B
+        run: |
+          detail="$(ops/release/proof_api.sh get "/api/connectors/$connector")"
+"""
+
+# A helper that signs in and makes the call, but never names the tenant
+# it acts as: the API resolves the caller's first tenant, and the
+# connector of another tenant is a 404.
+SYNTHETIC_HELPER_WITHOUT_A_TENANT = """
+#!/usr/bin/env bash
+set -euo pipefail
+curl -fsS -c "$COOKIE_JAR" -X POST "$API_URL/api/auth/login" -d "$payload" > /dev/null
+curl -fsS -b "$COOKIE_JAR" "$API_URL$path"
 """
 
 
@@ -535,6 +854,239 @@ def shell_commands(run: str) -> str:
     return "\n".join(
         line for line in run.splitlines() if not line.strip().startswith("#")
     )
+
+
+def logical_lines(run: str) -> list[str]:
+    """The run block's logical lines.
+
+    A line that ends with a backslash continues on the next one, so a
+    command split over two lines is ONE command: a `docker save` whose
+    image is named on the next line still saves that image.
+    """
+    lines: list[str] = []
+    buffer = ""
+    for raw in shell_commands(run).splitlines():
+        line = raw.strip()
+        buffer = f"{buffer} {line}" if buffer else line
+        if buffer.endswith("\\"):
+            buffer = buffer[:-1].rstrip()
+            continue
+        lines.append(buffer)
+        buffer = ""
+    if buffer:
+        lines.append(buffer)
+    return lines
+
+
+def digest_pulls(lines: list[str]) -> list[int]:
+    """Where the step pulls an image BY ITS DIGEST.
+
+    A pull of a plain tag (`alpine:3.20`) is not one: the tag is the
+    name that pull creates.
+    """
+    found: list[int] = []
+    for index, line in enumerate(lines):
+        match = PULL.search(line)
+        if match is None:
+            continue
+        argument = match.group("argument")
+        if "@" in argument or argument == DIGEST_REFERENCE:
+            found.append(index)
+    return found
+
+
+def tag_saves(lines: list[str]) -> list[int]:
+    """Where the step saves an image BY ITS TAG.
+
+    A save of a digest reference is not one: the archive it writes
+    loads as a dangling image, and the host that loads it cannot
+    resolve the digest-pinned reference the manifest names (REL-2 S3
+    D13).
+    """
+    found: list[int] = []
+    for index, line in enumerate(lines):
+        match = SAVE.search(line)
+        if match is None:
+            continue
+        argument = match.group("argument")
+        if "@" in argument or DIGEST_REFERENCE in argument:
+            continue
+        found.append(index)
+    return found
+
+
+def tags_the_digest_reference(lines: list[str], start: int, end: int) -> bool:
+    """Whether the lines between two of them tag the digest reference."""
+    for line in lines[start:end]:
+        match = TAG.search(line)
+        if match is None:
+            continue
+        argument = match.group("argument")
+        if argument == DIGEST_REFERENCE or "@" in argument:
+            return True
+    return False
+
+
+def untagged_saves(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every image the job pulls by digest and then saves BY TAG, with
+    no `docker tag` in between.
+
+    Docker's containerd image store does not register the TAG when the
+    pull is by digest, so the save of the tag fails with "No such
+    image" and the bundle's archive is never written (REL-2 S3 D13;
+    PR #335 update-proof, bundle B).
+    """
+    problems: list[str] = []
+    for step in steps_of(document, job_name):
+        name = str(step.get("name"))
+        lines = logical_lines(str(step.get("run") or ""))
+        for pull in digest_pulls(lines):
+            for save in tag_saves(lines):
+                if save <= pull:
+                    continue
+                if tags_the_digest_reference(lines, pull, save):
+                    continue
+                problems.append(
+                    f"{job_name}: {name}: the image is pulled by digest and then saved by tag, "
+                    f"and nothing tags it in between: on Docker's containerd image store a pull by "
+                    f"digest does not create the tag, so the save fails with 'No such image'."
+                )
+    return problems
+
+
+def api_calls_without_a_session(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every call to the API that carries no session.
+
+    The API's `/api/` routes are authenticated, and a call with no
+    session answers 401 — the marker check that ran after the real
+    update to bundle B failed on exactly that (PR #335 update-proof,
+    marker check 401). A call carries a session either through the
+    authenticated helper — which signs in and keeps the session in a
+    cookie jar — or through the cookie jar or the bearer token itself.
+    """
+    problems: list[str] = []
+    for step in steps_of(document, job_name):
+        name = str(step.get("name"))
+        for line in logical_lines(str(step.get("run") or "")):
+            if API_BASE_URL not in line or API_PATH not in line:
+                continue
+            if PROOF_API_HELPER in line or SESSION_CARRYING.search(line):
+                continue
+            problems.append(
+                f"{job_name}: {name}: the call to the API carries no session: {line}"
+            )
+    return problems
+
+
+def helper_problems(script: str) -> list[str]:
+    """What the helper script is missing.
+
+    The helper is what makes the proof's calls authenticated, so it
+    must sign in, keep the session in a cookie jar, and make the call
+    with the jar.
+    """
+    problems: list[str] = []
+    if "/api/auth/login" not in script:
+        problems.append("the helper never signs in")
+    if "jq -n --arg" not in script:
+        problems.append(
+            "the sign-in payload is not built with jq -n --arg, and a secret is never "
+            "spliced into a string by the shell"
+        )
+    if '-c "$COOKIE_JAR"' not in script:
+        problems.append("the helper does not keep the session in a cookie jar")
+    if '-b "$COOKIE_JAR"' not in script:
+        problems.append("the helper does not make the call with the session")
+    return problems
+
+
+def connector_calls(document: dict[str, Any], job_name: str) -> list[tuple[str, str]]:
+    """Every call of the job that touches a connector route: the step it
+    is in, and the line it is on."""
+    found: list[tuple[str, str]] = []
+    for step in steps_of(document, job_name):
+        name = str(step.get("name"))
+        for line in logical_lines(str(step.get("run") or "")):
+            if PROOF_API_HELPER in line and CONNECTOR_PATH in line:
+                found.append((name, line))
+    return found
+
+
+def connector_tenant_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every connector call that names no tenant, or a tenant of its own.
+
+    The API's connector routes are tenant-scoped (`SEC-50`): a connector
+    belongs to a tenant, and a call that acts as another tenant sees no
+    connector at all — a 404. The proof's create and its two reads must
+    therefore all act as the SAME tenant, and each of them must NAME it
+    (the `X-Tenant` header the console sends on every request).
+    """
+    problems: list[str] = []
+    tenants: dict[str, list[str]] = {}
+    for name, line in connector_calls(document, job_name):
+        match = TENANT_NAMED.search(line)
+        if match is None:
+            problems.append(
+                f"{job_name}: {name}: the connector call names no tenant: {line}"
+            )
+            continue
+        tenants.setdefault(match.group("tenant"), []).append(f"{job_name}: {name}")
+    if len(tenants) > 1:
+        problems.append(
+            f"{job_name}: the connector calls name {len(tenants)} tenants "
+            f"({', '.join(sorted(tenants))}), and they must all name the same one: "
+            f"a call that acts as another tenant sees no connector at all."
+        )
+    return problems
+
+
+def helper_tenant_problems(script: str) -> list[str]:
+    """What the helper is missing about the tenant.
+
+    The API's tenant-scoped routes read the tenant from the `X-Tenant`
+    header (`tenant_scope::resolve`), and the console sends the active
+    tenant on every request (`src/services/http.ts`): the helper sends
+    it too, when `PROOF_TENANT` names a tenant.
+    """
+    problems: list[str] = []
+    if "PROOF_TENANT" not in script:
+        problems.append("the helper reads no tenant to act as")
+    if "X-Tenant: $PROOF_TENANT" not in script:
+        problems.append("the helper does not send the tenant as the X-Tenant header")
+    return problems
+
+
+def connector_tenant_file_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every connector call that does not act as the tenant the seeding
+    step created.
+
+    The seeding step writes the tenant's id to a file, and every step
+    that calls the API reads it back from there: the steps of a job are
+    separate shells, so a variable of one step is not in the next.
+    """
+    problems: list[str] = []
+    steps = steps_of(document, job_name)
+    if not any(
+        f"> {TENANT_FILE}" in str(step.get("run") or "") for step in steps
+    ):
+        problems.append(
+            f"{job_name}: no step writes the tenant's id to {TENANT_FILE}"
+        )
+    for step in steps:
+        name = str(step.get("name"))
+        run = str(step.get("run") or "")
+        if not any(
+            PROOF_API_HELPER in line and CONNECTOR_PATH in line
+            for line in logical_lines(run)
+        ):
+            continue
+        if f"cat {TENANT_FILE}" not in run:
+            problems.append(
+                f"{job_name}: {name}: the connector call does not read the tenant from "
+                f"{TENANT_FILE}, and so it does not act as the tenant the seeding step "
+                f"created"
+            )
+    return problems
 
 
 def sbom_steps(document: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -795,6 +1347,104 @@ def air_gap_problems(document: dict[str, Any]) -> list[str]:
             problems.append(f"the air-gap step does not cut {host} off")
     if "docker pull" not in run or "exit 1" not in run:
         problems.append("the air-gap step does not prove that the cut holds")
+    return problems
+
+
+def pull_request_paths(document: dict[str, Any]) -> list[str]:
+    """The paths a pull request must touch for the workflow to run.
+
+    PyYAML reads the `on:` key as the boolean `True`, because YAML 1.1
+    spells "on" as a boolean.
+    """
+    triggers = document.get(True) or document.get("on") or {}
+    pull_request = triggers.get("pull_request") or {}
+    return [str(path) for path in (pull_request.get("paths") or [])]
+
+
+def dockerignore_patterns(text: str) -> list[str]:
+    """The patterns of a `.dockerignore`, without its comments."""
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def dockerignore_excludes(text: str, path: str) -> bool:
+    """Whether a `.dockerignore` keeps a path out of the build context.
+
+    Docker's rule is that the LAST matching pattern wins, and a pattern
+    that starts with `!` re-includes what an earlier one excluded. So a
+    later `!src/app/landing` would undo the exclusion, and this answers
+    the question the build actually asks.
+    """
+    excluded = False
+    for pattern in dockerignore_patterns(text):
+        negated = pattern.startswith("!")
+        if negated:
+            pattern = pattern[1:]
+        pattern = pattern.rstrip("/")
+        if pattern == path or path.startswith(f"{pattern}/"):
+            excluded = not negated
+    return excluded
+
+
+def landing_proof_problems(document: dict[str, Any]) -> list[str]:
+    """Every way the install proof can fail to check the landing page.
+
+    An installed Lakehouse must not serve the landing page (WEB-2): the
+    console image excludes it, so the path answers with the console's
+    page-not-found. A proof that does not ask for the status, or that
+    does not fail the job unless the status is 404, lets the page back
+    into the install unnoticed.
+    """
+    try:
+        step = step_named(document, "install-proof", CONSOLE_STEP)
+    except AssertionError:
+        return ["the proof has no step that asks the console"]
+    commands = shell_commands(str(step.get("run") or ""))
+    problems: list[str] = []
+    if f"127.0.0.1:3000{LANDING_PATH}" not in commands:
+        problems.append("the proof does not ask for the landing page's status")
+    if LANDING_NOT_FOUND not in commands:
+        problems.append("the proof does not name the status the page must answer")
+    if "exit 1" not in commands:
+        problems.append("the proof does not fail the job")
+    return problems
+
+
+def dagster_assertion_problems(
+    document: dict[str, Any], job_name: str, step_name: str
+) -> list[str]:
+    """Every way the job's Dagster assertion can be missing.
+
+    The assertion is what proves the release install runs the Dagster
+    services: they carry the `dagster` profile, and a stack without it
+    runs no pipelines at all (REL-2 S4b review round 3 BLOCKER 3,
+    decision D22).
+
+    The stack is read with Compose's own JSON, and with the install's
+    own `.env`: that file names the profiles the install runs, and
+    without it the Dagster services are not part of the deployment the
+    command reads.
+    """
+    try:
+        step = step_named(document, job_name, step_name)
+    except AssertionError:
+        return [f"{job_name}: the job has no step named {step_name!r}"]
+    run = str(step.get("run") or "")
+    problems: list[str] = []
+    for service in DAGSTER_SERVICES:
+        if service not in run:
+            problems.append(f"{job_name}: {step_name}: it does not assert {service}")
+    if "ps --format json" not in run:
+        problems.append(
+            f"{job_name}: {step_name}: it does not read the stack's own JSON"
+        )
+    if INSTALL_ENV not in run:
+        problems.append(
+            f"{job_name}: {step_name}: it does not read the install's own .env"
+        )
     return problems
 
 
@@ -1183,6 +1833,55 @@ class ReleaseWorkflowTest(unittest.TestCase):
         job = self.document["jobs"]["install-proof"]
         self.assertEqual(job["needs"], "dry-run")
 
+    def test_the_proof_asserts_that_the_dagster_services_run(self) -> None:
+        """REL-2 S4b review round 3 BLOCKER 3, decision D22.
+
+        The Dagster services carry the `dagster` profile, and a stack
+        that does not run it runs no pipelines at all. The proof asserts
+        that the daemon and the code location run after the install.
+        """
+        self.assertEqual(
+            dagster_assertion_problems(self.document, "install-proof", DAGSTER_STEP),
+            [],
+        )
+
+    def test_the_proof_reads_the_stack_with_the_installs_own_env(self) -> None:
+        """The install's `.env` names the profiles the install runs.
+
+        The compose call reads the stack with that file, so the Dagster
+        services are part of the deployment the command reads.
+        """
+        step = step_named(self.document, "install-proof", DAGSTER_STEP)
+        self.assertIn(INSTALL_ENV, str(step.get("run")))
+
+    def test_a_proof_without_the_dagster_assertion_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_NO_DAGSTER_ASSERTION)
+        self.assertNotEqual(
+            dagster_assertion_problems(document, "install-proof", DAGSTER_STEP),
+            [],
+        )
+
+    def test_a_proof_that_reads_the_stack_without_the_installs_env_is_reported(
+        self,
+    ) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_DAGSTER_WITHOUT_THE_INSTALL_ENV)
+        problems = dagster_assertion_problems(
+            document, "install-proof", DAGSTER_STEP
+        )
+        self.assertTrue(
+            any("does not assert dagster-daemon" in problem for problem in problems),
+            problems,
+        )
+        self.assertTrue(
+            any(
+                "does not read the install's own .env" in problem
+                for problem in problems
+            ),
+            problems,
+        )
+
     def test_the_image_ids_are_the_config_digests_on_every_docker_store(self) -> None:
         """The two Docker stores identify an image differently.
 
@@ -1418,6 +2117,542 @@ class ReleaseWorkflowTest(unittest.TestCase):
         """The registry the job starts is the registry the job pushes to."""
         env = self.document["jobs"]["dry-run"].get("env") or {}
         self.assertEqual(env.get("RELEASE_REGISTRY"), DRY_RUN_REGISTRY)
+
+    def test_the_console_image_does_not_carry_the_landing_page(self) -> None:
+        """WEB-2: an installed Lakehouse does not serve `/landing`.
+
+        The product owner decided on 2026-11-02 that the landing page is a
+        separate product page and that an install must not offer it. The
+        console image is built from the repository ROOT, so the two
+        folders that hold the page have to be out of its build context —
+        otherwise every console image (the release's, the staging
+        deploy's, compose's) carries the route.
+        """
+        text = DOCKERIGNORE_PATH.read_text(encoding="utf-8")
+        for path in LANDING_PATHS:
+            self.assertTrue(
+                dockerignore_excludes(text, path),
+                f"the console image would carry {path}",
+            )
+
+    def test_a_build_context_that_carries_the_landing_page_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        text = "node_modules\n.next\n"
+        for path in LANDING_PATHS:
+            self.assertFalse(dockerignore_excludes(text, path), path)
+
+    def test_a_later_negation_would_undo_the_exclusion(self) -> None:
+        """Docker's last match wins, and `!` re-includes."""
+        text = "src/app/landing\n!src/app/landing\n"
+        self.assertFalse(dockerignore_excludes(text, "src/app/landing"))
+
+    def test_a_change_to_the_build_context_runs_the_dry_run(self) -> None:
+        """`.dockerignore` decides what the console image is made of.
+
+        A PR that edits it changes the image the dry run builds and the
+        install proof checks, so the workflow has to run for it (WEB-2).
+        """
+        self.assertIn(".dockerignore", pull_request_paths(self.document))
+
+    def test_a_workflow_without_the_build_context_in_its_paths_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_WITHOUT_THE_BUILD_CONTEXT_IN_THE_PATHS)
+        self.assertNotIn(".dockerignore", pull_request_paths(document))
+
+    def test_the_install_proof_checks_that_the_landing_page_is_not_served(self) -> None:
+        """WEB-2: the proof is on an installed bundle, not on a build.
+
+        The page must answer 404 there, and the job fails when it does
+        not: a 200 means the page is back in the install.
+        """
+        self.assertEqual(landing_proof_problems(self.document), [])
+
+    def test_a_proof_that_never_asks_about_the_landing_page_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_PROOF_WITHOUT_THE_LANDING_PAGE)
+        self.assertIn(
+            "the proof does not ask for the landing page's status",
+            landing_proof_problems(document),
+        )
+
+
+
+class UpdateProofTest(unittest.TestCase):
+    """The update proof: the job, and the rules it runs on.
+
+    REL-2 S4 decision D21. The proof installs the dry run's bundle A,
+    seeds three markers, updates to a bundle B whose API image is
+    REBUILT with a bumped version, and updates to a bundle C whose API
+    image never becomes ready: that update must fail and roll itself
+    back, and every marker must still be there.
+    """
+
+    def setUp(self) -> None:
+        self.document = load_workflow()
+
+    # ── The job ───────────────────────────────────────────────────────
+
+    def test_the_update_proof_needs_the_dry_run(self) -> None:
+        """The proof installs what the dry run built."""
+        self.assertEqual(self.document["jobs"]["update-proof"]["needs"], "dry-run")
+
+    def test_the_update_proof_installs_the_dry_runs_bundle(self) -> None:
+        """Step 1 of D21: bundle A is the dry run's bundle."""
+        install = step_named(self.document, "update-proof", "Install bundle A")
+        run = str(install.get("run"))
+        self.assertIn("--bundle bundle-a", run)
+        self.assertIn("lakehousectl install", run)
+        self.assertIn(
+            "dry-run/cosign.pub",
+            str(install.get("env")),
+            "bundle A is signed by the dry run's key, and the tool must trust that key",
+        )
+
+    def test_the_update_proof_builds_with_the_test_key_feature(self) -> None:
+        """The proof signs its own bundles with its own key."""
+        step = step_named(self.document, "update-proof", "Build lakehousectl (the proof's key)")
+        self.assertIn("--features test-key", str(step.get("run")))
+
+    def test_the_update_proof_builds_its_images_before_the_runner_is_cut_off(self) -> None:
+        """The builder pulls its base images from the registries, so
+        the image builds run BEFORE the cut — the runner is cut off
+        before the INSTALL, which is where the air-gap matters."""
+        cut = step_index(self.document, "update-proof", "Cut the runner off from the registries")
+        for step in (
+            "Build and push the API image of bundle B",
+            "Build and push the API image of bundle C",
+        ):
+            self.assertLess(
+                step_index(self.document, "update-proof", step),
+                cut,
+                f"{step} runs after the cut",
+            )
+
+    def test_the_update_skips_the_checks_the_runner_cannot_meet(self) -> None:
+        """The runner is below the release's minimums, so the two
+        checks are skipped — and the tool says which checks it
+        skipped."""
+        run = str(
+            step_named(self.document, "update-proof", "The update to bundle B succeeds").get("run")
+        )
+        self.assertIn("--ignore-preflight disk", run)
+        self.assertIn("--ignore-preflight memory", run)
+
+    def test_the_update_proof_cuts_the_runner_off_before_the_install(self) -> None:
+        """The proof is air-gapped, as `install-proof` is."""
+        self.assertLess(
+            step_index(self.document, "update-proof", "Cut the runner off from the registries"),
+            step_index(self.document, "update-proof", "Install bundle A"),
+            "the install runs before the runner is cut off",
+        )
+
+    def test_the_update_proof_seeds_the_three_markers(self) -> None:
+        """Step 2 of D21: a row in the application database, a row in
+        ClickHouse, and a stored connector credential through the API."""
+        run = str(step_named(self.document, "update-proof", "Seed the markers").get("run"))
+        self.assertIn("s4_update_marker", run)
+        self.assertIn("postgres", run)
+        self.assertIn("clickhouse", run)
+        self.assertIn("/api/connectors", run)
+        self.assertIn("credential", run)
+
+    def test_the_update_proof_builds_bundle_b_with_the_api_image_rebuilt(self) -> None:
+        """Step 3 of D21: the API image is rebuilt with a bumped
+        version, and every other image is reused from A."""
+        run = str(
+            step_named(self.document, "update-proof", "The API's version is bumped for bundle B").get(
+                "run"
+            )
+        )
+        self.assertIn("lakehouse-api/Cargo.toml", run)
+        self.assertIn("Cargo.lock", run)
+        assembled = str(
+            step_named(self.document, "update-proof", "The bundle B is assembled and signed").get(
+                "run"
+            )
+        )
+        self.assertIn("update_proof.py bundle", assembled)
+        self.assertIn("--from bundle-a --to bundle-b", assembled)
+        self.assertIn(
+            "images/rantai-lakehouse-api.tar",
+            assembled,
+            "the rebuilt image's archive replaces the old one's",
+        )
+
+    def test_the_update_proof_bumps_the_api_version_with_a_tested_script(self) -> None:
+        """The bump is a script of its own, so it can be tested.
+
+        It was inline Python in this step, and it was wrong (PR #335,
+        the `update-proof` job): the lockfile's version was replaced by
+        its PREFIX, so the old version text stayed behind and `cargo
+        chef prepare` stopped with a TOML parse error. The script that
+        replaces it is `ops/release/bump_api_version.py`, and its own
+        tests live in `ops/release/test_bump_api_version.py`.
+        """
+        run = str(
+            step_named(self.document, "update-proof", "The API's version is bumped for bundle B").get(
+                "run"
+            )
+        )
+        self.assertIn("ops/release/bump_api_version.py", run)
+        self.assertNotIn(
+            "python3 - ",
+            run,
+            "the bump must be the tested script, not inline Python",
+        )
+
+    def test_the_update_proof_signs_its_own_bundles(self) -> None:
+        """The bundles the proof builds are signed with the proof's
+        key, and the tool is pointed at that key for the updates."""
+        step = step_named(self.document, "update-proof", "The bundle B is assembled and signed")
+        self.assertIn("cosign sign-blob", str(step.get("run")))
+        update = step_named(self.document, "update-proof", "The update to bundle B succeeds")
+        self.assertIn(
+            "proof.pub",
+            str(update.get("env")),
+            "the update must verify against the proof's key",
+        )
+
+    def test_the_update_to_bundle_b_must_succeed(self) -> None:
+        """The update to bundle B reports the new version as ready."""
+        run = str(step_named(self.document, "update-proof", "The update to bundle B succeeds").get("run"))
+        self.assertIn("lakehousectl update --bundle bundle-b", run)
+        self.assertIn("/health/ready", run)
+
+    def test_the_update_proof_tags_every_image_it_saves_by_tag(self) -> None:
+        """Every image the proof pulls by digest is TAGGED before it is
+        saved.
+
+        Docker's containerd image store does not register the tag when
+        the pull is by digest: the digest reference and the tag are two
+        names for one image, and only the digest one is registered. A
+        `docker save` of the tag then fails with "No such image", and
+        the bundle's archive is never written (PR #335 update-proof,
+        bundle B; REL-2 S3 D13).
+        """
+        problems = untagged_saves(self.document, "update-proof")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_proof_that_saves_a_tag_without_tagging_it_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_PROOF_SAVES_A_TAG_WITHOUT_TAGGING_IT)
+        self.assertNotEqual(untagged_saves(document, "update-proof"), [])
+        tagged = yaml.safe_load(SYNTHETIC_PROOF_TAGS_BEFORE_IT_SAVES)
+        self.assertEqual(untagged_saves(tagged, "update-proof"), [])
+
+    def test_the_update_to_bundle_c_must_fail_and_roll_back(self) -> None:
+        """Step 4 of D21: the update to the bundle that never becomes
+        ready exits non-zero, and the rollback is reported."""
+        run = str(
+            step_named(self.document, "update-proof", "The update to bundle C fails and rolls back").get(
+                "run"
+            )
+        )
+        self.assertIn("lakehousectl update --bundle bundle-c", run)
+        self.assertIn("--ready-timeout 180", run)
+        self.assertIn("rolled back", run)
+
+    def test_the_update_proof_checks_the_markers_after_the_update(self) -> None:
+        """A marker that is gone after the update is data the update
+        lost."""
+        run = str(
+            step_named(
+                self.document,
+                "update-proof",
+                "The markers are still there after the update to bundle B",
+            ).get("run")
+        )
+        self.assertIn("the postgres marker", run)
+        self.assertIn("the clickhouse marker", run)
+        self.assertIn("credentialManaged", run)
+
+    def test_the_update_proof_checks_the_markers_after_the_rollback(self) -> None:
+        """The same three markers, after the rollback of bundle C."""
+        run = str(
+            step_named(
+                self.document,
+                "update-proof",
+                "The stack runs bundle B again, and the markers are still there",
+            ).get("run")
+        )
+        self.assertIn("the postgres marker", run)
+        self.assertIn("the clickhouse marker", run)
+        self.assertIn("credentialManaged", run)
+
+    def test_the_update_proof_counts_the_marker_rows_after_the_rollback(self) -> None:
+        """Each marker table holds EXACTLY ONE row after the rollback.
+
+        The rollback RESTORES the backup onto the data the failed
+        update left behind, and a restore that MERGES instead of
+        replacing leaves the marker of both: the row of the backup and
+        the row the failed update wrote (REL-2 S4b review round 6
+        BLOCKER 1, decision D24). A marker that is still there is not
+        enough — the row count is what says the data was replaced.
+        """
+        run = str(
+            step_named(
+                self.document,
+                "update-proof",
+                "The stack runs bundle B again, and the markers are still there",
+            ).get("run")
+        )
+        self.assertIn("SELECT count(*) FROM s4_update_marker", run)
+        self.assertIn("SELECT count() FROM s4_update_marker", run)
+        self.assertIn('"$postgres_rows" != "1"', run)
+        self.assertIn('"$clickhouse_rows" != "1"', run)
+
+    # ── The session the API calls carry ──────────────────────────────
+
+    def test_every_api_call_of_the_update_proof_carries_a_session(self) -> None:
+        """A call to the API with no session answers 401.
+
+        The marker check that ran after the REAL update to bundle B
+        failed on it (PR #335 update-proof, marker check 401): it read
+        the stored connector credential with a bare `curl`, and the API
+        refused the call. Every call of the proof now goes through the
+        authenticated helper, which signs in and keeps the session in a
+        cookie jar.
+        """
+        problems = api_calls_without_a_session(self.document, "update-proof")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_proof_that_calls_the_api_without_a_session_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_PROOF_CALLS_THE_API_WITHOUT_A_SESSION)
+        self.assertNotEqual(api_calls_without_a_session(document, "update-proof"), [])
+        with_jar = yaml.safe_load(SYNTHETIC_PROOF_CALLS_THE_API_WITH_THE_COOKIE_JAR)
+        self.assertEqual(api_calls_without_a_session(with_jar, "update-proof"), [])
+
+    def test_the_marker_checks_read_the_credential_through_the_helper(self) -> None:
+        """The two marker checks call the API through the helper.
+
+        The helper signs in per call: the update restarts the stack, and
+        the rollback restarts it again, so no step may depend on the
+        session of the step before it.
+        """
+        for name in MARKER_STEPS:
+            run = str(step_named(self.document, "update-proof", name).get("run"))
+            self.assertIn(PROOF_API_HELPER, run, name)
+
+    def test_the_helper_signs_in_and_calls_the_api_with_its_session(self) -> None:
+        """The helper is what makes the call authenticated.
+
+        It signs in, it keeps the session in a cookie jar, and it makes
+        the call with the jar.
+        """
+        script = (RELEASE_DIR / "proof_api.sh").read_text(encoding="utf-8")
+        problems = helper_problems(script)
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_helper_that_calls_the_api_without_its_session_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        self.assertNotEqual(helper_problems(SYNTHETIC_HELPER_WITHOUT_A_SESSION), [])
+
+    # ── The tenant the connector calls act as ─────────────────────────
+
+    def test_every_connector_call_of_the_update_proof_names_the_same_tenant(self) -> None:
+        """The create and the two reads must act as ONE tenant.
+
+        The API's connector routes are tenant-scoped (`SEC-50`,
+        `rust/crates/lakehouse-api/src/tenant_scope.rs`): a connector
+        belongs to a tenant, and `GET /api/connectors/{id}` answers 404
+        for a caller that does not belong to it. The read of the marker
+        connector answered 404 after the real update to bundle B, because
+        the connector had no tenant at all — the bootstrap administrator
+        belongs to no tenant, so the create fell back to the typed name
+        and the row's `tenant_id` stayed NULL (PR #335 update-proof,
+        connector 404).
+
+        Every call therefore NAMES the tenant it acts as, through the
+        `X-Tenant` header the console sends on every request, and they
+        all name the same one.
+        """
+        problems = connector_tenant_problems(self.document, "update-proof")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_proof_whose_connector_calls_name_two_tenants_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        two_tenants = yaml.safe_load(SYNTHETIC_PROOF_CALLS_THE_CONNECTORS_IN_TWO_TENANTS)
+        self.assertNotEqual(connector_tenant_problems(two_tenants, "update-proof"), [])
+        no_tenant = yaml.safe_load(SYNTHETIC_PROOF_CALLS_THE_CONNECTOR_WITHOUT_A_TENANT)
+        self.assertNotEqual(connector_tenant_problems(no_tenant, "update-proof"), [])
+
+    def test_the_connector_calls_act_as_the_tenant_the_seeding_step_created(self) -> None:
+        """The tenant every call names is the one the seed made.
+
+        The steps of a job are separate shells, so the tenant's id is
+        written to a file by the seeding step and read back from there by
+        every step that calls the API.
+        """
+        problems = connector_tenant_file_problems(self.document, "update-proof")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_the_seeding_step_creates_the_tenant_and_the_membership(self) -> None:
+        """The tenant exists, and the administrator is a member of it.
+
+        A connector in a tenant the caller does not belong to is a 404
+        (`SEC-50`), so the proof needs both: the tenant, and the
+        administrator's membership of it — the console's Identity → Users
+        page does exactly this, through `PUT /api/identity/users/{id}/
+        tenants/{tenant_id}`.
+        """
+        run = str(step_named(self.document, "update-proof", "Seed the markers").get("run"))
+        self.assertIn("INSERT INTO tenant", run)
+        self.assertIn(f"> {TENANT_FILE}", run)
+        self.assertIn("ops/release/proof_api.sh put", run)
+        self.assertIn("/api/identity/users/", run)
+        self.assertIn("/tenants/", run)
+
+    def test_the_helper_sends_the_tenant_the_api_reads(self) -> None:
+        """The helper sends `X-Tenant`, the header the API reads.
+
+        The API's tenant-scoped routes resolve the tenant from the
+        `X-Tenant` header (`tenant_scope::resolve`), and the console
+        sends the active tenant on every request (`src/services/http.ts`).
+        The helper sends it when `PROOF_TENANT` names a tenant — and no
+        header at all when it does not, so a call that names no tenant
+        acts as the caller's first tenant, the way the API resolves it.
+        """
+        script = (RELEASE_DIR / "proof_api.sh").read_text(encoding="utf-8")
+        problems = helper_tenant_problems(script)
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_a_helper_that_names_no_tenant_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        self.assertNotEqual(helper_tenant_problems(SYNTHETIC_HELPER_WITHOUT_A_TENANT), [])
+
+    def test_the_update_proof_says_why_the_real_previous_release_test_is_not_here(self) -> None:
+        """The real "previous release" test joins this job once 0.2.0
+        exists (REL-2 S5), and the reason is written in the job."""
+        text = WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn("joins this job once 0.2.0 exists", text)
+
+    def test_the_update_proof_asserts_that_the_dagster_services_run(self) -> None:
+        """REL-2 S4b review round 3 BLOCKER 3, decision D22.
+
+        The three points of the proof: after the install, after the
+        update, and after the rollback. A stack that stops running the
+        Dagster services runs no pipelines at all, and the rollback is
+        the point where that is most likely to happen.
+        """
+        for name in DAGSTER_STEPS:
+            self.assertEqual(
+                dagster_assertion_problems(self.document, "update-proof", name),
+                [],
+                name,
+            )
+
+    def test_the_dagster_assertions_come_after_the_three_points(self) -> None:
+        """The assertion is worth nothing before the thing it asserts."""
+        for point, assertion in (
+            ("Install bundle A", DAGSTER_STEPS[0]),
+            ("The update to bundle B succeeds", DAGSTER_STEPS[1]),
+            ("The update to bundle C fails and rolls back", DAGSTER_STEPS[2]),
+        ):
+            self.assertLess(
+                step_index(self.document, "update-proof", point),
+                step_index(self.document, "update-proof", assertion),
+                assertion,
+            )
+
+    def test_the_update_proof_reads_the_stack_with_the_installs_own_env(self) -> None:
+        """The install's `.env` names the profiles the install runs.
+
+        The compose call reads the stack with that file, so the Dagster
+        services are part of the deployment the command reads.
+        """
+        for name in DAGSTER_STEPS:
+            step = step_named(self.document, "update-proof", name)
+            self.assertIn(INSTALL_ENV, str(step.get("run")), name)
+
+    # ── The rules the job runs on ────────────────────────────────────
+
+    def test_the_version_of_a_proof_bundle_is_the_release_and_the_step(self) -> None:
+        """D21: bundle B is `V-update-proof.1` and bundle C is
+        `V-update-proof.2`."""
+        self.assertEqual(
+            update_proof.proof_version("0.1.0", 1), "0.1.0-update-proof.1"
+        )
+        self.assertEqual(
+            update_proof.proof_version("0.1.0", 2), "0.1.0-update-proof.2"
+        )
+
+    def test_a_proof_bundle_reuses_every_image_but_the_api(self) -> None:
+        """D21: "every other image reused from A"."""
+        manifest = {
+            "images": {
+                "lakehouse-api": "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa",
+                "console": "localhost:5000/rantai-lakehouse-console:0.1.0@sha256:bbb",
+                "dagster": "localhost:5000/rantai-lakehouse-dagster:0.1.0@sha256:ccc",
+            }
+        }
+        self.assertEqual(
+            update_proof.reused_images(manifest),
+            {
+                "console": "localhost:5000/rantai-lakehouse-console:0.1.0@sha256:bbb",
+                "dagster": "localhost:5000/rantai-lakehouse-dagster:0.1.0@sha256:ccc",
+            },
+        )
+        self.assertEqual(
+            update_proof.api_reference(manifest),
+            "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa",
+        )
+
+    def test_the_compose_file_of_a_proof_bundle_names_the_new_image(self) -> None:
+        """The reference is pinned by digest, and the rebuilt image has
+        another digest."""
+        old = "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa"
+        new = "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@sha256:bbb"
+        compose = f"services:\n  lakehouse-api:\n    image: {old}\n"
+        self.assertEqual(
+            update_proof.compose_with(compose, old, new),
+            f"services:\n  lakehouse-api:\n    image: {new}\n",
+        )
+
+    def test_a_compose_file_that_does_not_name_the_old_image_is_refused(self) -> None:
+        """A file that does not name the old reference would run the
+        old image."""
+        with self.assertRaises(update_proof.ProofError):
+            update_proof.compose_with("services: {}\n", "one", "two")
+
+    def test_the_manifest_of_a_proof_bundle_names_the_new_version_and_the_new_image(self) -> None:
+        """Everything else is the manifest of bundle A: the other
+        images, and the other files."""
+        old = "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa"
+        new = "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@sha256:bbb"
+        manifest = {
+            "schemaVersion": 1,
+            "version": "0.1.0",
+            "gitSha": "a" * 40,
+            "createdAt": "2026-11-02T00:00:00Z",
+            "minFrom": "0.0.0",
+            "stops": [],
+            "images": {"lakehouse-api": old, "console": "console@sha256:ccc"},
+            "imageIds": {old: "sha256:111", "console@sha256:ccc": "sha256:222"},
+            "files": {"docker-compose.yml": "sha256:old", "lakehousectl": "sha256:tool"},
+        }
+        new_manifest = update_proof.manifest_for(
+            manifest,
+            version="0.1.0-update-proof.1",
+            compose_sha256="sha256:new",
+            api_reference_new=new,
+            api_image_id="sha256:333",
+            created_at="2026-11-02T01:00:00Z",
+        )
+        self.assertEqual(new_manifest["version"], "0.1.0-update-proof.1")
+        self.assertEqual(new_manifest["images"]["lakehouse-api"], new)
+        self.assertEqual(new_manifest["images"]["console"], "console@sha256:ccc")
+        self.assertEqual(new_manifest["imageIds"][new], "sha256:333")
+        self.assertNotIn(old, new_manifest["imageIds"])
+        self.assertEqual(new_manifest["files"]["docker-compose.yml"], "sha256:new")
+        self.assertEqual(new_manifest["files"]["lakehousectl"], "sha256:tool")
+
+    def test_a_manifest_that_names_no_api_image_is_refused(self) -> None:
+        """A bundle with no API image is not a bundle the proof can
+        rebuild."""
+        with self.assertRaises(update_proof.ProofError):
+            update_proof.api_reference({"images": {"console": "console@sha256:ccc"}})
+
 
 
 if __name__ == "__main__":

@@ -1,0 +1,31 @@
+-- SEC-50 slice 2 (D4, M8): a public link acts as the tenant that made it.
+--
+-- WHY: a public link is read by nobody in particular, so the shared
+-- catalog it reads belongs to the tenant that made the link -- not to
+-- whoever opens the URL. Without this column every public link read the
+-- shared catalog as the deployment's catalog tenant, and a link made by a
+-- member of another tenant showed that member rows of the catalog they do
+-- not own.
+--
+-- The column is NULLABLE, and there is no backfill:
+--
+--   - NULL means "the creator's first tenant at view time" (D4). The links
+--     that existed before this column were made by somebody whose tenant
+--     was never recorded, and the links a service identity made have no
+--     person to name one for. Attributing them to a tenant now would be a
+--     guess, and a guess that decides who may read the shared catalog is
+--     worse than the gap it closes (the same rule `0099_saved_query_tenant`
+--     follows).
+--   - A creator who later leaves the tenant the link names does not change
+--     the link: the link keeps the tenant it was made in, and the creator
+--     is read as a member of it (D5's rule -- a principal that may not act
+--     as a tenant is refused with the same 404 an `X-Tenant` header naming
+--     a foreign tenant gets).
+--
+-- `ON DELETE SET NULL`, the same treatment the other tenant-scoped columns
+-- already get (`file_upload.tenant_id`, `upload_table_claim.tenant_id`,
+-- `saved_query.tenant_id`): a tenant that goes must not take the links
+-- with it, and the rows it leaves fall back to the creator (or, with no
+-- creator, to the fail-closed rule of `SEC-50` M8).
+ALTER TABLE dashboard_public_link
+    ADD COLUMN IF NOT EXISTS tenant_id UUID NULL REFERENCES tenant(id) ON DELETE SET NULL;

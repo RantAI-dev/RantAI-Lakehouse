@@ -29,16 +29,23 @@
 //! in any migration yet (the `agents` domain brings its own), so it is
 //! reported as `0` rather than invented; see [`Tenant::agents`].
 //!
-//! # Read/create only
+//! # Read/create, and the ADM-4 mutations
 //!
 //! `IdentityService` (the contract) declares four list methods, one
 //! settings getter, and four creates — no update and no delete. The
 //! functions below cover exactly that surface plus `get_*` (needed to
 //! re-read a row after insert) and `delete_*` (needed to make a seeded or
-//! test-created row removable, and exercised by
-//! `tests/identity.rs`). No `update_*` exists because nothing can call one:
-//! adding an unreachable mutation path to a service that has no
-//! authorization layer would be strictly worse than not having it.
+//! test-created row removable, and exercised by `tests/identity.rs`).
+//!
+//! ADM-4 adds the mutations the console needs to change what a user may
+//! do — a user's role set, a user's tenant membership, and a user's
+//! status — as `*_in_tx` functions: the CALLER opens the transaction,
+//! because the rule that guards the change (ADM-4 D5: a change that would
+//! leave no active user holding `*:*` is refused, in the same transaction
+//! as the change) has to see the change and the count together. The
+//! authorization rules (who may make the change) live in
+//! `lakehouse-api`'s routes, like every other route's rules; nothing here
+//! decides who may call it.
 
 use serde::Serialize;
 use sqlx::FromRow;
@@ -361,6 +368,205 @@ pub async fn user_exists(pool: &PgPool, id: Uuid) -> Result<bool, StoreError> {
             .fetch_optional(pool)
             .await?;
     Ok(present.is_some_and(|(present,)| present))
+}
+
+// ── ADM-4: changing what a user may do ──────────────────────────────────
+//
+// The functions below are the store's half of ADM-4: they move a user's
+// role memberships and tenant memberships, and they do it INSIDE a
+// transaction the caller owns. The caller owns it because the rule the
+// change has to satisfy (ADM-4 D5: "any change that would leave no active
+// user holding `*:*` is refused with a 409, in the same transaction as the
+// change") needs the change and the check that guards it to be one unit of
+// work — a change committed here and checked afterwards would let two
+// concurrent changes each see the other one still holding the grant and
+// both be allowed, leaving nobody.
+//
+// The authorization half of ADM-4 (who may make the change at all) lives
+// in `lakehouse-api`'s routes, next to every other route's rules; nothing
+// in this module decides who may call it.
+
+/// One role, as the identity routes need it: the name a caller uses, the
+/// id `app_user_role.role_id` points at, and the raw `role.permissions`
+/// text the role's grant is made of.
+///
+/// The permissions are handed over VERBATIM on purpose. `role.permissions`
+/// is free text, and the ONE parser for it is `lakehouse_auth::PermissionSet`
+/// — the parser every principal's permissions go through. A second
+/// token matcher in this crate could disagree with it about what a grant
+/// means, and a disagreement about a grant is a privilege-escalation hole
+/// (AGENTS.md rule 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleGrant {
+    /// `role.name` — what `User.roles` holds and what a caller names.
+    pub name: String,
+    /// `role.id` — what `app_user_role.role_id` points at.
+    pub id: Uuid,
+    /// `role.permissions`, verbatim: the free-text grant list.
+    pub permissions: String,
+}
+
+/// Resolve `names` to the roles they name, inside the CALLER's
+/// transaction.
+///
+/// Returns the roles that EXIST, sorted by name. A name that names no
+/// role is simply absent from the answer: the caller compares the names it
+/// asked for with the names it got back and answers 400 for the
+/// difference (ADM-4 D1: "an unknown role name is a 400").
+///
+/// Duplicate names collapse — the answer is a SET of roles, and
+/// `app_user_role`'s composite primary key would refuse the same role
+/// twice.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any storage failure.
+pub async fn resolve_roles_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    names: &[String],
+) -> Result<Vec<RoleGrant>, StoreError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, Uuid, String)> =
+        sqlx::query_as("SELECT name, id, permissions FROM role WHERE name = ANY($1)")
+            .bind(names)
+            .fetch_all(&mut **tx)
+            .await?;
+    let mut found: Vec<RoleGrant> = rows
+        .into_iter()
+        .map(|(name, id, permissions)| RoleGrant {
+            name,
+            id,
+            permissions,
+        })
+        .collect();
+    found.sort_by(|left, right| left.name.cmp(&right.name));
+    found.dedup_by(|left, right| left.id == right.id);
+    Ok(found)
+}
+
+/// Replace `user_id`'s local role set with exactly `role_ids`, inside the
+/// CALLER's transaction.
+///
+/// ADM-4 D1: the request carries the user's COMPLETE role set, not a
+/// delta, so the user's roles after the call are exactly the roles the
+/// request named. The rows are therefore deleted and re-inserted rather
+/// than diffed: a diff would need a second implementation of "which roles
+/// changed" (here and in the audit row that names the old and the new
+/// set), and the two could disagree about what the user's role set is.
+///
+/// The delete and the inserts share the caller's transaction, so a
+/// failure anywhere in it leaves the user's roles exactly as they were.
+///
+/// # Errors
+///
+/// Returns [`StoreError::ForeignKeyViolation`] if a role id names no
+/// `role` row (the route resolves the names to ids first, so this can
+/// only happen if the role was deleted between the resolution and this
+/// write), or [`StoreError::Database`] on any other failure.
+pub async fn set_user_roles_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    role_ids: &[Uuid],
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM app_user_role WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    for role_id in role_ids {
+        sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(role_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The names of the roles `user_id` holds, inside the CALLER's
+/// transaction.
+///
+/// Read for the audit row's "before" half: ADM-4 D6 asks the audit to
+/// name the old AND the new role names, so an operator can see what the
+/// change took away — not only what it gave.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any storage failure.
+pub async fn user_role_names_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<Vec<String>, StoreError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT r.name FROM app_user_role ur JOIN role r ON r.id = ur.role_id \
+         WHERE ur.user_id = $1 ORDER BY r.name",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+/// Remove `user_id` from `tenant_id` — the counterpart of
+/// [`add_user_to_tenant`], inside the CALLER's transaction.
+///
+/// Returns `true` when a membership row was removed and `false` when the
+/// user was not in that tenant (there was nothing to remove). Idempotent,
+/// exactly like the add: removing a member who is not a member changes
+/// nothing and says so.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any storage failure.
+pub async fn remove_user_from_tenant_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<bool, StoreError> {
+    let removed = sqlx::query("DELETE FROM app_user_tenant WHERE user_id = $1 AND tenant_id = $2")
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    Ok(removed > 0)
+}
+
+/// Set `user_id`'s `app_user.status` to `status` (`"active"` or
+/// `"inactive"`), inside the CALLER's transaction.
+///
+/// ADM-4 D3: switching a user off is a status change AND the end of every
+/// session that user holds — ONE unit of work, so a user can never be
+/// deactivated with a live session left behind. The caller therefore owns
+/// the transaction and writes the session revocations into it too
+/// (`lakehouse_auth::session::revoke_all_sessions_for_user_in_tx`).
+///
+/// The user's data, dashboards and audit history are NOT touched: only
+/// the status changes. Deactivation is the answer to "this person has
+/// left"; deleting the account would lose who authored what.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no such user exists, or
+/// [`StoreError::Database`] on any other failure. A `status` the schema
+/// does not allow is refused by `app_user_status_check` — a database
+/// error, not a silent write.
+pub async fn set_user_status_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    status: &str,
+) -> Result<(), StoreError> {
+    let affected = sqlx::query("UPDATE app_user SET status = $2, updated_at = now() WHERE id = $1")
+        .bind(user_id)
+        .bind(status)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
 }
 
 /// The `app_user.status` of `id` — `"active"` or `"inactive"`, the two

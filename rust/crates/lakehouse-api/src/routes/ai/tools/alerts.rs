@@ -77,7 +77,14 @@ pub(super) async fn create_alert_rule(
     // way around it.
     // BI-19 B1 review R6 (assistant path): the same create guard, which now also
     // refuses a digest of a board the caller cannot see or that is restricted.
-    if let Err(err) = crate::routes::alerts::authorise_rule_create(state, principal, &input).await {
+    // `SEC-50` slice 2 D7a (M7): the same guard as the console route, tenant
+    // gate included. No `X-Tenant` here: a tool call carries the model's
+    // arguments, not the chat's request headers, so the person's first tenant
+    // acts (the same fallback as everywhere else).
+    let headers = axum::http::HeaderMap::new();
+    if let Err(err) =
+        crate::routes::alerts::authorise_rule_create(state, principal, &headers, &input).await
+    {
         return json!({ "error": err.to_string() });
     }
     // SEC-10: `save_rule` checks the webhook target with the same sender and
@@ -100,8 +107,10 @@ pub(super) async fn update_alert_rule(
     }
     let input = parse_input(args);
     // `SRC-7` D7: as in `create_alert_rule`.
+    // `SEC-50` slice 2 D7a (M7): the same guard, tenant gate included.
+    let headers = axum::http::HeaderMap::new();
     if let Err(err) =
-        crate::routes::alerts::authorise_rule_update(state, principal, &id, &input).await
+        crate::routes::alerts::authorise_rule_update(state, principal, &headers, &id, &input).await
     {
         return json!({ "error": err.to_string() });
     }
@@ -137,7 +146,11 @@ pub(super) async fn delete_alert_rule(
     }
 }
 
-pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn run_alert_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
@@ -166,6 +179,16 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
         .pg
         .as_deref()
         .map(|pg| crate::routes::alerts::ApiStateSource { pg });
+    // `SEC-50` slice 2 T7 (M6): a person's call is gated as the person, even
+    // when it arrives through the assistant (`SEC-50` R4). No `X-Tenant`
+    // here: a tool call carries the model's arguments, not the chat's
+    // request headers, so the person's FIRST tenant acts — the same fallback
+    // `tenant_scope::resolve` uses when no header is sent, and the same
+    // mapping `export_gold_mart` uses for its own tool call. A service
+    // identity or a call with no principal is a job with no user, and acts
+    // as the catalog's tenant (D3).
+    let headers = axum::http::HeaderMap::new();
+    let actor = crate::routes::gold::gold_export_gate_actor(principal, &headers);
     match lakehouse_alerts::run_rules(
         &state.clickhouse,
         &http,
@@ -180,10 +203,7 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
         state_source
             .as_ref()
             .map(|s| s as &dyn lakehouse_alerts::StateSource),
-        &crate::routes::alerts::ApiSqlGate {
-            pg: state.pg.as_deref(),
-            ch: &state.clickhouse,
-        },
+        &crate::routes::alerts::ApiSqlGate { state, actor },
     )
     .await
     {
@@ -293,7 +313,7 @@ mod tests {
         );
         let s = state();
         assert_eq!(
-            run_alert_rule(&s, &Map::new()).await,
+            run_alert_rule(&s, None, &Map::new()).await,
             json!({ "error": "id is required" })
         );
     }
@@ -318,5 +338,108 @@ mod tests {
         assert_eq!(input.mart.as_deref(), Some("mart_wisman"));
         assert_eq!(input.op.as_deref(), Some("<"));
         assert_eq!(input.threshold, Some(100.0));
+    }
+
+    /// An [`AppState`] over `pool` and a `ClickHouse` at `ch_url`, naming the
+    /// catalog's own tenant (`SEC-50` slice 2 M11), built through `Config`
+    /// (the production path).
+    fn state_in(pool: &sqlx::PgPool, ch_url: &str) -> AppState {
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        );
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), url);
+        env.insert("CH_URL".to_owned(), ch_url.to_owned());
+        env.insert(
+            "CATALOG_TENANT_ID".to_owned(),
+            "11111111-1111-4111-8111-000000000001".to_owned(),
+        );
+        AppState::new(Config::from_map(&env).expect("a valid test Config"))
+    }
+
+    /// `SEC-50` slice 2 T7 (M6, R4): a person's `run_alert_rule` is gated as
+    /// that person. A member of a tenant that does not own the shared
+    /// catalog is refused with `SEC-20`'s own sentence, and the mart is never
+    /// read — the copilot is not a way around the gate.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_alert_rule_reads_as_the_person_who_asked(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use uuid::Uuid;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// The tenant the seeded deployment holds besides the catalog's.
+        const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+        /// `SEC-20`'s refusal of `serving.mart_x`, byte for byte.
+        const REFUSAL: &str =
+            "Table not found or not available to your organisation: serving.mart_x";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.alert_rule"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "data": [{
+                    "id": "al-mine",
+                    "name": "Mine",
+                    "type": "alert",
+                    "mart": "mart_x",
+                    "measure": "v",
+                    "agg": "sum",
+                    "op": ">",
+                    "threshold": "10",
+                    "board": "",
+                    "channel": "email",
+                    "target": "ops@example.com",
+                    "enabled": "1",
+                    "created_at": "",
+                    "severity": "high",
+                }],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [], "data": [{ "v": "999" }], "rows": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("al-mine"));
+        let state = state_in(&pool, &server.uri());
+        let person = Principal {
+            id: PrincipalId::User(Uuid::from_u128(9)),
+            tenant_ids: vec![OTHER_TENANT.parse().expect("a seeded tenant id")],
+            display_name: "Other tenant".to_owned(),
+            permissions: PermissionSet::parse("alert:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let result = run_alert_rule(&state, Some(&person), &args).await;
+
+        assert_eq!(result["results"][0]["skipped"], REFUSAL, "{result}");
+        assert_eq!(result["results"][0]["fired"], false, "{result}");
+        let asked = server
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        assert!(
+            !asked
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("FROM serving.")),
+            "the refusal precedes the engine: the mart must not be read"
+        );
+        Ok(())
     }
 }
