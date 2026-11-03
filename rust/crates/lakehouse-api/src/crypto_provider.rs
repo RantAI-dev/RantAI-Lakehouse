@@ -32,8 +32,14 @@
 //!   and `:271`), so the install changes which provider a SQL Server dial
 //!   uses -- from `aws-lc-rs` to `ring` -- but never panics.
 //! - `lettre` 0.11.23: **does not need it**, for the same reason
-//!   (`lettre-0.11.23/src/rustls_crypto.rs:5`: the process default, else
-//!   `aws-lc-rs`).
+//!   (`lettre-0.11.23/src/rustls_crypto.rs:8`: the process default, else
+//!   the provider its own build names). That fallback is `ring`, not
+//!   `aws-lc-rs`: this workspace builds `lettre` with its `rustls-tls`
+//!   feature, which turns `ring` on (`lettre-0.11.23/Cargo.toml:119`,
+//!   `rustls-tls = ["webpki-roots", "rustls", "ring"]`) and leaves
+//!   `aws-lc-rs` off, so the arm that runs is
+//!   `lettre-0.11.23/src/rustls_crypto.rs:12`
+//!   (`rustls::crypto::ring::default_provider()`).
 //!
 //! So the install is what keeps the `sqlx` `VerifyCa` dials and every
 //! `reqwest`/`object_store` request from panicking, and choosing `ring`

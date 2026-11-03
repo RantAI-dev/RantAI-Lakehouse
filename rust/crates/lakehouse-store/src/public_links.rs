@@ -51,6 +51,11 @@ pub struct PublicLink {
     pub password_version: i32,
     /// The person who made it, while their account exists.
     pub created_by: Option<Uuid>,
+    /// `SEC-50` slice 2 D4: the tenant the link acts as — the tenant of
+    /// the person who made it. `None` means "the creator's first tenant at
+    /// view time" (the links that predate the column, and the links a
+    /// service identity made, which name no person).
+    pub tenant_id: Option<Uuid>,
     /// When the row was made (a replacement is a new row).
     pub created_at: OffsetDateTime,
     /// When it last changed.
@@ -99,7 +104,7 @@ impl std::fmt::Debug for PasswordChange {
 }
 
 const COLUMNS: &str = "board_id, token, expires_at, password_hash, password_version, created_by, \
-     created_at, updated_at";
+     tenant_id, created_at, updated_at";
 
 /// The link of a dashboard, live or not, for the Share dialog.
 ///
@@ -170,6 +175,7 @@ pub async fn replace(
     expires_at: OffsetDateTime,
     password: Option<&str>,
     created_by: Option<Uuid>,
+    tenant_id: Option<Uuid>,
 ) -> Result<PublicLink, StoreError> {
     // One transaction. BI-19 part A review (NOTE): a DELETE then an INSERT let
     // two simultaneous "new link" calls both pass the delete and the second
@@ -185,12 +191,13 @@ pub async fn replace(
         .await?;
     // safe: only the constant `COLUMNS` is formatted in; values are bound (SEC-41).
     let link = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO dashboard_public_link (board_id, token, expires_at, password_hash, created_by) \
-         VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO dashboard_public_link (board_id, token, expires_at, password_hash, created_by, tenant_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (board_id) DO UPDATE SET token = EXCLUDED.token, \
              expires_at = EXCLUDED.expires_at, password_hash = EXCLUDED.password_hash, \
              password_version = dashboard_public_link.password_version + 1, \
-             created_by = EXCLUDED.created_by, created_at = now(), updated_at = now() \
+             created_by = EXCLUDED.created_by, tenant_id = EXCLUDED.tenant_id, \
+             created_at = now(), updated_at = now() \
          RETURNING {COLUMNS}"
     )))
     .bind(board_id)
@@ -198,6 +205,7 @@ pub async fn replace(
     .bind(expires_at)
     .bind(password)
     .bind(created_by)
+    .bind(tenant_id)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -205,7 +213,8 @@ pub async fn replace(
 }
 
 /// Change the expiry and the password of a link that has not expired, keeping
-/// its token. `None` when the dashboard has no live link (nothing is written:
+/// its token (and its tenant: `SEC-50` slice 2 D4 — the link keeps acting as
+/// the tenant it was made in). `None` when the dashboard has no live link (nothing is written:
 /// an expired link is not revived, the caller makes a new one with
 /// [`replace`]). A new or removed password bumps `password_version`, which
 /// ends every ticket issued before.
@@ -316,6 +325,10 @@ pub async fn ticket_is_live(
 /// Copy the links that existed before migration `0098` (`(board_id, token)`
 /// pairs read from the dashboard rows) into the table, each expiring
 /// [`LEGACY_DAYS`] days from now (feature A2). Returns how many were copied.
+///
+/// `SEC-50` slice 2 D4/M8: a copied link names no tenant and no creator, so
+/// it acts as the creator's first tenant — and, with no creator, it reaches
+/// nothing in a deployment with more than one tenant.
 ///
 /// It copies once per database: the first call writes the marker row of
 /// `dashboard_public_link_copy` in the same transaction as the links, and every

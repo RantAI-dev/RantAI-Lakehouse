@@ -139,6 +139,36 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "invalid JSON: {err}",
         "serde error over the caller's own request body",
     ),
+    // `SEC-50` slice 2 M1: the gate keeps its refusal for the rest of the
+    // request so every statement of it is refused the same way. What is kept
+    // is the gate's own fixed sentence (`SEC-20`'s 404 naming the table, D6's
+    // 422 naming the setting), never upstream text — see `GateRefusal`'s doc
+    // comment.
+    (
+        "query.rs",
+        "message: err.to_string(),",
+        "GateRefusal keeps the gate's own fixed sentence, written in this repository, to rebuild the same refusal",
+    ),
+    // `SEC-50` slice 2 M3: `SpecRunFailure::Gated` carries the tenant gate's
+    // own `ApiError`, whose sentence is fixed text this repository wrote (the
+    // enum's doc comment says so). It is the same sentence the route itself
+    // answers with, so it belongs in the tile's, the preview's and the
+    // layer's error slot; no engine text is involved.
+    (
+        "dashboard_sources.rs",
+        "Err(SpecRunFailure::Gated(err)) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
+    (
+        "layers.rs",
+        "SpecRunFailure::Gated(err) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
+    (
+        "support.rs",
+        "Err(SpecRunFailure::Gated(err)) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
     (
         "quality.rs",
         "Invalid request body: {err}",

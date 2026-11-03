@@ -16,11 +16,12 @@ export const notificationsService: NotificationsService = {
     }
     return json as Notifications;
   },
-  async markMentionsRead(signal) {
+  async markMentionsRead(board, signal) {
     const res = await apiFetch("/api/dashboard/comments/mentions/read", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: "{}",
+      // `{}` marks every mention; a named board marks only its own (`BI-38` D5).
+      body: JSON.stringify(board === undefined ? {} : { board }),
       signal,
     });
     if (!res.ok) {

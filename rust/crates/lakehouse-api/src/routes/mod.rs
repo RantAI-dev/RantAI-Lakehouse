@@ -94,6 +94,11 @@ mod query_limits;
 // logic in a second place is exactly the drift the one definition exists
 // to prevent (`AGENTS.md` rule 4).
 pub(crate) mod query;
+// The trash sweep is started by the binary's `main`, and the library
+// target has no caller of its own: the re-export is what keeps the
+// function reachable there, so no build calls it dead code.
+pub use query::spawn_saved_query_trash_sweep;
+mod saved_queries;
 mod schema_changes;
 pub(crate) mod schema_versions;
 mod settings;
@@ -112,11 +117,34 @@ use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
+use lakehouse_core::ApiError;
 use serde::Serialize;
 
 use crate::json::ApiJson;
 use crate::policy::auth_gate;
 use crate::state::AppState;
+use crate::upstream_error;
+
+/// The sentence a query string the route cannot read is told.
+///
+/// One sentence for every route that refuses a query string its extractor
+/// could not read — the saved-query list, the query history, the result
+/// download and the uploads. The route's own words, never the extractor's:
+/// a response never carries a library's rendering of the caller's request.
+pub(crate) const QUERY_STRING_UNREADABLE: &str = "The query string could not be read.";
+
+/// A failure of an exported file, reported under a reference with a fixed
+/// sentence (`SEC-11`). The `ctx` names the operation in the log and the
+/// words the caller reads, so each surface keeps its own.
+pub(crate) fn export_failure(
+    ctx: &upstream_error::Context,
+    err: &crate::export::ExportError,
+) -> ApiError {
+    match err {
+        crate::export::ExportError::Source(ch) => upstream_error::ch_error(ctx, ch),
+        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+    }
+}
 
 /// The `/api/auth/*` sub-router (Task 3.2), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
@@ -196,6 +224,7 @@ const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
 /// | `/api/alerts/run`               | 60               |
 /// | `/api/query/run`                | 60 (BI-5: the longest configured limit + 15, see [`deadline_for`]) |
 /// | board routes (`/api/dashboard`, `/api/embed/*`, `/api/public/dashboard/*`, `/api/render/data`) | 60 (BI-5: an outer cap of 35 minutes, see [`deadline_for`]) |
+/// | `/api/query/run/{id}/download`   | no TS handler (QS-2: an outer cap of 35 minutes, see [`crate::query_limits::BOARD_DEADLINE_CAP`]) |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
 ///
 /// `/api/uploads` has no TypeScript handler to mirror and takes
@@ -215,6 +244,11 @@ fn route_timeout(path: &str) -> Duration {
         // gets the export deadline too.
         "/api/dashboard/chart-export" | "/api/dashboard/table-export" | "/api/dashboard/import" => {
             EXPORT_REQUEST_TIMEOUT
+        }
+        // QS-2: a download of a whole result writes a file that can be
+        // gigabytes, so it gets the same outer bound as a board.
+        other if other.starts_with("/api/query/run/") && other.ends_with("/download") => {
+            crate::query_limits::BOARD_DEADLINE_CAP
         }
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
         // RPT-1: "Send now" makes the PDF and the chart files in the request,
@@ -1052,6 +1086,29 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users/{id}/tenants/{tenant_id}",
             axum::routing::put(identity::add_user_to_tenant),
         )
+        // ADM-4 D2: take a user out of a tenant — the counterpart of the
+        // PUT above, under the same "who may" rule. `{id}` and
+        // `{tenant_id}` are validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/tenants/{tenant_id}",
+            axum::routing::delete(identity::remove_user_from_tenant),
+        )
+        // ADM-4 D1: replace a user's local role set. The body names the
+        // user's COMPLETE role set; `{id}` is validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/roles",
+            axum::routing::put(identity::set_user_roles),
+        )
+        // ADM-4 D3: switch a user off, and back on again. Both take no
+        // body; `{id}` is validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/deactivate",
+            axum::routing::post(identity::deactivate_user),
+        )
+        .route(
+            "/api/identity/users/{id}/reactivate",
+            axum::routing::post(identity::reactivate_user),
+        )
         // ADM-3 D2: hand an existing user a new temporary password. The
         // password is generated server-side and returned once; `{id}` is
         // validated inside the handler (400 when malformed, 404 when
@@ -1214,6 +1271,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/status", get(alerts::status))
+        // `BI-40` D1: a person's door for one rule, next to the scheduler's
+        // (`/api/alerts/run`, unchanged, still behind `check_run_token`).
+        .route("/api/alerts/test", post(alerts::test_one))
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .route(
             "/api/gold/export/{mart}",
@@ -1235,6 +1295,56 @@ pub fn router(state: AppState) -> Router {
             "/api/query/saved",
             get(query::list_saved).post(query::create_saved),
         )
+        // QS-3: the saved-query surface. Every route is `query:read` at
+        // the gate; the level the caller holds on the item (view, edit or
+        // manage) is checked in the handler, so a route that changes
+        // something needs `edit` and a route that shares, deletes or
+        // restores needs `manage`. An item the caller may not see is a
+        // 404, never a 403 (no existence leak).
+        .route(
+            "/api/query/saved/{id}",
+            get(saved_queries::get_saved)
+                .patch(saved_queries::patch_saved)
+                .delete(saved_queries::delete_saved),
+        )
+        .route(
+            "/api/query/saved/{id}/duplicate",
+            post(saved_queries::duplicate_saved),
+        )
+        .route(
+            "/api/query/saved/{id}/restore",
+            post(saved_queries::restore_saved),
+        )
+        .route("/api/query/saved-trash", get(saved_queries::list_trash))
+        .route(
+            "/api/query/saved/{id}/versions",
+            get(saved_queries::list_versions),
+        )
+        .route(
+            "/api/query/saved/{id}/versions/{version}/revert",
+            post(saved_queries::revert_version),
+        )
+        .route(
+            "/api/query/folders",
+            get(saved_queries::list_folders).post(saved_queries::create_folder),
+        )
+        .route(
+            "/api/query/folders/{id}",
+            axum::routing::patch(saved_queries::patch_folder).delete(saved_queries::delete_folder),
+        )
+        // QS-3: the sharing surface. The access lists need `manage` on the
+        // item -- reading who else has access is part of sharing -- and
+        // the grantee search answers with the people and the roles of the
+        // caller's organisation.
+        .route(
+            "/api/query/saved/{id}/access",
+            get(saved_queries::get_query_access).put(saved_queries::put_query_access),
+        )
+        .route(
+            "/api/query/folders/{id}/access",
+            get(saved_queries::get_folder_access).put(saved_queries::put_folder_access),
+        )
+        .route("/api/query/grantees", get(saved_queries::search_grantees))
         .route("/api/query/history", get(query::list_history))
         .route("/api/query/run/{id}/download", get(query::download))
         .route("/api/query/scheduling", get(query::scheduling))
@@ -1695,6 +1805,67 @@ mod tests {
             route_timeout("/api/dashboard/export"),
             DEFAULT_REQUEST_TIMEOUT
         );
+    }
+
+    /// `QS-2`: a download of a whole result writes a file that can be
+    /// gigabytes, so it gets the same outer bound as a board. The run route
+    /// itself keeps the default, and a path that has nothing to do with a
+    /// download keeps it too.
+    #[test]
+    fn a_result_download_gets_the_board_outer_bound() {
+        assert_eq!(
+            route_timeout("/api/query/run/q-1750000000/download"),
+            crate::query_limits::BOARD_DEADLINE_CAP
+        );
+        assert_eq!(route_timeout("/api/query/run"), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(route_timeout("/api/catalog"), DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /// The sentence a query string the route cannot read is told is written
+    /// down once in the crate (`QS-2`): one constant, so the routes that
+    /// answer with it cannot drift apart. The scan counts the quoted
+    /// sentence over the crate's own sources, so a second copy of it fails
+    /// this test.
+    #[test]
+    fn the_unreadable_query_string_is_written_down_once() -> std::io::Result<()> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files)?;
+        // The quoted sentence, so a prose mention of it in a doc comment is
+        // not counted: only a copy of the words themselves is.
+        let quoted = format!("{QUERY_STRING_UNREADABLE:?}");
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path)?;
+            let count = text.matches(&quoted).count();
+            if count > 0 {
+                let name = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path.as_path())
+                    .display()
+                    .to_string();
+                found.push((name, count));
+            }
+        }
+        assert_eq!(
+            found,
+            vec![("routes/mod.rs".to_owned(), 1)],
+            "the sentence must be written down once, in routes/mod.rs"
+        );
+        Ok(())
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                rust_files(&path, out)?;
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        Ok(())
     }
 
     /// `BI-5` plan D4: the query route follows the longest configured limit

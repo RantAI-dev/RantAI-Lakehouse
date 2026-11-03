@@ -24,19 +24,19 @@ Organise, share and recover saved queries.
 | --- | --- | --- |
 | Manage | Create and list only | Edit, rename, duplicate, move, delete (to a trash kept 30 days, proposed) |
 | Folders | None | Folders and a personal space |
-| Sharing | Everyone | Four levels per query or folder: view, run, edit, manage (Databricks) |
+| Sharing | Everyone | Three levels per query or folder: view, edit, manage (decision 1 of the feature page) |
 | History | None | Last 15 versions with author and time, revert to any (Metabase) |
 | Search | Not checked | Search saved queries by name and SQL text |
 
 ## Benchmark
 
-Databricks: folders, sharing CAN VIEW / CAN RUN / CAN EDIT / CAN MANAGE. Metabase: collections with permissions; 15 versions of history with revert.
+Databricks: folders, sharing CAN VIEW / CAN RUN / CAN EDIT / CAN MANAGE. Metabase: collections with permissions; 15 versions of history with revert. The product takes three of Databricks' four levels, view, edit and manage (decision 1 of the feature page); the separate "run" level is dropped.
 
 ## Acceptance checklist
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- `QS-3-AC1` A query shared as 'run' can be run but not changed
+- `QS-3-AC1` A query shared at 'view' can be run but not changed (decision 1 of the feature page)
 - `QS-3-AC2` Reverting to version 3 restores its SQL
 - `QS-3-AC3` A deleted query is restored from the trash
 - `QS-3-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)

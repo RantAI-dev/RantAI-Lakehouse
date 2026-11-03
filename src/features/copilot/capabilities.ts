@@ -31,7 +31,9 @@ export const CAPABILITIES: Capability[] = [
       // BI-1 / AI-10: "give me this dashboard as a PDF" is a question, not a change: a link, in Ask mode too.
       "export_dashboard", "export_chart",
       // RPT-1 / AI-10: listing one's scheduled reports is a question too.
-      "list_report_subscriptions"],
+      "list_report_subscriptions",
+      // BI-37 D8: what people wrote on a dashboard is a read, so Ask mode offers it (the route's own list).
+      "list_dashboard_comments"],
   },
   {
     key: "dashboard",
@@ -60,6 +62,8 @@ export const CAPABILITIES: Capability[] = [
       "rename_board", "delete_board", "arrange_board", "move_chart", "set_board_view_filters", "save_board_filters",
       // BI-1 / AI-10: a download link for a dashboard (PDF) or a chart's data (Excel, CSV). Read-only, so Ask mode can offer them too.
       "export_dashboard", "export_chart",
+      // BI-37 D8: the dashboard's comments, read through the route's own list (read-only, so Ask mode can offer it too).
+      "list_dashboard_comments",
       // RPT-1 / AI-10: scheduled reports by email. Creating one for the person alone waits for the Confirm button;
       // naming anyone else, and every delete, waits in Approvals (the composer sends this list as the allowlist, see BI-8 R1).
       "list_report_subscriptions", "create_report_subscription", "update_report_subscription", "delete_report_subscription",

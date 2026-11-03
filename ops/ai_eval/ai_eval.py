@@ -574,10 +574,14 @@ DELETE_ROUTES = {
     "source": "/api/dashboard/sources",
     "board": "/api/dashboard/boards",
     "metric": "/api/dashboard/metrics",
+    # BI-37: an alert or digest rule, deleted by id like the others
+    # (`DELETE /api/alerts?id=`).
+    "alert": "/api/alerts",
 }
 # Newest first: a chart may use a field, a field a source, and a board holds
-# charts, so the dependants go before what they depend on.
-CLEANUP_ORDER = ("chart", "metric", "field", "source", "board")
+# charts, so the dependants go before what they depend on. An alert watches a
+# chart, so it goes before the charts.
+CLEANUP_ORDER = ("alert", "chart", "metric", "field", "source", "board")
 
 
 def kind_of_path(path: str) -> str | None:
@@ -848,29 +852,33 @@ def collect_created(
     confirms: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
     """Every object this run created: setup calls, trace results marked
-    created with an id, and the calculated fields and boards the tools made."""
+    created with an id, the calculated fields and boards the tools made, and
+    (BI-37) the alert or digest rule `create_alert_rule` saved."""
     found = list(setup_created)
-    for trace in traces:
-        for step in trace:
-            result = step.get("result") or {}
-            if not isinstance(result, dict) or not result.get("id"):
-                continue
-            tool = step.get("tool")
+
+    def note(tool: str | None, result: Any) -> None:
+        """Collect one reply's object, by the shape that tool answers with."""
+        if not isinstance(result, dict):
+            return
+        if result.get("id"):
             if tool == "create_chart" and result.get("created"):
                 found.append({"kind": "chart", "id": str(result["id"])})
             elif tool == "create_board" and result.get("created"):
                 found.append({"kind": "board", "id": str(result["id"])})
             elif tool == "create_calculated_field" and result.get("ok") is True:
                 found.append({"kind": "field", "id": str(result["id"])})
+            return
+        # BI-37: `create_alert_rule` answers `{ok: true, rule: {id, ...}}` — the
+        # object to clean up is the rule, not the reply.
+        rule = result.get("rule")
+        if tool == "create_alert_rule" and isinstance(rule, dict) and rule.get("id"):
+            found.append({"kind": "alert", "id": str(rule["id"])})
+
+    for trace in traces:
+        for step in trace:
+            note(step.get("tool"), step.get("result"))
     for confirm in confirms:
-        tool = confirm.get("tool")
-        result = confirmed_result(confirm)
-        if result.get("id") and result.get("created"):
-            kind = {"create_chart": "chart", "create_board": "board"}.get(tool or "")
-            if kind:
-                found.append({"kind": kind, "id": str(result["id"])})
-        if tool == "create_calculated_field" and result.get("id") and result.get("ok") is True:
-            found.append({"kind": "field", "id": str(result["id"])})
+        note(confirm.get("tool"), confirmed_result(confirm))
     return found
 
 

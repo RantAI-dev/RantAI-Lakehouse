@@ -13,8 +13,9 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { notifyMentionsRead } from "@/lib/mention-events"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { SidebarProvider } from "@/components/ui/sidebar"
@@ -77,6 +78,38 @@ describe("AppNavbar notification panel (BI-19 QA-2)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }))
     await waitFor(() => expect(markRead).toHaveBeenCalledTimes(1))
+  })
+
+  // BI-38 D6: opening a dashboard's comments marks that dashboard read from a
+  // feature, far from the navbar; the bell reloads from the event.
+  it("reloads its notifications when a mention is marked read elsewhere", async () => {
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return Promise.resolve(json({ id: "u1", name: "Analyst", email: null, roles: [], permissions: [], tenants: [] }))
+      }
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+    const list = spyOn(notificationsService, "list").mockResolvedValue({
+      supported: true,
+      openAlerts: [],
+      pendingApprovals: [],
+      unreadMentions: [],
+      unreadMentionsUnavailable: null,
+    } as never)
+
+    render(
+      <AuthProvider>
+        <CopilotProvider>
+          <SidebarProvider>
+            <AppNavbar />
+          </SidebarProvider>
+        </CopilotProvider>
+      </AuthProvider>,
+    )
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1))
+    act(() => notifyMentionsRead())
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2))
   })
 })
 
