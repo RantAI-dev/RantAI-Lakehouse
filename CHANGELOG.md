@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Added
+
+- Comments are limited to ten per person in any five minutes, on all dashboards together (backlog `BI-38`; plan `docs/superpowers/plans/2026-11-02-bi-38-comment-limits.md`). The count is read inside the posting transaction under a per-author lock and includes deleted comments, so a loop cannot dodge it by deleting; the eleventh answer is a 429 with `Retry-After` and "You have posted many comments in a few minutes. Try again in a moment.", and nothing is written — no comment, no bell line, no email. An edit is not counted, and access is still checked first, so a dashboard the caller cannot see is the same 404. Opening a dashboard's comments now marks that dashboard's mentions read (`POST /api/dashboard/comments/mentions/read` with `{"board": "<id>"}`), so the bell drops a conversation the reader has just opened; `{}` still marks every mention, as the bell's "Mark all as read" does. Migration `0121_dashboard_comment_author_index.sql` adds the index the count reads.
+
 ## [0.2.0] - 2026-11-02
 
 ### Security

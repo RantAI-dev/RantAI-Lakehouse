@@ -11,7 +11,25 @@
 //! | `PUT /api/dashboard/comments/{id}` | signed in, `view`, the author | change its text and mentions |
 //! | `DELETE /api/dashboard/comments/{id}` | signed in, `view`, the author or `manage` | remove it |
 //! | `GET /api/dashboard/comments/people?board=&q=` | signed in, `view` | the @ picker: people who can see the dashboard |
-//! | `POST /api/dashboard/comments/mentions/read` | signed in | mark the caller's mentions read (the bell) |
+//! | `POST /api/dashboard/comments/mentions/read` | signed in | mark the caller's mentions read: all of them, or one dashboard's |
+//!
+//! # Posting limit (`BI-38`)
+//!
+//! One person may post at most ten comments in any five minutes, on all
+//! dashboards together (`BI-38` D1). The store counts and decides inside the
+//! writing transaction, under a per-author lock (`BI-38` D2); this module maps
+//! a refusal to a 429 with `Retry-After` and one fixed sentence (`BI-38` D3).
+//! Access is checked first, so a dashboard the caller cannot see is still a
+//! 404 and the limit is no oracle for whether a board exists (`BI-38` D4). An
+//! edit is not counted (D4) and a deleted post keeps its place (D2).
+//!
+//! # Marking mentions read (`BI-38` D5)
+//!
+//! `{}` marks every unread mention of the caller (the bell's "Mark all as
+//! read"); `{"board": "<id>"}` first resolves that dashboard exactly as the
+//! other comment routes do (`404 dashboard not found.` for one the caller
+//! cannot see) and then marks only the mentions on its comments. Opening a
+//! dashboard's comments sends the latter (`BI-38` D6).
 //!
 //! The router asks only "signed in": the level is a property of the dashboard,
 //! so the handlers work it out with the same [`Scope`] the other BI-19 routes
@@ -67,7 +85,7 @@ use lakehouse_bi::access::Level;
 use lakehouse_bi::store::{self, Board};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
-use lakehouse_store::dashboard_comments::{self as comments, Comment};
+use lakehouse_store::dashboard_comments::{self as comments, Comment, PostOutcome};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -90,6 +108,12 @@ const TOO_LONG: &str = "A comment can have at most 2000 characters.";
 const CONTROL_CHARS: &str = "A comment cannot contain control characters.";
 const MENTION_REFUSED: &str = "One of the people mentioned cannot see this dashboard.";
 const TOO_MANY_MENTIONS: &str = "A comment can mention at most 20 people.";
+/// The one sentence a poster at the limit gets (`BI-38` D3). `pub` so the route
+/// tests assert the exact text; it says nothing about the dashboard, only about
+/// the caller's own posting.
+pub const TOO_MANY_POSTS: &str =
+    "You have posted many comments in a few minutes. Try again in a moment.";
+const MARK_READ_SHAPE: &str = "body must be {\"board\"?: string}";
 /// The one sentence a service identity (a run token or API key) gets on every
 /// comment route. `pub` so the route tests assert the exact text; comments are
 /// a human conversation, and a service identity has no name to show on one.
@@ -435,7 +459,9 @@ struct EditBody {
 ///
 /// As [`list`]; also `400` for a body of another shape, an empty, oversized or
 /// control-character text, or a mention of somebody who cannot see the
-/// dashboard (one sentence for every reason).
+/// dashboard (one sentence for every reason); `429` with `Retry-After` when the
+/// caller has posted ten comments in five minutes (`BI-38` D1 to D3), in which
+/// case nothing is written.
 pub async fn post(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -445,18 +471,30 @@ pub async fn post(
     let parsed: PostBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BODY_SHAPE.to_owned()))?;
     // Access before the body is judged: a caller who cannot see the dashboard
-    // learns nothing from the validation sentences.
+    // learns nothing from the validation sentences, and the limit below is
+    // never read for a board they cannot see (`BI-38` D4).
     let target = target_for(&state, &principal, &parsed.board).await?;
     let text = checked_text(&parsed.body)?;
     let author = principal.id.uuid();
     let mentions = parsed_mentions(&parsed.mentions, author)?;
     require_all_see(&state, &principal, &target, &mentions).await?;
     let pool = pool_of(&state)?;
-    let (id, to_email) = comments::insert(pool, &target.key, author, &text, &mentions)
+    match comments::insert(pool, &target.key, author, &text, &mentions)
         .await
-        .map_err(|e| store_failure(&e))?;
-    notify(&state, &principal, &target, &to_email);
-    Ok(ApiJson(one_json(&state, &principal, &target, id).await?))
+        .map_err(|e| store_failure(&e))?
+    {
+        PostOutcome::Posted { id, email } => {
+            notify(&state, &principal, &target, &email);
+            Ok(ApiJson(one_json(&state, &principal, &target, id).await?))
+        }
+        // BI-38 D3: the store wrote nothing, so there is no comment to return,
+        // no mention line and no email; the header says when to try again.
+        PostOutcome::TooMany { retry_after_secs } => Err(ApiError::TooManyRequests {
+            message: TOO_MANY_POSTS.to_owned(),
+            retry_after_secs,
+        }
+        .into()),
+    }
 }
 
 /// `PUT /api/dashboard/comments/{id}` — the author changes the text and,
@@ -596,18 +634,55 @@ pub async fn people(
     Ok(ApiJson(json!({ "items": shown })))
 }
 
-/// `POST /api/dashboard/comments/mentions/read` — the caller's mentions are
-/// read (what the bell's "mark as read" calls).
+/// The body of `POST /api/dashboard/comments/mentions/read` (`BI-38` D5): absent
+/// or `{}` means every mention, a `board` means that dashboard's only. Another
+/// shape is our `400`, not the extractor's text.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkReadBody {
+    #[serde(default)]
+    board: Option<String>,
+}
+
+/// `POST /api/dashboard/comments/mentions/read` — the caller's unread mentions
+/// are read: every one (`{}`, what the bell's "Mark all as read" calls), or
+/// only those on one dashboard (`{"board": "<id>"}`, what opening that
+/// dashboard's comments sends; `BI-38` D5, D6).
+///
+/// An empty body is `{}`: the route took no body before `BI-38`, and that
+/// request still means "all".
 ///
 /// # Errors
 ///
-/// `503` without a database.
+/// `400` for a body of another shape; `404 dashboard not found.` for a board the
+/// caller cannot see (the same answer as for an unknown one); `503` without a
+/// database.
 pub async fn mark_read(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    let parsed: MarkReadBody = if body.is_empty() {
+        MarkReadBody { board: None }
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| ApiError::BadRequest(MARK_READ_SHAPE.to_owned()))?
+    };
+    // A named board is resolved exactly as the other comment routes do, before
+    // anything is marked: a board the caller cannot see is a 404, and the
+    // answer says nothing about whether it exists (`BI-38` D5).
+    let board = match parsed.board.as_deref() {
+        None => None,
+        Some(raw) => {
+            let id = raw.trim();
+            if id.is_empty() {
+                return Err(ApiError::BadRequest(MARK_READ_SHAPE.to_owned()).into());
+            }
+            Some(target_for(&state, &principal, id).await?.key)
+        }
+    };
     let pool = pool_of(&state)?;
-    let marked = comments::mark_mentions_read(pool, principal.id.uuid())
+    let marked = comments::mark_mentions_read(pool, principal.id.uuid(), board.as_deref())
         .await
         .map_err(|e| store_failure(&e))?;
     Ok(ApiJson(json!({ "marked": marked })))
