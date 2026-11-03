@@ -2216,8 +2216,9 @@ bundle="rantai-lakehouse-$version-linux-x86_64.tar.zst"
 sha256sum -c SHA256SUMS                         # every part, and the release's other files
 cat "$bundle".part-* > "$bundle"                # name order: part-00, part-01, …
 sha256sum -c "$bundle.sha256"                   # the joined file, as the release published it
-tar --zstd -xf "$bundle"
-./lakehousectl install --bundle <the directory you unpacked into>
+mkdir -p bundle
+tar --zstd -xf "$bundle" -C bundle
+./bundle/lakehousectl install --bundle bundle   # the bundle carries the installer
 ```
 
 A part that does not match is named by `sha256sum -c SHA256SUMS` before anything is
