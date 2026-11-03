@@ -713,5 +713,21 @@
       "SELECT",
       "geoDistance"
     ]
+  },
+  {
+    "id": "alert_test_run_now",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "rule", "method": "POST", "path": "/api/alerts", "body": {"name": "Eval Alert Test Run", "type": "alert", "mart": "mart_event", "measure": "jumlah_event", "agg": "sum", "op": ">", "threshold": 1000000000, "channel": "email", "target": "e@example.com"}, "id_at": "rule.id"}
+    ],
+    "cleanup": [
+      {"method": "DELETE", "path": "/api/alerts?id={rule}"}
+    ],
+    "turns": ["Test my alert {rule} now."],
+    "expect_tool": {"name": "run_alert_rule", "args_contains": {"id": "{rule}"}},
+    "expect_state": [
+      {"path": "/api/alerts", "list": "rules", "where": {"id": "{rule}", "enabled": true}, "count": 1, "scope": "all"}
+    ]
   }
 ]
