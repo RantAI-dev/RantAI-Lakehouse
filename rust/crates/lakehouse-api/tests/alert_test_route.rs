@@ -23,6 +23,7 @@ use axum::http::{Request, StatusCode};
 use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+use uuid::Uuid;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
@@ -103,6 +104,19 @@ impl Respond for FakeCh {
     }
 }
 
+/// The app under test, with `serving.mart_x` in the tenant that owns it
+/// (`SEC-50` slice 2 M11).
+///
+/// A person testing a rule reads as THEMSELVES (the tenant gate runs as the
+/// caller, `GateActor::Caller`), not as the scheduler's catalog tenant, so a
+/// test over the shared catalog needs a deployment that names the catalog's
+/// tenant and callers who are members of it. The seeded identity migration
+/// holds four tenants and this app named no `CATALOG_TENANT_ID`, so the gate
+/// found no tenant that owns the catalog and refused the statement with
+/// `SEC-20`'s 404 ("Table not found or not available to your organisation:
+/// `serving.mart_x`") — the fixture, not the route, was wrong. The membership
+/// is added here, where the app is built, so every test in this file has the
+/// same shape (`common::in_the_catalog_tenant`, as the other gated tests do).
 async fn app() -> TestApp {
     let ch = MockServer::start().await;
     Mock::given(method("POST"))
@@ -111,8 +125,25 @@ async fn app() -> TestApp {
         })
         .mount(&ch)
         .await;
-    let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
-    spin_up_with_env(&env).await
+    let env: HashMap<String, String> = HashMap::from([
+        ("CH_URL".to_owned(), ch.uri()),
+        (
+            "CATALOG_TENANT_ID".to_owned(),
+            common::CATALOG_TENANT.to_owned(),
+        ),
+    ]);
+    let app = spin_up_with_env(&env).await;
+    // Only the caller who reads a mart needs the membership: the two refusals
+    // (an unknown id, and a connector rule of a tenant the caller does not
+    // see) must keep Andi outside Meridian Group, or she would see its
+    // connector rule.
+    let user: Uuid = sqlx::query_scalar("SELECT id FROM app_user WHERE email = $1")
+        .bind("bayu@meridian.example")
+        .fetch_one(&app.pool)
+        .await
+        .expect("a seeded user");
+    common::in_the_catalog_tenant(&app.pool, user).await;
+    app
 }
 
 async fn test_run(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) {

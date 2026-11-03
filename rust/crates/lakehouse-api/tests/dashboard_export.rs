@@ -189,11 +189,28 @@ async fn get(router: &axum::Router, uri: &str, cookie: &str) -> axum::http::Resp
         .unwrap()
 }
 
+/// The app, its pool and the exporter's session cookie.
+///
+/// `SEC-50` slice 2 review round 2 `BLOCKER 1`: the export reads the shared
+/// catalog (`serving.mart_x`), and from slice 2 that read goes through the
+/// tenant gate (`StatementGate` as the caller). The seeded identity
+/// migration holds four tenants and this app names no `CATALOG_TENANT_ID`,
+/// so the gate found no tenant that owns the catalog and refused the
+/// statement with `SEC-20`'s 404 (`Table not found or not available to your
+/// organisation: serving.mart_x`) — the fixture, not the route, was wrong.
+/// The deployment now names the catalog's tenant and the exporter is a
+/// member of it, exactly as the other gated tests do
+/// (`common::in_the_catalog_tenant`).
 async fn app(ch: &MockServer) -> (axum::Router, PgPool, String) {
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     let user = exporter(&pool).await;
+    common::in_the_catalog_tenant(&pool, user).await;
     let cookie = session_cookie_for_user(&pool, user).await;
     (router, pool, cookie)
 }

@@ -249,7 +249,19 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
 /// refused by the auth gate; with no session the router answers 401.
 #[tokio::test]
 async fn the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right() {
-    let TestApp { router, pool } = spin_up().await;
+    // `SEC-50` slice 2 review round 2 BLOCKER 1, the same fixture rule as
+    // `tests/dashboard_export.rs`: the mart rule below reads the shared
+    // catalog, and the tenant gate runs before the `alert:write` check this
+    // test is about. Without a catalog tenant the gate answers `SEC-20`'s
+    // 404 for `serving.m` and the Analyst never reaches the 403. The
+    // deployment names the catalog's tenant and both seeded readers are in
+    // it, so the only refusal left is the permission.
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     for method in ["POST", "PUT", "DELETE"] {
         assert_eq!(
             POLICY_TABLE
@@ -274,6 +286,14 @@ async fn the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_t
             StatusCode::UNAUTHORIZED,
             "{method} with no session"
         );
+    }
+    for email in ["sari@meridian.example", "bayu@meridian.example"] {
+        let (id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind(email)
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded reader (0002_seed_identity.sql)");
+        common::in_the_catalog_tenant(&pool, id).await;
     }
     let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
     let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;

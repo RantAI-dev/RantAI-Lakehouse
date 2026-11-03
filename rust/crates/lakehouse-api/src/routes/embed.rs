@@ -448,6 +448,12 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         render_board_payload(
             &state.clickhouse,
             &PolicyEngineObligations::from_state(&state),
+            // `SEC-50` slice 2 D3: an embed is read by nobody in particular,
+            // so it acts as the deployment's catalog tenant.
+            &crate::routes::query::StatementGate::clickhouse(
+                &state,
+                crate::routes::query::GateActor::CatalogTenant,
+            ),
             &board,
             &board_id,
             &filters,
@@ -563,6 +569,12 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
             &time,
         ),
         crate::routes::dashboard::EMBED_VALUES_LIMIT,
+        // `SEC-50` slice 2 D3: an embed is read by nobody in particular, so
+        // it acts as the deployment's catalog tenant.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::CatalogTenant,
+        ),
     )
     .await
     {
@@ -950,19 +962,39 @@ pub async fn public_dashboard(
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
-    let board = match crate::routes::public_links::resolve(&state, &token).await {
-        Ok(crate::routes::public_links::Resolved::Open(open)) => {
-            if let Some(refusal) =
-                crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
-            {
-                return refusal;
-            }
-            open.board
-        }
+    let open = match crate::routes::public_links::resolve(&state, &token).await {
+        Ok(crate::routes::public_links::Resolved::Open(open)) => open,
         Ok(crate::routes::public_links::Resolved::Gone) => {
             return crate::routes::public_links::not_found();
         }
         Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    if let Some(refusal) =
+        crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
+    {
+        return refusal;
+    }
+    let board = open.board;
+    // `SEC-50` slice 2 D4/M8: the link acts as the tenant that made it.
+    // The creator is read as they are now; a link with no creator (or with a
+    // creator who is gone) has no owner and reaches nothing.
+    let creator = match crate::routes::public_links::creator_of(&state, &open.link).await {
+        Ok(creator) => creator,
+        Err(response) => return response,
+    };
+    // The creator's own headers: a public link is read by nobody in
+    // particular, so the tenant is the creator's first tenant (D4).
+    let no_headers = HeaderMap::new();
+    let actor = match (&creator, open.link.tenant_id) {
+        (Some(principal), Some(tenant_id)) => crate::routes::query::GateActor::AsTenant {
+            principal,
+            tenant_id: Some(tenant_id),
+        },
+        (Some(principal), None) => crate::routes::query::GateActor::Caller {
+            principal,
+            headers: &no_headers,
+        },
+        (None, _) => crate::routes::query::GateActor::Ownerless,
     };
 
     let filters = board.filters.clone().unwrap_or_default();
@@ -987,6 +1019,7 @@ pub async fn public_dashboard(
         render_board_payload(
             &state.clickhouse,
             &PolicyEngineObligations::from_state(&state),
+            &crate::routes::query::StatementGate::clickhouse(&state, actor),
             &board,
             &board_id,
             &filters,
@@ -1375,9 +1408,17 @@ struct Narrowing<'a> {
               borrows eleven locals, so a helper would need as many \
               parameters as the body has lines it saves"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one pipeline (read the board's charts and sources, run every tile \
+              through `tile_pool`, assemble the payload); the gate \
+              (`SEC-50` slice 2) is one argument more than the limit, and a \
+              struct for it alone would hide what the pipeline reads"
+)]
 async fn render_board_payload(
     ch: &ChClient,
     obligations: &PolicyEngineObligations<'_>,
+    gate: &crate::routes::query::StatementGate<'_>,
     board: &Board,
     board_id: &str,
     filters: &[FilterDef],
@@ -1426,6 +1467,7 @@ async fn render_board_payload(
         crate::routes::layers::layer_sources(ch, stored_for_board.iter().copied()).await;
     let layer_runner = crate::routes::layers::RoleRunner {
         ch,
+        gate,
         roles: &roles,
         placeholders: &placeholders,
         obligations,
@@ -1489,6 +1531,7 @@ async fn render_board_payload(
                                 &filtered.sql,
                                 run_spec_sql(
                                     ch,
+                                    gate,
                                     &c.spec.id,
                                     &filtered.sql,
                                     roles_ref,
@@ -1504,6 +1547,7 @@ async fn render_board_payload(
                             // paging.
                             crate::routes::support::annotate_table(
                                 ch,
+                                gate,
                                 &mut val,
                                 &filtered,
                                 (roles_ref, placeholders_ref, obligations),
@@ -1757,9 +1801,11 @@ mod typed_filters {
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
 
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &filters,
@@ -1909,9 +1955,11 @@ mod typed_filters {
             owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &filters,
@@ -2022,9 +2070,11 @@ mod typed_filters {
         let locked: Vec<FilterDef> =
             serde_json::from_str(r#"[{"column":"kab","values":["b","c"]}]"#).unwrap();
 
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &locked,
@@ -2127,9 +2177,11 @@ mod typed_filters {
             lakehouse_bi::grain::WeekStart::Monday,
         )
         .unwrap();
+        let state = crate::state::AppState::without_a_database();
         render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &[],

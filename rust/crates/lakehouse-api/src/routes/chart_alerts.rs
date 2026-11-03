@@ -34,7 +34,7 @@
 //! refused when saved and skipped with a recorded reason when the restriction
 //! is added later. A store that cannot answer counts as restricted.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use lakehouse_alerts::{
     AlertChannel, AlertKind, AlertRule, AlertRuleInput, Reading, RunResult, SilenceSource,
     StateSource,
@@ -147,15 +147,22 @@ async fn read(state: &AppState, rule: &AlertRule) -> Result<Reading, Unreadable>
     // BI-19 C (PR #250 CI): a number that decides a send is never a remembered
     // one (the recovery would arrive a cache age late).
     .fresh_chart(chart_id);
-    let payload = match crate::routes::dashboard::payload_for(state, &principal, &query).await {
-        Ok(payload) => payload,
-        Err(response) => {
-            return Err(match response.status() {
-                StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => Unreadable::Stop(LOST_ACCESS),
-                _ => failed(UNREADABLE),
-            });
-        }
-    };
+    // `SEC-50` slice 2 M4: the chart alert reads as the person who set it —
+    // their first tenant, because the runner sends no `X-Tenant` header.
+    // A refusal is the tile's own error, which this module already turns
+    // into `failed(UNREADABLE)`.
+    let payload =
+        match crate::routes::dashboard::payload_for(state, &principal, &query, &HeaderMap::new())
+            .await
+        {
+            Ok(payload) => payload,
+            Err(response) => {
+                return Err(match response.status() {
+                    StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => Unreadable::Stop(LOST_ACCESS),
+                    _ => failed(UNREADABLE),
+                });
+            }
+        };
     let Some(tile) = payload.get("results").and_then(|r| r.get(chart_id)) else {
         return Err(failed(UNREADABLE));
     };

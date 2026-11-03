@@ -226,16 +226,21 @@ pub(crate) fn render_stored_spec(spec: &store::ChartSpec, source: ChartSource) -
 /// silently execute the unrewritten `sql` instead.
 pub(crate) async fn run_spec_sql(
     ch: &ChClient,
+    gate: &crate::routes::query::StatementGate<'_>,
     id: &str,
     sql: &str,
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
 ) -> (String, Value) {
-    let result = match try_run_spec_sql(ch, sql, roles, placeholders, obligations).await {
+    let result = match try_run_spec_sql(ch, gate, sql, roles, placeholders, obligations).await {
         Ok(result) => result,
         Err(SpecRunFailure::Refused(message)) => json!({ "error": message }),
         Err(SpecRunFailure::Tile(answer)) => answer,
+        // `SEC-50` slice 2 M3: the gate's own refusal, in the tile's own
+        // error slot — the same sentence the route would have answered with,
+        // so a tile that may not read its table says why.
+        Err(SpecRunFailure::Gated(err)) => json!({ "error": err.to_string() }),
         // SEC-11: a tile on a public or embed link is read by someone with
         // no sign-in; the database's text goes to the log under the id.
         Err(SpecRunFailure::Clickhouse(err)) => {
@@ -252,6 +257,13 @@ pub(crate) async fn run_spec_sql(
 pub(crate) enum SpecRunFailure {
     /// Refused by the policy rewrite before any query ran; the text is fixed.
     Refused(&'static str),
+    /// `SEC-50` slice 2 M3: refused by the tenant gate before the rewrite
+    /// and before the engine.
+    ///
+    /// The gate's own error, kept as it is: the sentence is `SEC-20`'s (a
+    /// 404 naming the table) or D6's (a 422 naming the setting), never
+    /// upstream text, so it may be shown in the tile's error slot.
+    Gated(lakehouse_core::ApiError),
     /// The query ended on a limit or a Stop (`BI-5` plan D6): the tile's
     /// whole answer, with a fixed sentence and, for the time limit, a `limit`
     /// object. Built here so every caller says the same thing and none of
@@ -298,9 +310,12 @@ pub(crate) fn enforcement_message_for(
 /// # Errors
 ///
 /// [`SpecRunFailure::Refused`] when the rewrite refuses (nothing was sent to
-/// `ClickHouse`), [`SpecRunFailure::Clickhouse`] when the query fails.
+/// `ClickHouse`), [`SpecRunFailure::Gated`] when the tenant gate refuses
+/// (nothing was sent to `ClickHouse` either), [`SpecRunFailure::Clickhouse`]
+/// when the query fails.
 pub(crate) async fn try_run_spec_sql(
     ch: &ChClient,
+    gate: &crate::routes::query::StatementGate<'_>,
     sql: &str,
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
@@ -309,6 +324,11 @@ pub(crate) async fn try_run_spec_sql(
     if sql.is_empty() {
         return Ok(json!({ "columns": [], "rows": [] }));
     }
+    // `SEC-50` slice 2 M3: the tenant gate runs BEFORE the rewrite, so a
+    // tile that may not read its table is refused before the policy's own
+    // prefetch asks the engine about that table, before the result cache is
+    // looked up, and before the engine is asked at all.
+    gate.check(sql).await.map_err(SpecRunFailure::Gated)?;
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         sql,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -792,6 +812,7 @@ pub(crate) fn annotate_grain(
 /// as plain numbers, and the failure is only logged under a reference id.
 pub(crate) async fn annotate_bins(
     ch: &ChClient,
+    gate: &crate::routes::query::StatementGate<'_>,
     tile: &mut Value,
     reads: &[lakehouse_bi::builder::BinRead],
     context: (
@@ -801,12 +822,13 @@ pub(crate) async fn annotate_bins(
     ),
 ) {
     if let Value::Object(tile) = tile {
-        add_bins(ch, tile, reads, context).await;
+        add_bins(ch, gate, tile, reads, context).await;
     }
 }
 
 async fn add_bins(
     ch: &ChClient,
+    gate: &crate::routes::query::StatementGate<'_>,
     tile: &mut Map<String, Value>,
     reads: &[lakehouse_bi::builder::BinRead],
     (roles, placeholders, obligations): (
@@ -820,7 +842,7 @@ async fn add_bins(
     }
     let mut out = Map::new();
     for read in reads {
-        match try_run_spec_sql(ch, &read.sql, roles, placeholders, obligations).await {
+        match try_run_spec_sql(ch, gate, &read.sql, roles, placeholders, obligations).await {
             Ok(result) => {
                 let row = &result["rows"][0];
                 out.insert(
@@ -836,7 +858,14 @@ async fn add_bins(
             Err(SpecRunFailure::Clickhouse(err)) => {
                 let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
             }
-            Err(SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_)) => {}
+            // `SEC-50` slice 2 M3: a bin read the gate refused leaves the
+            // bin's label out, exactly as a refused read does — the tile
+            // keeps its rows and says nothing about the bins. The refusal
+            // itself is the tile's own error when the tile's own statement
+            // was refused (it names the same tables).
+            Err(
+                SpecRunFailure::Gated(_) | SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_),
+            ) => {}
         }
     }
     if !out.is_empty() {
@@ -892,6 +921,7 @@ pub(crate) async fn preview_bin_reads(
 /// A tile that carries an error (no `rows`) is left alone.
 pub(crate) async fn annotate_table(
     ch: &ChClient,
+    gate: &crate::routes::query::StatementGate<'_>,
     tile: &mut Value,
     filtered: &FilteredSql,
     (roles, placeholders, obligations): (
@@ -907,10 +937,17 @@ pub(crate) async fn annotate_table(
     if !tile.contains_key("rows") {
         return;
     }
-    add_bins(ch, tile, &filtered.bins, (roles, placeholders, obligations)).await;
+    add_bins(
+        ch,
+        gate,
+        tile,
+        &filtered.bins,
+        (roles, placeholders, obligations),
+    )
+    .await;
     match &filtered.table {
         Some(TableRead::Rows { count_sql }) => {
-            match try_run_spec_sql(ch, count_sql, roles, placeholders, obligations).await {
+            match try_run_spec_sql(ch, gate, count_sql, roles, placeholders, obligations).await {
                 Ok(counted) => {
                     let total = counted["rows"][0]["n"].as_u64().or_else(|| {
                         counted["rows"][0]["n"]
@@ -931,7 +968,12 @@ pub(crate) async fn annotate_table(
                     // a reference id, nothing of it in the response.
                     let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
                 }
-                Err(SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_)) => {}
+                // `SEC-50` slice 2 M3: a count the gate refused leaves the
+                // total out, exactly as a refused count does — the tile
+                // keeps its rows and offers no paging.
+                Err(
+                    SpecRunFailure::Gated(_) | SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_),
+                ) => {}
             }
         }
         Some(TableRead::Pivot { row_cap }) => {
@@ -944,7 +986,7 @@ pub(crate) async fn annotate_table(
         // BI-16 part C1: the Gantt chart's reversed rows, counted through the
         // same role rewrite; a failed count only leaves the note out.
         Some(TableRead::Reversed { count_sql }) => {
-            match try_run_spec_sql(ch, count_sql, roles, placeholders, obligations).await {
+            match try_run_spec_sql(ch, gate, count_sql, roles, placeholders, obligations).await {
                 Ok(counted) => {
                     let n = counted["rows"][0]["n"].as_u64().or_else(|| {
                         counted["rows"][0]["n"]
@@ -961,7 +1003,9 @@ pub(crate) async fn annotate_table(
                 // A refused statement, and (BI-5) a count the time limit or a
                 // Stop ended: the note is left out, as it is for any other
                 // failure.
-                Err(SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_)) => {}
+                Err(
+                    SpecRunFailure::Gated(_) | SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_),
+                ) => {}
             }
         }
         Some(TableRead::Trend { .. }) | None => {}
@@ -1036,6 +1080,7 @@ pub(crate) const PREVIEW_RESULT_ROWS: usize = 2000;
 /// error or the longer read fails (the failure is logged under a reference).
 pub(crate) async fn preview_rows(
     ch: &ChClient,
+    gate: &crate::routes::query::StatementGate<'_>,
     chart: &store::StoredChartSpec,
     result: &Value,
     (roles, placeholders, obligations): (
@@ -1057,9 +1102,13 @@ pub(crate) async fn preview_rows(
             limit,
             u32::try_from(cap + 1).ok()?,
         )?;
-        shown = match try_run_spec_sql(ch, &sql, roles, placeholders, obligations).await {
+        shown = match try_run_spec_sql(ch, gate, &sql, roles, placeholders, obligations).await {
             Ok(rows) => rows,
-            Err(SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_)) => return None,
+            // `SEC-50` slice 2 M3: a statement the gate refused shows no
+            // rows, exactly as a refused statement does.
+            Err(
+                SpecRunFailure::Gated(_) | SpecRunFailure::Refused(_) | SpecRunFailure::Tile(_),
+            ) => return None,
             Err(SpecRunFailure::Clickhouse(err)) => {
                 let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
                 return None;
@@ -1248,6 +1297,15 @@ mod run_spec_sql_enforcement {
     use crate::policy_engine::PolicyEngineObligations;
     use crate::sql_rewrite::PlaceholderValues;
 
+    /// `SEC-50` slice 2 T1: the state the unrestricted gate is built from.
+    ///
+    /// The unrestricted gate reaches everything without a database, so a
+    /// test that is about the rewrite and not about the tenant gate needs
+    /// no deployment.
+    fn gate_state() -> crate::state::AppState {
+        crate::state::AppState::without_a_database()
+    }
+
     /// Mounts the `system.columns` response `PolicyEngineObligations`
     /// needs to resolve `silver.customers`'s real column list, and the
     /// masked-projection query's own response — the ONLY two `ClickHouse`
@@ -1320,8 +1378,10 @@ mod run_spec_sql_enforcement {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
 
+        let state = gate_state();
         let (_id, _val) = run_spec_sql(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             "chart1",
             "SELECT id, email FROM silver.customers",
             &["Analyst".to_owned()],
@@ -1414,6 +1474,7 @@ mod run_spec_sql_enforcement {
                     scope,
                     run_spec_sql(
                         &ch,
+                        &crate::routes::query::StatementGate::unrestricted(&gate_state()),
                         "chart1",
                         "SELECT id, email FROM silver.customers",
                         roles,
@@ -1466,8 +1527,10 @@ mod run_spec_sql_enforcement {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
 
+        let state = gate_state();
         let (id, val) = run_spec_sql(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             "chart1",
             "SELECT 1 AS n",
             &[],
@@ -1515,8 +1578,10 @@ mod run_spec_sql_enforcement {
                 .await;
             let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
             let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+            let state = gate_state();
             let (_, val) = run_spec_sql(
                 &ch,
+                &crate::routes::query::StatementGate::unrestricted(&state),
                 "c",
                 "SELECT 1 AS n",
                 &[],
@@ -1558,8 +1623,10 @@ mod run_spec_sql_enforcement {
             "SELECT 1 AS n{}",
             lakehouse_bi::builder::SQL_SOURCE_SETTINGS
         );
+        let state = gate_state();
         let (_, val) = run_spec_sql(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             "c",
             &sql,
             &[],
@@ -1630,10 +1697,19 @@ mod run_spec_sql_enforcement {
                 .await;
             let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
             let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+            let state = gate_state();
             let (_, val) = super::with_tile_rows(
                 kind,
                 sql,
-                run_spec_sql(&ch, "c", sql, &[], &PlaceholderValues::none(), &obligations),
+                run_spec_sql(
+                    &ch,
+                    &crate::routes::query::StatementGate::unrestricted(&state),
+                    "c",
+                    sql,
+                    &[],
+                    &PlaceholderValues::none(),
+                    &obligations,
+                ),
             )
             .await;
             let requests = server.received_requests().await.unwrap();
@@ -1666,18 +1742,22 @@ mod run_spec_sql_enforcement {
         let run = crate::query_limits::QueryRun::detached();
         let id = uuid::Uuid::parse_str(run.run_id()).unwrap();
         let none = PlaceholderValues::none();
-        let ask = |run: crate::query_limits::QueryRun| {
-            crate::query_limits::scope(
-                run,
-                run_spec_sql(&ch, "c", "SELECT 1 AS n", &[], &none, &obligations),
-            )
-        };
+        let state = gate_state();
+        let gate = crate::routes::query::StatementGate::unrestricted(&state);
         crate::query_limits::mark_stopped(uuid::Uuid::nil(), id);
-        let (_, val) = ask(run).await;
+        let (_, val) = crate::query_limits::scope(
+            run,
+            run_spec_sql(&ch, &gate, "c", "SELECT 1 AS n", &[], &none, &obligations),
+        )
+        .await;
         assert_eq!(val["error"], "Stopped");
         assert!(server.received_requests().await.unwrap().is_empty());
         // Another run of the same person is not affected.
-        let (_, other) = ask(crate::query_limits::QueryRun::detached()).await;
+        let (_, other) = crate::query_limits::scope(
+            crate::query_limits::QueryRun::detached(),
+            run_spec_sql(&ch, &gate, "c", "SELECT 1 AS n", &[], &none, &obligations),
+        )
+        .await;
         assert_eq!(other["rows"].as_array().map(Vec::len), Some(1));
         Ok(())
     }
@@ -1694,8 +1774,10 @@ mod run_spec_sql_enforcement {
             String::new(),
         );
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let state = gate_state();
         let (_id, val) = run_spec_sql(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             "chart1",
             "SELECT 1 AS n",
             &[],
@@ -1724,8 +1806,10 @@ mod run_spec_sql_enforcement {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
 
+        let state = gate_state();
         let (_id, val) = run_spec_sql(
             &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             "chart1",
             "SELECT * FROM url('h', 'CSV')",
             &[],
