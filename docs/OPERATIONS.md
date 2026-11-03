@@ -2186,3 +2186,45 @@ What that means for an operator:
 The pipeline itself, the key, the draft release and the one manual step after the first
 release are documented in [CI.md](CI.md#release-pipeline). The tooling is in
 `ops/release/`.
+
+### The offline bundle is published in parts
+
+GitHub refuses a release asset of 2 GiB or more, and the bundle holds every image the
+release runs, so it is bigger than that (0.2.0's was 3,794,642,569 bytes — the run failed
+with `size must be less than 2147483648`). The release therefore attaches the bundle in
+parts and NOT the whole file (REL-7 D1):
+
+```
+rantai-lakehouse-<version>-linux-x86_64.tar.zst.part-00
+rantai-lakehouse-<version>-linux-x86_64.tar.zst.part-01
+…
+```
+
+Each part is at most 1900 MiB. Two checksums cover them: `SHA256SUMS` lists every part
+beside the release's other assets, and the whole file's own checksum is still an asset,
+`rantai-lakehouse-<version>-linux-x86_64.tar.zst.sha256` — the joined file must match it.
+A part is checked before the parts are joined, and the joined file before it is unpacked,
+so a damaged download is refused at the step that would otherwise install it.
+
+**Join them in name order.** The parts are numbered with `-d` and padded to two digits
+(`-a 2`), so the name order is the byte order:
+
+```bash
+version=0.2.0
+gh release download "v$version"                 # every asset, so SHA256SUMS can be checked
+bundle="rantai-lakehouse-$version-linux-x86_64.tar.zst"
+sha256sum -c SHA256SUMS                         # every part, and the release's other files
+cat "$bundle".part-* > "$bundle"                # name order: part-00, part-01, …
+sha256sum -c "$bundle.sha256"                   # the joined file, as the release published it
+tar --zstd -xf "$bundle"
+./lakehousectl install --bundle <the directory you unpacked into>
+```
+
+A part that does not match is named by `sha256sum -c SHA256SUMS` before anything is
+joined, so the failure says which download to repeat. Joining a set of parts that came
+from two different releases fails the `.sha256` check instead: the joined file is not the
+one the release published, and it is not unpacked.
+
+That is one way to join, and the whole of it (REL-7 D2). `lakehousectl` changes nothing:
+it still reads an UNPACKED bundle directory (`install --bundle <dir>`), so the join is
+the operator's step and the tool never sees the parts.
