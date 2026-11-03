@@ -54,6 +54,18 @@ REAL_LOCK = REPO_ROOT / "rust" / "Cargo.lock"
 NEW_VERSION = "0.1.0-update-proof.1"
 
 
+def real_api_version() -> str:
+    """The API crate's version, as the repository carries it today.
+
+    Read from the manifest instead of hardcoded: the release bump changes
+    this version, and a test that names the pre-release one ("0.1.0")
+    fails on every release for a reason that is not a defect — the 0.2.0
+    bump found three such assertions here.
+    """
+    with REAL_MANIFEST.open("rb") as handle:
+        return tomllib.load(handle)["package"]["version"]
+
+
 class BumpApiVersionTest(unittest.TestCase):
     """What the bump does to the manifest and to the lockfile."""
 
@@ -66,6 +78,7 @@ class BumpApiVersionTest(unittest.TestCase):
             REAL_MANIFEST.read_text(encoding="utf-8"), encoding="utf-8"
         )
         self.lock.write_text(REAL_LOCK.read_text(encoding="utf-8"), encoding="utf-8")
+        self.real_version = real_api_version()
 
     def tearDown(self) -> None:
         self._directory.cleanup()
@@ -123,7 +136,7 @@ class BumpApiVersionTest(unittest.TestCase):
             ),
         )
         index, old, new = changed[0]
-        self.assertEqual(old, 'version = "0.1.0"')
+        self.assertEqual(old, f'version = "{self.real_version}"')
         self.assertEqual(new, f'version = "{NEW_VERSION}"')
         self.assertEqual(before[index - 1], 'name = "lakehouse-api"')
 
@@ -148,7 +161,7 @@ class BumpApiVersionTest(unittest.TestCase):
             ),
         )
         index, old, new = changed[0]
-        self.assertEqual(old, 'version = "0.1.0"')
+        self.assertEqual(old, f'version = "{self.real_version}"')
         self.assertEqual(new, f'version = "{NEW_VERSION}"')
         self.assertEqual(before[index - 1], 'name = "lakehouse-api"')
 
@@ -206,7 +219,7 @@ class BumpApiVersionTest(unittest.TestCase):
         above), but the form this crate uses is recorded here."""
         text = REAL_MANIFEST.read_text(encoding="utf-8")
         package = text.split("[package]", 1)[1].split("[lib]", 1)[0]
-        self.assertIn('version = "0.1.0"', package.splitlines())
+        self.assertIn(f'version = "{real_api_version()}"', package.splitlines())
         self.assertNotIn("version.workspace = true", package.splitlines())
 
 
