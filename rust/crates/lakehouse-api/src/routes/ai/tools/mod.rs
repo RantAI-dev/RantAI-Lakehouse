@@ -17,7 +17,8 @@
 //! - [`reports`] — the scheduled-report tools (`AI-10`, with `RPT-1`).
 //! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
-//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
+//! - [`embed`] — the signed-embed tools (`BI-26` slice 2, with `AI-11-AC3`):
+//!   enable, filter modes, withdraw, and the snippet.//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
 //! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
 //! - [`connectors`] — Tier 1 connector tools (T1.2).
@@ -35,6 +36,7 @@ mod calc_fields;
 mod comments;
 mod connectors;
 mod dashboards;
+mod embed;
 mod export;
 mod maps;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
@@ -238,6 +240,7 @@ pub(in crate::routes) async fn run_tool(
         n if comments::handles(n) => {
             comments::list_dashboard_comments(state, principal, args).await
         }
+        n if embed::handles(n) => embed::run(state, principal, name, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,
         "test_connector" => connectors::test_connector(state, principal, args).await,
@@ -480,10 +483,15 @@ pub(crate) async fn check_before_approval(
 ) -> Result<(), Value> {
     match name {
         "enable_embed" => {
-            managed_embed_board(state, principal, args).await?;
+            let board = managed_embed_board(state, principal, args).await?;
             embed_configured(state)?;
             let sites = arg_string_list(args, "sites")?;
-            lakehouse_bi::embed_access::validate_origins(&sites)
+            let sites = lakehouse_bi::embed_access::validate_origins(&sites)
+                .map_err(|err| json!({ "error": err }))?;
+            // D6: the limit is on the board's list after the addition, so a
+            // call that would be the twenty-first site is refused here too,
+            // before an approval exists.
+            merged_origins(&board, &sites)
                 .map(|_| ())
                 .map_err(|err| json!({ "error": err }))
         }
@@ -526,6 +534,31 @@ fn embed_configured(state: &AppState) -> Result<(), Value> {
     } else {
         Err(json!({ "error": crate::routes::embed::EMBEDDING_NOT_CONFIGURED }))
     }
+}
+
+/// `BI-26` slice 2 D6: the sites a board would have after adding `sites` to
+/// the ones it lists now. A site already listed is not an error, and more than
+/// [`lakehouse_bi::embed_access::MAX_ORIGINS`] is refused with the validator's
+/// own sentence. Read at execution from the board the manage guard resolved,
+/// so two approvals in a row cannot lose an earlier site; the pre-approval hook
+/// uses the same function so a call that could never run asks no one.
+fn merged_origins(
+    board: &lakehouse_bi::store::Board,
+    sites: &[String],
+) -> Result<Vec<String>, String> {
+    let mut merged = board.embed_access.origins.clone();
+    for site in sites {
+        if !merged.contains(site) {
+            merged.push(site.clone());
+        }
+    }
+    if merged.len() > lakehouse_bi::embed_access::MAX_ORIGINS {
+        return Err(format!(
+            "at most {} sites can be allowed per dashboard.",
+            lakehouse_bi::embed_access::MAX_ORIGINS
+        ));
+    }
+    Ok(merged)
 }
 
 /// `args[key]` as a list of strings; a missing key, a non-list or a non-string

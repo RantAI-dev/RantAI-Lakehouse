@@ -382,6 +382,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "a formatting field has the wrong shape: ",
         "the same serde error over the model's own formatting arguments, in front of the field's name",
     ),
+    // BI-26 slice 2 D4: `embed::check_filter_modes` returns an `ApiError` whose
+    // text the settings route writes itself (a column that is no filter, or a
+    // mode on a range filter). It is the route's sentence, not an upstream's.
+    (
+        "ai/tools/embed.rs",
+        "return json!({ \"error\": err.to_string() });",
+        "check_filter_modes' ApiError: the settings route's own fixed sentences, written in this repository",
+    ),
 ];
 
 /// Calls that are the choke point: a line using one is not a leak.

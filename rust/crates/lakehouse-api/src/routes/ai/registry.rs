@@ -1862,6 +1862,53 @@ fn get_capacity_schema() -> Value {
         "parameters": { "type": "object", "properties": {} } } })
 }
 
+/// The four signed-embed tools (`BI-26` slice 2 D4, `AI-11-AC3`). The gate
+/// permission is empty because the console's embed routes are "signed in"
+/// with `manage` checked in the handler (`policy.rs`); each tool runs
+/// `public_links::managed_board` itself, so a person who manages a dashboard
+/// through a rule may use them. No schema exposes a token: the customer's
+/// server signs it (`BI-26` slice 2 D7).
+fn enable_embed_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "enable_embed",
+        "description": "Make a dashboard embeddable on another site: turn its signed embedding on and allow the sites given to frame it. Adds to the sites already allowed; it never removes one. Waits for a human's approval in Approvals. The assistant never signs or shows a token: the customer's own server signs one with the embedding secret. The copyable iframe snippet with the resize listener is in the dashboard's Share > Embed.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
+            "sites": { "type": "array", "maxItems": 20, "items": { "type": "string" },
+                "description": "the sites allowed to frame it, each as https://host or https://host:port (http://localhost for development)" } },
+            "required": ["board", "sites"] } } })
+}
+
+fn set_embed_filter_modes_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "set_embed_filter_modes",
+        "description": "Set what an embed's viewer may do with each of a dashboard's filters: locked (the token must set it and the viewer cannot change it), editable (the viewer changes it), or hidden (not shown; the saved value applies). Waits for a human's approval in Approvals, because it changes what a viewer can see. Only a filter that picks values can be locked or editable.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
+            "modes": { "type": "object", "additionalProperties": { "type": "string", "enum": ["locked", "editable", "hidden"] },
+                "description": "column name to mode, for the dashboard's saved filters" } },
+            "required": ["board", "modes"] } } })
+}
+
+fn withdraw_embed_tokens_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "withdraw_embed_tokens",
+        "description": "Withdraw every signed embed token issued so far for a dashboard: tokens minted before now stop working. Needs a confirm in this chat; it only narrows access. The assistant never sees or shows a token.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard's id, from list_boards" } },
+            "required": ["board"] } } })
+}
+
+fn get_embed_snippet_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "get_embed_snippet",
+        "description": "Describe how to embed a dashboard or one of its charts on another site: whether embedding is on, the sites allowed to frame it, the address template with its look options, and the locked filters the token must set. Never returns a token or the embedding secret; the customer's server signs the token. The copyable snippet with the resize listener is in Share > Embed.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
+            "chart": { "type": "string", "description": "one of the dashboard's chart ids, from list_charts, to embed one chart instead of the dashboard; leave out for the dashboard" } },
+            "required": ["board"] } } })
+}
+
 /// The AI Copilot's full tool table, in the exact order the LLM sees them
 /// in — [`tool_schemas`] preserves this order verbatim, and it is
 /// load-bearing for the committed snapshot in
@@ -2640,6 +2687,35 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // BI-26 slice 2 D4 (with `AI-11-AC3`): the signed-embed tools. The gate
+    // permission is empty because the console's embed routes are signed-in with
+    // `manage` in the handler, and the tool runs the one guard itself
+    // (`public_links::managed_board`); a `dashboard:write` gate would refuse a
+    // person who manages the dashboard through a rule alone.
+    ToolSpec {
+        name: "enable_embed",
+        schema: enable_embed_schema,
+        risk: Risk::WriteHigh,
+        permission: "",
+    },
+    ToolSpec {
+        name: "set_embed_filter_modes",
+        schema: set_embed_filter_modes_schema,
+        risk: Risk::WriteHigh,
+        permission: "",
+    },
+    ToolSpec {
+        name: "withdraw_embed_tokens",
+        schema: withdraw_embed_tokens_schema,
+        risk: Risk::WriteLow,
+        permission: "",
+    },
+    ToolSpec {
+        name: "get_embed_snippet",
+        schema: get_embed_snippet_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -2829,8 +2905,8 @@ mod tests {
         // `update_report_subscription` and `delete_report_subscription`
         // (`AI-10`, with `RPT-1`) + `set_cache_rule` (`BI-4` part B)
         // + `list_maps` (`BI-16` part C2, `AI-5`) + `list_dashboard_comments`
-        // (`BI-37` D8).
-        assert_eq!(tool_schemas().len(), 111);
+        // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2).
+        assert_eq!(tool_schemas().len(), 115);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -3619,6 +3695,12 @@ mod tests {
                 "export_gold_mart".to_owned(),
                 "get_gold_export".to_owned(),
                 "ask_user".to_owned(),
+                // BI-26 slice 2 D4: the four signed-embed tools declare no
+                // permission; each runs `public_links::managed_board` itself.
+                "enable_embed".to_owned(),
+                "set_embed_filter_modes".to_owned(),
+                "withdraw_embed_tokens".to_owned(),
+                "get_embed_snippet".to_owned(),
             ]
         );
     }
