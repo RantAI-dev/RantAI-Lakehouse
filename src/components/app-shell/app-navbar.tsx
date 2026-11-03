@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { cn } from "@/lib/utils"
 import { formatRelativeTime } from "@/lib/format"
+import { useMentionsRead } from "@/lib/mention-events"
 import { pageTitleFor } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
 import { useAuth } from "@/features/auth/auth-provider"
@@ -49,6 +50,9 @@ export function AppNavbar() {
   // stuck-on or stuck-off guess) and never from an invented "unread"
   // count (no per-principal read cursor exists).
   const notifications = useService((signal) => notificationsService.list(signal), [])
+  // BI-38 D6: opening a dashboard's comments marks its mentions read and says
+  // so here, so the dot and the list reflect it without a page reload.
+  useMentionsRead(notifications.reload)
   const hasNotifications =
     notifications.status === "success" &&
     notifications.data.supported &&

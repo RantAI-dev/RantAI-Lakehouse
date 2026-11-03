@@ -4,9 +4,13 @@
 //!
 //! This module stores and answers; it decides nothing about who may read,
 //! write, edit or delete. The routes (`lakehouse-api`) own those rules, because
-//! they depend on the dashboard's access levels, which live elsewhere. The one
-//! rule kept here is the one the database can keep: the length of the text
-//! (`CHECK` in the migration, and [`MAX_CHARS`] for the route's sentence).
+//! they depend on the dashboard's access levels, which live elsewhere. The two
+//! rules kept here are the ones the database can keep: the length of the text
+//! (`CHECK` in the migration, and [`MAX_CHARS`] for the route's sentence), and
+//! how many comments one person may post in a window ([`POST_LIMIT`], `BI-38`
+//! D1 to D3) — counted and decided inside the writing transaction, under a
+//! per-author lock, because that is the only place two posts cannot both take
+//! the last place.
 //!
 //! A comment is plain text. Nothing here parses or renders it; the console
 //! shows it as text and the notification email never contains it.
@@ -29,6 +33,37 @@ pub const PANEL_LIMIT: i64 = 200;
 
 /// How many unread mentions the bell lists.
 pub const BELL_LIMIT: i64 = 50;
+
+/// How many comments one person may post in [`POST_WINDOW_SECS`], on any
+/// dashboard together (`BI-38` D1).
+///
+/// Ten posts in five minutes allow a real back-and-forth (a reply every 30
+/// seconds) and stop a loop; the numbers are constants, not settings, so no
+/// deployment can raise them silently (`BI-38` D1). An edit is not counted
+/// (`BI-38` D4): it writes no new row and its emails are bounded by E-1.
+pub const POST_LIMIT: i64 = 10;
+
+/// The window [`POST_LIMIT`] counts, in seconds (`BI-38` D1: five minutes).
+pub const POST_WINDOW_SECS: f64 = 300.0;
+
+/// What [`insert`] did (`BI-38` D1 to D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostOutcome {
+    /// The comment was written: its id, and the mentioned people to email
+    /// (`BI-19` E review E-1).
+    Posted {
+        /// The new comment's id.
+        id: Uuid,
+        /// The mentioned people a mention email is for.
+        email: Vec<Uuid>,
+    },
+    /// The author has used every place of [`POST_LIMIT`] in the window and
+    /// nothing was written (`BI-38` D2, D3).
+    TooMany {
+        /// Seconds until the oldest counted post leaves the window, at least 1.
+        retry_after_secs: u64,
+    },
+}
 
 /// A live comment with its author's current name.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -168,10 +203,47 @@ async fn lock_board(tx: &mut sqlx::PgConnection, board_id: &str) -> Result<(), S
     Ok(())
 }
 
-/// Post a comment with its mentions, in one transaction. Returns the comment's
-/// id and the mentioned people who are to be emailed: those with no other
-/// unread mention on this dashboard (`BI-19` E review E-1). Every mentioned
-/// person gets the bell line either way.
+/// Take the author's post lock for the rest of the transaction (`BI-38` D2).
+///
+/// The lock is per author across every dashboard, so two posts started at once
+/// cannot both take the last place of [`POST_LIMIT`]: the second reads the
+/// count only after the first committed. Its key is distinct from
+/// [`lock_board`]'s, which is per dashboard.
+async fn lock_author(tx: &mut sqlx::PgConnection, author: Uuid) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("dashboard_comment_post:{author}"))
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+/// The author's posts counted by [`POST_LIMIT`] and the seconds until the
+/// oldest of them leaves the window (`BI-38` D2, D3).
+///
+/// Deleted rows are counted: the filter is on when the comment was written,
+/// not on whether it is still live, so deleting and posting again does not free
+/// a place.
+async fn places_used(tx: &mut sqlx::PgConnection, author: Uuid) -> Result<(i64, i64), StoreError> {
+    Ok(sqlx::query_as(
+        "SELECT count(*)::bigint, \
+                COALESCE(ceil(extract(epoch FROM \
+                    (min(created_at) + make_interval(secs => $2) - now())))::bigint, 0) \
+         FROM dashboard_comment \
+         WHERE author_id = $1 AND created_at > now() - make_interval(secs => $2)",
+    )
+    .bind(author)
+    .bind(POST_WINDOW_SECS)
+    .fetch_one(tx)
+    .await?)
+}
+
+/// Post a comment with its mentions, in one transaction, if the author has a
+/// place left in [`POST_LIMIT`] (`BI-38` D1, D2). [`PostOutcome::Posted`] names
+/// the comment and the mentioned people who are to be emailed: those with no
+/// other unread mention on this dashboard (`BI-19` E review E-1). Every
+/// mentioned person gets the bell line either way.
+///
+/// A refusal writes nothing: no comment, no mention, nothing to email.
 ///
 /// # Errors
 ///
@@ -182,9 +254,17 @@ pub async fn insert(
     author: Uuid,
     body: &str,
     mentions: &[Uuid],
-) -> Result<(Uuid, Vec<Uuid>), StoreError> {
+) -> Result<PostOutcome, StoreError> {
     let mut tx = pool.begin().await?;
     lock_board(&mut tx, board_id).await?;
+    lock_author(&mut tx, author).await?;
+    let (posted, wait) = places_used(&mut tx, author).await?;
+    if posted >= POST_LIMIT {
+        // Dropping the transaction rolls it back; nothing was written.
+        return Ok(PostOutcome::TooMany {
+            retry_after_secs: u64::try_from(wait.max(1)).unwrap_or(1),
+        });
+    }
     let (id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO dashboard_comment (board_id, author_id, body) VALUES ($1, $2, $3) \
          RETURNING id",
@@ -204,7 +284,7 @@ pub async fn insert(
     .await?;
     let email = first_unread(&mut tx, board_id, id, mentions).await?;
     tx.commit().await?;
-    Ok((id, email))
+    Ok(PostOutcome::Posted { id, email })
 }
 
 /// Replace a live comment's text and mentions, in one transaction. Returns the
@@ -324,17 +404,30 @@ pub async fn unread_mentions(pool: &PgPool, user: Uuid) -> Result<Vec<Mention>, 
     .await?)
 }
 
-/// Mark every unread mention of a person as read. Returns how many.
+/// Mark a person's unread mentions read: every one when `board` is `None`,
+/// otherwise only those in comments on that dashboard (`BI-38` D5). Returns how
+/// many.
+///
+/// The board is the one the route already resolved for the caller; this
+/// function decides nothing about access and only filters by it.
 ///
 /// # Errors
 ///
 /// [`StoreError::Database`] if the query fails.
-pub async fn mark_mentions_read(pool: &PgPool, user: Uuid) -> Result<u64, StoreError> {
+pub async fn mark_mentions_read(
+    pool: &PgPool,
+    user: Uuid,
+    board: Option<&str>,
+) -> Result<u64, StoreError> {
     Ok(sqlx::query(
-        "UPDATE dashboard_comment_mention SET read_at = now() \
-         WHERE user_id = $1 AND read_at IS NULL",
+        "UPDATE dashboard_comment_mention AS m SET read_at = now() \
+         WHERE m.user_id = $1 AND m.read_at IS NULL \
+           AND ($2::text IS NULL OR EXISTS ( \
+               SELECT 1 FROM dashboard_comment c \
+               WHERE c.id = m.comment_id AND c.board_id = $2))",
     )
     .bind(user)
+    .bind(board)
     .execute(pool)
     .await?
     .rows_affected())
