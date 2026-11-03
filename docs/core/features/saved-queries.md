@@ -22,7 +22,7 @@ A saved query can be created and listed, nothing else (`GET`/`POST /api/query/sa
 `SEC-20` the list is scoped to the caller's organisation, and inside it every `query:read` holder sees every saved
 query (`routes/query.rs:639`, `lakehouse-store/src/queries.rs:304`). The table is `saved_query` in Postgres
 (`0005`, `0046`, `0099`); this change gives it the columns and the tables it had none of: the migration
-`rust/migrations/0121_saved_query_access.sql` adds `folder_id`, `deleted_at` and `deleted_by` to it and creates
+`rust/migrations/0122_saved_query_access.sql` adds `folder_id`, `deleted_at` and `deleted_by` to it and creates
 the tables `saved_query_folder`, `saved_query_version` and `saved_query_access_rule`.
 
 Dashboards already have the patterns, in ClickHouse: a 30-day trash (`lakehouse-bi/src/trash.rs:44`), 15 versions

@@ -17,7 +17,7 @@
 //! (`0004_queries.sql`) the way `identity`'s `workspace_settings` is backed
 //! by a constant. This module now owns their write side too — create,
 //! update, delete, folders, versions and trash (migration
-//! `0121_saved_query_access.sql`) — with the access rules of
+//! `0122_saved_query_access.sql`) — with the access rules of
 //! `crate::saved_query_access` applied on every read and write.
 
 use serde::Serialize;
