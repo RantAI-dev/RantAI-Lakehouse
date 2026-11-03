@@ -233,7 +233,7 @@ pub(in crate::routes) async fn run_tool(
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
         "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,
         "delete_alert_rule" => alerts::delete_alert_rule(state, principal, args).await,
-        "run_alert_rule" => alerts::run_alert_rule(state, args).await,
+        "run_alert_rule" => alerts::run_alert_rule(state, principal, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,
         "test_connector" => connectors::test_connector(state, principal, args).await,
