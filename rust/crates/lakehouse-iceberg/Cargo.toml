@@ -19,7 +19,7 @@ iceberg-catalog-rest = "=0.10.1"
 # APIs: only the plain S3 API surface `object_store::aws` speaks.
 object_store = { version = "0.14", features = ["aws"] }
 arrow-array = "58"
-arrow-schema = "58"
+arrow-schema = "60"
 parquet = "58"
 typetag = "0.2"
 async-trait = { workspace = true }
