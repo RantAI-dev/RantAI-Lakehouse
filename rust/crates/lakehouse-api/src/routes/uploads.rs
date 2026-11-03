@@ -159,6 +159,7 @@ use super::governance::{IngestRunRow, ingest_runs_or_empty};
 use super::lakehouse::is_unknown_table_or_database_error;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::state::AppState;
 use crate::upload_convert::{self, Answer, ConversionError, FileKind, Operation, Source};
 use crate::upload_formats::{self, ByName, Compression, Format, Layout, Refusal};
@@ -298,7 +299,6 @@ const OTHER_BUSY: &str = "One of the other files is already being loaded.";
 const ENCODING_RULE: &str = "encoding must be utf-8 or utf-16.";
 const DELIMITER_RULE: &str = "delimiter must be a comma, a semicolon, a tab or a pipe.";
 const HEADER_ROW_RULE: &str = "headerRow must be a whole number, 0 or more.";
-const QUERY_UNREADABLE: &str = "The query string could not be read.";
 const ALREADY_LOADING: &str = "This upload is already being loaded.";
 const TABLE_BUSY: &str = "Another upload is loading into that table.";
 const CONNECTOR_TABLE: &str = "A connector loads that table, so a file cannot be loaded into it.";
@@ -1630,7 +1630,7 @@ pub async fn list(
     };
     let Query(query) = query.map_err(|err| {
         tracing::warn!(%err, "an upload list query string could not be read");
-        ApiError::BadRequest(QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
         return Ok(ApiJson(Vec::new()));
@@ -1834,7 +1834,7 @@ pub async fn preview(
 ) -> ApiResult<ApiJson<PreviewResponse>> {
     let Query(query) = query.map_err(|err| {
         tracing::warn!(%err, "a preview query string could not be read");
-        ApiError::BadRequest(QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let row = uploads::get(pool(&state)?, &id)
         .await?

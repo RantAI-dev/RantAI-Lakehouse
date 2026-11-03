@@ -172,6 +172,7 @@ async fn a_public_link_tile_with_the_same_engine_error_stays_fixed() {
         time::OffsetDateTime::now_utc() + time::Duration::days(1),
         None,
         None,
+        None,
     )
     .await
     .expect("store a live public link");

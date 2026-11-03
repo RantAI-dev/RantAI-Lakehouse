@@ -513,7 +513,7 @@ describe("the table's meaning card", () => {
 
     const noModel = readyMeanings([], { table: entry({ description: "A", status: "draft", model: null }) })
     render(<TableMeaningCard state={noModel.state} />)
-    expect(screen.getByText(/^Drafted by the assistant · /)).toBeTruthy()
+    expect(screen.getByText(/^Drafted by AI Copilot · /)).toBeTruthy()
   })
 
   it("says a person confirmed a confirmed entry", () => {
@@ -802,7 +802,7 @@ describe("the header's meaning pill", () => {
 
     const pill = pillText(/^Meaning: AI draft$/)
     expect(pill.className).toContain("bg-amber-500/12")
-    expect(link().getAttribute("title")).toBe("The assistant drafted this table's meanings. Nobody has confirmed them yet.")
+    expect(link().getAttribute("title")).toBe("AI Copilot drafted this table's meanings. Nobody has confirmed them yet.")
   })
 
   it("shows the count of confirmed meanings in the info tone when some are confirmed", () => {

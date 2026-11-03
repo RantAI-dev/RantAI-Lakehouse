@@ -55,7 +55,7 @@ export function PendingActionCard({
         Action requires confirmation
       </div>
       <p className="leading-relaxed text-foreground">
-        {typeof res.summary === "string" && res.summary ? res.summary : "Copilot wants to run this action."}
+        {typeof res.summary === "string" && res.summary ? res.summary : "AI Copilot wants to run this action."}
       </p>
       <div className="flex items-center gap-2 pt-1">
         <Button size="sm" onClick={onConfirm} disabled={confirming}>

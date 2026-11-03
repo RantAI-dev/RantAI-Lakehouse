@@ -70,7 +70,7 @@ export function CopilotSidebar() {
       {/* Resizing drag handle */}
       <button
         type="button"
-        aria-label="Resize Copilot sidebar"
+        aria-label="Resize AI Copilot sidebar"
         onMouseDown={startResizing}
         onDoubleClick={handleDoubleClick}
         title="Drag to resize, double click to reset"
@@ -122,8 +122,8 @@ export function CopilotSidebar() {
           <button
             type="button"
             onClick={() => c.setExpanded(false)}
-            aria-label="Collapse Copilot"
-            title="Collapse Copilot"
+            aria-label="Collapse AI Copilot"
+            title="Collapse AI Copilot"
             className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           >
             <PanelRightClose className="size-4" />

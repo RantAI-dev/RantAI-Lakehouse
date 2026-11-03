@@ -46,7 +46,9 @@ describe("ChatMessages (RantAI-Agents layout)", () => {
     const view = within(container)
     // The avatar and the "Copilot" name beside each answer were removed on
     // purpose (QA feedback); the user's bubble already says who speaks.
+    // AI-23: the rename must not bring the label back, under either name.
     expect(view.queryByText("Copilot")).toBeNull()
+    expect(view.queryByText("AI Copilot")).toBeNull()
     expect(view.getByText("Thought for 2s")).toBeDefined()
     expect(view.queryByText("Use list_datasets.")).toBeNull()
     expect(view.getByText("Search")).toBeDefined()

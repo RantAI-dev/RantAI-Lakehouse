@@ -28,6 +28,7 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 use lakehouse_bi::builder::{ReadContext, RelationColumns};
 use lakehouse_bi::fields::{self, FieldCatalog, FieldDef, SourceKind};
@@ -657,6 +658,7 @@ pub async fn usage(
 pub async fn validate(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: MetricBody = parse(&body)?;
@@ -704,7 +706,15 @@ pub async fn validate(
             grain: None,
             filters: Vec::new(),
         };
-        out["value"] = value_query(&state, &principal, &source, catalog_fields, &query).await?;
+        out["value"] = value_query(
+            &state,
+            &principal,
+            &headers,
+            &source,
+            catalog_fields,
+            &query,
+        )
+        .await?;
     }
     Ok(ApiJson(out))
 }
@@ -718,6 +728,7 @@ pub async fn validate(
 pub(crate) async fn value_query(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     source: &Resolved,
     catalog_fields: Vec<FieldDef>,
     query: &ValueQuery<'_>,
@@ -780,6 +791,12 @@ pub(crate) async fn value_query(
         scope,
         crate::routes::support::run_spec_sql(
             ch,
+            // `SEC-50` slice 2 M4: the metric's number is the caller's own
+            // read, so it is gated as the caller.
+            &crate::routes::query::StatementGate::clickhouse(
+                state,
+                crate::routes::query::GateActor::Caller { principal, headers },
+            ),
             &chart.spec.id,
             &filtered.sql,
             &principal.role_names,

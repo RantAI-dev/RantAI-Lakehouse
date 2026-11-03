@@ -94,6 +94,8 @@ export const TOOL_LABEL: Record<string, string> = {
   // BI-1 / AI-10: the link opens the same download the dashboard's menu makes.
   export_dashboard: "Export dashboard",
   export_chart: "Export chart data",
+  // BI-37 D8: the dashboard's comments, as the console lists them.
+  list_dashboard_comments: "Read comments",
   // RPT-1 / AI-10: scheduled reports by email.
   create_report_subscription: "Schedule report",
   list_report_subscriptions: "List scheduled reports",
@@ -103,10 +105,12 @@ export const TOOL_LABEL: Record<string, string> = {
 
 /**
  * The only addresses an export step may link to: the console's own download
- * routes (`BI-1`). A result is data from the server, but the card never turns
- * an arbitrary string into a link.
+ * routes (`BI-1`), plus the dashboard file (`BI-37` D7: `format=file`, the
+ * importable JSON of one dashboard — the route keeps every check). A result is
+ * data from the server, but the card never turns an arbitrary string into a
+ * link.
  */
-const EXPORT_LINK = /^\/api\/dashboard\/(export\/pdf|chart-export)\?/;
+const EXPORT_LINK = /^\/api\/dashboard\/(export\/pdf\?|export\?format=file&|chart-export\?)/;
 
 /** A tool result that is a download link (`export_dashboard`, `export_chart`), or null. */
 export function exportLink(tool: string, result: unknown): { url: string; fileName: string } | null {
