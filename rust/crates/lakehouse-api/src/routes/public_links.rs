@@ -183,6 +183,31 @@ fn store_failure(err: &lakehouse_store::StoreError) -> ApiError {
     upstream_error::internal_error(&upstream_error::STORE, err)
 }
 
+/// `SEC-50` slice 2 D4/M8: the creator of a public link, as they are now.
+///
+/// `None` for a link with no creator (the links that predate the tenant
+/// column, and the links a service identity made) and for a creator who was
+/// deleted or disabled: such a link has no owner, and it reaches nothing
+/// (`GateActor::Ownerless`).
+///
+/// # Errors
+///
+/// The response a store failure answers with.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the caller returns verbatim; boxing it \
+              would change every call site for no gain on the success path"
+)]
+pub(crate) async fn creator_of(
+    state: &AppState,
+    link: &PublicLink,
+) -> Result<Option<Principal>, Response> {
+    let Some(id) = link.created_by else {
+        return Ok(None);
+    };
+    crate::routes::render::principal_of(state, &id.to_string()).await
+}
+
 /// Judge a token: the link, the administrator's switch, then the dashboard.
 ///
 /// Fail closed: with no Postgres pool nothing resolves (a 503, not a 404, since
@@ -605,6 +630,7 @@ async fn audit(
 pub async fn put_link(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     // Before the body is read: a caller who manages nothing is refused as such.
@@ -656,6 +682,15 @@ pub async fn put_link(
         // `created_by` points at a person; a service identity is not one.
         PrincipalId::Service(_) => None,
     };
+    // `SEC-50` slice 2 D4: the link acts as the tenant of the person who
+    // made it — the `X-Tenant` header when they sent one, else their first
+    // tenant. A service identity is not a person and has no tenant of its
+    // own, so its link names none (and reads as the creator's first tenant,
+    // which is no tenant at all).
+    let tenant_id = match principal.id {
+        PrincipalId::User(_) => crate::tenant_scope::resolve(&principal, &headers)?,
+        PrincipalId::Service(_) => None,
+    };
     let saved = if replace {
         // A new link starts from a clean count of wrong tries.
         throttle::clear(pool, &lock_key(&board.id)).await?;
@@ -667,6 +702,7 @@ pub async fn put_link(
                 expires_at,
                 new_hash.as_deref(),
                 created_by,
+                tenant_id,
             )
             .await
             .map_err(|err| store_failure(&err))?,
@@ -819,6 +855,7 @@ mod tests {
     fn only_a_link_that_has_not_expired_counts_as_a_link() {
         let now = OffsetDateTime::now_utc();
         let link = |expires_at| PublicLink {
+            tenant_id: None,
             board_id: "b_1".to_owned(),
             token: "p_token".to_owned(),
             expires_at,
@@ -863,6 +900,7 @@ mod tests {
     #[test]
     fn the_link_json_never_carries_the_password_or_its_hash() {
         let link = PublicLink {
+            tenant_id: None,
             board_id: "b_1".to_owned(),
             token: "p_token".to_owned(),
             expires_at: OffsetDateTime::now_utc() + Duration::days(1),

@@ -36,6 +36,12 @@ const SECRET: &str = "test-render-secret-not-real";
 const EMBED_SECRET: &str = "test-embed-secret-not-real";
 const PUBLIC_BOARD: &str = "b_public";
 const PRIVATE_BOARD: &str = "b_private";
+/// `SEC-50` slice 2 M11: another tenant of the same deployment, whose
+/// members may not read the shared catalog.
+const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+/// `SEC-50`'s refusal of a table the caller's tenant may not read, byte for
+/// byte.
+const REFUSAL: &str = "Table not found or not available to your organisation: serving.mart_x";
 
 /// A recording `ClickHouse`: boards, charts and columns as the stores ask.
 #[derive(Clone)]
@@ -127,6 +133,9 @@ struct Fixture {
     fake: FakeCh,
     owner: Uuid,
     other: Uuid,
+    /// `SEC-50` slice 2 M11: a person of another tenant, whose reads of the
+    /// shared catalog are refused.
+    stranger: Uuid,
     _ch: MockServer,
 }
 
@@ -168,7 +177,15 @@ async fn fixture(secret: Option<&str>) -> Fixture {
         .respond_with(fake.clone())
         .mount(&ch)
         .await;
-    let mut env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    let mut env: HashMap<String, String> = HashMap::from([
+        ("CH_URL".to_owned(), ch.uri()),
+        // `SEC-50` slice 2 M11: the shared catalog belongs to a tenant, and
+        // the readers below are in it.
+        (
+            "CATALOG_TENANT_ID".to_owned(),
+            common::CATALOG_TENANT.to_owned(),
+        ),
+    ]);
     if let Some(secret) = secret {
         env.insert("RENDER_TOKEN_SECRET".to_owned(), secret.to_owned());
         // The embedding customer's secret is a different one (R1).
@@ -194,11 +211,23 @@ async fn fixture(secret: Option<&str>) -> Fixture {
         .await
         .unwrap();
     let other = user(&app.pool, "Other Role").await;
+    let stranger = user(&app.pool, "Stranger Role").await;
+    // `SEC-50` slice 2 M11: the two readers of the shared catalog are in
+    // the catalog's own tenant; the stranger is in another one.
+    common::in_the_catalog_tenant(&app.pool, owner_id).await;
+    common::in_the_catalog_tenant(&app.pool, other).await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(stranger)
+        .bind(OTHER_TENANT.parse::<Uuid>().expect("a seeded tenant id"))
+        .execute(&app.pool)
+        .await
+        .unwrap();
     Fixture {
         app,
         fake,
         owner: owner_id,
         other,
+        stranger,
         _ch: ch,
     }
 }
@@ -564,4 +593,29 @@ async fn a_chart_token_for_another_chart_or_another_persons_board_is_refused() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["error"], "render token is invalid or expired");
+}
+
+/// `SEC-50` slice 2 M4/M5: a render token for a person of another tenant
+/// reads nothing — the tile carries the gate's own refusal, in the tile's
+/// own error slot.
+#[tokio::test]
+async fn a_person_of_another_tenant_sees_the_tile_refused() {
+    let f = fixture(Some(SECRET)).await;
+    let token = render_token(f.stranger, PUBLIC_BOARD, 5.0, 120.0);
+    let (status, body) = post(&f.app, &json!({ "token": token }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"]["c_one"]["error"], REFUSAL, "{body}");
+    assert!(
+        body["results"]["c_one"].get("rows").is_none(),
+        "the refused tile has no rows: {body}"
+    );
+    assert!(
+        !f.fake
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("FROM serving.mart_x") && !sql.contains("system.")),
+        "nothing is read when the person may not read the mart"
+    );
 }
