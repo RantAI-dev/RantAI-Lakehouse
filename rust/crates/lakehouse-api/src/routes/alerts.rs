@@ -21,8 +21,8 @@ use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_alerts::{
-    AlertKind, AlertRule, AlertRuleInput, AlertState, FreshnessSource, LateSource, SilenceSource,
-    SqlGate, StateSource,
+    AlertKind, AlertRule, AlertRuleInput, AlertState, FreshnessSource, GateRefusal, LateSource,
+    SilenceSource, SqlGate, StateSource,
 };
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
@@ -967,7 +967,7 @@ impl LateSource for ApiLateSource<'_> {
 
 #[async_trait::async_trait]
 impl SqlGate for ApiSqlGate<'_> {
-    async fn gate(&self, sql: &str) -> Result<String, String> {
+    async fn gate(&self, _owner: Option<&str>, sql: &str) -> Result<String, GateRefusal> {
         // `SEC-50` slice 2 T7 (M1/M2): the tenant gate first, before the
         // rewrite and before the engine. A refusal keeps the gate's own
         // fixed sentence (never upstream text, `AGENTS.md` principle 4) as
@@ -978,7 +978,7 @@ impl SqlGate for ApiSqlGate<'_> {
         crate::routes::query::StatementGate::clickhouse(self.state, self.actor)
             .check(sql)
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| GateRefusal::Refused(err.to_string()))?;
         let obligations = crate::policy_engine::PolicyEngineObligations::new(
             self.state.pg.as_deref(),
             &self.state.clickhouse,
@@ -992,7 +992,9 @@ impl SqlGate for ApiSqlGate<'_> {
             &obligations,
         )
         .await
-        .map_err(|err| crate::policy_engine::enforcement_error_message(&err).to_owned())
+        .map_err(|err| {
+            GateRefusal::Refused(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        })
     }
 
     async fn board_restricted(&self, board_id: &str) -> bool {
@@ -2531,7 +2533,7 @@ mod sql_gate_enforcement {
 
     use std::collections::HashMap;
 
-    use lakehouse_alerts::SqlGate;
+    use lakehouse_alerts::{GateRefusal, SqlGate};
     use lakehouse_store::PgPool;
     use lakehouse_store::governance::{self, CreatePolicyInput};
     use wiremock::matchers::{body_string_contains, method};
@@ -2626,7 +2628,10 @@ mod sql_gate_enforcement {
         };
 
         let governed = gate
-            .gate("SELECT email, sum(amount) AS v FROM serving.mart_x GROUP BY email")
+            .gate(
+                None,
+                "SELECT email, sum(amount) AS v FROM serving.mart_x GROUP BY email",
+            )
             .await
             .expect("a governed table is rewritten, not refused");
 
@@ -2649,11 +2654,14 @@ mod sql_gate_enforcement {
         };
 
         let err = gate
-            .gate("SELECT * FROM url('http://example.com/x.csv', 'CSV')")
+            .gate(None, "SELECT * FROM url('http://example.com/x.csv', 'CSV')")
             .await
             .expect_err("a table function is refused");
 
-        assert!(!err.contains("example.com"), "{err}");
+        let GateRefusal::Refused(message) = err else {
+            panic!("a table function is a refusal, not a stop");
+        };
+        assert!(!message.contains("example.com"), "{message}");
         assert!(server.received_requests().await.unwrap().is_empty());
         Ok(())
     }
