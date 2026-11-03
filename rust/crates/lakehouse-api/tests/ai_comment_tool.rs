@@ -20,7 +20,7 @@ use common::{
 };
 use lakehouse_api::routes::dashboard_comments::SERVICE_REFUSED;
 use lakehouse_store::dashboard_access::{NewRule, replace_item};
-use lakehouse_store::dashboard_comments::insert;
+use lakehouse_store::dashboard_comments::{PostOutcome, insert};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -108,6 +108,52 @@ fn rule(user: Uuid) -> NewRule {
     }
 }
 
+/// Post through the store's real writer, failing loudly when `BI-38` D1's
+/// posting limit refuses it: `insert` answers `Ok(PostOutcome::TooMany)`
+/// instead of writing, so an ignored outcome would silently shorten a fixture
+/// and make the assertion below look wrong for the wrong reason.
+async fn post(app: &TestApp, board: &str, author: Uuid, body: &str, mentions: &[Uuid]) -> Uuid {
+    match insert(&app.pool, board, author, body, mentions)
+        .await
+        .unwrap()
+    {
+        PostOutcome::Posted { id, .. } => id,
+        refused @ PostOutcome::TooMany { .. } => {
+            panic!("the fixture's comment was refused as {refused:?}")
+        }
+    }
+}
+
+/// Seed a thread longer than `BI-38` D1's five-minute window: `count` rows in
+/// one statement, one minute apart, so the oldest is `count` minutes old.
+///
+/// This goes to the table instead of through [`post`] on purpose. `insert` now
+/// counts a person's posts over the last five minutes (`BI-38` D1) and refuses
+/// the eleventh, so a sixty-comment fixture cannot be built with it; the test
+/// is about the newest fifty of sixty, not about when they were written
+/// (`BI-37` #357, rule 2: fix the fixture, not the assertion). The SQL is a
+/// constant; the board, the author and the count are bound, not formatted in.
+async fn seed_thread(app: &TestApp, board: &str, author: Uuid, count: i32) {
+    let written = sqlx::query(
+        "INSERT INTO dashboard_comment (board_id, author_id, body, created_at) \
+         SELECT $1, $2, 'comment ' || n::text, \
+                now() - make_interval(mins => $3::int - n) \
+         FROM generate_series(1, $3::int) AS n",
+    )
+    .bind(board)
+    .bind(author)
+    .bind(count)
+    .execute(&app.pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(
+        written,
+        u64::try_from(count).unwrap(),
+        "the whole thread was seeded"
+    );
+}
+
 /// A viewer reads the comments of a dashboard they see: who wrote them, when,
 /// what they say, and the untrusted-text note — and not the console's buttons.
 #[tokio::test]
@@ -115,12 +161,8 @@ async fn a_viewer_reads_the_comments_of_a_dashboard_they_see() {
     let (app, _ch) = app().await;
     let ann = create_principal_with_permissions(&app.pool, "dashboard:read").await;
     let bo = create_principal_with_permissions(&app.pool, "dashboard:read").await;
-    insert(&app.pool, "b1", ann, "Visitors look wrong for March", &[bo])
-        .await
-        .unwrap();
-    insert(&app.pool, "b1", bo, "Check the region filter", &[])
-        .await
-        .unwrap();
+    post(&app, "b1", ann, "Visitors look wrong for March", &[bo]).await;
+    post(&app, "b1", bo, "Check the region filter", &[]).await;
     let cookie = session_cookie_for_user(&app.pool, ann).await;
     let body = call(&app, &cookie, json!({ "board": "b1" })).await;
     assert_eq!(body["outcome"], "executed", "{body}");
@@ -228,11 +270,10 @@ async fn a_service_identity_is_refused_in_the_routes_sentence() {
 async fn sixty_comments_give_the_newest_fifty_and_say_they_are_truncated() {
     let (app, _ch) = app().await;
     let ann = create_principal_with_permissions(&app.pool, "dashboard:read").await;
-    for n in 1..=60 {
-        insert(&app.pool, "b1", ann, &format!("comment {n}"), &[])
-            .await
-            .unwrap();
-    }
+    // Sixty comments from one author would hit `BI-38` D1's posting limit
+    // through `insert`, so they are seeded as a thread older than its window
+    // (`BI-37` #357, rule 2).
+    seed_thread(&app, "b1", ann, 60).await;
     let cookie = session_cookie_for_user(&app.pool, ann).await;
     let body = call(&app, &cookie, json!({ "board": "b1" })).await;
     let result = &body["result"];
@@ -251,12 +292,8 @@ async fn sixty_comments_give_the_newest_fifty_and_say_they_are_truncated() {
 async fn a_two_thousand_character_body_is_cut_at_five_hundred() {
     let (app, _ch) = app().await;
     let ann = create_principal_with_permissions(&app.pool, "dashboard:read").await;
-    insert(&app.pool, "b1", ann, &"x".repeat(2000), &[])
-        .await
-        .unwrap();
-    insert(&app.pool, "b1", ann, "short one", &[])
-        .await
-        .unwrap();
+    post(&app, "b1", ann, &"x".repeat(2000), &[]).await;
+    post(&app, "b1", ann, "short one", &[]).await;
     let cookie = session_cookie_for_user(&app.pool, ann).await;
     let body = call(&app, &cookie, json!({ "board": "b1" })).await;
     let comments = body["result"]["comments"].as_array().unwrap();
