@@ -364,7 +364,7 @@ export function ApprovalsPage() {
       {state.status === "success" && data.length === 0 ? (
         <EmptyState
           title="No approvals"
-          description="A request lands here whenever a run — from the copilot chat, Run now, or a schedule — hits a high-risk (WriteHigh) tool call, or a catalog viewer requests a permission they don't hold. Nothing is waiting on you right now."
+          description="A request lands here whenever a run — from an AI Copilot chat, Run now, or a schedule — hits a high-risk (WriteHigh) tool call, or a catalog viewer requests a permission they don't hold. Nothing is waiting on you right now."
           action={
             <Button size="sm" variant="outline" render={<Link href="/agents/runs" />}>
               View agent runs

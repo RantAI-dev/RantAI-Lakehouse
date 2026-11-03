@@ -58,12 +58,12 @@ describe("TileBody on a failed tile", () => {
 describe("chatErrorText", () => {
   it("appends the reference the server logged the provider's error under", () => {
     expect(
-      chatErrorText({ error: "AI Copilot is unavailable", detail: "Try again later.", errorId: "ab12" }),
+      chatErrorText({ error: "AI Copilot is unavailable.", detail: "Try again later.", errorId: "ab12" }),
     ).toBe("Try again later. Reference: ab12")
   })
 
   it("is unchanged without a reference", () => {
     expect(chatErrorText({ detail: "Try again later." })).toBe("Try again later.")
-    expect(chatErrorText(null)).toBe("Copilot couldn't answer. Try again.")
+    expect(chatErrorText(null)).toBe("AI Copilot couldn't answer. Try again.")
   })
 })

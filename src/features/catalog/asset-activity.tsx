@@ -596,13 +596,13 @@ export function AssetActivity({
         <SectionCard
           size="sm"
           title={`Usage (${a.usage?.days ?? 30}d)`}
-          description="Queries run in Query Studio or by the copilot that read this asset, by anyone. Only your own query text is shown in full; everyone's frequent queries are shown without their values."
+          description="Queries run in Query Studio or by AI Copilot that read this asset, by anyone. Only your own query text is shown in full; everyone's frequent queries are shown without their values."
         >
           {a.usage === null ? (
             <QuietEmpty title="Usage not measured" description="The query history could not be read." />
           ) : a.usage.queries === 0 ? (
             <QuietEmpty
-              title={`No Query Studio or copilot query in the last ${a.usage.days} days`}
+              title={`No Query Studio or AI Copilot query in the last ${a.usage.days} days`}
               description={uncounted ?? undefined}
             />
           ) : (

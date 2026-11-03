@@ -554,7 +554,7 @@ fn set_dashboard_theme_schema() -> Value {
 
 fn set_cache_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_cache_rule",
-        "description": "Set how long a dashboard's or a chart's results may be remembered instead of computed again (\"Make this chart always fresh\"). Give a board (list_boards) or a chart (list_charts), one of the two. rule: default follows the level above (a chart follows its dashboard, a dashboard follows the install's setting in Admin > Settings), fresh computes every time, minutes remembers for `minutes` (1 to 1440). The narrowest rule set wins. Not for the built-in dashboard; set it on one of its charts or duplicate it first. The install's own rule is set by an administrator in Admin > Settings, not here. A result is also recomputed whenever the data under it changes, whatever the rule.",
+        "description": "Set how long a dashboard's or a chart's results may be remembered instead of computed again (\"Make this chart always fresh\"). For \"this chart\", \"the chart\" or \"it\" about one chart, give its chart id; give a board (list_boards) only when the person means the whole dashboard, and never set the dashboard's rule for a request about one chart. When the page lists more than one chart and the person did not name one, call ask_user with the charts' titles as the options first; with exactly one chart on the page, use it. Give a board or a chart, one of the two. rule: default follows the level above (a chart follows its dashboard, a dashboard follows the install's setting in Admin > Settings), fresh computes every time, minutes remembers for `minutes` (1 to 1440). The narrowest rule set wins. Not for the built-in dashboard; set it on one of its charts or duplicate it first. The install's own rule is set by an administrator in Admin > Settings, not here. A result is also recomputed whenever the data under it changes, whatever the rule.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string", "description": "the dashboard id (list_boards)" },
             "chart": { "type": "string", "description": "the chart id (list_charts)" },
@@ -3165,6 +3165,27 @@ mod tests {
         let schema = (spec.schema)();
         let required = &schema["function"]["parameters"]["required"];
         assert_eq!(required, &json!(["term", "question", "options"]));
+    }
+
+    /// `BI-41` D2: the tool's own description repeats the rule, because the
+    /// model reads a tool description even next to a long build suffix.
+    #[test]
+    fn set_cache_rule_reads_this_chart_as_one_chart_and_asks_when_it_is_unclear() {
+        let schema = (find("set_cache_rule").expect("registered tool").schema)();
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("set_cache_rule has a description");
+        for clause in [
+            "For \"this chart\", \"the chart\" or \"it\" about one chart, give its chart id",
+            "never set the dashboard's rule for a request about one chart",
+            "call ask_user with the charts' titles as the options",
+            "with exactly one chart on the page, use it",
+        ] {
+            assert!(
+                description.contains(clause),
+                "set_cache_rule must say: {clause}"
+            );
+        }
     }
 
     /// One-off fixture writer, run by hand only after an intentional schema
