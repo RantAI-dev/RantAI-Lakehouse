@@ -5,13 +5,13 @@
 //! Every function here calls straight into the `lakehouse-alerts` crate —
 //! the SAME `list_rules`/`save_rule`/`delete_rule`/`run_rules` functions
 //! `routes::alerts` calls — rather than re-implementing rule storage or
-//! evaluation. `run_alert_rule` also reuses `routes::alerts::smtp_config`
-//! so a fired alert is delivered through the exact same `SmtpConfig` the
-//! console's `/api/alerts/run` builds, and `routes::alerts::ApiFreshnessSource`/
-//! `ApiSilenceSource` (WS5 item C1) so a copilot-triggered run evaluates
-//! `Freshness` rules and suppresses delivery for a silenced rule exactly
-//! like the HTTP route does — a rule silenced from the console must not
-//! page someone again just because the copilot ran it instead.
+//! evaluation. `run_alert_rule` calls `routes::alerts::run_one` (`BI-40`
+//! D4), the one place a rule's run is wired, so a copilot-triggered run
+//! reads a chart rule as its owner, saves a fired result as an
+//! `alert_instance`, resolves a recovery, evaluates a `Freshness` rule and
+//! suppresses delivery for a silenced rule exactly as the HTTP route does —
+//! a rule silenced from the console must not page someone again just because
+//! the copilot ran it instead.
 //!
 //! `run_alert_rule` deliberately does NOT go through
 //! `routes::alerts::run`/`check_run_token`: that guard's whole point (see
@@ -39,7 +39,6 @@
 
 use lakehouse_alerts::AlertRuleInput;
 use lakehouse_auth::Principal;
-use lakehouse_notify::EmailSender;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
@@ -208,60 +207,30 @@ pub(super) async fn run_alert_rule(
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    // SEC-10: the sender checks every webhook target and never follows a redirect.
-    let http = state.webhook_sender();
-    let email = EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
-    // Same real `FreshnessSource`/`SilenceSource` wiring as
-    // `routes::alerts::run` (WS5 item C1) — reused here, not
-    // reimplemented, so a copilot-triggered run also evaluates `Freshness`
-    // rules and never pages someone about an incident they already
-    // silenced. `AppState::iceberg` is read once, through the lock, guard
-    // dropped immediately.
-    let cached_iceberg = state.iceberg.read().await.clone();
-    let freshness_source = match (state.pg.as_deref(), cached_iceberg) {
-        (Some(pg), Some(iceberg)) => {
-            Some(crate::routes::alerts::ApiFreshnessSource { pg, iceberg })
-        }
-        _ => None,
-    };
-    let silence_source = state
-        .pg
-        .as_deref()
-        .map(|pg| crate::routes::alerts::ApiSilenceSource { pg });
-    let state_source = state
-        .pg
-        .as_deref()
-        .map(|pg| crate::routes::alerts::ApiStateSource { pg });
+    // `BI-40` D2/D7: the assistant runs through the same guard as the person's
+    // test route. The tool's `alert:write` (`registry.rs`) says it may run *an*
+    // alert; this says it may run *this* one — the rule is in what the caller's
+    // list shows, the `SRC-7` D7 scope check passes, and it is theirs to manage.
+    if let Err(err) = crate::routes::alerts::authorise_rule_test(state, principal, &id).await {
+        return json!({ "error": err.to_string() });
+    }
+    // `BI-40` D4: one helper for one rule, shared with `/api/alerts/run` and the
+    // person's test route. The copilot therefore reads a chart rule as its owner
+    // and saves its fired instance as the route does — the two gaps this tool
+    // had when it carried its own copy of the run wiring.
     // `SEC-50` slice 2 T7 (M6): a person's call is gated as the person, even
     // when it arrives through the assistant (`SEC-50` R4). No `X-Tenant`
-    // here: a tool call carries the model's arguments, not the chat's
-    // request headers, so the person's FIRST tenant acts — the same fallback
-    // `tenant_scope::resolve` uses when no header is sent, and the same
-    // mapping `export_gold_mart` uses for its own tool call. A service
-    // identity or a call with no principal is a job with no user, and acts
-    // as the catalog's tenant (D3).
+    // here: a tool call carries the model's arguments, not the chat's request
+    // headers, so the person's FIRST tenant acts — the same fallback the
+    // person's test route takes with no header, and the same mapping
+    // `export_gold_mart` uses for its own tool call. A service identity or a
+    // call with no principal is a job with no user and acts as the catalog's
+    // tenant (D3), through the same one helper.
     let headers = axum::http::HeaderMap::new();
     let actor = crate::routes::gold::gold_export_gate_actor(principal, &headers);
-    match lakehouse_alerts::run_rules(
-        &state.clickhouse,
-        &http,
-        &email,
-        Some(&id),
-        freshness_source
-            .as_ref()
-            .map(|s| s as &dyn lakehouse_alerts::FreshnessSource),
-        silence_source
-            .as_ref()
-            .map(|s| s as &dyn lakehouse_alerts::SilenceSource),
-        state_source
-            .as_ref()
-            .map(|s| s as &dyn lakehouse_alerts::StateSource),
-        &crate::routes::alerts::ApiSqlGate { state, actor },
-    )
-    .await
-    {
+    match crate::routes::alerts::run_one(state, Some(&id), actor).await {
         Ok(results) => json!({ "ran": results.len(), "results": results }),
-        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+        Err(err) => json!({ "error": err.to_string() }),
     }
 }
 
@@ -346,6 +315,62 @@ mod tests {
         let result = create_alert_rule(&state, None, &Map::new()).await;
         assert!(result["error"].is_string(), "{result}");
         assert!(result.get("errorId").is_none(), "{result}");
+    }
+
+    /// `BI-40` D4: `run_alert_rule` goes through `routes::alerts::run_one`, which
+    /// reads a chart rule as its owner. Before that, the tool carried its own
+    /// copy of the run wiring and answered a chart rule with
+    /// `run_rules`' `CHART_SKIPPED` sentence — the rule was never read.
+    #[tokio::test]
+    async fn running_a_chart_rule_from_the_assistant_does_not_answer_chart_skipped() {
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        // The tool's own gate is `alert:write`; the caller owns the rule, so
+        // D2.1 shows it to them (the same C3 pair the console's guard uses).
+        let owner = uuid::Uuid::new_v4();
+        let caller = Principal {
+            id: PrincipalId::User(owner),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: PermissionSet::parse("alert:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+        let server = wiremock::MockServer::start().await;
+        let rule = json!({
+            "id": "al_chart", "name": "Visitors in Bali", "type": "alert",
+            "mart": "", "measure": "", "agg": "sum", "op": ">", "threshold": "100",
+            "board": "", "channel": "email", "target": "owner@test.invalid",
+            "enabled": "1", "created_at": "2026-11-02 00:00:00", "severity": "",
+            "pipeline": "", "metric": "", "connector": "", "asset": "", "chart": "c_kpi",
+            "series": "", "condition": "above", "owner_id": owner.to_string(),
+            "filters_json": "[]",
+        });
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [rule], "rows": 1 })),
+            )
+            .mount(&server)
+            .await;
+        let mut state = state();
+        state.clickhouse = std::sync::Arc::new(lakehouse_clickhouse::ChClient::new(
+            server.uri(),
+            "default".to_owned(),
+            String::new(),
+        ));
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("al_chart"));
+        let result = run_alert_rule(&state, Some(&caller), &args).await;
+        let text = result.to_string();
+        assert!(
+            !text.contains("chart alerts are evaluated by /api/alerts/run"),
+            "a chart rule is read now, not skipped as before: {text}"
+        );
+        assert_eq!(result["ran"], json!(1), "{text}");
+        assert!(result["results"][0]["skipped"].is_string(), "{text}");
     }
 
     #[tokio::test]

@@ -1,8 +1,17 @@
-//! `GET/POST/PUT/DELETE /api/alerts`, `GET/POST /api/alerts/run` — threshold
-//! alerts & scheduled digests.
+//! `GET/POST/PUT/DELETE /api/alerts`, `GET/POST /api/alerts/run` and
+//! `POST /api/alerts/test` — threshold alerts & scheduled digests.
 //!
 //! Ports `src/app/api/alerts/route.ts` and
 //! `src/app/api/alerts/run/route.ts`.
+//!
+//! Two doors run rules, and they answer different callers (`BI-40` D1). The
+//! scheduler's is `GET/POST /api/alerts/run`: [`run`] checks
+//! [`check_run_token`] first, so only the cron's shared token or a service
+//! identity gets through (D4), and it drives the whole tick — rules, then the
+//! quality, schema, semantic, lineage and late-pipeline passes. A person's is
+//! `POST /api/alerts/test?id=`: [`test_one`] asks [`authorise_rule_test`] who
+//! may manage that one rule and runs it through [`run_one`], the one wiring
+//! both doors (and the assistant's `run_alert_rule`) share.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -623,7 +632,7 @@ pub async fn delete(
     authorise_existing_rule(&state, caller, &id).await?;
     // BI-19 part C (C3): the router's floor is "signed in"; without the alert
     // permission a person removes only their own chart alert.
-    if !crate::routes::chart_alerts::may_delete(
+    if !crate::routes::chart_alerts::may_manage(
         caller,
         crate::routes::chart_alerts::stored_rule(&state, &id)
             .await?
@@ -1194,6 +1203,104 @@ async fn resolve_recovered(pg: &PgPool, results: &[lakehouse_alerts::RunResult])
     }
 }
 
+/// Run the alert rules once and deliver what fires (`BI-40` D4): the one place
+/// the rule part of a run lives, shared by the scheduler's tick
+/// ([`run`]), a person's test of one rule
+/// (`crate::routes::alerts::test_one`) and the assistant's `run_alert_rule`.
+///
+/// `only` narrows the run to one rule id, as `?id=` does. The wiring is
+/// deliberately the route's whole rule part and nothing of the scheduler's
+/// extra passes (quality, schema versions, semantic drafting, lineage,
+/// pipeline-late): those belong to the tick and are not a test of one rule.
+///
+/// - `run_rules` evaluates the threshold, digest, freshness and pipeline kinds;
+/// - a chart rule is answered `CHART_SKIPPED` there, so
+///   [`crate::routes::chart_alerts::evaluate`] reads it as its owner and its
+///   result replaces the skipped one (`BI-19` D12);
+/// - every fired, non-`Digest` result is saved as an `alert_instance` and every
+///   recovery resolves its open instance (`BI-19` D12), best-effort.
+///
+/// `actor` is the caller the gate measures each rule's statement against
+/// (`SEC-50` slice 2 T7, M6/R4): the deployment's catalog tenant for the
+/// scheduler's tick, the signed-in person for a test run and for the
+/// assistant's `run_alert_rule`. The caller-of-this-helper decides, so no path
+/// can run a rule around the gate.
+///
+/// # Errors
+///
+/// 500 [`ApiError::Internal`] on a `ClickHouse` failure while listing or
+/// evaluating rules; the fixed "database error" sentence, never upstream text.
+pub(crate) async fn run_one(
+    state: &AppState,
+    only: Option<&str>,
+    actor: crate::routes::query::GateActor<'_>,
+) -> Result<Vec<lakehouse_alerts::RunResult>, ApiError> {
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = state.webhook_sender();
+    let email = EmailSender::new(smtp_config(&state.config));
+    // `freshness`/`silence` sources are real, Postgres/Iceberg-backed
+    // implementations when both dependencies are configured for this
+    // request; otherwise `None` — every `Freshness` rule then reports
+    // `skipped` and no rule's delivery is ever silence-suppressed, an
+    // honest degrade rather than a placeholder failure. `AppState::iceberg`
+    // is read once, through the lock, with the guard dropped immediately
+    // (never held across an `.await`) — this only uses whatever client is
+    // already cached; it does not itself trigger a connect.
+    let cached_iceberg = state.iceberg.read().await.clone();
+    let freshness_source = match (state.pg.as_deref(), cached_iceberg) {
+        (Some(pg), Some(iceberg)) => Some(ApiFreshnessSource { pg, iceberg }),
+        _ => None,
+    };
+    let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
+    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg });
+    // `SEC-50` slice 2 T7 (M1): the gate is the caller's, carried whole — the
+    // state holds the pool the tenant count reads, the actor says whose reach
+    // the rule's statement is measured against.
+    let gate = ApiSqlGate { state, actor };
+
+    let mut results = lakehouse_alerts::run_rules(
+        &state.clickhouse,
+        &http,
+        &email,
+        only,
+        freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
+        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+        state_source.as_ref().map(|s| s as &dyn StateSource),
+        &gate,
+    )
+    .await
+    .map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::Internal,
+        )
+    })?;
+
+    // BI-19 part C (D12): chart rules are read as their owners here; their
+    // `run_rules` entries (skipped, with the reason) are replaced by the result.
+    let state_ref = state_source.as_ref().map(|s| s as &dyn StateSource);
+    let chart_results = crate::routes::chart_alerts::evaluate(
+        state,
+        (&http, &email),
+        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+        state_ref,
+        only,
+    )
+    .await;
+    results.retain(|r| !chart_results.iter().any(|c| c.id == r.id));
+    results.extend(chart_results);
+
+    // Persist every fired, non-Digest result as an `alert_instance` row,
+    // best-effort (WS5 item C1) — see [`persist_fired_results`]'s doc
+    // comment.
+    if let Some(pg) = state.pg.as_deref() {
+        persist_fired_results(pg, &state.clickhouse, &results).await;
+        resolve_recovered(pg, &results).await;
+    }
+    Ok(results)
+}
+
 /// `GET`/`POST /api/alerts/run` — evaluate rules and deliver alerts/
 /// digests that fire.
 ///
@@ -1248,72 +1355,23 @@ pub async fn run(
         principal.as_ref().map(|Extension(p)| p),
     )?;
 
+    // `SEC-50` slice 2 T7 (D3): this route is the scheduled run — a run token
+    // or a service identity (`check_run_token`), never a person's browser
+    // session — so it acts as the deployment's catalog tenant.
+    let results = run_one(
+        &state,
+        query.id.as_deref(),
+        crate::routes::query::GateActor::CatalogTenant,
+    )
+    .await?;
+
+    // The scheduler's passes below need the same senders and silence source the
+    // rule part used; `run_one` keeps its own, so this is a second, cheap build
+    // of the same configuration (`BI-40` D4).
     // SEC-10: the sender checks every webhook target and never follows a redirect.
     let http = state.webhook_sender();
     let email = EmailSender::new(smtp_config(&state.config));
-    // `freshness`/`silence` sources are real, Postgres/Iceberg-backed
-    // implementations when both dependencies are configured for this
-    // request; otherwise `None` — every `Freshness` rule then reports
-    // `skipped` and no rule's delivery is ever silence-suppressed, an
-    // honest degrade rather than a placeholder failure. `AppState::iceberg`
-    // is read once, through the lock, with the guard dropped immediately
-    // (never held across an `.await`) — this route only uses whatever
-    // client is already cached; it does not itself trigger a connect.
-    let cached_iceberg = state.iceberg.read().await.clone();
-    let freshness_source = match (state.pg.as_deref(), cached_iceberg) {
-        (Some(pg), Some(iceberg)) => Some(ApiFreshnessSource { pg, iceberg }),
-        _ => None,
-    };
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
-    let state_source = state.pg.as_deref().map(|pg| ApiStateSource { pg });
-    let gate = ApiSqlGate {
-        // `SEC-50` slice 2 T7 (D3): this route is the scheduled run — a run
-        // token or a service identity (`check_run_token`), never a person's
-        // browser session — so it acts as the deployment's catalog tenant.
-        state: &state,
-        actor: crate::routes::query::GateActor::CatalogTenant,
-    };
-
-    let mut results = lakehouse_alerts::run_rules(
-        &state.clickhouse,
-        &http,
-        &email,
-        query.id.as_deref(),
-        freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
-        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
-        state_source.as_ref().map(|s| s as &dyn StateSource),
-        &gate,
-    )
-    .await
-    .map_err(|err| {
-        upstream_error::ch_error_as(
-            &upstream_error::DATABASE,
-            &err,
-            upstream_error::FailedAs::Internal,
-        )
-    })?;
-
-    // BI-19 part C (D12): chart rules are read as their owners here; their
-    // `run_rules` entries (skipped, with the reason) are replaced by the result.
-    let state_ref = state_source.as_ref().map(|s| s as &dyn StateSource);
-    let chart_results = crate::routes::chart_alerts::evaluate(
-        &state,
-        (&http, &email),
-        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
-        state_ref,
-        query.id.as_deref(),
-    )
-    .await;
-    results.retain(|r| !chart_results.iter().any(|c| c.id == r.id));
-    results.extend(chart_results);
-
-    // Persist every fired, non-Digest result as an `alert_instance` row,
-    // best-effort (WS5 item C1) — see `persist_fired_results`'s doc
-    // comment.
-    if let Some(pg) = state.pg.as_deref() {
-        persist_fired_results(pg, &state.clickhouse, &results).await;
-        resolve_recovered(pg, &results).await;
-    }
 
     // Plan 1f: `pipeline_late` rules fire from this op, not from the
     // orchestrator event path. A "late" claim depends on the clock at
@@ -1385,6 +1443,131 @@ pub async fn run(
         "qualityPassStarted": quality_started,
         "schemaPassStarted": schema_started,
     })))
+}
+
+/// Query parameters for `POST /api/alerts/test`.
+#[derive(Debug, Deserialize)]
+pub struct TestQuery {
+    /// The rule to run, required.
+    id: Option<String>,
+}
+
+/// The answer of a `pipeline_late` rule asked to test-run (`BI-40` D3, honest:
+/// principle 2). A "late" claim needs the Postgres SLA row and the
+/// orchestrator's last success, so it belongs to the 15-minute tick, not to a
+/// single-rule test.
+const PIPELINE_LATE_TEST: &str =
+    "A late-pipeline alert is checked by the 15-minute pass, not by a test run.";
+
+/// The one refusal an unknown rule and a rule the caller cannot see share, so
+/// the route is not an oracle (`BI-40` D2.1).
+const RULE_NOT_FOUND: &str = "alert rule not found.";
+
+/// The guard of `POST /api/alerts/test` and the assistant's `run_alert_rule`
+/// (`BI-40` D2, D7): who may run this one rule now.
+///
+/// All three must hold, in this order:
+///
+/// 1. the rule is in what the caller's list shows ([`visible_rules`] over the
+///    one rule), else 404 — the same body an unknown id gets, so neither route
+///    is an oracle;
+/// 2. [`authorise_existing_rule`] passes (`SRC-7` D7: connector, upload and
+///    quality rules);
+/// 3. [`crate::routes::chart_alerts::may_manage`]: `alert:write`, or their own
+///    chart rule (C3 lets a person without the permission own one).
+///
+/// # Errors
+///
+/// 401 with no caller; 404 for an unknown rule or one they cannot see; 503 when
+/// the rules cannot be read; 403 `alert:write` when it is not theirs to manage.
+pub(crate) async fn authorise_rule_test(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: &str,
+) -> Result<(), ApiError> {
+    let Some(caller) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    let Some(rule) = crate::routes::chart_alerts::stored_rule(state, id).await? else {
+        return Err(ApiError::NotFound(RULE_NOT_FOUND.to_owned()));
+    };
+    // D2.1: the list the caller sees decides, so an id of another tenant's
+    // connector rule answers exactly as an unknown one.
+    if visible_rules(state, Some(caller), vec![rule.clone()])
+        .await?
+        .is_empty()
+    {
+        return Err(ApiError::NotFound(RULE_NOT_FOUND.to_owned()));
+    }
+    // D2.2: the same scope check as an update or a delete (`SRC-7` D7).
+    authorise_existing_rule(state, Some(caller), id).await?;
+    // D2.3: `alert:write`, or their own chart rule.
+    if !crate::routes::chart_alerts::may_manage(Some(caller), Some(&rule)) {
+        return Err(ApiError::PermissionDenied("alert:write".to_owned()));
+    }
+    Ok(())
+}
+
+/// `POST /api/alerts/test?id=` — run one rule now, for a signed-in person
+/// (`BI-40` D1).
+///
+/// This is a person's door, not the scheduler's: `POST /api/alerts/run` and its
+/// [`check_run_token`] guard (D4) are unchanged, and this route never calls
+/// them. The handler decides, as `POST /api/alerts` does (`BI-40` D2), in this
+/// order:
+///
+/// 1. the rule must be in what the caller's list shows ([`visible_rules`] over
+///    the one rule), else 404 — the same body an unknown id gets;
+/// 2. [`authorise_existing_rule`] must pass (`SRC-7` D7: connector, upload and
+///    quality rules);
+/// 3. [`crate::routes::chart_alerts::may_manage`]: `alert:write`, or their own
+///    chart rule (C3 lets a person without the permission own one).
+///
+/// The run is [`run_one`] with this id (`BI-40` D4): a real run, not a dry one
+/// (`BI-40` D3) — if the condition holds the email or webhook is really sent,
+/// the rule's state is settled, a fired result is saved and a recovery
+/// resolves. A `pipeline_late` rule answers [`PIPELINE_LATE_TEST`].
+///
+/// The body is `{ "ran": n, "results": [...] }`, the shape the console's
+/// `testRule` reads.
+///
+/// # `SEC-50` slice 2 T7 (M6/R4)
+///
+/// The run is gated as the person who asked for it — the same actor every
+/// signed-in site of this slice uses ([`crate::routes::gold::gold_export_gate_actor`],
+/// the request's `X-Tenant` honoured) — because a person testing a rule reads
+/// as themselves, exactly as the assistant's `run_alert_rule` does. It is
+/// never the scheduler's catalog tenant: that door is `POST /api/alerts/run`.
+///
+/// # Refusals (`BI-40` D6)
+///
+/// 401 only with no session; 403 `alert:write` when the caller may not manage
+/// the rule; 404 when the caller cannot see it. Never a 401 for a signed-in
+/// person, so the console does not read a refusal as a lost session.
+///
+/// # Errors
+///
+/// 400 without an id; 404 as above; 403 as above; 401 with no session; 503 when
+/// the rules cannot be read; 500 on a `ClickHouse` failure during the run.
+pub async fn test_one(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    principal: Option<Extension<Principal>>,
+    Query(query): Query<TestQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(id) = query.id else {
+        return Err(ApiError::BadRequest("id is required".to_owned()).into());
+    };
+    let caller = principal.as_ref().map(|Extension(p)| p);
+    authorise_rule_test(&state, caller, &id).await?;
+    let actor = crate::routes::gold::gold_export_gate_actor(caller, &headers);
+    let mut results = run_one(&state, Some(&id), actor).await?;
+    for result in &mut results {
+        if result.kind == AlertKind::PipelineLate {
+            result.skipped = Some(PIPELINE_LATE_TEST.to_owned());
+        }
+    }
+    Ok(ApiJson(json!({ "ran": results.len(), "results": results })))
 }
 
 /// Plan 1f: list every distinct `pipeline_id` referenced by an enabled

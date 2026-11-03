@@ -1288,7 +1288,7 @@ fn delete_alert_rule_schema() -> Value {
 
 fn run_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_alert_rule",
-        "description": "Evaluate one alert or digest rule now (by id). If its condition holds, the webhook or email is really sent.",
+        "description": "Run one alert or digest rule now (by id), as a test: chart alerts included. If its condition holds, the email or webhook is really sent and the alert is marked as fired.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
