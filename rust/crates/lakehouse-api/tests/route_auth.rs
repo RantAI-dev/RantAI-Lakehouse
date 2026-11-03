@@ -334,6 +334,44 @@ async fn a_seeded_analyst_is_denied_adding_a_user_to_a_tenant() {
     );
 }
 
+/// ADM-3 D2: `POST /api/identity/users/{id}/reset-password` hands out a
+/// new credential, so it is `identity:write` — the same permission every
+/// other write-side identity route uses, and no new token minted for it.
+///
+/// Both directions are named here with a real principal: a seeded Analyst
+/// (no `identity:write`) is refused with 403, a Platform Admin is not
+/// refused by the auth gate at all (the handler then answers 404 for the
+/// unknown id the request names, which is the handler's business, not the
+/// gate's). The two loops over [`POLICY_TABLE`] above walk this entry
+/// too; this one names it.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_resetting_a_password_and_a_platform_admin_is_not() {
+    let TestApp { router, pool } = spin_up().await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let path = format!(
+        "/api/identity/users/{}/reset-password",
+        Uuid::new_v4().simple()
+    );
+
+    let denied = request_with_cookie(&router, "POST", &path, &analyst).await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied identity:write"
+    );
+
+    let allowed = request_with_cookie(&router, "POST", &path, &admin).await;
+    assert!(
+        !matches!(
+            allowed.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "a Platform Admin must never be refused by the auth gate, got {}",
+        allowed.status()
+    );
+}
+
 /// BLD-1 / D2: `PUT /api/pipelines/{id}/run-as` decides whose permissions
 /// every future run of that pipeline is governed by, so it is
 /// `identity:write` — a governance decision, exactly like
@@ -3528,6 +3566,53 @@ async fn the_door_needs_the_iceberg_read_scope_and_a_service_identity() {
             ),
             "{method} {path}: a service identity holding iceberg:read must pass the gate, got {}",
             resp.status()
+        );
+    }
+}
+
+/// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
+/// as `identity:write`, and the gate agrees both ways: no session is 401,
+/// a principal without `identity:write` is 403, and one holding it gets
+/// past the gate (what follows is the handler's own answer — 400 for the
+/// concretized ids used here — never 401 or 403).
+#[tokio::test]
+async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    for (method, path) in [
+        ("PUT", "/api/identity/users/{id}/roles"),
+        ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
+        ("POST", "/api/identity/users/{id}/deactivate"),
+        ("POST", "/api/identity/users/{id}/reactivate"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("identity:write")),
+            "{method} {path}"
+        );
+        let concrete = concretize(path);
+        let anonymous = request_with_cookie(&router, method, &concrete, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+        let plain = create_principal_with_permissions(&pool, "query:read").await;
+        let cookie = session_cookie_for_user(&pool, plain).await;
+        let refused = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let writer = create_principal_with_permissions(&pool, "identity:write").await;
+        let cookie = session_cookie_for_user(&pool, writer).await;
+        let allowed = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert!(
+            !matches!(
+                allowed.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a caller holding identity:write must get past the gate, got {}",
+            allowed.status()
         );
     }
 }

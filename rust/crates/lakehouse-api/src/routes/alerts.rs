@@ -704,6 +704,9 @@ pub(crate) fn smtp_config(config: &Config) -> SmtpConfig {
         user: config.smtp_user.clone(),
         pass: config.smtp_pass.clone(),
         from: config.smtp_from.clone(),
+        // `SEC-56` D1/D6: the bundle is read once, at start-up, and handed
+        // to the sender as it is.
+        ca_bundle: config.smtp_ca.clone(),
     }
 }
 
@@ -2114,6 +2117,7 @@ mod tests {
                 user: None,
                 pass: String::new(),
                 from: String::new(),
+                ca_bundle: None,
             })
         }
 
