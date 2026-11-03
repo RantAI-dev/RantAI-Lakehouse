@@ -101,7 +101,7 @@ export function CopilotHistoryPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Copilot history"
+        title="AI Copilot history"
         description="Your conversations with AI Copilot. Only you can see them."
         actions={
           <Button size="sm" onClick={startNewChat}>

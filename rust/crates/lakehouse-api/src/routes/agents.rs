@@ -1288,7 +1288,10 @@ async fn run_headless_loop_inner(
                 // SEC-11: this step is stored and shown to whoever opens the run;
                 // the provider's text goes to the log under a reference.
                 let detail = format!(
-                    "AI Copilot unavailable. {}",
+                    // AI-23 (product owner 2026-11-02): one sentence for an
+                    // unavailable assistant, the same one the chat answers
+                    // with: "AI Copilot is unavailable."
+                    "AI Copilot is unavailable. {}",
                     crate::upstream_error::report(
                         &crate::upstream_error::MODEL,
                         match &err {

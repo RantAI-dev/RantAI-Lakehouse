@@ -176,10 +176,10 @@ export function CopilotPage() {
             <ChatComposer onStop={c.stop} solid
               mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy}
               enabledCaps={c.enabledCaps} toggleCap={c.toggleCap}
-              placeholder={c.mode === "build" ? "Tell Copilot what to build or change…" : "Ask anything about your lakehouse data…"}
+              placeholder={c.mode === "build" ? "Tell AI Copilot what to build or change…" : "Ask anything about your lakehouse data…"}
             />
             <p className="mt-2 text-center text-[11px] text-muted-foreground">
-              Copilot can be wrong. Check its answers; anything that changes data asks you first.
+              AI Copilot can be wrong. Check its answers; anything that changes data asks you first.
             </p>
           </div>
         </div>
