@@ -20,6 +20,10 @@ once a first release is tagged.
 
 - "Test run now" works for people again (backlog `BI-40`; plan `docs/superpowers/plans/2026-11-02-bi-40-test-run-now.md`). Since `D4` the run door, `POST /api/alerts/run`, admits only the scheduler (a shared `ALERTS_RUN_TOKEN`, or a service identity when it is unset), so a signed-in person's click answered 401 and `apiFetch` sent them to the login page. A person now tests one rule at `POST /api/alerts/test?id=`, which runs it for real — the email or webhook is sent, the alert fires once and recovers once (`BI-19` D11), and a fired result is saved — for whoever may manage that rule: `alert:write`, or their own chart alert. A rule they cannot see answers "alert rule not found.", the same as an unknown id, and a refusal is a 403 or 404, so the console never reads it as a lost session. `POST /api/alerts/run` and its token are unchanged. The assistant's `run_alert_rule` runs through the same guard and the same wiring, so it reads chart alerts too and saves their instances. **Removed:** the Alerts page's "Run all now" button and the client call behind it; the tick is the scheduler's. No migration.
 
+### Security
+
+- `calamine` 0.37 -> 0.38 leaves `RUSTSEC-2026-0436` out of the dependency tree (a malformed compound file could panic the reader or ask it for unbounded memory in the CFB/OLE2 parser, the `.xls` path the upload reader takes). No ignore was added, and `zip` stays one version (9.1.2) shared with `calamine` and `rust_xlsxwriter`. A workbook that reads today reads the same: the release notes' changes to what the upload reader touches are the fixed panics and an `.xls` stream name matched without regard to case.
+
 ## [0.2.0] - 2026-11-02
 
 ### Security
