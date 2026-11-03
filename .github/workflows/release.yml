@@ -660,6 +660,51 @@ jobs:
             --out dist
           df -h /
 
+      # REL-7 D4: the split is proved HERE, before a tag can need it.
+      #
+      # The release attaches the bundle in PARTS, because GitHub refuses
+      # an asset of 2 GiB or more (REL-7 D1) — and the dry run never
+      # caught the size limit, because it builds the bundle but uploads
+      # it as a workflow artifact and no release asset. So the dry run
+      # splits the bundle it built, joins the parts back in name order,
+      # and compares the joined file's checksum with the one
+      # `make_bundle.sh` wrote. A split that does not round-trip fails
+      # here, and no release is cut from it.
+      - name: The bundle splits into parts and joins back to the same bytes
+        run: |
+          set -euo pipefail
+          bundle="dist/rantai-lakehouse-${{ steps.version.outputs.version }}-linux-x86_64.tar.zst"
+          parts_dir="$RUNNER_TEMP/bundle-parts"
+          mkdir -p "$parts_dir"
+          # The SAME command the release job runs: the part size and the
+          # suffix padding are the release's contract with the operator's
+          # join (REL-7 D2), so the dry run proves this command and no
+          # other.
+          split -b 1900M -d -a 2 "$bundle" "$parts_dir/$(basename "$bundle").part-"
+          parts=("$parts_dir/$(basename "$bundle").part-"*)
+          echo "the bundle is ${#parts[@]} part(s):"
+          for part in "${parts[@]}"; do
+            part_size="$(wc -c < "$part")"
+            echo "  $(basename "$part"): $part_size bytes"
+            # The limit the parts exist for (REL-7 D1): the release
+            # refuses one at or above it, and this refuses it first.
+            if [ "$part_size" -ge 2147483648 ]; then
+              echo "::error::$(basename "$part") is $part_size bytes, and a release asset must be less than 2 GiB" >&2
+              exit 1
+            fi
+          done
+          # The join, in NAME order: `-d` numbers the parts, so the
+          # glob's sorted expansion is the order `cat` must read them in.
+          joined="$RUNNER_TEMP/bundle-joined.tar.zst"
+          cat "${parts[@]}" > "$joined"
+          recorded="$(awk '{print $1}' "$bundle.sha256")"
+          actual="$(sha256sum "$joined" | awk '{print $1}')"
+          if [ "$actual" != "$recorded" ]; then
+            echo "::error::the joined bundle is $actual, and make_bundle.sh recorded $recorded" >&2
+            exit 1
+          fi
+          echo "the joined bundle matches $bundle.sha256 ($actual)"
+
       # The rendered Compose file must be a file compose accepts: the
       # env values are throwaway, because the template has no default
       # credentials (SEC-18) and compose refuses to interpolate a missing
@@ -1179,13 +1224,26 @@ jobs:
 
       # The release's own assets, and their checksums: the operator who
       # downloads them can check them against the release page.
+      #
+      # The bundle is published IN PARTS (REL-7 D1). GitHub refuses a
+      # release asset of 2 GiB or more — the v0.2.0 run failed with
+      # "size must be less than 2147483648", because the bundle had grown
+      # to 3,794,642,569 bytes — so it is split at 1900 MiB, which leaves
+      # a margin under the limit, and the whole file itself is NOT an
+      # asset. Its own `.sha256` still is: the joined file must match it
+      # (the join is in docs/OPERATIONS.md, REL-7 D2), and `SHA256SUMS`
+      # lists every part, so a damaged part is refused before the join.
       - name: The release's assets
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
+          bundle="dist/rantai-lakehouse-$version-linux-x86_64.tar.zst"
           mkdir -p release-assets
-          cp "dist/rantai-lakehouse-$version-linux-x86_64.tar.zst" release-assets/
-          cp "dist/rantai-lakehouse-$version-linux-x86_64.tar.zst.sha256" release-assets/
+          # `-d` numbers the parts (`part-00`, `part-01`, …) and `-a 2`
+          # pads to two digits, so a plain sort — the order `cat` uses —
+          # is the join order.
+          split -b 1900M -d -a 2 "$bundle" "release-assets/$(basename "$bundle").part-"
+          cp "$bundle.sha256" release-assets/
           cp release.json release-assets/
           cp release.json.sigstore.json release-assets/
           cp sbom/*.cdx.json release-assets/
@@ -1214,7 +1272,7 @@ jobs:
           done < shipped-files.txt
           (
             cd release-assets
-            sha256sum ./*.tar.zst ./release.json ./release.json.sigstore.json ./*.cdx.json \
+            sha256sum ./*.tar.zst.part-* ./release.json ./release.json.sigstore.json ./*.cdx.json \
               ./lakehousectl-linux-x86_64 > SHA256SUMS
             while read -r name; do
               [ -n "$name" ] || continue
@@ -1225,6 +1283,13 @@ jobs:
       # The release is a DRAFT: the product owner publishes it, after
       # checking that the bundle, the manifest and the images are what
       # the release should be. Nothing is public until then.
+      #
+      # A re-run must not fail on a draft that already exists
+      # (REL-7 D5): the v0.2.0 run created its draft and then failed on
+      # the bundle, and the job has to be re-runnable on the same tag.
+      # So a DRAFT is written into with `gh release upload --clobber`,
+      # and a PUBLISHED release is refused: it is what an operator
+      # installed, and the pipeline never rewrites it.
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1237,10 +1302,11 @@ jobs:
           # began to hold every image the release runs (REL-2 S2 review
           # round 6 BLOCKER 1).
           size="$(wc -c < "$bundle")"
+          parts="$(find release-assets -maxdepth 1 -name '*.tar.zst.part-*' | wc -l)"
           {
             echo "RantAI Lakehouse v$version."
             echo ""
-            echo "Attached: the offline bundle and its checksum, the release manifest"
+            echo "Attached: the offline bundle in parts and its checksum, the release manifest"
             echo "and its Sigstore bundle, and the CycloneDX SBOM of each image. The upgrade"
             echo "notes are written in REL-2 S5 (docs/core/reference/release-policy.md)."
             echo ""
@@ -1248,13 +1314,35 @@ jobs:
             echo "It holds every image the release runs — the four published ones and the"
             echo "third-party ones, each by digest."
             echo ""
+            echo "The bundle is attached in $parts part(s), 1900 MiB at most each ($version"
+            echo "→ rantai-lakehouse-$version-linux-x86_64.tar.zst.part-00, .part-01, …),"
+            echo "because a release asset may not exceed 2 GiB (REL-7 D1). Join the parts in"
+            echo "name order, check each of them against SHA256SUMS and the joined file"
+            echo "against its .sha256, then unpack it: the commands are in"
+            echo "docs/OPERATIONS.md, and so is why the order matters."
+            echo ""
             echo "This release is a draft. The product owner publishes it."
           } > release-notes.md
-          gh release create "v$version" \
-            --draft \
-            --title "RantAI Lakehouse v$version" \
-            --notes-file release-notes.md \
-            release-assets/*
+          draft="$(gh release view "v$version" --json isDraft --jq '.isDraft' 2>/dev/null || echo absent)"
+          case "$draft" in
+            absent)
+              gh release create "v$version" \
+                --draft \
+                --title "RantAI Lakehouse v$version" \
+                --notes-file release-notes.md \
+                release-assets/*
+              ;;
+            true)
+              echo "the draft v$version exists: writing this run's assets into it"
+              gh release edit "v$version" --title "RantAI Lakehouse v$version" \
+                --notes-file release-notes.md
+              gh release upload "v$version" --clobber release-assets/*
+              ;;
+            *)
+              echo "::error::v$version is already published, and this job never rewrites a published release" >&2
+              exit 1
+              ;;
+          esac
 
   # ── The proof: the bundle installs ──────────────────────────────────
   install-proof:
