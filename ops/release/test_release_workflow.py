@@ -86,6 +86,19 @@ page:
   - the install proof asks for `/landing`'s status and fails the job
     unless it is 404.
 
+And four more since REL-7, from the 0.2.0 release that could not attach its
+bundle (GitHub refuses a release asset of 2 GiB or more):
+
+  - the release attaches the bundle IN PARTS, split at 1900 MiB with
+    `-d -a 2` numbering, `SHA256SUMS` lists every part, and the whole
+    file's `.sha256` is an asset so the joined file can be checked;
+  - a draft release that already exists for the tag is written into with
+    `gh release upload --clobber`, so the job re-runs on the same tag —
+    and a PUBLISHED release is refused;
+  - the dry run splits the bundle it built, checks the parts, joins them
+    in name order and checks the joined file against the bundle's own
+    `.sha256`, so a split that does not round-trip fails before a tag.
+
 The workflow is parsed with PyYAML (`pyyaml==6.0.3`, installed by the jobs
 that run these tests). The checks are run against synthetic workflows too,
 so a check that cannot fail is itself a failure. No network, no repository:
@@ -197,6 +210,20 @@ DAGSTER_STEPS = (
 # The install's own `.env`: the file that names the profiles the
 # install runs, and the file the proof's compose call reads.
 INSTALL_ENV = "--env-file install/.env"
+
+# A release asset may not reach 2 GiB, and the bundle holds every image
+# the release runs, so it is attached IN PARTS (REL-7 D1). The parts are
+# made at 1900 MiB — the margin under the limit — numbered and padded by
+# `-d -a 2`, so the operator's name-order join is the byte order (D2).
+BUNDLE_PART_SIZE = "1900M"
+BUNDLE_PARTS_GLOB = "./*.tar.zst.part-*"
+
+# The steps of REL-7: the release job's asset list (the split and the
+# checksums, D1/D5), and the dry run's round trip (D4).
+ASSETS_STEP = "The release's assets"
+DRAFT_STEP = "Create the draft release"
+ROUND_TRIP_STEP = "The bundle splits into parts and joins back to the same bytes"
+
 
 # The API the proof talks to, and the part of it that is authenticated.
 #
@@ -706,6 +733,62 @@ SYNTHETIC_HELPER_WITHOUT_A_TENANT = """
 set -euo pipefail
 curl -fsS -c "$COOKIE_JAR" -X POST "$API_URL/api/auth/login" -d "$payload" > /dev/null
 curl -fsS -b "$COOKIE_JAR" "$API_URL$path"
+"""
+
+
+# A workflow that attaches the WHOLE bundle as a release asset: GitHub
+# refuses an asset of 2 GiB or more, and the bundle is bigger (REL-7 D1).
+SYNTHETIC_WHOLE_BUNDLE_AS_AN_ASSET = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The release's assets
+        run: |
+          set -euo pipefail
+          bundle="dist/rantai-lakehouse-$version-linux-x86_64.tar.zst"
+          mkdir -p release-assets
+          cp "$bundle" release-assets/
+          (
+            cd release-assets
+            sha256sum ./*.tar.zst > SHA256SUMS
+          )
+"""
+
+# A dry run whose round trip splits and joins, but never checks the
+# joined file: a split that does not round-trip would pass it (REL-7 D4).
+SYNTHETIC_ROUND_TRIP_WITHOUT_THE_CHECK = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The bundle splits into parts and joins back to the same bytes
+        run: |
+          set -euo pipefail
+          split -b 1900M -d -a 2 "$bundle" "$parts_dir/$name.part-"
+          (
+            cd "$parts_dir"
+            cat ./"$name".part-* > "$name"
+          )
+"""
+
+# A draft step that only creates the release: a re-run on a tag whose
+# draft already exists fails (REL-7 D5).
+SYNTHETIC_CREATE_ONLY = """
+name: Synthetic
+on: workflow_dispatch
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the draft release
+        run: |
+          set -euo pipefail
+          gh release create "v$version" --draft release-assets/*
 """
 
 
@@ -1448,6 +1531,108 @@ def dagster_assertion_problems(
     return problems
 
 
+def bundle_parts_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every way the job's asset list breaks the bundle into parts wrong.
+
+    GitHub refuses a release asset of 2 GiB or more, and the v0.2.0
+    bundle was 3,794,642,569 bytes ("size must be less than
+    2147483648"), so the release splits it at 1900 MiB and attaches the
+    PARTS (REL-7 D1). The whole file itself must not be an asset, its
+    `.sha256` must be one, and `SHA256SUMS` must list every part — that
+    is the list the operator checks each download against (D2).
+    """
+    problems: list[str] = []
+    try:
+        step = step_named(document, job_name, ASSETS_STEP)
+    except AssertionError:
+        return [f"{job_name}: the job has no step named {ASSETS_STEP!r}"]
+    commands = shell_commands(str(step.get("run") or ""))
+    split = f"split -b {BUNDLE_PART_SIZE} -d -a 2"
+    if split not in commands:
+        problems.append(
+            f"{job_name}: the bundle is not split with `{split}`, and a part at "
+            f"2 GiB or more is an asset GitHub refuses"
+        )
+    if 'cp "$bundle" release-assets/' in commands:
+        problems.append(
+            f"{job_name}: the whole bundle is copied into the assets, and GitHub "
+            f"refuses an asset of 2 GiB or more"
+        )
+    if 'cp "$bundle.sha256" release-assets/' not in commands:
+        problems.append(
+            f"{job_name}: the whole file's .sha256 is not an asset, so the joined "
+            f"file has nothing to be checked against"
+        )
+    if BUNDLE_PARTS_GLOB not in commands:
+        problems.append(
+            f"{job_name}: SHA256SUMS does not list the parts (`{BUNDLE_PARTS_GLOB}`)"
+        )
+    return problems
+
+
+def draft_reuse_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every way `gh release create` cannot be re-run on an existing draft.
+
+    The v0.2.0 run created its draft and then failed on the bundle's
+    size, so the job has to run again on the same tag (REL-7 D5): a
+    DRAFT is written into with `gh release upload --clobber`, and a
+    PUBLISHED release is refused — it is what an operator installed.
+    """
+    problems: list[str] = []
+    try:
+        step = step_named(document, job_name, DRAFT_STEP)
+    except AssertionError:
+        return [f"{job_name}: the job has no step named {DRAFT_STEP!r}"]
+    commands = shell_commands(str(step.get("run") or ""))
+    if "gh release create" not in commands:
+        problems.append(f"{job_name}: the step never creates the draft release")
+    if "gh release upload" not in commands or "--clobber" not in commands:
+        problems.append(
+            f"{job_name}: the step does not write into a draft that already exists "
+            f"(`gh release upload --clobber`)"
+        )
+    if "isDraft" not in commands:
+        problems.append(
+            f"{job_name}: the step does not ask whether the release is a draft"
+        )
+    if "published" not in commands:
+        problems.append(
+            f"{job_name}: the step does not refuse a published release"
+        )
+    return problems
+
+
+def round_trip_problems(document: dict[str, Any], job_name: str) -> list[str]:
+    """Every way the dry run fails to prove the split round-trips.
+
+    REL-7 D4: the dry run makes the parts the release makes, checks them
+    against a `SHA256SUMS` of its own, joins them in name order, and
+    checks the joined file against the `.sha256` the bundle script
+    wrote. A bundle that does not round-trip must fail the dry run.
+    """
+    problems: list[str] = []
+    try:
+        step = step_named(document, job_name, ROUND_TRIP_STEP)
+    except AssertionError:
+        return [f"{job_name}: the job has no step named {ROUND_TRIP_STEP!r}"]
+    commands = shell_commands(str(step.get("run") or ""))
+    split = f"split -b {BUNDLE_PART_SIZE} -d -a 2"
+    if split not in commands:
+        problems.append(f"{job_name}: the round trip does not split with `{split}`")
+    if "sha256sum -c SHA256SUMS" not in commands:
+        problems.append(f"{job_name}: the round trip does not check each part")
+    if 'cat ./"$name".part-* > "$name"' not in commands:
+        problems.append(
+            f"{job_name}: the round trip does not join the parts in name order"
+        )
+    if 'sha256sum -c "$name.sha256"' not in commands:
+        problems.append(
+            f"{job_name}: the round trip does not check the joined file against the "
+            f"bundle's own .sha256"
+        )
+    return problems
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     """The release workflow's own properties."""
 
@@ -1753,6 +1938,59 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 str(bundle.get("run")),
                 job,
             )
+
+    def test_the_release_attaches_the_bundle_in_parts(self) -> None:
+        """REL-7 D1: GitHub refuses a release asset of 2 GiB or more.
+
+        The v0.2.0 bundle was 3,794,642,569 bytes, and the release failed
+        with "size must be less than 2147483648". So the bundle is split
+        at 1900 MiB — the margin under the limit — and the PARTS are the
+        assets. The whole file's `.sha256` stays one, because the joined
+        file must match it (D2).
+        """
+        self.assertEqual(bundle_parts_problems(self.document, "release"), [])
+
+    def test_a_release_that_attaches_the_whole_bundle_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_WHOLE_BUNDLE_AS_AN_ASSET)
+        self.assertNotEqual(bundle_parts_problems(document, "release"), [])
+
+    def test_the_dry_run_proves_the_split_round_trips(self) -> None:
+        """REL-7 D4: the split is proved before a tag can need it.
+
+        The dry run never caught the size limit, because it builds the
+        bundle and attaches no release asset. It now makes the parts the
+        release makes, checks each against `SHA256SUMS`, joins them in
+        name order, and checks the joined file against the bundle's own
+        `.sha256` — the operator's commands (D2).
+        """
+        self.assertEqual(round_trip_problems(self.document, "dry-run"), [])
+
+    def test_a_round_trip_that_never_checks_the_join_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_ROUND_TRIP_WITHOUT_THE_CHECK)
+        self.assertNotEqual(round_trip_problems(document, "dry-run"), [])
+
+    def test_the_round_trip_comes_after_the_bundle_is_built(self) -> None:
+        """A split is worth nothing before the file it splits."""
+        self.assertLess(
+            step_index(self.document, "dry-run", "Build the offline bundle"),
+            step_index(self.document, "dry-run", ROUND_TRIP_STEP),
+        )
+
+    def test_the_draft_release_can_be_written_again(self) -> None:
+        """REL-7 D5: the v0.2.0 run left a draft, and the job re-runs.
+
+        A draft that already exists for the tag is written into with
+        `gh release upload --clobber`, and a PUBLISHED release is
+        refused: it is what an operator installed.
+        """
+        self.assertEqual(draft_reuse_problems(self.document, "release"), [])
+
+    def test_a_create_only_draft_step_is_reported(self) -> None:
+        """The check above must be able to fail."""
+        document = yaml.safe_load(SYNTHETIC_CREATE_ONLY)
+        self.assertNotEqual(draft_reuse_problems(document, "release"), [])
 
     def test_the_release_job_publishes_the_files_the_release_ships(self) -> None:
         """REL-2 S4 decision D14: the release ships every file its
