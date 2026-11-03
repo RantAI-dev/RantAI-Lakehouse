@@ -132,7 +132,7 @@ postgres-protocol = "0.6.12"
 # `fallible_iterator::FallibleIterator`, and reading its mechanisms needs the
 # trait in scope. Declared directly because `postgres-protocol` already pulls
 # the crate in, so it adds no package of its own. MIT OR Apache-2.0.
-fallible-iterator = "0.2"
+fallible-iterator = "0.3"
 # `postgres-protocol` frames messages in `bytes::BytesMut`; already in
 # `Cargo.lock` (a `tokio`/`sqlx` dependency) -- this is the first direct use.
 bytes = "1"
