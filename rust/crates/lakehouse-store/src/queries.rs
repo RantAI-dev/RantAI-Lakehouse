@@ -13,18 +13,23 @@
 //! past executions instead of fabricated fixtures — see
 //! [`record_history`]'s doc comment for how that write is made non-fatal.
 //!
-//! `SavedQuery` has no `create`/`update`/`delete` method anywhere in the
-//! `QueryService` contract — [`list_saved`] is genuinely read-only,
-//! backed by seed rows (`0004_queries.sql`) the way `identity`'s
-//! `workspace_settings` is backed by a constant, except here the shape
-//! (rows in a table with `dimension`/`tags`) earns an actual table rather
-//! than a hardcoded response.
+//! The console's saved queries started as mock data, backed by seed rows
+//! (`0004_queries.sql`) the way `identity`'s `workspace_settings` is backed
+//! by a constant. This module now owns their write side too — create,
+//! update, delete, folders, versions and trash (migration
+//! `0122_saved_query_access.sql`) — with the access rules of
+//! `crate::saved_query_access` applied on every read and write.
 
 use serde::Serialize;
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub use crate::saved_query_access::SavedQueryViewer;
+use crate::saved_query_access::{
+    AccessGrant, AccessTarget, FolderMap, FolderNode, Level, ensure_personal_space,
+    escape_like_pattern, grants_for_viewer, list_folders, resolve_level,
+};
 use crate::{PgPool, StoreError};
 
 /// Render a timestamp the way JavaScript's `Date.prototype.toISOString`
@@ -44,7 +49,7 @@ fn iso_millis(at: OffsetDateTime) -> String {
     )
 }
 
-// ── Saved query (read-only — no writer in the contract) ────────────────
+// ── Saved queries ───────────────────────────────────────────────────────
 
 /// A saved query. Mirrors `SavedQuery` in `contracts/queries.ts`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -62,8 +67,15 @@ pub struct SavedQuery {
     pub updated_at: String,
     /// Free-text tags.
     pub tags: Vec<String>,
+    /// The folder the query sits in; `None` is the shared space.
+    pub folder_id: Option<String>,
+    /// The author's user id, when the query has one.
+    pub owner_id: Option<String>,
+    /// The level the caller holds on it: "view", "edit" or "manage".
+    pub level: String,
 }
 
+/// A saved query, as the database holds it.
 #[derive(Debug, FromRow)]
 struct SavedQueryRow {
     id: Uuid,
@@ -72,37 +84,61 @@ struct SavedQueryRow {
     owner: String,
     updated_at: OffsetDateTime,
     tags: Vec<String>,
+    folder_id: Option<Uuid>,
+    owner_id: Option<Uuid>,
+    tenant_id: Option<Uuid>,
+    deleted_at: Option<OffsetDateTime>,
 }
 
-impl From<SavedQueryRow> for SavedQuery {
-    fn from(row: SavedQueryRow) -> Self {
-        Self {
-            id: row.id.to_string(),
-            title: row.title,
-            sql: row.sql,
-            owner: row.owner,
-            updated_at: iso_millis(row.updated_at),
-            tags: row.tags,
+impl SavedQueryRow {
+    /// The item the access resolver is asked about.
+    fn target(&self) -> AccessTarget {
+        AccessTarget {
+            id: self.id,
+            owner_id: self.owner_id,
+            folder_id: self.folder_id,
+            tenant_id: self.tenant_id,
+        }
+    }
+
+    /// The wire shape, at the level the caller holds on it.
+    fn into_saved(self, level: Level) -> SavedQuery {
+        SavedQuery {
+            id: self.id.to_string(),
+            title: self.title,
+            sql: self.sql,
+            owner: self.owner,
+            updated_at: iso_millis(self.updated_at),
+            tags: self.tags,
+            folder_id: self.folder_id.map(|id| id.to_string()),
+            owner_id: self.owner_id.map(|id| id.to_string()),
+            level: level.as_str().to_owned(),
         }
     }
 }
 
-/// Which saved queries a caller may read (`SEC-20`).
+/// Which saved queries a caller may read (`SEC-20`), and who they are.
 ///
 /// A saved query is a statement somebody wrote against their own data, so
 /// it belongs to the tenant that wrote it: one tenant's rows are that
 /// tenant's alone, and the rows that belong to no tenant are read only by
 /// the tenant that owns the shared catalog.
 ///
-/// The scope is decided once per request, beside the decision the same
-/// request makes about the tables a statement may read, so "which
-/// tenant is this" is answered once for both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The scope also carries the **viewer**: who is asking, with the roles
+/// they hold and the tenant they act as. The level the viewer holds on a
+/// row is decided by [`resolve_level`], so a read path cannot answer
+/// "visible" without also answering "at what level" — and a new read path
+/// cannot compile without saying who reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SavedQueryScope {
     /// Every row: a caller who holds every permission, or a deployment
     /// that holds a single tenant — there is no other tenant's row to
     /// hide from anybody.
-    All,
+    All {
+        /// Who is asking. The scope's tenant is "every tenant's rows",
+        /// so the viewer carries no tenant of its own.
+        viewer: SavedQueryViewer,
+    },
     /// One tenant's rows, and the rows that belong to no tenant when
     /// `include_tenantless` is set.
     Tenant {
@@ -114,59 +150,278 @@ pub enum SavedQueryScope {
         /// wrote them, so they are the shared catalog's own, and the
         /// tenant that owns that catalog is the one that reads them.
         include_tenantless: bool,
+        /// Who is asking.
+        viewer: SavedQueryViewer,
     },
     /// No row at all: a caller that belongs to no tenant owns no saved
     /// query and reads none.
     None,
 }
 
+impl SavedQueryScope {
+    /// The tenant whose rows the scope reads: `None` for every row.
+    fn tenant_id(&self) -> Option<Uuid> {
+        match self {
+            Self::All { .. } | Self::None => None,
+            Self::Tenant { tenant_id, .. } => Some(*tenant_id),
+        }
+    }
+
+    /// Whether the rows that belong to no tenant are read as well.
+    fn includes_tenantless(&self) -> bool {
+        match self {
+            Self::Tenant {
+                include_tenantless, ..
+            } => *include_tenantless,
+            Self::All { .. } | Self::None => false,
+        }
+    }
+
+    /// The viewer, with the scope's own tenant applied.
+    ///
+    /// The scope's tenant and the viewer's tenant are the same thing: a
+    /// scope that reads one tenant's rows is a scope whose viewer acts
+    /// as that tenant, and a scope that reads every tenant's rows is a
+    /// scope whose viewer acts as none of them. The scope decides, so a
+    /// caller cannot widen the reach by handing in a viewer of its own.
+    ///
+    /// Public because a write path needs the same viewer the read path
+    /// used: the store's own writes take a [`SavedQueryViewer`] and check
+    /// the tenant boundary against it, so a route that writes has to ask
+    /// the scope — never a viewer of its own — who it writes as.
+    #[must_use]
+    pub fn effective_viewer(&self) -> Option<SavedQueryViewer> {
+        match self {
+            Self::All { viewer } => {
+                let mut viewer = viewer.clone();
+                viewer.tenant_id = None;
+                Some(viewer)
+            }
+            Self::Tenant {
+                tenant_id, viewer, ..
+            } => {
+                let mut viewer = viewer.clone();
+                viewer.tenant_id = Some(*tenant_id);
+                Some(viewer)
+            }
+            Self::None => None,
+        }
+    }
+}
+
+/// What the caller may see, and at what level: the folders of the tenant
+/// the read covers, the rules that name the viewer, and the one resolver
+/// that turns both into a level.
+struct Visibility {
+    folders: FolderMap,
+    grants: Vec<AccessGrant>,
+    viewer: SavedQueryViewer,
+}
+
+impl Visibility {
+    /// Read the folders and the rules once, for the whole answer.
+    async fn load(pool: &PgPool, viewer: &SavedQueryViewer) -> Result<Self, StoreError> {
+        Ok(Self {
+            folders: FolderMap::new(list_folders(pool, viewer.tenant_id).await?),
+            grants: grants_for_viewer(pool, viewer).await?,
+            viewer: viewer.clone(),
+        })
+    }
+
+    /// The level the viewer holds on the item, or `None` when the item
+    /// does not exist for them.
+    ///
+    /// A query whose folder is not in the map — a folder of another
+    /// tenant, or one whose chain cannot be built — has no level at all:
+    /// it is invisible, not an error.
+    fn level(&self, target: &AccessTarget) -> Option<Level> {
+        let chain: Vec<FolderNode> = match target.folder_id {
+            Some(folder_id) => self
+                .folders
+                .chain(folder_id)?
+                .into_iter()
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        resolve_level(target, &chain, &self.grants, &self.viewer)
+    }
+}
+
 /// The saved queries the scope allows, newest first.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] if the query fails.
+/// Returns [`StoreError::Database`] if a query fails.
 pub async fn list_saved(
     pool: &PgPool,
     scope: SavedQueryScope,
 ) -> Result<Vec<SavedQuery>, StoreError> {
-    let rows: Vec<SavedQueryRow> = match scope {
-        SavedQueryScope::All => {
-            sqlx::query_as(
-                "SELECT id, title, sql, owner, updated_at, tags FROM saved_query \
-                 ORDER BY updated_at DESC, title",
-            )
-            .fetch_all(pool)
-            .await?
-        }
-        SavedQueryScope::Tenant {
-            tenant_id,
-            include_tenantless,
-        } => {
-            if include_tenantless {
-                sqlx::query_as(
-                    "SELECT id, title, sql, owner, updated_at, tags FROM saved_query \
-                     WHERE tenant_id = $1 OR tenant_id IS NULL \
-                     ORDER BY updated_at DESC, title",
-                )
-                .bind(tenant_id)
-                .fetch_all(pool)
-                .await?
-            } else {
-                sqlx::query_as(
-                    "SELECT id, title, sql, owner, updated_at, tags FROM saved_query \
-                     WHERE tenant_id = $1 \
-                     ORDER BY updated_at DESC, title",
-                )
-                .bind(tenant_id)
-                .fetch_all(pool)
-                .await?
-            }
-        }
+    list_saved_filtered(pool, &scope, None, None).await
+}
+
+/// The saved queries the scope allows whose title or SQL holds `needle`,
+/// newest first.
+///
+/// `%`, `_` and `\` in `needle` are literals, not wildcards: the shared
+/// `escape_like_pattern` helper escapes the escape character first, then
+/// the two wildcards, and `ILIKE` does the case-insensitive contains-match
+/// over the visible rows only.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn list_saved_matching(
+    pool: &PgPool,
+    scope: &SavedQueryScope,
+    needle: Option<&str>,
+) -> Result<Vec<SavedQuery>, StoreError> {
+    list_saved_filtered(pool, scope, needle, None).await
+}
+
+/// Which folder the list is filtered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedQueryFolder {
+    /// One folder: the queries that sit in it.
+    Folder(Uuid),
+    /// The shared space: the queries that sit in no folder.
+    Root,
+}
+
+/// The saved queries the scope allows, newest first, filtered by the text
+/// typed and by the folder asked for.
+///
+/// Both filters are the same filter as the single-SQL list they replace:
+/// one statement, one pass over the visible rows, so a list that is
+/// filtered by text and by folder cannot disagree with a list that is
+/// filtered by text alone. A folder that does not exist matches no row —
+/// the answer is an empty list, not an error, because the caller asked
+/// for "what is in this folder", not "does this folder exist".
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn list_saved_filtered(
+    pool: &PgPool,
+    scope: &SavedQueryScope,
+    needle: Option<&str>,
+    folder: Option<SavedQueryFolder>,
+) -> Result<Vec<SavedQuery>, StoreError> {
+    let Some(viewer) = scope.effective_viewer() else {
         // A caller that belongs to no tenant reads no row: the answer is
         // empty, and the database is never asked.
-        SavedQueryScope::None => Vec::new(),
+        return Ok(Vec::new());
     };
-    Ok(rows.into_iter().map(SavedQuery::from).collect())
+    let pattern = needle.map(escape_like_pattern);
+    // The folder filter is two bound values rather than one, because
+    // "the shared space" is the absence of a folder and cannot be spelled
+    // as an id.
+    let (folder_kind, folder_id): (Option<&str>, Option<Uuid>) = match folder {
+        None => (None, None),
+        Some(SavedQueryFolder::Root) => (Some("root"), None),
+        Some(SavedQueryFolder::Folder(id)) => (Some("folder"), Some(id)),
+    };
+    let rows: Vec<SavedQueryRow> = sqlx::query_as(
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+         FROM saved_query \
+         WHERE deleted_at IS NULL \
+           AND ($1::uuid IS NULL OR tenant_id = $1 OR ($2::boolean AND tenant_id IS NULL)) \
+           AND ($3::text IS NULL OR title ILIKE $4 OR sql ILIKE $4) \
+           AND ($5::text IS NULL \
+                OR ($5::text = 'root' AND folder_id IS NULL) \
+                OR ($6::uuid IS NOT NULL AND folder_id = $6)) \
+         ORDER BY updated_at DESC, title",
+    )
+    .bind(scope.tenant_id())
+    .bind(scope.includes_tenantless())
+    .bind(needle)
+    .bind(pattern.as_deref())
+    .bind(folder_kind)
+    .bind(folder_id)
+    .fetch_all(pool)
+    .await?;
+    let visibility = Visibility::load(pool, &viewer).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let level = visibility.level(&row.target())?;
+            Some(row.into_saved(level))
+        })
+        .collect())
+}
+
+/// One saved query, when the scope allows the caller to see it.
+///
+/// A query the caller may not see is `None`, not an error: the caller
+/// learns nothing about a row that is not theirs.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn get_saved(
+    pool: &PgPool,
+    id: &str,
+    scope: &SavedQueryScope,
+) -> Result<Option<SavedQuery>, StoreError> {
+    get_saved_inner(pool, id, scope, false).await
+}
+
+/// One saved query, live or waiting in the trash, when the scope allows
+/// the caller to see it.
+///
+/// The trash entry is part of managing a query, so the route that brings
+/// one back has to find it the same way the trash list finds it: with the
+/// same scope and the same resolver. A live query is found by
+/// [`get_saved`] alone.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn get_saved_including_trash(
+    pool: &PgPool,
+    id: &str,
+    scope: &SavedQueryScope,
+) -> Result<Option<SavedQuery>, StoreError> {
+    get_saved_inner(pool, id, scope, true).await
+}
+
+/// The one read behind [`get_saved`] and [`get_saved_including_trash`].
+///
+/// `include_trash` decides whether a row that waits in the trash is
+/// found; everything else — the tenant boundary and the level — is the
+/// same rule for both, so the two cannot answer differently about the
+/// same row.
+async fn get_saved_inner(
+    pool: &PgPool,
+    id: &str,
+    scope: &SavedQueryScope,
+    include_trash: bool,
+) -> Result<Option<SavedQuery>, StoreError> {
+    let Some(viewer) = scope.effective_viewer() else {
+        return Ok(None);
+    };
+    let Ok(query_id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let row: Option<SavedQueryRow> = sqlx::query_as(
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+         FROM saved_query \
+         WHERE id = $1 AND ($4::boolean OR deleted_at IS NULL) \
+           AND ($2::uuid IS NULL OR tenant_id = $2 OR ($3::boolean AND tenant_id IS NULL))",
+    )
+    .bind(query_id)
+    .bind(scope.tenant_id())
+    .bind(scope.includes_tenantless())
+    .bind(include_trash)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let visibility = Visibility::load(pool, &viewer).await?;
+    Ok(visibility
+        .level(&row.target())
+        .map(|level| row.into_saved(level)))
 }
 
 /// One `query_history` row whose text mentions a table name, for working
@@ -217,16 +472,7 @@ pub async fn history_mentioning(
         return Ok(Vec::new());
     }
     // `%`, `_` and `\` in a table name are literals, not wildcards.
-    let patterns: Vec<String> = needles
-        .iter()
-        .map(|n| {
-            let escaped = n
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            format!("%{escaped}%")
-        })
-        .collect();
+    let patterns: Vec<String> = needles.iter().map(|n| escape_like_pattern(n)).collect();
     let rows: Vec<HistoryMention> = sqlx::query_as(
         "SELECT q.id, q.sql, q.user_name, q.owner_id, \
                 to_char(q.at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS at, \
@@ -278,43 +524,607 @@ pub async fn history_recent(
     Ok(rows.into_iter().map(|(sql,)| sql).collect())
 }
 
-/// Insert a new saved query. New for the AI Copilot's `save_query` tool
-/// (T1.4 of the copilot-operations-handover plan) — `SavedQuery` had no
-/// writer anywhere in the `QueryService` contract before this (see the
-/// module doc comment: only `listSaved()` existed), because the console
-/// itself never authored one; the copilot is the first caller that does.
+/// Where a new saved query lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedQueryPlacement {
+    /// The caller's **personal space** — the folder of the caller,
+    /// created on first use.
+    PersonalSpace,
+    /// The organisation's **shared space**: the root of the tree, where
+    /// every member of the organisation sees the query at `view`.
+    SharedSpace,
+    /// The folder named.
+    Folder(Uuid),
+}
+
+/// Insert a new saved query in the place the caller asked for.
 ///
-/// `tenant_id` is the tenant the query belongs to (`SEC-20`): the row is
-/// that tenant's alone, and the rows written with no tenant are read only
-/// by the tenant that owns the shared catalog. `None` is honest for a
-/// caller that belongs to no tenant — nobody can say whose query it is.
+/// The row belongs to the tenant the viewer acts as, and to nobody else
+/// (`SEC-20`). The author is the viewer's own id, so the author manages
+/// what they wrote — the rule itself, not a row of rules.
+///
+/// The first version is written in the same transaction as the row, so the
+/// history of a query never starts later than the query itself.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] if the insert fails.
-pub async fn create_saved_query(
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn create_saved_query_at(
     pool: &PgPool,
+    viewer: &SavedQueryViewer,
     title: &str,
     sql: &str,
     owner: &str,
     tags: &[String],
-    owner_id: Option<Uuid>,
-    tenant_id: Option<Uuid>,
+    placement: SavedQueryPlacement,
 ) -> Result<SavedQuery, StoreError> {
+    let folder_id = match placement {
+        SavedQueryPlacement::Folder(folder_id) => Some(folder_id),
+        SavedQueryPlacement::SharedSpace => None,
+        SavedQueryPlacement::PersonalSpace => match (viewer.id, viewer.tenant_id) {
+            (Some(person), Some(tenant_id)) => Some(
+                ensure_personal_space(pool, tenant_id, person, owner)
+                    .await?
+                    .id,
+            ),
+            // No tenant, with or without a person: the shared space is
+            // the only place such a row can live. A personal space hangs
+            // off a tenant, so a row that belongs to no tenant has no
+            // personal space to land in.
+            _ => None,
+        },
+    };
+    let mut tx = pool.begin().await?;
     let row: SavedQueryRow = sqlx::query_as(
-        "INSERT INTO saved_query (title, sql, owner, tags, owner_id, tenant_id) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         RETURNING id, title, sql, owner, updated_at, tags",
+        "INSERT INTO saved_query (title, sql, owner, tags, owner_id, tenant_id, folder_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
     )
     .bind(title)
     .bind(sql)
     .bind(owner)
     .bind(tags)
-    .bind(owner_id)
-    .bind(tenant_id)
+    .bind(viewer.id)
+    .bind(viewer.tenant_id)
+    .bind(folder_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let author = version_author_name(&mut tx, viewer.id, owner).await?;
+    write_version(
+        &mut tx, row.id, &row.title, &row.sql, viewer.id, &author, "",
+    )
+    .await?;
+    tx.commit().await?;
+    let visibility = Visibility::load(pool, viewer).await?;
+    let level = visibility.level(&row.target()).unwrap_or(Level::View);
+    Ok(row.into_saved(level))
+}
+
+/// Insert a new saved query in the folder named, or in the caller's
+/// personal space when no folder is named.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn create_saved_query(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    title: &str,
+    sql: &str,
+    owner: &str,
+    tags: &[String],
+    folder_id: Option<Uuid>,
+) -> Result<SavedQuery, StoreError> {
+    let placement = folder_id.map_or(
+        SavedQueryPlacement::PersonalSpace,
+        SavedQueryPlacement::Folder,
+    );
+    create_saved_query_at(pool, viewer, title, sql, owner, tags, placement).await
+}
+
+/// What one update may change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedQueryPatch {
+    /// A new title.
+    pub title: Option<String>,
+    /// New SQL.
+    pub sql: Option<String>,
+    /// New tags.
+    pub tags: Option<Vec<String>>,
+    /// The folder the query moves to. `None` leaves it where it is.
+    pub folder: Option<FolderMove>,
+}
+
+/// Where a query moves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderMove {
+    /// Into this folder.
+    Into(Uuid),
+    /// Back to the shared space, the root.
+    Root,
+}
+
+/// Change a saved query.
+///
+/// The caller must hold **edit** on the query: `edit` changes the SQL,
+/// the title, the tags and the folder, `view` may do neither. A caller
+/// that may not change the row finds no row at all, so the answer never
+/// says whether it exists.
+///
+/// A version is written for every change of the title or the SQL, in the
+/// same transaction as the change; a change that leaves both as they
+/// were writes none.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] when the caller may not change the
+/// query, and [`StoreError::Database`] if a query fails.
+pub async fn update_saved_query(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    id: &str,
+    patch: &SavedQueryPatch,
+) -> Result<SavedQuery, StoreError> {
+    let Ok(query_id) = Uuid::parse_str(id) else {
+        return Err(StoreError::NotFound);
+    };
+    let Some(row) = load_row(pool, query_id).await? else {
+        return Err(StoreError::NotFound);
+    };
+    // A trashed query is not changed: it waits in the trash until it is
+    // restored.
+    if row.deleted_at.is_some() || !writable_by(row.tenant_id, viewer) {
+        return Err(StoreError::NotFound);
+    }
+    let visibility = Visibility::load(pool, viewer).await?;
+    let Some(level) = visibility.level(&row.target()) else {
+        return Err(StoreError::NotFound);
+    };
+    if level < Level::Edit {
+        return Err(StoreError::NotFound);
+    }
+    let title = patch.title.as_deref().unwrap_or(&row.title);
+    let sql = patch.sql.as_deref().unwrap_or(&row.sql);
+    let tags = patch.tags.as_deref().unwrap_or(&row.tags);
+    let folder_id = match patch.folder {
+        Some(FolderMove::Into(folder_id)) => Some(folder_id),
+        Some(FolderMove::Root) => None,
+        None => row.folder_id,
+    };
+    let mut tx = pool.begin().await?;
+    let updated: SavedQueryRow = sqlx::query_as(
+        "UPDATE saved_query \
+         SET title = $2, sql = $3, tags = $4, folder_id = $5, updated_at = now() \
+         WHERE id = $1 \
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+    )
+    .bind(query_id)
+    .bind(title)
+    .bind(sql)
+    .bind(tags)
+    .bind(folder_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if title != row.title || sql != row.sql {
+        let author = version_author_name(&mut tx, viewer.id, &row.owner).await?;
+        write_version(&mut tx, query_id, title, sql, viewer.id, &author, "").await?;
+    }
+    tx.commit().await?;
+    Ok(updated.into_saved(level))
+}
+
+/// Move a saved query to the trash.
+///
+/// The caller must hold **manage** on the query: only then may it be
+/// deleted. Trashing a query that is already in the trash does nothing.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] when the caller may not delete the
+/// query, and [`StoreError::Database`] if a query fails.
+pub async fn trash_saved_query(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    id: &str,
+) -> Result<(), StoreError> {
+    let Ok(query_id) = Uuid::parse_str(id) else {
+        return Err(StoreError::NotFound);
+    };
+    let Some(row) = load_row(pool, query_id).await? else {
+        return Err(StoreError::NotFound);
+    };
+    if !writable_by(row.tenant_id, viewer) {
+        return Err(StoreError::NotFound);
+    }
+    let visibility = Visibility::load(pool, viewer).await?;
+    let Some(level) = visibility.level(&row.target()) else {
+        return Err(StoreError::NotFound);
+    };
+    if level < Level::Manage {
+        return Err(StoreError::NotFound);
+    }
+    if row.deleted_at.is_some() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE saved_query SET deleted_at = now(), deleted_by = $2 WHERE id = $1")
+        .bind(query_id)
+        .bind(viewer.id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Bring a saved query back out of the trash, into the folder it was in.
+///
+/// The caller must hold **manage** on the query: only then may it be
+/// restored.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] when the caller may not restore the
+/// query, and [`StoreError::Database`] if a query fails.
+pub async fn restore_saved_query(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    id: &str,
+) -> Result<SavedQuery, StoreError> {
+    let Ok(query_id) = Uuid::parse_str(id) else {
+        return Err(StoreError::NotFound);
+    };
+    let Some(row) = load_row(pool, query_id).await? else {
+        return Err(StoreError::NotFound);
+    };
+    if !writable_by(row.tenant_id, viewer) {
+        return Err(StoreError::NotFound);
+    }
+    let visibility = Visibility::load(pool, viewer).await?;
+    let Some(level) = visibility.level(&row.target()) else {
+        return Err(StoreError::NotFound);
+    };
+    if level < Level::Manage {
+        return Err(StoreError::NotFound);
+    }
+    let restored: SavedQueryRow = sqlx::query_as(
+        "UPDATE saved_query \
+         SET deleted_at = NULL, deleted_by = NULL, updated_at = now() \
+         WHERE id = $1 \
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+    )
+    .bind(query_id)
     .fetch_one(pool)
     .await?;
-    Ok(SavedQuery::from(row))
+    Ok(restored.into_saved(level))
+}
+
+/// How long a trashed query waits before the sweep takes it away.
+///
+/// The same window the dashboards' trash keeps (`lakehouse-bi`'s
+/// `RETENTION_DAYS`), so a saved query and a dashboard wait the same
+/// length of time before they are gone for good.
+pub const TRASH_RETENTION_DAYS: i32 = 30;
+
+/// One entry in the trash: the query, the folder it waits in, and the
+/// days it has left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedQueryTrashEntry {
+    /// The query's id.
+    pub id: String,
+    /// Its title.
+    pub title: String,
+    /// The folder it sits in; `None` is the shared space.
+    pub folder_id: Option<String>,
+    /// When it went to the trash, ISO 8601.
+    pub deleted_at: String,
+    /// How many days it has left before the sweep takes it away.
+    pub days_left: i32,
+}
+
+/// The queries in the trash the caller may manage.
+///
+/// A trashed query waits here until it is restored or swept away; the
+/// caller sees only the ones it may manage, because the trash entry is
+/// part of managing a query.
+///
+/// The days left are counted here rather than by the caller, so the
+/// number the console shows and the number the sweep acts on come from
+/// the same constant.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn list_saved_trash_entries(
+    pool: &PgPool,
+    scope: &SavedQueryScope,
+) -> Result<Vec<SavedQueryTrashEntry>, StoreError> {
+    let Some(viewer) = scope.effective_viewer() else {
+        return Ok(Vec::new());
+    };
+    let rows: Vec<SavedQueryRow> = sqlx::query_as(
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+         FROM saved_query \
+         WHERE deleted_at IS NOT NULL \
+           AND ($1::uuid IS NULL OR tenant_id = $1 OR ($2::boolean AND tenant_id IS NULL)) \
+         ORDER BY deleted_at DESC",
+    )
+    .bind(scope.tenant_id())
+    .bind(scope.includes_tenantless())
+    .fetch_all(pool)
+    .await?;
+    let visibility = Visibility::load(pool, &viewer).await?;
+    let now = OffsetDateTime::now_utc();
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let level = visibility.level(&row.target())?;
+            if level < Level::Manage {
+                return None;
+            }
+            let deleted_at = row.deleted_at?;
+            Some(SavedQueryTrashEntry {
+                id: row.id.to_string(),
+                title: row.title,
+                folder_id: row.folder_id.map(|id| id.to_string()),
+                deleted_at: iso_millis(deleted_at),
+                days_left: days_left(deleted_at, now),
+            })
+        })
+        .collect())
+}
+
+/// The days a trashed query has left, counted from when it went to the
+/// trash.
+///
+/// Whole days, never a fraction: a query trashed a moment ago has 29
+/// days left, not 29.99. A query that is past the window has none.
+fn days_left(deleted_at: OffsetDateTime, now: OffsetDateTime) -> i32 {
+    let deadline = deleted_at + time::Duration::days(i64::from(TRASH_RETENTION_DAYS));
+    let seconds = (deadline - now).whole_seconds();
+    if seconds <= 0 {
+        return 0;
+    }
+    i32::try_from(seconds / 86_400).unwrap_or(i32::MAX)
+}
+
+/// Delete the queries that were trashed before `cutoff`, and answer how
+/// many went.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails. Nothing is
+/// deleted when it does.
+pub async fn purge_trashed_before(
+    pool: &PgPool,
+    cutoff: OffsetDateTime,
+) -> Result<u64, StoreError> {
+    let removed =
+        sqlx::query("DELETE FROM saved_query WHERE deleted_at IS NOT NULL AND deleted_at < $1")
+            .bind(cutoff)
+            .execute(pool)
+            .await?;
+    Ok(removed.rows_affected())
+}
+
+/// One version of a saved query: the title and the SQL it had.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedQueryVersion {
+    /// The version's number: 1 for the first.
+    pub version: i32,
+    /// The title the query had.
+    pub title: String,
+    /// The SQL the query had.
+    pub sql: String,
+    /// The author's user id, when there is one.
+    pub author_id: Option<String>,
+    /// The author's name, as the history shows it.
+    pub author_name: String,
+    /// What the history says about this version: "Restored version 3",
+    /// or nothing for a change that was only a change.
+    pub label: String,
+    /// When it was written, ISO 8601.
+    pub created_at: String,
+}
+
+/// A version, as the database holds it.
+#[derive(Debug, FromRow)]
+struct SavedQueryVersionRow {
+    version: i32,
+    title: String,
+    sql: String,
+    author_id: Option<Uuid>,
+    author_name: String,
+    label: String,
+    created_at: OffsetDateTime,
+}
+
+impl From<SavedQueryVersionRow> for SavedQueryVersion {
+    fn from(row: SavedQueryVersionRow) -> Self {
+        Self {
+            version: row.version,
+            title: row.title,
+            sql: row.sql,
+            author_id: row.author_id.map(|id| id.to_string()),
+            author_name: row.author_name,
+            label: row.label,
+            created_at: iso_millis(row.created_at),
+        }
+    }
+}
+
+/// The versions kept per query: the newest [`VERSION_KEEP`] of them.
+pub const VERSION_KEEP: usize = 15;
+
+/// The history of one query, newest first.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn list_versions(
+    pool: &PgPool,
+    query_id: Uuid,
+) -> Result<Vec<SavedQueryVersion>, StoreError> {
+    let rows: Vec<SavedQueryVersionRow> = sqlx::query_as(
+        "SELECT version, title, sql, author_id, author_name, label, created_at \
+         FROM saved_query_version WHERE query_id = $1 ORDER BY version DESC",
+    )
+    .bind(query_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(SavedQueryVersion::from).collect())
+}
+
+/// Go back to an earlier version of a saved query.
+///
+/// The revert writes a **new** version, holding the content of the
+/// version it went back to, so going back is itself undoable.
+///
+/// The caller must hold **edit** on the query.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] when the caller may not change the
+/// query or when the version does not exist, and [`StoreError::Database`]
+/// if a query fails.
+pub async fn revert_to_version(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    query_id: Uuid,
+    version: i32,
+) -> Result<SavedQuery, StoreError> {
+    let Some(row) = load_row(pool, query_id).await? else {
+        return Err(StoreError::NotFound);
+    };
+    if row.deleted_at.is_some() || !writable_by(row.tenant_id, viewer) {
+        return Err(StoreError::NotFound);
+    }
+    let visibility = Visibility::load(pool, viewer).await?;
+    let Some(level) = visibility.level(&row.target()) else {
+        return Err(StoreError::NotFound);
+    };
+    if level < Level::Edit {
+        return Err(StoreError::NotFound);
+    }
+    let wanted: Option<(String, String)> = sqlx::query_as(
+        "SELECT title, sql FROM saved_query_version WHERE query_id = $1 AND version = $2",
+    )
+    .bind(query_id)
+    .bind(version)
+    .fetch_optional(pool)
+    .await?;
+    let Some((title, sql)) = wanted else {
+        return Err(StoreError::NotFound);
+    };
+    let mut tx = pool.begin().await?;
+    let updated: SavedQueryRow = sqlx::query_as(
+        "UPDATE saved_query SET title = $2, sql = $3, updated_at = now() \
+         WHERE id = $1 \
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+    )
+    .bind(query_id)
+    .bind(&title)
+    .bind(&sql)
+    .fetch_one(&mut *tx)
+    .await?;
+    let author = version_author_name(&mut tx, viewer.id, &row.owner).await?;
+    write_version(
+        &mut tx,
+        query_id,
+        &title,
+        &sql,
+        viewer.id,
+        &author,
+        &format!("Restored version {version}"),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(updated.into_saved(level))
+}
+
+/// One row, with the columns the access rules need.
+async fn load_row(pool: &PgPool, query_id: Uuid) -> Result<Option<SavedQueryRow>, StoreError> {
+    let row: Option<SavedQueryRow> = sqlx::query_as(
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+         FROM saved_query WHERE id = $1",
+    )
+    .bind(query_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Whether the caller may write a row of that tenant.
+///
+/// The tenant is the outer boundary: a caller that acts as one tenant
+/// writes that tenant's rows and no others. A caller that acts as no
+/// tenant in particular — the scope that reads every tenant's rows —
+/// reaches every row, exactly as it reads them.
+fn writable_by(tenant_id: Option<Uuid>, viewer: &SavedQueryViewer) -> bool {
+    match viewer.tenant_id {
+        Some(caller) => tenant_id == Some(caller),
+        None => true,
+    }
+}
+
+/// Write one version of a query and drop the ones that fell out of the
+/// history.
+///
+/// The number is the highest the query has plus one, and the history
+/// keeps the newest [`VERSION_KEEP`] versions: the older ones go in the
+/// same transaction as the version that pushed them out.
+async fn write_version(
+    tx: &mut Transaction<'_, Postgres>,
+    query_id: Uuid,
+    title: &str,
+    sql: &str,
+    author_id: Option<Uuid>,
+    author_name: &str,
+    label: &str,
+) -> Result<(), StoreError> {
+    let next: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM saved_query_version WHERE query_id = $1",
+    )
+    .bind(query_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO saved_query_version \
+         (query_id, version, title, sql, author_id, author_name, label) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(query_id)
+    .bind(next)
+    .bind(title)
+    .bind(sql)
+    .bind(author_id)
+    .bind(author_name)
+    .bind(label)
+    .execute(&mut **tx)
+    .await?;
+    let keep = i32::try_from(VERSION_KEEP).unwrap_or(i32::MAX);
+    sqlx::query("DELETE FROM saved_query_version WHERE query_id = $1 AND version <= $2")
+        .bind(query_id)
+        .bind(next - keep)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// The name the history shows for the author: the person's own name in
+/// `app_user`, or the display name the row itself carries.
+async fn version_author_name(
+    tx: &mut Transaction<'_, Postgres>,
+    author_id: Option<Uuid>,
+    fallback: &str,
+) -> Result<String, StoreError> {
+    let Some(author_id) = author_id else {
+        return Ok(fallback.to_owned());
+    };
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM app_user WHERE id = $1")
+        .bind(author_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(name.unwrap_or_else(|| fallback.to_owned()))
 }
 
 // ── Query history (written by `routes::query::run`, read by listHistory) ─
@@ -509,10 +1319,10 @@ const HISTORY_PAGE_LIMIT: i64 = 50;
 ///
 /// # The `table` match (decision 7)
 ///
-/// `%` and `_` in the caller's text are matched literally: the three
-/// `replace`s escape the escape character first, then the two wildcards,
-/// and `ILIKE` does the case-insensitive contains-match against every
-/// element of `tables_read`.
+/// `%` and `_` in the caller's text are matched literally: the shared
+/// `escape_like_pattern` helper escapes the escape character first, then
+/// the two wildcards, and `ILIKE` does the case-insensitive contains-match
+/// against every element of `tables_read`.
 ///
 /// # `auditEventId` resolution (WS1 task 1.14, judge finding J12)
 ///
@@ -715,9 +1525,22 @@ mod tests {
             owner: "o".to_owned(),
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
             tags: vec!["finance".to_owned()],
+            folder_id: None,
+            owner_id: None,
+            level: "view".to_owned(),
         };
         let value = serde_json::to_value(&saved).unwrap();
-        for key in ["id", "title", "sql", "owner", "updatedAt", "tags"] {
+        for key in [
+            "id",
+            "title",
+            "sql",
+            "owner",
+            "updatedAt",
+            "tags",
+            "folderId",
+            "ownerId",
+            "level",
+        ] {
             assert!(value.get(key).is_some(), "SavedQuery is missing `{key}`");
         }
 

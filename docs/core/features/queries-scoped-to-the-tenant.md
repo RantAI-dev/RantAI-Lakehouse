@@ -36,11 +36,11 @@ table (`routes/catalog_governance.rs:206`).
 
 ## Not included
 
-- The dashboards, the embeds, the public links and the alerts. They call the role rewrite directly
-  (`dashboard.rs:331-388`, `embed.rs`, `alerts.rs:644`), not the query path. `SEC-50` gates them in its second
-  slice; its first slice already gates the authored pipelines and the Gold export. Of those two, only the authored
-  pipeline can name a `bronze.*` table — the Gold export reads the shared catalog's `serving.*` marts — so the
-  authored pipeline is the one path in this service where another tenant's upload can be reached.
+- The dashboards, the embeds, the public links, the alerts, the reports and the PDF/chart-image exports are gated
+  by `SEC-50` too (its second slice), but they are not part of this task's acceptance: they call the role rewrite
+  directly (`dashboard.rs`, `embed.rs`, `alerts.rs`), not the query path. Only the authored pipeline can name a
+  `bronze.*` table — the Gold export and every `SEC-50` slice 2 site read the shared catalog's `serving.*` marts —
+  so the authored pipeline is the one path in this service where another tenant's upload can be reached.
 - Tenants on Silver and Gold tables. Nothing maps them to a tenant today; they stay shared catalog tables under the
   catalog's gate (decision 1).
 - Query history. It is already per user (`lakehouse-store/src/queries.rs:367-384`).
@@ -75,8 +75,22 @@ chat's saved-query tools know who asks (owner's exception, 2026-10-23 for the on
   the shared catalog; a job with no user (the scheduled export, a manual trigger done as a service) acts as the tenant
   that owns the shared catalog. On a deployment with several tenants and no `CATALOG_TENANT_ID`, the export is refused
   outright until an operator sets it.
-- The dashboards, the embeds, the public links and the alerts are not yet scoped this way; they follow in the second
-  slice of `SEC-50`.
+- The dashboards are scoped now (`SEC-50`, its second slice): a board, its tiles, its downloaded files, its
+  drill-through rows and its SQL sources are read as the person looking, so a member of a tenant that does not own
+  the shared catalog sees the refusal in each tile's own error slot — "Table not found or not available to your
+  organisation: `serving.<mart>`" — and the mart is never queried. The embeds act as the deployment's catalog
+  tenant, so they are refused per tile with the 422 that names `CATALOG_TENANT_ID` when a deployment with several
+  tenants names none.
+- Public links act as the tenant that made the link. A link made by a member of another tenant shows that
+  member's refusals to everyone who opens it; a link whose creator has left the tenant is refused; a link with no
+  creator still works on a one-tenant deployment and is refused on a deployment with several.
+- Alerts and digests are read as the catalog's tenant when the scheduler runs them, and a person who saves a rule
+  must be able to read what the rule reads. A chart alert reads as the person who set it, and a report as its
+  owner.
+- A PDF or a chart image (`format=png`) is exported as your **first** tenant, even if you were working as another
+  one when you asked for it, so the file can differ from the screen.
+- Table and column **names** of the shared catalog are still listed to every tenant (the fields list and the import
+  preview); that is metadata, not rows, and gets its own item (`SEC-58`).
 - Silver and Gold tables belong to the shared catalog, not to a tenant. With more than one tenant, only the
   tenant that owns the catalog can query them.
 - A refused table reads "not found or not available to your organisation", whether it exists or not.

@@ -26,7 +26,7 @@
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -119,7 +119,9 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         claims.params.as_deref(),
         claims.grain.as_deref(),
     );
-    match payload_for(&state, &principal, &query).await {
+    // `SEC-50` slice 2 M4/M5: the PDF reads as the person the token names —
+    // their first tenant, because the token carries no tenant (M5).
+    match payload_for(&state, &principal, &query, &HeaderMap::new()).await {
         Ok(mut payload) => {
             // BI-19 part D (plan D13): a chart token is good for that chart
             // only. The dashboard was read as the person (rules, masks, trash,

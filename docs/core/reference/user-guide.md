@@ -484,8 +484,9 @@ Approvals holds the requests waiting for a person:
    you like, then confirm.
 
 Approving carries out exactly what was requested. Rejecting carries out
-nothing. Either way the decision is recorded. You cannot approve your own
-access request: another Governance Admin must decide it.
+nothing. Either way the decision is recorded. You cannot decide your own
+request: whoever asked for it — a risky action or an access request —
+waits for somebody else to decide.
 
 ## 8. Monitoring
 

@@ -56,7 +56,9 @@ use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::ai::{audit as ai_audit, registry as ai_registry, tools as ai_tools};
+use crate::routes::ai::{
+    audit as ai_audit, gate as ai_gate, registry as ai_registry, tools as ai_tools,
+};
 use crate::state::AppState;
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
@@ -453,6 +455,51 @@ pub struct DecideApprovalBody {
     pub(crate) comment: Option<String>,
 }
 
+/// The ONE self-approval check both decide routes call (`SEC-57`).
+///
+/// The person who asked for an approval may not decide it — the same rule
+/// for a `kind = "tool_call"` approval as for a `kind = "access"` one. It
+/// was already the rule for access requests (WS7 item E3), where the check
+/// lived inline in `routes::catalog::decide_access_request`; `SEC-57`
+/// moves that comparison here, next to [`DecideApprovalBody`] — the body
+/// type both routes already share — so there is ONE check, not two
+/// (AGENTS.md rule 4: duplicated guards are a finding).
+///
+/// The refusal is `403 permission_denied`, and NOTHING is written when it
+/// fires: both routes call this BEFORE their store call, so a refused
+/// decision leaves the approval `pending`, writes no audit row and grants
+/// nothing.
+///
+/// The message is one sentence for BOTH kinds — the access route's own
+/// wording minus the word "akses", which would not fit a tool call
+/// (`SEC-57` decision D3). The body stays `permission_denied: …`
+/// (`lakehouse_core::error::ApiError::PermissionDenied`), so the shape the
+/// console reads does not change.
+///
+/// Only a HUMAN principal can be "the requester":
+/// `approval_item.requested_by_user_id` points at `app_user`, and a
+/// service identity's id is never an `app_user.id` — so a service
+/// identity is never refused here, exactly as a scheduled run (no
+/// requester at all) is decidable by anyone holding `agent:approve`.
+///
+/// # Errors
+///
+/// `Err(ApiError::PermissionDenied)` when `principal` IS the human who
+/// requested this approval; `Ok(())` otherwise.
+pub(crate) fn refuse_own_request(
+    existing: &ApprovalItem,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    match (existing.requested_by_user_id, principal.user_id()) {
+        (Some(requester), Some(decider)) if requester == decider => {
+            Err(ApiError::PermissionDenied(
+                "tidak boleh menyetujui permintaan milik sendiri".to_owned(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `POST /api/agents/approvals/{id}/decide` — approve or reject a pending
 /// approval.
 ///
@@ -494,6 +541,9 @@ pub struct DecideApprovalBody {
 /// been decided (mirrors `mock/agents.ts`'s "already {status}" guard — a
 /// state conflict, not a bad request, hence 409 rather than the mock's
 /// 400: see `lakehouse_store::agents::decide_approval`'s doc comment);
+/// 403 if the approver IS the human who requested this approval
+/// (`SEC-57`: the requester may not decide their own request — refused
+/// BEFORE any write, so the approval stays `pending` and nothing runs);
 /// 403 if the approval was approved but the approver lacks the underlying
 /// tool's own permission (the tool is never executed in that case);
 /// 503/500 as above.
@@ -572,9 +622,18 @@ pub async fn decide_approval(
     // it, even though `agents::decide_approval`'s own UPDATE would happily
     // transition it too. A 404, not 403: from THIS route's point of view
     // the resource simply does not exist as something it can decide.
+    //
+    // SEC-57: the requester of a tool call may not decide their own
+    // request. The check runs HERE — after the kind check, before the store
+    // call — so a refused decision writes nothing at all: the approval
+    // stays `pending`, the run stays `waiting_approval`, the tool never
+    // runs.
     match agents::get_approval(pg, &id).await {
         Ok(Some(existing)) if existing.kind != "tool_call" => {
             return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
+        }
+        Ok(Some(existing)) => {
+            refuse_own_request(&existing, &principal)?;
         }
         Ok(_) => {}
         Err(err) => return Err(ApiError::from(err).into()),
@@ -642,11 +701,8 @@ pub async fn decide_approval(
         return Ok(ApiJson(json!({ "approval": approval, "executed": false })));
     }
 
-    // Approved: check the APPROVER's own permission for the tool BEFORE
-    // executing anything — `agent:approve` is a narrower, per-decision
-    // grant that does not imply the approver may perform the underlying
-    // action (plan invariant 3 / the copilot-operations-handover plan's
-    // permission rule).
+    // Approved: the tool must exist, and the approver's own permission for it
+    // is checked below, once the stored call's arguments are known (BI-37 D10).
     let Some(spec) = ai_registry::find(&approval.action) else {
         let detail = format!("unknown tool: {}", approval.action);
         if let Err(err) =
@@ -656,34 +712,6 @@ pub async fn decide_approval(
         }
         return Err(ApiError::Internal(detail).into());
     };
-
-    if !spec.permission.is_empty() && !principal.permissions.has(spec.permission) {
-        let detail = format!(
-            "approval approved, BUT not executed: approver lacks permission '{}' to run \
-             this tool",
-            spec.permission
-        );
-        if let Err(err) =
-            agents::record_run_outcome(pg, &run_id, "failed", "Not executed", &detail).await
-        {
-            tracing::warn!(%err, run_id, "failed to record permission-denied outcome");
-        }
-        ai_audit::record(
-            Some(pg),
-            Some(&principal),
-            None,
-            &approval.action,
-            None,
-            approval.resource.as_deref(),
-            &json!({}),
-            "failed",
-            Some(&detail),
-            Some(&run_id),
-            Some(&id),
-        )
-        .await;
-        return Err(ApiError::PermissionDenied(detail).into());
-    }
 
     // Load the run and replay its stored tool call through the SAME
     // dispatch every other execution path uses.
@@ -700,6 +728,46 @@ pub async fn decide_approval(
         return Err(ApiError::Internal(detail).into());
     };
     let args: Map<String, Value> = pending.args.as_object().cloned().unwrap_or_default();
+    // Approved: check the APPROVER's own permission for the tool BEFORE
+    // executing anything — `agent:approve` is a narrower, per-decision
+    // grant that does not imply the approver may perform the underlying
+    // action (plan invariant 3 / the copilot-operations-handover plan's
+    // permission rule).
+    //
+    // BI-37 D10: judged as the call is judged — the global permission, or the
+    // approver's own level on the dashboard it acts on (an approver with
+    // manage on that dashboard through a rule may run the approved
+    // `delete_chart`; one without it may not). The call's arguments are
+    // needed for that, so the check sits after the stored call is loaded and
+    // still before anything runs.
+    let reach = ai_tools::dashboard_reach(&state, Some(&principal), &pending.tool, &args).await;
+    if !ai_gate::permission_granted(spec, Some(&principal.permissions), reach) {
+        let detail = format!(
+            "approval approved, BUT not executed: approver lacks permission '{}' to run \
+             this tool",
+            spec.permission
+        );
+        if let Err(err) =
+            agents::record_run_outcome(pg, &run_id, "failed", "Not executed", &detail).await
+        {
+            tracing::warn!(%err, run_id, "failed to record permission-denied outcome");
+        }
+        ai_audit::record(
+            Some(pg),
+            Some(&principal),
+            None,
+            &pending.tool,
+            None,
+            approval.resource.as_deref(),
+            &json!({}),
+            "failed",
+            Some(&detail),
+            Some(&run_id),
+            Some(&id),
+        )
+        .await;
+        return Err(ApiError::PermissionDenied(detail).into());
+    }
     let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
     let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
     let status = if ok { "succeeded" } else { "failed" };
@@ -973,7 +1041,9 @@ fn headless_system_prompt(is_build: bool) -> String {
 /// `ask_user`. A run has nobody to answer a question, so a model that asked
 /// would only stall.
 fn headless_tools(perms: &PermissionSet, is_build: bool) -> Vec<Value> {
-    ai_registry::tool_schemas_for(Some(perms))
+    // BI-37 D10: a digital employee has no dashboard rules of its own, so the
+    // per-dashboard reach is `None` and the plain permission decides.
+    ai_registry::tool_schemas_for(Some(perms), None)
         .into_iter()
         .filter(|t| {
             let name = t["function"]["name"].as_str().unwrap_or("");
@@ -1460,6 +1530,15 @@ async fn run_headless_loop_inner(
                         risk: "High-risk action (WriteHigh): cannot be undone once \
                                executed.",
                         redacted_args: &redacted,
+                        // SEC-57: the approval names the HUMAN who started
+                        // this run, when a person started it — so the API
+                        // can refuse them deciding their own request. A
+                        // scheduled run (`RunAuth::Token`) has no
+                        // principal at all, and a service identity's id
+                        // is never an `app_user.id`, so both record NULL:
+                        // nobody asked in person, so nobody is refused as
+                        // "the requester".
+                        requested_by: principal.and_then(Principal::user_id),
                     },
                 )
                 .await;

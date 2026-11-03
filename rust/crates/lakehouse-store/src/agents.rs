@@ -882,10 +882,17 @@ pub struct ApprovalItem {
     /// the OTHER kind with a 404 — see that pair's own doc comments.
     pub kind: String,
     /// The human who requested this approval — set for `kind = "access"`
-    /// (WS7 item E2's `create_access_request`), `None` for `kind =
-    /// "tool_call"` (a digital employee acted; no single human requester
-    /// exists). Used by `decide_access_request` (WS7 item E3) to refuse a
-    /// principal approving their own request.
+    /// (WS7 item E2's `create_access_request`) AND for a `kind =
+    /// "tool_call"` a person asked for (`SEC-57`: `routes::ai`'s chat and
+    /// `POST /api/ai/tool` record the signed-in principal, a headless run
+    /// started by a person records that run's principal). `None` for a
+    /// `kind = "tool_call"` nobody asked for in person — a scheduled run
+    /// or a service identity: no human is behind it, so nobody may be
+    /// refused as "the requester".
+    ///
+    /// Used by `routes::agents::refuse_own_request` (`SEC-57`) to refuse a
+    /// principal deciding their own request — for a tool call exactly as
+    /// for an access request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_by_user_id: Option<Uuid>,
 }
@@ -1132,6 +1139,14 @@ pub struct NewApprovalRequest<'a> {
     /// linked run's first step, so [`pending_tool_call`] can replay the
     /// exact call later.
     pub redacted_args: &'a Value,
+    /// The human who ASKED for this call, when a person did — written to
+    /// `approval_item.requested_by_user_id` so the API can refuse a
+    /// self-approval (`SEC-57`).
+    ///
+    /// `None` when no human asked: a scheduled run or a service identity.
+    /// The column's foreign key points at `app_user`, so a service id must
+    /// never be written here — `None` is the honest value for those.
+    pub requested_by: Option<Uuid>,
 }
 
 /// The ids [`create_pending_approval`] created.
@@ -1152,11 +1167,16 @@ pub struct CreatedApproval {
 /// Both rows are created in one transaction: either both exist or
 /// neither does, so `approval_item.run_id` never dangles.
 ///
+/// The approval's `requested_by_user_id` is `NewApprovalRequest::
+/// requested_by` (`SEC-57`): the human who asked, when a person did, so
+/// the API can refuse a self-approval.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if either insert fails (e.g. the
 /// `emp-copilot` row is missing — it should never be, see
-/// `0025_agent_schedule.sql`).
+/// `0025_agent_schedule.sql`; or `requested_by` names an `app_user` row
+/// that does not exist).
 pub async fn create_pending_approval(
     pool: &PgPool,
     req: NewApprovalRequest<'_>,
@@ -1185,8 +1205,8 @@ pub async fn create_pending_approval(
     let approval_id = format!("appr-{}", Uuid::new_v4());
     sqlx::query(
         "INSERT INTO approval_item \
-         (id, employee_id, employee_name, run_id, action, resource, reason, evidence, status, risk) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)",
+         (id, employee_id, employee_name, run_id, action, resource, reason, evidence, status, risk, requested_by_user_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10)",
     )
     .bind(&approval_id)
     .bind(COPILOT_EMPLOYEE_ID)
@@ -1197,6 +1217,7 @@ pub async fn create_pending_approval(
     .bind(req.reason)
     .bind(vec![serde_json::to_string(req.redacted_args).unwrap_or_default()])
     .bind(req.risk)
+    .bind(req.requested_by)
     .execute(&mut *tx)
     .await?;
 
@@ -1458,6 +1479,15 @@ pub struct LinkedApprovalRequest<'a> {
     /// The tool call's REDACTED arguments — the caller must have already
     /// run these through `routes::ai::audit::redact`.
     pub redacted_args: &'a Value,
+    /// The human who started this run, when a person did — written to
+    /// `approval_item.requested_by_user_id` so the API can refuse a
+    /// self-approval (`SEC-57`).
+    ///
+    /// `None` for a scheduled run (`RunAuth::Token`) and for a service
+    /// identity: no human asked, so nobody may be refused as "the
+    /// requester". The column's foreign key points at `app_user`, so a
+    /// service id must never be written here.
+    pub requested_by: Option<Uuid>,
 }
 
 /// Creates one `pending` `approval_item` linked to an existing run (see
@@ -1470,7 +1500,8 @@ pub struct LinkedApprovalRequest<'a> {
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the insert fails (e.g. `run_id`/
-/// `employee_id` do not reference existing rows).
+/// `employee_id` do not reference existing rows, or `requested_by` names
+/// an `app_user` row that does not exist).
 pub async fn create_linked_approval(
     pool: &PgPool,
     req: LinkedApprovalRequest<'_>,
@@ -1478,8 +1509,8 @@ pub async fn create_linked_approval(
     let approval_id = format!("appr-{}", Uuid::new_v4());
     sqlx::query(
         "INSERT INTO approval_item \
-         (id, employee_id, employee_name, run_id, action, resource, reason, evidence, status, risk) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)",
+         (id, employee_id, employee_name, run_id, action, resource, reason, evidence, status, risk, requested_by_user_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10)",
     )
     .bind(&approval_id)
     .bind(req.employee_id)
@@ -1490,6 +1521,7 @@ pub async fn create_linked_approval(
     .bind(req.reason)
     .bind(vec![serde_json::to_string(req.redacted_args).unwrap_or_default()])
     .bind(req.risk)
+    .bind(req.requested_by)
     .execute(pool)
     .await?;
     Ok(approval_id)

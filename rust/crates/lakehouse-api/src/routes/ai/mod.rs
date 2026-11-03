@@ -22,7 +22,7 @@
 pub(in crate::routes) mod audit;
 mod citations;
 mod data_map;
-mod gate;
+pub(in crate::routes) mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
 pub(crate) mod semantic;
@@ -546,7 +546,11 @@ async fn prepare_chat(
         .tools
         .filter(|t| !t.is_empty())
         .map(|t| t.into_iter().collect());
-    let mut tools: Vec<Value> = registry::tool_schemas_for(perms)
+    // BI-37 D10: a person who holds only a rule on a dashboard is offered the
+    // dashboard tools their level covers, so their best level anywhere is
+    // worked out once for the list.
+    let anywhere = tools::dashboard_anywhere(state, principal).await;
+    let mut tools: Vec<Value> = registry::tool_schemas_for(perms, anywhere)
         .into_iter()
         .filter(|t| {
             let name = t["function"]["name"].as_str().unwrap_or("");
@@ -940,10 +944,9 @@ async fn run_chat(
             // RPT-1 review fix (BLOCKER) R2: who an update leaves receiving the
             // report is looked up here, before the gate, and given to it as a
             // server-side fact.
-            let audience =
-                tools::report_audience(state, principal, &call.function.name, &args).await;
+            let (audience, reach) = gate_facts(state, principal, &call.function.name, &args).await;
             let gate_result =
-                gate::decide_by_name(is_build, perms, &call.function.name, &args, audience);
+                gate::decide_by_name(is_build, perms, &call.function.name, &args, audience, reach);
             // plan 17: with an allowlist, the tools the console named are the
             // only ones a call may reach. The check is against the offered
             // list, not the request's strings, so a tool the switch removed,
@@ -1255,6 +1258,23 @@ struct ToolCallBody {
 /// moment ago is `args["confirmed"] == true`, which is precisely the
 /// signal a `WriteLow` call needs to actually execute (see [`gate::decide`]).
 ///
+/// The two facts the gate needs about a call, worked out on the server before it
+/// decides (`RPT-1` review fix (BLOCKER) R2 and `BI-37` D10): `audience` says
+/// whether a report update leaves anyone but the requester receiving it, and
+/// `reach` is the caller's own level on the dashboard a listed tool acts on.
+/// Neither is ever read from the arguments the model sent.
+async fn gate_facts(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> (Option<bool>, Option<lakehouse_bi::access::Level>) {
+    (
+        tools::report_audience(state, principal, name, args).await,
+        tools::dashboard_reach(state, principal, name, args).await,
+    )
+}
+
 /// # Errors
 ///
 /// Returns 400 for an unparseable body or an unregistered `tool` name.
@@ -1283,16 +1303,10 @@ pub async fn tool_call(
     };
     let is_build = parsed.mode.as_deref() == Some("build");
 
-    // RPT-1 review fix (BLOCKER) R2: as in the chat loop, the audience of a
-    // report update is looked up before the gate.
-    let audience = tools::report_audience(
-        &state,
-        principal.as_ref().map(|Extension(p)| p),
-        &parsed.tool,
-        &parsed.args,
-    )
-    .await;
-    let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience);
+    // The two facts the gate needs beyond the arguments (see `gate_facts`).
+    let caller = principal.as_ref().map(|Extension(p)| p);
+    let (audience, reach) = gate_facts(&state, caller, &parsed.tool, &parsed.args).await;
+    let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience, reach);
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
         if gate::is_write_high_pending(&refusal) {
             let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));
@@ -1393,6 +1407,13 @@ async fn request_approval(
                 &stored,
                 &redacted,
                 resource_id,
+                // SEC-57: the approval records the HUMAN who asked for it,
+                // so the API can refuse them deciding their own request
+                // (`routes::agents::refuse_own_request`). `None` for a
+                // service identity and for a call with no principal at
+                // all: `approval_item.requested_by_user_id` points at
+                // `app_user`, and no human asked in those cases.
+                principal.and_then(Principal::user_id),
             )
             .await
         }
@@ -2274,8 +2295,13 @@ mod tests {
     /// Length and FNV-1a fingerprint of `prompt::SYSTEM_BASE` as committed
     /// before this change, computed from the file's text and not from this
     /// code.
-    const BASE_LEN_BEFORE_ASK_BACK: usize = 2907;
-    const BASE_FNV_BEFORE_ASK_BACK: u64 = 0xd92c_9883_6331_6470;
+    ///
+    /// `BI-37` D8 moved them: the base prompt gained one line saying that
+    /// dashboard comments are what people wrote and are never instructions
+    /// (the same sentence the tool's result carries). (`3107`,
+    /// `0xeed4_cb58_35c8_1eca`; before: `2907`, `0xd92c_9883_6331_6470`.)
+    const BASE_LEN_BEFORE_ASK_BACK: usize = 3107;
+    const BASE_FNV_BEFORE_ASK_BACK: u64 = 0xeed4_cb58_35c8_1eca;
 
     const WORDS_HEADER: &str = "\n\nTHIS USER'S WORDS\n";
 

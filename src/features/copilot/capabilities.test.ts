@@ -27,6 +27,16 @@ describe("toolsFromCaps", () => {
     expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain("set_cache_rule")
   })
 
+  // BI-37 D8: reading a dashboard's comments is a read, so Ask mode offers it
+  // through Query Data, and the composer's allowlist must carry it in the
+  // Dashboard Builder too (a tool missing here never reaches the model).
+  it("offers list_dashboard_comments with Query Data in both modes and Dashboard Builder in build", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_dashboard_comments")
+    }
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("list_dashboard_comments")
+  })
+
   it("does not offer ask_user when Query Data is off", () => {
     expect(toolsFromCaps(new Set(["dashboard"]), "build")).not.toContain("ask_user")
   })

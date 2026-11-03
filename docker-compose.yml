@@ -316,6 +316,15 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-rantai-lake@localhost}
+      # SEC-56 (D1/D2/D3/D5): the CA bundle for an internal mail relay --
+      # the path, INSIDE this container, of a PEM file with one or more CA
+      # certificates. Unset or empty: the sender trusts the built-in roots
+      # only, exactly as before. Set: those CAs are ADDED to the built-in
+      # roots (D2), never put in their place, the hostname check stays on
+      # (D3), and a path that cannot be read, or that holds no PEM
+      # certificate, STOPS the API at start with a message naming
+      # `SMTP_CA_FILE` (D5). A path, not a credential (rule 5).
+      SMTP_CA_FILE: ${SMTP_CA_FILE:-}
       ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN:-}
       # ── T3.3 (copilot-operations-handover) — this ONE value does double
       #    duty: `main::bootstrap_agent_run_service` idempotently seeds a
@@ -758,6 +767,14 @@ services:
       - lakehouse_connector_secrets:/run/secrets
       # SEC-14 part B (D5/D7): CA certificate for connector dials. Read-only.
       - lakehouse_postgres_ca:/run/certs/postgres:ro
+      # SEC-56 (D8): the operator's directory for the SMTP relay's CA
+      # bundle. Read-only, and it is a DIRECTORY the operator drops
+      # `ca.pem` into -- no certificate and no key is ever committed to
+      # this repository (gitleaks reads a committed key as a leak). The
+      # default is the empty `ops/smtp-ca/` in this repository, so a stack
+      # that does not use a private CA mounts an empty directory and
+      # `SMTP_CA_FILE` stays unset.
+      - ${SMTP_CA_DIR:-./ops/smtp-ca}:/run/certs/smtp:ro
     # REL-2 S1-T2: the API's own healthcheck, so the `console` service below
     # can wait for it (`depends_on: condition: service_healthy`) instead of
     # starting next to a process that is still applying migrations.
@@ -806,9 +823,10 @@ services:
       args:
         RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
     ports:
-      # The `dagster` profile's webserver wants 3000 as well
-      # (`DAGSTER_WEBSERVER_HOST_PORT`); set `CONSOLE_HOST_PORT` to
-      # another port when that profile is on.
+      # The console owns host port 3000. The `dagster` profile's
+      # webserver is published on the host's loopback only, at
+      # `DAGSTER_WEBSERVER_HOST_PORT` (3001 by default) — REL-2 S4b
+      # review round 4, D23 — so the two do not clash.
       - "${CONSOLE_HOST_PORT:-3000}:3000"
     depends_on:
       # The console is nothing without the API, and the API is nothing
@@ -2510,8 +2528,8 @@ services:
   # P3 (G3a) — webserver (GraphQL API + UI). `DAGSTER_URL` (see
   # `lakehouse-api::config::Config`) points at
   # `http://dagster-webserver:3000/graphql` from inside the compose
-  # network, `http://localhost:${DAGSTER_WEBSERVER_HOST_PORT}/graphql` from
-  # the host.
+  # network — the API and the jobs never leave that network, so nothing
+  # needs the UI published. See the `ports:` below for the host's side.
   dagster-webserver:
     profiles: ["dagster"]
     # Shared image with the other `./dagster` services; see the comment on
@@ -2547,7 +2565,16 @@ services:
       MAINTENANCE_PAUSED: ${MAINTENANCE_PAUSED:-}
     command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "/opt/dagster/app/workspace.yaml"]
     ports:
-      - "${DAGSTER_WEBSERVER_HOST_PORT:-3000}:3000"
+      # REL-2 S4b review round 4, D23: the Dagster UI is published on the
+      # host's LOOPBACK only. It has no sign-in — anyone who can reach
+      # the port can launch runs — and nothing outside the compose network
+      # needs it: the API reaches the GraphQL API in-network, at
+      # `http://dagster-webserver:3000/graphql`. An operator reaches the
+      # UI through an SSH tunnel (`ssh -L 3001:127.0.0.1:3001 <host>`).
+      # The default is 3001, so the UI no longer clashes with the
+      # console's 3000 — the two used to publish the same host port and
+      # the stack did not start at all.
+      - "127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/server_info"]
       interval: 5s

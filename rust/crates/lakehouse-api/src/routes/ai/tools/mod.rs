@@ -32,6 +32,7 @@ mod alerts;
 mod ask;
 mod boards;
 mod calc_fields;
+mod comments;
 mod connectors;
 mod dashboards;
 mod export;
@@ -60,7 +61,7 @@ mod tabs;
 
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_bi::access::Viewer;
+use lakehouse_bi::access::{Level, Viewer};
 use serde_json::{Map, Value, json};
 
 use super::registry;
@@ -233,7 +234,10 @@ pub(in crate::routes) async fn run_tool(
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
         "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,
         "delete_alert_rule" => alerts::delete_alert_rule(state, principal, args).await,
-        "run_alert_rule" => alerts::run_alert_rule(state, args).await,
+        "run_alert_rule" => alerts::run_alert_rule(state, principal, args).await,
+        n if comments::handles(n) => {
+            comments::list_dashboard_comments(state, principal, args).await
+        }
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,
         "test_connector" => connectors::test_connector(state, principal, args).await,
@@ -286,6 +290,65 @@ pub(in crate::routes) async fn run_tool(
             )
         }
     }
+}
+
+/// The level on the dashboard a call acts on, for the gate (`BI-37` D10):
+/// worked out on the server before `gate::decide_with`/`decide_by_name`, never
+/// taken from the arguments the model sent. `None` for a tool outside
+/// [`registry::DASHBOARD_SCOPED`], for a call with nobody attached, and for a
+/// dashboard the caller cannot see or the store cannot read — the gate then
+/// falls back to the plain permission (fail closed).
+pub(in crate::routes) async fn dashboard_reach(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Option<Level> {
+    let reach = registry::dashboard_scoped(name)?;
+    let principal = principal?;
+    match reach {
+        registry::Reach::Board(argument) => {
+            crate::routes::dashboard_access::level_on_board(
+                state,
+                principal,
+                &arg_str(args, argument),
+            )
+            .await
+        }
+        registry::Reach::Chart(argument) => {
+            crate::routes::dashboard_access::level_on_chart(
+                state,
+                principal,
+                &arg_str(args, argument),
+            )
+            .await
+        }
+        // `set_cache_rule` names one of the two; the empty one is not filled.
+        registry::Reach::BoardOrChart => {
+            let board = arg_str(args, "board");
+            if board.trim().is_empty() {
+                crate::routes::dashboard_access::level_on_chart(
+                    state,
+                    principal,
+                    &arg_str(args, "chart"),
+                )
+                .await
+            } else {
+                crate::routes::dashboard_access::level_on_board(state, principal, &board).await
+            }
+        }
+        registry::Reach::Anywhere => dashboard_anywhere(state, Some(principal)).await,
+    }
+}
+
+/// The highest level the caller holds on any dashboard (`BI-37` D10): what the
+/// listing tools may be offered for and what an `Anywhere` tool is judged by.
+/// `None` with nobody attached, or when the rules cannot be read.
+pub(in crate::routes) async fn dashboard_anywhere(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Option<Level> {
+    crate::routes::dashboard_access::highest_level(state, principal?).await
 }
 
 /// Who a dashboard tool reads as: the caller's viewer after their rules, the

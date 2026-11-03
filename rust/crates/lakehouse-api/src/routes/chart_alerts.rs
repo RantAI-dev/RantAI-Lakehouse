@@ -13,7 +13,7 @@
 //!   parameter the dashboard takes. The number is taken from the chart's tile
 //!   (`lakehouse_alerts::chart_number`) and settled with
 //!   [`lakehouse_alerts::settle`], so it fires once and recovers once (D11).
-//! - [`authorise_save`] and [`may_delete`]: who may save or remove such a rule
+//! - [`authorise_save`] and [`may_manage`]: who may save, test or remove such a rule
 //!   (C3), checked in the handler because the router's floor for
 //!   `/api/alerts` is "signed in".
 //!
@@ -34,7 +34,7 @@
 //! refused when saved and skipped with a recorded reason when the restriction
 //! is added later. A store that cannot answer counts as restricted.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use lakehouse_alerts::{
     AlertChannel, AlertKind, AlertRule, AlertRuleInput, Reading, RunResult, SilenceSource,
     StateSource,
@@ -76,7 +76,10 @@ fn failed(reason: &str) -> Unreadable {
 }
 
 /// The address of `owner`, lower-cased; `None` when it cannot be read.
-async fn address_of(state: &AppState, owner: &str) -> Option<String> {
+/// `pub(crate)` for the assistant's "alert me" (`BI-37` D3), which fills a
+/// chart alert's target from the caller's own account rather than a guessed
+/// string.
+pub(crate) async fn address_of(state: &AppState, owner: &str) -> Option<String> {
     let pg = state.pg.as_deref()?;
     lakehouse_store::identity::get_user(pg, owner)
         .await
@@ -147,15 +150,22 @@ async fn read(state: &AppState, rule: &AlertRule) -> Result<Reading, Unreadable>
     // BI-19 C (PR #250 CI): a number that decides a send is never a remembered
     // one (the recovery would arrive a cache age late).
     .fresh_chart(chart_id);
-    let payload = match crate::routes::dashboard::payload_for(state, &principal, &query).await {
-        Ok(payload) => payload,
-        Err(response) => {
-            return Err(match response.status() {
-                StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => Unreadable::Stop(LOST_ACCESS),
-                _ => failed(UNREADABLE),
-            });
-        }
-    };
+    // `SEC-50` slice 2 M4: the chart alert reads as the person who set it —
+    // their first tenant, because the runner sends no `X-Tenant` header.
+    // A refusal is the tile's own error, which this module already turns
+    // into `failed(UNREADABLE)`.
+    let payload =
+        match crate::routes::dashboard::payload_for(state, &principal, &query, &HeaderMap::new())
+            .await
+        {
+            Ok(payload) => payload,
+            Err(response) => {
+                return Err(match response.status() {
+                    StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => Unreadable::Stop(LOST_ACCESS),
+                    _ => failed(UNREADABLE),
+                });
+            }
+        };
     let Some(tile) = payload.get("results").and_then(|r| r.get(chart_id)) else {
         return Err(failed(UNREADABLE));
     };
@@ -279,10 +289,14 @@ pub(crate) async fn visible_to(
         .collect()
 }
 
-/// Whether `principal` may delete `rule` (C3): the alert permission, or their
+/// Whether `principal` may manage `rule` (C3): the alert permission, or their
 /// own chart rule. With no principal it is `false` (`BI-19` C review SF-4,
 /// principle 3: the guard never opens for an unknown caller).
-pub(crate) fn may_delete(principal: Option<&Principal>, rule: Option<&AlertRule>) -> bool {
+///
+/// `BI-40` D2: the same test decides who may remove a rule (`DELETE`) and who
+/// may test-run it (`POST /api/alerts/test`), so it is named for the rule it
+/// guards rather than for one caller.
+pub(crate) fn may_manage(principal: Option<&Principal>, rule: Option<&AlertRule>) -> bool {
     let Some(principal) = principal else {
         return false;
     };
@@ -388,11 +402,11 @@ pub(crate) async fn authorise_save(
 
 #[cfg(test)]
 mod tests {
-    use super::may_delete;
+    use super::may_manage;
 
     /// `BI-19` C review SF-4: with no principal the guard is closed.
     #[test]
     fn a_delete_with_no_principal_is_refused() {
-        assert!(!may_delete(None, None));
+        assert!(!may_manage(None, None));
     }
 }

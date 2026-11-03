@@ -1767,8 +1767,10 @@ fn coerce_number(v: Option<&Value>) -> f64 {
     }
 }
 
-/// Current aggregate value for an alert rule's `mart`/`measure`/`agg`.
-/// Ports `currentValue`.
+/// The statement a mart rule's check runs — the ONE builder the run and the
+/// rule save share (`SEC-50` slice 2 D7a: extracted from `current_value`,
+/// never copied, so the gate at save time measures exactly the statement the
+/// scheduled run would execute).
 ///
 /// `mart`/`measure` reach `ClickHouse` as raw, unquoted `SQL` identifiers
 /// (unlike every other field in this module, which is sent as a
@@ -1776,13 +1778,12 @@ fn coerce_number(v: Option<&Value>) -> f64 {
 /// same check `saveRule` already ran before persisting them, re-run as
 /// defence in depth against a row that predates this validation or was
 /// written by another process.
-async fn current_value(
-    ch: &ChClient,
-    gate: &dyn SqlGate,
-    mart: &str,
-    measure: &str,
-    agg: &str,
-) -> Result<f64, AlertError> {
+///
+/// # Errors
+///
+/// [`AlertError::Validation`] for a mart or measure that is not a valid
+/// identifier, or for an aggregate `ClickHouse` does not have.
+pub fn mart_statement(mart: &str, measure: &str, agg: &str) -> Result<String, AlertError> {
     let mart_ident =
         Ident::new(mart).map_err(|e| AlertError::Validation(format!("invalid mart: {e}")))?;
     if !aggregate_allowed(agg) {
@@ -1795,7 +1796,19 @@ async fn current_value(
             .map_err(|e| AlertError::Validation(format!("invalid measure: {e}")))?;
         format!("round({agg}({measure_ident}))")
     };
-    let sql = format!("SELECT {expr} AS v FROM serving.{mart_ident}");
+    Ok(format!("SELECT {expr} AS v FROM serving.{mart_ident}"))
+}
+
+/// Current aggregate value for an alert rule's `mart`/`measure`/`agg`.
+/// Ports `currentValue`, through [`mart_statement`].
+async fn current_value(
+    ch: &ChClient,
+    gate: &dyn SqlGate,
+    mart: &str,
+    measure: &str,
+    agg: &str,
+) -> Result<f64, AlertError> {
+    let sql = mart_statement(mart, measure, agg)?;
     let sql = gate.gate(&sql).await.map_err(AlertError::Validation)?;
     let rows = ch.rows(&sql, None).await?;
     Ok(coerce_number(rows.first().and_then(|r| r.get("v"))))
@@ -1810,7 +1823,18 @@ async fn current_value(
 /// Every way this can fail is a fixed sentence and the rule is recorded as
 /// skipped with it, so a rule whose metric is gone or cannot be evaluated is
 /// neither fired nor silently treated as fine, and no engine text is kept.
-async fn metric_value(ch: &ChClient, gate: &dyn SqlGate, name: &str) -> Result<f64, AlertError> {
+/// The statement a metric rule's check runs — the ONE builder the run and
+/// the rule save share (`SEC-50` slice 2 D7a: extracted from `metric_value`,
+/// never copied). It resolves the metric through the very builder path a KPI
+/// tile on the metric uses (`lakehouse_bi::metrics::value_chart`), including
+/// the lookups, so the save path does not grow a second copy of them.
+///
+/// # Errors
+///
+/// [`AlertError::Validation`] with the fixed sentence that says why the
+/// metric cannot be evaluated (gone, its source unavailable, its definition
+/// no longer checks out, no statement to build) — never engine text.
+pub async fn metric_statement(ch: &ChClient, name: &str) -> Result<String, AlertError> {
     use lakehouse_bi::builder::ReadContext;
     use lakehouse_bi::fields::{FieldCatalog, SourceKind};
     use lakehouse_bi::metrics::{ValueQuery, value_chart};
@@ -1875,9 +1899,60 @@ async fn metric_value(ch: &ChClient, gate: &dyn SqlGate, name: &str) -> Result<f
         Some(lakehouse_bi::builder::sql_with_filters_report(&chart, &[], &[], &marts, &read).sql)
     };
     // A value chart has no stored statement: an empty one is "cannot be built".
-    let Some(sql) = sql.filter(|s| !s.is_empty()) else {
-        return Err(fail("the metric cannot be evaluated."));
-    };
+    match sql.filter(|s| !s.is_empty()) {
+        Some(sql) => Ok(sql),
+        None => Err(fail("the metric cannot be evaluated.")),
+    }
+}
+
+/// `SEC-50` slice 2 D7a: the statement a rule ABOUT TO BE SAVED would run, for
+/// the kinds that read data — the save-side entry point the plan's M7 gating
+/// uses.
+///
+/// It normalizes the input with the very [`normalize_input`] `save_rule` uses,
+/// so the statement the gate sees is the statement the rule will actually
+/// run: a mart given as `serving.x`, an omitted `agg` defaulting to `sum`, a
+/// `count()` with no measure all resolve here exactly as they do at save and
+/// at run. The statement itself comes from [`mart_statement`] /
+/// [`metric_statement`], the builders the run uses — one builder, no copy
+/// (`AGENTS.md` rule 4).
+///
+/// `Ok(None)` means the rule reads no table of its own (a digest, a
+/// freshness, a connector or pipeline rule; a chart rule reads its chart),
+/// so there is no statement to gate.
+///
+/// # Errors
+///
+/// The input's own validation errors (the same `save_rule` reports), and the
+/// builders' — never engine text.
+pub async fn statement_for_input(
+    ch: &ChClient,
+    input: &AlertRuleInput,
+) -> Result<Option<String>, AlertError> {
+    let normalized = normalize_input(input)?;
+    if normalized.kind != AlertKind::Alert {
+        return Ok(None);
+    }
+    if !normalized.metric.is_empty() {
+        return metric_statement(ch, &normalized.metric).await.map(Some);
+    }
+    if normalized.mart.is_empty() {
+        return Ok(None);
+    }
+    mart_statement(&normalized.mart, &normalized.measure, &normalized.agg).map(Some)
+}
+
+/// `BI-2`: the current value of the metric `name`, read through
+/// [`metric_statement`] and the same gate every rule's statement goes
+/// through (the fixed viewer role: a rule has no owner, so a metric alert is
+/// evaluated with that role, never with its author's access).
+///
+/// Every way this can fail is a fixed sentence and the rule is recorded as
+/// skipped with it, so a rule whose metric is gone or cannot be evaluated is
+/// neither fired nor silently treated as fine, and no engine text is kept.
+async fn metric_value(ch: &ChClient, gate: &dyn SqlGate, name: &str) -> Result<f64, AlertError> {
+    let fail = |reason: &str| AlertError::Validation(reason.to_owned());
+    let sql = metric_statement(ch, name).await?;
     let sql = gate.gate(&sql).await.map_err(AlertError::Validation)?;
     let Ok(rows) = ch.rows(&sql, None).await else {
         return Err(fail("the metric could not be read."));
@@ -4638,6 +4713,7 @@ mod tests {
             user: None,
             pass: String::new(),
             from: String::new(),
+            ca_bundle: None,
         })
     }
 
