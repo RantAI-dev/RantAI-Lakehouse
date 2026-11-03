@@ -899,7 +899,7 @@ fn calc_source_properties() -> Value {
 
 fn list_formula_functions_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_formula_functions",
-        "description": "The formula language of calculated fields and every function it has (name, signature, one line of help, an example). Call it before writing a formula. You write formulas, never SQL.",
+        "description": "The formula language of calculated fields and every function it has (its signature and one line of help, by category). Call it before writing a formula. You write formulas, never SQL.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 

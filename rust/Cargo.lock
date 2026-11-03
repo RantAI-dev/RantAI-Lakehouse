@@ -2734,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2943,10 +2943,15 @@ dependencies = [
 name = "lakehouse-notify"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "lettre",
+ "rcgen",
  "reqwest 0.12.28",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "testcontainers",
  "tokio",
  "wiremock",
 ]

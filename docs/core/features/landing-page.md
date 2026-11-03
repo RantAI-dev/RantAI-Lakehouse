@@ -68,7 +68,9 @@ gets elsewhere, and without claiming anything the build does not do.
   testimonials or a "trusted by" row. There are none.
 - Analytics, tracking scripts or a cookie banner on the page.
 - A separate domain or a separate deployment. The page ships at `/landing`
-  in the console's own app.
+  in the console's own app, in the source tree; an installed Lakehouse does
+  not serve it (decision 6), and where it lives instead is open (open
+  question 2).
 - A link to the landing page from inside the console. The page is reached by
   typing its address or from a link outside the console.
 - A translation of the page. It is English only.
@@ -89,6 +91,7 @@ and the assistant needs one.
 | 3 | What it claims | Only what `PRODUCT.md` section 2 marks as built. No customer names, no numbers, no prices. The review of round 1 removed two claims that went further (SFTP and S3-compatible storage) and reworded two more | Product owner, 2026-10-11, plan §2.6; review round 1, BLOCKER 1 |
 | 4 | The calls to action | "Open the console" to `/login`, "Talk to us" to a mail address, "Read the source" to the public repository | Product owner, 2026-10-11, plan §2.7 |
 | 5 | Without WebGL, and without motion | No WebGL: the DOM hero stays and the page reads end to end. `prefers-reduced-motion: reduce`: one still frame, no dive, no tracking | Product owner, 2026-10-11, plan §2.8 |
+| 6 | Where it lives, on an installed Lakehouse | Not there. The console image leaves `src/app/landing` and `src/features/landing` out of its build context, so an installed Lakehouse has no `/landing`: the path answers with the console's page-not-found. The source stays in this repository, and the dev server (`bun run dev`) serves the page | Product owner, 2026-11-02 (QA-1 decisions), plan §1 D1–D2 (the planner's default) |
 
 ## Limits to tell a customer
 
@@ -103,6 +106,12 @@ and the assistant needs one.
   there are, because none of that is settled.
 - The page loads in the console's app, so it is rendered per request with the
   console's security headers. It asks no API of its own.
+- An installed Lakehouse does not serve this page: the console image leaves
+  it out (decision 6), so `/landing` answers with the console's
+  page-not-found — without the console's chrome, because the path is under
+  the public prefix. The dev server (`bun run dev`) and a console run from
+  the source tree (`bun run build`, then `bun start`) do serve it, and so
+  will wherever the owner puts it (open question 2).
 - The console asks the API once who the visitor is, whatever page the
   visitor is on; on the landing page the answer changes nothing.
 
@@ -111,6 +120,11 @@ and the assistant needs one.
 Run on a real deployment. Mark each Pass, Fail or Not run with the reason. A
 step not performed is never Pass. Do the first half of the list signed out
 (in a private window), the second half signed in.
+
+The deployment is the dev server (`bun run dev`), until the owner has decided
+where the page lives instead (open question 2). An installed Lakehouse does
+not serve the page at all (decision 6), so it cannot be run there.
+`WEB-1-AC1` to `WEB-1-AC17` stand as they are.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
@@ -145,9 +159,23 @@ The code does not settle these, so they are not decided here.
    is reached by typing its address or from a link outside the console. A
    "back to the product page" link on the sign-in page, or a link in the
    console's footer, is a decision about the two halves of the product.
-2. **Should the landing page have its own domain?** It ships at `/landing`
-   in the console's app. A domain of its own is a deployment question the
-   code cannot answer.
+2. **Where should the landing page live instead?** It is not on an installed
+   Lakehouse (decision 6), so it needs a home of its own. The code does not
+   settle this, so the owner does. Three ways:
+   - **A static export deployed as its own site** under the RantAI public
+     domain. The page calls no API of its own, so it can be a static build:
+     either a small separate Next app, or a `next build` with only this
+     route. The deployment target (the Cloudflare account the team already
+     uses, or another host) is the owner's choice.
+   - **Its own repository**, with the 3D scene and the copy moved there and
+     deleted here.
+   - **A page in the existing RantAI marketing site.**
+
+   Whichever is chosen, two things change with it: the "Open the console"
+   link has no single console to point to from a public site, so it becomes
+   a link to the install guide or it is removed (the owner's call); and
+   `three`, which only this page uses, can then leave the console's
+   `package.json`.
 3. **Should the page be translated?** It is English only today, and the
    product's other pages are English too. Which languages, and who keeps
    them current, is not decided.
