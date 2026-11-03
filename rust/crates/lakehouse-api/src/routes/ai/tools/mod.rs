@@ -457,6 +457,103 @@ pub(super) async fn require_edit_on_chart(
     Ok(())
 }
 
+/// Checks the requester of a `WriteHigh` call before an approval is created
+/// (`BI-26` slice 2 D4, `DEC-8`). The gate answers "pending approval", and
+/// this runs before `request_approval`: an error goes to the model as the tool
+/// result and no approval row is written, so a call that could never run does
+/// not ask a person to approve it.
+///
+/// The two embed writes run the same checks their console routes do: the one
+/// manage guard (`public_links::managed_board`, `BI-26` review fix R6), the
+/// configured `EMBED_SECRET` (`SEC-12` D4), and the argument validation the
+/// route makes (`embed::check_filter_modes`; `embed_access::validate_origins`).
+/// Every other tool is a no-op here: its own tool body checks what it needs.
+///
+/// # Errors
+///
+/// The tool-result JSON the model sees, as the routes' own sentence.
+pub(crate) async fn check_before_approval(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Result<(), Value> {
+    match name {
+        "enable_embed" => {
+            managed_embed_board(state, principal, args).await?;
+            embed_configured(state)?;
+            let sites = arg_string_list(args, "sites")?;
+            lakehouse_bi::embed_access::validate_origins(&sites)
+                .map(|_| ())
+                .map_err(|err| json!({ "error": err }))
+        }
+        "set_embed_filter_modes" => {
+            let board = managed_embed_board(state, principal, args).await?;
+            embed_configured(state)?;
+            let modes = arg_filter_modes(args)?;
+            crate::routes::embed::check_filter_modes(&board, &modes)
+                .map_err(|err| json!({ "error": err.to_string() }))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The dashboard an embed tool acts on: the caller must manage it, by the one
+/// guard the embed settings route uses (`BI-26` review fix R6). A call with no
+/// signed-in person is refused: the embed settings are managed as somebody.
+async fn managed_embed_board(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Result<lakehouse_bi::store::Board, Value> {
+    let Some(principal) = principal else {
+        return Err(json!({
+            "error": "the embed tools change a dashboard as the signed-in person, and there is none."
+        }));
+    };
+    let board = arg_str(args, "board");
+    crate::routes::public_links::managed_board(state, principal, Some(&board))
+        .await
+        .map_err(|err| json!({ "error": err.to_string() }))
+}
+
+/// `SEC-12` D4: signed embedding cannot work without `EMBED_SECRET`, so every
+/// embed tool refuses with the one sentence the routes use, before any
+/// approval exists (`BI-26` slice 2 D5).
+fn embed_configured(state: &AppState) -> Result<(), Value> {
+    if state.config.embed_secret.as_deref().is_some() {
+        Ok(())
+    } else {
+        Err(json!({ "error": crate::routes::embed::EMBEDDING_NOT_CONFIGURED }))
+    }
+}
+
+/// `args[key]` as a list of strings; a missing key, a non-list or a non-string
+/// entry is refused rather than read as empty (`BI-26` slice 2 D4).
+fn arg_string_list(args: &Map<String, Value>, key: &str) -> Result<Vec<String>, Value> {
+    let Some(Value::Array(entries)) = args.get(key) else {
+        return Err(json!({ "error": format!("{key} must be a list.") }));
+    };
+    entries
+        .iter()
+        .map(|entry| entry.as_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| json!({ "error": format!("{key} must be a list of text entries.") }))
+}
+
+/// `args["modes"]` as the map the settings route writes: a column to one of
+/// `locked`, `editable`, `hidden`.
+fn arg_filter_modes(
+    args: &Map<String, Value>,
+) -> Result<std::collections::BTreeMap<String, lakehouse_bi::embed_access::FilterMode>, Value> {
+    let Some(modes) = args.get("modes") else {
+        return Err(json!({ "error": "modes is required." }));
+    };
+    serde_json::from_value(modes.clone()).map_err(
+        |_| json!({ "error": "modes must be {column: \"locked\"|\"editable\"|\"hidden\"}" }),
+    )
+}
+
 /// Checks a chart call before the gate offers it as a draft (plan 18). `None`
 /// when the call is not a chart call, or when the draft can be built; the
 /// error otherwise, so a draft on a mart or column that does not exist is
@@ -530,6 +627,46 @@ mod tests {
         }
         let unknown = run_tool(&state, None, "not_a_real_tool", &Map::new()).await;
         assert_eq!(unknown, json!({ "error": "unknown tool: not_a_real_tool" }));
+    }
+
+    /// BI-26 slice 2 T4 (D4): the pre-approval hook is a no-op for every tool
+    /// that is not one of the two embed writes, so adding it to the dispatch
+    /// sites changes no other call. A tool that is not an embed write is never
+    /// touched by the hook, even with no signed-in person.
+    #[tokio::test]
+    async fn check_before_approval_is_a_no_op_for_every_other_tool() {
+        let state = dispatch_test_state();
+        for spec in registry::TOOLS {
+            if spec.name == "enable_embed" || spec.name == "set_embed_filter_modes" {
+                continue;
+            }
+            assert!(
+                check_before_approval(&state, None, spec.name, &Map::new())
+                    .await
+                    .is_ok(),
+                "{} was checked by the pre-approval hook",
+                spec.name
+            );
+        }
+    }
+
+    /// BI-26 slice 2 T4 (D4): both embed writes are refused with nobody
+    /// signed in, before any approval can be made, because the embed settings
+    /// are managed as somebody (`public_links::managed_board`).
+    #[tokio::test]
+    async fn check_before_approval_refuses_an_embed_write_with_nobody_signed_in() {
+        let state = dispatch_test_state();
+        for name in ["enable_embed", "set_embed_filter_modes"] {
+            let error = check_before_approval(&state, None, name, &Map::new())
+                .await
+                .expect_err("refused");
+            assert!(
+                error["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("there is none")),
+                "{name}: {error}"
+            );
+        }
     }
 
     /// A stand-in `ClickHouse` that holds dashboards `b1` and `b2` (unfiled,

@@ -965,27 +965,10 @@ async fn run_chat(
                     };
                     let (_, resource_id) =
                         audit::resource_for(&call.function.name, &args, &json!({}));
-                    let approval_result =
-                        request_approval(state, principal, spec, &args, resource_id.as_deref())
-                            .await;
-                    let (run_id, approval_id) = if approval_result
-                        .get("needs_approval")
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                    {
-                        (
-                            approval_result["run_id"].as_str().map(str::to_owned),
-                            approval_result["approval_id"].as_str().map(str::to_owned),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    let outcome = if run_id.is_some() {
-                        "needs_approval"
-                    } else {
-                        "failed"
-                    };
-                    (approval_result, outcome, run_id, approval_id)
+                    // BI-26 slice 2 D4: the requester is checked before an
+                    // approval exists, so a call that could never run does not
+                    // ask anyone to approve it.
+                    approval_outcome(state, principal, spec, &args, resource_id.as_deref()).await
                 } else {
                     let outcome = gate::outcome_of(&refusal);
                     if outcome == "needs_confirmation"
@@ -1310,32 +1293,16 @@ pub async fn tool_call(
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
         if gate::is_write_high_pending(&refusal) {
             let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));
-            let approval_result = request_approval(
+            // BI-26 slice 2 D4: the requester is checked before an approval
+            // exists, so a call that could never run writes no approval row.
+            approval_outcome(
                 &state,
                 principal.as_ref().map(|Extension(p)| p),
                 spec,
                 &parsed.args,
                 resource_id.as_deref(),
             )
-            .await;
-            let (run_id, approval_id) = if approval_result
-                .get("needs_approval")
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                (
-                    approval_result["run_id"].as_str().map(str::to_owned),
-                    approval_result["approval_id"].as_str().map(str::to_owned),
-                )
-            } else {
-                (None, None)
-            };
-            let outcome = if run_id.is_some() {
-                "needs_approval"
-            } else {
-                "failed"
-            };
-            (approval_result, outcome, run_id, approval_id)
+            .await
         } else {
             let outcome = gate::outcome_of(&refusal);
             if outcome == "needs_confirmation"
@@ -1379,6 +1346,40 @@ pub async fn tool_call(
         ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": result })),
     )
         .into_response()
+}
+
+/// The `WriteHigh` arm both dispatch sites run: the requester's own checks
+/// first (`BI-26` slice 2 D4), then the approval. A failed check is the tool
+/// result and no approval row is written.
+async fn approval_outcome(
+    state: &AppState,
+    principal: Option<&Principal>,
+    spec: &registry::ToolSpec,
+    args: &Map<String, Value>,
+    resource_id: Option<&str>,
+) -> (Value, &'static str, Option<String>, Option<String>) {
+    if let Err(error) = tools::check_before_approval(state, principal, spec.name, args).await {
+        return (error, "failed", None, None);
+    }
+    let approval_result = request_approval(state, principal, spec, args, resource_id).await;
+    let (run_id, approval_id) = if approval_result
+        .get("needs_approval")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        (
+            approval_result["run_id"].as_str().map(str::to_owned),
+            approval_result["approval_id"].as_str().map(str::to_owned),
+        )
+    } else {
+        (None, None)
+    };
+    let outcome = if run_id.is_some() {
+        "needs_approval"
+    } else {
+        "failed"
+    };
+    (approval_result, outcome, run_id, approval_id)
 }
 
 /// Create the approval for a `WriteHigh` call that [`gate::decide`] flagged, and
