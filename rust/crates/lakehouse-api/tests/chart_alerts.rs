@@ -31,6 +31,9 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 const BOARD: &str = "b_pub";
 const RULE: &str = "al_c1";
 const TOKEN: &str = "run-token-not-real";
+/// `SEC-50` slice 2 M11: another tenant of the same deployment, whose
+/// members may not read the shared catalog.
+const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
 
 #[derive(Clone)]
 struct FakeCh {
@@ -167,6 +170,12 @@ struct Fixture {
 }
 
 async fn fixture(target: &str) -> Fixture {
+    fixture_in(target, common::CATALOG_TENANT).await
+}
+
+/// `SEC-50` slice 2 M11: the same fixture, with the rule's owner in
+/// `tenant` — the catalog's own tenant, or another one.
+async fn fixture_in(target: &str, tenant: &str) -> Fixture {
     let owner = Uuid::new_v4();
     let fake = FakeCh {
         owner: owner.to_string(),
@@ -185,6 +194,12 @@ async fn fixture(target: &str) -> Fixture {
     let env: HashMap<String, String> = HashMap::from([
         ("CH_URL".to_owned(), ch.uri()),
         ("ALERTS_RUN_TOKEN".to_owned(), TOKEN.to_owned()),
+        // `SEC-50` slice 2 M11: the shared catalog belongs to a tenant, and
+        // the rule's owner is in it.
+        (
+            "CATALOG_TENANT_ID".to_owned(),
+            common::CATALOG_TENANT.to_owned(),
+        ),
     ]);
     let app = spin_up_with_env(&env).await;
     let role = Uuid::new_v4();
@@ -201,6 +216,13 @@ async fn fixture(target: &str) -> Fixture {
     sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
         .bind(owner)
         .bind(role)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    // `SEC-50` slice 2 M11: the owner is in the tenant the fixture names.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(owner)
+        .bind(tenant.parse::<Uuid>().expect("a seeded tenant id"))
         .execute(&app.pool)
         .await
         .unwrap();
@@ -556,4 +578,28 @@ async fn an_owner_who_lost_the_dashboard_stops_the_alert() {
     let (state, reason) = state_of(&f.app.pool).await.unwrap();
     assert_eq!(state, "stopped");
     assert!(reason.unwrap().contains("can no longer see"));
+}
+
+/// `SEC-50` slice 2 M4: a chart alert whose owner is of another tenant
+/// reads nothing: the tile is refused, the alert fails, and nothing is
+/// sent.
+#[tokio::test]
+async fn a_chart_alert_of_another_tenant_fails_and_sends_nothing() {
+    let f = fixture_in("owner@test.invalid", OTHER_TENANT).await;
+    let r = run(&f).await;
+    assert_eq!(
+        r["skipped"],
+        json!("The chart could not be read."),
+        "the tile is refused, so the alert cannot be read: {r}"
+    );
+    assert_eq!(r["fired"], json!(false), "{r}");
+    assert!(
+        !f.fake
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("FROM serving.mart_x")),
+        "nothing is read when the owner may not read the mart"
+    );
 }

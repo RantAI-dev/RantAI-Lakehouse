@@ -180,8 +180,13 @@ export interface AlertRuleService {
   createRule(input: SaveAlertRuleInput, signal?: AbortSignal): Promise<AlertRule>
   updateRule(rule: SaveAlertRuleInput & { id: string }, signal?: AbortSignal): Promise<AlertRule>
   deleteRule(id: string, signal?: AbortSignal): Promise<void>
-  runRules(
-    id: string | undefined,
+  /**
+   * `BI-40` D1: run one rule now, as a test. There is no "run every rule"
+   * form: the whole tick belongs to the scheduler (`POST /api/alerts/run`,
+   * which a person's session cannot call).
+   */
+  testRule(
+    id: string,
     signal?: AbortSignal
   ): Promise<{ ran: number; results: AlertRunResult[] }>
 }

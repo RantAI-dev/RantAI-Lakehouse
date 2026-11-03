@@ -411,13 +411,19 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // may save an alert on it for themselves (and remove their own), so the
     // handler decides: `alert:write` for every other rule or target, the
     // owner's own address for a chart alert without it
-    // (`routes::chart_alerts::authorise_save`, `may_delete`). Asserted both
+    // (`routes::chart_alerts::authorise_save`, `may_manage`). Asserted both
     // ways in `tests/route_auth.rs`.
     ("POST",   "/api/alerts",      Policy::RequiresAuth),
     ("PUT",    "/api/alerts",      Policy::RequiresAuth),
     ("DELETE", "/api/alerts",      Policy::RequiresAuth),
     // `SRC-7` D9: whether run reports can arrive; auth only, it reads no rule.
     ("GET",    "/api/alerts/status", Policy::RequiresAuth),
+    // `BI-40` D1/D2: a signed-in person tests one rule they may manage. The
+    // handler decides (the same shape as `POST /api/alerts`): 404 for a rule
+    // they cannot see, 403 without `alert:write` on a rule that is not their
+    // own chart alert. `/api/alerts/run` below is the scheduler's door and is
+    // unchanged — `check_run_token` still guards it (D4 not weakened).
+    ("POST",   "/api/alerts/test",  Policy::RequiresAuth),
     ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
@@ -459,6 +465,43 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/query/history",        Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/run/{id}/download", Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/scheduling",     Policy::RequiresPermission("query:read")),
+
+    // ── Query: the saved-query surface (`QS-3`). ─────────────────────────
+    //
+    // The gate is `query:read` for every route: the level the caller
+    // holds on the item (view, edit or manage) is the handler's business,
+    // because it is decided by the one resolver in the store and not by
+    // the permission set. A route that changes something needs `edit`,
+    // a route that deletes, restores or manages needs `manage`; an item
+    // the caller may not see is a 404, never a 403.
+    ("GET",    "/api/query/saved/{id}",                    Policy::RequiresPermission("query:read")),
+    ("PATCH",  "/api/query/saved/{id}",                    Policy::RequiresPermission("query:read")),
+    ("DELETE", "/api/query/saved/{id}",                    Policy::RequiresPermission("query:read")),
+    ("POST",   "/api/query/saved/{id}/duplicate",          Policy::RequiresPermission("query:read")),
+    ("POST",   "/api/query/saved/{id}/restore",            Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/saved-trash",                   Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/saved/{id}/versions",           Policy::RequiresPermission("query:read")),
+    ("POST",   "/api/query/saved/{id}/versions/{version}/revert",
+                                                            Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/folders",                       Policy::RequiresPermission("query:read")),
+    ("POST",   "/api/query/folders",                       Policy::RequiresPermission("query:read")),
+    ("PATCH",  "/api/query/folders/{id}",                  Policy::RequiresPermission("query:read")),
+    ("DELETE", "/api/query/folders/{id}",                  Policy::RequiresPermission("query:read")),
+
+    // ── Query: the sharing surface (`QS-3`). ───────────────────────────
+    //
+    // The gate is `query:read` for every route, as it is for the rest
+    // of the saved-query surface: the level the caller holds on the item
+    // (view, edit or manage) is the handler's business, because it is
+    // decided by the one resolver in the store and not by the permission
+    // set. The access lists need `manage` — reading the list is part of
+    // sharing — and a grantee that is not of the caller's organisation is
+    // refused before anything is written.
+    ("GET",    "/api/query/saved/{id}/access",             Policy::RequiresPermission("query:read")),
+    ("PUT",    "/api/query/saved/{id}/access",             Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/folders/{id}/access",           Policy::RequiresPermission("query:read")),
+    ("PUT",    "/api/query/folders/{id}/access",           Policy::RequiresPermission("query:read")),
+    ("GET",    "/api/query/grantees",                      Policy::RequiresPermission("query:read")),
 
     // ── Pipelines: seeded Data Engineer permission `pipeline:*`. ─────────
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),
@@ -783,6 +826,24 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/identity/users",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/users",                  Policy::RequiresPermission("identity:write")),
     ("PUT",  "/api/identity/users/{id}/tenants/{tenant_id}", Policy::RequiresPermission("identity:write")),
+    // ADM-4 D2: the counterpart of the PUT above — taking a user out of
+    // a tenant. Same permission, because it is the same act of
+    // administration on the same table; the "who may" rule (an
+    // unrestricted caller, or a member of that tenant) lives in the
+    // handler, exactly as the add's does.
+    ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}", Policy::RequiresPermission("identity:write")),
+    // ADM-4 D1: replacing a user's role set. Same permission as every
+    // other identity write: the route's own guard (only an unrestricted
+    // caller may change an unrestricted user, or grant a role that holds
+    // `*:*`) is in the handler, next to the escalation rules it shares
+    // with the reset route.
+    ("PUT",  "/api/identity/users/{id}/roles",      Policy::RequiresPermission("identity:write")),
+    // ADM-4 D3: switching a user off and back on again. Same permission
+    // as every other identity write — the handler adds the escalation
+    // rule on top (D5): only an unrestricted caller may switch an
+    // unrestricted user off or on.
+    ("POST", "/api/identity/users/{id}/deactivate", Policy::RequiresPermission("identity:write")),
+    ("POST", "/api/identity/users/{id}/reactivate", Policy::RequiresPermission("identity:write")),
     // ADM-3 D2: an admin password reset is a credential write, so it
     // reuses `identity:write` exactly the way every other write-side
     // identity route does (AGENTS.md rule 4: no new permission token

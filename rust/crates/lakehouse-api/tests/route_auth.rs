@@ -47,7 +47,7 @@ use tower::ServiceExt;
 
 use common::{
     TestApp, create_principal_with_permissions, create_zero_permission_principal,
-    session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
+    session_cookie_for_seeded_user, session_cookie_for_user, spin_up, spin_up_with_env,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -249,7 +249,19 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
 /// refused by the auth gate; with no session the router answers 401.
 #[tokio::test]
 async fn the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right() {
-    let TestApp { router, pool } = spin_up().await;
+    // `SEC-50` slice 2 review round 2 BLOCKER 1, the same fixture rule as
+    // `tests/dashboard_export.rs`: the mart rule below reads the shared
+    // catalog, and the tenant gate runs before the `alert:write` check this
+    // test is about. Without a catalog tenant the gate answers `SEC-20`'s
+    // 404 for `serving.m` and the Analyst never reaches the 403. The
+    // deployment names the catalog's tenant and both seeded readers are in
+    // it, so the only refusal left is the permission.
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     for method in ["POST", "PUT", "DELETE"] {
         assert_eq!(
             POLICY_TABLE
@@ -274,6 +286,14 @@ async fn the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_t
             StatusCode::UNAUTHORIZED,
             "{method} with no session"
         );
+    }
+    for email in ["sari@meridian.example", "bayu@meridian.example"] {
+        let (id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind(email)
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded reader (0002_seed_identity.sql)");
+        common::in_the_catalog_tenant(&pool, id).await;
     }
     let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
     let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
@@ -3546,6 +3566,233 @@ async fn the_door_needs_the_iceberg_read_scope_and_a_service_identity() {
             ),
             "{method} {path}: a service identity holding iceberg:read must pass the gate, got {}",
             resp.status()
+        );
+    }
+}
+
+// `BI-40` T2 (`D1`, `D2`, `D6`): `POST /api/alerts/test` is a person's door, so
+// it is `RequiresAuth` at the router and the handler decides who may run which
+// rule. The `ClickHouse` below serves the two rule reads the guard makes: a
+// plain threshold rule and a chart rule the Analyst owns.
+mod alert_test_fixture {
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+    use wiremock::{Request as MockRequest, Respond, ResponseTemplate};
+
+    /// The two rules this fixture's `ClickHouse` serves.
+    pub struct TwoRules {
+        pub owner: Uuid,
+    }
+
+    impl TwoRules {
+        fn plain() -> Value {
+            json!({
+                "id": "al_plain", "name": "Visitors", "type": "alert", "mart": "mart_x",
+                "measure": "visitors", "agg": "sum", "op": ">", "threshold": "100",
+                "board": "", "channel": "email", "target": "someone@test.invalid",
+                "enabled": "1", "created_at": "2026-11-02 00:00:00", "severity": "",
+                "pipeline": "", "metric": "", "connector": "", "asset": "", "chart": "",
+                "series": "", "condition": "", "owner_id": "", "filters_json": "[]",
+            })
+        }
+
+        fn mine(owner: Uuid) -> Value {
+            json!({
+                "id": "al_chart", "name": "Visitors in Bali", "type": "alert", "mart": "",
+                "measure": "", "agg": "sum", "op": ">", "threshold": "100", "board": "",
+                "channel": "email", "target": "sari@meridian.example", "enabled": "1",
+                "created_at": "2026-11-02 00:00:00", "severity": "", "pipeline": "",
+                "metric": "", "connector": "", "asset": "", "chart": "c_kpi", "series": "",
+                "condition": "above", "owner_id": owner.to_string(), "filters_json": "[]",
+            })
+        }
+    }
+
+    impl Respond for TwoRules {
+        fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+            let sql = String::from_utf8_lossy(&request.body).into_owned();
+            let data = if sql.contains("FROM console.alert_rule") {
+                if sql.contains("id='al_plain'") {
+                    vec![Self::plain()]
+                } else if sql.contains("id='al_chart'") {
+                    vec![Self::mine(self.owner)]
+                } else {
+                    Vec::new()
+                }
+            } else if sql.contains("system.columns") {
+                vec![json!({ "table": "mart_x", "name": "visitors", "type": "Float64" })]
+            } else if sql.contains("FROM serving.mart_x") {
+                vec![json!({ "v": 0.0 })]
+            } else {
+                return ResponseTemplate::new(200).set_body_string("Ok.\n");
+            };
+            let n = data.len();
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
+        }
+    }
+}
+
+/// A test app whose `ClickHouse` serves [`alert_test_fixture::TwoRules`].
+async fn alert_test_app() -> TestApp {
+    use std::collections::HashMap;
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer};
+
+    let sari = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM app_user WHERE email = 'sari@meridian.example'",
+    )
+    .fetch_one(&spin_up().await.pool)
+    .await
+    .expect("seeded sari@meridian.example");
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(alert_test_fixture::TwoRules { owner: sari })
+        .mount(&ch)
+        .await;
+    let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    spin_up_with_env(&env).await
+}
+
+/// `BI-40` D2, both directions with real principals: no session is 401; the
+/// seeded Analyst (no `alert:write`) is refused a mart rule with the
+/// permission's own name and is let through on their own chart rule; a Data
+/// Engineer, who holds `alert:write`, is not refused either.
+#[tokio::test]
+async fn testing_an_alert_is_signed_in_at_the_router_and_asks_for_alert_write() {
+    use serde_json::json;
+
+    let TestApp { router, pool } = alert_test_app().await;
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/alerts/test")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresAuth)
+    );
+
+    let no_session = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerts/test?id=al_plain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_session.status(), StatusCode::UNAUTHORIZED);
+
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    // A seeded Analyst has no `alert:write`, and a mart rule is nobody's chart
+    // alert: refused with the permission's own name, never a 401.
+    let denied =
+        request_with_cookie(&router, "POST", "/api/alerts/test?id=al_plain", &analyst).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(denied.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], json!("permission_denied: alert:write"));
+
+    // Their own chart alert is theirs to run (C3): not refused by the guard.
+    let own = request_with_cookie(&router, "POST", "/api/alerts/test?id=al_chart", &analyst).await;
+    assert!(
+        !matches!(
+            own.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "an Analyst's own chart rule must pass the guard, got {}",
+        own.status()
+    );
+
+    // A Data Engineer holds `alert:write` and is not refused by the guard.
+    let allowed =
+        request_with_cookie(&router, "POST", "/api/alerts/test?id=al_plain", &engineer).await;
+    assert!(
+        !matches!(
+            allowed.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "a holder of alert:write must pass the guard, got {}",
+        allowed.status()
+    );
+}
+
+/// `BI-40` D1 and D4 kept: the new door opens for a person and the scheduler's
+/// door stays shut to one.
+#[tokio::test]
+async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_open() {
+    let TestApp { router, pool } = alert_test_app().await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let scheduler = request_with_cookie(&router, "POST", "/api/alerts/run", &analyst).await;
+    assert!(
+        matches!(
+            scheduler.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "POST /api/alerts/run must stay closed to a person, got {}",
+        scheduler.status()
+    );
+
+    let tested =
+        request_with_cookie(&router, "POST", "/api/alerts/test?id=al_chart", &analyst).await;
+    assert!(
+        !matches!(
+            tested.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "POST /api/alerts/test is a person's door, got {}",
+        tested.status()
+    );
+}
+
+/// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
+/// as `identity:write`, and the gate agrees both ways: no session is 401,
+/// a principal without `identity:write` is 403, and one holding it gets
+/// past the gate (what follows is the handler's own answer — 400 for the
+/// concretized ids used here — never 401 or 403).
+#[tokio::test]
+async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    for (method, path) in [
+        ("PUT", "/api/identity/users/{id}/roles"),
+        ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
+        ("POST", "/api/identity/users/{id}/deactivate"),
+        ("POST", "/api/identity/users/{id}/reactivate"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("identity:write")),
+            "{method} {path}"
+        );
+        let concrete = concretize(path);
+        let anonymous = request_with_cookie(&router, method, &concrete, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+        let plain = create_principal_with_permissions(&pool, "query:read").await;
+        let cookie = session_cookie_for_user(&pool, plain).await;
+        let refused = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let writer = create_principal_with_permissions(&pool, "identity:write").await;
+        let cookie = session_cookie_for_user(&pool, writer).await;
+        let allowed = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert!(
+            !matches!(
+                allowed.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a caller holding identity:write must get past the gate, got {}",
+            allowed.status()
         );
     }
 }

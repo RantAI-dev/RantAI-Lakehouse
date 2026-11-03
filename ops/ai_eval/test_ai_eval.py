@@ -614,6 +614,31 @@ class CleanupPlanTests(unittest.TestCase):
             [{"kind": "source", "id": "s9"}],
         )
 
+    # BI-37: the alert the assistant saves is an object the run made, so the
+    # state check counts it and the cleanup deletes it.
+    def test_create_alert_rule_saves_a_rule_that_the_run_collects_and_deletes(self) -> None:
+        reply = {"ok": True, "rule": {"id": "al7", "name": "Visitors", "chart": "c1"}}
+        trace = [{"tool": "create_alert_rule", "result": {"ok": True, "rule": {"id": "al7"}}}]
+        confirms = [{"tool": "create_alert_rule", "result": confirm_reply("create_alert_rule", reply)}]
+        self.assertEqual(m.collect_created([], [trace], []), [{"kind": "alert", "id": "al7"}])
+        self.assertEqual(m.collect_created([], [], confirms), [{"kind": "alert", "id": "al7"}])
+        cfg = make_cfg()
+        session = FakeSession()
+        self.assertEqual(m.run_cleanup(cfg, session, m.collect_created([], [], confirms)), [])
+        self.assertIn(
+            ("DELETE", "http://api.test/api/alerts?id=al7", None), session.calls
+        )
+
+    def test_a_draft_that_only_asks_for_confirmation_collects_no_alert(self) -> None:
+        # The pending confirmation names the tool and its args, never a saved
+        # rule, so the run must not delete an id it never saw.
+        trace = [{"tool": "create_alert_rule", "result": {"needs_confirmation": True, "tool": "create_alert_rule"}}]
+        self.assertEqual(m.collect_created([], [trace], []), [])
+
+    def test_an_alert_is_deleted_before_the_chart_it_watches(self) -> None:
+        created = [{"kind": "chart", "id": "c1"}, {"kind": "alert", "id": "al1"}]
+        self.assertEqual([s["kind"] for s in m.cleanup_plan(created)], ["alert", "chart"])
+
 
 class TeardownTests(unittest.TestCase):
     """The calls a case names in `cleanup` undo what its setup changed and the

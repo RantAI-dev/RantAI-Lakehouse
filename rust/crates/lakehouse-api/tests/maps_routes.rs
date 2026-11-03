@@ -628,6 +628,7 @@ async fn a_public_link_reads_the_boundary_of_a_map_its_board_uses_and_refuses_th
         OffsetDateTime::now_utc() + Duration::days(5),
         None,
         None,
+        None,
     )
     .await
     .unwrap();

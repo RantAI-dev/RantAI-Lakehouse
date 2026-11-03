@@ -9,9 +9,10 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * AlertRuleService over `/api/alerts` (rule CRUD) and `/api/alerts/run`
- * (evaluate). WS1 task 1.15: this client (and its contract) did not exist
- * before — the feature fetched `/api/alerts` directly with no `res.ok`
+ * AlertRuleService over `/api/alerts` (rule CRUD) and `/api/alerts/test`
+ * (`testRule`, one rule at a time: `BI-40` D1; the scheduler's
+ * `/api/alerts/run` is not a person's door). WS1 task 1.15: this client (and
+ * its contract) did not exist before — the feature fetched `/api/alerts` directly with no `res.ok`
  * check, so a dead API rendered as an empty rule list. Every method here
  * throws a `ServiceError` carrying the server's `{ error }` message on a
  * non-OK response, classified the same way `clickhouseOverviewService`
@@ -92,12 +93,23 @@ export const clickhouseAlertRuleService: AlertRuleService = {
       "Rule could not be deleted"
     );
   },
-  async runRules(id, signal) {
-    const q = id ? `?id=${encodeURIComponent(id)}` : "";
-    return request<{ ran: number; results: AlertRunResult[] }>(
-      `/api/alerts/run${q}`,
-      { method: "POST", signal },
-      "Rules could not be run"
-    );
+  async testRule(id, signal) {
+    try {
+      return await request<{ ran: number; results: AlertRunResult[] }>(
+        `/api/alerts/test?id=${encodeURIComponent(id)}`,
+        { method: "POST", signal },
+        "Rule could not be tested"
+      );
+    } catch (err) {
+      // `BI-40` D2 gives this route's refusal as the `alert:write` permission
+      // (`permission_denied: alert:write`); the console says it in words a
+      // person can act on. A 404 keeps the server's own sentence
+      // ("alert rule not found."), which is the same whether the rule is gone
+      // or simply not theirs to see.
+      if (err instanceof ServiceError && err.code === "permission_denied") {
+        throw new ServiceError("permission_denied", "You can test only the alerts you manage.");
+      }
+      throw err;
+    }
   },
 };

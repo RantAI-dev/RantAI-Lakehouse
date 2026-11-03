@@ -23,7 +23,7 @@ import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval }
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
 import { readableErrorMessage } from "@/lib/notify-message";
-import { summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
+import { buildDashboardPageContext, summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, isActiveFilter, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-chat";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
@@ -916,9 +916,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ],
       results,
     );
-    const filterLine = filterJson
-      ? `Active filters: ${summarizeFilters(filters)} (raw: ${filterJson}).`
-      : `Active filters: ${summarizeFilters(filters)}.`;
     setPageContext({
       key: "dashboard-view",
       title: `Working on "${dashName}"`,
@@ -927,15 +924,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         ask: ["Explain the charts on this dashboard", "Which category leads here?"],
         build: ["Add a KPI of total visitors", "Add a table of top countries", "Add a pie of visitors by region"],
       },
-      system:
-        `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
-        `${grainText}. ` +
-        `${filterLine} ` +
-        `Parameters shown (a formula reads one as {name}; list_parameters has them all): ${summarizeParams(paramControls)}. ` +
-        `Tabs: ${summarizeTabs(tabs, (id) => tabOf(tabs, layout, id), chartIds, selTab)}. ` +
-        `Tiles and the data they currently show (built-in tiles are not editable):\n${tiles || "none yet"}\n` +
-        `When creating a chart use board="${board}". To change a tile you created, use update_chart with its id. ` +
-        `You can also explain what the charts show.`,
+      system: buildDashboardPageContext({
+        dashName,
+        board,
+        grainText,
+        filterChips: summarizeFilters(filters),
+        filterJson,
+        params: summarizeParams(paramControls),
+        tabs: summarizeTabs(tabs, (id) => tabOf(tabs, layout, id), chartIds, selTab),
+        tiles,
+      }),
     });
     return () => setPageContext(null);
   }, [board, dashName, charts, kpis, results, filters, grainText, filterJson, paramControls, tabs, layout, chartIds, selTab, setPageContext]);

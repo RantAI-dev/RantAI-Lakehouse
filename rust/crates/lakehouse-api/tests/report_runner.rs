@@ -48,12 +48,16 @@ struct FakeCh {
     log: Arc<Mutex<Vec<String>>>,
     empty: Arc<AtomicBool>,
     stream_rows: Arc<AtomicUsize>,
+    /// The statement the board's chart holds. `SEC-50` slice 2 T4: a
+    /// statement that names a table the owner may not read is refused by
+    /// the tenant gate.
+    chart_sql: Arc<Mutex<String>>,
 }
 
-fn chart_row(id: &str, kind: &str, def: &Value) -> Value {
+fn chart_row(id: &str, kind: &str, def: &Value, sql: &str) -> Value {
     let spec = json!({
         "id": id, "title": "Visits by place", "kind": kind, "mart": "mart_x",
-        "sql": "SELECT stored", "x": "region", "y": "email"
+        "sql": sql, "x": "region", "y": "email"
     });
     let mut def = def.clone();
     def["title"] = json!("Visits by place");
@@ -81,13 +85,15 @@ impl Respond for FakeCh {
             return ResponseTemplate::new(200).set_body_string(body);
         }
         if sql.contains("FROM console.bi_chart") {
+            let sql = self.chart_sql.lock().unwrap().clone();
             return rows(vec![
                 chart_row(
                     "c_bar",
                     "bar",
                     &json!({ "dimension": "region", "measures": ["email"] }),
+                    &sql,
                 ),
-                chart_row("c_text", "text", &json!({ "text": "hello" })),
+                chart_row("c_text", "text", &json!({ "text": "hello" }), &sql),
             ]);
         }
         if sql.contains("FROM console.bi_board") {
@@ -253,6 +259,7 @@ async fn fixture(pdf: ResponseTemplate, configured: bool) -> F {
         log: Arc::new(Mutex::new(Vec::new())),
         empty: Arc::new(AtomicBool::new(false)),
         stream_rows: Arc::new(AtomicUsize::new(2)),
+        chart_sql: Arc::new(Mutex::new("SELECT stored".to_owned())),
     };
     let ch_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -276,6 +283,11 @@ async fn fixture(pdf: ResponseTemplate, configured: bool) -> F {
         ),
     ]);
     let (state, pool) = spin_up_state(&env).await;
+    // `SEC-50` slice 2 M11: the deployment holds no tenant of the seeded
+    // ones, so the tenant gate changes nothing here (D2) and the rules
+    // these tests are about keep their own shape — the owner belongs to
+    // no tenant, and an owner in no tenant constrains nobody.
+    common::leave_no_seeded_tenants(&pool).await;
     let role_id = Uuid::new_v4();
     let owner_role = "Report Owner".to_owned();
     sqlx::query("INSERT INTO role (id, name, permissions, description) VALUES ($1, $2, 'dashboard:read', 'test')")
@@ -1127,5 +1139,71 @@ async fn a_rule_only_viewer_of_a_restricted_dashboard_is_sent_its_report() {
         reports[0].bcc,
         ["colleague@company.example"],
         "the rule-only viewer gets it; the outside address is left out"
+    );
+}
+
+/// `SEC-50` slice 2 S6: a report whose owner is of a tenant that does not
+/// own the shared catalog reads nothing. The chart's file is left out with
+/// the existing "left out" line — not a new sentence — and the report
+/// still goes.
+#[tokio::test]
+async fn a_report_of_another_tenant_leaves_the_chart_out() {
+    let f = fixture(ok_pdf(), true).await;
+    // The board's chart reads the shared catalog.
+    *f.ch.chart_sql.lock().unwrap() = "SELECT region, email FROM serving.mart_x".to_owned();
+    // Two tenants in the deployment, and no tenant owns the shared catalog
+    // (the fixture names no `CATALOG_TENANT_ID`): the owner reads as their
+    // own tenant, which is not the catalog's.
+    for (name, slug) in [("Owner's tenant", "t-owner"), ("Another tenant", "t-other")] {
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) \
+             VALUES ($1, $2, $3, 'standard', 'id')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(name)
+        .bind(slug)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+    let owner_tenant: Uuid = sqlx::query_scalar("SELECT id FROM tenant WHERE slug = 't-owner'")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(f.owner)
+        .bind(owner_tenant)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let sub = subscription(&f, |_| {}).await;
+    tick(&f.state, &f.mailer).await;
+
+    let reports = f.mailer.reports();
+    assert_eq!(reports.len(), 1, "{:?}", deliveries(&f, &sub).await);
+    assert!(
+        reports[0].html.contains("was left out"),
+        "the chart's file is left out with the existing line: {}",
+        reports[0].html
+    );
+    let rows = deliveries(&f, &sub).await;
+    assert_eq!(rows[0].status, "sent", "the report itself still goes");
+    assert!(
+        rows[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("left out"),
+        "{:?}",
+        rows[0].reason
+    );
+    assert!(
+        !f.ch
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("FROM serving.mart_x") && !sql.contains("system.")),
+        "the refused chart is never read"
     );
 }
