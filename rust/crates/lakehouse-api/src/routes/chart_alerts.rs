@@ -153,7 +153,10 @@ async fn read(state: &AppState, rule: &AlertRule) -> Result<Reading, Unreadable>
     )
     // BI-19 C (PR #250 CI): a number that decides a send is never a remembered
     // one (the recovery would arrive a cache age late).
-    .fresh_chart(chart_id);
+    .fresh_chart(chart_id)
+    // `BI-39` D7: the alert decides from this one tile, so the board's other
+    // charts are not computed for it.
+    .only_chart(chart_id);
     // `SEC-50` slice 2 M4: the chart alert reads as the person who set it —
     // their first tenant, because the runner sends no `X-Tenant` header.
     // A refusal is the tile's own error, which this module already turns

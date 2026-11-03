@@ -73,8 +73,124 @@ pub async fn list(
                 upstream_error::FailedAs::Internal,
             )
         })?;
-    let rules = visible_rules(&state, principal.as_ref().map(|Extension(p)| p), rules).await?;
+    let rules = listed_rules(&state, principal.as_ref().map(|Extension(p)| p), rules).await?;
     Ok(ApiJson(json!({ "rules": rules })))
+}
+
+/// What a chart rule's row says about the chart it watches (`BI-39` D8), read
+/// live: the title is never stored, so a rename shows at once and a chart the
+/// caller lost access to stops naming itself (the same reason the bell is built
+/// live, `BI-19` part E deviation 1).
+struct ChartTitle {
+    title: String,
+    board_id: String,
+    board_title: String,
+}
+
+/// The rules of `rules` the caller may see, each as the list's JSON
+/// (`GET /api/alerts` and the assistant's `list_alert_rules`, one helper so the
+/// two cannot drift — rule 4).
+///
+/// `BI-39` D8: a chart rule whose chart the caller can see **now** also carries
+/// `chartTitle`, `dashboardId` and `dashboardTitle`; a chart rule whose chart
+/// they cannot see carries none of the three, and the console keeps
+/// "Dashboard chart". The caller's charts and boards are read once for the whole
+/// list, never once per rule.
+///
+/// # Errors
+///
+/// As [`visible_rules`]; a rule that cannot be serialized is a 500 with a fixed
+/// sentence (it cannot happen for this type, and is never guessed around).
+pub(crate) async fn listed_rules(
+    state: &AppState,
+    principal: Option<&Principal>,
+    rules: Vec<AlertRule>,
+) -> Result<Vec<Value>, ApiError> {
+    let rules = visible_rules(state, principal, rules).await?;
+    let titles = if rules.iter().any(|rule| rule.chart.is_some()) {
+        chart_titles(state, principal).await
+    } else {
+        HashMap::new()
+    };
+    let mut out = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let mut value = serde_json::to_value(&rule).map_err(|err| {
+            tracing::warn!(%err, rule_id = %rule.id, "an alert rule could not be serialized");
+            ApiError::Internal("the alert rules could not be listed".to_owned())
+        })?;
+        let found = rule.chart.as_deref().and_then(|id| titles.get(id));
+        if let Some(found) = found
+            && let Some(map) = value.as_object_mut()
+        {
+            map.insert("chartTitle".to_owned(), json!(found.title));
+            map.insert("dashboardId".to_owned(), json!(found.board_id));
+            map.insert("dashboardTitle".to_owned(), json!(found.board_title));
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
+
+/// Chart id → its title and its dashboard's id and name, for the charts
+/// `principal` can see now (`BI-39` D8). One read of the charts and one of the
+/// boards; the built-in board's row, which `list_boards` leaves out, is read
+/// once more only when a chart sits on it.
+///
+/// A store that cannot answer, or a caller with no principal, leaves the map
+/// empty: the list then names no chart and the console shows its own fallback
+/// text. Never a made-up title (principle 2).
+async fn chart_titles(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> HashMap<String, ChartTitle> {
+    let Some(principal) = principal else {
+        return HashMap::new();
+    };
+    let Ok(viewer) = crate::routes::dashboard_access::viewer_for(state, principal).await else {
+        return HashMap::new();
+    };
+    let ch = &state.clickhouse;
+    let Ok(charts) = lakehouse_bi::store::list_stored_charts(ch, &viewer).await else {
+        return HashMap::new();
+    };
+    let Ok(boards) = lakehouse_bi::store::list_boards(ch, &viewer).await else {
+        return HashMap::new();
+    };
+    let mut names: HashMap<String, String> = boards
+        .into_iter()
+        .map(|board| (board.id, board.name))
+        .collect();
+    // The built-in board's layout row is kept out of `list_boards`, and a chart
+    // on it (stored with no board, or as `default`) is still the caller's to
+    // see: its name comes from `get_board`, which answers a shell board when no
+    // row was ever saved.
+    if charts
+        .iter()
+        .any(|chart| chart.board.is_empty() || chart.board == lakehouse_bi::store::DEFAULT_BOARD_ID)
+        && let Ok(Some(builtin)) =
+            lakehouse_bi::store::get_board(ch, lakehouse_bi::store::DEFAULT_BOARD_ID, &viewer).await
+    {
+        names.entry(builtin.id).or_insert(builtin.name);
+    }
+    charts
+        .into_iter()
+        .filter_map(|chart| {
+            let board_id = if chart.board.is_empty() {
+                lakehouse_bi::store::DEFAULT_BOARD_ID.to_owned()
+            } else {
+                chart.board.clone()
+            };
+            let board_title = names.get(&board_id)?.clone();
+            Some((
+                chart.spec.id.clone(),
+                ChartTitle {
+                    title: chart.spec.title,
+                    board_id,
+                    board_title,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Body of `GET /api/alerts/status`.

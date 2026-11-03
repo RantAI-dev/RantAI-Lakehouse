@@ -43,6 +43,9 @@ struct FakeCh {
     chart_exists: Arc<Mutex<bool>>,
     /// The stored rule is a mart rule (no chart) instead of a chart rule.
     plain: Arc<Mutex<bool>>,
+    /// How many charts `BOARD` holds (`BI-39` T3: a chart alert reads one
+    /// tile, whatever the board's size). Default 1.
+    charts: Arc<Mutex<usize>>,
     /// The stored rule exists at all (false: an unknown id).
     rule_exists: Arc<Mutex<bool>>,
     log: Arc<Mutex<Vec<String>>>,
@@ -59,17 +62,21 @@ fn rule_row(owner: &str, target: &str) -> Value {
     })
 }
 
-fn chart_row() -> Value {
+/// One chart of `BOARD` reading `measure` of the mart: `BI-39` D7 counts the
+/// tile statements, so a board of several charts must cost one statement each
+/// (the cache computes one statement per key, so the charts differ).
+fn chart_row_for(id: &str, title: &str, measure: &str) -> Value {
     let spec = json!({
-        "id": "c_kpi", "title": "Visitors", "kind": "kpi", "mart": "mart_x",
-        "sql": "SELECT sum(visitors) AS visitors FROM serving.mart_x", "x": "", "y": "visitors"
+        "id": id, "title": title, "kind": "kpi", "mart": "mart_x",
+        "sql": format!("SELECT sum({measure}) AS {measure} FROM serving.mart_x"),
+        "x": "", "y": measure
     });
     let def = json!({
-        "title": "Visitors", "mart": "mart_x", "kind": "kpi", "measures": ["visitors"],
+        "title": title, "mart": "mart_x", "kind": "kpi", "measures": [measure],
         "aggregate": "sum"
     });
     json!({
-        "id": "c_kpi", "board": BOARD, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+        "id": id, "board": BOARD, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
         "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
     })
 }
@@ -164,7 +171,17 @@ impl Respond for FakeCh {
         }
         if sql.contains("FROM console.bi_chart") {
             let present = *self.chart_exists.lock().unwrap() && !clause_hides_board(&sql);
-            return rows(json!([]), if present { vec![chart_row()] } else { vec![] });
+            let count = *self.charts.lock().unwrap();
+            let charts: Vec<Value> = [
+                ("c_kpi", "Visitors", "visitors"),
+                ("c_two", "Tile c_two", "visitors_two"),
+                ("c_three", "Tile c_three", "visitors_three"),
+            ]
+            .iter()
+            .take(count)
+            .map(|(id, title, measure)| chart_row_for(id, title, measure))
+            .collect();
+            return rows(json!([]), if present { charts } else { vec![] });
         }
         if sql.contains("FROM console.bi_board") {
             let hidden = clause_hides_board(&sql);
@@ -173,16 +190,26 @@ impl Respond for FakeCh {
         if sql.contains("system.columns") {
             return rows(
                 json!([]),
-                [("region", "String"), ("visitors", "Float64")]
-                    .iter()
-                    .map(|(n, t)| json!({"table": "mart_x", "name": n, "type": t}))
-                    .collect(),
+                [
+                    ("region", "String"),
+                    ("visitors", "Float64"),
+                    ("visitors_two", "Float64"),
+                    ("visitors_three", "Float64"),
+                ]
+                .iter()
+                .map(|(n, t)| json!({"table": "mart_x", "name": n, "type": t}))
+                .collect(),
             );
         }
         if sql.contains("FROM serving.mart_x") {
+            let value = *self.value.lock().unwrap();
             return rows(
-                json!([{"name": "visitors", "type": "Float64"}]),
-                vec![json!({ "visitors": *self.value.lock().unwrap() })],
+                json!([
+                    {"name": "visitors", "type": "Float64"},
+                    {"name": "visitors_two", "type": "Float64"},
+                    {"name": "visitors_three", "type": "Float64"},
+                ]),
+                vec![json!({ "visitors": value, "visitors_two": value, "visitors_three": value })],
             );
         }
         ResponseTemplate::new(200).set_body_string("Ok.\n")
@@ -210,6 +237,7 @@ async fn fixture_in(target: &str, tenant: &str) -> Fixture {
         value: Arc::new(Mutex::new(150.0)),
         chart_exists: Arc::new(Mutex::new(true)),
         plain: Arc::new(Mutex::new(false)),
+        charts: Arc::new(Mutex::new(1)),
         rule_exists: Arc::new(Mutex::new(true)),
         log: Arc::new(Mutex::new(Vec::new())),
     };
@@ -776,4 +804,147 @@ async fn a_mart_rules_disabled_owner_stops_it_with_the_sentence_and_sends_nothin
             .any(|sql| sql.contains("FROM serving.mart_x")),
         "nothing is read for a stopped rule"
     );
+}
+
+// ---- BI-39 T3: one tile (D7) and the chart's name in the list (D8) ----
+
+/// A `GET` of the console's JSON, as `who`.
+async fn get_json(f: &Fixture, who: Uuid, uri: &str) -> (u16, Value) {
+    let cookie = session_cookie_for_user(&f.app.pool, who).await;
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// How many times a tile was computed in `log`: a tile's own statement, not the
+/// column or table lookup beside it (those name `serving.mart_x` in a list).
+fn tile_statements(log: &[String]) -> usize {
+    log.iter()
+        .filter(|sql| sql.contains("FROM serving.mart_x"))
+        .count()
+}
+
+/// `BI-39` D7: on a board of three charts a chart alert's check computes one
+/// tile, where the board itself computes three — and the number is the same as
+/// before.
+#[tokio::test]
+async fn a_chart_alert_on_a_board_of_three_charts_reads_exactly_one_tile() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.charts.lock().unwrap() = 3;
+    silence(&f.app.pool).await;
+
+    // The board read the browser makes: three tiles. `fresh=1` so none of them
+    // is answered from the in-process cache (the three share one statement).
+    let before = f.fake.log.lock().unwrap().len();
+    let (status, body) = get_json(
+        &f,
+        f.owner,
+        &format!("/api/dashboard?board={BOARD}&fresh=1"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["charts"].as_array().unwrap().len(),
+        3,
+        "the board has three charts: {body}"
+    );
+    let board_log = f.fake.log.lock().unwrap()[before..].to_vec();
+    assert_eq!(
+        tile_statements(&board_log),
+        3,
+        "one statement per chart of the board"
+    );
+
+    // The rule's check: one.
+    let before = f.fake.log.lock().unwrap().len();
+    let r = run(&f).await;
+    let rule_log = f.fake.log.lock().unwrap()[before..].to_vec();
+    let rule_tiles = tile_statements(&rule_log);
+    assert_eq!(
+        rule_tiles, 1,
+        "a chart alert reads the tile it watches: {rule_log:#?} / {r}"
+    );
+    assert_eq!(r["skipped"], Value::Null, "{r}");
+    assert_eq!(r["value"].as_f64(), Some(150.0), "{r}");
+}
+
+/// `BI-39` D7: `only` is `serde(skip)`, so a request cannot narrow a dashboard
+/// read with it — the board still answers every tile.
+#[tokio::test]
+async fn a_query_string_cannot_narrow_a_dashboard_to_one_chart() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.charts.lock().unwrap() = 3;
+
+    let (status, body) = get_json(
+        &f,
+        f.owner,
+        &format!("/api/dashboard?board={BOARD}&only=c_kpi"),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    let ids: Vec<&str> = body["charts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c_kpi", "c_two", "c_three"], "{body}");
+}
+
+/// `BI-39` D8: the list names a chart rule's chart and dashboard, live.
+#[tokio::test]
+async fn the_rule_list_names_the_chart_and_the_dashboard() {
+    let f = fixture("owner@test.invalid").await;
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts").await;
+
+    assert_eq!(status, 200, "{body}");
+    let rule = body["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(RULE))
+        .expect("the chart rule is listed");
+    assert_eq!(rule["chartTitle"], json!("Visitors"), "{rule}");
+    assert_eq!(rule["dashboardId"], json!(BOARD), "{rule}");
+    assert_eq!(rule["dashboardTitle"], json!("Public board"), "{rule}");
+}
+
+/// `BI-39` D8: a chart rule whose chart the caller cannot see carries none of
+/// the three, and the rule itself is still listed.
+#[tokio::test]
+async fn the_rule_list_names_no_chart_the_caller_cannot_see() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.chart_exists.lock().unwrap() = false;
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts").await;
+
+    assert_eq!(status, 200, "{body}");
+    let rule = body["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(RULE))
+        .expect("the caller's own rule is still listed");
+    assert_eq!(rule["chart"], json!("c_kpi"), "{rule}");
+    for field in ["chartTitle", "dashboardId", "dashboardTitle"] {
+        assert!(rule.get(field).is_none(), "{field} is absent: {rule}");
+    }
 }

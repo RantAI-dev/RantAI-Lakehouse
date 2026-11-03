@@ -108,8 +108,11 @@ async fn fill_own_address(
 pub(super) async fn list_alert_rules(state: &AppState, principal: Option<&Principal>) -> Value {
     match lakehouse_alerts::list_rules(&state.clickhouse).await {
         // `SRC-7` review BLOCKER 1: the copilot lists through the same
-        // filter as `GET /api/alerts`, else it is a way around it.
-        Ok(rules) => match crate::routes::alerts::visible_rules(state, principal, rules).await {
+        // filter as `GET /api/alerts`, else it is a way around it. `BI-39` D9:
+        // through the same helper too, so a chart rule arrives with its chart's
+        // name (`chartTitle`, `dashboardTitle`) and the assistant can say which
+        // chart an alert is on.
+        Ok(rules) => match crate::routes::alerts::listed_rules(state, principal, rules).await {
             Ok(rules) => json!({ "rules": rules }),
             Err(err) => json!({ "error": err.to_string() }),
         },
