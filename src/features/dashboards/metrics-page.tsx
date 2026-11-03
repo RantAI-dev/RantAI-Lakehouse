@@ -28,7 +28,7 @@ export function MetricsPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Metrics"
-        description="One definition of a number, used by every chart, KPI and the assistant."
+        description="One definition of a number, used by every chart, KPI and AI Copilot."
         actions={
           <div className="flex items-center gap-2">
             <Button variant="outline" size="sm" render={<Link href="/dashboards/browse" />}>Dashboards</Button>

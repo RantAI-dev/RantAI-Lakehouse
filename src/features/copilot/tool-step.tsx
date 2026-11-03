@@ -30,8 +30,20 @@ import { ErrorWithReference } from "@/components/error-reference";
 /**
  * One step of a turn. `confirmed` says the person confirmed it, so it saved
  * an object; it is optional because steps saved before it existed carry none.
+ * AI-24 D4: in a conversation over the size cap the server keeps a step's
+ * `tool`, `ok` and `args` and drops its `result`, marking it
+ * `resultDropped` — so `result` is absent on those and `undefined` at run
+ * time for every other step too if it saved none.
  */
-export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown; confirmed?: boolean };
+export type ToolStep = {
+  tool: string;
+  args: unknown;
+  ok: boolean;
+  result?: unknown;
+  confirmed?: boolean;
+  /** The server dropped this step's `result` to fit the conversation cap. */
+  resultDropped?: boolean;
+};
 
 export const TOOL_LABEL: Record<string, string> = {
   run_sql: "SQL query",
@@ -206,6 +218,15 @@ function StepBody({ step }: { step: ToolStep }) {
   // read at the top of `StepBody` so a conditional return above does not
   // make the rule of hooks complain.
   const here = usePathname();
+
+  // AI-24 D4: the step's outcome is still known, its details were not kept.
+  if (step.resultDropped) {
+    return (
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        Details not kept for long conversations.
+      </p>
+    );
+  }
 
   // Confirm/Cancel live on the message's confirmation card (`chat-messages`),
   // which also recovers a title the model left empty; a second pair of
@@ -551,14 +572,17 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
               ) : (
                 <StepBody step={step} />
               )}
-              <button
-                type="button"
-                onClick={() => setRaw((r) => !r)}
-                className="flex items-center gap-1 text-[10px] text-muted-foreground/70 transition-colors hover:text-muted-foreground"
-              >
-                <Braces className="size-2.5" aria-hidden />
-                {raw ? "Hide raw" : "View raw"}
-              </button>
+              {/* AI-24 D4: a dropped result has nothing raw to show. */}
+              {step.resultDropped ? null : (
+                <button
+                  type="button"
+                  onClick={() => setRaw((r) => !r)}
+                  className="flex items-center gap-1 text-[10px] text-muted-foreground/70 transition-colors hover:text-muted-foreground"
+                >
+                  <Braces className="size-2.5" aria-hidden />
+                  {raw ? "Hide raw" : "View raw"}
+                </button>
+              )}
             </div>
           </motion.div>
         ) : null}

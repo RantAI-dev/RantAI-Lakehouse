@@ -9,7 +9,8 @@ import { notifyDashboardsChanged } from "@/features/dashboards/dashboard-events"
 import { changedABoard, takeNewBoardChanges } from "./board-change";
 import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
-import { chatTermService } from "@/services";
+import { chatSessionService, chatTermService } from "@/services";
+import { isServiceError } from "@/services/errors";
 import { apiFetch } from "@/services/http";
 import { answerAsk, type AskAnswer } from "./answer-ask";
 
@@ -35,6 +36,12 @@ export type Msg = {
   reasoning?: string;
   /** How long the model reasoned, from its first reasoning piece to its first answer text or the end. */
   reasoningMs?: number;
+  /**
+   * This browser just streamed this answer, so the reveal finishes from what
+   * was on screen (`AI-24` D5). Never saved: a conversation reopened later
+   * shows its answers whole.
+   */
+  streamed?: boolean;
 };
 export type SessionMeta = {
   id: string;
@@ -69,7 +76,7 @@ function newMsgId(): string {
  */
 export function chatErrorText(body: unknown): string {
   const b = (body ?? {}) as { error?: string; detail?: string; hint?: string; errorId?: string };
-  const text = b.detail ?? b.error ?? "Copilot couldn't answer. Try again.";
+  const text = b.detail ?? b.error ?? "AI Copilot couldn't answer. Try again.";
   return b.errorId ? `${text} Reference: ${b.errorId}` : text;
 }
 
@@ -169,6 +176,15 @@ export const MAX_CONTINUATIONS = 3;
  * (save/load sessions from console.chat_session). One instance means every
  * view stays consistent.
  */
+/**
+ * The messages as the server stores them. `streamed` is this browser's
+ * marker for the answer it just watched arrive (`AI-24` D5); `undefined` is
+ * left out of the JSON, so a reopened conversation shows its answers whole.
+ */
+function savedMessages(msgs: Msg[]): Msg[] {
+  return msgs.map((m) => ({ ...m, streamed: undefined }));
+}
+
 /** A copy of `messages` with one tool step swapped out; `null` if it no longer exists. */
 function replaceToolStep(
   messages: Msg[],
@@ -224,6 +240,12 @@ function useCopilotState() {
   /** A line about the last picked answer (not remembered); any later send, new chat or opened chat clears it. */
   const [askNotice, setAskNotice] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
+  /**
+   * The open conversation's title, from the server — not from `sessions`,
+   * which holds only the newest 20 (`AI-24` D2). A conversation reopened
+   * from History is usually older than those, and still shows its title.
+   */
+  const [sessionTitle, setSessionTitle] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
   const [confirmingKey, setConfirmingKey] = React.useState<string | null>(null);
   const [enabledCaps, setEnabledCaps] = React.useState<Set<string>>(() => new Set(ALL_CAP_KEYS));
@@ -287,24 +309,20 @@ function useCopilotState() {
 
   const refreshSessions = React.useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/ai/sessions?limit=${RECENT_SESSIONS}`, { cache: "no-store" });
-      const json = await res.json();
-      if (Array.isArray(json.sessions)) setSessions(json.sessions);
-    } catch { /* abaikan */ }
+      const page = await chatSessionService.list({ limit: RECENT_SESSIONS });
+      if (Array.isArray(page.sessions)) setSessions(page.sessions);
+    } catch { /* the menu keeps what it had */ }
   }, []);
 
   React.useEffect(() => { void refreshSessions(); }, [refreshSessions]);
 
   const persist = React.useCallback(async (msgs: Msg[], m: Mode, id: string | null) => {
     try {
-      const res = await apiFetch("/api/ai/sessions", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: id ?? undefined, mode: m, messages: msgs }),
-      });
-      const json = await res.json();
-      if (json.id) setSessionId(json.id);
+      const saved = await chatSessionService.save({ id: id ?? undefined, mode: m, messages: savedMessages(msgs) });
+      if (saved.id) setSessionId(saved.id);
+      if (saved.title) setSessionTitle(saved.title);
       void refreshSessions();
-    } catch { /* abaikan */ }
+    } catch { /* the next message saves the conversation again */ }
   }, [refreshSessions]);
 
   // Every tool that changes something is gated per call on the server
@@ -403,7 +421,7 @@ function useCopilotState() {
           throw new Error(chatErrorText(event.body));
         }
       }
-      if (!result) throw new Error("Copilot's answer was cut off. Try again.");
+      if (!result) throw new Error("AI Copilot's answer was cut off. Try again.");
 
       const chartCreated = Boolean(
         result.chartCreated &&
@@ -418,13 +436,14 @@ function useCopilotState() {
         {
           id: assistantId,
           role: "assistant",
-          content: result.answer || (tools.length ? "" : "Copilot didn't return an answer."),
+          content: result.answer || (tools.length ? "" : "AI Copilot didn't return an answer."),
           tools,
           buildRunId: result.buildRunId,
           chartCreated,
           ...(result.nextStep ? { nextStep: result.nextStep } : {}),
           elapsedMs: Date.now() - startedAt,
           at: new Date().toISOString(),
+          streamed: true,
           ...(reasoning.trim()
             ? { reasoning: reasoning.trim(), reasoningMs: (reasoningEnd ?? Date.now()) - (reasoningStart ?? startedAt) }
             : {}),
@@ -585,7 +604,7 @@ function useCopilotState() {
 
   const newChat = React.useCallback(() => {
     discardInFlight();
-    setMessages([]); setSessionId(null); setError(null); setAskNotice(null);
+    setMessages([]); setSessionId(null); setSessionTitle(null); setError(null); setAskNotice(null);
   }, [discardInFlight]);
 
   const loadSession = React.useCallback(async (id: string) => {
@@ -593,21 +612,25 @@ function useCopilotState() {
     setError(null);
     setAskNotice(null);
     try {
-      const res = await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { cache: "no-store" });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json?.error ?? "Failed to load session");
-      setMessages(((json.session.messages ?? []) as Msg[]).map((m) => (m.id ? m : { ...m, id: newMsgId() })));
-      if (json.session.mode === "build" || json.session.mode === "ask") setMode(json.session.mode);
-      setSessionId(json.session.id);
+      const session = await chatSessionService.get(id);
+      setMessages(((session.messages ?? []) as Msg[]).map((m) => (m.id ? m : { ...m, id: newMsgId() })));
+      if (session.mode === "build" || session.mode === "ask") setMode(session.mode);
+      setSessionId(session.id);
+      setSessionTitle(session.title);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // AI-24 D3: a plain sentence, never the API's own text (its 404 body
+      // says "sesi tidak ditemukan", which is not something to show).
+      setError(
+        isServiceError(e) && e.code === "not_found"
+          ? "This conversation could not be found. It may have been deleted."
+          : "This conversation could not be loaded. Try again.",
+      );
     }
   }, [discardInFlight]);
 
   const removeSession = React.useCallback(async (id: string): Promise<boolean> => {
     try {
-      const res = await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? "Failed to delete");
+      await chatSessionService.remove(id);
     } catch (e) {
       notifyError("Couldn't delete conversation", e);
       return false;
@@ -620,11 +643,10 @@ function useCopilotState() {
 
   const renameSession = React.useCallback(async (id: string, title: string): Promise<boolean> => {
     try {
-      const res = await apiFetch("/api/ai/sessions", {
-        method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, title }),
-      });
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? "Failed to rename");
+      const renamed = await chatSessionService.rename(id, title);
+      // AI-24 D2: renaming the open conversation changes what the title bar
+      // shows, whether or not it is among the recent 20 the menu lists.
+      if (id === sessionId) setSessionTitle(renamed.title);
     } catch (e) {
       notifyError("Couldn't rename conversation", e);
       return false;
@@ -632,26 +654,59 @@ function useCopilotState() {
     notifySuccess("Conversation renamed");
     void refreshSessions();
     return true;
-  }, [refreshSessions]);
+  }, [sessionId, refreshSessions]);
 
-  return {
-    mode, setMode, messages, busy, error, askNotice, sessionId, sessions,
-    enabledCaps, toggleCap, pageContext, setPageContext,
-    send, newChat, loadSession, removeSession, renameSession, refreshSessions,
-    progress, draft, liveReasoning, stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
-    confirmTool, cancelTool, completeToolStep, confirmingKey,
-    dockPosition, setDockPosition, expanded, setExpanded,
-    sidebarWidth, setSidebarWidth,
-  };
+  // AI-24 D6: what the answer is writing changes on every delta, and only
+  // the message list and its status pill show it. It gets its own memoized
+  // value, so a piece of text does not re-render every `useCopilot()`
+  // consumer (the navbar, the dock, the sidebar, a dashboard with charts —
+  // BI-32's moving label was this).
+  const stream = React.useMemo(
+    () => ({ draft, liveReasoning, progress }),
+    [draft, liveReasoning, progress],
+  );
+
+  const main = React.useMemo(
+    () => ({
+      sessionTitle,
+      mode, setMode, messages, busy, error, askNotice, sessionId, sessions,
+      enabledCaps, toggleCap, pageContext, setPageContext,
+      send, newChat, loadSession, removeSession, renameSession, refreshSessions,
+      stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
+      confirmTool, cancelTool, completeToolStep, confirmingKey,
+      dockPosition, setDockPosition, expanded, setExpanded,
+      sidebarWidth, setSidebarWidth,
+    }),
+    [
+      sessionTitle, mode, messages, busy, error, askNotice, sessionId, sessions,
+      enabledCaps, toggleCap, pageContext, setPageContext,
+      send, newChat, loadSession, removeSession, renameSession, refreshSessions,
+      stop, retry, editAndResend, deleteMessage, clearError, answerAskOption,
+      confirmTool, cancelTool, completeToolStep, confirmingKey,
+      dockPosition, setDockPosition, expanded, setExpanded,
+      sidebarWidth, setSidebarWidth,
+    ],
+  );
+
+  return { main, stream };
 }
 
-type CopilotValue = ReturnType<typeof useCopilotState>;
+type CopilotValue = ReturnType<typeof useCopilotState>["main"];
+
+/** The part of the Copilot that changes while an answer streams (AI-24 D6). */
+export type CopilotStreamValue = ReturnType<typeof useCopilotState>["stream"];
+
 const CopilotContext = React.createContext<CopilotValue | null>(null);
+const CopilotStreamContext = React.createContext<CopilotStreamValue | null>(null);
 
 /** A single provider — wraps the app so dock/page/sidebar share one conversation. */
 export function CopilotProvider({ children }: { children: React.ReactNode }) {
-  const value = useCopilotState();
-  return React.createElement(CopilotContext.Provider, { value }, children);
+  const { main, stream } = useCopilotState();
+  return React.createElement(
+    CopilotContext.Provider,
+    { value: main },
+    React.createElement(CopilotStreamContext.Provider, { value: stream }, children),
+  );
 }
 
 /** Access the shared Copilot brain. */
@@ -659,4 +714,26 @@ export function useCopilot(): CopilotValue {
   const ctx = React.useContext(CopilotContext);
   if (!ctx) throw new Error("useCopilot must be used within a CopilotProvider");
   return ctx;
+}
+
+/**
+ * The answer text, reasoning and progress being written right now. Read by
+ * the message list and its status pill only (AI-24 D6): every other
+ * consumer takes `useCopilot()`, whose value does not change per piece.
+ */
+export function useCopilotStream(): CopilotStreamValue {
+  const ctx = React.useContext(CopilotStreamContext);
+  if (!ctx) throw new Error("useCopilotStream must be used within a CopilotProvider");
+  return ctx;
+}
+
+/** A stream value for a test or a story that renders the message list alone. */
+export function CopilotStreamProvider({
+  value,
+  children,
+}: {
+  value: CopilotStreamValue;
+  children: React.ReactNode;
+}) {
+  return React.createElement(CopilotStreamContext.Provider, { value }, children);
 }

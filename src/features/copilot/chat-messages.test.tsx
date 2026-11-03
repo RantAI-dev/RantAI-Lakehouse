@@ -1,8 +1,24 @@
 import { fireEvent, render, within } from "@testing-library/react"
 import { describe, expect, it, mock } from "bun:test"
+import * as React from "react"
 
-import { ChatMessages } from "./chat-messages"
-import type { Msg } from "./use-copilot"
+import { ChatMessages, useStickToBottom } from "./chat-messages"
+import { CopilotStreamProvider, type CopilotStreamValue, type Msg } from "./use-copilot"
+
+/**
+ * Renders the list with a stream value (AI-24 D6: the list reads the
+ * streaming part of the Copilot from its own context).
+ */
+function renderMessages(
+  props: React.ComponentProps<typeof ChatMessages>,
+  stream: Partial<CopilotStreamValue> = {},
+) {
+  return render(
+    <CopilotStreamProvider value={{ draft: "", liveReasoning: "", progress: null, ...stream }}>
+      <ChatMessages {...props} />
+    </CopilotStreamProvider>,
+  )
+}
 
 // Queries stay inside each render's own container: the test process shares
 // one global document across files (see mini-markdown.test.tsx).
@@ -26,11 +42,13 @@ const conversation: Msg[] = [
 
 describe("ChatMessages (RantAI-Agents layout)", () => {
   it("shows the answer with a closed reasoning box, one row per tool and the answer time, and no name or avatar", () => {
-    const { container } = render(<ChatMessages messages={conversation} busy={false} />)
+    const { container } = renderMessages({ messages: conversation, busy: false })
     const view = within(container)
     // The avatar and the "Copilot" name beside each answer were removed on
     // purpose (QA feedback); the user's bubble already says who speaks.
+    // AI-23: the rename must not bring the label back, under either name.
     expect(view.queryByText("Copilot")).toBeNull()
+    expect(view.queryByText("AI Copilot")).toBeNull()
     expect(view.getByText("Thought for 2s")).toBeDefined()
     expect(view.queryByText("Use list_datasets.")).toBeNull()
     expect(view.getByText("Search")).toBeDefined()
@@ -41,9 +59,9 @@ describe("ChatMessages (RantAI-Agents layout)", () => {
   it("offers edit on the user's message and regenerate on the last answer, and resends an edit", () => {
     const onEdit = mock(() => {})
     const onRetry = mock(() => {})
-    const { container } = render(
-      <ChatMessages messages={conversation} busy={false} onEdit={onEdit} onRetry={onRetry} />,
-    )
+    const { container } = renderMessages({
+      messages: conversation, busy: false, onEdit, onRetry,
+    })
     const view = within(container)
     fireEvent.click(view.getByLabelText("Regenerate response"))
     expect(onRetry).toHaveBeenCalledTimes(1)
@@ -57,13 +75,12 @@ describe("ChatMessages (RantAI-Agents layout)", () => {
   })
 
   it("while busy shows the live reasoning open, the tool being run, and the status pill", () => {
-    const { container } = render(
-      <ChatMessages
-        messages={conversation.slice(0, 1)}
-        busy
-        liveReasoning="Checking the catalog"
-        progress={{ phase: "tool", tool: "list_datasets", startedAt: Date.now(), steps: ["list_datasets"] }}
-      />,
+    const { container } = renderMessages(
+      { messages: conversation.slice(0, 1), busy: true },
+      {
+        liveReasoning: "Checking the catalog",
+        progress: { phase: "tool", tool: "list_datasets", startedAt: Date.now(), steps: ["list_datasets"] },
+      },
     )
     const view = within(container)
     expect(view.getByText("Thinking…")).toBeDefined()
@@ -76,7 +93,9 @@ describe("ChatMessages (RantAI-Agents layout)", () => {
       { id: "u1", role: "user", content: "How many events?" },
       { id: "a1", role: "assistant", content: "", stopped: true },
     ]
-    const { container } = render(<ChatMessages messages={stopped} busy={false} />)
+    // AI-24 D6 moved the streaming part onto its own context, so the list no
+    // longer mounts without it; this case still renders the list alone.
+    const { container } = renderMessages({ messages: stopped, busy: false })
     const view = within(container)
     expect(view.getByText("Response stopped.")).toBeDefined()
     expect(container.textContent).not.toContain("The person stopped this answer")
@@ -108,7 +127,7 @@ const asking: Msg[] = [
 
 describe("ChatMessages ask-back options", () => {
   it("shows the options of the newest ask as buttons and hides the ask_user step itself", () => {
-    const { container } = render(<ChatMessages messages={asking} busy={false} onAnswerAsk={() => {}} />)
+    const { container } = renderMessages({ messages: asking, busy: false, onAnswerAsk: () => {} })
     const view = within(container)
     expect(view.getByRole("button", { name: "Ordered in the last 30 days" })).toBeDefined()
     expect(view.getByRole("button", { name: "Ordered in the last 90 days" })).toBeDefined()
@@ -119,7 +138,7 @@ describe("ChatMessages ask-back options", () => {
 
   it("passes the term, the picked option and the user's previous message when an option is clicked", () => {
     const onAnswerAsk = mock(() => {})
-    const { container } = render(<ChatMessages messages={asking} busy={false} onAnswerAsk={onAnswerAsk} />)
+    const { container } = renderMessages({ messages: asking, busy: false, onAnswerAsk })
     fireEvent.click(within(container).getByRole("button", { name: "Ordered in the last 90 days" }))
     expect(onAnswerAsk).toHaveBeenCalledTimes(1)
     expect(onAnswerAsk).toHaveBeenCalledWith({
@@ -134,7 +153,7 @@ describe("ChatMessages ask-back options", () => {
       ...asking,
       { id: "u2", role: "user", content: "Ordered in the last 30 days", at: "2026-10-07T07:01:00Z" },
     ]
-    const { container } = render(<ChatMessages messages={followed} busy={false} onAnswerAsk={() => {}} />)
+    const { container } = renderMessages({ messages: followed, busy: false, onAnswerAsk: () => {} })
     const view = within(container)
     expect(view.queryByRole("button", { name: "Ordered in the last 30 days" })).toBeNull()
     expect(view.queryByRole("button", { name: "Ordered in the last 90 days" })).toBeNull()
@@ -142,7 +161,7 @@ describe("ChatMessages ask-back options", () => {
   })
 
   it("disables the option buttons while an answer is on its way", () => {
-    const { container } = render(<ChatMessages messages={asking} busy onAnswerAsk={() => {}} />)
+    const { container } = renderMessages({ messages: asking, busy: true, onAnswerAsk: () => {} })
     const button = within(container).getByRole("button", { name: "Ordered in the last 30 days" }) as HTMLButtonElement
     expect(button.disabled).toBe(true)
   })
@@ -155,14 +174,50 @@ describe("ChatMessages ask-back options", () => {
         tools: [{ ...ASK_STEP, result: { asked: true, term: "t", question: "q", options: ["only one"] } }],
       },
     ]
-    const { container } = render(<ChatMessages messages={broken} busy={false} onAnswerAsk={() => {}} />)
+    const { container } = renderMessages({ messages: broken, busy: false, onAnswerAsk: () => {} })
     expect(within(container).queryByRole("button", { name: "only one" })).toBeNull()
   })
 
   it("shows the notice line when the answer was not remembered", () => {
-    const { container } = render(
-      <ChatMessages messages={asking} busy={false} onAnswerAsk={() => {}} askNotice="Your answer was not remembered." />,
-    )
+    const { container } = renderMessages({
+      messages: asking, busy: false, onAnswerAsk: () => {}, askNotice: "Your answer was not remembered.",
+    })
     expect(within(container).getByText("Your answer was not remembered.")).toBeDefined()
+  })
+})
+
+describe("the chat follows the shown text while it arrives (AI-24 D7)", () => {
+  function ScrollProbe({ tail, instant }: { tail: string; instant: boolean }) {
+    const ref = React.useRef<HTMLDivElement>(null)
+    useStickToBottom(ref, tail, instant)
+    return <div ref={ref} />
+  }
+
+  it("scrolls instantly while text arrives, and smoothly only for a new message", () => {
+    const scroller = document.createElement("div")
+    scroller.style.overflowY = "auto"
+    document.body.appendChild(scroller)
+    const behaviours: ScrollBehavior[] = []
+    Object.defineProperty(scroller, "scrollTo", {
+      configurable: true,
+      writable: true,
+      value: (options: ScrollToOptions) => {
+        behaviours.push(options.behavior ?? "auto")
+      },
+    })
+
+    const view = render(<ScrollProbe tail="0" instant />, { container: scroller })
+    behaviours.length = 0
+    // One tail change per revealed frame while the answer arrives.
+    view.rerender(<ScrollProbe tail="1" instant />)
+    view.rerender(<ScrollProbe tail="2" instant />)
+    expect(behaviours).toEqual(["auto", "auto"])
+
+    // A new message (or jump to latest) still glides.
+    view.rerender(<ScrollProbe tail="3" instant={false} />)
+    expect(behaviours.at(-1)).toBe("smooth")
+
+    view.unmount()
+    scroller.remove()
   })
 })

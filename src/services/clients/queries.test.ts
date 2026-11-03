@@ -82,21 +82,21 @@ describe("clickhouseQueryService.askQuestion failures", () => {
     stubFetch(() => new Response("<html>bad gateway</html>", { status: 502 }))
     const err = await rejection(clickhouseQueryService.askQuestion("q"))
     expect(err.code).toBe("unavailable")
-    expect(err.message).toBe("The assistant could not answer. Try again.")
+    expect(err.message).toBe("AI Copilot could not answer. Try again.")
   })
 
   it("raises unavailable instead of an empty answer when a 200 response body is not JSON", async () => {
     stubFetch(() => new Response("<html>proxy page</html>", { status: 200 }))
     const err = await rejection(clickhouseQueryService.askQuestion("q"))
     expect(err.code).toBe("unavailable")
-    expect(err.message).toBe("The assistant could not answer. Try again.")
+    expect(err.message).toBe("AI Copilot could not answer. Try again.")
   })
 
   it("raises unavailable instead of an empty answer when a 200 response body is JSON but not an object", async () => {
     stubFetch(() => json(["answer"]))
     const err = await rejection(clickhouseQueryService.askQuestion("q"))
     expect(err.code).toBe("unavailable")
-    expect(err.message).toBe("The assistant could not answer. Try again.")
+    expect(err.message).toBe("AI Copilot could not answer. Try again.")
   })
 })
 
@@ -281,7 +281,7 @@ describe("clickhouseQueryService.proposeFix request", () => {
     const long = "é".repeat(20_001)
     const err = await rejection(clickhouseQueryService.proposeFix(long, "clickhouse", "err"))
     expect(err.code).toBe("invalid_request")
-    expect(err.message).toBe("This query is too long for the assistant to fix.")
+    expect(err.message).toBe("This query is too long for AI Copilot to fix.")
     expect(calls).toHaveLength(0)
   })
 
