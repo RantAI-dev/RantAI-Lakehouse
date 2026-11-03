@@ -573,4 +573,118 @@ mod tests {
         );
         Ok(())
     }
+
+    /// `BI-39` D2/D3: saving through the assistant goes through the route's
+    /// save guard (`BI-37` D1), so the caller owns the rule it saves — before
+    /// `BI-39` a mart rule reached the store with no owner at all.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_alert_rule_stores_the_caller_as_the_owner(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use uuid::Uuid;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// The catalog's own tenant, so the save's tenant gate admits the
+        /// statement (`SEC-50` slice 2 M11).
+        const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
+        let server = MockServer::start().await;
+        // Every write succeeds; a read of the rule answers the row just saved.
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.alert_rule"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "data": [{
+                    "id": "al_new",
+                    "name": "Visitors over the line",
+                    "type": "alert",
+                    "mart": "mart_x",
+                    "measure": "visitors",
+                    "agg": "sum",
+                    "op": ">",
+                    "threshold": "100",
+                    "board": "",
+                    "channel": "email",
+                    "target": "rina@test.invalid",
+                    "enabled": "1",
+                    "created_at": "",
+                    "severity": "",
+                    "owner_id": Uuid::from_u128(11).to_string(),
+                }],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
+            .mount(&server)
+            .await;
+
+        let role = Uuid::new_v4();
+        // Role names are unique and the seeded deployment has its own "Data
+        // Engineer", whose permissions this test is not about.
+        let role_name = format!("Data Engineer {}", Uuid::new_v4());
+        sqlx::query("INSERT INTO role (id, name, permissions, description) VALUES ($1, $2, 'dashboard:read, alert:write', 'test')")
+            .bind(role)
+            .bind(&role_name)
+            .execute(&pool)
+            .await?;
+        let caller_id = Uuid::from_u128(11);
+        sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Rina', 'rina@test.invalid', 'active')")
+            .bind(caller_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+            .bind(caller_id)
+            .bind(role)
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+            .bind(caller_id)
+            .bind(CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id"))
+            .execute(&pool)
+            .await?;
+        let person = Principal {
+            id: PrincipalId::User(caller_id),
+            tenant_ids: vec![CATALOG_TENANT.parse().expect("a seeded tenant id")],
+            display_name: "Rina".to_owned(),
+            permissions: PermissionSet::parse("dashboard:read, alert:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: vec!["Data Engineer".to_owned()],
+        };
+
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("Visitors over the line"));
+        args.insert("type".to_owned(), json!("alert"));
+        args.insert("mart".to_owned(), json!("mart_x"));
+        args.insert("measure".to_owned(), json!("visitors"));
+        args.insert("agg".to_owned(), json!("sum"));
+        args.insert("op".to_owned(), json!(">"));
+        args.insert("threshold".to_owned(), json!(100.0));
+        args.insert("channel".to_owned(), json!("email"));
+        args.insert("target".to_owned(), json!("rina@test.invalid"));
+
+        let state = state_in(&pool, &server.uri());
+        let result = create_alert_rule(&state, Some(&person), &args).await;
+
+        assert_eq!(result["ok"], json!(true), "{result}");
+        let inserts: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("mock records requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|body| body.contains("INSERT INTO console.alert_rule"))
+            .collect();
+        assert_eq!(inserts.len(), 1, "{inserts:?}");
+        assert!(
+            inserts[0].contains(&caller_id.to_string()),
+            "the caller is the stored owner: {}",
+            inserts[0]
+        );
+        Ok(())
+    }
 }

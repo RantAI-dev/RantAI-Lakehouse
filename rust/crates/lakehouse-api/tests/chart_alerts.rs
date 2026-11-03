@@ -113,6 +113,17 @@ fn clause_hides_board(sql: &str) -> bool {
     false
 }
 
+/// The `owner_id` a saved rule's `INSERT` wrote: the rule's last value, a
+/// single-quoted literal (`SqlLiteral` doubles an inner quote; owner ids never
+/// carry one).
+fn inserted_owner(sql: &str) -> Option<String> {
+    // `save_rule` writes `VALUES ('id','name',...)` with no space after a
+    // comma, and `owner_id` is the last column.
+    let values = sql.split(") VALUES (").nth(1)?;
+    let last = values.rsplit("','").next()?;
+    Some(last.strip_suffix("')")?.to_owned())
+}
+
 impl Respond for FakeCh {
     fn respond(&self, request: &MockRequest) -> ResponseTemplate {
         let sql = String::from_utf8_lossy(&request.body).into_owned();
@@ -126,7 +137,23 @@ impl Respond for FakeCh {
             if !*self.rule_exists.lock().unwrap() {
                 return rows(json!([]), vec![]);
             }
-            let mut row = rule_row(&self.owner, &self.target.lock().unwrap());
+            // `ReplacingMergeTree` + `FINAL` sees a just-inserted row on the
+            // same connection immediately, and `save_rule` re-reads the rule it
+            // wrote; the owner it reads is the one just inserted, not the
+            // fixture's (`BI-39` D2: a save sets the owner, so the read after it
+            // must show that).
+            let owner = self.owner.clone();
+            let mut row = rule_row(&owner, &self.target.lock().unwrap());
+            if let Some(saved) = self
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|previous| inserted_owner(previous))
+            {
+                row["owner_id"] = json!(saved);
+            }
             if *self.plain.lock().unwrap() {
                 row["chart"] = json!("");
                 row["condition"] = json!("");
@@ -259,7 +286,13 @@ async fn silence(pool: &PgPool) -> String {
 }
 
 async fn run(f: &Fixture) -> Value {
-    let cookie = session_cookie_for_user(&f.app.pool, f.owner).await;
+    run_as(f, f.owner).await
+}
+
+/// The same run, triggered by `who` (the rule's owner need not be the caller:
+/// the scheduled tick is nobody's session).
+async fn run_as(f: &Fixture, who: Uuid) -> Value {
+    let cookie = session_cookie_for_user(&f.app.pool, who).await;
     let resp = f
         .app
         .router
@@ -601,5 +634,146 @@ async fn a_chart_alert_of_another_tenant_fails_and_sends_nothing() {
             .iter()
             .any(|sql| sql.contains("FROM serving.mart_x")),
         "nothing is read when the owner may not read the mart"
+    );
+}
+
+// ---- BI-39: every threshold rule is owned by whoever saved it (D1, D2, D5) ----
+
+/// A mart rule body the save routes accept.
+fn mart_rule_body() -> Value {
+    json!({
+        "name": "Visitors over the line", "type": "alert", "mart": "mart_x",
+        "measure": "visitors", "agg": "sum", "op": ">", "threshold": 100.0,
+        "channel": "email", "target": "someone@example.com",
+    })
+}
+
+/// A role named `name` holding `permissions`, and an active person in it.
+async fn writer(pool: &PgPool, name: &str, permissions: &str) -> Uuid {
+    let role = Uuid::new_v4();
+    // Role names are unique, and the seeded deployment already has "Data
+    // Engineer"; the suffix keeps the role this test means distinct from it.
+    let name = format!("{name} {}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions, description) VALUES ($1, $2, $3, 'test')",
+    )
+    .bind(role)
+    .bind(&name)
+    .bind(permissions)
+    .execute(pool)
+    .await
+    .unwrap();
+    let user = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
+        .bind(user)
+        .bind(format!("{name} person"))
+        .bind(format!("{user}@test.invalid"))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+        .bind(user)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    // `SEC-50` slice 2 M11: a writer of the catalog's own tenant, so the save's
+    // tenant gate admits the `serving.*` statement.
+    common::in_the_catalog_tenant(pool, user).await;
+    user
+}
+
+/// `BI-39` D2: a mart rule is owned by whoever saved it — it is not left
+/// without an owner as it was before.
+#[tokio::test]
+async fn a_mart_rule_saved_by_a_writer_stores_that_writer_as_its_owner() {
+    let f = fixture("owner@test.invalid").await;
+    let engineer = writer(&f.app.pool, "Data Engineer", "dashboard:read, alert:write").await;
+
+    let (status, body) = send_alert(&f, engineer, "POST", mart_rule_body()).await;
+
+    assert_eq!(status, 200, "{body}");
+    let inserts = saved(&f);
+    assert_eq!(inserts.len(), 1, "{inserts:?}");
+    assert!(
+        inserts[0].contains(&engineer.to_string()),
+        "the saving person's id is the stored owner: {}",
+        inserts[0]
+    );
+}
+
+/// `BI-39` D2: a writer who saves somebody else's mart rule owns it from then
+/// on, and `watches_differ`'s `owner_id` starts its state over — the number is
+/// read as another person now.
+#[tokio::test]
+async fn re_saving_a_mart_rule_by_another_writer_makes_them_its_owner_and_resets_its_state() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.plain.lock().unwrap() = true;
+    sqlx::query("INSERT INTO alert_rule_state (rule_id, state) VALUES ($1, 'firing')")
+        .bind(RULE)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let engineer = writer(&f.app.pool, "Data Engineer", "dashboard:read, alert:write").await;
+
+    let mut body = mart_rule_body();
+    body["id"] = json!(RULE);
+    let (status, body) = send_alert(&f, engineer, "PUT", body).await;
+
+    assert_eq!(status, 200, "{body}");
+    let inserts = saved(&f);
+    assert_eq!(inserts.len(), 1, "{inserts:?}");
+    assert!(
+        inserts[0].contains(&engineer.to_string()),
+        "the editing person's id is the stored owner: {}",
+        inserts[0]
+    );
+    let state: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM alert_rule_state WHERE rule_id = $1")
+            .bind(RULE)
+            .fetch_optional(&f.app.pool)
+            .await
+            .unwrap();
+    assert!(state.is_none(), "a change of owner starts the state over");
+}
+
+/// `BI-39` D5: a mart rule whose owner is disabled stops with the shared
+/// sentence, reads nothing and sends nothing.
+#[tokio::test]
+async fn a_mart_rules_disabled_owner_stops_it_with_the_sentence_and_sends_nothing() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.plain.lock().unwrap() = true;
+    let owner = f.owner;
+    let trigger = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Trigger', 'trigger@test.invalid', 'active')")
+        .bind(trigger)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_user SET status = 'inactive' WHERE id = $1")
+        .bind(owner)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+
+    let r = run_as(&f, trigger).await;
+
+    assert_eq!(
+        r["skipped"],
+        json!("The person who set this alert is disabled or no longer exists."),
+        "{r}"
+    );
+    assert_eq!(r["fired"], json!(false), "{r}");
+    let (state, reason) = state_of(&f.app.pool).await.unwrap();
+    assert_eq!(state, "stopped");
+    assert!(reason.unwrap().contains("disabled"));
+    assert!(
+        !f.fake
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("FROM serving.mart_x")),
+        "nothing is read for a stopped rule"
     );
 }

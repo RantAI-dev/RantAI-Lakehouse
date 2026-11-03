@@ -1542,9 +1542,22 @@ async fn check_chart_has_a_number(ch: &ChClient, extras: &RuleExtras) -> Result<
 const CHART_SKIPPED: &str = "chart alerts are evaluated by /api/alerts/run after run_rules returns, \
      because they are read as the person who set them";
 
-/// A chart rule that cannot run: record `Stopped` with `reason` (no message is
-/// sent) and report it as skipped. For an owner who is disabled or can no longer
-/// see the chart (C4).
+/// `BI-39` D5: the owner named by a rule is disabled or deleted, so the rule
+/// does not run. One sentence for every kind of threshold rule — the API's
+/// chart pass and its statement gate both report it from here, never a second
+/// copy (`AGENTS.md` rule 4).
+pub const OWNER_GONE: &str = "The person who set this alert is disabled or no longer exists.";
+
+/// `BI-39` D5: the owner no longer holds `alert:write`. The permission is what
+/// allowed a rule to send to somebody other than its owner (feature C3), so a
+/// rule does not outlive it.
+pub const OWNER_NO_PERMISSION: &str =
+    "The person who set this alert no longer has the alert permission.";
+
+/// A rule that cannot run: record `Stopped` with `reason` (no message is
+/// sent) and report it as skipped. For an owner who is disabled, lost the
+/// alert permission, or can no longer see what the rule watches (`BI-19` C4,
+/// `BI-39` D5).
 pub async fn stop(state: Option<&dyn StateSource>, rule: &AlertRule, reason: &str) -> RunResult {
     if let Some(state) = state {
         state
