@@ -128,6 +128,13 @@ for name in $(required_compose_vars); do
 done
 unset name value
 
+# BI-26 slice 2: the signed-embed tools refuse with `embedding is not
+# configured` when EMBED_SECRET is unset, so the set that reaches
+# `enable_embed`, `set_embed_filter_modes` and `get_embed_snippet` needs one.
+# Made for this run like the must-set values above, and never printed. Compose
+# has no default for it (rule 5).
+EMBED_SECRET="$(random_hex 32)"
+
 # The api image. Without --image the run builds its own, so it never measures
 # an image left by an earlier build, and removes it at teardown. With --image
 # the caller's image is used and left alone.
@@ -159,7 +166,7 @@ dc() { docker compose -p "$PROJECT" "$@"; }
 
 export API_HOST_PORT CH_HTTP_HOST_PORT CH_NATIVE_HOST_PORT POSTGRES_HOST_PORT
 export AUTH_BOOTSTRAP_EMAIL="$ADMIN_EMAIL" AUTH_BOOTSTRAP_PASSWORD="$ADMIN_PASSWORD"
-export CH_USER CH_PASSWORD
+export CH_USER CH_PASSWORD EMBED_SECRET
 # Compose resolves LLM_URL and LLM_MODEL itself, from the caller's .env or its
 # own default. An exported variable outranks .env in compose, so export them
 # only when the caller set them; never write a default here (S1).

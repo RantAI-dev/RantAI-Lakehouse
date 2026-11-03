@@ -443,8 +443,9 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Iceberg tables: list_iceberg_tables, describe_iceberg_table, get_table_maintenance, set_table_maintenance. Storage: get_capacity.
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
+- Embedding a dashboard on another site: get_embed_snippet describes the address template, its look options and the locked filters the token must set; enable_embed switches signed embedding on and adds the sites it names, and waits for human approval; set_embed_filter_modes sets what a viewer may do with each filter, and waits for approval too; withdraw_embed_tokens needs a confirm in this chat. You never sign a token and never show one: the customer's own server signs it with the embedding secret, so never write a token or a signing command in your answer. The copyable snippet with the resize listener is in the dashboard's Share > Embed.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, call no other tool that needs the drafted object (a chart, a board or a tab that does not exist yet, a calculated field): reply with ONE short sentence that names the draft the result is for (a chart, a board, a tab or a calculated field). Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab): for example a chart on the board being drafted, the charts moved to the tab being drafted, or the cache rule of the chart just drafted; never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.");
 
@@ -764,6 +765,19 @@ const DOMAINS: &[Domain] = &[
     Domain {
         words: &["comment", "komentar", "mention", "discussion"],
         tools: &["list_dashboard_comments", "list_boards"],
+    },
+    // BI-26 slice 2 D10: embedding a dashboard on another site. The three
+    // writes are dropped from an ask turn by the gate; `list_boards` names the
+    // dashboard the request is about.
+    Domain {
+        words: &["embed", "sematkan", "iframe", "frame", "situs", "website"],
+        tools: &[
+            "enable_embed",
+            "set_embed_filter_modes",
+            "withdraw_embed_tokens",
+            "get_embed_snippet",
+            "list_boards",
+        ],
     },
     Domain {
         words: &["saved", "simpan", "tersimpan", "save "],

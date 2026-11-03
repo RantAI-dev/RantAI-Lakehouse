@@ -25,6 +25,7 @@ afterAll(() => {
 })
 
 const { EmbedView } = await import("./embed-view")
+const { TileCard } = await import("./tile-card")
 const { DEFAULT_EMBED_LOOK } = await import("@/lib/embed-look")
 
 const originalFetch = global.fetch
@@ -96,6 +97,49 @@ describe("the look in the embed address (BI-26 D6)", () => {
     await waitFor(() => expect(screen.getByTestId("tile").getAttribute("data-dark")).toBe("true"))
   })
 
+  it("shows our name in the whole-dashboard frame, and logo=none hides it", async () => {
+    // BI-26 slice 2 D1 / gap 1: before this, our name was drawn only in the
+    // single-chart frame, so `logo=none` changed nothing on a dashboard embed.
+    serve()
+    render(<EmbedView jwt="j" />)
+    await screen.findByTestId("tile")
+    expect(screen.getByText("Rantai Lake")).toBeTruthy()
+    cleanup()
+    serve()
+    render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, showName: false }} />)
+    await screen.findByTestId("tile")
+    expect(screen.queryByText("Rantai Lake")).toBeNull()
+  })
+
+  it("links our name on a public-link dashboard embed, like the single chart", async () => {
+    // Decision 12: a public-link embed gets the look too.
+    serve()
+    render(<EmbedView token="p_tok" />)
+    const name = await screen.findByText("Rantai Lake ↗")
+    const link = name.closest("a")
+    expect(link?.getAttribute("href")).toBe("/public/dashboard/p_tok")
+    expect(link?.getAttribute("target")).toBe("_blank")
+  })
+
+  it("background=transparent makes the dashboard page transparent, and a tile keeps its card", async () => {
+    serve()
+    const transparent = render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, transparent: true }} />)
+    await screen.findByTestId("tile")
+    expect((transparent.container.firstElementChild as HTMLElement).className).toContain("!bg-transparent")
+    transparent.unmount()
+    // Without the option the page is opaque, so the host's page shows only when asked.
+    serve()
+    const opaque = render(<EmbedView jwt="j" />)
+    await screen.findByTestId("tile")
+    const root = opaque.container.firstElementChild as HTMLElement
+    expect(root.className).not.toContain("!bg-transparent")
+    expect(root.className).toContain("bg-background")
+    // D2: the cards stay legible on the host's page. The grid is mocked in this
+    // file, so the card's own class is asserted on the real tile.
+    const card = render(<TileCard item={{ id: "c1", title: "Visits", body: null }} editable={false} />)
+    expect((card.container.firstElementChild as HTMLElement).className).toContain("bg-card")
+  })
+
   it("background=transparent makes the page and the frame transparent", async () => {
     serve()
     const { container } = render(<EmbedView jwt="j" chartId="c1" look={{ ...DEFAULT_EMBED_LOOK, transparent: true }} />)
@@ -160,12 +204,13 @@ describe("height messages (BI-26 D7, decision 9)", () => {
       value: { postMessage: (message: unknown, origin: string) => posted.push({ message, origin }) },
     })
     let notify: () => void = () => {}
+    let observed: Element | null = null
     ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
       constructor(cb: () => void) { notify = cb }
-      observe() {}
+      observe(el: Element) { observed = el }
       disconnect() {}
     }
-    return { posted, resize: () => notify() }
+    return { posted, resize: () => notify(), measured: () => observed }
   }
 
   it("posts the content height once to each allowed site, as its own target origin", async () => {
@@ -181,6 +226,17 @@ describe("height messages (BI-26 D7, decision 9)", () => {
     resize()
     await new Promise((r) => setTimeout(r, 250))
     expect(posted.length).toBe(2)
+  })
+
+  it("measures a root that holds the footer (BI-26 slice 2 D1)", async () => {
+    const { posted, measured } = frameUnderTest()
+    serve({ origins: ["https://a.example"] })
+    render(<EmbedView jwt="j" />)
+    await screen.findByTestId("tile")
+    await waitFor(() => expect(posted.length).toBe(1), { timeout: 2000 })
+    const root = measured()
+    expect(root).not.toBeNull()
+    expect(root?.contains(screen.getByText("Rantai Lake"))).toBe(true)
   })
 
   it("posts nothing while the payload is still loading, then the real height (BI-26 review fix R5)", async () => {

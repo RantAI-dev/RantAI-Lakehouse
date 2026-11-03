@@ -101,6 +101,13 @@ export const TOOL_LABEL: Record<string, string> = {
   list_report_subscriptions: "List scheduled reports",
   update_report_subscription: "Change scheduled report",
   delete_report_subscription: "Delete scheduled report",
+  // BI-26 slice 2: signed embedding. The labels say what waits for a human
+  // (Approvals) and what only narrows access (the Confirm card), and never
+  // suggest the assistant holds a token.
+  enable_embed: "Enable embedding",
+  set_embed_filter_modes: "Set embed filter modes",
+  withdraw_embed_tokens: "Withdraw embed tokens",
+  get_embed_snippet: "Describe embedding",
 };
 
 /**
