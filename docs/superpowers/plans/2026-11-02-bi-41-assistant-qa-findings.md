@@ -313,3 +313,67 @@ and `docker compose config`/`up` (no Python under `dagster/`, no compose
 change in this slice). The `bun test src/features/copilot` alone red under
 `mock.module("next/navigation")` noted in section 5 is unchanged by this
 merge: the full `bun run test` is green, and that fix is its own backlog item.
+
+## Handoff (merge main after AI-24, 2026-11-03)
+
+Developer. Merge commit `45a85b8c`, pushed to
+`fix/bi-41-assistant-qa-findings` (never rebased, never force-pushed).
+`origin/main` was `2e33133` (`Merge pull request #349 …
+fix/ai-24-history-and-streaming`); the merge base was `388936b`. AI-24
+(#349) touched the same copilot hook and its test while BI-41 did, so this
+is a second merge of `main` into the same branch.
+
+**One conflict, resolved hunk by hunk** (`--ours`/`--theirs` never used):
+`src/features/copilot/use-copilot.test.tsx`, three hunks.
+
+- **Import.** The dynamic import destructures the union: `CopilotProvider`,
+  `useCopilot`, `continuationText` (both), `useCopilotStream` (AI-24),
+  `chatHistory` and `STOPPED_ANSWER_TEXT` (BI-41 D3).
+- **`beforeEach`.** Both reset blocks kept: BI-41's `slowChat = false` and
+  AI-24's `sessionOpens`, `sessionList`, `sessionSave`, `sessionRename`,
+  `sessionDeleteStatus`, `deletedSessions`.
+- **Describe blocks.** Both stay whole: BI-41's "a stopped answer stays in
+  the history (BI-41 D3)" (its last case closes with `});` / `});` before
+  the other block) and AI-24's "the open conversation's title and its load
+  errors (AI-24)" plus "streaming does not re-render the whole Copilot
+  (AI-24 D6)".
+
+**`use-copilot.ts` auto-merged; checked, not trusted.** The result is
+AI-24's file plus exactly BI-41's two additions: the
+`STOPPED_ANSWER_TEXT`/`chatHistory` pair and `messages: chatHistory(next)`
+in `send`. Both sides save a stopped answer the same way (assistant message
+with empty content and `stopped: true`, written through AI-24's
+`savedMessages`, which strips only `streamed`), so the two features want
+the same behaviour and no product decision was needed.
+
+**One fix inside the merge, in a test the auto-merge left stale.**
+`chat-messages.test.tsx`'s BI-41 case rendered `<ChatMessages>` bare; AI-24
+D6 moved the streaming part onto `CopilotStreamContext`, so that mount threw
+"useCopilotStream must be used within a CopilotProvider". The case now uses
+that file's own `renderMessages` harness (AI-24's provider) and asserts the
+same thing. No test was dropped, renamed or weakened.
+
+**Commands run, on the merge commit, foreground:**
+
+- `bun install --frozen-lockfile` — 739 packages (this worktree had no
+  `node_modules` again).
+- `bun run typecheck` — pass.
+- `bun run lint` — 0 errors, 10 warnings, every warning present on both
+  parents (e.g. the unused `changedABoard` import in `use-copilot.ts`).
+- `bun run test` — **3195 pass, 1 skip, 0 fail** across 327 files
+  (8679 `expect()` calls, 3196 tests).
+- `cd rust && cargo fmt --check` — pass.
+- `/home/shiro/bin/cargo-locked clippy -p lakehouse-api --all-targets --
+  -D warnings` — pass, finished in 5m 59s.
+- `/home/shiro/bin/cargo-locked test -p lakehouse-api` — 106 suites,
+  **7216 passed, 0 failed, 43 ignored**.
+- `git status` before committing — clean, nothing generated.
+
+**Not verified, and why:** `cargo clippy/test --workspace` (the machine rule
+scopes cargo to the touched crate; CI runs the workspace), dagster pytest
+and `docker compose config` (no file under `dagster/` and no
+`docker-compose.yml` change in this merge). Running
+`bun test src/features/copilot` alone still reports red files from the
+`mock.module("next/navigation")` leak noted at review (now four files, as
+AI-24 added `copilot-page.test.tsx`); it reproduces on `main` without this
+branch and is its own backlog item, and the full `bun run test` is green.
