@@ -411,13 +411,19 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // may save an alert on it for themselves (and remove their own), so the
     // handler decides: `alert:write` for every other rule or target, the
     // owner's own address for a chart alert without it
-    // (`routes::chart_alerts::authorise_save`, `may_delete`). Asserted both
+    // (`routes::chart_alerts::authorise_save`, `may_manage`). Asserted both
     // ways in `tests/route_auth.rs`.
     ("POST",   "/api/alerts",      Policy::RequiresAuth),
     ("PUT",    "/api/alerts",      Policy::RequiresAuth),
     ("DELETE", "/api/alerts",      Policy::RequiresAuth),
     // `SRC-7` D9: whether run reports can arrive; auth only, it reads no rule.
     ("GET",    "/api/alerts/status", Policy::RequiresAuth),
+    // `BI-40` D1/D2: a signed-in person tests one rule they may manage. The
+    // handler decides (the same shape as `POST /api/alerts`): 404 for a rule
+    // they cannot see, 403 without `alert:write` on a rule that is not their
+    // own chart alert. `/api/alerts/run` below is the scheduler's door and is
+    // unchanged — `check_run_token` still guards it (D4 not weakened).
+    ("POST",   "/api/alerts/test",  Policy::RequiresAuth),
     ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 

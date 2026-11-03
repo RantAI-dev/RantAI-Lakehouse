@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Bell, CircleCheck, CircleX, Play, Plus } from "lucide-react"
+import { Bell, CircleCheck, CircleX, Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -722,7 +722,9 @@ export function AlertsPage() {
     // A load rule goes back with only the fields that apply to it, as a save does.
     alertRuleService.updateRule({ ...alertRuleSaveInput(rule), id: rule.id, enabled: !rule.enabled }, signal)
   );
-  const runAction = useServiceAction((signal, id: string | undefined) => alertRuleService.runRules(id, signal));
+  // `BI-40` D5: only one rule is tested at a time; "Run all now" is gone,
+  // because the whole tick is the scheduler's (`POST /api/alerts/run`).
+  const runAction = useServiceAction((signal, id: string) => alertRuleService.testRule(id, signal));
 
   // Dashboard board list and mart/measure names: page-local (see import
   // comment above), but every failure is reported instead of leaving the
@@ -800,8 +802,8 @@ export function AlertsPage() {
     if (result) state.reload();
   }
 
-  async function run(only?: string) {
-    await runAction.run(only);
+  async function run(id: string) {
+    await runAction.run(id);
   }
 
   const mutationError = removeAction.error ?? toggleAction.error ?? runAction.error;
@@ -872,9 +874,6 @@ export function AlertsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => void run()} disabled={runAction.status === "pending"}>
-            <Play className="size-4" /> Run all now
-          </Button>
           <Button size="sm" onClick={openNew}>
             <Plus className="size-4" /> New rule
           </Button>
