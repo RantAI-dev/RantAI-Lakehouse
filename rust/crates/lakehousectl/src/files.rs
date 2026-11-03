@@ -181,6 +181,29 @@ pub fn check(name: &str, expected: &str, bytes: &[u8]) -> Result<(), ToolError> 
     Ok(())
 }
 
+/// Check the release's Compose file against the checksum the signed
+/// manifest carries.
+///
+/// The Compose file is the one file the install writes itself, from
+/// the bytes the release served, and it is the file every other file
+/// of the release is mounted next to.
+///
+/// # Errors
+///
+/// Returns the error that says what does not match: a manifest that
+/// names no checksum for the Compose file, or a file that does not
+/// hash to it.
+pub fn check_compose(manifest: &Manifest, compose: &str) -> Result<(), ToolError> {
+    let Some(expected) = manifest.files.get(COMPOSE_FILE) else {
+        return Err(ToolError::Failed(
+            "the manifest names no checksum for the Compose file. A release that does not say \
+             which Compose file it ships is a release that cannot be installed."
+                .to_string(),
+        ));
+    };
+    check(COMPOSE_FILE, expected, compose.as_bytes())
+}
+
 /// Write the shipped files into the install's own directory.
 ///
 /// Each file is written at the relative path the release ships it at:
@@ -250,6 +273,8 @@ mod tests {
     fn manifest_with_a_shipped_file() -> Manifest {
         Manifest {
             version: "0.2.0".to_string(),
+            min_from: None,
+            stops: Vec::new(),
             images: BTreeMap::new(),
             image_ids: BTreeMap::new(),
             files: BTreeMap::from([
@@ -337,6 +362,8 @@ mod tests {
 
         let manifest = Manifest {
             version: "0.2.0".to_string(),
+            min_from: None,
+            stops: Vec::new(),
             images: BTreeMap::new(),
             image_ids: BTreeMap::new(),
             files: BTreeMap::from([("ops/backups/clickhouse/backups.xml".to_string(), digest)]),
@@ -359,6 +386,8 @@ mod tests {
         let digest = hex::encode(Sha256::digest(b"the bytes"));
         let manifest = Manifest {
             version: "0.2.0".to_string(),
+            min_from: None,
+            stops: Vec::new(),
             images: BTreeMap::new(),
             image_ids: BTreeMap::new(),
             files: BTreeMap::from([
@@ -399,6 +428,8 @@ mod tests {
     fn a_downloaded_file_that_does_not_match_the_manifest_is_refused() {
         let manifest = Manifest {
             version: "0.2.0".to_string(),
+            min_from: None,
+            stops: Vec::new(),
             images: BTreeMap::new(),
             image_ids: BTreeMap::new(),
             files: BTreeMap::from([(
@@ -420,6 +451,8 @@ mod tests {
         let bundle = tempfile::tempdir().expect("a temporary directory");
         let manifest = Manifest {
             version: "0.2.0".to_string(),
+            min_from: None,
+            stops: Vec::new(),
             images: BTreeMap::new(),
             image_ids: BTreeMap::new(),
             files: BTreeMap::from([(
@@ -518,6 +551,8 @@ mod tests {
         let bundle = tempfile::tempdir().expect("a temporary directory");
         let manifest = Manifest {
             version: "0.2.0".to_string(),
+            min_from: None,
+            stops: Vec::new(),
             images: BTreeMap::new(),
             image_ids: BTreeMap::new(),
             files: BTreeMap::from([("../escaped.txt".to_string(), "the checksum".to_string())]),

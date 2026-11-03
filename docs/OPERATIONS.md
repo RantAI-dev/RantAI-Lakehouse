@@ -335,7 +335,21 @@ compose up`. Brings up `dagster-db-init` (one-shot: creates Dagster's own
 `dagster` database on the existing `postgres` service), `dagster-code-location`
 (a gRPC server serving `dispar_orchestrate.definitions`, built from
 `dagster/Dockerfile` — see ADR 0005), `dagster-webserver` (GraphQL API +
-UI, port `3000`), and `dagster-daemon` (schedules/sensors/run queueing).
+UI, container port `3000`), and `dagster-daemon` (schedules/sensors/run
+queueing).
+
+**The Dagster UI is published on the host's loopback only**
+(`127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, REL-2 S4b review
+round 4, D23). Its UI has no sign-in: anyone who can reach the port can
+launch runs. Nothing outside the compose network needs it — the API and
+the jobs reach the GraphQL API in-network, at
+`http://dagster-webserver:3000/graphql` — and the default port `3001`
+keeps it clear of the console's `3000`. An operator reaches the UI
+through an SSH tunnel:
+
+```bash
+ssh -L 3001:127.0.0.1:3001 <host>   # then open http://127.0.0.1:3001
+```
 
 Put `DAGSTER_URL` in `.env` — do **not** rely on prefixing it onto a single
 command:
@@ -1144,6 +1158,78 @@ acted and the user affected. Neither carries the password.
   old password first. A self-reset is refused with a 400 naming that
   route.
 
+## Changing what a user may do, and switching a user off
+
+`app_user.status` has been in the schema since `0001_init.sql`, but
+until ADM-4 nothing enforced it: an inactive user still signed in with a
+password, kept working sessions, and signed in through single sign-on.
+ADM-4 makes the column mean what it says, and adds the three changes an
+administrator needs after the invite.
+
+**In the console.** Administration → Users → the row's **⋮** menu:
+
+- **Edit roles** replaces the user's **whole local role set**. The ticked
+  roles are the roles the user holds; a role left unticked is a role they
+  no longer hold. Roles mapped from the identity provider's groups
+  (`OIDC_ROLE_MAP`) are not stored and are not touched — they are
+  re-resolved from the provider's claims on every request, so the user
+  keeps the union of the two, exactly as before.
+- **Remove from tenant** takes the user out of one tenant. Their data,
+  dashboards and audit history stay.
+- **Deactivate** / **Reactivate** switches the user off and on again.
+
+**From the API.** The same four calls, with the same permission
+(`identity:write` — Platform Admin holds it):
+
+```bash
+# Replace a user's local role set. The list is the user's COMPLETE set.
+curl -sS -X PUT "$LAKEHOUSE_URL/api/identity/users/<user-id>/roles" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"roles":["Analyst"]}'
+
+# Take a user out of a tenant.
+curl -sS -X DELETE "$LAKEHOUSE_URL/api/identity/users/<user-id>/tenants/<tenant-id>" \
+  -b cookies.txt
+
+# Switch a user off, and back on again.
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users/<user-id>/deactivate" \
+  -H 'content-type: application/json' -b cookies.txt
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users/<user-id>/reactivate" \
+  -H 'content-type: application/json' -b cookies.txt
+```
+
+All four writes are audited: one `identity.user.roles.set` row (with the
+old and the new role names), one `identity.user.tenant.remove` row, and
+one `identity.user.deactivate` / `identity.user.reactivate` row, each
+naming the administrator who acted and the user affected.
+
+**Three rules worth knowing before you use them.**
+
+- **They are not an escalation path.** Only an administrator holding the
+  unrestricted `*:*` grant may change the roles of a user who holds
+  `*:*`, grant a role that holds `*:*`, or switch an unrestricted user
+  off or on. Anyone else gets the same "not found" answer as for a user
+  id that does not exist, so the answer never reveals which accounts
+  exist.
+- **The deployment keeps an administrator.** A change that would leave no
+  active user holding `*:*` is refused with a 409, in the same
+  transaction as the change. Nobody may switch themselves off either.
+- **Switching a user off ends every session they hold, at once.** It
+  also refuses the account on every path: the password sign-in answers
+  exactly as a wrong password does, an existing session cookie stops
+  working, and single sign-on refuses them — and does **not** create a
+  new account for them, so the identity provider cannot be used to walk
+  around the deactivation. The user's data is untouched: deactivation is
+  not deletion.
+
+A user with no personal API token owns none to revoke: `service_credential`
+belongs to `service_identity`, and a service identity is a separate
+principal that no user route touches.
+
+The bootstrap admin is **not** re-activated by a restart: it is seeded
+only when an account with that email does not exist yet, so a bootstrap
+admin an administrator deliberately switched off stays off.
+
 ## Postgres: unreachable is loud, a mismatched schema refuses to start
 
 `lakehouse_store::connect_lazy` never does network I/O at startup, so a
@@ -1189,13 +1275,67 @@ wired into `depends_on: condition: service_healthy`, so this specific
 failure mode is less likely to bite you locally than in a deployment that
 skips that check.
 
+## Email through an internal relay (SEC-56)
+
+Alerts, digests, chart alerts, scheduled reports, comment mentions and
+pipeline notifications all go out through one sender, and it talks to one
+relay: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`,
+`SMTP_FROM`. A relay whose certificate chains to a **private** CA (a
+company CA, a service-mesh CA) used to be unreachable: the sender trusted
+the built-in root store only, so the handshake failed and every send said
+"the mail server could not be reached" — the same sentence as a wrong
+host, and no clue about the file that is missing.
+
+**The CA bundle.** `SMTP_CA_FILE` is the path, inside the API container, of
+a PEM file with one or more CA certificates:
+
+```bash
+# the file goes into the host directory the API mounts, read-only
+cp /path/to/your/ca.pem ops/smtp-ca/ca.pem
+# and the API is told where to read it — the path INSIDE the container
+SMTP_CA_FILE=/run/certs/smtp/ca.pem
+```
+
+Under Compose the mount is `${SMTP_CA_DIR:-./ops/smtp-ca}` at
+`/run/certs/smtp`, so the default path above is the one the stack gives
+you. The CAs are **added** to the built-in roots, never put in their
+place: a deployment that trusts a private CA can still reach a public
+relay. The file is read once, at start — replace it and restart the API.
+A path that cannot be read, or that holds no PEM certificate, **stops the
+API at start** with a message naming `SMTP_CA_FILE`; the API never
+starts with a CA bundle it could not read.
+
+**What the relay must look like.**
+
+- The name on the relay's certificate must match `SMTP_HOST`. The
+  hostname check stays on: there is no way to turn it off, and no way to
+  accept a certificate that does not carry the name.
+- Port **587** with `STARTTLS` (the default), or port **465** with
+  `SMTP_SECURE=true` (implicit TLS). A relay **without** TLS is not
+  supported: the connection is never plaintext, so `SMTP_PASS` is never
+  sent in the clear.
+
+**When a send fails.** The failure reasons are a closed set, and a failed
+handshake has its own:
+
+> a secure connection to the mail server could not be made
+
+That is the reason stored on the alert and shown on the Alerts page (the
+report runner says the same thing as "The email was not sent: a secure
+connection to the mail server could not be made."). It means the TLS
+handshake failed: the relay's certificate is not trusted — is
+`SMTP_CA_FILE` the right file, and does it hold the CA that signed that
+certificate? — or the name does not match — is `SMTP_HOST` the name on
+the certificate? "The mail server could not be reached" still means the
+relay could not be dialled at all.
+
 ## Features unavailable in the local stack
 
 | Feature | Needs | Symptom without it | To enable |
 | --- | --- | --- | --- |
 | Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
-| Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
+| Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay; for a relay behind a private CA, set `SMTP_CA_FILE` as well (see "Email through an internal relay" above) |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs); `OIDC_JWKS_URL` is optional — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 
