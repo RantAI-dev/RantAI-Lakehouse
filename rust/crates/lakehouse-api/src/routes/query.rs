@@ -12,10 +12,11 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use lakehouse_auth::Principal;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::StoreError;
 use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::queries::{
     self, HistoryFilter, QueryHistoryItem, RecordHistoryInput, SavedQuery,
@@ -30,6 +31,11 @@ use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::QUERY_STRING_UNREADABLE;
+use crate::routes::saved_queries::{
+    FolderField, NOT_READ_ONLY, SavedQueryListQuery, TITLE_AND_SQL_REQUIRED, parse_folder_filter,
+    parse_folder_reference, require_query_placement,
+};
 use crate::sql_guard::{is_read_only, is_trino_safe};
 use crate::state::AppState;
 use crate::upstream_error;
@@ -685,6 +691,32 @@ fn reach_from(
     }
 }
 
+/// The viewer the saved-query resolver asks about: who is asking, with
+/// the roles they hold and the tenant they act as.
+///
+/// This is the one place a [`Principal`] becomes a
+/// [`queries::SavedQueryViewer`], so a read path and a write path cannot
+/// disagree about who the caller is: the console's own save and the
+/// assistant's save build the same viewer from the same principal.
+///
+/// A service identity is nobody's personal space's owner and nobody's
+/// query's author — it has no `app_user` row — so its id is not carried
+/// over.
+pub(crate) fn saved_query_viewer(
+    principal: &Principal,
+    tenant_id: Option<Uuid>,
+) -> queries::SavedQueryViewer {
+    queries::SavedQueryViewer {
+        id: match principal.id {
+            PrincipalId::User(id) => Some(id),
+            PrincipalId::Service(_) => None,
+        },
+        role_names: principal.role_names.clone(),
+        tenant_id,
+        all: crate::routes::catalog::is_unrestricted(principal),
+    }
+}
+
 /// `SEC-20`: the saved queries the caller may read.
 ///
 /// The same reach the same request resolves for the tables a statement
@@ -695,6 +727,10 @@ fn reach_from(
 /// reach over saved queries end in the same place — and there is only
 /// one rule that says which tenant a request acts as
 /// ([`crate::tenant_scope::resolve`]).
+///
+/// The scope also carries the **viewer**: the resolver answers "at what
+/// level may this caller do this", and a scope that cannot say who reads
+/// cannot answer it.
 ///
 /// # Errors
 ///
@@ -707,7 +743,9 @@ pub(crate) async fn saved_query_scope(
 ) -> Result<queries::SavedQueryScope, ApiError> {
     Ok(match resolve_reach(state, principal, headers).await? {
         // Every permission, or a deployment with one tenant: every row.
-        TenantReach::All => queries::SavedQueryScope::All,
+        TenantReach::All => queries::SavedQueryScope::All {
+            viewer: saved_query_viewer(principal, None),
+        },
         // One tenant's rows; the rows that belong to no tenant are the
         // shared catalog's own, and the catalog's tenant reads them.
         TenantReach::Tenant {
@@ -716,6 +754,7 @@ pub(crate) async fn saved_query_scope(
         } => queries::SavedQueryScope::Tenant {
             tenant_id,
             include_tenantless: owns_catalog,
+            viewer: saved_query_viewer(principal, Some(tenant_id)),
         },
         // A caller in no tenant owns no saved query and reads none.
         TenantReach::NoTenant => queries::SavedQueryScope::None,
@@ -2331,21 +2370,41 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
 /// the caller's tenant's rows, and the rows that belong to no tenant
 /// when that tenant owns the shared catalog (see [`saved_query_scope`]).
 ///
+/// The list is filtered by the text typed in the search box (`?q=`, which
+/// matches the title or the SQL) and by the folder asked for (`?folder=`,
+/// an id or `"root"` for the shared space). Both filters are the store's
+/// own, applied to the visible rows only.
+///
 /// # Errors
 ///
 /// 401 when nobody is signed in — a saved query belongs to a tenant, so
-/// there is no sensible answer for "everybody's"; 404 for an `X-Tenant`
-/// header the caller does not belong to; 503 if no pool is configured;
-/// 500 on a database failure.
+/// there is no sensible answer for "everybody's"; 400 for a folder filter
+/// that is neither an id nor `"root"`, and for a query string the route
+/// cannot read; 404 for an `X-Tenant` header the caller does not belong
+/// to; 503 if no pool is configured; 500 on a database failure.
 pub async fn list_saved(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     headers: HeaderMap,
+    query: Result<Query<SavedQueryListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<Vec<SavedQuery>>> {
     let Extension(principal) =
         principal.ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?;
+    // A query string the extractor cannot read — a parameter sent twice,
+    // for instance — is refused with this surface's own sentence. The
+    // rejection's own text is serde's, and it stays in the log: a
+    // response never carries a library's rendering of the caller's
+    // request.
+    let Query(raw) = query.map_err(|rejection| {
+        tracing::warn!(%rejection, "a saved-query query string could not be read");
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
+    })?;
+    let needle = raw.q.as_deref().filter(|needle| !needle.is_empty());
+    let folder = parse_folder_filter(raw.folder.as_deref())?;
     let scope = saved_query_scope(&state, &principal, &headers).await?;
-    Ok(ApiJson(queries::list_saved(pool(&state)?, scope).await?))
+    Ok(ApiJson(
+        queries::list_saved_filtered(pool(&state)?, &scope, needle, folder).await?,
+    ))
 }
 
 /// The `GET /api/query/history` query string (`QS-4`, decision 5). Every
@@ -2354,7 +2413,7 @@ pub async fn list_saved(
 /// fixed message in [`parse_history_query`] — never `serde_urlencoded`'s
 /// rendering of a serde error. A query string the extractor itself cannot
 /// read (a parameter sent twice) never reaches this struct: it is refused
-/// with the fixed sentence of [`HISTORY_QUERY_UNREADABLE`].
+/// with the fixed sentence of [`QUERY_STRING_UNREADABLE`].
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryQueryRaw {
@@ -2375,14 +2434,6 @@ const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "blocke
 
 /// The engines [`run`] records.
 const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
-
-/// What a query string the route cannot read is told.
-///
-/// The twin of this sentence lives in `routes/uploads.rs`
-/// (`QUERY_UNREADABLE`). The two cannot be one constant yet: the place
-/// both could share is `routes/mod.rs`, and that file is held by another
-/// open pull request.
-const HISTORY_QUERY_UNREADABLE: &str = "The query string could not be read.";
 
 /// Parse the history query string into a [`HistoryFilter`], refusing a
 /// bad value with a fixed 400 before the store sees it.
@@ -2462,7 +2513,7 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 /// no sensible answer for "everyone's". 400 for a bad filter value, with a
 /// fixed message naming the field, and for a query string the route cannot
 /// read (a parameter sent twice), with the fixed sentence of
-/// [`HISTORY_QUERY_UNREADABLE`]. 503 if no pool is configured; 500 on a
+/// [`QUERY_STRING_UNREADABLE`]. 503 if no pool is configured; 500 on a
 /// database failure.
 pub async fn list_history(
     State(state): State<AppState>,
@@ -2476,7 +2527,7 @@ pub async fn list_history(
     // carries a library's rendering of the caller's request.
     let Query(raw) = query.map_err(|err| {
         tracing::warn!(%err, "a query history query string could not be read");
-        ApiError::BadRequest(HISTORY_QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let filter = parse_history_query(&raw)?;
     Ok(ApiJson(
@@ -2499,6 +2550,10 @@ pub struct CreateSavedQueryBody {
     sql: String,
     #[serde(default)]
     tags: Vec<String>,
+    /// The folder the query lands in: an id, `null` for the shared space,
+    /// or absent for the caller's own personal space.
+    #[serde(default)]
+    folder_id: FolderField,
 }
 
 /// `POST /api/query/saved` — save the SQL in the editor under a name.
@@ -2507,14 +2562,19 @@ pub struct CreateSavedQueryBody {
 /// tenant is the one the request acts as — the `X-Tenant` header when the
 /// caller sends one, the caller's first tenant otherwise — and the row is
 /// that tenant's alone; the rows that belong to no tenant are the shared
-/// catalog's own. The author is recorded all the same.
+/// catalog's own. The author is recorded all the same, and the query
+/// lands in the folder the body names: the shared space, a folder the
+/// caller may fill, or — when the body names none — the caller's own
+/// personal space (`QS-3`).
 ///
 /// # Errors
 ///
-/// 400 on a malformed body or a blank title/SQL; 401 when nobody is signed
-/// in; 404 for an `X-Tenant` header the caller does not belong to; 422
-/// when the SQL is not read-only — a saved query is run through the same
-/// guard as anything else, so refusing it here is better than storing
+/// 400 on a malformed body, a blank title/SQL or a folder that is neither
+/// an id nor the root; 401 when nobody is signed in; 404 for an
+/// `X-Tenant` header the caller does not belong to, and for a folder the
+/// caller may not see; 403 for a folder the caller may see but not fill;
+/// 422 when the SQL is not read-only — a saved query is run through the
+/// same guard as anything else, so refusing it here is better than storing
 /// something that can never run; 503/500 as above.
 pub async fn create_saved(
     State(state): State<AppState>,
@@ -2527,36 +2587,40 @@ pub async fn create_saved(
     let title = body.title.trim().to_owned();
     let sql = body.sql.trim().to_owned();
     if title.is_empty() || sql.is_empty() {
-        return Err(ApiError::BadRequest("title and sql are required".to_owned()).into());
+        return Err(ApiError::BadRequest(TITLE_AND_SQL_REQUIRED.to_owned()).into());
     }
     if !is_read_only(&sql) {
-        return Err(ApiError::Unprocessable(
-            "only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) can be saved".to_owned(),
-        )
-        .into());
+        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
-    let owner_id = caller_id(principal.as_ref())?;
+    let principal = principal
+        .as_ref()
+        .map(|Extension(p)| p)
+        .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?;
     // The tenant the row belongs to is the tenant the request acts as,
     // answered by the one resolver every caller without a header gets
     // (`tenant_scope::resolve`). A caller in no tenant writes a row that
     // belongs to no tenant: nobody can say whose query it is, so it is
     // not anybody's to read but the shared catalog's owner's.
-    let tenant_id = crate::tenant_scope::resolve(
-        principal
-            .as_ref()
-            .map(|Extension(p)| p)
-            .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?,
-        &headers,
-    )?;
-    let owner = principal.map_or_else(|| "anonymous".to_owned(), |Extension(p)| p.display_name);
-    let saved = queries::create_saved_query(
+    let tenant_id = crate::tenant_scope::resolve(principal, &headers)?;
+    let owner = principal.display_name.clone();
+    let viewer = saved_query_viewer(principal, tenant_id);
+    // The place the row lands is the caller's to choose: the shared
+    // space, one of the folders they may fill, or — when the body names
+    // no folder — their own personal space (`QS-3`).
+    let placement = require_query_placement(
         pool(&state)?,
+        &viewer,
+        parse_folder_reference(body.folder_id)?,
+    )
+    .await?;
+    let saved = queries::create_saved_query_at(
+        pool(&state)?,
+        &viewer,
         &title,
         &sql,
         &owner,
         &body.tags,
-        Some(owner_id),
-        tenant_id,
+        placement,
     )
     .await?;
     Ok((StatusCode::CREATED, ApiJson(saved)))
@@ -2687,15 +2751,6 @@ const DOWNLOAD_BYTE_CAP: u64 = 5 * 1024 * 1024 * 1024;
 const DOWNLOAD_TOO_LARGE: &str =
     "This result is larger than 5 GB. Add a filter or download it as CSV.";
 
-/// What a query string the download route cannot read is told.
-///
-/// The twin of this sentence lives in `routes/uploads.rs`
-/// (`QUERY_UNREADABLE`), and this file's history route has its own copy of
-/// it (`HISTORY_QUERY_UNREADABLE`). The three cannot be one constant yet:
-/// the place they could share is `routes/mod.rs`, and that file is held by
-/// another open pull request.
-const DOWNLOAD_QUERY_UNREADABLE: &str = "The query string could not be read.";
-
 /// The name the download's query carries on the engine: the caller's own id,
 /// the run, and what the query is. Stop's pattern
 /// (`<caller uuid>:<runId>:%`) finds it, so Stop reaches the download's
@@ -2820,21 +2875,7 @@ async fn download_engine_file<S: crate::export::ByteSource>(
     match crate::export::write_bytes_file(source, Some(byte_cap)).await {
         Ok(Some(file)) => Ok(file),
         Ok(None) => Err(ApiError::Unprocessable(DOWNLOAD_TOO_LARGE.to_owned())),
-        Err(err) => Err(download_failure(&err)),
-    }
-}
-
-/// A failure of the file itself, reported under a reference with a fixed
-/// sentence (`SEC-11`).
-///
-/// The dashboard's own export has the same mapping in
-/// `routes::dashboard::export_failure`, which is private to that module.
-fn download_failure(err: &crate::export::ExportError) -> ApiError {
-    match err {
-        crate::export::ExportError::Source(ch) => {
-            upstream_error::ch_error(&upstream_error::DATABASE, ch)
-        }
-        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+        Err(err) => Err(super::export_failure(&upstream_error::DATABASE, &err)),
     }
 }
 
@@ -2947,7 +2988,7 @@ fn download_response(
 ///   match the `query_history.id` shape (`q-<digits>` or
 ///   `q-<digits>-<32 lowercase hex>`), or when the query string cannot be
 ///   read at all — a repeated parameter, or no `format` — with the fixed
-///   sentence of [`DOWNLOAD_QUERY_UNREADABLE`].
+///   sentence of [`QUERY_STRING_UNREADABLE`].
 /// - 403 [`ApiError::PermissionDenied`] when every role of the caller is
 ///   switched off from downloading.
 /// - 404 [`ApiError::NotFound`] when no history row matches `id`, or when
@@ -2975,7 +3016,7 @@ pub async fn download(
     // never carries a library's rendering of the caller's request.
     let Query(query) = query.map_err(|err| {
         tracing::warn!(%err, "a download query string could not be read");
-        ApiError::BadRequest(DOWNLOAD_QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let Some(format) = DownloadFormat::parse(&query.format) else {
         return Err(
@@ -3083,7 +3124,7 @@ pub async fn download(
         .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
     let written = write_download_rows(&mut rows, row_format, &locale, DOWNLOAD_BYTE_CAP)
         .await
-        .map_err(|err| download_failure(&err))?;
+        .map_err(|err| super::export_failure(&upstream_error::DATABASE, &err))?;
     // Which limit cut the file: the rows the format allows, or the bytes the
     // cap allows. A file that was not cut names no limit.
     let cut_by = written.cut.then(|| cut_by(format, written.rows));
@@ -3132,6 +3173,143 @@ fn scheduling_capability_body() -> Value {
 /// This handler never fails — it reports a fixed, static capability.
 pub async fn scheduling(State(_state): State<AppState>) -> ApiResult<ApiJson<Value>> {
     Ok(ApiJson(scheduling_capability_body()))
+}
+
+// ── The trash sweep (QS-3) ───────────────────────────────────────────────
+
+/// Remove the saved queries that waited in the trash longer than
+/// [`TRASH_RETENTION_DAYS`](lakehouse_store::queries::TRASH_RETENTION_DAYS)
+/// days, and answer how many went.
+///
+/// The cutoff is the store's own constant, the same one the trash list
+/// counts its days from: the number the console shows and the number this
+/// pass acts on are one number.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the delete fails. Nothing is deleted when
+/// it does.
+pub(crate) async fn purge_expired_saved_queries(pool: &PgPool) -> Result<u64, StoreError> {
+    let cutoff =
+        OffsetDateTime::now_utc() - time::Duration::days(i64::from(queries::TRASH_RETENTION_DAYS));
+    queries::purge_trashed_before(pool, cutoff).await
+}
+
+/// Spawn the sweep that removes the saved queries that waited in the trash
+/// longer than
+/// [`TRASH_RETENTION_DAYS`](lakehouse_store::queries::TRASH_RETENTION_DAYS)
+/// days.
+///
+/// It runs once at start (the first tick is immediate) and then every
+/// hour, missed ticks skipped. An error is logged at `warn` and never
+/// takes the process down; the next pass removes what this one missed.
+/// Without a Postgres pool, it logs once and spawns nothing.
+///
+/// `pub` and not `pub(crate)`: `routes/mod.rs` re-exports it, because the
+/// binary's `main` is its only caller and the library target would
+/// otherwise call it dead code — and a re-export of a `pub(crate)` item
+/// is refused by the compiler.
+pub fn spawn_saved_query_trash_sweep(state: &AppState) {
+    let Some(pool) = state.pg.clone() else {
+        tracing::warn!("no Postgres pool configured; the saved-query trash sweep will not run");
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match purge_expired_saved_queries(&pool).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "saved-query trash sweep removed expired queries");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(%err, "saved-query trash sweep failed; nothing was deleted");
+                }
+            }
+        }
+    });
+}
+
+/// The trash sweep (`QS-3`): a saved query that waited in the trash for
+/// more than 30 days is gone for good, and one that waited a day is
+/// still there.
+///
+/// The test calls the pass itself and not the hourly loop: a test that
+/// waits an hour proves nothing, and the loop is the same one the
+/// run-log cleanup uses.
+#[cfg(test)]
+mod trash_sweep_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_store::PgPool;
+    // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+    // testcontainer bootstrap runs for this test binary, the same reason
+    // `tests`'s own `source_marks` module does it.
+    use lakehouse_test_support as _;
+    use time::Duration;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::purge_expired_saved_queries;
+
+    /// A saved query that went to the trash `days` days ago, and the id
+    /// it got.
+    async fn trashed_query(pool: &PgPool, title: &str, days: i64) -> Uuid {
+        let id = Uuid::new_v4();
+        let deleted_at = OffsetDateTime::now_utc() - Duration::days(days);
+        sqlx::query(
+            "INSERT INTO saved_query (id, title, sql, owner, deleted_at) \
+             VALUES ($1, $2, 'SELECT 1', 'Rina Wijaya', $3)",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(deleted_at)
+        .execute(pool)
+        .await
+        .expect("the trashed query is written");
+        id
+    }
+
+    /// Whether the saved query with this id is still in the table.
+    async fn is_there(pool: &PgPool, id: Uuid) -> bool {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM saved_query WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the saved queries are counted");
+        count > 0
+    }
+
+    /// The sweep takes the query that waited in the trash for more than 30
+    /// days and leaves the one that waited a day alone, and it says how
+    /// many it took.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_sweep_removes_only_the_queries_trashed_more_than_thirty_days_ago(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let old = trashed_query(&pool, "In the trash for 31 days", 31).await;
+        let fresh = trashed_query(&pool, "In the trash for a day", 1).await;
+
+        let removed = purge_expired_saved_queries(&pool)
+            .await
+            .expect("the sweep runs");
+
+        assert!(
+            !is_there(&pool, old).await,
+            "the query trashed 31 days ago is gone for good"
+        );
+        assert!(
+            is_there(&pool, fresh).await,
+            "the query trashed a day ago is still in the trash"
+        );
+        assert_eq!(
+            removed, 1,
+            "the sweep answers how many queries it took: the one that waited 31 days"
+        );
+        Ok(())
+    }
 }
 
 /// The SEC-21 settings rule, tested on its own. A separate module from
@@ -4853,9 +5031,12 @@ mod tests {
         /// caller gets a fixed sentence and a reference id.
         #[test]
         fn an_engine_failure_answers_a_fixed_sentence_with_a_reference() {
-            let err = download_failure(&crate::export::ExportError::Source(ChError::Server(
-                "Code: 47. Unknown identifier: nope".to_owned(),
-            )));
+            let err = crate::routes::export_failure(
+                &upstream_error::DATABASE,
+                &crate::export::ExportError::Source(ChError::Server(
+                    "Code: 47. Unknown identifier: nope".to_owned(),
+                )),
+            );
             assert_eq!(err.status(), 422);
             let text = err.to_string();
             assert!(
@@ -4867,7 +5048,10 @@ mod tests {
 
         #[test]
         fn an_unreachable_engine_answers_503() {
-            let err = download_failure(&crate::export::ExportError::Source(ChError::Cancelled));
+            let err = crate::routes::export_failure(
+                &upstream_error::DATABASE,
+                &crate::export::ExportError::Source(ChError::Cancelled),
+            );
             assert_eq!(err.status(), 503);
         }
 
