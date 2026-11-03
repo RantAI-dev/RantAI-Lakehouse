@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import {
+  buildDashboardPageContext,
   summarizeFilterJson,
   summarizeFilters,
   summarizeGrain,
@@ -187,4 +188,113 @@ test("summarizeTabs stays inside its budget: it counts the charts per tab when t
     '"Overview" (id t_1, open; charts a, b, c); "Maps" (id t_2; charts m, n); "Detail" (id t_3; no charts)'
   )
   assert.doesNotMatch(full, /list_charts/)
+})
+
+test("buildDashboardPageContext returns today's joined string when everything fits", () => {
+  const parts = {
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: "region is north",
+    filterJson: null,
+    params: "target = 1000 (number)",
+    tabs: "none (the dashboard has no tabs)",
+    tiles: '- "Sales" (bar, id u_1; mart_sales): rows: north=5',
+  }
+  const expected =
+    'The user is viewing the dashboard "Sales" (board id: b_1). ' +
+    "Time grain: Day. " +
+    "Active filters: region is north. " +
+    "Parameters shown (a formula reads one as {name}; list_parameters has them all): target = 1000 (number). " +
+    "Tabs: none (the dashboard has no tabs). " +
+    "Tiles and the data they currently show (built-in tiles are not editable):\n" +
+    '- "Sales" (bar, id u_1; mart_sales): rows: north=5\n' +
+    'When creating a chart use board="b_1". To change a tile you created, use update_chart with its id. ' +
+    "You can also explain what the charts show."
+  assert.equal(buildDashboardPageContext(parts), expected)
+  // The raw filters ride along in the filter line, as the page writes them.
+  const json = '[{"column":"region"}]'
+  assert.equal(
+    buildDashboardPageContext({ ...parts, filterJson: json }),
+    expected.replace(
+      "Active filters: region is north.",
+      `Active filters: region is north (raw: ${json}).`
+    )
+  )
+})
+
+test("buildDashboardPageContext gives up the raw filter JSON first", () => {
+  const json = `[{"column":"region","values":["${"y".repeat(3965)}"]}]`
+  assert.equal(json.length, 4000)
+  const tiles = `- "Tile" (bar, id u_1; mart_m): ${"t".repeat(4968)}`
+  assert.equal(tiles.length, 5000)
+  const out = buildDashboardPageContext({
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: "region is north",
+    filterJson: json,
+    params: "target = 1000 (number)",
+    tabs: "none (the dashboard has no tabs)",
+    tiles,
+  })
+  assert.ok(out.length <= 6000, String(out.length))
+  assert.ok(!out.includes(json))
+  // The chip text stays; the raw JSON is what goes.
+  assert.ok(out.includes("Active filters: region is north."))
+  assert.ok(out.startsWith("The user is viewing the dashboard"))
+  assert.ok(out.includes('When creating a chart use board="b_1".'))
+  assert.ok(out.endsWith("You can also explain what the charts show."))
+})
+
+test("buildDashboardPageContext cuts the end of the tile list when the rest still does not fit", () => {
+  const json = `[{"column":"region","values":["${"y".repeat(2965)}"]}]`
+  assert.equal(json.length, 3000)
+  const chips = `region is ${"n".repeat(1990)}`
+  assert.equal(chips.length, 2000)
+  const tiles = `- "Tile" (bar, id u_1; mart_m): ${"t".repeat(4968)}`
+  assert.equal(tiles.length, 5000)
+  const out = buildDashboardPageContext({
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: chips,
+    filterJson: json,
+    params: "target = 1000 (number)",
+    tabs: "none (the dashboard has no tabs)",
+    tiles,
+  })
+  assert.ok(out.length <= 6000, String(out.length))
+  assert.ok(!out.includes(json))
+  // The tile list gives way, and says where the rest of it is.
+  assert.ok(
+    out.includes('… (more tiles; list_charts lists every chart)\nWhen creating a chart use board="b_1".')
+  )
+  // The tile list is cut, not dropped: its beginning stays.
+  assert.ok(out.includes('- "Tile" (bar, id u_1; mart_m): '))
+  // The chip text still fits, so it stays whole.
+  assert.ok(out.includes(chips))
+  assert.ok(!out.includes("… (more filters)"))
+})
+
+test("buildDashboardPageContext cuts the filter chip text last and keeps the board id and the instruction", () => {
+  const chips = `region is ${"n".repeat(6990)}`
+  assert.equal(chips.length, 7000)
+  const out = buildDashboardPageContext({
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: chips,
+    filterJson: null,
+    params: "target = 1000 (number)",
+    tabs: "none (the dashboard has no tabs)",
+    tiles: '- "Tile" (bar, id u_1; mart_m): rows: north=5',
+  })
+  assert.ok(out.length <= 6000, String(out.length))
+  assert.ok(out.includes("… (more filters)"))
+  assert.ok(out.startsWith('The user is viewing the dashboard "Sales" (board id: b_1).'))
+  assert.ok(out.includes('When creating a chart use board="b_1".'))
+  assert.ok(out.endsWith("You can also explain what the charts show."))
+  // The tile list is short, so it stays whole: the chips are what did not fit.
+  assert.ok(out.includes('- "Tile" (bar, id u_1; mart_m): rows: north=5'))
 })
