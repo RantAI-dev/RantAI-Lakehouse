@@ -68,6 +68,7 @@ pub mod report_schedule;
 pub mod report_subscriptions;
 pub mod reporting_settings;
 pub mod saas_vendors;
+pub mod saved_query_access;
 pub mod schema_change;
 pub mod schema_diff;
 pub mod semantic;

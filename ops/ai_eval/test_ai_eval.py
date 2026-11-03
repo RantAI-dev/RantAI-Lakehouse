@@ -18,6 +18,7 @@ compares every score with the values the code printed before the change
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -612,6 +613,31 @@ class CleanupPlanTests(unittest.TestCase):
             m.collect_created([{"kind": "source", "id": "s9"}], [], []),
             [{"kind": "source", "id": "s9"}],
         )
+
+    # BI-37: the alert the assistant saves is an object the run made, so the
+    # state check counts it and the cleanup deletes it.
+    def test_create_alert_rule_saves_a_rule_that_the_run_collects_and_deletes(self) -> None:
+        reply = {"ok": True, "rule": {"id": "al7", "name": "Visitors", "chart": "c1"}}
+        trace = [{"tool": "create_alert_rule", "result": {"ok": True, "rule": {"id": "al7"}}}]
+        confirms = [{"tool": "create_alert_rule", "result": confirm_reply("create_alert_rule", reply)}]
+        self.assertEqual(m.collect_created([], [trace], []), [{"kind": "alert", "id": "al7"}])
+        self.assertEqual(m.collect_created([], [], confirms), [{"kind": "alert", "id": "al7"}])
+        cfg = make_cfg()
+        session = FakeSession()
+        self.assertEqual(m.run_cleanup(cfg, session, m.collect_created([], [], confirms)), [])
+        self.assertIn(
+            ("DELETE", "http://api.test/api/alerts?id=al7", None), session.calls
+        )
+
+    def test_a_draft_that_only_asks_for_confirmation_collects_no_alert(self) -> None:
+        # The pending confirmation names the tool and its args, never a saved
+        # rule, so the run must not delete an id it never saw.
+        trace = [{"tool": "create_alert_rule", "result": {"needs_confirmation": True, "tool": "create_alert_rule"}}]
+        self.assertEqual(m.collect_created([], [trace], []), [])
+
+    def test_an_alert_is_deleted_before_the_chart_it_watches(self) -> None:
+        created = [{"kind": "chart", "id": "c1"}, {"kind": "alert", "id": "al1"}]
+        self.assertEqual([s["kind"] for s in m.cleanup_plan(created)], ["alert", "chart"])
 
 
 class TeardownTests(unittest.TestCase):
@@ -1774,6 +1800,41 @@ class DashboardCasesTests(unittest.TestCase):
             self.assertIs(case.get("confirm"), True, case_id)
             self.assertEqual(case["expect_tool"], expect_tool, case_id)
             self.assertEqual(len(case["expect_state"]), 2, case_id)
+
+    def test_the_distance_case_brings_its_own_source_with_coordinates_and_names_it(self) -> None:
+        # The eval stack has no mart with coordinates, and `mart_demo_map_points`
+        # exists only in Rust tests, so the case creates a SQL source with
+        # latitude and longitude and asks for the field on that source.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["calc_distance_to_bandung"]
+        setup = {step["name"]: step for step in case["setup"]}
+        self.assertEqual(setup["src"]["path"], "/api/dashboard/sources")
+        sql = setup["src"]["body"]["sql"]
+        self.assertIn("latitude", sql)
+        self.assertIn("longitude", sql)
+        # The only mart the case may mention is one its own setup SQL reads.
+        everything = json.dumps(
+            {k: case[k] for k in ("turns", "expect_tool", "expect_state")}
+        )
+        self.assertNotIn("mart_demo_map_points", everything)
+        for mart in set(re.findall(r"mart_[a-z_]+", everything)):
+            self.assertIn(mart, sql)
+        # The turn, the tool arguments and the state check all use the
+        # source the setup created.
+        self.assertIn("{src}", case["turns"][0])
+        self.assertEqual(case["expect_tool"]["args_contains"]["sqlSource"], "{src}")
+        self.assertEqual(case["expect_tool"]["args_contains"]["name"], "km_from_bandung")
+        self.assertEqual(
+            case["expect_state"][0]["path"], "/api/dashboard/calc-fields?source={src}"
+        )
+
+    def test_the_view_filter_year_case_tells_the_assistant_which_dashboard_is_open(self) -> None:
+        # The console always sends the open dashboard with its board id; a
+        # case without that context never tells the assistant which board to
+        # name in `set_board_view_filters`.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["view_filter_year"]
+        self.assertIn("{board}", case.get("context", ""))
 
 
 class ForecastAndDeprecationCaseTests(unittest.TestCase):
