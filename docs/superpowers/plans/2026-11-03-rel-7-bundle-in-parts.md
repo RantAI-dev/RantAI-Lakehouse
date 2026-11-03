@@ -45,4 +45,54 @@ Making the bundle smaller (a separate item, if wanted), and any `lakehousectl` c
 
 ## 4. Handoff (developer appends below)
 
+**Developer report, 2026-11-03.** Branch `fix/rel-7-bundle-parts`, off `origin/main`
+`d932256a` (the plan's `0855177e` is its own commit on this branch). Pushed after every
+commit; no PR opened.
+
+### Commits
+
+| Commit | Task | What it does |
+|---|---|---|
+| `beaa9849` | T1 (D1, D5) | The release job splits the bundle at 1900 MiB with `split -b 1900M -d -a 2` straight into `release-assets/`, keeps the whole file's `.sha256` as an asset, lists the parts in `SHA256SUMS`, and the notes name the part count and size. `Create the draft release` writes into a DRAFT that already exists (`gh release upload --clobber` + `gh release edit`) and refuses a PUBLISHED release. |
+| `2a292dbd` | T2 (D2) | `docs/OPERATIONS.md` gets the one way to join (check every part against `SHA256SUMS`, join in name order, check the joined file against its `.sha256`, unpack, run the bundle's own installer). `docs/CI.md` gets steps 9–10 and the round trip. `install.sh` is unchanged: it downloads the installer, not the bundle, and `lakehousectl` reads an unpacked directory (D3). |
+| `eade7cc1` | T3 (D4) | The dry run's new step splits the bundle it just built, writes a `SHA256SUMS` over the parts, checks every part, joins them in name order and checks the joined file against `make_bundle.sh`'s `.sha256` — the operator's own commands. Also refuses a part at 2 GiB or more. |
+| `cf47fd4c` | T4 | New `ops/release/test_bundle_parts.py`: a 2 KiB file split into three parts, `SHA256SUMS` written the release's way, the documented join run, a damaged part refused before the join and named, two releases' parts refused by the `.sha256`, and the docs/workflow/parts names pinned against each other. `test_release_workflow.py`: the split size and numbering, the parts in the asset list, no whole-bundle asset, the round-trip step and its order, the draft re-run — each with a synthetic workflow that must be reported. |
+| `a744bafd` | T2 fixup | The join's last two commands unpack into `bundle/` and run `bundle/lakehousectl`, which is the file the bundle carries. |
+
+**One deviation, stated plainly:** the dry run's round-trip step (T3) was in the working
+tree when T1 was committed, so its FIRST form is in `beaa9849`. `eade7cc1` is the T3
+change proper: it replaces that first form with the operator's commands (a per-part
+`SHA256SUMS` check and `sha256sum -c "$name.sha256"`, instead of an `awk` comparison of
+two digests). History was not rewritten to hide it — the branch is pushed after each
+commit.
+
+### Commands, as run
+
+- `python3 -m pytest ops/release -q` — **265 passed, 1 warning** (on the final code, and
+  on `cf47fd4c`; 111 of them the workflow suite before the REL-7 tests were added).
+- `bash -n` on the three new/changed `run:` blocks, with `${{ … }}` replaced by `X` —
+  `The release's assets`, `Create the draft release`, and the dry run's round-trip step:
+  **ok, ok, ok**. The YAML itself parses (`yaml.safe_load`).
+- `uvx --from shellcheck-py shellcheck -S warning` on the same three blocks: **rc 0 on
+  each, no findings**. No tracked `*.sh` file was touched, so no script file needed these
+  beyond the workflow blocks. (`shellcheck` is not installed on this machine; the `uvx`
+  form the task names is what ran.)
+- A local simulation of the round trip (`split -b 1900M -d -a 2`, per-part
+  `sha256sum -c SHA256SUMS`, `cat …part-*`, `sha256sum -c …sha256`) on a 5,000,000-byte
+  file: **1 part, both checks OK**.
+
+### Not verified
+
+- **The dry run itself.** The task says not to run the release workflow locally and that
+  CI's `Release · dry run` proves it. The workflow's split/join commands were run by hand
+  on a small file (above) and by `test_bundle_parts.py` on three parts, but the step has
+  not run inside Actions, and the **real** 3.5 GiB bundle has not been split into its
+  two parts on a runner.
+- **The draft re-run against GitHub.** `gh release upload --clobber` into the existing
+  `v0.2.0` draft, and the refusal of a published release, are pinned by a test on the
+  step's text; neither has been exercised against the live API. The first re-run of the
+  `v0.2.0` tag is the proof.
+- **The product-owner acceptance checklist** for the release itself (REL-2-AC3 and the
+  release's own checks) is untouched by this change.
+
 ## 5. Review (planner appends below)
