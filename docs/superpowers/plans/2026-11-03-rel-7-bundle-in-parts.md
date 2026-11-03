@@ -96,3 +96,15 @@ commit.
   release's own checks) is untouched by this change.
 
 ## 5. Review (planner appends below)
+
+### Review round 1 (planner, 2026-11-03, at `d276d94f`)
+
+- **D1.** The release job splits the bundle with `split -b 1900M -d -a 2` into `release-assets/`. The parts replace the whole file as assets, the whole file's `.sha256` stays, and every part is listed in `SHA256SUMS`. The release notes give the number of parts and how to join them.
+- **D5.** The draft-exists path uses `gh release edit` and `upload --clobber`. A PUBLISHED release is refused with an error and never rewritten. That is what lets the planner re-run 0.2.0.
+- **D2.** `docs/OPERATIONS.md` gives the join: check each part against `SHA256SUMS`, join in name order, check the whole file against its `.sha256`, then unpack and install with the bundle's own `lakehousectl`.
+- **D4.** The dry run splits, checks, joins and compares against `make_bundle.sh`'s `.sha256`, and refuses any part of 2 GiB or more.
+- **Tests:** `ops/release` 265 passed. `test_bundle_parts.py` covers a 3-part round trip, a damaged part refused and named before the join, and parts from two different releases refused.
+- **A risk to watch, not a blocker:** during the release job the runner disk holds the bundle twice (3.5 GiB whole plus 3.5 GiB of parts). The job already frees disk first, and the PR's dry run will show it.
+- **Not verified:** the real 3.5 GiB split on a runner, which this PR's dry run proves, and the draft re-run against the live `v0.2.0`, which happens after the merge.
+
+**Open: no BLOCKER.** The merge waits for the PR's `Release · dry run`.
