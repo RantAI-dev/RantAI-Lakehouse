@@ -312,6 +312,153 @@ must be, run a real `up` (rule 8).
 
 ## 5. Handoff (developer appends below)
 
+### Handoff — BI-26 slice 2 (developer, 2026-11-04)
+
+Base: `main` at `388936bb` (merged into the branch as `b03046e6`). Branch
+`feat/bi-26-slice-2-embed-proposed`, one commit per task, pushed after each.
+
+| Task | Commit |
+| --- | --- |
+| T1 | `a5ad4f0d` test(embed): an old token narrows a saved filter whose mode nobody chose |
+| T2 | `3dbebfc0` feat(embed): our name and a transparent page in the whole-dashboard frame |
+| T4 | `929c47cc` feat(ai): check an embed write's requester before its approval |
+| T5 | `c99a6e41` feat(ai): four signed-embed tools with approval, a confirm and a snippet |
+| T6 | `65d101ed` feat(copilot): offer the signed-embed tools and label them |
+| T7 | `7b04ed72` test(ai-eval): the three embed requests in the standard set |
+
+T3 and T8 produce no commit of their own (T3 is evidence, T8 is drafted below).
+
+**Anchors.** Re-checked at `388936bb` before editing. Lines moved (e.g.
+`tests/embed_tokens.rs` cases at `:1490`, `:1515`, `:1577`, `:1790`;
+the tool count pin at `:2833`); no meaning changed.
+
+**No code change was needed for T1.** The new test passed on the first run.
+
+### Per-commit scoped checks
+
+- T1: `cargo fmt --check`; `cargo test -p lakehouse-api --test embed_tokens` —
+  48 passed, 0 failed.
+- T2: `bun test src/features/dashboards/embed-view.test.tsx src/lib` — 1130
+  passed, 1 skip; `bun run typecheck`; `bun run lint`.
+- T4: `cargo fmt --check`; `cargo clippy -p lakehouse-api --all-targets -- -D
+  warnings`; `cargo test -p lakehouse-api --lib ai::` — 458 passed, 1 ignored;
+  `cargo test -p lakehouse-api --test embed_tokens` — 48 passed.
+- T5: `cargo test -p lakehouse-api --test ai_embed_tools` — 11 passed;
+  `--lib ai::registry` — 30 passed, 1 ignored; `--lib ai::gate` — 30 passed;
+  `--lib ai::prompt` — 33 passed; `--test ai_build_tool_list` — 10 passed (the
+  60,000-character budget still holds); `--test sec11_guard` — 4 passed;
+  clippy for the crate.
+- T6: `bun test src/features/copilot` — 89 passed; `bun run typecheck`;
+  `bun run lint`.
+- T7: `python3 -m pytest ops/ai_eval -q` — 185 passed; `bash -n
+  ops/ai_eval/run_dashboard_eval.sh` (shellcheck is not installed here).
+
+### Full verification (final commit `7b04ed72`)
+
+```text
+cargo fmt --check                                             ok
+cargo clippy --workspace --all-targets --all-features -D warnings   ok
+cargo test --workspace        183 suites, 9527 passed, 0 failed, 52 ignored
+bun run typecheck                                            ok
+bun run lint                   0 errors, 10 warnings (all pre-existing)
+bun run test                   3178 pass, 1 skip, 0 fail (3179 tests, 325 files)
+python3 ops/lint/check_intra_package_imports.py              OK
+python3 ops/lint/check_bare_iceberg_count.py                 R11 guard: clean
+python3 -m pytest ops/ai_eval -q                             185 passed
+(cd dagster && .venv/bin/python -m pytest dispar_orchestrate -q)
+                              2411 passed, 1 skipped, 40 subtests
+docker compose --profile '*' config --quiet                  exit 0
+git status                                                   clean
+```
+
+Two environment notes, neither about this diff:
+
+- The first `cargo test --workspace` was OOM-killed (`sccache: Compile
+  terminated by signal 9`) while the machine was under a load average around
+  600 from long-lived test containers. It passed with
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0`; clippy and tests then ran clean.
+- `bun run lint` walks `dagster/.venv` (a git-ignored local venv, not in the
+  repository or CI) and reports its minified JavaScript. The block above was
+  run with that directory moved aside and put back; `dagster/.venv` is not
+  committed.
+
+### T3 — the browser check (partial; not verified in a browser)
+
+A dev stack was brought up on this machine for the check: compose `postgres`
+and `clickhouse` (seeded with `scripts/seed-clickhouse.sh`), the API built from
+this branch run on the host with `EMBED_SECRET` and `CATALOG_TENANT_ID` set,
+the console under `next dev`, and a static host page on
+`http://localhost:9099` (a second local origin, added to both boards' allowed
+sites). Two dashboards were made through the API: A (`kawasan` editable,
+`tahun` locked, `negara` hidden, a saved `kawasan` filter `[ASEAN, Eropa]`) and
+B (a saved `kawasan` filter and no mode chosen). Tokens were signed with a
+throwaway script outside the repository; no token was written to any file.
+
+What was observed, by row:
+
+| Row | Result | What was seen |
+| --- | --- | --- |
+| `logo=none` in the whole-dashboard frame | **partial** | The console's server-rendered markup has `Rantai Lake` 7 times with no option and 6 with `logo=none` (the difference is the footer; the others are the page title and manifest metadata). The single-chart frame renders it too. |
+| `background=transparent`, whole dashboard | **partial** | The rendered root carries `!bg-transparent` with the option and `bg-background` without it. The tile card's `bg-card` is asserted in `embed-view.test.tsx` (the grid is mocked there). |
+| `theme=dark` | **not verified** | It is applied from the payload on the client, so the server-rendered markup cannot show it. |
+| An editable filter changing the data | **passed at the API** | `POST /api/embed/data` for A with `{kawasan: [Eropa]}` returned 2 rows (Jerman, Prancis) where the saved value returned Malaysia/Singapura; only `kawasan` was described in `embedFilters`. |
+| A hidden filter not shown | **passed at the API** | `tahun` (locked) and `negara` (hidden) never appear in `embedFilters`; only the editable `kawasan` does. |
+| A token without a locked value refused | **passed** | 401, body `{"error":"embed token is invalid or expired"}`; the column is not named. |
+| An old `kawasan` token showing only that region | **passed at the API** | The old token (`params {kawasan: ASEAN}`, no mode chosen for the column) answers 200 and its rows are ASEAN only; the same narrowing is pinned in `embed_tokens.rs` (T1). |
+| The framed page inside the host page | **not verified** | `[browser.disconnected]`: no desktop browser is connected to this session, so nothing could be rendered or screenshotted in an iframe. `POST /api/embed/frame` did answer `{"origins":["http://localhost:9099"],"contentSites":[]}`, and `GET /embed/signed/…` answered 200. |
+
+The theme, the visual look in both frames, and the iframe on the host page
+still need a person (or a session with a browser) to open
+`http://localhost:9099/?src=…`. This is the developer's evidence, not the
+owner's acceptance.
+
+### Deviations, reported rather than improvised
+
+- **T4's "error means no approval row" test is in T5's integration test.**
+  T4 adds the hook and its lib tests (no-op for every other tool; both embed
+  writes refuse with nobody signed in). Proving "no approval row" needs a
+  registered `WriteHigh` tool to drive `POST /api/ai/tool`, and the four tools
+  are registered in T5; `tests/ai_embed_tools.rs` asserts the zero approval
+  count for a requester without manage, an invalid site, a 21st site and Ask
+  mode.
+- **The 21st-site limit also runs in the pre-approval hook.** T5's test
+  demands "before approval"; D6's limit is computed from the board's current
+  list, so one helper (`tools::merged_origins`) serves both the hook and the
+  execution path (rule 4).
+- **`get_embed_snippet` is also in the Query Data capability.** The Dashboard
+  Builder is `write: true`, so Ask mode drops the whole capability; T7 asks
+  the snippet question in Ask mode, and the tool is `Read`. This follows the
+  existing read-tool pattern (`export_*`, `list_dashboard_comments`).
+- **The pre-approval hook names every refusal as the routes do**, including
+  `ApiError` text from `check_filter_modes`; `tests/sec11_guard.rs` gained one
+  allowlist entry with the reason (the sentence is written in this
+  repository), per the guard's own rule.
+
+### T7 live run
+
+**Not verified.** `LLM_KEY` is not available in this session, so
+`ops/ai_eval/run_dashboard_eval.sh` was not run. The case set parses and the
+harness tests pass; the reviewer's live run is the one that scores the three
+new cases.
+
+### T8 — docs, drafted for the planner (not edited here)
+
+- `docs/core/features/embedding.md`: once the review passes, drop *(proposed)*
+  from AC5, AC6, AC7 and `AI-11-AC3`; add D1 (our name shows in both frames, a
+  one-line footer inside the measured root, hidden by `logo=none`) and D2
+  (`background=transparent` makes the page behind the tiles transparent in
+  both frames; the tiles keep their card) to the decision table as planner
+  defaults.
+- `docs/core/features/safer-embed-tokens.md:38-39`: the assistant can switch
+  embedding on with approval, set each filter's mode with approval and
+  withdraw every token with a confirm; it still never signs a token and never
+  sees one or the secret. The customer's server signs it; the copyable snippet
+  is in Share > Embed.
+- `CHANGELOG.md`: our name now shows on whole-dashboard embeds in a footer,
+  unless the address says `logo=none`. This is visible to customers whose
+  embeds are already live.
+
+
 ## 6. Review (planner appends below)
 
 
