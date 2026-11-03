@@ -24,6 +24,22 @@ import { fetchFrameOrigins, useEmbedHeight } from "./use-embed-height";
 /** BI-19 part A: the same words as the public page, for a link that does not work. */
 const LINK_GONE = "This link does not work";
 
+/**
+ * Our name in an embed (`BI-26` decision 4, slice 2 D1). It shows in both
+ * frames unless the address says `logo=none`; a public link is linked, a
+ * signed token has no address to link to, so it stays plain text as in the
+ * single-chart frame.
+ */
+function EmbedName({ look, linkBase }: { look: EmbedLook; linkBase: string }) {
+  if (!look.showName) return null;
+  return linkBase ? (
+    <a href={linkBase} target="_blank" rel="noopener noreferrer"
+       className="text-[10px] font-medium text-muted-foreground hover:text-foreground">Rantai Lake ↗</a>
+  ) : (
+    <span className="text-[10px] font-medium text-muted-foreground">Rantai Lake</span>
+  );
+}
+
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
   board: { id: string; name: string; theme?: string; font?: string };
@@ -178,12 +194,7 @@ export function EmbedView({
           <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
             <p className="min-w-0 flex-1 truncate text-sm font-semibold">{spec?.title ?? "…"}</p>
             {/* BI-26 (D6, decision 4): `logo=none` hides our name. */}
-            {!look.showName ? null : linkBase ? (
-              <a href={linkBase} target="_blank" rel="noopener noreferrer"
-                 className="text-[10px] font-medium text-muted-foreground hover:text-foreground">Rantai Lake ↗</a>
-            ) : (
-              <span className="text-[10px] font-medium text-muted-foreground">Rantai Lake</span>
-            )}
+            <EmbedName look={look} linkBase={linkBase} />
           </div>
           <div className="min-h-0 flex-1 p-2">
             {spec ? <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} loadMap={loadMap} /> : null}
@@ -207,7 +218,7 @@ export function EmbedView({
 
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className={cn("min-h-screen bg-transparent p-2", boardLook.className, look.transparent && "!bg-transparent")} style={boardLook.style}>
+    <div className={cn("min-h-screen p-2", boardLook.className, look.transparent ? "!bg-transparent" : "bg-background")} style={boardLook.style}>
       <div ref={measured}>
       {jwt && data?.embedFilters?.length ? (
         <EmbedFilterBar jwt={jwt} filters={data.embedFilters} onChange={setViewerFilters} />
@@ -225,6 +236,11 @@ export function EmbedView({
             tabs={data?.tabs} tab={tab} phone={data?.phoneLayout} foldKey={data?.board.id} />
         </>
       )}
+      {/* BI-26 slice 2 D1: the footer is inside the measured root, so the height
+          message includes it. */}
+      <footer className="mt-2 flex justify-end border-t border-border pt-1.5">
+        <EmbedName look={look} linkBase={linkBase} />
+      </footer>
       </div>
     </div>
     </ReportingProvider>
