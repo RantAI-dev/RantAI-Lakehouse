@@ -87,6 +87,19 @@ describe("ChatMessages (RantAI-Agents layout)", () => {
     expect(view.getByText("Checking the catalog")).toBeDefined()
     expect(view.getByText("Running Search datasets…")).toBeDefined()
   })
+
+  it('shows a stopped answer as "Response stopped.", not the line the model is sent (BI-41 D3)', () => {
+    const stopped: Msg[] = [
+      { id: "u1", role: "user", content: "How many events?" },
+      { id: "a1", role: "assistant", content: "", stopped: true },
+    ]
+    // AI-24 D6 moved the streaming part onto its own context, so the list no
+    // longer mounts without it; this case still renders the list alone.
+    const { container } = renderMessages({ messages: stopped, busy: false })
+    const view = within(container)
+    expect(view.getByText("Response stopped.")).toBeDefined()
+    expect(container.textContent).not.toContain("The person stopped this answer")
+  })
 })
 
 const ASK_STEP = {
