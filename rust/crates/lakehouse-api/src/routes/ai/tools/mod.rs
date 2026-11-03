@@ -234,7 +234,7 @@ pub(in crate::routes) async fn run_tool(
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
         "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,
         "delete_alert_rule" => alerts::delete_alert_rule(state, principal, args).await,
-        "run_alert_rule" => alerts::run_alert_rule(state, args).await,
+        "run_alert_rule" => alerts::run_alert_rule(state, principal, args).await,
         n if comments::handles(n) => {
             comments::list_dashboard_comments(state, principal, args).await
         }

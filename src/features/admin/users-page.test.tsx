@@ -32,6 +32,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { TableProviders } from "@/components/app-shell/table-providers"
+import type { User } from "@/services"
 import { UsersPage } from "./users-page"
 
 const originalFetch = global.fetch
@@ -39,6 +40,8 @@ const originalFetch = global.fetch
 type FetchCall = {
   url: string
   method: string
+  /** The request body, when there was one (ADM-4 D1's role change). */
+  body?: string
 }
 
 let fetchCalls: FetchCall[] = []
@@ -51,15 +54,57 @@ let fetchCalls: FetchCall[] = []
 const TEMPORARY_PASSWORD = "test-only-temporary-password"
 const RESET_PASSWORD = "test-only-reset-password"
 
-const ROW = {
+// The row every test starts from. Typed as the contract's `User` so a test
+// can flip `status` (ADM-4 D3's inactive user) without widening a literal.
+const ROW: User = {
   id: "11111111-1111-4111-8111-000000000001",
   name: "Rina Wijaya",
   email: "rina@meridian.example",
-  status: "active" as const,
+  status: "active",
   roles: ["Analyst"],
   tenants: ["Meridian Retail"],
   lastActivity: null,
 }
+
+/**
+ * The roles that exist (ADM-4 D7: the role editor offers every role the
+ * deployment has, not only the ones this user holds).
+ */
+const ROLES = [
+  {
+    id: "22222222-2222-4222-8222-000000000001",
+    name: "Analyst",
+    members: 24,
+    permissions: "query:read",
+    description: "Read governed data.",
+  },
+  {
+    id: "22222222-2222-4222-8222-000000000002",
+    name: "Approver",
+    members: 4,
+    permissions: "agent:approve",
+    description: "Approve agent actions.",
+  },
+]
+
+/**
+ * The tenants that exist (ADM-4 D2/D7: the user carries tenant NAMES,
+ * and the route needs the id behind each one).
+ */
+const TENANTS = [
+  {
+    id: "11111111-1111-4111-8111-000000000002",
+    name: "Meridian Retail",
+    slug: "meridian-retail",
+    plan: "Enterprise",
+    residency: "Jakarta (ID)",
+    users: 3,
+    agents: 0,
+    storageBytes: 0,
+    quotaCompute: 0,
+    usedCompute: 0,
+  },
+]
 
 afterEach(() => {
   // Same caveat as `sessions-page.test.tsx`: testing-library v16 stopped
@@ -93,17 +138,34 @@ function jsonResponse(body: unknown, status = 200): Response {
  *                                  the invite and reset actions are
  *                                  enabled)
  * - GET  /api/identity/users     → the table's list call
+ * - GET  /api/identity/roles     → the role editor's list (ADM-4 D7)
+ * - GET  /api/identity/tenants   → the tenant remover's list (ADM-4 D2)
  * - POST /api/identity/users     → the invite; the response carries the
  *                                  server-generated temporary password
  * - POST /api/identity/users/{id}/reset-password
  *                                → the reset; the response carries a
  *                                  NEW temporary password
+ * - PUT  /api/identity/users/{id}/roles
+ *                                → the role change (ADM-4 D1)
+ * - DELETE /api/identity/users/{id}/tenants/{tenant_id}
+ *                                → the tenant removal (ADM-4 D2)
+ * - POST /api/identity/users/{id}/deactivate and /reactivate
+ *                                → the status switch (ADM-4 D3)
  *
  * Other paths return an empty 200 so a stray fetch from a future
  * contributor surfaces in the failure message rather than a swallowed
  * `undefined`.
  */
-function setupFetch(opts: { inviteStatus?: number; resetStatus?: number }): void {
+function setupFetch(opts: {
+  inviteStatus?: number
+  resetStatus?: number
+  rolesStatus?: number
+  tenantsStatus?: number
+  setRolesStatus?: number
+  deactivateStatus?: number
+  row?: typeof ROW
+} = {}): void {
+  const row = opts.row ?? ROW
   fetchCalls = []
   global.fetch = mock(
     async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -114,7 +176,11 @@ function setupFetch(opts: { inviteStatus?: number; resetStatus?: number }): void
             ? input.toString()
             : input.url
       const method = init?.method ?? "GET"
-      fetchCalls.push({ url, method })
+      fetchCalls.push({
+        url,
+        method,
+        body: init?.body === undefined ? undefined : String(init.body),
+      })
 
       if (url.includes("/api/auth/me")) {
         return jsonResponse({
@@ -125,6 +191,50 @@ function setupFetch(opts: { inviteStatus?: number; resetStatus?: number }): void
           permissions: ["identity:write", "*:*"],
           tenants: [{ id: "t1", name: "Acme", slug: "acme" }],
         })
+      }
+
+      // ADM-4 D1: the role change. The body carries the user's COMPLETE
+      // role set, so the answer echoes it back.
+      if (method === "PUT" && url.includes("/roles")) {
+        const status = opts.setRolesStatus ?? 200
+        if (status >= 400) {
+          return jsonResponse({ error: "role change failed" }, status)
+        }
+        const body = JSON.parse(String(init?.body ?? "{}")) as { roles?: string[] }
+        return jsonResponse({ ...row, roles: body.roles ?? row.roles }, status)
+      }
+
+      // ADM-4 D2: the tenant removal. The answer no longer lists the
+      // tenant.
+      if (method === "DELETE" && url.includes("/tenants/")) {
+        return jsonResponse({ ...row, tenants: [] }, 200)
+      }
+
+      // ADM-4 D3: the status switch.
+      if (method === "POST" && url.endsWith("/deactivate")) {
+        const status = opts.deactivateStatus ?? 200
+        if (status >= 400) {
+          return jsonResponse({ error: "deactivate failed" }, status)
+        }
+        return jsonResponse({ ...row, status: "inactive" }, status)
+      }
+      if (method === "POST" && url.endsWith("/reactivate")) {
+        return jsonResponse({ ...row, status: "active" }, 200)
+      }
+
+      if (method === "GET" && url.includes("/api/identity/roles")) {
+        const status = opts.rolesStatus ?? 200
+        if (status >= 400) {
+          return jsonResponse({ error: "roles failed" }, status)
+        }
+        return jsonResponse(ROLES, status)
+      }
+      if (method === "GET" && url.includes("/api/identity/tenants")) {
+        const status = opts.tenantsStatus ?? 200
+        if (status >= 400) {
+          return jsonResponse({ error: "tenants failed" }, status)
+        }
+        return jsonResponse(TENANTS, status)
       }
 
       if (method === "POST" && url.endsWith("/reset-password")) {
@@ -147,7 +257,7 @@ function setupFetch(opts: { inviteStatus?: number; resetStatus?: number }): void
       }
 
       if (url.includes("/api/identity/users")) {
-        return jsonResponse([ROW])
+        return jsonResponse([row])
       }
 
       return new Response("{}", { status: 200 })
@@ -188,6 +298,13 @@ async function resetPassword() {
   // a bare `fireEvent.click` is dropped as a stray mouse click.
   fireEvent.pointerDown(screen.getByRole("button", { name: /user actions/i }))
   const item = await screen.findByRole("menuitem", { name: /reset password/i })
+  fireEvent.click(item)
+}
+
+/** Open the row actions menu and click the item whose name matches. */
+async function openRowAction(name: RegExp) {
+  fireEvent.pointerDown(screen.getByRole("button", { name: /user actions/i }))
+  const item = await screen.findByRole("menuitem", { name })
   fireEvent.click(item)
 }
 
@@ -303,5 +420,112 @@ describe("UsersPage reset password (a new password shown once)", () => {
       expect(posts.length).toBeGreaterThan(0)
     })
     expect(screen.queryByTestId("revealed-password")).toBeNull()
+  })
+})
+
+describe("UsersPage edit roles (ADM-4 D1/D7)", () => {
+  it("the role editor lists every role, ticks the ones the user holds, and saves the whole set", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await openRowAction(/edit roles/i)
+
+    // The editor offers every role the deployment has...
+    const analyst = await screen.findByLabelText("Analyst")
+    const approver = await screen.findByLabelText("Approver")
+    // ...with the ones the user already holds ticked.
+    expect(analyst.getAttribute("aria-checked")).toBe("true")
+    expect(approver.getAttribute("aria-checked")).toBe("false")
+
+    fireEvent.click(approver)
+    fireEvent.click(screen.getByRole("button", { name: /save roles/i }))
+
+    await waitFor(() => {
+      const put = fetchCalls.find(
+        (c) => c.method === "PUT" && c.url.endsWith(`/api/identity/users/${ROW.id}/roles`)
+      )
+      expect(put).toBeDefined()
+      // The body carries the user's COMPLETE role set, not a delta.
+      expect(JSON.parse(put?.body ?? "{}")).toEqual({ roles: ["Analyst", "Approver"] })
+    })
+  })
+
+  it("a failed role change leaves the dialog open", async () => {
+    setupFetch({ setRolesStatus: 500 })
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await openRowAction(/edit roles/i)
+    await screen.findByLabelText("Analyst")
+    fireEvent.click(screen.getByRole("button", { name: /save roles/i }))
+
+    await waitFor(() => {
+      const puts = fetchCalls.filter(
+        (c) => c.method === "PUT" && c.url.includes("/roles")
+      )
+      expect(puts.length).toBeGreaterThan(0)
+    })
+    expect(screen.getByRole("button", { name: /save roles/i })).toBeDefined()
+  })
+})
+
+describe("UsersPage remove from tenant (ADM-4 D2/D7)", () => {
+  it("the tenant remover names the user's tenants and removes the one pressed", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await openRowAction(/remove from tenant/i)
+
+    const remove = await screen.findByRole("button", { name: "Remove" })
+    fireEvent.click(remove)
+
+    await waitFor(() => {
+      const del = fetchCalls.find(
+        (c) =>
+          c.method === "DELETE" &&
+          c.url.endsWith(
+            `/api/identity/users/${ROW.id}/tenants/${TENANTS[0].id}`
+          )
+      )
+      expect(del).toBeDefined()
+    })
+  })
+})
+
+describe("UsersPage deactivate and reactivate (ADM-4 D3/D7)", () => {
+  it("deactivating asks for confirmation first, and then switches the user off", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await openRowAction(/deactivate/i)
+
+    // The confirmation comes first: nothing is called before it.
+    const confirm = await screen.findByRole("button", { name: "Deactivate" })
+    expect(
+      fetchCalls.some((c) => c.method === "POST" && c.url.endsWith("/deactivate"))
+    ).toBe(false)
+
+    fireEvent.click(confirm)
+    await waitFor(() => {
+      const post = fetchCalls.find(
+        (c) => c.method === "POST" && c.url.endsWith(`/api/identity/users/${ROW.id}/deactivate`)
+      )
+      expect(post).toBeDefined()
+    })
+  })
+
+  it("an inactive user is offered Reactivate instead", async () => {
+    setupFetch({ row: { ...ROW, status: "inactive" } })
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await openRowAction(/reactivate/i)
+
+    const confirm = await screen.findByRole("button", { name: "Reactivate" })
+    fireEvent.click(confirm)
+    await waitFor(() => {
+      const post = fetchCalls.find(
+        (c) => c.method === "POST" && c.url.endsWith(`/api/identity/users/${ROW.id}/reactivate`)
+      )
+      expect(post).toBeDefined()
+    })
   })
 })

@@ -52,6 +52,7 @@
 
 use std::time::Duration;
 
+use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 use lakehouse_bi::filters::FilterDef;
 use lakehouse_bi::specs::ChartKind;
@@ -549,6 +550,12 @@ fn email_failure_reason(error: Option<&str>) -> &'static str {
         Some(e) if e == F::MailServerRefused.message() => {
             "The email was not sent: the mail server refused the message."
         }
+        // `SEC-56` D7: a failed handshake has its own sentence, so the
+        // owner is told to look at `SMTP_CA_FILE` and `SMTP_HOST` rather
+        // than at a relay that "could not be reached".
+        Some(e) if e == F::MailServerTlsFailed.message() => {
+            "The email was not sent: a secure connection to the mail server could not be made."
+        }
         _ => "The email was not sent.",
     }
 }
@@ -761,7 +768,10 @@ async fn is_empty_report(
     // stayed skipped. The emptiness check always reads fresh.
     let query = DashboardQuery::for_render(&sub.board, values.filters, values.params, values.grain)
         .fresh_all();
-    let payload = payload_for(state, owner, &query)
+    // `SEC-50` slice 2 S6: the report runner acts as the subscription's
+    // owner, so the report shows the owner's own data — their first tenant,
+    // because the runner sends no `X-Tenant` header.
+    let payload = payload_for(state, owner, &query, &HeaderMap::new())
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
     Ok(every_data_chart_is_empty(&payload))
@@ -979,7 +989,24 @@ impl Collected<'_> {
             (&wanted.format, &wanted.values),
             self.values,
         );
-        let file = match build_chart_file(self.state, self.owner, &query, false).await {
+        let file = match build_chart_file(
+            self.state,
+            self.owner,
+            &query,
+            false,
+            // `SEC-50` slice 2 S6: the report runner acts as the
+            // subscription's owner, so the file shows the owner's own data —
+            // their first tenant, because the runner sends no `X-Tenant`.
+            &crate::routes::query::StatementGate::clickhouse(
+                self.state,
+                crate::routes::query::GateActor::Caller {
+                    principal: self.owner,
+                    headers: &HeaderMap::new(),
+                },
+            ),
+        )
+        .await
+        {
             Ok(file) => file,
             Err(ApiError::NotFound(_) | ApiError::BadRequest(_)) => {
                 self.files.left_out.push(
@@ -1759,6 +1786,12 @@ mod tests {
         assert_eq!(
             email_failure_reason(Some(F::MailServerRefused.message())),
             "The email was not sent: the mail server refused the message."
+        );
+        // `SEC-56` D7: the TLS failure has its own sentence, so the owner
+        // is told to look at `SMTP_CA_FILE` and `SMTP_HOST`.
+        assert_eq!(
+            email_failure_reason(Some(F::MailServerTlsFailed.message())),
+            "The email was not sent: a secure connection to the mail server could not be made."
         );
         assert_eq!(
             email_failure_reason(Some(F::EmailNotConfigured.message())),

@@ -882,11 +882,22 @@ impl OidcAuthenticator {
     /// account with two linked identities, not two accounts with the same
     /// email.
     ///
+    /// # A deactivated account is NOT re-provisioned (ADM-4 D4)
+    ///
+    /// An `app_user` with the same email but `status = 'inactive'` is a
+    /// person an administrator deliberately switched off. Re-provisioning
+    /// would create a SECOND, active account with the same email — a way
+    /// to walk around the deactivation with nothing but the identity
+    /// provider. So the sign-in is refused instead: the same
+    /// [`AuthError::InvalidCredentials`] every other failure here answers
+    /// with, so nothing about the account's state leaks.
+    ///
     /// # Errors
     ///
-    /// Returns [`AuthError::Conflict`] on an email race (two concurrent
-    /// first-time logins), or [`AuthError::Database`] on any other storage
-    /// failure.
+    /// Returns [`AuthError::InvalidCredentials`] if the email belongs to a
+    /// deactivated account, [`AuthError::Conflict`] on an email race (two
+    /// concurrent first-time logins), or [`AuthError::Database`] on any
+    /// other storage failure.
     async fn provision_user(&self, claims: &OidcClaims) -> Result<Uuid, AuthError> {
         let email = claims.email.clone().unwrap_or_else(|| {
             format!("{}@{}.oidc.invalid", claims.sub, self.config.provider_name)
@@ -895,12 +906,17 @@ impl OidcAuthenticator {
 
         let mut tx = self.pool.begin().await?;
 
-        let existing_user: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        let existing_user: Option<(Uuid, String)> =
+            sqlx::query_as("SELECT id, status FROM app_user WHERE email = $1")
                 .bind(&email)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let app_user_id = if let Some((id,)) = existing_user {
+        let app_user_id = if let Some((id, status)) = existing_user {
+            // ADM-4 D4: a deactivated account is refused, never
+            // re-provisioned — and the row is left exactly as it is.
+            if status != "active" {
+                return Err(AuthError::InvalidCredentials);
+            }
             id
         } else {
             let (id,): (Uuid,) =

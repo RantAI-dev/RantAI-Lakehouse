@@ -60,6 +60,22 @@ export const opsService = clickhouseOpsService
 // Postgres. Every contract method is served, so mock/identity.ts has been
 // deleted.
 export const identityService = postgresIdentityService
+/**
+ * The identity directory's shapes (ADM-4). The contract owns them, and
+ * they are exported here so a feature imports them from `@/services` and
+ * not from `services/contracts/identity` directly (`PR #199 review M
+ * SHOULD-FIX BI-16 7`).
+ */
+export type {
+  InviteUserInput,
+  InviteUserResponse,
+  ResetPasswordResponse,
+  Role,
+  ServiceIdentity,
+  SetUserRolesInput,
+  Tenant,
+  User,
+} from "./contracts/identity"
 // Connectors is now real — connector definitions (CRUD + testConnection) live
 // in Postgres (Task 2.7). Credentials are NEVER stored or returned: only the
 // `secretRef` (a reference, e.g. "env:FOO"); see

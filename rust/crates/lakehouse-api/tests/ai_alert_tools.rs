@@ -152,9 +152,23 @@ async fn fixture(permissions: &str, chart_visible: bool) -> (Fixture, Uuid) {
         .respond_with(fake.clone())
         .mount(&ch)
         .await;
-    let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    // `SEC-50` slice 2 M11: the save now gates a mart or metric rule's
+    // statement as the saving person, and the seeded migration creates
+    // several tenants, so the shared catalog belongs to none of them unless
+    // the deployment names it. These tests are about the console's own
+    // sentences, not the gate: the deployment names the catalog's tenant and
+    // the person is in it, so the gate asks the same question the save
+    // already answered.
+    let env: HashMap<String, String> = HashMap::from([
+        ("CH_URL".to_owned(), ch.uri()),
+        (
+            "CATALOG_TENANT_ID".to_owned(),
+            common::CATALOG_TENANT.to_owned(),
+        ),
+    ]);
     let app = spin_up_with_env(&env).await;
     let user = create_principal_with_permissions(&app.pool, permissions).await;
+    common::in_the_catalog_tenant(&app.pool, user).await;
     let fixture = Fixture {
         app,
         fake,

@@ -87,6 +87,20 @@ export type ResetPasswordResponse = {
   temporaryPassword: string
 }
 
+/**
+ * What `PUT /api/identity/users/{id}/roles` takes (ADM-4 D1).
+ *
+ * The list is the user's COMPLETE local role set, not a delta: what the
+ * user holds after the call is exactly what this names. Roles mapped
+ * from an identity provider's groups are not stored and are not part of
+ * it — the server re-resolves those from the provider's claims on every
+ * request, and the user keeps the union of the two.
+ */
+export type SetUserRolesInput = {
+  /** Role names. An empty list leaves the user with no local role. */
+  roles: string[]
+}
+
 export type CreateRoleInput = {
   name: string
   permissions: string
@@ -150,4 +164,35 @@ export interface IdentityService {
     id: string,
     signal?: AbortSignal
   ): Promise<ResetPasswordResponse>
+  /**
+   * Replace a user's local role set (ADM-4 D1).
+   *
+   * `roles` is the user's COMPLETE set of local role names, not a delta:
+   * a role left out of the list is a role the user no longer holds. The
+   * server refuses an unknown role name, and refuses the change when it
+   * would leave the deployment without an active administrator.
+   */
+  setUserRoles(
+    id: string,
+    roles: string[],
+    signal?: AbortSignal
+  ): Promise<User>
+  /**
+   * Take a user out of a tenant (ADM-4 D2) — the counterpart of giving
+   * one to a tenant.
+   */
+  removeUserFromTenant(
+    id: string,
+    tenantId: string,
+    signal?: AbortSignal
+  ): Promise<User>
+  /**
+   * Switch a user off (ADM-4 D3): they can no longer sign in, and every
+   * session they hold ends at once. Their data stays.
+   */
+  deactivateUser(id: string, signal?: AbortSignal): Promise<User>
+  /**
+   * Switch a user back on (ADM-4 D3).
+   */
+  reactivateUser(id: string, signal?: AbortSignal): Promise<User>
 }

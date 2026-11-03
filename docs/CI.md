@@ -293,7 +293,7 @@ one JSON file, and that is what `lakehousectl` reads (REL-2 S2 D3a).
 |---|---|
 | `push` of a `v*` tag | The real release: the four images go to `ghcr.io/rantai-dev`, the manifest is signed with the release key, and a **draft** GitHub Release is created |
 | `workflow_dispatch` | The dry run |
-| `pull_request` on `.github/workflows/release.yml`, `ops/release/**`, `Dockerfile.frontend`, `rust/Dockerfile`, `dagster/Dockerfile`, `ops/oidc-mock/**` | The dry run |
+| `pull_request` on `.github/workflows/release.yml`, `ops/release/**`, `Dockerfile.frontend`, `.dockerignore`, `rust/Dockerfile`, `dagster/Dockerfile`, `ops/oidc-mock/**` | The dry run |
 
 The real job never runs for a pull request: it is gated on a tag push, and it is the only
 job in this repository that can see the release key.
