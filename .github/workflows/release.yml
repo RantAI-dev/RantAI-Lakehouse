@@ -664,24 +664,33 @@ jobs:
       #
       # The release attaches the bundle in PARTS, because GitHub refuses
       # an asset of 2 GiB or more (REL-7 D1) — and the dry run never
-      # caught the size limit, because it builds the bundle but uploads
+      # caught the size limit, because it builds the bundle but attaches
       # it as a workflow artifact and no release asset. So the dry run
-      # splits the bundle it built, joins the parts back in name order,
-      # and compares the joined file's checksum with the one
-      # `make_bundle.sh` wrote. A split that does not round-trip fails
-      # here, and no release is cut from it.
+      # splits the bundle it built, checks the parts against a
+      # `SHA256SUMS` of its own, joins them in name order, and checks
+      # the joined file against the `.sha256` the bundle script wrote.
+      #
+      # These are the OPERATOR'S commands (REL-7 D2, the join in
+      # docs/OPERATIONS.md), run on the release's own naming: a dry run
+      # that joined its parts some other way would prove a join nobody
+      # performs. A split that does not round-trip fails here, and no
+      # release is cut from it.
       - name: The bundle splits into parts and joins back to the same bytes
         run: |
           set -euo pipefail
           bundle="dist/rantai-lakehouse-${{ steps.version.outputs.version }}-linux-x86_64.tar.zst"
+          name="$(basename "$bundle")"
           parts_dir="$RUNNER_TEMP/bundle-parts"
+          rm -rf "$parts_dir"
           mkdir -p "$parts_dir"
           # The SAME command the release job runs: the part size and the
           # suffix padding are the release's contract with the operator's
           # join (REL-7 D2), so the dry run proves this command and no
-          # other.
-          split -b 1900M -d -a 2 "$bundle" "$parts_dir/$(basename "$bundle").part-"
-          parts=("$parts_dir/$(basename "$bundle").part-"*)
+          # other. The checksum file is copied whole, because it is the
+          # asset the operator checks the joined file against.
+          split -b 1900M -d -a 2 "$bundle" "$parts_dir/$name.part-"
+          cp "$bundle.sha256" "$parts_dir/"
+          parts=("$parts_dir/$name.part-"*)
           echo "the bundle is ${#parts[@]} part(s):"
           for part in "${parts[@]}"; do
             part_size="$(wc -c < "$part")"
@@ -693,17 +702,22 @@ jobs:
               exit 1
             fi
           done
-          # The join, in NAME order: `-d` numbers the parts, so the
-          # glob's sorted expansion is the order `cat` must read them in.
-          joined="$RUNNER_TEMP/bundle-joined.tar.zst"
-          cat "${parts[@]}" > "$joined"
-          recorded="$(awk '{print $1}' "$bundle.sha256")"
-          actual="$(sha256sum "$joined" | awk '{print $1}')"
-          if [ "$actual" != "$recorded" ]; then
-            echo "::error::the joined bundle is $actual, and make_bundle.sh recorded $recorded" >&2
-            exit 1
-          fi
-          echo "the joined bundle matches $bundle.sha256 ($actual)"
+          # The parts' checksums, written the way the release job writes
+          # them into the release's `SHA256SUMS`.
+          (
+            cd "$parts_dir"
+            sha256sum ./"$name".part-* > SHA256SUMS
+            cat SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          # The join, in NAME order: `-d` numbers the parts and `-a 2`
+          # pads them, so the glob's sorted expansion is the byte order.
+          (
+            cd "$parts_dir"
+            cat ./"$name".part-* > "$name"
+            sha256sum -c "$name.sha256"
+          )
+          echo "the joined bundle matches $bundle.sha256"
 
       # The rendered Compose file must be a file compose accepts: the
       # env values are throwaway, because the template has no default
