@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import { ToolStepCard, boardFromPath, toolLabel } from "./tool-step"
+import { ToolStepCard, boardFromPath, exportLink, toolLabel } from "./tool-step"
 import type { ToolStep } from "./tool-step"
 
 afterEach(cleanup)
@@ -31,6 +31,29 @@ describe("boardFromPath reads the board the page is showing", () => {
 
   it("decodes a percent-encoded board id", () => {
     expect(boardFromPath("/dashboards/board%20one")).toBe("board one")
+  })
+})
+
+describe("an export step links only to the console's own downloads", () => {
+  // BI-37 D7: the dashboard file is a link like the PDF and the chart data, and
+  // the card must never turn any other string into one.
+  it("admits the PDF, the chart data and the dashboard file, and nothing else", () => {
+    const step = (url: string) => exportLink("export_dashboard", { url, fileName: "f" })
+    expect(step("/api/dashboard/export/pdf?board=b1&paper=a4")).not.toBeNull()
+    expect(step("/api/dashboard/export?format=file&board=b1")).not.toBeNull()
+    expect(exportLink("export_chart", { url: "/api/dashboard/chart-export?chart=c1&format=png" })).not.toBeNull()
+    for (const url of [
+      "/api/dashboard/export?format=yaml",
+      "/api/dashboard/export?board=b1",
+      "https://evil.example/api/dashboard/export/pdf?board=b1",
+      "/api/alerts?id=1",
+    ]) {
+      expect(step(url)).toBeNull()
+    }
+  })
+
+  it("is not the card of any other tool", () => {
+    expect(exportLink("list_dashboard_comments", { url: "/api/dashboard/export/pdf?board=b1" })).toBeNull()
   })
 })
 
