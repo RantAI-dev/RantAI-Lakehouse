@@ -269,3 +269,47 @@ folder-only result).
 - **Already on `main`, not caused here:** `bun test src/features/copilot` alone has 3 fails, from the `mock.module("next/navigation")` leak in `use-copilot.test.tsx`. It reproduces without this PR, so it is filed as a backlog item (a test isolation fix).
 
 **Open: no BLOCKER, no SHOULD-FIX.** The merge waits for the PR's CI.
+
+## Handoff (merge main, 2026-11-03)
+
+Developer. Merge commit `0c8cb1ea`, pushed to
+`fix/bi-41-assistant-qa-findings` (never rebased, never force-pushed).
+`origin/main` was `388936b` (`Merge pull request #357 … bi-37-assistant-alerts-files-comments`);
+the merge base was `a081fea`.
+
+**One conflict, resolved hunk by hunk** (`--ours`/`--theirs` never used):
+`rust/crates/lakehouse-api/src/routes/ai/prompt.rs`, one physical string line
+inside `SYSTEM_BUILD_SUFFIX`.
+
+- Export sentence: base and BI-41 were identical; main added the JSON-file
+  export (`format file`) and the chart image (`format png`). Main's sentence
+  kept whole.
+- Cache rule: base and main were identical; BI-41 added the chart-id
+  guidance, the `ask_user` options for a page with several charts, and the
+  `NEXT:` case for a drafted object's cache rule. BI-41's sentence kept
+  whole (the base sentence would have dropped it).
+- No sentence was rewritten to say something new, so no product decision
+  was needed. BI-41's other auto-merged prompt change (the `NEXT:` line
+  covering a change to the drafted object) is intact.
+- `CHANGELOG.md` did not conflict; both sides' entries are present and
+  BI-41's line sits under `## [Unreleased]`.
+- No prompt snapshot test asserts these sentences and
+  `tests/fixtures/tool_schemas.json` merged cleanly, so nothing was
+  regenerated.
+
+**Commands run, on the merge commit, foreground:**
+
+- `cd rust && cargo fmt --check` — pass.
+- `/home/shiro/bin/cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings` — pass, finished in 5m 26s.
+- `/home/shiro/bin/cargo-locked test -p lakehouse-api` — 105 suites, **7201 passed, 0 failed, 43 ignored** (up from 7021 passed across 97 suites at the review, because main's suites came along).
+- `bun install --frozen-lockfile` — 739 packages (this worktree had no `node_modules` again).
+- `bun run typecheck` — pass.
+- `bun run test` — **3178 pass, 1 skip, 0 fail** across 325 files (8629 `expect()` calls).
+- `git status` before committing — only the merge's own staged entries, nothing generated.
+
+**Not verified, and why:** `cargo clippy/test --workspace` (the machine rule
+scopes cargo to the touched crate; CI runs the workspace), dagster pytest
+and `docker compose config`/`up` (no Python under `dagster/`, no compose
+change in this slice). The `bun test src/features/copilot` alone red under
+`mock.module("next/navigation")` noted in section 5 is unchanged by this
+merge: the full `bun run test` is green, and that fix is its own backlog item.
