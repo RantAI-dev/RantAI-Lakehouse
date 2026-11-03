@@ -433,8 +433,19 @@ async fn ask_mode_refuses_and_an_unconfirmed_call_names_the_chart_and_condition(
 
 /// D4 (verified, not changed): `run_alert_rule` on a chart rule surfaces the
 /// runner's own reason as it is, and adds no second sentence.
+///
+/// `BI-40`: a chart rule is evaluated now. `run_alert_rule` goes through
+/// `routes::alerts::run_one`, which reads a chart rule as its owner, so the
+/// old skip sentence (`CHART_SKIPPED`: "chart alerts are evaluated by
+/// /api/alerts/run") is gone and the reason is the one the reading gives.
+/// This test's fake chart has no usable result, so that reason is
+/// `lakehouse_alerts::chart_number`'s own sentence.
 #[tokio::test]
 async fn running_a_chart_rule_surfaces_the_runners_own_reason() {
+    /// `lakehouse_alerts::chart_number`'s own sentence. It is an inline
+    /// literal in that crate, not a `pub` const, so it is copied here: a
+    /// change there must fail this test rather than be silently accepted.
+    const SERIES_NOT_IN_CHART: &str = "the series is not in the chart's result.";
     let (f, person) = fixture("dashboard:read, alert:write", true).await;
     let me = person.to_string();
     f.fake.held.lock().unwrap().rule = Some(rule_row(CHART, &me, &f.email));
@@ -447,11 +458,45 @@ async fn running_a_chart_rule_surfaces_the_runners_own_reason() {
     )
     .await;
     assert_eq!(body["outcome"], "executed", "{body}");
-    let skipped = body["result"]["results"][0]["skipped"]
-        .as_str()
-        .unwrap_or_default();
+    let item = &body["result"]["results"][0];
+    let skipped = item["skipped"].as_str().unwrap_or_default();
+    // Equal, not `starts_with`: the whole sentence is the runner's, and the
+    // tool appends nothing to it (D4).
+    assert_eq!(
+        skipped, SERIES_NOT_IN_CHART,
+        "the runner's own reason: {body}"
+    );
+    // No sentence of the assistant's own: the answer is the runner's `ran`
+    // count and its results, and each result carries only the runner's fields.
+    let keys = |value: &Value| -> Vec<String> {
+        value
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let mut top = keys(&body);
+    top.sort();
+    assert_eq!(
+        top,
+        ["outcome", "result", "tool"],
+        "the tool adds no text of its own to the answer: {body}"
+    );
+    let mut result = keys(&body["result"]);
+    result.sort();
+    assert_eq!(
+        result,
+        ["ran", "results"],
+        "the tool adds no note beside the runner's results: {body}"
+    );
+    let mut fields = keys(item);
+    fields.sort();
+    assert_eq!(
+        fields,
+        ["fired", "id", "name", "skipped", "type"],
+        "the result is the runner's, with no extra field: {body}"
+    );
     assert!(
-        skipped.starts_with("chart alerts are evaluated by /api/alerts/run"),
-        "the runner's own reason, as it is: {body}"
+        !body.to_string().contains("chart alerts are evaluated by"),
+        "`BI-40` removed the old skip sentence; it is not repeated here: {body}"
     );
 }
