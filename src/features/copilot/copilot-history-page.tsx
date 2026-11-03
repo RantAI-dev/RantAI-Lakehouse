@@ -18,8 +18,8 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback";
 import { groupSessions, plainPreview } from "@/lib/copilot-sessions";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
+import { chatSessionService } from "@/services";
 import { toServiceError } from "@/services/errors";
-import { apiFetch } from "@/services/http";
 import { SessionActionsMenu, SessionModeIcon } from "./session-parts";
 import { useCopilot, type SessionMeta } from "./use-copilot";
 
@@ -35,13 +35,16 @@ type SessionPage = {
 };
 
 async function fetchSessions(q: string, mode: ModeFilter, offset: number): Promise<SessionPage> {
-  const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
-  if (q) params.set("q", q);
-  if (mode !== "all") params.set("mode", mode);
-  const res = await apiFetch(`/api/ai/sessions?${params.toString()}`, { cache: "no-store" });
-  const json = await res.json();
-  if (!res.ok) throw new Error(json?.error ?? "Failed to load conversations");
-  return json as SessionPage;
+  const page = await chatSessionService.list({
+    limit: PAGE_SIZE,
+    offset,
+    ...(q ? { q } : {}),
+    ...(mode !== "all" ? { mode } : {}),
+  });
+  const counts: SessionPage["counts"] = {};
+  if (page.counts.ask != null) counts.ask = page.counts.ask;
+  if (page.counts.build != null) counts.build = page.counts.build;
+  return { sessions: page.sessions, hasMore: page.hasMore, nextOffset: page.nextOffset, counts };
 }
 
 /**

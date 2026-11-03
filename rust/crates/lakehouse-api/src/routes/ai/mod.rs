@@ -1222,7 +1222,15 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     (
         [
             (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            // AI-24 D8: a reverse proxy in front of the API buffers a
+            // proxied response by default, which would hold the whole
+            // answer until the model finished. nginx honours this header,
+            // and `no-transform` asks any proxy not to re-encode the body.
+            (axum::http::header::CACHE_CONTROL, "no-cache, no-transform"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
         ],
         axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
     )
@@ -1917,6 +1925,66 @@ async fn session_detail(
     })))
 }
 
+/// The largest conversation body `sessions_save` stores. `ClickHouse` has no
+/// row-size limit of its own; this keeps one long conversation from being
+/// written back whole on every message.
+const MESSAGES_MAX_BYTES: usize = 200_000;
+
+/// The conversation body to store, at most `max` bytes.
+///
+/// `AI-24` D4: over the cap the bulk goes first, oldest message first. Each
+/// tool step keeps `tool`, `ok` and `args`, and its `result` — most of a long
+/// conversation's bytes — is replaced by `resultDropped: true` (the message's
+/// `reasoning` goes with it) until the body fits. That keeps the steps of the
+/// conversations people come back to, which the old trim dropped whole. Only
+/// when dropping the bulk is still not enough does the old trim apply
+/// (`role`, `content`, `buildRunId`, `chartCreated` only).
+fn fit_messages(messages: &[Value], max: usize) -> String {
+    let full = serde_json::to_string(messages).unwrap_or_else(|_| "[]".to_owned());
+    if full.len() <= max {
+        return full;
+    }
+    let mut kept = messages.to_vec();
+    for index in 0..kept.len() {
+        // Scoped so the mutable borrow ends before the body is measured.
+        let changed = {
+            let Some(obj) = kept[index].as_object_mut() else {
+                continue;
+            };
+            let mut changed = obj.remove("reasoning").is_some();
+            if let Some(Value::Array(tools)) = obj.get_mut("tools") {
+                for step in tools {
+                    let Some(step) = step.as_object_mut() else {
+                        continue;
+                    };
+                    if step.remove("result").is_some() {
+                        step.insert("resultDropped".to_owned(), Value::Bool(true));
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        };
+        if !changed {
+            continue;
+        }
+        let body = serde_json::to_string(&kept).unwrap_or_else(|_| "[]".to_owned());
+        if body.len() <= max {
+            return body;
+        }
+    }
+    let trimmed: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            json!({
+                "role": m.get("role"), "content": m.get("content"),
+                "buildRunId": m.get("buildRunId"), "chartCreated": m.get("chartCreated"),
+            })
+        })
+        .collect();
+    serde_json::to_string(&trimmed).unwrap_or_else(|_| "[]".to_owned())
+}
+
 /// `POST /api/ai/sessions` request body.
 #[derive(Debug, Default, Deserialize)]
 struct SaveSessionBody {
@@ -2031,19 +2099,7 @@ pub async fn sessions_save(
         derive_title(&messages)
     };
 
-    let mut json_body = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_owned());
-    if json_body.len() > 200_000 {
-        let trimmed: Vec<Value> = messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "role": m.get("role"), "content": m.get("content"),
-                    "buildRunId": m.get("buildRunId"), "chartCreated": m.get("chartCreated"),
-                })
-            })
-            .collect();
-        json_body = serde_json::to_string(&trimmed).unwrap_or_else(|_| "[]".to_owned());
-    }
+    let json_body = fit_messages(&messages, MESSAGES_MAX_BYTES);
 
     let mode = parsed.mode.unwrap_or_else(|| "ask".to_owned());
     write_session(
@@ -3347,5 +3403,95 @@ mod tests {
     #[test]
     fn esc_doubles_backslashes_and_quotes() {
         assert_eq!(esc("O'Brien\\x"), "O''Brien\\\\x");
+    }
+
+    /// One message with one tool step whose result carries `bytes` of text.
+    fn bulky_message(role: &str, bytes: usize) -> Value {
+        json!({
+            "role": role,
+            "content": "A short line about the numbers.",
+            "reasoning": "I looked at the catalog first.",
+            "tools": [{
+                "tool": "run_sql",
+                "args": { "sql": "SELECT count() FROM serving.mart_x" },
+                "ok": true,
+                "result": { "columns": [{ "name": "n" }], "rows": [{ "n": 5 }],
+                            "padding": "x".repeat(bytes) },
+            }],
+        })
+    }
+
+    #[test]
+    fn a_long_conversation_keeps_every_steps_tool_and_ok() {
+        let messages: Vec<Value> = (0..6).map(|_| bulky_message("assistant", 60_000)).collect();
+        assert!(
+            serde_json::to_string(&messages).unwrap().len() > 300_000,
+            "the fixture is over the cap to begin with"
+        );
+
+        let body = fit_messages(&messages, MESSAGES_MAX_BYTES);
+        assert!(body.len() <= MESSAGES_MAX_BYTES, "{} bytes", body.len());
+        let kept: Vec<Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(kept.len(), messages.len(), "no message is dropped");
+        for message in &kept {
+            let step = &message["tools"][0];
+            assert_eq!(step["tool"], "run_sql", "every step keeps its tool");
+            assert_eq!(step["ok"], true, "every step keeps its outcome");
+            assert!(step["args"]["sql"].is_string(), "and its arguments");
+            assert!(step.get("reasoning").is_none(), "reasoning goes first");
+        }
+    }
+
+    #[test]
+    fn the_newest_messages_of_a_long_conversation_keep_their_result() {
+        let messages: Vec<Value> = (0..6).map(|_| bulky_message("assistant", 60_000)).collect();
+
+        let kept: Vec<Value> =
+            serde_json::from_str(&fit_messages(&messages, MESSAGES_MAX_BYTES)).unwrap();
+        let last = &kept[kept.len() - 1]["tools"][0];
+        assert!(
+            last["result"]["padding"]
+                .as_str()
+                .is_some_and(|p| p.len() == 60_000),
+            "the newest message keeps its result: {last}"
+        );
+        assert!(last.get("resultDropped").is_none());
+        let first = &kept[0]["tools"][0];
+        assert_eq!(first["resultDropped"], true);
+        assert!(first.get("result").is_none());
+    }
+
+    #[test]
+    fn a_conversation_of_plain_text_over_the_cap_falls_back_to_the_old_trim() {
+        // No tools and no reasoning: there is no bulk to drop, so the body
+        // gets the old trim (`role`, `content`, `buildRunId`, `chartCreated`).
+        // The trim cannot shrink `content`, so text alone over the cap stays
+        // over it — the behaviour before AI-24, kept as D4 says.
+        let messages: Vec<Value> = (0..4)
+            .map(|_| json!({ "role": "user", "content": "y".repeat(80_000) }))
+            .collect();
+        assert!(serde_json::to_string(&messages).unwrap().len() > 300_000);
+
+        let kept: Vec<Value> =
+            serde_json::from_str(&fit_messages(&messages, MESSAGES_MAX_BYTES)).unwrap();
+        assert_eq!(kept.len(), 4);
+        for message in &kept {
+            let keys: Vec<&str> = message
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, ["role", "content", "buildRunId", "chartCreated"]);
+        }
+    }
+
+    #[test]
+    fn a_body_under_the_cap_is_byte_for_byte_unchanged() {
+        let messages = vec![bulky_message("user", 10), bulky_message("assistant", 100)];
+        assert_eq!(
+            fit_messages(&messages, MESSAGES_MAX_BYTES),
+            serde_json::to_string(&messages).unwrap()
+        );
     }
 }
