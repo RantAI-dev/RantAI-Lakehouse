@@ -1271,6 +1271,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/status", get(alerts::status))
+        // `BI-40` D1: a person's door for one rule, next to the scheduler's
+        // (`/api/alerts/run`, unchanged, still behind `check_run_token`).
+        .route("/api/alerts/test", post(alerts::test_one))
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .route(
             "/api/gold/export/{mart}",
