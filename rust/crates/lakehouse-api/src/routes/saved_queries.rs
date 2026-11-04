@@ -70,6 +70,7 @@ use crate::routes::quality::pool;
 use crate::routes::query::{saved_query_scope, saved_query_viewer};
 use crate::sql_guard::is_read_only;
 use crate::state::AppState;
+use crate::upstream_error;
 
 // ── The fixed sentences ──────────────────────────────────────────────────
 //
@@ -553,7 +554,26 @@ fn folder_failure(failure: FolderError) -> ApiError {
         FolderError::TooDeep => ApiError::BadRequest(FOLDER_TOO_DEEP.to_owned()),
         FolderError::Cycle => ApiError::BadRequest(FOLDER_CYCLE.to_owned()),
         FolderError::PersonalSpace => ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()),
-        FolderError::Database(_database) => ApiError::Internal("database error".to_owned()),
+        FolderError::Database(store_error) => {
+            // The body stays the fixed sentence; the cause goes to the log
+            // under a reference id (AGENTS.md principle 4; QS-3 review
+            // finding 7, plan 55 D7). store() itself is not used here: its
+            // Own variant carries caller-facing text, and this arm's
+            // answer must stay the fixed one.
+            match store_error {
+                lakehouse_store::StoreError::Database(source) => {
+                    let _logged = upstream_error::report_sqlx(&upstream_error::STORE, &source);
+                }
+                other => {
+                    let _logged = upstream_error::report(
+                        &upstream_error::STORE,
+                        upstream_error::Class::Failed,
+                        &other,
+                    );
+                }
+            }
+            ApiError::Internal("database error".to_owned())
+        }
     }
 }
 

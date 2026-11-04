@@ -92,9 +92,10 @@ pub const MAX_FOLDER_NAME_CHARS: usize = 100;
 pub enum Level {
     /// See it and run it.
     View,
-    /// Change its SQL, its title, its tags and the folder it sits in.
+    /// Change its SQL, its title, its tags and the folder it sits in,
+    /// delete it and restore it from the trash.
     Edit,
-    /// Share it, delete it, restore it and see its entry in the trash.
+    /// Share it, move it across a personal space and delete a folder.
     Manage,
 }
 
