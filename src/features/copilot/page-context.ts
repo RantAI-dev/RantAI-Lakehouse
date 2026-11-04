@@ -100,6 +100,22 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
     },
   },
   {
+    // WEB-3 D9: the approvals inbox moved to `/governance/approvals` (D4).
+    // It sits before the generic Governance entry so the inbox gets its own
+    // context; its suggestions name no removed page.
+    test: (p) => p.startsWith("/governance/approvals"),
+    ctx: {
+      key: "approvals",
+      title: "Review what needs you",
+      hint: "Ask what a request would let the agent do, or why it was raised.",
+      suggest: {
+        ask: ["What is waiting for approval?", "What would this approval let the agent do?", "Summarize this week's approval decisions"],
+        build: ["Chart approval decisions over the last 30 days"],
+      },
+      system: "The user is on the Approvals inbox (agent tool calls and catalog access requests). Explain impact and risk; never decide for them.",
+    },
+  },
+  {
     test: (p) => p.startsWith("/governance") || p.startsWith("/lineage") || p.startsWith("/audit"),
     ctx: {
       key: "governance",

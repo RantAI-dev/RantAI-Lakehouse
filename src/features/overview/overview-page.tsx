@@ -109,7 +109,7 @@ export function OverviewPage() {
               label="Pending approvals"
               value={fmtMeasured(summary.data.pendingApprovals)}
               hint="Agent actions waiting for a decision"
-              href="/agents/approvals"
+              href="/governance/approvals"
             />
             <MetricCard
               label="Agent runs"

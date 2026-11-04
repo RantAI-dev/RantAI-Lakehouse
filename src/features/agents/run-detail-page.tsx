@@ -73,8 +73,8 @@ export function RunDetailPage() {
           <Link
             href={
               lastApproval
-                ? `/agents/approvals?id=${encodeURIComponent(lastApproval.id)}`
-                : "/agents/approvals"
+                ? `/governance/approvals?id=${encodeURIComponent(lastApproval.id)}`
+                : "/governance/approvals"
             }
             className="mt-2 inline-flex items-center gap-1 font-medium text-amber-800 underline underline-offset-2 dark:text-amber-300"
           >
@@ -140,7 +140,7 @@ export function RunDetailPage() {
                 className="flex flex-wrap items-center justify-between gap-2 border-b border-border py-2 last:border-b-0"
               >
                 <Link
-                  href={`/agents/approvals?id=${encodeURIComponent(a.id)}`}
+                  href={`/governance/approvals?id=${encodeURIComponent(a.id)}`}
                   className="font-mono text-xs font-medium hover:underline"
                 >
                   {a.id}

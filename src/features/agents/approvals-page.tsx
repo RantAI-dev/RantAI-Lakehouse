@@ -305,7 +305,7 @@ export function ApprovalsPage() {
     manualPagination: false,
     manualSorting: false,
     manualFiltering: true,
-    persistKey: "/agents/approvals",
+    persistKey: "/governance/approvals",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
