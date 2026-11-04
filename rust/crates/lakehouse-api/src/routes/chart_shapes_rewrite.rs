@@ -26,7 +26,7 @@ use lakehouse_bi::store::{ChartInput, ChartSpec, StoredChartSpec};
 use sqlparser::dialect::ClickHouseDialect;
 
 use crate::sql_rewrite::{
-    NoViews, ObligationsSource, PlaceholderValues, TableObligations, enforce,
+    Engine, NoViews, ObligationsSource, PlaceholderValues, TableObligations, enforce,
 };
 
 const TABLE: &str = "serving.mart_demo_map_points";
@@ -145,6 +145,7 @@ fn rewritten(
     let out = enforce(
         &sql,
         &ClickHouseDialect {},
+        Engine::ClickHouse,
         &["analyst".to_owned()],
         &PlaceholderValues::none(),
         policy,
@@ -594,8 +595,11 @@ async fn the_preview_rows_are_read_past_the_charts_limit_and_say_when_they_are_c
     stepped.spec.sql =
         sql_with_filters_report(&stepped, &[], &[], &columns(), &ReadContext::new(&time)).sql;
     let shown_tile = serde_json::json!({ "columns": ["provinsi", "visitors"], "rows": [{"provinsi": "a", "visitors": 1}] });
+    let state = crate::state::AppState::without_a_database();
+    let gate = crate::routes::query::StatementGate::unrestricted(&state);
     let shown = crate::routes::support::preview_rows(
         &ch,
+        &gate,
         &stepped,
         &shown_tile,
         (&[], &PlaceholderValues::none(), &obligations),
@@ -622,6 +626,7 @@ async fn the_preview_rows_are_read_past_the_charts_limit_and_say_when_they_are_c
     let plain = chart(&serde_json::json!({"limit": 5}));
     let shown = crate::routes::support::preview_rows(
         &ch,
+        &gate,
         &plain,
         &shown_tile,
         (&[], &PlaceholderValues::none(), &obligations),
@@ -635,6 +640,7 @@ async fn the_preview_rows_are_read_past_the_charts_limit_and_say_when_they_are_c
     assert!(
         crate::routes::support::preview_rows(
             &ch,
+            &gate,
             &plain,
             &serde_json::json!({ "error": "x" }),
             (&[], &PlaceholderValues::none(), &obligations),

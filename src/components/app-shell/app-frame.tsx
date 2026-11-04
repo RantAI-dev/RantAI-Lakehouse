@@ -12,6 +12,7 @@ import { CopilotProvider } from "@/features/copilot/use-copilot";
 import { CommandPalette } from "@/components/command-palette";
 import { isPublicPath, useAuth } from "@/features/auth/auth-provider";
 import { SsoNotice } from "@/features/auth/sso-notice";
+import { VersionBanner } from "@/features/version/version-banner";
 import { AppShellSkeleton } from "@/components/app-shell/app-shell-skeleton";
 
 /**
@@ -80,6 +81,11 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
             <React.Suspense fallback={null}>
               <SsoNotice />
             </React.Suspense>
+            {/* REL-2 S1-T5: the console and the server it talks to may
+                not be the same build (an update that half-landed). The
+                banner names both versions; it renders nothing when they
+                match. */}
+            <VersionBanner />
             {children}
           </main>
           <CopilotSidebar />

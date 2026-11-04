@@ -16,7 +16,7 @@ use super::{
 };
 use crate::routes::support::SpecRunFailure;
 use crate::sql_rewrite::{
-    NoViews, ObligationsSource, PlaceholderValues, TableObligations, enforce,
+    Engine, NoViews, ObligationsSource, PlaceholderValues, TableObligations, enforce,
 };
 
 /// A clock the test moves.
@@ -183,6 +183,7 @@ fn rewritten(roles: &[&str], principal: &str) -> String {
     enforce(
         "SELECT id, email FROM silver.customers",
         &sqlparser::dialect::ClickHouseDialect {},
+        Engine::ClickHouse,
         &roles,
         &PlaceholderValues {
             principal_id: Some(principal.to_owned()),

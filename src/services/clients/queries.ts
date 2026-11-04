@@ -3,6 +3,8 @@ import type {
   SaveQueryInput,
   QueryResult,
   QueryEstimate,
+  QueryDownload,
+  QueryDownloadFormat,
   SavedQuery,
   QueryHistoryItem,
   QuerySchedulingCapability,
@@ -15,6 +17,7 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 import { chatAnswerFromBody } from "./chat-answer";
 import { RUN_ID_HEADER } from "@/lib/run-id";
+import { fileNameOf, refusalOf } from "@/lib/browser-file";
 
 /**
  * QueryService is real — `run`/`estimate` execute SQL against ClickHouse
@@ -86,13 +89,13 @@ async function postChat(
   if (!res.ok) {
     throw new ServiceError(
       "unavailable",
-      json?.detail ?? json?.error ?? "The assistant could not answer. Try again."
+      json?.detail ?? json?.error ?? "AI Copilot could not answer. Try again."
     );
   }
   // A 200 whose body is not a JSON object (a proxy's HTML page, say) would
   // otherwise read as an empty answer and show the user nothing, with no error.
   if (json === null || typeof json !== "object" || Array.isArray(json)) {
-    throw new ServiceError("unavailable", "The assistant could not answer. Try again.");
+    throw new ServiceError("unavailable", "AI Copilot could not answer. Try again.");
   }
   return json as Record<string, unknown>;
 }
@@ -138,7 +141,7 @@ async function proposeFix(
   signal?: AbortSignal
 ): Promise<SqlFixOutcome> {
   if ([...sql].length > MAX_FIX_SQL_CHARS) {
-    throw new ServiceError("invalid_request", "This query is too long for the assistant to fix.");
+    throw new ServiceError("invalid_request", "This query is too long for AI Copilot to fix.");
   }
   const json = await postChat(
     [
@@ -162,6 +165,51 @@ async function proposeFix(
 }
 
 
+/**
+ * Download the file of one run (`GET /api/query/run/{id}/download`).
+ *
+ * The server re-runs the stored statement with the caller's current masks and
+ * row filters, so the file is the result as it is now, not as it was when the
+ * run happened. `runId` names the run the download belongs to: the download's
+ * own query on the engine carries it, so the Stop button reaches it.
+ *
+ * The response says what the file holds in its headers (`X-Export-Rows`,
+ * `X-Export-Cut`, `X-Export-Cut-By`), so a cut is never silent. A refusal
+ * carries the server's own sentence, thrown as a `ServiceError` whose code
+ * the status implies.
+ */
+async function download(
+  id: string,
+  format: QueryDownloadFormat,
+  runId: string,
+  signal?: AbortSignal
+): Promise<QueryDownload> {
+  const query = new URLSearchParams({ format, runId });
+  const res = await apiFetch(
+    `/api/query/run/${encodeURIComponent(id)}/download?${query.toString()}`,
+    { signal, cache: "no-store" }
+  );
+  if (!res.ok) {
+    throw errorFor(res.status, await refusalOf(res, "The download failed."));
+  }
+  const blob = await res.blob();
+  // The fallback name carries the format's own extension: a file named
+  // `query.csv` that holds Parquet bytes will not open.
+  const fileName = fileNameOf(res.headers.get("content-disposition"), `query.${format}`);
+  const rowsHeader = res.headers.get("x-export-rows");
+  const rows = rowsHeader === null ? Number.NaN : Number(rowsHeader);
+  const cutBy = res.headers.get("x-export-cut-by");
+  return {
+    blob,
+    fileName,
+    // The engine-written file carries no row count: the server never counted
+    // the rows it wrote, so the console does not invent one.
+    rows: Number.isFinite(rows) ? rows : null,
+    cut: res.headers.get("x-export-cut") === "true",
+    cutBy: cutBy === "rows" || cutBy === "bytes" ? cutBy : null,
+  };
+}
+
 export const clickhouseQueryService: QueryService = {
   // ── real (ClickHouse / Trino) ────────────────────────────────────────────
   run(sql, options, signal) {
@@ -175,6 +223,7 @@ export const clickhouseQueryService: QueryService = {
   cancel(runId, signal) {
     return postJson<{ stopped: number }>("/api/query/cancel", { runId }, signal);
   },
+  download,
   estimate(sql, signal) {
     return postJson<QueryEstimate>("/api/query/estimate", { sql }, signal);
   },
@@ -187,7 +236,7 @@ export const clickhouseQueryService: QueryService = {
     // Same call as `askQuestion`: the query runs once on the server on the way.
     const out = await askQuestion(question, signal);
     if (out.sql === undefined) {
-      throw new ServiceError("unavailable", out.answer || "The assistant ran no query.");
+      throw new ServiceError("unavailable", out.answer || "AI Copilot ran no query.");
     }
     return { sql: out.sql, explanation: out.answer };
   },

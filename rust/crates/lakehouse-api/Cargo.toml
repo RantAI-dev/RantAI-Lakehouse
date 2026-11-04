@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-api"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -74,11 +74,14 @@ axum = { workspace = true }
 # (`tokio::sync::Mutex`/`OwnedMutexGuard`) and its tests
 # (`tokio::sync::Barrier`) need it directly, and this crate should compile
 # correctly on its own, not only as part of the whole-workspace build.
+# `process`: the child that reads an uploaded workbook or a Parquet file
+# (`upload_convert`, `SEC-22`) is a process of this binary, started with
+# `tokio::process::Command`.
 # `time`: `crate::bounded::run_with_budget` (WS2 §4) needs
 # `tokio::time::{timeout_at, Instant, sleep}` to bound per-table/per-namespace
 # Lakekeeper calls. `io-util`: `tokio::io::duplex` backs `routes::ai::stream_chat`'s
 # NDJSON progress pipe for `POST /api/ai/chat` (`stream: true`).
-tokio = { workspace = true, features = ["sync", "time", "io-util"] }
+tokio = { workspace = true, features = ["sync", "time", "io-util", "process"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }
@@ -115,7 +118,7 @@ jiff = { workspace = true }
 # lockfile, each MIT or Apache-2.0, all in `deny.toml`'s allow list. No
 # features: dates are rendered from its date components, so its `chrono`
 # feature is not needed.
-calamine = "0.37"
+calamine = "0.38"
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,
@@ -146,7 +149,7 @@ parquet = "58"
 # `zip` has `deflate` as `calamine` already enables it; `flate2` reads the gzip prefix.
 apache-avro = { version = "0.21", default-features = false }
 flate2 = "1.1"
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 # 0.13, not 0.12: SEC-8 — tiberius 0.12 pulls rustls 0.21 ->
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
@@ -180,17 +183,31 @@ reqwest013 = { package = "reqwest", version = "0.13", default-features = false, 
 # `futures` 0.3 is already in `Cargo.lock` (`lakehouse-iceberg` depends on it),
 # so this adds no package; only this crate's dependency list in the lockfile.
 futures = "0.3"
+# `SEC-22`: the child process that reads an uploaded workbook or a Parquet
+# file (`upload_convert`) sets its own `RLIMIT_DATA` and `RLIMIT_CPU` with
+# `nix`, so the memory a crafted file can ask for is the child's and never
+# the API's. The crate was already in `Cargo.lock` (0.31.3) through other
+# crates, so the lockfile gains no package; only the `resource` feature and
+# this dependency list change. MIT.
+nix = { workspace = true }
 # `BI-1` D6: the .xlsx writer. Pinned exactly (a download format must not change
 # under a routine update); `constant_memory` mode keeps a million-row export off
 # the heap. MIT OR Apache-2.0; `cargo deny check` and `cargo audit` pass with it
 # (plan 2026-10-17-bi-1-export.md, section 5).
-rust_xlsxwriter = { version = "=0.99.1", features = ["constant_memory"] }
+# 0.102.0 (2026-10-29): `RUSTSEC-2026-0429` (`zip` 8.6.0: `ZipArchive::extract`
+# aborts the process on a symlink entry with a large declared size) came in
+# through this crate's own `zip` 8.6.0, and 0.102.0 is the release that asks
+# for `zip` 9, so `zip` 8.6.0 leaves the tree instead of being ignored
+# (plan `docs/superpowers/plans/2026-11-02-deps-rust-xlsxwriter-0102.md` D1).
+# The pin stays exact: a routine `cargo update` must not change the download
+# format.
+rust_xlsxwriter = { version = "=0.102.0", features = ["constant_memory"] }
 
 [dev-dependencies]
 # `BI-1` T2: the export tests open the .xlsx they wrote to read its cells and
 # styles. Same version and features as `calamine` and `rust_xlsxwriter` already
 # ask for, so the lockfile gains no package.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 uuid = { workspace = true }

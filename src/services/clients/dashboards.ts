@@ -16,7 +16,9 @@ import type {
   UpdateBoardInput,
   VersionHistory,
 } from "../contracts/dashboards"
-import type { EmbedInfo, PublicLink, PublicLinkState } from "../contracts/dashboards"
+import type {
+  CommentPerson, DashboardComment, EmbedInfo, GranteeMatches, ItemAccess, MoveEffect, PublicLink, PublicLinkState,
+} from "../contracts/dashboards"
 import { apiFetch } from "../http"
 import { ServiceError, type ServiceErrorCode } from "../errors"
 
@@ -312,6 +314,80 @@ export const clickhouseDashboardService: DashboardService = {
       signal,
     })
     await checkedWrite<{ ok: boolean }>(res)
+  },
+  // BI-19 part E. The server's sentences are ours, so they are shown as they come.
+  async listComments(board, signal) {
+    const json = await request<{ comments?: DashboardComment[]; truncated?: boolean }>(
+      `/api/dashboard/comments?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "The comments could not be loaded"
+    )
+    return { comments: json.comments ?? [], truncated: json.truncated === true }
+  },
+  async postComment(input, signal) {
+    const res = await apiFetch("/api/dashboard/comments", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    return await checkedWrite<DashboardComment>(res)
+  },
+  async editComment(id, body, mentions, signal) {
+    const res = await apiFetch(`/api/dashboard/comments/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(mentions === undefined ? { body } : { body, mentions }),
+      signal,
+    })
+    return await checkedWrite<DashboardComment>(res)
+  },
+  async deleteComment(id, signal) {
+    const res = await apiFetch(`/api/dashboard/comments/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
+  },
+  async commentPeople(board, query, signal) {
+    const json = await request<{ items?: CommentPerson[] }>(
+      `/api/dashboard/comments/people?board=${encodeURIComponent(board)}&q=${encodeURIComponent(query)}`,
+      { cache: "no-store", signal },
+      "The people could not be loaded"
+    )
+    return json.items ?? []
+  },
+  // BI-19 part B. The server's sentences are ours, so they are shown as they come.
+  async getAccess(kind, id, signal) {
+    return await request<ItemAccess>(
+      `/api/dashboard/access?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`,
+      { cache: "no-store", signal },
+      "The permissions could not be loaded"
+    )
+  },
+  async saveAccess(input, signal) {
+    const res = await apiFetch("/api/dashboard/access", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    return await checkedWrite<ItemAccess>(res)
+  },
+  async findGrantees(query, signal) {
+    const json = await request<{ items?: GranteeMatches["people"]; roles?: GranteeMatches["roles"] }>(
+      `/api/reports/recipients?roles=1&q=${encodeURIComponent(query)}`,
+      { cache: "no-store", signal },
+      "People could not be searched"
+    )
+    return { people: json.items ?? [], roles: json.roles ?? [] }
+  },
+  async previewMove(board, folderId, signal) {
+    return await request<MoveEffect>(
+      `/api/dashboard/access-preview?board=${encodeURIComponent(board)}&folder=${encodeURIComponent(folderId)}`,
+      { cache: "no-store", signal },
+      "The effect of the move could not be worked out"
+    )
   },
   async setEmbedOrigins(board, origins, signal) {
     const json = await request<{ embedOrigins?: string[] }>(

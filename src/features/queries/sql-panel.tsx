@@ -14,6 +14,7 @@ import {
 
 import { SqlEditor } from "@/components/sql-editor"
 import { formatSql, type KeywordCase } from "@/lib/sql-format"
+import { formatDuration } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import {
@@ -78,6 +79,8 @@ export function SqlPanel({
     statements,
     running,
     stopRun,
+    elapsedMs,
+    download,
     estimateAct,
     runnable,
     targetStatement,
@@ -139,16 +142,34 @@ export function SqlPanel({
           <Play className="size-4" aria-hidden />
           {running ? "Running…" : manyStatements ? "Run all" : "Run query"}
         </Button>
-        {running ? (
+        {/* Stop is here for a run and for a download: a download is a query
+            on the engine as well, and the person who presses Stop means it
+            either way. */}
+        {running || download.busy !== null ? (
           <Button
             size="sm"
             variant="outline"
             onClick={stopRun}
-            title={engine === "trino" ? "Stops the page waiting; the query keeps running on Trino." : "Ends the query on the engine and stops the page waiting."}
+            title={
+              running
+                ? engine === "trino"
+                  ? "Stops the page waiting; the query keeps running on Trino."
+                  : "Ends the query on the engine and stops the page waiting."
+                : "Stops the download and ends the query on the engine."
+            }
           >
             <Square className="size-4" aria-hidden />
             Stop
           </Button>
+        ) : null}
+        {running ? (
+          <span
+            role="timer"
+            aria-label="Elapsed time"
+            className="text-xs tabular-nums text-muted-foreground"
+          >
+            {formatDuration(elapsedMs ?? 0)}
+          </span>
         ) : null}
         <Button
           size="sm"

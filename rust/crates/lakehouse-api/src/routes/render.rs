@@ -26,7 +26,7 @@
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -119,8 +119,27 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         claims.params.as_deref(),
         claims.grain.as_deref(),
     );
-    match payload_for(&state, &principal, &query).await {
+    // `BI-39` D7: a chart image's data is that chart, so the board's other tiles
+    // are not computed for it. `narrow_to_chart` below stays the guard on what
+    // leaves, whatever was read.
+    let query = match claims.chart.as_deref() {
+        Some(chart) => query.only_chart(chart),
+        None => query,
+    };
+    // `SEC-50` slice 2 M4/M5: the PDF reads as the person the token names —
+    // their first tenant, because the token carries no tenant (M5).
+    match payload_for(&state, &principal, &query, &HeaderMap::new()).await {
         Ok(mut payload) => {
+            // BI-19 part D (plan D13): a chart token is good for that chart
+            // only. The dashboard was read as the person (rules, masks, trash,
+            // personal space), so a chart they cannot see is not in it; a
+            // token naming another chart, or one that is gone, reads the same
+            // as any refused token and nothing of the rest of the board leaves.
+            if let Some(chart) = claims.chart.as_deref()
+                && !narrow_to_chart(&mut payload, chart)
+            {
+                return refused();
+            }
             if let Some(map) = payload.as_object_mut() {
                 map.insert(
                     "render".to_owned(),
@@ -133,6 +152,32 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     }
 }
 
+/// Keep `chart` and nothing else of the board's tiles: its spec, its result and
+/// its place. Returns `false` when the payload has no such chart. The board's
+/// other tiles' data never reaches a chart image's view.
+fn narrow_to_chart(payload: &mut Value, chart: &str) -> bool {
+    let Some(map) = payload.as_object_mut() else {
+        return false;
+    };
+    let Some(charts) = map.get_mut("charts").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    charts.retain(|c| c.get("id").and_then(Value::as_str) == Some(chart));
+    if charts.is_empty() {
+        return false;
+    }
+    if let Some(results) = map.get_mut("results").and_then(Value::as_object_mut) {
+        results.retain(|id, _| id == chart);
+    }
+    if let Some(layout) = map.get_mut("layout").and_then(Value::as_object_mut) {
+        layout.retain(|id, _| id == chart);
+    }
+    // The tab list and the phone order describe the other tiles.
+    map.remove("tabs");
+    map.remove("phoneLayout");
+    true
+}
+
 /// What the print view's first page lists beyond the dashboard itself (feature
 /// decision 4): who asked, when, and the paper.
 fn render_block(requested_by: &str, claims: &lakehouse_embed::RenderClaims) -> Value {
@@ -141,6 +186,7 @@ fn render_block(requested_by: &str, claims: &lakehouse_embed::RenderClaims) -> V
         "issuedAt": claims.iat,
         "paper": claims.paper,
         "orientation": claims.orientation,
+        "chart": claims.chart,
     })
 }
 

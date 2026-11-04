@@ -42,6 +42,7 @@ import {
   createSqlCompletionSource,
   sqlCompletionExtension,
 } from "./sql-completion-source"
+import { useQueryDownload } from "./use-query-download"
 
 /** What the editor holds before anyone types. */
 export const STARTER_SQL = "-- Write SQL here, or generate it from a question"
@@ -80,7 +81,17 @@ export type StudioTab = "nl" | "sql"
 export type StatementRun =
   | { status: "pending"; statement: SqlStatement }
   | { status: "running"; statement: SqlStatement }
-  | { status: "done"; statement: SqlStatement; result: QueryResult }
+  | {
+      status: "done"
+      statement: SqlStatement
+      result: QueryResult
+      /**
+       * The id the statement ran under. The download of the result names it,
+       * so the file's query on the engine belongs to the same run and Stop
+       * reaches it.
+       */
+      runId: string
+    }
   | { status: "error"; statement: SqlStatement; error: ServiceError }
   | { status: "not-run"; statement: SqlStatement }
 
@@ -194,6 +205,22 @@ export function useQueryStudio() {
   const [runIndex, setRunIndex] = React.useState<Record<string, number>>({})
   // Whether a batch of requests is in flight.
   const [running, setRunning] = React.useState(false)
+
+  // The moment Run was pressed, and the clock the elapsed time is read
+  // from. The clock ticks only while a run is in flight: a timer that keeps
+  // running on an idle page is a timer nobody looks at.
+  const [startedAt, setStartedAt] = React.useState<number | null>(null)
+  const [now, setNow] = React.useState(() => Date.now())
+  React.useEffect(() => {
+    if (!running) return
+    const tick = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(tick)
+  }, [running])
+
+  // The download of a result: it is a query on the engine like any other, so
+  // it belongs with the run it belongs to.
+  const download = useQueryDownload()
+  const stopDownload = download.stop
 
   // The open tab holds the SQL and the engine. The rest of the page keeps
   // using `sql` and `engine` and does not know there are tabs at all.
@@ -687,6 +714,9 @@ export function useQueryStudio() {
 
       const controller = new AbortController()
       runControllerRef.current = controller
+      const started = Date.now()
+      setStartedAt(started)
+      setNow(started)
       const batch: Batch = {
         tabId,
         index: 0,
@@ -735,7 +765,7 @@ export function useQueryStudio() {
               ...previous,
               [tabId]: (previous[tabId] ?? []).map((run, at) =>
                 at === index
-                  ? { status: "done", statement: run.statement, result }
+                  ? { status: "done", statement: run.statement, result, runId }
                   : run
               ),
             }))
@@ -834,6 +864,10 @@ export function useQueryStudio() {
    * run, and the batch is over.
    */
   const stopRun = React.useCallback(() => {
+    // A download is a query on the engine too, so it is stopped first: a
+    // file that is being written must end even when no statement is in
+    // flight, and the person pressed Stop for it.
+    stopDownload()
     const batch = batchRef.current
     // BI-5: ask the server to end the statement's query first. Best effort (a
     // Trino run has no id to send: the built-in engine is the only one that can
@@ -861,7 +895,7 @@ export function useQueryStudio() {
       batch.reloaded = true
       historyState.reload()
     }
-  }, [historyState])
+  }, [historyState, stopDownload])
 
   const save = React.useCallback(
     async (input: SaveQueryInput) => {
@@ -1057,6 +1091,18 @@ export function useQueryStudio() {
     results,
     running,
     stopRun,
+    /**
+     * How long the run has been going, counted in the browser from the
+     * moment Run was pressed; null when no run has started.
+     */
+    elapsedMs: startedAt === null ? null : Math.max(0, now - startedAt),
+    download: {
+      busy: download.busy,
+      done: download.done,
+      error: download.error,
+      start: download.start,
+      stop: download.stop,
+    },
     runnable,
     targetStatement,
     assetsState,

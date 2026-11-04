@@ -1,4 +1,5 @@
-//! The CSV of a whole-result export (`BI-16` part A, T8; `BI-1` D6 streams it).
+//! The delimited text of a whole-result export (`BI-16` part A, T8; `BI-1` D6
+//! streams it): the comma file and the tab-separated one.
 //!
 //! One writer, one set of rules: UTF-8 with a byte-order mark (so a
 //! spreadsheet reads the encoding right), CRLF line ends and RFC 4180 quoting.
@@ -7,7 +8,9 @@
 //! of running it as a formula (OWASP CSV-injection guidance); a JSON number
 //! stays a number and is written as the digits the engine sent. This is the
 //! only place the export neutralises cells, so the rule cannot drift between
-//! callers.
+//! callers. The tab-separated file is the comma file's twin: the same mark,
+//! the same line ends and the same formula guard, with a tab as the separator
+//! and a field quoted when it holds a tab, a line break or a quote.
 
 use serde_json::Value;
 
@@ -36,29 +39,73 @@ pub(crate) fn neutralise(text: &str) -> String {
     }
 }
 
-/// RFC 4180: a field with a comma, a double quote, CR or LF is quoted and its
-/// quotes doubled.
-fn quote(field: &str) -> String {
-    if field.contains([',', '"', '\r', '\n']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_owned()
+/// The separator between the fields of a delimited file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delimiter {
+    /// A comma: the CSV of RFC 4180.
+    Comma,
+    /// A tab: the tab-separated file the Query Studio download offers.
+    Tab,
+}
+
+impl Delimiter {
+    /// The character the fields are joined with.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Comma => ",",
+            Self::Tab => "\t",
+        }
+    }
+
+    /// A field is quoted when it holds the separator, a double quote, CR or
+    /// LF; the quotes inside it are doubled.
+    fn quote(self, field: &str) -> String {
+        if field.contains(['"', '\r', '\n']) || field.contains(self.as_str()) {
+            format!("\"{}\"", field.replace('"', "\"\""))
+        } else {
+            field.to_owned()
+        }
+    }
+
+    /// One line of the file from fields that are already text (neutralised by
+    /// the caller where they are text, [`neutralise`]): quoted when they need
+    /// it, ended by CRLF.
+    fn line(self, fields: &[String]) -> String {
+        let quoted: Vec<String> = fields.iter().map(|f| self.quote(f)).collect();
+        format!("{}\r\n", quoted.join(self.as_str()))
+    }
+
+    /// The start of every file: the byte-order mark and the header row of
+    /// `labels` (neutralised like any text cell).
+    fn header(self, labels: &[String]) -> String {
+        let neutral: Vec<String> = labels.iter().map(|l| neutralise(l)).collect();
+        format!("{BOM}{}", self.line(&neutral))
     }
 }
 
-/// One line of the file from fields that are already text (neutralised by the
-/// caller where they are text, [`neutralise`]): quoted when they need it, ended
-/// by CRLF. `BI-1` D6 writes a download a line at a time.
+/// One line of the comma file from fields that are already text (neutralised
+/// by the caller where they are text, [`neutralise`]): quoted when they need
+/// it, ended by CRLF. `BI-1` D6 writes a download a line at a time.
 pub(crate) fn line(fields: &[String]) -> String {
-    let quoted: Vec<String> = fields.iter().map(|f| quote(f)).collect();
-    format!("{}\r\n", quoted.join(","))
+    Delimiter::Comma.line(fields)
 }
 
-/// The start of every file: the byte-order mark and the header row of `labels`
-/// (neutralised like any text cell).
+/// The start of every comma file: the byte-order mark and the header row of
+/// `labels` (neutralised like any text cell).
 pub(crate) fn header(labels: &[String]) -> String {
-    let neutral: Vec<String> = labels.iter().map(|l| neutralise(l)).collect();
-    format!("{BOM}{}", line(&neutral))
+    Delimiter::Comma.header(labels)
+}
+
+/// One line of the tab-separated file, beside the comma one: the same rule,
+/// with a tab as the separator.
+pub(crate) fn tsv_line(fields: &[String]) -> String {
+    Delimiter::Tab.line(fields)
+}
+
+/// The start of every tab-separated file, beside the comma one: the same
+/// byte-order mark and header row.
+pub(crate) fn tsv_header(labels: &[String]) -> String {
+    Delimiter::Tab.header(labels)
 }
 
 /// The whole file in memory, for the tests: a header row of `labels` (neutralised like any text cell), then
@@ -73,6 +120,22 @@ pub(crate) fn write_csv(
     for row in rows {
         let fields: Vec<String> = columns.iter().map(|c| cell_text(row.get(c))).collect();
         out.push_str(&line(&fields));
+    }
+    out
+}
+
+/// The whole tab-separated file in memory, for the tests: the comma file's
+/// twin, with a tab between the fields.
+#[cfg(test)]
+pub(crate) fn write_tsv(
+    labels: &[String],
+    columns: &[String],
+    rows: &[serde_json::Map<String, Value>],
+) -> String {
+    let mut out = tsv_header(labels);
+    for row in rows {
+        let fields: Vec<String> = columns.iter().map(|c| cell_text(row.get(c))).collect();
+        out.push_str(&tsv_line(&fields));
     }
     out
 }
@@ -144,5 +207,31 @@ mod tests {
             &[row(&json!({ "d": "2026-03-05", "n": 1.5, "z": null }))],
         );
         assert_eq!(csv, "\u{feff}d,n,z\r\n2026-03-05,1.5,\r\n");
+    }
+
+    #[test]
+    fn a_tab_separated_file_quotes_a_tab_a_quote_and_a_line_break_and_leaves_a_comma_alone() {
+        let tsv = write_tsv(
+            &["a".to_owned(), "b".to_owned()],
+            &["a".to_owned(), "b".to_owned()],
+            &[
+                row(&json!({ "a": "x\ty", "b": "x,y" })),
+                row(&json!({ "a": "say \"hi\"", "b": "two\nlines" })),
+            ],
+        );
+        assert_eq!(
+            tsv,
+            "\u{feff}a\tb\r\n\"x\ty\"\tx,y\r\n\"say \"\"hi\"\"\"\t\"two\nlines\"\r\n"
+        );
+    }
+
+    #[test]
+    fn a_tab_separated_file_guards_a_formula_the_way_the_comma_file_does() {
+        let tsv = write_tsv(
+            &["a".to_owned()],
+            &["a".to_owned()],
+            &[row(&json!({ "a": "=1+1" })), row(&json!({ "a": -5 }))],
+        );
+        assert_eq!(tsv, "\u{feff}a\r\n'=1+1\r\n-5\r\n");
     }
 }

@@ -107,6 +107,7 @@ impl LayerRunner for Engine {
         let rewritten = enforce(
             sql,
             &ClickHouseDialect {},
+            crate::sql_rewrite::Engine::ClickHouse,
             &["analyst".to_owned()],
             &PlaceholderValues::none(),
             &self.policies,

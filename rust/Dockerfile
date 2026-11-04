@@ -100,7 +100,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # (`GLIBC_2.39' not found`) — matching the base OS avoids a glibc skew
 # between the two stages.
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# `curl` is here for ONE thing: the compose healthcheck this image's
+# service carries (`docker-compose.yml`, `lakehouse-api`'s `healthcheck:`),
+# which asks `http://localhost:8080/health`. The runtime image is
+# `debian:*-slim`, which carries neither curl nor wget, and the
+# `dagster-webserver` service's own healthcheck already uses `curl` the
+# same way.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /usr/local/bin/lakehouse-api /usr/local/bin/lakehouse-api
 COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
@@ -113,9 +119,11 @@ COPY migrations ./migrations
 # `pipeline_src` ADDITIONAL build context (docker-compose.yml's
 # `additional_contexts: { pipeline_src: ./dagster/dispar_orchestrate }`),
 # never from the primary `./rust` context above — the primary context is
-# deliberately never widened to the repository root, since the untracked,
-# developer-owned `.dockerignore` excludes `rust`/`docs`/`*.md` and would
-# break every existing COPY the moment the context became `.`, and a
+# deliberately never widened to the repository root, since the repository
+# root's `.dockerignore` excludes `rust`/`docs`/`*.md` and would break
+# every existing COPY the moment the context became `.` (that ignore file
+# is read only by a build whose context IS the root, so it does not
+# apply to this one — but it would apply to that change), and a
 # repo-root context with NO `.dockerignore` present at all (a clean
 # checkout) would instead pull in `.git`, `node_modules`, and everything
 # else unbounded.

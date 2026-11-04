@@ -25,6 +25,9 @@ Query Studio's version picker writes only the Trino form, whichever engine
 is chosen, so the button it offers produces a query that cannot run.
 Evidence is in the plan, section 2.
 
+The Trino half is fixed by `DATA-21` (2026-11-01): the API reads Trino's own
+past-version clause, and the mask is written in Trino's SQL.
+
 ## What the user can do when this is done
 
 1. On an asset's Activity tab, press "Query this version" and get the table
@@ -34,17 +37,20 @@ Evidence is in the plan, section 2.
 3. Trust that a masked column is still masked, and a row filter still
    applied, at an earlier version: a gate test in CI proves it on every
    change.
-4. With Trino chosen, see the version picker switched off with the reason,
-   and get a plain message if a past-version query is typed by hand.
+4. In Query Studio with Trino chosen, pick a table and a version and have
+   that table read as it was then — with the mask and the row filter still
+   applied — and get a plain message if a past version by date and time is
+   typed by hand.
 5. Read how many versions a table has and how far back they go, where the
    versions are listed and where one is chosen.
 
 ## Not included
 
-- Past versions on Trino, and masking on Trino at all: `DATA-21`.
 - Two tables at two different versions in one query. On ClickHouse one
-  version id applies to every Iceberg table in the query.
-- Querying by date and time instead of by version.
+  version id applies to every Iceberg table in the query; on Trino the
+  version belongs to the table it is written on, so a query that reads two
+  raw tables can pin one of them only.
+- Querying by date and time instead of by version, on either engine.
 - Versions of Silver and Gold tables: the engine keeps none.
 
 ## Asking the assistant
@@ -58,17 +64,19 @@ Signed by the product owner on 2026-10-09.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Trino. The spec says "works for ClickHouse and Trino". On Trino the query is refused today, and by reading the code masking on Trino does not work either; fixing both is larger than this task and cannot be tried on the build machine. | Split. This task proves ClickHouse and refuses Trino with a plain message. Trino becomes `DATA-21`, with its own gate. The spec's Trino target is not met by this task. | 2026-10-09 |
+| 1 | Trino. The spec says "works for ClickHouse and Trino". On Trino the query is refused today, and by reading the code masking on Trino does not work either; fixing both is larger than this task and cannot be tried on the build machine. | Split, then joined: this task proved ClickHouse and refused Trino with a plain message. `DATA-21` (2026-11-01) made the Trino half work too — masking on Trino, and a past version by its id. | 2026-10-09; `DATA-21` closed the Trino half on 2026-11-01 |
 | 2 | What "retention shown" says. Version clean-up does not run on this ClickHouse version, so a promise in days would be invented. | State what is there: "N versions, the oldest from <date>". | |
 | 3 | Two tables in one query at a pinned version fail on ClickHouse. | State it as a limit beside the picker; not fixed. | |
 
 ## Limits to tell a customer
 
-- A past version can be queried on ClickHouse, for raw (Iceberg) tables
-  only.
-- One version applies to the whole query; a query that joins two raw tables
-  cannot be pinned to a version.
-- Past versions cannot be queried on Trino.
+- A past version can be queried on ClickHouse and on Trino, for raw (Iceberg)
+  tables only.
+- On ClickHouse one version applies to the whole query; a query that joins two
+  raw tables cannot be pinned to a version.
+- On Trino the version belongs to the table it is written on: a query that
+  reads two raw tables can pin one of them only.
+- A past version cannot be selected by date and time, on either engine.
 
 ## Acceptance checklist
 
@@ -88,6 +96,12 @@ A step not performed is never Pass. Steps needing a terminal are marked
 | `DATA-16-AC8` | Read the picker's note | It says one version applies to every raw table in the query | Not run |
 | `DATA-16-AC9` | As a user without `query:read`, open the Activity tab | No "Query this version" that runs; the page says access is missing | Not run |
 | `DATA-16-AC10` | (operator) Open the CI run of the pull request | The time-travel gate passed | Not run |
+
+`DATA-16-AC5` and `DATA-16-AC6` describe the state before `DATA-21`
+(2026-11-01): the Trino picker is offered now, and a past version by its
+id runs on Trino. A past version by date and time is still refused, with
+the sentence `AC6` names. The Trino rows are asked again in `DATA-21`'s
+own acceptance.
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

@@ -115,10 +115,13 @@ async fn dashboard(server: &MockServer, filters: &str) -> Value {
         grain: None,
         params: None,
         fresh: None,
+        only: None,
     };
     let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
+    let state = crate::state::AppState::without_a_database();
     get_body(
         &ch,
+        &crate::routes::query::StatementGate::unrestricted(&state),
         &q,
         parsed,
         &[],
@@ -649,10 +652,13 @@ mod verify {
             grain: None,
             params: None,
             fresh: None,
+            only: None,
         };
         let obligations = PolicyEngineObligations::new(None, ch);
+        let state = crate::state::AppState::without_a_database();
         get_body(
             ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &q,
             None,
             &[],

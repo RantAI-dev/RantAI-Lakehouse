@@ -53,6 +53,10 @@ function stub(
       return info === "fail" ? json({ error: "x" }, 500) : json(info)
     }
     if (url === "/api/dashboard/boards" && method === "GET") return json({ boards: [{ id: "b_1", publicToken: "" }] })
+    // BI-19 part B1: the People panel reads who has access when the dialog opens.
+    if (url.startsWith("/api/dashboard/access") && method === "GET") {
+      return json({ kind: "board", id: "b_1", yourLevel: "manage", restricted: false, rules: [], inherited: [], restrictedAbove: [] })
+    }
     return onWrite(call)
   }) as unknown as typeof fetch
   return calls

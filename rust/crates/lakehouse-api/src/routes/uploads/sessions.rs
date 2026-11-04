@@ -31,12 +31,14 @@
 //! ReceiveLimiter`] place of `SEC-17` is taken BEFORE the body is read and
 //! held until the handler returns, so "four per user, sixteen in all" bounds
 //! the memory of this route as it bounds `POST /api/uploads`. Opening a
-//! session reads no file, and completing a text file reads 64 KiB. Completing a
-//! Parquet file reads its footer, by range (`upload_parquet_range`), never the
-//! file. Completing a workbook reads the whole object, as `POST /api/uploads`
-//! does (it must be opened whole), so that path takes a place too and is refused
-//! above [`super::MAX_UPLOAD_BYTES`]: a workbook stays at 50 MB (feature page,
-//! decision 9).
+//! session reads no file, and completing a text file reads 64 KiB. Completing
+//! a Parquet file reads its footer — by the CHILD, which is given the tail
+//! of the file and not the file (`SEC-22` P1). Completing a workbook reads
+//! the whole object — but in the CHILD (`SEC-22` D1a): the API feeds the
+//! stored object to the child in pieces of 8 MiB, so the API holds one piece
+//! at a time and the child never reads the store (D1); that path takes a
+//! place too and is refused above [`super::MAX_UPLOAD_BYTES`]: a workbook
+//! stays at 50 MB (feature page, decision 9).
 //!
 //! # Posture
 //!
@@ -63,13 +65,15 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    Accepted, CreateResponse, EMPTY_FILE, MAX_UNPACKED_BYTES, MAX_UPLOAD_BYTES, NO_TENANT,
-    UploadView, blocking, classify_head, display_name, not_found, pool, record_audit, sha256_hex,
+    Accepted, CONVERSION_FAILED, CreateResponse, EMPTY_FILE, MAX_UNPACKED_BYTES, MAX_UPLOAD_BYTES,
+    NO_TENANT, ParquetFile, UploadView, blocking, classify_head, conversion_error, display_name,
+    not_found, parquet_footer, pool, record_audit, sha256_hex, sheets_key, sheets_of_answer,
     storage_key, upload_audit_event,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upload_convert::{FileKind, Operation, Source};
 use crate::upload_formats;
 use crate::upload_limits::too_many_uploads;
 use crate::upload_parquet;
@@ -80,8 +84,10 @@ use crate::upload_workbook;
 /// The size of every piece but the last: 8 MiB. S3 refuses to assemble an
 /// upload whose pieces before the last are under 5 MiB (checked against
 /// `RustFS`, plan section 8 item 1), and 8 MiB keeps a 2 GiB file at 256 pieces
-/// against S3's limit of 10,000.
-pub(crate) const PART_SIZE: u64 = 8 * 1024 * 1024;
+/// against S3's limit of 10,000. One definition, in the store: the converted
+/// text of a workbook is written in pieces of the same size
+/// (`crate::upload_store::PART_SIZE`).
+pub(crate) const PART_SIZE: u64 = crate::upload_store::PART_SIZE;
 
 /// What the body limit of the piece route allows: a piece plus 64 KiB, so the
 /// limit is not what decides whether a piece is the right size (the size check
@@ -457,6 +463,10 @@ fn parts_digest(parts: &[UploadPart]) -> Option<Vec<u8>> {
 /// Remove a file the rules refused, object and row, and give the refusal back.
 /// A failed removal is logged: the sweep ([`crate::upload_sweep`]) finds the
 /// row again, which is why the row is deleted last.
+///
+/// Only a refusal of the FILE comes here: a refusal that a retry can answer
+/// differently (a busy installation, a store that is down) leaves the file
+/// where it is, so the retry finds it (`PR #187` review SHOULD-FIX 1).
 async fn refuse_and_remove(
     pool: &PgPool,
     store: &UploadStore,
@@ -550,7 +560,16 @@ pub async fn complete(
     };
     let facts = match open_whole(&state, &store, &row, accepted, declared).await {
         Ok(facts) => facts,
-        Err(refusal) => return Err(refuse_and_remove(pool, &store, &row, refusal).await.into()),
+        Err(refusal) => {
+            // Only a refusal of the FILE removes it (`PR #187` review
+            // SHOULD-FIX 1). A busy installation (429), a child that could
+            // not be started (500) and a store that is down (503) are all
+            // retryable, and the retry must find the file still there.
+            if matches!(refusal, ApiError::BadRequest(_)) {
+                return Err(refuse_and_remove(pool, &store, &row, refusal).await.into());
+            }
+            return Err(refusal.into());
+        }
     };
 
     let size = i64::try_from(declared).unwrap_or(i64::MAX);
@@ -594,12 +613,15 @@ struct WholeFacts {
 }
 
 /// Open a workbook or a Parquet file, the way `POST /api/uploads` does before
-/// it stores one. A workbook must be read whole: the read takes a `SEC-17`
-/// place (it holds up to [`MAX_UPLOAD_BYTES`] in memory), and a workbook above
-/// that size is refused with the existing sentence; this is where a workbook's
+/// it stores one. A workbook is opened by the CHILD (`SEC-22` D1a): the API
+/// feeds the stored object to the child in pieces of 8 MiB, and the child
+/// never reads the store (D1); the read takes a `SEC-17` place (the child
+/// reads up to [`MAX_UPLOAD_BYTES`] at a time), and a workbook above that
+/// size is refused with the existing sentence; this is where a workbook's
 /// 50 MB limit stays when sessions accept more (feature page, decision 9). A
-/// Parquet file's footer is read by range and checked (`DATA-17` T2.2), and the
-/// file is not held. A text file is not read at all.
+/// Parquet file's footer is read by the CHILD as well (`SEC-22` P1), which is
+/// given the file's tail, and the file is not held. A text file is not read
+/// at all.
 async fn open_whole(
     state: &AppState,
     store: &UploadStore,
@@ -632,15 +654,24 @@ async fn open_whole(
         Accepted::Parquet | Accepted::Workbook => {}
     }
     if accepted == Accepted::Parquet {
-        // `DATA-17` T2.2: only the footer is read, by range. The file is never
-        // held, so it has no size cap here beyond the session's (2 GiB), and no cell cap
-        // either: the job streams the file by row group (`DATA-17-RESULT.md`, plan T6.2
-        // item 3). The footer is bounded by `MAX_FOOTER_BYTES` before it is read.
-        let reader = RangeReader::open(store, &row.storage_key).await?;
-        let opened = blocking(move || upload_parquet::inspect(&reader)).await?;
+        // `DATA-17` T2.2: only the footer is read. The file is never held, so
+        // it has no size cap here beyond the session's (2 GiB), and no cell cap
+        // either: the job streams the file by row group (`DATA-17-RESULT.md`,
+        // plan T6.2 item 3). The footer is bounded by `MAX_FOOTER_BYTES` before
+        // it is read.
+        //
+        // `SEC-22` P1: the footer is read by the CHILD, which is given the
+        // file's TAIL — the bytes the footer is in — and never the whole
+        // file. So a session's Parquet file may be 2 GiB and is read exactly
+        // as a small one is, and a footer that asks for more memory than the
+        // machine has ends the CHILD and never this process (`PR #187` review
+        // BLOCKER 1: the footer decode reserved the file's own counts, and
+        // that decode used to run here).
+        let file = ParquetFile::stored(store, &row.storage_key).await?;
+        let footer = parquet_footer(state, &file).await?;
         return Ok(WholeFacts {
             workbook: None,
-            parquet: Some(opened),
+            parquet: Some(footer.info),
         });
     }
     if declared > u64::try_from(MAX_UPLOAD_BYTES).unwrap_or(u64::MAX) {
@@ -650,17 +681,36 @@ async fn open_whole(
         // Not a refusal of the file: it stays, and the caller completes again.
         return Err(too_many_uploads());
     };
-    let bytes = store.get_all(&row.storage_key).await?;
-    match accepted {
-        Accepted::Workbook => {
-            let opened = blocking(move || upload_workbook::list_sheets(&bytes)).await?;
-            Ok(WholeFacts {
-                workbook: Some(opened),
-                parquet: None,
-            })
-        }
-        _ => Ok(nothing()),
+    if accepted == Accepted::Workbook {
+        // `SEC-22` D1a: the workbook is opened by the CHILD, never by this
+        // process. A workbook declares how much memory its reader will want,
+        // and an allocation failure ends the process that made it — so the
+        // API must not be the one making it. The API feeds the stored object
+        // to the child in pieces of 8 MiB, so the API holds one piece at a
+        // time and the child never reads the store (D1).
+        let source = Source::Stored {
+            store: store.clone(),
+            key: row.storage_key.clone(),
+        };
+        let answer = state
+            .conversion_runner
+            .answer(Operation::ListSheets, source)
+            .await
+            .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+        let info = sheets_of_answer(&answer)?;
+        // The list of the sheets goes beside the original (`SEC-22` D5), so
+        // that a preview reads it from the store and needs no child.
+        let line = serde_json::to_vec(&answer)
+            .map_err(|_err| ApiError::Internal(CONVERSION_FAILED.to_owned()))?;
+        store
+            .put(&sheets_key(&row.storage_key), Bytes::from(line))
+            .await?;
+        return Ok(WholeFacts {
+            workbook: Some(info),
+            parquet: None,
+        });
     }
+    Ok(nothing())
 }
 
 /// Abort the multipart upload of a `receiving` row and remove the object that

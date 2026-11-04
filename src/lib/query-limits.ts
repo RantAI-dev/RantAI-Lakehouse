@@ -16,7 +16,7 @@ export const LIMIT_RANGES = {
 export type LimitField = keyof typeof LIMIT_RANGES
 
 /** What an install has before an administrator saves (feature decisions 1 and 2). */
-export const LIMIT_DEFAULTS: QueryLimitValues = { timeoutSeconds: 60, chartRows: 2000, mapPoints: 5000, studioRows: 2000 }
+export const LIMIT_DEFAULTS: QueryLimitValues = { timeoutSeconds: 60, chartRows: 2000, mapPoints: 5000, studioRows: 64000 }
 
 /** A whole number inside the field's range, else a sentence that says the range; `null` when it is fine. */
 export function limitProblem(field: LimitField, text: string): string | null {

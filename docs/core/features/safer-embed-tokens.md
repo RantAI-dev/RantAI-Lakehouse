@@ -35,8 +35,12 @@ sign in. The customer's server signs a token with a shared secret
 
 ## Asking the assistant
 
-Not an assistant feature. The assistant cannot mint, revoke or configure
-embeds.
+The assistant can switch embedding on (`enable_embed`, after approval), set
+each filter's embed mode (`set_embed_filter_modes`, after approval) and
+withdraw every token of a dashboard (`withdraw_embed_tokens`, after a confirm)
+(`BI-26` slice 2). It still never signs a token and never sees one or the
+secret: the customer's server signs it, and the copyable snippet is in
+Share > Embed (`features/embedding.md`, Asking the assistant).
 
 ## Decisions
 
@@ -84,3 +88,8 @@ Exceptions, each with an owner and a date:
 - [ ] `PRODUCT.md` section 2 and 3 updated
 - [ ] `BACKLOG.md` item moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- The 60-second clock tolerance is confirmed: a token that expired 30 seconds ago still renders, one that expired five minutes ago is refused.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

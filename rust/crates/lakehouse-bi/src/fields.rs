@@ -14,6 +14,17 @@
 //! formula is checked and compiled again against the source's current
 //! columns.
 //!
+//! # The name is checked again on read
+//!
+//! A name is checked when the field is saved ([`validate_name`]: an
+//! identifier of at most [`MAX_NAME_LEN`] characters, not a reserved word,
+//! not a column of the source). The table can also be written directly, and
+//! the name reaches the statement as a plain alias (see below), so the read
+//! checks it again: a row whose name is not an identifier, or is longer than
+//! [`MAX_NAME_LEN`], is left out of every read. Such a row can also not be
+//! opened or deleted through the API - the route answers "not found" - which
+//! is acceptable, because the API never wrote it.
+//!
 //! # How a chart uses a field
 //!
 //! [`prepare`] looks for field names in the slots of a chart definition
@@ -207,11 +218,24 @@ fn row_str<'a>(row: &'a serde_json::Map<String, Value>, key: &str) -> &'a str {
 }
 
 fn row_to_field(row: &serde_json::Map<String, Value>) -> Option<FieldDef> {
+    let source_kind = SourceKind::parse(row_str(row, "source_kind"))?;
+    // The name is checked when the field is saved, but the table can also be
+    // written directly, and the name reaches the statement as a plain alias
+    // (`Relation::Calculated`), so it is checked again here. Only the id is
+    // logged: the name is the part that is not trusted.
+    let name = row_str(row, "name").to_owned();
+    if name.len() > MAX_NAME_LEN || Ident::new(name.as_str()).is_err() {
+        tracing::warn!(
+            field_id = row_str(row, "id"),
+            "a stored calculated field has a name that is not an identifier; the row is left out"
+        );
+        return None;
+    }
     Some(FieldDef {
         id: row_str(row, "id").to_owned(),
-        source_kind: SourceKind::parse(row_str(row, "source_kind"))?,
+        source_kind,
         source_id: row_str(row, "source_id").to_owned(),
-        name: row_str(row, "name").to_owned(),
+        name,
         formula: row_str(row, "formula").to_owned(),
         level: row_str(row, "level").to_owned(),
         ty: row_str(row, "data_type").to_owned(),
@@ -221,7 +245,8 @@ fn row_to_field(row: &serde_json::Map<String, Value>) -> Option<FieldDef> {
 }
 
 /// Every live field, by name. A row with an unknown source kind is left out
-/// (it can only come from a newer version of the console).
+/// (it can only come from a newer version of the console), and so is a row
+/// whose stored name is not an identifier (see the module doc).
 ///
 /// # Errors
 ///
@@ -1196,6 +1221,52 @@ mod tests {
         f.level = crate::groups::LEVEL.to_owned();
         f.ty = "text".to_owned();
         f
+    }
+
+    /// A row of `console.bi_field` as the reader gets it.
+    fn stored_row(id: &str, name: &str) -> serde_json::Map<String, Value> {
+        let mut row = serde_json::Map::new();
+        for (key, value) in [
+            ("id", id),
+            ("source_kind", "mart"),
+            ("source_id", "mart_x"),
+            ("name", name),
+            ("formula", "v - w"),
+            ("level", "row"),
+            ("data_type", "number"),
+            ("created_by", "u"),
+            ("updated_at", "2026-01-01 00:00:00"),
+        ] {
+            row.insert(key.to_owned(), Value::String(value.to_owned()));
+        }
+        row
+    }
+
+    #[test]
+    fn a_stored_row_whose_name_is_not_an_identifier_is_left_out() {
+        assert!(row_to_field(&stored_row("f_1", "a; DROP TABLE x")).is_none());
+        assert!(row_to_field(&stored_row("f_2", "")).is_none());
+        assert!(row_to_field(&stored_row("f_3", "1abc")).is_none());
+    }
+
+    #[test]
+    fn a_stored_row_whose_name_is_longer_than_the_limit_is_left_out() {
+        let too_long = "a".repeat(MAX_NAME_LEN + 1);
+        assert!(row_to_field(&stored_row("f_4", &too_long)).is_none());
+        let at_the_limit = "a".repeat(MAX_NAME_LEN);
+        assert!(row_to_field(&stored_row("f_5", &at_the_limit)).is_some());
+    }
+
+    #[test]
+    fn a_stored_row_with_a_valid_name_is_read_as_it_is() {
+        let read = row_to_field(&stored_row("f_6", "profit")).expect("a valid row");
+        assert_eq!(read.id, "f_6");
+        assert_eq!(read.source_kind, SourceKind::Mart);
+        assert_eq!(read.source_id, "mart_x");
+        assert_eq!(read.name, "profit");
+        assert_eq!(read.formula, "v - w");
+        assert_eq!(read.level, "row");
+        assert_eq!(read.ty, "number");
     }
 
     #[test]

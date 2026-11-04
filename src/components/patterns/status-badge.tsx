@@ -398,6 +398,8 @@ const OUTCOME_TONE: Record<AuditOutcome, Tone> = {
   success: "success",
   denied: "warning",
   error: "destructive",
+  // A decision still waiting: neither a warning nor a success (GOV-5).
+  pending: "info",
 }
 
 /** Outcome pill for audited actions after policy evaluation. */

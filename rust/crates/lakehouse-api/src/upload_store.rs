@@ -79,6 +79,7 @@ use axum::body::Bytes;
 use lakehouse_core::ApiError;
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path as ObjectPath};
+use tokio::io::AsyncReadExt as _;
 
 use crate::config::Config;
 use crate::connector_probe::classify_object_store_error;
@@ -89,6 +90,15 @@ use crate::rustfs_client::{self, RustfsClientError};
 /// every uploaded file without consulting Postgres, and nothing can be
 /// written next to the Iceberg data by accident.
 pub const PREFIX: &str = "uploads";
+
+/// The size of every piece of a multipart upload but the last: 8 MiB. S3
+/// refuses to assemble an upload whose pieces before the last are under
+/// 5 MiB (checked against `RustFS`, plan section 8 item 1), and 8 MiB keeps a
+/// 2 GiB file at 256 pieces against S3's limit of 10,000. The one definition:
+/// the chunked upload's piece size (`routes::uploads::sessions::PART_SIZE`)
+/// and the converted text's piece size ([`UploadStore::put_stream`]) are the
+/// same number.
+pub(crate) const PART_SIZE: u64 = 8 * 1024 * 1024;
 
 /// What a caller of [`UploadStore`] can be told. Exactly two messages, both
 /// fixed text: see the module doc.
@@ -472,6 +482,153 @@ impl UploadStore {
             Err(err) => Err(user_error("abort_multipart", key, &Failure::Store(&err))),
         }
     }
+
+    /// Write everything `reader` yields to `key` as ONE multipart upload, and
+    /// LEAVE IT UNASSEMBLED.
+    ///
+    /// Nothing is stored at `key` until the upload is completed, and the
+    /// upload is ABORTED when anything goes wrong: a partial object is never
+    /// kept (`SEC-22` D6). The caller decides when the object is assembled
+    /// ([`Self::complete_pending`]) or thrown away ([`Self::abort_pending`]):
+    /// a conversion is committed only after the child that wrote it has
+    /// exited 0 (`SEC-22` P2), so the text must not be visible before that.
+    ///
+    /// The pieces are [`PART_SIZE`] bytes each, except the last: S3 refuses
+    /// to assemble an upload whose pieces before the last are under 5 MiB.
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the store refuses or cannot be
+    /// reached, or when the stream cannot be read.
+    pub async fn put_stream<R>(
+        &self,
+        key: &str,
+        reader: &mut R,
+    ) -> Result<PendingText, UploadStoreError>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        let id = self.create_multipart(key).await?;
+        let mut etags: Vec<String> = Vec::new();
+        let mut part: Vec<u8> = Vec::new();
+        let mut piece = [0_u8; 16 * 1024];
+        let mut written: u64 = 0;
+        let mut failure: Option<UploadStoreError> = None;
+        let part_size = usize::try_from(PART_SIZE).unwrap_or(usize::MAX);
+        loop {
+            let read = match reader.read(&mut piece).await {
+                Ok(read) => read,
+                Err(err) => {
+                    tracing::warn!(%err, key, "the stream of a converted file could not be read");
+                    failure = Some(UploadStoreError::Unavailable("connection failed"));
+                    break;
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            written = written.saturating_add(read as u64);
+            part.extend_from_slice(&piece[..read]);
+            while part.len() >= part_size {
+                let rest = part.split_off(part_size);
+                let number = u32::try_from(etags.len() + 1).unwrap_or(u32::MAX);
+                match self
+                    .put_part(key, &id, number, Bytes::from(std::mem::take(&mut part)))
+                    .await
+                {
+                    Ok(etag) => etags.push(etag),
+                    Err(err) => {
+                        failure = Some(err);
+                        break;
+                    }
+                }
+                part = rest;
+            }
+            if failure.is_some() {
+                break;
+            }
+        }
+        if failure.is_none() && !part.is_empty() {
+            let number = u32::try_from(etags.len() + 1).unwrap_or(u32::MAX);
+            match self.put_part(key, &id, number, Bytes::from(part)).await {
+                Ok(etag) => etags.push(etag),
+                Err(err) => failure = Some(err),
+            }
+        }
+        if let Some(err) = failure {
+            let _aborted = self.abort_multipart(key, &id).await;
+            return Err(err);
+        }
+        if etags.is_empty() {
+            // Nothing was written: an empty object is not a multipart upload,
+            // and a store refuses to assemble one with no pieces. The upload
+            // is thrown away, and the text is written whole when the caller
+            // completes it.
+            let _aborted = self.abort_multipart(key, &id).await;
+            return Ok(PendingText {
+                key: key.to_owned(),
+                upload: None,
+                etags,
+                written,
+            });
+        }
+        Ok(PendingText {
+            key: key.to_owned(),
+            upload: Some(id),
+            etags,
+            written,
+        })
+    }
+
+    /// Assemble a pending text into the object at its key.
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the store refuses or cannot be
+    /// reached.
+    pub async fn complete_pending(&self, pending: &PendingText) -> Result<(), UploadStoreError> {
+        match pending.upload.as_deref() {
+            Some(id) => {
+                self.complete_multipart(&pending.key, id, &pending.etags)
+                    .await
+            }
+            None => self.put(&pending.key, Bytes::new()).await,
+        }
+    }
+
+    /// Throw a pending text away, with its pieces: the bytes a store keeps
+    /// and bills for are not left behind, and the object at the key is NOT
+    /// touched (it is not there: a pending text was never assembled).
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the abort fails for any other
+    /// reason.
+    pub async fn abort_pending(&self, pending: &PendingText) -> Result<(), UploadStoreError> {
+        match pending.upload.as_deref() {
+            Some(id) => self.abort_multipart(&pending.key, id).await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// A text that has been written to the store but NOT yet assembled.
+///
+/// `SEC-22` P2: a conversion is committed only after the child that wrote it
+/// has exited 0, so the text is written as a multipart upload that the caller
+/// assembles ([`UploadStore::complete_pending`]) or throws away
+/// ([`UploadStore::abort_pending`]) once the child's ending is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingText {
+    /// The key the text is at.
+    key: String,
+    /// The multipart upload's id, or `None` when nothing was written: a
+    /// store refuses to assemble an upload with no pieces.
+    upload: Option<String>,
+    /// The pieces' `ETags`, in piece-number order.
+    etags: Vec<String>,
+    /// How many bytes were written.
+    written: u64,
 }
 
 #[cfg(test)]

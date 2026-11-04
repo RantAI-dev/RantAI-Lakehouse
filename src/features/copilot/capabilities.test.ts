@@ -27,8 +27,45 @@ describe("toolsFromCaps", () => {
     expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain("set_cache_rule")
   })
 
+  // BI-37 D8: reading a dashboard's comments is a read, so Ask mode offers it
+  // through Query Data, and the composer's allowlist must carry it in the
+  // Dashboard Builder too (a tool missing here never reaches the model).
+  it("offers list_dashboard_comments with Query Data in both modes and Dashboard Builder in build", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_dashboard_comments")
+    }
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("list_dashboard_comments")
+  })
+
   it("does not offer ask_user when Query Data is off", () => {
     expect(toolsFromCaps(new Set(["dashboard"]), "build")).not.toContain("ask_user")
+  })
+})
+
+// BI-26 slice 2 D10 (AI-11-AC3): the embed tools, named here or they never
+// reach the model. The snippet is a read, so Ask mode offers it; the three
+// writes belong to the Dashboard Builder's build mode.
+describe("the signed-embed tools", () => {
+  const fixture = JSON.parse(
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
+  ) as { function: { name: string } }[]
+  const serverTools = fixture.map((t) => t.function.name)
+  const writers = ["enable_embed", "set_embed_filter_modes", "withdraw_embed_tokens"]
+
+  it("are on the server", () => {
+    for (const tool of [...writers, "get_embed_snippet"]) expect(serverTools).toContain(tool)
+  })
+
+  it("offers the snippet in both modes and the three writes in build mode only", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("get_embed_snippet")
+    }
+    for (const tool of writers) {
+      expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
+      expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(tool)
+      expect(toolsFromCaps(new Set(["data"]), "build")).not.toContain(tool)
+    }
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("get_embed_snippet")
   })
 })
 

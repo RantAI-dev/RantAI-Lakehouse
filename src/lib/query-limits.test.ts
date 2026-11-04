@@ -22,7 +22,7 @@ describe("limitProblem", () => {
   })
 
   it("keeps the feature page's defaults", () => {
-    expect(LIMIT_DEFAULTS).toEqual({ timeoutSeconds: 60, chartRows: 2000, mapPoints: 5000, studioRows: 2000 })
+    expect(LIMIT_DEFAULTS).toEqual({ timeoutSeconds: 60, chartRows: 2000, mapPoints: 5000, studioRows: 64000 })
   })
 })
 

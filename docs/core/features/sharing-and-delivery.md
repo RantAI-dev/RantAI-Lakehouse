@@ -53,7 +53,7 @@ Part D, images and import:
 
 Part E, comments:
 
-13. Comment on a dashboard, and mention a colleague with @. They are told in the console and by email.
+13. Comment on a dashboard, and mention a colleague with @. They are told in the console and by email. You can post ten comments in five minutes (the eleventh is refused with "Try again in a moment"), and opening a dashboard's comments marks that dashboard's mentions read, so the bell drops a conversation you have just opened (`BI-38`).
 
 Part F, digests (after `RPT-1` is merged):
 
@@ -95,7 +95,7 @@ person to approve first).
 | C1 | An alert reads one number. A KPI or gauge gives its value; a line or bar over time gives its latest point of the chosen series. Any other chart can only use "returns any rows" | Planner default | Owner to confirm at QA |
 | C2 | It fires once when the value crosses the line, then once when it is back. A check that cannot run is recorded and changes nothing | Spec | Decided by the spec |
 | C3 | Anyone who can view a chart can set an alert on it for themselves. Sending it to other people, outside addresses or a webhook needs the alert permission (`alert:write`), as today | Planner default | Signed by the owner, 2026-10-18 |
-| C4 | An alert reads the data as the person who set it (their masking and row filters), like a scheduled report. If they lose access, the alert stops and says why | Planner default (`RPT-1` decision 1) | Owner to confirm at QA |
+| C4 | An alert reads the data as the person who set it (their masking and row filters), like a scheduled report. This covers every threshold alert: a table column, a metric or a chart. If they lose access or the alert permission, the alert stops and says why | Planner default (`RPT-1` decision 1) | Owner to confirm at QA |
 | C5 | Alerts are still checked every 15 minutes | Planner default (today) | Owner to confirm at QA |
 | D1 | The PNG is made on the server, like the PDF (`BI-1`): same masking, same audit, works for the assistant. Without the PDF service it says "Images are not set up on this deployment" | Planner default | Owner to confirm at QA |
 | D2 | The image is the chart with its title and the filters applied written under it, 1200 pixels wide, sharp on high-resolution screens | Planner default | Owner to confirm at QA |
@@ -116,6 +116,13 @@ person to approve first).
 - An alert looks at one number every 15 minutes. A spike that comes and goes between two checks is not seen.
 - A PNG needs the PDF service (`BI-1`).
 - Import cannot read the old YAML file. Export again as a dashboard file.
+- A manager can mark an item "only the people listed" without listing themselves, and the manager of a sub-folder can do the same to a dashboard the manager of the folder above could open. The People tab warns when nobody listed can manage the item; administrators always keep access. To undo it, an administrator or a person listed with manage changes the list.
+- A restricted dashboard inside a restricted folder counts only its own list. People listed on the folder do not open it unless they are listed on the dashboard too (owner confirmed, 2026-10-25).
+- A SQL source filed in a folder is listed, read and changed only by people who may see that folder, and cannot be filed into a folder you cannot see. A source at the top level is for everyone who may use dashboards (owner decision, 2026-10-25).
+- Deleting a folder is refused while a dashboard of it is still in the trash, and says so; restoring a dashboard whose folder is gone files it at the top level and needs edit there.
+- The effect preview ("who gains and loses access") covers moving a dashboard. The console has no folder move yet, so there is no preview for one; the server's folder move needs manage on the folder and edit on the destination, and gives no preview.
+- The assistant's chart tools (`create_chart`, `update_chart`, `delete_chart`, `move_chart`, `format_chart`) check the same edit level as the console, on the dashboard the chart is on and the one it moves to. The assistant's own gate still asks for the global permission, so a person who holds only a rule on a dashboard cannot use the assistant on it yet (the D9 gate is not built; with the AI team).
+- In the People tab, searching for people to give access shows names and email addresses to anyone who manages something.
 
 ## Asking the assistant
 

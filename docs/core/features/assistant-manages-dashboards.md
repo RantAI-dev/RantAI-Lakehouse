@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Module | AI Copilot |
-| Backlog | `AI-1`, `AI-2`, `AI-20` |
+| Backlog | `AI-1`, `AI-2`, `AI-20`, `AI-5`, `AI-8`, `AI-15`, `AI-22` |
 | Spec | `docs/core/specs/ai-1.md`, `docs/core/specs/ai-2.md`; `AI-20` has no spec (it is a follow-up from PR #104 review SHOULD-FIX 11) |
 | Status | Decisions signed 2026-10-15 (two decisions); the rest are planner defaults, owner to confirm at QA |
 | Plan | Plan files are not kept in the repository. |
@@ -36,6 +36,12 @@ grain answers from the chart's own grain or not at all.
    this as the default for everyone".
 7. Ask the assistant about the dashboard's time grain; the answer names
    the grain set on the dashboard's control, not the chart's own grain.
+8. Ask for a chart in words that do not name a dashboard ("Show the share of
+   foreign visitors by country as a pie.") in Build mode; the assistant is
+   offered the chart tools for that turn and drafts the chart.
+9. Ask for a request with more than one step ("Build me a dashboard about
+   events, then add a chart of the events per month."); after the first
+   draft is confirmed, the chat goes on with the next step by itself.
 
 ## Not included
 
@@ -119,6 +125,40 @@ screen and the board's saved grain (`summarizeGrain`, new, beside the
 filter summary), so the assistant can name the dashboard's grain rather
 than the chart's own.
 
+### What the chat is offered
+
+In Build mode the chat is offered the chart and dashboard tools on every
+turn, whatever the question says: the tools that list charts and SQL
+sources, that suggest a dashboard or a join, that create and change a
+chart, a board or a tab, that move charts into a tab, that read and set
+the view's filters, and that write and check a calculated field. A
+question that asks for a pie, a pivot, a progress bar or a bullet graph
+no longer has to name a dashboard to reach them. Ask mode is unchanged: it
+offers no write tool.
+
+The console's own tool list (the Tools menu) is an upper bound, not a
+replacement: a tool the person allowed is offered only when the turn needs
+it, and a tool the person did not allow is never offered. The offered
+list is ordered the same way every time - the tools every turn has, then
+the chart tools of a Build turn, then the rest - so two Build turns from
+the same page share the model's prompt.
+
+### A request that goes on by itself
+
+A write that the rest of the request needs cannot be finished in one
+turn: the draft waits for the Confirm button, and the chart that needs
+the board does not exist yet. The assistant therefore names the draft it
+made and, when steps are left, the steps that are left; once the draft is
+confirmed and succeeded, the console sends a message that begins
+"Confirmed and saved: ..." in the same session. The message names each
+object the Confirm saved (its tool, id and title, the parts the result
+carries; a part the result does not carry is left out) and says not to
+draft those objects again, then "Continue:" with the steps that are left;
+it names what was saved, it does not re-send the tool results. A
+cancelled or failed draft sends nothing, so a refused step stops the
+request there. At most three such continuations follow one typed
+message.
+
 ## Decisions
 
 | # | Decision | Default | Signed |
@@ -156,6 +196,11 @@ than the chart's own.
     within a 4,000-character budget of their own, which leaves room inside
     the page context's 6,000-character cap. When they do not, the JSON
   is left out and the chip summary stays.
+- **The chat goes on by itself at most three times.** A request that needs
+  more than four dependent writes stops after the fourth, and the person
+  asks for the rest.
+- A tool the person took out of the Tools menu is not offered, even when
+  the request needs it.
 
 ## Acceptance checklist
 

@@ -7,6 +7,15 @@
 //! (not in memory: it can restart before the run ends). When Dagster's
 //! sensor reports the run `SUCCESS`, the API maps the kept SQL and writes the
 //! pipeline's rows. A run that did not succeed writes nothing.
+//!
+//! `SEC-50` puts the tenant gate in front of `.../enforce`: a pipeline acts
+//! as its OWN tenant (`pipeline_definition.tenant_id`), and a pipeline with
+//! no tenant reaches nothing. So the fixtures below give every pipeline a
+//! tenant and the deployment a catalog tenant, because that is what a
+//! pipeline that can run at all looks like. The statement read here
+//! (`bronze.orders`) is a table no upload claimed, so only the catalog's own
+//! tenant may read it — the fixture names that tenant, and the author
+//! (`yoga`) belongs to it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -30,6 +39,20 @@ use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 /// one cast.
 const SQL: &str = "SELECT id, amount AS amt, CAST(price AS Float64) AS price_f \
                    FROM icecat.`bronze.orders`";
+
+/// `SEC-50`: the tenant that owns the shared catalog in these tests —
+/// Meridian Group, the tenant the seeded identity migration gives `yoga`
+/// (the pipeline's author here).
+const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
+/// The tenant every pipeline in this file belongs to. The gate applies the
+/// pipeline's own tenant as if the author had sent it in `X-Tenant`, so it
+/// has to be a tenant the author really is in.
+fn catalog_tenant() -> Uuid {
+    CATALOG_TENANT
+        .parse()
+        .expect("the seeded catalog tenant id")
+}
 
 /// The router, its database, an admin's session cookie, and the two mock
 /// servers (returned so they stay up for the whole test).
@@ -76,6 +99,11 @@ async fn app(run_status: &str) -> (axum::Router, PgPool, String, (MockServer, Mo
         "DAGSTER_URL".to_owned(),
         format!("{}/graphql", dagster.uri()),
     );
+    // `SEC-50`: the deployment names its catalog tenant. The gate reads it
+    // to decide which tenant may read the shared catalog, and the statement
+    // these tests read (`bronze.orders`) is a table no upload claimed, so
+    // only that tenant may read it.
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
     (router, pool, cookie, (ch, dagster))
@@ -90,7 +118,10 @@ async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
 }
 
 /// A runnable pipeline `bronze.orders -> silver.orders_clean`.
-async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>) -> String {
+///
+/// `SEC-50`: the pipeline carries a tenant of its own, because that is the
+/// tenant the enforce route's gate measures the statement against.
+async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uuid>) -> String {
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
@@ -107,7 +138,7 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>) -> String {
             fbic_enabled: false,
             max_retries: None,
             owner: None,
-            tenant_id: None,
+            tenant_id,
             depends_on: Vec::new(),
             connector_id: None,
             id: None,
@@ -200,7 +231,7 @@ async fn pending(pool: &PgPool, id: &str) -> Option<String> {
 async fn the_enforce_call_keeps_the_submitted_sql_in_postgres() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
-    let id = seed_pipeline(&pool, Some(author)).await;
+    let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
 
     let (status, body) = enforce(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -210,7 +241,7 @@ async fn the_enforce_call_keeps_the_submitted_sql_in_postgres() {
 #[tokio::test]
 async fn a_refused_enforce_keeps_nothing() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
-    let id = seed_pipeline(&pool, None).await;
+    let id = seed_pipeline(&pool, None, Some(catalog_tenant())).await;
 
     let (status, _) = enforce(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -221,7 +252,7 @@ async fn a_refused_enforce_keeps_nothing() {
 async fn a_successful_run_writes_the_pipelines_mappings_and_clears_the_pending_sql() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
-    let id = seed_pipeline(&pool, Some(author)).await;
+    let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
     // Enforce through the route, then report the run: the pending row is the
     // only thing carried from one request to the other. A restart of the
     // API between the two loses nothing, because nothing is in memory.
@@ -278,7 +309,7 @@ async fn pending_sql_left_by_an_earlier_process_is_mapped_by_the_next_success() 
     // The "restart": the row was written by a process that no longer
     // exists; this app instance never saw the enforce call.
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
-    let id = seed_pipeline(&pool, None).await;
+    let id = seed_pipeline(&pool, None, Some(catalog_tenant())).await;
     column_lineage::put_pending(&pool, &id, SQL).await.unwrap();
 
     let (status, body) = run_finished(&router, &cookie, &id).await;
@@ -293,7 +324,7 @@ async fn pending_sql_left_by_an_earlier_process_is_mapped_by_the_next_success() 
 async fn a_run_that_did_not_succeed_writes_nothing() {
     let (router, pool, cookie, _servers) = app("FAILURE").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
-    let id = seed_pipeline(&pool, Some(author)).await;
+    let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
     let (status, _) = enforce(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -309,7 +340,7 @@ async fn a_run_that_did_not_succeed_writes_nothing() {
 async fn a_repeated_success_event_leaves_the_rows_as_they_were() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
-    let id = seed_pipeline(&pool, Some(author)).await;
+    let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
     enforce(&router, &cookie, &id).await;
     run_finished(&router, &cookie, &id).await;
     let (status, _) = run_finished(&router, &cookie, &id).await;

@@ -139,6 +139,15 @@ const MAX_RESULT_ROWS: usize = 100;
 /// saying how many more there were and what to do instead, and an error
 /// keeps its message but loses the engine boilerplate
 /// ([`clean_sql_error`]).
+///
+/// A result the run route cut carries a second note, under `truncated`,
+/// that names the limit which cut it — the route names it in `cutBy` — so
+/// the model is never told the wrong limit did it.
+///
+/// `DATA-29`: the cells are handed over as the route built them, so a
+/// `NULL` cell reaches the model as `null` and an empty cell as `""` — the
+/// two are told apart, and this tool does not flatten them again on the way
+/// to the model.
 fn compact_query_result(result: Value) -> Value {
     let Value::Object(mut body) = result else {
         return result;
@@ -175,13 +184,34 @@ fn compact_query_result(result: Value) -> Value {
         );
     }
     if body.get("truncated") == Some(&Value::Bool(true)) {
-        out.insert(
-            "truncated".to_owned(),
-            json!("the engine's row limit cut this result; aggregate in SQL"),
-        );
+        // The run route names the limit that cut the result (`cutBy`), and
+        // the note has to name that same limit: a result cut by the byte
+        // cap was not cut by a row limit, and the row limit is the
+        // server's own, not the engine's. A route that named no limit
+        // leaves the note naming none, rather than guessing one.
+        let note = match body.get("cutBy").and_then(Value::as_str) {
+            Some("rows") => ROW_LIMIT_NOTE,
+            Some("bytes") => BYTE_CAP_NOTE,
+            _ => CUT_NOTE,
+        };
+        out.insert("truncated".to_owned(), json!(note));
     }
     Value::Object(out)
 }
+
+/// The note for a result the Query Studio row limit cut. The limit is the
+/// server's own, so the note says so instead of blaming the engine.
+const ROW_LIMIT_NOTE: &str =
+    "the Query Studio row limit (64,000 rows by default) cut this result; aggregate in SQL";
+
+/// The note for a result the server-side byte cap cut: a result of few,
+/// wide rows passes the row limit and still reaches the cap, so the note
+/// must not point at rows.
+const BYTE_CAP_NOTE: &str = "the 10 MB result size cap cut this result; aggregate in SQL";
+
+/// The note for a cut result whose limit the route did not name: the model
+/// is told the result was cut and what to do, but not which limit did it.
+const CUT_NOTE: &str = "this result was cut; aggregate in SQL";
 
 /// A `ClickHouse` error for the query's own author: the message and its
 /// error name, without the `Code: N. DB::Exception:` prefix, the server
@@ -1129,6 +1159,48 @@ mod run_sql_delegation {
         Ok(())
     }
 
+    /// `DATA-29`: a `NULL` cell reaches the model as `null`, and an empty
+    /// cell stays `""` — the tool must not flatten the two again on the way
+    /// to the model.
+    ///
+    /// The tool forwards the run route's rows, so the shape is the route's:
+    /// the engine's answer carries one column as `null` and the other as an
+    /// empty string, and the model sees both as they came.
+    #[tokio::test]
+    async fn run_sql_hands_the_model_a_null_cell_as_null() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("EXPLAIN AST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("SelectWithUnionQuery (children 1)\n"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "maybe", "type": "Nullable(String)"},
+                    {"name": "text", "type": "String"},
+                ],
+                "data": [{"maybe": null, "text": ""}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!("SELECT 1"));
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        assert_eq!(
+            result["rows"],
+            json!([{"maybe": null, "text": ""}]),
+            "a NULL cell must reach the model as null, and an empty cell as an empty string"
+        );
+    }
+
     /// SEC-9-AC4: a statement that fails in the engine comes back to the
     /// model as the trimmed diagnosis with a reference, never the engine
     /// version or an address (SEC-11's query-author exception, reached
@@ -1355,5 +1427,86 @@ mod read_only_guard {
         ] {
             assert!(!is_read_only_sql(&format!("SELECT 1; {kw} x")));
         }
+    }
+}
+
+#[cfg(test)]
+mod truncated_note {
+    //! The note `compact_query_result` hands the model when the run route
+    //! reports a cut result: it must name the limit that actually cut it.
+    //! The run route names that limit (`cutBy`), so a note that blames the
+    //! wrong one sends the model after the wrong fix — a byte-cut result
+    //! was not cut by a row limit, and the row limit is the server's own,
+    //! not the engine's.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// A run response as `routes::query::run` builds it: `truncated` says
+    /// whether anything was cut, `cutBy` names the limit that did it and is
+    /// absent when the route named none.
+    fn run_body(truncated: bool, cut_by: Option<&str>) -> Value {
+        let mut body = Map::new();
+        body.insert("columns".to_owned(), json!([{"name": "n"}]));
+        body.insert("rows".to_owned(), json!([{"n": 1}]));
+        body.insert("rowCount".to_owned(), json!(1));
+        if truncated {
+            body.insert("truncated".to_owned(), json!(true));
+        }
+        if let Some(cut_by) = cut_by {
+            body.insert("cutBy".to_owned(), json!(cut_by));
+        }
+        Value::Object(body)
+    }
+
+    /// The note of a cut result.
+    fn note_for(body: Value) -> String {
+        let out = compact_query_result(body);
+        out["truncated"]
+            .as_str()
+            .expect("a cut result carries the note")
+            .to_owned()
+    }
+
+    #[test]
+    fn a_result_cut_by_the_row_limit_names_the_row_limit() {
+        let note = note_for(run_body(true, Some("rows")));
+        assert!(note.contains("row limit"), "{note}");
+        assert!(note.contains("aggregate in SQL"), "{note}");
+        // The row limit is the server's own, so the note must not blame the
+        // engine for a cut the server made.
+        assert!(!note.contains("engine"), "{note}");
+    }
+
+    #[test]
+    fn a_result_cut_by_the_byte_cap_names_the_byte_cap() {
+        let note = note_for(run_body(true, Some("bytes")));
+        assert!(note.contains("10 MB"), "{note}");
+        assert!(note.contains("aggregate in SQL"), "{note}");
+        // A byte-cut result was not cut by a row limit.
+        assert!(!note.contains("row"), "{note}");
+    }
+
+    #[test]
+    fn a_cut_result_without_a_named_limit_names_no_limit() {
+        let note = note_for(run_body(true, None));
+        assert!(note.contains("aggregate in SQL"), "{note}");
+        // The route named no limit, so the note may not guess one.
+        assert!(!note.contains("row"), "{note}");
+        assert!(!note.contains("limit"), "{note}");
+        assert!(!note.contains("10 MB"), "{note}");
+    }
+
+    #[test]
+    fn a_result_that_was_not_cut_carries_no_note() {
+        let out = compact_query_result(run_body(false, None));
+        assert!(out.get("truncated").is_none(), "{out}");
+
+        // A response without the field at all is not cut either.
+        let mut body = run_body(false, None);
+        body.as_object_mut().expect("an object").remove("truncated");
+        let out = compact_query_result(body);
+        assert!(out.get("truncated").is_none(), "{out}");
     }
 }

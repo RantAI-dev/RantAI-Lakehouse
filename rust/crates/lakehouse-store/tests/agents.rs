@@ -483,11 +483,92 @@ async fn emp_copilot_exists_and_is_manual_only(pool: PgPool) -> sqlx::Result<()>
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(config.name, "Copilot (interactive)");
+    assert_eq!(config.name, "AI Copilot");
     assert_eq!(config.status, "ready");
     assert_eq!(config.prompt, None);
     assert_eq!(config.mode, "build");
     assert_eq!(config.permissions, "");
+    Ok(())
+}
+
+/// The `0119` migration, as it SHIPS: the file is read into the test at
+/// compile time (`include_str!`), so the SQL that is proved here is the SQL
+/// that runs in a deployment, not a copy of it that can drift.
+const AI23_MIGRATION: &str = include_str!("../../../migrations/0119_ai23_copilot_name.sql");
+
+/// `#[sqlx::test]` applies the migrations BEFORE the test body, so a state
+/// that only exists just before `0119` has to be rebuilt by hand. The
+/// reserved row is put back to its old name and the old label is written
+/// on an approval, which is the state `0119` was written for.
+async fn restore_the_state_before_ai23(pool: &PgPool) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE agent_employee SET name = 'Copilot (interactive)' WHERE id = 'emp-copilot'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO approval_item (id, employee_id, employee_name, action) \
+         VALUES ('appr-ai23-label', 'emp-copilot', 'Copilot (interactive)', 'run_sql')",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `0119` renames the reserved row to "AI Copilot" (AI-23: one name for the
+/// assistant) and rewrites the label of every approval that copied the old
+/// name, so Approvals shows one name for old and new rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ai23_renames_the_copilot_row_and_the_approval_labels(pool: PgPool) -> sqlx::Result<()> {
+    restore_the_state_before_ai23(&pool).await?;
+
+    sqlx::raw_sql(AI23_MIGRATION).execute(&pool).await?;
+
+    let name: String =
+        sqlx::query_scalar("SELECT name FROM agent_employee WHERE id = 'emp-copilot'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(name, "AI Copilot");
+
+    let label: String =
+        sqlx::query_scalar("SELECT employee_name FROM approval_item WHERE id = 'appr-ai23-label'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(label, "AI Copilot");
+    Ok(())
+}
+
+/// `agent_employee.name` is UNIQUE, so a customer who already named an
+/// employee of their own "AI Copilot" would make a plain rename fail and
+/// take the API down at start-up. The migration therefore renames the
+/// reserved row ONLY when no other row holds the new name: in that case the
+/// reserved row keeps the name it had, and the customer's row is untouched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ai23_keeps_the_old_name_when_another_row_holds_the_new_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    restore_the_state_before_ai23(&pool).await?;
+    sqlx::query(
+        "INSERT INTO agent_employee (id, name, purpose, autonomy) \
+         VALUES ('emp-customer-ai-copilot', 'AI Copilot', 'A customer employee.', 'L2')",
+    )
+    .execute(&pool)
+    .await?;
+
+    // The migration must not fail on the clash.
+    sqlx::raw_sql(AI23_MIGRATION).execute(&pool).await?;
+
+    let name: String =
+        sqlx::query_scalar("SELECT name FROM agent_employee WHERE id = 'emp-copilot'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(name, "Copilot (interactive)");
+
+    let other: String =
+        sqlx::query_scalar("SELECT name FROM agent_employee WHERE id = 'emp-customer-ai-copilot'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(other, "AI Copilot");
     Ok(())
 }
 
@@ -544,6 +625,7 @@ async fn create_pending_approval_creates_linked_run_and_approval(pool: PgPool) -
             reason: "Menghapus chart c-1.",
             risk: "tinggi",
             redacted_args: &args,
+            requested_by: None,
         },
     )
     .await
@@ -593,6 +675,7 @@ async fn record_run_outcome_sets_status_and_appends_step(pool: PgPool) -> sqlx::
             reason: "Menghapus chart c-1.",
             risk: "tinggi",
             redacted_args: &json!({ "id": "c-1" }),
+            requested_by: None,
         },
     )
     .await
@@ -913,6 +996,7 @@ async fn create_linked_approval_attaches_to_existing_run_and_real_employee(
             reason: "Membatalkan pipeline wl-1.",
             risk: "tinggi",
             redacted_args: &args,
+            requested_by: None,
         },
     )
     .await
@@ -937,6 +1021,161 @@ async fn create_linked_approval_attaches_to_existing_run_and_real_employee(
     // `run_id` join — same mechanism `run_embeds_its_approvals` covers.
     assert_eq!(run.approvals.len(), 1);
     assert_eq!(run.approvals[0].id, approval_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// SEC-57: a tool-call approval records the human who asked for it.
+//
+// `0118_sec57_approval_requester.sql` widens
+// `approval_item_kind_shape_check`: a `kind = 'tool_call'` row may now
+// name a requester (`app_user.id`) and may still leave it NULL; a
+// `kind = 'access'` row keeps its old shape exactly. These tests pin
+// both halves of the widened constraint and the round-trip of the new
+// column.
+// ---------------------------------------------------------------------
+
+/// Inserts a minimal `app_user` row and returns its id — the only kind
+/// of identity `approval_item.requested_by_user_id` can name (its
+/// foreign key points at `app_user`, never at `service_identity`).
+/// Test-only fixture helper.
+async fn insert_requester(pool: &PgPool, email: &str) -> uuid::Uuid {
+    sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
+        .bind("Requester Test User")
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A `tool_call` approval created for a person who asked for it stores
+/// that person's id and reads it back — the column the API's
+/// self-approval refusal reads (`SEC-57`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tool_call_approval_with_a_requester_is_stored_and_read_back(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let requester = insert_requester(&pool, "sec57-requester@example.test").await;
+    let args = json!({ "id": "c-1" });
+    let CreatedApproval { approval_id, .. } = create_pending_approval(
+        &pool,
+        NewApprovalRequest {
+            tool: "delete_chart",
+            actor: "Requester Test User",
+            resource: Some("c-1"),
+            reason: "Menghapus chart c-1.",
+            risk: "tinggi",
+            redacted_args: &args,
+            requested_by: Some(requester),
+        },
+    )
+    .await
+    .unwrap();
+
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .unwrap()
+        .expect("the created approval exists");
+    assert_eq!(approval.kind, "tool_call");
+    assert_eq!(approval.requested_by_user_id, Some(requester));
+    Ok(())
+}
+
+/// A `tool_call` approval nobody asked for in person (a scheduled run, a
+/// service identity) keeps `requested_by_user_id` NULL — the honest
+/// value, so nobody may be refused as "the requester".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tool_call_approval_without_a_requester_stays_null(pool: PgPool) -> sqlx::Result<()> {
+    let args = json!({ "id": "c-1" });
+    let CreatedApproval { approval_id, .. } = create_pending_approval(
+        &pool,
+        NewApprovalRequest {
+            tool: "delete_chart",
+            actor: "A schedule",
+            resource: Some("c-1"),
+            reason: "Menghapus chart c-1.",
+            risk: "tinggi",
+            redacted_args: &args,
+            requested_by: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .unwrap()
+        .expect("the created approval exists");
+    assert_eq!(approval.kind, "tool_call");
+    assert_eq!(approval.requested_by_user_id, None);
+    Ok(())
+}
+
+/// The `kind = 'access'` half of the widened shape constraint is
+/// UNCHANGED: an access request with no requester is still refused by
+/// the database, not merely by the route.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_access_row_without_a_requester_is_still_refused_by_the_shape_constraint(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let result = sqlx::query(
+        "INSERT INTO approval_item (id, kind, action, status) \
+         VALUES ('appr-sec57-no-requester', 'access', 'access:catalog:write', 'pending')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        result.is_err(),
+        "an access row with no requester must be refused by the constraint"
+    );
+    Ok(())
+}
+
+/// The `kind = 'tool_call'` half of the widened shape constraint still
+/// requires an employee: the widened constraint lets a tool call NAME a
+/// requester, it does not let a tool call lose its employee.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tool_call_row_without_an_employee_is_still_refused_by_the_shape_constraint(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let result = sqlx::query(
+        "INSERT INTO approval_item (id, kind, action, status) \
+         VALUES ('appr-sec57-no-employee', 'tool_call', 'delete_chart', 'pending')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        result.is_err(),
+        "a tool_call row with no employee must be refused by the constraint"
+    );
+    Ok(())
+}
+
+/// A `tool_call` approval whose requester names a user that does not
+/// exist is refused by the foreign key — the column can only ever hold
+/// a real `app_user.id`, never a made-up one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tool_call_approval_with_an_unknown_requester_is_refused(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let args = json!({ "id": "c-1" });
+    let result = create_pending_approval(
+        &pool,
+        NewApprovalRequest {
+            tool: "delete_chart",
+            actor: "Nobody",
+            resource: Some("c-1"),
+            reason: "Menghapus chart c-1.",
+            risk: "tinggi",
+            redacted_args: &args,
+            requested_by: Some(uuid::Uuid::new_v4()),
+        },
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a requester that is not an app_user must be refused"
+    );
     Ok(())
 }
 

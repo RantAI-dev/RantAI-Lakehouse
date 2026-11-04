@@ -18,6 +18,7 @@ compares every score with the values the code printed before the change
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -59,7 +60,11 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Records every call; answers from a script keyed by (method, path)."""
+    """Records every call; answers from a script keyed by (method, path).
+
+    A list of replies answers in order and stays on its last reply, the
+    way a single scripted reply repeats.
+    """
 
     def __init__(self, replies: dict[tuple[str, str], Any] | None = None) -> None:
         self.replies = replies or {}
@@ -70,6 +75,8 @@ class FakeSession:
         key = (method, path)
         self.calls.append((method, url, body))
         reply = self.replies.get(key)
+        if isinstance(reply, list):
+            reply = reply.pop(0) if len(reply) > 1 else (reply[0] if reply else None)
         if isinstance(reply, FakeResponse):
             return reply
         return FakeResponse(200, reply if reply is not None else {"ok": True})
@@ -254,6 +261,215 @@ class ConfirmRunTests(unittest.TestCase):
         self.assertEqual((method, url), ("POST", "http://api.test/api/ai/tool"))
         self.assertEqual(body["args"]["title"], "E")
         self.assertIs(body["args"]["confirmed"], True)
+
+
+class ContinuationTests(unittest.TestCase):
+    """The runner goes on after a confirmed draft, the way the console does.
+
+    A request with two dependent writes could not finish: the first draft
+    waited for its Confirm and the conversation stopped there. The model now
+    ends such a turn with the steps that are left, and the console sends
+    them back. The runner does the same, so the eval measures the product.
+    """
+
+    def scripted_ask(
+        self, bodies: list[dict[str, Any]]
+    ) -> tuple[Any, list[list[dict[str, str]]]]:
+        """A fake `ask` that answers with the given bodies in order (the last
+        one again when the script runs out) and records every request."""
+        sent: list[list[dict[str, str]]] = []
+
+        def fake_ask(
+            _cfg: Any,
+            _session: Any,
+            _mode: str,
+            messages: list[dict[str, str]],
+            context: str | None = None,
+        ) -> dict[str, Any]:
+            sent.append([dict(message) for message in messages])
+            return bodies[min(len(sent) - 1, len(bodies) - 1)]
+
+        return fake_ask, sent
+
+    def body_with_next_step(
+        self, next_step: str | None = "add two charts", tools: list[str] | None = None
+    ) -> dict[str, Any]:
+        """A turn that drafted a tool call (waiting for a Confirm) and, when
+        it says so, the steps the request still has. `tools` names every
+        draft of the turn when there is more than one."""
+        drafts = tools or ["create_chart"]
+        body: dict[str, Any] = {
+            "answer": "The chart draft is ready.",
+            "_status": 200,
+            "toolTrace": [
+                {
+                    "tool": tool,
+                    "args": {"caption": "C"},
+                    "result": {
+                        "needs_confirmation": True,
+                        "tool": tool,
+                        "args": {"caption": "C"},
+                    },
+                }
+                for tool in drafts
+            ],
+        }
+        if next_step:
+            body["nextStep"] = next_step
+        return body
+
+    def run_with(
+        self,
+        bodies: list[dict[str, Any]],
+        confirm: dict[str, Any] | list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], list[list[dict[str, str]]]]:
+        """Run one case against the bodies; `confirm` scripts the replies the
+        confirms get, one per drafted tool when it is a list."""
+        if confirm is None:
+            confirm = confirm_reply("create_chart", {"created": True, "id": "c1", "title": "Visitors"})
+        replies = confirm if isinstance(confirm, list) else [confirm]
+        cfg = make_cfg()
+        session = FakeSession({("POST", "/api/ai/tool"): replies})
+        fake_ask, sent = self.scripted_ask(bodies)
+        case = {"id": "continues", "mode": "build", "confirm": True, "turns": ["Draw it."]}
+        with mock.patch.object(m, "ask", side_effect=fake_ask):
+            result = m.run_case(cfg, session, case)
+        return result, sent
+
+    def test_a_body_with_a_next_step_adds_one_turn(self) -> None:
+        result, sent = self.run_with([self.body_with_next_step(), self.body_with_next_step(None)])
+
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(
+            sent[1][-1],
+            {
+                "role": "user",
+                "content": 'Confirmed and saved: create_chart c1 "Visitors". Do not draft these again. Continue: add two charts',
+            },
+        )
+
+    def test_two_confirmed_drafts_are_listed_in_one_continuation(self) -> None:
+        # Both drafts the person confirmed are named, in the order of the
+        # steps, so the model sees what exists and drafts nothing again.
+        result, sent = self.run_with(
+            [
+                self.body_with_next_step(tools=["create_board", "update_chart"]),
+                self.body_with_next_step(None),
+            ],
+            confirm=[
+                confirm_reply("create_board", {"created": True, "id": "b1", "name": "Overview"}),
+                confirm_reply("update_chart", {"updated": True, "id": "c1", "title": "Visitors"}),
+            ],
+        )
+
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(
+            sent[1][-1],
+            {
+                "role": "user",
+                "content": 'Confirmed and saved: create_board b1 "Overview"; update_chart c1 "Visitors". Do not draft these again. Continue: add two charts',
+            },
+        )
+
+    def test_a_result_without_an_id_or_a_title_names_only_the_tool(self) -> None:
+        _result, sent = self.run_with(
+            [self.body_with_next_step(), self.body_with_next_step(None)],
+            confirm=confirm_reply("create_chart", {"created": True}),
+        )
+
+        self.assertEqual(
+            sent[1][-1],
+            {
+                "role": "user",
+                "content": "Confirmed and saved: create_chart. Do not draft these again. Continue: add two charts",
+            },
+        )
+
+    def test_a_calculated_field_is_named_through_its_field(self) -> None:
+        # A calculated field carries its name in `field`, not at the top of
+        # the result; the item still names it.
+        _result, sent = self.run_with(
+            [
+                self.body_with_next_step(tools=["create_calculated_field"]),
+                self.body_with_next_step(None),
+            ],
+            confirm=confirm_reply(
+                "create_calculated_field", {"ok": True, "id": "f1", "field": {"id": "f1", "name": "Roas"}}
+            ),
+        )
+
+        self.assertEqual(
+            sent[1][-1],
+            {
+                "role": "user",
+                "content": 'Confirmed and saved: create_calculated_field f1 "Roas". Do not draft these again. Continue: add two charts',
+            },
+        )
+
+    def test_a_body_without_a_next_step_adds_no_turn(self) -> None:
+        _result, sent = self.run_with([self.body_with_next_step(None)])
+
+        self.assertEqual(len(sent), 1)
+
+    def test_the_cap_holds(self) -> None:
+        # Every turn says it has steps left: the runner sends at most three
+        # continuations after the scripted turn.
+        _result, sent = self.run_with([self.body_with_next_step()])
+
+        self.assertEqual(len(sent), 4)
+
+    def test_a_confirm_that_failed_stops_the_chain(self) -> None:
+        _result, sent = self.run_with(
+            [self.body_with_next_step()],
+            confirm=confirm_reply("create_chart", {"error": "no"}, outcome="failed"),
+        )
+
+        self.assertEqual(len(sent), 1)
+
+    def run_after_confirm(self, chart_arg: str) -> dict[str, Any]:
+        """The continuation calls `set_cache_rule` on the chart the confirm
+        made; the case expects `{created:chart}` (`BI-41` T1)."""
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/ai/tool"): confirm_reply(
+                "create_chart", {"created": True, "id": "c1", "title": "Visitors"}
+            ),
+        })
+        drafted = self.body_with_next_step("make it always fresh")
+        fresh = {
+            "answer": "It is always fresh now.",
+            "_status": 200,
+            "toolTrace": [{
+                "tool": "set_cache_rule",
+                "args": {"chart": chart_arg, "rule": "fresh"},
+                "ok": True,
+                "result": {"updated": True},
+            }],
+        }
+        fake_ask, _sent = self.scripted_ask([drafted, fresh])
+        case = {
+            "id": "new-chart-fresh",
+            "mode": "build",
+            "confirm": True,
+            "turns": ["Draw it and make it always fresh."],
+            "expect_tool": {
+                "name": "set_cache_rule",
+                "args_contains": {"chart": "{created:chart}", "rule": "fresh"},
+            },
+        }
+        with mock.patch.object(m, "ask", side_effect=fake_ask):
+            return m.run_case(cfg, session, case)
+
+    def test_the_continuation_s_names_the_created_chart(self) -> None:
+        result = self.run_after_confirm("c1")
+
+        self.assertEqual(result["missing"], [])
+
+    def test_another_chart_id_does_not_stand_in_for_the_created_one(self) -> None:
+        result = self.run_after_confirm("c2")
+
+        self.assertEqual(len(result["missing"]), 1)
 
 
 # ── cleanup ───────────────────────────────────────────────────────────────
@@ -441,6 +657,92 @@ class CleanupPlanTests(unittest.TestCase):
             m.collect_created([{"kind": "source", "id": "s9"}], [], []),
             [{"kind": "source", "id": "s9"}],
         )
+
+    # BI-37: the alert the assistant saves is an object the run made, so the
+    # state check counts it and the cleanup deletes it.
+    def test_create_alert_rule_saves_a_rule_that_the_run_collects_and_deletes(self) -> None:
+        reply = {"ok": True, "rule": {"id": "al7", "name": "Visitors", "chart": "c1"}}
+        trace = [{"tool": "create_alert_rule", "result": {"ok": True, "rule": {"id": "al7"}}}]
+        confirms = [{"tool": "create_alert_rule", "result": confirm_reply("create_alert_rule", reply)}]
+        self.assertEqual(m.collect_created([], [trace], []), [{"kind": "alert", "id": "al7"}])
+        self.assertEqual(m.collect_created([], [], confirms), [{"kind": "alert", "id": "al7"}])
+        cfg = make_cfg()
+        session = FakeSession()
+        self.assertEqual(m.run_cleanup(cfg, session, m.collect_created([], [], confirms)), [])
+        self.assertIn(
+            ("DELETE", "http://api.test/api/alerts?id=al7", None), session.calls
+        )
+
+    def test_a_draft_that_only_asks_for_confirmation_collects_no_alert(self) -> None:
+        # The pending confirmation names the tool and its args, never a saved
+        # rule, so the run must not delete an id it never saw.
+        trace = [{"tool": "create_alert_rule", "result": {"needs_confirmation": True, "tool": "create_alert_rule"}}]
+        self.assertEqual(m.collect_created([], [trace], []), [])
+
+    def test_an_alert_is_deleted_before_the_chart_it_watches(self) -> None:
+        created = [{"kind": "chart", "id": "c1"}, {"kind": "alert", "id": "al1"}]
+        self.assertEqual([s["kind"] for s in m.cleanup_plan(created)], ["alert", "chart"])
+
+
+class TeardownTests(unittest.TestCase):
+    """The calls a case names in `cleanup` undo what its setup changed and the
+    deletes cannot: a certification mark it put on an asset. They run after
+    the deletes, on every exit of the run."""
+
+    MARK = {"method": "PUT", "path": "/api/catalog/serving.mart_x/certification", "body": {"status": None}}
+
+    def test_a_teardown_call_is_made_the_way_a_setup_call_is(self) -> None:
+        cfg = make_cfg()
+        session = FakeSession()
+        problems = m.run_teardown(cfg, session, [self.MARK], {})
+        self.assertEqual(problems, [])
+        method, url, body = session.calls[-1]
+        self.assertEqual((method, url), ("PUT", "http://api.test/api/catalog/serving.mart_x/certification"))
+        self.assertEqual(body, {"status": None})
+
+    def test_a_teardown_call_can_use_a_name_the_setup_saved(self) -> None:
+        cfg = make_cfg()
+        session = FakeSession()
+        calls = [{"method": "PUT", "path": "/api/catalog/{mart}/certification", "body": {"status": None}}]
+        m.run_teardown(cfg, session, calls, {"mart": "serving.mart_x"})
+        self.assertEqual(session.calls[-1][1], "http://api.test/api/catalog/serving.mart_x/certification")
+
+    def test_a_failed_teardown_call_is_a_problem_not_a_crash(self) -> None:
+        cfg = make_cfg()
+        session = FakeSession({("PUT", "/api/catalog/serving.mart_x/certification"): FakeResponse(403, {"error": "no"})})
+        problems = m.run_teardown(cfg, session, [self.MARK], {})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("HTTP 403", problems[0])
+
+    def test_the_teardown_runs_after_the_deletes_even_when_the_run_raises(self) -> None:
+        # The turn raises (the stack is gone mid-run). The mark the setup put
+        # is still cleared, so the next run does not read a mart that is
+        # deprecated for good.
+        cfg = make_cfg()
+        case = {
+            "id": "raises_then_teardown",
+            "mode": "build",
+            "turns": ["Make a chart of events."],
+            "setup": [
+                {"method": "PUT", "path": "/api/catalog/serving.mart_x/certification",
+                 "body": {"status": "deprecated", "replacementAssetId": "serving.mart_y"}}
+            ],
+            "cleanup": [self.MARK],
+        }
+
+        class Broken(FakeSession):
+            def post(self, url: str, json: Any = None, **_: Any) -> FakeResponse:
+                if "/api/ai/chat" in url:
+                    raise m.requests.ConnectionError("stack gone")
+                return self._answer("POST", url, json)
+
+        session = Broken()
+        result = m.run_case(cfg, session, case)
+        self.assertIn("request failed", " ".join(result["problems"]))
+        puts = [(method, url, body) for method, url, body in session.calls if method == "PUT"]
+        self.assertEqual(len(puts), 2)
+        self.assertEqual(puts[0][2]["status"], "deprecated")
+        self.assertIsNone(puts[-1][2]["status"])
 
 
 # ── setup and {name} substitution ─────────────────────────────────────────
@@ -1233,7 +1535,8 @@ class DashboardRowsTests(unittest.TestCase):
     def test_the_date_cases_read_a_sql_source_made_in_setup_with_a_date_column(self) -> None:
         # The seed has no date column. Each case builds one in a source and the
         # state check names that source, so a model that charts the mart fails.
-        for case_id in ("chart_line_monthly", "chart_quarterly_id", "chart_kpi_compare"):
+        for case_id in ("chart_line_monthly", "chart_quarterly_id", "chart_kpi_compare",
+                        "chart_forecast"):
             case = self.cases()[case_id]
             setup = case["setup"]
             self.assertEqual([c["path"] for c in setup], ["/api/dashboard/sources"], case_id)
@@ -1453,6 +1756,39 @@ class DashboardCasesTests(unittest.TestCase):
         self.assertGreaterEqual(len(cases), 30)
         self.assertEqual(len({c["id"] for c in cases}), len(cases))
 
+    def test_the_new_chart_fresh_case_checks_the_created_chart(self) -> None:
+        # `BI-41` T1: the request drafts a chart and then changes it, so the
+        # case confirms the draft and expects the rule on the chart the
+        # confirm made (`{created:chart}`), never on the board.
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}[
+            "dash_new_chart_then_fresh"
+        ]
+        self.assertIs(case.get("confirm"), True)
+        self.assertEqual(
+            case["expect_tool"],
+            {"name": "set_cache_rule", "args_contains": {"chart": "{created:chart}", "rule": "fresh"}},
+        )
+        where = case["expect_state"][0]["where"]
+        self.assertEqual(where["id"], "{created:chart}")
+        self.assertEqual(where["def.cache.mode"], "fresh")
+        self.assertNotIn("board", json.dumps(case["expect_tool"]))
+
+    def test_the_this_chart_cases_carry_the_page_context_they_ask_about(self) -> None:
+        # `BI-41` T2: "this chart" is only ambiguous with the tiles on the
+        # page, so each case sends the dashboard page's context: two tiles
+        # for the one that must ask, one tile for the one that acts.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        asks = cases["dash_this_chart_fresh_asks"]
+        self.assertEqual(asks["expect_tool"]["name"], "ask_user")
+        self.assertEqual(asks["expect_no_tool"], ["set_cache_rule"])
+        for name in ("{chart_a}", "{chart_b}", "board id: {board}"):
+            self.assertIn(name, asks["context"])
+        one = cases["dash_this_chart_fresh_one_tile"]
+        self.assertIn("{chart_a}", one["context"])
+        self.assertNotIn("{chart_b}", one["context"])
+        self.assertEqual(one["expect_tool"]["args_contains"], {"chart": "{chart_a}", "rule": "fresh"})
+        self.assertNotIn("board", one["expect_tool"]["args_contains"])
+
     def test_every_write_case_confirms_and_checks_state_unless_it_tests_a_refusal_or_approval(self) -> None:
         # The plan's rule (step 2): a write case has `confirm` and `expect_state`,
         # except a case that tests a refusal (`expect_no_tool`, or a no-chart
@@ -1541,6 +1877,102 @@ class DashboardCasesTests(unittest.TestCase):
             self.assertIs(case.get("confirm"), True, case_id)
             self.assertEqual(case["expect_tool"], expect_tool, case_id)
             self.assertEqual(len(case["expect_state"]), 2, case_id)
+
+    def test_the_distance_case_brings_its_own_source_with_coordinates_and_names_it(self) -> None:
+        # The eval stack has no mart with coordinates, and `mart_demo_map_points`
+        # exists only in Rust tests, so the case creates a SQL source with
+        # latitude and longitude and asks for the field on that source.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["calc_distance_to_bandung"]
+        setup = {step["name"]: step for step in case["setup"]}
+        self.assertEqual(setup["src"]["path"], "/api/dashboard/sources")
+        sql = setup["src"]["body"]["sql"]
+        self.assertIn("latitude", sql)
+        self.assertIn("longitude", sql)
+        # The only mart the case may mention is one its own setup SQL reads.
+        everything = json.dumps(
+            {k: case[k] for k in ("turns", "expect_tool", "expect_state")}
+        )
+        self.assertNotIn("mart_demo_map_points", everything)
+        for mart in set(re.findall(r"mart_[a-z_]+", everything)):
+            self.assertIn(mart, sql)
+        # The turn, the tool arguments and the state check all use the
+        # source the setup created.
+        self.assertIn("{src}", case["turns"][0])
+        self.assertEqual(case["expect_tool"]["args_contains"]["sqlSource"], "{src}")
+        self.assertEqual(case["expect_tool"]["args_contains"]["name"], "km_from_bandung")
+        self.assertEqual(
+            case["expect_state"][0]["path"], "/api/dashboard/calc-fields?source={src}"
+        )
+
+    def test_the_view_filter_year_case_tells_the_assistant_which_dashboard_is_open(self) -> None:
+        # The console always sends the open dashboard with its board id; a
+        # case without that context never tells the assistant which board to
+        # name in `set_board_view_filters`.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["view_filter_year"]
+        self.assertIn("{board}", case.get("context", ""))
+
+
+class ForecastAndDeprecationCaseTests(unittest.TestCase):
+    """The two cases the chart-tools plan added: a forecast line, and a mart
+    the assistant must warn about."""
+
+    def cases(self) -> dict[str, dict[str, Any]]:
+        return {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+
+    def test_the_forecast_case_asks_for_a_forecast_line_of_six_periods(self) -> None:
+        case = self.cases()["chart_forecast"]
+        self.assertIs(case.get("confirm"), True)
+        self.assertEqual(case["expect_tool"]["name"], "create_chart")
+        self.assertEqual(case["expect_tool"]["args_contains"]["referenceLines"], "forecast")
+        where = case["expect_state"][0]["where"]
+        self.assertEqual(where["def.referenceLines[].kind"], "forecast")
+        self.assertEqual(where["def.referenceLines[].horizon"], 6)
+        # The seed has no date column, so the case reads a source that has
+        # one, and the turn names it so the model finds it.
+        self.assertEqual([c["path"] for c in case["setup"]], ["/api/dashboard/sources"])
+        self.assertIn("makeDate(", case["setup"][0]["body"]["sql"])
+        self.assertEqual(where["sqlSource"], "{" + case["setup"][0]["name"] + "}")
+        self.assertIn(case["setup"][0]["body"]["title"], case["turns"][0])
+
+    def test_the_forecast_state_check_needs_the_line_and_the_horizon(self) -> None:
+        case = self.cases()["chart_forecast"]
+        where = m.fill_check(case["expect_state"][0], {"src": "s1"})["where"]
+        chart = {"id": "c1", "kind": "line", "sqlSource": "s1",
+                 "def": {"grain": "month", "referenceLines": [{"kind": "forecast", "horizon": 6}]}}
+        self.assertTrue(m.where_matches(chart, where))
+        without_line = {"id": "c1", "kind": "line", "sqlSource": "s1",
+                        "def": {"grain": "month", "referenceLines": [{"kind": "trend"}]}}
+        self.assertFalse(m.where_matches(without_line, where))
+        other_horizon = {"id": "c1", "kind": "line", "sqlSource": "s1",
+                         "def": {"grain": "month", "referenceLines": [{"kind": "forecast", "horizon": 3}]}}
+        self.assertFalse(m.where_matches(other_horizon, where))
+
+    def test_the_deprecated_case_marks_a_mart_and_names_the_replacement(self) -> None:
+        case = self.cases()["deprecated_mart_warned"]
+        self.assertIs(case.get("confirm"), True)
+        mark = case["setup"][0]
+        self.assertEqual(mark["method"], "PUT")
+        self.assertEqual(mark["path"], "/api/catalog/serving.mart_kunjungan_dtw/certification")
+        self.assertEqual(mark["body"]["status"], "deprecated")
+        self.assertEqual(mark["body"]["replacementAssetId"], "serving.mart_wisman")
+        # The mark is put back, or the next run reads a mart that is deprecated
+        # for good.
+        clear = case["cleanup"][0]
+        self.assertEqual(clear["path"], mark["path"])
+        self.assertIsNone(clear["body"]["status"])
+        # The answer must name the replacement, and the chart must be built on it.
+        self.assertIn("mart_wisman", case["facts"][0]["values"])
+        self.assertEqual(case["expect_tool"]["args_contains"]["mart"], "mart_wisman")
+        self.assertEqual(case["expect_state"][0]["where"]["mart"], "mart_wisman")
+
+    def test_the_deprecated_mart_is_one_no_other_dashboard_case_uses(self) -> None:
+        cases = json.loads((HERE / "dashboard_cases.json").read_text())
+        for case in cases:
+            if case["id"] == "deprecated_mart_warned":
+                continue
+            self.assertNotIn("mart_kunjungan_dtw", json.dumps(case), case["id"])
 
 
 class ToolArgsMatchTest(unittest.TestCase):

@@ -106,6 +106,16 @@ is `DATA-19`
     moved out, the three folders are deleted (204) and are gone from the list. The files
     are deleted; the table stays.
 
+11. A workbook that asks for more memory than the machine has (`SEC-22`): it
+    uploads `ops/fixtures/uploads/hostile/huge_shared_strings.xlsx`, whose
+    shared strings declare two billion strings, so the file asks for 48 GB
+    before a single cell is read. The upload is refused with the one
+    sentence of `SEC-22` D4 ("This file needs more memory or time to read
+    than an upload is allowed. Save it as CSV and upload that instead."),
+    because the read happens in a child process that runs under a memory
+    limit and the CHILD is the one that ends. The API is still there: the
+    list of the uploads answers 200.
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -502,7 +512,11 @@ def step_rows_and_types(api, table: str, expected: dict, column_types: dict) -> 
     columns = ["plnt", "material", "description", "qty"]
     body = run_query(api, f"SELECT {', '.join(columns)} FROM {QUERY_DB}.`bronze.{table}` WHERE 1 ORDER BY material, plnt")
     # Compared as text: `plnt` and `qty` are integers now, `material` keeps its leading zeros.
-    got = [[str(row[c]) for c in columns] for row in body["rows"]]
+    # DATA-29: `/api/query/run` answers a NULL cell as JSON `null`, so a cell that holds no
+    # value reads as the empty value here -- this gate compares text, and these columns are
+    # typed plain, so a null cell is not a value the file had. It must not print Python's
+    # `None` as if it were the cell's text.
+    got = [["" if row[c] is None else str(row[c]) for c in columns] for row in body["rows"]]
     want = sorted(expected["rows"], key=lambda r: (r[1], r[0]))
     # The table holds the file twice after the append: compare the distinct rows.
     distinct = [list(r) for r in sorted({tuple(r) for r in got}, key=lambda r: (r[1], r[0]))]
@@ -559,6 +573,13 @@ def step_delete_keeps_the_table(api, upload_id: str, table: str, table_rows: int
 # SEC-17: the sentence for the column cap, as `routes/uploads.rs` words it
 # (`JOB_TOO_MANY_COLUMNS`) and `file_ingest.py` records it (`TOO_MANY_COLUMNS`).
 TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
+# The one sentence of `SEC-22` D4 for a file that needed more memory or more
+# time than a read is allowed: a child that was killed, ran out of time or ran
+# out of memory looks the same from here.
+NEEDS_MORE_MEMORY = (
+    "This file needs more memory or time to read than an upload is allowed. "
+    "Save it as CSV and upload that instead."
+)
 
 
 def step_column_cap(api) -> None:
@@ -729,6 +750,46 @@ def step_parquet(api, base_table: str, state: dict) -> None:
     state["deleted"] = True
     _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 404, "GET of the deleted Parquet upload")
     print("[g9] parquet: PASS (the upload is gone, the table stays)")
+
+
+def step_hostile_workbook(api, state: dict) -> None:
+    """A workbook that asks for more memory than the machine has must not end
+    the API (`SEC-22`).
+
+    The fixture is a real workbook whose shared strings declare two billion
+    strings: the reader reserves room for all of them before it reads one, so
+    the file asks for 48 GB. The read happens in a child process that runs
+    under a memory limit, so the CHILD is the one that ends, and the answer is
+    the one sentence of `SEC-22` D4. The upload itself is refused, so there is
+    no upload to preview: the API reads the workbook to list its sheets when it
+    arrives.
+
+    The API is still there afterwards: the list of the uploads answers 200.
+    """
+    path = FIXTURES / "hostile" / "huge_shared_strings.xlsx"
+    if not path.is_file():
+        raise G9Failure(f"fixture missing: {path} (this gate reads ops/fixtures/uploads/ beside it)")
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={
+            "file": (
+                "hostile.xlsx",
+                path.read_bytes(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+        timeout=120,
+    )
+    if resp.status_code != 400:
+        raise G9Failure(
+            f"the hostile workbook should be refused with 400, it answered {resp.status_code}: {resp.text[:200]}"
+        )
+    if resp.json().get("error") != NEEDS_MORE_MEMORY:
+        raise G9Failure(
+            f"the refusal should say {NEEDS_MORE_MEMORY!r}, it said {resp.text[:200]}"
+        )
+    _expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads after the hostile workbook")
+    print("[g9] hostile workbook: refused with the one sentence, the API is still there")
 
 
 def _dagster_lists_job(requests, job_name: str) -> bool:
@@ -966,11 +1027,13 @@ def step_new_formats(api, base_table: str, state: dict) -> None:
         if loaded.get("rows") != len(expected["rows"]) or loaded.get("bronzeTable") != table:
             raise G9Failure(f"{name}: the load settled with rows {loaded.get('rows')!r} in {loaded.get('bronzeTable')!r}, expected {len(expected['rows'])} in {table!r}")
         _wait_for(f"{table} holds its rows", lambda: count_rows(api, table) == len(expected["rows"]), VISIBLE_TIMEOUT_S, retry_failures=True)
-        # PR #186 review BLOCKER 4: `/api/query/run` answers every cell as text and renders a
-        # NULL as "" (`stringify_cell`), so a value read through it cannot tell a missing key
-        # (decision 11: null) from an empty string. Each column is asked `isNull` beside its
-        # value, and a cell is None only where ClickHouse says it is NULL. Nothing is loosened:
-        # a table that held "" where the fixture says null still fails here.
+        # PR #186 review BLOCKER 4: a value read through `/api/query/run` must tell a missing
+        # key (decision 11: null) from an empty string. DATA-29: the route answers a NULL cell
+        # as JSON `null` now, so the cell itself says so. The gate still asks ClickHouse
+        # `isNull` beside each value, so its own answer to "is this cell NULL" does not depend
+        # on the route's shape, and a cell is None only where ClickHouse says it is NULL.
+        # Nothing is loosened: a table that held "" where the fixture says null still fails
+        # here.
         flags = ", ".join(f"isNull({c}) AS is_null_{i}" for i, c in enumerate(names))
         got = run_query(api, f"SELECT {', '.join(names)}, {flags} FROM {QUERY_DB}.`bronze.{table}` WHERE 1")["rows"]
         got_rows = sorted(
@@ -1564,6 +1627,7 @@ def main() -> int:
         step_column_cap(api)
         step_workbook(api, table, state)
         step_parquet(api, table, state)
+        step_hostile_workbook(api, state)
         step_typed_columns(api, table, state)
         step_new_formats(api, table, state)
         step_several_files(api, table, state)

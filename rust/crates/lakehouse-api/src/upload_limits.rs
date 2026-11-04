@@ -24,6 +24,16 @@ use lakehouse_core::ApiError;
 /// constant so the two refusals cannot word it differently.
 pub const TOO_MANY_UPLOADS: &str = "Too many uploads are in progress. Try again in a moment.";
 
+/// The sentence of the refusal of a large load (`DATA-37` decision D4). It
+/// says that the installation already runs the maximum number of large
+/// loads, that the load can be started again when one of them finishes, and
+/// names the setting that decides, so the person can tell this refusal from
+/// the per-user one.
+pub const TOO_MANY_LARGE_LOADS: &str = "This installation already runs the maximum number of \
+                                        large loads. Start this load again when one of them \
+                                        finishes. The limit is set by \
+                                        UPLOAD_MAX_CONCURRENT_LARGE.";
+
 /// Seconds a refused caller is told to wait (`Retry-After`).
 pub const RETRY_AFTER_SECS: u64 = 5;
 
@@ -32,6 +42,16 @@ pub const RETRY_AFTER_SECS: u64 = 5;
 pub fn too_many_uploads() -> ApiError {
     ApiError::TooManyRequests {
         message: TOO_MANY_UPLOADS.to_owned(),
+        retry_after_secs: RETRY_AFTER_SECS,
+    }
+}
+
+/// The 429 of the large-load limit (`DATA-37` decision D4): a 429 with
+/// `Retry-After`, like the other refusal, and a sentence of its own.
+#[must_use]
+pub fn too_many_large_loads() -> ApiError {
+    ApiError::TooManyRequests {
+        message: TOO_MANY_LARGE_LOADS.to_owned(),
         retry_after_secs: RETRY_AFTER_SECS,
     }
 }
@@ -170,6 +190,28 @@ mod tests {
                     message,
                     "Too many uploads are in progress. Try again in a moment."
                 );
+                assert_eq!(retry_after_secs, 5);
+            }
+            other => panic!("expected TooManyRequests, got {other:?}"),
+        }
+    }
+
+    /// `DATA-37` decision D4: the refusal of the large-load limit says what
+    /// happened, what to do and which setting decides.
+    #[test]
+    fn the_refusal_of_the_large_load_limit_names_the_setting_and_says_to_try_again() {
+        match too_many_large_loads() {
+            ApiError::TooManyRequests {
+                message,
+                retry_after_secs,
+            } => {
+                assert_eq!(message, TOO_MANY_LARGE_LOADS);
+                assert!(
+                    message.contains("maximum number of large loads"),
+                    "{message}"
+                );
+                assert!(message.contains("Start this load again"), "{message}");
+                assert!(message.contains("UPLOAD_MAX_CONCURRENT_LARGE"), "{message}");
                 assert_eq!(retry_after_secs, 5);
             }
             other => panic!("expected TooManyRequests, got {other:?}"),

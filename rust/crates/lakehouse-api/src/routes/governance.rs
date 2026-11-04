@@ -26,6 +26,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::lakehouse::{is_unknown_table_error, is_unknown_table_or_database_error};
 use crate::routes::support::{nullable_u64_col, str_col};
 use crate::state::AppState;
@@ -315,16 +316,33 @@ fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
 }
 
 /// Same narrowing for `outcome`: `audit_event.outcome` has eight values,
-/// the TS `AuditOutcome` union has three (`"success" | "denied" |
-/// "error"`). `needs_confirmation`/`needs_approval` are in-flight, not yet
-/// allowed, so they map to `"denied"` rather than `"success"` — a viewer
-/// scanning for problems should not read a still-pending gate as clean.
+/// the TS `AuditOutcome` union has four (`"success" | "denied" | "error" |
+/// "pending"`). `needs_confirmation`/`needs_approval` are in-flight: the
+/// decision is still open, so they map to `"pending"` and not to
+/// `"denied"` — the policy refused nothing — and not to `"success"`,
+/// because a viewer scanning for problems must not read a still-pending
+/// gate as clean (`GOV-5`).
 fn outcome_of(outcome: &str) -> &'static str {
     match outcome {
         "allowed" | "executed" | "approved" => "success",
         "failed" => "error",
-        // "refused" | "rejected" | "needs_confirmation" | "needs_approval"
+        // A decision still waiting on a person: open, not refused.
+        "needs_confirmation" | "needs_approval" => "pending",
+        // "refused" | "rejected"
         _ => "denied",
+    }
+}
+
+/// The policy decision a row reports beside its outcome. A row whose
+/// decision is still open reports `"pending"` too: the policy allowed
+/// nothing and denied nothing, so neither `"allow"` nor `"deny"` would be
+/// true (`GOV-5`). A success row stays `"allow"`, everything else stays
+/// `"deny"`.
+fn policy_decision_of(outcome: &str) -> &'static str {
+    match outcome_of(outcome) {
+        "success" => "allow",
+        "pending" => "pending",
+        _ => "deny",
     }
 }
 
@@ -387,13 +405,15 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
             json!({
                 "id": e.id,
                 "at": e.at,
-                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "Copilot".to_owned()),
+                // AI-23 (product owner 2026-11-02): one name for the
+                // assistant — "AI Copilot", the same name the console shows.
+                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "AI Copilot".to_owned()),
                 "actorKind": actor_kind_of(e.principal_kind.as_deref()),
                 "tenant": TENANT_ID.as_str(),
                 "action": e.action,
                 "resource": resource,
                 "outcome": outcome_of(&e.outcome),
-                "policyDecision": if outcome_of(&e.outcome) == "success" { "allow" } else { "deny" },
+                "policyDecision": policy_decision_of(&e.outcome),
                 "obligations": [],
                 "approvalId": e.approval_id,
                 "source": "copilot",
@@ -413,14 +433,32 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
 
 /// **Gap fix** — same shape as [`quality`], unioning authored classification
 /// rules onto the `ClickHouse`-derived per-asset list.
+///
+/// DATA-42 D1/D3: the primary registry wins, and every registry table this
+/// reader touches is read with `FINAL`.
+///
+/// D1: the secondary branch drops the slugs the primary registry holds
+/// (see [`crate::routes::catalog::NOT_IN_PRIMARY`]), so a slug that is in
+/// both registries is classified ONCE — the list used to carry two rows
+/// with the same id `c-<slug>`, one per registry.
+///
+/// D3: `FINAL`, for the reason the catalog's reads give (`DATA-40` D4):
+/// the registry is a `ReplacingMergeTree ORDER BY slug` that every run of
+/// a connector writes again, and `ClickHouse` merges the copies only in
+/// the background. Without it a slug a second run registered was
+/// classified twice.
+///
+/// The `LIMIT 500` stays where it is — after the last `SELECT` of the
+/// union — so it caps what it capped before (see the plan's D5: in
+/// `ClickHouse` a `LIMIT` after an unparenthesized `UNION ALL` binds to
+/// that last `SELECT`, not to the whole union).
 async fn classification(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
-    let rows = ch
-        .rows(
-            "SELECT slug, title, tier FROM lake.`bronze_meta.dataset_catalog`
-         UNION ALL SELECT slug, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` LIMIT 500",
-            None,
-        )
-        .await?;
+    let sql = format!(
+        "SELECT slug, title, tier FROM lake.`bronze_meta.dataset_catalog` FINAL
+         UNION ALL SELECT slug, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
+         WHERE slug {NOT_IN_PRIMARY} LIMIT 500"
+    );
+    let rows = ch.rows(&sql, None).await?;
     let mut classifications: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -1262,13 +1300,17 @@ async fn preview_policy_impl(state: &AppState, body: &PreviewPolicyBody) -> Valu
         .filter(|f| !f.is_empty())
     {
         Some(filter) => {
-            let expanded = crate::sql_rewrite::validate_row_filter_expr(filter, &real_columns)
-                .and_then(|expr| {
-                    crate::sql_rewrite::expand_placeholders(
-                        &expr,
-                        &crate::sql_rewrite::PlaceholderValues::none(),
-                    )
-                });
+            let expanded = crate::sql_rewrite::validate_row_filter_expr(
+                filter,
+                &real_columns,
+                crate::sql_rewrite::Engine::ClickHouse,
+            )
+            .and_then(|expr| {
+                crate::sql_rewrite::expand_placeholders(
+                    &expr,
+                    &crate::sql_rewrite::PlaceholderValues::none(),
+                )
+            });
             match expanded {
                 Ok(expanded) => format!(" WHERE {expanded}"),
                 // Same "conditions do not parse" shape Step 1's own test
@@ -2219,18 +2261,34 @@ mod tests {
     }
 
     #[test]
-    fn outcome_of_treats_pending_gates_as_denied_not_success() {
+    fn outcome_of_reports_a_gate_still_waiting_as_pending() {
         assert_eq!(outcome_of("allowed"), "success");
         assert_eq!(outcome_of("executed"), "success");
         assert_eq!(outcome_of("approved"), "success");
         assert_eq!(outcome_of("failed"), "error");
         assert_eq!(outcome_of("refused"), "denied");
         assert_eq!(outcome_of("rejected"), "denied");
-        // The regression this test guards: a still-pending gate decision
-        // must never read as "success" just because it isn't a hard
-        // refusal yet.
-        assert_eq!(outcome_of("needs_confirmation"), "denied");
-        assert_eq!(outcome_of("needs_approval"), "denied");
+        // The regression this test guards: a gate decision that is still
+        // waiting reads "pending" — never "denied", because the policy
+        // refused nothing, and never "success", because nobody has
+        // decided yet.
+        assert_eq!(outcome_of("needs_confirmation"), "pending");
+        assert_eq!(outcome_of("needs_approval"), "pending");
+    }
+
+    /// `GOV-5`: a row whose decision is still open reports `"pending"` as
+    /// its policy decision as well — it allowed nothing and denied
+    /// nothing.
+    #[test]
+    fn policy_decision_of_reports_pending_for_a_gate_still_waiting() {
+        assert_eq!(policy_decision_of("allowed"), "allow");
+        assert_eq!(policy_decision_of("executed"), "allow");
+        assert_eq!(policy_decision_of("approved"), "allow");
+        assert_eq!(policy_decision_of("needs_confirmation"), "pending");
+        assert_eq!(policy_decision_of("needs_approval"), "pending");
+        assert_eq!(policy_decision_of("refused"), "deny");
+        assert_eq!(policy_decision_of("rejected"), "deny");
+        assert_eq!(policy_decision_of("failed"), "deny");
     }
 
     /// The merge sort in [`audit`] compares `at` strings lexicographically;
@@ -2615,6 +2673,136 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(stored, 0);
+        }
+    }
+
+    // ── DATA-42 D1/D3: the primary registry wins. ────────────────────────
+    //
+    // The classification list is built from BOTH Bronze registries
+    // (`lake.bronze_meta.*`, the primary one, and
+    // `lake.bronze_meta_sec.*`, the secondary one). A slug that is in
+    // both was listed TWICE, under the same id `c-<slug>` -- once per
+    // registry.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), because the fix is a
+    // statement: `FINAL` and the `NOT IN (SELECT slug FROM ...)` clause
+    // are the engine's, and a fake that answered them would only prove
+    // that this module asks for what it means to ask for.
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_clickhouse::ChClient;
+
+        use super::*;
+        use crate::routes::bronze_registry_fixture::{
+            clickhouse, seed_catalog, seed_sync_with_author,
+        };
+
+        /// The rows of the list that classify `slug`.
+        fn classifications_of<'a>(body: &'a Value, slug: &str) -> Vec<&'a Value> {
+            let id = Value::String(format!("c-{slug}"));
+            body["classifications"]
+                .as_array()
+                .expect("the list has classifications")
+                .iter()
+                .filter(|row| row["id"] == id)
+                .collect()
+        }
+
+        /// A slug the two registries both hold: one dataset, one
+        /// classification, and the PRIMARY's title.
+        #[tokio::test]
+        async fn the_classification_list_shows_a_slug_that_is_in_both_registries_once() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_gov",
+                "Primary governance",
+                "clash_gov_raw",
+            )
+            .await;
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta",
+                "clash_gov",
+                "Primary governance",
+                "clash_gov_raw",
+                10,
+                "primary_team",
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_gov",
+                "Secondary governance",
+                "clash_gov_sec_raw",
+            )
+            .await;
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta_sec",
+                "clash_gov",
+                "Secondary governance",
+                "clash_gov_sec_raw",
+                99,
+                "secondary_team",
+            )
+            .await;
+
+            let body = classification(&ch, None).await.unwrap();
+            let rows = classifications_of(&body, "clash_gov");
+            assert_eq!(rows.len(), 1, "one dataset, one classification: {rows:?}");
+            assert_eq!(
+                rows[0]["asset"],
+                json!("Primary governance"),
+                "the primary's title, not the secondary's: {rows:?}"
+            );
+        }
+
+        /// A slug a second run wrote again is classified once, not twice.
+        ///
+        /// DATA-42 D3: without `FINAL` the two copies of the row are two
+        /// rows, so the list carries the dataset twice.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_is_classified_once() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            // The two copies of the row stay apart: no merge may collapse
+            // them before the list reads them.
+            ch.exec(
+                "SYSTEM STOP MERGES lake.`bronze_meta.dataset_catalog`",
+                None,
+            )
+            .await
+            .expect("stop the merges of the catalog table");
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_gov",
+                "Twice governance",
+                "twice_gov_raw",
+            )
+            .await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_gov",
+                "Twice governance again",
+                "twice_gov_raw",
+            )
+            .await;
+
+            let body = classification(&ch, None).await.unwrap();
+            let rows = classifications_of(&body, "twice_gov");
+            assert_eq!(rows.len(), 1, "one dataset, one classification: {rows:?}");
         }
     }
 }

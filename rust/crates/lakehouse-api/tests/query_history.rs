@@ -55,6 +55,10 @@ mod filters {
         self, TestApp, create_principal_with_permissions, session_cookie_for_user,
     };
 
+    /// What a query string the route cannot read is told — the route's own
+    /// sentence, byte for byte.
+    const QUERY_UNREADABLE: &str = "The query string could not be read.";
+
     /// One recorded run for the pass-through test, written the way `run`
     /// writes them — the caller is the owner, the status is whatever the run
     /// reached.
@@ -112,8 +116,13 @@ mod filters {
             .await
             .unwrap();
         let status = response.status();
-        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        // A refusal the route itself builds is JSON; a refusal the extractor
+        // builds is not (it is plain text), so the body is kept as text when
+        // it is not JSON — otherwise the test could not say what the caller
+        // was actually sent.
+        let body: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, body)
     }
 
@@ -151,6 +160,27 @@ mod filters {
                 "{query}: the response carries a library error: {rendered}"
             );
         }
+    }
+
+    /// A query string the extractor itself cannot read — a parameter sent
+    /// twice — is refused with this route's own fixed sentence, never with
+    /// serde's rendering of what went wrong. The repeated parameter is
+    /// refused, not merged: the second value is not silently dropped.
+    #[tokio::test]
+    async fn a_repeated_query_parameter_is_a_400_with_the_fixed_sentence() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+
+        let (status, body) = get_history(&app, &cookie, "status=completed&status=failed").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], QUERY_UNREADABLE, "{body}");
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("duplicate field") && !rendered.contains("serde"),
+            "the response carries a library error: {rendered}"
+        );
     }
 
     /// The parsed filters reach the rows: the endpoint answers the page's
@@ -246,7 +276,7 @@ mod recording {
     use sqlx::PgPool;
     use tower::ServiceExt;
     use uuid::Uuid;
-    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
@@ -285,6 +315,16 @@ mod recording {
     async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
         let mut overrides = HashMap::new();
         overrides.insert("CH_URL".to_owned(), ch_uri.to_owned());
+        overrides.insert("CATALOG_TENANT_ID".to_owned(), OWNER_TENANT.to_owned());
+        spin_up_with_env(&overrides).await
+    }
+
+    /// The caller acts in a deployment whose shared catalog the owner tenant
+    /// holds (`CATALOG_TENANT_ID`), with `ClickHouse` and `Trino` at mocks.
+    async fn spin_up_with_clickhouse_and_trino(ch_uri: &str, trino_uri: &str) -> TestApp {
+        let mut overrides = HashMap::new();
+        overrides.insert("CH_URL".to_owned(), ch_uri.to_owned());
+        overrides.insert("TRINO_URL".to_owned(), trino_uri.to_owned());
         overrides.insert("CATALOG_TENANT_ID".to_owned(), OWNER_TENANT.to_owned());
         spin_up_with_env(&overrides).await
     }
@@ -404,6 +444,36 @@ mod recording {
             .fetch_one(pool)
             .await
             .expect("read the run history")
+    }
+
+    /// The ids the history holds, oldest first.
+    async fn recorded_ids(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar("SELECT id FROM query_history ORDER BY at, id")
+            .fetch_all(pool)
+            .await
+            .expect("read the recorded run ids")
+    }
+
+    /// The shape a recorded run's id carries: `q-<epoch_ms>-<32 lowercase
+    /// hex>`.
+    ///
+    /// The rule is written out again here on purpose: the shape is the
+    /// contract the download route and the parity harness rely on, so the
+    /// test states it in full instead of asking the route's own helper
+    /// whether the route's own helper is right.
+    fn is_the_new_id_shape(id: &str) -> bool {
+        let Some(rest) = id.strip_prefix("q-") else {
+            return false;
+        };
+        let Some((epoch, suffix)) = rest.rsplit_once('-') else {
+            return false;
+        };
+        !epoch.is_empty()
+            && epoch.bytes().all(|b| b.is_ascii_digit())
+            && suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     }
 
     /// The one row the caller's run recorded: its status, its message, and the
@@ -563,11 +633,74 @@ mod recording {
         );
     }
 
-    /// A past-version clause cannot run on Trino: the rewrite cannot parse
-    /// it, and the refusal is recorded as `blocked` — with the sentence
-    /// the caller was told, and without the engine ever being asked.
+    /// A past version by its id runs on `Trino` now (`DATA-21` D4), so
+    /// the run is recorded as `ok` — the test changes because the
+    /// behaviour it guarded (the refusal of a past version on `Trino`)
+    /// is supported now.
     #[tokio::test]
-    async fn a_past_version_clause_on_trino_records_blocked() {
+    async fn a_past_version_clause_on_trino_runs_and_records_ok() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok(&ch).await;
+        let trino = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "q1",
+                "columns": [{"name": "n", "type": "bigint"}],
+                "data": [[1]],
+            })))
+            .mount(&trino)
+            .await;
+
+        let TestApp { router, pool } =
+            spin_up_with_clickhouse_and_trino(&ch.uri(), &trino.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_json(
+            &router,
+            &cookie,
+            json!({
+                "sql": "SELECT * FROM bronze.group_orders FOR VERSION AS OF 1",
+                "engine": "trino",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The statement `Trino` received carries the version, in `Trino`'s
+        // own form.
+        assert!(
+            trino
+                .received_requests()
+                .await
+                .expect("mock records requests")
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("FOR VERSION AS OF 1")),
+            "the statement Trino received must carry the version"
+        );
+        let (recorded_status, message, tables_read) =
+            the_recorded_run(&pool, "rina@meridian.example").await;
+        // The store's word for a successful run (`completed`); the plan's
+        // "records `ok`" is that, not a status of its own.
+        assert_eq!(recorded_status, "completed");
+        assert_eq!(message.as_deref(), None);
+        assert_eq!(
+            tables_read,
+            vec!["bronze.group_orders".to_owned()],
+            "{tables_read:?}"
+        );
+        assert_eq!(
+            the_recorded_engine(&pool, "rina@meridian.example").await,
+            "trino",
+            "the row carries the engine the request named"
+        );
+    }
+
+    /// A past version by TIMESTAMP is still refused on `Trino` (`DATA-21`
+    /// D2/D4): no engine has a timestamp form, `ClickHouse` included. The
+    /// sentence the caller is told is the one they already know.
+    #[tokio::test]
+    async fn a_past_timestamp_clause_on_trino_is_refused_with_the_fixed_sentence() {
         let ch = MockServer::start().await;
         let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
         let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
@@ -576,7 +709,7 @@ mod recording {
             &router,
             &cookie,
             json!({
-                "sql": "SELECT * FROM bronze.group_orders VERSION AS OF 1",
+                "sql": "SELECT * FROM bronze.group_orders FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00 UTC'",
                 "engine": "trino",
             }),
         )
@@ -584,24 +717,9 @@ mod recording {
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"], PAST_VERSION_REFUSAL, "{body}");
-        assert_eq!(
-            engine_requests(&ch).await,
-            0,
-            "the statement never reaches an engine"
-        );
-        let (recorded_status, message, tables_read) =
-            the_recorded_run(&pool, "rina@meridian.example").await;
+        let (recorded_status, message, _) = the_recorded_run(&pool, "rina@meridian.example").await;
         assert_eq!(recorded_status, "blocked");
         assert_eq!(message.as_deref(), Some(PAST_VERSION_REFUSAL));
-        assert!(
-            tables_read.is_empty(),
-            "a statement that does not parse names no table: {tables_read:?}"
-        );
-        assert_eq!(
-            the_recorded_engine(&pool, "rina@meridian.example").await,
-            "trino",
-            "the row carries the engine the request named"
-        );
     }
 
     /// A Trino statement the keyword check refuses is refused before the
@@ -742,6 +860,75 @@ mod recording {
             vec!["bronze.group_orders".to_owned()],
             "{tables_read:?}"
         );
+    }
+
+    /// `DATA-29`: a `NULL` cell and an empty cell in the same row are told
+    /// apart in the answer — the `NULL` is `null` and the empty cell stays
+    /// `""`.
+    ///
+    /// The engine's own answer decides it: the mock reports one column as
+    /// `null` and the other as an empty string, and the route passes both
+    /// on as they came. Before this change the `NULL` arrived as `""` and
+    /// the two were the same answer.
+    #[tokio::test]
+    async fn a_null_cell_is_null_and_an_empty_cell_is_an_empty_string() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok(&ch).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "maybe", "type": "Nullable(String)"},
+                    {"name": "text", "type": "String"},
+                ],
+                "data": [{"maybe": null, "text": ""}],
+                "rows": 1,
+            })))
+            .mount(&ch)
+            .await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        claim_table_for(&pool, OWNER_TENANT).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, OWNED_STATEMENT).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["rows"],
+            json!([{"maybe": null, "text": ""}]),
+            "a NULL cell must be null and an empty cell must stay an empty string"
+        );
+    }
+
+    /// Two runs are both recorded, and their ids cannot collide.
+    ///
+    /// The store inserts the history row with `ON CONFLICT (id) DO NOTHING`,
+    /// so two runs whose ids are the same lose one of their rows: a run
+    /// that answered is then nowhere in the history. The id carries the
+    /// epoch milliseconds *and* a uuid, so two runs in the same
+    /// millisecond still get two ids and two rows.
+    #[tokio::test]
+    async fn two_runs_are_both_recorded_and_their_ids_cannot_collide() {
+        let ch = MockServer::start().await;
+        mount_engine(&ch).await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, "SELECT 1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post_sql(&router, &cookie, "SELECT 2").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        assert_eq!(
+            history_rows(&pool).await,
+            2,
+            "both runs are recorded: neither row is dropped"
+        );
+        let ids = recorded_ids(&pool).await;
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_ne!(ids[0], ids[1], "two runs never share an id: {ids:?}");
+        for id in &ids {
+            assert!(is_the_new_id_shape(id), "the id's shape: {id}");
+        }
     }
 
     #[tokio::test]

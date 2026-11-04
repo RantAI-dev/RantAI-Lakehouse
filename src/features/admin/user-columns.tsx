@@ -7,10 +7,13 @@ import {
   Clock,
   Copy,
   Eye,
+  KeyRound as KeyRoundIcon,
   Mail,
   MoreHorizontal,
   Shield,
   User as UserIcon,
+  UserCheck,
+  UserX,
 } from "lucide-react"
 
 import { Copyable } from "@/components/copyable"
@@ -24,7 +27,7 @@ import {
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
-import type { User } from "@/services/contracts/identity"
+import type { User } from "@/services"
 
 export const USER_STATUS_OPTIONS = [
   { value: "active", label: "Active" },
@@ -56,8 +59,39 @@ export function PillList({ values }: { readonly values: readonly string[] }) {
 
 export function getUserColumns({
   onSelect,
+  canWrite = false,
+  onResetPassword,
+  onEditRoles,
+  onRemoveFromTenant,
+  onToggleStatus,
 }: {
   onSelect: (user: User) => void
+  /**
+   * Whether the caller may reset a password. ADM-3 D2: the reset route
+   * needs `identity:write`, so the action is disabled without it rather
+   * than offered and refused by the server.
+   */
+  canWrite?: boolean
+  /**
+   * ADM-3 D2: hand this user a new temporary password. Omitted when the
+   * caller may not, which hides the action entirely.
+   */
+  onResetPassword?: (user: User) => void
+  /**
+   * ADM-4 D1: replace this user's local role set. Omitted when the
+   * caller may not, which hides the action entirely.
+   */
+  onEditRoles?: (user: User) => void
+  /**
+   * ADM-4 D2: take this user out of a tenant. Omitted when the caller
+   * may not, which hides the action entirely.
+   */
+  onRemoveFromTenant?: (user: User) => void
+  /**
+   * ADM-4 D3: switch this user off, or back on. The label follows the
+   * user's current status.
+   */
+  onToggleStatus?: (user: User) => void
 }): ColumnDef<User>[] {
   return [
     {
@@ -219,6 +253,66 @@ export function getUserColumns({
                   <UserIcon className="size-4" />
                   <span>Copy user ID</span>
                 </DropdownMenuItem>
+                {onResetPassword ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={!canWrite}
+                      onClick={() => {
+                        onResetPassword(user)
+                      }}
+                    >
+                      <KeyRoundIcon className="size-4" />
+                      <span>Reset password</span>
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
+                {/* ADM-4 D1/D2/D3: the three changes to what a user may
+                    do. Each is hidden when the caller may not make it,
+                    and disabled when the caller may not WRITE — the same
+                    rule the reset action above follows. */}
+                {onEditRoles ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={!canWrite}
+                      onClick={() => {
+                        onEditRoles(user)
+                      }}
+                    >
+                      <Shield className="size-4" />
+                      <span>Edit roles</span>
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
+                {onRemoveFromTenant ? (
+                  <DropdownMenuItem
+                    disabled={!canWrite}
+                    onClick={() => {
+                      onRemoveFromTenant(user)
+                    }}
+                  >
+                    <Building2 className="size-4" />
+                    <span>Remove from tenant</span>
+                  </DropdownMenuItem>
+                ) : null}
+                {onToggleStatus ? (
+                  <DropdownMenuItem
+                    disabled={!canWrite}
+                    onClick={() => {
+                      onToggleStatus(user)
+                    }}
+                  >
+                    {user.status === "active" ? (
+                      <UserX className="size-4" />
+                    ) : (
+                      <UserCheck className="size-4" />
+                    )}
+                    <span>
+                      {user.status === "active" ? "Deactivate" : "Reactivate"}
+                    </span>
+                  </DropdownMenuItem>
+                ) : null}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>

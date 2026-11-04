@@ -42,6 +42,11 @@ export function ServiceIdentitiesPage() {
   // table (filter/search input, a refetch landing) cannot leak it via any
   // hook that stores its argument.
   const [revealedSecret, setRevealedSecret] = React.useState<string | null>(null)
+  // The console address an outside tool points at (DATA-5 D10, ADR
+  // 0016). It is read when the admin opens the sheet — a click handler,
+  // so the server-rendered pass never touches `window`, and the value
+  // cannot differ between the two renders.
+  const [consoleOrigin, setConsoleOrigin] = React.useState("")
   const create = useServiceAction(
     withNotify(
       {
@@ -125,6 +130,11 @@ export function ServiceIdentitiesPage() {
     setEnvironment("")
   }
 
+  function openCreateSheet() {
+    setConsoleOrigin(typeof window !== "undefined" ? window.location.origin : "")
+    setCreateOpen(true)
+  }
+
   async function handleCreate() {
     const result = await create.run({
       name: name.trim(),
@@ -149,7 +159,7 @@ export function ServiceIdentitiesPage() {
         actions={
           <Button
             size="sm"
-            onClick={() => setCreateOpen(true)}
+            onClick={() => openCreateSheet()}
             disabled={!canWrite}
             title={canWrite ? undefined : "You don't have permission to create service identities."}
           >
@@ -198,6 +208,13 @@ export function ServiceIdentitiesPage() {
             onChange={(e) => setScopes(e.target.value)}
             placeholder="query:read, storage:write"
           />
+          {/* DATA-5 D10: an admin who grants `iceberg:read` needs the
+              address the outside tool points at, and the fact that the
+              key comes from Rotate, not from this form. */}
+          <p className="text-xs text-muted-foreground">
+            <code>iceberg:read</code> lets an outside tool read published Gold tables at{" "}
+            <code data-testid="outside-reader-address">{consoleOrigin}/api/iceberg</code>. Use Rotate to get its key.
+          </p>
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="si-env">Environment</Label>

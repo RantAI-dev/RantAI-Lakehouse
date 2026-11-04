@@ -12,7 +12,7 @@
 //!
 //! The load job reads delimited text and nothing else (ADR 0014, decision 3:
 //! two readers, one dialect). A workbook is brought to that dialect here, once,
-//! in the API: [`read_sheet`] turns the chosen sheet into text, [`SheetData::to_csv`]
+//! in the API: [`read_sheet`] turns the chosen sheet into text, [`SheetData::write_csv`]
 //! writes it as UTF-8 text separated by commas, and the routes store that beside
 //! the original and hand it to the unchanged job. The output is pinned by
 //! `ops/fixtures/uploads/converted_sheet.csv`, which `upload_parse` and the
@@ -64,13 +64,26 @@
 //! # Limits
 //!
 //! A workbook is compressed and can hold far more than the bytes of the upload
-//! suggest, and the API converts it in memory. A sheet whose used range is
-//! more than [`MAX_SHEET_CELLS`] cells (rows times columns, empty cells
+//! suggest, and the reader holds the sheet it opens. A sheet whose used range
+//! is more than [`MAX_SHEET_CELLS`] cells (rows times columns, empty cells
 //! included) is refused ([`WorkbookError::TooLarge`]). The number is a cap, not
 //! a measurement. For `.xlsx` the cap is checked while the sheet streams in, so
 //! a sheet that only claims a huge range costs no more than the cells it has;
 //! for `.xls` the library builds the sheet before this module sees it, and the
 //! format itself bounds it (65,536 rows by 256 columns).
+//!
+//! That cap is NOT the whole bound, and this module used to say it was: the
+//! reader of a workbook believes the counts the file declares, so a workbook
+//! can ask for more memory than the machine has BEFORE a single cell is read
+//! (the shared strings of an `.xlsx` are the worst case: the header of the
+//! part declares how many there are, and the reader reserves room for all of
+//! them). Rust ABORTS the process on an allocation failure, and
+//! `catch_unwind` cannot catch that, so the API must not be the process that
+//! opens a workbook somebody uploaded. `SEC-22` D1a: this module runs in the
+//! CHILD process (`crate::upload_convert`), which sets a memory limit on
+//! itself before it reads anything — so a workbook that asks for too much
+//! ends the child and never the API. The limit is the real bound; the cell
+//! cap is a second one, in front of it.
 //!
 //! # What is accepted
 //!
@@ -86,11 +99,21 @@ use std::num::FpCategory;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use calamine::{Data, ExcelDateTime, Reader, Sheet, SheetType, SheetVisible, Xls, XlsError, Xlsx};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The most cells a sheet's used range may hold: 5,000,000. A cap that keeps
 /// the conversion's memory bounded, not a measured limit.
 pub const MAX_SHEET_CELLS: u64 = 5_000_000;
+
+/// The most sheets the delete of an upload looks for when the number of
+/// sheets is not known (`SEC-22` review SHOULD-FIX 7).
+///
+/// The list of a workbook's sheets is written by the API itself, so the
+/// number of sheets is normally known exactly and this bound never applies.
+/// It applies when the list cannot be read: the delete then looks for this
+/// many sheets, and a workbook with more leaves the converted text of its
+/// last sheets behind. A bound, not a measurement.
+pub const MAX_SHEETS: usize = 256;
 
 /// Why a workbook could not be read. Each is a fixed sentence: nothing the
 /// library said reaches a response.
@@ -117,7 +140,7 @@ pub enum WorkbookError {
 }
 
 /// One sheet of a workbook, as the console lists it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SheetInfo {
     /// The sheet's name, as the workbook spells it.
@@ -127,7 +150,7 @@ pub struct SheetInfo {
 }
 
 /// The sheets of a workbook and which one is read when none is asked for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkbookInfo {
     /// Every sheet of cells, in workbook order. Chart sheets, dialog sheets
@@ -441,7 +464,10 @@ impl SheetData {
         &self.name
     }
 
-    /// Records in the used range (0 for a sheet with no cells).
+    /// Records in the used range (0 for a sheet with no cells). Tests only:
+    /// the text is what the routes read, and it says how many records it
+    /// holds.
+    #[cfg(test)]
     #[must_use]
     pub fn rows(&self) -> usize {
         self.rows
@@ -460,10 +486,16 @@ impl SheetData {
     #[must_use]
     pub fn records(&self, max_records: Option<usize>) -> Vec<Vec<String>> {
         let mut out = Vec::new();
-        self.each_record(max_records, |fields| {
-            out.push(fields.iter().map(|field| (*field).to_owned()).collect());
-        });
-        out
+        let collected: Result<(), std::convert::Infallible> =
+            self.each_record(max_records, |fields| {
+                out.push(fields.iter().map(|field| (*field).to_owned()).collect());
+                Ok(())
+            });
+        match collected {
+            Ok(()) => out,
+            // The closure above cannot fail.
+            Err(never) => match never {},
+        }
     }
 
     /// The used range as delimited text: UTF-8, comma, `"` quoting, a line
@@ -471,14 +503,59 @@ impl SheetData {
     /// `None`). One writer, [`write_record`], for every caller; what it writes
     /// reads back through `upload_parse::split_records` to exactly
     /// `records`.
+    ///
+    /// The text is built whole, in memory. A caller that must not hold it
+    /// whole — the child process of `SEC-22`, which writes the text to a
+    /// stream — uses [`Self::write_csv`] instead, which writes the same text
+    /// in the same order, one record at a time.
+    ///
+    /// Tests only: the child writes its text to a stream, and the routes
+    /// read the stored text.
+    #[cfg(test)]
     #[must_use]
     pub fn to_csv(&self, max_records: Option<usize>) -> Vec<u8> {
         let mut out = Vec::new();
-        self.each_record(max_records, |fields| write_record(&mut out, fields));
-        finish_text(out)
+        // Writing into a `Vec` cannot fail (it grows instead), so the result
+        // is dropped rather than unwrapped: `unwrap` is denied outside tests.
+        let _written = self.write_csv(&mut out, max_records);
+        out
     }
 
-    fn each_record(&self, max_records: Option<usize>, mut each: impl FnMut(&[&str])) {
+    /// The used range as delimited text, written to `out`: the same text
+    /// [`Self::to_csv`] builds, one record at a time, so a caller never
+    /// holds the whole thing.
+    ///
+    /// A text that really starts with a byte order mark gets a mark of its
+    /// own in front, as [`Self::to_csv`] does.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `out` returns: the caller decides what a failed write means.
+    pub fn write_csv<W: std::io::Write>(
+        &self,
+        out: &mut W,
+        max_records: Option<usize>,
+    ) -> std::io::Result<()> {
+        let mut first = true;
+        self.each_record(max_records, |fields| {
+            if first {
+                first = false;
+                // The mark goes in front of the first record, and only when
+                // the text really starts with one: a quoted field starts with
+                // a quote, not with a mark.
+                if starts_with_mark(fields) {
+                    out.write_all(BOM)?;
+                }
+            }
+            write_record(out, fields)
+        })
+    }
+
+    fn each_record<E>(
+        &self,
+        max_records: Option<usize>,
+        mut each: impl FnMut(&[&str]) -> Result<(), E>,
+    ) -> Result<(), E> {
         let rows = max_records.map_or(self.rows, |max| max.min(self.rows));
         let mut next = 0;
         let mut fields: Vec<&str> = vec![""; self.cols];
@@ -492,8 +569,9 @@ impl SheetData {
                 }
                 next += 1;
             }
-            each(&fields);
+            each(&fields)?;
         }
+        Ok(())
     }
 }
 
@@ -587,32 +665,48 @@ fn duration_text(days: f64) -> String {
 ///
 /// A record of one empty field is written `""`: as an empty line it would read
 /// back as a record with no fields.
-pub fn write_record(out: &mut Vec<u8>, fields: &[&str]) {
+///
+/// # Errors
+///
+/// Whatever the writer returns: a caller that writes to a stream decides
+/// what a failed write means.
+pub fn write_record<W: std::io::Write>(out: &mut W, fields: &[&str]) -> std::io::Result<()> {
     if matches!(fields, [""]) {
-        out.extend_from_slice(b"\"\"");
+        out.write_all(b"\"\"")?;
     } else {
         for (index, field) in fields.iter().enumerate() {
             if index > 0 {
-                out.push(b',');
+                out.write_all(b",")?;
             }
-            write_field(out, field);
+            write_field(out, field)?;
         }
     }
-    out.push(b'\n');
+    out.write_all(b"\n")
 }
 
-fn write_field(out: &mut Vec<u8>, field: &str) {
+fn write_field<W: std::io::Write>(out: &mut W, field: &str) -> std::io::Result<()> {
     if field.contains([',', '"', '\n', '\r']) {
-        out.push(b'"');
-        out.extend_from_slice(field.replace('"', "\"\"").as_bytes());
-        out.push(b'"');
+        out.write_all(b"\"")?;
+        out.write_all(field.replace('"', "\"\"").as_bytes())?;
+        out.write_all(b"\"")?;
     } else {
-        out.extend_from_slice(field.as_bytes());
+        out.write_all(field.as_bytes())?;
     }
+    Ok(())
 }
 
 /// The byte order mark of UTF-8.
 const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// Whether the record's text starts with a byte order mark: the first field
+/// holds one and is written as it is (a field with a comma, a quote or a line
+/// break in it is quoted, and then the text starts with a quote).
+fn starts_with_mark(fields: &[&str]) -> bool {
+    match fields {
+        [first, ..] => first.starts_with('\u{feff}') && !first.contains([',', '"', '\n', '\r']),
+        [] => false,
+    }
+}
 
 /// Both readers drop a byte order mark at the start of the text, so text that
 /// really starts with U+FEFF (an unquoted first cell that begins with it) gets
@@ -634,7 +728,8 @@ pub fn encode_csv(records: &[Vec<String>]) -> Vec<u8> {
     let mut out = Vec::new();
     for record in records {
         let fields: Vec<&str> = record.iter().map(String::as_str).collect();
-        write_record(&mut out, &fields);
+        // Writing into a `Vec` cannot fail.
+        let _written = write_record(&mut out, &fields);
     }
     finish_text(out)
 }

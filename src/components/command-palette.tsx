@@ -15,7 +15,7 @@ import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
 import type { ShortcutItem } from "@/services/contracts/dashboards";
 import { itemHref } from "@/lib/dashboard-organise";
-import { capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
+import { PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
  * (WS2 §13). */
@@ -107,7 +107,10 @@ export function CommandPalette() {
     const controller = new AbortController();
     const timer = setTimeout(() => {
       assetService
-        .listAssets({ search: term }, controller.signal)
+        // `DATA-41` D3: the server is asked for what the box shows, so a
+        // catalog of ten thousand tables is not sent to throw all but
+        // eight away. `capPaletteAssetResults` stays as the second guard.
+        .listAssets({ search: term, limit: PALETTE_ASSET_RESULT_LIMIT }, controller.signal)
         .then((assets) => {
           if (cancelled) return;
           setSearchFailed(null);

@@ -272,6 +272,25 @@ fn token_value(snapshot_id: Option<i64>) -> String {
     snapshot_id.map_or_else(|| "-".to_owned(), |id| id.to_string())
 }
 
+/// The `ClickHouse` half of [`StateTokenReader`]: a Silver/Gold input's
+/// content fingerprint, as an opaque token.
+///
+/// `SEC-50` slice 2 T8 (M12): deliberately NOT tenant-gated, unlike every
+/// other statement site of the slice. The three reasons, at the site:
+///
+/// - **Who reaches it:** the orchestrator's lag check only, which posts a
+///   pipeline's `source_zone`/`source_table` and nothing a person typed.
+/// - **What leaves:** a boolean, or an opaque `fp:<fingerprint>` token the
+///   pipeline compares by equality. `mart_content_fingerprint` answers
+///   "not in `system.tables`" with `None` and is never polled for rows —
+///   no `serving.*` row content reaches the caller, so the gate would
+///   protect nothing a tenant owns.
+/// - **What it reads:** a pipeline's OWN inputs, the ones the orchestrator
+///   is about to build from; refusing them would stop a tenant's pipeline
+///   for a claim about rows nobody receives.
+///
+/// A later site that returns the fingerprint itself, or its count, must ask
+/// the gate first.
 async fn clickhouse_fingerprint_token(
     state: &crate::state::AppState,
     input: &InputTable,

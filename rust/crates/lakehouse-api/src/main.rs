@@ -20,7 +20,13 @@ mod connector_probe;
 mod connector_secret_store;
 mod crypto_provider;
 mod csv_export;
-mod csv_safe;
+// `csv_safe` is not compiled into the binary. It rewrites CSV bytes as a
+// whole, and the only caller it had was the download route, which now
+// writes its files cell by cell through `export.rs` — where the formula
+// guard every file goes through is `csv_export::neutralise`. Nothing in
+// this binary uses the byte-level rule, so compiling it here would only
+// leave dead code behind. The library target keeps the module (it is
+// declared `pub` there), so its own tests still run.
 mod error;
 mod export;
 mod gold_export;
@@ -39,6 +45,7 @@ mod pipeline_source;
 mod policy;
 mod policy_engine;
 mod query_limits;
+mod readiness;
 mod result_cache;
 mod routes;
 mod rustfs_client;
@@ -59,9 +66,11 @@ mod tile_pool;
 mod tls_proxy;
 
 mod transform_grammar;
+mod upload_convert;
 mod upload_formats;
 mod upload_limits;
 mod upload_parquet;
+mod upload_parquet_parts;
 mod upload_parquet_range;
 mod upload_parse;
 mod upload_store;
@@ -80,7 +89,20 @@ use state::AppState;
 /// Builds the runtime by hand instead of `#[tokio::main]` only to set the
 /// thread stack size: phase 2 catch-up with main (sqlparser 0.63), see
 /// [`config::WORKER_STACK_BYTES`] for the measurement behind the value.
+///
+/// `SEC-22` D1: the child that reads an uploaded workbook or a Parquet file
+/// is this same binary, started again with `inspect-upload`. Its branch comes
+/// FIRST — before the runtime is built, before the configuration is read and
+/// before the crypto provider is installed — so the child needs no
+/// environment, starts no threads, opens no connection and dials nothing, and
+/// so that a file which asks for more memory than the machine has ends the
+/// CHILD and never the API. `PR #192` added the provider install; it stays
+/// after this branch, because a child that reads a file does not dial.
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = upload_convert::run_child_if_asked(&args) {
+        std::process::exit(code);
+    }
     // PR #192 review BLOCKER 10: install `ring` crypto provider before any task dials.
     if let Err(err) = crypto_provider::install_default_provider() {
         eprintln!("fatal: failed to install default rustls crypto provider: {err}");
@@ -132,6 +154,13 @@ async fn run() -> anyhow::Result<()> {
     // the process, while an unreachable one degrades (Phase 1 routes
     // serve) and retries loudly. See that function's doc comment.
     bring_database_up(&state).await?;
+
+    // DATA-41 D4: build the catalog search copy once, in the background,
+    // now that the application database is up. On a catalog of 10,000
+    // tables the build takes about five seconds, and the first person to
+    // search should not pay for it. A search that arrives first builds the
+    // copy inline, single-flight, as before.
+    routes::catalog::spawn_startup_search_copy(&state);
 
     // Task 3.2: idempotently seed the one bootstrap admin, from
     // `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD` — see
@@ -195,6 +224,9 @@ async fn run() -> anyhow::Result<()> {
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
     spawn_run_log_cleanup(&state);
+    // QS-3: the saved queries that waited in the trash for more than 30
+    // days are removed for good, at start and every hour.
+    routes::spawn_saved_query_trash_sweep(&state);
     // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
     // 90-day cleanup of deliveries).
     routes::report_runner::spawn(&state);
@@ -1111,6 +1143,7 @@ fn spawn_upload_session_sweep(state: &AppState) {
 /// never takes the process down.
 fn spawn_trash_sweep(state: &AppState) {
     let ch = state.clickhouse.clone();
+    let pg = state.pg.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1118,6 +1151,32 @@ fn spawn_trash_sweep(state: &AppState) {
             interval.tick().await;
             match lakehouse_bi::trash::purge_expired(&ch).await {
                 Ok(purged) if purged.boards + purged.charts > 0 => {
+                    // BI-19 B1 review R8: a dashboard removed for good takes its
+                    // permission rules and mark with it (migration 0103 says so).
+                    // The ids are tombstoned by now, so a failure here is logged
+                    // and cannot be retried; the leftover rows name an id that
+                    // no dashboard has any more.
+                    if let Some(pg) = pg.as_deref() {
+                        for id in &purged.board_ids {
+                            if let Err(err) =
+                                lakehouse_store::dashboard_access::delete_item(pg, "board", id)
+                                    .await
+                            {
+                                tracing::warn!(%err, "permission rules of a purged dashboard were not removed");
+                            }
+                            // BI-19 part E (D15) and the part A review note: a purged
+                            // dashboard's comments (and, with them, their mentions) and
+                            // its public-link row go too. `board_id` has no foreign key.
+                            if let Err(err) =
+                                lakehouse_store::dashboard_comments::delete_for_board(pg, id).await
+                            {
+                                tracing::warn!(%err, "comments of a purged dashboard were not removed");
+                            }
+                            if let Err(err) = lakehouse_store::public_links::delete(pg, id).await {
+                                tracing::warn!(%err, "public link of a purged dashboard was not removed");
+                            }
+                        }
+                    }
                     tracing::info!(
                         boards = purged.boards,
                         charts = purged.charts,
@@ -1170,6 +1229,31 @@ fn spawn_run_log_cleanup(state: &AppState) {
     });
 }
 
+/// The boot warning's text: what a deployment without `CATALOG_TENANT_ID`
+/// gives up, and what to set.
+///
+/// A constant, not a literal in the call, so the test can read the words
+/// an operator reads (`SEC-50` D7).
+///
+/// `SEC-50` slice 2 T9 (`SEC-50` D7): the warning names EVERY path that
+/// reads the shared catalog and needs the setting — Query Studio's
+/// `SHOW`-family statements, the `Dagster`-job half of `GET /api/pipelines`,
+/// the authored pipelines and the Gold export (`SEC-50`'s first slice), and
+/// now the dashboards (tiles, rows, downloads, SQL sources), the embeds, the
+/// public links, the alerts and digests, the reports, and the PDF and
+/// `PNG` chart images (`SEC-50` slice 2). Nothing is named as merely
+/// "later" any more: with the setting unset, every one of them is refused
+/// for a caller who does not own the shared catalog.
+const CATALOG_TENANT_UNCONFIGURED_WARNING: &str = "CATALOG_TENANT_ID is not set: on a deployment with more than one tenant, \
+     the shared catalog and the Dagster-job half of GET /api/pipelines are \
+     refused for every principal without the unrestricted grant, and so is \
+     every path that reads that same shared catalog: the authored pipelines \
+     and the Gold export, the dashboards (tiles, rows, downloads and SQL \
+     sources), the embeds, the public links, the alerts and digests, the \
+     reports, and the PDF and chart-image exports. Set it to the id of the \
+     tenant that owns this deployment's shared catalog to restore access for \
+     that tenant's members (docs/OPERATIONS.md).";
+
 /// Log ONCE at boot when this deployment refuses the shared catalog and
 /// `Dagster`-job list to tenant-scoped callers because nobody has said who
 /// owns them.
@@ -1181,15 +1265,19 @@ fn spawn_run_log_cleanup(state: &AppState) {
 /// which may not be reachable yet at this point in startup, and the route
 /// itself already treats a single-tenant deployment as never refused. So
 /// this says what is configured, never what will happen to a given request.
+///
+/// `SEC-50` D7: the boot warning names every path that reads the
+/// shared catalog and needs the setting, so an operator reads what the
+/// setting is for and not only that it is missing.
+///
+/// `SEC-50` slice 2 T9 (`SEC-50` D7): it names every path that reads the
+/// shared catalog — the `SEC-20` surfaces, `SEC-50`'s first slice, and
+/// every site `SEC-50` slice 2 gated (dashboards, embeds, public links,
+/// alerts and digests, reports, PDF and chart images). The old
+/// "gated in `SEC-50`'s next slice" wording is gone with the slice.
 fn warn_if_catalog_tenant_unconfigured(config: &config::Config) {
     if config.catalog_tenant_id.is_none() {
-        tracing::warn!(
-            "CATALOG_TENANT_ID is not set: on a deployment with more than one tenant, \
-             the shared catalog and the Dagster-job half of GET /api/pipelines are \
-             refused for every principal without the unrestricted grant. Set it to the \
-             id of the tenant that owns this deployment's shared catalog to restore \
-             access for that tenant's members (docs/OPERATIONS.md)."
-        );
+        tracing::warn!("{CATALOG_TENANT_UNCONFIGURED_WARNING}");
     }
 }
 
@@ -1202,6 +1290,66 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    /// `SEC-50` D7: the boot warning names every path that reads the shared
+    /// catalog, so an operator reads what the setting is for and not only
+    /// that it is missing.
+    ///
+    /// `SEC-50` slice 2 T9: the list is now the whole set — the `SEC-20`
+    /// surfaces, slice 1's two paths, and every site slice 2 gated. The old
+    /// split into "gated today" and "later" is gone, because nothing named
+    /// here is served to a caller who does not own the shared catalog.
+    #[test]
+    fn the_boot_warning_names_every_path_that_is_gated() {
+        for path in [
+            "shared catalog",
+            "Dagster-job",
+            "authored pipelines",
+            "Gold export",
+            "dashboards",
+            "embeds",
+            "public links",
+            "alerts",
+            "reports",
+            "chart-image",
+        ] {
+            assert!(
+                CATALOG_TENANT_UNCONFIGURED_WARNING.contains(path),
+                "the boot warning must name {path:?}: {CATALOG_TENANT_UNCONFIGURED_WARNING}"
+            );
+        }
+    }
+
+    /// The warning no longer defers any path to a later slice: `SEC-50`
+    /// slice 2 gated every one of them, and a warning that still said
+    /// "gated next slice" would be about a slice that has shipped.
+    ///
+    /// (This test replaces `the_boot_warning_says_the_paths_that_are_not_gated_yet_follow_later`,
+    /// whose purpose was "nothing is named as refused that is still served".
+    /// That purpose is kept as "every path is named" above; the deferral
+    /// sentence itself is what the slice removed.)
+    #[test]
+    fn the_boot_warning_no_longer_defers_a_path_to_a_later_slice() {
+        assert!(
+            !CATALOG_TENANT_UNCONFIGURED_WARNING.contains("next slice"),
+            "SEC-50 slice 2 gated every path the warning names: \
+             {CATALOG_TENANT_UNCONFIGURED_WARNING}"
+        );
+    }
+
+    /// The warning is about a deployment that has NOT said who owns the
+    /// shared catalog, and it says what to set.
+    #[test]
+    fn the_boot_warning_names_the_setting_and_what_to_set_it_to() {
+        assert!(
+            CATALOG_TENANT_UNCONFIGURED_WARNING.contains("CATALOG_TENANT_ID"),
+            "{CATALOG_TENANT_UNCONFIGURED_WARNING}"
+        );
+        assert!(
+            CATALOG_TENANT_UNCONFIGURED_WARNING.contains("docs/OPERATIONS.md"),
+            "{CATALOG_TENANT_UNCONFIGURED_WARNING}"
+        );
+    }
 
     /// `OPS-4` decision 2: with no pool the body names the database as
     /// unavailable, so an operator reads "up but degraded" instead of a

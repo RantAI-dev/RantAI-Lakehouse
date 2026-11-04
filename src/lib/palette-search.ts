@@ -28,12 +28,20 @@ export function capPaletteAssetResults<T>(results: T[]): T[] {
  * "column revenue_amount", "tag finance", "description", with
  * "approximate match" added when a typo was forgiven. `null` when the
  * server sent no reason — a match on the name needs none.
+ *
+ * `DATA-32` D1: the server reports the name itself when the name forgave a
+ * typo and nothing else explains the hit. The name is on screen already, so
+ * that reason reads "approximate match" and nothing more.
  */
 export function matchedOnLabel(matchedOn: Asset["matchedOn"]): string | null {
   if (!matchedOn) return null
   const { field, value, approximate } = matchedOn
   let what: string
   switch (field) {
+    case "name":
+      // `DATA-32` D1: the name forgave a typo; saying the name again would
+      // say nothing the reader does not already see.
+      return approximate ? "approximate match" : "name"
     case "column":
     case "tag":
       what = value ? `${field} ${value}` : field

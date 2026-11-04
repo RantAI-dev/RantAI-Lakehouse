@@ -55,3 +55,8 @@ cities on the same chart.
 - `BI-10-AC4` A grid map at 1 degree shows one mark per cell and the marks' values add up to the total.
 - `BI-10-AC5` A user without `dashboard:write` cannot define a group or a hierarchy; a failure shows a plain message.
 - `AI-6-AC1` (the `BI-10` part) "visitors per place in bins of 500" is built by the assistant.
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- Bin edges confirmed: the lower edge is included and the upper excluded, and the last bin includes the maximum (1000 falls in 1,000 – 1,500).
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

@@ -9,7 +9,7 @@
 # instead of silently landing.
 #
 # The project's outbound license is AGPL-3.0-or-later (see LICENSE), so the
-# 13 first-party `lakehouse-*` workspace crates declare
+# 15 first-party `lakehouse-*` workspace crates declare
 # `license = "AGPL-3.0-or-later"` (via `[workspace.package]` in the root
 # Cargo.toml). AGPL is deliberately NOT in the global `allow` list below —
 # that list governs third-party *dependencies*, which remain permissive-only
@@ -48,19 +48,6 @@ targets = []
 # whole point of this workspace. Re-evaluate when arrow/parquet drops the
 # dependency or upstream transfers maintenance.
 #
-# RUSTSEC-2026-0367 (SUID/SGID bits kept on extract), RUSTSEC-2026-0368
-# (`ZipArchive::extract` writes symlinks outside destination), and
-# RUSTSEC-2026-0369 (`extract` applies permissions through symlinks):
-# all three vulnerabilities are in `zip::extract`, which writes an archive to
-# disk. Fixed upstream in `zip` 9.0.0. Not reachable in this workspace:
-# `calamine` 0.36.1 reads zip entries in memory using `by_name` and never calls
-# `extract`. The workspace has no direct `zip` dependency and no `extract` call.
-# It arrives only transitively through `calamine`:
-#
-#   zip <- calamine <- lakehouse-api
-#
-# Latest `calamine` (0.36.1) requires `zip ^8.6` and does not yet accept
-# `zip` 9.0.0. Drop when `calamine` accepts `zip` >= 9.0.0; then `cargo update -p zip`.
 # RUSTSEC-2026-0381 (SEC-46, bundled roots trust distrusted emSign
 # intermediates) is gone from this list with `SEC-41`: it matched only
 # `webpki-roots` 0.26.11, the semver shim `sqlx-core` 0.8.6 required, and
@@ -139,9 +126,6 @@ targets = []
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0391",
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",
@@ -173,7 +157,7 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# Per-crate exceptions: the 12 first-party workspace crates only. This does
+# Per-crate exceptions: the 15 first-party workspace crates only. This does
 # NOT add AGPL-3.0-or-later to the global `allow` list above, so a
 # third-party dependency under AGPL/GPL would still fail the check.
 [[licenses.exceptions]]
@@ -207,6 +191,14 @@ name = "lakehouse-dagster"
 [[licenses.exceptions]]
 allow = ["AGPL-3.0-or-later"]
 name = "lakehouse-embed"
+
+# `lakehousectl` (REL-2 S3-T1): the operator's install and update tool.
+# Same reasoning as the others — AGPL is our own outbound license
+# (CHANGELOG D4/2025-04 relicensing), accepted only for workspace
+# crates, never for third-party dependencies.
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehousectl"
 
 [[licenses.exceptions]]
 allow = ["AGPL-3.0-or-later"]

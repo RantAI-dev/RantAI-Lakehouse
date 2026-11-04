@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { toCsv } from "./csv"
+import { toCsv, toTsv } from "./csv"
 
 /**
  * `downloadCsv` menyentuh DOM dan tidak diuji di sini; yang penting dan
@@ -101,5 +101,68 @@ test("toCsv membiarkan sel biasa dan sel kosong", () => {
 
 test("toCsv memperlakukan header seperti sel lain", () => {
   assert.equal(toCsv(["=total", "@x"], []), "'=total,'@x")
+})
+
+// SEC-17: the tab-separated twin shares the formula guard with the comma
+// one, so both are proven here.
+
+test("toTsv menulis header dan baris dengan pemisah tab", () => {
+  const tsv = toTsv(
+    ["id", "name"],
+    [
+      { id: "1", name: "alpha" },
+      { id: "2", name: "beta" },
+    ]
+  )
+
+  // CRLF, as RFC 4180 says, the same as the comma version.
+  assert.equal(tsv, "id\tname\r\n1\talpha\r\n2\tbeta")
+})
+
+test("toTsv membungkus sel yang mengandung tab", () => {
+  // A tab inside a cell is the separator, so the cell has to be quoted.
+  const tsv = toTsv(["v"], [{ v: "a\tb" }])
+
+  assert.equal(tsv, 'v\r\n"a\tb"')
+})
+
+test("toTsv membungkus sel yang mengandung newline", () => {
+  const tsv = toTsv(["v"], [{ v: "line1\nline2" }])
+
+  assert.equal(tsv, 'v\r\n"line1\nline2"')
+})
+
+test("toTsv menggandakan tanda kutip di dalam sel", () => {
+  const tsv = toTsv(["v"], [{ v: 'say "hi"' }])
+
+  assert.equal(tsv, 'v\r\n"say ""hi"""')
+})
+
+test("toTsv memberi apostrof pada sel yang diawali karakter rumus", () => {
+  for (const value of ["=1+1", "+cmd", "-cmd", "@SUM(A1)"]) {
+    assert.equal(toTsv(["v"], [{ v: value }]), `v\r\n'${value}`)
+  }
+})
+
+test("toTsv memberi apostrof di dalam tanda kutip, bukan di luarnya", () => {
+  assert.equal(
+    toTsv(["v"], [{ v: '=HYPERLINK("http://example.invalid","x")' }]),
+    `v\r\n"'=HYPERLINK(""http://example.invalid"",""x"")"`
+  )
+})
+
+test("toTsv menulis sel kosong untuk nilai null dan undefined", () => {
+  const tsv = toTsv(["a", "b", "c"], [{ a: "x", b: null, c: undefined }])
+
+  assert.equal(tsv, "a\tb\tc\r\nx\t\t")
+})
+
+test("toTsv memperlakukan header seperti sel lain", () => {
+  assert.equal(toTsv(["=total", "@x"], []), "'=total\t'@x")
+})
+
+test("toTsv membiarkan koma di dalam sel apa adanya", () => {
+  // A comma is not the separator in a tab file, so the cell needs no quotes.
+  assert.equal(toTsv(["v"], [{ v: "a,b" }]), "v\r\na,b")
 })
 

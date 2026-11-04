@@ -45,8 +45,8 @@ pub const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE`,
 /// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK`, `AI_RELEVANT_TABLES`, `AI_SQL_HELP`,
-/// `CONNECTOR_TYPED_CREDENTIALS`, `EMBED_TOKEN_MAX_LIFETIME_SECONDS` and
-/// `CONNECTOR_TLS_CA_FILE` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// `CONNECTOR_TYPED_CREDENTIALS`, `EMBED_TOKEN_MAX_LIFETIME_SECONDS`,
+/// `CONNECTOR_TLS_CA_FILE` and `SMTP_CA_FILE` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -171,6 +171,20 @@ pub enum ConfigError {
     /// file cannot be used (SEC-14B review round 1, SHOULD-FIX 6).
     #[error("CONNECTOR_TLS_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
     EmptyConnectorTlsCaFile(std::path::PathBuf),
+    /// `SMTP_CA_FILE` names a path that cannot be read as a file
+    /// (`SEC-56` D5). Fails config resolution for the same reason
+    /// [`ConfigError::UnreadableConnectorTlsCaFile`] does: an operator who
+    /// set a CA meant the mail relay's certificate to be verified against
+    /// it, and an unreadable path would otherwise be discovered on the
+    /// first send — as "the mail server could not be reached", which says
+    /// nothing about the file that is wrong.
+    #[error("SMTP_CA_FILE must name a readable file, cannot read {0:?}")]
+    UnreadableSmtpCaFile(std::path::PathBuf),
+    /// A set `SMTP_CA_FILE` contains no valid PEM certificate. We refuse
+    /// start-up rather than discovering on the first send that the CA
+    /// bundle cannot be used (`SEC-56` D5).
+    #[error("SMTP_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
+    EmptySmtpCaFile(std::path::PathBuf),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -284,6 +298,20 @@ pub struct Config {
     /// ([`ConfigError::UnreadableConnectorTlsCaFile`]) — never a silent
     /// fall-back to the trust-everything posture.
     pub connector_tls_ca_file: Option<std::path::PathBuf>,
+    /// The CA certificates the SMTP relay's own certificate may chain to
+    /// (`SMTP_CA_FILE`; `SEC-56` D1/D6).
+    ///
+    /// `None` when unset or empty: the mail sender trusts the built-in
+    /// roots only, exactly as it did before this setting existed (D1). The
+    /// bundle's CAs are ADDED to those roots, never put in their place
+    /// (D2), and the hostname check stays on (D3). The bundle is read once,
+    /// here, and kept in memory: the send path does no file I/O (D6).
+    pub smtp_ca: Option<lakehouse_notify::SmtpCaBundle>,
+    /// The path `SMTP_CA_FILE` named, kept for the [`std::fmt::Debug`]
+    /// output: the bundle itself prints its count and nothing else
+    /// (`SEC-56` D9), and an operator reading a start-up log wants the
+    /// path, not a count.
+    pub smtp_ca_file: Option<std::path::PathBuf>,
     /// The installation's secret manager and how to sign in to it
     /// (`SECRET_MANAGER` and its manager's variables; `SRC-12` part B). The
     /// sign-in settings are secrets: this field's `Debug` prints the manager
@@ -660,6 +688,32 @@ pub struct Config {
     /// with an empty-string token that would only surface as a confusing
     /// 401 from Lakekeeper later.
     pub lakekeeper_admin_token_file: String,
+    /// DATA-5 / ADR 0016 point 4 — the storage address an operator
+    /// PUBLISHES for outside readers.
+    ///
+    /// `Lakekeeper` vends the deployment's own internal name
+    /// (`http://rustfs:9000`), which resolves only inside the deployment,
+    /// so the API's door (`routes::iceberg_door`) swaps it for this one in
+    /// a table-load and a credentials response. `None` when unset, and
+    /// unset means OUTSIDE READING IS OFF: every door route answers 503
+    /// naming this setting, and the console says "Not measured" with that
+    /// reason — never a count of zero, and never a vended address an
+    /// outside tool cannot reach.
+    ///
+    /// Not a secret: it is an address, not a credential.
+    pub outside_s3_endpoint: Option<String>,
+    /// DATA-5 / ADR 0016 point 3 — path to a file holding the
+    /// `outside-readers` Lakekeeper principal's pre-minted static bearer
+    /// token: the identity the door forwards an outside tool's catalog
+    /// call under (the tool's own key never reaches `Lakekeeper`).
+    ///
+    /// Same "always a default path, never `None`-when-unset" shape, and
+    /// the same shared reader, as
+    /// [`Self::lakekeeper_gold_export_token_file`] and
+    /// [`Self::lakekeeper_read_token_file`] (AGENTS rule 4: no second
+    /// reader). An empty value means the setting is unset, which the door
+    /// reports as "not set up" (503) rather than trying to read it.
+    pub lakekeeper_outside_read_token_file: String,
     /// S3-compatible endpoint `POST /api/identity/tenants` creates tenant
     /// Lakekeeper warehouses against. `None` when unset.
     ///
@@ -929,6 +983,30 @@ pub struct Config {
     /// The same, for the whole installation: `UPLOAD_MAX_CONCURRENT`,
     /// default 16 (`SEC-17`).
     pub upload_max_concurrent: u32,
+    /// Large loads that may run at once in the whole installation: loads
+    /// whose files total more than 512 MiB (`DATA-37` decision D1).
+    /// `UPLOAD_MAX_CONCURRENT_LARGE`, default 2 (decision D2). Two are
+    /// about 4.4 GiB of job memory, which leaves room for the stack on the
+    /// 16 GiB minimum host, and the stack's own idle memory is not
+    /// measured. A value that is not a whole number of 1 or more fails
+    /// config resolution ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_max_concurrent_large: u32,
+    /// How many files may be READ at once per API process: the workbook and
+    /// Parquet files an upload converts, each read by a child process
+    /// (`SEC-22` D3). `UPLOAD_MAX_CONVERSIONS`, default 2. A request that
+    /// arrives when every slot is taken is refused at once (429), not
+    /// queued. A value that is not a whole number of 1 or more fails config
+    /// resolution ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_max_conversions: u32,
+    /// The memory limit the child that reads an uploaded file sets for
+    /// itself: `UPLOAD_CONVERT_MEMORY_MB`, default 1280 MiB. The number is
+    /// the measured peak of the largest allowed workbook times 1.5, rounded
+    /// up to 128 MiB (`SEC-22` D7; the measurement is in
+    /// `ops/g9/sec22_measure.py` and its numbers in
+    /// `docs/plans/SEC-22-RESULT.md`). A value that is not a whole number of
+    /// 1 or more fails config resolution
+    /// ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_convert_memory_mb: u32,
     /// Hours after which an upload session whose pieces never all arrived
     /// is aborted and removed: `UPLOAD_SESSION_TTL_HOURS`, default 24
     /// (`DATA-17`, decision 8 of the feature page, *proposed* and signed by
@@ -999,6 +1077,11 @@ impl std::fmt::Debug for Config {
             .field("smtp_from", &self.smtp_from)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field("outside_s3_endpoint", &self.outside_s3_endpoint)
+            .field(
+                "lakekeeper_outside_read_token_file",
+                &self.lakekeeper_outside_read_token_file,
+            )
             .field("iceberg_query_db", &self.iceberg_query_db)
             .field("lakekeeper_base_url", &self.lakekeeper_base_url)
             .field(
@@ -1063,6 +1146,8 @@ impl std::fmt::Debug for Config {
                     .map(|_| REDACTED),
             )
             .field("connector_tls_ca_file", &self.connector_tls_ca_file)
+            .field("smtp_ca_file", &self.smtp_ca_file)
+            .field("smtp_ca", &self.smtp_ca)
             .field("secret_manager", &self.secret_manager)
             .field(
                 "connector_typed_credentials",
@@ -1178,6 +1263,12 @@ impl std::fmt::Debug for Config {
                 &self.upload_max_concurrent_per_user,
             )
             .field("upload_max_concurrent", &self.upload_max_concurrent)
+            .field(
+                "upload_max_concurrent_large",
+                &self.upload_max_concurrent_large,
+            )
+            .field("upload_max_conversions", &self.upload_max_conversions)
+            .field("upload_convert_memory_mb", &self.upload_convert_memory_mb)
             .field("upload_session_ttl_hours", &self.upload_session_ttl_hours)
             .field(
                 "connector_auto_disable_after",
@@ -1269,30 +1360,109 @@ fn parse_embed_token_max_lifetime(env: &HashMap<String, String>) -> Result<u64, 
     }
 }
 
+/// What is wrong with a CA file a setting named (`SEC-56` D5).
+///
+/// Each setting maps this to its OWN [`ConfigError`] variant, so the
+/// message names the setting that is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaFileProblemKind {
+    /// The path cannot be read as a file (it is missing, or it is a
+    /// directory).
+    Unreadable,
+    /// The file holds no PEM certificate.
+    Empty,
+}
+
+/// A CA file a setting named, and what is wrong with it (`SEC-56` D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaFileProblem {
+    /// The path the setting named.
+    path: std::path::PathBuf,
+    /// What is wrong with it.
+    kind: CaFileProblemKind,
+}
+
+/// Read the CA file a setting names, if it names one (`SEC-56` D5).
+///
+/// ONE helper for every setting that points at a CA file, so the checks
+/// are the same everywhere: a set path that cannot be read, or that holds
+/// no PEM certificate, stops the API at start rather than being discovered
+/// on the first dial or the first send. An unset or empty setting is
+/// "no CA file" — the same truthy rule every other setting uses.
+///
+/// The bytes are returned with the path, so a caller that needs the
+/// certificates (`SMTP_CA_FILE`) does not read the file a second time.
+fn parse_ca_file(
+    env: &HashMap<String, String>,
+    variable: &str,
+) -> Result<Option<(std::path::PathBuf, Vec<u8>)>, CaFileProblem> {
+    let Some(raw) = truthy(env, variable) else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(raw);
+    // `read` (not `File::open`) so a directory, which opens but cannot be
+    // read as a certificate, is caught here too.
+    let bytes = std::fs::read(&path).map_err(|_| CaFileProblem {
+        path: path.clone(),
+        kind: CaFileProblemKind::Unreadable,
+    })?;
+    let mut count = 0usize;
+    for certificate in CertificateDer::pem_slice_iter(&bytes) {
+        certificate.map_err(|_| CaFileProblem {
+            path: path.clone(),
+            kind: CaFileProblemKind::Empty,
+        })?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(CaFileProblem {
+            path,
+            kind: CaFileProblemKind::Empty,
+        });
+    }
+    Ok(Some((path, bytes)))
+}
+
 /// `CONNECTOR_TLS_CA_FILE` (`SEC-14` part B, D5): unset or empty is "no CA,
 /// require TLS only"; a set path is read now so an unreadable one stops the
 /// API at start rather than on the first connector dial.
 fn parse_connector_tls_ca_file(
     env: &HashMap<String, String>,
 ) -> Result<Option<std::path::PathBuf>, ConfigError> {
-    let Some(raw) = truthy(env, "CONNECTOR_TLS_CA_FILE") else {
+    match parse_ca_file(env, "CONNECTOR_TLS_CA_FILE") {
+        Ok(None) => Ok(None),
+        Ok(Some((path, _bytes))) => Ok(Some(path)),
+        Err(problem) => Err(match problem.kind {
+            CaFileProblemKind::Unreadable => {
+                ConfigError::UnreadableConnectorTlsCaFile(problem.path)
+            }
+            CaFileProblemKind::Empty => ConfigError::EmptyConnectorTlsCaFile(problem.path),
+        }),
+    }
+}
+
+/// `SMTP_CA_FILE` (`SEC-56` D1/D5/D6): unset or empty is "no bundle", and
+/// the sender behaves exactly as it did before the setting existed. A set
+/// path is read now, and the certificates are kept in memory, so the send
+/// path does no file I/O and a replaced file takes effect at the next
+/// restart.
+fn parse_smtp_ca_file(
+    env: &HashMap<String, String>,
+) -> Result<Option<(std::path::PathBuf, lakehouse_notify::SmtpCaBundle)>, ConfigError> {
+    let Some((path, bytes)) =
+        parse_ca_file(env, "SMTP_CA_FILE").map_err(|problem| match problem.kind {
+            CaFileProblemKind::Unreadable => ConfigError::UnreadableSmtpCaFile(problem.path),
+            CaFileProblemKind::Empty => ConfigError::EmptySmtpCaFile(problem.path),
+        })?
+    else {
         return Ok(None);
     };
-    let path = std::path::PathBuf::from(raw);
-    // `read` (not `File::open`) so a directory, which opens but cannot be
-    // read as a certificate, is caught here too.
-    std::fs::read(&path).map_err(|_| ConfigError::UnreadableConnectorTlsCaFile(path.clone()))?;
-    let certificates = CertificateDer::pem_file_iter(&path)
-        .map_err(|_| ConfigError::UnreadableConnectorTlsCaFile(path.clone()))?;
-    let mut count = 0usize;
-    for cert in certificates {
-        cert.map_err(|_| ConfigError::EmptyConnectorTlsCaFile(path.clone()))?;
-        count += 1;
-    }
-    if count == 0 {
-        return Err(ConfigError::EmptyConnectorTlsCaFile(path));
-    }
-    Ok(Some(path))
+    // The file was validated above with the same PEM parser, so this can
+    // only fail if the file changed between the two reads; it is reported
+    // as an empty bundle rather than ignored.
+    let bundle = lakehouse_notify::SmtpCaBundle::from_pem(&bytes)
+        .map_err(|_| ConfigError::EmptySmtpCaFile(path.clone()))?;
+    Ok(Some((path, bundle)))
 }
 
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
@@ -1341,8 +1511,13 @@ impl Config {
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
     ///   nor `false`.
     /// - [`ConfigError::InvalidUploadLimit`], if
-    ///   `UPLOAD_MAX_CONCURRENT_PER_USER`, `UPLOAD_MAX_CONCURRENT` or
+    ///   `UPLOAD_MAX_CONCURRENT_PER_USER`, `UPLOAD_MAX_CONCURRENT`,
+    ///   `UPLOAD_MAX_CONVERSIONS`, `UPLOAD_CONVERT_MEMORY_MB` or
     ///   `UPLOAD_SESSION_TTL_HOURS` is set and non-empty but is not a whole number of 1 or more.
+    /// - [`ConfigError::UnreadableSmtpCaFile`] or
+    ///   [`ConfigError::EmptySmtpCaFile`], if `SMTP_CA_FILE` is set and
+    ///   non-empty but names a file that cannot be read, or one that holds
+    ///   no PEM certificate (`SEC-56` D5).
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1389,6 +1564,14 @@ impl Config {
         // `CONNECTOR_TLS_CA_FILE`: read the file now so an unreadable path
         // stops the API at start, not on the first connector dial (T1).
         let connector_tls_ca_file = parse_connector_tls_ca_file(env)?;
+
+        // `SMTP_CA_FILE`: the same rule, the same checks, its own error
+        // variants so the message names its own setting (`SEC-56` D5). The
+        // bundle is kept in memory: the send path does no file I/O (D6).
+        let (smtp_ca_file, smtp_ca) = match parse_smtp_ca_file(env)? {
+            Some((path, bundle)) => (Some(path), Some(bundle)),
+            None => (None, None),
+        };
 
         Ok(Self {
             ch_url: or_default(env, "CH_URL", "http://localhost:18123"),
@@ -1457,6 +1640,8 @@ impl Config {
             connector_secrets_key: truthy(env, "CONNECTOR_SECRETS_KEY"),
             connector_secrets_key_previous: truthy(env, "CONNECTOR_SECRETS_KEY_PREVIOUS"),
             connector_tls_ca_file,
+            smtp_ca,
+            smtp_ca_file,
             secret_manager: crate::secret_manager::SecretManagerSettings::from_map(env)?,
             connector_typed_credentials: parse_switch(
                 env,
@@ -1510,6 +1695,12 @@ impl Config {
                 env,
                 "LAKEKEEPER_ADMIN_TOKEN_FILE",
                 "/tokens/admin.jwt",
+            ),
+            outside_s3_endpoint: truthy(env, "OUTSIDE_S3_ENDPOINT"),
+            lakekeeper_outside_read_token_file: or_default(
+                env,
+                "LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE",
+                "/tokens/outside-readers.jwt",
             ),
             tenant_warehouse_s3_endpoint: truthy(env, "TENANT_WAREHOUSE_S3_ENDPOINT"),
             tenant_warehouse_s3_bucket: or_default(
@@ -1593,6 +1784,13 @@ impl Config {
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
+            upload_max_concurrent_large: parse_limit(env, "UPLOAD_MAX_CONCURRENT_LARGE", 2)?,
+            upload_max_conversions: parse_limit(env, "UPLOAD_MAX_CONVERSIONS", 2)?,
+            upload_convert_memory_mb: parse_limit(
+                env,
+                "UPLOAD_CONVERT_MEMORY_MB",
+                crate::upload_convert::DEFAULT_MEMORY_MIB,
+            )?,
             upload_session_ttl_hours: parse_limit(env, "UPLOAD_SESSION_TTL_HOURS", 24)?,
             connector_auto_disable_after: i32::try_from(parse_positive_u32_or_default(
                 env,
@@ -2715,6 +2913,88 @@ mod tests {
         );
     }
 
+    /// A PEM certificate minted for the test (`SEC-56` D8: nothing is
+    /// committed to this repository).
+    fn a_minted_certificate() -> String {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["relay.example.com".to_string()]).unwrap();
+        crate::tls_proxy::pem_certificate(certified.cert.der())
+    }
+
+    /// `SEC-56` D1/D6: unset or empty means "no bundle", and the sender
+    /// behaves exactly as it did before the setting existed.
+    #[test]
+    fn an_smtp_ca_file_is_absent_by_default_and_empty_means_absent() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.smtp_ca, None);
+        assert_eq!(cfg.smtp_ca_file, None);
+
+        let cfg = Config::from_map(&env_with("SMTP_CA_FILE", "")).unwrap();
+        assert_eq!(cfg.smtp_ca, None);
+        assert_eq!(cfg.smtp_ca_file, None);
+    }
+
+    /// `SEC-56` D2/D6: a readable bundle is kept in memory, and the path
+    /// is kept beside it for the `Debug` output.
+    #[test]
+    fn a_readable_smtp_ca_file_is_read_into_a_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        let mut pem = a_minted_certificate();
+        pem.push_str(&a_minted_certificate());
+        std::fs::write(&ca, pem).unwrap();
+
+        let env = env_with("SMTP_CA_FILE", ca.to_str().unwrap());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_ca_file.as_deref(), Some(ca.as_path()));
+        let bundle = cfg.smtp_ca.as_ref().expect("the bundle is read");
+        assert_eq!(bundle.len(), 2);
+    }
+
+    /// `SEC-56` D5: a set path that cannot be read stops the API at start
+    /// with a message naming the variable — never a silent fall back to
+    /// trusting every certificate.
+    #[test]
+    fn an_unreadable_smtp_ca_file_stops_the_api() {
+        for path in [
+            std::path::PathBuf::from("/nonexistent/rantai/smtp-ca.pem"),
+            // A directory: opens but is not a readable certificate file.
+            std::path::PathBuf::from("/"),
+        ] {
+            let env = env_with("SMTP_CA_FILE", path.to_str().unwrap());
+            let err = Config::from_map(&env).expect_err("an unreadable path must fail start-up");
+            assert_eq!(err, ConfigError::UnreadableSmtpCaFile(path));
+            assert!(
+                err.to_string().contains("SMTP_CA_FILE"),
+                "the message must name the variable: {err}"
+            );
+        }
+    }
+
+    /// `SEC-56` D5: a set path that holds no PEM certificate stops the API
+    /// at start, with a message naming the variable.
+    #[test]
+    fn an_empty_smtp_ca_file_stops_the_api() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        // The file is empty (0 bytes, no PEM certificate).
+        let env = env_with("SMTP_CA_FILE", temp.path().to_str().unwrap());
+        let err = Config::from_map(&env).expect_err("an empty CA file must fail start-up");
+        assert_eq!(err, ConfigError::EmptySmtpCaFile(temp.path().to_path_buf()));
+        assert!(
+            err.to_string().contains("SMTP_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+
+        // The file has non-PEM text.
+        std::fs::write(temp.path(), "this is not a pem certificate\n").unwrap();
+        let err = Config::from_map(&env).expect_err("a non-PEM CA file must fail start-up");
+        assert_eq!(err, ConfigError::EmptySmtpCaFile(temp.path().to_path_buf()));
+        assert!(
+            err.to_string().contains("SMTP_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+    }
+
     #[test]
     fn sql_help_is_on_when_the_setting_is_absent_or_empty() {
         assert!(Config::from_map(&HashMap::new()).unwrap().ai_sql_help);
@@ -2829,6 +3109,75 @@ mod tests {
             err,
             ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT", _)
         ));
+    }
+
+    // ── DATA-37: the limit on large loads ─────────────────────────────────
+
+    #[test]
+    fn the_large_load_limit_defaults_to_two_and_is_read_from_its_variable() {
+        for env in [HashMap::new(), env_with("UPLOAD_MAX_CONCURRENT_LARGE", "")] {
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.upload_max_concurrent_large, 2);
+        }
+        let cfg = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_LARGE", "3")).unwrap();
+        assert_eq!(cfg.upload_max_concurrent_large, 3);
+    }
+
+    #[test]
+    fn a_large_load_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
+        for bad in ["0", "-1", "abc", "2.5", " 3"] {
+            let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_LARGE", bad))
+                .expect_err("a bad limit must stop start-up, not fall back to the default");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT_LARGE", bad.to_owned())
+            );
+        }
+    }
+
+    // ── SEC-22: the limits of the child that reads an uploaded file ─────
+
+    #[test]
+    fn the_conversion_limits_default_to_two_conversions_and_the_measured_peak() {
+        for env in [
+            HashMap::new(),
+            env_with("UPLOAD_MAX_CONVERSIONS", ""),
+            env_with("UPLOAD_CONVERT_MEMORY_MB", ""),
+        ] {
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.upload_max_conversions, 2);
+            assert_eq!(
+                cfg.upload_convert_memory_mb,
+                crate::upload_convert::DEFAULT_MEMORY_MIB
+            );
+        }
+    }
+
+    #[test]
+    fn the_conversion_limits_are_read_from_their_variables() {
+        let mut env = env_with("UPLOAD_MAX_CONVERSIONS", "4");
+        env.insert("UPLOAD_CONVERT_MEMORY_MB".to_owned(), "256".to_owned());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.upload_max_conversions, 4);
+        assert_eq!(cfg.upload_convert_memory_mb, 256);
+    }
+
+    #[test]
+    fn a_conversion_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
+        for (name, bad) in [
+            ("UPLOAD_MAX_CONVERSIONS", "0"),
+            ("UPLOAD_CONVERT_MEMORY_MB", "0"),
+            ("UPLOAD_MAX_CONVERSIONS", "abc"),
+            ("UPLOAD_CONVERT_MEMORY_MB", "-1"),
+        ] {
+            let err = Config::from_map(&env_with(name, bad))
+                .expect_err("a bad limit must stop start-up, not fall back to the default");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit(name, bad.to_owned()),
+                "{name}"
+            );
+        }
     }
 
     /// `BI-1` D1: the PDF renderer's two addresses are plain configuration;

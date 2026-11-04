@@ -106,6 +106,21 @@ pub async fn spin_up_state(overrides: &HashMap<String, String>) -> (AppState, Pg
     build_state_and_pool(overrides).await
 }
 
+/// Same as [`spin_up_with_env`], but the [`AppState`] the router was built
+/// from is returned as well, and `prepare` may change it before the router
+/// is built: a test that counts what the API did — the child runs of
+/// `SEC-22` — needs the handle, and a test that points the runner at
+/// another child needs to do it before the router takes the state.
+pub async fn spin_up_with_state(
+    overrides: &HashMap<String, String>,
+    prepare: impl FnOnce(&mut AppState),
+) -> (TestApp, AppState) {
+    let (mut state, pool) = build_state_and_pool(overrides).await;
+    prepare(&mut state);
+    let router = lakehouse_api::routes::router(state.clone());
+    (TestApp { router, pool }, state)
+}
+
 /// Same as [`spin_up_with_env`], but replaces
 /// [`AppState::connector_secret_resolver`] with `resolver` before the
 /// router is built.
@@ -258,7 +273,16 @@ async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState,
     // these tests never rely on the cookie flowing over plaintext HTTP,
     // since `tower::ServiceExt::oneshot` never touches a real socket.
     let config = Config::from_map(&env).expect("a valid test Config");
-    let state = AppState::new(config);
+    let mut state = AppState::new(config);
+    // `SEC-22` D3: the child that reads an uploaded workbook or a Parquet
+    // file is the binary Cargo built for these tests — the test binary
+    // itself would run the test suite again, so the runner is pointed at
+    // the real child.
+    state.conversion_runner = state
+        .conversion_runner
+        .with_binary(std::path::PathBuf::from(env!(
+            "CARGO_BIN_EXE_lakehouse-api"
+        )));
     // OPS-4: the harness applied the migrations to this database before
     // building the state, which is what `main::bring_database_up` confirms
     // in production — so `GET /health` reports the database as usable here
@@ -301,6 +325,65 @@ pub async fn session_cookie_for_user(pool: &PgPool, user_id: Uuid) -> String {
     .await
     .expect("mint a session for a test principal");
     format!("lh_session={}", token.expose())
+}
+
+/// `SEC-50` slice 2 M11: the tenant that owns the shared catalog in the
+/// tests that read it.
+///
+/// The seeded identity migration creates four tenants, so a deployment with
+/// no `CATALOG_TENANT_ID` has no tenant that owns the shared catalog — and
+/// every read of it is refused (`SEC-50` D2). A test that reads the shared
+/// catalog names this tenant (in the environment it starts the app with)
+/// and puts its reader in it.
+pub const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
+/// Puts `user` in the catalog's own tenant, so a read of the shared
+/// catalog is the read the test means (`SEC-50` slice 2 M11).
+pub async fn in_the_catalog_tenant(pool: &PgPool, user: Uuid) {
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(user)
+    .bind(CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id"))
+    .execute(pool)
+    .await
+    .expect("add the membership");
+}
+
+/// `SEC-50` slice 2 M11: makes the deployment hold no tenant of the seeded
+/// ones, so the tenant gate changes nothing (D2) and a test that is about
+/// its own rule keeps it.
+///
+/// The seeded identity migration creates four tenants, so a deployment with
+/// several of them has no tenant that owns the shared catalog unless it
+/// names one (`CATALOG_TENANT_ID`) — and every read of the shared catalog
+/// is then refused. A test that reads the shared catalog and is not about
+/// the gate either names the catalog's tenant (and puts its reader in it,
+/// see [`in_the_catalog_tenant`]) or makes the deployment a one-tenant one
+/// instead: there is then no other tenant's table to reach, and nothing
+/// changes.
+///
+/// The membership rows go first: `app_user_tenant.tenant_id` refuses the
+/// deletion of a tenant that still has members.
+pub async fn leave_no_seeded_tenants(pool: &PgPool) {
+    for tenant in [
+        "11111111-1111-4111-8111-000000000001",
+        "11111111-1111-4111-8111-000000000002",
+        "11111111-1111-4111-8111-000000000003",
+        "11111111-1111-4111-8111-000000000004",
+    ] {
+        let tenant_id: Uuid = tenant.parse().expect("a seeded tenant id");
+        sqlx::query("DELETE FROM app_user_tenant WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .execute(pool)
+            .await
+            .expect("drop the memberships of the tenant that goes");
+        sqlx::query("DELETE FROM tenant WHERE id = $1")
+            .bind(tenant_id)
+            .execute(pool)
+            .await
+            .expect("drop the tenant");
+    }
 }
 
 /// Creates a fresh `app_user` holding a role that grants NO permissions at

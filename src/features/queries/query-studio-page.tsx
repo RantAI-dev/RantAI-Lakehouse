@@ -47,7 +47,7 @@ export function QueryStudioPage() {
     setPageContext({
       key: "query",
       title: "Write and run SQL",
-      hint: "Ask about this query or its result, or have Copilot write SQL.",
+      hint: "Ask about this query or its result, or have AI Copilot write SQL.",
       suggest: {
         ask: ["Explain this query", "What does this result show?", "Why might this query be slow?"],
         build: ["Turn this into a chart on a dashboard"],
@@ -136,7 +136,14 @@ export function QueryStudioPage() {
               the statement that is open on it. */}
           {studio.activeRuns.length > 1 ? <QueryResultTabs studio={studio} /> : null}
           {openRun?.status === "done" ? (
-            <QueryResultsSection result={openRun.result} />
+            <QueryResultsSection
+              result={openRun.result}
+              runId={openRun.runId}
+              downloadBusy={studio.download.busy}
+              onDownload={(format) =>
+                studio.download.start(openRun.result.id, format, openRun.runId)
+              }
+            />
           ) : null}
           {openRun?.status === "error" ? (
             <div className="space-y-2">

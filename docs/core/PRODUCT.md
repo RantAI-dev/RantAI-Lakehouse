@@ -69,8 +69,10 @@ cloud version is possible in future. Neither exists today.
 
 ### Stage
 
-Version 0.1, in heavy development, built by one product owner working with
-AI agents (`AGENTS.md`).
+Version 0.2.0, built by the release pipeline on 2026-11-04 and waiting as a
+draft for the product owner to publish it (`docs/plans/REL-2-RESULT.md`).
+Still in heavy development, built by one product owner working with AI agents
+(`AGENTS.md`).
 
 ---
 
@@ -150,7 +152,7 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Query tenancy | **Partial.** A query and a saved query are scoped to the caller's tenant — another tenant's uploaded table is refused with the same 404 as a missing table, and the shared catalog belongs to the tenant named in `CATALOG_TENANT_ID` (`SEC-20`). Dashboards, scheduled exports, alerts and authored pipelines are not scoped this way yet | Yes | `SEC-50` |
+| Query tenancy | **Partial.** A query and a saved query are scoped to the caller's tenant — another tenant's uploaded table is refused with the same 404 as a missing table, and the shared catalog belongs to the tenant named in `CATALOG_TENANT_ID` (`SEC-20`). Authored pipelines and the Gold export are scoped too (`SEC-50` slice 1, #281, 2026-10-30): a pipeline reads as its own tenant, and a job with no user acts as the catalog's tenant. Dashboards, embeds, public links and alerts are not yet (slice 2) | Yes | `SEC-50` |
 | Roles and permissions | **Have** | Yes | — |
 | Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
@@ -240,6 +242,11 @@ in `README.md` ("Status / Known limitations").
   that table; it is off by default. A published table holds every past
   copy; outside readers must pick the latest. Tables over 5,000,000 rows
   are refused. A background merge in the engine can cause one extra copy.
+- Outside tools read published Gold tables only through the API
+  (`/api/iceberg`), with a service identity that has `iceberg:read`, and
+  each table read is counted per tool (`DATA-5`). An operator must first
+  publish storage at `OUTSIDE_S3_ENDPOINT`; until then the console says
+  "Not measured". Tenant warehouses and Silver tables are not served yet.
 - Raw table history is never trimmed.
 - A plain row count on a change-captured table can overcount on some engine
   versions. The product's own queries avoid this; a hand-written one may not.
@@ -302,10 +309,12 @@ run without the product owner fixing things by hand.
 | --- | --- | --- |
 | 1 | No feature has been accepted. "Built" means merged, not checked by a person | Run the acceptance checklist for each feature, starting with what a demo shows |
 | 2 | A leaked key is in the public git history | Confirm it was rotated; decide whether to rewrite history |
-| 3 | No human security review | Commission one |
-| 4 | The main branch can be changed without review | Apply the settings drafted in `docs/CI.md` |
+| 3 | ~~No human security review~~ | Not a blocker: the product owner dropped it on 2026-10-30 (`SEC-4`) |
+| 4 | ~~The main branch can be changed without review~~ | Cleared 2026-10-30: `main` requires five checks and blocks force-pushes (`REL-1`, `docs/CI.md`) |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
-| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 6 | ~~Open high-severity security findings~~: connector password theft (`SEC-14`) is merged (#85, #192) and waits for acceptance; connection tests reaching internal addresses (`SEC-15`) was accepted 2026-10-23 | Accept `SEC-14` (`QA-1`) |
+| 7 | A fresh install refuses its scheduled work (exports, alerts, reports, embeds) and the shared catalog until `CATALOG_TENANT_ID` is set by hand, because every install seeds four tenants (`REL-10`) | Being fixed: the installer and the updater set it (`REL-10`, In Progress) |
+| 8 | Previewing a Parquet file in an S3 files connector reads it in the API process, so a crafted file can end the API for every tenant (`SEC-55`) | Being fixed: the preview reads the file's tail in the separate reader process, as uploads do (`SEC-55`, In Progress) |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table
