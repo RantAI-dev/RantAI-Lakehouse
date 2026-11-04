@@ -1868,7 +1868,11 @@ the deployment has more than one tenant.
 **What this means for an existing deployment.** `0002_seed_identity.sql` seeds
 four tenants, and its users belong to several of them — so on upgrade,
 Analysts, Data Engineers and Governance Admins lose the catalog and the job
-list until you say who owns them:
+list until you say who owns them. `lakehousectl install` writes this setting
+as the group tenant on a fresh install, and `lakehousectl update` fills it
+when the line is empty — so a stack made or updated by the tool needs no hand
+edit (`REL-10`). Set it by hand only on a stack not made by `lakehousectl`,
+where a value is not already there:
 
 ```
 CATALOG_TENANT_ID=<the id of the tenant that owns this deployment's shared catalog>
