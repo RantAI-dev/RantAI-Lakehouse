@@ -716,6 +716,134 @@ changed):
 - I served on :3460 and :9555 only, and both are stopped; :3400 was not
   touched. `git status` is clean.
 
+### Handoff 6: developer (Opus), 2026-11-04, D14 storyboard (S1–S6)
+
+**Commits** (`85c76d3c..c0e9dd95`, all pushed, in plan order):
+
+| Commit | What |
+| --- | --- |
+| `388c83eb` | R1 follow-up: unique keys on the chat's switching `m` elements. React's dev build warned "two children with the same key" (found while building S1). |
+| `e0b6c085` | S1 the dive |
+| `e89f4c0f` | S2 the page-wide water |
+| `a9bee695` | S3 the depth gauge |
+| `f0b81418` | S4 the guide |
+| `85187993` | S5 the ascent and the surfacing |
+| `c0e9dd95` | S6 the measurement, in `WEB-5-RESULT.md` |
+
+**S1, the dive** (evidence: `docs/plans/web-5-screens/d14-s1-dive-strip.jpg`).
+- **Hero length.** The hero is 220 vh while the live lake runs
+  (`DIVE.heroVh`). The DOM hero keeps 150 vh.
+- **Camera path.** The camera eases to y 0.45 at 0.6 vh, then crosses
+  slowly: 0.16 at 1.1 vh and −0.16 at 1.6 vh, about 0.6 units per viewport
+  (it was about 2.6). It reaches −2.4 at 2.7 vh, in the sources (−5 m).
+- **Underwater blend.** It follows the un-hopped path height, from 0.32 to
+  2.36 vh, with at most 1.1 % per 1 % of a viewport. The `avoidSurface`
+  band is halved, to 0.07.
+- **The waterline.** A single water plane cannot show both sides, so the
+  sky-to-ceiling flip is one frame. A waterline overlay driven by the
+  engine (meniscus plus tint) rises up the screen, and the flip happens
+  with 75 % of the screen already under it. A ripple spreads from the
+  crossing.
+- **The strip.** Eight frames lie between fully above (0.9 vh) and fully
+  below (1.6 vh): 1.10, 1.20, 1.25, 1.30, 1.35, 1.40, 1.45 and 1.50.
+- **The test-only override.** The frames were rendered with
+  `NEXT_PUBLIC_WEB5_FORCE_WEBGL=1`, read only when NODE_ENV is
+  "development" (`next dev` on :3461, a SwiftShader Chrome on :9556). The
+  export drops it, and `scripts/check-bundle.mjs` fails if the flag's name
+  is anywhere in `out/` ("not in the export" in every run since).
+
+**S2, one water** (evidence: `d14-s2-edges.jpg`).
+- **The layer.** `DepthBackdrop` is a fixed layer whose top and bottom
+  colours follow the depth through CSS variables, written from a passive,
+  rAF-throttled listener only when they change. Under reduced motion the
+  colour steps per chapter.
+- **The journey** is `JOURNEY` in `home-content.ts`, and the maths is in
+  `lib/depth-journey.ts` (tested).
+- **No-JS fallback.** The sections keep their own backgrounds only without
+  JS (`.lk-fallback-bg`, dropped once `data-scene` is set).
+- **Seams fixed:**
+  - the assistant's old top fade is no-JS only;
+  - its caustics fade in and out over the stage's first and last quarter;
+  - the dashboards shore wash fades to transparent.
+- **The evidence:** each section edge at mid-screen at 1440, under reduced
+  motion and at 390, plus the live-lake seam from the gold slab into the
+  assistant. There is no band at any edge.
+
+**S3, the gauge** (evidence: `d14-s3-gauge-{desk,phone,small}.jpg`, 1440,
+390 and 360, EN over ID, one frame per chapter).
+- **Desktop:** a scale on the left edge, hidden inside the depths pin,
+  where that section's own gauge with the slab labels stands.
+- **Phone:** a hairline under the bar, with the reading at its right end.
+  A reading in the bar's row would crowd 360 px.
+- **Readings:**
+  - hero 0, sources −5, Bronze / Silver / Gold −10 / −40 / −90 (as their
+    labels), assistant −100;
+  - dashboards −95 / −96, governance −45 / −46, open −12 to −14;
+  - final 0;
+  - EN and ID read the same.
+
+**S4, the guide** (evidence: `d14-s4-guide.jpg`).
+- The creature's mark, in a small disc, sits beside both assistant turns.
+  There is no copy change.
+- At 360×740 the pinned assistant stage already overflowed before S4: on
+  `a9bee695` the heading was under the bar and the chat ran past the
+  bottom. I fixed it with phone-only spacing. It now measures heading top
+  / chat bottom 77 / 727 (EN) and 66 / 738 (ID); desktop is unchanged.
+
+**S5, the ascent** (evidence: `d14-s5-ascent.jpg`,
+`d14-s5-bubbles-detail.jpg`, and `t5-{reduced,nowebgl,nojs}.jpg`
+re-taken).
+- **Caustics** grow as the water gets shallower, and twelve CSS **bubbles**
+  rise at the edges. They run only during the climb, are mounted after
+  paint, and are hidden under reduced motion and without JS.
+- **Reveals** already rise into place (their start offsets are downward),
+  so they move with the ascent. Nothing was added.
+- **The surfacing.** The final creature rises from 30 % lower as the
+  section enters.
+- **Fixed on the way:**
+  - the stepped (reduced-motion) water showed the shallow depths colour at
+    the assistant's start;
+  - the final's grain drew an edge.
+- **Fallbacks.** The three modes still read end to end.
+
+**S6, the measurement** (`WEB-5-RESULT.md`, "Update: D14 S6").
+- `bun run size`: 181.1 KB, with the scene 147.0 KB, deferred.
+- Lighthouse, interleaved against R7 (`b2634f3d`), three rounds:
+
+| Metric | EN R7 | EN D14 | ID R7 | ID D14 |
+| --- | --- | --- | --- | --- |
+| TBT median | 227 ms | 118.8 ms | 126 ms | 119.3 ms |
+
+- LCP is 1.07 s, CLS 0, and SEO, accessibility and best practices 100 in
+  all 12 runs.
+- Every target is met. I read this as "no regression": the lower medians
+  are within the VM's spread, and R7's EN median includes a 3,990 ms spike.
+
+**Checks.**
+- The site block on the final code (`85187993`'s code; S6 is docs only):
+  lint 0, typecheck 0, `bun run test` 61 pass, 0 fail, build 0,
+  `bun run size` 0 (181.1 KB).
+- No new library and no per-scroll React state:
+  - the backdrop, the gauge, the waterline and the final's rise write
+    CSS variables or styles through refs;
+  - the only setState calls are on mode or lit-depth changes, as before.
+
+**Not verified, and limits:**
+- **Not measured by Lighthouse:** the live-lake path, including the 220 vh
+  hero and the waterline. This VM's Chrome has only SwiftShader, so it was
+  checked visually with the dev-only override, and not for performance on
+  a GPU.
+- **Observed, not changed (outside D14):** at 360 px the English hero h1
+  wraps to three lines ("Your data / has a / home now."). T7's check
+  covered 1440 and 390.
+- **Process:**
+  - `next dev` writes `site/AGENTS.md`; I removed it each time, and it
+    was never committed;
+  - scratch worktrees (`a9bee695`, `b2634f3d`) are removed;
+  - my servers on :3460, :3461, :9555 and :9556 are stopped, and :3400
+    was not touched;
+  - `git status` is clean.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
