@@ -44,6 +44,8 @@ const DEFAULT_CHARS = 5000
 const VALUE_CHARS = 40
 /** The tab list's own budget, and where the chart-to-tab mapping is read. */
 const TAB_MAX_CHARS = 600
+/** The parameter line's own budget: it plays the part for the parameter line that `TAB_MAX_CHARS` plays for the tabs line. */
+const PARAM_MAX_CHARS = 600
 const TAB_HINT = "; list_charts gives each chart's tab"
 /**
  * How many characters of page context the API keeps, mirrored from
@@ -164,10 +166,36 @@ export function summarizeFilterJson(
  * "target = 1000 (number); pick = rooms (list)" — or "none". The parameters the
  * dashboard shows with the value in force (BI-11), so the assistant reuses them
  * (`list_parameters` has the rest) instead of defining a second one.
+ *
+ * The line has its own budget (`PARAM_MAX_CHARS`), like the tabs: a board with
+ * many shown parameters must not push the dashboard's whole context past the
+ * API's cap, which would cut off the board id and the closing instruction.
+ * When the entries do not fit whole, the first ones that fit stay and a note
+ * counts the rest, toward the budget; a single entry too long for the budget
+ * is cut with `clip`.
  */
-export function summarizeParams(controls: { param: { name: string; type: string }; value: string | number }[]): string {
-  const parts = controls.map((c) => `${c.param.name} = ${fmt(c.value)} (${c.param.type})`)
-  return parts.length ? parts.join("; ") : "none"
+export function summarizeParams(
+  controls: { param: { name: string; type: string }; value: string | number }[],
+  opts: { maxChars?: number } = {}
+): string {
+  if (controls.length === 0) return "none"
+  const maxChars = opts.maxChars ?? PARAM_MAX_CHARS
+  const entries = controls.map((c) => `${c.param.name} = ${fmt(c.value)} (${c.param.type})`)
+  const whole = entries.join("; ")
+  if (whole.length <= maxChars) return whole
+  // The note is part of the budget: it counts the entries the line leaves out.
+  const note = (leftOut: number): string => (leftOut > 0 ? `; … (+${leftOut} more)` : "")
+  // Not even the first entry fits beside its note: cut it, reserving the note's room.
+  const firstNote = note(entries.length - 1)
+  if (entries[0].length + firstNote.length > maxChars) {
+    return clip(entries[0], maxChars - firstNote.length) + firstNote
+  }
+  // Keep the most entries whose joined line plus the note stays inside the budget.
+  let kept = entries.length - 1
+  while (kept > 1 && entries.slice(0, kept).join("; ").length + note(entries.length - kept).length > maxChars) {
+    kept--
+  }
+  return entries.slice(0, kept).join("; ") + note(entries.length - kept)
 }
 
 /**
