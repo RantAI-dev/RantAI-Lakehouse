@@ -6,14 +6,14 @@
 | Backlog | `DATA-35` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-35.md` (the *(proposed)* rows are decisions 2 to 6 below) |
-| Status | Planned. All eight decisions signed on 2026-10-26: 1, 7 and 8 as the product owner stated them, 2 to 6 by the product owner taking the planner's defaults ("sisanya jalankan default anda") |
+| Status | Released: merged in #259 on 2026-10-28; accepted by the product owner on 2026-10-29 (six of seven checklist rows run in the browser, all Pass; `DATA-35-AC5` not run on the QA instance, covered by CI) |
 | Priority | P2 *(planner's proposal)* |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Plan | `docs/superpowers/plans/2026-10-26-data-35-upload-folders.md` |
 | Started | 2026-10-26 |
-| Shipped | Not yet |
-| Evidence | The pull request, once there is one |
+| Shipped | 2026-10-28 (#259) |
+| Evidence | #259; the acceptance below |
 
 ## Problem
 
@@ -72,17 +72,19 @@ A step not performed is never Pass.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `DATA-35-AC1` | Create a folder, a folder inside it; upload a file choosing the inner folder on the Table step | The file appears in the inner folder | Not run |
-| `DATA-35-AC2` | Move that file and another one to a third folder, then to "No folder" | Both follow; their tables, a chart reading one of them and its lineage are unchanged | Not run |
-| `DATA-35-AC3` | Re-upload into the first file's table | The new file joins the table's folder | Not run |
-| `DATA-35-AC4` | Look at a folder that holds a file; move the file out; delete the folder | The delete control is disabled with the reason while the file is in it; afterwards the folder is deleted | Not run |
-| `DATA-35-AC5` | As a user without `connector:manage`; then as a user of another tenant | The first is refused, as on the Uploaded files tab today; the second sees none of the folders | Not run |
-| `DATA-35-AC6` | Search the tab for a file that is in a folder | Found, with its folder shown | Not run |
-| `DATA-35-AC7` | Create a fourth level of folders | Refused with the limit named (decision 3) | Not run |
+| `DATA-35-AC1` | Create a folder, a folder inside it; upload a file choosing the inner folder on the Table step | The file appears in the inner folder | Pass 2026-10-29 (product owner) |
+| `DATA-35-AC2` | Move that file and another one to a third folder, then to "No folder" | Both follow; their tables, a chart reading one of them and its lineage are unchanged | Pass 2026-10-29 (product owner) |
+| `DATA-35-AC3` | Re-upload into the first file's table | The new file joins the table's folder | Pass 2026-10-29 (product owner) |
+| `DATA-35-AC4` | Look at a folder that holds a file; move the file out; delete the folder | The delete control is disabled with the reason while the file is in it; afterwards the folder is deleted | Pass 2026-10-29 (product owner) |
+| `DATA-35-AC5` | As a user without `connector:manage`; then as a user of another tenant | The first is refused, as on the Uploaded files tab today; the second sees none of the folders | Not run: the QA instance had no second user or tenant (creating them was refused to the planner); covered by `tests/route_auth.rs` and the cross-tenant tests in CI |
+| `DATA-35-AC6` | Search the tab for a file that is in a folder | Found, with its folder shown | Pass 2026-10-29 (product owner) |
+| `DATA-35-AC7` | Create a fourth level of folders | Refused with the limit named (decision 3) | Pass 2026-10-29 (product owner) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (held in the base) **Date:** 2026-10-29 **Build:** PR #259 head `54588c4e` (its CI images, on a QA instance)
 
 Exceptions, each with an owner and a date:
+
+- `DATA-35-AC5` not run in the browser (see its row); no follow-up needed beyond CI, which runs on every pull request.
 
 ## After acceptance
 
