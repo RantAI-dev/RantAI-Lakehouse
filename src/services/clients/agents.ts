@@ -2,29 +2,24 @@ import type {
   AgentRun,
   AgentService,
   ApprovalItem,
-  CreateEmployeeInput,
   DecideApprovalInput,
   DecideApprovalResult,
   DigitalEmployee,
-  RunEmployeeInput,
 } from "../contracts/agents"
 import { apiFetch } from "../http"
 import { ServiceError } from "../errors"
 
 /**
- * AgentService is real — digital employee definitions, tools, workflows,
- * run history, and the approval cycle are all stored in Postgres via the
- * `/api/agents/*` route (crate `lakehouse-store`, Task 2.9).
+ * AgentService is real: employee definitions, run history and the approval
+ * cycle are stored in Postgres via the `/api/agents/*` route (crate
+ * `lakehouse-store`, Task 2.9).
  *
- * UPDATE (T3.2/T3.4, copilot-operations-handover plan): there is now a
- * headless execution runtime — `runEmployee` calls `POST
- * /api/agents/employees/{id}/run`, which actually runs the copilot's
- * tool-calling loop for one digital employee without interactive
- * supervision, writing real `agent_run`/`steps`/`audit_event` rows.
- * `listRuns`/`getRun` can now surface run history that actually happened,
- * not just seed data — see migration `0026_drop_seeded_agent_runs.sql`,
- * which removed the old seed runs/approvals so this page would not
- * mislead.
+ * `WEB-3` slice 1 (D1/D2/D3) removed the employees list, employee detail and
+ * runs list — and with them the employee create/suspend/resume/revoke/run
+ * actions and the two list reads. What remains is what live pages read: a
+ * run's own trace (`/agents/runs/[runId]`, reachable from an approval, D3)
+ * and the approvals inbox. The backend routes stay registered (D2): the
+ * assistant's tools still use them, and `WEB-4` retires them.
  */
 
 function errorFor(status: number, message: string): ServiceError {
@@ -67,23 +62,12 @@ function post<T>(
 }
 
 export const postgresAgentService: AgentService = {
-  listEmployees(signal) {
-    return get<DigitalEmployee[]>(
-      "/api/agents/employees",
-      signal,
-      "Failed to load digital employee list"
-    )
-  },
   getEmployee(id, signal) {
     return get<DigitalEmployee>(
       `/api/agents/employees/${encodeURIComponent(id)}`,
       signal,
       "Failed to load digital employee detail"
     )
-  },
-  listRuns(employeeId, signal) {
-    const qs = employeeId ? `?employeeId=${encodeURIComponent(employeeId)}` : ""
-    return get<AgentRun[]>(`/api/agents/runs${qs}`, signal, "Failed to load run list")
   },
   getRun(id, signal) {
     return get<AgentRun>(`/api/agents/runs/${encodeURIComponent(id)}`, signal, "Failed to load run detail")
@@ -99,47 +83,5 @@ export const postgresAgentService: AgentService = {
       signal,
       "Failed to decide approval"
     )
-  },
-  createEmployee(input: CreateEmployeeInput, signal) {
-    return post<DigitalEmployee>(
-      "/api/agents/employees",
-      input,
-      signal,
-      "Failed to create digital employee"
-    )
-  },
-  suspendEmployee(id, signal) {
-    return post<DigitalEmployee>(
-      `/api/agents/employees/${encodeURIComponent(id)}/suspend`,
-      undefined,
-      signal,
-      "Failed to suspend digital employee"
-    )
-  },
-  resumeEmployee(id, signal) {
-    return post<DigitalEmployee>(
-      `/api/agents/employees/${encodeURIComponent(id)}/resume`,
-      undefined,
-      signal,
-      "Failed to resume digital employee"
-    )
-  },
-  revokeEmployee(id, signal) {
-    return post<DigitalEmployee>(
-      `/api/agents/employees/${encodeURIComponent(id)}/revoke`,
-      undefined,
-      signal,
-      "Failed to revoke digital employee"
-    )
-  },
-  async runEmployee(id, input: RunEmployeeInput | undefined, signal) {
-    const body = input?.prompt?.trim() ? { prompt: input.prompt.trim() } : undefined
-    const { run } = await post<{ run: AgentRun }>(
-      `/api/agents/employees/${encodeURIComponent(id)}/run`,
-      body,
-      signal,
-      "Failed to run digital employee"
-    )
-    return run
   },
 }
