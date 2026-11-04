@@ -5,7 +5,6 @@ import type {
   LakehouseService,
   LakehouseTableDetail,
   LakehouseTableSummary,
-  LakehouseWarehouse,
   MaintenancePolicyInput,
   MaintenancePolicyResult,
 } from "../contracts/lakehouse"
@@ -17,7 +16,6 @@ import {
   lakehouseNamespacesUrl,
   lakehouseTableDetailUrl,
   lakehouseTablesUrl,
-  lakehouseWarehousesUrl,
 } from "@/lib/lakehouse-view"
 
 /**
@@ -48,14 +46,6 @@ async function request<T>(
 }
 
 export const icebergLakehouseService: LakehouseService = {
-  async listWarehouses(signal) {
-    const json = await request<{ warehouses: LakehouseWarehouse[] }>(
-      lakehouseWarehousesUrl(),
-      { cache: "no-store", signal },
-      "Lakehouse warehouses could not be loaded"
-    )
-    return json.warehouses
-  },
   async getCapacity(signal) {
     return request<LakehouseCapacity>(
       lakehouseCapacityUrl(),
