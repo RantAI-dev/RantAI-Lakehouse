@@ -729,3 +729,30 @@ hydrated, and is recorded under "Reviewer's run" in the RESULT file.
       update.
   - If the EN median is still over 200 ms after the split, write the number and the remaining
     long tasks. The owner then decides; the target is not lowered.
+
+### Review 3: planner, 2026-11-04, at `382c190d`
+
+**Re-run by the reviewer:**
+- Site, from a clean `git archive` with a fresh install: lint 0, typecheck 0, 46 pass, build 0.
+- `bun run size` 0, at 178.6 KB.
+- Lighthouse, interleaved against `61b5aa26`: recorded in RESULT under "Reviewer's run 2".
+  - EN TBT 213 ms after R5 against 215 ms before.
+  - ID TBT 208 ms after against 209 ms before.
+
+**R5: closed.**
+- The sections are server components with client leaves, as D5 asks.
+- TBT on equal terms is unchanged. The developer's 284 ms was the VM's load.
+- The dashboards-rail regression from R1 was found and fixed in R5. The fix keeps refs off
+  animated elements.
+
+**New finding:**
+- **R6 SHOULD-FIX: render the two static dashboard tiles as images,** per the developer's own
+  suggestion in Handoff 3.
+  - The dot map and the calendar heatmap are about 420 of the page's 1,088 elements.
+  - Each becomes one `<img>` of an SVG file in `public/`, with the tile's `aria` text as `alt`.
+    The look is pixel-identical, and D6 applies.
+  - Then measure interleaved against `382c190d`, as in "Reviewer's run 2": two `npx serve`
+    ports, three rounds of EN and ID.
+  - Add the medians to RESULT as a dated update.
+  - If EN is still over 200 ms, write the number. The owner decides; the target is not
+    lowered.

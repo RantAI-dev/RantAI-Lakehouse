@@ -216,3 +216,25 @@ remaining long tasks to be recorded. The reviewer's run and this one differ
 - Every home section file is a client component, while D5 says sections that only render text
   are server components with client leaves. Review 2 finding R5 asks for that split and a
   re-measure.
+
+### Reviewer's run 2: `382c190d` (R5) against `61b5aa26` (before R5), interleaved
+
+- **Why interleaved:** the developer's R5 runs (EN 284 ms, ID 218 ms) were taken at a load of
+  7.5 to 10.9. To compare the builds on equal terms, both were served side by side, from clean
+  builds, and run in turn: pre EN, R5 EN, pre ID, R5 ID, three rounds.
+- **Conditions:** the same Lighthouse command. The load average was 5.1 to 8.1, and
+  `benchmarkIndex` 1440 to 1659.
+
+| Build | EN TBT runs | EN median | ID TBT runs | ID median | Longest task (median) |
+| --- | --- | --- | --- | --- | --- |
+| `61b5aa26` (before R5) | 212, 215, 222 ms | **215 ms** | 209, 275, 208 ms | **209 ms** | 230 ms |
+| `382c190d` (R5) | 213, 241, 162 ms | **213 ms** | 251, 197, 208 ms | **208 ms** | 229 ms |
+
+- Every other metric held in all twelve runs: LCP 1.07–1.08 s, CLS 0, accessibility and SEO
+  100, performance 94–98.
+- Initial JS at `382c190d` is 178.6 KB.
+- **Reading:** R5 neither helped nor hurt TBT on equal terms. Both builds sit about 10 ms over
+  200 ms. What remains is one hydration task of about 230 ms, which alone is 180 ms of blocking
+  time.
+- Review 3 finding R6 tries the developer's suggestion: draw the two static tiles as images, to
+  cut the elements React hydrates.
