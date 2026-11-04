@@ -196,6 +196,7 @@ async fn payload_result(
         grain: None,
         params: None,
         fresh: None,
+        only: None,
     };
     let state = crate::state::AppState::without_a_database();
     get_body(

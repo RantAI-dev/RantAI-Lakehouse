@@ -21,8 +21,8 @@ use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_alerts::{
-    AlertKind, AlertRule, AlertRuleInput, AlertState, FreshnessSource, LateSource, SilenceSource,
-    SqlGate, StateSource,
+    AlertKind, AlertRule, AlertRuleInput, AlertState, FreshnessSource, GateRefusal, LateSource,
+    SilenceSource, SqlGate, StateSource,
 };
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
@@ -73,8 +73,124 @@ pub async fn list(
                 upstream_error::FailedAs::Internal,
             )
         })?;
-    let rules = visible_rules(&state, principal.as_ref().map(|Extension(p)| p), rules).await?;
+    let rules = listed_rules(&state, principal.as_ref().map(|Extension(p)| p), rules).await?;
     Ok(ApiJson(json!({ "rules": rules })))
+}
+
+/// What a chart rule's row says about the chart it watches (`BI-39` D8), read
+/// live: the title is never stored, so a rename shows at once and a chart the
+/// caller lost access to stops naming itself (the same reason the bell is built
+/// live, `BI-19` part E deviation 1).
+struct ChartTitle {
+    title: String,
+    board_id: String,
+    board_title: String,
+}
+
+/// The rules of `rules` the caller may see, each as the list's JSON
+/// (`GET /api/alerts` and the assistant's `list_alert_rules`, one helper so the
+/// two cannot drift — rule 4).
+///
+/// `BI-39` D8: a chart rule whose chart the caller can see **now** also carries
+/// `chartTitle`, `dashboardId` and `dashboardTitle`; a chart rule whose chart
+/// they cannot see carries none of the three, and the console keeps
+/// "Dashboard chart". The caller's charts and boards are read once for the whole
+/// list, never once per rule.
+///
+/// # Errors
+///
+/// As [`visible_rules`]; a rule that cannot be serialized is a 500 with a fixed
+/// sentence (it cannot happen for this type, and is never guessed around).
+pub(crate) async fn listed_rules(
+    state: &AppState,
+    principal: Option<&Principal>,
+    rules: Vec<AlertRule>,
+) -> Result<Vec<Value>, ApiError> {
+    let rules = visible_rules(state, principal, rules).await?;
+    let titles = if rules.iter().any(|rule| rule.chart.is_some()) {
+        chart_titles(state, principal).await
+    } else {
+        HashMap::new()
+    };
+    let mut out = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let mut value = serde_json::to_value(&rule).map_err(|err| {
+            tracing::warn!(%err, rule_id = %rule.id, "an alert rule could not be serialized");
+            ApiError::Internal("the alert rules could not be listed".to_owned())
+        })?;
+        let found = rule.chart.as_deref().and_then(|id| titles.get(id));
+        if let Some(found) = found
+            && let Some(map) = value.as_object_mut()
+        {
+            map.insert("chartTitle".to_owned(), json!(found.title));
+            map.insert("dashboardId".to_owned(), json!(found.board_id));
+            map.insert("dashboardTitle".to_owned(), json!(found.board_title));
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
+
+/// Chart id → its title and its dashboard's id and name, for the charts
+/// `principal` can see now (`BI-39` D8). One read of the charts and one of the
+/// boards; the built-in board's row, which `list_boards` leaves out, is read
+/// once more only when a chart sits on it.
+///
+/// A store that cannot answer, or a caller with no principal, leaves the map
+/// empty: the list then names no chart and the console shows its own fallback
+/// text. Never a made-up title (principle 2).
+async fn chart_titles(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> HashMap<String, ChartTitle> {
+    let Some(principal) = principal else {
+        return HashMap::new();
+    };
+    let Ok(viewer) = crate::routes::dashboard_access::viewer_for(state, principal).await else {
+        return HashMap::new();
+    };
+    let ch = &state.clickhouse;
+    let Ok(charts) = lakehouse_bi::store::list_stored_charts(ch, &viewer).await else {
+        return HashMap::new();
+    };
+    let Ok(boards) = lakehouse_bi::store::list_boards(ch, &viewer).await else {
+        return HashMap::new();
+    };
+    let mut names: HashMap<String, String> = boards
+        .into_iter()
+        .map(|board| (board.id, board.name))
+        .collect();
+    // The built-in board's layout row is kept out of `list_boards`, and a chart
+    // on it (stored with no board, or as `default`) is still the caller's to
+    // see: its name comes from `get_board`, which answers a shell board when no
+    // row was ever saved.
+    if charts
+        .iter()
+        .any(|chart| chart.board.is_empty() || chart.board == lakehouse_bi::store::DEFAULT_BOARD_ID)
+        && let Ok(Some(builtin)) =
+            lakehouse_bi::store::get_board(ch, lakehouse_bi::store::DEFAULT_BOARD_ID, &viewer).await
+    {
+        names.entry(builtin.id).or_insert(builtin.name);
+    }
+    charts
+        .into_iter()
+        .filter_map(|chart| {
+            let board_id = if chart.board.is_empty() {
+                lakehouse_bi::store::DEFAULT_BOARD_ID.to_owned()
+            } else {
+                chart.board.clone()
+            };
+            let board_title = names.get(&board_id)?.clone();
+            Some((
+                chart.spec.id.clone(),
+                ChartTitle {
+                    title: chart.spec.title,
+                    board_id,
+                    board_title,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Body of `GET /api/alerts/status`.
@@ -890,12 +1006,13 @@ impl StateSource for ApiStateSource<'_> {
 /// (`policy_engine::rewrite_sql_for_roles`, the path tiles, embeds and
 /// Query Studio use).
 ///
-/// Governed as the least-privileged "Dashboard Viewer" role, the same
-/// mapping `embed.rs` documents for public/embedded dashboards: an alert
-/// value or a digest is delivered outside the console (webhook, email) to
-/// whoever the rule targets, so no rule author's or caller's own grants
-/// apply to what the recipient sees. A refusal is the engine's fixed,
-/// non-leaking message.
+/// `BI-39` D1: a rule saved now reads as the person who saved it — their roles,
+/// masking and row filters, and the principal/tenant placeholders — the same
+/// rewrite a dashboard read as that person gets. A rule saved before owners
+/// existed carries none, and keeps the least-privileged "Dashboard Viewer" role
+/// it always had, the mapping `embed.rs` documents for public dashboards (`BI-39`
+/// D4); a digest passes no owner for the same reason (`BI-39` D1, out of scope).
+/// A refusal is the engine's fixed, non-leaking message.
 ///
 /// `SEC-50` slice 2 T7 (M1): the TENANT gate runs first, through the same
 /// [`crate::routes::query::StatementGate`] every other slice-2 site asks —
@@ -912,6 +1029,11 @@ pub(in crate::routes) struct ApiSqlGate<'a> {
     pub(in crate::routes) state: &'a AppState,
     pub(in crate::routes) actor: crate::routes::query::GateActor<'a>,
 }
+
+/// What the gate answers for an owner whose record cannot be read (`BI-39` D5):
+/// a check that could not run, so the rule's state is left alone (C2) and the
+/// sentence is recorded.
+const OWNER_UNREADABLE: &str = "The person who set this alert could not be read.";
 
 /// Plan 1f: [`LateSource`] backed by Postgres (for the SLA row) and a
 /// pre-fetched map of last-success epoch seconds per pipeline id
@@ -967,7 +1089,7 @@ impl LateSource for ApiLateSource<'_> {
 
 #[async_trait::async_trait]
 impl SqlGate for ApiSqlGate<'_> {
-    async fn gate(&self, sql: &str) -> Result<String, String> {
+    async fn gate(&self, owner: Option<&str>, sql: &str) -> Result<String, GateRefusal> {
         // `SEC-50` slice 2 T7 (M1/M2): the tenant gate first, before the
         // rewrite and before the engine. A refusal keeps the gate's own
         // fixed sentence (never upstream text, `AGENTS.md` principle 4) as
@@ -978,21 +1100,46 @@ impl SqlGate for ApiSqlGate<'_> {
         crate::routes::query::StatementGate::clickhouse(self.state, self.actor)
             .check(sql)
             .await
-            .map_err(|err| err.to_string())?;
-        let obligations = crate::policy_engine::PolicyEngineObligations::new(
-            self.state.pg.as_deref(),
-            &self.state.clickhouse,
-        );
-        crate::policy_engine::rewrite_sql_for_roles(
-            sql,
-            &sqlparser::dialect::ClickHouseDialect {},
-            crate::sql_rewrite::Engine::ClickHouse,
-            &[crate::routes::embed::EMBED_VIEWER_ROLE.to_owned()],
-            &crate::sql_rewrite::PlaceholderValues::none(),
-            &obligations,
-        )
-        .await
-        .map_err(|err| crate::policy_engine::enforcement_error_message(&err).to_owned())
+            .map_err(|err| GateRefusal::Refused(err.to_string()))?;
+        let Some(owner) = owner else {
+            // `BI-39` D4: a rule saved before owners existed reads as the role
+            // every alert used to, and a digest keeps it (`BI-39` D1).
+            return self
+                .rewrite(
+                    sql,
+                    &[crate::routes::embed::EMBED_VIEWER_ROLE.to_owned()],
+                    &crate::sql_rewrite::PlaceholderValues::none(),
+                )
+                .await;
+        };
+        // `BI-39` D1/D5: the rule reads as its owner, and a person who cannot
+        // be read stops it rather than falling back to a wider or narrower
+        // view. `principal_of` is the reader the PDF, the reports and chart
+        // alerts already use — one copy (rule 4).
+        let principal = match crate::routes::render::principal_of(self.state, owner).await {
+            Ok(Some(principal)) => principal,
+            Ok(None) => return Err(GateRefusal::Stop(lakehouse_alerts::OWNER_GONE)),
+            Err(_) => return Err(GateRefusal::Refused(OWNER_UNREADABLE.to_owned())),
+        };
+        // `BI-39` D5: the permission is what allowed a rule to send to somebody
+        // other than its owner (feature C3), so a rule does not outlive it. A
+        // rule sent only to the owner's own address does not need it, and such
+        // a rule is the chart kind — read by `routes::chart_alerts`, never
+        // through this gate — because a mart or metric rule is only ever saved
+        // by somebody holding `alert:write` (`chart_alerts::authorise_save`).
+        if !principal.has("alert:write") {
+            return Err(GateRefusal::Stop(lakehouse_alerts::OWNER_NO_PERMISSION));
+        }
+        let placeholders = crate::sql_rewrite::PlaceholderValues {
+            principal_id: Some(principal.id.uuid().to_string()),
+            principal_tenant_ids: principal
+                .tenant_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        };
+        self.rewrite(sql, &principal.role_names, &placeholders)
+            .await
     }
 
     async fn board_restricted(&self, board_id: &str) -> bool {
@@ -1005,6 +1152,35 @@ impl SqlGate for ApiSqlGate<'_> {
         )
         .await
         .unwrap_or(true)
+    }
+}
+
+impl ApiSqlGate<'_> {
+    /// `sql` rewritten for exactly `roles` and `placeholders` — the one call to
+    /// the shared policy engine, so the owner's path and the legacy path cannot
+    /// drift apart (rule 4).
+    async fn rewrite(
+        &self,
+        sql: &str,
+        roles: &[String],
+        placeholders: &crate::sql_rewrite::PlaceholderValues,
+    ) -> Result<String, GateRefusal> {
+        let obligations = crate::policy_engine::PolicyEngineObligations::new(
+            self.state.pg.as_deref(),
+            &self.state.clickhouse,
+        );
+        crate::policy_engine::rewrite_sql_for_roles(
+            sql,
+            &sqlparser::dialect::ClickHouseDialect {},
+            crate::sql_rewrite::Engine::ClickHouse,
+            roles,
+            placeholders,
+            &obligations,
+        )
+        .await
+        .map_err(|err| {
+            GateRefusal::Refused(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        })
     }
 }
 
@@ -2531,9 +2707,10 @@ mod sql_gate_enforcement {
 
     use std::collections::HashMap;
 
-    use lakehouse_alerts::SqlGate;
+    use lakehouse_alerts::{GateRefusal, SqlGate};
     use lakehouse_store::PgPool;
     use lakehouse_store::governance::{self, CreatePolicyInput};
+    use uuid::Uuid;
     use wiremock::matchers::{body_string_contains, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2626,7 +2803,10 @@ mod sql_gate_enforcement {
         };
 
         let governed = gate
-            .gate("SELECT email, sum(amount) AS v FROM serving.mart_x GROUP BY email")
+            .gate(
+                None,
+                "SELECT email, sum(amount) AS v FROM serving.mart_x GROUP BY email",
+            )
             .await
             .expect("a governed table is rewritten, not refused");
 
@@ -2649,12 +2829,203 @@ mod sql_gate_enforcement {
         };
 
         let err = gate
-            .gate("SELECT * FROM url('http://example.com/x.csv', 'CSV')")
+            .gate(None, "SELECT * FROM url('http://example.com/x.csv', 'CSV')")
             .await
             .expect_err("a table function is refused");
 
-        assert!(!err.contains("example.com"), "{err}");
+        let GateRefusal::Refused(message) = err else {
+            panic!("a table function is a refusal, not a stop");
+        };
+        assert!(!message.contains("example.com"), "{message}");
         assert!(server.received_requests().await.unwrap().is_empty());
+        Ok(())
+    }
+
+    // ── `BI-39` T2: an owned rule reads as its owner (D1), and D5 ────────
+
+    /// Seed a mask policy for `role` over `serving.mart_x`, masking `column`.
+    async fn mask_for(pool: &PgPool, role: &str, column: &str) {
+        governance::create_policy(
+            pool,
+            &CreatePolicyInput {
+                name: format!("bi-39-mask-{role}"),
+                kind: "Row filter".to_owned(),
+                subjects: role.to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    serde_json::json!({ "roles": [role], "table": "serving.mart_x", "mask": [column] })
+                        .to_string(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+    }
+
+    /// A person whose role is named `role` and carries `permissions`.
+    async fn user_with_role(pool: &PgPool, role: &str, permissions: &str, status: &str) -> Uuid {
+        let role_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO role (id, name, permissions, description) VALUES ($1, $2, $3, 'test')",
+        )
+        .bind(role_id)
+        .bind(role)
+        .bind(permissions)
+        .execute(pool)
+        .await
+        .expect("insert the role");
+        let user = Uuid::new_v4();
+        sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, $4)")
+            .bind(user)
+            .bind(format!("{role} person"))
+            .bind(format!("{user}@test.invalid"))
+            .bind(status)
+            .execute(pool)
+            .await
+            .expect("insert the person");
+        sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+            .bind(user)
+            .bind(role_id)
+            .execute(pool)
+            .await
+            .expect("attach the role");
+        user
+    }
+
+    /// A `ClickHouse` that lists the columns a mask needs, so the rewrite can
+    /// produce its expression.
+    async fn engine_with_columns() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                    {"name": "phone", "default_kind": "", "default_expression": ""},
+                    {"name": "amount", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 3,
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `BI-39` D1: the statement of a rule saved by somebody is rewritten with
+    /// that person's roles — their mask, not the Dashboard Viewer role's; and a
+    /// rule saved before owners existed (`None`) keeps the viewer role's mask
+    /// (D4).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_owned_rules_statement_is_rewritten_for_its_owner_and_a_legacy_one_for_the_viewer(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        // A role of its own: the seeded ones are fixed, and a policy names a
+        // role by name.
+        let analyst = format!("BI-39 Analyst {}", Uuid::new_v4());
+        mask_for(&pool, "Dashboard Viewer", "email").await;
+        mask_for(&pool, &analyst, "phone").await;
+        let server = engine_with_columns().await;
+        let state = state_for(&pool, &server.uri());
+        let owner = user_with_role(&pool, &analyst, "dashboard:read, alert:write", "active").await;
+        let gate = ApiSqlGate {
+            state: &state,
+            actor: crate::routes::query::GateActor::CatalogTenant,
+        };
+        let sql = "SELECT email, phone, sum(amount) AS v FROM serving.mart_x GROUP BY email, phone";
+
+        let owned = gate
+            .gate(Some(&owner.to_string()), sql)
+            .await
+            .expect("the owner's statement is rewritten, not refused");
+        assert!(
+            owned.contains("replaceRegexpOne(toString(`phone`)"),
+            "the owner's own mask must apply: {owned}"
+        );
+        assert!(
+            !owned.contains("replaceRegexpOne(toString(`email`)"),
+            "the Dashboard Viewer role's mask must not apply to the owner: {owned}"
+        );
+
+        let legacy = gate
+            .gate(None, sql)
+            .await
+            .expect("a rule saved before owners existed is rewritten");
+        assert!(
+            legacy.contains("replaceRegexpOne(toString(`email`)"),
+            "the fixed viewer role's mask still applies to a legacy rule: {legacy}"
+        );
+        assert!(
+            !legacy.contains("replaceRegexpOne(toString(`phone`)"),
+            "a legacy rule does not read as the owner: {legacy}"
+        );
+        Ok(())
+    }
+
+    /// `BI-39` D5: a disabled owner stops the rule with the one shared sentence,
+    /// rather than being read with a wider or narrower view.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_disabled_owner_stops_the_rule(pool: PgPool) -> sqlx::Result<()> {
+        let server = engine_with_columns().await;
+        let state = state_for(&pool, &server.uri());
+        let role = format!("BI-39 Disabled {}", Uuid::new_v4());
+        let owner = user_with_role(&pool, &role, "dashboard:read, alert:write", "inactive").await;
+        let gate = ApiSqlGate {
+            state: &state,
+            actor: crate::routes::query::GateActor::CatalogTenant,
+        };
+
+        let err = gate
+            .gate(
+                Some(&owner.to_string()),
+                "SELECT sum(amount) AS v FROM serving.mart_x",
+            )
+            .await
+            .expect_err("a disabled owner stops the rule");
+
+        assert_eq!(
+            err,
+            GateRefusal::Stop(lakehouse_alerts::OWNER_GONE),
+            "the shared sentence, nothing engine-derived"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        Ok(())
+    }
+
+    /// `BI-39` D5: an owner who no longer holds `alert:write` stops the rule —
+    /// the permission is what let it send to others (C3).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_owner_without_the_alert_permission_stops_the_rule(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = engine_with_columns().await;
+        let state = state_for(&pool, &server.uri());
+        let role = format!("BI-39 NoPermission {}", Uuid::new_v4());
+        let owner = user_with_role(&pool, &role, "dashboard:read", "active").await;
+        let gate = ApiSqlGate {
+            state: &state,
+            actor: crate::routes::query::GateActor::CatalogTenant,
+        };
+
+        let err = gate
+            .gate(
+                Some(&owner.to_string()),
+                "SELECT sum(amount) AS v FROM serving.mart_x",
+            )
+            .await
+            .expect_err("an owner without the permission stops the rule");
+
+        assert_eq!(
+            err,
+            GateRefusal::Stop(lakehouse_alerts::OWNER_NO_PERMISSION)
+        );
         Ok(())
     }
 }

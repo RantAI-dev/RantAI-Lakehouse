@@ -95,7 +95,7 @@ person to approve first).
 | C1 | An alert reads one number. A KPI or gauge gives its value; a line or bar over time gives its latest point of the chosen series. Any other chart can only use "returns any rows" | Planner default | Owner to confirm at QA |
 | C2 | It fires once when the value crosses the line, then once when it is back. A check that cannot run is recorded and changes nothing | Spec | Decided by the spec |
 | C3 | Anyone who can view a chart can set an alert on it for themselves. Sending it to other people, outside addresses or a webhook needs the alert permission (`alert:write`), as today | Planner default | Signed by the owner, 2026-10-18 |
-| C4 | An alert reads the data as the person who set it (their masking and row filters), like a scheduled report. If they lose access, the alert stops and says why | Planner default (`RPT-1` decision 1) | Owner to confirm at QA |
+| C4 | An alert reads the data as the person who set it (their masking and row filters), like a scheduled report. This covers every threshold alert: a table column, a metric or a chart. If they lose access or the alert permission, the alert stops and says why | Planner default (`RPT-1` decision 1) | Owner to confirm at QA |
 | C5 | Alerts are still checked every 15 minutes | Planner default (today) | Owner to confirm at QA |
 | D1 | The PNG is made on the server, like the PDF (`BI-1`): same masking, same audit, works for the assistant. Without the PDF service it says "Images are not set up on this deployment" | Planner default | Owner to confirm at QA |
 | D2 | The image is the chart with its title and the filters applied written under it, 1200 pixels wide, sharp on high-resolution screens | Planner default | Owner to confirm at QA |
