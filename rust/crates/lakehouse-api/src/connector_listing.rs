@@ -26,6 +26,13 @@
 //!   ([`connector_probe::resolve_checked`]) runs before the credential is
 //!   resolved and before any dial, and the dial goes to the approved address
 //!   (`SEC-15`).
+//! - **A Parquet preview is read by the child, from the file's tail
+//!   (`SEC-55`, `SEC-22` P1).** A footer declares how much memory its reader
+//!   will want, and reading it here would end the API for every tenant; so
+//!   the preview fetches only the file's last
+//!   [`ConversionRunner::parquet_tail_bytes`] bytes and asks the conversion
+//!   child, exactly as an upload does. The API never decodes a connector's
+//!   Parquet bytes itself, and a file of any size previews.
 //! - **Principle 4.** A failure is an [`ErrorClass`] chosen from the error's
 //!   TYPE and CODE; no driver, `object_store` or source text is read into a
 //!   response (the log gets the class and nothing else).
@@ -63,7 +70,8 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::connector_probe::{self, Approved, DialTarget};
 use crate::internal_hosts::InternalHosts;
-use crate::{upload_parquet, upload_parse};
+use crate::upload_convert::{self, ConversionError, ConversionRunner, Operation, Source};
+use crate::upload_parse;
 
 /// The limit of one listing or one preview, connect included (`SRC-13`
 /// decision D9: "the listing call's own limit is 120 s").
@@ -82,10 +90,6 @@ const CSV_HEAD_BYTES: u64 = 1024 * 1024;
 
 /// The CSV preview shows the header and at most this many rows' types (D6).
 const CSV_PREVIEW_ROWS: usize = 1000;
-
-/// A Parquet file is read whole to read its footer
-/// ([`upload_parquet::inspect`] takes the bytes); a larger one is refused.
-const PARQUET_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What a listing or preview request asks, after the route validated it.
 #[derive(Debug, Clone, Default)]
@@ -199,6 +203,33 @@ fn class_of_address_error(message: &str) -> ErrorClass {
     } else {
         ErrorClass::Unreachable
     }
+}
+
+/// The class of a child that could not read a Parquet preview (`SEC-55` D4,
+/// principle 4).
+///
+/// Every one of these is [`ErrorClass::Failed`]: the listing's fixed sentence
+/// is all the caller gets, and the child's own words never reach it. A full
+/// run of conversion slots and a child that could not be started are the
+/// installation's fault, so they are logged — without the file's name or key.
+fn class_of_conversion(err: &ConversionError) -> ErrorClass {
+    match err {
+        ConversionError::Busy => {
+            tracing::warn!(
+                "SEC-55: every conversion slot was taken, so an S3 Parquet preview was refused"
+            );
+        }
+        ConversionError::NotStarted | ConversionError::LimitFailed => {
+            tracing::error!("SEC-55: the conversion child could not be started");
+        }
+        ConversionError::ResourceLimit | ConversionError::Refused(_) => {}
+        // A preview hands the child bytes it already holds, so no store is
+        // read on this path; the arm is here because the error has it.
+        ConversionError::Store(_) => {
+            tracing::warn!("SEC-55: the conversion child's store failed");
+        }
+    }
+    ErrorClass::Failed
 }
 
 /// Log the class of a failure and nothing else (no error text), then return it.
@@ -999,11 +1030,21 @@ async fn list_s3(
     Ok(Listing { objects, truncated })
 }
 
-/// The columns of one file (D6): a CSV from its head, a Parquet from its footer.
+/// The columns of one file (D6): a CSV from its head, a Parquet from its
+/// footer — and the footer is read by the child, from the file's tail
+/// (`SEC-55` D1, `SEC-22` P1).
+///
+/// # Errors
+///
+/// An [`ErrorClass`]: the S3 read failed (the object-store mapping, unchanged),
+/// or the child refused the file, was killed, ran out of time, found every
+/// conversion slot taken or could not be started (`SEC-55` D4). The child's
+/// own words never reach the answer.
 async fn preview_s3(
     client: &AmazonS3,
     format: FilesFormat,
     key: &str,
+    runner: &ConversionRunner,
 ) -> Result<Preview, ErrorClass> {
     let path = ObjectPath::parse(key).map_err(|_| ErrorClass::Failed)?;
     let fail = |err: object_store::Error| logged("an S3 read", class_of_object_store(&err));
@@ -1018,13 +1059,28 @@ async fn preview_s3(
             csv_preview(&head, size > end)
         }
         FilesFormat::Parquet => {
-            if size == 0 || size > PARQUET_MAX_BYTES {
+            if size == 0 {
                 return Err(ErrorClass::Failed);
             }
-            let bytes = client.get_range(&path, 0..size).await.map_err(fail)?;
-            let info = upload_parquet::inspect(&bytes).map_err(|_| ErrorClass::Failed)?;
+            // The tail and nothing else (`SEC-55` D1): the footer and the
+            // eight bytes after it are all the child is given, so a file of
+            // any size costs the same read (`SEC-55` D2).
+            let tail_len = size.min(runner.parquet_tail_bytes());
+            let tail = client
+                .get_range(&path, size - tail_len..size)
+                .await
+                .map_err(fail)?;
+            let answer = runner
+                .answer(Operation::InspectParquet { size }, Source::Bytes(tail))
+                .await
+                .map_err(|err| class_of_conversion(&err))?;
+            // One reader of the child's answer, shared with the upload path
+            // (`SEC-55` D3).
+            let footer = upload_convert::parquet_footer_of_answer(&answer)
+                .ok_or_else(|| logged("an S3 Parquet preview", ErrorClass::Failed))?;
             Ok(Preview {
-                columns: info
+                columns: footer
+                    .info
                     .columns
                     .into_iter()
                     .map(|column| ListedColumn {
@@ -1049,6 +1105,7 @@ async fn files_answer(
     request: &Request,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    runner: &ConversionRunner,
 ) -> Answer {
     if dial.protocol != FilesProtocol::S3 {
         return Answer::failed(kind, ErrorClass::NotSupported);
@@ -1065,7 +1122,7 @@ async fn files_answer(
                     .await
                     .map(|listing| Answer::listing(&request.glob, listing))
             }
-            Kind::Preview => preview_s3(&client, dial.format, &request.object)
+            Kind::Preview => preview_s3(&client, dial.format, &request.object, runner)
                 .await
                 .map(|preview| Answer::preview(&request.object, preview)),
             // See `sql_answer`: `dispatch` refuses a test before this.
@@ -1112,6 +1169,7 @@ pub async fn dispatch(
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
     ca: Option<&Path>,
+    runner: &ConversionRunner,
 ) -> Dispatch {
     if kind == Kind::Test {
         // `SRC-4` T1.1: a connection test is not a listing; it has its own
@@ -1151,7 +1209,7 @@ pub async fn dispatch(
             .await
         }
         Dial::Files(files) => {
-            files_answer(kind, files, info, request, resolver, internal_hosts).await
+            files_answer(kind, files, info, request, resolver, internal_hosts, runner).await
         }
         Dial::Rest(rest) if kind == Kind::List => {
             let paths: Vec<String> = rest.endpoints.iter().map(|e| e.path.clone()).collect();
@@ -1184,6 +1242,13 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// A runner for the dispatch tests, which never reaches the child: every
+    /// case here is answered by the API or handed to the orchestrator before
+    /// a conversion would start (`SEC-55` D5 passes the runner through).
+    fn unused_runner() -> ConversionRunner {
+        ConversionRunner::new(std::path::PathBuf::from("unused"), 1, 64)
+    }
 
     fn globs(pattern: &str) -> Glob {
         Glob::parse(pattern).unwrap()
@@ -1386,6 +1451,7 @@ mod tests {
             &PanicIfCalled,
             &InternalHosts::NONE,
             None,
+            &unused_runner(),
         )
         .await
         else {
@@ -1435,6 +1501,10 @@ mod tests {
     /// `SRC-13` D1: the types the orchestrator reads are handed over, and a
     /// REST connector's list is its declared endpoints, searchable, with no
     /// network.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one connector kind after another, each a short arm of the same dispatch; the runner of SEC-55 D5 adds a line to every call"
+    )]
     #[tokio::test]
     async fn dispatch_hands_orchestrator_types_over_and_lists_rest_endpoints_itself() {
         let resolver =
@@ -1472,7 +1542,16 @@ mod tests {
         );
         for kind in [Kind::List, Kind::Preview] {
             assert!(matches!(
-                dispatch(kind, &saas, &request, &resolver, &InternalHosts::NONE, None).await,
+                dispatch(
+                    kind,
+                    &saas,
+                    &request,
+                    &resolver,
+                    &InternalHosts::NONE,
+                    None,
+                    &unused_runner(),
+                )
+                .await,
                 Dispatch::Orchestrator
             ));
         }
@@ -1484,6 +1563,7 @@ mod tests {
                 &resolver,
                 &InternalHosts::NONE,
                 None,
+                &unused_runner(),
             )
             .await;
             assert!(matches!(out, Dispatch::Orchestrator));
@@ -1508,6 +1588,7 @@ mod tests {
             &resolver,
             &InternalHosts::NONE,
             None,
+            &unused_runner(),
         )
         .await
         else {
@@ -1531,6 +1612,7 @@ mod tests {
                 &resolver,
                 &InternalHosts::NONE,
                 None,
+                &unused_runner(),
             )
             .await,
             Dispatch::Orchestrator
@@ -1567,6 +1649,7 @@ mod tests {
                 &resolver,
                 &InternalHosts::NONE,
                 None,
+                &unused_runner(),
             )
             .await
             else {
