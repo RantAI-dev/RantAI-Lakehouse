@@ -3,9 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useSearchParams } from "next/navigation"
-import { PlusIcon } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
-import { Button } from "@/components/ui/button"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import {
@@ -88,12 +86,19 @@ export function PoliciesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Policies"
-        description="Access, agent, residency, retention, and budget policies."
+        description="Access policies applied to catalog tables."
+        // WEB-3 D5: policies are made on a table's Access tab, where the
+        // policy engine actually enforces them. The old wizard saved
+        // free-text subjects/resources/conditions, so a policy made there
+        // was listed as enforced and masked nothing.
         actions={
-          <Button size="sm" render={<Link href="/governance/policies/create" />}>
-            <PlusIcon data-icon="inline-start" />
-            Create Policy
-          </Button>
+          <p className="max-w-md text-sm text-muted-foreground">
+            Policies are added on a table&apos;s Access tab, where they are
+            enforced.{" "}
+            <Link href="/catalog" className="text-primary hover:underline">
+              Browse the Catalog
+            </Link>
+          </p>
         }
       />
 
@@ -104,14 +109,11 @@ export function PoliciesPage() {
       {state.status === "success" && (state.data?.length ?? 0) === 0 ? (
         <EmptyState
           title="No policies"
-          description="Create an access, agent, residency, retention, or budget policy."
+          description="Policies are added on a table's Access tab, where they are enforced."
           action={
-            <Button
-              size="sm"
-              render={<Link href="/governance/policies/create" />}
-            >
-              Create Policy
-            </Button>
+            <Link href="/catalog" className="text-sm text-primary hover:underline">
+              Browse the Catalog
+            </Link>
           }
         />
       ) : null}

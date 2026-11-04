@@ -111,17 +111,10 @@ function ApprovalDrawerContent({
           ...(selected.kind === "access"
             ? []
             : [
-                {
-                  label: "Agent",
-                  value: (
-                    <Link
-                      href={`/agents/employees/${selected.employeeId}`}
-                      className="text-primary hover:underline"
-                    >
-                      {selected.employeeName}
-                    </Link>
-                  ),
-                },
+                // WEB-3 D7: the employee detail page was removed, so the
+                // agent's name is plain text. The run id below keeps its
+                // link to `/agents/runs/[runId]` (D3).
+                { label: "Agent", value: selected.employeeName },
               ]),
           {
             label: "Run",
@@ -305,7 +298,7 @@ export function ApprovalsPage() {
     manualPagination: false,
     manualSorting: false,
     manualFiltering: true,
-    persistKey: "/agents/approvals",
+    persistKey: "/governance/approvals",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
@@ -362,14 +355,10 @@ export function ApprovalsPage() {
         <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
       {state.status === "success" && data.length === 0 ? (
+        // WEB-3 D7: no "View agent runs" action — the runs list was removed.
         <EmptyState
           title="No approvals"
           description="A request lands here whenever a run — from an AI Copilot chat, Run now, or a schedule — hits a high-risk (WriteHigh) tool call, or a catalog viewer requests a permission they don't hold. Nothing is waiting on you right now."
-          action={
-            <Button size="sm" variant="outline" render={<Link href="/agents/runs" />}>
-              View agent runs
-            </Button>
-          }
         />
       ) : null}
       {state.status === "success" && data.length > 0 ? (
