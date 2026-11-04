@@ -261,7 +261,7 @@ function StepBody({ step }: { step: ToolStep }) {
           Someone else with approval rights must approve it.
         </p>
         <Link
-          href={approvalId ? `/agents/approvals?id=${encodeURIComponent(approvalId)}` : "/agents/approvals"}
+          href={approvalId ? `/governance/approvals?id=${encodeURIComponent(approvalId)}` : "/governance/approvals"}
           className="inline-flex items-center gap-1 font-medium text-amber-700 underline underline-offset-2 dark:text-amber-400"
         >
           View in Approvals →

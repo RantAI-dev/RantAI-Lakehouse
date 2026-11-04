@@ -1,15 +1,11 @@
 import {
-  Activity,
   BarChart3,
   BellRing,
   Boxes,
-  Bot,
   Building2,
-  CircleGauge,
   ClipboardCheck,
   Database,
   DatabaseZap,
-  FileSearch,
   FileText,
   GitBranch,
   HeartPulse,
@@ -19,7 +15,6 @@ import {
   KeyRound,
   Library,
   ListChecks,
-  LogIn,
   Map,
   MonitorSmartphone,
   Plug,
@@ -30,7 +25,6 @@ import {
   ShieldCheck,
   Tags,
   Users,
-  Waypoints,
   Wrench,
   type LucideIcon,
 } from "lucide-react"
@@ -46,13 +40,6 @@ export type NavItem = {
    * expanded sidebar.
    */
   action?: { title: string; href: string; icon: LucideIcon }
-  /**
-   * `true` when the page still runs on mock data (not wired to a real
-   * service yet). Hidden from the sidebar unless
-   * `NEXT_PUBLIC_SHOW_PREVIEW="1"`. Remove this flag once the page's
-   * service is real.
-   */
-  preview?: boolean
 }
 
 export type NavGroup = {
@@ -66,23 +53,6 @@ export type NavGroup = {
    * flag only affects the first impression.
    */
   defaultOpen?: boolean
-  /**
-   * DERIVED, never hand-written. Set by `visibleNavGroups()` when EVERY
-   * item in a group is still `preview` — the group still renders
-   * (disabled, "Soon" badge) instead of vanishing without a trace.
-   */
-  comingSoon?: boolean
-  /**
-   * DERIVED. `true` when some of a group's items are hidden as preview.
-   *
-   * Used by the sidebar to choose a label. A group genuinely declared
-   * with 1 item (e.g. "AI" → "AI Copilot") uses that item's title, since
-   * it is more descriptive. But a group that BECAME 1 item through
-   * filtering must keep its group label — otherwise "Administration"
-   * would rename itself to "Settings" just because its other four pages
-   * are still mock.
-   */
-  partiallyHidden?: boolean
 }
 
 /**
@@ -101,14 +71,14 @@ export type NavGroup = {
  *   people spend their time, not a sub-page of Data.
  * - Data: where data lives and how it is read (catalog, queries).
  * - Build: author and operate data movement and outbound exports.
- * - Governance: the rules applied to the data (policies, quality, lineage).
+ * - Governance: the rules applied to the data (policies, quality) and the
+ *   human approval queue. Lineage is still a page, but it is reached from a
+ *   table, chart, pipeline or run rather than the sidebar (`WEB-3` D8).
  * - Monitoring: whether the platform is healthy, and what happened — the
  *   old "Overview" dashboard lives here as Health, next to alerts and the
  *   audit trail, instead of being the landing page.
- * - Intelligence: digital employees and their runs. Still `preview`: they
- *   have not been proven end-to-end, so the group renders as "Soon" rather
- *   than as working pages. Their approvals inbox is under Governance.
- * - Administration: identity and workspace configuration.
+ * - Administration: identity and workspace configuration. Sign-in (SSO)
+ *   lives inside Settings (`WEB-3` D6).
  */
 export const NAV_GROUPS: NavGroup[] = [
   {
@@ -170,11 +140,8 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/governance/data-quality",
         icon: ListChecks,
       },
-      { title: "Lineage", href: "/lineage", icon: Waypoints },
-      // Not under Intelligence: Copilot's destructive tools and data access
-      // requests queue here, so it must stay reachable while the digital
-      // employee pages are hidden.
-      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck },
+      // Copilot's destructive tools and catalog access requests queue here.
+      { title: "Approvals", href: "/governance/approvals", icon: ClipboardCheck },
     ],
   },
   {
@@ -184,9 +151,6 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "Health", href: "/health", icon: HeartPulse },
       { title: "Alerts", href: "/alerts", icon: BellRing },
       { title: "Audit Log", href: "/audit", icon: FileText },
-      { title: "Activity", href: "/activity", icon: Activity },
-      { title: "Workloads", href: "/workloads", icon: CircleGauge },
-      { title: "Observability", href: "/observability", icon: FileSearch },
       { title: "Services", href: "/services", icon: Server },
       { title: "Capacity", href: "/lakehouse/capacity", icon: BarChart3 },
       // Also holds the Iceberg table list that used to be "Tables" under
@@ -205,19 +169,6 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Intelligence",
-    icon: Bot,
-    items: [
-      {
-        title: "Digital Employees",
-        href: "/agents/employees",
-        icon: Bot,
-        preview: true,
-      },
-      { title: "Agent Runs", href: "/agents/runs", icon: History, preview: true },
-    ],
-  },
-  {
     label: "Administration",
     icon: Settings,
     items: [
@@ -229,41 +180,12 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/admin/service-identities",
         icon: KeyRound,
       },
-      { title: "SSO", href: "/admin/sso", icon: LogIn },
       { title: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone },
       { title: "Settings", href: "/admin/settings", icon: SlidersHorizontal },
       { title: "Maps", href: "/admin/maps", icon: Map },
     ],
   },
 ]
-
-/**
- * Whether preview (mock) items are shown. Default is NO; set
- * `NEXT_PUBLIC_SHOW_PREVIEW="1"` to bring back every mock page.
- */
-export const SHOW_PREVIEW = process.env.NEXT_PUBLIC_SHOW_PREVIEW === "1"
-
-/**
- * Nav groups shown in the sidebar, with `preview` items filtered out
- * unless SHOW_PREVIEW is on.
- *
- * A group whose items are ALL preview is not dropped, only flagged
- * `comingSoon` and still rendered (disabled, "Soon" badge). It used to
- * vanish entirely — a section with several pages and none of them ever
- * shown left the product map in this config out of sync with what the
- * user actually saw, with no hint anything was missing.
- */
-export function visibleNavGroups(): NavGroup[] {
-  if (SHOW_PREVIEW) return NAV_GROUPS
-  return NAV_GROUPS.map((g) => {
-    const items = g.items.filter((it) => !it.preview)
-    return items.length > 0
-      ? { ...g, items, partiallyHidden: items.length < g.items.length }
-      : // The preview items are kept so the flyout/label still has
-        // content to show; `comingSoon` is what prevents navigating to them.
-        { ...g, comingSoon: true }
-  })
-}
 
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)

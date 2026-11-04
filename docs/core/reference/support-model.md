@@ -65,7 +65,7 @@ Where to look before escalating. Pages are in the Monitoring module.
 | Pages return errors, service appears up | Services; application database reachability (`docs/OPERATIONS.md`, "Postgres: unreachable is loud, a mismatched schema refuses to start") |
 | Data is stale | Ingestion (CDC); the pipeline's run history; Alerts |
 | A pipeline failed | The pipeline's run inspector; Alerts |
-| Queries are slow | Workloads; Table Maintenance |
+| Queries are slow | Health's query cards; Table Maintenance |
 | A published table is out of date | The mart's page; its publish history |
 | An AI action did not happen | Approvals; Audit Log |
 | Something changed and nobody knows who | Audit Log, noting its coverage limit in [PRODUCT.md](../PRODUCT.md) |
