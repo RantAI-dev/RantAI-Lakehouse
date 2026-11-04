@@ -3172,6 +3172,43 @@ mod tests {
             );
         }
 
+        /// `WEB-3` S3a-D1: a Bronze policy's asset id is its registry slug,
+        /// read through the same reader the catalog uses; a table no
+        /// registry row names has none, and a Silver table needs no registry
+        /// at all.
+        #[tokio::test]
+        async fn a_bronze_policy_names_the_registry_slug_of_its_table() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+            seed_catalog_with_tier(
+                &ch,
+                "bronze_meta",
+                "policy_orders",
+                "Policy orders",
+                "policy_orders_raw",
+                "primer",
+            )
+            .await;
+
+            let conditions = |table: &str| {
+                Some(format!(
+                    r#"{{"roles":["Analyst"],"table":"{table}","mask":["email"]}}"#
+                ))
+            };
+            let registered = conditions("bronze.policy_orders_raw");
+            let unknown = conditions("bronze.no_such_table");
+            let silver = conditions("silver.orders");
+            let policies = vec![
+                stored_policy("Column mask", registered.as_deref()),
+                stored_policy("Column mask", unknown.as_deref()),
+                stored_policy("Column mask", silver.as_deref()),
+            ];
+            let ids = PolicyView::asset_ids(&ch, &policies).await;
+            assert_eq!(ids[0], Some("policy_orders".to_owned()), "the slug");
+            assert_eq!(ids[1], None, "no registry row names it: no invented page");
+            assert_eq!(ids[2], Some("silver.orders".to_owned()), "the table itself");
+        }
+
         /// A slug a second run wrote again is classified once, not twice.
         ///
         /// DATA-42 D3: without `FINAL` the two copies of the row are two
