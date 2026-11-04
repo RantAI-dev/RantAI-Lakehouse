@@ -16,6 +16,7 @@
 //! | [`StoreError::Conflict`]   | `Conflict`            | 409    | caller-supplied data collides with a unique constraint         |
 //! | [`StoreError::ForeignKeyViolation`] | `BadRequest`  | 400    | caller referenced a row that doesn't exist                     |
 //! | [`StoreError::NotFound`]   | `NotFound`            | 404    | caller asked for a row that doesn't exist                      |
+//! | [`StoreError::NotAllowed`] | `PermissionDenied`    | 403    | the store's own rule refuses the action on a row that does exist (`QS-3` review finding 1) |
 //! | [`StoreError::Unavailable`]| `Unavailable`         | 503    | no pool configured at all (see [`crate::connect_lazy`])         |
 //! | [`StoreError::Validation`] | `BadRequest`          | 400    | this crate's own validator rejected caller input (never a raw `sqlx` error) |
 //! | [`StoreError::Database`]   | `Internal`            | 500    | anything else — connection refused, timeout, syntax error, ...  |
@@ -55,6 +56,17 @@ pub enum StoreError {
     /// A query expected to find a row (e.g. `fetch_one`) found none.
     #[error("record not found")]
     NotFound,
+    /// The caller may not do this to a row that does exist and may even
+    /// be visible to them: the store's own rule refuses the action, not
+    /// the row's existence — unlike [`Self::NotFound`], which says the
+    /// row is not there at all. The one rule that raises it today is the
+    /// move rule (`QS-3` review finding 1): a move into or out of a
+    /// personal space needs manage. The message is this crate's own
+    /// fixed sentence — the one the fix ships to callers — never an
+    /// upstream error's text, so it is safe to surface the way
+    /// [`Self::Validation`]'s is.
+    #[error("Only someone who manages this can move it into or out of a personal space.")]
+    NotAllowed,
     /// No Postgres pool is configured/available for this request. See the
     /// boot-behavior note on [`crate::connect_lazy`]: an unreachable
     /// Postgres is not fatal at startup, so this is the error a Phase 2
@@ -149,6 +161,11 @@ impl From<StoreError> for ApiError {
             StoreError::ForeignKeyViolation | StoreError::Validation(_) => {
                 Self::BadRequest(message)
             }
+            // `NotAllowed` is the store's own refusal of an action on a
+            // row that exists: 403, the caller's fault, carrying the
+            // fixed sentence the store wrote — never 404, which would
+            // tell the caller the row is not there at all.
+            StoreError::NotAllowed => Self::PermissionDenied(message),
             StoreError::NotFound => Self::NotFound(message),
             StoreError::Unavailable => Self::Unavailable(message),
             StoreError::Database(_) | StoreError::Migration(_) | StoreError::Serialization(_) => {
@@ -193,6 +210,24 @@ mod tests {
     fn not_found_maps_to_404() {
         let api: ApiError = StoreError::NotFound.into();
         assert_eq!(api.status(), 404);
+    }
+
+    /// `NotAllowed` must map to 403 and never to 404: the row exists and
+    /// is even visible to the caller, and what is refused is the action —
+    /// a refusal that looked like a missing row would hide the rule
+    /// (`QS-3` review finding 1). The asserted body is the full
+    /// `Display` the caller receives: [`ApiError::PermissionDenied`]'s
+    /// own `permission_denied:` prefix — kept by lakehouse-core so its
+    /// 403s stay distinguishable from [`ApiError::Forbidden`]'s fixed
+    /// body — followed by this store's fixed sentence, unchanged.
+    #[test]
+    fn not_allowed_maps_to_403_and_carries_the_fixed_sentence() {
+        let api: ApiError = StoreError::NotAllowed.into();
+        assert_eq!(api.status(), 403);
+        assert_eq!(
+            api.to_string(),
+            "permission_denied: Only someone who manages this can move it into or out of a personal space."
+        );
     }
 
     /// `Unavailable` is the one 5xx that is NOT a 500: "there is no pool
