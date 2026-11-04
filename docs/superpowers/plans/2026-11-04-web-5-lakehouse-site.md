@@ -827,3 +827,19 @@ hydrated, and is recorded under "Reviewer's run" in the RESULT file.
 
 **No open finding.** Next steps: owner QA on the R6 build (served on :3400), then CI green, then
 the PR marked ready.
+
+### Owner QA note 1, 2026-11-04
+
+> "sama kayak rantai landing page, aku gasuka font monospace dipake kalo bukan untuk terminal"
+
+This changes D6 for one thing: type.
+- **The rule:** monospace is used only for code or terminal text, as on the RantAI site, where
+  `globals.css` sets `--font-mono: var(--font-sans)` and a real monospace stack appears only in
+  `.code-frame pre code`.
+- **R7 (owner):** every `lk-mono` use that is not code becomes the sans face. That covers the
+  eyebrows, labels, source pills, captions, table headers and cells, the footer, the depth
+  markers and the tile kinds.
+  - The one code identifier, the pipeline name in the approval card, stays monospace.
+  - Numbers in the governance table use `tabular-nums` in sans.
+  - If Geist Mono is then only used for that one `<code>`, drop the font file and use a system
+    monospace stack, as the RantAI site does.
