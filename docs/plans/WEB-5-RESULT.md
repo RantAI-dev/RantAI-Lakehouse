@@ -211,6 +211,43 @@ and compared pixel by pixel in the browser:
   shift.
 - The owner judges at QA whether the rims count as a visual change.
 
+## Update: D14 S6 (the story), 2026-11-04
+
+Measured on `85187993` (D14 S1–S5), interleaved against the R7 commit
+`b2634f3d`:
+- R7 served on :3461, and the D14 build on :3460, both `npx serve` of
+  `out/`;
+- three rounds of R7-EN, D14-EN, R7-ID, D14-ID with the RESULT's
+  Lighthouse command;
+- VM load average 4.8 to 8.4.
+
+| Metric | Target | EN R7 | EN D14 | ID R7 | ID D14 |
+| --- | --- | --- | --- | --- | --- |
+| TBT (median) | ≤ 200 ms | 227.0 ms | **118.8 ms** | 126.4 ms | **119.3 ms** |
+| TBT (runs) | — | 3990 / 227 / 107 | 148 / 114 / 119 | 126 / 177 / 111 | 162 / 118 / 119 |
+| LCP (median) | ≤ 2.5 s | 1.07 s | 1.07 s | 1.07 s | 1.07 s |
+| CLS | ≤ 0.1 | 0 | 0 | 0 | 0 |
+| SEO / accessibility / best practices | 100 / ≥ 95 / — | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 100 / 100 |
+| Performance (median) | — | 96 | 99 | 98 | 99 |
+| Initial JS (`bun run size`) | ≤ 200 KB | 178.5 KB | 181.1 KB | 178.5 KB | 181.1 KB |
+
+- **Every target is met on the D14 build.** No D14 run has a non-passing
+  accessibility, SEO or best-practices audit.
+- **Read these numbers as "no regression measured", not as a gain.** The
+  D14 medians are lower than R7's, but the story adds work: the page-wide
+  water, the gauge, and the deferred bubbles and caustics. R7's EN median
+  includes one 3,990 ms run, a load spike on the VM; its other two runs are
+  107 and 227 ms. The difference is within this machine's run-to-run
+  spread.
+- The longest task is still react-dom's hydration or the App Router,
+  214–260 ms.
+- The 3D scene chunk is 147.0 KB, deferred.
+- **Not measured here:** the live-lake path, including the longer 220 vh
+  hero and the waterline overlay. Lighthouse's Chrome on this VM has only
+  SwiftShader, so these runs are the DOM-hero mode, as in every earlier run
+  on this page. The test-only WebGL override is development-only and is not
+  in the export (checked by `bun run size`).
+
 ## Findings that do not change a score
 
 - Accessibility audit `label-content-name-mismatch` (weight 0, so the score
