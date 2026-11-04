@@ -187,6 +187,7 @@ pub async fn start(
         state.connector_secret_resolver.as_ref(),
         &state.config.connector_internal_hosts(),
         state.config.connector_tls_ca(),
+        &state.conversion_runner,
     )
     .await;
     let answer = match dispatched {
