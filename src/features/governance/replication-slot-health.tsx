@@ -106,6 +106,13 @@ function columns(linkConnector: boolean): ColumnDef<ReplicationSlot>[] {
  * connector's own page (`connectorId` set, its slots only), so the two
  * cannot drift apart (rule 4).
  *
+ * This is deliberately not "streaming": there is no Kafka/Flink/streaming
+ * engine processing pipeline here. Debezium on Kafka Connect captures
+ * row-level changes and the applier writes them to Bronze Iceberg (`SRC-4`);
+ * what this component watches is the Postgres logical-replication slot that
+ * backs such a connector, because a lagging or disconnected slot pins WAL on
+ * the source.
+ *
  * Reads `GET /api/governance/replication` (`lake.bronze_meta.
  * replication_slot`, written every 15 minutes by `replication_metrics.py`).
  * That route returns every check, newest first, so each slot is shown once,

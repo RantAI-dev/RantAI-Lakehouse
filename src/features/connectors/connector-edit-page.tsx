@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService } from "@/hooks/use-service"
+import { runConnectionTest } from "@/lib/connectors/run-connection-test"
 import { targetChanged } from "@/lib/connectors/target-identity"
 import { connectorService } from "@/services"
 import { isServiceError } from "@/services/errors"
@@ -297,7 +298,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
     setSaveSteps([...steps])
     if (allSaved) {
       try {
-        setTestResult(await connectorService.testConnection(detail.id))
+        setTestResult(await runConnectionTest(connectorService, detail.id))
       } catch {
         setTestResult(null)
       }

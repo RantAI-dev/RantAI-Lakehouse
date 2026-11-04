@@ -12,9 +12,9 @@ import type { SqlDial } from "@/services/contracts/connectors"
  * value — `ingest_spec.rs`). Kept as its own form, not a `SqlDialForm`
  * prop, for two Oracle-only facts `SqlDialForm` has no field for:
  *
- * - This build cannot run Oracle CDC in either state of
- *   `ORACLE_CDC_LOGMINER_ENABLED` — batch only, stated here so a user
- *   configuring an Oracle connector sees it before creating one.
+ * - This form is the batch type's. Change capture from Oracle is the `Oracle CDC`
+ *   type, with its own dial (`CdcDialForm`: container database, PDB, native
+ *   network encryption; `SRC-4` slice 6).
  * - `sslServerCertDn` is OPERATOR-TYPED, never derived from `host` — a
  *   bare `CN=<hostname>` would not match a real certificate's full DN
  *   (`SqlDial::ssl_server_cert_dn`'s doc comment).

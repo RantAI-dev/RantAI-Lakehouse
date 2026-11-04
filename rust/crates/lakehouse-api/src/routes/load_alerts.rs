@@ -555,6 +555,9 @@ async fn deliver_failure_alerts(
     // rule-store failure on this report still delivers on the retry,
     // and no other run delivers it.
     if recorded.auto_disabled {
+        // `SRC-4` slice 2: the pause also stops a change-capture connector's
+        // worker (best effort, see `cdc_lifecycle`).
+        crate::cdc_lifecycle::sync_pause_state(state, &connector.id).await;
         let text = format!(
             "{who} was paused after {} failed runs in a row; the latest is run {}. \
              Resume it from its page once the cause is fixed. View: {link}",

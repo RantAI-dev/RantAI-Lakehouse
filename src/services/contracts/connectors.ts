@@ -170,6 +170,29 @@ export type ConnectorTestResult = {
   message: string
   /** `null` when `supported` is `false`: an unsupported type was never actually dialed. */
   testedAt: string | null
+  /**
+   * `true` only while a test that runs in the orchestrator has not finished (`SRC-4` T1.1: Oracle). Nothing was
+   * dialled yet, so `ok: false` is not a failure; read the end of it with `getDiscovery(id, "test")` and the
+   * probe history, as `runConnectionTest` does. Absent otherwise.
+   */
+  pending?: boolean
+  /**
+   * For a change-capture connector (`SRC-4` decision S4-f): what the source must have switched on. Absent for every
+   * other connector. Never part of `ok`: a connector can be saved whatever these say.
+   */
+  setupChecks?: SetupCheck[]
+}
+
+/**
+ * One setting a change-capture source needs, as `POST /api/connectors/{id}/test` reports it (`SRC-4` S4-f). Every
+ * word is the API's fixed text, never the server's. `unchecked` means it could not be read (usually a permission):
+ * nothing is claimed about it. `command` is the statement or line that sets a `missing` one.
+ */
+export type SetupCheck = {
+  setting: string
+  status: "ok" | "missing" | "unchecked" | string
+  message: string
+  command?: string
 }
 
 /**
@@ -482,17 +505,45 @@ export type SqlDial = {
   sslServerCertDn?: string | null
 }
 
-/** `CdcDial` = `SqlDial`'s fields plus `slotName`/`publicationName`,
- * both required with no fallback (`ingest_spec.rs`'s `CdcDial`). */
+/** `CdcDial` = `SqlDial`'s fields plus the change-capture settings of the
+ * driver (`ingest_spec.rs`'s `CdcDial`, `SRC-4` decision S3-a): PostgreSQL
+ * requires `slotName` and `publicationName` and refuses `serverId`; MySQL
+ * requires `serverId` (1 to 4294967295) and refuses the other two; SQL Server
+ * refuses all three. A field the driver does not use is omitted, never sent
+ * empty, because the server refuses a present one. */
 export type CdcDial = {
   driver: SqlDriver
   host: string
   port: number
   database: string
   user: string
-  slotName: string
-  publicationName: string
-  serverId: number | null
+  slotName?: string
+  publicationName?: string
+  serverId?: number | null
+  /** The pluggable database an Oracle connector reads (`database.pdb.name`, `SRC-4` slice 6, S6-b); then `database`
+   * is the container database. Omitted for a non-container Oracle database and for every other driver (the server
+   * refuses a present one). */
+  pdbName?: string
+  /** How the change-capture worker secures its connection to the source
+   * (`SRC-4` S2-d). Absent means `require`: encrypted, certificate taken as
+   * presented. `disable` is not encrypted. `verify-ca` and `verify-full` use the
+   * worker's own trust store. Widened with `string` as the other contract
+   * enums are. */
+  sslMode?: "disable" | "require" | "verify-ca" | "verify-full" | string
+}
+
+/** The `dial` of a MongoDB change-capture connector (`ingest_spec.rs`'s `CdcMongoDial`, `SRC-4`
+ * slice 5, decision S5-a): a `cdc` dial whose `driver` is `mongodb`. `hosts` are the replica set's
+ * explicit `host:port` seeds; `replicaSet` is required (change streams need a replica set). There is
+ * no connection string and no `mongodb+srv`: the server refuses an unknown field. `sslMode`
+ * is omitted unless chosen; the server then takes `require`. */
+export type CdcMongoDial = {
+  driver: "mongodb"
+  hosts: string[]
+  database: string
+  user: string
+  replicaSet: string
+  sslMode?: "disable" | "require" | "verify-ca" | "verify-full" | string
 }
 
 export type FilesProtocol = "s3" | "sftp"
@@ -792,6 +843,13 @@ export type ConnectorType = {
  */
 export type DiscoveryKind = "list" | "preview"
 
+/**
+ * What a discovery answer or poll can be about: the two a person starts, and `test` (`SRC-4` T1.1), the connection
+ * test of a connector only the orchestrator can dial, which `POST /api/connectors/{id}/test` launches. A test is
+ * never started on the discovery route (the API answers 400), only read there.
+ */
+export type DiscoveryReadKind = DiscoveryKind | "test"
+
 /** `running` only for the sources the orchestrator reads; the console polls until it ends. */
 export type DiscoveryState = "running" | "done" | "failed"
 
@@ -862,7 +920,7 @@ export type DiscoveryColumn = {
  * topic, collection or file, not a failure.
  */
 export type DiscoveryAnswer = {
-  kind: DiscoveryKind
+  kind: DiscoveryReadKind
   state: DiscoveryState
   /** What a list was narrowed by (the schema or the glob), when it was. */
   scope?: string
@@ -872,6 +930,13 @@ export type DiscoveryAnswer = {
   truncated?: boolean
   columns?: DiscoveryColumn[]
   primaryKey?: string[]
+  /** A finished connection test: the milliseconds the connection took, as the orchestrator measured them. */
+  latencyMs?: number
+  /**
+   * A finished test of a MongoDB change-capture connector (`SRC-4` Amendment 8, S8-e): what the source must have
+   * switched on, in the API's fixed words. Absent for every other kind and connector. Never part of `ok`.
+   */
+  setupChecks?: SetupCheck[]
   errorClass?: DiscoveryErrorClass
   reason?: string
   startedAt?: string
@@ -1015,19 +1080,51 @@ export type ConnectorRunLog = {
 /** `POST /api/connectors/{id}/resume`. */
 export type ResumeConnectorResponse = { resumed: boolean }
 
+/** `POST /api/connectors/{id}/pause` (`SRC-4` decision S2-e). */
+export type PauseConnectorResponse = { paused: boolean }
+
 /**
- * `GET /api/connectors/{id}/debezium-properties?table=`'s response.
- * Mirrors Rust `DebeziumPropertiesResponse`
- * (`rust/crates/lakehouse-api/src/routes/connectors.rs`). `properties`
- * contains ONLY `${ENV_VAR_NAME}` references for every credential-shaped
- * field, never a resolved secret — rendered as literal text, labeled with
- * `note`, and never resolved client-side.
+ * `GET /api/connectors/{id}/change-capture`'s response (`SRC-4` decision S2-h). Mirrors Rust
+ * `ChangeCaptureResponse` (`rust/crates/lakehouse-api/src/routes/connector_runs.rs`).
+ * `supported: false` carries a fixed `reason` (a connector that captures no changes, or a
+ * deployment without Kafka Connect). `state` is `running`, `paused`, `failed`, `starting`,
+ * `not_created` (the capture service has no such connector yet) or `unreachable` (it could not
+ * be asked); never a made-up `running`.
  */
-export type DebeziumProperties = {
-  properties: string
-  table: string
-  note: string
+export type ChangeCaptureState = {
+  supported: boolean
+  reason?: string
+  state?: "running" | "paused" | "failed" | "starting" | "not_created" | "unreachable" | string
+  /** Why a failed Oracle connector failed, when its trace carries one of the two messages Debezium throws for a
+   * source that is not set up (`ARCHIVELOG` off, minimal supplemental logging off; `SRC-4` Amendment 11, S11-d). */
+  setupChecks?: SetupCheck[]
+  /** How far behind the source each table is, the limit and whether its alert is open (`SRC-4` slice 4). */
+  lag?: ChangeCaptureLag
 }
+
+/**
+ * One table's lag, as the API words it (`SRC-4` decision S4-c). `behind` carries `seconds`; `not_known_since` carries
+ * `since` (the time of the newest report); the others carry neither. A number is never invented: `not_known_yet`
+ * means nothing was reported, `not_known_since` that the orchestrator stopped reporting.
+ */
+export type CaptureTableLag = {
+  table: string
+  status: "up_to_date" | "behind" | "not_known_yet" | "not_known_since" | "paused" | string
+  seconds?: number
+  since?: string
+}
+
+/** Mirrors Rust `LagReadout` (`rust/crates/lakehouse-api/src/routes/capture_lag.rs`). */
+export type ChangeCaptureLag = {
+  tables: CaptureTableLag[]
+  /** The table furthest behind; absent when none is behind by a number. */
+  worst?: { table: string; seconds: number }
+  limitMinutes: number
+  alertOpen: boolean
+}
+
+/** `PUT /api/connectors/{id}/lag-limit` (`SRC-4` S4-d). */
+export type LagLimitResponse = { minutes: number }
 
 /**
  * One connector `dagster/dispar_orchestrate/ingest_factory.py` can build
@@ -1075,7 +1172,7 @@ export interface ConnectorService {
    */
   startDiscovery(id: string, kind: DiscoveryKind, request: DiscoveryRequest, signal?: AbortSignal): Promise<DiscoveryAnswer>
   /** `GET /api/connectors/{id}/discovery/{kind}`: the latest answer of that kind (404 when none was asked for). */
-  getDiscovery(id: string, kind: DiscoveryKind, signal?: AbortSignal): Promise<DiscoveryAnswer>
+  getDiscovery(id: string, kind: DiscoveryReadKind, signal?: AbortSignal): Promise<DiscoveryAnswer>
   /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
   runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
   /** `GET /api/connectors/{id}/runs` (`SRC-11`): the newest 50 runs from the product's own run record. */
@@ -1084,20 +1181,14 @@ export interface ConnectorService {
   getConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<ConnectorRunLog>
   /** The same log as text (`?format=text`), for the Download log button. */
   downloadConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<string>
-  /** `POST /api/connectors/{id}/resume` (`SRC-11` decision 4): lifts a pause set by repeated failures, and only that one. */
+  /** `POST /api/connectors/{id}/resume` (`SRC-11` decision 4): lifts a pause set by repeated failures, or by a person (`SRC-4`); no other. */
   resumeConnector(connectorId: string, signal?: AbortSignal): Promise<ResumeConnectorResponse>
-  /**
-   * `GET /api/connectors/{id}/debezium-properties?table=` — a read-only
-   * rendering of the `Debezium` `.properties` file body for a `cdc`
-   * adapter's captured table, `${ENV_VAR_NAME}` references only, never a
-   * resolved secret. `table` is required: no registry column stores which
-   * table alone until an ingest spec names one via `sourceObjects`.
-   */
-  getDebeziumProperties(
-    id: string,
-    table: string,
-    signal?: AbortSignal
-  ): Promise<DebeziumProperties>
+  /** `POST /api/connectors/{id}/pause` (`SRC-4`): pauses the connector until a person resumes it. */
+  pauseConnector(connectorId: string, signal?: AbortSignal): Promise<PauseConnectorResponse>
+  /** `GET /api/connectors/{id}/change-capture` (`SRC-4`): the connector's state in the capture service. */
+  getChangeCapture(connectorId: string, signal?: AbortSignal): Promise<ChangeCaptureState>
+  /** `PUT /api/connectors/{id}/lag-limit` (`SRC-4`): the lag, in minutes (1 to 1440), at which an alert is sent. */
+  setLagLimit(connectorId: string, minutes: number, signal?: AbortSignal): Promise<LagLimitResponse>
   /**
    * `GET /api/connectors/{id}/probe-history?limit=` — the connector's most
    * recent connectivity-probe results, newest first. `limit` defaults to

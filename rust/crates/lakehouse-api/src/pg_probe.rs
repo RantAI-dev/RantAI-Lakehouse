@@ -37,6 +37,12 @@
 //! 5. Runs `SELECT 1` (a constant string, `postgres-protocol`'s own
 //!    serialization) and terminates.
 //!
+//! [`connect_and_fetch`] is the same dial for the setup checks of a
+//! change-capture connector (`SRC-4` decision S4-f, D10): after step 4 it runs
+//! a list of constant statements and returns their rows as text. Rows are read
+//! with the protocol's `DataRow`; the checks never go back to `sqlx`, which
+//! cannot be told which authentication method it may use.
+//!
 //! # What it never does
 //!
 //! No upstream message text (a server `ErrorResponse`, a TLS error, a
@@ -302,6 +308,25 @@ async fn authenticate_and_select<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut buffer = BytesMut::new();
+    authenticate(stream, target, password, &mut buffer).await?;
+    run_query(stream, &mut buffer, "SELECT 1").await?;
+    terminate(stream).await;
+    Ok(())
+}
+
+/// The startup-and-authenticate half of [`authenticate_and_select`]: send the
+/// startup packet and complete `SCRAM-SHA-256`. `buffer` carries the bytes read
+/// past the last message, for the query that follows.
+async fn authenticate<S>(
+    stream: &mut S,
+    target: &PgDialTarget<'_>,
+    password: &str,
+    buffer: &mut BytesMut,
+) -> Result<(), PgProbeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut out = BytesMut::new();
     frontend::startup_message(
         [("user", target.user), ("database", target.database)],
@@ -311,11 +336,10 @@ where
     stream.write_all(&out).await?;
     stream.flush().await?;
 
-    let mut buffer = BytesMut::new();
     let mut scram: Option<ScramSha256> = None;
     let mut scram_finished = false;
     loop {
-        match read_message(stream, &mut buffer).await? {
+        match read_message(stream, buffer).await? {
             Message::AuthenticationOk => {
                 if !scram_finished {
                     if scram.is_some() {
@@ -380,23 +404,72 @@ where
         }
     }
 
+    Ok(())
+}
+
+/// Best-effort clean shutdown; the connection's fate is decided already.
+async fn terminate<S>(stream: &mut S)
+where
+    S: AsyncWrite + Unpin,
+{
     let mut out = BytesMut::new();
-    frontend::query("SELECT 1", &mut out).map_err(|_| PgProbeError::Protocol)?;
+    frontend::terminate(&mut out);
+    let _ = stream.write_all(&out).await;
+    let _ = stream.flush().await;
+}
+
+/// The most rows [`run_query`] keeps. The fixed statements of the setup checks
+/// return a handful; a server that sends more is refused as a protocol error
+/// rather than buffered (the same posture as [`MAX_BACKEND_MESSAGE_LEN`]).
+const MAX_ROWS: usize = 10_000;
+
+/// One row of text values; `None` is SQL `NULL`.
+pub(crate) type TextRow = Vec<Option<String>>;
+
+/// Run one statement over the simple query protocol and read its rows, as text.
+/// `sql` is always a constant string of this build (`SEC-14` part B's rule for
+/// `SELECT 1`, kept for the setup checks): never built from a value.
+///
+/// Reads to the end of the query: the server sends `CommandComplete` and then
+/// `ReadyForQuery`. Requiring the `CommandComplete` first keeps a startup-time
+/// `ReadyForQuery` (some servers emit one right after authentication) from
+/// ending the read before the query ran. An `ErrorResponse` is returned at once
+/// as [`PgProbeError::Query`] without reading on; [`drain_to_ready`] reads the
+/// rest when the connection is to be used again.
+async fn run_query<S>(
+    stream: &mut S,
+    buffer: &mut BytesMut,
+    sql: &str,
+) -> Result<Vec<TextRow>, PgProbeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut out = BytesMut::new();
+    frontend::query(sql, &mut out).map_err(|_| PgProbeError::Protocol)?;
     stream.write_all(&out).await?;
     stream.flush().await?;
 
-    // Read to the end of the query: the server sends CommandComplete and then
-    // ReadyForQuery. Requiring the CommandComplete first keeps a
-    // startup-time ReadyForQuery (some servers emit one right after
-    // authentication) from ending the read before the query ran.
+    let mut rows: Vec<TextRow> = Vec::new();
     let mut saw_command_complete = false;
     loop {
-        match read_message(stream, &mut buffer).await? {
+        match read_message(stream, buffer).await? {
             Message::CommandComplete(_) => saw_command_complete = true,
             Message::ReadyForQuery(_) if saw_command_complete => break,
+            Message::DataRow(body) => {
+                if rows.len() >= MAX_ROWS {
+                    return Err(PgProbeError::Protocol);
+                }
+                let mut row: TextRow = Vec::new();
+                let mut ranges = body.ranges();
+                while let Some(range) = ranges.next().map_err(|_| PgProbeError::Protocol)? {
+                    row.push(
+                        range.map(|r| String::from_utf8_lossy(&body.buffer()[r]).into_owned()),
+                    );
+                }
+                rows.push(row);
+            }
             Message::ReadyForQuery(_)
             | Message::RowDescription(_)
-            | Message::DataRow(_)
             | Message::ParameterStatus(_)
             // Sent once per session right after `AuthenticationOk`, with the
             // backend's cancellation keys. This probe never cancels, so it
@@ -407,13 +480,71 @@ where
             _ => return Err(PgProbeError::Protocol),
         }
     }
+    Ok(rows)
+}
 
-    // Best-effort clean shutdown; the connection's fate is decided already.
-    let mut out = BytesMut::new();
-    frontend::terminate(&mut out);
-    let _ = stream.write_all(&out).await;
-    let _ = stream.flush().await;
-    Ok(())
+/// After a [`PgProbeError::Query`], read up to the `ReadyForQuery` that ends the
+/// failed statement, so the next one starts clean. `false` when the connection
+/// is not usable any more.
+async fn drain_to_ready<S>(stream: &mut S, buffer: &mut BytesMut) -> bool
+where
+    S: AsyncRead + Unpin,
+{
+    loop {
+        match read_message(stream, buffer).await {
+            Ok(Message::ReadyForQuery(_)) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Connect like [`connect_and_select`] (pinned address, TLS first, SCRAM only)
+/// and run each of `statements` in turn. The answer has one entry per statement:
+/// its rows, or `None` when it could not be read (the server rejected it, most
+/// often for a missing permission, or the connection ended). The server's error
+/// text is never kept (`SEC-11`).
+///
+/// `statements` are constants of this build; no value is ever put in one. A
+/// caller that must compare a value (a publication name) gets the full list and
+/// compares in Rust.
+///
+/// # Errors
+///
+/// A [`PgProbeError`] when the connection or the sign-in fails, as
+/// [`connect_and_select`].
+pub(crate) async fn connect_and_fetch(
+    target: &PgDialTarget<'_>,
+    approved: &Approved,
+    password: &SecretValue,
+    ca: Option<&Path>,
+    statements: &[&str],
+) -> Result<Vec<Option<Vec<TextRow>>>, PgProbeError> {
+    let tcp = connect_pinned(approved).await?;
+    let mut stream = negotiate_tls(tcp, target.host, ca).await?;
+    let mut buffer = BytesMut::new();
+    authenticate(&mut stream, target, password.expose_secret(), &mut buffer).await?;
+    let mut answers = Vec::with_capacity(statements.len());
+    let mut usable = true;
+    for sql in statements {
+        if !usable {
+            answers.push(None);
+            continue;
+        }
+        match run_query(&mut stream, &mut buffer, sql).await {
+            Ok(rows) => answers.push(Some(rows)),
+            Err(PgProbeError::Query) => {
+                answers.push(None);
+                usable = drain_to_ready(&mut stream, &mut buffer).await;
+            }
+            Err(_) => {
+                answers.push(None);
+                usable = false;
+            }
+        }
+    }
+    terminate(&mut stream).await;
+    Ok(answers)
 }
 
 /// Does the `AuthenticationSasl` offer include `SCRAM-SHA-256` (not only
@@ -680,6 +811,39 @@ mod tests {
         )
         .await
         .expect("SCRAM-SHA-256 over an encrypted socket must succeed");
+    }
+
+    /// `SRC-4` S4-f: `connect_and_fetch` returns each fixed statement's rows as
+    /// text, answers `None` for one the server rejects (without ending the
+    /// session: the next statement still runs), and keeps no server text.
+    #[sqlx::test(migrations = false)]
+    async fn fixed_statements_return_rows_and_a_rejected_one_leaves_the_session_usable(
+        pool: PgPool,
+    ) {
+        let (user, database) = pool_credentials(&pool);
+        let proxy = proxy_for(&pool).await;
+        let answers = connect_and_fetch(
+            &real_target(&user, &database, proxy.port()),
+            &approved_for(proxy.port()).await,
+            &test_password(),
+            None,
+            &[
+                "SHOW wal_level",
+                "SELECT * FROM a_table_that_does_not_exist",
+                "SELECT 'a', NULL, 3",
+            ],
+        )
+        .await
+        .expect("the session opens");
+        assert_eq!(answers.len(), 3);
+        let wal = answers[0].as_ref().expect("SHOW wal_level is readable");
+        assert_eq!(wal.len(), 1);
+        assert!(wal[0][0].is_some());
+        assert!(answers[1].is_none(), "a rejected statement is unread");
+        assert_eq!(
+            answers[2].as_ref().expect("the session was drained"),
+            &vec![vec![Some("a".to_owned()), None, Some("3".to_owned())]]
+        );
     }
 
     /// (d, second half) The same real exchange with `CONNECTOR_TLS_CA_FILE`

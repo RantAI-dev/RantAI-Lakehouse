@@ -17,8 +17,8 @@
 export type AlertRuleKind = "alert" | "digest" | "freshness" | "pipeline_behind_target" | string
 
 /**
- * The six rule kinds for connector and upload loads (`SRC-7`). The first five
- * are scoped to one connector id, or `*` for all connectors (an administrator
+ * The seven rule kinds for connector and upload loads (`SRC-7`, and `connector_lag`
+ * of `SRC-4`). The first six are scoped to one connector id, or `*` for all connectors (an administrator
  * who sees every tenant only; never for `connector_success`); `upload_failure`
  * is always scoped to every upload and sends no connector.
  */
@@ -28,6 +28,7 @@ export const LOAD_ALERT_KINDS = [
   "connector_disabled",
   "connector_schema_change",
   "connector_success",
+  "connector_lag",
   "upload_failure",
 ] as const
 

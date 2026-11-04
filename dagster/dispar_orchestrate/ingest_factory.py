@@ -757,8 +757,18 @@ def _run_one_object(
 
     try:
         reject_unsupported_column_types(obj.get("columns", []))
-        plan = _load_plan(adapter_name, obj, refresh=_REFRESH_OF_ACTION.get(action or ""))
-        gate = _make_gate(connector, obj, run_id)
+        # SRC-4 T1.2/T1.3: the console's column names for Oracle are Oracle's own spelling
+        # (`CREATED_AT`); the reflected table and the rows say `created_at`. The plan (cursor,
+        # key) and the gate (columns left out) are matched against the reflection, so they get
+        # the reflected spelling. `obj` itself stays as saved: its `name` and `target` are not
+        # column names.
+        column_obj = (
+            oracle_adapter.in_reflected_spelling(obj)
+            if adapter_name == "sql" and dial.get("driver") == "oracle"
+            else obj
+        )
+        plan = _load_plan(adapter_name, column_obj, refresh=_REFRESH_OF_ACTION.get(action or ""))
+        gate = _make_gate(connector, column_obj, run_id)
 
         if adapter_name == "sql" and dial.get("driver") in _POSTGRES_DRIVERS:
             # See this module's docstring, "Postgres routing" -- pinned

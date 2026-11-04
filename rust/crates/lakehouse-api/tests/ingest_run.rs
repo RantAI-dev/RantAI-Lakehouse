@@ -221,16 +221,11 @@ async fn ingest_run_reports_cdc_as_unsupported_not_a_launch() {
     let reason = body["reason"].as_str().expect("reason is a string");
     assert!(reason.contains("ADR 0008"), "{reason}");
     assert!(reason.contains("snapshot.mode=initial"), "{reason}");
-    // Names the ACTUAL compose service this connector's ingestion starts
-    // from (`ops/debezium/render_compose.py`'s `debezium-<sanitized_id>`,
-    // same `-` -> `_` sanitize transform as `connector_slug_for_id`) --
-    // not a generic placeholder, so an operator reading this reason can
-    // act on it directly.
-    assert!(
-        reason.contains("debezium-conn_ingest_cdc"),
-        "reason must name this connector's own compose service, not a \
-         generic placeholder: {reason}"
-    );
+    // The reason must say what actually starts ingestion now (Kafka Connect and
+    // the applier), not name the removed `debezium-<id>` compose service
+    // (`SRC-4` slice 2, decision S2-h).
+    assert!(reason.contains("Kafka Connect"), "{reason}");
+    assert!(!reason.contains("compose service"), "{reason}");
 }
 
 /// An unknown connector id is a 404, not a 500/422 — the route must check
