@@ -5,7 +5,6 @@ import {
   Building2,
   ClipboardCheck,
   Database,
-  DatabaseZap,
   FileText,
   GitBranch,
   HeartPulse,
@@ -19,13 +18,11 @@ import {
   MonitorSmartphone,
   Plug,
   SearchCode,
-  Server,
   Settings,
   SlidersHorizontal,
   ShieldCheck,
   Tags,
   Users,
-  Wrench,
   type LucideIcon,
 } from "lucide-react"
 
@@ -112,7 +109,6 @@ export const NAV_GROUPS: NavGroup[] = [
     defaultOpen: true,
     items: [
       { title: "Catalog", href: "/catalog", icon: Library },
-      { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Query Studio", href: "/query-studio", icon: SearchCode },
       { title: "Sources", href: "/connectors", icon: Plug },
     ],
@@ -148,24 +144,12 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Monitoring",
     icon: HeartPulse,
     items: [
-      { title: "Health", href: "/health", icon: HeartPulse },
+      // WEB-3 S2-D2: Services, Capacity, Ingestion (CDC) and Table
+      // Maintenance are sections of System status; their old addresses
+      // redirect to `/health#<section>`.
+      { title: "System status", href: "/health", icon: HeartPulse },
       { title: "Alerts", href: "/alerts", icon: BellRing },
       { title: "Audit Log", href: "/audit", icon: FileText },
-      { title: "Services", href: "/services", icon: Server },
-      { title: "Capacity", href: "/lakehouse/capacity", icon: BarChart3 },
-      // Also holds the Iceberg table list that used to be "Tables" under
-      // Data: next to Data Explorer it read as a duplicate, and its only
-      // unique job, the per-table maintenance policy, belongs here.
-      {
-        title: "Table Maintenance",
-        href: "/governance/maintenance",
-        icon: Wrench,
-      },
-      {
-        title: "Ingestion (CDC)",
-        href: "/governance/ingestion",
-        icon: DatabaseZap,
-      },
     ],
   },
   {
@@ -213,8 +197,8 @@ const SECONDARY_ROUTES: { title: string; href: string }[] = [
   // One conversation with Copilot. Not a sidebar entry: it is opened from
   // Home (a new one) or from History (an old one).
   { title: "Conversation", href: "/copilot" },
-  // Table detail pages, opened from Table Maintenance or an asset's
-  // Snapshots tab. Their nav entry was removed, so without this the
+  // Table detail pages, opened from System status's maintenance runs or
+  // an asset's Snapshots tab. Their nav entry was removed, so without this the
   // title would fall back to the product name.
   { title: "Iceberg Table", href: "/lakehouse/tables" },
 ]

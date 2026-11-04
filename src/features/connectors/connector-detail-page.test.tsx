@@ -652,6 +652,67 @@ describe("ConnectorDetailPage", () => {
     expect(screen.getByRole("link", { name: "ingest_demo" }).getAttribute("href")).toBe("/pipelines/pl-1")
   })
 
+  // WEB-3 S2-D3: a CDC connector shows its own replication slot's health,
+  // from the same component and API as System status.
+  describe("the replication slot of a CDC connector", () => {
+    const CDC_SPEC = {
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { ...SPEC.dial, slotName: "rantai_slot", publicationName: "rantai_pub" },
+    }
+    const slot = (connectorId: string, slotName: string, checkedAt: string, active: boolean) => ({
+      connectorId,
+      slotName,
+      checkedAt,
+      active,
+      walRetainedBytes: "1024",
+      confirmedFlushLagBytes: "0",
+      status: active ? "ok" : "critical",
+    })
+
+    it("shows this connector's slot as last checked, and no other connector's", async () => {
+      stubFetch({
+        "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+        "GET /api/governance/replication": () =>
+          json({
+            replicationSlots: [
+              slot("conn-a", "rantai_slot", "2026-11-04T10:00:00Z", false),
+              slot("conn-b", "other_slot", "2026-11-04T10:00:00Z", true),
+              slot("conn-a", "rantai_slot", "2026-11-04T09:45:00Z", true),
+            ],
+          }),
+      })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+
+      expect(await screen.findByText("rantai_slot")).toBeDefined()
+      // The newest reading only: disconnected at 10:00, not connected at 09:45.
+      expect(screen.getAllByText("rantai_slot")).toHaveLength(1)
+      expect(screen.getByText("Disconnected")).toBeDefined()
+      expect(screen.queryByText("other_slot")).toBeNull()
+    })
+
+    it("says there is no reading yet, in one line, when the connector has none", async () => {
+      stubFetch({
+        "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+        "GET /api/governance/replication": () => json({ replicationSlots: [] }),
+      })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+
+      expect(await screen.findByText(/No replication-slot reading for this connector yet/)).toBeDefined()
+    })
+
+    it("does not ask for slot health for a connector that is not CDC", async () => {
+      const { count } = stubFetch()
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+      await screen.findByRole("button", { name: "Delete" })
+      await settle()
+
+      expect(count("GET /api/governance/replication")).toBe(0)
+      expect(screen.queryByText("Replication slot")).toBeNull()
+    })
+  })
+
   it("goes back to Sources after the connector is deleted", async () => {
     const { count } = stubFetch()
     render(<ConnectorDetailPage connectorId="conn-a" />)

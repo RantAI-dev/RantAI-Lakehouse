@@ -325,7 +325,8 @@ default). **Failure modes:** if `kafka-connect` is down, capture stops while the
 source's replication slot keeps pinning WAL at its last `restart_lsn` (R5), which
 is why slot lag and WAL retention are first-class metrics
 (`dagster/dispar_orchestrate/replication_metrics.py`, `GET
-/api/governance/replication`, Governance > "Ingestion (CDC)"); if the applier is
+/api/governance/replication`, System status > "Live change capture",
+`/health#change-capture`); if the applier is
 down, changes wait in the topics, which the broker keeps 7 days
 (`KAFKA_LOG_RETENTION_HOURS`), then are gone, and a connector deleted in the
 console leaves its topics to that retention. The two services use about

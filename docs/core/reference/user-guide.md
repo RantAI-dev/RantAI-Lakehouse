@@ -177,15 +177,14 @@ Then click **Save policy**. A change that is waiting for you appears under
 
 ### Catalog
 
-**Catalog** lists the namespaces (groups of tables).
+**Catalog** lists every table and file the lakehouse governs. (It was two
+pages, Catalog and Data Explorer; an old Data Explorer link opens the
+Catalog with the same search.)
 
-1. Search with **Search namespaces…**.
-2. Click a row to see its owner, residency and assets.
-3. Click **Browse in Data Explorer** to see its tables.
-
-### Data Explorer
-
-1. Pick a layer:
+1. Pick a **Namespace** (a group of tables), or **All**. The namespace's
+   description, owner, residency and source engine appear above the list;
+   **All namespaces** clears it.
+2. Pick a layer:
 
    | Layer | What it holds |
    | --- | --- |
@@ -195,8 +194,9 @@ Then click **Save policy**. A change that is waiting for you appears under
    | **Gold** | Curated tables ready for dashboards. |
 
    Or pick **All**.
-2. Search by name, column, tag, description or owner.
-3. Click a row to open the table. Its tabs:
+3. Search by name, column, tag, description or owner. **Filter** adds
+   more (owner, tags, tier, type, certification, …).
+4. Click a row to open the table, or use its **⋮** menu. Its tabs:
 
    | Tab | What it shows |
    | --- | --- |
@@ -316,7 +316,7 @@ lag** alert ([section 8](#alerts)).
 
 ### Publish a Gold table for other tools
 
-1. Open the Gold table in Data Explorer. On **Overview**, find **Publish
+1. Open the Gold table in the Catalog. On **Overview**, find **Publish
    in open format (Iceberg)** and switch it on.
 2. Click **Publish now**. The card lists the last 5 publish runs.
 
@@ -409,7 +409,7 @@ tells you if it is not.
 
 ### Policies
 
-Policies are added on a table's **Access** tab, in Data Explorer, where
+Policies are added on a table's **Access** tab, in the Catalog, where
 the policy engine enforces them (see **Hide sensitive columns** below).
 There is no separate create form: **Policies** lists what exists, and
 clicking a policy lets you **Enforce**, **Stop enforcing** or **Delete**
@@ -421,7 +421,7 @@ conditions as free text, and the engine reads only structured conditions.
 
 ### Hide sensitive columns
 
-Do this on the table itself: open it in Data Explorer and go to its
+Do this on the table itself: open it in the Catalog and go to its
 **Access** tab.
 
 1. **Label the data:** click **Classify**. Choose **Applies to** (one
@@ -519,15 +519,22 @@ Each entry's outcome is one of:
 
 It does not yet record every change made in the console.
 
-### The other monitoring pages
+### System status
 
-| Page | What it shows |
+**System status** answers "is the system healthy?" on one page. (It
+replaces Health, Services, Capacity, Ingestion (CDC) and Table
+Maintenance; their old addresses open the matching section.) The top line
+says whether every probed component is up, names any that is not, and
+links the open alerts. **Refresh** reloads every section; a section that
+cannot load says so with **Retry**, and the rest still shows.
+
+| Section | What it shows |
 | --- | --- |
-| **Health** | Platform health across storage, pipelines, queries, agents and governance. |
-| **Services** | Whether each component is up, with its version. A component that was never set up shows "unknown", not "down". |
-| **Capacity** | Storage per bucket, from a daily snapshot, plus ClickHouse's live disk use. |
-| **Table Maintenance** | Each table's upkeep and the nightly maintenance runs. The **Dry run (would delete)** column shows what the next run would remove. A table's own page sets **Snapshots to keep**, **Compact small files** and the **Schedule**. |
-| **Ingestion (CDC)** | The health of live change capture from each source database, including how far behind it is. |
+| **Services** | Whether each component is up. A component that is not probed says **Not probed** and is not counted as up; a version, latency or error rate nothing measures reads **Not measured**. |
+| **Storage** | ClickHouse's disk use now, its growth over 7 days (Not measured until there are 7 days of readings), and each bucket from the daily snapshot. |
+| **Live change capture** | Each CDC connector's replication slot as last checked: connected or not, WAL retained, flush lag. With no CDC connector it is one line. A CDC connector's own page shows its slot too. |
+| **Table maintenance** | What the nightly run last did to each table: what the dry run would delete and what was deleted, and any skipped step. Click a table to open its page, which sets **Snapshots to keep**, **Compact small files** and the **Schedule**. |
+| **Freshness** and **Queries** | Tables against their freshness target, and the last 24 hours' query volume and failure rate. |
 
 ## 9. Administration
 

@@ -32,6 +32,7 @@ import { connectorService } from "@/services"
 import type { ConnectorDetail, ConnectorTestResult } from "@/services/contracts/connectors"
 import { ConnectorChangeCapturePanel } from "./connector-change-capture-panel"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
+import { ReplicationSlotHealth } from "@/features/governance/replication-slot-health"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
 import { ConnectorOAuthPanel, oauthSignIn } from "./connector-oauth-panel"
 import { ConnectorOverview } from "./connector-overview"
@@ -236,10 +237,18 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   // (`SRC-12` part C); its ingest spec says which one that is.
   const ingestSpec = useService((s) => connectorService.getIngestSpec(id, s), [id])
   const oauth = ingestSpec.status === "success" ? oauthSignIn(ingestSpec.data) : null
-  // The Change capture tab is only for a connector that captures changes (`SRC-4` S4-g). A link to it for any
-  // other connector lands on the overview once the spec has said so.
-  const capturesChanges = ingestSpec.status === "success" && ingestSpec.data.adapter === "cdc"
-  const shownTab: ConnectorTab = tab === "capture" && ingestSpec.status === "success" && !capturesChanges ? "overview" : tab
+  // A connector that captures changes shows the Change capture tab (`SRC-4` S4-g) and, on
+  // its Overview tab, its own Postgres replication slot (`WEB-3` S2-D3). Both read this one
+  // predicate so a connector cannot show one and not the other (rule 4); the spec may say
+  // "cdc" in either field, and the API sets the two together. Decided by the spec the page
+  // already loads, so a connector that does not capture changes asks for nothing more.
+  const capturesChanges =
+    ingestSpec.status === "success" &&
+    (ingestSpec.data.adapter === "cdc" || ingestSpec.data.ingestMode === "cdc")
+  // A link to the Change capture tab for any other connector lands on the overview once
+  // the spec has said so.
+  const shownTab: ConnectorTab =
+    tab === "capture" && ingestSpec.status === "success" && !capturesChanges ? "overview" : tab
   const latestProbe = useService((s) => connectorService.listProbeHistory(id, 1, s), [id], {
     keepDataOnReload: true,
   })
@@ -392,7 +401,18 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
           <TabsContent value="overview">
             {/* Remounted on every visit (and after a test), so it never
                 shows a schedule or a run from before a change elsewhere. */}
-            <ConnectorOverview key={historyKey} detail={c} onOpenTab={selectTab} />
+            <div className="flex flex-col gap-3">
+              <ConnectorOverview key={historyKey} detail={c} onOpenTab={selectTab} />
+              {capturesChanges ? (
+                <ReplicationSlotHealth
+                  connectorId={id}
+                  title="Replication slot"
+                  description="This connector's Postgres replication slot as last checked (every 15 minutes). A disconnected slot is critical whatever its size: it keeps WAL on the source database."
+                  emptyLine="No replication-slot reading for this connector yet. The check runs every 15 minutes once the connector is streaming."
+                  refreshKey={historyKey}
+                />
+              ) : null}
+            </div>
           </TabsContent>
           <TabsContent value="ingest" keepMounted>
             <ConnectorIngestPanel

@@ -110,7 +110,7 @@ export function AssetDetailPage() {
     <div className="flex flex-col gap-3">
       <EntityHeader
         className="pb-3"
-        eyebrow={<Link href="/data" className="hover:underline">Data Explorer</Link>}
+        eyebrow={<Link href="/catalog" className="hover:underline">Catalog</Link>}
         title={a.name}
         titleAccessory={
           <>
