@@ -104,6 +104,28 @@ pub const PROFILES_VARIABLE: &str = "COMPOSE_PROFILES";
 /// BLOCKER 3, decision D22).
 pub const RELEASE_PROFILES: &str = "dagster";
 
+/// The tenant that owns the shared catalog and the `Dagster`-job list.
+///
+/// `0002_seed_identity.sql` seeds the four demo tenants, and
+/// `11111111-1111-4111-8111-000000000001` is the group tenant: the
+/// first row, the tenant of the seeded identities, and the tenant
+/// `0042_tenant_provisioning.sql` gives the seeded connectors and
+/// pipelines. `docs/OPERATIONS.md` names it as the owner of a stack
+/// that still runs the seeded identities (REL-10).
+pub const GROUP_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
+/// The variable that names the shared catalog's tenant.
+///
+/// The shared catalog and the `Dagster`-job half of `GET
+/// /api/pipelines` have no tenant column, so with more than one tenant
+/// and this unset the API refuses both for every principal without the
+/// unrestricted grant, and every job with no user — a scheduled
+/// export, an alert or a digest, a report, an embed, a public link — is
+/// refused with a 422 that names this setting (SEC-50,
+/// `.env.example`). An install that leaves it empty runs no scheduled
+/// work at all (REL-10).
+pub const CATALOG_TENANT_VARIABLE: &str = "CATALOG_TENANT_ID";
+
 /// The variable the console's host port comes from.
 ///
 /// The tool does not set it either — the ports are the operator's and
@@ -162,11 +184,17 @@ pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
         // not run it runs no pipelines at all (REL-2 S4b review round 3
         // BLOCKER 3, decision D22).
         let with_profiles = with_release_profiles(&text);
-        if with_profiles != text {
-            write_replacing(path, &with_profiles)?;
+        // And the shared catalog's tenant, for the same reason an older
+        // install's `.env` gets the profiles: an install made before
+        // REL-10 writes `CATALOG_TENANT_ID=` empty, and a stack with
+        // more than one tenant refuses every job with no user until it
+        // is set. An operator's own value is never changed.
+        let with_tenant = with_the_catalog_tenant(&with_profiles);
+        if with_tenant != text {
+            write_replacing(path, &with_tenant)?;
         }
         return Ok(Secrets {
-            admin_email: read_value(&with_profiles, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
+            admin_email: read_value(&with_tenant, "AUTH_BOOTSTRAP_EMAIL").unwrap_or_default(),
             admin_password: None,
         });
     }
@@ -208,6 +236,11 @@ pub fn write_env(path: &Path) -> Result<Secrets, std::io::Error> {
     // the Dagster services (REL-2 S4b review round 3 BLOCKER 3,
     // decision D22).
     let text = with_release_profiles(&text);
+
+    // The shared catalog belongs to the group tenant: the template
+    // leaves the key empty, and a stack with more than one tenant
+    // refuses every job with no user until it is set (REL-10 D1).
+    let text = with_the_catalog_tenant(&text);
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -266,6 +299,81 @@ fn with_the_profiles(text: &str) -> String {
     out
 }
 
+/// The `.env` naming the group tenant, when it names no catalog tenant.
+///
+/// An install made before REL-10 writes `CATALOG_TENANT_ID=` empty, and
+/// the one-step installer's `.env` did not carry the key at all. A
+/// stack with more than one tenant refuses the shared catalog, the
+/// `Dagster`-job list and every job with no user until the setting
+/// names a tenant (SEC-50), so the tool sets it to the group tenant —
+/// `0002_seed_identity.sql`'s first row, the tenant of the seeded
+/// identities and of the seeded connectors and pipelines
+/// (`0042_tenant_provisioning.sql`).
+///
+/// A file that SETS the variable to any value is left alone: the
+/// value is the operator's, and the API refuses a malformed one at
+/// startup rather than the tool guessing. A commented-out line sets
+/// nothing, so it does not count.
+fn with_the_catalog_tenant(text: &str) -> String {
+    match read_value(text, CATALOG_TENANT_VARIABLE) {
+        Some(value) if !value.trim().is_empty() => text.to_string(),
+        Some(_) => {
+            // The line is there and empty: the value goes where it is,
+            // so the key keeps its place and its comment above it.
+            let mut out = text.to_string();
+            replace_empty_assignment(&mut out, CATALOG_TENANT_VARIABLE, GROUP_TENANT_ID);
+            out
+        }
+        None => {
+            let mut out = text.to_string();
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            let _ = writeln!(out, "{CATALOG_TENANT_VARIABLE}={GROUP_TENANT_ID}");
+            out
+        }
+    }
+}
+
+/// Replace the empty assignment of a key with a value.
+///
+/// `replace_assignment` matches the template's exact `NAME=` line, which
+/// is what the template writes; an operator's file may carry spaces or
+/// quotes around an empty value, and this matches the key instead. A
+/// line with a value is not touched.
+fn replace_empty_assignment(text: &mut String, name: &str, value: &str) {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                return line.to_string();
+            }
+            let Some((key, assigned)) = trimmed.split_once('=') else {
+                return line.to_string();
+            };
+            if key.trim() != name {
+                return line.to_string();
+            }
+            if assigned
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .is_empty()
+            {
+                return format!("{name}={value}");
+            }
+            line.to_string()
+        })
+        .collect();
+    let mut joined = lines.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    *text = joined;
+}
+
 /// Make the install's `.env` name the release's profiles.
 ///
 /// An older install's `.env` names none: the Dagster services carry
@@ -286,6 +394,39 @@ fn with_the_profiles(text: &str) -> String {
 /// Returns the error the operating system gave when the file could not
 /// be read or written.
 pub fn ensure_release_profiles(dir: &Path) -> Result<bool, std::io::Error> {
+    rewrite_env(dir, with_release_profiles)
+}
+
+/// Make the install's `.env` name the group tenant as the shared
+/// catalog's tenant.
+///
+/// An install made before REL-10 has `CATALOG_TENANT_ID=` empty:
+/// a stack with more than one tenant refuses the shared catalog, the
+/// `Dagster`-job list and every job with no user until it is set
+/// (SEC-50), and the update sets it BEFORE it starts anything. An
+/// operator's own value is kept, valid or not: the API refuses a
+/// malformed one at startup, and the tool does not guess (REL-10 D2).
+///
+/// Returns whether the file was changed.
+///
+/// # Errors
+///
+/// Returns the error the operating system gave when the file could not
+/// be read or written.
+pub fn ensure_catalog_tenant(dir: &Path) -> Result<bool, std::io::Error> {
+    rewrite_env(dir, with_the_catalog_tenant)
+}
+
+/// Rewrite the install's `.env` with `rewrite`, when it changes it.
+///
+/// One reader and one writer for both settings, so install and update
+/// fill the file the same way (REL-10 D3).
+///
+/// # Errors
+///
+/// Returns the error the operating system gave when the file could not
+/// be read or written, named with the path.
+fn rewrite_env(dir: &Path, rewrite: fn(&str) -> String) -> Result<bool, std::io::Error> {
     let path = dir.join(".env");
     let text = std::fs::read_to_string(&path).map_err(|error| {
         std::io::Error::new(
@@ -293,11 +434,11 @@ pub fn ensure_release_profiles(dir: &Path) -> Result<bool, std::io::Error> {
             format!("{} could not be read: {error}", path.display()),
         )
     })?;
-    let with_profiles = with_release_profiles(&text);
-    if with_profiles == text {
+    let rewritten = rewrite(&text);
+    if rewritten == text {
         return Ok(false);
     }
-    write_replacing(&path, &with_profiles).map_err(|error| {
+    write_replacing(&path, &rewritten).map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!("{} could not be written: {error}", path.display()),
@@ -622,6 +763,158 @@ mod tests {
             text.contains("# COMPOSE_PROFILES=trino"),
             "a comment was removed: {text}"
         );
+    }
+
+    #[test]
+    fn a_fresh_env_names_the_group_tenant_as_the_catalogs_tenant() {
+        // REL-10 D1: the shared catalog belongs to the group tenant, so
+        // an installed stack runs its scheduled work without an
+        // operator editing the `.env` by hand.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+
+        write_env(&path).expect("the .env is written");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, CATALOG_TENANT_VARIABLE).as_deref(),
+            Some(GROUP_TENANT_ID),
+            "the .env names no catalog tenant: {text}"
+        );
+    }
+
+    #[test]
+    fn an_env_with_an_empty_catalog_tenant_gets_the_group_tenant() {
+        // REL-10 D1/D3: the template and a 0.2.0 install write
+        // `CATALOG_TENANT_ID=` empty.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "POSTGRES_PASSWORD=secret\nCATALOG_TENANT_ID=\n")
+            .expect("the .env is written");
+
+        write_env(&path).expect("the .env is read");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, CATALOG_TENANT_VARIABLE).as_deref(),
+            Some(GROUP_TENANT_ID),
+            "the empty catalog tenant was not filled: {text}"
+        );
+        assert!(
+            text.contains("POSTGRES_PASSWORD=secret"),
+            "the operator's own values were lost: {text}"
+        );
+    }
+
+    #[test]
+    fn the_catalog_tenant_an_operator_set_is_kept() {
+        // REL-10 D2: "A line with any value, valid or not, is the
+        // operator's and is left alone." The file must come back
+        // byte-for-byte unchanged.
+        for value in [
+            "22222222-2222-4222-8222-000000000002",
+            "not-a-uuid",
+            "\"11111111-1111-4111-8111-000000000003\"",
+        ] {
+            let directory = tempfile::tempdir().expect("a temporary directory");
+            let path = directory.path().join(".env");
+            // The profiles are already named, so the only thing this
+            // run could change is the catalog tenant.
+            let before = format!(
+                "POSTGRES_PASSWORD=secret\nCATALOG_TENANT_ID={value}\nCOMPOSE_PROFILES={RELEASE_PROFILES}\n"
+            );
+            std::fs::write(&path, &before).expect("the .env is written");
+
+            write_env(&path).expect("the .env is read");
+
+            let after = std::fs::read_to_string(&path).expect("the .env is readable");
+            assert_eq!(
+                after, before,
+                "an operator's catalog tenant ({value}) was changed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_env_with_no_catalog_tenant_line_gets_it() {
+        // REL-10 D2: the key is added when the line is missing
+        // entirely, the way the profiles are.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "POSTGRES_PASSWORD=secret\n").expect("the .env is written");
+
+        write_env(&path).expect("the .env is read");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, CATALOG_TENANT_VARIABLE).as_deref(),
+            Some(GROUP_TENANT_ID),
+            "the .env has no catalog tenant line: {text}"
+        );
+    }
+
+    #[test]
+    fn a_commented_out_catalog_tenant_is_not_a_tenant() {
+        // A comment sets nothing: the key is added beside it, the way
+        // the profiles rule says.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(
+            &path,
+            "# CATALOG_TENANT_ID=22222222-2222-4222-8222-000000000002\n",
+        )
+        .expect("the .env is written");
+
+        write_env(&path).expect("the .env is read");
+
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, CATALOG_TENANT_VARIABLE).as_deref(),
+            Some(GROUP_TENANT_ID),
+            "the .env names no catalog tenant: {text}"
+        );
+        assert!(
+            text.contains("# CATALOG_TENANT_ID=22222222-2222-4222-8222-000000000002"),
+            "a comment was removed: {text}"
+        );
+    }
+
+    #[test]
+    fn the_update_fills_an_empty_catalog_tenant() {
+        // REL-10 D2: the update fills the line before it starts
+        // anything, and reports that it changed the file.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(
+            directory.path().join(".env"),
+            "POSTGRES_PASSWORD=secret\nCATALOG_TENANT_ID=\n",
+        )
+        .expect("the .env is written");
+
+        let changed = ensure_catalog_tenant(directory.path()).expect("the tenant is set");
+
+        assert!(changed, "the .env was not changed");
+        let text =
+            std::fs::read_to_string(directory.path().join(".env")).expect("the .env is readable");
+        assert_eq!(
+            read_value(&text, CATALOG_TENANT_VARIABLE).as_deref(),
+            Some(GROUP_TENANT_ID),
+            "the empty catalog tenant was not filled: {text}"
+        );
+    }
+
+    #[test]
+    fn the_update_keeps_the_catalog_tenant_an_operator_set() {
+        // REL-10 D2: a value the operator set is never changed.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let before = "CATALOG_TENANT_ID=22222222-2222-4222-8222-000000000002\n";
+        std::fs::write(directory.path().join(".env"), before).expect("the .env is written");
+
+        let changed = ensure_catalog_tenant(directory.path()).expect("the tenant is set");
+
+        assert!(!changed, "the .env was changed");
+        let text =
+            std::fs::read_to_string(directory.path().join(".env")).expect("the .env is readable");
+        assert_eq!(text, before, "an operator's catalog tenant was changed");
     }
 
     #[test]
