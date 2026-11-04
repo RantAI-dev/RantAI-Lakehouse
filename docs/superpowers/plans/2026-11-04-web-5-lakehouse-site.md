@@ -1158,6 +1158,45 @@ This changes D6 for one thing: type.
 
 **Open: R8 (BLOCKER), R9 and R10 (SHOULD-FIX).**
 
+### Review 6: planner, 2026-11-04, at `59055f3e` (Review 5 fixes)
+
+**What the reviewer re-ran** (clean `git archive`, fresh install):
+- lint 0, typecheck 0;
+- tests: 65 pass, 0 fail;
+- the build exits 0, and a build without the site URL fails, as it should;
+- `bun run size` exits 0: initial JS is 181.3 KB for EN and for ID, and the override is not in the export.
+
+**R8: closed.**
+- The overlap probe found no overlap at 768, 1024, 1280, 1360 or 1440.
+- Below 1360 the scale is hidden and the hairline shows. In `r8-gauge-w1024.jpg` the hairline sits under the bar, clear of the text.
+
+**R9: closed.**
+- One `measureJourney`, built on the pure `journeyFromBoxes`, which has tests.
+- The hero hold is a parameter, with a comment saying why it is there.
+
+**R10: closed.**
+- The view is measured before and after `data-scene` is written and kept in place.
+- The developer's control run, with scroll anchoring off and the fix disabled, shows the 560 px move that the fix prevents.
+- Safari and Firefox are not verified; this VM has only Chrome.
+
+**R11: SHOULD-FIX, a deep link lands short of its section. It predates D14.**
+- **What happens:** on the reviewer's run, at 1440×900, 8 s after load:
+  - `/#governance` leaves `#governance` at y 1036, not at the top;
+  - `/#open` leaves `#open` at y 1036.
+- **Same on R7.** The R7 build (`6b1566c9`) gives the same numbers, so this is not a D14 regression.
+- **Cause** (developer, Handoff 7): the browser scrolls to the hash smoothly, and meanwhile hydration grows `#dashboards` from 800 to 1852 px.
+- **Why it matters:** in-page navigation from the top bar runs after hydration and is not affected. A shared or README link to a section is affected, and it lands on the wrong screen.
+- **Fix:**
+  - once, after the page has settled, if `location.hash` names a section and the visitor has not scrolled since load, scroll it into place with `behavior: "instant"`;
+  - or give the dashboards scroller its final height before hydration.
+
+  The developer picks one and says why. No new library.
+- **Acceptance:**
+  - `/#governance`, `/#open` and `/id/#open` put their section's top within 80 px of the top of the screen at 1440×900 and 390×844;
+  - a visitor who scrolls before the page settles is not moved.
+
+**Open: R11 (SHOULD-FIX).** After that: Lighthouse interleaved against R7 on the final commit, owner QA, CI, then the PR marked ready.
+
 ## 9. Addendum: the story, top to bottom (owner, 2026-11-04)
 
 The owner's QA asked:
