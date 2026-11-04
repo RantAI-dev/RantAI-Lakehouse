@@ -723,8 +723,10 @@ fn create_chart_schema() -> Value {
 /// refused calls in the eval (`AI-15`). `create_chart` has the shape already,
 /// so [`type_shape`] derives it from there and the two cannot drift.
 ///
-/// `title` and `kind` stay required, as they were: the server replaces the
-/// chart's whole definition, so a call without them would empty the chart.
+/// `title` and `kind` stay required, as they were: the owner kept them
+/// required. The server keeps every other field a call leaves out and clears
+/// one sent as `null`, so a call is `id`, `title`, `kind` and the fields to
+/// change.
 fn update_chart_schema() -> Value {
     let mut properties = serde_json::Map::new();
     properties.insert("id".to_owned(), json!({ "type": "string" }));
@@ -737,7 +739,7 @@ fn update_chart_schema() -> Value {
         }
     }
     json!({ "type": "function", "function": { "name": "update_chart",
-        "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values: the fields, their meanings and their rules are those of create_chart, which this same turn offers. list_charts gives the ids.",
+        "description": "Change a saved chart (by id), keeping its id. Send id, title, kind and only the fields to change: a field you leave out keeps its saved value, and null clears it. The fields, their meanings and their rules are those of create_chart, which this same turn offers. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": properties,
             "required": ["id", "title", "kind"] } } })
 }
@@ -3296,8 +3298,8 @@ mod tests {
         // those are the ones of `create_chart`, which the same turn offers
         // (the shapes are checked in
         // `update_chart_fields_carry_the_type_of_the_same_fields_in_create_chart`).
-        // `title` and `kind` stay required: the server replaces the chart's
-        // whole definition, so a call without them would empty the chart.
+        // `title` and `kind` stay required because the owner kept them
+        // required; the server keeps every other field a call leaves out.
         assert_eq!(
             update["function"]["parameters"]["required"],
             json!(["id", "title", "kind"])

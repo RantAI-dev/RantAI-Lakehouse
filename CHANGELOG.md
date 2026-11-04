@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Fixed
+
+- The assistant's `update_chart` keeps every field the request does not name, and `null` clears one, so a rename no longer empties a chart (backlog `AI-3`). The reply lists the kept fields as `fieldsKept`.
+
 ## [0.2.1] - 2026-11-04
 
 ### Added
