@@ -284,7 +284,7 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-45` | Task | Iceberg tables with no catalog entry (for example some Gold export tables) are no longer listed anywhere since `WEB-3` slice 2 removed the Table Maintenance list; their pages work by address only | Data | P3 | Todo |  | #374 handoff |
 | `DATA-46` | Task | Data Quality > Schedules lists only tables with a saved schedule and cannot add a schedule for another table (needs a table picker) | Data | P3 | Todo |  | #376 handoff |
 | `OPS-17` | Task | bluefin's daily cargo sweep let the shared target reach 272 GB on 2026-11-04 (pruned to 88 GB by hand); check the `cargo-target-sweep.timer` there | Operations | P3 | Todo |  | 2026-11-04 |
-| `WEB-5` | Task | Some existing failure toasts read the action's error right after it fails and get the old value, so the API's sentence may be missing (for example the Access tab's policy buttons); the `WEB-3` dialogs show the error inside the dialog instead | Platform | P3 | Todo |  | #376 handoff |
+| `WEB-6` | Task | Some existing failure toasts read the action's error right after it fails and get the old value, so the API's sentence may be missing (for example the Access tab's policy buttons); the `WEB-3` dialogs show the error inside the dialog instead | Platform | P3 | Todo |  | #376 handoff |
 | `OPS-3` | Feature | Run on several servers; high availability. The product owner wants clustering supported later (2026-11-04); `DATA-44` stays on one server | Platform | P3 | Idea |  | PRODUCT §1, §2 |
 | `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. `DEC-9` decided 2026-10-19; `SRC-12` merged. Feature page `features/business-app-connectors.md`. Eight of the ten are built and supported (gate-tested on mock vendors only; no real account); Workday Reports and NetSuite are built and stay unsupported until `SRC-27`. Result: `plans/SRC-3-RESULT.md`. Follow-ups: `SRC-26` to `SRC-31`. Accepted by the product owner on 2026-11-02 for the eight supported vendors; Workday Reports and NetSuite wait for `SRC-27` | Data | P3 | Released | #216 | PRODUCT §2 |
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
@@ -382,7 +382,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `ADM-5`, `AI-10`, `AI-21`, `AI-25`, `AI-26`, `AI-27`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-42`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-4`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-4`, `WEB-5`
+`ADM-1`, `ADM-2`, `ADM-5`, `AI-10`, `AI-21`, `AI-25`, `AI-26`, `AI-27`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-42`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-4`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-4`, `WEB-6`
 
 ## Dates
 
@@ -396,7 +396,7 @@ set by the product owner and are left empty until they are.
 | `SEC-61` | 2026-11-04 | 2026-11-04 | |
 | `ADM-3` | 2026-11-02 | 2026-11-02 | |
 | `QS-2` | 2026-10-28 | 2026-10-30 | |
-| `SRC-4` | 2026-10-29 | | |
+| `SRC-4` | 2026-10-29 | 2026-11-05 | |
 | `QS-3` | 2026-10-30 | API 2026-11-03 (#361) | |
 | `SEC-20` | 2026-10-24 | | |
 | `QS-4` | 2026-10-24 | 2026-10-27 | |
