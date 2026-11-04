@@ -114,9 +114,10 @@ function columns(linkConnector: boolean): ColumnDef<ReplicationSlot>[] {
  *
  * With no slot to show, the section shrinks to `emptyLine`, one muted line,
  * rather than a card around an empty table. On a deployment where no CDC
- * connector has ever run the slot table does not exist and the route
- * answers 503 (`routes/governance.rs`), which the API does not tell apart
- * from ClickHouse being down; the error says both, and keeps its Retry.
+ * connector has ever run the slot table does not exist; the route answers
+ * that with an empty list (`routes/governance.rs`, `WEB-3 review R1`), so
+ * it shows the same muted line. The error, with its Retry, is left for a
+ * real failure to read the slots.
  */
 export function ReplicationSlotHealth({
   connectorId,
@@ -163,9 +164,7 @@ export function ReplicationSlotHealth({
         <div className="flex flex-col gap-2">
           <ErrorState error={state.error} onRetry={state.reload} className="py-6" />
           <p className="text-xs text-muted-foreground">
-            The slot readings could not be read. On a deployment where no CDC
-            connector has run yet there is nothing to read, and the API answers
-            the same way as when ClickHouse is unreachable.
+            The slot readings could not be read from ClickHouse.
           </p>
         </div>
       ) : null}
