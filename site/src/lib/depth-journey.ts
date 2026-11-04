@@ -139,3 +139,62 @@ export function causticAt(depth: number): number {
   return Math.min(1, Math.max(0, (depth + 100) / 97));
 }
 
+
+/** A section's box in page coordinates (its top plus the scroll position, and its height). */
+export type SectionBox = { top: number; height: number };
+
+/** What the page's sections turn into: the depth anchors, the depths pin, and the climb (S5). */
+export type Journey = { anchors: Anchor[]; depths: DepthsRange | null; climb: { from: number; to: number } };
+
+/**
+ * WEB-5 review fix R9 (SHOULD-FIX): the one place that turns the chapters'
+ * boxes into the journey. The gauge and the water used to build their own
+ * anchors, and the copies had already drifted apart; both now go through
+ * this (via `measureJourney`, lib/measure-journey.ts), so they agree on
+ * every depth by construction.
+ *
+ * - Each chapter's depth applies when its top reaches the middle of the
+ *   screen. A chapter without a box (not on the page) is skipped.
+ * - `holdSurfaceThroughHero`: also hold the hero's depth until the hero's
+ *   pin ends, about where the live camera goes under (S1). The gauge needs
+ *   it, because its reading is on screen over the hero and must not leave
+ *   0 m while the visitor is still above the water. The water does not:
+ *   behind the hero and the scene zone it is covered by the canvas or the
+ *   zone's own gradient, and only its colour where that cover ends shows.
+ * - The depths pin ends on Gold (−90 m), so that is the depth after it.
+ * - The surface (0 m) is reached `surfaceAtFinal` of the way into the final.
+ * - The climb runs from a screen before the dashboards to the surface.
+ */
+export function journeyFromBoxes(
+  chapters: readonly { id: string; depth: number }[],
+  boxes: Readonly<Record<string, SectionBox | undefined>>,
+  viewportH: number,
+  opts: { holdSurfaceThroughHero: boolean; surfaceAtFinal: number },
+): Journey {
+  const half = viewportH / 2;
+  const anchors: Anchor[] = [];
+  for (const c of chapters) {
+    const box = boxes[c.id];
+    if (!box) continue;
+    anchors.push({ at: box.top - half, depth: c.depth });
+    if (c.id === "hero" && opts.holdSurfaceThroughHero) {
+      anchors.push({ at: box.top + box.height - viewportH, depth: c.depth });
+    }
+  }
+  let depths: DepthsRange | null = null;
+  const d = boxes.depths;
+  if (d) {
+    depths = { top: d.top, span: Math.max(1, d.height - viewportH) };
+    anchors.push({ at: depths.top + depths.span, depth: SLAB_DEPTHS[2] });
+  }
+  const final = boxes.final;
+  if (final) anchors.push({ at: final.top + final.height * opts.surfaceAtFinal - half, depth: 0 });
+  anchors.sort((a, b) => a.at - b.at);
+  const dash = boxes.dashboards;
+  const surface = anchors[anchors.length - 1];
+  return {
+    anchors,
+    depths,
+    climb: { from: dash ? dash.top - viewportH : 0, to: surface ? surface.at : 0 },
+  };
+}

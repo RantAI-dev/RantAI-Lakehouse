@@ -1,8 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { JOURNEY, SURFACE_AT_FINAL } from "@/lib/home-content";
-import { ascentAt, causticAt, depthAt, SLAB_DEPTHS, steppedDepthAt, waterAt, type Anchor } from "@/lib/depth-journey";
+import { ascentAt, causticAt, depthAt, steppedDepthAt, waterAt, type Anchor } from "@/lib/depth-journey";
+import { measureJourney } from "@/lib/measure-journey";
 import { afterPaint } from "@/lib/after-paint";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
@@ -44,35 +44,10 @@ export function DepthBackdrop() {
     let frame = 0;
     let last = "";
 
-    // Each chapter's depth applies when its top reaches the middle of the
-    // screen; the surface is reached halfway into the final section.
+    // R9: the same measurement as the gauge. No hold through the hero: the
+    // water is covered there (see `journeyFromBoxes`).
     const measure = () => {
-      const half = window.innerHeight / 2;
-      const next: Anchor[] = [];
-      for (const c of JOURNEY) {
-        const node = document.getElementById(c.id);
-        if (!node) continue;
-        next.push({ at: node.getBoundingClientRect().top + window.scrollY - half, depth: c.depth });
-      }
-      // The depths pin ends on Gold (−90 m), as the gauge reads it, so the
-      // water is already deep where the assistant comes in.
-      const depthsEl = document.getElementById("depths");
-      if (depthsEl) {
-        const r = depthsEl.getBoundingClientRect();
-        next.push({ at: r.top + window.scrollY + Math.max(1, r.height - window.innerHeight), depth: SLAB_DEPTHS[2] });
-      }
-      const final = document.getElementById("final");
-      if (final) {
-        const r = final.getBoundingClientRect();
-        next.push({ at: r.top + window.scrollY + r.height * SURFACE_AT_FINAL - half, depth: 0 });
-      }
-      anchors = next.sort((a, b) => a.at - b.at);
-      const dash = document.getElementById("dashboards");
-      const surface = anchors[anchors.length - 1];
-      climb = {
-        from: dash ? dash.getBoundingClientRect().top + window.scrollY - window.innerHeight : 0,
-        to: surface ? surface.at : 0,
-      };
+      ({ anchors, climb } = measureJourney({ holdSurfaceThroughHero: false }));
       paint();
     };
     const paint = () => {

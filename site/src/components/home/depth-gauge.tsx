@@ -1,8 +1,9 @@
 "use client";
 
 import * as React from "react";
-import { JOURNEY, SURFACE_AT_FINAL } from "@/lib/home-content";
+import { JOURNEY } from "@/lib/home-content";
 import { formatDepth, gaugeDepthAt, SLAB_DEPTHS, type Anchor, type DepthsRange } from "@/lib/depth-journey";
+import { measureJourney } from "@/lib/measure-journey";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /** Every depth a chapter starts at, plus the three slabs: one tick each. */
@@ -50,34 +51,9 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
     let last = "";
 
     const measure = () => {
-      const half = window.innerHeight / 2;
-      const next: Anchor[] = [];
-      for (const c of JOURNEY) {
-        const node = document.getElementById(c.id);
-        if (!node) continue;
-        const r = node.getBoundingClientRect();
-        if (c.id === "hero") {
-          // The surface holds from the top of the page until the hero's pin
-          // ends, which is about where the live camera goes under (S1).
-          next.push({ at: 0, depth: c.depth });
-          next.push({ at: r.top + window.scrollY + r.height - window.innerHeight, depth: c.depth });
-          continue;
-        }
-        next.push({ at: r.top + window.scrollY - half, depth: c.depth });
-      }
-      const d = document.getElementById("depths");
-      if (d) {
-        const r = d.getBoundingClientRect();
-        depths = { top: r.top + window.scrollY, span: Math.max(1, r.height - window.innerHeight) };
-        // The pin ends on Gold, so the reading carries on from there.
-        next.push({ at: depths.top + depths.span, depth: SLAB_DEPTHS[2] });
-      }
-      const final = document.getElementById("final");
-      if (final) {
-        const r = final.getBoundingClientRect();
-        next.push({ at: r.top + window.scrollY + r.height * SURFACE_AT_FINAL - half, depth: 0 });
-      }
-      anchors = next.sort((a, b) => a.at - b.at);
+      // R9: the same measurement as the water, holding 0 m through the
+      // hero's pin because this reading is on screen over the hero.
+      ({ anchors, depths } = measureJourney({ holdSurfaceThroughHero: true }));
       paint();
     };
     const paint = () => {

@@ -1,6 +1,17 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { ascentAt, causticAt, depthAt, formatDepth, gaugeDepthAt, mixColour, steppedDepthAt, WATER_BY_DEPTH, waterAt } from "./depth-journey";
+import {
+  ascentAt,
+  causticAt,
+  depthAt,
+  formatDepth,
+  gaugeDepthAt,
+  journeyFromBoxes,
+  mixColour,
+  steppedDepthAt,
+  WATER_BY_DEPTH,
+  waterAt,
+} from "./depth-journey";
 
 const anchors = [
   { at: 0, depth: 0 },
@@ -84,4 +95,74 @@ test("caustic light grows as the water gets shallower", () => {
   assert.equal(causticAt(-100), 0);
   assert.ok(causticAt(-50) < causticAt(-15));
   assert.equal(causticAt(-3), 1);
+});
+
+// WEB-5 review fix R9: the pure part of the one measurement both the gauge
+// and the water use. A 1000 px screen and boxes laid out like the page.
+const chapters = [
+  { id: "hero", depth: 0 },
+  { id: "sources", depth: -5 },
+  { id: "depths", depth: -10 },
+  { id: "assistant", depth: -100 },
+  { id: "dashboards", depth: -100 },
+  { id: "final", depth: -3 },
+];
+const boxes = {
+  hero: { top: 0, height: 2200 },
+  sources: { top: 2200, height: 1000 },
+  depths: { top: 3200, height: 4000 },
+  assistant: { top: 7200, height: 1000 },
+  dashboards: { top: 8200, height: 1000 },
+  final: { top: 9200, height: 800 },
+};
+const vh = 1000;
+
+test("journeyFromBoxes puts each chapter's depth where its top reaches the middle of the screen, plus the Gold pin end and the surface", () => {
+  const j = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: false, surfaceAtFinal: 0.5 });
+  assert.deepEqual(j.anchors, [
+    { at: -500, depth: 0 },
+    { at: 1700, depth: -5 },
+    { at: 2700, depth: -10 },
+    { at: 6200, depth: -90 },
+    { at: 6700, depth: -100 },
+    { at: 7700, depth: -100 },
+    { at: 8700, depth: -3 },
+    { at: 9100, depth: 0 },
+  ]);
+  assert.deepEqual(j.depths, { top: 3200, span: 3000 });
+  assert.deepEqual(j.climb, { from: 7200, to: 9100 });
+});
+
+test("holding the surface through the hero adds one anchor at the end of the hero's pin and changes nothing else", () => {
+  const free = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: false, surfaceAtFinal: 0.5 });
+  const held = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: true, surfaceAtFinal: 0.5 });
+  assert.deepEqual(held.anchors, [...free.anchors.slice(0, 1), { at: 1200, depth: 0 }, ...free.anchors.slice(1)]);
+  assert.deepEqual(held.depths, free.depths);
+  assert.deepEqual(held.climb, free.climb);
+  // Held: still 0 m just before the pin ends; free: already on its way down.
+  assert.equal(depthAt(1199, held.anchors), 0);
+  assert.ok(depthAt(1199, free.anchors) < 0);
+});
+
+test("journeyFromBoxes skips sections that are not on the page and keeps the anchors in scroll order", () => {
+  const j = journeyFromBoxes(chapters, { hero: boxes.hero, final: boxes.final }, vh, {
+    holdSurfaceThroughHero: true,
+    surfaceAtFinal: 0.5,
+  });
+  assert.equal(j.depths, null);
+  assert.deepEqual(j.climb, { from: 0, to: 9100 });
+  assert.deepEqual(
+    j.anchors.map((a) => a.depth),
+    [0, 0, -3, 0],
+  );
+  const empty = journeyFromBoxes(chapters, {}, vh, { holdSurfaceThroughHero: false, surfaceAtFinal: 0.5 });
+  assert.deepEqual(empty, { anchors: [], depths: null, climb: { from: 0, to: 0 } });
+});
+
+test("a depths section no taller than the screen still gets a one-pixel pin", () => {
+  const j = journeyFromBoxes(chapters, { depths: { top: 100, height: 800 } }, vh, {
+    holdSurfaceThroughHero: false,
+    surfaceAtFinal: 0.5,
+  });
+  assert.deepEqual(j.depths, { top: 100, span: 1 });
 });
