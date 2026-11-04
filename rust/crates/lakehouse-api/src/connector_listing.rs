@@ -1489,6 +1489,7 @@ mod tests {
                 &resolver,
                 &InternalHosts::NONE,
                 None,
+                &unused_runner(),
             )
             .await
             else {
