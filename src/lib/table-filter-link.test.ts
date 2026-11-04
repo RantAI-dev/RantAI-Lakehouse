@@ -5,6 +5,7 @@ import {
   filterParam,
   namespaceAssetsHref,
   removeFilter,
+  setFilter,
   tableFilterHref,
   toggleFilterValue,
 } from "./table-filter-link"
@@ -47,7 +48,8 @@ test("tableFilterHref tanpa isi tetap mengembalikan path apa adanya", () => {
 
 test("namespaceAssetsHref menyaring kolom namespace, bukan pencarian bebas", () => {
   const url = new URL(namespaceAssetsHref("lake.bronze"), "http://x")
-  assert.equal(url.pathname, "/data")
+  // WEB-3 S2-D1: the asset list moved from /data to /catalog.
+  assert.equal(url.pathname, "/catalog")
   assert.equal(url.searchParams.get("search"), null)
   const [filter] = JSON.parse(url.searchParams.get("filters") ?? "[]")
   assert.deepEqual(filter, {
@@ -101,4 +103,30 @@ test("removeFilter hanya membuang kolom yang diminta", () => {
   const cleared = removeFilter(start, "layer")
   assert.deepEqual(activeFilterValues(cleared, "layer"), [])
   assert.deepEqual(activeFilterValues(cleared, "tier"), ["gold"])
+})
+
+test("setFilter replaces one column's filter and keeps the others", () => {
+  const start = filterParam([
+    { id: "layer", value: ["gold"], variant: "multiSelect", operator: "inArray" },
+    { id: "namespace", value: "silver", variant: "text", operator: "eq" },
+  ])
+  const next = JSON.parse(
+    setFilter(start, { id: "namespace", value: "bronze", variant: "text", operator: "eq" })
+  ) as { id: string; value: unknown }[]
+  assert.deepEqual(
+    next.map((f) => [f.id, f.value]),
+    [
+      ["layer", ["gold"]],
+      ["namespace", "bronze"],
+    ]
+  )
+})
+
+test("setFilter starts from nothing when the parameter is empty or unreadable", () => {
+  for (const start of ["", "not json"]) {
+    const next = JSON.parse(
+      setFilter(start, { id: "namespace", value: "gold", variant: "text", operator: "eq" })
+    ) as { id: string }[]
+    assert.deepEqual(next.map((f) => f.id), ["namespace"])
+  }
 })

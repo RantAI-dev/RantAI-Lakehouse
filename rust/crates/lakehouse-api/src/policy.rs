@@ -368,6 +368,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // incidents and alerts) run, so it is a governance decision.
     ("GET",  "/api/governance/quality/schedules", Policy::RequiresAuth),
     ("PUT",  "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
+    // WEB-3 S3a-D3: resetting a schedule is the same governance write as
+    // setting one.
+    ("DELETE", "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
     // DATA-14 (F5): a table's learned-or-learning state; open to any login
     // like the quality list it is shown beside.
     ("GET",  "/api/governance/quality/learning/{asset}", Policy::RequiresAuth),
@@ -853,6 +856,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/identity/users/{id}/reset-password", Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/roles",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/roles",                  Policy::RequiresPermission("identity:write")),
+    // WEB-3 S3a-D2: editing or removing a role is exactly the privilege
+    // bundle write `POST` above is, so it takes `identity:write`, not a new
+    // token (AGENTS.md rule 4).
+    ("PUT",  "/api/identity/roles/{id}",             Policy::RequiresPermission("identity:write")),
+    ("DELETE", "/api/identity/roles/{id}",           Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),
@@ -922,7 +930,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // The tenant gate is the route layer.
     ("POST", "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
-    ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
     // `ingest-spec` GET/PUT deliberately carry DIFFERENT permissions, unlike
     // every other connector route above: `connector:manage` is a broad
     // write-capable grant, and a read-only caller (Phase G's ingest
@@ -963,6 +970,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/connectors/{id}/runs", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/runs/{runId}/log", Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/resume", Policy::RequiresPermission("connector:manage")),
+    // `SRC-4` slice 2: a person's pause (resume above lifts it), and a change-capture
+    // connector's state in Kafka Connect; same permission and tenant gate.
+    ("POST", "/api/connectors/{id}/pause", Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/change-capture", Policy::RequiresPermission("connector:manage")),
+    // `SRC-4` slice 4: a person sets the lag a change-capture connector may have
+    // before it alerts; the orchestrator posts each table's backlog and last
+    // applied change. `ingest:read` is the one permission its service identity
+    // holds and a user can hold it too (Data Engineer), so the handler adds
+    // `schema_changes::require_orchestrator`, as the run reports do.
+    ("PUT",  "/api/connectors/{id}/lag-limit", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/capture/observations", Policy::RequiresPermission("ingest:read")),
     // `SRC-11`: the orchestrator reports a run's start, each attempt, a line of
     // the closed log list, and the run's end. `ingest:read`, the one
     // permission its service identity holds; a user can hold it too (Data
@@ -1359,6 +1377,11 @@ mod tests {
             policy_for("PUT", "/api/governance/quality/schedules/{asset}"),
             Some(Policy::RequiresPermission("governance:write"))
         );
+        // WEB-3 S3a-D3: resetting takes the permission setting one does.
+        assert_eq!(
+            policy_for("DELETE", "/api/governance/quality/schedules/{asset}"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
     }
 
     /// `DATA-14` (F7): a rule's run history is readable by any login.
@@ -1468,6 +1491,16 @@ mod tests {
         );
         assert_eq!(
             policy_for("POST", "/api/identity/roles"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+        // WEB-3 S3a-D2: editing or removing a role takes the same
+        // permission as minting one.
+        assert_eq!(
+            policy_for("PUT", "/api/identity/roles/{id}"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+        assert_eq!(
+            policy_for("DELETE", "/api/identity/roles/{id}"),
             Some(Policy::RequiresPermission("identity:write"))
         );
         assert_eq!(

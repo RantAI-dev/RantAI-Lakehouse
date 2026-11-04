@@ -21,8 +21,9 @@ use lakehouse_store::governance::{
     self, ClassificationRule, CreateClassificationRuleInput, CreatePolicyInput,
     CreateQualityRuleInput, CreateResidencyRuleInput, Policy, QualityRule, ResidencyRule,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -42,8 +43,9 @@ enum Kind {
     Quality,
     /// `governance/audit` — recent `Dagster` runs as audit events.
     Audit,
-    /// `governance/classification` — per-asset classification (currently
-    /// always `"internal"`).
+    /// `governance/classification` — per-asset classification: the authored
+    /// rules, plus a registry row only when a dataset's `tier` is one of the
+    /// product's levels (`WEB-3` S3a-D4; the seeded tiers are not).
     Classification,
     /// `governance/residency` — static tenant residency policy.
     ///
@@ -431,6 +433,47 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
     Ok(json!({ "audit": audit }))
 }
 
+/// The product's classification levels: the four the console's badge shows
+/// (`src/lib/status.ts` `CLASSIFICATION_LABEL`) and the four
+/// `classification_rule`'s `CHECK` accepts (`0003_governance.sql`). A
+/// registry `tier` is a SOURCE tier, not a level: `register_bronze_table`
+/// writes `primer` and the secondary registry is `sekunder`
+/// (`dagster/dispar_orchestrate/bronze_catalog.py`), so no seeded dataset
+/// produces a derived classification row — see [`registry_classification`]
+/// (`WEB-3` S3a-D4).
+const CLASSIFICATION_LEVELS: [&str; 4] = ["public", "internal", "confidential", "restricted"];
+
+/// One classification row derived from a registry dataset, or `None` when
+/// its `tier` is not one of [`CLASSIFICATION_LEVELS`] (`WEB-3` S3a-D4).
+///
+/// The row's `asset` is the key the stored classification rules use for that
+/// dataset — `lineageKey` in `src/features/catalog/asset-lineage.tsx`: a
+/// Bronze table is `bronze.<table_name>` while the registry has a table name
+/// for it, and the slug otherwise. A registry row with a real level as its
+/// tier is then matched by the catalog like an authored rule; `primer` and
+/// `sekunder` are not levels and produce no row at all, rather than the
+/// hardcoded `"internal"` this list used to show for every dataset.
+///
+/// Pure, so the rule is testable without `ClickHouse`; `title` is not part of
+/// the `ClassificationRule` contract, so it is not carried into the row.
+fn registry_classification(slug: &str, table_name: &str, tier: &str) -> Option<Value> {
+    if !CLASSIFICATION_LEVELS.contains(&tier) {
+        return None;
+    }
+    let asset = if table_name.is_empty() {
+        slug.to_owned()
+    } else {
+        format!("bronze.{table_name}")
+    };
+    Some(json!({
+        "id": format!("c-{slug}"),
+        "asset": asset,
+        "classification": tier,
+        "confidence": 1,
+        "reviewStatus": "auto",
+    }))
+}
+
 /// **Gap fix** — same shape as [`quality`], unioning authored classification
 /// rules onto the `ClickHouse`-derived per-asset list.
 ///
@@ -448,27 +491,31 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
 /// the background. Without it a slug a second run registered was
 /// classified twice.
 ///
+/// `WEB-3` S3a-D4: a registry row is reported only when its `tier` is one of
+/// the product's classification levels (see [`registry_classification`]).
+/// It used to report `"internal"` for every dataset, a level nothing had
+/// assigned; the tiers this deployment writes (`primer`, `sekunder`) are not
+/// levels, so no registry row appears.
+///
 /// The `LIMIT 500` stays where it is — after the last `SELECT` of the
 /// union — so it caps what it capped before (see the plan's D5: in
 /// `ClickHouse` a `LIMIT` after an unparenthesized `UNION ALL` binds to
 /// that last `SELECT`, not to the whole union).
 async fn classification(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
     let sql = format!(
-        "SELECT slug, title, tier FROM lake.`bronze_meta.dataset_catalog` FINAL
-         UNION ALL SELECT slug, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
+        "SELECT slug, table_name, tier FROM lake.`bronze_meta.dataset_catalog` FINAL
+         UNION ALL SELECT slug, table_name, tier FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
          WHERE slug {NOT_IN_PRIMARY} LIMIT 500"
     );
     let rows = ch.rows(&sql, None).await?;
     let mut classifications: Vec<Value> = rows
         .iter()
-        .map(|r| {
-            json!({
-                "id": format!("c-{}", str_col(r, "slug")),
-                "asset": str_col(r, "title"),
-                "classification": "internal",
-                "confidence": 1,
-                "reviewStatus": "auto",
-            })
+        .filter_map(|r| {
+            registry_classification(
+                str_col(r, "slug"),
+                str_col(r, "table_name"),
+                str_col(r, "tier"),
+            )
         })
         .collect();
     if let Some(pg) = pg {
@@ -606,8 +653,12 @@ pub(crate) fn maintenance_run_row_json(row: &Map<String, Value>) -> Value {
 /// surface. Reads `lake.bronze_meta.replication_slot` directly (Dagster-
 /// written only, same posture as `maintenance` — no `pg` union). On a
 /// deployment where no CDC connector has ever run, this table does not
-/// exist yet and the query fails, surfaced as the standard 503 every other
-/// `kind` already gives — not a special case.
+/// exist yet: that is "no slots", answered as `{"replicationSlots": []}`
+/// with 200, not an outage (`WEB-3 review R1` — a fresh install must not
+/// open System status on an error). The decision is `ClickHouse`'s own
+/// error code ([`CH_UNKNOWN_TABLE`], via [`ChError::server_code`]), never
+/// the error text (principle 4); every other failure — `ClickHouse` down, a
+/// permission error, a malformed answer — is still the standard 503.
 /// The `SELECT` behind [`replication`], pulled out so the
 /// `toString(active)` wrapping is assertable — the bug it fixes is invisible
 /// in the response shape (a slot just reads inactive) and only reproduces
@@ -635,8 +686,19 @@ fn ch_bool(row: &serde_json::Map<String, Value>, key: &str) -> bool {
     matches!(str_col(row, key), "1" | "true")
 }
 
+/// `ClickHouse` error code `UNKNOWN_TABLE`: the table named in the query
+/// does not exist. [`replication`] reads it as "no CDC connector has run
+/// yet" (`WEB-3 review R1`).
+const CH_UNKNOWN_TABLE: u32 = 60;
+
 async fn replication(ch: &ChClient) -> Result<Value, GovError> {
-    let rows = ch.rows(REPLICATION_SLOTS_SQL, None).await?;
+    // WEB-3 review R1: only the engine's UNKNOWN_TABLE code is "no slots
+    // yet"; any other error, including one with no code, stays a 503.
+    let rows = match ch.rows(REPLICATION_SLOTS_SQL, None).await {
+        Ok(rows) => rows,
+        Err(err) if err.server_code() == Some(CH_UNKNOWN_TABLE) => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
     let slots: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -962,13 +1024,141 @@ pub async fn create_rule(
     }
 }
 
-/// `GET /api/governance/policies` — every authored policy.
+/// One authored policy as the console sees it: the stored row plus the two
+/// facts `lakehouse-store`'s [`Policy`] cannot answer on its own — whether
+/// the policy engine can enforce anything from it (`SEC-61`) and which
+/// table page it belongs to (`WEB-3` S3a-D1).
+///
+/// `enforceable` is deliberately NOT part of `status`: it says whether the
+/// rule CAN be enforced, while `status` says whether it is switched on.
+/// Both are real and independent, and a `ready` policy with `enforceable:
+/// false` masks nothing and filters no rows — the console shows it as "Not
+/// enforced" instead of "Enforced" (plan `SEC-61`, decision D3).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyView {
+    /// The stored policy, flattened so the wire shape is unchanged apart
+    /// from the added `enforceable` and `assetId` fields (`SEC-61` D2,
+    /// `WEB-3` S3a-D1).
+    #[serde(flatten)]
+    policy: Policy,
+    /// True when [`crate::policy_engine::PolicyCondition::parse_opt`]
+    /// accepts this row's authored `conditions` — the engine's own test,
+    /// never a second parser (decision D1). Absent or free-text conditions
+    /// and conditions with no real obligation are `false`: a policy with
+    /// no structured `conditions` is enforced nowhere.
+    enforceable: bool,
+    /// The catalog asset id of the table the policy governs, resolved from
+    /// `conditions.table` (`WEB-3` S3a-D1). Absent when the conditions do
+    /// not parse, name no table the catalog addresses, or name a Bronze
+    /// table no registry row describes — the console then shows the table
+    /// as plain text rather than linking to an invented page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset_id: Option<String>,
+}
+
+/// Which catalog asset a policy's `conditions.table` names (`WEB-3`
+/// S3a-D1). The two zones the catalog addresses differently: a Silver or
+/// Serving table is its own asset id (`routes::catalog::detail`), while a
+/// Bronze table is known by its registry slug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PolicyAsset {
+    /// `silver.*`/`serving.*` — the table itself is the asset id.
+    Table(String),
+    /// `bronze.<table>` — the dataset registered under that table name.
+    Bronze(String),
+}
+
+impl PolicyAsset {
+    /// Classifies the table [`crate::policy_engine::PolicyCondition`] parsed
+    /// out of a policy's `conditions`. `None` when the conditions do not
+    /// parse (legacy prose, absent, or no real obligation), name no zone
+    /// and table, or name a zone the catalog does not address this way —
+    /// never a guess.
+    fn of(conditions: Option<&str>) -> Option<Self> {
+        let table = crate::policy_engine::PolicyCondition::parse_opt(conditions)?.table;
+        let (zone, name) = table.split_once('.')?;
+        match zone {
+            "silver" | "serving" => Some(Self::Table(table)),
+            "bronze" if !name.is_empty() => Some(Self::Bronze(name.to_owned())),
+            _ => None,
+        }
+    }
+}
+
+impl PolicyView {
+    /// Wraps `policy` with the engine's verdict on its `conditions` and the
+    /// asset id resolved by [`Self::asset_ids`].
+    fn new(policy: Policy, asset_id: Option<String>) -> Self {
+        let enforceable =
+            crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
+                .is_some();
+        Self {
+            policy,
+            enforceable,
+            asset_id,
+        }
+    }
+
+    /// One asset id per policy, in order: a Silver/Serving table is its own
+    /// id, and a Bronze table's id is its registry slug from the same
+    /// reader the catalog uses ([`crate::routes::catalog::registered_slug`],
+    /// rule 4), read once per distinct table. A registry that cannot answer
+    /// costs the link, never the list — the same choice
+    /// [`crate::routes::catalog::registered_slug`]'s Bronze upstream makes.
+    async fn asset_ids(ch: &ChClient, policies: &[Policy]) -> Vec<Option<String>> {
+        let mut bronze: HashMap<String, Option<String>> = HashMap::new();
+        let mut ids = Vec::with_capacity(policies.len());
+        for policy in policies {
+            ids.push(match PolicyAsset::of(policy.conditions.as_deref()) {
+                Some(PolicyAsset::Table(table)) => Some(table),
+                Some(PolicyAsset::Bronze(table)) => {
+                    if let Some(found) = bronze.get(&table) {
+                        found.clone()
+                    } else {
+                        let found = crate::routes::catalog::registered_slug(ch, &table)
+                            .await
+                            .ok()
+                            .flatten();
+                        bronze.insert(table, found.clone());
+                        found
+                    }
+                }
+                None => None,
+            });
+        }
+        ids
+    }
+}
+
+/// `GET /api/governance/policies` — every authored policy, each with the
+/// engine's verdict on whether it can be enforced (`SEC-61`) and the catalog
+/// asset it governs, where one can be named (`WEB-3` S3a-D1).
 ///
 /// # Errors
 ///
 /// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<Policy>>> {
-    Ok(ApiJson(governance::list_policies(pool(&state)?).await?))
+pub async fn list_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<PolicyView>>> {
+    let policies = governance::list_policies(pool(&state)?).await?;
+    let ids = PolicyView::asset_ids(&state.clickhouse, &policies).await;
+    Ok(ApiJson(
+        policies
+            .into_iter()
+            .zip(ids)
+            .map(|(policy, asset_id)| PolicyView::new(policy, asset_id))
+            .collect(),
+    ))
+}
+
+/// [`PolicyView::new`] for one policy, with its asset id resolved
+/// (`WEB-3` S3a-D1).
+async fn policy_view(state: &AppState, policy: Policy) -> PolicyView {
+    let asset_id = PolicyView::asset_ids(&state.clickhouse, std::slice::from_ref(&policy))
+        .await
+        .into_iter()
+        .next()
+        .flatten();
+    PolicyView::new(policy, asset_id)
 }
 
 /// The `POST /api/governance/policies` body. Mirrors `CreatePolicyInput`.
@@ -1029,7 +1219,8 @@ fn create_policy_body(body: Value) -> Result<CreatePolicyInput, ApiError> {
     })
 }
 
-/// `POST /api/governance/policies` — author a new policy. Returns 201.
+/// `POST /api/governance/policies` — author a new policy. Returns 201, with
+/// the same `enforceable` verdict [`list_policies`] reports (decision D2).
 ///
 /// # Errors
 ///
@@ -1038,12 +1229,13 @@ fn create_policy_body(body: Value) -> Result<CreatePolicyInput, ApiError> {
 pub async fn create_policy(
     State(state): State<AppState>,
     body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
+) -> ApiResult<(StatusCode, ApiJson<PolicyView>)> {
     let body: Value = serde_json::from_slice(&body)
         .map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))?;
     let input = create_policy_body(body)?;
     let created = governance::create_policy(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
+    let view = policy_view(&state, created).await;
+    Ok((StatusCode::CREATED, ApiJson(view)))
 }
 
 /// `POST /api/governance/policies` as the router mounts it:
@@ -1057,9 +1249,9 @@ pub async fn create_policy_route(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
+) -> ApiResult<(StatusCode, ApiJson<PolicyView>)> {
     let created = create_policy(State(state.clone()), body).await?;
-    let policy = &created.1.0;
+    let policy = &created.1.0.policy;
     if let Some(cond) =
         crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
     {
@@ -1124,6 +1316,10 @@ pub struct PolicyStatusBody {
 /// enforced, and an enforced one could never be stopped. It takes effect
 /// on the next query — obligations are read from the store each time.
 ///
+/// The response carries `enforceable` too (decision D2): switching a policy
+/// on says nothing about whether the engine can enforce it, and the console
+/// must keep both facts apart when it updates the row.
+///
 /// # Errors
 ///
 /// `400` for a malformed body or any other status; `404` when no policy
@@ -1133,7 +1329,7 @@ pub async fn set_policy_status(
     principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     body: Bytes,
-) -> ApiResult<ApiJson<Policy>> {
+) -> ApiResult<ApiJson<PolicyView>> {
     let body: PolicyStatusBody = parse_body(&body)?;
     if !matches!(body.status.as_str(), "ready" | "draft") {
         return Err(ApiError::BadRequest(
@@ -1165,7 +1361,8 @@ pub async fn set_policy_status(
         )
         .await;
     }
-    Ok(ApiJson(policy))
+    let view = policy_view(&state, policy).await;
+    Ok(ApiJson(view))
 }
 
 /// `DELETE /api/governance/policies/{id}` — remove a policy. An enforced
@@ -1872,6 +2069,237 @@ mod tests {
         assert!(create_policy_body(body).is_ok());
     }
 
+    // ── SEC-61: the policy list says when a policy enforces nothing ─────
+
+    /// A stored policy row, as `lakehouse-store` returns it; the kind and
+    /// conditions are what each test varies.
+    fn stored_policy(kind: &str, conditions: Option<&str>) -> Policy {
+        Policy {
+            id: "11111111-1111-1111-1111-111111111111".to_owned(),
+            name: "mask_customer_email".to_owned(),
+            status: "ready".to_owned(),
+            kind: kind.to_owned(),
+            subjects: "Analyst".to_owned(),
+            resources: "serving.mart_customer".to_owned(),
+            effect: "Permit with obligation".to_owned(),
+            version: 1,
+            owner: "Rina".to_owned(),
+            updated_at: "2026-11-04T00:00:00.000Z".to_owned(),
+            conditions: conditions.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_policy_with_structured_conditions_is_enforceable() {
+        let view = PolicyView::new(
+            stored_policy(
+                "Row filter",
+                Some(r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#),
+            ),
+            None,
+        );
+        assert!(view.enforceable);
+    }
+
+    #[test]
+    fn free_text_conditions_are_not_enforceable() {
+        let view = PolicyView::new(
+            stored_policy("Row filter", Some("Applies broadly, reviewed quarterly")),
+            None,
+        );
+        assert!(
+            !view.enforceable,
+            "the engine skips prose, so the list must not call it enforced"
+        );
+    }
+
+    #[test]
+    fn a_policy_with_no_conditions_is_not_enforceable() {
+        let view = PolicyView::new(stored_policy("Retention", None), None);
+        assert!(!view.enforceable);
+    }
+
+    #[test]
+    fn an_agent_autonomy_policy_is_not_enforceable() {
+        // Agent autonomy is enforced by nothing in the workspace; free-text
+        // prose is all such a policy can carry today.
+        let view = PolicyView::new(
+            stored_policy(
+                "Agent autonomy",
+                Some("Agents may act without approval on serving tables"),
+            ),
+            None,
+        );
+        assert!(!view.enforceable);
+    }
+
+    #[test]
+    fn the_policy_wire_shape_keeps_the_row_and_adds_enforceable() {
+        let view = PolicyView::new(
+            stored_policy(
+                "Row filter",
+                Some(r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#),
+            ),
+            None,
+        );
+        let wire = serde_json::to_value(&view).expect("a PolicyView serializes");
+        assert_eq!(wire["enforceable"], json!(true));
+        assert_eq!(wire["name"], json!("mask_customer_email"));
+        assert_eq!(wire["updatedAt"], json!("2026-11-04T00:00:00.000Z"));
+        assert_eq!(wire["status"], json!("ready"));
+    }
+
+    // ── WEB-3 S3a-D4: no invented classification ────────────────────────
+
+    #[test]
+    fn a_registry_tier_that_is_a_level_is_reported_as_that_level() {
+        let row = registry_classification("orders", "commerce_orders", "confidential")
+            .expect("a level is reported");
+        assert_eq!(
+            row["classification"],
+            json!("confidential"),
+            "the dataset's own tier, never a hardcoded \"internal\": {row}"
+        );
+        assert_eq!(row["id"], json!("c-orders"));
+        assert_eq!(row["confidence"], json!(1));
+        assert_eq!(row["reviewStatus"], json!("auto"));
+    }
+
+    /// The key the stored classification rules use for a Bronze table
+    /// (`lineageKey`), so the console can match the two.
+    #[test]
+    fn a_registry_row_is_keyed_the_way_stored_rules_key_a_table() {
+        assert_eq!(
+            registry_classification("orders", "commerce_orders", "internal")
+                .expect("a level is reported")["asset"],
+            json!("bronze.commerce_orders")
+        );
+        // No table name in the registry: the slug is what the catalog shows,
+        // and what a rule written on that page uses.
+        assert_eq!(
+            registry_classification("orders", "", "internal").expect("a level is reported")["asset"],
+            json!("orders")
+        );
+    }
+
+    /// Every seeded dataset carries `primer` (and the secondary registry
+    /// `sekunder`), which is where data comes from, not how sensitive it is:
+    /// reporting a level for it would be an invented value.
+    #[test]
+    fn a_source_tier_is_not_a_classification_and_reports_nothing() {
+        for tier in ["primer", "sekunder", "", "PRIMER", "internal-ish"] {
+            assert_eq!(
+                registry_classification("orders", "commerce_orders", tier),
+                None,
+                "{tier} names no classification level"
+            );
+        }
+    }
+
+    #[test]
+    fn every_product_level_is_accepted() {
+        for level in CLASSIFICATION_LEVELS {
+            assert!(
+                registry_classification("slug", "table", level).is_some(),
+                "{level} is one of the console's levels"
+            );
+        }
+    }
+
+    // ── WEB-3 S3a-D1: a policy says which table page it belongs to ──────
+
+    #[test]
+    fn a_silver_or_serving_table_is_its_own_asset_id() {
+        for table in ["serving.mart_customer", "silver.orders_enriched"] {
+            let conditions =
+                format!(r#"{{"roles":["Analyst"],"table":"{table}","mask":["email"]}}"#);
+            assert_eq!(
+                PolicyAsset::of(Some(&conditions)),
+                Some(PolicyAsset::Table(table.to_owned())),
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bronze_table_asks_the_registry_for_its_slug() {
+        assert_eq!(
+            PolicyAsset::of(Some(
+                r#"{"roles":["Analyst"],"table":"bronze.commerce_orders","mask":["card_last4"]}"#
+            )),
+            Some(PolicyAsset::Bronze("commerce_orders".to_owned()))
+        );
+    }
+
+    #[test]
+    fn absent_conditions_name_no_asset() {
+        assert_eq!(PolicyAsset::of(None), None);
+    }
+
+    #[test]
+    fn free_text_conditions_name_no_asset() {
+        assert_eq!(
+            PolicyAsset::of(Some("Applies broadly, reviewed quarterly")),
+            None
+        );
+    }
+
+    /// The third unparseable shape: JSON-looking but truncated. The engine's
+    /// parser gives up rather than guessing, so no table is named and no
+    /// asset id is invented from a substring.
+    #[test]
+    fn malformed_conditions_name_no_asset() {
+        for conditions in [
+            r#"{"roles":["Analyst"],"table":"serving.mart_customer","#,
+            r#"{"roles":["Analyst"],"table":}"#,
+            "{",
+        ] {
+            assert_eq!(PolicyAsset::of(Some(conditions)), None, "{conditions}");
+        }
+    }
+
+    #[test]
+    fn a_condition_with_no_obligation_names_no_asset() {
+        // JSON-shaped, but the engine would enforce nothing from it, so the
+        // table it mentions is not a fact about a policy in force.
+        assert_eq!(
+            PolicyAsset::of(Some(
+                r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":[]}"#
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn a_table_no_zone_addresses_name_no_asset() {
+        for conditions in [
+            r#"{"roles":["Analyst"],"table":"core.customer_360","mask":["email"]}"#,
+            r#"{"roles":["Analyst"],"table":"orders","mask":["email"]}"#,
+            r#"{"roles":["Analyst"],"table":"bronze.","mask":["email"]}"#,
+        ] {
+            assert_eq!(PolicyAsset::of(Some(conditions)), None, "{conditions}");
+        }
+    }
+
+    #[test]
+    fn the_wire_shape_omits_an_unknown_asset_id_and_keeps_a_known_one() {
+        let conditions =
+            r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#;
+        let known = PolicyView::new(
+            stored_policy("Row filter", Some(conditions)),
+            Some("serving.mart_customer".to_owned()),
+        );
+        let wire = serde_json::to_value(&known).expect("a PolicyView serializes");
+        assert_eq!(wire["assetId"], json!("serving.mart_customer"));
+
+        let unknown = PolicyView::new(stored_policy("Row filter", Some(conditions)), None);
+        let wire = serde_json::to_value(&unknown).expect("a PolicyView serializes");
+        assert!(
+            wire.get("assetId").is_none(),
+            "an unknown asset id is absent, never a fabricated value"
+        );
+    }
+
     // ── WS7 item A5: real policy impact preview ─────────────────────────
 
     #[test]
@@ -2195,6 +2623,94 @@ mod tests {
         assert_eq!(severity_of("fail"), "high");
         assert_eq!(severity_of("warn"), "medium");
         assert_eq!(severity_of("pass"), "info");
+    }
+
+    /// `GET /api/governance/replication` against a `ClickHouse` stub that
+    /// answers every query with `status` and `body`; returns the route's
+    /// status and JSON body.
+    async fn replication_route_answer(ch: Option<(u16, &str)>) -> (StatusCode, Value) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let server = wiremock::MockServer::start().await;
+        let mut env = std::collections::HashMap::new();
+        match ch {
+            Some((status, body)) => {
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(status).set_body_string(body.to_owned()),
+                    )
+                    .mount(&server)
+                    .await;
+                env.insert("CH_URL".to_owned(), server.uri());
+            }
+            // Nothing listens on port 1: `ClickHouse` is down.
+            None => {
+                env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+            }
+        }
+        let cfg = crate::config::Config::from_map(&env).unwrap();
+        let router = axum::Router::new()
+            .route("/api/governance/{kind}", axum::routing::get(get))
+            .with_state(AppState::new(cfg));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/governance/replication")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// WEB-3 review R1: before any CDC connector has run,
+    /// `bronze_meta.replication_slot` does not exist. That is "no slots", a
+    /// 200 with an empty list, not an outage on a fresh install.
+    #[tokio::test]
+    async fn replication_route_answers_an_empty_list_when_the_slot_table_does_not_exist() {
+        let (status, body) = replication_route_answer(Some((
+            404,
+            "Code: 60. DB::Exception: Unknown table expression identifier \
+             'lake.bronze_meta.replication_slot' in scope SELECT connector_id FROM \
+             lake.`bronze_meta.replication_slot`. (UNKNOWN_TABLE)",
+        )))
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "replicationSlots": [] }));
+    }
+
+    /// WEB-3 review R1: the empty list is for the missing table only.
+    /// `ClickHouse` being unreachable is still a 503.
+    #[tokio::test]
+    async fn replication_route_is_503_when_clickhouse_is_down() {
+        let (status, body) = replication_route_answer(None).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.get("replicationSlots").is_none());
+    }
+
+    /// WEB-3 review R1: another engine error (here a permission error,
+    /// `ACCESS_DENIED`, code 497) is still a 503, and a body that merely
+    /// mentions `UNKNOWN_TABLE` without the code does not count: the
+    /// decision is the code, never the text.
+    #[tokio::test]
+    async fn replication_route_is_503_for_any_other_clickhouse_error() {
+        for body in [
+            "Code: 497. DB::Exception: default: Not enough privileges. (ACCESS_DENIED)",
+            "UNKNOWN_TABLE",
+        ] {
+            let (status, _) = replication_route_answer(Some((500, body))).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        }
     }
 
     /// The bug this guards: `active` is `UInt8`, so `ClickHouse` renders it as
@@ -2696,7 +3212,7 @@ mod tests {
 
         use super::*;
         use crate::routes::bronze_registry_fixture::{
-            clickhouse, seed_catalog, seed_sync_with_author,
+            clickhouse, seed_catalog_with_tier, seed_sync_with_author,
         };
 
         /// The rows of the list that classify `slug`.
@@ -2711,18 +3227,21 @@ mod tests {
         }
 
         /// A slug the two registries both hold: one dataset, one
-        /// classification, and the PRIMARY's title.
+        /// classification, and the PRIMARY's table and tier (both rows carry
+        /// a level as their tier, so each one would be reported; only the
+        /// primary may be).
         #[tokio::test]
         async fn the_classification_list_shows_a_slug_that_is_in_both_registries_once() {
             let (url, _container) = clickhouse().await;
             let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
 
-            seed_catalog(
+            seed_catalog_with_tier(
                 &ch,
                 "bronze_meta",
                 "clash_gov",
                 "Primary governance",
                 "clash_gov_raw",
+                "confidential",
             )
             .await;
             seed_sync_with_author(
@@ -2735,12 +3254,13 @@ mod tests {
                 "primary_team",
             )
             .await;
-            seed_catalog(
+            seed_catalog_with_tier(
                 &ch,
                 "bronze_meta_sec",
                 "clash_gov",
                 "Secondary governance",
                 "clash_gov_sec_raw",
+                "restricted",
             )
             .await;
             seed_sync_with_author(
@@ -2759,9 +3279,51 @@ mod tests {
             assert_eq!(rows.len(), 1, "one dataset, one classification: {rows:?}");
             assert_eq!(
                 rows[0]["asset"],
-                json!("Primary governance"),
-                "the primary's title, not the secondary's: {rows:?}"
+                json!("bronze.clash_gov_raw"),
+                "the primary's table, not the secondary's: {rows:?}"
             );
+            assert_eq!(
+                rows[0]["classification"],
+                json!("confidential"),
+                "the primary's tier, not the secondary's: {rows:?}"
+            );
+        }
+
+        /// `WEB-3` S3a-D1: a Bronze policy's asset id is its registry slug,
+        /// read through the same reader the catalog uses; a table no
+        /// registry row names has none, and a Silver table needs no registry
+        /// at all.
+        #[tokio::test]
+        async fn a_bronze_policy_names_the_registry_slug_of_its_table() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+            seed_catalog_with_tier(
+                &ch,
+                "bronze_meta",
+                "policy_orders",
+                "Policy orders",
+                "policy_orders_raw",
+                "primer",
+            )
+            .await;
+
+            let conditions = |table: &str| {
+                Some(format!(
+                    r#"{{"roles":["Analyst"],"table":"{table}","mask":["email"]}}"#
+                ))
+            };
+            let registered = conditions("bronze.policy_orders_raw");
+            let unknown = conditions("bronze.no_such_table");
+            let silver = conditions("silver.orders");
+            let policies = vec![
+                stored_policy("Column mask", registered.as_deref()),
+                stored_policy("Column mask", unknown.as_deref()),
+                stored_policy("Column mask", silver.as_deref()),
+            ];
+            let ids = PolicyView::asset_ids(&ch, &policies).await;
+            assert_eq!(ids[0], Some("policy_orders".to_owned()), "the slug");
+            assert_eq!(ids[1], None, "no registry row names it: no invented page");
+            assert_eq!(ids[2], Some("silver.orders".to_owned()), "the table itself");
         }
 
         /// A slug a second run wrote again is classified once, not twice.
@@ -2782,21 +3344,23 @@ mod tests {
             .await
             .expect("stop the merges of the catalog table");
 
-            seed_catalog(
+            seed_catalog_with_tier(
                 &ch,
                 "bronze_meta",
                 "twice_gov",
                 "Twice governance",
                 "twice_gov_raw",
+                "internal",
             )
             .await;
             // The same run again, before `ClickHouse` merged the parts.
-            seed_catalog(
+            seed_catalog_with_tier(
                 &ch,
                 "bronze_meta",
                 "twice_gov",
                 "Twice governance again",
                 "twice_gov_raw",
+                "internal",
             )
             .await;
 

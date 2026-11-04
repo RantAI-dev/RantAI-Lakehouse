@@ -159,11 +159,13 @@ export function lineageCount(a: AssetDetail, state: AssetLineageState): number {
   )
 }
 
-function dependentHref(id: string, kind: string) {
+function dependentHref(id: string, kind: string): string | null {
   const k = kind.toLowerCase()
   const ref = encodeURIComponent(id)
   if (k.includes("pipeline")) return `/pipelines/${ref}`
-  if (k.includes("agent")) return `/agents/employees/${ref}`
+  // WEB-3 D7: an agent dependent is plain text — the digital-employee detail
+  // page it used to open was removed, and a run is reached from its approval.
+  if (k.includes("agent")) return null
   if (k.includes("dashboard")) return `/dashboards?board=${ref}`
   if (k.includes("query")) return `/query-studio?saved=${ref}`
   return `/data/assets/${ref}`

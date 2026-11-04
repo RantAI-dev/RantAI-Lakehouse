@@ -26,7 +26,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { cn } from "@/lib/utils"
-import { visibleNavGroups, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
+import { NAV_GROUPS, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
 
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
@@ -51,15 +51,12 @@ type FlyoutState = { label: string; top: number; left: number } | null
  *    sub-pages to the right, since there is no room to show them in place.
  *
  * A 1-item group always links directly — nothing to open.
- *
- * A section whose pages are ALL still mock renders disabled with a
- * "Soon" badge (see `comingSoon` in nav-config), not hidden.
  */
 export function AppSidebar() {
   const router = useRouter()
   const pathname = usePathname()
   const activeHref = activeNavHref(pathname)
-  const groups = visibleNavGroups()
+  const groups = NAV_GROUPS
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
   const { user } = useAuth()
@@ -155,39 +152,9 @@ export function AppSidebar() {
     const first = group.items[0]
     const Icon = group.icon ?? first.icon
     // A group declared with one page shows that page's title, which is the
-    // more descriptive of the two ("AI Copilot" over "AI"). A group that
-    // was REDUCED to one page by the preview filter keeps its own label —
-    // otherwise "Administration" silently renames itself to "Settings"
-    // just because its other four pages are still mocks.
-    const label = single && !group.partiallyHidden ? first.title : group.label
+    // more descriptive of the two ("History" over "History").
+    const label = single ? first.title : group.label
     const active = group.items.some((it) => it.href === activeHref)
-
-    // Every page in this section is still a mock. Shown, but inert — the
-    // alternative was the whole section vanishing with no explanation.
-    if (group.comingSoon) {
-      return (
-        <SidebarMenuItem key={group.label}>
-          <div
-            title={`${group.label} — coming soon`}
-            aria-disabled
-            className={cn(
-              "flex h-8 cursor-default items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-sidebar-foreground/40",
-              iconMode && "justify-center px-0"
-            )}
-          >
-            <Icon className="size-4 shrink-0" />
-            {!iconMode ? (
-              <>
-                <span className="flex-1 truncate">{group.label}</span>
-                <span className="rounded bg-sidebar-accent px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-sidebar-foreground/50">
-                  Soon
-                </span>
-              </>
-            ) : null}
-          </div>
-        </SidebarMenuItem>
-      )
-    }
 
     // One page, or icon mode with one page: nothing to expand.
     if (single) {

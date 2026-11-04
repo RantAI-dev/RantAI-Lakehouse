@@ -21,6 +21,7 @@ mod chart_alerts;
 // the drift the one definition exists to prevent.
 pub(crate) mod authored_pipelines;
 mod calc_fields;
+mod capture_lag;
 // `pub(crate)`, not private: `main.rs` starts the background build of the
 // catalog search copy at start-up (`DATA-41` D4), so it names
 // `catalog::spawn_startup_search_copy`.
@@ -643,8 +644,10 @@ fn governance_static_router() -> Router<AppState> {
             get(quality_schedules::list_schedules),
         )
         .route(
+            // WEB-3 S3a-D3: a table's own schedule, or its absence (the
+            // default every 60 minutes).
             "/api/governance/quality/schedules/{asset}",
-            put(quality_schedules::put_schedule),
+            put(quality_schedules::put_schedule).delete(quality_schedules::delete_schedule),
         )
         // DATA-14 (F5): whether a table's anomalies are being raised yet.
         .route(
@@ -803,10 +806,6 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
             axum::routing::post(connector_discovery::start).get(connector_discovery::poll),
         )
         .route(
-            "/api/connectors/{id}/debezium-properties",
-            get(connectors::debezium_properties),
-        )
-        .route(
             "/api/connectors/{id}/ingest-spec",
             get(connectors::ingest_spec_get).put(connectors::ingest_spec_put),
         )
@@ -825,6 +824,16 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/connectors/{id}/resume",
             axum::routing::post(connector_runs::resume),
+        )
+        // `SRC-4` slice 2 (S2-e, S2-h): a person's pause, and the state of a
+        // change-capture connector in Kafka Connect.
+        .route(
+            "/api/connectors/{id}/pause",
+            axum::routing::post(connector_runs::pause),
+        )
+        .route(
+            "/api/connectors/{id}/change-capture",
+            get(connector_runs::change_capture),
         )
         // `SRC-12` part C: signing a REST connector in with `OAuth2`, for a
         // person with `connector:manage` on a connector of their own tenant.
@@ -851,6 +860,29 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
             state.clone(),
             connectors::require_connector_in_tenants,
         ))
+}
+
+/// The change-capture lag routes (`SRC-4` slice 4), merged into
+/// [`connectors_router`] and split from it for `clippy::too_many_lines`. The orchestrator's
+/// observations sit outside the tenant gate (a service identity belongs to no
+/// tenant; the handler checks `schema_changes::require_orchestrator`); a
+/// person's lag limit sits behind it.
+fn capture_lag_router(state: &AppState) -> Router<AppState> {
+    let gated = Router::new()
+        .route(
+            "/api/connectors/{id}/lag-limit",
+            put(capture_lag::set_limit),
+        )
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            connectors::require_connector_in_tenants,
+        ));
+    Router::new()
+        .route(
+            "/api/connectors/{id}/capture/observations",
+            post(capture_lag::observe),
+        )
+        .merge(gated)
 }
 
 /// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
@@ -957,6 +989,7 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             )),
         )
         .merge(per_connector)
+        .merge(capture_lag_router(state))
 }
 
 /// The `/api/uploads/*` sub-router (ADR 0014, plan T6), shaped like
@@ -1120,6 +1153,12 @@ fn identity_router() -> Router<AppState> {
         .route(
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),
+        )
+        // WEB-3 S3a-D2: a role can be rewritten and removed. `{id}` is
+        // validated inside each handler (404 on an unknown or malformed id).
+        .route(
+            "/api/identity/roles/{id}",
+            axum::routing::put(identity::update_role).delete(identity::delete_role),
         )
         .route(
             "/api/identity/tenants",

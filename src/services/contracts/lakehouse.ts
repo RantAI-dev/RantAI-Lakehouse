@@ -11,24 +11,6 @@
  */
 import type { Measured } from "@/lib/measured"
 
-export type LakehouseWarehouse = {
-  id: string
-  name: string
-  /**
-   * Reported by the Management API only, which this service's reader
-   * identity cannot call — always `null` today, kept typed loosely (not
-   * `string | null`) so a future real value isn't forced into the wrong
-   * shape.
-   */
-  storageProfile: unknown
-  /**
-   * Nothing on this service proves Lakekeeper actually vends credentials
-   * for this warehouse's storage profile — always `null` today.
-   */
-  credentialVending: unknown
-  reachable: boolean
-}
-
 export type LakehouseNamespace = {
   name: string
   /** `null` when the per-namespace table listing did not finish in budget. */
@@ -225,7 +207,6 @@ export type LakehouseCapacity = {
 }
 
 export interface LakehouseService {
-  listWarehouses(signal?: AbortSignal): Promise<LakehouseWarehouse[]>
   getCapacity(signal?: AbortSignal): Promise<LakehouseCapacity>
   listNamespaces(warehouse?: string, signal?: AbortSignal): Promise<LakehouseNamespace[]>
   listTables(

@@ -519,7 +519,7 @@ describe("opening a column", () => {
     expect(fact(panel, "Description")).toBe("Plant code")
     expect(fact(panel, "Partitioned by")).toBe("This column (identity)")
     expect(fact(panel, "Sorted by")).toBe("This column")
-    expect(fact(panel, "Masked")).toBe("Yes")
+    expect(fact(panel, "Masked for you")).toBe("Yes")  // WEB-3 S3-D1: masked means masked for the viewer
     expect(fact(panel, "Classification")).toBe("Confidential")
   })
 

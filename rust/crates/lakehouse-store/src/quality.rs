@@ -444,8 +444,23 @@ pub async fn put_schedule(
     )
 }
 
-// ── Load history ───────────────────────────────────────────────────────
+/// Removes a table's schedule, so it runs every
+/// [`DEFAULT_INTERVAL_MINUTES`] again. Returns how many rows went (0 or 1): a
+/// table with no schedule row is already on the default, which is the
+/// outcome the caller asked for, so that is not an error.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the delete fails.
+pub async fn delete_schedule(pool: &PgPool, asset: &str) -> Result<u64, StoreError> {
+    let done = sqlx::query("DELETE FROM quality_schedule WHERE asset = $1")
+        .bind(asset.trim().to_lowercase())
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
+}
 
+// ── Load history ───────────────────────────────────────────────────────
 /// How long a load is kept, in days (the spec's history for learning).
 pub const LOAD_RETENTION_DAYS: i32 = 90;
 
