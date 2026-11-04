@@ -32,10 +32,11 @@
 //! # Read/create, and the ADM-4 mutations
 //!
 //! `IdentityService` (the contract) declares four list methods, one
-//! settings getter, and four creates — no update and no delete. The
-//! functions below cover exactly that surface plus `get_*` (needed to
-//! re-read a row after insert) and `delete_*` (needed to make a seeded or
-//! test-created row removable, and exercised by `tests/identity.rs`).
+//! settings getter, and four creates — no update beyond roles and no
+//! delete. The functions below cover exactly that surface plus `get_*`
+//! (needed to re-read a row after insert) and `delete_*` (needed to make a
+//! seeded or test-created row removable, and exercised by `tests/identity.rs`).
+//! `update_role` and `delete_role`'s console route are `WEB-3` S3a-D2.
 //!
 //! ADM-4 adds the mutations the console needs to change what a user may
 //! do — a user's role set, a user's tenant membership, and a user's
@@ -805,6 +806,78 @@ pub async fn delete_role(pool: &PgPool, id: &str) -> Result<(), StoreError> {
         return Err(StoreError::NotFound);
     }
     Ok(())
+}
+
+/// The roles `0002_seed_identity.sql` creates: the product's built-in
+/// permission bundles, which a deployment starts with and which
+/// `DELETE /api/identity/roles/{id}` refuses (`WEB-3` S3a-D2).
+///
+/// The seed's fixed ids are the only marker it writes — there is no
+/// `system` column — and they are what this list pins. Ids, not names, so a
+/// rename (`update_role`) never turns a built-in role into a removable one.
+pub const BUILT_IN_ROLE_IDS: [&str; 7] = [
+    "22222222-2222-4222-8222-000000000001",
+    "22222222-2222-4222-8222-000000000002",
+    "22222222-2222-4222-8222-000000000003",
+    "22222222-2222-4222-8222-000000000004",
+    "22222222-2222-4222-8222-000000000005",
+    "22222222-2222-4222-8222-000000000006",
+    "22222222-2222-4222-8222-000000000007",
+];
+
+/// Whether `id` is one of [`BUILT_IN_ROLE_IDS`] (compared lower-cased, as
+/// [`Role::id`] renders a UUID).
+#[must_use]
+pub fn is_built_in_role(id: &str) -> bool {
+    let id = id.trim().to_lowercase();
+    BUILT_IN_ROLE_IDS.contains(&id.as_str())
+}
+
+/// Everything [`update_role`] needs. Mirrors `UpdateRoleInput`.
+#[derive(Debug, Clone)]
+pub struct UpdateRoleInput {
+    /// The role's new name; must not collide with another role's.
+    pub name: String,
+    /// Free-text permission list.
+    pub permissions: String,
+    /// Human-readable description.
+    pub description: String,
+}
+
+/// Rewrite a role's name, permissions and description, returning it as the
+/// list shows it (with its current member count).
+///
+/// Memberships join by id, so a rename reaches every user who holds the
+/// role at their next request. A policy's `subjects` is free text and is
+/// NOT rewritten: after a rename, a policy that named the old name stops
+/// applying to that role (the console's Access rules page shows the stored
+/// text, so the old name stays visible).
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no role has that id (including an id
+/// that is not a UUID), [`StoreError::Conflict`] (409) if another role has
+/// the name, or [`StoreError::Database`] on any other failure.
+pub async fn update_role(
+    pool: &PgPool,
+    id: &str,
+    input: &UpdateRoleInput,
+) -> Result<Role, StoreError> {
+    let affected = sqlx::query(
+        "UPDATE role SET name = $2, permissions = $3, description = $4, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(parse_id(id)?)
+    .bind(&input.name)
+    .bind(&input.permissions)
+    .bind(&input.description)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if affected == 0 {
+        return Err(StoreError::NotFound);
+    }
+    get_role(pool, id).await
 }
 
 // ── Tenant ──────────────────────────────────────────────────────────────

@@ -236,7 +236,11 @@ function PolicyItem({
         {p.appliesToYou ? <Pill tone="info">Applies to you</Pill> : null}
         <span className="ml-auto text-xs text-muted-foreground">{p.effect}</span>
         <PolicyActions
-          policy={{ id: p.id, name: p.name, status: p.status ?? "draft" }}
+          // Every `policySummary` entry passed `PolicyCondition::parse_opt`
+          // in `routes::catalog_governance::summarize_policies` — a policy
+          // with no enforceable condition binds no table and is left out —
+          // so these rows are enforceable by construction.
+          policy={{ id: p.id, name: p.name, status: p.status ?? "draft", enforceable: true }}
           onChanged={onChanged}
         />
       </div>
