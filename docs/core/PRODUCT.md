@@ -135,7 +135,7 @@ hands-on testing.
 | --- | --- | --- | --- |
 | Pipelines with schedules, dependencies, retries, alerts, version history | **Have**. A pipeline reads Bronze (Iceberg) tables since `BLD-3` (PR #155), proven by gate `g7` in CI | Yes | — |
 | Transformations authored in the console | **Partial.** Five operations: dedupe, filter, rename, cast, select. Joins and aggregations are written as SQL outside the builder | Yes: full SQL, visual and code | Richer transformations |
-| Tables that refresh themselves when their inputs change | **Missing.** Not found; pipelines that run after their upstreams are the nearest thing | Yes (Dynamic Tables, materialized views) | Yes |
+| Tables that refresh themselves when their inputs change | **Partial.** A pipeline keeps its table within a target lag (`BLD-2`, #194, merged, not accepted); dashboards do not refresh themselves yet | Yes (Dynamic Tables, materialized views) | Accept `BLD-2`; near real-time end to end (`DATA-44`) |
 | Notebooks, Python, Spark | **Missing** | Yes, all three | Large; decide if wanted |
 | Works with dbt | **Missing** | Yes | Decide if wanted |
 
@@ -145,7 +145,7 @@ hands-on testing.
 | --- | --- | --- | --- |
 | SQL editor, saved queries, result download | **Partial.** Autocomplete knows table names only; 2,000 rows shown; saved queries cannot be edited or shared; downloads are a browser CSV | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-1` to `QS-4` |
 | Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct in Data Explorer's Schema tab. | Yes, inside the user's permissions | `AI-16` |
-| Scale out across servers | **Missing.** One server | Yes: elastic | Modest multi-server is a goal |
+| Scale out across servers | **Missing.** One server | Yes: elastic | Wanted later (product owner, 2026-11-04; `OPS-3`) |
 | Query other systems in place, without loading | **Missing** | Yes | Yes |
 
 #### Governance
