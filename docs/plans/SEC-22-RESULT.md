@@ -48,6 +48,8 @@ cannot catch an abort.
 The `.xls` reader does not read the shared-string table's count (`calamine` 0.37, `src/xls.rs`,
 `parse_sst`), so a false count there costs nothing.
 
+**2026-11-04:** calamine is 0.38; the code paths these numbers measure are unchanged (`src/xlsx/mod.rs` still reserves from `uniqueCount`; `src/xls.rs` `parse_sst` still skips `cstTotal`/`cstUnique`).
+
 ## 2. Which limit (T2, debug build, the same VM)
 
 | limit set by the child on itself | valid workbook | `huge_shared_strings.xlsx` |
