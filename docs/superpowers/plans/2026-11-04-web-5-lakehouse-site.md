@@ -631,6 +631,56 @@ measured.
   `<img>` each, the same SVG as a data URI or a static file, with no
   design change. It is not done here; R5 asked to record.
 
+### Handoff 4: developer (Opus), 2026-11-04, review 3 (R6)
+
+**Commit:** `66606e38` WEB-5 review fix R6 (base `2e5468b6`), pushed.
+
+**What changed.**
+- The dot map and the calendar heatmap are one `<img>` each:
+  `public/tiles/dot-map.svg` and `calendar-heatmap.svg`, with the tile's
+  aria text as `alt` and an explicit 360×190 size. A plain `<img>`, because
+  `next/image` is a client component.
+- `src/lib/tile-svg.ts` is the single drawing (the same shapes and numbers
+  as before), and `bun run tiles` writes the files.
+- `tile-svg.test.ts` fails if the committed files drift from the
+  generator. It also checks 280 circles, 140 rects and the viewBox.
+- A page has 670 elements, down from 1,088.
+
+**Measured, interleaved** against `382c190d`:
+- `npx serve` on :3461 (before) and :3460 (R6); :3400 was not touched;
+- three rounds of pre-EN, R6-EN, pre-ID, R6-ID with the RESULT's
+  Lighthouse command, VM load 2.5–8.3.
+
+| Metric | Before | R6 |
+| --- | --- | --- |
+| EN TBT median | 202.5 ms | **197.8 ms** (runs 182 / 242 / 198) |
+| ID TBT median | 191.5 ms | **140.1 ms** (runs 195 / 101 / 140) |
+
+- LCP is about 1.07 s, CLS 0, and SEO, accessibility and best practices
+  100 in all 12 runs.
+- EN is under 200 ms, by less than the spread between runs.
+- The medians are in `WEB-5-RESULT.md`, "Update: review fix R6"; the
+  reviewer's sections are untouched.
+
+**D6, pixel-identical: not met exactly.**
+- Lossless CDP PNG captures of each tile on both builds, scrolled into
+  view, compared pixel by pixel. At 1440 @1x, 4,315 and 3,483 of 72,150
+  pixels differ (map, calendar), max channel delta 53 and 49. The shares
+  are similar at 1440 @2x and at 390 @2x.
+- A 4× zoom with a difference mask shows only the antialiased rims of the
+  dots and cells differ. Fills, colours, positions and the box size
+  (370 × 195.27 px at 1440) are identical, so there is no layout shift.
+- The likely cause: Chrome rasterizes SVG-as-image differently from inline
+  SVG when it scales the viewBox to a fractional box.
+- I could not make an `<img>` match exactly. The owner judges the rims at
+  QA; reverting `66606e38` restores the inline tiles.
+
+**Commands and counts.**
+- Site block on the final code: lint 0, typecheck 0, `bun run test`
+  49 pass, 0 fail, build 0, `bun run size` 0 (178.6 KB).
+- The scratch worktree is removed, and my servers on :3460, :3461 and
+  :9555 are stopped. `git status` is clean.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
