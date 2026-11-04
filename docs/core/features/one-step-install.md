@@ -33,6 +33,10 @@
 6. Back up and restore on demand, to local disk or S3.
 7. See the version in the console, and be told when the console and server versions differ.
 
+The installer writes the `.env` itself: a generated value for every secret,
+`COMPOSE_PROFILES=dagster`, and `CATALOG_TENANT_ID` naming the group tenant, so
+a fresh install runs its scheduled work without a hand edit (`REL-10`).
+
 ## Decisions
 
 See the spec's "Decisions the product owner makes", and the plan's D5 to D12.
