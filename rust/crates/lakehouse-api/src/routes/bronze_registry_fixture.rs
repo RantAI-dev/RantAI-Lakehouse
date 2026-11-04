@@ -131,13 +131,37 @@ pub(crate) async fn seed_catalog(
     title: &str,
     table_name: &str,
 ) {
+    // The tier a real ingest writes (`bronze_catalog.py`'s
+    // `register_bronze_table`).
+    seed_catalog_with_tier(ch, registry, slug, title, table_name, "primer").await;
+}
+
+/// One catalog row with its own `tier`.
+///
+/// `WEB-3` S3a-D4: the classification list reports a registry dataset only
+/// when its tier is one of the product's classification levels, and a real
+/// ingest writes `primer`, so a test of that reader needs to write the other
+/// kind of tier. Kept beside [`seed_catalog`] rather than copied.
+///
+/// # Panics
+///
+/// Panics when the engine refuses the insert.
+pub(crate) async fn seed_catalog_with_tier(
+    ch: &ChClient,
+    registry: &str,
+    slug: &str,
+    title: &str,
+    table_name: &str,
+    tier: &str,
+) {
     let slug = SqlLiteral::from(slug);
     let title = SqlLiteral::from(title);
     let table_name = SqlLiteral::from(table_name);
+    let tier = SqlLiteral::from(tier);
     let sql = format!(
         "INSERT INTO lake.`{registry}.dataset_catalog` \
          (slug, title, description, tier, updated_at, table_name) \
-         VALUES ({slug}, {title}, 'the dataset', 'primer', '2026-11-01T00:00:00Z', {table_name})"
+         VALUES ({slug}, {title}, 'the dataset', {tier}, '2026-11-01T00:00:00Z', {table_name})"
     );
     ch.exec(&sql, None).await.expect("seed the catalog row");
 }

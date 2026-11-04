@@ -43,8 +43,9 @@ enum Kind {
     Quality,
     /// `governance/audit` — recent `Dagster` runs as audit events.
     Audit,
-    /// `governance/classification` — per-asset classification (currently
-    /// always `"internal"`).
+    /// `governance/classification` — per-asset classification: the authored
+    /// rules, plus a registry row only when a dataset's `tier` is one of the
+    /// product's levels (`WEB-3` S3a-D4; the seeded tiers are not).
     Classification,
     /// `governance/residency` — static tenant residency policy.
     ///
@@ -432,6 +433,47 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
     Ok(json!({ "audit": audit }))
 }
 
+/// The product's classification levels: the four the console's badge shows
+/// (`src/lib/status.ts` `CLASSIFICATION_LABEL`) and the four
+/// `classification_rule`'s `CHECK` accepts (`0003_governance.sql`). A
+/// registry `tier` is a SOURCE tier, not a level: `register_bronze_table`
+/// writes `primer` and the secondary registry is `sekunder`
+/// (`dagster/dispar_orchestrate/bronze_catalog.py`), so no seeded dataset
+/// produces a derived classification row — see [`registry_classification`]
+/// (`WEB-3` S3a-D4).
+const CLASSIFICATION_LEVELS: [&str; 4] = ["public", "internal", "confidential", "restricted"];
+
+/// One classification row derived from a registry dataset, or `None` when
+/// its `tier` is not one of [`CLASSIFICATION_LEVELS`] (`WEB-3` S3a-D4).
+///
+/// The row's `asset` is the key the stored classification rules use for that
+/// dataset — `lineageKey` in `src/features/catalog/asset-lineage.tsx`: a
+/// Bronze table is `bronze.<table_name>` while the registry has a table name
+/// for it, and the slug otherwise. A registry row with a real level as its
+/// tier is then matched by the catalog like an authored rule; `primer` and
+/// `sekunder` are not levels and produce no row at all, rather than the
+/// hardcoded `"internal"` this list used to show for every dataset.
+///
+/// Pure, so the rule is testable without `ClickHouse`; `title` is not part of
+/// the `ClassificationRule` contract, so it is not carried into the row.
+fn registry_classification(slug: &str, table_name: &str, tier: &str) -> Option<Value> {
+    if !CLASSIFICATION_LEVELS.contains(&tier) {
+        return None;
+    }
+    let asset = if table_name.is_empty() {
+        slug.to_owned()
+    } else {
+        format!("bronze.{table_name}")
+    };
+    Some(json!({
+        "id": format!("c-{slug}"),
+        "asset": asset,
+        "classification": tier,
+        "confidence": 1,
+        "reviewStatus": "auto",
+    }))
+}
+
 /// **Gap fix** — same shape as [`quality`], unioning authored classification
 /// rules onto the `ClickHouse`-derived per-asset list.
 ///
@@ -449,27 +491,31 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
 /// the background. Without it a slug a second run registered was
 /// classified twice.
 ///
+/// `WEB-3` S3a-D4: a registry row is reported only when its `tier` is one of
+/// the product's classification levels (see [`registry_classification`]).
+/// It used to report `"internal"` for every dataset, a level nothing had
+/// assigned; the tiers this deployment writes (`primer`, `sekunder`) are not
+/// levels, so no registry row appears.
+///
 /// The `LIMIT 500` stays where it is — after the last `SELECT` of the
 /// union — so it caps what it capped before (see the plan's D5: in
 /// `ClickHouse` a `LIMIT` after an unparenthesized `UNION ALL` binds to
 /// that last `SELECT`, not to the whole union).
 async fn classification(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
     let sql = format!(
-        "SELECT slug, title, tier FROM lake.`bronze_meta.dataset_catalog` FINAL
-         UNION ALL SELECT slug, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
+        "SELECT slug, table_name, tier FROM lake.`bronze_meta.dataset_catalog` FINAL
+         UNION ALL SELECT slug, table_name, tier FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
          WHERE slug {NOT_IN_PRIMARY} LIMIT 500"
     );
     let rows = ch.rows(&sql, None).await?;
     let mut classifications: Vec<Value> = rows
         .iter()
-        .map(|r| {
-            json!({
-                "id": format!("c-{}", str_col(r, "slug")),
-                "asset": str_col(r, "title"),
-                "classification": "internal",
-                "confidence": 1,
-                "reviewStatus": "auto",
-            })
+        .filter_map(|r| {
+            registry_classification(
+                str_col(r, "slug"),
+                str_col(r, "table_name"),
+                str_col(r, "tier"),
+            )
         })
         .collect();
     if let Some(pg) = pg {
@@ -2088,6 +2134,63 @@ mod tests {
         assert_eq!(wire["status"], json!("ready"));
     }
 
+    // ── WEB-3 S3a-D4: no invented classification ────────────────────────
+
+    #[test]
+    fn a_registry_tier_that_is_a_level_is_reported_as_that_level() {
+        let row = registry_classification("orders", "commerce_orders", "confidential")
+            .expect("a level is reported");
+        assert_eq!(
+            row["classification"],
+            json!("confidential"),
+            "the dataset's own tier, never a hardcoded \"internal\": {row}"
+        );
+        assert_eq!(row["id"], json!("c-orders"));
+        assert_eq!(row["confidence"], json!(1));
+        assert_eq!(row["reviewStatus"], json!("auto"));
+    }
+
+    /// The key the stored classification rules use for a Bronze table
+    /// (`lineageKey`), so the console can match the two.
+    #[test]
+    fn a_registry_row_is_keyed_the_way_stored_rules_key_a_table() {
+        assert_eq!(
+            registry_classification("orders", "commerce_orders", "internal")
+                .expect("a level is reported")["asset"],
+            json!("bronze.commerce_orders")
+        );
+        // No table name in the registry: the slug is what the catalog shows,
+        // and what a rule written on that page uses.
+        assert_eq!(
+            registry_classification("orders", "", "internal").expect("a level is reported")["asset"],
+            json!("orders")
+        );
+    }
+
+    /// Every seeded dataset carries `primer` (and the secondary registry
+    /// `sekunder`), which is where data comes from, not how sensitive it is:
+    /// reporting a level for it would be an invented value.
+    #[test]
+    fn a_source_tier_is_not_a_classification_and_reports_nothing() {
+        for tier in ["primer", "sekunder", "", "PRIMER", "internal-ish"] {
+            assert_eq!(
+                registry_classification("orders", "commerce_orders", tier),
+                None,
+                "{tier} names no classification level"
+            );
+        }
+    }
+
+    #[test]
+    fn every_product_level_is_accepted() {
+        for level in CLASSIFICATION_LEVELS {
+            assert!(
+                registry_classification("slug", "table", level).is_some(),
+                "{level} is one of the console's levels"
+            );
+        }
+    }
+
     // ── WEB-3 S3a-D1: a policy says which table page it belongs to ──────
 
     #[test]
@@ -2992,7 +3095,7 @@ mod tests {
 
         use super::*;
         use crate::routes::bronze_registry_fixture::{
-            clickhouse, seed_catalog, seed_sync_with_author,
+            clickhouse, seed_catalog_with_tier, seed_sync_with_author,
         };
 
         /// The rows of the list that classify `slug`.
@@ -3007,18 +3110,21 @@ mod tests {
         }
 
         /// A slug the two registries both hold: one dataset, one
-        /// classification, and the PRIMARY's title.
+        /// classification, and the PRIMARY's table and tier (both rows carry
+        /// a level as their tier, so each one would be reported; only the
+        /// primary may be).
         #[tokio::test]
         async fn the_classification_list_shows_a_slug_that_is_in_both_registries_once() {
             let (url, _container) = clickhouse().await;
             let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
 
-            seed_catalog(
+            seed_catalog_with_tier(
                 &ch,
                 "bronze_meta",
                 "clash_gov",
                 "Primary governance",
                 "clash_gov_raw",
+                "confidential",
             )
             .await;
             seed_sync_with_author(
@@ -3031,12 +3137,13 @@ mod tests {
                 "primary_team",
             )
             .await;
-            seed_catalog(
+            seed_catalog_with_tier(
                 &ch,
                 "bronze_meta_sec",
                 "clash_gov",
                 "Secondary governance",
                 "clash_gov_sec_raw",
+                "restricted",
             )
             .await;
             seed_sync_with_author(
@@ -3055,8 +3162,13 @@ mod tests {
             assert_eq!(rows.len(), 1, "one dataset, one classification: {rows:?}");
             assert_eq!(
                 rows[0]["asset"],
-                json!("Primary governance"),
-                "the primary's title, not the secondary's: {rows:?}"
+                json!("bronze.clash_gov_raw"),
+                "the primary's table, not the secondary's: {rows:?}"
+            );
+            assert_eq!(
+                rows[0]["classification"],
+                json!("confidential"),
+                "the primary's tier, not the secondary's: {rows:?}"
             );
         }
 
@@ -3078,21 +3190,23 @@ mod tests {
             .await
             .expect("stop the merges of the catalog table");
 
-            seed_catalog(
+            seed_catalog_with_tier(
                 &ch,
                 "bronze_meta",
                 "twice_gov",
                 "Twice governance",
                 "twice_gov_raw",
+                "internal",
             )
             .await;
             // The same run again, before `ClickHouse` merged the parts.
-            seed_catalog(
+            seed_catalog_with_tier(
                 &ch,
                 "bronze_meta",
                 "twice_gov",
                 "Twice governance again",
                 "twice_gov_raw",
+                "internal",
             )
             .await;
 
