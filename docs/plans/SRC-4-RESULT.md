@@ -122,6 +122,17 @@ was set for cost.
 | Source | `postgres:16` at `sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c` |
 | Reader | `clickhouse/clickhouse-server:26.8` at `sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7` |
 
+The rows above are what the measurement ran against and are left as measured.
+**Note (2026-11-04, SRC-4, PR #264 CI):** the Kafka Connect pin moved. Quay no
+longer serves `sha256:d67d678c…` for `quay.io/debezium/connect:3.8`
+(`docker buildx imagetools inspect` answers `not found`), so `docker-compose.yml`
+now pins `quay.io/debezium/connect:3.8@sha256:113aaf1983020e225a30a99daafea1125c4f5d404b90d1f746113641f9061be6`,
+the top-level index digest the `3.8` tag resolves to after that re-push. That
+build reports `DEBEZIUM_VERSION=3.8.0.Alpha1` (its `/kafka/connect` jars are all
+`3.8.0.Alpha1`), where the withdrawn pin's config reported `3.7.0.Final`, so
+this is a version move under an unchanged tag name, not just a digest change.
+**The measurement in this file was not re-run against the new image.**
+
 ## Corrections to the plan found by measuring
 
 1. **Deletes in current mode.** `dlt` 1.30.0's Iceberg merge has no

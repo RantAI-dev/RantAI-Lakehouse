@@ -3400,7 +3400,11 @@ services:
   # `CDC_KAFKA_BOOTSTRAP=kafka:9092` in `.env` to turn change capture on.
   kafka-connect:
     profiles: ["cdc"]
-    image: quay.io/debezium/connect:3.8@sha256:d67d678c726d1659f458e057e4a3a50a3b14c3e85a3be7f31de9db53dfb46668
+    # SRC-4, PR #264 CI: the pinned digest was withdrawn upstream on or before
+    # 2026-11-04, so this is the digest the moving `3.8` tag resolves to now.
+    # That build is 3.8.0.Alpha1; the withdrawn pin was a 3.7.0.Final build
+    # under the same tag (SRC-4-RESULT.md), so its measurement was not re-run.
+    image: quay.io/debezium/connect:3.8@sha256:113aaf1983020e225a30a99daafea1125c4f5d404b90d1f746113641f9061be6
     restart: unless-stopped
     depends_on:
       kafka:
