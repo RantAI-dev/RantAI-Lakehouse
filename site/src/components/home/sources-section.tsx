@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { m, useTransform, type MotionValue } from "motion/react";
+import { m, useTransform, type MotionValue } from "framer-motion";
 import type { HomeCopy } from "@/lib/copy";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
 import { Reveal } from "@/components/shared/reveal";
@@ -36,6 +36,9 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
             // glow of the mascot's eye seen through the water, so it gets a dark
             // backing there (body text stays above 4.5:1 on it).
             className="relative z-10 max-md:rounded-3xl max-md:bg-[#020b2a]/70 max-md:p-4"
+            // Keyed on `reduced`: before motion's features load an `m` element keeps
+            // the style it first rendered (review fix R1), so a switch must remount it.
+            key={reduced ? "reduced" : "motion"}
             style={reduced ? { opacity: 1, y: 0 } : { opacity: headOpacity, y: headY }}
           >
             <DisplayHeading>{copy.headline}</DisplayHeading>

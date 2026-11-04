@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { m } from "motion/react";
+import { m } from "framer-motion";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**

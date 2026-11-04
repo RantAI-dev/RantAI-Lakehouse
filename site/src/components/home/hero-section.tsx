@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { m, useTransform } from "motion/react";
+import { m, useTransform } from "framer-motion";
 import { cn } from "@/lib/utils";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { LINKS } from "@/lib/home-content";
@@ -48,6 +48,9 @@ export function HeroSection({ copy, cta }: { copy: HomeCopy["hero"]; cta: Common
             // no opacity, travel or filter until the live lake runs; the
             // server HTML and the DOM hero carry no style here at all.
             style={live ? { opacity: copyOpacity, y: copyY, filter: copyBlur } : undefined}
+            // Keyed on `live` for the same reason as the reduced-motion keys
+            // (review fix R1): the scroll styles arrive after hydration.
+            key={live ? "live" : "still"}
           >
             {/* WEB-1 review round 1 SHOULD-FIX 4: on a phone the eyebrow sits on the moon's
                 reflection, so it is lighter and carries a dark halo there. */}

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { m } from "motion/react";
+import { m } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
@@ -10,8 +10,9 @@ import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
  *
  * With `prefers-reduced-motion` they are fades only: no travel, no blur,
  * no stagger (plan §2.8). Every revealed node carries `data-reveal`, which
- * `app/globals.css` shows in full until the `js` class is on <html> (WEB-5
- * D5), so the page reads without JavaScript.
+ * `app/globals.css` shows in full until `motion-ready` is on <html> (WEB-5
+ * D5, review fix R1), so the page reads without JavaScript and when the
+ * animation features fail to load.
  */
 
 /** A cubic ease-out with a long tail; the page's default "arrive" curve. */

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { AnimatePresence, m, useReducedMotion } from "motion/react";
+import { AnimatePresence, m, useReducedMotion } from "framer-motion";
 import { Languages, X } from "lucide-react";
 import { usePathname } from "@/i18n/navigation";
 import { localizedPath } from "@/i18n/paths";

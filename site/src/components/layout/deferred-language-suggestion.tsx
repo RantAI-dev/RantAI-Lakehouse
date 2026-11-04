@@ -3,6 +3,7 @@
 import * as React from "react";
 import dynamic from "next/dynamic";
 import { afterPaint } from "@/lib/after-paint";
+import { QuietBoundary } from "@/components/shared/quiet-boundary";
 import type { SuggestionText } from "./language-suggestion";
 
 const LanguageSuggestion = dynamic(() => import("./language-suggestion"), { ssr: false });
@@ -14,7 +15,13 @@ const LanguageSuggestion = dynamic(() => import("./language-suggestion"), { ssr:
  */
 export function DeferredLanguageSuggestion({ text }: Readonly<{ text: SuggestionText }>) {
   const ready = React.useSyncExternalStore(subscribeReady, () => isReady, () => false);
-  return ready ? <LanguageSuggestion text={text} /> : null;
+  if (!ready) return null;
+  // A chunk that fails to load just means no offer (review fix R1).
+  return (
+    <QuietBoundary>
+      <LanguageSuggestion text={text} />
+    </QuietBoundary>
+  );
 }
 
 let isReady = false;

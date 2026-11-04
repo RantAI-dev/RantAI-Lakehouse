@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useMotionValue, type MotionValue } from "motion/react";
+import { useMotionValue, type MotionValue } from "framer-motion";
 import { clamp01 } from "@/lib/scroll-timeline";
 
 /**

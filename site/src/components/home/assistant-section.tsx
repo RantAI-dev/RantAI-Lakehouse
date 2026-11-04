@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { m, useMotionValueEvent, useTransform, type MotionValue } from "motion/react";
+import { m, useMotionValueEvent, useTransform, type MotionValue } from "framer-motion";
 import type { HomeCopy } from "@/lib/copy";
 import { APPROVAL_TARGET, REGIONS } from "@/lib/home-content";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
@@ -79,6 +79,10 @@ function Caustics() {
   );
 }
 
+// Every `m` element below whose style switches on `reduced` is keyed on it:
+// before motion's features load an `m` element keeps the style it first
+// rendered (WEB-5 review fix R1), and `reduced` is only known after
+// hydration, so a switch of style must remount the element.
 function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress: MotionValue<number>; reduced: boolean }) {
   // Opacity and travel of each beat, from the same progress.
   const frame = useTransform(progress, [0, 0.05], [0, 1]);
@@ -99,6 +103,7 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
         data-reveal
         aria-hidden="true"
         className="overflow-hidden rounded-3xl border border-[#E8F4FF]/12 bg-[#020514]/70 shadow-[0_30px_120px_-30px_rgba(68,166,250,0.35)] backdrop-blur-xl"
+        key={reduced ? "reduced" : "motion"}
         style={reduced ? { opacity: 1 } : { opacity: frame }}
       >
         <div className="flex items-center justify-between border-b border-[#E8F4FF]/10 px-4 py-3">
@@ -118,6 +123,7 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
           <div className="relative min-h-[120px] md:min-h-[158px]">
             <m.div
               className="absolute top-0 left-0 flex h-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
+              key={reduced ? "reduced" : "motion"}
               style={reduced ? { opacity: 0 } : { opacity: think1 }}
             >
               <Dots />
@@ -125,6 +131,7 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
             <m.div
               data-reveal
               className="max-w-[92%] rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-3.5 py-3 md:px-4"
+              key={reduced ? "reduced" : "motion"}
               style={reduced ? { opacity: 1, y: 0 } : { opacity: answerO, y: answerY }}
             >
               <p className="text-[13px] leading-5 text-[#E8F4FF] md:text-[15px] md:leading-6">{copy.answerOne}</p>
@@ -143,6 +150,7 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
           <div className="relative min-h-[92px] md:min-h-[104px]">
             <m.div
               className="absolute top-0 left-0 flex h-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
+              key={reduced ? "reduced" : "motion"}
               style={reduced ? { opacity: 0 } : { opacity: think2 }}
             >
               <Dots />
@@ -150,6 +158,7 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
             <m.div
               data-reveal
               className="rounded-2xl border border-[#44A6FA]/45 bg-[#44A6FA]/[0.08] p-3.5 md:p-4"
+              key={reduced ? "reduced" : "motion"}
               style={reduced ? { opacity: 1, y: 0, scale: 1 } : { opacity: approvalO, y: approvalY, scale: approvalS }}
             >
               <div className="flex items-center gap-2">
@@ -199,6 +208,7 @@ function Bar({
       <m.div
         data-reveal
         className="w-full origin-bottom rounded-t-md bg-gradient-to-t from-[#44A6FA]/60 to-[#44A6FA]"
+        key={reduced ? "reduced" : "motion"}
         style={{ height: `${Math.round(height * 100)}%`, scaleY: reduced ? 1 : scaleY }}
       />
       <span className="lk-mono text-center text-[9px] leading-3 text-[#E8F4FF]/60 md:text-[10px]">

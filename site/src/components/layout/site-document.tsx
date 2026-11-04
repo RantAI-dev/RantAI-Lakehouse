@@ -17,8 +17,6 @@ import type { SuggestionText } from "./language-suggestion";
  * `NextIntlClientProvider`, so neither the message files nor next-intl's
  * client runtime ship (D5, measured in T5).
  */
-const JS_CLASS_SCRIPT = `document.documentElement.classList.add("js")`;
-
 export async function SiteDocument({
   locale,
   children,
@@ -30,17 +28,10 @@ export async function SiteDocument({
       : null;
 
   return (
-    // `suppressHydrationWarning`: the inline script below adds `js` to this
-    // element's classes before React hydrates it, on purpose.
+    // `suppressHydrationWarning`: `motion-features.tsx` adds `motion-ready`
+    // to this element's classes in the browser, on purpose.
     <html lang={locale} className={fontVariables} suppressHydrationWarning>
       <body>
-        {/* WEB-5 D5: reveal animations hide their content only once this class
-            is set (globals.css), so the server HTML reads in full without
-            JavaScript, or when the scripts fail to load. A synchronous script
-            at the top of <body> runs before any of the page below it is
-            painted, so a visitor with JavaScript never sees content flash in
-            and out. */}
-        <script dangerouslySetInnerHTML={{ __html: JS_CLASS_SCRIPT }} />
         <MotionFeatures>
           {children}
           {suggestion && <DeferredLanguageSuggestion text={suggestion} />}

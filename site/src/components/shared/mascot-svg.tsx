@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { m, type MotionValue } from "motion/react";
+import { m, type MotionValue } from "framer-motion";
 
 /**
  * The RantAI Lakehouse creature as inline SVG.

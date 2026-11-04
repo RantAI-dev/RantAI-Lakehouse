@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useInView, useMotionValue, useSpring } from "motion/react";
+import { useInView, useMotionValue, useSpring } from "framer-motion";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { LINKS } from "@/lib/home-content";
 import { Container, CtaLink, DisplayHeading } from "@/components/shared/primitives";

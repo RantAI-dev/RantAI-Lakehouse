@@ -94,6 +94,26 @@ CSS, which is a design-level change under D6. Both are the planner's and
 the owner's call. Until then `bun run size` exits 1 and the CI site job is
 red on that step.
 
+## Update: review fix R1 (initial JS)
+
+Measured on the R1 commit with `bun run size`: **181.2 KB** initial JS on
+`/` and `/id/`, against 200 KB, so it is **met**, and `bun run size` exits 0.
+The scene is unchanged (146.8 KB, deferred), and so are the legacy
+polyfills (39.6 KB, `noModule`). Two changes did it:
+- **Imports from `framer-motion`.** `motion/react` is
+  `import * as fm from "framer-motion"`, plus `const motion = fm.motion`, so
+  any import from it kept the whole `motion` component, layout and drag
+  included. `framer-motion` 14.9.1 is the package `motion/react`
+  re-exports, and its plain re-exports tree-shake. The unused `motion`
+  dependency was removed.
+- **The animation features after hydration.** `domAnimation` (about 17 KB
+  in two chunks) is loaded through a `next/dynamic` component; a bare
+  `import()` was written into the HTML as an `async` script (measured
+  210.1 KB).
+
+The Lighthouse table above is from `5cf9dfa0`, before R1. The reviewer's
+run on the R1 commit is the measurement for TBT.
+
 ## Findings that do not change a score
 
 - Accessibility audit `label-content-name-mismatch` (weight 0, so the score

@@ -3,6 +3,7 @@
 import * as React from "react";
 import dynamic from "next/dynamic";
 import { useLandingMode } from "@/components/effects/scene-mode";
+import { QuietBoundary } from "@/components/shared/quiet-boundary";
 import { cn } from "@/lib/utils";
 
 /**
@@ -46,12 +47,15 @@ export function SceneZone({ children }: { children: React.ReactNode }) {
             sceneReady ? "opacity-100" : "opacity-0",
           )}
         >
-          <LakeScene
-            mode={mode === "still" ? "still" : "full"}
-            observe={zoneRef}
-            onReady={markReady}
-            onFail={markFailed}
-          />
+          {/* A scene chunk that fails to load falls back to the DOM hero, like a lost context (review fix R1). */}
+          <QuietBoundary onError={markFailed}>
+            <LakeScene
+              mode={mode === "still" ? "still" : "full"}
+              observe={zoneRef}
+              onReady={markReady}
+              onFail={markFailed}
+            />
+          </QuietBoundary>
         </div>
       )}
       <div className="relative z-10">{children}</div>

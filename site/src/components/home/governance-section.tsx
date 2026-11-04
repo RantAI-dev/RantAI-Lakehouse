@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useInView } from "motion/react";
+import { useInView } from "framer-motion";
 import { Lock } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";

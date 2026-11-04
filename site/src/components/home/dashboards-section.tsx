@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { m, useMotionValue, useTransform } from "motion/react";
+import { m, useMotionValue, useTransform } from "framer-motion";
 import type { HomeCopy } from "@/lib/copy";
 import { TILE_IDS } from "@/lib/home-content";
 import { CalendarTile, DotMapTile, KpiTile, LineChartTile, SankeyTile } from "./dashboard-tiles";

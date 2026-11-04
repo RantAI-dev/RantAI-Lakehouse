@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { AnimatePresence, m, useMotionValueEvent, useTransform, type MotionValue } from "motion/react";
+import { AnimatePresence, m, useMotionValueEvent, useTransform, type MotionValue } from "framer-motion";
 import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";
 import { DEPTH_LAYERS, type DepthLayer } from "@/lib/home-content";
