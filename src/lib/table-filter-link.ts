@@ -30,7 +30,7 @@ export function filterParam(filters: readonly FilterLink[]): string {
   )
 }
 
-/** `/data` with filters, and optionally a search term, already applied. */
+/** A table page with filters, and optionally a search term, already applied. */
 export function tableFilterHref(
   path: string,
   filters: readonly FilterLink[],
@@ -43,9 +43,13 @@ export function tableFilterHref(
   return query ? `${path}?${query}` : path
 }
 
-/** Data Explorer, showing one namespace's assets. */
+/**
+ * The Catalog, showing one namespace's assets. `WEB-3` S2-D1: the asset list
+ * lives at `/catalog` now (`/data` only redirects there). The namespace is
+ * named by its **id**, the value the assets carry (DATA-23).
+ */
 export function namespaceAssetsHref(namespace: string): string {
-  return tableFilterHref("/data", [
+  return tableFilterHref("/catalog", [
     { id: "namespace", value: namespace, variant: "text", operator: "eq" },
   ])
 }
@@ -121,4 +125,25 @@ export function removeFilter(filtersParam: string, id: string): string {
     (acc, value) => toggleFilterValue(acc, id, value),
     filtersParam
   )
+}
+
+/**
+ * The same `filters` value with one column's entries replaced by `filter`.
+ *
+ * For a quick filter that holds one value at a time (the Catalog's namespace
+ * row): it owns its column and must leave every other filter as it was.
+ */
+export function setFilter(filtersParam: string, filter: FilterLink): string {
+  const others = (() => {
+    if (!filtersParam) return []
+    try {
+      const parsed: unknown = JSON.parse(filtersParam)
+      return Array.isArray(parsed)
+        ? (parsed as FilterLink[]).filter((entry) => entry?.id !== filter.id)
+        : []
+    } catch {
+      return []
+    }
+  })()
+  return filterParam([...others, filter])
 }
