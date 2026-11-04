@@ -1,13 +1,9 @@
-"use client";
-
 import * as React from "react";
-import { useInView, useMotionValue, useSpring } from "framer-motion";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { LINKS } from "@/lib/home-content";
 import { Container, CtaLink, DisplayHeading } from "@/components/shared/primitives";
-import { MascotRising } from "@/components/shared/mascot-svg";
 import { Reveal, SplitWords } from "@/components/shared/reveal";
-import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
+import { FinalMascotStage } from "./final-mascot";
 
 /**
  * S8 — the last call. Back to the night lake: a CSS sky with a few stars and
@@ -15,6 +11,9 @@ import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
  * turned up to the headline. The eye follows a mouse a little; on touch
  * screens, where there is no pointer to follow, it glances around now and then.
  * With reduced motion it rests.
+ *
+ * WEB-5 review fix R5: a server component; the creature and its eye are
+ * the client leaf in `final-mascot.tsx`.
  */
 
 /** Deterministic star field (integer maths: the server and the browser must agree). */
@@ -33,47 +32,8 @@ const STARS = Array.from({ length: 44 }, (_, i) => {
 });
 
 export function FinalSection({ copy, cta }: { copy: HomeCopy["final"]; cta: CommonCopy["cta"] }) {
-  const ref = React.useRef<HTMLElement>(null);
-  const stageRef = React.useRef<HTMLDivElement>(null);
-  const reduced = useReducedMotionSafe();
-  const inView = useInView(ref, { amount: 0.2 });
-  // Resting gaze: up and a little left, towards the headline.
-  const tx = useMotionValue(-6);
-  const ty = useMotionValue(-22);
-  const eyeX = useSpring(tx, { stiffness: 120, damping: 18 });
-  const eyeY = useSpring(ty, { stiffness: 120, damping: 18 });
-
-  React.useEffect(() => {
-    if (reduced || !inView) return;
-    const stage = stageRef.current;
-    if (!stage) return;
-    let lastMove = 0;
-    const onMove = (e: PointerEvent) => {
-      if (e.pointerType === "touch") return;
-      lastMove = performance.now();
-      const r = stage.getBoundingClientRect();
-      const dx = (e.clientX - (r.left + r.width / 2)) / window.innerWidth;
-      const dy = (e.clientY - (r.top + r.height * 0.35)) / window.innerHeight;
-      tx.set(Math.max(-18, Math.min(18, -6 + dx * 46)));
-      ty.set(Math.max(-26, Math.min(8, -22 + dy * 40)));
-    };
-    window.addEventListener("pointermove", onMove, { passive: true });
-    // With no pointer in play, glance somewhere every few seconds, then back up.
-    const id = window.setInterval(() => {
-      if (performance.now() - lastMove < 6000) return;
-      const glance = Math.random() < 0.5;
-      tx.set(glance ? -6 + (Math.random() - 0.5) * 28 : -6);
-      ty.set(glance ? -22 + (Math.random() - 0.3) * 18 : -22);
-    }, 3200);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.clearInterval(id);
-    };
-  }, [reduced, inView, tx, ty]);
-
   return (
     <section
-      ref={ref}
       id="final"
       className="lk-grain relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[linear-gradient(180deg,#020514_0%,#050A30_45%,#0A1F55_72%,#0b2a66_100%)] pt-28 md:pt-32"
     >
@@ -104,9 +64,7 @@ export function FinalSection({ copy, cta }: { copy: HomeCopy["final"]; cta: Comm
         </Reveal>
       </Container>
 
-      <div ref={stageRef} className="relative z-0 mt-auto w-full max-w-[760px] px-2">
-        <MascotRising className="w-full" eyeX={reduced ? tx : eyeX} eyeY={reduced ? ty : eyeY} />
-      </div>
+      <FinalMascotStage />
     </section>
   );
 }

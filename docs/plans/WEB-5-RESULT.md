@@ -114,6 +114,53 @@ polyfills (39.6 KB, `noModule`). Two changes did it:
 The Lighthouse table above is from `5cf9dfa0`, before R1. The reviewer's
 run on the R1 commit is the measurement for TBT.
 
+## Update: review fix R5 (server sections), 2026-11-04
+
+Measured on the R5 build, with the same command and server as "What was
+measured": Lighthouse 13.6.0, mobile, simulated, three runs per locale.
+The VM's load average was 7.5 to 10.9 during the runs.
+
+| Metric | Target | EN median | ID median | Met |
+| --- | --- | --- | --- | --- |
+| LCP | ≤ 2.5 s | 1.07 s | 1.07 s | Yes |
+| CLS | ≤ 0.1 | 0 | 0 | Yes |
+| TBT | ≤ 200 ms | **284 ms** | **218 ms** | **No** |
+| SEO | 100 | 100 | 100 | Yes |
+| Accessibility | ≥ 95 | 100 | 100 | Yes |
+| Initial JS (`bun run size`) | ≤ 200 KB | 178.6 KB | 178.6 KB | Yes |
+| Performance (no target) | — | 94 | 96 | — |
+
+| Run | TBT | Longest tasks (ms) | react-dom scripting |
+| --- | --- | --- | --- |
+| EN 1 | 592 ms | App Router chunk 298; react-dom 291, 127; page 129 | 637 ms |
+| EN 2 | 284 ms | react-dom 246, 155; page 122 | 786 ms |
+| EN 3 | 230 ms | react-dom 254, 83; page 80 | 846 ms |
+| ID 1 | 200 ms | react-dom 229, 83; page 141 | 706 ms |
+| ID 2 | 255 ms | react-dom 251, 87, 82; page 85 | 753 ms |
+| ID 3 | 218 ms | react-dom 245, 82; page 78 | 716 ms |
+
+Benchmark index 1450.5 to 1612.5. LCP 1.07 s in every run, CLS 0, SEO,
+accessibility and best practices 100 in every run.
+
+**TBT is still over 200 ms. The remaining long task is react-dom's
+hydration, one task of 229 to 291 ms in every run, which alone is more
+than 180 ms of blocking time.** R5 moved the sections' text into server
+components; seven of the eight section files are server modules now, and
+`"use client"` is on the leaves only. That did not shorten the hydration
+task. React still hydrates every host element in the tree, including those
+rendered by server components. What it saves is running the components,
+not walking the DOM.
+- The page has 1,088 elements. 420 of them are the two static dashboard
+  tiles: the dot map (280 circles) and the calendar heatmap (140 rects).
+- The inline RSC payload is 125.6 KB.
+
+A lever left for the planner and owner, with no design change: draw those
+two tiles as one `<img>` each (the same SVG as a data URI, or a static
+file). That removes about 40 % of the elements React walks. It was not
+done here, because R5 asked for the client/server split and for the
+remaining long tasks to be recorded. The reviewer's run and this one differ
+(EN 225 / 284 ms); both are on the same loaded VM.
+
 ## Findings that do not change a score
 
 - Accessibility audit `label-content-name-mismatch` (weight 0, so the score

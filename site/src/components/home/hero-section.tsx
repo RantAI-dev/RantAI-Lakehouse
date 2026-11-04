@@ -1,14 +1,10 @@
-"use client";
-
 import * as React from "react";
-import { m, useTransform } from "framer-motion";
-import { cn } from "@/lib/utils";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { LINKS } from "@/lib/home-content";
-import { useLandingMode } from "@/components/effects/scene-mode";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { MascotLogo } from "@/components/shared/mascot-svg";
-import { useSectionProgress } from "@/hooks/use-section-progress";
+import { ProgressSection } from "@/components/shared/progress-section";
+import { BackdropFade, HeroCopyMotion, ScrollCueFade } from "./hero-motion";
 
 /**
  * S1 — hero. The DOM hero paints first: a CSS night lake with the logo as
@@ -20,20 +16,14 @@ import { useSectionProgress } from "@/hooks/use-section-progress";
  * to dive; the rest of the dive happens as the stage scrolls away. With
  * `prefers-reduced-motion` the section is a plain 100 vh screen (the CSS
  * `motion-reduce:` variants), so no pinned scroll remains.
+ *
+ * WEB-5 review fix R5: a server component. The copy, the backdrop's drawing
+ * and the cue render on the server; `hero-motion.tsx` holds the three
+ * client leaves that move them.
  */
 export function HeroSection({ copy, cta }: { copy: HomeCopy["hero"]; cta: CommonCopy["cta"] }) {
-  const ref = React.useRef<HTMLElement>(null);
-  const { mode } = useLandingMode();
-  // Over the whole section (150 vh), the copy is gone by 0.28 (about 42 vh).
-  const scrollYProgress = useSectionProgress(ref, ["start start", "end start"]);
-  const live = mode === "full";
-  const copyOpacity = useTransform(scrollYProgress, [0, 0.2, 0.3], live ? [1, 0.7, 0] : [1, 1, 1]);
-  const copyY = useTransform(scrollYProgress, [0, 0.3], live ? [0, -72] : [0, 0]);
-  const copyBlur = useTransform(scrollYProgress, [0.08, 0.3], live ? ["blur(0px)", "blur(8px)"] : ["blur(0px)", "blur(0px)"]);
-  const cueOpacity = useTransform(scrollYProgress, [0, 0.07], [1, 0]);
-
   return (
-    <section ref={ref} id="hero" className="relative h-[150vh] motion-reduce:h-auto">
+    <ProgressSection range={["start start", "end start"]} id="hero" className="relative h-[150vh] motion-reduce:h-auto">
       <div className="sticky top-0 isolate h-[100svh] overflow-hidden motion-reduce:relative motion-reduce:min-h-[100svh]">
         <HeroBackdrop />
         {/* A soft dark wash behind the copy keeps it above 4.5:1 over any frame of the canvas. */}
@@ -42,16 +32,7 @@ export function HeroSection({ copy, cta }: { copy: HomeCopy["hero"]; cta: Common
           className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.92)_0%,rgba(2,5,20,0.84)_52%,rgba(2,5,20,0.4)_70%,transparent_86%)]"
         />
         <Container className="relative z-10 flex h-full min-h-[100svh] flex-col items-center justify-end pt-24 pb-32 text-center md:items-start md:justify-center md:pb-24 md:text-left">
-          <m.div
-            className="max-w-[660px]"
-            // WEB-5 D5: the h1 inside is the page's largest paint, so it gets
-            // no opacity, travel or filter until the live lake runs; the
-            // server HTML and the DOM hero carry no style here at all.
-            style={live ? { opacity: copyOpacity, y: copyY, filter: copyBlur } : undefined}
-            // Keyed on `live` for the same reason as the reduced-motion keys
-            // (review fix R1): the scroll styles arrive after hydration.
-            key={live ? "live" : "still"}
-          >
+          <HeroCopyMotion>
             {/* WEB-1 review round 1 SHOULD-FIX 4: on a phone the eyebrow sits on the moon's
                 reflection, so it is lighter and carries a dark halo there. */}
             <Eyebrow className="max-md:text-[#a9d6ff] max-md:[text-shadow:0_0_10px_rgba(2,5,20,0.95),0_1px_2px_rgba(2,5,20,0.9)]">
@@ -67,23 +48,19 @@ export function HeroSection({ copy, cta }: { copy: HomeCopy["hero"]; cta: Common
                 {cta.talk}
               </CtaLink>
             </div>
-          </m.div>
+          </HeroCopyMotion>
         </Container>
-        <m.div style={{ opacity: cueOpacity }}>
+        <ScrollCueFade>
           <ScrollCue label={copy.scrollCue} />
-        </m.div>
+        </ScrollCueFade>
       </div>
-    </section>
+    </ProgressSection>
   );
 }
 
 function HeroBackdrop() {
-  const { sceneReady } = useLandingMode();
   return (
-    <div
-      aria-hidden="true"
-      className={cn("absolute inset-0 -z-10 transition-opacity duration-700", sceneReady && "opacity-0")}
-    >
+    <BackdropFade>
       {/* Sky to horizon to lake, in the logo's own blues. */}
       <div className="absolute inset-0 bg-[linear-gradient(180deg,#020514_0%,#050A30_38%,#0A1F55_61%,#0B2A66_61.4%,#061440_74%,#030B2A_100%)]" />
       {/* Moon glow and its reflection streak on the water. */}
@@ -94,7 +71,7 @@ function HeroBackdrop() {
         <MascotLogo className="lk-bob w-full drop-shadow-[0_0_60px_rgba(68,166,250,0.25)]" />
       </div>
       <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-[#020514] via-[#020514]/55 to-transparent md:hidden" />
-    </div>
+    </BackdropFade>
   );
 }
 

@@ -1,15 +1,13 @@
-"use client";
-
 import * as React from "react";
-import { m, useMotionValue, useTransform } from "framer-motion";
 import type { HomeCopy } from "@/lib/copy";
 import { TILE_IDS } from "@/lib/home-content";
-import { CalendarTile, DotMapTile, KpiTile, LineChartTile, SankeyTile } from "./dashboard-tiles";
+import { KpiTile, LineChartTile, SankeyTile } from "./dashboard-tiles";
+import { CalendarTile, DotMapTile } from "./dashboard-tiles-static";
+import { DashboardsScroller } from "./dashboards-scroller";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
 import { MascotLogo } from "@/components/shared/mascot-svg";
 import { SplitWords } from "@/components/shared/reveal";
 import { TiltCard } from "@/components/shared/tilt-card";
-import { useSectionProgress } from "@/hooks/use-section-progress";
 
 /**
  * S5 — "Dashboards live on the shore": answers come back up as dashboards.
@@ -31,77 +29,43 @@ const TILE_VISUALS = {
 } as const;
 
 export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
-  const ref = React.useRef<HTMLElement>(null);
-  const trackRef = React.useRef<HTMLUListElement>(null);
-  const progress = useSectionProgress(ref, ["start start", "end end"]);
-  const travel = useMotionValue(0);
-  const x = useTransform([progress, travel], ([p, t]: number[]) => -p * t);
-  const height = useTransform(travel, (t) => `calc(100vh + ${Math.round(t)}px)`);
-
-  React.useEffect(() => {
-    const track = trackRef.current;
-    if (!track) return;
-    const measure = () => {
-      // How far the row sticks out past the viewport, with a little air at the end.
-      travel.set(Math.max(0, track.scrollWidth - window.innerWidth + 32));
-    };
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(track);
-    window.addEventListener("resize", measure);
-    return () => {
-      ro.disconnect();
-      window.removeEventListener("resize", measure);
-    };
-  }, [travel]);
-
   return (
-    <m.section
-      ref={ref}
-      id="dashboards"
-      className="relative h-[240vh] motion-reduce:h-auto!"
-      style={{ height }}
-    >
-      <div className="sticky top-0 flex h-[100svh] flex-col justify-center overflow-hidden bg-[linear-gradient(180deg,#050A30_0%,#09154a_45%,#0B1A4A_75%,#12307a_100%)] motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
-        <Shore />
-        <Container className="relative z-10">
-          <DisplayHeading size="lg" className="max-w-[16ch] max-md:text-[clamp(2.4rem,11vw,3.2rem)]">
-            <SplitWords text={copy.headline} />
-          </DisplayHeading>
-          <LeadText className="mt-4 max-w-[38rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
-            {copy.sub}
-          </LeadText>
-        </Container>
-
-        {/* The rail. Pinned: transformed by scroll. Reduced motion: a native horizontal scroller. */}
-        <div className="relative z-10 mt-8 md:mt-12 motion-reduce:overflow-x-auto motion-reduce:pb-4">
-          <m.ul
-            ref={trackRef}
-            className="flex w-max gap-4 motion-reduce:transform-none! pr-4 pl-[max(1rem,calc((100vw-1120px)/2+1.5rem))] md:gap-5"
-            style={{ x }}
-          >
-            {TILE_IDS.map((id) => {
-              const Visual = TILE_VISUALS[id];
-              const tile = copy.tiles[id];
-              return (
-                <li key={id} className="w-[78vw] shrink-0 sm:w-[380px] md:w-[420px]">
-                  <TiltCard className="rounded-3xl border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] backdrop-blur-md md:p-6">
-                    <p className="lk-mono text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{tile.kind}</p>
-                    <p className="mt-1.5 text-[15px] text-[#E8F4FF]">{tile.title}</p>
-                    <div className="mt-4">
-                      <Visual tile={tile} />
-                    </div>
-                  </TiltCard>
-                </li>
-              );
-            })}
-          </m.ul>
-        </div>
+    <DashboardsScroller
+      before={
+        <>
+          <Shore />
+          <Container className="relative z-10">
+            <DisplayHeading size="lg" className="max-w-[16ch] max-md:text-[clamp(2.4rem,11vw,3.2rem)]">
+              <SplitWords text={copy.headline} />
+            </DisplayHeading>
+            <LeadText className="mt-4 max-w-[38rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
+              {copy.sub}
+            </LeadText>
+          </Container>
+        </>
+      }
+      after={
         <Container className="relative z-10 mt-5">
           <p className="lk-mono text-[12px] text-[#E8F4FF]/65">{copy.caption}</p>
         </Container>
-      </div>
-    </m.section>
+      }
+    >
+      {TILE_IDS.map((id) => {
+        const Visual = TILE_VISUALS[id];
+        const tile = copy.tiles[id];
+        return (
+          <li key={id} className="w-[78vw] shrink-0 sm:w-[380px] md:w-[420px]">
+            <TiltCard className="rounded-3xl border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] backdrop-blur-md md:p-6">
+              <p className="lk-mono text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{tile.kind}</p>
+              <p className="mt-1.5 text-[15px] text-[#E8F4FF]">{tile.title}</p>
+              <div className="mt-4">
+                <Visual tile={tile} />
+              </div>
+            </TiltCard>
+          </li>
+        );
+      })}
+    </DashboardsScroller>
   );
 }
 
