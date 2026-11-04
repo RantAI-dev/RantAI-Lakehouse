@@ -141,6 +141,68 @@ test("BI-11: summarizeParams lists each shown parameter with its value and type,
   )
 })
 
+test("AI-14: summarizeParams keeps the parameter line inside its budget, keeping the first whole entries and counting the rest", () => {
+  // 100 parameters with 20-character names: together far over the 600-character budget.
+  const controls = Array.from({ length: 100 }, (_, i) => ({
+    param: { name: `p${String(i + 1).padStart(3, "0")}`.padEnd(20, "x"), type: "number" },
+    value: i + 1,
+  }))
+  const entries = controls.map((c) => `${c.param.name} = ${c.value} (${c.param.type})`)
+  const uncut = entries.join("; ")
+  assert.ok(uncut.length > 600, String(uncut.length))
+  const out = summarizeParams(controls)
+  assert.ok(out.length <= 600, String(out.length))
+  const note = /; … \(\+(\d+) more\)$/.exec(out)
+  assert.ok(note, out.slice(-40))
+  const left = Number(note![1])
+  const kept = controls.length - left
+  assert.ok(kept >= 1, String(kept))
+  // The result is exactly the first `kept` entries, whole, plus the note.
+  const keptLine = entries.slice(0, kept).join("; ")
+  assert.equal(out, `${keptLine}; … (+${left} more)`)
+  assert.ok(uncut.startsWith(keptLine))
+  // The first left-out entry is not in the result.
+  assert.ok(!out.includes(entries[kept]))
+  // The kept count is the largest that fits: one more entry would pass the budget.
+  assert.ok(`${keptLine}; ${entries[kept]}; … (+${left - 1} more)`.length > 600)
+})
+
+test("AI-14: summarizeParams cuts a single parameter that does not fit and counts the entries left out", () => {
+  const long = { param: { name: "n".repeat(1000), type: "number" }, value: 1 }
+  const single = summarizeParams([long])
+  assert.ok(single.length <= 600, String(single.length))
+  assert.ok(single.endsWith("… (truncated)"))
+  assert.ok(!single.includes("more)"))
+  // The same long name followed by two short parameters: they are counted, not named.
+  const twoMore = summarizeParams([long, { param: { name: "a", type: "list" }, value: "x" }, { param: { name: "b", type: "list" }, value: "y" }])
+  assert.ok(twoMore.length <= 600, String(twoMore.length))
+  assert.ok(twoMore.endsWith("; … (+2 more)"), twoMore.slice(-40))
+})
+
+test("AI-14: buildDashboardPageContext stays inside the API cap when hundreds of parameters crowd the parameter line", () => {
+  const controls = Array.from({ length: 200 }, (_, i) => ({
+    param: { name: `p${String(i + 1).padStart(3, "0")}`.padEnd(20, "x"), type: "number" },
+    value: i + 1,
+  }))
+  const chips = `region is ${"n".repeat(6990)}`
+  assert.equal(chips.length, 7000)
+  const tiles = `- "Tile" (bar, id u_1; mart_m): ${"t".repeat(4968)}`
+  assert.equal(tiles.length, 5000)
+  const out = buildDashboardPageContext({
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: chips,
+    filterJson: null,
+    params: summarizeParams(controls),
+    tabs: "none (the dashboard has no tabs)",
+    tiles,
+  })
+  assert.ok(out.length <= 6000, String(out.length))
+  assert.ok(out.startsWith("The user is viewing the dashboard"))
+  assert.ok(out.endsWith("You can also explain what the charts show."))
+})
+
 test("a chart's other questions are listed beside its own rows, with their reason when they failed (BI-13)", () => {
   const tile = { id: "c_1", title: "Visitors and rooms", kind: "bar", source: "ui", mart: "mart_x" }
   const cell = {
