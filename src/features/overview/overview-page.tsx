@@ -201,7 +201,7 @@ export function OverviewPage() {
 
       <SectionCard
         title="Recent activity"
-        description="Every console and Copilot action, from the audit trail."
+        description="Every console and AI Copilot action, from the audit trail."
         action={
           <Link href="/activity" className="text-sm text-primary hover:underline">
             View all

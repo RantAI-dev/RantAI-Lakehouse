@@ -56,6 +56,12 @@ export type Notifications =
 
 export interface NotificationsService {
   list(signal?: AbortSignal): Promise<Notifications>
-  /** Mark every unread mention of the caller as read. */
-  markMentionsRead(signal?: AbortSignal): Promise<void>
+  /**
+   * Mark the caller's unread mentions read. Without a board, every one (the
+   * bell's "Mark all as read"); with one, only the mentions on that
+   * dashboard's comments — what opening the dashboard's comments sends
+   * (`BI-38` D5, D6). A board the caller cannot see is answered like an
+   * unknown one and the call rejects, marking nothing.
+   */
+  markMentionsRead(board?: string, signal?: AbortSignal): Promise<void>
 }

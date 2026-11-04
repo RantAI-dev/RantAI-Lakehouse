@@ -1459,14 +1459,11 @@ async fn the_chart_lists_leave_out_a_restricted_dashboards_charts() {
         .await;
         assert_eq!(status, StatusCode::OK, "{tool}");
         let text = tool["result"].to_string();
+        // BI-37 D10: a person with a level on a dashboard may use the
+        // dashboard-scoped tools; the leak check (no c_secret) is the
+        // invariant. `list_charts` is on `registry::DASHBOARD_SCOPED` with
+        // `Reach::Anywhere`, so the rule-only person gets exactly `c1`.
         assert!(!text.contains("c_secret"), "{text}");
-        if who == rule_only {
-            // BI-19 B2 re-review (test bug, rule 2): the assistant's chart
-            // tools need `dashboard:read`, which a rule-only person lacks, so
-            // the tool refuses them; the leak check above still holds.
-            assert!(text.contains("dashboard:read"), "{text}");
-            continue;
-        }
         for id in &expect {
             assert!(text.contains(id), "{id} missing from {text}");
         }

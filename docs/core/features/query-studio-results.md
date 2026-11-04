@@ -74,6 +74,7 @@ No new tool. The chat's `run_sql` keeps its own limit. Downloads are a console a
   is MiB: 10 MB is 10,485,760 bytes.
 - A download re-runs the query. If the data changed since the run, the file shows the new data.
 - Downloads stop at 5 GB, and Excel at 1,048,575 data rows (1,048,576 with the header).
+- The server waits for a download for up to 35 minutes; the 60-second default no longer cuts a download off.
 - A comma or tab file over 5 GB is cut at the last whole row that fits, and the file's name says how many rows it
   holds. A Parquet result over 5 GB is refused whole, never sent half.
 - The grid copies the rows it shows as TSV, and one cell's value from the inspector; a selection of several cells

@@ -12,7 +12,14 @@ mock.module("next/navigation", () => ({
   usePathname: () => "/dashboards/main-board",
 }));
 
-const { CopilotProvider, useCopilot, continuationText } = await import("./use-copilot");
+const {
+  CopilotProvider,
+  useCopilot,
+  useCopilotStream,
+  continuationText,
+  chatHistory,
+  STOPPED_ANSWER_TEXT,
+} = await import("./use-copilot");
 
 /** A draft the model made and the person still has to confirm. */
 type Draft = { tool: string; args: Record<string, unknown>; summary: string };
@@ -41,6 +48,27 @@ let drafts: Draft[] = [defaultDraft];
 let readSteps: ReadStep[] = [];
 /** The steps the model says the request still has. */
 let nextStep: string | null = "add two charts";
+/** Whether the chat answer hangs until the person stops it. */
+let slowChat = false;
+
+/** A JSON response, for the session routes. */
+function fakeJson(status: number, json: unknown): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => json,
+  } as unknown as Response;
+}
+
+/** What `GET /api/ai/sessions?id=` answers, per id. */
+let sessionOpens: Record<string, { status: number; json: unknown }> = {};
+/** What the list and the writes answer. */
+let sessionList: unknown = { sessions: [], hasMore: false, nextOffset: null, counts: {} };
+let sessionSave: unknown = { ok: true, id: "s1", title: "A saved conversation" };
+let sessionRename: unknown = null;
+let sessionDeleteStatus = 200;
+/** The ids `DELETE /api/ai/sessions?id=` was sent, in order. */
+const deletedSessions: string[] = [];
 
 /** A response the hook can read: the body as one chunk, and a JSON body. */
 function fakeResponse(body: string, json: unknown): Response {
@@ -57,6 +85,25 @@ function fakeResponse(body: string, json: unknown): Response {
           sent = true;
           return { done: false, value: encoder.encode(body) };
         },
+      }),
+    },
+  } as unknown as Response;
+}
+
+/** A chat answer that has sent nothing and rejects when the person stops it. */
+function hangingResponse(signal?: AbortSignal): Response {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({}),
+    body: {
+      getReader: () => ({
+        read: () =>
+          new Promise((_resolve, reject) => {
+            signal?.addEventListener("abort", () =>
+              reject(new DOMException("Aborted", "AbortError")),
+            );
+          }),
       }),
     },
   } as unknown as Response;
@@ -101,18 +148,46 @@ beforeEach(() => {
   drafts = [defaultDraft];
   readSteps = [];
   nextStep = "add two charts";
+  slowChat = false;
+  sessionOpens = {};
+  sessionList = { sessions: [], hasMore: false, nextOffset: null, counts: {} };
+  sessionSave = { ok: true, id: "s1", title: "A saved conversation" };
+  sessionRename = null;
+  sessionDeleteStatus = 200;
+  deletedSessions.length = 0;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : String(input);
     const body = typeof init?.body === "string" ? init.body : "";
     if (url.startsWith("/api/ai/chat")) {
       chatRequests.push({ body });
+      if (slowChat) return hangingResponse(init?.signal ?? undefined);
       return fakeResponse(chatBody(), {});
     }
     if (url === "/api/ai/tool") {
       const sent = body ? (JSON.parse(body) as { tool?: string }) : {};
       return fakeResponse("{}", toolResults[sent.tool ?? ""] ?? toolResult);
     }
-    if (url.startsWith("/api/ai/sessions")) return fakeResponse("{}", { id: "s1", sessions: [] });
+    if (url.startsWith("/api/ai/sessions")) {
+      const method = init?.method ?? "GET";
+      const id = new URL(url, "http://test.invalid").searchParams.get("id");
+      if (method === "POST") return fakeJson(200, sessionSave);
+      if (method === "PATCH") {
+        const sent = body ? (JSON.parse(body) as { title?: string }) : {};
+        return fakeJson(200, sessionRename ?? { ok: true, id, title: sent.title });
+      }
+      if (method === "DELETE") {
+        if (id) deletedSessions.push(id);
+        return fakeJson(sessionDeleteStatus, { ok: sessionDeleteStatus < 300 });
+      }
+      if (id) {
+        const answer = sessionOpens[id] ?? {
+          status: 200,
+          json: { session: { id, title: "Untitled", mode: "ask", messages: [] } },
+        };
+        return fakeJson(answer.status, answer.json);
+      }
+      return fakeJson(200, sessionList);
+    }
     return fakeResponse("{}", {});
   }) as typeof fetch;
 });
@@ -364,5 +439,259 @@ describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
     expect(continuationText(messages, 0, "add the chart")).toBe(
       'Confirmed and saved: create_calculated_field f1 "Margin". Do not draft these again. Continue: add the chart',
     );
+  });
+});
+
+describe("a stopped answer stays in the history (BI-41 D3)", () => {
+  it("sends the fixed line between the stopped question and the next one", () => {
+    const messages: Msg[] = [
+      { role: "user", content: "How many events are there?" },
+      { role: "assistant", content: "", stopped: true },
+      { role: "user", content: "And how many visitors?" },
+    ];
+
+    expect(chatHistory(messages)).toEqual([
+      { role: "user", content: "How many events are there?" },
+      { role: "assistant", content: STOPPED_ANSWER_TEXT },
+      { role: "user", content: "And how many visitors?" },
+    ]);
+  });
+
+  it("sends a session saved before this change, with no line stored, the same way", () => {
+    // An older saved session stores the stopped answer as empty content and
+    // `stopped: true`, exactly as today; no migration is needed.
+    const saved: Msg[] = [
+      { role: "user", content: "How many events are there?" },
+      { role: "assistant", content: "", stopped: true },
+    ];
+
+    expect(chatHistory(saved).at(-1)).toEqual({ role: "assistant", content: STOPPED_ANSWER_TEXT });
+  });
+
+  it("still drops empty messages that were not stopped", () => {
+    const messages: Msg[] = [
+      { role: "user", content: "Hi." },
+      { role: "assistant", content: "" },
+    ];
+
+    expect(chatHistory(messages)).toEqual([{ role: "user", content: "Hi." }]);
+  });
+
+  it("leaves a continuation's history unchanged", () => {
+    const continuation =
+      'Confirmed and saved: create_board b1 "Overview". Do not draft these again. Continue: add two charts';
+    const messages: Msg[] = [
+      { role: "user", content: "Build me a dashboard about events." },
+      { role: "assistant", content: "The board draft is ready." },
+      { role: "user", content: continuation },
+    ];
+
+    expect(chatHistory(messages)).toEqual([
+      { role: "user", content: "Build me a dashboard about events." },
+      { role: "assistant", content: "The board draft is ready." },
+      { role: "user", content: continuation },
+    ]);
+  });
+
+  it("sends the line in the request after the person stops an answer", async () => {
+    slowChat = true;
+    renderCopilot();
+    act(() => {
+      void copilot!.send("How many events are there?");
+    });
+    await waitFor(() => expect(chatRequests.length).toBe(1));
+    act(() => {
+      copilot!.stop();
+    });
+    await waitFor(() => expect(copilot!.busy).toBe(false));
+    expect(copilot!.messages.at(-1)?.stopped).toBe(true);
+
+    slowChat = false;
+    await act(async () => {
+      await copilot!.send("And how many visitors?");
+    });
+
+    expect(sentMessages(1)).toEqual([
+      { role: "user", content: "How many events are there?" },
+      { role: "assistant", content: STOPPED_ANSWER_TEXT },
+      { role: "user", content: "And how many visitors?" },
+    ]);
+  });
+});
+
+describe("the open conversation's title and its load errors (AI-24)", () => {
+  const opened = (id: string, title: string): { status: number; json: unknown } => ({
+    status: 200,
+    json: { session: { id, title, mode: "ask", messages: [{ id: "u1", role: "user", content: "Revenue?" }] } },
+  });
+
+  it("shows the title of a conversation older than the newest 20", async () => {
+    sessionList = {
+      sessions: [{ id: "recent", title: "A recent one", mode: "ask" }],
+      hasMore: true,
+      nextOffset: 20,
+      counts: {},
+    };
+    sessionOpens = { old: opened("old", "Quarterly revenue") };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("old");
+    });
+
+    expect(copilot!.sessionId).toBe("old");
+    expect(copilot!.sessionTitle).toBe("Quarterly revenue");
+    expect(
+      copilot!.sessions.some((s) => s.id === "old"),
+      "the fixture is a conversation the recent list does not hold",
+    ).toBe(false);
+  });
+
+  it("renames the open conversation without it being in the recent list", async () => {
+    sessionOpens = { old: opened("old", "Quarterly revenue") };
+    renderCopilot();
+    await act(async () => {
+      await copilot!.loadSession("old");
+    });
+
+    let renamed = false;
+    await act(async () => {
+      renamed = await copilot!.renameSession("old", "Board plan");
+    });
+
+    expect(renamed).toBe(true);
+    expect(copilot!.sessionTitle).toBe("Board plan");
+  });
+
+  it("shows a plain sentence for a deleted conversation, never the API's text", async () => {
+    sessionOpens = { gone: { status: 404, json: { error: "sesi tidak ditemukan" } } };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("gone");
+    });
+
+    expect(copilot!.error).toBe("This conversation could not be found. It may have been deleted.");
+    expect(copilot!.error).not.toContain("sesi");
+  });
+
+  it("shows the other plain sentence when the conversation could not be loaded", async () => {
+    sessionOpens = { broken: { status: 500, json: { error: "database error" } } };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("broken");
+    });
+
+    expect(copilot!.error).toBe("This conversation could not be loaded. Try again.");
+    expect(copilot!.error).not.toContain("database");
+  });
+
+  it("starts a new chat when the open conversation is deleted", async () => {
+    sessionOpens = { open: opened("open", "Open conversation") };
+    renderCopilot();
+    await act(async () => {
+      await copilot!.loadSession("open");
+    });
+
+    let removed = false;
+    await act(async () => {
+      removed = await copilot!.removeSession("open");
+    });
+
+    expect(removed).toBe(true);
+    expect(deletedSessions).toEqual(["open"]);
+    expect(copilot!.sessionId).toBeNull();
+    expect(copilot!.sessionTitle).toBeNull();
+    expect(copilot!.messages).toEqual([]);
+  });
+});
+
+/** A chat stream the test pushes events into, one macrotask apart. */
+function controlledChatStream() {
+  const encoder = new TextEncoder();
+  let push!: (chunk: Uint8Array) => void;
+  let close!: () => void;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      push = (chunk) => controller.enqueue(chunk);
+      close = () => controller.close();
+    },
+  });
+  return {
+    response: { ok: true, status: 200, json: async () => ({}), body } as unknown as Response,
+    async send(line: string) {
+      push(encoder.encode(`${line}\n`));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+    end() {
+      close();
+    },
+  };
+}
+
+describe("streaming does not re-render the whole Copilot (AI-24 D6)", () => {
+  it("leaves a useCopilot() consumer alone while 50 deltas arrive", async () => {
+    const stream = controlledChatStream();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.startsWith("/api/ai/chat")) return stream.response;
+      if (url.startsWith("/api/ai/sessions")) {
+        return fakeJson(200, init?.method === "POST" ? sessionSave : sessionList);
+      }
+      return fakeJson(200, {});
+    }) as typeof fetch;
+
+    // Counted in an effect, after each commit: a memory write during render
+    // would itself be what the count is meant to catch.
+    const mainRenders = { current: 0 };
+    const streamRenders = { current: 0 };
+    function Main() {
+      const api = useCopilot();
+      React.useEffect(() => {
+        copilot = api;
+        mainRenders.current += 1;
+      });
+      return null;
+    }
+    function StreamConsumer() {
+      useCopilotStream();
+      React.useEffect(() => {
+        streamRenders.current += 1;
+      });
+      return null;
+    }
+
+    render(
+      <CopilotProvider>
+        <Main />
+        <StreamConsumer />
+      </CopilotProvider>,
+    );
+
+    let sending: Promise<void> = Promise.resolve();
+    act(() => {
+      sending = copilot!.send("Show me revenue");
+    });
+    await act(async () => {
+      await stream.send(JSON.stringify({ type: "delta", text: "The " }));
+    });
+
+    const mainBefore = mainRenders.current;
+    const streamBefore = streamRenders.current;
+    await act(async () => {
+      for (let i = 0; i < 50; i += 1) {
+        await stream.send(JSON.stringify({ type: "delta", text: `piece ${i} ` }));
+      }
+    });
+
+    expect(streamRenders.current).toBeGreaterThan(streamBefore);
+    expect(mainRenders.current).toBe(mainBefore);
+
+    await act(async () => {
+      await stream.send(JSON.stringify({ type: "done", body: { answer: "The answer." } }));
+      stream.end();
+      await sending;
+    });
   });
 });

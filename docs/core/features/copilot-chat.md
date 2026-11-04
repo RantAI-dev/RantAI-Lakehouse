@@ -69,7 +69,7 @@ nothing recorded that it had.
 12. Stop an answer that is on its way, ask it again, edit a message and send
     it again, or delete a message from the conversation.
 13. Be told honestly when the model endpoint is not configured: the question
-    is refused with "AI Copilot is unavailable", the reason and a reference
+    is refused with "AI Copilot is unavailable." — the reason and a reference
     id to quote.
 14. Be told honestly when the assistant may not do what was asked: the tool
     step says which permission is missing, or that Ask mode cannot change
@@ -114,12 +114,13 @@ refused with the permission it lacks.
 | 5 | The approver's own permission is checked again | `agent:approve` is not "may do everything a person may approve": without the permission the action itself needs, the decision is recorded and the action does not run | ADR 0012 decision 3 |
 | 6 | Everything is written to the audit | One immutable row per gate decision and per executed tool call, with secrets in the arguments replaced by `[redacted]` | ADR 0012 decision 4 |
 | 7 | The requester cannot decide their own approval | A person who asked for a high-risk action cannot approve it: the API refuses the decision with 403 and the request waits for somebody else. A catalog access request obeys the same rule | `SEC-57`, product owner 2026-11-02 |
+| 8 | One name: AI Copilot | Every screen that names the assistant says "AI Copilot" — never "Copilot" alone and never "the assistant" — and the reserved employee row (`emp-copilot`) carries the same name | `AI-23`, product owner 2026-11-02 |
 
 ## Limits to tell a customer
 
 - The assistant needs a model endpoint. `LLM_URL`, `LLM_MODEL` and `LLM_KEY`
   are read by the API service; with no key the chat refuses the question and
-  the page says "AI Copilot is unavailable" with a reference id. Nothing in
+  the page says "AI Copilot is unavailable." with a reference id. Nothing in
   the console reports before the question is sent that no model is
   configured.
 - The assistant can only do what the same person could do by clicking. A
@@ -170,7 +171,7 @@ so a refusal here means the rest of the list cannot be run.
 | --- | --- | --- | --- |
 | `AI-18-AC1` | Open Home | The composer, the status line and the starter questions are there; no conversation is open yet | |
 | `AI-18-AC2` | Type a question and send it | The answer arrives; the tools it used are listed under the answer, collapsed | |
-| `AI-18-AC3` | Click the "Ask" / "Build" switch in the composer | The selected one is highlighted; on the conversation page the placeholder changes with it ("Ask anything about your lakehouse data…" / "Tell Copilot what to build or change…") | |
+| `AI-18-AC3` | Click the "Ask" / "Build" switch in the composer | The selected one is highlighted; on the conversation page the placeholder changes with it ("Ask anything about your lakehouse data…" / "Tell AI Copilot what to build or change…") | |
 | `AI-18-AC4` | In Build mode, ask for an alert rule to be created | A card appears under the answer with the heading "Action requires confirmation", a Confirm button and a Cancel button. Nothing has been created yet | |
 | `AI-18-AC5` | Press "Cancel" on that card | The step says "Cancelled."; the alert rule does not exist | |
 | `AI-18-AC6` | Ask for the same alert rule again and press "Confirm" | The rule is created and is listed under Alerts | |
@@ -192,7 +193,7 @@ so a refusal here means the rest of the list cannot be run.
 | `AI-18-AC22` | Sign in as the Analyst and open the address of a conversation of the Platform Admin | The conversation does not open; the page reports that it could not be loaded, and the conversation is not in the Analyst's History | |
 | `AI-18-AC23` | Ask a question, then press "Stop" while the answer is on its way | The answer stops and the conversation shows that it was stopped; it can be asked again | |
 | `AI-18-AC24` | Make a question fail (for example, stop the model endpoint), then look at the page | The failure is shown in a red panel with a "Retry" button and a reference id; no empty answer is shown as a success | |
-| `AI-18-AC25` | (operator) Unset `LLM_KEY` and restart the API service; ask a question | The question is refused with "AI Copilot is unavailable" and the reference id; the page does not show a made-up answer | |
+| `AI-18-AC25` | (operator) Unset `LLM_KEY` and restart the API service; ask a question | The question is refused with "AI Copilot is unavailable." and the reference id; the page does not show a made-up answer | |
 | `AI-18-AC26` | Open the Audit page and look for the conversation of `AI-18-AC2` | The list holds an event for every tool call of that conversation, with the action that was run | |
 | `AI-18-AC27` | Ask a question about a table that has a masking policy (the setup of `SEC-9-AC1`) | The answer shows the masked value, not the raw one | |
 | `AI-18-AC28` | As A, ask for a high-risk action; then, as A, open that row on Approvals and try to approve it. Then, as B (a second principal with approval rights), approve the same row | As A the Approve and Reject buttons are disabled and the API refuses the decision (403, "tidak boleh menyetujui permintaan milik sendiri"); the action never runs. As B the action runs once, exactly as in `AI-18-AC12` | |
@@ -218,9 +219,6 @@ The code does not settle these, so they are not decided here.
    product says the assistant is the way the team works; sharing a
    conversation is not built and its rules (read-only? a copy? who sees the
    tool steps?) are not decided.
-4. **What is the assistant's own name in the interface?** The screens say
-   "AI Copilot", "Copilot" and "AI Copilot is unavailable" in three
-   different places.
 
 ## After acceptance
 
@@ -232,5 +230,5 @@ The code does not settle these, so they are not decided here.
 
 - An answer counts as correct when it says which table or query it came from. A partly wrong number is a finding ("Pass with findings"), not a failure: the assistant will also run on local models, so QA does not hold it to always being right. It fails only when it breaks something, takes an action it should not, or crosses a permission.
 - History: a past conversation can be reopened and continued, **renamed and deleted**, and replies stream smoothly as they are written. A missing rename or delete is a gap to build.
-- With no model endpoint configured, the console says: "The assistant isn't available, ask your admin." It never shows technical error text.
+- With no model endpoint configured, the console says: "AI Copilot isn't available. Ask your admin." It never shows technical error text.
 - When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

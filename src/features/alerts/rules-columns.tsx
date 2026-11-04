@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import type { ColumnDef } from "@tanstack/react-table"
 import {
   Mail,
@@ -68,12 +69,25 @@ export function ruleTypeLabel(rule: Pick<AlertRule, "type" | "chart">): string {
 }
 
 /**
- * The condition of a chart alert in words. The rule row carries the chart's id
- * but not its title, and the page loads no dashboards' charts, so the text
- * starts with "Dashboard chart" instead of a made-up title (QA-9).
+ * What a chart alert watches, in words: the chart and its dashboard when the
+ * list knows them, "Dashboard chart" when it does not (a chart the caller
+ * cannot see, or an older answer). `BI-39` D8: the two names are read live, so
+ * the text follows a rename and never states a chart the reader lost.
+ */
+export function chartAlertScope(
+  rule: Pick<AlertRule, "chartTitle" | "dashboardTitle">
+): string {
+  return rule.chartTitle && rule.dashboardTitle
+    ? `${rule.chartTitle} on ${rule.dashboardTitle}`
+    : "Dashboard chart"
+}
+
+/**
+ * The condition of a chart alert in words (`QA-9`): the scope, then what the
+ * number does.
  */
 export function chartAlertCondition(
-  rule: Pick<AlertRule, "series" | "condition" | "threshold">
+  rule: Pick<AlertRule, "chartTitle" | "dashboardTitle" | "series" | "condition" | "threshold">
 ): string {
   const series = rule.series ? displayColumn(rule.series) : "the chart"
   const what =
@@ -84,7 +98,16 @@ export function chartAlertCondition(
         : rule.condition === "any_rows"
           ? "returns any rows"
           : String(rule.condition ?? "")
-  return `Dashboard chart · ${what}`.trim()
+  return `${chartAlertScope(rule)} · ${what}`.trim()
+}
+
+/** Where the chart's name in the condition links to, when the list knows it. */
+export function chartAlertHref(
+  rule: Pick<AlertRule, "chartTitle" | "dashboardId">
+): string | null {
+  return rule.chartTitle && rule.dashboardId
+    ? `/dashboards/${encodeURIComponent(rule.dashboardId)}`
+    : null
 }
 
 /** Whether `type` is one of the `SRC-7` kinds for connector and upload loads. */
@@ -184,8 +207,20 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       cell: ({ row }) => {
         const r = row.original
         if (isChartAlert(r)) {
+          const text = chartAlertCondition(r)
+          const href = chartAlertHref(r)
+          if (!href || !r.chartTitle) {
+            return <span className="text-sm text-muted-foreground">{text}</span>
+          }
+          // The title is the start of `chartAlertCondition`'s text, so the
+          // linked name and the rest read as one sentence.
           return (
-            <span className="text-sm text-muted-foreground">{chartAlertCondition(r)}</span>
+            <span className="text-sm text-muted-foreground">
+              <Link href={href} className="text-primary hover:underline">
+                {r.chartTitle}
+              </Link>
+              {text.slice(r.chartTitle.length)}
+            </span>
           )
         }
         if (r.type === "alert" && r.metric) {

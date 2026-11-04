@@ -483,11 +483,92 @@ async fn emp_copilot_exists_and_is_manual_only(pool: PgPool) -> sqlx::Result<()>
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(config.name, "Copilot (interactive)");
+    assert_eq!(config.name, "AI Copilot");
     assert_eq!(config.status, "ready");
     assert_eq!(config.prompt, None);
     assert_eq!(config.mode, "build");
     assert_eq!(config.permissions, "");
+    Ok(())
+}
+
+/// The `0119` migration, as it SHIPS: the file is read into the test at
+/// compile time (`include_str!`), so the SQL that is proved here is the SQL
+/// that runs in a deployment, not a copy of it that can drift.
+const AI23_MIGRATION: &str = include_str!("../../../migrations/0119_ai23_copilot_name.sql");
+
+/// `#[sqlx::test]` applies the migrations BEFORE the test body, so a state
+/// that only exists just before `0119` has to be rebuilt by hand. The
+/// reserved row is put back to its old name and the old label is written
+/// on an approval, which is the state `0119` was written for.
+async fn restore_the_state_before_ai23(pool: &PgPool) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE agent_employee SET name = 'Copilot (interactive)' WHERE id = 'emp-copilot'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO approval_item (id, employee_id, employee_name, action) \
+         VALUES ('appr-ai23-label', 'emp-copilot', 'Copilot (interactive)', 'run_sql')",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `0119` renames the reserved row to "AI Copilot" (AI-23: one name for the
+/// assistant) and rewrites the label of every approval that copied the old
+/// name, so Approvals shows one name for old and new rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ai23_renames_the_copilot_row_and_the_approval_labels(pool: PgPool) -> sqlx::Result<()> {
+    restore_the_state_before_ai23(&pool).await?;
+
+    sqlx::raw_sql(AI23_MIGRATION).execute(&pool).await?;
+
+    let name: String =
+        sqlx::query_scalar("SELECT name FROM agent_employee WHERE id = 'emp-copilot'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(name, "AI Copilot");
+
+    let label: String =
+        sqlx::query_scalar("SELECT employee_name FROM approval_item WHERE id = 'appr-ai23-label'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(label, "AI Copilot");
+    Ok(())
+}
+
+/// `agent_employee.name` is UNIQUE, so a customer who already named an
+/// employee of their own "AI Copilot" would make a plain rename fail and
+/// take the API down at start-up. The migration therefore renames the
+/// reserved row ONLY when no other row holds the new name: in that case the
+/// reserved row keeps the name it had, and the customer's row is untouched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ai23_keeps_the_old_name_when_another_row_holds_the_new_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    restore_the_state_before_ai23(&pool).await?;
+    sqlx::query(
+        "INSERT INTO agent_employee (id, name, purpose, autonomy) \
+         VALUES ('emp-customer-ai-copilot', 'AI Copilot', 'A customer employee.', 'L2')",
+    )
+    .execute(&pool)
+    .await?;
+
+    // The migration must not fail on the clash.
+    sqlx::raw_sql(AI23_MIGRATION).execute(&pool).await?;
+
+    let name: String =
+        sqlx::query_scalar("SELECT name FROM agent_employee WHERE id = 'emp-copilot'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(name, "Copilot (interactive)");
+
+    let other: String =
+        sqlx::query_scalar("SELECT name FROM agent_employee WHERE id = 'emp-customer-ai-copilot'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(other, "AI Copilot");
     Ok(())
 }
 

@@ -91,7 +91,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
     ctx: {
       key: "query",
       title: "Write and run SQL",
-      hint: "Ask a data question — Copilot writes and runs the SQL.",
+      hint: "Ask a data question — AI Copilot writes and runs the SQL.",
       suggest: {
         ask: ["Total revenue by channel", "Top 10 products by revenue", "Monthly revenue trend"],
         build: ["Turn this into a chart on a dashboard"],

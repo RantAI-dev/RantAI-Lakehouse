@@ -367,9 +367,10 @@ pub struct AlertRule {
     pub pipeline: Option<String>,
     /// `BI-2`: the name of the saved metric a threshold alert watches, in
     /// place of `mart`, `measure` and `agg`. The metric is read through the
-    /// same builder path as a KPI tile, with the fixed viewer role every rule
-    /// is evaluated with (a rule has no owner), not with its author's access.
-    /// `None` for a rule that watches a column.
+    /// same builder path as a KPI tile, as the person the rule belongs to
+    /// (`BI-39` D1, `owner_id`), and as the fixed viewer role only for a rule
+    /// saved before owners existed (`BI-39` D4). `None` for a rule that
+    /// watches a column.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub metric: Option<String>,
     /// Connector id (or `"*"`) for the `connector_*` kinds, and `"*"` for
@@ -401,10 +402,11 @@ pub struct AlertRule {
     /// rule, which keeps `op` (D11).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub condition: Option<String>,
-    /// The person the rule reads its data as (C4): their roles, masking and row
-    /// filters apply, and their access to the chart decides whether it still
-    /// runs. `None` for a rule saved before part C, which reads as the fixed
-    /// viewer role it always did.
+    /// The person the rule reads its data as (`BI-19` C4; `BI-39` D1 for every
+    /// threshold rule): their roles, masking and row filters apply, and their
+    /// access to what it watches decides whether it still runs. `None` for a
+    /// rule saved before part C, which reads as the fixed viewer role it always
+    /// did until it is saved again (`BI-39` D4).
     #[serde(rename = "ownerId", skip_serializing_if = "Option::is_none", default)]
     pub owner_id: Option<String>,
 }
@@ -1540,9 +1542,22 @@ async fn check_chart_has_a_number(ch: &ChClient, extras: &RuleExtras) -> Result<
 const CHART_SKIPPED: &str = "chart alerts are evaluated by /api/alerts/run after run_rules returns, \
      because they are read as the person who set them";
 
-/// A chart rule that cannot run: record `Stopped` with `reason` (no message is
-/// sent) and report it as skipped. For an owner who is disabled or can no longer
-/// see the chart (C4).
+/// `BI-39` D5: the owner named by a rule is disabled or deleted, so the rule
+/// does not run. One sentence for every kind of threshold rule — the API's
+/// chart pass and its statement gate both report it from here, never a second
+/// copy (`AGENTS.md` rule 4).
+pub const OWNER_GONE: &str = "The person who set this alert is disabled or no longer exists.";
+
+/// `BI-39` D5: the owner no longer holds `alert:write`. The permission is what
+/// allowed a rule to send to somebody other than its owner (feature C3), so a
+/// rule does not outlive it.
+pub const OWNER_NO_PERMISSION: &str =
+    "The person who set this alert no longer has the alert permission.";
+
+/// A rule that cannot run: record `Stopped` with `reason` (no message is
+/// sent) and report it as skipped. For an owner who is disabled, lost the
+/// alert permission, or can no longer see what the rule watches (`BI-19` C4,
+/// `BI-39` D5).
 pub async fn stop(state: Option<&dyn StateSource>, rule: &AlertRule, reason: &str) -> RunResult {
     if let Some(state) = state {
         state
@@ -1767,8 +1782,10 @@ fn coerce_number(v: Option<&Value>) -> f64 {
     }
 }
 
-/// Current aggregate value for an alert rule's `mart`/`measure`/`agg`.
-/// Ports `currentValue`.
+/// The statement a mart rule's check runs — the ONE builder the run and the
+/// rule save share (`SEC-50` slice 2 D7a: extracted from `current_value`,
+/// never copied, so the gate at save time measures exactly the statement the
+/// scheduled run would execute).
 ///
 /// `mart`/`measure` reach `ClickHouse` as raw, unquoted `SQL` identifiers
 /// (unlike every other field in this module, which is sent as a
@@ -1776,13 +1793,12 @@ fn coerce_number(v: Option<&Value>) -> f64 {
 /// same check `saveRule` already ran before persisting them, re-run as
 /// defence in depth against a row that predates this validation or was
 /// written by another process.
-async fn current_value(
-    ch: &ChClient,
-    gate: &dyn SqlGate,
-    mart: &str,
-    measure: &str,
-    agg: &str,
-) -> Result<f64, AlertError> {
+///
+/// # Errors
+///
+/// [`AlertError::Validation`] for a mart or measure that is not a valid
+/// identifier, or for an aggregate `ClickHouse` does not have.
+pub fn mart_statement(mart: &str, measure: &str, agg: &str) -> Result<String, AlertError> {
     let mart_ident =
         Ident::new(mart).map_err(|e| AlertError::Validation(format!("invalid mart: {e}")))?;
     if !aggregate_allowed(agg) {
@@ -1795,22 +1811,72 @@ async fn current_value(
             .map_err(|e| AlertError::Validation(format!("invalid measure: {e}")))?;
         format!("round({agg}({measure_ident}))")
     };
-    let sql = format!("SELECT {expr} AS v FROM serving.{mart_ident}");
-    let sql = gate.gate(&sql).await.map_err(AlertError::Validation)?;
-    let rows = ch.rows(&sql, None).await?;
+    Ok(format!("SELECT {expr} AS v FROM serving.{mart_ident}"))
+}
+
+/// Why reading a threshold rule's value did not produce a number (`BI-39` D6).
+#[derive(Debug)]
+enum ReadFailure {
+    /// The gate refused this statement; the state stays and the sentence is
+    /// recorded (C2).
+    Refused(String),
+    /// The gate says the rule cannot run any more (D5): it is stopped with
+    /// this reason.
+    Stop(&'static str),
+    /// The statement could not be built, or the read failed.
+    Failed(AlertError),
+}
+
+impl From<GateRefusal> for ReadFailure {
+    fn from(refusal: GateRefusal) -> Self {
+        match refusal {
+            GateRefusal::Refused(reason) => Self::Refused(reason),
+            GateRefusal::Stop(reason) => Self::Stop(reason),
+        }
+    }
+}
+
+/// Current aggregate value for an alert rule's `mart`/`measure`/`agg`.
+/// Ports `currentValue`, through [`mart_statement`]. `owner` is the person the
+/// rule reads as (`BI-39` D1): `None` for a rule saved before owners existed.
+async fn current_value(
+    ch: &ChClient,
+    gate: &dyn SqlGate,
+    owner: Option<&str>,
+    mart: &str,
+    measure: &str,
+    agg: &str,
+) -> Result<f64, ReadFailure> {
+    let sql = mart_statement(mart, measure, agg).map_err(ReadFailure::Failed)?;
+    let sql = gate.gate(owner, &sql).await?;
+    let rows = ch
+        .rows(&sql, None)
+        .await
+        .map_err(|err| ReadFailure::Failed(err.into()))?;
     Ok(coerce_number(rows.first().and_then(|r| r.get("v"))))
 }
 
 /// `BI-2`: the current value of the metric `name`, read through the very
 /// builder path a KPI tile on the metric uses (`lakehouse_bi::metrics::value_chart`)
-/// and the same gate every rule's statement goes through (the fixed viewer
-/// role: a rule has no owner, so a metric alert is evaluated with that role,
-/// never with its author's access).
+/// and the same gate every rule's statement goes through (as the person the
+/// rule belongs to, or, for a rule saved before owners existed, the fixed
+/// viewer role — `BI-39` D1, D4).
 ///
 /// Every way this can fail is a fixed sentence and the rule is recorded as
 /// skipped with it, so a rule whose metric is gone or cannot be evaluated is
 /// neither fired nor silently treated as fine, and no engine text is kept.
-async fn metric_value(ch: &ChClient, gate: &dyn SqlGate, name: &str) -> Result<f64, AlertError> {
+/// The statement a metric rule's check runs — the ONE builder the run and
+/// the rule save share (`SEC-50` slice 2 D7a: extracted from `metric_value`,
+/// never copied). It resolves the metric through the very builder path a KPI
+/// tile on the metric uses (`lakehouse_bi::metrics::value_chart`), including
+/// the lookups, so the save path does not grow a second copy of them.
+///
+/// # Errors
+///
+/// [`AlertError::Validation`] with the fixed sentence that says why the
+/// metric cannot be evaluated (gone, its source unavailable, its definition
+/// no longer checks out, no statement to build) — never engine text.
+pub async fn metric_statement(ch: &ChClient, name: &str) -> Result<String, AlertError> {
     use lakehouse_bi::builder::ReadContext;
     use lakehouse_bi::fields::{FieldCatalog, SourceKind};
     use lakehouse_bi::metrics::{ValueQuery, value_chart};
@@ -1875,10 +1941,68 @@ async fn metric_value(ch: &ChClient, gate: &dyn SqlGate, name: &str) -> Result<f
         Some(lakehouse_bi::builder::sql_with_filters_report(&chart, &[], &[], &marts, &read).sql)
     };
     // A value chart has no stored statement: an empty one is "cannot be built".
-    let Some(sql) = sql.filter(|s| !s.is_empty()) else {
-        return Err(fail("the metric cannot be evaluated."));
-    };
-    let sql = gate.gate(&sql).await.map_err(AlertError::Validation)?;
+    match sql.filter(|s| !s.is_empty()) {
+        Some(sql) => Ok(sql),
+        None => Err(fail("the metric cannot be evaluated.")),
+    }
+}
+
+/// `SEC-50` slice 2 D7a: the statement a rule ABOUT TO BE SAVED would run, for
+/// the kinds that read data — the save-side entry point the plan's M7 gating
+/// uses.
+///
+/// It normalizes the input with the very [`normalize_input`] `save_rule` uses,
+/// so the statement the gate sees is the statement the rule will actually
+/// run: a mart given as `serving.x`, an omitted `agg` defaulting to `sum`, a
+/// `count()` with no measure all resolve here exactly as they do at save and
+/// at run. The statement itself comes from [`mart_statement`] /
+/// [`metric_statement`], the builders the run uses — one builder, no copy
+/// (`AGENTS.md` rule 4).
+///
+/// `Ok(None)` means the rule reads no table of its own (a digest, a
+/// freshness, a connector or pipeline rule; a chart rule reads its chart),
+/// so there is no statement to gate.
+///
+/// # Errors
+///
+/// The input's own validation errors (the same `save_rule` reports), and the
+/// builders' — never engine text.
+pub async fn statement_for_input(
+    ch: &ChClient,
+    input: &AlertRuleInput,
+) -> Result<Option<String>, AlertError> {
+    let normalized = normalize_input(input)?;
+    if normalized.kind != AlertKind::Alert {
+        return Ok(None);
+    }
+    if !normalized.metric.is_empty() {
+        return metric_statement(ch, &normalized.metric).await.map(Some);
+    }
+    if normalized.mart.is_empty() {
+        return Ok(None);
+    }
+    mart_statement(&normalized.mart, &normalized.measure, &normalized.agg).map(Some)
+}
+
+/// `BI-2`: the current value of the metric `name`, read through
+/// [`metric_statement`] and the same gate every rule's statement goes
+/// through, as `owner` — the person the rule belongs to, or `None` for a rule
+/// saved before owners existed (`BI-39` D1, D4).
+///
+/// Every way this can fail is a fixed sentence and the rule is recorded as
+/// skipped with it, so a rule whose metric is gone or cannot be evaluated is
+/// neither fired nor silently treated as fine, and no engine text is kept.
+async fn metric_value(
+    ch: &ChClient,
+    gate: &dyn SqlGate,
+    owner: Option<&str>,
+    name: &str,
+) -> Result<f64, ReadFailure> {
+    let fail = |reason: &str| ReadFailure::Failed(AlertError::Validation(reason.to_owned()));
+    let sql = metric_statement(ch, name)
+        .await
+        .map_err(ReadFailure::Failed)?;
+    let sql = gate.gate(owner, &sql).await?;
     let Ok(rows) = ch.rows(&sql, None).await else {
         return Err(fail("the metric could not be read."));
     };
@@ -1988,9 +2112,10 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
         // `try { ... } catch { /* skip */ }` in the TypeScript: a failing
         // tile query is silently omitted from the digest, not propagated.
         // A tile the gate refuses, or whose SQL source is gone, is omitted
-        // the same way — never run ungoverned.
+        // the same way — never run ungoverned. `BI-39` D1: a digest keeps the
+        // fixed viewer role (`None`), which is out of this plan's scope.
         let Some(sql) = sql else { continue };
-        let Ok(sql) = gate.gate(&sql).await else {
+        let Ok(sql) = gate.gate(None, &sql).await else {
             continue;
         };
         if let Ok(rows) = ch.rows(&sql, None).await {
@@ -2106,6 +2231,20 @@ pub trait LateSource: Send + Sync {
     async fn late_inputs(&self, pipeline_id: &str) -> Result<Option<(i32, Option<f64>)>, String>;
 }
 
+/// Why a [`SqlGate`] refused a statement (`BI-39` D6).
+///
+/// The two are told apart because they end a check differently (feature C2,
+/// `BI-39` D5): a statement the engine refuses for the person the rule reads as
+/// leaves the rule's state where it was and records the sentence, while a
+/// person who may no longer run the rule stops it with its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateRefusal {
+    /// This check could not run; the state stays, the sentence is recorded.
+    Refused(String),
+    /// The rule cannot run for now and says why: state `stopped`.
+    Stop(&'static str),
+}
+
 /// Governance gate every statement this crate runs goes through, injected
 /// by the caller like [`SilenceSource`] so this crate stays free of the
 /// API's policy engine. Required, not optional: an alert value or a digest
@@ -2117,11 +2256,19 @@ pub trait LateSource: Send + Sync {
 pub trait SqlGate: Send + Sync {
     /// The statement to execute in place of `sql`.
     ///
+    /// `owner` is the person the rule reads as (`rule.owner_id`), or `None`
+    /// for a rule saved before owners existed and for a digest (`BI-39` D1,
+    /// D6): the implementation rewrites the statement with that person's
+    /// roles, masking and row filters, and decides from them whether the rule
+    /// may run at all.
+    ///
     /// # Errors
     ///
-    /// A fixed, non-leaking refusal message when `sql` may not run; the
-    /// caller skips that value rather than running anything else.
-    async fn gate(&self, sql: &str) -> Result<String, String>;
+    /// [`GateRefusal::Refused`] with a fixed, non-leaking refusal message when
+    /// `sql` may not run, [`GateRefusal::Stop`] with the reason when the rule
+    /// cannot run any more; the caller either skips this value or stops the
+    /// rule rather than running anything else.
+    async fn gate(&self, owner: Option<&str>, sql: &str) -> Result<String, GateRefusal>;
 
     /// Whether dashboard `board_id` is restricted ("only the people listed",
     /// itself or through a folder above it). A digest leaves the console to
@@ -3097,22 +3244,32 @@ async fn run_alert(
     }
     let mart = rule.mart.as_deref().unwrap_or("");
     let measure = rule.measure.as_deref().unwrap_or("");
+    // `BI-39` D1: the rule reads as whoever saved it last; a rule saved before
+    // owners existed reads as the fixed viewer role (D4).
+    let owner = rule.owner_id.as_deref();
     // BI-2: a rule that watches a metric reads the metric, not a column.
     let read = match rule.metric.as_deref() {
-        Some(metric) => metric_value(ch, gate, metric).await,
-        None => current_value(ch, gate, mart, measure, &rule.agg).await,
+        Some(metric) => metric_value(ch, gate, owner, metric).await,
+        None => current_value(ch, gate, owner, mart, measure, &rule.agg).await,
     };
     let watched = rule.metric.as_deref().map_or_else(
         || format!("{}({measure}) on {mart}", rule.agg),
         |m| format!("metric {m}"),
     );
-    // BI-2 kept its own sentence for a metric that could not be read.
-    let reading = read
-        .map(|value| Reading::against_threshold(rule, &watched, value))
-        .map_err(|err| match (&err, rule.metric.is_some()) {
+    let reading = match read {
+        Ok(value) => Ok(Reading::against_threshold(rule, &watched, value)),
+        // `BI-39` D5: a person who may no longer run the rule stops it with the
+        // reason, and nothing is sent.
+        Err(ReadFailure::Stop(reason)) => return stop(state, rule, reason).await,
+        // A statement the gate refused leaves the state and records the
+        // sentence (C2).
+        Err(ReadFailure::Refused(reason)) => Err(reason),
+        // BI-2 kept its own sentence for a metric that could not be read.
+        Err(ReadFailure::Failed(err)) => Err(match (&err, rule.metric.is_some()) {
             (AlertError::Clickhouse(_), true) => "the metric could not be read.".to_owned(),
             _ => failure_reason(&err),
-        });
+        }),
+    };
     settle((http, email), silence, state, rule, reading).await
 }
 
@@ -3335,7 +3492,7 @@ mod tests {
     struct RewriteGate;
     #[async_trait::async_trait]
     impl SqlGate for RewriteGate {
-        async fn gate(&self, sql: &str) -> Result<String, String> {
+        async fn gate(&self, _owner: Option<&str>, sql: &str) -> Result<String, GateRefusal> {
             Ok(format!("{sql} /* GOVERNED */"))
         }
         async fn board_restricted(&self, _board_id: &str) -> bool {
@@ -3346,8 +3503,33 @@ mod tests {
     struct RefuseGate;
     #[async_trait::async_trait]
     impl SqlGate for RefuseGate {
-        async fn gate(&self, _sql: &str) -> Result<String, String> {
-            Err("refused by policy".to_owned())
+        async fn gate(&self, _owner: Option<&str>, _sql: &str) -> Result<String, GateRefusal> {
+            Err(GateRefusal::Refused("refused by policy".to_owned()))
+        }
+        async fn board_restricted(&self, _board_id: &str) -> bool {
+            false
+        }
+    }
+
+    /// `BI-39` T1: a gate that writes down the rule's owner and statement it
+    /// was handed, and answers `refusal` instead when one is set.
+    #[derive(Default)]
+    struct RecordingGate {
+        seen: std::sync::Mutex<Vec<(Option<String>, String)>>,
+        refusal: Option<GateRefusal>,
+    }
+
+    #[async_trait::async_trait]
+    impl SqlGate for RecordingGate {
+        async fn gate(&self, owner: Option<&str>, sql: &str) -> Result<String, GateRefusal> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((owner.map(str::to_owned), sql.to_owned()));
+            match &self.refusal {
+                Some(refusal) => Err(refusal.clone()),
+                None => Ok(sql.to_owned()),
+            }
         }
         async fn board_restricted(&self, _board_id: &str) -> bool {
             false
@@ -3370,7 +3552,7 @@ mod tests {
             .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
 
-        let v = current_value(&ch, &RewriteGate, "mart_x", "amount", "sum")
+        let v = current_value(&ch, &RewriteGate, None, "mart_x", "amount", "sum")
             .await
             .expect("the governed statement answers");
 
@@ -3393,12 +3575,126 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
 
-        let err = current_value(&ch, &RefuseGate, "mart_x", "amount", "sum")
+        let err = current_value(&ch, &RefuseGate, None, "mart_x", "amount", "sum")
             .await
             .expect_err("a refusal is an error, not a value");
 
-        assert!(matches!(err, AlertError::Validation(ref m) if m == "refused by policy"));
+        assert!(
+            matches!(err, ReadFailure::Refused(ref m) if m == "refused by policy"),
+            "a refusal is the gate's sentence, kept for the record"
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    // ── `BI-39` T1: the gate knows whose rule it is ──────────────────────
+
+    #[tokio::test]
+    async fn an_owned_rules_statement_reaches_the_gate_with_its_owner() {
+        let engine = engine_answering(7.0).await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let gate = RecordingGate::default();
+        let mut rule = legacy_rule("http://hooks.test");
+        rule.owner_id = Some("u_de".to_owned());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let state = FakeState::default();
+
+        let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
+
+        assert_eq!(result.value, Some(7.0), "the read is the same as before");
+        let seen = gate.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one statement per check: {seen:?}");
+        assert_eq!(seen[0].0.as_deref(), Some("u_de"));
+        assert_eq!(
+            seen[0].1,
+            "SELECT round(sum(amount)) AS v FROM serving.mart_x"
+        );
+    }
+
+    /// `BI-39` D4: a rule saved before owners existed reads as the fixed
+    /// viewer role, which the API's gate expresses as "no owner".
+    #[tokio::test]
+    async fn a_legacy_rules_statement_reaches_the_gate_with_no_owner() {
+        let engine = engine_answering(7.0).await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let gate = RecordingGate::default();
+        let rule = legacy_rule("http://hooks.test");
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+
+        run_one(&ch, &http, &email, None, (None, None), &gate, &rule).await;
+
+        let seen = gate.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, None, "a legacy rule has no owner");
+    }
+
+    /// `BI-39` D5: a rule the gate stops is recorded `stopped` with the reason,
+    /// nothing is read and nothing is sent.
+    #[tokio::test]
+    async fn a_rule_the_gate_stops_is_recorded_stopped_with_its_reason_and_sends_nothing() {
+        const GONE: &str = "The person who set this alert is disabled or no longer exists.";
+        let engine = engine_answering(150.0).await;
+        let hook = hook_receiving().await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let state = FakeState::default();
+        let gate = RecordingGate {
+            refusal: Some(GateRefusal::Stop(GONE)),
+            ..RecordingGate::default()
+        };
+        let mut rule = legacy_rule(&hook.uri());
+        rule.owner_id = Some("u_gone".to_owned());
+
+        let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
+
+        assert!(!result.fired);
+        assert_eq!(result.skipped.as_deref(), Some(GONE));
+        assert_eq!(state.states.lock().unwrap()["al_1"], AlertState::Stopped);
+        assert!(
+            hook.received_requests().await.unwrap().is_empty(),
+            "a stopped rule sends nothing"
+        );
+        assert!(
+            engine.received_requests().await.unwrap().is_empty(),
+            "a stopped rule reads nothing"
+        );
+    }
+
+    /// `BI-39` D5, C2: a statement the gate refuses leaves the state where it
+    /// was and records the sentence, so the next check starts afresh.
+    #[tokio::test]
+    async fn a_refused_statement_leaves_the_state_and_records_the_sentence() {
+        const REFUSED: &str = "the statement could not run for this person.";
+        let engine = engine_answering(150.0).await;
+        let hook = hook_receiving().await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let state = FakeState::default();
+        state
+            .states
+            .lock()
+            .unwrap()
+            .insert("al_1".to_owned(), AlertState::Firing);
+        let gate = RecordingGate {
+            refusal: Some(GateRefusal::Refused(REFUSED.to_owned())),
+            ..RecordingGate::default()
+        };
+        let mut rule = legacy_rule(&hook.uri());
+        rule.owner_id = Some("u_1".to_owned());
+
+        let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
+
+        assert_eq!(result.skipped.as_deref(), Some(REFUSED));
+        assert_eq!(
+            state.states.lock().unwrap()["al_1"],
+            AlertState::Firing,
+            "a check that could not run changes nothing"
+        );
+        assert_eq!(state.failed.lock().unwrap().as_slice(), [REFUSED]);
+        assert!(hook.received_requests().await.unwrap().is_empty());
     }
 
     // ── compare / AlertOp ──────────────────────────────────────────────
@@ -4948,7 +5244,7 @@ mod tests {
     struct PassGate;
     #[async_trait::async_trait]
     impl SqlGate for PassGate {
-        async fn gate(&self, sql: &str) -> Result<String, String> {
+        async fn gate(&self, _owner: Option<&str>, sql: &str) -> Result<String, GateRefusal> {
             Ok(sql.to_owned())
         }
         async fn board_restricted(&self, _board_id: &str) -> bool {
@@ -4960,7 +5256,7 @@ mod tests {
     struct RestrictedGate;
     #[async_trait::async_trait]
     impl SqlGate for RestrictedGate {
-        async fn gate(&self, sql: &str) -> Result<String, String> {
+        async fn gate(&self, _owner: Option<&str>, sql: &str) -> Result<String, GateRefusal> {
             Ok(sql.to_owned())
         }
         async fn board_restricted(&self, _board_id: &str) -> bool {

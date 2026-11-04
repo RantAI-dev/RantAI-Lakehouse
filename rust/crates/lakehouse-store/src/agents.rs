@@ -1111,7 +1111,12 @@ pub const COPILOT_EMPLOYEE_ID: &str = "emp-copilot";
 /// `approval_item.employee_name` at request time (matching every other
 /// approval's `employee_name`, which is never re-derived from
 /// `agent_employee` after the fact).
-pub const COPILOT_EMPLOYEE_NAME: &str = "Copilot (interactive)";
+///
+/// "AI Copilot" (AI-23, product owner 2026-11-02: one name for the
+/// assistant). `0119_ai23_copilot_name.sql` renames the seeded row to the
+/// same string; the constant and the row must agree, or every new approval
+/// shows a different name than the employee it belongs to.
+pub const COPILOT_EMPLOYEE_NAME: &str = "AI Copilot";
 
 /// Everything [`create_pending_approval`] needs to create the linked
 /// `agent_run` (`waiting_approval`) + `approval_item` (`pending`) pair for
