@@ -587,6 +587,123 @@ the diff checked.
 **Not verified.** The page against a real install with no CDC connector (no stack was brought up). The empty line
 was not checked in a browser.
 
+### Handoff (slice 3b) — developer (Opus), 2026-11-04
+
+Branch `feat/web-3-slice-3b-screens` (from `b2b55d9a`), one commit per task, pushed after each. No
+rebase, no force-push. **S3-T5 is not built: slice 3a is not done.** At the last check (after S3-T6)
+`origin/feat/web-3-slice-3a-api` had S3a-D1 (`632df1df`) and S3a-D2 (`1f279d10`) but no schedule
+`DELETE` (S3a-D3) and no "Handoff (slice 3a)" entry, so it was not merged and nothing of its API was
+used. `origin/main` has neither #373 nor #374, so `origin/main` was not merged either.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| S3-T1 | `9216e132` | Settings sections in `?section=`; Tag keys and Maps inside; three redirects (S3-D6) |
+| S3-T2 | `56eac7da` | Users: People and Sessions tabs in `?tab=`; `/admin/sessions` redirect (S3-D7) |
+| S3-T3 | `34d79561` | Data Quality: Schedules (Edit) and Freshness targets (Add, Edit, Remove) tabs (S3-D5 without Reset) |
+| S3-T4 | `bf637397` | Column "Sensitivity and masking"; Access tab loses classification; Classification page gone (S3-D1 to S3-D3) |
+| S3-T5 | — | **Waits for 3a** (Access rules S3-D4, schedule Reset, Roles edit/delete S3-D8, and the two sidebar renames) |
+| S3-T6 | `6d7fe3d2` | Pipeline lineage link, sidebar removals, page context, user guide, CHANGELOG (S3-D9, S3-D10 in part) |
+| — | the commit that adds this entry | This handoff |
+
+No Rust, Python or compose change; no `cargo` command was run.
+
+**Per-task checks** (each: `bun run typecheck` exit 0; `bun run lint` 0 errors, 10 warnings, the same
+pre-existing list as slices 1 and 2). Scoped runs used `bun test <paths>` (`bun run test <paths>` runs everything):
+
+- S3-T1: `bun test src/features/admin src/features/governance/tag-keys-page.test.tsx src/lib/url-tab.test.ts` 67 pass, 0 fail.
+- S3-T2: `bun test src/features/admin/users-page.test.tsx src/features/admin/sessions-page.test.tsx` 17 pass, 0 fail.
+- S3-T3: `bun test src/features/catalog src/features/governance src/lib/table-key-href.test.ts` 385 pass, 0 fail.
+- S3-T4: `bun test src/features/catalog src/features/governance src/lib/column-masks.test.ts src/services` 547 pass, 0 fail.
+- S3-T6: `bun test src/features/pipelines/pipeline-detail-page.test.tsx src/features/copilot src/components/app-shell`
+  130 pass, 0 fail; `./rust/tests/parity/check-no-secrets.sh` corpus clean.
+
+**Before handoff, on `6d7fe3d2`, foreground.**
+
+- `bun run typecheck` — exit 0.
+- `bun run lint` — exit 0; 0 errors, 10 warnings, none in a file this slice touched.
+- `bun run test` — first run: 3253 pass, 1 skip, **1 fail**, 3255 tests, 331 files, 206.18 s. The failure was
+  `UploadsPanel > refreshes while a row is loading and stops when none is` (a poll-count assertion, expected 3), in
+  `src/features/connectors/uploads-panel.test.tsx`, which this slice does not touch (no file under
+  `src/features/connectors` changed). It passed 3 of 3 runs alone (27 pass each), and the second full run was green:
+  **3254 pass, 1 skip, 0 fail, 8804 expect() calls, 3255 tests, 331 files, 196.39 s.** Read as a timing flake under
+  load, not proven.
+- `git status` — empty.
+
+**Not verified.** Screenshots and every look at 1280 px and 390 px: `libnss3` / `libnspr4` are still not installed,
+so no browser starts. The redirects were not exercised against a running server this time (the five redirect
+pages are one `redirect()` each). The assistant's page context with a model (no test covers `page-context.ts`).
+
+**Mismatches with the plan, reported, not improvised.**
+
+1. *S3-D2 leaves the table's own classification without a control.* The Access tab's Classify dialog was the only
+   place that set or removed a classification rule for **the whole table** (no column). S3-D1 gives columns their
+   controls; nothing replaces the table-level one, so after S3-T4 a table-level rule can neither be set nor removed
+   in the console (the header badge still shows the level and where it comes from). Built as decided; the planner
+   should decide whether the header or the Overview gets a Set / Remove for the table, or whether a table is only
+   ever as sensitive as its columns.
+2. *S3-D9's first bullet is a self-link.* The asset page's only lineage link (`asset-lineage.tsx:298`, "Open lineage
+   graph") is on the Lineage tab itself, so pointing it at `?tab=lineage` would link the page to itself. It was left
+   pointing at `/lineage?focus=` (the full graph page, which S3-D9 keeps). Remove the button, or keep it?
+3. *S3-D5 "every table's schedule".* `GET /api/governance/quality/schedules` lists only tables with a saved schedule
+   (`routes/quality_schedules.rs:43`). The tab lists those and says in one line that any other table runs every
+   N minutes (the endpoint's `defaultIntervalMinutes`). There is no Add on the Schedules tab (not decided); a new
+   schedule is set from the table's Quality tab, and the empty state says so.
+4. *S3-D3 filter left out.* The catalog list row carries the asset's own `classification` (asset level, which a
+   table-level rule can raise on its own), not whether any column is classified, so a "Has sensitive columns" filter
+   would be approximate (rule 14). Not added; no endpoint added.
+5. *S3-D10 in part.* The sidebar removals are in S3-T6; the renames "Policies" → "Access rules" and "Teams & Roles"
+   → "Roles" wait for S3-T5, so the sidebar never names a page by a title the page does not have.
+
+**Choices made inside the decisions, for the reviewer.**
+
+1. *One URL-tab helper.* Three pages needed the asset page's `?tab=` posture, so it is `useUrlTab`
+   (`src/hooks/use-url-tab.ts`, pure parts and tests in `src/lib/url-tab.ts`): first tab is the bare address, an
+   unknown value opens the first tab. The asset, connector and Sources pages keep their own copies (not refactored).
+2. *Settings* uses the asset page's line tabs (six sections, sideways scroll on a phone), under one "Settings"
+   header. The sections are the old components unchanged except their titles: Reporting's header said "Settings"
+   and now says "Reporting"; Sign-in's said "Single Sign-On" and now says "Sign-in". Tag keys and Maps keep their own
+   headers (they carry the New tag key action and the upload form). Only the open section loads.
+   `/admin/sso` now redirects to `?section=sign-in` (was `/admin/settings`).
+3. *Users and Data Quality* use the plain tab list, as Sources does. Invite User shows only on People; Add Quality
+   Rule only on the rules tab, now named "Incidents and rules". The page descriptions were rewritten to say what the
+   tabs hold. The stale user-guide line "Roles cannot yet be changed here once a person is invited" was dropped
+   (`ADM-4` D1 shipped a role editor).
+4. *Reuse, not copies (rule 4).* The asset page's freshness dialog moved to
+   `governance/freshness-target-dialog.tsx`, keyed by the SLA's table key, with a Table field when adding from the
+   tab; the schedule control moved into `ScheduleControls` in `quality-schedule.tsx`; `policyTable` /
+   `policyCondition` moved to `catalog/asset-policy.ts` (their test file moved with them). A table key links only
+   for `silver.` / `serving.` keys (`src/lib/table-key-href.ts`), which `lineage-graph.tsx`'s `nodeHref` now uses
+   too; a Bronze key is plain text.
+5. *The column section* sits under the opened column's facts on the Schema tab (`column-sensitivity.tsx`); the
+   Sample tab's inspector opens the same `ColumnDetail` without it. When the section is shown, the facts no longer
+   repeat Masked / Classification. The `masked` pill has the title "Masked for you", and the fact reads
+   "Masked for you" (it is masked for the viewer, section 6.1).
+   - Change is one action, delete then create. A failed create after a successful delete says the old level is
+     already gone and reloads, so the page shows what is stored.
+   - **Add a mask is enforced at once** (`activate: true`), because the section lists enforced masks only and a
+     draft would be added and not appear. The policy name defaults to `mask_<table>_<column>_for_<roles>` (names are
+     `UNIQUE`, `0003_governance.sql:48`) and can be edited.
+   - A policy with a row filter counts as "does more than this column" even when it masks only this column, so it
+     is not deleted from here ("Part of X, which also filters rows"): deleting it would also lift the row filter.
+   - Drafts that mask the column are not listed (S3-D1 says enforced).
+   - Without `policy:read` the API sends no roles: the section says "You. Who else it is masked for is shown with
+     policy:read." (or "Not for you. …") instead of "No one".
+6. *The asset page keeps its data on screen while it reloads* (`useService`'s existing `keepDataOnReload`), so the
+   opened column stays open after a change instead of the page flashing to a skeleton. This applies to every
+   reload on that page (certification, Access tab policies, and so on).
+7. *Removed with the Classification page:* `classification-page.tsx`, `classification-columns.tsx`, their test, and
+   `listClassifications` from the contract and client (its only consumer). The `GET /api/governance/classification`
+   route is untouched (S3a-D4 is 3a's).
+8. *Tests.* Added: `url-tab` (4), `table-key-href` (2), `column-masks` (4), `settings-page` (3), two Users tab cases,
+   eight Data Quality tab cases, ten column-section cases in `asset-detail-tabs.test.tsx`, two pipeline lineage-link
+   cases. Removed with what they tested: the six Access-tab classification cases (replaced by the column cases) and
+   `classification-page.test.tsx`. Renamed: `asset-access.test.ts` → `asset-policy.test.ts`. One assertion changed
+   its label: "Masked" → "Masked for you" (`asset-columns.test.tsx`).
+
+**What S3-T5 needs when 3a lands:** merge `origin/feat/web-3-slice-3a-api` once its handoff is in; then Access rules
+(S3-D4, read-only list with `assetId` links, drawer read-only), Reset on the Schedules tab (S3a-D3), Roles edit and
+delete with the API's 409 sentence (S3-D8), the sidebar renames, and the user-guide rows for Policies and Roles.
+
 ## 9. Review (planner appends below)
 
 ### Review slice 2, round 1 (planner, 2026-11-04, at `e566187b`)
