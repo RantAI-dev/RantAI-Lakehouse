@@ -1725,14 +1725,16 @@ async fn another_tenants_query_gives_nothing(pool: PgPool) -> sqlx::Result<()> {
     let group = tenant(GROUP_TENANT);
     let retail = tenant(RETAIL_TENANT);
     let rina = viewer(Some(person(RINA)), Some(group));
-    let saved = create_saved_query(
+    // The query sits in the shared space, so only the tenant check can
+    // hide it from Sari (`QS-3` review finding 8).
+    let saved = create_saved_query_at(
         &pool,
         &rina,
         "The group's",
         "SELECT 1",
         "Rina Wijaya",
         &[],
-        None,
+        SavedQueryPlacement::SharedSpace,
     )
     .await
     .unwrap();
