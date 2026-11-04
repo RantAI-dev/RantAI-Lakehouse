@@ -28,10 +28,34 @@ import {
 import { formatRelativeTime } from "@/lib/format"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import type { Policy } from "@/services/contracts/governance"
+import { POLICY_NOT_ENFORCEABLE } from "./policy-actions"
 
 export const POLICY_STATUS_OPTIONS = (
   Object.keys(ENTITY_STATUS_LABEL) as EntityStatus[]
 ).map((s) => ({ value: s, label: ENTITY_STATUS_LABEL[s] }))
+
+/**
+ * The Status cell (`SEC-61`): a `ready` policy the engine cannot enforce
+ * reads "Not enforced", not its lifecycle status — the engine skips its
+ * conditions, so calling it enforced would tell an admin a column is
+ * masked when it is not. A draft keeps its draft status, which is already
+ * accurate. The column still filters and sorts on `status`; this changes
+ * only what the cell says.
+ */
+export function PolicyStatusPill({
+  policy,
+}: {
+  policy: Pick<Policy, "status" | "enforceable">
+}) {
+  if (policy.status === "ready" && !policy.enforceable) {
+    return (
+      <Pill tone="warning" title={POLICY_NOT_ENFORCEABLE}>
+        Not enforced
+      </Pill>
+    )
+  }
+  return <StatusBadge status={policy.status} />
+}
 
 export function getPolicyColumns({
   onSelect,
@@ -72,7 +96,7 @@ export function getPolicyColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Status" />
       ),
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      cell: ({ row }) => <PolicyStatusPill policy={row.original} />,
       enableColumnFilter: true,
       enableSorting: true,
       meta: {
@@ -148,24 +172,19 @@ export function getPolicyColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Effect" />
       ),
-      cell: ({ row }) => {
-        const effect = row.original.effect?.toLowerCase()
-        const isAllow = effect === "allow"
-        return (
-          <Pill tone={isAllow ? "success" : "destructive"}>
-            {row.original.effect}
-          </Pill>
-        )
-      },
-      enableColumnFilter: true,
+      // The stored effect is a sentence ("Permit with obligation"), not the
+      // `allow`/`deny` the old filter offered, so every value rendered red
+      // through a filter that matched nothing. Show it as neutral text and
+      // drop the filter (`SEC-61`, same audit).
+      cell: ({ row }) => (
+        <span className="text-sm text-muted-foreground">
+          {row.original.effect}
+        </span>
+      ),
+      enableColumnFilter: false,
       enableSorting: true,
       meta: {
         label: "Effect",
-        variant: "select",
-        options: [
-          { value: "allow", label: "Allow" },
-          { value: "deny", label: "Deny" },
-        ],
         icon: Lock,
       },
     },

@@ -21,7 +21,7 @@ use lakehouse_store::governance::{
     self, ClassificationRule, CreateClassificationRuleInput, CreatePolicyInput,
     CreateQualityRuleInput, CreateResidencyRuleInput, Policy, QualityRule, ResidencyRule,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
@@ -977,13 +977,52 @@ pub async fn create_rule(
     }
 }
 
-/// `GET /api/governance/policies` — every authored policy.
+/// One authored policy as the console sees it: the stored row plus the one
+/// fact `lakehouse-store`'s [`Policy`] cannot answer on its own — whether
+/// the policy engine can enforce anything from it (`SEC-61`).
+///
+/// `enforceable` is deliberately NOT part of `status`: it says whether the
+/// rule CAN be enforced, while `status` says whether it is switched on.
+/// Both are real and independent, and a `ready` policy with `enforceable:
+/// false` masks nothing and filters no rows — the console shows it as "Not
+/// enforced" instead of "Enforced" (plan `SEC-61`, decision D3).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyView {
+    /// The stored policy, flattened so the wire shape is unchanged apart
+    /// from the added `enforceable` field (decision D2).
+    #[serde(flatten)]
+    policy: Policy,
+    /// True when [`crate::policy_engine::PolicyCondition::parse_opt`]
+    /// accepts this row's authored `conditions` — the engine's own test,
+    /// never a second parser (decision D1). Absent or free-text conditions
+    /// and conditions with no real obligation are `false`: a policy with
+    /// no structured `conditions` is enforced nowhere.
+    enforceable: bool,
+}
+
+impl PolicyView {
+    /// Wraps `policy` with the engine's verdict on its `conditions`.
+    fn new(policy: Policy) -> Self {
+        let enforceable =
+            crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
+                .is_some();
+        Self {
+            policy,
+            enforceable,
+        }
+    }
+}
+
+/// `GET /api/governance/policies` — every authored policy, each with the
+/// engine's verdict on whether it can be enforced (`SEC-61`).
 ///
 /// # Errors
 ///
 /// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<Policy>>> {
-    Ok(ApiJson(governance::list_policies(pool(&state)?).await?))
+pub async fn list_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<PolicyView>>> {
+    let policies = governance::list_policies(pool(&state)?).await?;
+    Ok(ApiJson(policies.into_iter().map(PolicyView::new).collect()))
 }
 
 /// The `POST /api/governance/policies` body. Mirrors `CreatePolicyInput`.
@@ -1044,7 +1083,8 @@ fn create_policy_body(body: Value) -> Result<CreatePolicyInput, ApiError> {
     })
 }
 
-/// `POST /api/governance/policies` — author a new policy. Returns 201.
+/// `POST /api/governance/policies` — author a new policy. Returns 201, with
+/// the same `enforceable` verdict [`list_policies`] reports (decision D2).
 ///
 /// # Errors
 ///
@@ -1053,12 +1093,12 @@ fn create_policy_body(body: Value) -> Result<CreatePolicyInput, ApiError> {
 pub async fn create_policy(
     State(state): State<AppState>,
     body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
+) -> ApiResult<(StatusCode, ApiJson<PolicyView>)> {
     let body: Value = serde_json::from_slice(&body)
         .map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))?;
     let input = create_policy_body(body)?;
     let created = governance::create_policy(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
+    Ok((StatusCode::CREATED, ApiJson(PolicyView::new(created))))
 }
 
 /// `POST /api/governance/policies` as the router mounts it:
@@ -1072,9 +1112,9 @@ pub async fn create_policy_route(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
+) -> ApiResult<(StatusCode, ApiJson<PolicyView>)> {
     let created = create_policy(State(state.clone()), body).await?;
-    let policy = &created.1.0;
+    let policy = &created.1.0.policy;
     if let Some(cond) =
         crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
     {
@@ -1139,6 +1179,10 @@ pub struct PolicyStatusBody {
 /// enforced, and an enforced one could never be stopped. It takes effect
 /// on the next query — obligations are read from the store each time.
 ///
+/// The response carries `enforceable` too (decision D2): switching a policy
+/// on says nothing about whether the engine can enforce it, and the console
+/// must keep both facts apart when it updates the row.
+///
 /// # Errors
 ///
 /// `400` for a malformed body or any other status; `404` when no policy
@@ -1148,7 +1192,7 @@ pub async fn set_policy_status(
     principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     body: Bytes,
-) -> ApiResult<ApiJson<Policy>> {
+) -> ApiResult<ApiJson<PolicyView>> {
     let body: PolicyStatusBody = parse_body(&body)?;
     if !matches!(body.status.as_str(), "ready" | "draft") {
         return Err(ApiError::BadRequest(
@@ -1180,7 +1224,7 @@ pub async fn set_policy_status(
         )
         .await;
     }
-    Ok(ApiJson(policy))
+    Ok(ApiJson(PolicyView::new(policy)))
 }
 
 /// `DELETE /api/governance/policies/{id}` — remove a policy. An enforced
@@ -1885,6 +1929,77 @@ mod tests {
             "effect": "Permit with obligation",
         });
         assert!(create_policy_body(body).is_ok());
+    }
+
+    // ── SEC-61: the policy list says when a policy enforces nothing ─────
+
+    /// A stored policy row, as `lakehouse-store` returns it; the kind and
+    /// conditions are what each test varies.
+    fn stored_policy(kind: &str, conditions: Option<&str>) -> Policy {
+        Policy {
+            id: "11111111-1111-1111-1111-111111111111".to_owned(),
+            name: "mask_customer_email".to_owned(),
+            status: "ready".to_owned(),
+            kind: kind.to_owned(),
+            subjects: "Analyst".to_owned(),
+            resources: "serving.mart_customer".to_owned(),
+            effect: "Permit with obligation".to_owned(),
+            version: 1,
+            owner: "Rina".to_owned(),
+            updated_at: "2026-11-04T00:00:00.000Z".to_owned(),
+            conditions: conditions.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_policy_with_structured_conditions_is_enforceable() {
+        let view = PolicyView::new(stored_policy(
+            "Row filter",
+            Some(r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#),
+        ));
+        assert!(view.enforceable);
+    }
+
+    #[test]
+    fn free_text_conditions_are_not_enforceable() {
+        let view = PolicyView::new(stored_policy(
+            "Row filter",
+            Some("Applies broadly, reviewed quarterly"),
+        ));
+        assert!(
+            !view.enforceable,
+            "the engine skips prose, so the list must not call it enforced"
+        );
+    }
+
+    #[test]
+    fn a_policy_with_no_conditions_is_not_enforceable() {
+        let view = PolicyView::new(stored_policy("Retention", None));
+        assert!(!view.enforceable);
+    }
+
+    #[test]
+    fn an_agent_autonomy_policy_is_not_enforceable() {
+        // Agent autonomy is enforced by nothing in the workspace; free-text
+        // prose is all such a policy can carry today.
+        let view = PolicyView::new(stored_policy(
+            "Agent autonomy",
+            Some("Agents may act without approval on serving tables"),
+        ));
+        assert!(!view.enforceable);
+    }
+
+    #[test]
+    fn the_policy_wire_shape_keeps_the_row_and_adds_enforceable() {
+        let view = PolicyView::new(stored_policy(
+            "Row filter",
+            Some(r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#),
+        ));
+        let wire = serde_json::to_value(&view).expect("a PolicyView serializes");
+        assert_eq!(wire["enforceable"], json!(true));
+        assert_eq!(wire["name"], json!("mask_customer_email"));
+        assert_eq!(wire["updatedAt"], json!("2026-11-04T00:00:00.000Z"));
+        assert_eq!(wire["status"], json!("ready"));
     }
 
     // ── WS7 item A5: real policy impact preview ─────────────────────────
