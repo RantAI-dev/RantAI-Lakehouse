@@ -247,3 +247,23 @@ describe("the pipeline page's Definition tab (BLD-10)", () => {
     expect(await screen.findByText("Not available (stored as on; nothing runs it)")).toBeTruthy()
   })
 })
+
+// WEB-3 S3-D9: a pipeline that names its target table opens that table's
+// Lineage tab; one that names none keeps the Lineage page.
+describe("the pipeline page's lineage link (WEB-3 S3-D9)", () => {
+  it("opens the target table's Lineage tab when the pipeline names one", async () => {
+    search = "tab=settings"
+    stubApi({ status: () => "completed", pipeline: { ...PIPELINE, targetAssetId: "silver.northwind_orders" } })
+    renderPage()
+    const link = await screen.findByRole("link", { name: "open its target table's Lineage tab" })
+    expect(link.getAttribute("href")).toBe("/data/assets/silver.northwind_orders?tab=lineage")
+  })
+
+  it("keeps the Lineage page for a pipeline with no target table", async () => {
+    search = "tab=settings"
+    stubApi({ status: () => "completed" })
+    renderPage()
+    const link = await screen.findByRole("link", { name: "open in Lineage" })
+    expect(link.getAttribute("href")).toBe("/lineage?focus=pl-connector-1")
+  })
+})

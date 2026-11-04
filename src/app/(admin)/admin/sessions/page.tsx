@@ -1,8 +1,9 @@
-"use client"
+import { redirect } from "next/navigation"
 
-import { SessionsPage } from "@/features/admin/sessions-page"
-
-/** Thin App Router page for SessionsPage. */
-export default function Page() {
-  return <SessionsPage />
+/**
+ * Legacy route compatibility redirect (`WEB-3` S3-D7): sessions are the
+ * Sessions tab of Users now.
+ */
+export default function LegacyRedirect() {
+  redirect("/admin/users?tab=sessions")
 }

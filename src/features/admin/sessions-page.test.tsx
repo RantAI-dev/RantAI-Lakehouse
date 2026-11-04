@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import { SessionsPage } from "./sessions-page"
+import { SessionsPanel } from "./sessions-page"
 
 const originalFetch = global.fetch
 
@@ -13,7 +13,7 @@ let fetchCalls: FetchCall[] = []
 
 afterEach(() => {
   // `@testing-library/react` v16 stopped auto-cleaning between tests, so
-  // the previous `it`'s `<SessionsPage />` would otherwise still be in
+  // the previous `it`'s `<SessionsPanel />` would otherwise still be in
   // the DOM when the next `it` rendered — `getByRole("button", { name:
   // /revoke/i })` would then find two matching buttons and throw
   // "Found multiple elements". The sso and connector tests don't hit
@@ -35,7 +35,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 /**
  * Stubs `GET /api/auth/sessions` to `sessionsBody` and
  * `DELETE /api/auth/sessions/<id>` to an empty 204 — the two routes
- * `SessionsPage` actually exercises. Every other path returns an empty
+ * `SessionsPanel` actually exercises. Every other path returns an empty
  * 200 so a stray fetch surfaces in the failure message rather than a
  * swallowed `undefined`. Records every call so the test can assert the
  * page refetches the list after a successful revoke (the "no stale row"
@@ -64,7 +64,7 @@ function mockSessions(sessionsBody: unknown): void {
   ) as unknown as typeof fetch
 }
 
-describe("SessionsPage (list + revoke)", () => {
+describe("SessionsPanel (list + revoke)", () => {
   it("lists sessions and revokes one on click", async () => {
     mockSessions([
       {
@@ -77,7 +77,7 @@ describe("SessionsPage (list + revoke)", () => {
         userAgent: null,
       },
     ])
-    render(<SessionsPage />)
+    render(<SessionsPanel />)
     await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
     fireEvent.click(screen.getByRole("button", { name: /revoke/i }))
     await waitFor(() => {
@@ -100,7 +100,7 @@ describe("SessionsPage (list + revoke)", () => {
         userAgent: null,
       },
     ])
-    render(<SessionsPage />)
+    render(<SessionsPanel />)
     await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
     const callsBeforeRevoke = fetchCalls.filter(
       (c) => c.url.includes("/api/auth/sessions") && c.method === "GET",
@@ -118,7 +118,7 @@ describe("SessionsPage (list + revoke)", () => {
     global.fetch = mock(async () => {
       throw new Error("boom")
     }) as unknown as typeof fetch
-    render(<SessionsPage />)
+    render(<SessionsPanel />)
     // `<ErrorState>` renders a `role="status"` shell (see
     // `components/patterns/page-states.tsx`), not `role="alert"`; this is
     // what the test asserts on so it stays in sync with the shared

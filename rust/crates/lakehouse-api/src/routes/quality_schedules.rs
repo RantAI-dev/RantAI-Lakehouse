@@ -11,10 +11,15 @@
 //! capture, a connector run that failed after committing some tables) are
 //! then still checked. The tick (`routes::quality`) applies the interval;
 //! the load hook (`routes::quality_load`) applies `on_load`.
+//!
+//! `DELETE /api/governance/quality/schedules/{asset}` (`governance:write`,
+//! `WEB-3` S3a-D3) removes a table's row, so the table runs at
+//! [`DEFAULT_INTERVAL_MINUTES`] again — the schedule it had before anyone
+//! set one.
 
 use axum::Extension;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::Ident;
@@ -123,6 +128,38 @@ pub async fn put_schedule(
     )
     .await;
     Ok(ApiJson(json!(schedule)))
+}
+
+/// `DELETE /api/governance/quality/schedules/{asset}` — put a table back on
+/// the default schedule, every [`DEFAULT_INTERVAL_MINUTES`] (60). Returns
+/// 204; `GET …/schedules` then lists no row for the table, which is how the
+/// console reads "the default". Audited as `quality.schedule_reset` on the
+/// table, like [`put_schedule`] is on the setting it changes.
+///
+/// # Errors
+///
+/// `400` when the table is not `bronze.`/`silver.`/`serving.` plus a plain
+/// name; `503`/`500` on a store failure.
+pub async fn delete_schedule(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(asset): Path<String>,
+) -> ApiResult<StatusCode> {
+    let key = table_key(&asset).ok_or_else(|| {
+        ApiError::BadRequest(
+            "Name the table as bronze.<table>, silver.<table> or serving.<table>.".to_owned(),
+        )
+    })?;
+    quality::delete_schedule(pool(&state)?, &key).await?;
+    crate::routes::governance::audit_table_change(
+        &state,
+        Some(&principal),
+        &key,
+        "quality.schedule_reset",
+        json!({ "intervalMinutes": DEFAULT_INTERVAL_MINUTES }),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

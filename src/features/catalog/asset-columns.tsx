@@ -472,7 +472,12 @@ function ValueLines({
 }
 
 /** What the opened column states about itself; each fact is there only when it has something to say. */
-function factsOf(row: SchemaRow, column: ColumnProfile | undefined, sortKey: boolean): MetadataItem[] {
+function factsOf(
+  row: SchemaRow,
+  column: ColumnProfile | undefined,
+  sortKey: boolean,
+  sensitivityShown: boolean
+): MetadataItem[] {
   const c = row.column
   const mono = "break-all font-mono text-xs"
   const items: MetadataItem[] = [
@@ -497,9 +502,13 @@ function factsOf(row: SchemaRow, column: ColumnProfile | undefined, sortKey: boo
   if (row.partition) items.push({ label: "Partitioned by", value: `This column (${row.partition})` })
   if (sortKey) items.push({ label: "Sorted by", value: "This column" })
   // The row's marks can be cut short on a narrow screen; the opened column says them in full.
-  if (c.masked) items.push({ label: "Masked", value: "Yes" })
-  if (c.classification) {
-    items.push({ label: "Classification", value: <ClassificationBadge classification={c.classification} /> })
+  // With the Schema tab's "Sensitivity and masking" section beside them
+  // (`WEB-3` S3-D1) these two would say the same thing twice.
+  if (!sensitivityShown) {
+    if (c.masked) items.push({ label: "Masked for you", value: "Yes" })
+    if (c.classification) {
+      items.push({ label: "Classification", value: <ClassificationBadge classification={c.classification} /> })
+    }
   }
   if (c.description) items.push({ label: "Description", value: c.description })
   return items
@@ -515,12 +524,15 @@ export function ColumnDetail({
   column,
   shares,
   sortKey,
+  extra,
 }: {
   row: SchemaRow
   state: ProfileState
   column: ColumnProfile | undefined
   shares: ValueShares | null
   sortKey: boolean
+  /** Shown under the facts: the Schema tab's "Sensitivity and masking" section (`WEB-3` S3-D1). */
+  extra?: React.ReactNode
 }) {
   const name = row.column.name
   // Without a profile (no permission, unsupported, failed) the column still opens, on the facts that need none.
@@ -534,8 +546,9 @@ export function ColumnDetail({
         </div>
       ) : null}
       <div role="group" aria-label={`Facts about ${name}`} className="min-w-0">
-        <MetadataList items={factsOf(row, column, sortKey)} columns={withValues ? 2 : 3} />
+        <MetadataList items={factsOf(row, column, sortKey, extra !== undefined)} columns={withValues ? 2 : 3} />
       </div>
+      {extra !== undefined ? <div className="min-w-0 @3xl:col-span-2">{extra}</div> : null}
     </div>
   )
 }
@@ -559,7 +572,12 @@ function Marks({ row, sortKey, className }: { row: SchemaRow; sortKey: boolean; 
           inactive since {formatDate(c.inactiveSince, { month: "short" })}
         </Pill>
       ) : null}
-      {c.masked ? <Pill tone="warning">masked</Pill> : null}
+      {/* `masked` is masked for the viewer (`routes/catalog.rs`), not "a mask exists". */}
+      {c.masked ? (
+        <Pill tone="warning" title="Masked for you: you read this column as ***">
+          masked
+        </Pill>
+      ) : null}
       {c.classification ? <ClassificationBadge classification={c.classification} /> : null}
       {row.partition ? (
         <Pill tone="neutral" title="The table is partitioned by this column">
@@ -582,6 +600,7 @@ function ColumnRow({
   sortKey,
   open,
   onToggle,
+  extra,
 }: {
   row: SchemaRow
   state: ProfileState
@@ -589,6 +608,7 @@ function ColumnRow({
   sortKey: boolean
   open: boolean
   onToggle: () => void
+  extra?: React.ReactNode
 }) {
   const panelId = React.useId()
   const c = row.column
@@ -661,7 +681,7 @@ function ColumnRow({
       {open ? (
         <div role="row" className="border-b last:border-b-0">
           <div role="cell" id={panelId} className="bg-muted/20 px-3 py-3">
-            <ColumnDetail row={row} state={state} column={profiled} shares={shares} sortKey={sortKey} />
+            <ColumnDetail row={row} state={state} column={profiled} shares={shares} sortKey={sortKey} extra={extra} />
           </div>
         </div>
       ) : null}
@@ -724,6 +744,7 @@ export function ColumnsCard({
   profile,
   sortingKey,
   meanings,
+  columnExtra,
 }: {
   rows: SchemaRow[]
   profile: ProfileState
@@ -731,6 +752,8 @@ export function ColumnsCard({
   sortingKey?: string | null
   /** The meanings of the table's columns; absent or `none` leaves the card as it was. */
   meanings?: MeaningState
+  /** What an opened column shows under its facts (`WEB-3` S3-D1: its sensitivity and masks). */
+  columnExtra?: (row: SchemaRow) => React.ReactNode
 }) {
   const showStats = profile.kind === "ready" || profile.kind === "loading"
   const [limit, setLimit] = React.useState<number>(COLUMN_PAGE_SIZES[0])
@@ -895,6 +918,7 @@ export function ColumnsCard({
                       sortKey={sortKeys.has(row.column.name)}
                       open={open.has(row.column.name)}
                       onToggle={() => toggle(row.column.name)}
+                      extra={columnExtra && open.has(row.column.name) ? columnExtra(row) : undefined}
                     />
                   ))}
                 </div>

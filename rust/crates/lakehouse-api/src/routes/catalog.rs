@@ -2896,10 +2896,12 @@ async fn bronze_upstream(ch: &ChClient, table: &str) -> Vec<Value> {
 /// registry (`bronze_meta`, `bronze_meta_sec`): `None` when no dataset is
 /// registered under that name.
 ///
-/// One query for two readers with different needs. [`bronze_upstream`] makes
+/// One query for readers with different needs. [`bronze_upstream`] makes
 /// a missing answer cost a link, so it drops the error. `routes::uploads`
 /// asks it to decide whether a name is taken, where an error must not read
-/// as "free", so it gets the error.
+/// as "free", so it gets the error. `routes::governance`'s policy list asks
+/// it to name a Bronze table's asset page (`WEB-3` S3a-D1) and drops the
+/// error the same way [`bronze_upstream`] does.
 ///
 /// DATA-40 D3: the secondary branch drops the slugs the primary registry
 /// holds (see [`NOT_IN_PRIMARY`]), so a slug that is in both registries is

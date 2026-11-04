@@ -1,18 +1,15 @@
 "use client"
 
 import type { ColumnDef } from "@tanstack/react-table"
+import Link from "next/link"
 import {
   Activity,
-  Clock,
   Copy,
   Eye,
-  FileCode,
   Layers,
-  Lock,
+  ListChecks,
   MoreHorizontal,
   Shield,
-  Tag,
-  User,
   Users,
 } from "lucide-react"
 
@@ -25,9 +22,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
-import { formatRelativeTime } from "@/lib/format"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import type { Policy } from "@/services/contracts/governance"
+import { accessTabHref, type AccessRule } from "./access-rules"
 import { POLICY_NOT_ENFORCEABLE } from "./policy-actions"
 
 export const POLICY_STATUS_OPTIONS = (
@@ -57,17 +54,40 @@ export function PolicyStatusPill({
   return <StatusBadge status={policy.status} />
 }
 
-export function getPolicyColumns({
+/**
+ * The table an access rule governs: a link to its Access tab when the API
+ * named the asset (`assetId`, `WEB-3` S3a-D1), plain text otherwise (a
+ * table the catalog does not address, or a rule written as text).
+ */
+export function AccessRuleTable({ rule }: { rule: Pick<AccessRule, "table" | "assetId"> }) {
+  const href = accessTabHref(rule)
+  if (!href) return <span className="font-mono text-xs text-muted-foreground">{rule.table}</span>
+  return (
+    <Link
+      href={href}
+      onClick={(e) => e.stopPropagation()}
+      className="font-mono text-xs text-primary underline-offset-2 hover:underline"
+    >
+      {rule.table}
+    </Link>
+  )
+}
+
+/**
+ * The Access rules list (`WEB-3` S3-D4): read-only. Enforce, Stop and
+ * Delete stay on the table's Access tab, where the rule is made.
+ */
+export function getAccessRuleColumns({
   onSelect,
 }: {
-  onSelect: (policy: Policy) => void
-}): ColumnDef<Policy>[] {
+  onSelect: (rule: AccessRule) => void
+}): ColumnDef<AccessRule>[] {
   return [
     {
       id: "name",
       accessorKey: "name",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Policy" />
+        <DataTableColumnHeader column={column} label="Rule" />
       ),
       cell: ({ row }) => (
         <div className="flex items-center gap-2">
@@ -84,10 +104,64 @@ export function getPolicyColumns({
       enableColumnFilter: true,
       enableSorting: true,
       meta: {
-        label: "Policy",
-        placeholder: "Filter policy name…",
+        label: "Rule",
+        placeholder: "Filter rule name…",
         variant: "text",
         icon: Shield,
+      },
+    },
+    {
+      id: "table",
+      accessorKey: "table",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Table" />
+      ),
+      cell: ({ row }) => <AccessRuleTable rule={row.original} />,
+      enableColumnFilter: true,
+      enableSorting: true,
+      meta: {
+        label: "Table",
+        placeholder: "Filter table…",
+        variant: "text",
+        icon: Layers,
+      },
+    },
+    {
+      id: "roles",
+      accessorKey: "roles",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Roles" />
+      ),
+      cell: ({ row }) => (
+        <span className="line-clamp-1 max-w-44 text-sm text-muted-foreground">
+          {row.original.roles}
+        </span>
+      ),
+      enableColumnFilter: true,
+      enableSorting: true,
+      meta: {
+        label: "Roles",
+        placeholder: "Filter roles…",
+        variant: "text",
+        icon: Users,
+      },
+    },
+    {
+      id: "does",
+      accessorKey: "does",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="What it does" />
+      ),
+      cell: ({ row }) => (
+        <span className="line-clamp-2 max-w-64 text-sm text-muted-foreground">
+          {row.original.does}
+        </span>
+      ),
+      enableColumnFilter: false,
+      enableSorting: true,
+      meta: {
+        label: "What it does",
+        icon: ListChecks,
       },
     },
     {
@@ -107,154 +181,16 @@ export function getPolicyColumns({
       },
     },
     {
-      id: "kind",
-      accessorKey: "kind",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Kind" />
-      ),
-      cell: ({ row }) => (
-        <span className="inline-flex items-center rounded-md bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground">
-          {row.original.kind}
-        </span>
-      ),
-      enableColumnFilter: true,
-      enableSorting: true,
-      meta: {
-        label: "Kind",
-        placeholder: "Filter kind…",
-        variant: "text",
-        icon: Tag,
-      },
-    },
-    {
-      id: "subjects",
-      accessorKey: "subjects",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Subjects" />
-      ),
-      cell: ({ row }) => (
-        <span className="line-clamp-1 max-w-44 text-sm text-muted-foreground">
-          {row.original.subjects}
-        </span>
-      ),
-      enableColumnFilter: true,
-      enableSorting: true,
-      meta: {
-        label: "Subjects",
-        placeholder: "Filter subjects…",
-        variant: "text",
-        icon: Users,
-      },
-    },
-    {
-      id: "resources",
-      accessorKey: "resources",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Resources" />
-      ),
-      cell: ({ row }) => (
-        <span className="line-clamp-1 max-w-44 font-mono text-xs text-muted-foreground">
-          {row.original.resources}
-        </span>
-      ),
-      enableColumnFilter: true,
-      enableSorting: true,
-      meta: {
-        label: "Resources",
-        placeholder: "Filter resources…",
-        variant: "text",
-        icon: Layers,
-      },
-    },
-    {
-      id: "effect",
-      accessorKey: "effect",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Effect" />
-      ),
-      // The stored effect is a sentence ("Permit with obligation"), not the
-      // `allow`/`deny` the old filter offered, so every value rendered red
-      // through a filter that matched nothing. Show it as neutral text and
-      // drop the filter (`SEC-61`, same audit).
-      cell: ({ row }) => (
-        <span className="text-sm text-muted-foreground">
-          {row.original.effect}
-        </span>
-      ),
-      enableColumnFilter: false,
-      enableSorting: true,
-      meta: {
-        label: "Effect",
-        icon: Lock,
-      },
-    },
-    {
-      id: "version",
-      accessorKey: "version",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Version" align="right" />
-      ),
-      cell: ({ row }) => (
-        <div className="text-right font-mono text-xs text-muted-foreground">
-          v{row.original.version}
-        </div>
-      ),
-      enableColumnFilter: true,
-      enableSorting: true,
-      meta: {
-        label: "Version",
-        variant: "number",
-        icon: FileCode,
-      },
-    },
-    {
-      id: "owner",
-      accessorKey: "owner",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Owner" />
-      ),
-      cell: ({ row }) => (
-        <span className="text-sm text-foreground">{row.original.owner}</span>
-      ),
-      enableColumnFilter: true,
-      enableSorting: true,
-      meta: {
-        label: "Owner",
-        placeholder: "Filter owner…",
-        variant: "text",
-        icon: User,
-      },
-    },
-    {
-      id: "updatedAt",
-      accessorKey: "updatedAt",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Updated" />
-      ),
-      cell: ({ row }) => (
-        <span className="text-xs text-muted-foreground">
-          {formatRelativeTime(row.original.updatedAt)}
-        </span>
-      ),
-      enableColumnFilter: true,
-      enableSorting: true,
-      meta: {
-        label: "Updated",
-        variant: "text",
-        icon: Clock,
-      },
-    },
-    {
       id: "actions",
       header: () => null,
       cell: ({ row }) => {
-        const policy = row.original
+        const rule = row.original
         return (
           <div className="flex items-center justify-end">
             <DropdownMenu>
               <DropdownMenuTrigger
                 className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus:outline-none"
-                aria-label="Policy actions"
+                aria-label="Access rule actions"
               >
                 <MoreHorizontal className="size-4" />
               </DropdownMenuTrigger>
@@ -262,7 +198,7 @@ export function getPolicyColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    onSelect(policy)
+                    onSelect(rule)
                   }}
                 >
                   <Eye className="size-4" />
@@ -272,20 +208,20 @@ export function getPolicyColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(policy.name)
+                    void navigator.clipboard.writeText(rule.name)
                   }}
                 >
                   <Copy className="size-4" />
-                  <span>Copy policy name</span>
+                  <span>Copy rule name</span>
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(policy.id)
+                    void navigator.clipboard.writeText(rule.id)
                   }}
                 >
                   <Shield className="size-4" />
-                  <span>Copy policy ID</span>
+                  <span>Copy rule ID</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
