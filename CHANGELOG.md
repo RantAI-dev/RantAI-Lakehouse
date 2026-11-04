@@ -9,6 +9,8 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+- The parameter line in a dashboard's context to the assistant is bounded to 600 characters, so a dashboard with many parameters still sends the board id and the last instruction (backlog `AI-14`).
+
 ## [0.2.1] - 2026-11-04
 
 ### Added
