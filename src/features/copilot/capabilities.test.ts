@@ -42,6 +42,33 @@ describe("toolsFromCaps", () => {
   })
 })
 
+// BI-26 slice 2 D10 (AI-11-AC3): the embed tools, named here or they never
+// reach the model. The snippet is a read, so Ask mode offers it; the three
+// writes belong to the Dashboard Builder's build mode.
+describe("the signed-embed tools", () => {
+  const fixture = JSON.parse(
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
+  ) as { function: { name: string } }[]
+  const serverTools = fixture.map((t) => t.function.name)
+  const writers = ["enable_embed", "set_embed_filter_modes", "withdraw_embed_tokens"]
+
+  it("are on the server", () => {
+    for (const tool of [...writers, "get_embed_snippet"]) expect(serverTools).toContain(tool)
+  })
+
+  it("offers the snippet in both modes and the three writes in build mode only", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("get_embed_snippet")
+    }
+    for (const tool of writers) {
+      expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
+      expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(tool)
+      expect(toolsFromCaps(new Set(["data"]), "build")).not.toContain(tool)
+    }
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("get_embed_snippet")
+  })
+})
+
 describe("the dashboard capability against the server's tool list", () => {
   // BI-8 review fix (BLOCKER) R1: the composer sends these names as the turn's
   // allowlist, so a dashboard tool the server has but this list lacks is never

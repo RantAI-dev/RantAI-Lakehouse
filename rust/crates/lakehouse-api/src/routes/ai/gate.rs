@@ -178,6 +178,9 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("tab"),
             s("board")
         ),
+        // BI-26 slice 2 D9: the two WriteHigh embed tools. The first says who
+        // can reach the dashboard after it, the second what a viewer may change.
+        "enable_embed" | "set_embed_filter_modes" => embed_write_high_reason(spec.name, args),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -190,6 +193,52 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             spec.name
         ),
     }
+}
+
+/// The two `WriteHigh` embed tools' sentences (`BI-26` slice 2 D9): the sites
+/// `enable_embed` adds and who can then reach the dashboard, and each column
+/// `set_embed_filter_modes` sets with what an embed's viewer may change. Split
+/// out of [`reason_for_write_high`] to keep its match within the line limit.
+fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
+    let board = args
+        .get("board")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if name == "enable_embed" {
+        let sites: Vec<&str> = args
+            .get("sites")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        return format!(
+            "Menjadikan dashboard {board} bisa disematkan di situs {}. Siapa pun yang servernya menandatangani token untuk situs itu dapat menampilkan dashboard ini sebagai peran penonton tetap.",
+            if sites.is_empty() {
+                "(belum ada situs)".to_owned()
+            } else {
+                sites.join(", ")
+            }
+        );
+    }
+    let modes: Vec<String> = args
+        .get("modes")
+        .and_then(Value::as_object)
+        .map(|modes| {
+            modes
+                .iter()
+                .map(|(column, mode)| format!("{} {}", column, mode.as_str().unwrap_or("?")))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "Mengatur mode filter embed dashboard {board}: {}. Filter editable dapat diubah oleh penonton embed.",
+        if modes.is_empty() {
+            "(belum ada filter)".to_owned()
+        } else {
+            modes.join(", ")
+        }
+    )
 }
 
 /// Fixed Indonesian risk statement stored on every `WriteHigh` approval —
@@ -503,6 +552,12 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         ),
         "arrange_board" | "save_board_filters" => board_layout_summary(spec.name, args),
         "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
+        // BI-26 slice 2 D9: the Confirm card's text for the one embed write
+        // that only narrows access.
+        "withdraw_embed_tokens" => format!(
+            "Menarik semua token embed dashboard {}; token yang ditandatangani sebelum sekarang tidak berlaku lagi.",
+            s("board")
+        ),
         "create_report_subscription" | "update_report_subscription" => {
             report_summary(spec.name, args)
         }

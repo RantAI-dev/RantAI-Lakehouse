@@ -647,6 +647,47 @@
     ]
   },
   {
+    "id": "dash_new_chart_then_fresh",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Fresh On New Chart"}, "id_at": "board.id"}
+    ],
+    "turns": ["Add a bar chart of events by year to dashboard {board} and make it always fresh."],
+    "expect_tool": {"name": "set_cache_rule", "args_contains": {"chart": "{created:chart}", "rule": "fresh"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{created:chart}", "def.cache.mode": "fresh"}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_this_chart_fresh_asks",
+    "mode": "build",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval This Chart Board"}, "id_at": "board.id"},
+      {"name": "chart_a", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval This Chart A", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
+      {"name": "chart_b", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval This Chart B", "kind": "line", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "context": "The user is viewing the dashboard \"Eval This Chart Board\" (board id: {board}). Tiles and the data they currently show (built-in tiles are not editable):\n- \"Eval This Chart A\" (bar, id {chart_a}; mart_event): rows: tahun=2023, jumlah_event=120\n- \"Eval This Chart B\" (line, id {chart_b}; mart_event): rows: tahun=2023, jumlah_event=120\nWhen creating a chart use board=\"{board}\".",
+    "turns": ["Make this chart always fresh."],
+    "expect_tool": {"name": "ask_user"},
+    "expect_no_tool": ["set_cache_rule"]
+  },
+  {
+    "id": "dash_this_chart_fresh_one_tile",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval One Tile Board"}, "id_at": "board.id"},
+      {"name": "chart_a", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Only Tile A", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "context": "The user is viewing the dashboard \"Eval One Tile Board\" (board id: {board}). Tiles and the data they currently show (built-in tiles are not editable):\n- \"Eval Only Tile A\" (bar, id {chart_a}; mart_event): rows: tahun=2023, jumlah_event=120\nWhen creating a chart use board=\"{board}\".",
+    "turns": ["Make this chart always fresh."],
+    "expect_tool": {"name": "set_cache_rule", "args_contains": {"chart": "{chart_a}", "rule": "fresh"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart_a}", "def.cache.mode": "fresh"}, "count": 1}
+    ]
+  },
+  {
     "id": "chart_forecast",
     "mode": "build",
     "confirm": true,
@@ -829,5 +870,47 @@
     "expect_state": [
       {"path": "/api/alerts", "list": "rules", "where": {"id": "{rule}", "enabled": true}, "count": 1, "scope": "all"}
     ]
+  },
+  {
+    "id": "embed_enable_needs_approval",
+    "mode": "build",
+    "note": "BI-26 slice 2 / AI-11-AC3: making a dashboard embeddable waits for approval, and nothing is on until a human approves it.",
+    "context": "The person is on the dashboard page for board {board}.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Embed Board"}, "id_at": "board.id"}
+    ],
+    "turns": ["Let example.com embed this dashboard."],
+    "expect_approval": "enable_embed",
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "embedEnabled": false}, "count": 1, "scope": "all"}
+    ]
+  },
+  {
+    "id": "embed_withdraw_confirm",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-26 slice 2: withdrawing every token only narrows access, so it is the chat's Confirm, not an approval.",
+    "context": "The person is on the dashboard page for board {board}.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Embed Withdraw Board"}, "id_at": "board.id"},
+      {"name": "enable", "method": "PUT", "path": "/api/dashboard/boards", "body": {"id": "{board}", "embed": true, "embedOrigins": ["https://example.com"]}}
+    ],
+    "turns": ["Withdraw all embed tokens for this dashboard."],
+    "expect_tool": {"name": "withdraw_embed_tokens", "args_contains": {"board": "{board}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "embedEnabled": true}, "count": 1, "scope": "all"}
+    ]
+  },
+  {
+    "id": "embed_snippet_no_token",
+    "mode": "ask",
+    "note": "BI-26 slice 2 D7: the snippet is a read, and the answer never carries a token; the customer's server signs one.",
+    "context": "The person is on the dashboard page for board {board}.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Embed Snippet Board"}, "id_at": "board.id"}
+    ],
+    "turns": ["How do I embed this dashboard on our site?"],
+    "expect_tool": {"name": "get_embed_snippet", "args_contains": {"board": "{board}"}},
+    "forbid": ["[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}"]
   }
 ]

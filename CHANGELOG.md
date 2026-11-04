@@ -23,6 +23,7 @@ once a first release is tagged.
 
 ### Security
 
+- The ignores for RUSTSEC-2026-0367, -0368 and -0369 are removed: `zip` 8.6.0 left the dependency tree with `rust_xlsxwriter` 0.102 (backlog `SEC-42`).
 - `calamine` 0.37 -> 0.38 leaves `RUSTSEC-2026-0436` out of the dependency tree (a malformed compound file could panic the reader or ask it for unbounded memory in the CFB/OLE2 parser, the `.xls` path the upload reader takes). No ignore was added, and `zip` stays one version (9.1.2) shared with `calamine` and `rust_xlsxwriter`. A workbook that reads today reads the same: the release notes' changes to what the upload reader touches are the fixed panics and an `.xls` stream name matched without regard to case.
 
 ## [0.2.0] - 2026-11-02

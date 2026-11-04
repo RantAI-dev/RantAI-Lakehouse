@@ -83,7 +83,7 @@ function TriggerChip({
       )
     default:
       return (
-        <span className={base} title="No schedule, sensor or backfill launched it: started from the console, the Copilot or the API">
+        <span className={base} title="No schedule, sensor or backfill launched it: started from the console, AI Copilot or the API">
           <HandIcon className="size-3.5" aria-hidden />
           Manual
         </span>

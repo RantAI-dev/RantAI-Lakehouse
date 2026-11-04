@@ -405,7 +405,9 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
             json!({
                 "id": e.id,
                 "at": e.at,
-                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "Copilot".to_owned()),
+                // AI-23 (product owner 2026-11-02): one name for the
+                // assistant — "AI Copilot", the same name the console shows.
+                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "AI Copilot".to_owned()),
                 "actorKind": actor_kind_of(e.principal_kind.as_deref()),
                 "tenant": TENANT_ID.as_str(),
                 "action": e.action,

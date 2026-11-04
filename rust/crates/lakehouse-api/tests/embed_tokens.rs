@@ -1587,6 +1587,41 @@ async fn an_old_token_that_locks_a_column_that_is_no_filter_still_narrows() {
 }
 
 #[tokio::test]
+async fn an_old_token_on_a_saved_filter_whose_mode_nobody_chose_still_narrows_to_it() {
+    // BI-26 slice 2 gap 3 (owner-signed decision 7): the commonest old case.
+    // `region` is a saved dashboard filter and nobody chose a mode, so
+    // `embed_access::mode_of` reports `hidden` and the saved value keeps being
+    // ANDed with the token's. An old `{"region": "Bali"}` token must therefore
+    // still show only Bali, and it is not described as an editable filter.
+    let fake = FakeCh::new(&json!({
+        "filters_json": r#"[{"column":"region","op":"in","values":["Bali","Java"]}]"#
+    }));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) =
+        embed_with(&app, &token_with(Some(json!({ "region": "Bali" }))), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("embedFilters").is_none(),
+        "a hidden filter is not described: {body}"
+    );
+    let statements = fake.tile_statements();
+    assert!(!statements.is_empty(), "the tiles were read");
+    for statement in &statements {
+        assert!(
+            statement.contains("Bali"),
+            "the token's value narrows every tile, so no tile can return Java alone: {statement}"
+        );
+    }
+    assert!(
+        sql_has(&fake, "Java"),
+        "the saved filter is still ANDed in, not replaced: {statements:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_invalid_viewer_filter_is_a_400() {
     let fake = modal_board(&json!({ "region": "editable" }));
     let ch = fake.serve().await;

@@ -107,7 +107,10 @@ export function CopilotPage() {
       // not remembered; the toggle still works for this visit
     }
   };
-  const activeTitle = c.sessions.find((s) => s.id === c.sessionId)?.title || "Conversation";
+  // AI-24 D2: the open conversation's own title, not a lookup in the newest
+  // 20 the history menu lists — a conversation reopened from History is
+  // often older than those. "New conversation" is for no conversation.
+  const activeTitle = c.sessionTitle || (c.sessionId ? "Conversation" : "New conversation");
   const startNew = () => {
     c.newChat();
     router.push("/");
@@ -165,7 +168,7 @@ export function CopilotPage() {
               </p>
             ) : (
               <ChatMessages
-                messages={c.messages} draft={c.draft} liveReasoning={c.liveReasoning} onEdit={c.editAndResend} onDelete={c.deleteMessage} onDismissError={c.clearError} busy={c.busy} error={c.error} progress={c.progress} onRetry={c.retry}
+                messages={c.messages} onEdit={c.editAndResend} onDelete={c.deleteMessage} onDismissError={c.clearError} busy={c.busy} error={c.error} onRetry={c.retry}
                 onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} onCompleteTool={c.completeToolStep} confirmingKey={c.confirmingKey}
                 onAnswerAsk={c.answerAskOption} askNotice={c.askNotice}
               />
@@ -176,10 +179,10 @@ export function CopilotPage() {
             <ChatComposer onStop={c.stop} solid
               mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy}
               enabledCaps={c.enabledCaps} toggleCap={c.toggleCap}
-              placeholder={c.mode === "build" ? "Tell Copilot what to build or change…" : "Ask anything about your lakehouse data…"}
+              placeholder={c.mode === "build" ? "Tell AI Copilot what to build or change…" : "Ask anything about your lakehouse data…"}
             />
             <p className="mt-2 text-center text-[11px] text-muted-foreground">
-              Copilot can be wrong. Check its answers; anything that changes data asks you first.
+              AI Copilot can be wrong. Check its answers; anything that changes data asks you first.
             </p>
           </div>
         </div>
