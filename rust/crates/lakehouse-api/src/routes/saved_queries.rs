@@ -1004,9 +1004,10 @@ pub async fn patch_saved(
 
 /// `DELETE /api/query/saved/{id}` — move a saved query to the trash.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// deleted. The query waits in the trash until it is restored or swept
-/// away; it is not gone yet.
+/// The caller must hold **edit** on the query: decision 6 (plan 55 D5)
+/// puts deleting a query beside changing it, because a person who may
+/// rewrite its SQL may take it to the trash too. The query waits in the
+/// trash until it is restored or swept away; it is not gone yet.
 ///
 /// # Errors
 ///
@@ -1027,7 +1028,9 @@ pub async fn delete_saved(
     let saved = queries::get_saved(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if level_of(&saved.level) < Level::Manage {
+    // Edit may delete a query (decision 6, plan 55 D5); the store
+    // re-checks the same level on the write.
+    if level_of(&saved.level) < Level::Edit {
         return Err(ApiError::PermissionDenied(QUERY_FORBIDDEN.to_owned()).into());
     }
     queries::trash_saved_query(pool(&state)?, &viewer, &id)
@@ -1096,7 +1099,8 @@ pub async fn duplicate_saved(
 /// trash.
 ///
 /// The query comes back in the folder it was in. The caller must hold
-/// **manage** on it: the trash entry is part of managing a query.
+/// **edit** on it: whoever may delete a query may bring it back
+/// (decision 6, plan 55 D5).
 ///
 /// # Errors
 ///
@@ -1114,12 +1118,14 @@ pub async fn restore_saved(
     let Some(viewer) = scope.effective_viewer() else {
         return Err(ApiError::NotFound(QUERY_NOT_FOUND.to_owned()).into());
     };
-    // The trash entry is part of managing a query, so it is found with the
-    // same scope and the same resolver the trash list uses.
+    // A trashed query is found with the same scope and the same resolver
+    // the trash list uses: what the list shows is what restore acts on.
     let saved = queries::get_saved_including_trash(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if level_of(&saved.level) < Level::Manage {
+    // Edit may restore a query (decision 6, plan 55 D5); the store
+    // re-checks the same level on the write.
+    if level_of(&saved.level) < Level::Edit {
         return Err(ApiError::PermissionDenied(QUERY_FORBIDDEN.to_owned()).into());
     }
     let restored = queries::restore_saved_query(pool(&state)?, &viewer, &id)
@@ -1130,9 +1136,10 @@ pub async fn restore_saved(
 
 /// `GET /api/query/saved-trash` — the queries waiting in the trash.
 ///
-/// The trash holds what the caller may **manage**: the entry in the trash
-/// is part of managing a query, and a caller that may only see a query
-/// has no business seeing where it waits.
+/// The trash holds what the caller may **edit** (decision 6, plan 55
+/// D5): a query they may delete and restore is theirs to see waiting,
+/// and a caller that may only view a query has no business seeing where
+/// it waits.
 ///
 /// # Errors
 ///
@@ -1472,6 +1479,8 @@ pub async fn patch_folder(
 /// A folder is deleted only when it holds nothing: no live query, no
 /// query in the trash and no folder of its own. The caller must hold
 /// **manage** on it, and a **personal** space may not be deleted at all.
+/// Manage, not edit: decision 6 lifted only a query's delete and
+/// restore to edit, and a folder is not a query (plan 55 D5).
 ///
 /// # Errors
 ///
@@ -1509,7 +1518,9 @@ pub async fn delete_folder(
 // who may be given a rule at all. Every route here needs **manage** on
 // the item, and every route reads the item first — a 404 for what the
 // caller may not see, a 403 for what it may see but not manage, and only
-// then the body.
+// then the body. Manage stays the bar here even though decision 6
+// lifted a query's delete and restore to edit (plan 55 D5): sharing is
+// not changing, and edit must not reach it.
 
 /// `GET /api/query/saved/{id}/access` — who has what on one saved query.
 ///

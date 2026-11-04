@@ -740,8 +740,9 @@ pub async fn update_saved_query(
 
 /// Move a saved query to the trash.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// deleted. Trashing a query that is already in the trash does nothing.
+/// The caller must hold **edit** on the query: decision 6 (plan 55 D5)
+/// puts deleting a query beside changing it. Trashing a query that is
+/// already in the trash does nothing.
 ///
 /// # Errors
 ///
@@ -765,7 +766,8 @@ pub async fn trash_saved_query(
     let Some(level) = visibility.level(&row.target()) else {
         return Err(StoreError::NotFound);
     };
-    if level < Level::Manage {
+    // Edit may delete a query (decision 6, plan 55 D5).
+    if level < Level::Edit {
         return Err(StoreError::NotFound);
     }
     if row.deleted_at.is_some() {
@@ -781,8 +783,8 @@ pub async fn trash_saved_query(
 
 /// Bring a saved query back out of the trash, into the folder it was in.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// restored.
+/// The caller must hold **edit** on the query: whoever may delete it may
+/// bring it back (decision 6, plan 55 D5).
 ///
 /// # Errors
 ///
@@ -806,7 +808,8 @@ pub async fn restore_saved_query(
     let Some(level) = visibility.level(&row.target()) else {
         return Err(StoreError::NotFound);
     };
-    if level < Level::Manage {
+    // Edit may restore a query (decision 6, plan 55 D5).
+    if level < Level::Edit {
         return Err(StoreError::NotFound);
     }
     let restored: SavedQueryRow = sqlx::query_as(
@@ -845,11 +848,13 @@ pub struct SavedQueryTrashEntry {
     pub days_left: i32,
 }
 
-/// The queries in the trash the caller may manage.
+/// The queries in the trash the caller may edit (decision 6, plan 55
+/// D5).
 ///
 /// A trashed query waits here until it is restored or swept away; the
-/// caller sees only the ones it may manage, because the trash entry is
-/// part of managing a query.
+/// caller sees the ones it may edit — the same set that may delete and
+/// restore a query — so what the list shows is what the caller can act
+/// on.
 ///
 /// The days left are counted here rather than by the caller, so the
 /// number the console shows and the number the sweep acts on come from
@@ -882,7 +887,9 @@ pub async fn list_saved_trash_entries(
         .into_iter()
         .filter_map(|row| {
             let level = visibility.level(&row.target())?;
-            if level < Level::Manage {
+            // The trash lists the queries the caller may edit, the same
+            // level delete and restore ask for (decision 6, plan 55 D5).
+            if level < Level::Edit {
                 return None;
             }
             let deleted_at = row.deleted_at?;
