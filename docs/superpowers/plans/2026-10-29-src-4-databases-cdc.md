@@ -2461,3 +2461,63 @@ Both SHOULD-FIX are fixed. No open `BLOCKER`. Slice 6 is closed on code
 ee3c6e38. `SRC-37` (Oracle over TCPS with certificate checking) is now on the
 backlog. Still open with the owner: the MySQL 7-day binlog minimum, and AC7
 QA with a real webhook.
+
+## Handoff (merge main, 2026-11-04)
+
+Merge commit `51ec9fec` of `origin/main` (`d19bdf73`) into
+`feat/data-phase-4-src-4` (head before it `787d6e2d`). No rebase, no
+force-push. `origin/main` moved to `c15ac662` while the checks ran; that
+commit is not in this merge (see "Not verified").
+
+**Conflicts and resolutions (hunk by hunk, both sides kept):**
+
+- `CHANGELOG.md`, Unreleased: both sides' entries kept. Added has SRC-4's
+  Oracle and MongoDB entries then main's `BI-37` and `BI-26`; Changed and
+  Removed keep SRC-4's four; Fixed keeps main's four; Security is main's.
+- `docs/core/BACKLOG.md`, Dates table: both rows kept, `SRC-4` (started
+  2026-10-29) and `QS-3` (started 2026-10-30).
+- `docs/core/PRODUCT.md`, coverage table: took main's business-app-connectors
+  row (`#216` merged and accepted 2026-11-02; this branch's copy predated
+  that) and kept the branch's live-change-capture row (the accepted SRC-4
+  state; main's "Partial" predates the feature).
+
+**Migrations renumbered.** Main took `0121` (`dashboard_comment_author_index`,
+`BI-38`) and `0122` (`saved_query_access`), so this branch's four move above
+main's highest number, content unchanged (`git mv`): `0121_connector_type_cdc_supported`
+to `0123`, `0122_connector_capture_lag` to `0124`, `0123_connector_type_mongodb_cdc`
+to `0125`, `0124_connector_type_oracle_cdc` to `0126`. References updated in
+`CHANGELOG.md`, `ops/lint/check_connector_gate_coverage.py` and its test,
+`lakehouse-store`'s `connector_type.rs`/`capture_lag.rs` docs and
+`docs/core/features/databases-and-change-capture.md`. All four statements are
+idempotent, so a database that ran the branch under the old numbers re-runs
+them and changes nothing.
+
+**Commands run (foreground, final commit, rule 7):**
+
+- `cd rust && cargo fmt --check`: clean.
+- `/home/shiro/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings`: clean, 15 crates.
+- `/home/shiro/bin/cargo-locked test --workspace`: exit 0, **9,730 passed, 0 failed** across 184 suites.
+- `(cd dagster && venv-pr186/bin/python -m pytest dispar_orchestrate -q)`: **2,524 passed, 1 skipped, 41 subtests** (20m29s). The system `python3` has no pytest; `/home/shiro/rantai/venv-bld3` lacks `fastavro`, so `/home/shiro/rantai/venv-pr186` was used.
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `check_bare_iceberg_count.py`: OK. `pytest ops/lint/test_check_connector_gate_coverage.py`: 24 passed.
+- `docker compose --profile '*' config --quiet` with throwaway secrets (`POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY`, `CONNECTOR_SECRETS_KEY`): exit 0.
+- `bun install --frozen-lockfile` (fresh worktree), `bun run typecheck`: clean; `bun run lint`: 0 errors, 10 pre-existing warnings; `bun run test`: **3,247 pass, 1 skip, 0 fail** (331 files).
+
+**Not verified:** no `docker compose up` of the affected profile (the merge
+auto-merged `docker-compose.yml`; CI's gates remain the proof); the
+`g4-*` gates were not run locally; `origin/main`'s `c15ac662` (DATA-39
+memory-registry fix, landed after the fetch) is not merged, so the PR is
+`BEHIND` and may need a follow-up merge.
+
+**Proof · the bundle installs on a fresh host (run `41387243363`, head
+`787d6e2d`):** failed in "Cut the runner off from the registries", before the
+install steps, with "the runner can still pull from a registry: the proof is
+not air-gapped". The step writes `0.0.0.0` entries for six registry hosts into
+`/etc/hosts` and asserts `docker pull alpine:3.20` fails; on that runner the
+pull still resolved and downloaded a layer in 0.4 s (an IPv6 path or a
+daemon-side resolution bypassing the hosts entries). The step is identical on
+`origin/main` (diffed against `d19bdf73`), the branch's only change near it is
+the `g4-source-init` expectation in `ops/release/test_release_workflow.py`,
+and other branches' Release runs pass it, so this is a release-workflow flake,
+not something SRC-4 caused. This merge does not change that step and cannot
+fix it; the new Release run re-runs it unchanged. No release-workflow code was
+touched, per the brief.
