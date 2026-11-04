@@ -194,10 +194,10 @@ export function ClassificationPage() {
               size="sm"
               className="self-start"
               render={
-                <Link href={`/data?q=${encodeURIComponent(selected.asset)}`} />
+                <Link href={`/catalog?q=${encodeURIComponent(selected.asset)}`} />
               }
             >
-              Inspect in Data Explorer
+              Find in Catalog
             </Button>
           </>
         ) : null}

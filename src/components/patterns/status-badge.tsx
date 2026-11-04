@@ -16,7 +16,6 @@ import {
   RUN_STEP_STATUS_LABEL,
   SEVERITY_LABEL,
   STORAGE_TIER_LABEL,
-  WORKLOAD_STATUS_LABEL,
   type AgentRunStatus,
   type AlertStatus,
   type ApprovalStatus,
@@ -30,7 +29,6 @@ import {
   type RunStepStatus,
   type Severity,
   type StorageTier,
-  type WorkloadStatus,
 } from "@/lib/status"
 
 type Tone =
@@ -438,27 +436,3 @@ export function AlertStatusBadge({
   )
 }
 
-const WORKLOAD_STATUS_TONE: Record<WorkloadStatus, Tone> = {
-  queued: "sky",
-  running: "info",
-  completed: "success",
-  cancelled: "neutral",
-}
-
-/** Workload queue lifecycle pill. */
-export function WorkloadStatusBadge({
-  status,
-  className,
-}: {
-  status: WorkloadStatus
-  className?: string
-}) {
-  return (
-    <Pill tone={WORKLOAD_STATUS_TONE[status]} className={className}>
-      {status === "running" ? (
-        <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
-      ) : null}
-      {WORKLOAD_STATUS_LABEL[status]}
-    </Pill>
-  )
-}

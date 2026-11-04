@@ -301,13 +301,3 @@ export const ALERT_STATUS_LABEL: Record<AlertStatus, string> = {
   acknowledged: "Acknowledged",
   resolved: "Resolved",
 }
-
-/** Request lifecycle in the workload admission queue. */
-export type WorkloadStatus = "queued" | "running" | "completed" | "cancelled"
-
-export const WORKLOAD_STATUS_LABEL: Record<WorkloadStatus, string> = {
-  queued: "Queued",
-  running: "Running",
-  completed: "Completed",
-  cancelled: "Cancelled",
-}

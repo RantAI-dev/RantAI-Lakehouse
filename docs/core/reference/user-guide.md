@@ -177,15 +177,14 @@ Then click **Save policy**. A change that is waiting for you appears under
 
 ### Catalog
 
-**Catalog** lists the namespaces (groups of tables).
+**Catalog** lists every table and file the lakehouse governs. (It was two
+pages, Catalog and Data Explorer; an old Data Explorer link opens the
+Catalog with the same search.)
 
-1. Search with **Search namespaces…**.
-2. Click a row to see its owner, residency and assets.
-3. Click **Browse in Data Explorer** to see its tables.
-
-### Data Explorer
-
-1. Pick a layer:
+1. Pick a **Namespace** (a group of tables), or **All**. The namespace's
+   description, owner, residency and source engine appear above the list;
+   **All namespaces** clears it.
+2. Pick a layer:
 
    | Layer | What it holds |
    | --- | --- |
@@ -195,8 +194,9 @@ Then click **Save policy**. A change that is waiting for you appears under
    | **Gold** | Curated tables ready for dashboards. |
 
    Or pick **All**.
-2. Search by name, column, tag, description or owner.
-3. Click a row to open the table. Its tabs:
+3. Search by name, column, tag, description or owner. **Filter** adds
+   more (owner, tags, tier, type, certification, …).
+4. Click a row to open the table, or use its **⋮** menu. Its tabs:
 
    | Tab | What it shows |
    | --- | --- |
@@ -316,7 +316,7 @@ lag** alert ([section 8](#alerts)).
 
 ### Publish a Gold table for other tools
 
-1. Open the Gold table in Data Explorer. On **Overview**, find **Publish
+1. Open the Gold table in the Catalog. On **Overview**, find **Publish
    in open format (Iceberg)** and switch it on.
 2. Click **Publish now**. The card lists the last 5 publish runs.
 
@@ -409,25 +409,19 @@ tells you if it is not.
 
 ### Policies
 
-1. In **Policies**, click **Create Policy**.
-2. **Basics:** give it a **Policy name** and choose its **Kind**:
-   - **Row filter**;
-   - **Column mask**;
-   - **Agent autonomy**;
-   - **Retention**;
-   - **Residency**.
-3. **Scope:** fill **Subjects** (who it applies to) and **Resources**
-   (what it covers).
-4. **Rules:** choose the **Effect**, and add **Conditions** if needed.
-5. **Review:** switch on **Activate on create** to enforce it straight
-   away, or leave it off to keep a draft. Then click **Create draft** or
-   **Create & activate**.
+Policies are added on a table's **Access** tab, in the Catalog, where
+the policy engine enforces them (see **Hide sensitive columns** below).
+There is no separate create form: **Policies** lists what exists, and
+clicking a policy lets you **Enforce**, **Stop enforcing** or **Delete**
+it.
 
-Later, click a policy to **Enforce**, **Stop enforcing** or **Delete** it.
+A policy made with the old **Create Policy** wizard is still listed, but
+it enforces nothing: the wizard saved its subjects, resources and
+conditions as free text, and the engine reads only structured conditions.
 
 ### Hide sensitive columns
 
-Do this on the table itself: open it in Data Explorer and go to its
+Do this on the table itself: open it in the Catalog and go to its
 **Access** tab.
 
 1. **Label the data:** click **Classify**. Choose **Applies to** (one
@@ -470,8 +464,10 @@ check opens an incident, listed under **Open incidents**, with
 
 ### Lineage
 
-In **Lineage**, type a table name. The page shows its **Graph**,
-**Connections**, **Column mappings**, and **What this graph covers**.
+Open the Lineage page from a table's **Lineage** tab, from a chart, from a
+pipeline or from a run, with **Open lineage graph**. It shows the table's
+**Graph**, **Connections**, **Column mappings**, and **What this graph
+covers**.
 
 ### Approvals
 
@@ -523,18 +519,22 @@ Each entry's outcome is one of:
 
 It does not yet record every change made in the console.
 
-### The other monitoring pages
+### System status
 
-| Page | What it shows |
+**System status** answers "is the system healthy?" on one page. (It
+replaces Health, Services, Capacity, Ingestion (CDC) and Table
+Maintenance; their old addresses open the matching section.) The top line
+says whether every probed component is up, names any that is not, and
+links the open alerts. **Refresh** reloads every section; a section that
+cannot load says so with **Retry**, and the rest still shows.
+
+| Section | What it shows |
 | --- | --- |
-| **Health** | Platform health across storage, pipelines, queries, agents and governance. |
-| **Activity** | Recent actions from pipelines, queries, schema changes, policies, connectors, agents and approvals. |
-| **Workloads** | Running and queued requests, with their cost. |
-| **Observability** | Service levels, lag, cache behaviour, policy latency and agent performance. There is no log or trace explorer. |
-| **Services** | Whether each component is up, with its version. A component that was never set up shows "unknown", not "down". |
-| **Capacity** | Storage per bucket, from a daily snapshot, plus ClickHouse's live disk use. |
-| **Table Maintenance** | Each table's upkeep and the nightly maintenance runs. The **Dry run (would delete)** column shows what the next run would remove. A table's own page sets **Snapshots to keep**, **Compact small files** and the **Schedule**. |
-| **Ingestion (CDC)** | The health of live change capture from each source database, including how far behind it is. |
+| **Services** | Whether each component is up. A component that is not probed says **Not probed** and is not counted as up; a version, latency or error rate nothing measures reads **Not measured**. |
+| **Storage** | ClickHouse's disk use now, its growth over 7 days (Not measured until there are 7 days of readings), and each bucket from the daily snapshot. |
+| **Live change capture** | Each CDC connector's replication slot as last checked: connected or not, WAL retained, flush lag. With no CDC connector it is one line. A CDC connector's own page shows its slot too. |
+| **Table maintenance** | What the nightly run last did to each table: what the dry run would delete and what was deleted, and any skipped step. Click a table to open its page, which sets **Snapshots to keep**, **Compact small files** and the **Schedule**. |
+| **Freshness** and **Queries** | Tables against their freshness target, and the last 24 hours' query volume and failure rate. |
 
 ## 9. Administration
 
@@ -546,13 +546,9 @@ These pages are for platform administrators.
 | **Teams & Roles** | **Create Role**: give a **Name**, its **Permissions** (for example `catalog:read, query:run`) and a **Description**. |
 | **Tenants** | **Create Tenant**: an organisation, with its **Name**, **Slug**, **Plan** and **Residency**. |
 | **Service Identities** | **Create Service Identity**: an account for scheduled jobs. Its secret is shown once, when you create a credential. Copy it then. |
-| **SSO** | See the single sign-on setup and click **Test sign-in**. Your operator configures it on the server. |
 | **Sessions** | See who is signed in, and **Revoke** a session. |
-| **Settings** | Report time zone, first day of the week, number format, company palette and fonts, allowed outside sites and email domains, downloads, public links, remembered results, and query limits per role. |
+| **Settings** | Report time zone, first day of the week, number format, company palette and fonts, allowed outside sites and email domains, downloads, public links, remembered results, query limits per role, and sign-in: whether single sign-on is set up (with **Test sign-in**). Your operator configures single sign-on on the server. |
 | **Maps** | **Upload a map** (a GeoJSON file of polygons) for map charts. A map that a chart uses cannot be deleted. |
-
-**Intelligence** (Digital Employees, Agent Runs) is marked **Soon** and
-cannot be opened yet.
 
 ## 10. What the console will always tell you
 
