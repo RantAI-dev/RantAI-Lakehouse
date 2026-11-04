@@ -10,12 +10,23 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { formatNumber } from "@/lib/format"
 import type { Role } from "@/services/contracts/identity"
 
-export function getRoleColumns(): ColumnDef<Role>[] {
+/**
+ * The Roles list. `onEdit` / `onDelete` are given only to someone with
+ * `identity:write` (`WEB-3` S3-D8); without them the menu only copies.
+ */
+export function getRoleColumns({
+  onEdit,
+  onDelete,
+}: {
+  onEdit?: (role: Role) => void
+  onDelete?: (role: Role) => void
+} = {}): ColumnDef<Role>[] {
   return [
     {
       accessorKey: "name",
@@ -83,7 +94,7 @@ export function getRoleColumns(): ColumnDef<Role>[] {
                   variant="ghost"
                   size="icon"
                   className="size-8 p-0"
-                  aria-label="Role actions"
+                  aria-label={`Actions for role ${item.name}`}
                 >
                   <MoreHorizontal className="size-4" />
                 </Button>
@@ -97,6 +108,15 @@ export function getRoleColumns(): ColumnDef<Role>[] {
                 >
                   Copy role name
                 </DropdownMenuItem>
+                {onEdit || onDelete ? <DropdownMenuSeparator /> : null}
+                {onEdit ? (
+                  <DropdownMenuItem onClick={() => onEdit(item)}>Edit role</DropdownMenuItem>
+                ) : null}
+                {onDelete ? (
+                  <DropdownMenuItem variant="destructive" onClick={() => onDelete(item)}>
+                    Delete role
+                  </DropdownMenuItem>
+                ) : null}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>

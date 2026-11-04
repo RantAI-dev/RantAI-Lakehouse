@@ -201,10 +201,10 @@ Catalog with the same search.)
    | Tab | What it shows |
    | --- | --- |
    | **Overview** | Owner, description, and for a Gold table the **Publish in open format (Iceberg)** card ([section 5](#publish-a-gold-table-for-other-tools)). |
-   | **Schema** | The columns, and **Schema versions**. |
+   | **Schema** | The columns, and **Schema versions**. Open a column for its values and its **Sensitivity and masking** ([section 7](#hide-sensitive-columns)). |
    | **Sample** | Up to 1,000 rows, and **Open in Query Studio**. |
    | **Quality** | The checks on this table; **Run checks** and **Add rule**. |
-   | **Access** | **Your access**, its **Classification** and its **Policies** ([section 7](#hide-sensitive-columns)). |
+   | **Access** | **Your access**, its grants and its **Policies** ([section 7](#hide-sensitive-columns)). |
    | **Lineage** | Where the data came from and what depends on it. |
    | **Activity** | **Snapshots**, **Change history** and **Freshness**. |
 
@@ -407,43 +407,46 @@ tells you if it is not.
 
 ## 7. Governance
 
-### Policies
+### Access rules
 
-Policies are added on a table's **Access** tab, in the Catalog, where
-the policy engine enforces them (see **Hide sensitive columns** below).
-There is no separate create form: **Policies** lists what exists, and
-clicking a policy lets you **Enforce**, **Stop enforcing** or **Delete**
-it.
+Access rules (policies) are added on a table's **Access** tab, in the
+Catalog, where the policy engine enforces them (see **Hide sensitive
+columns** below). **Access rules** lists every rule, read-only: its
+table, the roles it applies to, what it does (the columns it masks, or
+that it filters rows) and whether it is enforced. Click a table to open
+its **Access** tab, where you **Enforce**, **Stop enforcing** or
+**Delete** the rule. A table the catalog cannot open is named without a
+link.
 
-A policy made with the old **Create Policy** wizard is still listed, but
-it enforces nothing: the wizard saved its subjects, resources and
+A rule made with the old **Create Policy** wizard is still listed, but it
+reads **Not enforced**: the wizard saved its subjects, resources and
 conditions as free text, and the engine reads only structured conditions.
 
 ### Hide sensitive columns
 
-Do this on the table itself: open it in the Catalog and go to its
-**Access** tab.
+Do this on the column itself: open the table in the Catalog, go to its
+**Schema** tab and click the column. Its **Sensitivity and masking**
+section says how sensitive it is and who sees it as `***`.
 
-1. **Label the data:** click **Classify**. Choose **Applies to** (one
-   column, or the whole table) and a classification (**Public**,
-   **Internal**, **Confidential** or **Restricted**). Click **Save**.
-2. **Mask it:** click **Add policy**.
-   1. Choose the **Roles it applies to**.
-   2. Tick the **Columns to mask**.
-   3. Optionally add a row filter.
-   4. Click **Add and enforce**, or **Save draft**.
+1. **Label it:** under **Sensitivity**, click **Set** (or **Change**),
+   choose **Public**, **Internal**, **Confidential** or **Restricted**,
+   and click **Save**. **Remove** takes the label back.
+2. **Mask it:** under **Masked for**, click **Add a mask**, type the
+   roles (separated by commas) and click **Add mask**. The mask is
+   enforced from the next query on. **Remove** next to a mask deletes it.
 
-People in those roles then see `***` in place of the values.
+People in those roles then see `***` in place of the values. A mask that
+is part of a wider policy (one that also masks other columns, or filters
+rows) is named there and changed on the table's **Access** tab, where
+**Add policy** masks several columns or filters rows at once.
 
-The **Classification & Masking** page lists labels across all tables, and
-**Add Rule** labels a column from there. To make sure a value is hidden,
-use the table's **Access** tab as above.
+A `masked` mark on a column means it is masked for you.
 
 ### Tag keys
 
 Tags describe tables with values from a fixed list.
 
-1. In **Tag keys**, click **New tag key**.
+1. In **Settings**, open **Tag keys** and click **New tag key**.
 2. Fill **Key** (lower-case letters, digits, `_` and `-`, up to 64
    characters) and **Allowed values** (up to 50).
 3. Click **Define key**.
@@ -462,10 +465,20 @@ Open a rule to **Run check**, **Edit rule** or **Delete rule**. A failing
 check opens an incident, listed under **Open incidents**, with
 **Resolve**.
 
+Two more tabs show what each table's page sets, for every table at once:
+
+- **Schedules**: the tables whose checks run on their own schedule, with
+  **Edit** and **Reset**. **Reset** puts the table back on the default and
+  takes it off the list. Any other table runs its checks every hour.
+- **Freshness targets**: how often each table must get new data, with
+  **Add target**, **Edit** and **Remove**. Past its target a table reads
+  as late.
+
 ### Lineage
 
 Open the Lineage page from a table's **Lineage** tab, from a chart, from a
-pipeline or from a run, with **Open lineage graph**. It shows the table's
+pipeline or from a run, with **Open lineage graph**. A pipeline that names
+its target table links to that table's **Lineage** tab instead. It shows the table's
 **Graph**, **Connections**, **Column mappings**, and **What this graph
 covers**.
 
@@ -542,13 +555,11 @@ These pages are for platform administrators.
 
 | Page | What you can do |
 | --- | --- |
-| **Users** | **Invite User**: give a **Name**, **Email**, **Roles** and **Tenants**, then click **Invite**. Roles cannot yet be changed here once a person is invited. |
-| **Teams & Roles** | **Create Role**: give a **Name**, its **Permissions** (for example `catalog:read, query:run`) and a **Description**. |
+| **Users** | **People**: **Invite User**: give a **Name**, **Email**, **Roles** and **Tenants**, then click **Invite**. **Sessions**: see who is signed in, and **Revoke** a session. |
+| **Roles** | **Create Role**: give a **Name**, its **Permissions** (for example `catalog:read, query:run`) and a **Description**. From a role's menu, **Edit role** changes all three, and **Delete role** removes a role nobody holds; a role people still hold, or a built-in role, cannot be deleted, and the dialog says why. Access rules name roles by name, so a rule that names a role's old name stops applying to it after a rename. |
 | **Tenants** | **Create Tenant**: an organisation, with its **Name**, **Slug**, **Plan** and **Residency**. |
 | **Service Identities** | **Create Service Identity**: an account for scheduled jobs. Its secret is shown once, when you create a credential. Copy it then. |
-| **Sessions** | See who is signed in, and **Revoke** a session. |
-| **Settings** | Report time zone, first day of the week, number format, company palette and fonts, allowed outside sites and email domains, downloads, public links, remembered results, query limits per role, and sign-in: whether single sign-on is set up (with **Test sign-in**). Your operator configures single sign-on on the server. |
-| **Maps** | **Upload a map** (a GeoJSON file of polygons) for map charts. A map that a chart uses cannot be deleted. |
+| **Settings** | One section at a time. **Reporting**: report time zone, first day of the week, number format, company palette and fonts, allowed outside sites and email domains, downloads and public links. **Remembered results**. **Query limits** per role. **Sign-in**: whether single sign-on is set up (with **Test sign-in**); your operator configures it on the server. **Tag keys** ([section 7](#tag-keys)). **Maps**: **Upload a map** (a GeoJSON file of polygons) for map charts; a map that a chart uses cannot be deleted. |
 
 ## 10. What the console will always tell you
 

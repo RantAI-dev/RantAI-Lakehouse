@@ -1,7 +1,6 @@
 "use client"
 
 import * as React from "react"
-import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -11,7 +10,8 @@ import { authService } from "@/services"
 import type { Session } from "@/services/contracts/auth"
 
 /**
- * Sessions admin page. Reads `GET /api/auth/sessions` and revokes with
+ * The Sessions tab of Users (`WEB-3` S3-D7; it was the `/admin/sessions`
+ * page, which now redirects to `/admin/users?tab=sessions`). Reads `GET /api/auth/sessions` and revokes with
  * `DELETE /api/auth/sessions/{id}`. The page deliberately does not gate on
  * `identity:sessions:manage`: the ownership split lives server-side, so
  * any authenticated caller can render their own sessions — the revoke
@@ -20,7 +20,7 @@ import type { Session } from "@/services/contracts/auth"
  * missing id and a foreign id prevents the UI from being an enumeration
  * oracle.
  */
-export function SessionsPage() {
+export function SessionsPanel() {
   const state = useService((signal) => authService.listSessions(signal), [])
   const revoke = useServiceAction<[string], void>(
     (signal, id) => authService.deleteSession(id, signal),
@@ -66,10 +66,9 @@ export function SessionsPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader
-        title="Sessions"
-        description="Active browser sessions across this workspace."
-      />
+      <p className="text-sm text-muted-foreground">
+        Active browser sessions across this workspace.
+      </p>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />

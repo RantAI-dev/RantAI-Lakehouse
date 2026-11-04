@@ -62,9 +62,13 @@ const REQUESTABLE_PERMISSIONS = ["catalog:write", "lineage:read", "query:read"] 
 /** Asset detail with schema, freshness, lineage hops, policies, and snapshots. */
 export function AssetDetailPage() {
   const params = useParams<{ assetId: string }>()
+  // WEB-3 S3-D1: a column's sensitivity and masks change from inside the
+  // opened column; a reload that swapped the page for a skeleton would close
+  // it. Keep the asset on screen while the same asset reloads.
   const state = useService(
     (s) => assetService.getAsset(params.assetId, s),
-    [params.assetId]
+    [params.assetId],
+    { keepDataOnReload: true }
   )
   const { hasPermission } = useAuth()
   // Read here, not in the Schema tab, so the header pill and the tab share one request.

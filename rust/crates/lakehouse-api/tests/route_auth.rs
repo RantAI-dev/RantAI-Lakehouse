@@ -2287,6 +2287,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         StatusCode::FORBIDDEN,
         "catalog:read alone must NOT be enough to set a schedule"
     );
+    // WEB-3 S3a-D3: resetting a schedule is the same write, both ways.
+    let refused_reset = request_with_cookie(&router, "DELETE", set, &reader_cookie).await;
+    assert_eq!(
+        refused_reset.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must NOT be enough to reset a schedule"
+    );
 
     let admin_cookie = session_cookie_for_user(&pool, admin).await;
     let allowed = request_with_cookie(&router, "PUT", set, &admin_cookie).await;
@@ -2295,6 +2302,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         allowed.status(),
         StatusCode::BAD_REQUEST,
         "governance:write must be enough to reach set handler which answers 400 on empty body"
+    );
+
+    let allowed_reset = request_with_cookie(&router, "DELETE", set, &admin_cookie).await;
+    assert_eq!(
+        allowed_reset.status(),
+        StatusCode::NO_CONTENT,
+        "governance:write must be enough to reset a schedule"
     );
 
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")
@@ -3795,4 +3809,109 @@ async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
             allowed.status()
         );
     }
+}
+
+/// `WEB-3` S3a-D2: editing or removing a role needs `identity:write`, the
+/// permission creating one needs, and the gate agrees both ways. A reader
+/// is refused (403) and nothing changes; a writer gets the handler's own
+/// answer — here the built-in refusal for the seeded `Analyst` role — never
+/// 401 or 403, and the row stays.
+#[tokio::test]
+async fn role_edit_and_delete_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    // The seeded `Analyst` role (`0002_seed_identity.sql`).
+    let built_in = "22222222-2222-4222-8222-000000000001";
+    let url = format!("/api/identity/roles/{built_in}");
+
+    let members_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM app_user_role WHERE role_id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("count the role's members");
+
+    for (method, path) in [
+        ("PUT", "/api/identity/roles/{id}"),
+        ("DELETE", "/api/identity/roles/{id}"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("identity:write")),
+            "{method} {path}"
+        );
+        let anonymous = request_with_cookie(&router, method, &url, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+        let reader = create_principal_with_permissions(&pool, "identity:read").await;
+        let cookie = session_cookie_for_user(&pool, reader).await;
+        let refused = request_with_cookie(&router, method, &url, &cookie).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: identity:read alone must not change a role"
+        );
+    }
+
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>("SELECT name, permissions FROM role WHERE id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("read the role"),
+        (
+            "Analyst".to_owned(),
+            "query:read, catalog:read, lineage:read".to_owned()
+        ),
+        "a refused caller must not rewrite the role"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM app_user_role WHERE role_id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("count the role's members"),
+        members_before,
+        "a refused caller must not change who holds the role"
+    );
+
+    let writer = create_principal_with_permissions(&pool, "identity:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let allowed = request_with_cookie(&router, "DELETE", &url, &cookie).await;
+    assert_eq!(
+        allowed.status(),
+        StatusCode::CONFLICT,
+        "identity:write reaches the delete handler, which refuses a built-in role"
+    );
+    let body = to_bytes(allowed.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("the body is JSON");
+    assert_eq!(
+        body["error"],
+        serde_json::json!("A built-in role cannot be deleted.")
+    );
+
+    let blank =
+        request_with_cookie_and_body(&router, "PUT", &url, &cookie, br#"{"name":"   "}"#.to_vec())
+            .await;
+    assert_eq!(
+        blank.status(),
+        StatusCode::BAD_REQUEST,
+        "identity:write reaches the update handler, which refuses a blank name"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT name FROM role WHERE id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("read the role"),
+        "Analyst",
+        "a refused update leaves the role alone"
+    );
 }

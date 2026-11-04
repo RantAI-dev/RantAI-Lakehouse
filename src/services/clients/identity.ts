@@ -10,6 +10,7 @@ import type {
   RotateServiceIdentityResponse,
   ServiceIdentity,
   Tenant,
+  UpdateRoleInput,
   User,
 } from "../contracts/identity";
 import { apiFetch } from "../http";
@@ -133,6 +134,24 @@ export const postgresIdentityService: IdentityService = {
   },
   createRole(input: CreateRoleInput, signal) {
     return post<Role>("/api/identity/roles", input, signal, "Failed to create role");
+  },
+  // WEB-3 S3a-D2: a role can be rewritten and removed. The API's 409
+  // sentence (still held / built-in) reaches the console through
+  // `ServiceError.message` unchanged.
+  updateRole(id, input: UpdateRoleInput, signal) {
+    return put<Role>(
+      `/api/identity/roles/${encodeURIComponent(id)}`,
+      input,
+      signal,
+      "Failed to update role"
+    );
+  },
+  deleteRole(id, signal) {
+    return del<void>(
+      `/api/identity/roles/${encodeURIComponent(id)}`,
+      signal,
+      "Failed to delete role"
+    );
   },
   createTenant(input: CreateTenantInput, signal) {
     return post<Tenant>("/api/identity/tenants", input, signal, "Failed to create tenant");
