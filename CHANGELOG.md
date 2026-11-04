@@ -42,6 +42,7 @@ once a first release is tagged.
 - **Data Quality** has **Schedules** and **Freshness targets** tabs (backlog `WEB-3`, slice 3b): every table with a check schedule of its own, with **Edit** and **Reset** (back to the default schedule), and every freshness target, with **Add**, **Edit** and **Remove**, using the same controls as a table's page. A Bronze table is named without a link, because its page is addressed by a registry name its key does not carry.
 - A pipeline that names its target table links to that table's **Lineage** tab instead of the Lineage page (backlog `WEB-3`, slice 3b). The sidebar's Governance group loses Tag keys and Classification & Masking; Administration loses Sessions and Maps.
 - **Policies** is **Access rules**, at the same address, and is read-only (backlog `WEB-3`, slice 3b): each rule's table, its roles, what it does (the columns it masks, or that it filters rows) and whether it is enforced. The table links to its **Access** tab, where a rule is enforced, stopped and deleted; a table the catalog cannot open is plain text. The list and its drawer no longer have **Enforce**, **Stop enforcing** or **Delete**.
+- **Teams & Roles** is **Roles**, with **Edit role** and **Delete role** (backlog `WEB-3`, slice 3b). Deleting a role people still hold, or a built-in role, is refused with the API's own sentence, shown in the dialog. Changing a role's name warns first that access rules naming the old name stop applying to it.
 
 ### Removed
 

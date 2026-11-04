@@ -556,7 +556,7 @@ These pages are for platform administrators.
 | Page | What you can do |
 | --- | --- |
 | **Users** | **People**: **Invite User**: give a **Name**, **Email**, **Roles** and **Tenants**, then click **Invite**. **Sessions**: see who is signed in, and **Revoke** a session. |
-| **Teams & Roles** | **Create Role**: give a **Name**, its **Permissions** (for example `catalog:read, query:run`) and a **Description**. |
+| **Roles** | **Create Role**: give a **Name**, its **Permissions** (for example `catalog:read, query:run`) and a **Description**. From a role's menu, **Edit role** changes all three, and **Delete role** removes a role nobody holds; a role people still hold, or a built-in role, cannot be deleted, and the dialog says why. Access rules name roles by name, so a rule that names a role's old name stops applying to it after a rename. |
 | **Tenants** | **Create Tenant**: an organisation, with its **Name**, **Slug**, **Plan** and **Residency**. |
 | **Service Identities** | **Create Service Identity**: an account for scheduled jobs. Its secret is shown once, when you create a credential. Copy it then. |
 | **Settings** | One section at a time. **Reporting**: report time zone, first day of the week, number format, company palette and fonts, allowed outside sites and email domains, downloads and public links. **Remembered results**. **Query limits** per role. **Sign-in**: whether single sign-on is set up (with **Test sign-in**); your operator configures it on the server. **Tag keys** ([section 7](#tag-keys)). **Maps**: **Upload a map** (a GeoJSON file of polygons) for map charts; a map that a chart uses cannot be deleted. |

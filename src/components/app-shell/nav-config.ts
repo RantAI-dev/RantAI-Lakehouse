@@ -152,7 +152,8 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: Settings,
     items: [
       { title: "Users", href: "/admin/users", icon: Users },
-      { title: "Teams & Roles", href: "/admin/roles", icon: Building2 },
+      // WEB-3 S3-D8: the page holds roles only, so it is named for them.
+      { title: "Roles", href: "/admin/roles", icon: Building2 },
       { title: "Tenants", href: "/admin/tenants", icon: Boxes },
       {
         title: "Service Identities",
