@@ -450,6 +450,113 @@ The planner opens it.
 - `next dev` on the console (the T3 comparison) appends an agent-rules block to `AGENTS.md`. It was restored with `git checkout` and never committed.
 - Evidence screenshots: `docs/plans/web-5-screens/`, 7 files (T3 before/after ×2, T5 three modes, T7 `/id/` ×2).
 
+### Handoff 2: developer (Opus), 2026-11-04, review 1 fixes
+
+**Commits** (`d4c8ba2e..d05fde85`, all pushed; one per finding, R2 plus a follow-up):
+
+| Commit | What |
+| --- | --- |
+| `a5c6fdd0` | R1 BLOCKER: initial JS 181.2 KB (was 209.0 KB) |
+| `71ae28a4` | R2: label in name on the EN/ID links |
+| `3760073c` | R2 follow-up: the RESULT note (`71ae28a4`'s body claimed it, but the edit had not applied) |
+| `81822b80` | R3: `codeRepository` on a `SoftwareSourceCode` node |
+| `d05fde85` | R4: the sources stage fits 360×740 |
+
+**R1: what was measured and changed.**
+- The review's form, motion's async `LazyMotion` with
+  `features={() => import("./dom-animation")…}`, measured **210.1 KB**.
+  Turbopack writes a bare `import()` target into the HTML as an `async`
+  script, so the chunk stays in the first load.
+- **The cause:** `motion/react` is
+  `import * as fm from "framer-motion"; export *…; const motion = fm.motion`.
+  Any import from it keeps the full `motion` component (layout and drag),
+  so neither `LazyMotion` nor `m.*` could shed code (T5's step saved
+  0.2 KB).
+- **Fix 1, for review:** all 15 site files import from `framer-motion`,
+  added at **14.9.1**, the exact version `motion` 14.9.1 had installed.
+  It is the package `motion/react` re-exports, and its plain re-exports
+  tree-shake. The unused `motion` dependency was removed. Both changes
+  were made with bun 1.3.12 (lockfileVersion 1). This replaces D1's
+  "motion ^14.9.0" with its React package.
+- **Fix 2:** `domAnimation` arrives after hydration through a
+  `next/dynamic` component (`DomAnimationLoader`, `ssr: false`), which is
+  not written into the HTML, feeding an async `LazyMotion`. The feature
+  code is in two deferred chunks, about 17 KB.
+- **Result:** 181.2 KB on `/` and `/id/`, so `bun run size` exits 0. The
+  scene is 146.8 KB, deferred; the `noModule` polyfills are 39.6 KB,
+  listed and not counted.
+
+**R1: the review's conditions.**
+- The hero `h1` and the CTAs use no reveal and no feature, so LCP never
+  waits on the chunk.
+- **A failed features chunk must not blank the page.**
+  - Reveals are hidden only once `motion-ready` is on `<html>`, which is
+    set when the features load. This replaces T5's `js` class and its
+    inline script.
+  - Blocking the deferred chunks over CDP (`Network.setBlockedURLs`) first
+    showed that a failed `next/dynamic` chunk replaces the whole page with
+    Next's "This page couldn't load".
+  - So `QuietBoundary` now wraps all three deferred pieces: the features
+    loader, the 3D scene (its boundary calls `markFailed`, so the DOM hero
+    stays) and the language offer.
+  - Re-measured blocked: the page intact, `motion-ready` false, every
+    in-view reveal at opacity 1. Loaded: `motion-ready` true, and reveals
+    animate.
+- **A regression found while retaking the screenshots, and fixed.** Before
+  the features arrive, an `m` element keeps its first rendered style.
+  Under reduced motion the sources headline and the chat window stayed at
+  opacity 0. Each `m` element whose style switches on `reduced` (and the
+  hero copy, on `live`) is now keyed on that state. Probed afterwards:
+  opacity 1.
+- `docs/plans/web-5-screens/t5-{reduced,nowebgl,nojs}.jpg` were re-taken;
+  their content matches T5's.
+
+**R2.** The names are now "EN: English" and "ID: Switch to Bahasa
+Indonesia" on `/`, and "EN: Ganti ke English" and "ID: Bahasa Indonesia"
+on `/id/`. Lighthouse 13.6.0, accessibility only, scores
+`label-content-name-mismatch` 1 on both pages; accessibility stays 100.
+
+**R3.** The SoftwareApplication has an `@id` and no `codeRepository`. A
+SoftwareSourceCode node carries `codeRepository`, the license,
+`targetProduct` pointing at that `@id`, and the publisher. The test was
+updated (46 tests). The built JSON-LD of both pages parses.
+
+**R4.** Phone-only spacing:
+- the stage gets `pt-16`, so it centres below the bar;
+- the headline box `p-3`, and the lead `mt-3` with line height 1.45;
+- the pills `mt-5` and the caption `mt-4`.
+
+Measured (headline-box top / caption bottom; the bar ends at 65 px):
+
+| Viewport | EN | ID |
+| --- | --- | --- |
+| 360×740 | 91 / 713 | 111 / 693 |
+| 390×844 | 196 / 712 | 163 / 745 |
+| 1440×900 | 197 / 703 | 197 / 703 (desktop unchanged) |
+
+Evidence: `docs/plans/web-5-screens/r4-sources-360x740.jpg` (EN and ID).
+
+**Checks.**
+- Per commit, the scoped site block (lint, typecheck, test, build, size).
+- Final, on `d05fde85`'s code, the site block: lint 0, typecheck 0,
+  `bun run test` 46 pass, 0 fail, build 0, `bun run size` 0
+  (181.2 KB / 181.2 KB).
+- No root, compose or release files changed in R1–R4, so the root checks
+  were not re-run. Their last run is in Handoff 1 (at `a1cce859`).
+- `git status`: clean.
+
+**Not done, as asked.**
+- The RESULT's "Reviewer's run" section is untouched.
+- A dated "Update: review fix R1" section records 181.2 KB; the
+  Lighthouse table stays as measured at `5cf9dfa0`.
+- I did not re-run Lighthouse for TBT: the reviewer's run on this commit
+  is that measurement.
+
+**For the planner.** R1 swaps D1's `motion` dependency for
+`framer-motion` 14.9.1 (same code, the package `motion/react` re-exports).
+Please confirm it or ask for it back. Keeping `motion` means importing
+through its namespace re-export, which brings back the full bundle.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
