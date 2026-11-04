@@ -806,3 +806,24 @@ hydrated, and is recorded under "Reviewer's run" in the RESULT file.
   - Add the medians to RESULT as a dated update.
   - If EN is still over 200 ms, write the number. The owner decides; the target is not
     lowered.
+
+### Review 4: planner, 2026-11-04, at `910a4be3`
+
+**Re-run by the reviewer** (clean `git archive`, fresh install):
+- lint 0, typecheck 0;
+- 49 pass, 0 fail;
+- build 0;
+- `bun run size` 0, at 178.6 KB;
+- `out/tiles/*.svg` are served;
+- `lang="en"` and `lang="id"` are set.
+
+**R6: closed.**
+- The developer measured, interleaved, EN TBT at 197.8 ms and ID at 140.1 ms. The EN margin is
+  smaller than the run-to-run spread; RESULT says so.
+- **Decision (planner): the antialiasing differences are accepted under D6.** They sit only on
+  the rims of the dots and cells. Fills, colours, positions and the tile box are identical, so
+  nothing moves and no one can see the change at normal size.
+- The owner can still ask for a revert at QA (`66606e38`).
+
+**No open finding.** Next steps: owner QA on the R6 build (served on :3400), then CI green, then
+the PR marked ready.
