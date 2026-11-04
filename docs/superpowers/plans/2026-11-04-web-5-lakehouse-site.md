@@ -641,7 +641,7 @@ hydrated, and is recorded under "Reviewer's run" in the RESULT file.
 **New finding:**
 - **R5 SHOULD-FIX (before owner QA): the section files are client components, against D5.**
   - D5: "Sections that only render text are server components. Motion and scroll pieces are
-    client leaves." All nine `components/home/*-section.tsx` files except `open-section` start
+    client leaves." Seven of the eight `components/home/*-section.tsx` files (all but `open-section`) start
     with `"use client"`.
   - The reviewer's runs put the EN TBT median at 225 ms against 200 ms. The longest task is
     react-dom's hydration in every run (234 ms in EN 3).
