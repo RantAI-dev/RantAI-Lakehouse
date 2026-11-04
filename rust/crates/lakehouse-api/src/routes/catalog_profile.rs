@@ -40,6 +40,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::catalog::{catalog_tenant_refusal, split_db_table};
 use crate::routes::catalog_source::{self, ReadSource, SourceKind};
 use crate::routes::query::rewrite_sql_for_principal_with_headers;
@@ -269,6 +270,31 @@ fn unsupported(reason: &str) -> Response {
 /// Shared by [`resolve_source`] and the restore of a dropped table
 /// (`DATA-15` F4), so the registry is asked one way.
 ///
+/// DATA-42 D4: the answer is the PRIMARY registry's, and it no longer
+/// depends on which row the engine answered first.
+///
+/// D1: the secondary branch drops the slugs the primary registry holds
+/// (see [`crate::routes::catalog::NOT_IN_PRIMARY`]), so a slug that is in
+/// both registries is answered from the primary — one slug names one
+/// dataset (`DATA-40` D1).
+///
+/// D3: both branches read with `FINAL`, so a slug a second run registered
+/// is one row and not two.
+///
+/// The `LIMIT 1` stays as a guard. It is not what decides the answer: in
+/// `ClickHouse` a `LIMIT` after an unparenthesized `UNION ALL` binds to
+/// the LAST `SELECT` of the union (measured on the test `ClickHouse`
+/// 26.8), so it caps the secondary branch — which, after the clause
+/// above, holds no row for a slug the primary holds. At most one row can
+/// answer, whichever order the engine reads the parts in.
+///
+/// The clause asks the primary CATALOG while this reader reads SYNC, so a
+/// slug the primary's sync table holds and its catalog does not would
+/// still be read from both. That edge is accepted on purpose: the
+/// catalog's own sync reads accept the same one
+/// (`routes::catalog`'s list read), and a second rule here would be a
+/// second answer for one slug.
+///
 /// # Errors
 ///
 /// [`ApiError::NotFound`] when no dataset has that slug; a classified
@@ -276,8 +302,9 @@ fn unsupported(reason: &str) -> Response {
 pub(crate) async fn bronze_table_name(state: &AppState, slug: &str) -> Result<String, ApiError> {
     let slug = SqlLiteral::from(slug);
     let sql = format!(
-        "SELECT table_name FROM lake.`bronze_meta.dataset_sync` WHERE slug = {slug}
-         UNION ALL SELECT table_name FROM lake.`bronze_meta_sec.dataset_sync` WHERE slug = {slug}
+        "SELECT table_name FROM lake.`bronze_meta.dataset_sync` FINAL WHERE slug = {slug}
+         UNION ALL SELECT table_name FROM lake.`bronze_meta_sec.dataset_sync` FINAL WHERE slug = {slug}
+         AND slug {NOT_IN_PRIMARY}
          LIMIT 1"
     );
     let rows = state
@@ -489,5 +516,194 @@ mod tests {
             out[1],
             json!({ "name": "tags", "dataType": "Array(String)", "profiled": false })
         );
+    }
+
+    // ── DATA-42 D4: the primary registry answers. ─────────────────────────
+    //
+    // The reader asks BOTH Bronze registries for a dataset's table name and
+    // takes the first row the engine answers. A slug that is in both
+    // registries therefore got WHICHEVER table name the engine read first
+    // -- the asset page and the restore of a dropped table read a
+    // different table from one read to the next.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), because the fix is a
+    // statement: `FINAL` and the `NOT IN (SELECT slug FROM ...)` clause
+    // are the engine's, and a fake that answered them would only prove
+    // that this module asks for what it means to ask for.
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_clickhouse::ChClient;
+
+        use super::*;
+        use crate::routes::bronze_registry_fixture::{
+            clickhouse, pinned, seed_catalog, seed_sync, state_for,
+        };
+
+        /// A slug the two registries both hold: the PRIMARY's table name,
+        /// on every read.
+        #[tokio::test]
+        async fn the_primary_registry_answers_the_table_name_on_every_read() {
+            let (url, _container) = clickhouse().await;
+            // `max_threads=1` pins the engine's read order, so the answer
+            // is one thing and not a coin toss (a URL setting, so the
+            // statement the module sends is the statement that runs).
+            let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+            let state = state_for(&pinned(&url));
+
+            // The secondary registry writes its row FIRST: the reader must
+            // not answer with the row that was written first.
+            seed_sync(
+                &ch,
+                "bronze_meta_sec",
+                "clash_profile",
+                "Secondary profile",
+                "secondary_raw",
+                99,
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "clash_profile",
+                "Primary profile",
+                "primary_raw",
+                10,
+            )
+            .await;
+            // The primary's CATALOG row is what the exclusion clause asks:
+            // `NOT_IN_PRIMARY` reads the primary catalog.
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_profile",
+                "Primary profile",
+                "primary_raw",
+            )
+            .await;
+
+            // Several reads: the answer does not depend on which registry
+            // the engine read first.
+            //
+            // Measured on the test `ClickHouse` 26.8: the OLD statement
+            // (both branches, no `FINAL`, no exclusion) answers with the
+            // SECONDARY's table whenever the engine's parallel union
+            // delivers the secondary's block first -- 3 of 20 reads with
+            // the default settings. With `max_threads=1` the union
+            // answers in the ORDER OF THE STATEMENT'S BRANCHES, so the
+            // old statement answers with the primary's table on every
+            // read there too (20 of 20) -- which is why the test that
+            // fails on the old statement is the one below.
+            for _ in 0..5 {
+                let table = bronze_table_name(&state, "clash_profile").await.unwrap();
+                assert_eq!(
+                    table, "primary_raw",
+                    "the primary's table name, on every read"
+                );
+            }
+        }
+
+        /// The secondary does not answer for a slug the primary holds.
+        ///
+        /// The slug is in the primary's CATALOG -- the primary owns the
+        /// dataset -- and in the secondary's SYNC, but the primary's own
+        /// sync row is not there yet (the sync has not landed). The old
+        /// statement answered with the SECONDARY's table, so the asset
+        /// page and the restore of a dropped table read a table of a
+        /// registry that does not own the dataset.
+        ///
+        /// The new statement has no row to answer with: the primary's
+        /// branch has none and the secondary's branch is excluded. That
+        /// is the rule `DATA-40` D1 states -- a slug the primary
+        /// registry holds is not read from the secondary one -- and the
+        /// same edge the catalog's own sync read takes
+        /// (`routes::catalog`'s list read).
+        #[tokio::test]
+        async fn the_secondary_does_not_answer_for_a_slug_the_primary_holds() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+            let state = state_for(&pinned(&url));
+
+            // The primary's catalog holds the slug: the primary owns the
+            // dataset.
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "catalog_only_profile",
+                "Primary profile",
+                "primary_raw",
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "catalog_only_profile",
+                "Secondary profile",
+                "secondary_raw",
+            )
+            .await;
+            // The secondary's sync row is there; the primary's is not.
+            seed_sync(
+                &ch,
+                "bronze_meta_sec",
+                "catalog_only_profile",
+                "Secondary profile",
+                "secondary_raw",
+                99,
+            )
+            .await;
+
+            if let Ok(table) = bronze_table_name(&state, "catalog_only_profile").await {
+                assert_ne!(
+                    table, "secondary_raw",
+                    "the secondary's table must not answer for a slug the \
+                     primary holds"
+                );
+            }
+        }
+
+        /// A slug a second run wrote again is answered from the newer row.
+        ///
+        /// DATA-42 D3: without `FINAL` the two copies of the row are two
+        /// rows, and the reader takes whichever the engine answered first.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_is_answered_once() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+            let state = state_for(&pinned(&url));
+
+            // The two copies of the row stay apart: no merge may collapse
+            // them before the reader reads them.
+            ch.exec("SYSTEM STOP MERGES lake.`bronze_meta.dataset_sync`", None)
+                .await
+                .expect("stop the merges of the sync table");
+
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_profile",
+                "Twice profile",
+                "twice_profile_raw",
+                10,
+            )
+            .await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_profile",
+                "Twice profile again",
+                "twice_profile_raw_2",
+                20,
+            )
+            .await;
+
+            let table = bronze_table_name(&state, "twice_profile").await.unwrap();
+            assert_eq!(
+                table, "twice_profile_raw_2",
+                "the newer row's table name, not the older one"
+            );
+        }
     }
 }

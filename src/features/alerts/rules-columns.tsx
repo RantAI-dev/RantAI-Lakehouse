@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import type { ColumnDef } from "@tanstack/react-table"
 import {
   Mail,
@@ -21,6 +22,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
+import { displayColumn } from "@/lib/chart-joins"
 import { LOAD_ALERT_KINDS, QUALITY_ALERT_KIND, type AlertRule } from "@/services/contracts/alerts"
 
 /**
@@ -50,6 +52,62 @@ export const RULE_KIND_LABEL: Record<string, string> = {
 
 export function ruleKindLabel(type: string): string {
   return RULE_KIND_LABEL[type] ?? type
+}
+
+/**
+ * Whether a rule is a chart alert (`BI-19` part C): the "Alert me..." dialog
+ * saves `type: "alert"` with a `chart` id and a `condition`, and no mart.
+ * BI-19 owner QA 2026-10-28, QA-9: the list used to read it as a column rule.
+ */
+export function isChartAlert(rule: Pick<AlertRule, "type" | "chart">): boolean {
+  return rule.type === "alert" && !!rule.chart
+}
+
+/** The type badge text of a rule: "Chart alert" for a chart alert, the kind's label otherwise. */
+export function ruleTypeLabel(rule: Pick<AlertRule, "type" | "chart">): string {
+  return isChartAlert(rule) ? "Chart alert" : ruleKindLabel(rule.type)
+}
+
+/**
+ * What a chart alert watches, in words: the chart and its dashboard when the
+ * list knows them, "Dashboard chart" when it does not (a chart the caller
+ * cannot see, or an older answer). `BI-39` D8: the two names are read live, so
+ * the text follows a rename and never states a chart the reader lost.
+ */
+export function chartAlertScope(
+  rule: Pick<AlertRule, "chartTitle" | "dashboardTitle">
+): string {
+  return rule.chartTitle && rule.dashboardTitle
+    ? `${rule.chartTitle} on ${rule.dashboardTitle}`
+    : "Dashboard chart"
+}
+
+/**
+ * The condition of a chart alert in words (`QA-9`): the scope, then what the
+ * number does.
+ */
+export function chartAlertCondition(
+  rule: Pick<AlertRule, "chartTitle" | "dashboardTitle" | "series" | "condition" | "threshold">
+): string {
+  const series = rule.series ? displayColumn(rule.series) : "the chart"
+  const what =
+    rule.condition === "above"
+      ? `${series} goes above ${rule.threshold}`
+      : rule.condition === "below"
+        ? `${series} goes below ${rule.threshold}`
+        : rule.condition === "any_rows"
+          ? "returns any rows"
+          : String(rule.condition ?? "")
+  return `${chartAlertScope(rule)} · ${what}`.trim()
+}
+
+/** Where the chart's name in the condition links to, when the list knows it. */
+export function chartAlertHref(
+  rule: Pick<AlertRule, "chartTitle" | "dashboardId">
+): string | null {
+  return rule.chartTitle && rule.dashboardId
+    ? `/dashboards/${encodeURIComponent(rule.dashboardId)}`
+    : null
 }
 
 /** Whether `type` is one of the `SRC-7` kinds for connector and upload loads. */
@@ -138,7 +196,7 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
                 : "bg-sky-500/10 text-sky-600 dark:text-sky-400"
             )}
           >
-            {ruleKindLabel(row.original.type)}
+            {ruleTypeLabel(row.original)}
           </span>
         )
       },
@@ -148,6 +206,23 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Condition / Board",
       cell: ({ row }) => {
         const r = row.original
+        if (isChartAlert(r)) {
+          const text = chartAlertCondition(r)
+          const href = chartAlertHref(r)
+          if (!href || !r.chartTitle) {
+            return <span className="text-sm text-muted-foreground">{text}</span>
+          }
+          // The title is the start of `chartAlertCondition`'s text, so the
+          // linked name and the rest read as one sentence.
+          return (
+            <span className="text-sm text-muted-foreground">
+              <Link href={href} className="text-primary hover:underline">
+                {r.chartTitle}
+              </Link>
+              {text.slice(r.chartTitle.length)}
+            </span>
+          )
+        }
         if (r.type === "alert" && r.metric) {
           return (
             <span className="font-mono text-xs text-muted-foreground">

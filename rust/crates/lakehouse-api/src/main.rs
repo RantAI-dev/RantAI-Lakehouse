@@ -224,6 +224,9 @@ async fn run() -> anyhow::Result<()> {
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
     spawn_run_log_cleanup(&state);
+    // QS-3: the saved queries that waited in the trash for more than 30
+    // days are removed for good, at start and every hour.
+    routes::spawn_saved_query_trash_sweep(&state);
     // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
     // 90-day cleanup of deliveries).
     routes::report_runner::spawn(&state);
@@ -1140,6 +1143,7 @@ fn spawn_upload_session_sweep(state: &AppState) {
 /// never takes the process down.
 fn spawn_trash_sweep(state: &AppState) {
     let ch = state.clickhouse.clone();
+    let pg = state.pg.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1147,6 +1151,32 @@ fn spawn_trash_sweep(state: &AppState) {
             interval.tick().await;
             match lakehouse_bi::trash::purge_expired(&ch).await {
                 Ok(purged) if purged.boards + purged.charts > 0 => {
+                    // BI-19 B1 review R8: a dashboard removed for good takes its
+                    // permission rules and mark with it (migration 0103 says so).
+                    // The ids are tombstoned by now, so a failure here is logged
+                    // and cannot be retried; the leftover rows name an id that
+                    // no dashboard has any more.
+                    if let Some(pg) = pg.as_deref() {
+                        for id in &purged.board_ids {
+                            if let Err(err) =
+                                lakehouse_store::dashboard_access::delete_item(pg, "board", id)
+                                    .await
+                            {
+                                tracing::warn!(%err, "permission rules of a purged dashboard were not removed");
+                            }
+                            // BI-19 part E (D15) and the part A review note: a purged
+                            // dashboard's comments (and, with them, their mentions) and
+                            // its public-link row go too. `board_id` has no foreign key.
+                            if let Err(err) =
+                                lakehouse_store::dashboard_comments::delete_for_board(pg, id).await
+                            {
+                                tracing::warn!(%err, "comments of a purged dashboard were not removed");
+                            }
+                            if let Err(err) = lakehouse_store::public_links::delete(pg, id).await {
+                                tracing::warn!(%err, "public link of a purged dashboard was not removed");
+                            }
+                        }
+                    }
                     tracing::info!(
                         boards = purged.boards,
                         charts = purged.charts,
@@ -1205,19 +1235,22 @@ fn spawn_run_log_cleanup(state: &AppState) {
 /// A constant, not a literal in the call, so the test can read the words
 /// an operator reads (`SEC-50` D7).
 ///
-/// `SEC-50` review round 1, SHOULD-FIX 7: the warning names only what is
-/// GATED TODAY — the shared catalog and the `Dagster`-job list (`SEC-20`),
-/// the authored pipelines and the Gold export (`SEC-50`'s first slice).
-/// The dashboards, the embeds, the public links and the alerts read the
-/// same shared catalog, but they are NOT gated until `SEC-50`'s next
-/// slice, and a warning that says they are refused would be a warning
-/// about something the deployment still serves.
+/// `SEC-50` slice 2 T9 (`SEC-50` D7): the warning names EVERY path that
+/// reads the shared catalog and needs the setting — Query Studio's
+/// `SHOW`-family statements, the `Dagster`-job half of `GET /api/pipelines`,
+/// the authored pipelines and the Gold export (`SEC-50`'s first slice), and
+/// now the dashboards (tiles, rows, downloads, SQL sources), the embeds, the
+/// public links, the alerts and digests, the reports, and the PDF and
+/// `PNG` chart images (`SEC-50` slice 2). Nothing is named as merely
+/// "later" any more: with the setting unset, every one of them is refused
+/// for a caller who does not own the shared catalog.
 const CATALOG_TENANT_UNCONFIGURED_WARNING: &str = "CATALOG_TENANT_ID is not set: on a deployment with more than one tenant, \
      the shared catalog and the Dagster-job half of GET /api/pipelines are \
-     refused for every principal without the unrestricted grant, and so are \
-     the authored pipelines and the Gold export, which read that same shared \
-     catalog. The dashboards, the embeds, the public links and the alerts read \
-     it too and are gated in SEC-50's next slice. Set it to the id of the \
+     refused for every principal without the unrestricted grant, and so is \
+     every path that reads that same shared catalog: the authored pipelines \
+     and the Gold export, the dashboards (tiles, rows, downloads and SQL \
+     sources), the embeds, the public links, the alerts and digests, the \
+     reports, and the PDF and chart-image exports. Set it to the id of the \
      tenant that owns this deployment's shared catalog to restore access for \
      that tenant's members (docs/OPERATIONS.md).";
 
@@ -1237,12 +1270,11 @@ const CATALOG_TENANT_UNCONFIGURED_WARNING: &str = "CATALOG_TENANT_ID is not set:
 /// shared catalog and needs the setting, so an operator reads what the
 /// setting is for and not only that it is missing.
 ///
-/// `SEC-50` review round 1, SHOULD-FIX 7: it names the paths that are
-/// GATED TODAY — the shared catalog and the `Dagster`-job list
-/// (`SEC-20`), the authored pipelines and the Gold export (`SEC-50`'s
-/// first slice) — and says that the dashboards, the embeds, the public
-/// links and the alerts follow in the next slice. Those four are NOT
-/// gated yet, so the warning must not say they are refused.
+/// `SEC-50` slice 2 T9 (`SEC-50` D7): it names every path that reads the
+/// shared catalog — the `SEC-20` surfaces, `SEC-50`'s first slice, and
+/// every site `SEC-50` slice 2 gated (dashboards, embeds, public links,
+/// alerts and digests, reports, PDF and chart images). The old
+/// "gated in `SEC-50`'s next slice" wording is gone with the slice.
 fn warn_if_catalog_tenant_unconfigured(config: &config::Config) {
     if config.catalog_tenant_id.is_none() {
         tracing::warn!("{CATALOG_TENANT_UNCONFIGURED_WARNING}");
@@ -1259,20 +1291,27 @@ mod tests {
 
     use super::*;
 
-    /// `SEC-50` D7: the boot warning names every path that IS gated
-    /// today, so an operator reads what the setting is for and not only
+    /// `SEC-50` D7: the boot warning names every path that reads the shared
+    /// catalog, so an operator reads what the setting is for and not only
     /// that it is missing.
     ///
-    /// `SEC-50` review round 1, SHOULD-FIX 7: only the gated paths are
-    /// named as refused. The dashboards, the embeds, the public links and
-    /// the alerts are gated in the next slice, not now.
+    /// `SEC-50` slice 2 T9: the list is now the whole set — the `SEC-20`
+    /// surfaces, slice 1's two paths, and every site slice 2 gated. The old
+    /// split into "gated today" and "later" is gone, because nothing named
+    /// here is served to a caller who does not own the shared catalog.
     #[test]
-    fn the_boot_warning_names_every_path_that_is_gated_today() {
+    fn the_boot_warning_names_every_path_that_is_gated() {
         for path in [
             "shared catalog",
             "Dagster-job",
             "authored pipelines",
             "Gold export",
+            "dashboards",
+            "embeds",
+            "public links",
+            "alerts",
+            "reports",
+            "chart-image",
         ] {
             assert!(
                 CATALOG_TENANT_UNCONFIGURED_WARNING.contains(path),
@@ -1281,20 +1320,19 @@ mod tests {
         }
     }
 
-    /// The paths that are NOT gated yet are named as following later, so
-    /// the warning never claims the deployment refuses something it still
-    /// serves.
+    /// The warning no longer defers any path to a later slice: `SEC-50`
+    /// slice 2 gated every one of them, and a warning that still said
+    /// "gated next slice" would be about a slice that has shipped.
+    ///
+    /// (This test replaces `the_boot_warning_says_the_paths_that_are_not_gated_yet_follow_later`,
+    /// whose purpose was "nothing is named as refused that is still served".
+    /// That purpose is kept as "every path is named" above; the deferral
+    /// sentence itself is what the slice removed.)
     #[test]
-    fn the_boot_warning_says_the_paths_that_are_not_gated_yet_follow_later() {
-        for path in ["dashboards", "embeds", "public links", "alerts"] {
-            assert!(
-                CATALOG_TENANT_UNCONFIGURED_WARNING.contains(path),
-                "the boot warning must name {path:?}: {CATALOG_TENANT_UNCONFIGURED_WARNING}"
-            );
-        }
+    fn the_boot_warning_no_longer_defers_a_path_to_a_later_slice() {
         assert!(
-            CATALOG_TENANT_UNCONFIGURED_WARNING.contains("SEC-50's next slice"),
-            "the boot warning must say the paths that follow are gated later: \
+            !CATALOG_TENANT_UNCONFIGURED_WARNING.contains("next slice"),
+            "SEC-50 slice 2 gated every path the warning names: \
              {CATALOG_TENANT_UNCONFIGURED_WARNING}"
         );
     }

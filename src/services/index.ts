@@ -26,6 +26,7 @@ import { reportService as reportClientService } from "./clients/reports"
 import { settingsService as settingsClientService } from "./clients/settings"
 import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
+import { chatSessionService as chatSessionClientService } from "./clients/chat-sessions"
 import { semanticService as semanticClientService } from "./clients/semantic"
 import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
 import { httpVersionService } from "./clients/version"
@@ -60,6 +61,22 @@ export const opsService = clickhouseOpsService
 // Postgres. Every contract method is served, so mock/identity.ts has been
 // deleted.
 export const identityService = postgresIdentityService
+/**
+ * The identity directory's shapes (ADM-4). The contract owns them, and
+ * they are exported here so a feature imports them from `@/services` and
+ * not from `services/contracts/identity` directly (`PR #199 review M
+ * SHOULD-FIX BI-16 7`).
+ */
+export type {
+  InviteUserInput,
+  InviteUserResponse,
+  ResetPasswordResponse,
+  Role,
+  ServiceIdentity,
+  SetUserRolesInput,
+  Tenant,
+  User,
+} from "./contracts/identity"
 // Connectors is now real — connector definitions (CRUD + testConnection) live
 // in Postgres (Task 2.7). Credentials are NEVER stored or returned: only the
 // `secretRef` (a reference, e.g. "env:FOO"); see
@@ -79,7 +96,8 @@ export const dashboardService = clickhouseDashboardService
  * (`PR #199 review M SHOULD-FIX BI-16 7`).
  */
 export type {
-  Board, BoardChart, BoardTab, EmbedInfo, FilterMode, LayoutMap, PhoneTile, PublicLink, PublicLinkState, TileBox,
+  AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
+  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
 } from "./contracts/dashboards"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService
@@ -130,6 +148,14 @@ export type { ReportingSettingsInput } from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
+// The AI Copilot's saved conversations (`/api/ai/sessions`): list, open,
+// save, rename and delete (AI-24). No mock ever existed for this domain.
+export const chatSessionService = chatSessionClientService
+/** The conversation shapes the Copilot feature reads from `@/services`. */
+export type {
+  ChatSession, ChatSessionPage, ChatSessionSaved, ChatSessionService, ChatSessionSummary,
+  ListChatSessionsQuery, SaveChatSessionInput,
+} from "./contracts/chat-sessions"
 // The semantic entries of a table and its columns (`/api/semantic/{asset}`):
 // the drafted meaning and role, and the person's confirmed corrections. No
 // mock ever existed.

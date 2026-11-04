@@ -31,6 +31,8 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use async_trait::async_trait;
+use rand::RngExt;
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::authenticator::Authenticator;
@@ -90,6 +92,61 @@ pub fn verify_hash(password: &Secret, hash: &str) -> bool {
         .is_ok()
 }
 
+/// The alphabet a generated temporary password is drawn from.
+///
+/// # Why these characters and not others
+///
+/// No LOOK-ALIKE characters: `0`/`O`, `1`/`l`/`I` and `L`/`l` are all
+/// excluded, because a temporary password is read off one screen and
+/// typed into another by a human, and `0`-for-`O` is exactly the mistake
+/// that turns an invite into a support ticket. The digits are `2`-`9` and
+/// the letters are the rest of the alphabet, so every character in the
+/// password is distinguishable from every other at a glance.
+///
+/// The three symbols (`-`, `_`, `.`) are unambiguous and safe to paste
+/// into any field, so the password never needs quoting on the way in.
+///
+/// 59 characters in total; 24 of them drawn from this alphabet is about
+/// 142 bits of entropy (`log2(59) * 24`), far past anything a human
+/// chooses and far past any online guessing rate.
+const TEMPORARY_PASSWORD_ALPHABET: &[u8] =
+    b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789-_.";
+
+/// How many characters a generated temporary password has. The plan's
+/// floor is 20; this is 24, comfortably above it.
+const TEMPORARY_PASSWORD_LENGTH: usize = 24;
+
+/// Generate a fresh temporary password, from the OS random source.
+///
+/// ADM-3 D1: an invite (and an admin reset) hands the human a password
+/// the SERVER chose, so the caller never has to invent one and never
+/// picks a weak one. It is drawn from [`rand::rng`] — a `ChaCha20`-based
+/// CSPRNG seeded from the operating system and reseeded as it runs (see
+/// `rand`'s `rngs::thread` module) — through [`rand::RngExt::random_range`],
+/// which samples without modulo bias.
+///
+/// The alphabet carries no look-alike characters (see
+/// [`TEMPORARY_PASSWORD_ALPHABET`]), and the length is
+/// [`TEMPORARY_PASSWORD_LENGTH`].
+///
+/// # The value is a secret
+///
+/// The returned [`Secret`] never renders itself (`Debug`/`Display` are a
+/// fixed redaction marker), so it cannot reach a log line by accident.
+/// The caller shows it once, in the one response that carries it, and
+/// forgets it — the server keeps only the `Argon2id` hash.
+#[must_use]
+pub fn generate_temporary_password() -> Secret {
+    let mut rng = rand::rng();
+    let mut out = String::with_capacity(TEMPORARY_PASSWORD_LENGTH);
+    for _ in 0..TEMPORARY_PASSWORD_LENGTH {
+        let index = rng.random_range(0..TEMPORARY_PASSWORD_ALPHABET.len());
+        // The alphabet is ASCII by construction, so the byte is a char.
+        out.push(char::from(TEMPORARY_PASSWORD_ALPHABET[index]));
+    }
+    Secret::new(out)
+}
+
 /// Create a `provider = 'local'` identity for `app_user_id`, storing a
 /// hash of `password` (never the plaintext). `external_subject` is the
 /// user's own id, as text — a local login has no external subject of its
@@ -106,6 +163,37 @@ pub async fn create_local_identity(
     password: &Secret,
     must_change_password: bool,
 ) -> Result<(), AuthError> {
+    let mut tx = pool.begin().await?;
+    create_local_identity_in_tx(&mut tx, app_user_id, password, must_change_password).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`create_local_identity`], inside a transaction the CALLER owns.
+///
+/// ADM-3 D1: an invite writes the user, its memberships AND its
+/// credential as ONE unit of work, so a user can never be left behind
+/// without the credential the response promised. The store's
+/// `app_user` insert and this `auth_identity` insert therefore have to
+/// share one transaction, which means the caller opens it and passes it
+/// in — this crate owns the credential table, the store owns the user
+/// table, and neither one can open a transaction the other joins.
+///
+/// Dropping `tx` without committing rolls the whole thing back (sqlx's
+/// `Transaction` starts a rollback on drop), so an error here leaves no
+/// half-created account.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Conflict`] if `app_user_id` already has a `local`
+/// identity, [`AuthError::Hash`] if hashing fails, or
+/// [`AuthError::Database`] on any other failure.
+pub async fn create_local_identity_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_user_id: Uuid,
+    password: &Secret,
+    must_change_password: bool,
+) -> Result<(), AuthError> {
     let hash = hash_password(password)?;
     sqlx::query(
         "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash, must_change_password) \
@@ -115,7 +203,53 @@ pub async fn create_local_identity(
     .bind(app_user_id)
     .bind(hash.expose())
     .bind(must_change_password)
-    .execute(pool)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Replace `app_user_id`'s `local` credential with a new temporary
+/// password and flag it `must_change_password`, inside a transaction the
+/// CALLER owns.
+///
+/// ADM-3 D2/D7: a reset SETS a password rather than only replacing one —
+/// an account that signs in through an identity provider and is given a
+/// password here has no `local` `auth_identity` row yet, and gets one.
+/// The flag is set to `true` unconditionally: a reset hands out a
+/// server-chosen password, so the holder must replace it at first
+/// sign-in exactly like an invited user must.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Hash`] if hashing fails, or
+/// [`AuthError::Database`] on any other failure.
+pub async fn set_temporary_password_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_user_id: Uuid,
+    password: &Secret,
+) -> Result<(), AuthError> {
+    let hash = hash_password(password)?;
+    let affected = sqlx::query(
+        "UPDATE auth_identity SET password_hash = $1, must_change_password = true, \
+         updated_at = now() WHERE app_user_id = $2 AND provider = 'local'",
+    )
+    .bind(hash.expose())
+    .bind(app_user_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if affected > 0 {
+        return Ok(());
+    }
+    // No `local` identity yet — give the account one (ADM-3 D7).
+    sqlx::query(
+        "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash, must_change_password) \
+         VALUES ('local', $1, $2, $3, true)",
+    )
+    .bind(app_user_id.to_string())
+    .bind(app_user_id)
+    .bind(hash.expose())
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -321,5 +455,59 @@ mod tests {
         let hash = hash_password(&password).unwrap();
         let rendered = format!("{hash:?}");
         assert!(!rendered.contains("argon2id"));
+    }
+
+    /// ADM-3 D1: a temporary password is at least 20 characters, and is
+    /// drawn only from the alphabet the module documents.
+    #[test]
+    fn a_generated_temporary_password_is_long_enough_and_uses_the_documented_alphabet() {
+        let password = generate_temporary_password();
+        let value = password.expose();
+        assert!(
+            value.chars().count() >= 20,
+            "a temporary password must be at least 20 characters, got {}",
+            value.chars().count()
+        );
+        for character in value.chars() {
+            assert!(
+                TEMPORARY_PASSWORD_ALPHABET.contains(&(character as u8)),
+                "the temporary password alphabet must not carry {character:?}"
+            );
+        }
+    }
+
+    /// ADM-3 D1: no look-alike characters — the whole point of the
+    /// alphabet. `0`/`O`, `1`/`l`/`I` and `L`/`l` are the pairs a human
+    /// mistypes when reading a password off one screen.
+    #[test]
+    fn a_generated_temporary_password_carries_no_look_alike_characters() {
+        for _ in 0..64 {
+            let value = generate_temporary_password();
+            for forbidden in ['0', 'O', '1', 'l', 'I', 'L'] {
+                assert!(
+                    !value.expose().contains(forbidden),
+                    "a temporary password must not carry {forbidden:?}"
+                );
+            }
+        }
+    }
+
+    /// Two generated passwords must never be the same — the whole value of
+    /// the generator is that it is random.
+    #[test]
+    fn two_generated_temporary_passwords_differ() {
+        let first = generate_temporary_password();
+        let second = generate_temporary_password();
+        assert_ne!(first.expose(), second.expose());
+    }
+
+    /// The generated password is a [`Secret`]: it cannot be logged by
+    /// accident, which is half of ADM-3 D1's "never logged" promise.
+    #[test]
+    fn a_generated_temporary_password_never_renders_itself() {
+        let password = generate_temporary_password();
+        let rendered = format!("{password:?} {password}");
+        assert_eq!(rendered, "Secret(REDACTED) REDACTED");
+        assert!(!rendered.contains(password.expose()));
     }
 }

@@ -32,7 +32,25 @@ const STALE: &str = "p_stale_token_from_the_old_column";
 #[derive(Clone)]
 struct FakeCh {
     boards: Arc<Mutex<Vec<Value>>>,
+    charts: Arc<Mutex<Vec<Value>>>,
     log: Arc<Mutex<Vec<String>>>,
+}
+
+/// A `console.bi_chart` row: one tile on the shared catalog, which is what
+/// `SEC-50` slice 2 T6's gate refuses for a link of another tenant.
+fn chart_row(board: &str) -> Value {
+    let spec = json!({
+        "id": "c_one", "title": "Tile", "kind": "bar", "mart": "mart_x",
+        "sql": "SELECT region, visitors FROM serving.mart_x", "x": "region", "y": "visitors"
+    });
+    let def = json!({
+        "title": "Tile", "mart": "mart_x", "kind": "bar",
+        "dimension": "region", "measures": ["visitors"]
+    });
+    json!({
+        "id": "c_one", "board": board, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+        "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+    })
 }
 
 fn board_row(id: &str, owner: &str) -> Value {
@@ -56,10 +74,15 @@ impl Respond for FakeCh {
         let boards = self.boards.lock().unwrap().clone();
         let owner_ok = |b: &Value| {
             let owner = b["owner_id"].as_str().unwrap_or_default();
-            // An owner clause names the viewer ("owner_id = ''" for nobody).
+            // An owner clause names the viewer ("owner_id = ''" for nobody). BI-19
+            // B2 (PR #250 CI): a read as the system viewer (the access check
+            // loads the board before judging the caller's level) has no such
+            // clause and sees every board, so the stand-in must not hide the
+            // caller's own personal board from it; the select list names
+            // `owner_id` too, so the test is for the clause, not the column.
             owner.is_empty()
                 || sql.contains(&format!("owner_id = '{owner}'"))
-                || !sql.contains("owner_id")
+                || !sql.contains("owner_id = ''")
         };
         if sql.starts_with("SELECT is_deleted, owner_id FROM console.bi_board") {
             return rows(
@@ -90,7 +113,18 @@ impl Respond for FakeCh {
             );
         }
         if sql.contains("FROM console.bi_chart") {
-            return rows(vec![]);
+            return rows(self.charts.lock().unwrap().clone());
+        }
+        // The columns of the mart the tile reads.
+        if sql.contains("FROM system.columns") {
+            return rows(vec![
+                json!({ "table": "mart_x", "name": "region", "type": "String" }),
+                json!({ "table": "mart_x", "name": "visitors", "type": "UInt32" }),
+            ]);
+        }
+        // The rows of the mart the tile reads.
+        if sql.contains("FROM serving.mart_x") {
+            return rows(vec![json!({ "region": "north", "visitors": 3 })]);
         }
         ResponseTemplate::new(200).set_body_string("Ok.\n")
     }
@@ -103,8 +137,24 @@ struct F {
 }
 
 async fn fixture(boards: Vec<Value>) -> F {
+    fixture_with_charts(boards, Vec::new()).await
+}
+
+/// The same fixture, with the board's tiles.
+async fn fixture_with_charts(boards: Vec<Value>, charts: Vec<Value>) -> F {
+    fixture_with(boards, charts, Some(common::CATALOG_TENANT)).await
+}
+
+/// The same fixture, in a deployment that names no tenant to own the shared
+/// catalog (`SEC-50` slice 2 M8).
+async fn fixture_without_catalog_tenant(boards: Vec<Value>, charts: Vec<Value>) -> F {
+    fixture_with(boards, charts, None).await
+}
+
+async fn fixture_with(boards: Vec<Value>, charts: Vec<Value>, catalog_tenant: Option<&str>) -> F {
     let fake = FakeCh {
         boards: Arc::new(Mutex::new(boards)),
+        charts: Arc::new(Mutex::new(charts)),
         log: Arc::new(Mutex::new(Vec::new())),
     };
     let ch = MockServer::start().await;
@@ -112,7 +162,10 @@ async fn fixture(boards: Vec<Value>) -> F {
         .respond_with(fake.clone())
         .mount(&ch)
         .await;
-    let env = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    let mut env = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    if let Some(tenant) = catalog_tenant {
+        env.insert("CATALOG_TENANT_ID".to_owned(), tenant.to_owned());
+    }
     F {
         app: spin_up_with_env(&env).await,
         fake,
@@ -149,6 +202,22 @@ async fn writer(f: &F) -> Writer {
     }
 }
 
+/// A person who may manage dashboards and belongs to `tenant` and to no
+/// other (`SEC-50` slice 2 M11).
+async fn writer_in(f: &F, tenant: &str) -> Writer {
+    let id = create_principal_with_permissions(&f.app.pool, "dashboard:write").await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(id)
+        .bind(tenant.parse::<uuid::Uuid>().unwrap())
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    Writer {
+        cookie: session_cookie_for_user(&f.app.pool, id).await,
+        id,
+    }
+}
+
 async fn manage(
     f: &F,
     w: &Writer,
@@ -176,7 +245,11 @@ fn at(d: Duration) -> String {
 }
 
 async fn put(f: &F, w: &Writer, extra: Value) -> (StatusCode, Value) {
-    let mut body = json!({ "board": BOARD, "expiresAt": at(Duration::days(30)) });
+    put_on(f, w, BOARD, extra).await
+}
+
+async fn put_on(f: &F, w: &Writer, board: &str, extra: Value) -> (StatusCode, Value) {
+    let mut body = json!({ "board": board, "expiresAt": at(Duration::days(30)) });
     for (k, v) in extra.as_object().unwrap() {
         body[k] = v.clone();
     }
@@ -318,6 +391,7 @@ async fn unknown_expired_switched_off_trashed_and_personal_links_answer_identica
         OffsetDateTime::now_utc() + Duration::days(5),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -328,6 +402,7 @@ async fn unknown_expired_switched_off_trashed_and_personal_links_answer_identica
         OffsetDateTime::now_utc() + Duration::days(5),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -336,6 +411,7 @@ async fn unknown_expired_switched_off_trashed_and_personal_links_answer_identica
         "b_old",
         "p_expired_board_link",
         OffsetDateTime::now_utc() + Duration::days(5),
+        None,
         None,
         None,
     )
@@ -690,5 +766,185 @@ async fn twenty_simultaneous_guesses_are_all_counted_and_all_refused() {
     assert_eq!(
         unlock(&f, &token, "correct horse").await.0,
         StatusCode::UNAUTHORIZED
+    );
+}
+
+// ── SEC-50 slice 2 T6: the link acts as the tenant that made it ─────────
+
+/// Another tenant of the same deployment, whose members may not read the
+/// shared catalog.
+const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+/// The board the second link is made for.
+const OTHER_BOARD: &str = "b_pub2";
+/// `SEC-20`'s refusal of a table the caller's tenant may not read, byte for
+/// byte.
+const REFUSAL: &str = "Table not found or not available to your organisation: serving.mart_x";
+
+/// `SEC-50` slice 2 D4: a link made by a member of the tenant that owns the
+/// shared catalog reads it; a link made by a member of another tenant does
+/// not.
+#[tokio::test]
+async fn a_link_reads_as_the_tenant_that_made_it() {
+    let f = fixture_with_charts(
+        vec![board_row(BOARD, ""), board_row(OTHER_BOARD, "")],
+        vec![chart_row(BOARD), chart_row(OTHER_BOARD)],
+    )
+    .await;
+    let owner = writer_in(&f, common::CATALOG_TENANT).await;
+    let other = writer_in(&f, OTHER_TENANT).await;
+
+    // The catalog's own tenant: the link reads the shared catalog.
+    let (status, body) = put(&f, &owner, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["link"]["token"].as_str().unwrap().to_owned();
+    let (status, bytes) = open(&f, &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = json_of(&bytes);
+    assert!(
+        view["results"]["c_one"].get("error").is_none(),
+        "the link reads the catalog: {view}"
+    );
+    assert_eq!(
+        view["results"]["c_one"]["rows"].as_array().map(Vec::len),
+        Some(1),
+        "{view}"
+    );
+
+    // Another tenant: the same board, the same link, refused.
+    let (status, body) = put_on(&f, &other, OTHER_BOARD, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["link"]["token"].as_str().unwrap().to_owned();
+    let (status, bytes) = open(&f, &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = json_of(&bytes);
+    assert_eq!(view["results"]["c_one"]["error"], REFUSAL, "{view}");
+    assert!(
+        view["results"]["c_one"].get("rows").is_none(),
+        "the refused tile has no rows: {view}"
+    );
+}
+
+/// `SEC-50` slice 2 D4/M8: a creator who later leaves the tenant the link
+/// names may not act as it, so the link is refused.
+#[tokio::test]
+async fn a_link_whose_creator_left_its_tenant_is_refused() {
+    let f = fixture_with_charts(vec![board_row(BOARD, "")], vec![chart_row(BOARD)]).await;
+    let other = writer_in(&f, OTHER_TENANT).await;
+    let (status, body) = put(&f, &other, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["link"]["token"].as_str().unwrap().to_owned();
+
+    // The creator leaves the tenant the link was made in.
+    sqlx::query("DELETE FROM app_user_tenant WHERE user_id = $1")
+        .bind(other.id)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+
+    let (status, bytes) = open(&f, &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = json_of(&bytes);
+    assert!(
+        view["results"]["c_one"].get("error").is_some(),
+        "the creator may not act as the tenant any more: {view}"
+    );
+    assert!(
+        view["results"]["c_one"].get("rows").is_none(),
+        "the refused tile has no rows: {view}"
+    );
+}
+
+/// `SEC-50` slice 2 M8: a link with no creator (the links that predate the
+/// column, and the links a service identity made) has no owner: it reads
+/// everything in a deployment with one tenant, and nothing in a deployment
+/// with several.
+#[tokio::test]
+async fn a_link_without_a_creator_reads_nothing_in_a_deployment_with_several_tenants() {
+    let f =
+        fixture_without_catalog_tenant(vec![board_row(BOARD, "")], vec![chart_row(BOARD)]).await;
+    links::replace(
+        &f.app.pool,
+        BOARD,
+        "p_legacy_link",
+        OffsetDateTime::now_utc() + Duration::days(30),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (status, bytes) = open(&f, "p_legacy_link", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = json_of(&bytes);
+    assert_eq!(view["results"]["c_one"]["error"], REFUSAL, "{view}");
+    assert!(
+        view["results"]["c_one"].get("rows").is_none(),
+        "the refused tile has no rows: {view}"
+    );
+}
+
+/// `SEC-50` slice 2 M8: the same link in a deployment with one tenant reads
+/// everything — there is no other tenant's table to reach.
+#[tokio::test]
+async fn a_link_without_a_creator_reads_everything_in_a_deployment_with_one_tenant() {
+    let f =
+        fixture_without_catalog_tenant(vec![board_row(BOARD, "")], vec![chart_row(BOARD)]).await;
+    common::leave_no_seeded_tenants(&f.app.pool).await;
+    links::replace(
+        &f.app.pool,
+        BOARD,
+        "p_legacy_link",
+        OffsetDateTime::now_utc() + Duration::days(30),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (status, bytes) = open(&f, "p_legacy_link", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = json_of(&bytes);
+    assert!(
+        view["results"]["c_one"].get("error").is_none(),
+        "one tenant in the deployment: nothing changes: {view}"
+    );
+    assert_eq!(
+        view["results"]["c_one"]["rows"].as_array().map(Vec::len),
+        Some(1),
+        "{view}"
+    );
+}
+
+/// `SEC-50` slice 2 D4: a link with no tenant of its own (the links that
+/// predate the column) reads as its creator's first tenant.
+#[tokio::test]
+async fn a_link_without_a_tenant_reads_as_its_creator() {
+    let f = fixture_with_charts(vec![board_row(BOARD, "")], vec![chart_row(BOARD)]).await;
+    let owner = writer_in(&f, common::CATALOG_TENANT).await;
+    links::replace(
+        &f.app.pool,
+        BOARD,
+        "p_no_tenant_link",
+        OffsetDateTime::now_utc() + Duration::days(30),
+        None,
+        Some(owner.id),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (status, bytes) = open(&f, "p_no_tenant_link", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = json_of(&bytes);
+    assert!(
+        view["results"]["c_one"].get("error").is_none(),
+        "the link reads as its creator: {view}"
+    );
+    assert_eq!(
+        view["results"]["c_one"]["rows"].as_array().map(Vec::len),
+        Some(1),
+        "{view}"
     );
 }

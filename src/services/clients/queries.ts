@@ -89,13 +89,13 @@ async function postChat(
   if (!res.ok) {
     throw new ServiceError(
       "unavailable",
-      json?.detail ?? json?.error ?? "The assistant could not answer. Try again."
+      json?.detail ?? json?.error ?? "AI Copilot could not answer. Try again."
     );
   }
   // A 200 whose body is not a JSON object (a proxy's HTML page, say) would
   // otherwise read as an empty answer and show the user nothing, with no error.
   if (json === null || typeof json !== "object" || Array.isArray(json)) {
-    throw new ServiceError("unavailable", "The assistant could not answer. Try again.");
+    throw new ServiceError("unavailable", "AI Copilot could not answer. Try again.");
   }
   return json as Record<string, unknown>;
 }
@@ -141,7 +141,7 @@ async function proposeFix(
   signal?: AbortSignal
 ): Promise<SqlFixOutcome> {
   if ([...sql].length > MAX_FIX_SQL_CHARS) {
-    throw new ServiceError("invalid_request", "This query is too long for the assistant to fix.");
+    throw new ServiceError("invalid_request", "This query is too long for AI Copilot to fix.");
   }
   const json = await postChat(
     [
@@ -236,7 +236,7 @@ export const clickhouseQueryService: QueryService = {
     // Same call as `askQuestion`: the query runs once on the server on the way.
     const out = await askQuestion(question, signal);
     if (out.sql === undefined) {
-      throw new ServiceError("unavailable", out.answer || "The assistant ran no query.");
+      throw new ServiceError("unavailable", out.answer || "AI Copilot ran no query.");
     }
     return { sql: out.sql, explanation: out.answer };
   },

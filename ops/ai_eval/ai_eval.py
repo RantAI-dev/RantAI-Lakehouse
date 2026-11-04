@@ -574,10 +574,14 @@ DELETE_ROUTES = {
     "source": "/api/dashboard/sources",
     "board": "/api/dashboard/boards",
     "metric": "/api/dashboard/metrics",
+    # BI-37: an alert or digest rule, deleted by id like the others
+    # (`DELETE /api/alerts?id=`).
+    "alert": "/api/alerts",
 }
 # Newest first: a chart may use a field, a field a source, and a board holds
-# charts, so the dependants go before what they depend on.
-CLEANUP_ORDER = ("chart", "metric", "field", "source", "board")
+# charts, so the dependants go before what they depend on. An alert watches a
+# chart, so it goes before the charts.
+CLEANUP_ORDER = ("alert", "chart", "metric", "field", "source", "board")
 
 
 def kind_of_path(path: str) -> str | None:
@@ -635,12 +639,15 @@ def fill_check(check: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
 CREATED_RE = re.compile(r"\{created:(\w+)\}")
 
 
-def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[str, Any]:
-    """Replace `{created:<kind>}` in a `where` value with the id of the first
-    object of that kind this run created (from the trace or a confirm). The
-    assistant makes such an object itself, so its id is not known when the case
-    is written. A kind this run did not create is left as written, so it
-    matches nothing."""
+def fill_created_ids(value: Any, created: list[dict[str, str]]) -> Any:
+    """Replace `{created:<kind>}` with the id of the first object of that
+    kind this run created. A kind this run did not create is left as
+    written, so it matches nothing.
+
+    `BI-41` T1: `set_cache_rule` after a continuation names a chart the
+    assistant made itself, so `expect_tool.args_contains` needs the created
+    id as much as an `expect_state` `where` does. `fill_created` applies this
+    to a `where`; both callers read the same first-id rule."""
     first: dict[str, str] = {}
     for obj in created:
         first.setdefault(obj["kind"], obj["id"])
@@ -652,8 +659,17 @@ def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[s
             return {k: sub(v) for k, v in value.items()}
         return value
 
+    return sub(value)
+
+
+def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[str, Any]:
+    """Replace `{created:<kind>}` in a `where` value with the id of the first
+    object of that kind this run created (from the trace or a confirm). The
+    assistant makes such an object itself, so its id is not known when the case
+    is written. A kind this run did not create is left as written, so it
+    matches nothing."""
     filled = dict(check)
-    filled["where"] = sub(check.get("where", {}))
+    filled["where"] = fill_created_ids(check.get("where", {}), created)
     return filled
 
 
@@ -836,29 +852,33 @@ def collect_created(
     confirms: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
     """Every object this run created: setup calls, trace results marked
-    created with an id, and the calculated fields and boards the tools made."""
+    created with an id, the calculated fields and boards the tools made, and
+    (BI-37) the alert or digest rule `create_alert_rule` saved."""
     found = list(setup_created)
-    for trace in traces:
-        for step in trace:
-            result = step.get("result") or {}
-            if not isinstance(result, dict) or not result.get("id"):
-                continue
-            tool = step.get("tool")
+
+    def note(tool: str | None, result: Any) -> None:
+        """Collect one reply's object, by the shape that tool answers with."""
+        if not isinstance(result, dict):
+            return
+        if result.get("id"):
             if tool == "create_chart" and result.get("created"):
                 found.append({"kind": "chart", "id": str(result["id"])})
             elif tool == "create_board" and result.get("created"):
                 found.append({"kind": "board", "id": str(result["id"])})
             elif tool == "create_calculated_field" and result.get("ok") is True:
                 found.append({"kind": "field", "id": str(result["id"])})
+            return
+        # BI-37: `create_alert_rule` answers `{ok: true, rule: {id, ...}}` — the
+        # object to clean up is the rule, not the reply.
+        rule = result.get("rule")
+        if tool == "create_alert_rule" and isinstance(rule, dict) and rule.get("id"):
+            found.append({"kind": "alert", "id": str(rule["id"])})
+
+    for trace in traces:
+        for step in trace:
+            note(step.get("tool"), step.get("result"))
     for confirm in confirms:
-        tool = confirm.get("tool")
-        result = confirmed_result(confirm)
-        if result.get("id") and result.get("created"):
-            kind = {"create_chart": "chart", "create_board": "board"}.get(tool or "")
-            if kind:
-                found.append({"kind": kind, "id": str(result["id"])})
-        if tool == "create_calculated_field" and result.get("id") and result.get("ok") is True:
-            found.append({"kind": "field", "id": str(result["id"])})
+        note(confirm.get("tool"), confirmed_result(confirm))
     return found
 
 
@@ -1081,11 +1101,11 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
                 )
                 messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
                 continuations += 1
-        scored = score_case(cfg, session, case, bodies, names)
-        scored["confirms"] = confirms
-        scored["problems"].extend(confirm_problems(confirms))
         trace = [s for b in bodies for s in b.get("toolTrace", [])]
         created = collect_created(setup_created, [trace], confirms)
+        scored = score_case(cfg, session, case, bodies, names, created)
+        scored["confirms"] = confirms
+        scored["problems"].extend(confirm_problems(confirms))
         own_ids = {c["id"] for c in created}
         for check in case.get("expect_state", []):
             try:
@@ -1179,10 +1199,13 @@ def score_case(
     case: dict[str, Any],
     bodies: list[dict[str, Any]],
     names: dict[str, str] | None = None,
+    created: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Score one case from its response bodies. `names` are the ids the case's
     setup saved, used to fill `{name}` in `expect_tool.args_contains` the way
-    the turns are filled; `--rescore` has no setup and passes none."""
+    the turns are filled; `created` are the objects the run made, used to fill
+    `{created:<kind>}` there (`BI-41` T1). `--rescore` has no setup and no
+    confirms, so it passes neither."""
     final = bodies[-1]
     raw_answer = final.get("answer", "") or ""
     answer = plain_text(raw_answer)
@@ -1212,7 +1235,7 @@ def score_case(
     if expect_tool:
         required += 1
         trace = [t for b in bodies for t in b.get("toolTrace", []) if t.get("tool") == expect_tool["name"]]
-        want = fill_value(expect_tool.get("args_contains", {}), names or {})
+        want = fill_created_ids(fill_value(expect_tool.get("args_contains", {}), names or {}), created or [])
         if any(tool_args_match(t.get("args", {}), want) for t in trace):
             hit += 1
         else:

@@ -31,7 +31,13 @@ export const CAPABILITIES: Capability[] = [
       // BI-1 / AI-10: "give me this dashboard as a PDF" is a question, not a change: a link, in Ask mode too.
       "export_dashboard", "export_chart",
       // RPT-1 / AI-10: listing one's scheduled reports is a question too.
-      "list_report_subscriptions"],
+      "list_report_subscriptions",
+      // BI-37 D8: what people wrote on a dashboard is a read, so Ask mode offers it (the route's own list).
+      "list_dashboard_comments",
+      // BI-26 slice 2 D10: describing an embed needs no write, so Ask mode
+      // offers it here; enabling, the filter modes and the withdrawal are
+      // writes and live in the Dashboard Builder.
+      "get_embed_snippet"],
   },
   {
     key: "dashboard",
@@ -60,11 +66,19 @@ export const CAPABILITIES: Capability[] = [
       "rename_board", "delete_board", "arrange_board", "move_chart", "set_board_view_filters", "save_board_filters",
       // BI-1 / AI-10: a download link for a dashboard (PDF) or a chart's data (Excel, CSV). Read-only, so Ask mode can offer them too.
       "export_dashboard", "export_chart",
+      // BI-37 D8: the dashboard's comments, read through the route's own list (read-only, so Ask mode can offer it too).
+      "list_dashboard_comments",
       // RPT-1 / AI-10: scheduled reports by email. Creating one for the person alone waits for the Confirm button;
       // naming anyone else, and every delete, waits in Approvals (the composer sends this list as the allowlist, see BI-8 R1).
       "list_report_subscriptions", "create_report_subscription", "update_report_subscription", "delete_report_subscription",
       // BI-16 part C2 / AI-5: the maps a map chart can use, built-in and uploaded (read-only).
-      "list_maps"],
+      "list_maps",
+      // BI-26 slice 2 D4/D10 (AI-11-AC3): signed embedding. `enable_embed` and
+      // `set_embed_filter_modes` wait in Approvals, `withdraw_embed_tokens`
+      // needs the chat's Confirm, and `get_embed_snippet` is a read (it is on
+      // Query Data for Ask mode too). None of them signs or shows a token: the
+      // customer's server does, with the embedding secret.
+      "enable_embed", "set_embed_filter_modes", "withdraw_embed_tokens", "get_embed_snippet"],
   },
   {
     key: "pipeline",

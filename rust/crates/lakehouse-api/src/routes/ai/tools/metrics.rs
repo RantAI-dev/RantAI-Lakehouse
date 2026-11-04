@@ -174,8 +174,16 @@ async fn query_metric(
                 .await
         }
         SourceKind::SqlSource => {
-            crate::routes::calc_fields::resolve(&state.clickhouse, None, Some(&found.source_id))
-                .await
+            // BI-19 B2 re-review S4-b: the metric's source is resolved as the
+            // person asking; one in a folder they cannot see is not available.
+            let who = Extension(principal.clone());
+            crate::routes::calc_fields::resolve_visible(
+                state,
+                Some(&who),
+                None,
+                Some(&found.source_id),
+            )
+            .await
         }
     };
     let source = match source {
@@ -211,8 +219,17 @@ async fn query_metric(
     };
     // Boxed: the read now also opens the result-cache scope, which grew this
     // future past the large-future lint's size for every caller of `run_tool`.
+    //
+    // `SEC-50` slice 2 M4: the assistant sends no `X-Tenant`, so the metric
+    // is read as the person's FIRST tenant — the same rule the query path
+    // uses for a request with no header (slice 1 S3).
     match Box::pin(routes::value_query(
-        state, principal, &source, catalog, &query,
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+        &source,
+        catalog,
+        &query,
     ))
     .await
     {

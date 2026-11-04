@@ -69,6 +69,40 @@ export async function downloadChartData(
   };
 }
 
+/** The deployment cannot make an image (`BI-19` part D, plan D13); the server's sentence. */
+export const IMAGES_NOT_SET_UP = "Images are not set up on this deployment.";
+
+/**
+ * Download a chart as a PNG (`BI-19` part D): the query of the data download
+ * with `format=png`, so the picture shows the filters, parameters and grain
+ * the page has on. Throws an `Error` carrying the server's sentence on a refusal.
+ */
+export async function downloadChartPng(chart: string, state: ReadState): Promise<string> {
+  const q = new URLSearchParams({ chart, format: "png" });
+  readQuery(q, state);
+  const res = await apiFetch(`/api/dashboard/chart-export?${q.toString()}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(await refusalOf(res, "The image could not be made."));
+  const blob = await res.blob();
+  const fileName = fileNameOf(res.headers.get("content-disposition")).replace(/\.csv$/, ".png");
+  saveBlob(blob, fileName);
+  return fileName;
+}
+
+/**
+ * Download one dashboard as a file (`BI-19` part D, plan D14): its settings,
+ * charts and the tables they read, to be imported on this or another
+ * deployment. Throws an `Error` carrying the server's sentence on a refusal.
+ */
+export async function downloadDashboardFile(board: string): Promise<string> {
+  const q = new URLSearchParams({ format: "file", board });
+  const res = await apiFetch(`/api/dashboard/export?${q.toString()}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(await refusalOf(res, "The dashboard file could not be made."));
+  const blob = await res.blob();
+  const fileName = fileNameOf(res.headers.get("content-disposition")).replace(/\.csv$/, ".rantai-dashboard.json");
+  saveBlob(blob, fileName);
+  return fileName;
+}
+
 export type PdfChoice = { paper: "a4" | "letter"; orientation: "portrait" | "landscape" };
 
 /** The query string of `export/pdf`. */

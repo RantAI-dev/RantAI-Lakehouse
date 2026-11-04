@@ -69,8 +69,10 @@ cloud version is possible in future. Neither exists today.
 
 ### Stage
 
-Version 0.1, in heavy development, built by one product owner working with
-AI agents (`AGENTS.md`).
+Version 0.2.0, built by the release pipeline on 2026-11-04 and waiting as a
+draft for the product owner to publish it (`docs/plans/REL-2-RESULT.md`).
+Still in heavy development, built by one product owner working with AI agents
+(`AGENTS.md`).
 
 ---
 
@@ -308,7 +310,9 @@ run without the product owner fixing things by hand.
 | 3 | ~~No human security review~~ | Not a blocker: the product owner dropped it on 2026-10-30 (`SEC-4`) |
 | 4 | ~~The main branch can be changed without review~~ | Cleared 2026-10-30: `main` requires five checks and blocks force-pushes (`REL-1`, `docs/CI.md`) |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
-| 6 | Open high-severity security findings: connector password theft (`SEC-14`, accepted 2026-11-02) and connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) are closed; the rest are under Now in `BACKLOG.md` | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 6 | ~~Open high-severity security findings~~: connector password theft (`SEC-14`, accepted 2026-11-02) and connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) are closed; the rest are under Now in `BACKLOG.md` | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 7 | A fresh install refuses its scheduled work (exports, alerts, reports, embeds) and the shared catalog until `CATALOG_TENANT_ID` is set by hand, because every install seeds four tenants (`REL-10`) | Being fixed: the installer and the updater set it (`REL-10`, In Progress) |
+| 8 | Previewing a Parquet file in an S3 files connector reads it in the API process, so a crafted file can end the API for every tenant (`SEC-55`) | Being fixed: the preview reads the file's tail in the separate reader process, as uploads do (`SEC-55`, In Progress) |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table

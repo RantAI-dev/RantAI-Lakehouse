@@ -1,8 +1,16 @@
 /**
  * RantAI Design System — Font Setup
  *
- * Geist (sans) + Geist Mono — Google Fonts loaded via next/font.
- * Import this in your root layout.tsx and apply the variables to <html>.
+ * Geist (sans) + Geist Mono (mono) loaded from the files committed beside this
+ * module through `next/font/local`, so the console builds with no network
+ * (OPS-16, decision D5). Import this in your root layout.tsx and apply the
+ * variables to <html>.
+ *
+ * The files are the release's own webfonts, not a subset: vercel/geist-font
+ * ships one variable `woff2` per face (the full character set), so there is no
+ * latin-only file to commit and no `subsets` option here. `weight` declares the
+ * `wght` axis the variable font carries, which is what the removed Google
+ * loader inferred from its request.
  *
  * @example
  * ```tsx
@@ -19,18 +27,24 @@
  * ```
  */
 
-import { Geist, Geist_Mono } from "next/font/google";
+import localFont from "next/font/local";
 
-export const geist = Geist({
-  subsets: ["latin"],
+export const geist = localFont({
+  src: "./geist/Geist-wght.woff2",
+  weight: "100 900",
+  style: "normal",
   variable: "--font-sans",
   display: "swap",
+  preload: true,
 });
 
-export const geistMono = Geist_Mono({
-  subsets: ["latin"],
+export const geistMono = localFont({
+  src: "./geist-mono/GeistMono-wght.woff2",
+  weight: "100 900",
+  style: "normal",
   variable: "--font-mono",
   display: "swap",
+  preload: true,
 });
 
 /**

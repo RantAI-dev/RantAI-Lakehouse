@@ -339,7 +339,7 @@ dashboard into a folder, use **Move to folder…** in its menu.
 ### Add a chart
 
 1. On the dashboard, click **New chart**. On an empty dashboard you can
-   also click **Ask Copilot**.
+   also click **Ask AI Copilot**.
 2. Under **Data**, choose the **Data source**:
    - a table under **Gold marts**. It can be joined with other Gold
      tables.
@@ -357,7 +357,7 @@ dashboard into a folder, use **Move to folder…** in its menu.
 
 **Shared definitions:** under **Browse all dashboards**, click
 **Metrics**. A metric is one definition of a number, used by every chart,
-KPI and the assistant. **Segments** works the same way for groups of rows.
+KPI and AI Copilot. **Segments** works the same way for groups of rows.
 
 ### Filter and drill
 
@@ -484,8 +484,9 @@ Approvals holds the requests waiting for a person:
    you like, then confirm.
 
 Approving carries out exactly what was requested. Rejecting carries out
-nothing. Either way the decision is recorded. You cannot approve your own
-access request: another Governance Admin must decide it.
+nothing. Either way the decision is recorded. You cannot decide your own
+request: whoever asked for it — a risky action or an access request —
+waits for somebody else to decide.
 
 ## 8. Monitoring
 

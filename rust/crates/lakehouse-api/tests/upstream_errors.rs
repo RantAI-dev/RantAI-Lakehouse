@@ -71,6 +71,7 @@ async fn the_public_dashboard_link_never_carries_the_database_text() {
         time::OffsetDateTime::now_utc() + time::Duration::days(1),
         None,
         None,
+        None,
     )
     .await
     .expect("store a live public link");
