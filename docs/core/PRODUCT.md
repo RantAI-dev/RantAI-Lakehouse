@@ -71,6 +71,8 @@ cloud version is possible in future. Neither exists today.
 
 Version 0.2.0, built by the release pipeline on 2026-11-04 and waiting as a
 draft for the product owner to publish it (`docs/plans/REL-2-RESULT.md`).
+Version 0.2.1 (the fixes for blockers 7 and 8, and the console cleanup) is
+tagged and waits for the owner's approval of the release job (2026-11-04).
 Still in heavy development, built by one product owner working with AI agents
 (`AGENTS.md`).
 
@@ -154,7 +156,7 @@ hands-on testing.
 | --- | --- | --- | --- |
 | Query tenancy | **Partial.** A query and a saved query are scoped to the caller's tenant — another tenant's uploaded table is refused with the same 404 as a missing table, and the shared catalog belongs to the tenant named in `CATALOG_TENANT_ID` (`SEC-20`). Authored pipelines and the Gold export are scoped too (`SEC-50` slice 1, #281, 2026-10-30): a pipeline reads as its own tenant, and a job with no user acts as the catalog's tenant. Dashboards, embeds, public links and alerts are not yet (slice 2) | Yes | `SEC-50` |
 | Roles and permissions | **Have** | Yes | — |
-| Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
+| Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`). Since `WEB-3` (#376) a column's sensitivity and masks are set on the table's columns, and Access rules lists what is enforced | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
 | Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, accepted 2026-10-23; speed on 10,000 tables not measured, and a typo that matches only a table's name carries no "approximate match" label, `DATA-24`, `DATA-32`). Certified and deprecated marks, governed tags, and the marks in the chart builder and Query Studio are built and accepted (`DATA-12`, 2026-10-23); per-user table visibility is not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
@@ -311,8 +313,9 @@ run without the product owner fixing things by hand.
 | 4 | ~~The main branch can be changed without review~~ | Cleared 2026-10-30: `main` requires five checks and blocks force-pushes (`REL-1`, `docs/CI.md`) |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
 | 6 | ~~Open high-severity security findings~~: connector password theft (`SEC-14`, accepted 2026-11-02) and connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) are closed; the rest are under Now in `BACKLOG.md` | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
-| 7 | A fresh install refuses its scheduled work (exports, alerts, reports, embeds) and the shared catalog until `CATALOG_TENANT_ID` is set by hand, because every install seeds four tenants (`REL-10`) | Being fixed: the installer and the updater set it (`REL-10`, In Progress) |
-| 8 | Previewing a Parquet file in an S3 files connector reads it in the API process, so a crafted file can end the API for every tenant (`SEC-55`) | Being fixed: the preview reads the file's tail in the separate reader process, as uploads do (`SEC-55`, In Progress) |
+| 7 | ~~A fresh install refuses its scheduled work and the shared catalog until `CATALOG_TENANT_ID` is set by hand~~ | Fixed in 0.2.1 (`REL-10`, #371): install and update set it to the group tenant when it is empty. 0.2.1 is tagged (2026-11-04) and waits for the owner to publish it |
+| 8 | ~~Previewing a Parquet file in an S3 files connector could end the API for every tenant~~ | Fixed in 0.2.1 (`SEC-55`, #370): the preview reads the file's tail in the separate reader process. Waits for the owner to publish 0.2.1 |
+| 9 | A truly offline install fails on first start: five init containers install packages from the internet while the stack starts, and the release's air-gap proof does not block that | Proposed fix `REL-16` (an init image shipped in the bundle; the proof blocks all outbound traffic); the owner has not decided |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table
