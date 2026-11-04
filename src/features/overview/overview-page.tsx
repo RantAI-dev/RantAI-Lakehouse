@@ -125,7 +125,7 @@ export function OverviewPage() {
                 return (
                   <Link
                     key={tier}
-                    href={`/data?tier=${tier}`}
+                    href={`/catalog?tier=${tier}`}
                     className="rounded-lg border border-border bg-muted/20 p-3 transition-colors hover:bg-muted/40"
                   >
                     <div className="flex items-center justify-between gap-2">

@@ -120,11 +120,11 @@ describe("CommandPalette catalog search", () => {
     expect(requested[0]).toContain("limit=8")
   })
 
-  it("opens the Data Explorer with the typed words from See all results", async () => {
+  it("opens the Catalog with the typed words from See all results", async () => {
     stubCatalog({ assets: [asset(1)] })
     await search("customer revenue")
     fireEvent.click(await screen.findByText("See all results"))
-    expect(pushed).toEqual(["/data?search=customer%20revenue"])
+    expect(pushed).toEqual(["/catalog?search=customer%20revenue"])
   })
 
   it("says the catalog search is unavailable when the request fails", async () => {

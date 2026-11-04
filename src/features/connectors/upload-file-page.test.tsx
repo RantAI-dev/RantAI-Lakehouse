@@ -986,7 +986,7 @@ describe("UploadFilePage, Table step", () => {
     expect(screen.getByText("Spaces are not allowed: use an underscore.")).toBeDefined()
   })
 
-  it("shows where the data will land, as Data Explorer names it, only for a name that passes", async () => {
+  it("shows where the data will land, as the Catalog names it, only for a name that passes", async () => {
     await openTable([])
     expect(screen.getByText("bronze.stock")).toBeDefined()
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
@@ -1163,7 +1163,7 @@ describe("UploadFilePage, after Load", () => {
 
     await screen.findByText("Loaded", { selector: "span" })
     expect(screen.getByText("3")).toBeDefined()
-    const open = screen.getByText("Open in Data Explorer").closest("a")
+    const open = screen.getByText("Open in Catalog").closest("a")
     expect(open?.getAttribute("href")).toBe("/data/assets/stock")
     expect(screen.getByRole("button", { name: "Upload another file" })).toBeDefined()
 
@@ -1214,7 +1214,7 @@ describe("UploadFilePage, after Load", () => {
     expect(screen.getByText("Replace its rows")).toBeDefined()
     expect(screen.getByText("stock.csv")).toBeDefined()
     expect(document.querySelector("[data-file-mark=delimited]")?.textContent).toBe("CSV")
-    const open = screen.getByText("Open in Data Explorer").closest("a")
+    const open = screen.getByText("Open in Catalog").closest("a")
     expect(open?.getAttribute("href")).toBe("/data/assets/stock")
   })
 

@@ -240,7 +240,7 @@ export function QualityIncidents({ asset }: { asset?: string }) {
           <section key={group.asset} className="rounded-lg border border-border px-3">
             <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-border py-2">
               <Link
-                href={`/data?q=${encodeURIComponent(group.asset)}`}
+                href={`/catalog?q=${encodeURIComponent(group.asset)}`}
                 className="font-mono text-sm font-medium hover:underline"
               >
                 {group.asset}

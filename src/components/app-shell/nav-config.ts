@@ -112,7 +112,6 @@ export const NAV_GROUPS: NavGroup[] = [
     defaultOpen: true,
     items: [
       { title: "Catalog", href: "/catalog", icon: Library },
-      { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Query Studio", href: "/query-studio", icon: SearchCode },
       { title: "Sources", href: "/connectors", icon: Plug },
     ],
