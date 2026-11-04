@@ -448,6 +448,12 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         render_board_payload(
             &state.clickhouse,
             &PolicyEngineObligations::from_state(&state),
+            // `SEC-50` slice 2 D3: an embed is read by nobody in particular,
+            // so it acts as the deployment's catalog tenant.
+            &crate::routes::query::StatementGate::clickhouse(
+                &state,
+                crate::routes::query::GateActor::CatalogTenant,
+            ),
             &board,
             &board_id,
             &filters,
@@ -563,6 +569,12 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
             &time,
         ),
         crate::routes::dashboard::EMBED_VALUES_LIMIT,
+        // `SEC-50` slice 2 D3: an embed is read by nobody in particular, so
+        // it acts as the deployment's catalog tenant.
+        &crate::routes::query::StatementGate::clickhouse(
+            &state,
+            crate::routes::query::GateActor::CatalogTenant,
+        ),
     )
     .await
     {
@@ -575,6 +587,47 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
 /// locked or editable (`BI-26` review fix R3).
 const ONLY_VALUE_FILTERS: &str = "Only a filter that picks values can be locked or editable in an embed. Leave the others hidden.";
 
+/// The column and operator checks a set of filter modes must pass: every
+/// column is a saved filter of the dashboard, and only a filter that picks
+/// values (`in`) is made locked or editable (`BI-26` review fix R3). One
+/// function for the settings route and the assistant's
+/// `set_embed_filter_modes`, which must refuse the same calls before an
+/// approval exists (`BI-26` slice 2 D4, rule 4).
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] with the sentence the route answers.
+pub(crate) fn check_filter_modes(
+    board: &Board,
+    modes: &std::collections::BTreeMap<String, lakehouse_bi::embed_access::FilterMode>,
+) -> Result<(), ApiError> {
+    let known: std::collections::BTreeSet<&str> = board
+        .filters
+        .iter()
+        .flatten()
+        .map(|f| f.column.as_str())
+        .collect();
+    if modes.keys().any(|c| !known.contains(c.as_str())) {
+        return Err(ApiError::BadRequest(
+            "A mode can only be set for a filter the dashboard has.".to_owned(),
+        ));
+    }
+    let not_values: std::collections::BTreeSet<&str> = board
+        .filters
+        .iter()
+        .flatten()
+        .filter(|f| !f.op.is_in())
+        .map(|f| f.column.as_str())
+        .collect();
+    if modes.iter().any(|(column, mode)| {
+        *mode != lakehouse_bi::embed_access::FilterMode::Hidden
+            && not_values.contains(column.as_str())
+    }) {
+        return Err(ApiError::BadRequest(ONLY_VALUE_FILTERS.to_owned()));
+    }
+    Ok(())
+}
+
 /// `{ board, filterModes }` — the `PUT /api/dashboard/embed-settings` body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -584,8 +637,8 @@ struct SettingsBody {
 }
 
 /// `PUT /api/dashboard/embed-settings` — set each filter's embed mode
-/// (`BI-26` plan D8). Needs `dashboard:write` until `BI-19` part B (feature
-/// decision 11: manage on the dashboard). The columns must be the dashboard's
+/// (`BI-26` plan D8). Needs `manage` on the dashboard (`BI-19` part B2, feature
+/// decision 11). The columns must be the dashboard's
 /// saved filters; the change is audited (`dashboard.embed_settings`) before it
 /// is made.
 ///
@@ -599,6 +652,13 @@ pub async fn put_settings(
     axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): refused first when the caller manages nothing.
+    crate::routes::dashboard_access::require_can_ever(
+        &state,
+        &principal,
+        lakehouse_bi::access::Level::Manage,
+    )
+    .await?;
     let parsed: SettingsBody = serde_json::from_slice(&body).map_err(|_| {
         ApiError::BadRequest(
             "body must be {\"board\": string, \"filterModes\": {column: \"locked\"|\"editable\"|\"hidden\"}}"
@@ -609,38 +669,7 @@ pub async fn put_settings(
     // names and may see" (`public_links::managed_board`), not a second copy.
     let board =
         crate::routes::public_links::managed_board(&state, &principal, Some(&parsed.board)).await?;
-    let known: std::collections::BTreeSet<&str> = board
-        .filters
-        .iter()
-        .flatten()
-        .map(|f| f.column.as_str())
-        .collect();
-    if parsed
-        .filter_modes
-        .keys()
-        .any(|c| !known.contains(c.as_str()))
-    {
-        return Err(ApiError::BadRequest(
-            "A mode can only be set for a filter the dashboard has.".to_owned(),
-        )
-        .into());
-    }
-    // BI-26 review fix (SHOULD-FIX) R3: locked and editable work for a filter that
-    // picks values (`in`). A range, a relative date or a text match has no value a
-    // token can set or a dropdown can offer, so it can only be hidden.
-    let not_values: std::collections::BTreeSet<&str> = board
-        .filters
-        .iter()
-        .flatten()
-        .filter(|f| !f.op.is_in())
-        .map(|f| f.column.as_str())
-        .collect();
-    if parsed.filter_modes.iter().any(|(column, mode)| {
-        *mode != lakehouse_bi::embed_access::FilterMode::Hidden
-            && not_values.contains(column.as_str())
-    }) {
-        return Err(ApiError::BadRequest(ONLY_VALUE_FILTERS.to_owned()).into());
-    }
+    check_filter_modes(&board, &parsed.filter_modes)?;
     // The audit helper is the download audit's single writer; the action name
     // and the arguments make the record this change's own (BI-26 review NOTE).
     crate::routes::dashboard::record_download_audit(
@@ -804,7 +833,7 @@ struct RevokeBody {
 }
 
 /// `POST /api/dashboard/embed-revoke` — withdraw ONE signed embed token of a
-/// dashboard (`SEC-12`). Needs `dashboard:write`.
+/// dashboard (`SEC-12`). Needs `manage` on the dashboard (`BI-19` part B2).
 ///
 /// The caller presents the whole token, never a bare `jti`: the server
 /// verifies the signature and reads the `jti` and `exp` itself, so nobody can
@@ -817,7 +846,18 @@ struct RevokeBody {
 /// same fixed message as everywhere), a token for another dashboard, a token
 /// with no `jti`, an unknown dashboard or a full withdrawal list; `503` when
 /// `EMBED_SECRET` is unset; the usual classified store errors otherwise.
-pub async fn revoke_token(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn revoke_token(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // BI-19 B2 (plan D8): refused first when the caller manages nothing.
+    crate::routes::dashboard_access::require_can_ever(
+        &state,
+        &principal,
+        lakehouse_bi::access::Level::Manage,
+    )
+    .await?;
     let parsed: RevokeBody = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("Body must be JSON {board, token}.".to_owned()))?;
     let board = parsed.board.as_deref().map(str::trim).unwrap_or_default();
@@ -825,6 +865,9 @@ pub async fn revoke_token(State(state): State<AppState>, body: Bytes) -> ApiResu
     if board.is_empty() || board == store::DEFAULT_BOARD_ID || token.is_empty() {
         return Err(ApiError::BadRequest("board and token are required.".to_owned()).into());
     }
+    // BI-19 B2 (plan D8): withdrawing an embed token changes who can read the
+    // dashboard, so it is `manage` on it (404 when the caller cannot see it).
+    crate::routes::public_links::managed_board(&state, &principal, Some(board)).await?;
     let Some(secret) = state.config.embed_secret.as_deref() else {
         return Err(ApiError::Unavailable(EMBEDDING_NOT_CONFIGURED.to_owned()).into());
     };
@@ -929,19 +972,39 @@ pub async fn public_dashboard(
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
-    let board = match crate::routes::public_links::resolve(&state, &token).await {
-        Ok(crate::routes::public_links::Resolved::Open(open)) => {
-            if let Some(refusal) =
-                crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
-            {
-                return refusal;
-            }
-            open.board
-        }
+    let open = match crate::routes::public_links::resolve(&state, &token).await {
+        Ok(crate::routes::public_links::Resolved::Open(open)) => open,
         Ok(crate::routes::public_links::Resolved::Gone) => {
             return crate::routes::public_links::not_found();
         }
         Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    if let Some(refusal) =
+        crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
+    {
+        return refusal;
+    }
+    let board = open.board;
+    // `SEC-50` slice 2 D4/M8: the link acts as the tenant that made it.
+    // The creator is read as they are now; a link with no creator (or with a
+    // creator who is gone) has no owner and reaches nothing.
+    let creator = match crate::routes::public_links::creator_of(&state, &open.link).await {
+        Ok(creator) => creator,
+        Err(response) => return response,
+    };
+    // The creator's own headers: a public link is read by nobody in
+    // particular, so the tenant is the creator's first tenant (D4).
+    let no_headers = HeaderMap::new();
+    let actor = match (&creator, open.link.tenant_id) {
+        (Some(principal), Some(tenant_id)) => crate::routes::query::GateActor::AsTenant {
+            principal,
+            tenant_id: Some(tenant_id),
+        },
+        (Some(principal), None) => crate::routes::query::GateActor::Caller {
+            principal,
+            headers: &no_headers,
+        },
+        (None, _) => crate::routes::query::GateActor::Ownerless,
     };
 
     let filters = board.filters.clone().unwrap_or_default();
@@ -966,6 +1029,7 @@ pub async fn public_dashboard(
         render_board_payload(
             &state.clickhouse,
             &PolicyEngineObligations::from_state(&state),
+            &crate::routes::query::StatementGate::clickhouse(&state, actor),
             &board,
             &board_id,
             &filters,
@@ -1354,9 +1418,17 @@ struct Narrowing<'a> {
               borrows eleven locals, so a helper would need as many \
               parameters as the body has lines it saves"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one pipeline (read the board's charts and sources, run every tile \
+              through `tile_pool`, assemble the payload); the gate \
+              (`SEC-50` slice 2) is one argument more than the limit, and a \
+              struct for it alone would hide what the pipeline reads"
+)]
 async fn render_board_payload(
     ch: &ChClient,
     obligations: &PolicyEngineObligations<'_>,
+    gate: &crate::routes::query::StatementGate<'_>,
     board: &Board,
     board_id: &str,
     filters: &[FilterDef],
@@ -1405,6 +1477,7 @@ async fn render_board_payload(
         crate::routes::layers::layer_sources(ch, stored_for_board.iter().copied()).await;
     let layer_runner = crate::routes::layers::RoleRunner {
         ch,
+        gate,
         roles: &roles,
         placeholders: &placeholders,
         obligations,
@@ -1468,6 +1541,7 @@ async fn render_board_payload(
                                 &filtered.sql,
                                 run_spec_sql(
                                     ch,
+                                    gate,
                                     &c.spec.id,
                                     &filtered.sql,
                                     roles_ref,
@@ -1483,6 +1557,7 @@ async fn render_board_payload(
                             // paging.
                             crate::routes::support::annotate_table(
                                 ch,
+                                gate,
                                 &mut val,
                                 &filtered,
                                 (roles_ref, placeholders_ref, obligations),
@@ -1736,9 +1811,11 @@ mod typed_filters {
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
 
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &filters,
@@ -1888,9 +1965,11 @@ mod typed_filters {
             owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &filters,
@@ -2001,9 +2080,11 @@ mod typed_filters {
         let locked: Vec<FilterDef> =
             serde_json::from_str(r#"[{"column":"kab","values":["b","c"]}]"#).unwrap();
 
+        let state = crate::state::AppState::without_a_database();
         let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &locked,
@@ -2106,9 +2187,11 @@ mod typed_filters {
             lakehouse_bi::grain::WeekStart::Monday,
         )
         .unwrap();
+        let state = crate::state::AppState::without_a_database();
         render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
+            &crate::routes::query::StatementGate::unrestricted(&state),
             &board,
             "b1",
             &[],

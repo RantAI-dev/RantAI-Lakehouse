@@ -8,9 +8,15 @@ import {
   alertRuleSaveInput,
   connectorForKind,
   isMetricRule,
+  legacyOwnerNote,
   seesEveryTenant,
 } from "./alerts-page"
-import { ruleKindLabel, ruleScope } from "./rules-columns"
+import {
+  chartAlertHref,
+  getRuleColumns,
+  ruleKindLabel,
+  ruleScope,
+} from "./rules-columns"
 
 afterEach(cleanup)
 
@@ -289,5 +295,78 @@ describe("RunAlertsNotice", () => {
       </>
     )
     expect(container.textContent).toBe("")
+  })
+})
+
+// BI-19 owner QA 2026-10-28, QA-9: a chart alert read as "Threshold alert ·
+// sum() on > 1" because the column treated it as a mart rule.
+describe("a chart alert in the rules list (BI-19 QA-9)", () => {
+  const base = {
+    id: "r1", name: "Alert: Pengunjung per bulan", type: "alert", agg: "", op: ">", threshold: 1,
+    channel: "email", target: "a@b.c", enabled: true, chart: "ch1", series: "visitors", condition: "above",
+  } as unknown as AlertRule
+  const cols = getRuleColumns({
+    onEdit: () => {}, onToggle: () => {}, onRun: () => {}, onDelete: () => {}, busy: false, boards: [], connectors: [],
+  })
+  const cell = (id: string, rule: AlertRule) => {
+    const col = cols.find((c) => c.id === id)
+    const render_ = col?.cell as (ctx: unknown) => React.ReactNode
+    return render_({ row: { original: rule } })
+  }
+
+  it("shows the Chart alert badge and the series and condition in words", () => {
+    render(<div>{cell("type", base)}{cell("condition", base)}</div>)
+    expect(screen.getByText("Chart alert")).toBeTruthy()
+    expect(screen.getByText("Dashboard chart · visitors goes above 1")).toBeTruthy()
+  })
+
+  it("words the below and any-rows conditions", () => {
+    render(<div>{cell("condition", { ...base, condition: "below", threshold: 5 })}</div>)
+    expect(screen.getByText("Dashboard chart · visitors goes below 5")).toBeTruthy()
+    cleanup()
+    render(<div>{cell("condition", { ...base, condition: "any_rows", series: undefined })}</div>)
+    expect(screen.getByText("Dashboard chart · returns any rows")).toBeTruthy()
+  })
+
+  // `BI-39` D8: the rule list names the chart and its dashboard, read live,
+  // and links the name to that dashboard.
+  it("names the chart and its dashboard, and links the name", () => {
+    const named = {
+      ...base,
+      chartTitle: "Visitors",
+      dashboardId: "b_pub",
+      dashboardTitle: "Public board",
+    } as unknown as AlertRule
+    render(<div>{cell("condition", named)}</div>)
+    const link = screen.getByRole("link", { name: "Visitors" })
+    expect(link.getAttribute("href")).toBe("/dashboards/b_pub")
+    expect(screen.getByText(/on Public board · visitors goes above 1/)).toBeTruthy()
+    cleanup()
+    // The chart's name without its dashboard is not a link and not a claim.
+    render(<div>{cell("condition", { ...base, chartTitle: "Visitors" } as unknown as AlertRule)}</div>)
+    expect(screen.getByText("Dashboard chart · visitors goes above 1")).toBeTruthy()
+    expect(screen.queryByRole("link")).toBeNull()
+  })
+
+  it("links only a chart whose dashboard the list named", () => {
+    expect(chartAlertHref({ chartTitle: "Visitors", dashboardId: "b1" })).toBe("/dashboards/b1")
+    expect(chartAlertHref({ chartTitle: "Visitors" })).toBeNull()
+    expect(chartAlertHref({ dashboardId: "b1" })).toBeNull()
+  })
+})
+
+// `BI-39` D4: a rule saved before alerts had owners reads as the Dashboard
+// Viewer role, and the editor says so; an owned one says nothing.
+describe("the legacy-owner note (BI-39 D4)", () => {
+  it("says what saving a rule with no owner does", () => {
+    expect(legacyOwnerNote({ type: "alert" })).toBe(
+      "This alert was set before alerts had owners and reads as the Dashboard Viewer role. Saving it makes it read as you."
+    )
+  })
+
+  it("stays quiet for an owned rule, a digest, and a new rule", () => {
+    expect(legacyOwnerNote({ type: "alert", ownerId: "u1" })).toBeNull()
+    expect(legacyOwnerNote({ type: "digest" })).toBeNull()
+    expect(legacyOwnerNote(null)).toBeNull()
   })
 })

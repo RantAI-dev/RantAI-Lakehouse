@@ -699,6 +699,27 @@ fn login_throttle_policy(config: &Config) -> ThrottlePolicy {
 }
 
 impl AppState {
+    /// A state with no database at all: for the unit tests that run a
+    /// statement against a mock `ClickHouse` and ask the unrestricted
+    /// tenant gate (`SEC-50` slice 2 T1).
+    ///
+    /// The gate that reaches everything without a database is the
+    /// unrestricted one (`routes::query::StatementGate::unrestricted`), so
+    /// a test that is about the runner and not about the gate needs no
+    /// deployment.
+    #[cfg(test)]
+    #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "an empty environment has no failure mode: every setting of \
+                  `Config` has a default, so `from_map` cannot fail here"
+    )]
+    pub(crate) fn without_a_database() -> Self {
+        AppState::new(
+            Config::from_map(&std::collections::HashMap::new()).expect("a config with no pool"),
+        )
+    }
+
     /// Build application state from a resolved [`Config`].
     #[must_use]
     #[allow(

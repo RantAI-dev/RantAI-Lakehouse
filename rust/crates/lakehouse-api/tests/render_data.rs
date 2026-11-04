@@ -36,6 +36,12 @@ const SECRET: &str = "test-render-secret-not-real";
 const EMBED_SECRET: &str = "test-embed-secret-not-real";
 const PUBLIC_BOARD: &str = "b_public";
 const PRIVATE_BOARD: &str = "b_private";
+/// `SEC-50` slice 2 M11: another tenant of the same deployment, whose
+/// members may not read the shared catalog.
+const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+/// `SEC-50`'s refusal of a table the caller's tenant may not read, byte for
+/// byte.
+const REFUSAL: &str = "Table not found or not available to your organisation: serving.mart_x";
 
 /// A recording `ClickHouse`: boards, charts and columns as the stores ask.
 #[derive(Clone)]
@@ -47,7 +53,10 @@ struct FakeCh {
 fn chart_row(id: &str, board: &str) -> Value {
     let spec = json!({
         "id": id, "title": format!("Tile {id}"), "kind": "bar", "mart": "mart_x",
-        "sql": "SELECT email, region FROM serving.mart_x", "x": "region", "y": "email"
+        // One statement per chart: `BI-39` D7's test counts them, and the
+        // result cache computes one statement per key.
+        "sql": format!("SELECT email, region FROM serving.mart_x WHERE '{}' != ''", id),
+        "x": "region", "y": "email"
     });
     let def = json!({
         "title": format!("Tile {id}"), "mart": "mart_x", "kind": "bar",
@@ -127,6 +136,9 @@ struct Fixture {
     fake: FakeCh,
     owner: Uuid,
     other: Uuid,
+    /// `SEC-50` slice 2 M11: a person of another tenant, whose reads of the
+    /// shared catalog are refused.
+    stranger: Uuid,
     _ch: MockServer,
 }
 
@@ -168,7 +180,15 @@ async fn fixture(secret: Option<&str>) -> Fixture {
         .respond_with(fake.clone())
         .mount(&ch)
         .await;
-    let mut env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    let mut env: HashMap<String, String> = HashMap::from([
+        ("CH_URL".to_owned(), ch.uri()),
+        // `SEC-50` slice 2 M11: the shared catalog belongs to a tenant, and
+        // the readers below are in it.
+        (
+            "CATALOG_TENANT_ID".to_owned(),
+            common::CATALOG_TENANT.to_owned(),
+        ),
+    ]);
     if let Some(secret) = secret {
         env.insert("RENDER_TOKEN_SECRET".to_owned(), secret.to_owned());
         // The embedding customer's secret is a different one (R1).
@@ -194,11 +214,23 @@ async fn fixture(secret: Option<&str>) -> Fixture {
         .await
         .unwrap();
     let other = user(&app.pool, "Other Role").await;
+    let stranger = user(&app.pool, "Stranger Role").await;
+    // `SEC-50` slice 2 M11: the two readers of the shared catalog are in
+    // the catalog's own tenant; the stranger is in another one.
+    common::in_the_catalog_tenant(&app.pool, owner_id).await;
+    common::in_the_catalog_tenant(&app.pool, other).await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(stranger)
+        .bind(OTHER_TENANT.parse::<Uuid>().expect("a seeded tenant id"))
+        .execute(&app.pool)
+        .await
+        .unwrap();
     Fixture {
         app,
         fake,
         owner: owner_id,
         other,
+        stranger,
         _ch: ch,
     }
 }
@@ -209,6 +241,7 @@ fn render_token(user: Uuid, board: &str, age: f64, lifetime: f64) -> String {
         &RenderClaims {
             aud: "render".to_owned(),
             board: board.to_owned(),
+            chart: None,
             principal: user.to_string(),
             filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
             params: None,
@@ -340,11 +373,10 @@ async fn a_personal_board_prints_for_its_owner_only() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{theirs}");
-    assert!(
-        theirs["charts"].as_array().unwrap().is_empty(),
-        "another person's personal board has no tiles for them: {theirs}"
-    );
+    // BI-19 B1 (PR #250 CI): another person's personal board reads as a board
+    // that does not exist (the same 404 as `GET /api/dashboard`), where it once
+    // printed an empty page. The product is right; the old expectation was not.
+    assert_eq!(status, StatusCode::NOT_FOUND, "{theirs}");
 }
 
 #[tokio::test]
@@ -436,6 +468,7 @@ async fn a_render_token_signed_with_the_embed_secret_is_refused() {
     let claims = lakehouse_embed::RenderClaims {
         aud: "render".to_owned(),
         board: PUBLIC_BOARD.to_owned(),
+        chart: None,
         principal: f.owner.to_string(),
         filters: None,
         params: None,
@@ -490,5 +523,110 @@ async fn a_revoked_permission_or_a_download_switch_inside_the_tokens_life_stops_
         status,
         StatusCode::UNAUTHORIZED,
         "dashboard:read taken away"
+    );
+}
+
+/// A token for one chart of a board.
+fn chart_token(user: Uuid, board: &str, chart: &str) -> String {
+    let iat = unix_now().floor();
+    sign_render(
+        &RenderClaims {
+            aud: "render".to_owned(),
+            board: board.to_owned(),
+            chart: Some(chart.to_owned()),
+            principal: user.to_string(),
+            filters: None,
+            params: None,
+            grain: None,
+            paper: "image".to_owned(),
+            orientation: "none".to_owned(),
+            exp: iat + 120.0,
+            iat,
+            jti: Uuid::new_v4().to_string(),
+        },
+        SECRET,
+    )
+}
+
+/// BI-19 part D (plan D13): a chart token answers with that chart and nothing
+/// else of the board: the other tile's spec, rows and place are not in it.
+#[tokio::test]
+async fn a_chart_token_gets_that_chart_only() {
+    let f = fixture(Some(SECRET)).await;
+    let before = f.fake.log.lock().unwrap().len();
+    let (status, body) = post(
+        &f.app,
+        &json!({ "token": chart_token(f.owner, PUBLIC_BOARD, "c_two") }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // `BI-39` D7: the image's data is read for its chart, so the board's other
+    // tile is not computed for it.
+    let tiles = f.fake.log.lock().unwrap()[before..]
+        .iter()
+        .filter(|sql| sql.contains("FROM serving.mart_x"))
+        .count();
+    assert_eq!(tiles, 1, "one tile statement for a chart image");
+    let ids: Vec<&str> = body["charts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c_two"]);
+    assert!(body["results"]["c_two"].is_object(), "{body}");
+    assert!(body["results"].get("c_one").is_none(), "{body}");
+    assert!(body["layout"].get("c_one").is_none(), "{body}");
+    assert_eq!(body["render"]["chart"], "c_two");
+}
+
+/// BI-19 part D: a token that names a chart the board does not hold (another
+/// board's, or none) is refused with the one sentence, and so is a chart on a
+/// personal board of somebody else.
+#[tokio::test]
+async fn a_chart_token_for_another_chart_or_another_persons_board_is_refused() {
+    let f = fixture(Some(SECRET)).await;
+    for token in [
+        chart_token(f.owner, PUBLIC_BOARD, "c_mine"),
+        chart_token(f.owner, PUBLIC_BOARD, "c_nope"),
+        chart_token(f.other, PRIVATE_BOARD, "c_mine"),
+    ] {
+        let (status, body) = post(&f.app, &json!({ "token": token }), None).await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        assert!(body.get("charts").is_none(), "{body}");
+    }
+    let (status, body) = post(
+        &f.app,
+        &json!({ "token": chart_token(f.owner, PUBLIC_BOARD, "c_mine") }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "render token is invalid or expired");
+}
+
+/// `SEC-50` slice 2 M4/M5: a render token for a person of another tenant
+/// reads nothing — the tile carries the gate's own refusal, in the tile's
+/// own error slot.
+#[tokio::test]
+async fn a_person_of_another_tenant_sees_the_tile_refused() {
+    let f = fixture(Some(SECRET)).await;
+    let token = render_token(f.stranger, PUBLIC_BOARD, 5.0, 120.0);
+    let (status, body) = post(&f.app, &json!({ "token": token }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"]["c_one"]["error"], REFUSAL, "{body}");
+    assert!(
+        body["results"]["c_one"].get("rows").is_none(),
+        "the refused tile has no rows: {body}"
+    );
+    assert!(
+        !f.fake
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("FROM serving.mart_x") && !sql.contains("system.")),
+        "nothing is read when the person may not read the mart"
     );
 }

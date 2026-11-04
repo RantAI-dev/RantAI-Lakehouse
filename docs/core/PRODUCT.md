@@ -69,8 +69,10 @@ cloud version is possible in future. Neither exists today.
 
 ### Stage
 
-Version 0.1, in heavy development, built by one product owner working with
-AI agents (`AGENTS.md`).
+Version 0.2.0, built by the release pipeline on 2026-11-04 and waiting as a
+draft for the product owner to publish it (`docs/plans/REL-2-RESULT.md`).
+Still in heavy development, built by one product owner working with AI agents
+(`AGENTS.md`).
 
 ---
 
@@ -112,10 +114,10 @@ hands-on testing.
 | --- | --- | --- | --- |
 | Connect to common databases | **Have.** PostgreSQL, MySQL, SQL Server, MongoDB and Oracle load end to end (gate `ops/g6`; Oracle full and incremental with chosen columns over native network encryption, `SRC-4`). "Test connection" really connects for PostgreSQL, MySQL, SQL Server, Oracle, REST and S3 storage; other types say unsupported | Yes, all three | MariaDB as its own type, Teradata (`SRC-35`) |
 | Files and APIs | **Have.** CSV files and REST sources (gate `ops/g6`). Adapters for SFTP, Google Sheets and Oracle exist; *Not verified* end to end | Yes | Verify the three |
-| Business-app connectors (CRM, ads, support tools) | **Partial.** Eight of Databricks' ten generally available ones are supported and gate-tested against mock vendors (`ops/g6`, job `g6-saas`): Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint; each with browser or key sign-in, object and column choice, incremental loads where the vendor has a change filter, and schema-change handling. *Not verified* on any real vendor account. Workday Reports and NetSuite are built and listed unsupported. Pull request #216, not merged or accepted | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Real-account test of all ten (`SRC-27`), the second wave of about 45 (`SRC-26`) |
+| Business-app connectors (CRM, ads, support tools) | **Partial.** Eight of Databricks' ten generally available ones are supported and gate-tested against mock vendors (`ops/g6`, job `g6-saas`): Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint; each with browser or key sign-in, object and column choice, incremental loads where the vendor has a change filter, and schema-change handling. *Not verified* on any real vendor account. Workday Reports and NetSuite are built and listed unsupported. Merged (#216) and accepted by the product owner on 2026-11-02 | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Real-account test of all ten (`SRC-27`), the second wave of about 45 (`SRC-26`) |
 | Live change capture | **Have.** PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, one Debezium connector each on Kafka Connect, each gate-tested (`ops/g4`: `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`; every change in Bronze within 120 s). Current-row and history modes, pause and resume, per-table lag with a lag alert, and setup checks in the connection test. Accepted 2026-11-01 (`SRC-4`, PR #264). Limits on the feature page `features/databases-and-change-capture.md`: Oracle has no certificate checking and reads its setup checks unencrypted (signed exception), its NUMBER columns arrive as text | Yes: PostgreSQL, MySQL, SQL Server, Oracle; MongoDB at Airbyte | MariaDB (`SRC-36`), Oracle over TCPS with certificate checking (`SRC-37`) |
 | Message queues | **Partial.** Kafka loads into tables; no processing over streams | Yes, with stream processing | Stream processing |
-| Upload a file from the console | **Partial.** On `main`: one CSV, TSV, Excel or Parquet file of up to 50 MB, every column stored as text; merged (PR #71, #76), not accepted. In PR #186 (not merged): JSON, JSON Lines, Avro, gzip, zip, 10 files into one table, 2 GB per upload (one load at a time measured, `docs/plans/DATA-17-RESULT.md`), and column types | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Acceptance and merge of #186 (`DATA-17`, `DATA-18`); loads of 2 GB at the same time unmeasured (`DATA-33`) |
+| Upload a file from the console | **Have.** CSV, TSV, Excel, Parquet, JSON, JSON Lines, Avro, gzip and zip; up to 10 files into one table, 2 GB per upload (one load at a time measured, `docs/plans/DATA-17-RESULT.md`), and guessed, editable column types. Merged (#76, #186) and accepted by the product owner on 2026-11-02 (`DATA-17`, `DATA-18`) | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Loads of 2 GB at the same time unmeasured (`DATA-33`) Uploaded files can be grouped in folders on the Uploaded files tab, a grouping only, with search across folders (`DATA-35`, released 2026-10-29). |
 
 #### Storing data
 
@@ -133,7 +135,7 @@ hands-on testing.
 | --- | --- | --- | --- |
 | Pipelines with schedules, dependencies, retries, alerts, version history | **Have**. A pipeline reads Bronze (Iceberg) tables since `BLD-3` (PR #155), proven by gate `g7` in CI | Yes | — |
 | Transformations authored in the console | **Partial.** Five operations: dedupe, filter, rename, cast, select. Joins and aggregations are written as SQL outside the builder | Yes: full SQL, visual and code | Richer transformations |
-| Tables that refresh themselves when their inputs change | **Missing.** Not found; pipelines that run after their upstreams are the nearest thing | Yes (Dynamic Tables, materialized views) | Yes |
+| Tables that refresh themselves when their inputs change | **Partial.** A pipeline keeps its table within a target lag (`BLD-2`, #194, merged, not accepted); dashboards do not refresh themselves yet | Yes (Dynamic Tables, materialized views) | Accept `BLD-2`; near real-time end to end (`DATA-44`) |
 | Notebooks, Python, Spark | **Missing** | Yes, all three | Large; decide if wanted |
 | Works with dbt | **Missing** | Yes | Decide if wanted |
 
@@ -143,7 +145,7 @@ hands-on testing.
 | --- | --- | --- | --- |
 | SQL editor, saved queries, result download | **Partial.** Autocomplete knows table names only; 2,000 rows shown; saved queries cannot be edited or shared; downloads are a browser CSV | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-1` to `QS-4` |
 | Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct in Data Explorer's Schema tab. | Yes, inside the user's permissions | `AI-16` |
-| Scale out across servers | **Missing.** One server | Yes: elastic | Modest multi-server is a goal |
+| Scale out across servers | **Missing.** One server | Yes: elastic | Wanted later (product owner, 2026-11-04; `OPS-3`) |
 | Query other systems in place, without loading | **Missing** | Yes | Yes |
 
 #### Governance
@@ -253,9 +255,8 @@ in `README.md` ("Status / Known limitations").
 - One engine; no querying other systems in place. Querying a table as it
   was earlier works from a version picker, but no test yet proves masking
   applies to past versions (`DATA-16`).
-- File upload on `main` takes one CSV, TSV, Excel or Parquet file of up to
-  50 MB, and every column is stored as text (merged, not accepted). Pull
-  request #186 (not merged) adds JSON, JSON Lines, Avro, gzip and zip, up to
+- File upload takes CSV, TSV, Excel, Parquet, JSON, JSON Lines, Avro, gzip
+  and zip (`DATA-17`, `DATA-18`, accepted 2026-11-02): up to
   10 files into one table, up to 2 GB per upload (measured for one load at a
   time; two at once, a Parquet row group larger than memory, and Avro and zip
   at large sizes are not measured, `DATA-33`, `DATA-34`), no row cap, and
@@ -274,7 +275,6 @@ in `README.md` ("Status / Known limitations").
   accepted. Single sign-on exists in the API but has not been tested
   against a real identity provider.
 - Open findings from the 2026-10-07 code audits, fixed before feature work:
-  a connector's stored password can be sent to a new host (`SEC-14`);
   connection tests and alert webhooks can reach internal addresses
   (`SEC-15`, `SEC-10`); raw database errors reach the screen on dashboard
   tiles and embeds (`SEC-11`). The full list is `SEC-10` to `SEC-21` in
@@ -310,7 +310,9 @@ run without the product owner fixing things by hand.
 | 3 | ~~No human security review~~ | Not a blocker: the product owner dropped it on 2026-10-30 (`SEC-4`) |
 | 4 | ~~The main branch can be changed without review~~ | Cleared 2026-10-30: `main` requires five checks and blocks force-pushes (`REL-1`, `docs/CI.md`) |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
-| 6 | Open high-severity security findings: connector password theft (`SEC-14`), connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 6 | ~~Open high-severity security findings~~: connector password theft (`SEC-14`, accepted 2026-11-02) and connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) are closed; the rest are under Now in `BACKLOG.md` | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
+| 7 | A fresh install refuses its scheduled work (exports, alerts, reports, embeds) and the shared catalog until `CATALOG_TENANT_ID` is set by hand, because every install seeds four tenants (`REL-10`) | Being fixed: the installer and the updater set it (`REL-10`, In Progress) |
+| 8 | Previewing a Parquet file in an S3 files connector reads it in the API process, so a crafted file can end the API for every tenant (`SEC-55`) | Being fixed: the preview reads the file's tail in the separate reader process, as uploads do (`SEC-55`, In Progress) |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table

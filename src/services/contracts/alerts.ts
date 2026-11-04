@@ -94,7 +94,36 @@ export type AlertRule = {
   asset?: string
   /** Pipeline id or `*` for pipeline rules. */
   pipeline?: string
+  /**
+   * `BI-19` part C: the chart a chart alert watches. Omitted for a rule that
+   * watches a mart column or a metric.
+   */
+  chart?: string
+  /** The series of a line, bar or combo chart whose latest point is read. */
+  series?: string
+  /** The dashboard filters the chart is read with (the shape the dashboard takes). */
+  filters?: unknown[]
+  /** `above`, `below` or `any_rows` on a chart alert; absent on a legacy rule. */
+  condition?: AlertCondition | string
+  /**
+   * The person the rule reads its data as (`BI-39` D1: every threshold rule,
+   * chart or not). Absent on a rule saved before alerts had owners, which
+   * keeps the Dashboard Viewer role until it is saved again (`BI-39` D4).
+   */
+  ownerId?: string
+  /**
+   * `BI-39` D8: the watched chart's title and its dashboard's id and name, read
+   * live when the list is answered. All three are absent together when the
+   * caller cannot see the chart any more (never stored, so a rename shows at
+   * once and a chart they lost access to stops naming itself).
+   */
+  chartTitle?: string
+  dashboardId?: string
+  dashboardTitle?: string
 }
+
+/** The conditions of a chart alert (`BI-19` D12). */
+export type AlertCondition = "above" | "below" | "any_rows"
 
 /**
  * Body accepted by `POST`/`PUT /api/alerts`, mirroring `AlertRuleInput`.
@@ -122,6 +151,11 @@ export type SaveAlertRuleInput = {
   /** Table or `*`; see [`AlertRule.asset`]. */
   asset?: string
   pipeline?: string
+  /** `BI-19` part C: see [`AlertRule.chart`]. */
+  chart?: string
+  series?: string
+  filters?: unknown[]
+  condition?: string
 }
 
 /** Body of `GET /api/alerts/status`. */
@@ -150,6 +184,8 @@ export type AlertRunResult = {
   value?: number
   delivered?: AlertDeliverResult
   skipped?: string
+  /** `BI-19` D11: the value is back under the line and the recovery was sent. */
+  recovered?: boolean
 }
 
 export interface AlertRuleService {
@@ -158,8 +194,13 @@ export interface AlertRuleService {
   createRule(input: SaveAlertRuleInput, signal?: AbortSignal): Promise<AlertRule>
   updateRule(rule: SaveAlertRuleInput & { id: string }, signal?: AbortSignal): Promise<AlertRule>
   deleteRule(id: string, signal?: AbortSignal): Promise<void>
-  runRules(
-    id: string | undefined,
+  /**
+   * `BI-40` D1: run one rule now, as a test. There is no "run every rule"
+   * form: the whole tick belongs to the scheduler (`POST /api/alerts/run`,
+   * which a person's session cannot call).
+   */
+  testRule(
+    id: string,
     signal?: AbortSignal
   ): Promise<{ ran: number; results: AlertRunResult[] }>
 }

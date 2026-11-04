@@ -26,6 +26,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::lakehouse::{is_unknown_table_error, is_unknown_table_or_database_error};
 use crate::routes::support::{nullable_u64_col, str_col};
 use crate::state::AppState;
@@ -404,7 +405,9 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
             json!({
                 "id": e.id,
                 "at": e.at,
-                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "Copilot".to_owned()),
+                // AI-23 (product owner 2026-11-02): one name for the
+                // assistant — "AI Copilot", the same name the console shows.
+                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "AI Copilot".to_owned()),
                 "actorKind": actor_kind_of(e.principal_kind.as_deref()),
                 "tenant": TENANT_ID.as_str(),
                 "action": e.action,
@@ -430,14 +433,32 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
 
 /// **Gap fix** — same shape as [`quality`], unioning authored classification
 /// rules onto the `ClickHouse`-derived per-asset list.
+///
+/// DATA-42 D1/D3: the primary registry wins, and every registry table this
+/// reader touches is read with `FINAL`.
+///
+/// D1: the secondary branch drops the slugs the primary registry holds
+/// (see [`crate::routes::catalog::NOT_IN_PRIMARY`]), so a slug that is in
+/// both registries is classified ONCE — the list used to carry two rows
+/// with the same id `c-<slug>`, one per registry.
+///
+/// D3: `FINAL`, for the reason the catalog's reads give (`DATA-40` D4):
+/// the registry is a `ReplacingMergeTree ORDER BY slug` that every run of
+/// a connector writes again, and `ClickHouse` merges the copies only in
+/// the background. Without it a slug a second run registered was
+/// classified twice.
+///
+/// The `LIMIT 500` stays where it is — after the last `SELECT` of the
+/// union — so it caps what it capped before (see the plan's D5: in
+/// `ClickHouse` a `LIMIT` after an unparenthesized `UNION ALL` binds to
+/// that last `SELECT`, not to the whole union).
 async fn classification(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
-    let rows = ch
-        .rows(
-            "SELECT slug, title, tier FROM lake.`bronze_meta.dataset_catalog`
-         UNION ALL SELECT slug, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` LIMIT 500",
-            None,
-        )
-        .await?;
+    let sql = format!(
+        "SELECT slug, title, tier FROM lake.`bronze_meta.dataset_catalog` FINAL
+         UNION ALL SELECT slug, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
+         WHERE slug {NOT_IN_PRIMARY} LIMIT 500"
+    );
+    let rows = ch.rows(&sql, None).await?;
     let mut classifications: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -2652,6 +2673,136 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(stored, 0);
+        }
+    }
+
+    // ── DATA-42 D1/D3: the primary registry wins. ────────────────────────
+    //
+    // The classification list is built from BOTH Bronze registries
+    // (`lake.bronze_meta.*`, the primary one, and
+    // `lake.bronze_meta_sec.*`, the secondary one). A slug that is in
+    // both was listed TWICE, under the same id `c-<slug>` -- once per
+    // registry.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), because the fix is a
+    // statement: `FINAL` and the `NOT IN (SELECT slug FROM ...)` clause
+    // are the engine's, and a fake that answered them would only prove
+    // that this module asks for what it means to ask for.
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_clickhouse::ChClient;
+
+        use super::*;
+        use crate::routes::bronze_registry_fixture::{
+            clickhouse, seed_catalog, seed_sync_with_author,
+        };
+
+        /// The rows of the list that classify `slug`.
+        fn classifications_of<'a>(body: &'a Value, slug: &str) -> Vec<&'a Value> {
+            let id = Value::String(format!("c-{slug}"));
+            body["classifications"]
+                .as_array()
+                .expect("the list has classifications")
+                .iter()
+                .filter(|row| row["id"] == id)
+                .collect()
+        }
+
+        /// A slug the two registries both hold: one dataset, one
+        /// classification, and the PRIMARY's title.
+        #[tokio::test]
+        async fn the_classification_list_shows_a_slug_that_is_in_both_registries_once() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_gov",
+                "Primary governance",
+                "clash_gov_raw",
+            )
+            .await;
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta",
+                "clash_gov",
+                "Primary governance",
+                "clash_gov_raw",
+                10,
+                "primary_team",
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_gov",
+                "Secondary governance",
+                "clash_gov_sec_raw",
+            )
+            .await;
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta_sec",
+                "clash_gov",
+                "Secondary governance",
+                "clash_gov_sec_raw",
+                99,
+                "secondary_team",
+            )
+            .await;
+
+            let body = classification(&ch, None).await.unwrap();
+            let rows = classifications_of(&body, "clash_gov");
+            assert_eq!(rows.len(), 1, "one dataset, one classification: {rows:?}");
+            assert_eq!(
+                rows[0]["asset"],
+                json!("Primary governance"),
+                "the primary's title, not the secondary's: {rows:?}"
+            );
+        }
+
+        /// A slug a second run wrote again is classified once, not twice.
+        ///
+        /// DATA-42 D3: without `FINAL` the two copies of the row are two
+        /// rows, so the list carries the dataset twice.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_is_classified_once() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            // The two copies of the row stay apart: no merge may collapse
+            // them before the list reads them.
+            ch.exec(
+                "SYSTEM STOP MERGES lake.`bronze_meta.dataset_catalog`",
+                None,
+            )
+            .await
+            .expect("stop the merges of the catalog table");
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_gov",
+                "Twice governance",
+                "twice_gov_raw",
+            )
+            .await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_gov",
+                "Twice governance again",
+                "twice_gov_raw",
+            )
+            .await;
+
+            let body = classification(&ch, None).await.unwrap();
+            let rows = classifications_of(&body, "twice_gov");
+            assert_eq!(rows.len(), 1, "one dataset, one classification: {rows:?}");
         }
     }
 }

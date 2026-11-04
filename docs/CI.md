@@ -293,7 +293,7 @@ one JSON file, and that is what `lakehousectl` reads (REL-2 S2 D3a).
 |---|---|
 | `push` of a `v*` tag | The real release: the four images go to `ghcr.io/rantai-dev`, the manifest is signed with the release key, and a **draft** GitHub Release is created |
 | `workflow_dispatch` | The dry run |
-| `pull_request` on `.github/workflows/release.yml`, `ops/release/**`, `Dockerfile.frontend`, `rust/Dockerfile`, `dagster/Dockerfile`, `ops/oidc-mock/**` | The dry run |
+| `pull_request` on `.github/workflows/release.yml`, `ops/release/**`, `Dockerfile.frontend`, `.dockerignore`, `rust/Dockerfile`, `dagster/Dockerfile`, `ops/oidc-mock/**` | The dry run |
 
 The real job never runs for a pull request: it is gated on a tag push, and it is the only
 job in this repository that can see the release key.
@@ -315,6 +315,9 @@ can be proved before it can cut a release:
 Nothing is published. The bundle, the manifest, its Sigstore bundle, the rendered Compose
 file, the installer and the SBOMs are uploaded as a workflow artifact (`release-dry-run`),
 and the run's summary prints the bundle's size — the number the release notes quote.
+The dry run also SPLITS the bundle into parts and joins them back (REL-7 D4), and fails
+unless the joined file matches the checksum `make_bundle.sh` wrote: the release attaches
+parts, so a split that does not round-trip is a release nobody can install.
 
 ### The installer
 
@@ -413,7 +416,13 @@ Until that is done, `docker pull ghcr.io/rantai-dev/rantai-lakehouse-api:<versio
 7. the manifest is signed into `release.json.sigstore.json` and the bundle verified at once,
    offline;
 8. `ops/release/make_bundle.sh` writes the offline bundle and prints its size;
-9. the release is created as a draft (the real run only).
+9. the bundle is split into parts of at most 1900 MiB — GitHub refuses a release asset
+   of 2 GiB or more (REL-7 D1) — and the parts are attached to the draft release, with
+   their checksums in `SHA256SUMS` and the whole file's `.sha256` beside them; the
+   operator joins them in name order (`docs/OPERATIONS.md`, REL-7 D2);
+10. the release is created as a draft, or a draft that already exists for the tag is
+    written into (`gh release upload --clobber`), so the job can be re-run (REL-7 D5).
+    A published release is never rewritten.
 
 The tooling is under `ops/release/`, and its own tests run in the `Repo lints` job of
 `ci.yml` (`python -m pytest ops/release`) and at the start of both pipeline jobs.

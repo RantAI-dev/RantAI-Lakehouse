@@ -139,6 +139,36 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "invalid JSON: {err}",
         "serde error over the caller's own request body",
     ),
+    // `SEC-50` slice 2 M1: the gate keeps its refusal for the rest of the
+    // request so every statement of it is refused the same way. What is kept
+    // is the gate's own fixed sentence (`SEC-20`'s 404 naming the table, D6's
+    // 422 naming the setting), never upstream text — see `GateRefusal`'s doc
+    // comment.
+    (
+        "query.rs",
+        "message: err.to_string(),",
+        "GateRefusal keeps the gate's own fixed sentence, written in this repository, to rebuild the same refusal",
+    ),
+    // `SEC-50` slice 2 M3: `SpecRunFailure::Gated` carries the tenant gate's
+    // own `ApiError`, whose sentence is fixed text this repository wrote (the
+    // enum's doc comment says so). It is the same sentence the route itself
+    // answers with, so it belongs in the tile's, the preview's and the
+    // layer's error slot; no engine text is involved.
+    (
+        "dashboard_sources.rs",
+        "Err(SpecRunFailure::Gated(err)) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
+    (
+        "layers.rs",
+        "SpecRunFailure::Gated(err) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
+    (
+        "support.rs",
+        "Err(SpecRunFailure::Gated(err)) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
     (
         "quality.rs",
         "Invalid request body: {err}",
@@ -249,6 +279,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| err.to_string())",
         "StoreError's Display is fixed text and is the LateSource contract",
     ),
+    // `BI-39` D6: the statement gate's own refusals (SEC-20's 404, D6's 422,
+    // the classified 503) are sentences written in this repository, and the
+    // alerts crate records one as a rule's skipped reason — never engine text.
+    (
+        "alerts.rs",
+        "GateRefusal::Refused(err.to_string())",
+        "StatementGate::check answers with our own fixed sentences, never an upstream payload",
+    ),
     // pipeline_source::SourceError: written in this repository.
     (
         "pipelines.rs",
@@ -262,6 +300,12 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "inspected for UNKNOWN_TABLE to pick a fixed message; never returned",
     ),
     // The assistant's tools.
+    // BI-19 B2 (PR #250 CI): the shared helpers in ai/tools/mod.rs.
+    (
+        "ai/tools/mod.rs",
+        ".map_err(|err| json!({ \"error\": err.to_string() }))",
+        "an ApiError from routes::dashboard_access (viewer_for, scope_for_write, require_board_level): fixed texts written in this repository, a store failure is already \"database error\" through From<StoreError>",
+    ),
     (
         "ai/tools/alerts.rs",
         "json!({ \"error\": err.to_string() })",
@@ -330,6 +374,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "ai/tools/look.rs",
         "a formatting field has the wrong shape: ",
         "the same serde error over the model's own formatting arguments, in front of the field's name",
+    ),
+    // BI-26 slice 2 D4: `embed::check_filter_modes` returns an `ApiError` whose
+    // text the settings route writes itself (a column that is no filter, or a
+    // mode on a range filter). It is the route's sentence, not an upstream's.
+    (
+        "ai/tools/embed.rs",
+        "return json!({ \"error\": err.to_string() });",
+        "check_filter_modes' ApiError: the settings route's own fixed sentences, written in this repository",
     ),
 ];
 

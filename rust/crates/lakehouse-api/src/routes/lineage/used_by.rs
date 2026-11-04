@@ -43,7 +43,6 @@ use super::charts::reads_of;
 use super::columns::{graph_key, scope_for};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -117,7 +116,8 @@ pub(crate) async fn read(
     let failed = |err: &lakehouse_clickhouse::ChError| {
         upstream_error::ch_error(&upstream_error::DATABASE, err)
     };
-    let viewer = viewer_of(principal);
+    // BI-19 B1: the resolved viewer, not the baseline.
+    let viewer = crate::routes::dashboard_access::usage_viewer_of(state, principal).await?;
     let visible = store::list_stored_charts(ch, &viewer)
         .await
         .map_err(|e| failed(&e))?;

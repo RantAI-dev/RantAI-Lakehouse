@@ -397,6 +397,10 @@ impl Respond for FakeCh {
         if sql.starts_with("SELECT v FROM (") {
             return rows(vec![json!({ "v": "Bali" }), json!({ "v": "Java" })]);
         }
+        // The mart the board's chart reads.
+        if sql.contains("FROM serving.mart_x") {
+            return rows(vec![json!({ "region": "north", "visitors": 3 })]);
+        }
         ResponseTemplate::new(200).set_body_string(
             "Ok.
 ",
@@ -405,6 +409,22 @@ impl Respond for FakeCh {
 }
 
 async fn app(ch: &MockServer, secret: Option<&str>) -> TestApp {
+    let mut env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    if let Some(secret) = secret {
+        env.insert("EMBED_SECRET".to_owned(), secret.to_owned());
+    }
+    // `SEC-50` slice 2 M11: an embed is read by nobody in particular, so it
+    // acts as the deployment's catalog tenant — which the deployment names.
+    env.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    spin_up_with_env(&env).await
+}
+
+/// The same app, in a deployment that names no tenant to own the shared
+/// catalog (`SEC-50` slice 2 M11).
+async fn app_without_catalog_tenant(ch: &MockServer, secret: Option<&str>) -> TestApp {
     let mut env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
     if let Some(secret) = secret {
         env.insert("EMBED_SECRET".to_owned(), secret.to_owned());
@@ -514,7 +534,7 @@ async fn embed_info_without_a_secret_is_unsupported_with_the_reason_and_no_sampl
     let app = app(&ch, None).await;
     let (status, body) = as_user(
         &app,
-        "dashboard:read",
+        "dashboard:read, dashboard:write",
         Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
         Body::empty(),
     )
@@ -538,7 +558,7 @@ async fn embed_info_with_a_secret_returns_a_sample_token_that_has_iat_exp_and_jt
     let app = app(&ch, Some(SECRET)).await;
     let (status, body) = as_user(
         &app,
-        "dashboard:read",
+        "dashboard:read, dashboard:write",
         Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
         Body::empty(),
     )
@@ -720,6 +740,7 @@ async fn the_public_link_ignores_every_new_check() {
         BOARD,
         &format!("p_{BOARD}"),
         time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
         None,
         None,
     )
@@ -990,7 +1011,7 @@ async fn embed_info_reports_the_allowed_sites_the_instant_and_the_limit() {
     let app = app(&ch, Some(SECRET)).await;
     let (status, body) = as_user(
         &app,
-        "dashboard:read",
+        "dashboard:read, dashboard:write",
         Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
         Body::empty(),
     )
@@ -1039,6 +1060,7 @@ async fn the_frame_answer_is_the_boards_sites_for_a_good_token_and_empty_for_eve
         BOARD,
         &format!("p_{BOARD}"),
         time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
         None,
         None,
     )
@@ -1151,6 +1173,7 @@ async fn the_frame_answer_carries_only_the_sites_of_this_boards_cards() {
         BOARD,
         &format!("p_{BOARD}"),
         time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
         None,
         None,
     )
@@ -1382,7 +1405,16 @@ async fn a_chart_token_obeys_the_boards_embed_switch_and_withdrawal() {
 
 #[tokio::test]
 async fn a_chart_token_is_framed_and_withdrawn_through_its_charts_board() {
-    let fake = FakeCh::new(&json!({ "embed_origins_json": r#"["https://app.customer.example"]"# }));
+    // BI-19 B2 (PR #250 CI): `b_other` must exist, because an unknown board
+    // answers 404 before the body is judged; the 400 below is the
+    // "different dashboard" refusal for a caller who may act on both boards.
+    let fake = FakeCh::with_boards(vec![
+        board_row(
+            BOARD,
+            &json!({ "embed_origins_json": r#"["https://app.customer.example"]"# }),
+        ),
+        board_row("b_other", &json!({})),
+    ]);
     two_charts(&fake);
     let ch = fake.serve().await;
     let app = app(&ch, Some(SECRET)).await;
@@ -1552,6 +1584,41 @@ async fn an_old_token_that_locks_a_column_that_is_no_filter_still_narrows() {
         embed_with(&app, &token_with(Some(json!({ "region": "Bali" }))), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(sql_has(&fake, "Bali"));
+}
+
+#[tokio::test]
+async fn an_old_token_on_a_saved_filter_whose_mode_nobody_chose_still_narrows_to_it() {
+    // BI-26 slice 2 gap 3 (owner-signed decision 7): the commonest old case.
+    // `region` is a saved dashboard filter and nobody chose a mode, so
+    // `embed_access::mode_of` reports `hidden` and the saved value keeps being
+    // ANDed with the token's. An old `{"region": "Bali"}` token must therefore
+    // still show only Bali, and it is not described as an editable filter.
+    let fake = FakeCh::new(&json!({
+        "filters_json": r#"[{"column":"region","op":"in","values":["Bali","Java"]}]"#
+    }));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) =
+        embed_with(&app, &token_with(Some(json!({ "region": "Bali" }))), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("embedFilters").is_none(),
+        "a hidden filter is not described: {body}"
+    );
+    let statements = fake.tile_statements();
+    assert!(!statements.is_empty(), "the tiles were read");
+    for statement in &statements {
+        assert!(
+            statement.contains("Bali"),
+            "the token's value narrows every tile, so no tile can return Java alone: {statement}"
+        );
+    }
+    assert!(
+        sql_has(&fake, "Java"),
+        "the saved filter is still ANDed in, not replaced: {statements:?}"
+    );
 }
 
 #[tokio::test]
@@ -1726,9 +1793,11 @@ async fn the_sample_token_carries_the_chart_when_asked_and_the_locked_values_it_
         let app = &app;
         let uri = format!("/api/dashboard/embed-info?board={BOARD}{chart}");
         async move {
+            // BI-19 B2 (PR #250 CI): `embed-info` mints a sample token, so it
+            // needs manage on the dashboard; `dashboard:write` holds it.
             as_user(
                 app,
-                "dashboard:read",
+                "dashboard:write",
                 Request::builder().uri(uri),
                 Body::empty(),
             )
@@ -1864,10 +1933,113 @@ async fn only_a_filter_that_picks_values_can_be_locked_or_editable() {
     // The dialog is told which filters can only be hidden.
     let (_, info) = as_user(
         &app,
-        "dashboard:read",
+        "dashboard:read, dashboard:write",
         Request::builder().uri(format!("/api/dashboard/embed-info?board={BOARD}")),
         Body::empty(),
     )
     .await;
     assert_eq!(info["hiddenOnlyColumns"], json!(["year"]));
+}
+
+// ── SEC-50 slice 2 T5: the embed acts as the deployment's catalog tenant ──
+
+/// `SEC-50` D6: the sentence a job with no user is refused with when the
+/// deployment holds several tenants and no tenant owns the shared catalog.
+const NO_CATALOG_TENANT: &str = "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog.";
+
+/// `SEC-50` slice 2 D3/D6: an embed is read by nobody in particular, so it
+/// acts as the deployment's catalog tenant. A deployment that names no
+/// tenant to own the shared catalog refuses every tile of it, and nothing is
+/// read.
+#[tokio::test]
+async fn an_embed_in_a_deployment_without_a_catalog_tenant_is_refused() {
+    let fake = modal_board(&json!(null));
+    let ch = fake.serve().await;
+    let app = app_without_catalog_tenant(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_data(&app, &token_issued(5.0, None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["results"]["u_one"]["error"], NO_CATALOG_TENANT,
+        "{body}"
+    );
+    assert!(
+        fake.tile_statements().is_empty(),
+        "nothing is read: {:?}",
+        fake.tile_statements()
+    );
+}
+
+/// `SEC-50` slice 2 D3: the deployment names the tenant that owns the shared
+/// catalog, so the embed reads it.
+#[tokio::test]
+async fn an_embed_in_a_deployment_with_a_catalog_tenant_reads_the_rows() {
+    let fake = modal_board(&json!(null));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_data(&app, &token_issued(5.0, None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["results"]["u_one"].get("error").is_none(),
+        "the tile is read: {body}"
+    );
+    assert_eq!(
+        body["results"]["u_one"]["rows"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+}
+
+/// `SEC-50` slice 2 D2: a deployment with one tenant holds no other
+/// tenant's table to reach, so nothing changes there.
+#[tokio::test]
+async fn an_embed_in_a_deployment_with_one_tenant_reads_the_rows() {
+    let fake = modal_board(&json!(null));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    common::leave_no_seeded_tenants(&app.pool).await;
+
+    let (status, body) = embed_data(&app, &token_issued(5.0, None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["results"]["u_one"].get("error").is_none(),
+        "one tenant in the deployment: nothing changes: {body}"
+    );
+    assert_eq!(
+        body["results"]["u_one"]["rows"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+}
+
+/// `SEC-50` slice 2 T5: the embed's dropdown is read as the deployment's
+/// catalog tenant too.
+#[tokio::test]
+async fn the_embed_values_in_a_deployment_without_a_catalog_tenant_are_refused() {
+    let fake = modal_board(&json!({ "region": "editable" }));
+    let ch = fake.serve().await;
+    let app = app_without_catalog_tenant(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_values(&app, &token_issued(5.0, None), "region").await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], NO_CATALOG_TENANT, "{body}");
+}
+
+/// `SEC-50` slice 2 T5: the embed's dropdown is read when the deployment
+/// names the tenant that owns the shared catalog.
+#[tokio::test]
+async fn the_embed_values_in_a_deployment_with_a_catalog_tenant_are_read() {
+    let fake = modal_board(&json!({ "region": "editable" }));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_values(&app, &token_issued(5.0, None), "region").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["values"], json!(["Bali", "Java"]), "{body}");
 }

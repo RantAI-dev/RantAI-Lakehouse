@@ -194,6 +194,60 @@ async fn a_streamed_chat_sends_deltas_then_the_checked_answer() {
     assert!(first_delta < done, "deltas arrive before done: {events:?}");
 }
 
+/// `AI-24` D8: a buffering or compressing proxy between the API and the
+/// browser must not hold the answer until the stream ends, so the response
+/// asks it not to (`X-Accel-Buffering`, which nginx honours) and not to
+/// re-encode the body (`no-transform`).
+#[tokio::test]
+async fn a_streamed_chat_asks_a_proxy_not_to_buffer_or_re_encode_it() {
+    let (llm, ch) = mock_backends().await;
+    let mut env = std::collections::HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/chat")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "stream": true,
+                        "messages": [{ "role": "user", "content": "berapa baris di mart_x?" }],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-accel-buffering")
+            .and_then(|v| v.to_str().ok()),
+        Some("no"),
+        "a buffering proxy would hold the answer to the end"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache, no-transform"),
+        "the answer streams; nothing may cache or re-encode it"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/x-ndjson")
+    );
+}
+
 /// `BI-5` review B2: the chat's tools run in a spawned task; `run_sql` there
 /// must still send the signed-in person's query id (so Stop can find it) and
 /// the configured limits, not the nil principal's compiled-in ones.

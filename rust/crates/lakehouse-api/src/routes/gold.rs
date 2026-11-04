@@ -836,13 +836,26 @@ pub fn compute_changed_since_export(
 
 /// The response body shared by the publication detail `GET` and `PUT`:
 /// the stored switch plus the freshness facts the console compares.
+///
+/// `SEC-50` slice 2 T8 (M12): `changedSinceExport` is a READ of the mart —
+/// the content fingerprint counts its rows — so the body asks the tenant
+/// gate for the route's caller first, through the same helper the export
+/// uses ([`gated_source_table`]), before its first `ClickHouse` read. A
+/// caller whose reach does not cover the shared catalog gets the gate's
+/// 404 and the mart is never read.
 async fn publication_body(
     state: &AppState,
     mart: &str,
     enabled: bool,
     updated_at: Option<String>,
     can_edit: bool,
+    actor: crate::routes::query::GateActor<'_>,
 ) -> Result<Value, ApiError> {
+    // `SEC-50` slice 2 T8 (M12): the gate is the export's own, so the two
+    // paths cannot drift. Its answer is the table name the export reads;
+    // this body reads through the fingerprint helpers, which take the
+    // schema and the mart, so only the refusal is used here.
+    gated_source_table(state, mart, actor).await?;
     let last_changed_at =
         mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
             .await
@@ -951,11 +964,14 @@ pub async fn publications(
 /// # Errors
 ///
 /// Returns 400 for a mart that is not a valid identifier, 503 when
-/// Postgres is not configured ([`pool`]), or classified
-/// store/`ClickHouse` errors otherwise.
+/// Postgres is not configured ([`pool`]), 404 with the tenant gate's own
+/// table sentence for a caller whose reach does not cover the shared
+/// catalog (`SEC-50` slice 2 T8), or classified store/`ClickHouse` errors
+/// otherwise.
 pub async fn publication(
     State(state): State<AppState>,
     Path(mart): Path<String>,
+    headers: HeaderMap,
     principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let mart_ident =
@@ -968,7 +984,19 @@ pub async fn publication(
     let can_edit = principal
         .as_ref()
         .is_some_and(|Extension(p)| p.has("gold:export"));
-    let body = publication_body(&state, mart_ident.as_str(), enabled, updated_at, can_edit).await?;
+    // `SEC-50` slice 2 T8 (M12/`SEC-50` R4): the body reads the mart, so it
+    // is gated as the route's caller — a person as themselves (`X-Tenant`
+    // honoured), a job with no user as the catalog's tenant.
+    let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
+    let body = publication_body(
+        &state,
+        mart_ident.as_str(),
+        enabled,
+        updated_at,
+        can_edit,
+        actor,
+    )
+    .await?;
     Ok(ApiJson(body))
 }
 
@@ -1032,6 +1060,7 @@ async fn record_publication_audit(
 pub async fn set_publication(
     State(state): State<AppState>,
     Path(mart): Path<String>,
+    headers: HeaderMap,
     principal: Option<Extension<Principal>>,
     // The body extractor is deliberately LAST: axum requires consuming
     // extractors at the end of the argument list (every sibling handler
@@ -1076,6 +1105,10 @@ pub async fn set_publication(
         updated.enabled,
         Some(updated.updated_at),
         true,
+        // `SEC-50` slice 2 T8: the response body reads the mart, so it is
+        // gated as the person who flipped the switch (the handler holds
+        // their principal; `SEC-50` R4).
+        gold_export_gate_actor(Some(&principal), &headers),
     )
     .await?;
     Ok(ApiJson(body))
@@ -1305,6 +1338,86 @@ mod tests {
             if_changed_skip_reason(None, Some("10:111:222"), Some(1_700_000_000_000),).is_none()
         );
         assert!(if_changed_skip_reason(None, None, None).is_none());
+    }
+
+    /// `SEC-50` slice 2 T8 (M12): the publication body reads the mart (its
+    /// content fingerprint counts the rows), so it is gated as the route's
+    /// caller. A member of a tenant that does not own the shared catalog gets
+    /// `SEC-20`'s 404, and the engine is asked nothing at all — not the
+    /// fingerprint, not the parts.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn another_tenants_member_cannot_read_a_publication(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_auth::PermissionSet;
+        use uuid::Uuid;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// The tenant that owns the shared catalog in this deployment.
+        const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+        /// Another tenant of the same deployment.
+        const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [], "data": [], "rows": 0
+            })))
+            .mount(&server)
+            .await;
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        );
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), url);
+        env.insert("CH_URL".to_owned(), server.uri());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+        let state = AppState::new(Config::from_map(&env).unwrap());
+
+        let person = Principal {
+            id: PrincipalId::User(Uuid::from_u128(11)),
+            tenant_ids: vec![OTHER_TENANT.parse().expect("a seeded tenant id")],
+            display_name: "Other tenant".to_owned(),
+            permissions: PermissionSet::parse("gold:export"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+        let result = publication(
+            State(state),
+            Path("orders_rollup".to_owned()),
+            HeaderMap::new(),
+            Some(Extension(person)),
+        )
+        .await;
+
+        let rejection = result.expect_err("the shared catalog is not this tenant's to read");
+        assert_eq!(
+            rejection.0.status(),
+            StatusCode::NOT_FOUND,
+            "SEC-20's 404, not a 403: {rejection:?}"
+        );
+        assert_eq!(
+            rejection.0.to_string(),
+            "Table not found or not available to your organisation: serving.orders_rollup"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("mock records requests")
+                .is_empty(),
+            "the refusal precedes the engine: no fingerprint and no parts read"
+        );
+        Ok(())
     }
 
     #[tokio::test]

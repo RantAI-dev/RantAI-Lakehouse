@@ -1039,6 +1039,19 @@ jobs:
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # SEC-50 slice 2 review round 3 BLOCKER 3: the WAL-slot alert step
+          # below calls POST /api/alerts/run, which is a job with no user and
+          # so acts as the tenant that OWNS the shared catalog
+          # (routes::query::GateActor::CatalogTenant, SEC-50 D3) -- its rule
+          # reads serving.replication_slot_health. Migration 0002 seeds four
+          # tenants, and with no catalog tenant named there is no tenant
+          # whose reach covers that table, so D6 makes the run SKIP the rule
+          # with its own honest sentence and the step fails on "no fired
+          # result". Same setting, same seeded value and the same contract
+          # the two G8 jobs, g3a-dagster's BLD-1 step and gold-export already
+          # use -- not a weaker gate. `lakehouse-api`'s compose block
+          # forwards it (`CATALOG_TENANT_ID: ${CATALOG_TENANT_ID:-}`).
+          CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001
           # WS5 item C3: step_wal_breach_produces_a_silenceable_alert_instance
           # calls POST /api/alerts/run with a bootstrap-admin (human)
           # session, never a service-identity principal. With
