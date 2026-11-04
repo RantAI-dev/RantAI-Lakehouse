@@ -1,0 +1,24 @@
+{
+  "skipToContent": "Langsung ke konten",
+  "language": {
+    "label": "Bahasa",
+    "en": "English",
+    "id": "Bahasa Indonesia",
+    "short": {
+      "en": "EN",
+      "id": "ID"
+    },
+    "switchTo": "Ganti ke {language}"
+  },
+  "suggestion": {
+    "label": "Pilihan bahasa",
+    "text": "Tersedia dalam Bahasa Indonesia",
+    "view": "Lihat",
+    "dismiss": "Tutup, tetap dalam bahasa Inggris"
+  },
+  "notFound": {
+    "title": "Halaman ini tidak ada.",
+    "body": "Tautannya mungkin usang, atau halamannya sudah pindah.",
+    "home": "Kembali ke beranda"
+  }
+}

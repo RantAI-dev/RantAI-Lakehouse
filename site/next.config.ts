@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { NextConfig } from "next";
+import createNextIntlPlugin from "next-intl/plugin";
 import { parseSiteUrl } from "./src/lib/site-url";
 
 // WEB-5 D2: the site's origin is required at build time and has no default.
@@ -24,4 +25,7 @@ const nextConfig: NextConfig = {
   turbopack: { root: path.resolve(__dirname) },
 };
 
-export default nextConfig;
+// WEB-5 D3: next-intl reads its per-locale messages from this file.
+const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
+
+export default withNextIntl(nextConfig);

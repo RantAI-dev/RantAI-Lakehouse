@@ -1,0 +1,24 @@
+{
+  "skipToContent": "Skip to content",
+  "language": {
+    "label": "Language",
+    "en": "English",
+    "id": "Bahasa Indonesia",
+    "short": {
+      "en": "EN",
+      "id": "ID"
+    },
+    "switchTo": "Switch to {language}"
+  },
+  "suggestion": {
+    "label": "Language choice",
+    "text": "Available in English",
+    "view": "View",
+    "dismiss": "Close, stay in Indonesian"
+  },
+  "notFound": {
+    "title": "This page is not here.",
+    "body": "The link may be old, or the page has moved.",
+    "home": "Back to the home page"
+  }
+}
