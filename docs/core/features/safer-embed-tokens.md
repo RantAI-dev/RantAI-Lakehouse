@@ -35,8 +35,12 @@ sign in. The customer's server signs a token with a shared secret
 
 ## Asking the assistant
 
-Not an assistant feature. The assistant cannot mint, revoke or configure
-embeds.
+The assistant can switch embedding on (`enable_embed`, after approval), set
+each filter's embed mode (`set_embed_filter_modes`, after approval) and
+withdraw every token of a dashboard (`withdraw_embed_tokens`, after a confirm)
+(`BI-26` slice 2). It still never signs a token and never sees one or the
+secret: the customer's server signs it, and the copyable snippet is in
+Share > Embed (`features/embedding.md`, Asking the assistant).
 
 ## Decisions
 
