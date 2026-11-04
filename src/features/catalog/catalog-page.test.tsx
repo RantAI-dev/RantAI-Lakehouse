@@ -1,15 +1,27 @@
-// DATA-23: the Catalog page leaves for the Data Explorer by namespace id. A
-// namespace has two values — the raw id the assets carry and the display
-// label — and the page used the label in all three places it leaves for the
-// explorer, so a labelled namespace ("Silver Layer" / `silver`) filtered
-// nothing: the drawer's preview was empty and the button showed the
-// explorer's empty namespace.
+// DATA-24: the Owner and Tags filters vanished on a laptop-width window.
+// The columns were dropped from the table's column list, and a filter lives
+// on a column, so the filters went with them — the one thing a narrow
+// window took away was the one thing the narrow window was for.
+//
+// The columns are hidden now, not removed: they stay in the column list, so
+// the toolbar's filter picker still offers them at every width, while the
+// table itself leaves the room they would take.
+//
+// WEB-3 S2-D1: Data Explorer and Catalog became one page at `/catalog`. These
+// tests moved here with the asset list (they were the Data Explorer's), and
+// the old Catalog page's DATA-23 tests are rewritten below for the namespace
+// row that replaced its namespace table and drawer.
 //
 // The page is rendered whole, with `fetch` stubbed, so what is under test is
-// the request the page sends and the link it puts on screen.
+// what the user is offered: the columns on screen, the filters in the
+// picker, and the links the namespace row puts on screen.
+
+/** The query string the page reads; a test sets it before rendering. */
+let currentQuery = ""
+
 mock.module("next/navigation", () => ({
   usePathname: () => "/catalog",
-  useSearchParams: () => new URLSearchParams(""),
+  useSearchParams: () => new URLSearchParams(currentQuery),
   useRouter: () => ({
     push: () => {},
     replace: () => {},
@@ -20,10 +32,10 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
-import { namespaceAssetsHref } from "@/lib/table-filter-link"
+import { activeFilterValues, namespaceAssetsHref } from "@/lib/table-filter-link"
 import type { Asset, CatalogNamespace } from "@/services/contracts/assets"
 import { CatalogPage } from "./catalog-page"
 
@@ -58,31 +70,50 @@ const ASSET = {
   lastUpdated: "2026-10-01T00:00:00Z",
   health: "healthy",
   residency: "id-jakarta",
+  tags: ["finance"],
 } as unknown as Asset
 
+const ASSET_LIST = [ASSET]
+
 const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  })
 
-/** Every URL the page asked for, in order. */
-let urls: string[] = []
+/** Whether the namespace list answers, or fails as an unreachable API would. */
+let namespacesFail = false
 
-function stubApi(namespace: CatalogNamespace = NAMESPACE) {
-  urls = []
-  spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+function stubApi() {
+  spyOn(globalThis, "fetch").mockImplementation((async (
+    input: RequestInfo | URL
+  ) => {
     const target = String(input)
-    urls.push(target)
     if (target.startsWith("/api/catalog/query")) {
-      // The API answers with the assets of the namespace the request names,
-      // and a namespace is named by its id.
-      const wanted = previewFilters().find((filter) => filter.id === "namespace")?.value
-      const items = wanted === ASSET.namespace ? [ASSET] : []
-      return json({ totalItems: items.length, totalPages: 1, pageSize: 5, page: 1, items })
+      return json({
+        totalItems: ASSET_LIST.length,
+        totalPages: 1,
+        pageSize: 5,
+        page: 1,
+        items: ASSET_LIST,
+      })
     }
     if (target.startsWith("/api/catalog")) {
-      return json({ assets: [], namespaces: [namespace] })
+      return namespacesFail
+        ? json({ error: "unavailable" }, 503)
+        : json({ assets: [], namespaces: [NAMESPACE] })
     }
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
+}
+
+/** The width the window is at, in pixels. */
+function setWindowWidth(width: number) {
+  Object.defineProperty(window, "innerWidth", {
+    value: width,
+    writable: true,
+    configurable: true,
+  })
 }
 
 function renderPage() {
@@ -93,68 +124,127 @@ function renderPage() {
   )
 }
 
-/** The namespace row of the table, opened by a press on its name. */
-async function openNamespace(name: string) {
-  const cell = await screen.findByText(name)
-  fireEvent.click(cell)
-  return cell
+/** Opens the toolbar's filter picker, which lists the filterable columns. */
+async function openFilterPicker() {
+  const trigger = await screen.findByRole("button", { name: "Filter" })
+  fireEvent.click(trigger)
+  return screen.findByPlaceholderText("Filter by...")
 }
 
-/** The filters the preview asked for, as the API would read them. */
-function previewFilters(): { id: string; value: string }[] {
-  const query = urls.find((url) => url.startsWith("/api/catalog/query"))
-  if (!query) throw new Error("the preview asked for nothing")
-  const raw = new URL(query, "http://console.invalid").searchParams.get("filters")
-  return JSON.parse(raw ?? "[]") as { id: string; value: string }[]
-}
+beforeEach(() => {
+  currentQuery = ""
+  namespacesFail = false
+  setWindowWidth(1280)
+  // The table remembers its layout per user, so a leftover one would decide
+  // which columns this test sees.
+  localStorage.clear()
+  stubApi()
+})
 
 afterEach(() => {
   cleanup()
   mock.restore()
 })
 
-describe("the Catalog page's namespace links", () => {
-  it("previews the namespace by its id, not by its display name", async () => {
-    stubApi()
+describe("the Catalog's columns at a narrow window", () => {
+  it("does not show the Owner and Tags columns at 1280px", async () => {
     renderPage()
-    await openNamespace("Silver Layer")
 
-    await waitFor(() => expect(urls.some((url) => url.startsWith("/api/catalog/query"))).toBe(true))
-    expect(previewFilters()).toEqual([
-      expect.objectContaining({ id: "namespace", value: NAMESPACE.id }),
-    ])
+    // The width is measured after the first render, so wait for the table.
+    await screen.findByRole("columnheader", { name: "Name" })
+    expect(screen.queryByRole("columnheader", { name: "Owner" })).toBeNull()
+    expect(screen.queryByRole("columnheader", { name: "Tags" })).toBeNull()
   })
 
-  it("links the drawer's button to the namespace id, not to its display name", async () => {
-    stubApi()
+  it("offers the Owner and Tags filters at 1280px all the same", async () => {
     renderPage()
-    await openNamespace("Silver Layer")
+    const picker = await openFilterPicker()
 
-    // The button is a link to the explorer, so it carries the explorer's
-    // filter — and that filter names the namespace by its id.
-    const button = await screen.findByRole("button", { name: "Browse all 12 assets" })
-    expect(button.getAttribute("href")).toBe(namespaceAssetsHref(NAMESPACE.id))
-    expect(button.getAttribute("href")).not.toBe(namespaceAssetsHref(NAMESPACE.name))
+    expect(picker).toBeTruthy()
+    expect(screen.getByRole("option", { name: "Owner" })).toBeTruthy()
+    expect(screen.getByRole("option", { name: "Tags" })).toBeTruthy()
   })
 
-  it("links the drawer's other button to the namespace id too", async () => {
-    // A namespace with few assets gets the other label on the same button.
-    stubApi({ ...NAMESPACE, assetCount: 3 })
+  it("shows the Owner and Tags columns at a wide window", async () => {
+    setWindowWidth(1800)
     renderPage()
-    await openNamespace("Silver Layer")
 
-    const button = await screen.findByRole("button", { name: "Browse in Data Explorer" })
-    expect(button.getAttribute("href")).toBe(namespaceAssetsHref(NAMESPACE.id))
+    await screen.findByRole("columnheader", { name: "Name" })
+    expect(screen.queryByRole("columnheader", { name: "Owner" })).toBeTruthy()
+    expect(screen.queryByRole("columnheader", { name: "Tags" })).toBeTruthy()
   })
 
-  it("shows the namespace's assets in the drawer, because the preview asked by id", async () => {
-    stubApi()
+  it("says the filters still work when it hides a column", async () => {
     renderPage()
-    await openNamespace("Silver Layer")
 
-    // The stub answers with the assets of the namespace the request named, so
-    // this only holds when the request named the id.
-    expect(await screen.findByRole("link", { name: /Orders Silver/ })).toBeTruthy()
-    expect(screen.queryByText("No assets in this namespace yet.")).toBeNull()
+    await screen.findByRole("columnheader", { name: "Name" })
+    expect(screen.getByText(/The filters still work\./)).toBeTruthy()
+  })
+
+  it("keeps the window's hide out of the layout it saves for the user", async () => {
+    renderPage()
+    await screen.findByRole("columnheader", { name: "Namespace" })
+
+    // Hide a column the user can see, the way the header menu does. The
+    // window's own hide must not ride along: it is the page's decision, not
+    // the user's, and it would keep the column hidden after the window grows.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Namespace" }))
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: "Hide" }))
+
+    const saved = JSON.parse(
+      localStorage.getItem("app:table-layout:/catalog") ?? "{}"
+    ) as { columnVisibility?: Record<string, boolean> }
+    expect(saved.columnVisibility?.namespace).toBe(false)
+    expect(saved.columnVisibility).not.toHaveProperty("owner")
+    expect(saved.columnVisibility).not.toHaveProperty("tags")
+  })
+})
+
+describe("the Catalog's namespace row", () => {
+  /** The namespace row's link for one namespace, found by its display name. */
+  async function namespaceChip(name: string) {
+    const label = await screen.findByText(name)
+    const link = label.closest("a")
+    if (!link) throw new Error(`no link around ${name}`)
+    return link
+  }
+
+  it("filters the list to the namespace id, not its display name (DATA-23)", async () => {
+    renderPage()
+    const link = await namespaceChip("Silver Layer")
+    const filters = new URL(link.getAttribute("href") ?? "", "http://x").searchParams.get("filters") ?? ""
+
+    expect(new URL(link.getAttribute("href") ?? "", "http://x").pathname).toBe("/catalog")
+    expect(activeFilterValues(filters, "namespace")).toEqual([NAMESPACE.id])
+    expect(link.getAttribute("href")).toBe(namespaceAssetsHref(NAMESPACE.id))
+  })
+
+  it("keeps the search term when a namespace is picked", async () => {
+    currentQuery = "search=orders"
+    renderPage()
+    const link = await namespaceChip("Silver Layer")
+
+    expect(new URL(link.getAttribute("href") ?? "", "http://x").searchParams.get("search")).toBe("orders")
+  })
+
+  it("describes the namespace the list is filtered to, with a way back to all of them", async () => {
+    currentQuery = new URL(namespaceAssetsHref(NAMESPACE.id), "http://x").search.slice(1)
+    renderPage()
+
+    expect(await screen.findByText("Curated tables.")).toBeTruthy()
+    expect(screen.getByText("id-jakarta")).toBeTruthy()
+    expect(screen.getByText("ClickHouse + Iceberg")).toBeTruthy()
+    const back = screen.getByRole("button", { name: "All namespaces" })
+    expect(back.getAttribute("href")).toBe("/catalog")
+  })
+
+  it("says the namespaces could not load, and still lists the assets", async () => {
+    namespacesFail = true
+    renderPage()
+
+    expect(await screen.findByText("Could not load namespaces.")).toBeTruthy()
+    const row = screen.getByText("Could not load namespaces.").parentElement
+    expect(row ? within(row).getByRole("button", { name: "Retry" }) : null).toBeTruthy()
+    expect(await screen.findByText("Orders Silver")).toBeTruthy()
   })
 })

@@ -257,11 +257,19 @@ class RealTemplateTest(unittest.TestCase):
         ):
             self.assertNotIn(f"\n  {name}:", self.rendered)
 
-    def test_the_rendered_template_keeps_the_one_harness_a_product_service_waits_for(self) -> None:
-        # `debezium-server` waits for `g4-source-init` (the demo table and
-        # its publication), so dropping that harness would leave the CDC
-        # service waiting for something that never runs.
-        self.assertIn("\n  g4-source-init:", self.rendered)
+    def test_no_rendered_service_waits_for_a_service_the_rendering_dropped(self) -> None:
+        # The invariant the old test protected, stated without a name: a harness a product service
+        # waits for is kept (`services_to_drop` computes it from `depends_on`). `debezium-server` and
+        # `g4-source-init` were its only case; SRC-4 slice 2 removed both, so the template has none and the
+        # check is now "every `depends_on` target of the rendered template is a service it still defines".
+        _head, services, _tail = render_compose.parse_compose(self.rendered)
+        defined = {service.name for service in services}
+        self.assertNotIn("\n  g4-source-init:", self.rendered)
+        for service in services:
+            for dependency in service.depends_on:
+                self.assertIn(
+                    dependency, defined, f"{service.name} waits for {dependency}, which was dropped"
+                )
 
 
 if __name__ == "__main__":

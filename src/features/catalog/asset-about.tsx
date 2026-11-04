@@ -21,9 +21,11 @@ import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
+import { CLASSIFICATION_LABEL } from "@/lib/status"
 import { cn } from "@/lib/utils"
 import { assetService, tagKeysService } from "@/services"
 import type { AssetAnnotation, AssetDetail } from "@/services/contracts/assets"
+import { SENSITIVITY_LEVELS, SensitivityControls } from "./column-sensitivity"
 import { chosenGovernedTags, governedPairLabels } from "./governed-tags"
 
 /** The API's bounds on an annotation (`routes::catalog::validate_annotation_body`). */
@@ -209,9 +211,32 @@ function EditDialog({
 }
 
 /**
+ * Why the header badge is stricter than the table-level rule, or `null`
+ * when it is not. A table is never less strict than its strictest column
+ * (review round 1 decision 1), so a column rule can raise the header above
+ * what the whole-table rule says; the card names those columns rather than
+ * leave two levels on one screen unexplained.
+ */
+export function stricterBecauseOfColumns(a: AssetDetail): string | null {
+  const rank = (l: AssetDetail["classification"] | undefined) =>
+    l ? SENSITIVITY_LEVELS.indexOf(l) : -1
+  const tableRule = (a.classificationRules ?? []).find((r) => r.column === undefined)
+  const strictest = a.schema.filter(
+    (c) => c.classification === a.classification && rank(c.classification) > rank(tableRule?.classification)
+  )
+  if (strictest.length === 0) return null
+  const names = strictest.map((c) => c.name).join(", ")
+  const level = CLASSIFICATION_LABEL[a.classification]
+  return strictest.length === 1
+    ? `The header shows ${level} because column ${names} is ${level}: a table is never less restrictive than its most restrictive column.`
+    : `The header shows ${level} because columns ${names} are ${level}: a table is never less restrictive than its most restrictive column.`
+}
+
+/**
  * What the asset is and who answers for it. Description, owner, steward,
  * tags and governed tags can be edited here by anyone with `catalog:write`; the rest is
- * the registry's.
+ * the registry's. The whole table's sensitivity (its table-level
+ * classification rule) is set here too, with `governance:write`.
  */
 export function AssetAbout({
   asset: a,
@@ -232,6 +257,8 @@ export function AssetAbout({
   const [editing, setEditing] = React.useState(false)
   const tags = a.tags ?? []
   const governedPairs = governedPairLabels(a.governedTags)
+  const tableRule = (a.classificationRules ?? []).find((r) => r.column === undefined)
+  const stricterNote = stricterBecauseOfColumns(a)
 
   return (
     <SectionCard
@@ -292,6 +319,24 @@ export function AssetAbout({
             : []),
         ]}
       />
+      {/* WEB-3 S3-T5a (review round 1 decision 1): the whole table's own
+          classification rule, which the Access tab's Classify dialog used to
+          set (S3-D2 removed it). A column's level is set on the column. */}
+      <section
+        aria-label="Sensitivity (whole table)"
+        className="mt-3 grid gap-1.5 border-t border-border pt-3 sm:grid-cols-[10rem_minmax(0,1fr)] sm:gap-3"
+      >
+        <div className="text-xs font-medium text-muted-foreground sm:pt-1.5">Sensitivity (whole table)</div>
+        <div className="flex min-w-0 flex-col gap-2">
+          <SensitivityControls
+            asset={a}
+            level={tableRule?.classification}
+            canWrite={hasPermission("governance:write")}
+            onChanged={onChanged}
+          />
+          {stricterNote ? <p className="text-xs text-muted-foreground">{stricterNote}</p> : null}
+        </div>
+      </section>
       {editing ? (
         // Mounted only while open, so each opening starts from the saved values.
         <EditDialog

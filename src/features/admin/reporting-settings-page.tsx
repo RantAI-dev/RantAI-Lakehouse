@@ -185,8 +185,9 @@ export function ReportingSettingsForm({
 
   return (
     <div className="flex flex-col gap-4">
+      {/* WEB-3 S3-D6: a section of Settings now, so it names itself. */}
       <PageHeader
-        title="Settings"
+        title="Reporting"
         description="Used by every dashboard, for grouping dates and for “today”."
       />
       {state.status === "loading" ? <LoadingSkeleton /> : null}

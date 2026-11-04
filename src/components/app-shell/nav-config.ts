@@ -1,15 +1,10 @@
 import {
-  Activity,
   BarChart3,
   BellRing,
   Boxes,
-  Bot,
   Building2,
-  CircleGauge,
   ClipboardCheck,
   Database,
-  DatabaseZap,
-  FileSearch,
   FileText,
   GitBranch,
   HeartPulse,
@@ -19,19 +14,12 @@ import {
   KeyRound,
   Library,
   ListChecks,
-  LogIn,
-  Map,
-  MonitorSmartphone,
   Plug,
   SearchCode,
-  Server,
   Settings,
   SlidersHorizontal,
   ShieldCheck,
-  Tags,
   Users,
-  Waypoints,
-  Wrench,
   type LucideIcon,
 } from "lucide-react"
 
@@ -46,13 +34,6 @@ export type NavItem = {
    * expanded sidebar.
    */
   action?: { title: string; href: string; icon: LucideIcon }
-  /**
-   * `true` when the page still runs on mock data (not wired to a real
-   * service yet). Hidden from the sidebar unless
-   * `NEXT_PUBLIC_SHOW_PREVIEW="1"`. Remove this flag once the page's
-   * service is real.
-   */
-  preview?: boolean
 }
 
 export type NavGroup = {
@@ -66,23 +47,6 @@ export type NavGroup = {
    * flag only affects the first impression.
    */
   defaultOpen?: boolean
-  /**
-   * DERIVED, never hand-written. Set by `visibleNavGroups()` when EVERY
-   * item in a group is still `preview` — the group still renders
-   * (disabled, "Soon" badge) instead of vanishing without a trace.
-   */
-  comingSoon?: boolean
-  /**
-   * DERIVED. `true` when some of a group's items are hidden as preview.
-   *
-   * Used by the sidebar to choose a label. A group genuinely declared
-   * with 1 item (e.g. "AI" → "AI Copilot") uses that item's title, since
-   * it is more descriptive. But a group that BECAME 1 item through
-   * filtering must keep its group label — otherwise "Administration"
-   * would rename itself to "Settings" just because its other four pages
-   * are still mock.
-   */
-  partiallyHidden?: boolean
 }
 
 /**
@@ -101,14 +65,14 @@ export type NavGroup = {
  *   people spend their time, not a sub-page of Data.
  * - Data: where data lives and how it is read (catalog, queries).
  * - Build: author and operate data movement and outbound exports.
- * - Governance: the rules applied to the data (policies, quality, lineage).
+ * - Governance: the rules applied to the data (policies, quality) and the
+ *   human approval queue. Lineage is still a page, but it is reached from a
+ *   table, chart, pipeline or run rather than the sidebar (`WEB-3` D8).
  * - Monitoring: whether the platform is healthy, and what happened — the
  *   old "Overview" dashboard lives here as Health, next to alerts and the
  *   audit trail, instead of being the landing page.
- * - Intelligence: digital employees and their runs. Still `preview`: they
- *   have not been proven end-to-end, so the group renders as "Soon" rather
- *   than as working pages. Their approvals inbox is under Governance.
- * - Administration: identity and workspace configuration.
+ * - Administration: identity and workspace configuration. Sign-in (SSO)
+ *   lives inside Settings (`WEB-3` D6).
  */
 export const NAV_GROUPS: NavGroup[] = [
   {
@@ -142,7 +106,6 @@ export const NAV_GROUPS: NavGroup[] = [
     defaultOpen: true,
     items: [
       { title: "Catalog", href: "/catalog", icon: Library },
-      { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Query Studio", href: "/query-studio", icon: SearchCode },
       { title: "Sources", href: "/connectors", icon: Plug },
     ],
@@ -158,63 +121,30 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Governance",
     icon: ShieldCheck,
     items: [
-      { title: "Policies", href: "/governance/policies", icon: ShieldCheck },
-      { title: "Tag keys", href: "/governance/tag-keys", icon: Tags },
-      {
-        title: "Classification & Masking",
-        href: "/governance/classification",
-        icon: Tags,
-      },
+      // WEB-3 S3-D3, S3-D6: a column's sensitivity and masks are set on the
+      // column (a table's Schema tab), and Tag keys is a section of Settings;
+      // their old addresses redirect. S3-D4: Policies is "Access rules", at
+      // the same address.
+      { title: "Access rules", href: "/governance/policies", icon: ShieldCheck },
       {
         title: "Data Quality",
         href: "/governance/data-quality",
         icon: ListChecks,
       },
-      { title: "Lineage", href: "/lineage", icon: Waypoints },
-      // Not under Intelligence: Copilot's destructive tools and data access
-      // requests queue here, so it must stay reachable while the digital
-      // employee pages are hidden.
-      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck },
+      // Copilot's destructive tools and catalog access requests queue here.
+      { title: "Approvals", href: "/governance/approvals", icon: ClipboardCheck },
     ],
   },
   {
     label: "Monitoring",
     icon: HeartPulse,
     items: [
-      { title: "Health", href: "/health", icon: HeartPulse },
+      // WEB-3 S2-D2: Services, Capacity, Ingestion (CDC) and Table
+      // Maintenance are sections of System status; their old addresses
+      // redirect to `/health#<section>`.
+      { title: "System status", href: "/health", icon: HeartPulse },
       { title: "Alerts", href: "/alerts", icon: BellRing },
       { title: "Audit Log", href: "/audit", icon: FileText },
-      { title: "Activity", href: "/activity", icon: Activity },
-      { title: "Workloads", href: "/workloads", icon: CircleGauge },
-      { title: "Observability", href: "/observability", icon: FileSearch },
-      { title: "Services", href: "/services", icon: Server },
-      { title: "Capacity", href: "/lakehouse/capacity", icon: BarChart3 },
-      // Also holds the Iceberg table list that used to be "Tables" under
-      // Data: next to Data Explorer it read as a duplicate, and its only
-      // unique job, the per-table maintenance policy, belongs here.
-      {
-        title: "Table Maintenance",
-        href: "/governance/maintenance",
-        icon: Wrench,
-      },
-      {
-        title: "Ingestion (CDC)",
-        href: "/governance/ingestion",
-        icon: DatabaseZap,
-      },
-    ],
-  },
-  {
-    label: "Intelligence",
-    icon: Bot,
-    items: [
-      {
-        title: "Digital Employees",
-        href: "/agents/employees",
-        icon: Bot,
-        preview: true,
-      },
-      { title: "Agent Runs", href: "/agents/runs", icon: History, preview: true },
     ],
   },
   {
@@ -222,48 +152,20 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: Settings,
     items: [
       { title: "Users", href: "/admin/users", icon: Users },
-      { title: "Teams & Roles", href: "/admin/roles", icon: Building2 },
+      // WEB-3 S3-D8: the page holds roles only, so it is named for them.
+      { title: "Roles", href: "/admin/roles", icon: Building2 },
       { title: "Tenants", href: "/admin/tenants", icon: Boxes },
       {
         title: "Service Identities",
         href: "/admin/service-identities",
         icon: KeyRound,
       },
-      { title: "SSO", href: "/admin/sso", icon: LogIn },
-      { title: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone },
+      // WEB-3 S3-D6, S3-D7: Sessions is a tab of Users and Maps a section
+      // of Settings; their old addresses redirect.
       { title: "Settings", href: "/admin/settings", icon: SlidersHorizontal },
-      { title: "Maps", href: "/admin/maps", icon: Map },
     ],
   },
 ]
-
-/**
- * Whether preview (mock) items are shown. Default is NO; set
- * `NEXT_PUBLIC_SHOW_PREVIEW="1"` to bring back every mock page.
- */
-export const SHOW_PREVIEW = process.env.NEXT_PUBLIC_SHOW_PREVIEW === "1"
-
-/**
- * Nav groups shown in the sidebar, with `preview` items filtered out
- * unless SHOW_PREVIEW is on.
- *
- * A group whose items are ALL preview is not dropped, only flagged
- * `comingSoon` and still rendered (disabled, "Soon" badge). It used to
- * vanish entirely — a section with several pages and none of them ever
- * shown left the product map in this config out of sync with what the
- * user actually saw, with no hint anything was missing.
- */
-export function visibleNavGroups(): NavGroup[] {
-  if (SHOW_PREVIEW) return NAV_GROUPS
-  return NAV_GROUPS.map((g) => {
-    const items = g.items.filter((it) => !it.preview)
-    return items.length > 0
-      ? { ...g, items, partiallyHidden: items.length < g.items.length }
-      : // The preview items are kept so the flyout/label still has
-        // content to show; `comingSoon` is what prevents navigating to them.
-        { ...g, comingSoon: true }
-  })
-}
 
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
@@ -291,8 +193,8 @@ const SECONDARY_ROUTES: { title: string; href: string }[] = [
   // One conversation with Copilot. Not a sidebar entry: it is opened from
   // Home (a new one) or from History (an old one).
   { title: "Conversation", href: "/copilot" },
-  // Table detail pages, opened from Table Maintenance or an asset's
-  // Snapshots tab. Their nav entry was removed, so without this the
+  // Table detail pages, opened from System status's maintenance runs or
+  // an asset's Snapshots tab. Their nav entry was removed, so without this the
   // title would fall back to the product name.
   { title: "Iceberg Table", href: "/lakehouse/tables" },
 ]

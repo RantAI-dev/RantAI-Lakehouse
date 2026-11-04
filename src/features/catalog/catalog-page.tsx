@@ -1,216 +1,444 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import * as React from "react"
+import { useCallback, useEffect, useMemo } from "react"
 import Link from "next/link"
-import { PageHeader } from "@/components/patterns/page-header"
-import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import { MetadataList } from "@/components/patterns/metadata-list"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { Button } from "@/components/ui/button"
-import { useService } from "@/hooks/use-service"
-import { assetService } from "@/services"
-import type { Asset, CatalogNamespace } from "@/services/contracts/assets"
+import { useRouter, useSearchParams } from "next/navigation"
 
+import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { DataTableSkeleton } from "@/components/data-table/data-table-skeleton"
+import {
+  ContextMenuItem,
+  ContextMenuSeparator,
+} from "@/components/ui/context-menu"
+import { EmptyState, ErrorState } from "@/components/patterns/page-states"
+import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
-import { useTableUrlState } from "@/hooks/use-table-url-state"
-import { filterDataClientSide } from "@/lib/data-table"
-import { filterParam, namespaceAssetsHref } from "@/lib/table-filter-link"
-import { formatRelativeTime } from "@/lib/format"
-import { TierBadge } from "@/components/patterns/status-badge"
-import { getCatalogNamespaceColumns } from "./catalog-namespace-columns"
+import { useInfiniteTableQuery } from "@/hooks/use-infinite-table-query"
+import {
+  toInfiniteQueryParams,
+  useTableUrlState,
+} from "@/hooks/use-table-url-state"
+import { useService } from "@/hooks/use-service"
+import { useWindowWidth } from "@/hooks/use-window-width"
+import { assetService } from "@/services"
+import type { Asset } from "@/services/contracts/assets"
+import { toServiceError } from "@/services/errors"
+import {
+  activeFilterValues,
+  filterParam,
+  removeFilter,
+  setFilter,
+  toggleFilterValue,
+} from "@/lib/table-filter-link"
+import { DATA_LAYER_LABEL, type DataLayer } from "@/lib/status"
+import { cn } from "@/lib/utils"
+import { NamespaceFilterRow, NamespaceSummary, QuickFilterRow } from "./catalog-namespaces"
+import { getAssetActions } from "./data-explorer-actions"
+import { getDataExplorerColumns } from "./data-explorer-columns"
 
-/** How many assets the namespace drawer previews before linking out. */
-const PREVIEW_SIZE = 5
+/**
+ * Legacy `?q/layer/tier/type` params, mapped onto the names the advanced
+ * table uses. Links to this page predate the table rewrite (the sidebar and
+ * several dashboard cards still build them), so they are translated once on
+ * arrival instead of being silently dropped.
+ */
+function legacyParamsToTableState(
+  params: URLSearchParams
+): URLSearchParams | null {
+  const search = params.get("q")
+  const facets = (["layer", "tier", "type"] as const).flatMap((id) => {
+    const value = params.get(id)
+    return value && value !== "all"
+      ? [
+          {
+            id,
+            value: [value],
+            variant: "multiSelect" as const,
+            operator: "inArray" as const,
+          },
+        ]
+      : []
+  })
+  if (!search && facets.length === 0) return null
 
-/** Unified catalog namespaces with ownership and residency metadata. */
+  const next = new URLSearchParams(params)
+  for (const key of ["q", "layer", "tier", "type", "classification"]) {
+    next.delete(key)
+  }
+  if (search) next.set("search", search)
+  // `filterParam`, not raw JSON: it fills in the `filterId` the filter
+  // schema requires, without which the chips never appear.
+  if (facets.length > 0) next.set("filters", filterParam(facets))
+  return next
+}
+
+/**
+ * The layers worth a one-click filter. `semantic` is left out on purpose:
+ * it is rare, and every layer remains available through the toolbar's own
+ * Layer filter — these are shortcuts, not the whole set.
+ */
+const QUICK_LAYERS: DataLayer[] = ["raw", "bronze", "silver", "gold"]
+
+/** Column labels, for telling the user which ones the window is too narrow for. */
+const WIDTH_HIDDEN_LABEL: Record<string, string> = {
+  tags: "Tags",
+  owner: "Owner",
+  sizeBytes: "Size",
+  freshnessLagSeconds: "Freshness",
+  type: "Type",
+  layer: "Layer",
+}
+
+/**
+ * The Catalog (`WEB-3` S2-D1): every governed asset in one list, with the
+ * search, filters and row actions the Data Explorer had and the namespace
+ * grouping the old Catalog page had.
+ *
+ * The two pages paged through the same `assetService.listAssetsPage`; the
+ * old Catalog only added a namespace table whose drawer previewed five
+ * assets. The namespaces are now a quick filter above the list, and the
+ * namespace a user filters to is described above the rows (owner,
+ * residency, source engine), so nothing the drawer showed is lost and there
+ * is one place to find a table. `/data` redirects here.
+ */
 export function CatalogPage() {
-  const state = useService((s) => assetService.listNamespaces(s), [])
-  const [selected, setSelected] = useState<CatalogNamespace | null>(null)
+  const router = useRouter()
+  const searchParams = useSearchParams()
   const tableUrlState = useTableUrlState()
+  const namespaces = useService((s) => assetService.listNamespaces(s), [])
 
-  const columns = useMemo(
-    () => getCatalogNamespaceColumns({ onSelect: setSelected }),
-    []
+  // Rewrite legacy links before the table reads the URL. `replace` keeps the
+  // old address out of history, so Back still leaves the page.
+  useEffect(() => {
+    const migrated = legacyParamsToTableState(
+      new URLSearchParams(searchParams.toString())
+    )
+    if (migrated) router.replace(`/catalog?${migrated.toString()}`)
+  }, [router, searchParams])
+
+  // Only the query-shaping state belongs in the key. Column order, widths
+  // and visibility also live in the URL but must not refetch when changed.
+  const assetsQueryKey = useMemo(
+    () => [
+      "catalog-assets",
+      tableUrlState.search,
+      tableUrlState.sort,
+      tableUrlState.filters,
+      tableUrlState.joinOperator,
+      tableUrlState.groupBy,
+    ],
+    [
+      tableUrlState.search,
+      tableUrlState.sort,
+      tableUrlState.filters,
+      tableUrlState.joinOperator,
+      tableUrlState.groupBy,
+    ]
   )
 
-  // The first few assets of the namespace being inspected. A namespace on
-  // its own says very little — "8 assets" is a number, not an answer — so
-  // the drawer shows what is actually in there before the user commits to
-  // navigating away. Nothing is fetched until a row is opened.
+  const {
+    rows,
+    totalItems,
+    groupSummaries,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading,
+    error,
+    refetch,
+    supported,
+    unsupportedReason,
+  } = useInfiniteTableQuery<Asset>({
+    queryKey: assetsQueryKey,
+    queryFn: (page, signal) =>
+      assetService.listAssetsPage(
+        toInfiniteQueryParams(tableUrlState, page),
+        signal
+      ),
+  })
+
+  const openAsset = useCallback(
+    (asset: Asset) => router.push(`/data/assets/${asset.id}`),
+    [router]
+  )
+
+  // All eight columns need ~875px, and the content area is much narrower
+  // than the window once the sidebar is open — at a 900px window it is
+  // only ~604px. Rather than let the page scroll sideways (which drags
+  // the sidebar and navbar with it and clips the last columns outright),
+  // leave out the columns that earn their width least as space runs out.
   //
-  // DATA-23: the preview filters on the namespace **id**, not on its
-  // display name. Assets carry the raw id (`catalog.rs`), and the
-  // explorer's namespace column compares to that, so a name that differs
-  // from the id ("Silver Layer" vs `silver`) matched nothing and the
-  // drawer said "No assets in this namespace yet."
-  const selectedId = selected?.id ?? null
-  const preview = useService<Asset[]>(
-    async (signal) => {
-      if (!selectedId) return []
-      const page = await assetService.listAssetsPage(
-        {
-          page: 1,
-          pageSize: PREVIEW_SIZE,
-          filters: filterParam([
-            {
+  // Order of sacrifice, least useful first: Tags and Owner (DATA-11; both
+  // are on the detail page) → Size (nice to know) → Freshness (also shown on the detail page) → Type (largely implied by
+  // Layer). Name, Namespace, Tier and the actions menu always stay.
+  //
+  // The columns are hidden, not removed (DATA-24): they stay in the column
+  // list, so their filters keep working in the toolbar's filter menu at
+  // every width. They used to be dropped from the column list, which took
+  // their filters with them — the Owner and Tags filters vanished on a
+  // laptop.
+  const width = useWindowWidth()
+  const hiddenByWidth = useMemo(() => {
+    // Before the first measurement, assume there is room: showing the full
+    // table and then trimming reads better than the reverse.
+    if (width === null) return []
+    const hidden: string[] = []
+    // Tags and Owner (DATA-11) are the widest new columns and go first.
+    //
+    // DATA-11 review SHOULD-FIX 7: derived like the figures above, from the
+    // window minus the open sidebar (~296px of content lost, 900 -> 604).
+    // Without Tags and Owner the table needs at most ~960px (Name at its
+    // `xl` cap of 22rem plus the ~605px the other columns took), so it
+    // already fills a 1280px window (984px of content). Owner is capped at
+    // 10rem (~190px with padding) and Tags at 14rem (~255px), and each is
+    // shown only when the content area has ~55px to spare beyond the table
+    // plus the column: Owner from 1500px (1204px of content for ~1150px),
+    // Tags from 1760px (1464px for ~1405px). At 1280, 1440 and 1536px the
+    // table therefore fits with the sidebar open, and Tags goes before Owner.
+    // These are estimates from the column caps, not measurements, and they
+    // follow the window width, not the table's container.
+    if (width < 1760) hidden.push("tags")
+    if (width < 1500) hidden.push("owner")
+    if (width < 1280) hidden.push("sizeBytes")
+    if (width < 1100) hidden.push("freshnessLagSeconds")
+    if (width < 950) hidden.push("type")
+    // Below this the sidebar collapses to a sheet, so the content area is
+    // the full window — but it is still too tight for five columns. Layer
+    // goes last because Tier carries the more operational signal.
+    if (width < 860) hidden.push("layer")
+    return hidden
+  }, [width])
+
+  const hiddenLabels = hiddenByWidth.map((id) => WIDTH_HIDDEN_LABEL[id] ?? id)
+
+  // The quick filters each own one filter (`layer`, `namespace`) and
+  // nothing else: they rewrite just that entry and carry the rest of the
+  // URL — search, sort, other filters, column layout — through untouched.
+  const activeLayers = useMemo(
+    () => activeFilterValues(tableUrlState.filters, "layer"),
+    [tableUrlState.filters]
+  )
+  const filtersHref = useCallback(
+    (filters: string) => {
+      const next = new URLSearchParams(searchParams.toString())
+      if (filters) next.set("filters", filters)
+      else next.delete("filters")
+      const query = next.toString()
+      return query ? `/catalog?${query}` : "/catalog"
+    },
+    [searchParams]
+  )
+
+  // A namespace counts as picked only when the filter names exactly one;
+  // two values typed into the toolbar are the user's own filter, and no
+  // chip claims it.
+  const activeNamespaceValues = useMemo(
+    () => activeFilterValues(tableUrlState.filters, "namespace"),
+    [tableUrlState.filters]
+  )
+  const activeNamespaceId =
+    activeNamespaceValues.length === 1 ? activeNamespaceValues[0] : null
+  const namespaceHref = useCallback(
+    (namespaceId: string | null) =>
+      filtersHref(
+        namespaceId === null
+          ? removeFilter(tableUrlState.filters, "namespace")
+          : setFilter(tableUrlState.filters, {
               id: "namespace",
-              value: selectedId,
+              value: namespaceId,
               variant: "text",
               operator: "eq",
-            },
-          ]),
-          joinOperator: "and",
-          skipListMeta: true,
-        },
-        signal
-      )
-      return page.items
-    },
-    [selectedId]
+            })
+      ),
+    [filtersHref, tableUrlState.filters]
+  )
+  const activeNamespace =
+    namespaces.status === "success" && activeNamespaceId !== null
+      ? (namespaces.data.find((ns) => ns.id === activeNamespaceId) ?? null)
+      : null
+
+  // Memoised: a new array each render would make TanStack Table rebuild
+  // its column model, losing in-flight state like a column being dragged.
+  //
+  // Every column stays in the list — the ones the window is too narrow for
+  // are hidden through the table's visibility, not dropped from it, so their
+  // filters keep working (DATA-24).
+  const columns = useMemo(
+    () => getDataExplorerColumns({ onOpen: openAsset }),
+    [openAsset]
   )
 
-  const filteredData = useMemo(() => {
-    if (state.status !== "success" || !state.data) return []
-    return filterDataClientSide(state.data, {
-      search: tableUrlState.search,
-      searchFields: [
-        (ns) => ns.name,
-        (ns) => ns.owner,
-        (ns) => ns.description,
-        (ns) => ns.sourceEngine,
-        (ns) => ns.residency,
-      ],
-      filters: tableUrlState.filters,
-      joinOperator: tableUrlState.joinOperator,
-    })
-  }, [
-    state.status,
-    state.data,
-    tableUrlState.search,
-    tableUrlState.filters,
-    tableUrlState.joinOperator,
-  ])
-
   const { table } = useDataTable({
-    data: filteredData,
+    data: rows,
     columns,
+    // The columns the window is too narrow for. Hidden through the table's
+    // visibility, never removed from the column list, so the Owner and Tags
+    // filters are still offered (DATA-24). The user's saved column layout
+    // is left alone: the hide is the page's, not theirs.
+    hiddenColumns: hiddenByWidth,
+    // -1 because the server never counts the pages for an infinite table;
+    // `hasNextPage` is what ends the scroll.
+    pageCount: -1,
+    rowCount: totalItems,
     enableAdvancedFilter: true,
     paginationMode: "infinite",
-    manualPagination: false,
-    manualSorting: false,
-    manualFiltering: true,
-    persistKey: "/catalog",
+    // The URL is the source of truth for the query, so navigation has to
+    // reach the server component too — `shallow: false` is what makes a
+    // filter change actually refetch.
+    shallow: false,
+    getRowId: (row) => row.id,
     initialState: {
+      // `id` stays available in the column menu, filters and the row
+      // context menu; it is just noise as a column, since Name and
+      // Namespace together already identify the asset.
+      columnVisibility: { id: false, certification: false },
+      // Keeps the ⋮ button reachable while the rest of the table scrolls
+      // sideways — the actions are useless if you have to scroll to them.
       columnPinning: { right: ["actions"] },
     },
   })
 
+  const infiniteState = useMemo(
+    () => ({
+      onLoadMore: () => {
+        void fetchNextPage()
+      },
+      hasNextPage: Boolean(hasNextPage),
+      isFetchingNextPage,
+      totalItems,
+      loadedCount: rows.length,
+    }),
+    [fetchNextPage, hasNextPage, isFetchingNextPage, rows.length, totalItems]
+  )
+
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-5">
       <PageHeader
         title="Catalog"
-        description="Namespaces, ownership, residency, and source-engine metadata for governed discovery."
+        description="Every governed table and file. Search by name, column, tag, description or owner, narrow by namespace or layer, and open an asset for its schema, quality, lineage and access."
       />
 
-      {/* The table's own skeleton, not the generic row list: this page
-          loads into a six-column table, and a placeholder shaped like
-          something else makes the layout jump when the data lands. */}
-      {state.status === "loading" ? (
-        <DataTableSkeleton columnCount={6} rowCount={8} filterCount={2} />
-      ) : null}
-      {state.status === "error" ? (
-        <ErrorState error={state.error} onRetry={state.reload} />
-      ) : null}
-      {state.status === "success" ? (
-        <div className="flex flex-col gap-4">
+      {error ? (
+        // React Query widens whatever was thrown to `Error`; `ErrorState`
+        // branches on `ServiceError.code` (a 403 renders as a permission
+        // notice, not a generic failure), so it is narrowed back here.
+        <ErrorState
+          error={toServiceError(error)}
+          onRetry={() => void refetch()}
+        />
+      ) : !isLoading && !supported ? (
+        // A refused tenant-scoped caller gets an otherwise-200 empty page
+        // (`supported: false`), not an error — say why instead of showing
+        // an empty table that reads as "no assets exist."
+        <EmptyState
+          title="The catalog cannot list assets for you"
+          description={
+            unsupportedReason ??
+            "The API answered that listing assets is not supported for this account, and gave no reason."
+          }
+        />
+      ) : isLoading ? (
+        <DataTableSkeleton
+          columnCount={columns.length - hiddenByWidth.length}
+          rowCount={8}
+          filterCount={2}
+        />
+      ) : (
+        <DataTable
+          table={table}
+          groupSummaries={groupSummaries}
+          infinite={infiniteState}
+          onRowClick={openAsset}
+          // Same list the ⋮ button renders, from `getAssetActions` — the
+          // two menus cannot drift apart because only the markup differs.
+          // Right-click stays as the shortcut for people who know it;
+          // the pinned column is what makes the actions discoverable.
+          renderRowContextMenu={(row) => (
+            <>
+              {getAssetActions(row, { onOpen: openAsset }).map((action) => (
+                <React.Fragment key={action.id}>
+                  {action.separatorBefore ? <ContextMenuSeparator /> : null}
+                  <ContextMenuItem onSelect={action.onSelect}>
+                    <action.icon />
+                    {action.label}
+                  </ContextMenuItem>
+                </React.Fragment>
+              ))}
+            </>
+          )}
+        >
           <DataTableAdvancedToolbar
             table={table}
-            onRefresh={state.reload}
-            exportName="Catalog namespaces"
+            onRefresh={() => void refetch()}
+            exportName="Catalog"
           >
-            <DataTableSearch placeholder="Search namespaces…" />
+            <DataTableSearch placeholder="Search by name, column, tag, description or owner…" />
           </DataTableAdvancedToolbar>
-          <DataTable table={table} onRowClick={setSelected} />
-        </div>
-      ) : null}
-
-      <DetailDrawer
-        open={selected !== null}
-        onOpenChange={(open) => {
-          if (!open) setSelected(null)
-        }}
-        title={selected?.name ?? ""}
-      >
-        {selected ? (
-          <>
-            <p className="text-sm text-foreground">{selected.description}</p>
-            <MetadataList
-              items={[
-                { label: "Owner", value: selected.owner },
-                { label: "Source engine", value: selected.sourceEngine },
-                { label: "Residency", value: selected.residency },
-                { label: "Assets", value: selected.assetCount },
-              ]}
+          <div className="flex flex-col gap-2">
+            <NamespaceFilterRow
+              state={namespaces}
+              activeId={activeNamespaceId}
+              hrefFor={namespaceHref}
             />
-            <div className="flex flex-col gap-2">
-              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                Assets
-              </p>
-              {preview.status === "loading" ? (
-                <LoadingSkeleton rows={3} />
-              ) : preview.status === "error" ? (
-                <p className="text-sm text-muted-foreground">
-                  Could not load this namespace&rsquo;s assets.
-                </p>
-              ) : preview.data.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No assets in this namespace yet.
-                </p>
-              ) : (
-                <ul className="divide-y divide-border">
-                  {preview.data.map((asset) => (
-                    <li key={asset.id}>
+            <QuickFilterRow label="Layer">
+              <Button
+                size="sm"
+                variant={activeLayers.length === 0 ? "secondary" : "ghost"}
+                render={
+                  <Link
+                    href={filtersHref(removeFilter(tableUrlState.filters, "layer"))}
+                  />
+                }
+              >
+                All
+              </Button>
+              {QUICK_LAYERS.map((layer) => {
+                const active = activeLayers.includes(layer)
+                return (
+                  <Button
+                    key={layer}
+                    size="sm"
+                    variant={active ? "secondary" : "ghost"}
+                    aria-pressed={active}
+                    className={cn("shrink-0", active && "font-semibold")}
+                    render={
                       <Link
-                        href={`/data/assets/${asset.id}`}
-                        className="-mx-2 flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-muted/40"
-                      >
-                        <span className="min-w-0 flex-1 truncate">
-                          {asset.name}
-                        </span>
-                        <TierBadge tier={asset.tier} />
-                        <span className="shrink-0 text-xs text-muted-foreground">
-                          {formatRelativeTime(asset.lastUpdated)}
-                        </span>
-                      </Link>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-            {/* Filters Data Explorer's namespace column rather than passing
-                the name as a search term: free text also matches names,
-                descriptions and owners, so a namespace like `lake.bronze`
-                used to return rows from other namespaces that merely
-                mention it. DATA-23: the filter carries the namespace **id**,
-                because that is the value the assets carry and the one the
-                explorer's namespace column compares to. */}
-            <Button
-              variant="outline"
-              size="sm"
-              className="self-start"
-              render={<Link href={namespaceAssetsHref(selected.id)} />}
-            >
-              {selected.assetCount > PREVIEW_SIZE
-                ? `Browse all ${selected.assetCount} assets`
-                : "Browse in Data Explorer"}
-            </Button>
-          </>
-        ) : null}
-      </DetailDrawer>
+                        href={filtersHref(
+                          toggleFilterValue(tableUrlState.filters, "layer", layer)
+                        )}
+                      />
+                    }
+                  >
+                    {DATA_LAYER_LABEL[layer]}
+                  </Button>
+                )
+              })}
+            </QuickFilterRow>
+            {activeNamespace ? (
+              <NamespaceSummary
+                namespace={activeNamespace}
+                clearHref={namespaceHref(null)}
+              />
+            ) : null}
+            {hiddenLabels.length > 0 ? (
+              // Said out loud rather than left as a mystery: columns vanish
+              // as the window narrows, and without this the table simply
+              // looks like it lost data. The filters are still there
+              // (DATA-24), so it says so.
+              <p className="text-xs text-muted-foreground">
+                {hiddenLabels.join(", ")}{" "}
+                {hiddenLabels.length === 1 ? "is" : "are"} hidden at this
+                window width — widen the window, or open an asset to see
+                everything. The filters still work.
+              </p>
+            ) : null}
+          </div>
+        </DataTable>
+      )}
     </div>
   )
 }

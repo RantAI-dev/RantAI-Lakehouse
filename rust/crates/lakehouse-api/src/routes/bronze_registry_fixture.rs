@@ -131,13 +131,37 @@ pub(crate) async fn seed_catalog(
     title: &str,
     table_name: &str,
 ) {
+    // The tier a real ingest writes (`bronze_catalog.py`'s
+    // `register_bronze_table`).
+    seed_catalog_with_tier(ch, registry, slug, title, table_name, "primer").await;
+}
+
+/// One catalog row with its own `tier`.
+///
+/// `WEB-3` S3a-D4: the classification list reports a registry dataset only
+/// when its tier is one of the product's classification levels, and a real
+/// ingest writes `primer`, so a test of that reader needs to write the other
+/// kind of tier. Kept beside [`seed_catalog`] rather than copied.
+///
+/// # Panics
+///
+/// Panics when the engine refuses the insert.
+pub(crate) async fn seed_catalog_with_tier(
+    ch: &ChClient,
+    registry: &str,
+    slug: &str,
+    title: &str,
+    table_name: &str,
+    tier: &str,
+) {
     let slug = SqlLiteral::from(slug);
     let title = SqlLiteral::from(title);
     let table_name = SqlLiteral::from(table_name);
+    let tier = SqlLiteral::from(tier);
     let sql = format!(
         "INSERT INTO lake.`{registry}.dataset_catalog` \
          (slug, title, description, tier, updated_at, table_name) \
-         VALUES ({slug}, {title}, 'the dataset', 'primer', '2026-11-01T00:00:00Z', {table_name})"
+         VALUES ({slug}, {title}, 'the dataset', {tier}, '2026-11-01T00:00:00Z', {table_name})"
     );
     ch.exec(&sql, None).await.expect("seed the catalog row");
 }
@@ -195,11 +219,34 @@ pub(crate) async fn seed_sync_with_author(
 ///
 /// Panics when the engine refuses the insert.
 pub(crate) async fn seed_column(ch: &ChClient, registry: &str, slug: &str, key: &str) {
+    seed_column_with(ch, registry, slug, key, "UInt64", "the column").await;
+}
+
+/// One column row with its own type and description.
+///
+/// `DATA-39` T2: a reader's answer for a column is its DESCRIPTION, so a
+/// test of "the primary registry wins" or "the newer row wins" needs two
+/// copies of ONE column that say different things — which [`seed_column`]
+/// cannot do (it always writes `UInt64` / "the column").
+///
+/// # Panics
+///
+/// Panics when the engine refuses the insert.
+pub(crate) async fn seed_column_with(
+    ch: &ChClient,
+    registry: &str,
+    slug: &str,
+    key: &str,
+    ty: &str,
+    description: &str,
+) {
     let slug = SqlLiteral::from(slug);
     let key = SqlLiteral::from(key);
+    let ty = SqlLiteral::from(ty);
+    let description = SqlLiteral::from(description);
     let sql = format!(
         "INSERT INTO lake.`{registry}.dataset_column` (slug, key_asli, tipe, deskripsi) \
-         VALUES ({slug}, {key}, 'UInt64', 'the column')"
+         VALUES ({slug}, {key}, {ty}, {description})"
     );
     ch.exec(&sql, None).await.expect("seed the column row");
 }

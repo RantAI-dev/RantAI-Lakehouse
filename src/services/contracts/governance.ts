@@ -19,11 +19,24 @@ export type Policy = {
   version: number
   owner: string
   updatedAt: string
+  // Whether the policy engine can enforce this row (SEC-61): true only when
+  // its `conditions` parse into the structured clause the read-time engine
+  // applies (roles, a table, and a mask or row filter). Required — every
+  // policy response carries it. Independent of `status`: a `ready` policy
+  // with `enforceable: false` masks nothing and filters no rows, so the
+  // console shows it as "Not enforced", not "Enforced".
+  enforceable: boolean
   // Raw, still-unparsed `conditions` JSON string (WS7 item A2). Absent for
   // a legacy policy authored before conditions were structured. A legacy
   // value may be free-text prose rather than JSON — never assume it parses
   // and never crash the policy list page on a `JSON.parse` failure.
   conditions?: string
+  // The catalog asset id of the table the policy governs (WEB-3 S3a-D1),
+  // resolved by the API from `conditions.table`: a Silver/Serving table is
+  // its own id, a Bronze table is its registry slug. Absent when the
+  // conditions do not parse or name no table the catalog addresses — show
+  // the table as plain text then, never a link to an invented page.
+  assetId?: string
 }
 
 export type ClassificationRule = {
@@ -314,7 +327,7 @@ export type MaintenanceRun = {
 /**
  * One row of `GET /api/governance/replication` — a point-in-time snapshot
  * of one Postgres logical-replication slot backing a CDC connector
- * (Debezium Server, P5). `status` is `"ok" | "warning" | "critical"`,
+ * (Debezium on Kafka Connect, `SRC-4`). `status` is `"ok" | "warning" | "critical"`,
  * computed in `dagster/dispar_orchestrate/replication_metrics.py` from WAL
  * retention thresholds and whether the slot is still `active` — an
  * inactive slot is flagged `critical` regardless of byte thresholds,
@@ -343,7 +356,6 @@ export type DatasetSla = {
 
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
-  listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
   listQuality(signal?: AbortSignal): Promise<QualityRule[]>
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
   /**
@@ -414,6 +426,11 @@ export interface GovernanceService {
     input: SetQualityScheduleInput,
     signal?: AbortSignal
   ): Promise<QualitySchedule>
+  /**
+   * Put a table back on the default schedule (WEB-3 S3a-D3); needs
+   * `governance:write`. `listQualitySchedules` then carries no row for it.
+   */
+  resetQualitySchedule(asset: string, signal?: AbortSignal): Promise<void>
   /** Whether a table's volume and freshness anomalies are being raised yet. */
   getQualityLearning(asset: string, signal?: AbortSignal): Promise<QualityLearning>
   createClassificationRule(

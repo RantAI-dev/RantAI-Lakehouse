@@ -1,8 +1,9 @@
-"use client"
+import { redirect } from "next/navigation"
 
-import { SsoPage } from "@/features/admin/sso-page"
-
-/** Thin App Router page for SsoPage. */
-export default function Page() {
-  return <SsoPage />
+/**
+ * Legacy route compatibility redirect (`WEB-3` D6, S3-D6): sign-in
+ * configuration is the "Sign-in" section of `/admin/settings`.
+ */
+export default function LegacyRedirect() {
+  redirect("/admin/settings?section=sign-in")
 }

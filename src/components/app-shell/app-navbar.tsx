@@ -94,8 +94,7 @@ export function AppNavbar() {
               normally used for a breadcrumb or the active workspace
               name, so a static label there would promise a
               multi-workspace feature that does not exist yet
-              (`workspaceName` is only used in Settings, and Tenants is
-              still preview). */}
+              (`workspaceName` is only used in Settings). */}
           <div className="hidden min-w-0 sm:block">
             <p className="truncate text-sm font-semibold text-foreground">
               {pageTitle}

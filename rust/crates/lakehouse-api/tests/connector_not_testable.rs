@@ -5,8 +5,9 @@
 //! Before the fix the Oracle probe answered `supported: true, ok: false`, so
 //! `PUT .../credential` refused every new Oracle credential with a 422 and
 //! every `POST .../test` marked the connector unhealthy. Now the probe is
-//! `supported: false`: the credential is saved with `verified: false`, and a
-//! test leaves the stored `health` as it was.
+//! `supported: false`: the credential is saved with `verified: false`, and the
+//! stored `health` is as it was. (`SRC-4` T1.1: the connection test itself runs
+//! in the orchestrator; see `connector_discovery_launch.rs`.)
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -65,7 +66,7 @@ async fn health_of(app: &TestApp) -> String {
 }
 
 #[tokio::test]
-async fn an_oracle_credential_is_saved_unverified_and_its_test_leaves_health_alone() {
+async fn an_oracle_credential_is_saved_unverified_and_leaves_health_alone() {
     let secrets = tempfile::tempdir().unwrap();
     let env = HashMap::from([(
         "CONNECTOR_SECRETS_DIR".to_owned(),
@@ -109,24 +110,11 @@ async fn an_oracle_credential_is_saved_unverified_and_its_test_leaves_health_alo
     );
     assert_eq!(stored, "a-new-oracle-password");
 
-    let (status, body) = send(
-        &app,
-        &cookie,
-        "POST",
-        &format!("/api/connectors/{ORACLE_ID}/test"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["supported"], false);
-    assert_eq!(body["ok"], false);
-    assert!(body["latencyMs"].is_null(), "{body}");
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap()
-            .contains("cannot be tested from the console"),
-        "{body}"
-    );
+    // `SRC-4` T1.1: `POST .../test` of an Oracle connector no longer answers
+    // `supported: false`; it launches the test in the orchestrator and records
+    // the result when it is posted (`connector_discovery_launch.rs` pins that).
+    // What stays here is the credential flow: it probes with the API's own
+    // probe, which cannot dial Oracle, so it is `verified: false` and leaves
+    // the stored health alone.
     assert_eq!(health_of(&app).await, "degraded");
 }

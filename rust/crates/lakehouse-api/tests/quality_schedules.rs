@@ -164,3 +164,69 @@ async fn a_bad_schedule_is_refused_and_stores_nothing() {
         .unwrap();
     assert_eq!(stored, 0);
 }
+
+/// `WEB-3` S3a-D3: a table goes back to the default schedule by removing
+/// its row, which is what `GET` then shows (no row for it, 60 minutes for
+/// every table). Resetting a table that has no row is not an error.
+#[tokio::test]
+async fn a_schedule_can_go_back_to_the_default() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let set = "/api/governance/quality/schedules/silver.orders";
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "PUT",
+        set,
+        Some(json!({ "mode": "interval", "intervalMinutes": 120 })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (_, listed) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/schedules",
+        None,
+    )
+    .await;
+    assert_eq!(listed["schedules"][0]["asset"], json!("silver.orders"));
+
+    let (code, body) = call(&router, &cookie, "DELETE", set, None).await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    let (_, listed) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/schedules",
+        None,
+    )
+    .await;
+    assert_eq!(listed["schedules"], json!([]), "back on the default");
+    assert_eq!(listed["defaultIntervalMinutes"], 60);
+
+    // The outcome already holds, so asking again is not an error.
+    let (code, _) = call(&router, &cookie, "DELETE", set, None).await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+
+    // A table that is not zone.table is a 400, and nothing is audited.
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/governance/quality/schedules/orders",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_event WHERE action = 'quality.schedule_reset'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read the audit rows");
+    assert_eq!(actions.len(), 2, "each reset is audited: {actions:?}");
+}

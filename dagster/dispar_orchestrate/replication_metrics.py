@@ -285,7 +285,7 @@ def _fetch_ingestible_connectors(cfg: ReplicationConfig) -> tuple[list[dict[str,
 
 def _slot_to_connector_id(connectors: list[dict[str, Any]]) -> dict[str, str]:
     """`{dial.slotName: id}` for every `adapter == "cdc"` connector — the
-    slot-name shape is registry-owned (`lakehouse_store::cdc::render_debezium_properties`
+    slot-name shape is registry-owned (`lakehouse_store::cdc::render_connect_config` (SRC-4 S2 review SHOULD-FIX 2)
     now takes the slot/publication names explicitly rather than deriving
     them from the connector id), so this lookup is the only correct way to
     attribute a live `pg_replication_slots` row; a slot name is no longer
@@ -310,7 +310,7 @@ def check_replication_slots(cfg: ReplicationConfig) -> list[dict[str, Any]]:
     /api/connectors/ingestible` (WS3 plan review X4) — never by
     string-stripping the slot name. That stripped-suffix guess
     (`slot_name[: -len("_slot")]`) was a fabricated attribution (AGENTS.md
-    rule 2: "Never fabricate"): `lakehouse_store::cdc::render_debezium_properties`
+    rule 2: "Never fabricate"): `lakehouse_store::cdc::render_connect_config` (SRC-4 S2 review SHOULD-FIX 2)
     now takes the slot/publication names explicitly (WS3 plan review X4),
     so a CDC connector's slot name is registry-owned and need not resemble
     its connector id at all.

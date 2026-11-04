@@ -5,6 +5,7 @@ import Link from "next/link"
 import { ChevronRight, ExternalLink } from "lucide-react"
 import { cn } from "@/lib/utils"
 import type { LineageGraph } from "@/services/contracts/governance"
+import { tableKeyAssetHref } from "@/lib/table-key-href"
 
 export type LineageNode = LineageGraph["nodes"][number]
 
@@ -66,7 +67,7 @@ export function nodeHref(node: LineageNode): string | null {
     case "dataset":
       return `/data/assets/${ref}`
     case "table":
-      return rest.startsWith("silver.") || rest.startsWith("serving.") ? `/data/assets/${ref}` : null
+      return tableKeyAssetHref(rest)
     default:
       return null
   }

@@ -26,7 +26,7 @@ else is a library crate it depends on.
 | `lakehouse-embed` | Signed embedding (Metabase-style): HS256 JWT carrying a dashboard resource plus locked filter params, hand-rolled (no external JWT crate), matching the original TypeScript. |
 | `lakehouse-notify` | Delivery to webhook (Slack/Discord/generic incoming webhook) and email (SMTP via `lettre`), used by alerts and digests. |
 | `lakehouse-alerts` | Threshold alerts and scheduled digests over `serving.*` ClickHouse marts, persisted in `console.alert_rule`, delivered via `lakehouse-notify`. |
-| `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append, and (ADR 0010) Gold export create/append/read-back. **`lakehouse-api` depends on it as of the Gold export work**: `routes::gold` (`POST`/`GET /api/gold/export/{mart}`, glued together by `gold_export.rs`) is its first real caller — Bronze itself is still surfaced in the console by reading `bronze_meta.*` (ClickHouse) directly, via `routes::catalog`/`routes::governance`/`routes::storage`, never through this crate. It is also exercised by the G1/G3a/G4/Gold-export gate test runners and (indirectly) by Debezium Server/dlt as REST-catalog clients. See its crate doc comment and `docs/adr/0002`–`0004`, `0010`. |
+| `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append, and (ADR 0010) Gold export create/append/read-back. **`lakehouse-api` depends on it as of the Gold export work**: `routes::gold` (`POST`/`GET /api/gold/export/{mart}`, glued together by `gold_export.rs`) is its first real caller — Bronze itself is still surfaced in the console by reading `bronze_meta.*` (ClickHouse) directly, via `routes::catalog`/`routes::governance`/`routes::storage`, never through this crate. It is also exercised by the G1/G3a/G4/Gold-export gate test runners and (indirectly) by dlt as a REST-catalog client. See its crate doc comment and `docs/adr/0002`–`0004`, `0010`. |
 | `lakehouse-trino` | A thin client for `Trino`'s `/v1/statement` REST protocol (no vendor SDK exists): submit SQL, follow `nextUri`. Used by `lakehouse-api`. |
 | `lakehouse-test-support` | Test-only: one shared, labelled `testcontainers` Postgres for the integration tests of `lakehouse-store` and `lakehouse-auth`. Not linked into the API. |
 | `lakehouse-api` | The axum HTTP service: config resolution, middleware, routing, policy, and every handler. The only crate with `main()`. |
@@ -109,7 +109,7 @@ P1–P5 added a third data path that is neither Postgres nor ClickHouse
 object store (RustFS by default; SeaweedFS is a verified drop-in swap, see
 `docs/STORAGE-COMPATIBILITY.md`), registered in Lakekeeper's Iceberg REST
 catalog. Two independent writers populate it — Dagster/dlt for batch
-ingest (P3) and Debezium Server for CDC (P5) — both writing through
+ingest (P3) and the change-capture applier for CDC (`SRC-4`: Debezium on Kafka Connect writes topics, a Dagster job writes Bronze) — both writing through
 Lakekeeper, never through ClickHouse. ClickHouse reads Bronze back out via
 a `DataLakeCatalog` database (`allow_database_iceberg = 1`) pointed at the
 same Lakekeeper catalog; this read path works and is what

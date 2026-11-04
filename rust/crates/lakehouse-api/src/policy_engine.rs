@@ -98,15 +98,24 @@ impl PolicyCondition {
     /// [`Self::parse`] over an `Option<&str>`, for the common
     /// `policy.conditions: Option<String>` shape.
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "no read-time caller exists yet in Phase A; Phase B's sql_rewrite \
-                  enforcement path (and WS7 item A5's preview route) call this on every \
-                  policy.conditions it loads"
-    )]
     pub fn parse_opt(raw: Option<&str>) -> Option<Self> {
         raw.and_then(Self::parse)
     }
+}
+
+/// Whether a policy's authored `conditions` name `role` among the roles it
+/// applies to.
+///
+/// The match is [`PolicyEngineObligations::obligations_for_async`]'s own —
+/// an exact entry in `PolicyCondition::roles` — exposed so the role-rename
+/// refusal (`WEB-3` review R2) asks the engine's question instead of
+/// growing a second parser. `false` for anything
+/// [`PolicyCondition::parse_opt`] does not accept: an unenforceable
+/// condition masks nothing and filters no rows today, so a rename cannot
+/// take an obligation away from the role through it.
+#[must_use]
+pub fn condition_names_role(conditions: Option<&str>, role: &str) -> bool {
+    PolicyCondition::parse_opt(conditions).is_some_and(|cond| cond.roles.iter().any(|r| r == role))
 }
 
 /// Errors resolving real obligations for a principal's query — never

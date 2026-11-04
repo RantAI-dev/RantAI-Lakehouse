@@ -71,6 +71,8 @@ cloud version is possible in future. Neither exists today.
 
 Version 0.2.0, built by the release pipeline on 2026-11-04 and waiting as a
 draft for the product owner to publish it (`docs/plans/REL-2-RESULT.md`).
+Version 0.2.1 (the fixes for blockers 7 and 8, and the console cleanup) is
+tagged and waits for the owner's approval of the release job (2026-11-04).
 Still in heavy development, built by one product owner working with AI agents
 (`AGENTS.md`).
 
@@ -112,10 +114,10 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Connect to common databases | **Partial.** PostgreSQL, MySQL, SQL Server and MongoDB load end to end (gate `ops/g6`). "Test connection" really connects for PostgreSQL, MySQL, SQL Server, REST and S3 storage; other types say unsupported | Yes, all three | Oracle, MariaDB, Teradata (`SRC-4`) |
+| Connect to common databases | **Have.** PostgreSQL, MySQL, SQL Server, MongoDB and Oracle load end to end (gate `ops/g6`; Oracle full and incremental with chosen columns over native network encryption, `SRC-4`). "Test connection" really connects for PostgreSQL, MySQL, SQL Server, Oracle, REST and S3 storage; other types say unsupported | Yes, all three | MariaDB as its own type, Teradata (`SRC-35`) |
 | Files and APIs | **Have.** CSV files and REST sources (gate `ops/g6`). Adapters for SFTP, Google Sheets and Oracle exist; *Not verified* end to end | Yes | Verify the three |
 | Business-app connectors (CRM, ads, support tools) | **Partial.** Eight of Databricks' ten generally available ones are supported and gate-tested against mock vendors (`ops/g6`, job `g6-saas`): Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint; each with browser or key sign-in, object and column choice, incremental loads where the vendor has a change filter, and schema-change handling. *Not verified* on any real vendor account. Workday Reports and NetSuite are built and listed unsupported. Merged (#216) and accepted by the product owner on 2026-11-02 | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Real-account test of all ten (`SRC-27`), the second wave of about 45 (`SRC-26`) |
-| Live change capture | **Partial.** Proven for PostgreSQL (gate `ops/g4`); MySQL and SQL Server exist but are not gate-tested | Yes: PostgreSQL, MySQL, SQL Server, Oracle; MongoDB at Airbyte | MySQL, SQL Server, Oracle, MongoDB (`SRC-4`) |
+| Live change capture | **Have.** PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, one Debezium connector each on Kafka Connect, each gate-tested (`ops/g4`: `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`; every change in Bronze within 120 s). Current-row and history modes, pause and resume, per-table lag with a lag alert, and setup checks in the connection test. Accepted 2026-11-01 (`SRC-4`, PR #264). Limits on the feature page `features/databases-and-change-capture.md`: Oracle has no certificate checking and reads its setup checks unencrypted (signed exception), its NUMBER columns arrive as text | Yes: PostgreSQL, MySQL, SQL Server, Oracle; MongoDB at Airbyte | MariaDB (`SRC-36`), Oracle over TCPS with certificate checking (`SRC-37`) |
 | Message queues | **Partial.** Kafka loads into tables; no processing over streams | Yes, with stream processing | Stream processing |
 | Upload a file from the console | **Have.** CSV, TSV, Excel, Parquet, JSON, JSON Lines, Avro, gzip and zip; up to 10 files into one table, 2 GB per upload (one load at a time measured, `docs/plans/DATA-17-RESULT.md`), and guessed, editable column types. Merged (#76, #186) and accepted by the product owner on 2026-11-02 (`DATA-17`, `DATA-18`) | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Loads of 2 GB at the same time unmeasured (`DATA-33`) Uploaded files can be grouped in folders on the Uploaded files tab, a grouping only, with search across folders (`DATA-35`, released 2026-10-29). |
 
@@ -154,7 +156,7 @@ hands-on testing.
 | --- | --- | --- | --- |
 | Query tenancy | **Partial.** A query and a saved query are scoped to the caller's tenant — another tenant's uploaded table is refused with the same 404 as a missing table, and the shared catalog belongs to the tenant named in `CATALOG_TENANT_ID` (`SEC-20`). Authored pipelines and the Gold export are scoped too (`SEC-50` slice 1, #281, 2026-10-30): a pipeline reads as its own tenant, and a job with no user acts as the catalog's tenant. Dashboards, embeds, public links and alerts are not yet (slice 2) | Yes | `SEC-50` |
 | Roles and permissions | **Have** | Yes | — |
-| Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`) | Yes | — |
+| Classify and mask sensitive columns | **Have.** Proven end to end (gate `ops/g8`). Since `WEB-3` (#376) a column's sensitivity and masks are set on the table's columns, and Access rules lists what is enforced | Yes | — |
 | Row-level rules | **Partial.** The policy engine applies row filters and masks on read; masking is proven end to end (gate `ops/g8`), row filters are not gate-tested | Yes | Prove row filters |
 | Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, accepted 2026-10-23; speed on 10,000 tables not measured, and a typo that matches only a table's name carries no "approximate match" label, `DATA-24`, `DATA-32`). Certified and deprecated marks, governed tags, and the marks in the chart builder and Query Studio are built and accepted (`DATA-12`, 2026-10-23); per-user table visibility is not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
@@ -311,8 +313,9 @@ run without the product owner fixing things by hand.
 | 4 | ~~The main branch can be changed without review~~ | Cleared 2026-10-30: `main` requires five checks and blocks force-pushes (`REL-1`, `docs/CI.md`) |
 | 5 | No support commitment to put in a contract | Decide one (`reference/support-model.md`) |
 | 6 | ~~Open high-severity security findings~~: connector password theft (`SEC-14`, accepted 2026-11-02) and connection tests reaching internal addresses (`SEC-15`, accepted 2026-10-23) are closed; the rest are under Now in `BACKLOG.md` | Fix the security items under Now in `BACKLOG.md`; their specs are in `specs/` |
-| 7 | A fresh install refuses its scheduled work (exports, alerts, reports, embeds) and the shared catalog until `CATALOG_TENANT_ID` is set by hand, because every install seeds four tenants (`REL-10`) | Being fixed: the installer and the updater set it (`REL-10`, In Progress) |
-| 8 | Previewing a Parquet file in an S3 files connector reads it in the API process, so a crafted file can end the API for every tenant (`SEC-55`) | Being fixed: the preview reads the file's tail in the separate reader process, as uploads do (`SEC-55`, In Progress) |
+| 7 | ~~A fresh install refuses its scheduled work and the shared catalog until `CATALOG_TENANT_ID` is set by hand~~ | Fixed in 0.2.1 (`REL-10`, #371): install and update set it to the group tenant when it is empty. 0.2.1 is tagged (2026-11-04) and waits for the owner to publish it |
+| 8 | ~~Previewing a Parquet file in an S3 files connector could end the API for every tenant~~ | Fixed in 0.2.1 (`SEC-55`, #370): the preview reads the file's tail in the separate reader process. Waits for the owner to publish 0.2.1 |
+| 9 | A truly offline install fails on first start: five init containers install packages from the internet while the stack starts, and the release's air-gap proof does not block that | Proposed fix `REL-16` (an init image shipped in the bundle; the proof blocks all outbound traffic); the owner has not decided |
 
 Not blockers, but will be found in a customer's evaluation: full audit
 coverage, single sign-on, tested backup restore, cleanup of old table
@@ -359,7 +362,7 @@ an order in its roadmap phase.
 | --- | --- | --- |
 | Dashboards | Filters, time grain, calculated fields, tables and KPIs first (`BI-18`, `BI-9`, `BI-8`, `BI-16`); then the builder, joins, metrics, formatting, layout, reports and sharing | The gaps a Metabase user hits on day one |
 | Assistant for dashboards | `AI-1`, `AI-12`, `AI-15` now; each other `AI-` item ships with its BI item | Agentic-first: what a user can click, they can ask for (`AGENTS.md`) |
-| Data | Fix and test every connector (`SRC-6`, `SRC-9`), failure alerts and schema changes (`SRC-7`, `SRC-8`), more databases with live change capture (`SRC-4`), then the catalog (`DATA-11` to `DATA-16`) and upload depth (`DATA-17` to `DATA-19`) | Make what we advertise work before adding more |
+| Data | Fix and test every connector (`SRC-6`, `SRC-9`), failure alerts and schema changes (`SRC-7`, `SRC-8`), then the catalog (`DATA-11` to `DATA-16`) and upload depth (`DATA-17` to `DATA-19`) | Make what we advertise work before adding more |
 | Query Studio | Its security fixes (`SEC-19` to `SEC-21`), then editor, results, saved queries and history (`QS-1` to `QS-4`) | Every SQL user expects these |
 | Security and platform | `SEC-12`, `SEC-16` to `SEC-18`, single sign-on (`SEC-3`), audit coverage (`GOV-1`), row filters (`VER-1`), table cleanup (`OPS-1`), usage view (`OPS-8`) | Found in every evaluation |
 | Pipelines | Joins and aggregations in the builder (`BLD-1`) | Today these need SQL written outside the builder |

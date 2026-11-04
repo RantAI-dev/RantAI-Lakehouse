@@ -718,19 +718,15 @@ fn sheets_of_answer(answer: &Answer) -> Result<WorkbookInfo, ApiError> {
 /// What a Parquet answer holds: the footer's account of the file, and where
 /// its first row group is.
 ///
+/// The answer itself is read by [`upload_convert::parquet_footer_of_answer`],
+/// the one reader an S3 connector's preview also calls (`SEC-55` D3).
+///
 /// # Errors
 ///
 /// 500 when the answer is not one of the answers this module knows.
 fn parquet_of_answer(answer: &Answer) -> Result<ParquetFooter, ApiError> {
-    match answer {
-        Answer::Parquet { info, group } => Ok(ParquetFooter {
-            info: info.clone(),
-            group: *group,
-        }),
-        Answer::Sheets { .. } | Answer::Sheet { .. } | Answer::Refusal { .. } => {
-            Err(ApiError::Internal(CONVERSION_FAILED.to_owned()))
-        }
-    }
+    upload_convert::parquet_footer_of_answer(answer)
+        .ok_or_else(|| ApiError::Internal(CONVERSION_FAILED.to_owned()))
 }
 
 /// The sheet the request names, and its position in the workbook's list.

@@ -27,7 +27,7 @@ type Polled = { attempt: number; upload: Upload }
  *   goes with the component. A refresh that fails is said, and the next tick
  *   tries again, so a dropped connection is never shown as a stalled load.
  * - Loaded: the row count (or "Not measured": a missing count is never
- *   written as 0), "Open in Data Explorer" and "Upload another file".
+ *   written as 0), "Open in Catalog" and "Upload another file".
  * - Failed: the API's reason as it is, "Change settings" and "Try again".
  *   After a failure that happened only at the catalog the rows ARE in the
  *   table, which `LoadFailure` says and `retryInput` accounts for.
@@ -163,7 +163,7 @@ export function UploadRunView({
             <div className="flex flex-wrap gap-2">
               {upload.assetId !== undefined ? (
                 <Button size="sm" render={<Link href={`/data/assets/${encodeURIComponent(upload.assetId)}`} />}>
-                  Open in Data Explorer
+                  Open in Catalog
                 </Button>
               ) : null}
               <Button size="sm" variant="outline" onClick={onReset}>

@@ -13,11 +13,13 @@ import { CheckBadge, SeverityBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { useUrlTab } from "@/hooks/use-url-tab"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { useAuth } from "@/features/auth/auth-provider"
@@ -33,13 +35,26 @@ import {
 import { CheckFields, ThresholdForms } from "./quality-check-fields"
 import { EMPTY_FORM, KINDS, ruleThreshold, type RuleForm } from "./quality-checks"
 import { QualityIncidents } from "./quality-incidents"
+import { FreshnessTargetsTab } from "./freshness-targets-tab"
 import { EditRuleDialog } from "./quality-rule-edit-dialog"
 import { RuleRuns } from "./quality-rule-runs"
+import { QualitySchedulesTab } from "./quality-schedules-tab"
 
 const selectClassName =
   "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
+const QUALITY_TABS = ["rules", "schedules", "freshness"] as const
+type QualityTab = (typeof QUALITY_TABS)[number]
+
+/**
+ * Data Quality, in three tabs (`WEB-3` S3-D5): the incidents and rules, the
+ * tables' check schedules, and the tables' freshness targets. Schedules and
+ * targets were set only on each table's page, one at a time; the tabs show
+ * them all, and the table page keeps its own controls. The open tab is in
+ * `?tab=`; the rules are the bare address.
+ */
 export function DataQualityPage() {
+  const [tab, setTab] = useUrlTab("tab", QUALITY_TABS)
   const state = useService((s) => governanceService.listQuality(s), [])
   const [selected, setSelected] = React.useState<QualityRule | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
@@ -189,11 +204,12 @@ export function DataQualityPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Data Quality"
-        description="Rules, dimensions, thresholds, and remediation signals."
+        description="The checks on each table, when they run, and how fresh each table must be."
         actions={
           // SEC-23 (F4): the API now refuses adding a rule without
-          // governance:write, like editing and deleting one.
-          hasPermission("governance:write") ? (
+          // governance:write, like editing and deleting one. WEB-3 S3-D5:
+          // adding a rule belongs to the rules tab.
+          tab === "rules" && hasPermission("governance:write") ? (
             <Button size="sm" onClick={() => setCreateOpen(true)}>
               <PlusIcon data-icon="inline-start" />
               Add Quality Rule
@@ -202,21 +218,36 @@ export function DataQualityPage() {
         }
       />
 
-      {/* DATA-14 (F7): what is wrong now leads; the rules follow. */}
-      <QualityIncidents />
+      <Tabs value={tab} onValueChange={(v) => setTab(v as QualityTab)} className="gap-4">
+        <TabsList>
+          <TabsTrigger value="rules">Incidents and rules</TabsTrigger>
+          <TabsTrigger value="schedules">Schedules</TabsTrigger>
+          <TabsTrigger value="freshness">Freshness targets</TabsTrigger>
+        </TabsList>
+        <TabsContent value="rules" className="flex flex-col gap-4">
+          {/* DATA-14 (F7): what is wrong now leads; the rules follow. */}
+          <QualityIncidents />
 
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? (
-        <ErrorState error={state.error} onRetry={state.reload} />
-      ) : null}
-      {state.status === "success" ? (
-        <div className="flex flex-col gap-4">
-          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
-            <DataTableSearch placeholder="Search rule, asset, dimension…" />
-          </DataTableAdvancedToolbar>
-          <DataTable table={table} onRowClick={setSelected} />
-        </div>
-      ) : null}
+          {state.status === "loading" ? <LoadingSkeleton /> : null}
+          {state.status === "error" ? (
+            <ErrorState error={state.error} onRetry={state.reload} />
+          ) : null}
+          {state.status === "success" ? (
+            <div className="flex flex-col gap-4">
+              <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+                <DataTableSearch placeholder="Search rule, asset, dimension…" />
+              </DataTableAdvancedToolbar>
+              <DataTable table={table} onRowClick={setSelected} />
+            </div>
+          ) : null}
+        </TabsContent>
+        <TabsContent value="schedules">
+          <QualitySchedulesTab canWrite={hasPermission("governance:write")} />
+        </TabsContent>
+        <TabsContent value="freshness">
+          <FreshnessTargetsTab canWrite={hasPermission("governance:write")} />
+        </TabsContent>
+      </Tabs>
 
       <DetailDrawer
         open={selected !== null}
@@ -280,10 +311,10 @@ export function DataQualityPage() {
                 variant="outline"
                 size="sm"
                 render={
-                  <Link href={`/data?q=${encodeURIComponent(selected.asset)}`} />
+                  <Link href={`/catalog?q=${encodeURIComponent(selected.asset)}`} />
                 }
               >
-                Inspect in Data Explorer
+                Find in Catalog
               </Button>
               {/* `evaluable` is only on an authored rule; a verdict a job
                   recorded is not a rule this page can change or delete. */}

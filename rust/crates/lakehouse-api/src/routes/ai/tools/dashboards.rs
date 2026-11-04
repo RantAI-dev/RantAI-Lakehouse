@@ -5,7 +5,7 @@
 use lakehouse_auth::Principal;
 use lakehouse_bi::access::Viewer;
 use lakehouse_bi::layout::tab_of;
-use lakehouse_bi::specs::ChartSource;
+use lakehouse_bi::specs::{ChartKind, ChartSource};
 use lakehouse_bi::store::{self, ChartInput};
 use lakehouse_clickhouse::ChClient;
 use serde_json::{Map, Value, json};
@@ -125,19 +125,142 @@ fn args_with_kept_source(
     (merged, false)
 }
 
+/// The fields `args_with_kept_fields` leaves alone because each has its own
+/// rule: `title` and `kind` are required in every call, `board` is kept by
+/// `update_chart` itself, and `mart` and `sqlSource` go through
+/// `args_with_kept_source`.
+const NOT_CARRIED: [&str; 5] = ["title", "kind", "board", "mart", "sqlSource"];
+
+/// The only fields a kind without data carries, and the kinds that take each.
+///
+/// A note, a heading, a divider, a section, an image and a web card read no
+/// data, so the dimension, measures, filters and the rest are never carried
+/// into one: the build refuses them. What the tile shows is its own content,
+/// which a rename must keep: `text` for a note, a heading and a section (a
+/// divider drops it), `url` for an image and a web card, `alt` for an image,
+/// and `span` for all of them. Each kind lists only the fields it accepts, so
+/// a carried field never makes the build refuse the rename.
+const STATIC_CONTENT: [(&str, &[ChartKind]); 4] = [
+    (
+        "text",
+        &[ChartKind::Text, ChartKind::Heading, ChartKind::Section],
+    ),
+    ("url", &[ChartKind::Image, ChartKind::Web]),
+    ("alt", &[ChartKind::Image]),
+    (
+        "span",
+        &[
+            ChartKind::Text,
+            ChartKind::Heading,
+            ChartKind::Divider,
+            ChartKind::Section,
+            ChartKind::Image,
+            ChartKind::Web,
+        ],
+    ),
+];
+
+/// Whether `field` is content the tile of this static `kind` carries.
+fn is_static_content(field: &str, kind: ChartKind) -> bool {
+    STATIC_CONTENT
+        .iter()
+        .any(|(name, kinds)| *name == field && kinds.contains(&kind))
+}
+
+/// The fields only a Gantt chart takes: the style and type checks refuse them
+/// on every other kind, so they are carried only into a Gantt chart.
+const GANTT_FIELDS: [&str; 4] = ["start", "end", "progress", "todayLine"];
+
+/// The args without the keys the call sent as `null`.
+///
+/// `null` means "clear this field", so the key must behave as if it were left
+/// out. Only the fields that are an `Option` accept `null` when the args are
+/// parsed; a map, a list or a column slot would refuse it.
+fn without_nulls(args: &Map<String, Value>) -> Map<String, Value> {
+    args.iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Whether a serialised field holds nothing. A chart serialises an empty
+/// dimension as `""` and empty measures as `[]`, which are the values of a
+/// field the chart never had.
+fn is_blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        _ => false,
+    }
+}
+
+/// The call's args with every other field of the stored chart that the call
+/// does not name filled in: the dimension, measures, breakdown, filters, sort
+/// and the rest, so a rename that sends only `id`, `title` and `kind` does not
+/// empty the chart.
+///
+/// A key the call sent as `null` is named, so it is not carried over; the
+/// caller removes it afterwards (see [`without_nulls`]). Left out because each
+/// has its own rule: [`NOT_CARRIED`] and the formatting. A kind that reads no
+/// data (a note, a heading, an image) carries only its own content
+/// ([`STATIC_CONTENT`]), and the Gantt fields are carried only into a Gantt
+/// chart. `text` is carried only into a kind that shows it: a data kind drops
+/// it when it builds the chart, so naming it as kept would be wrong. A field
+/// the new kind refuses is not dropped here: the build refuses it as it
+/// refuses any field, and the call clears it with `null`.
+///
+/// The second value is the sorted names of the fields carried over.
+fn args_with_kept_fields(
+    args: &Map<String, Value>,
+    call: &ChartInput,
+    stored: &ChartInput,
+) -> (Map<String, Value>, Vec<String>) {
+    let mut merged = args.clone();
+    let Ok(stored) = serde_json::to_value(stored) else {
+        return (merged, Vec::new());
+    };
+    let Some(fields) = stored.as_object() else {
+        return (merged, Vec::new());
+    };
+    let mut carried = Vec::new();
+    for (key, value) in fields {
+        if NOT_CARRIED.contains(&key.as_str())
+            || FORMAT_FIELDS.contains(&key.as_str())
+            || merged.contains_key(key)
+            || is_blank(value)
+            || (call.kind.is_static() && !is_static_content(key, call.kind))
+            || (key == "text" && !call.kind.is_static())
+            || (GANTT_FIELDS.contains(&key.as_str()) && call.kind != ChartKind::Gantt)
+        {
+            continue;
+        }
+        merged.insert(key.clone(), value.clone());
+        carried.push(key.clone());
+    }
+    carried.sort();
+    (merged, carried)
+}
+
 /// What a call carries over from the chart it changes: the call's own
-/// arguments with the formatting the call does not name filled in, and
-/// whether the stored formatting was kept.
+/// arguments with the formatting, the data source and the other fields the
+/// call does not name filled in, and what was kept.
 struct KeptFormatting {
     /// The stored formatting was kept: the call does not change the kind.
     kept: bool,
-    /// The call's arguments, with the kept formatting filled in.
+    /// The call's arguments, with everything kept filled in and the keys the
+    /// call sent as `null` removed.
     args: Map<String, Value>,
     /// The stored data source was kept: the call names no source of its own.
     source_kept: bool,
+    /// The names of the other stored fields the call did not name and that
+    /// were carried over, sorted.
+    fields_kept: Vec<String>,
 }
 
-/// The formatting a call does not name, carried over from the stored chart.
+/// The formatting, the data source and the other fields a call does not name,
+/// carried over from the stored chart.
 ///
 /// The stored chart is read as `viewer`, so a chart the caller may not see
 /// is not carried over. An `id` of `None` names no chart, so there is
@@ -163,15 +286,26 @@ async fn kept_formatting(
         },
         None => None,
     };
-    let call = match parse_chart_input(args) {
+    // The call is read without its `null` keys: `null` clears a field, so
+    // a field of any type may be sent as `null` (`title` and `kind` then
+    // read as missing, and the call is refused).
+    let call = match parse_chart_input(&without_nulls(args)) {
         Ok(i) => i,
         Err(e) => return Err(json!({ "error": e })),
     };
     let Some(stored) = stored else {
+        // A call that names a chart is read as an update even when the chart
+        // is gone, so its `null` keys are removed as for a chart found. A
+        // call with no id is a draft of `create_chart` and stays as it came.
         return Ok(KeptFormatting {
             kept: true,
-            args: args.clone(),
+            args: if id.is_some() {
+                without_nulls(args)
+            } else {
+                args.clone()
+            },
             source_kept: false,
+            fields_kept: Vec::new(),
         });
     };
     // The stored formatting is kept when the call does not change the kind:
@@ -186,10 +320,15 @@ async fn kept_formatting(
     // The data source is carried over whatever the kind becomes: a chart
     // that names no source of its own reads the one the stored chart has.
     let (args, source_kept) = args_with_kept_source(&args, &call, &stored.def);
+    // Every other field the call leaves out is carried over too, also when the
+    // kind changes. The `null` keys stay in `args` until here so that they
+    // count as named and are not carried; they are removed last.
+    let (args, fields_kept) = args_with_kept_fields(&args, &call, &stored.def);
     Ok(KeptFormatting {
         kept,
-        args,
+        args: without_nulls(&args),
         source_kept,
+        fields_kept,
     })
 }
 
@@ -349,6 +488,7 @@ pub(super) async fn update_chart(
     };
     let formatting_kept = kept.kept;
     let source_kept = kept.source_kept;
+    let fields_kept = kept.fields_kept;
     let mut input = match parse_chart_input(&kept.args) {
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
@@ -401,6 +541,9 @@ pub(super) async fn update_chart(
                 });
                 if source_kept {
                     reply["sourceKept"] = json!(true);
+                }
+                if !fields_kept.is_empty() {
+                    reply["fieldsKept"] = json!(fields_kept);
                 }
                 if !formatting_kept {
                     reply["note"] = json!(
@@ -1494,7 +1637,12 @@ mod tests {
     /// `mart_x`: the chart's own row, the stored document and the board it is
     /// on.
     async fn stored_chart_server(def: Value) -> MockServer {
-        let server = mart_server().await;
+        stored_chart_server_on(mart_server().await, def).await
+    }
+
+    /// [`stored_chart_server`] over a server the test built, for a chart that
+    /// needs columns `mart_server` does not have.
+    async fn stored_chart_server_on(server: MockServer, def: Value) -> MockServer {
         rows_first(
             &server,
             "SELECT is_deleted, board FROM console.bi_chart",
@@ -1828,6 +1976,384 @@ mod tests {
         )
         .await;
         assert!(draft.is_none(), "{draft:?}");
+    }
+
+    // ── A call that names only id, title and kind keeps the rest ───────────
+
+    /// `mart_x` with a second text column, three date and number columns for a
+    /// Gantt chart, and a console that takes every write.
+    async fn wide_mart_server() -> MockServer {
+        let server = MockServer::start().await;
+        rows(&server, "FROM system.tables", vec![json!({ "n": "1" })]).await;
+        rows(
+            &server,
+            "FROM system.columns",
+            vec![
+                json!({ "name": "province", "type": "String" }),
+                json!({ "name": "region", "type": "String" }),
+                json!({ "name": "visitors", "type": "UInt64" }),
+                json!({ "name": "begins", "type": "Date" }),
+                json!({ "name": "ends", "type": "Date" }),
+                json!({ "name": "done", "type": "Float64" }),
+            ],
+        )
+        .await;
+        rest(&server).await;
+        server
+    }
+
+    /// A stored bar with a dimension, a measure, a breakdown and a chart
+    /// filter, and no formatting.
+    fn stored_bar_with_data() -> Value {
+        json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "breakdown": "region",
+            "filters": [{ "column": "region", "values": ["north"] }],
+            "board": "b_board",
+        })
+    }
+
+    /// The call that renames a chart and sends nothing but `id`, `title` and
+    /// `kind`: the shape the tool's description asks for.
+    fn bare_rename_call(extra: Value) -> Map<String, Value> {
+        let mut args = arguments(json!({
+            "id": "c_1",
+            "title": "Visitors 2024",
+            "kind": "bar",
+        }));
+        for (name, value) in arguments(extra) {
+            args.insert(name, value);
+        }
+        args
+    }
+
+    /// A rename that names only `id`, `title` and `kind` keeps the chart's
+    /// dimension, measures, breakdown and filter, and the reply names them.
+    #[tokio::test]
+    async fn a_rename_that_names_no_data_fields_keeps_the_dimension_measures_breakdown_and_filter()
+    {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({})),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(
+            reply["fieldsKept"],
+            json!(["breakdown", "dimension", "filters", "measures"]),
+            "{reply}"
+        );
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("\"dimension\":\"province\""), "{row}");
+        assert!(row.contains("\"measures\":[\"visitors\"]"), "{row}");
+        assert!(row.contains("\"breakdown\":\"region\""), "{row}");
+        assert!(row.contains("\"values\":[\"north\"]"), "{row}");
+    }
+
+    /// `null` clears a field the call would otherwise keep: the breakdown is
+    /// gone and the measure stays.
+    #[tokio::test]
+    async fn a_rename_that_sends_a_null_breakdown_clears_it_and_keeps_the_measure() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "breakdown": null })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(
+            reply["fieldsKept"],
+            json!(["dimension", "filters", "measures"]),
+            "{reply}"
+        );
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("\"breakdown\""), "{row}");
+        assert!(row.contains("\"measures\":[\"visitors\"]"), "{row}");
+    }
+
+    /// A chart changed to another kind keeps its data fields, but not its
+    /// formatting.
+    #[tokio::test]
+    async fn a_kind_change_that_names_no_data_fields_keeps_them_and_resets_the_formatting() {
+        let mut def = stored_bar_with_data();
+        def["colors"] = json!({ "palette": "muted" });
+        let server = stored_chart_server_on(wide_mart_server().await, def).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "kind": "line" })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["formattingKept"], json!(false), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("\"dimension\":\"province\""), "{row}");
+        assert!(row.contains("\"measures\":[\"visitors\"]"), "{row}");
+        assert!(!row.contains("muted"), "{row}");
+    }
+
+    /// `null` clears a field of any type, not only an optional one: a call
+    /// that sends the value formats as `null` loses them.
+    #[tokio::test]
+    async fn a_rename_that_sends_null_value_formats_clears_them() {
+        let mut def = stored_bar_with_data();
+        def["valueFormats"] = json!({ "visitors": { "style": "number" } });
+        let server = stored_chart_server_on(wide_mart_server().await, def).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "valueFormats": null })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("valueFormats"), "{row}");
+    }
+
+    /// A heading keeps its text through a rename that names only `id`,
+    /// `title` and `kind`: the text is the tile's content, and the build
+    /// refuses a heading without one.
+    #[tokio::test]
+    async fn a_heading_renamed_with_only_id_title_and_kind_keeps_its_text() {
+        let server = stored_chart_server_on(
+            wide_mart_server().await,
+            json!({
+                "title": "Sales",
+                "kind": "heading",
+                "span": 2,
+                "text": "Sales in the north",
+                "board": "b_board",
+            }),
+        )
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &arguments(json!({ "id": "c_1", "title": "Sales 2024", "kind": "heading" })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["fieldsKept"], json!(["span", "text"]), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("Sales in the north"), "{row}");
+    }
+
+    /// An image keeps its address and its description through a rename, and a
+    /// tile without data never takes a data field: the stored image has none,
+    /// and nothing but its own content is named.
+    #[tokio::test]
+    async fn an_image_renamed_with_only_id_title_and_kind_keeps_its_address_and_description() {
+        let server = stored_chart_server_on(
+            wide_mart_server().await,
+            json!({
+                "title": "Logo",
+                "kind": "image",
+                "span": 1,
+                "url": "https://img.example/logo.png",
+                "alt": "The company logo",
+                "board": "b_board",
+            }),
+        )
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &arguments(json!({ "id": "c_1", "title": "Logo 2024", "kind": "image" })),
+            &sites(&["https://img.example"]),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(
+            reply["fieldsKept"],
+            json!(["alt", "span", "url"]),
+            "{reply}"
+        );
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("https://img.example/logo.png"), "{row}");
+        assert!(row.contains("The company logo"), "{row}");
+    }
+
+    /// A bar chart turned into a heading takes no data field along: the
+    /// build refuses a filter on a tile without data, so carrying one would
+    /// make the change fail. The call names the heading's text.
+    #[tokio::test]
+    async fn a_chart_turned_into_a_heading_carries_no_data_field() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &arguments(
+                json!({ "id": "c_1", "title": "Visitors", "kind": "heading", "text": "Visitors" }),
+            ),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        for gone in ["\"breakdown\"", "\"filters\"", "\"measures\":[\"visitors"] {
+            assert!(!row.contains(gone), "{gone} in {row}");
+        }
+    }
+
+    /// A heading changed to a bar chart does not report its text as kept: a
+    /// data kind drops `text` when it is built, so naming it in `fieldsKept`
+    /// would say something was saved that was not.
+    #[tokio::test]
+    async fn a_heading_changed_to_a_bar_chart_does_not_report_its_text_as_kept() {
+        let server = stored_chart_server_on(
+            wide_mart_server().await,
+            json!({
+                "title": "Sales",
+                "kind": "heading",
+                "span": 1,
+                "text": "Section A",
+                "board": "b_board",
+            }),
+        )
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &arguments(json!({
+                "id": "c_1", "title": "Sales", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+            })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let kept = reply["fieldsKept"].to_string();
+        assert!(!kept.contains("text"), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("Section A"), "{row}");
+    }
+
+    /// The draft check of an update whose chart is not found reads the call
+    /// as the tool does: `null` clears a field of any type, so a `null` list
+    /// or map does not make the draft unreadable.
+    #[tokio::test]
+    async fn the_draft_check_of_an_update_of_a_missing_chart_reads_null_as_a_cleared_field() {
+        let server = wide_mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let draft = check_chart_draft(
+            &ch,
+            &arguments(json!({
+                "title": "Visitors",
+                "kind": "bar",
+                "mart": "mart_x",
+                "dimension": "province",
+                "measures": ["visitors"],
+                "valueFormats": null,
+            })),
+            Some("c_gone".to_owned()),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert!(draft.is_none(), "{draft:?}");
+    }
+
+    /// The card and the save agree: the draft check of a rename that names
+    /// only `id`, `title` and `kind` builds the chart the save builds.
+    #[tokio::test]
+    async fn the_draft_check_of_a_rename_that_names_no_data_fields_passes() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let draft = check_chart_draft(
+            &ch,
+            &bare_rename_call(json!({})),
+            Some("c_1".to_owned()),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert!(draft.is_none(), "{draft:?}");
+    }
+
+    /// A title is required, and `null` is not a title: the call is refused and
+    /// nothing is written.
+    #[tokio::test]
+    async fn an_update_that_sends_a_null_title_is_refused() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "title": null })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        let error = reply["error"].as_str().unwrap_or_default();
+        assert!(error.contains("title"), "{reply}");
+        assert!(reply.get("updated").is_none(), "{reply}");
+        assert_eq!(
+            writes(&sent(&server).await),
+            [] as [&std::string::String; 0]
+        );
+    }
+
+    /// The Gantt fields are carried only when the new kind is Gantt: a Gantt
+    /// chart changed to a bar chart does not take its columns or its today
+    /// line along, because a bar chart refuses them.
+    #[tokio::test]
+    async fn a_gantt_chart_changed_to_a_bar_chart_does_not_carry_the_gantt_fields() {
+        let server = stored_chart_server_on(
+            wide_mart_server().await,
+            json!({
+                "title": "Plan",
+                "kind": "gantt",
+                "mart": "mart_x",
+                "dimension": "province",
+                "start": "begins",
+                "end": "ends",
+                "progress": "done",
+                "todayLine": false,
+                "board": "b_board",
+            }),
+        )
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "dimension": "province", "measures": ["visitors"] })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert!(reply.get("fieldsKept").is_none(), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        for gone in ["begins", "ends", "\"progress\"", "\"todayLine\""] {
+            assert!(!row.contains(gone), "{gone} in {row}");
+        }
     }
 
     /// A chart is listed with the board it is on and the tab it sits on: a
