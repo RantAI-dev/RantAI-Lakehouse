@@ -223,6 +223,98 @@ Full verification block of `AGENTS.md` once before handoff.
 
 ## 5. Handoff (developer appends below)
 
+**Developer handoff, 2026-11-04.** Branch `fix/bi-39-alerts-read-as-owner`, based on `origin/main`
+merged at `2592d722` (the plan's `BI-40`, `SEC-50` slice 2, `BI-37`, `BI-38`, `QS-3` all in).
+No PR opened, no force-push, no rebase; every commit was pushed.
+
+### Commits (one per task, in plan order)
+
+| Commit | Task | What it changes |
+| --- | --- | --- |
+| `e30fb8cc` | T1 | `GateRefusal`, `SqlGate::gate(owner, sql)`, `current_value`/`metric_value` take the owner, `run_alert` maps `Stop` to `stop(...)`, `run_digest`/`digest_text` pass `None`; the fixed-viewer comments corrected. The API's `ApiSqlGate` only adapts to the new signature here (behaviour unchanged), so the tree compiles at every commit; T2 fills it in. |
+| `ff8a1b5d` | T2 | `ApiSqlGate::gate` resolves the owner with `render::principal_of` and rewrites with their roles/placeholders (`D1`); `D5` stops with `OWNER_GONE`/`OWNER_NO_PERMISSION`, a store failure is a `Refused` (`C2`); `authorise_save` makes the caller the owner of every saved `alert` rule (`D2`); the assistant's create/update already went through `save_rule_with_checks` (`BI-37`), so `D3` only needed its test. |
+| `da65a9fd` | T3 | `DashboardQuery::only` (`#[serde(skip)]`) + `only_chart`; `get_body` narrows; `chart_alerts::read` and `render::data` use it (`D7`); `listed_rules` + `chart_titles` for `GET /api/alerts` and `list_alert_rules` (`D8`). |
+| `2bdc80aa` | T4 | `create_alert_rule` description, regenerated `tool_schemas.json` (one tool's hunk), the AI-15 case `alert_names_its_chart` in `ops/ai_eval/dashboard_cases.json`. |
+| `bb80b68e` | T5 | Contract `chartTitle`/`dashboardId`/`dashboardTitle`, `chartAlertScope`/`chartAlertHref`, the linked chart name in the rules table, `legacyOwnerNote` in the rule dialog (`D4`). |
+| `400db1a4` | T6 | `sharing-and-delivery.md` C4 sentence (status untouched), `CHANGELOG.md` Unreleased > Fixed. |
+| `65a11250` | T2 fix | `tests/sec11_guard.rs`: the gate's own sentences need their allowlist entry once T2 puts `to_string()` behind `GateRefusal` (full block found this, see below). |
+
+### Scoped checks, per task (run in the foreground)
+
+- T1: `cargo fmt --check` clean; `cargo clippy -p lakehouse-alerts --all-targets -- -D warnings`
+  finished with no warning; `cargo test -p lakehouse-alerts` -> 130 passed, 1 ignored, 0 failed.
+- T2: `cargo clippy -p lakehouse-api --all-targets -- -D warnings` clean;
+  `cargo test -p lakehouse-api --lib alerts` -> 71 passed, 0 failed;
+  `cargo test -p lakehouse-api --test chart_alerts` -> 19 passed, 0 failed (15 at the T2 commit,
+  4 more added by T3).
+- T3: `cargo test -p lakehouse-api --test render_data` -> 13 passed, 0 failed;
+  `cargo test -p lakehouse-api --lib dashboard` -> 248 passed, 3 ignored, 0 failed;
+  `cargo test -p lakehouse-api --test chart_alerts` -> 19 passed.
+- T4: `cargo test -p lakehouse-api --lib registry` -> 52 passed, 1 ignored, 0 failed;
+  `(cd ops/ai_eval && python3 -m unittest test_ai_eval)` -> 185 passed.
+- T5: `bun test src/features/alerts` -> 32 passed, 0 failed; `bun run typecheck` clean;
+  `bun run lint` -> 0 errors (10 pre-existing warnings, none in the files this branch touches).
+- T6: `git diff --stat` -> docs only (`CHANGELOG.md`, `docs/core/features/sharing-and-delivery.md`).
+
+### Full block, on the final commit (`65a11250`)
+
+- `cd rust && cargo fmt --check` -> clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` -> finished, no warning.
+- `cargo test --workspace` -> exit 0, 182 `test result: ok` lines, 0 `FAILED`; 9,526 passing
+  results and 52 ignored in the whole run (the API's lib and bin targets run the same unit tests,
+  so the largest two lines read 2,975 and 3,013 passed).
+  - One earlier attempt failed 18 tests in `--test query_tenant_scope` with
+    `Connection reset by peer` / `SSLRequest` errors from `tests/common`: the shared Postgres
+    testcontainer was restarted under two test runs on this machine. The same binary passed
+    19/19 on its own and the whole workspace passed on the rerun; no code changed for it.
+- `bun run typecheck` clean; `bun run lint` -> 0 errors, 10 warnings (all in files this branch does
+  not touch); `bun run test` -> 3,176 passed, 1 skipped, 0 failed (325 files).
+- `python3 ops/lint/check_intra_package_imports.py` -> OK;
+  `python3 ops/lint/check_bare_iceberg_count.py` -> no bare `count()` found;
+  `(cd ops/ai_eval && python3 -m unittest test_ai_eval)` -> 185 passed.
+- `git status` -> clean after the final commit.
+
+*Not run, with the reason:* `docker compose --profile '*' config --quiet` and `docker compose up`
+(no compose, compose profile, `.env.example` or migration changed); the Dagster suite
+(`(cd dagster && python -m pytest dispar_orchestrate -q)`: no Dagster code touched — the only
+Python-adjacent change is the `ops/ai_eval` case file, whose own tests ran).
+
+### Not verified
+
+- **The AI-15 run and its score.** `alert_names_its_chart` is a `mode: ask` case; scoring it
+  needs a model key and the eval stack, which this session did not have. The case parses and the
+  harness's own tests pass (185), but the model has not been asked "Which chart are my alerts on?".
+- **A real `docker compose up`** (not requested for this change; see above).
+- **The console in a browser.** The T5 tests render the rules table cell and call the pure helpers;
+  no browser was opened, and no page was previewed.
+
+### Notes for review
+
+1. **`D5`'s "and the target is not their own address" is satisfied by construction, not read at
+   the gate.** `SqlGate::gate` receives the owner id and the statement, never the rule's target
+   (`D6`'s signature), so `ApiSqlGate::gate` stops an owner without `alert:write` unconditionally.
+   Today that cannot hit a self-only rule: a rule sent only to the owner's own address is the chart
+   kind, which `chart_alerts` reads through `payload_for` and never through this gate, and a mart or
+   metric rule is only ever saved by somebody holding `alert:write` (`authorise_save`). The sentence
+   and that reasoning sit at the check (`alerts.rs`, `ApiSqlGate::gate`). If the planner wants the
+   target read literally, `gate` would need it — a change to `D6`'s contract, so it is flagged here
+   rather than made.
+2. **The list reads the caller's visible charts twice** — once in `chart_alerts::visible_to` (it
+   already did) and once in `chart_titles` — not once per rule (`D8`). Collapsing them would mean
+   threading a pre-read id/title list through `visible_to`; not done, to keep the change small.
+3. **Test fixtures changed on purpose.** `tests/chart_alerts.rs`'s `FakeCh` now serves the owner it
+   just saw inserted (so a save's re-read matches ClickHouse's `ReplacingMergeTree(updated_at)
+   FINAL`, which is how `D2`'s "a change of owner resets the state" becomes observable) and can
+   hold up to three charts with distinct statements (the result cache computes one statement per
+   key, so identical charts can never prove `D7`). `tests/render_data.rs`'s charts likewise got one
+   distinct statement each.
+4. **`tests/sec11_guard.rs` gained an allowlist entry** for `GateRefusal::Refused(err.to_string())`
+   with its reason: `StatementGate::check` answers with this repository's own sentences. The line
+   existed before `BI-39` as `.map_err(|err| err.to_string())?` under the older entry; the commit
+   that moves it behind `GateRefusal` needed its own, and the full block is what found it.
+5. **No migration, no dependency change.** `owner_id` already existed (`BI-19`); a rule saved
+   before this branch keeps it empty and keeps the viewer role (`D4`).
+
 ## 6. Review (planner appends below)
 
 
