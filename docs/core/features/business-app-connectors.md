@@ -215,26 +215,28 @@ per vendor; record the vendor with the result.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `SRC-3-AC1` | For each of the ten vendors: add a connector, sign in (or enter the integration credential), run the connection test | The test passes and names the account it reached | Not run |
-| `SRC-3-AC2` | Open the connector's object list | The vendor's objects are listed by the vendor (custom objects included for Salesforce) | Not run |
-| `SRC-3-AC3` | Choose two objects and leave one column out of one; run a load | Both tables appear in Bronze with the vendor's rows; the left-out column is absent | Not run |
-| `SRC-3-AC4` | Change one record and add one at the vendor; run again | Only the changed and new records are read for incremental objects (the run says how many); the table has the change and no duplicate | Not run |
-| `SRC-3-AC5` | Read the connector page | It names which objects load incrementally and which are re-read in full | Not run |
-| `SRC-3-AC6` | Add a field to an object at the vendor; run again | The connector's schema-change rule applies and the change is shown | Not run |
-| `SRC-3-AC7` | Revoke the app's access at the vendor; run again | The run fails with a plain message to sign in again; no vendor text | Not run |
-| `SRC-3-AC8` | Sign in as a user without `connector:manage` and try to add or change one | Refused; the page says access is missing | Not run |
-| `SRC-3-AC9` | Pause the connector | No run starts until it is resumed | Not run |
+| `SRC-3-AC1` | For each of the ten vendors: add a connector, sign in (or enter the integration credential), run the connection test | The test passes and names the account it reached | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
+| `SRC-3-AC2` | Open the connector's object list | The vendor's objects are listed by the vendor (custom objects included for Salesforce) | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
+| `SRC-3-AC3` | Choose two objects and leave one column out of one; run a load | Both tables appear in Bronze with the vendor's rows; the left-out column is absent | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
+| `SRC-3-AC4` | Change one record and add one at the vendor; run again | Only the changed and new records are read for incremental objects (the run says how many); the table has the change and no duplicate | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
+| `SRC-3-AC5` | Read the connector page | It names which objects load incrementally and which are re-read in full | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
+| `SRC-3-AC6` | Add a field to an object at the vendor; run again | The connector's schema-change rule applies and the change is shown | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
+| `SRC-3-AC7` | Revoke the app's access at the vendor; run again | The run fails with a plain message to sign in again; no vendor text | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
+| `SRC-3-AC8` | Sign in as a user without `connector:manage` and try to add or change one | Refused; the page says access is missing | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
+| `SRC-3-AC9` | Pause the connector | No run starts until it is resumed | Pass (product owner, 2026-11-02), for the eight supported vendors; Workday Reports and NetSuite: Not run, unsupported until `SRC-27` (see Exceptions) |
 | `SRC-3-AC10` | Look at Workday and NetSuite in the picker before their real-account row passes | Listed as not supported, with the reason | Pass 2026-10-22 (product owner, QA instance of #216) |
-| `SRC-3-AC11` | (operator) Open the CI run of the pull request | The SaaS gate passed for all ten | Not run |
+| `SRC-3-AC11` | (operator) Open the CI run of the pull request | The SaaS gate passed for all ten | Pass (CI of #216: `g6-saas` passed for all ten against mock vendors; product owner, 2026-11-02) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): the product owner **Date:** 2026-11-02 **Build:** not recorded by the acceptor
 
 Exceptions, each with an owner and a date:
 
+- Workday Reports and NetSuite stay unsupported, and rows 1 to 9 were not run for them, until a real-account test (`SRC-27`). Owner: the product owner, 2026-11-02.
+
 ## After acceptance
 
-- [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
+- [x] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
 - [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read
