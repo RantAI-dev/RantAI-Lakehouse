@@ -301,6 +301,14 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
     // profile would run no pipeline, and say nothing about it.
     set_profiles(dir)?;
 
+    // And the shared catalog's tenant, beside the profiles and for the
+    // same reason: an install made before REL-10 has
+    // `CATALOG_TENANT_ID=` empty, and a stack with more than one tenant
+    // refuses every job with no user — a scheduled export, an alert or
+    // a digest, a report, an embed, a public link — until it is set
+    // (REL-10 D2, SEC-50). An operator's own value is kept.
+    set_catalog_tenant(dir)?;
+
     // Step 3 — the pre-flight, the staged files and the images. Nothing
     // that is RUNNING is touched before this step succeeds.
     if !facts.preflight.is_empty() {
@@ -441,6 +449,40 @@ fn set_profiles(dir: &Path) -> Result<(), ToolError> {
         Err(error) => Err(ToolError::Failed(format!(
             "the install's profiles could not be set: {error}. The stack would run without the \
              Dagster services, so no pipeline would run at all."
+        ))),
+    }
+}
+
+/// Make the install's `.env` name the group tenant as the shared
+/// catalog's tenant.
+///
+/// An install made before REL-10 has `CATALOG_TENANT_ID=` empty, and a
+/// stack with more than one tenant refuses every job with no user —
+/// a scheduled export, an alert or a digest, a report, an embed, a
+/// public link — until it is set (SEC-50, REL-10 D2). The update sets
+/// it before it starts anything. An operator's own value is kept,
+/// valid or not: the API refuses a malformed one at startup.
+///
+/// # Errors
+///
+/// Returns the error that says the catalog tenant could not be set: a
+/// stack that starts without it refuses every scheduled job, and says
+/// nothing about it until one runs.
+fn set_catalog_tenant(dir: &Path) -> Result<(), ToolError> {
+    match secrets::ensure_catalog_tenant(dir) {
+        Ok(true) => {
+            println!(
+                "lakehousectl: the shared catalog now belongs to the group tenant \
+                 ({}).",
+                secrets::CATALOG_TENANT_VARIABLE
+            );
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(error) => Err(ToolError::Failed(format!(
+            "the install's catalog tenant could not be set: {error}. Every scheduled export, \
+             alert and report would be refused until {} is set.",
+            secrets::CATALOG_TENANT_VARIABLE
         ))),
     }
 }
