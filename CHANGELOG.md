@@ -9,6 +9,14 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Security
+
+- An edit grantee of a saved query or folder could move it into or out of a personal space; a move across a personal space now needs manage.
+
+### Changed
+
+- A saved query's delete and restore need edit instead of manage, and the trash list shows what the caller may edit.
+
 ### Fixed
 
 - The assistant's `update_chart` keeps every field the request does not name, and `null` clears one, so a rename no longer empties a chart (backlog `AI-3`). The reply lists the kept fields as `fieldsKept`.
