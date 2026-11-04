@@ -79,4 +79,107 @@ git status
 
 ## 7. Handoff (developer appends below)
 
+### Handoff 1 (developer, 2026-11-04)
+
+Base `fix/data-39-assistant-reads-registry-final` at `c3339533`; three commits, one
+per task, each pushed to `origin/fix/data-39-assistant-reads-registry-final`.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `af778ab7` | Both readers (`routes/ai/data_map.rs` `load_catalog`, `routes/ai/tools/data.rs` `describe_dataset`) read each registry `FINAL` and splice `crate::routes::catalog::NOT_IN_PRIMARY` into the secondary half. D2 holds by construction: the descriptions are a `HashMap<(slug, col), String>`. |
+| T2 | `405774cd` | Six tests against a real `ClickHouse` via `routes::bronze_registry_fixture` (DATA-42 D7), plus `seed_column_with` in that fixture (`seed_column` now delegates to it, so its five existing call sites are unchanged). |
+| T3 | `c068352c` | `CHANGELOG.md` → `## [Unreleased]` → `### Fixed`: the assistant no longer sees a Bronze column twice (`DATA-39`, the part `#315` left open). |
+| Handoff | this commit | this entry |
+
+**D3 respected:** `tests/fixtures/tool_schemas.json` is unchanged (`git status` /
+`git diff --stat` after the full run name no fixture); no tool schema or prompt was
+touched.
+
+**Tests added** (each reader: written twice / in both registries / secondary only):
+
+- `routes::ai::data_map::tests::registry_clash::{a_column_written_twice_to_the_primary_answers_once_from_the_newer_row,
+  a_slug_in_both_registries_answers_with_the_primary_columns,
+  a_slug_only_in_the_secondary_registry_still_answers}`
+- `routes::ai::tools::data::registry_clash::{a_column_written_twice_to_the_primary_is_listed_once,
+  a_slug_in_both_registries_answers_with_the_primary_columns,
+  a_slug_only_in_the_secondary_registry_still_answers}`
+
+Honest note on the DATA MAP's "written twice" test: a `HashMap` cannot hold two
+entries for one key, so for that reader "appears once" is structural (D2 said so)
+and what `FINAL` decides is *which* copy answers — the test asserts the newer
+row's description and one entry. Measured: with the OLD statement restored for
+that reader, the written-twice test PASSES (the map keeps one entry either way)
+and the clash test FAILS — the secondary's description wins the map and its own
+extra column is read:
+
+```
+test ...::a_column_written_twice_to_the_primary_answers_once_from_the_newer_row ... ok
+test ...::a_slug_in_both_registries_answers_with_the_primary_columns ... FAILED
+assertion `left == right` failed: the primary registry's description:
+{("clash_map", "id"): "the secondary id", ("clash_map", "note"): "the secondary note"}
+  left: Some("the secondary id")
+ right: Some("the primary id")
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 3006 filtered out
+```
+
+Restored, `cargo-locked test -p lakehouse-api --lib data_map::tests::registry_clash`:
+`3 passed; 0 failed; 0 ignored; 0 measured; 3006 filtered out; finished in 4.54s`.
+`describe_dataset` answers a LIST, so its written-twice test fails on the old
+statement directly (two `amount` columns) — that is the mutation check below.
+
+**Commands run, in the foreground, through `/home/shiro/bin/cargo-locked` with the
+shared `CARGO_TARGET_DIR`.** Per commit: `cargo fmt --check` and
+`cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings` (both green;
+T1 finished in 4m55s, T2 in 1m45s), plus the scoped tests below. No `cargo clean`,
+no per-worktree `target/`.
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p lakehouse-api --lib data_map` | `77 passed; 0 failed` (2932 filtered out), 4.77s |
+| `cargo test -p lakehouse-api --lib tools::data` | `22 passed; 0 failed` (2987 filtered out), 4.45s |
+| `cargo test -p lakehouse-api --lib registry_clash` (all readers' fixtures) | `22 passed; 0 failed` (2987 filtered out), 16.96s |
+
+**Mutation check (§4), both quoted.** Removed `FINAL` from reader 2's statement
+(both halves), then
+`cargo-locked test -p lakehouse-api --lib registry_clash::a_column_written_twice_to_the_primary_is_listed_once`:
+
+```
+test routes::ai::tools::data::registry_clash::a_column_written_twice_to_the_primary_is_listed_once ... FAILED
+assertion `left == right` failed: the column a second run registered is one column:
+{"slug":"twice_columns",...,"columns":[
+  {"name":"amount","type":"UInt64","description":"the first description"},
+  {"name":"amount","type":"UInt64","description":"the second description"}]}
+  left: 2
+ right: 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3008 filtered out
+```
+
+Restored, then `cargo-locked test -p lakehouse-api --lib registry_clash`:
+`22 passed; 0 failed; 0 ignored; 0 measured; 2987 filtered out; finished in 16.96s`.
+
+**Plan §6 block, on `c068352c`:**
+
+- `cd rust && cargo fmt --check` — clean.
+- `cargo-locked clippy --workspace --all-targets --all-features -- -D warnings` — green, `Finished dev profile ... in 5m 15s`.
+- `cargo-locked test --workspace` — exit 0. 184 `test result:` lines, `9579 passed;
+  0 failed; 52 ignored` (counted from the saved log of the second run; the first
+  run was green too and its counts were not saved).
+- `git status` — nothing to commit, nothing generated staged.
+
+**Testcontainers.** The shared fixture drops its container per test; measured
+around a `registry_clash` run, `docker ps` went 14 → 14. The full `--workspace`
+run does leak three containers it does not own the drop of: the three integration
+binaries that hold a container in a `OnceCell` static — `tests/ai_sessions.rs`,
+`tests/gold_publication.rs`, `tests/query_result_cap.rs` (the last two document
+why). Pre-existing, not this change; I stopped and removed the six my two runs
+left and left the seven from earlier sessions alone.
+
+**Not verified / not run, with the reason.**
+
+- The non-Rust lines of `AGENTS.md`'s verification block (`bun run typecheck /
+  lint / test`, the Python lints and Dagster pytest, `docker compose config`):
+  nothing outside `rust/` and `CHANGELOG.md` changed, so per "Only build what
+  changed" no TypeScript, Python or compose check was run.
+- Nothing else was skipped.
+
 ## 8. Review (planner appends below)
