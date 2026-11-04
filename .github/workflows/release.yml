@@ -1517,6 +1517,33 @@ jobs:
           ./lakehousectl install --bundle bundle --dir install \
             --ignore-preflight disk --ignore-preflight memory
 
+      # A fresh install names the tenant that owns the shared catalog
+      # (REL-10). With more than one tenant and the setting empty, the
+      # API refuses every job with no user — a scheduled export, an
+      # alert or a digest, a report, an embed, a public link — and the
+      # install runs no scheduled work until someone edits the `.env`
+      # by hand.
+      - name: The install names the shared catalog's tenant (REL-10)
+        run: |
+          set -euo pipefail
+          tenant="11111111-1111-4111-8111-000000000001"
+          if ! grep -qx "CATALOG_TENANT_ID=$tenant" install/.env; then
+            echo "::error::REL-10: the install's .env does not name the group tenant ($tenant) as CATALOG_TENANT_ID" >&2
+            grep -n 'CATALOG_TENANT_ID' install/.env >&2 || true
+            exit 1
+          fi
+          echo "the install's .env names the group tenant."
+          # The boot warning `main.rs` logs when the setting is absent
+          # says "CATALOG_TENANT_ID is not set: …". It must not be in
+          # this install's log.
+          compose=(docker compose -p rantai-lakehouse
+            -f install/docker-compose.yml --env-file install/.env)
+          if "${compose[@]}" logs lakehouse-api 2>&1 | grep -q "CATALOG_TENANT_ID is not set"; then
+            echo "::error::REL-10: the API logged the CATALOG_TENANT_ID refusal warning at boot" >&2
+            exit 1
+          fi
+          echo "the API logged no CATALOG_TENANT_ID refusal warning."
+
       - name: The stack is ready and the console answers
         run: |
           set -euo pipefail
@@ -1992,6 +2019,18 @@ jobs:
           ./lakehousectl install --bundle bundle-a --dir install \
             --ignore-preflight disk --ignore-preflight memory | tee install.log
 
+          # REL-10: bundle A's install is made to look like a 0.2.0
+          # install's `.env`. 0.2.0 wrote `CATALOG_TENANT_ID=` empty,
+          # and the update is what fills it — so the line is emptied
+          # here, and the step after the update to bundle B proves it
+          # is filled.
+          sed -i 's/^CATALOG_TENANT_ID=.*/CATALOG_TENANT_ID=/' install/.env
+          if ! grep -qx 'CATALOG_TENANT_ID=' install/.env; then
+            echo "::error::REL-10: bundle A's .env was not emptied for the update proof" >&2
+            grep -n 'CATALOG_TENANT_ID' install/.env >&2 || true
+            exit 1
+          fi
+
       - name: The stack is ready and the console answers
         run: |
           set -euo pipefail
@@ -2173,6 +2212,20 @@ jobs:
             echo "::error::the stack runs $version, and it must run ${{ steps.versions.outputs.b }}"
             exit 1
           fi
+
+      # REL-10: the update fills an older install's empty
+      # `CATALOG_TENANT_ID`, so the stack it starts runs its scheduled
+      # work instead of refusing every job with no user.
+      - name: The update names the shared catalog's tenant (REL-10)
+        run: |
+          set -euo pipefail
+          tenant="11111111-1111-4111-8111-000000000001"
+          if ! grep -qx "CATALOG_TENANT_ID=$tenant" install/.env; then
+            echo "::error::REL-10: the update did not set CATALOG_TENANT_ID to the group tenant ($tenant)" >&2
+            grep -n 'CATALOG_TENANT_ID' install/.env >&2 || true
+            exit 1
+          fi
+          echo "the update's .env names the group tenant."
 
       # The update starts the stack again, and the stack must still run
       # the Dagster services: they are what run the pipelines (REL-2 S4b
