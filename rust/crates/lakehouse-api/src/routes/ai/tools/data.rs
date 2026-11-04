@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use super::{api_result_to_value, arg_str};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::catalog::apply_serving_certification;
+use crate::routes::catalog::{NOT_IN_PRIMARY, apply_serving_certification};
 use crate::routes::support::{is_numeric_type, strip_non_ident};
 use crate::state::AppState;
 
@@ -474,11 +474,18 @@ pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // DATA-39 (the assistant part of `#315`): the same rule as the DATA
+    // MAP's description read above. `FINAL` makes a column a re-run
+    // registered one row instead of one per run, and the shared clause
+    // takes the primary registry's copy for a slug both registries hold —
+    // a slug the primary owns is not answered from the secondary one
+    // (`DATA-40` D1). `NOT_IN_PRIMARY` is the constant, spliced in, never
+    // retyped.
     let cols = ch
         .rows(
             &format!(
-                "SELECT key_asli AS name, tipe AS type, deskripsi AS description FROM lake.`bronze_meta.dataset_column` WHERE slug={slug} \
-                 UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={slug}"
+                "SELECT key_asli AS name, tipe AS type, deskripsi AS description FROM lake.`bronze_meta.dataset_column` FINAL WHERE slug={slug} \
+                 UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` FINAL WHERE slug={slug} AND slug {NOT_IN_PRIMARY}"
             ),
             None,
         )

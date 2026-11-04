@@ -60,6 +60,7 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use super::prompt::{ENGLISH_WORDS, INDONESIAN_WORDS, tokens};
+use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::support::is_numeric_type;
 
 /// How long one built map is reused. Two minutes keeps a newly loaded
@@ -598,10 +599,25 @@ async fn load_catalog(
             },
         );
     }
+    // DATA-39 (the assistant part of `#315`): the column registry is a
+    // `ReplacingMergeTree` that a re-run writes again, and `ClickHouse`
+    // merges the copies only in the background. Without `FINAL` a
+    // re-registered column is one row per run, and a slug in BOTH
+    // registries is read twice with the answer depending on which
+    // registry the engine delivered last. `FINAL` makes a re-registered
+    // column one row; the shared clause (`DATA-42` D2 — one definition,
+    // never a retyped string) makes the primary registry the one that
+    // answers.
+    //
+    // D2 then holds by construction: the rows below go into a map keyed
+    // by `(slug, col)`, so one column is one description.
     let described = ch
         .rows(
-            "SELECT slug, key_asli AS col, deskripsi AS description FROM lake.`bronze_meta.dataset_column` \
-             UNION ALL SELECT slug, key_asli AS col, deskripsi AS description FROM lake.`bronze_meta_sec.dataset_column`",
+            &format!(
+                "SELECT slug, key_asli AS col, deskripsi AS description FROM lake.`bronze_meta.dataset_column` FINAL \
+                 UNION ALL SELECT slug, key_asli AS col, deskripsi AS description FROM lake.`bronze_meta_sec.dataset_column` FINAL \
+                 WHERE slug {NOT_IN_PRIMARY}"
+            ),
             None,
         )
         .await
