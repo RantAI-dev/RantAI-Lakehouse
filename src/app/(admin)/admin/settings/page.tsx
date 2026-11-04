@@ -15,7 +15,7 @@ export default function Page() {
       <ReportingSettingsPage />
       <RememberedResultsSettings />
       <QueryLimitsSettings />
-      {/* WEB-3 D6: `/admin/sso` was one line and a button, so its content
+      {/* WEB-3 D6: the old SSO route was one line and a button, so its content
           moved here as a "Sign-in" section. The component is reused as-is;
           it reads the live `GET /api/auth/providers` state. */}
       <SsoPage />

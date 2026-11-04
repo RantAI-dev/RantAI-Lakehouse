@@ -80,18 +80,20 @@ export function OverviewPage() {
               label="Query volume (24h)"
               value={formatCompactNumber(summary.data.queries.volume24h)}
               hint={`p95 ${summary.data.queries.p95Ms} ms · cache ${fmtMeasured(summary.data.queries.cacheAssistRate, formatPercent)}`}
-              href="/workloads"
+              href="/query-studio/history"
             />
             <MetricCard
               label="Query failure rate (24h)"
               value={formatPercent(summary.data.queries.failureRate)}
               trendTone={summary.data.queries.failureRate > 0 ? "negative" : "positive"}
-              href="/workloads"
+              href="/query-studio/history"
             />
           </MetricGrid>
 
-          {/* What is waiting for a human. */}
-          <MetricGrid className="lg:grid-cols-3">
+          {/* What is waiting for a human. The agent-runs card was removed
+              with the runs list (WEB-3 D7): a run is reached from the
+              approval that blocked it, or from the chat that started it. */}
+          <MetricGrid className="lg:grid-cols-2">
             <MetricCard
               label="Policy violations (7d)"
               value={fmtMeasured(summary.data.policyViolations7d)}
@@ -110,12 +112,6 @@ export function OverviewPage() {
               value={fmtMeasured(summary.data.pendingApprovals)}
               hint="Agent actions waiting for a decision"
               href="/governance/approvals"
-            />
-            <MetricCard
-              label="Agent runs"
-              value={fmtMeasured(summary.data.agents.activeRuns)}
-              hint={`${fmtMeasured(summary.data.agents.budgetUsedRate, formatPercent)} budget used`}
-              href="/agents/runs"
             />
           </MetricGrid>
 
@@ -203,7 +199,7 @@ export function OverviewPage() {
         title="Recent activity"
         description="Every console and AI Copilot action, from the audit trail."
         action={
-          <Link href="/activity" className="text-sm text-primary hover:underline">
+          <Link href="/audit" className="text-sm text-primary hover:underline">
             View all
           </Link>
         }

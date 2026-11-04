@@ -54,7 +54,7 @@ export const agentService = postgresAgentService
 // policies + create*Rule from Postgres. mock/governance.ts has been deleted.
 export const governanceService = clickhouseGovernanceService
 // Ops is real — the service list from ClickHouse+Dagster. WEB-3 slice 1
-// removed observability/workloads from the client with their pages; the
+// removed the observability and workloads reads with their pages; the
 // backend routes stay registered (WEB-4 retires them).
 export const opsService = clickhouseOpsService
 // Identity is now real — users/roles/tenants/service identities live in
