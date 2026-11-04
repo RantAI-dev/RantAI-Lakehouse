@@ -23,6 +23,7 @@ use lakehouse_store::governance::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -962,9 +963,10 @@ pub async fn create_rule(
     }
 }
 
-/// One authored policy as the console sees it: the stored row plus the one
-/// fact `lakehouse-store`'s [`Policy`] cannot answer on its own — whether
-/// the policy engine can enforce anything from it (`SEC-61`).
+/// One authored policy as the console sees it: the stored row plus the two
+/// facts `lakehouse-store`'s [`Policy`] cannot answer on its own — whether
+/// the policy engine can enforce anything from it (`SEC-61`) and which
+/// table page it belongs to (`WEB-3` S3a-D1).
 ///
 /// `enforceable` is deliberately NOT part of `status`: it says whether the
 /// rule CAN be enforced, while `status` says whether it is switched on.
@@ -975,7 +977,8 @@ pub async fn create_rule(
 #[serde(rename_all = "camelCase")]
 pub struct PolicyView {
     /// The stored policy, flattened so the wire shape is unchanged apart
-    /// from the added `enforceable` field (decision D2).
+    /// from the added `enforceable` and `assetId` fields (`SEC-61` D2,
+    /// `WEB-3` S3a-D1).
     #[serde(flatten)]
     policy: Policy,
     /// True when [`crate::policy_engine::PolicyCondition::parse_opt`]
@@ -984,30 +987,117 @@ pub struct PolicyView {
     /// and conditions with no real obligation are `false`: a policy with
     /// no structured `conditions` is enforced nowhere.
     enforceable: bool,
+    /// The catalog asset id of the table the policy governs, resolved from
+    /// `conditions.table` (`WEB-3` S3a-D1). Absent when the conditions do
+    /// not parse, name no table the catalog addresses, or name a Bronze
+    /// table no registry row describes — the console then shows the table
+    /// as plain text rather than linking to an invented page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset_id: Option<String>,
+}
+
+/// Which catalog asset a policy's `conditions.table` names (`WEB-3`
+/// S3a-D1). The two zones the catalog addresses differently: a Silver or
+/// Serving table is its own asset id (`routes::catalog::detail`), while a
+/// Bronze table is known by its registry slug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PolicyAsset {
+    /// `silver.*`/`serving.*` — the table itself is the asset id.
+    Table(String),
+    /// `bronze.<table>` — the dataset registered under that table name.
+    Bronze(String),
+}
+
+impl PolicyAsset {
+    /// Classifies the table [`crate::policy_engine::PolicyCondition`] parsed
+    /// out of a policy's `conditions`. `None` when the conditions do not
+    /// parse (legacy prose, absent, or no real obligation), name no zone
+    /// and table, or name a zone the catalog does not address this way —
+    /// never a guess.
+    fn of(conditions: Option<&str>) -> Option<Self> {
+        let table = crate::policy_engine::PolicyCondition::parse_opt(conditions)?.table;
+        let (zone, name) = table.split_once('.')?;
+        match zone {
+            "silver" | "serving" => Some(Self::Table(table)),
+            "bronze" if !name.is_empty() => Some(Self::Bronze(name.to_owned())),
+            _ => None,
+        }
+    }
 }
 
 impl PolicyView {
-    /// Wraps `policy` with the engine's verdict on its `conditions`.
-    fn new(policy: Policy) -> Self {
+    /// Wraps `policy` with the engine's verdict on its `conditions` and the
+    /// asset id resolved by [`Self::asset_ids`].
+    fn new(policy: Policy, asset_id: Option<String>) -> Self {
         let enforceable =
             crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
                 .is_some();
         Self {
             policy,
             enforceable,
+            asset_id,
         }
+    }
+
+    /// One asset id per policy, in order: a Silver/Serving table is its own
+    /// id, and a Bronze table's id is its registry slug from the same
+    /// reader the catalog uses ([`crate::routes::catalog::registered_slug`],
+    /// rule 4), read once per distinct table. A registry that cannot answer
+    /// costs the link, never the list — the same choice
+    /// [`crate::routes::catalog::registered_slug`]'s Bronze upstream makes.
+    async fn asset_ids(ch: &ChClient, policies: &[Policy]) -> Vec<Option<String>> {
+        let mut bronze: HashMap<String, Option<String>> = HashMap::new();
+        let mut ids = Vec::with_capacity(policies.len());
+        for policy in policies {
+            ids.push(match PolicyAsset::of(policy.conditions.as_deref()) {
+                Some(PolicyAsset::Table(table)) => Some(table),
+                Some(PolicyAsset::Bronze(table)) => {
+                    if let Some(found) = bronze.get(&table) {
+                        found.clone()
+                    } else {
+                        let found = crate::routes::catalog::registered_slug(ch, &table)
+                            .await
+                            .ok()
+                            .flatten();
+                        bronze.insert(table, found.clone());
+                        found
+                    }
+                }
+                None => None,
+            });
+        }
+        ids
     }
 }
 
 /// `GET /api/governance/policies` — every authored policy, each with the
-/// engine's verdict on whether it can be enforced (`SEC-61`).
+/// engine's verdict on whether it can be enforced (`SEC-61`) and the catalog
+/// asset it governs, where one can be named (`WEB-3` S3a-D1).
 ///
 /// # Errors
 ///
 /// 503 if no pool is configured; 500 on a database failure.
 pub async fn list_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<PolicyView>>> {
     let policies = governance::list_policies(pool(&state)?).await?;
-    Ok(ApiJson(policies.into_iter().map(PolicyView::new).collect()))
+    let ids = PolicyView::asset_ids(&state.clickhouse, &policies).await;
+    Ok(ApiJson(
+        policies
+            .into_iter()
+            .zip(ids)
+            .map(|(policy, asset_id)| PolicyView::new(policy, asset_id))
+            .collect(),
+    ))
+}
+
+/// [`PolicyView::new`] for one policy, with its asset id resolved
+/// (`WEB-3` S3a-D1).
+async fn policy_view(state: &AppState, policy: Policy) -> PolicyView {
+    let asset_id = PolicyView::asset_ids(&state.clickhouse, std::slice::from_ref(&policy))
+        .await
+        .into_iter()
+        .next()
+        .flatten();
+    PolicyView::new(policy, asset_id)
 }
 
 /// The `POST /api/governance/policies` body. Mirrors `CreatePolicyInput`.
@@ -1083,7 +1173,8 @@ pub async fn create_policy(
         .map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))?;
     let input = create_policy_body(body)?;
     let created = governance::create_policy(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(PolicyView::new(created))))
+    let view = policy_view(&state, created).await;
+    Ok((StatusCode::CREATED, ApiJson(view)))
 }
 
 /// `POST /api/governance/policies` as the router mounts it:
@@ -1209,7 +1300,8 @@ pub async fn set_policy_status(
         )
         .await;
     }
-    Ok(ApiJson(PolicyView::new(policy)))
+    let view = policy_view(&state, policy).await;
+    Ok(ApiJson(view))
 }
 
 /// `DELETE /api/governance/policies/{id}` — remove a policy. An enforced
@@ -1938,19 +2030,22 @@ mod tests {
 
     #[test]
     fn a_policy_with_structured_conditions_is_enforceable() {
-        let view = PolicyView::new(stored_policy(
-            "Row filter",
-            Some(r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#),
-        ));
+        let view = PolicyView::new(
+            stored_policy(
+                "Row filter",
+                Some(r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#),
+            ),
+            None,
+        );
         assert!(view.enforceable);
     }
 
     #[test]
     fn free_text_conditions_are_not_enforceable() {
-        let view = PolicyView::new(stored_policy(
-            "Row filter",
-            Some("Applies broadly, reviewed quarterly"),
-        ));
+        let view = PolicyView::new(
+            stored_policy("Row filter", Some("Applies broadly, reviewed quarterly")),
+            None,
+        );
         assert!(
             !view.enforceable,
             "the engine skips prose, so the list must not call it enforced"
@@ -1959,7 +2054,7 @@ mod tests {
 
     #[test]
     fn a_policy_with_no_conditions_is_not_enforceable() {
-        let view = PolicyView::new(stored_policy("Retention", None));
+        let view = PolicyView::new(stored_policy("Retention", None), None);
         assert!(!view.enforceable);
     }
 
@@ -1967,24 +2062,110 @@ mod tests {
     fn an_agent_autonomy_policy_is_not_enforceable() {
         // Agent autonomy is enforced by nothing in the workspace; free-text
         // prose is all such a policy can carry today.
-        let view = PolicyView::new(stored_policy(
-            "Agent autonomy",
-            Some("Agents may act without approval on serving tables"),
-        ));
+        let view = PolicyView::new(
+            stored_policy(
+                "Agent autonomy",
+                Some("Agents may act without approval on serving tables"),
+            ),
+            None,
+        );
         assert!(!view.enforceable);
     }
 
     #[test]
     fn the_policy_wire_shape_keeps_the_row_and_adds_enforceable() {
-        let view = PolicyView::new(stored_policy(
-            "Row filter",
-            Some(r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#),
-        ));
+        let view = PolicyView::new(
+            stored_policy(
+                "Row filter",
+                Some(r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#),
+            ),
+            None,
+        );
         let wire = serde_json::to_value(&view).expect("a PolicyView serializes");
         assert_eq!(wire["enforceable"], json!(true));
         assert_eq!(wire["name"], json!("mask_customer_email"));
         assert_eq!(wire["updatedAt"], json!("2026-11-04T00:00:00.000Z"));
         assert_eq!(wire["status"], json!("ready"));
+    }
+
+    // ── WEB-3 S3a-D1: a policy says which table page it belongs to ──────
+
+    #[test]
+    fn a_silver_or_serving_table_is_its_own_asset_id() {
+        for table in ["serving.mart_customer", "silver.orders_enriched"] {
+            let conditions =
+                format!(r#"{{"roles":["Analyst"],"table":"{table}","mask":["email"]}}"#);
+            assert_eq!(
+                PolicyAsset::of(Some(&conditions)),
+                Some(PolicyAsset::Table(table.to_owned())),
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bronze_table_asks_the_registry_for_its_slug() {
+        assert_eq!(
+            PolicyAsset::of(Some(
+                r#"{"roles":["Analyst"],"table":"bronze.commerce_orders","mask":["card_last4"]}"#
+            )),
+            Some(PolicyAsset::Bronze("commerce_orders".to_owned()))
+        );
+    }
+
+    #[test]
+    fn absent_conditions_name_no_asset() {
+        assert_eq!(PolicyAsset::of(None), None);
+    }
+
+    #[test]
+    fn free_text_conditions_name_no_asset() {
+        assert_eq!(
+            PolicyAsset::of(Some("Applies broadly, reviewed quarterly")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_condition_with_no_obligation_names_no_asset() {
+        // JSON-shaped, but the engine would enforce nothing from it, so the
+        // table it mentions is not a fact about a policy in force.
+        assert_eq!(
+            PolicyAsset::of(Some(
+                r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":[]}"#
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn a_table_no_zone_addresses_name_no_asset() {
+        for conditions in [
+            r#"{"roles":["Analyst"],"table":"core.customer_360","mask":["email"]}"#,
+            r#"{"roles":["Analyst"],"table":"orders","mask":["email"]}"#,
+            r#"{"roles":["Analyst"],"table":"bronze.","mask":["email"]}"#,
+        ] {
+            assert_eq!(PolicyAsset::of(Some(conditions)), None, "{conditions}");
+        }
+    }
+
+    #[test]
+    fn the_wire_shape_omits_an_unknown_asset_id_and_keeps_a_known_one() {
+        let conditions =
+            r#"{"roles":["Analyst"],"table":"serving.mart_customer","mask":["email"]}"#;
+        let known = PolicyView::new(
+            stored_policy("Row filter", Some(conditions)),
+            Some("serving.mart_customer".to_owned()),
+        );
+        let wire = serde_json::to_value(&known).expect("a PolicyView serializes");
+        assert_eq!(wire["assetId"], json!("serving.mart_customer"));
+
+        let unknown = PolicyView::new(stored_policy("Row filter", Some(conditions)), None);
+        let wire = serde_json::to_value(&unknown).expect("a PolicyView serializes");
+        assert!(
+            wire.get("assetId").is_none(),
+            "an unknown asset id is absent, never a fabricated value"
+        );
     }
 
     // ── WS7 item A5: real policy impact preview ─────────────────────────
