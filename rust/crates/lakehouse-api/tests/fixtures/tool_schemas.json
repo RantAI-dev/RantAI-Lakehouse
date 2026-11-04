@@ -1645,7 +1645,7 @@
     "type": "function",
     "function": {
       "name": "update_chart",
-      "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values: the fields, their meanings and their rules are those of create_chart, which this same turn offers. list_charts gives the ids.",
+      "description": "Change a saved chart (by id), keeping its id. Send id, title, kind and only the fields to change: a field you leave out keeps its saved value, and null clears it. The fields, their meanings and their rules are those of create_chart, which this same turn offers. list_charts gives the ids.",
       "parameters": {
         "type": "object",
         "properties": {
