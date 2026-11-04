@@ -3387,9 +3387,10 @@ services:
       retries: 30
 
   # Kafka Connect: Debezium's distribution, pinned by tag AND digest (the tag
-  # `3.8` is a moving minor tag, so the digest is the pin). Config, offsets and
-  # status live in Kafka topics (ADR 0016 point 2), not in files, so a restart of
-  # the worker resumes every connector from its committed offset.
+  # names the measured version, `3.7.0.Final`, and the digest is the pin).
+  # Config, offsets and status live in Kafka topics (ADR 0016 point 2), not in
+  # files, so a restart of the worker resumes every connector from its committed
+  # offset.
   #
   # The source password never appears in a connector's JSON: the API writes it
   # to a file on `lakehouse_cdc_secrets` (tmpfs, read-write in `lakehouse-api`,
@@ -3400,11 +3401,14 @@ services:
   # `CDC_KAFKA_BOOTSTRAP=kafka:9092` in `.env` to turn change capture on.
   kafka-connect:
     profiles: ["cdc"]
-    # SRC-4, PR #264 CI: the pinned digest was withdrawn upstream on or before
-    # 2026-11-04, so this is the digest the moving `3.8` tag resolves to now.
-    # That build is 3.8.0.Alpha1; the withdrawn pin was a 3.7.0.Final build
-    # under the same tag (SRC-4-RESULT.md), so its measurement was not re-run.
-    image: quay.io/debezium/connect:3.8@sha256:113aaf1983020e225a30a99daafea1125c4f5d404b90d1f746113641f9061be6
+    # SRC-4, PR #264 CI: this names the measured version tag, `3.7.0.Final`,
+    # not the moving `3.8` tag. The `3.8` digest pinned here before was a
+    # 3.7.0.Final build (SRC-4-RESULT.md measured it); that digest was withdrawn
+    # on or before 2026-11-04 and the `3.8` tag then moved to 3.8.0.Alpha1, a
+    # pre-release that must not ship. Quay still serves the version SRC-4
+    # measured, so the pin names it: `DEBEZIUM_VERSION=3.7.0.Final`, jars
+    # `3.7.0.Final`.
+    image: quay.io/debezium/connect:3.7.0.Final@sha256:b866eea14029201e7eef9ee38ee8633bb47cef7229dde38321e139f3c13ccb0c
     restart: unless-stopped
     depends_on:
       kafka:

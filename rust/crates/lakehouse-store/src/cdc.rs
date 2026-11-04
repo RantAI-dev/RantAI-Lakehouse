@@ -489,8 +489,9 @@ const fn mssql_tls(mode: CdcSslMode) -> (&'static str, &'static str) {
 /// schema-history topic. The password is the config-provider reference of
 /// [`connect_password_reference`], never a value, and every value is a string,
 /// as `Kafka Connect` wants. `delete.tombstone.handling.mode=rewrite`:
-/// `Debezium` 3.7 (the image's version; the tag says 3.8) ignores `delete.handling.mode` and `drop.tombstones`, and
-/// with them every delete reaches the topic as a message with no value
+/// `Debezium` 3.7 (the version of the `3.7.0.Final` tag `docker-compose.yml`
+/// pins) ignores `delete.handling.mode` and `drop.tombstones`, and with them
+/// every delete reaches the topic as a message with no value
 /// (`docs/plans/SRC-4-RESULT.md`).
 ///
 /// With `verify-ca` and `verify-full` the worker uses its own trust store: this

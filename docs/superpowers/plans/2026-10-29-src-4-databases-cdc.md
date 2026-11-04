@@ -299,10 +299,12 @@ What slice 2 must carry over from it (each is in `docs/plans/SRC-4-RESULT.md`):
   above 10,000 rows, several connectors at once.
 - Images: `quay.io/debezium/connect:3.8@sha256:d67d678c…` and
   `apache/kafka:3.8.0@sha256:c89f315c…` (full digests in the result file).
-  *Note (2026-11-04, PR #264 CI): the connect digest was withdrawn upstream, so
-  `docker-compose.yml` pins `sha256:113aaf19…` (the `3.8` tag now), a
-  `3.8.0.Alpha1` build where the measured one was `3.7.0.Final`; the
-  measurement was not re-run. See SRC-4-RESULT.md.*
+  *Note (2026-11-04, PR #264 CI): the connect digest was withdrawn upstream and
+  the `3.8` tag then moved to a `3.8.0.Alpha1` pre-release, so `docker-compose.yml`
+  pins the measured version under its own tag,
+  `quay.io/debezium/connect:3.7.0.Final@sha256:b866eea1…` (its config says
+  `DEBEZIUM_VERSION=3.7.0.Final`); the measurement was not re-run. See
+  SRC-4-RESULT.md.*
 
 **Amendment 4 (2026-10-29): slice 2 in detail.** Anchors verified in the
 working tree at `d7e24aad` (the slice 2 survey; line numbers drift, so the

@@ -125,13 +125,16 @@ was set for cost.
 The rows above are what the measurement ran against and are left as measured.
 **Note (2026-11-04, SRC-4, PR #264 CI):** the Kafka Connect pin moved. Quay no
 longer serves `sha256:d67d678c…` for `quay.io/debezium/connect:3.8`
-(`docker buildx imagetools inspect` answers `not found`), so `docker-compose.yml`
-now pins `quay.io/debezium/connect:3.8@sha256:113aaf1983020e225a30a99daafea1125c4f5d404b90d1f746113641f9061be6`,
-the top-level index digest the `3.8` tag resolves to after that re-push. That
-build reports `DEBEZIUM_VERSION=3.8.0.Alpha1` (its `/kafka/connect` jars are all
-`3.8.0.Alpha1`), where the withdrawn pin's config reported `3.7.0.Final`, so
-this is a version move under an unchanged tag name, not just a digest change.
-**The measurement in this file was not re-run against the new image.**
+(`docker buildx imagetools inspect` answers `not found`), and the `3.8` tag now
+resolves to `sha256:113aaf1983020e225a30a99daafea1125c4f5d404b90d1f746113641f9061be6`,
+a build that reports `DEBEZIUM_VERSION=3.8.0.Alpha1` (its `/kafka/connect` jars
+are all `3.8.0.Alpha1`), a pre-release. The measured build was `3.7.0.Final`,
+and Quay still serves that version under its own tag, so `docker-compose.yml`
+pins `quay.io/debezium/connect:3.7.0.Final@sha256:b866eea14029201e7eef9ee38ee8633bb47cef7229dde38321e139f3c13ccb0c`,
+whose config reports `DEBEZIUM_VERSION=3.7.0.Final` and whose jars are
+`3.7.0.Final`: the version in the table above. Only the tag name in the pin
+changed. This is the same Debezium version as the withdrawn digest, not proven
+to be the same bits, and **the measurement in this file was not re-run**.
 
 ## Corrections to the plan found by measuring
 
