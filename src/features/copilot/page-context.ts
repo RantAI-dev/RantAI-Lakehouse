@@ -72,7 +72,8 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
         ask: ["Which datasets hold customer data?", "Describe this dataset's columns", "Show this dataset's lineage"],
         build: ["Refresh the lakehouse (Bronze→Silver→Gold)", "Check the latest build status"],
       },
-      system: "The user is in the Catalog: every governed table and file, searchable by name, column, tag, description and owner, filterable by namespace and layer, with each asset's own page for schema, quality, lineage and access. Prefer list_datasets / describe_dataset / get_lineage / get_quality.",
+      // WEB-3 S3-D1: a column's sensitivity and masks are set on the column, in the Schema tab.
+      system: "The user is in the Catalog: every governed table and file, searchable by name, column, tag, description and owner, filterable by namespace and layer, with each asset's own page for schema (each column's sensitivity and masks), quality, lineage and access. Prefer list_datasets / describe_dataset / get_lineage / get_quality.",
     },
   },
   {
@@ -138,12 +139,14 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
     ctx: {
       key: "governance",
       title: "Governance & quality",
-      hint: "Ask about data quality, lineage, or classification.",
+      // WEB-3 S3-D5, S3-D10: Data Quality holds the schedules and freshness
+      // targets; classification moved to the column (no Governance page).
+      hint: "Ask about data quality, freshness, or lineage.",
       suggest: {
         ask: ["Summarize lakehouse data quality", "Show the lineage of a Gold mart", "Which datasets have quality issues?"],
         build: ["Refresh the lakehouse (Bronze→Silver→Gold)"],
       },
-      system: "The user is in Governance (quality, lineage, audit). Prefer get_quality / get_lineage.",
+      system: "The user is in Governance (policies, data quality with its check schedules and freshness targets, lineage, audit). A column's sensitivity and masks are set on its table's Schema tab. Prefer get_quality / get_lineage.",
     },
   },
 ];

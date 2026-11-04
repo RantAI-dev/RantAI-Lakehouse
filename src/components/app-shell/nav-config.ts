@@ -14,14 +14,11 @@ import {
   KeyRound,
   Library,
   ListChecks,
-  Map,
-  MonitorSmartphone,
   Plug,
   SearchCode,
   Settings,
   SlidersHorizontal,
   ShieldCheck,
-  Tags,
   Users,
   type LucideIcon,
 } from "lucide-react"
@@ -124,13 +121,10 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Governance",
     icon: ShieldCheck,
     items: [
+      // WEB-3 S3-D3, S3-D6: a column's sensitivity and masks are set on the
+      // column (a table's Schema tab), and Tag keys is a section of Settings;
+      // their old addresses redirect.
       { title: "Policies", href: "/governance/policies", icon: ShieldCheck },
-      { title: "Tag keys", href: "/governance/tag-keys", icon: Tags },
-      {
-        title: "Classification & Masking",
-        href: "/governance/classification",
-        icon: Tags,
-      },
       {
         title: "Data Quality",
         href: "/governance/data-quality",
@@ -164,9 +158,9 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/admin/service-identities",
         icon: KeyRound,
       },
-      { title: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone },
+      // WEB-3 S3-D6, S3-D7: Sessions is a tab of Users and Maps a section
+      // of Settings; their old addresses redirect.
       { title: "Settings", href: "/admin/settings", icon: SlidersHorizontal },
-      { title: "Maps", href: "/admin/maps", icon: Map },
     ],
   },
 ]
