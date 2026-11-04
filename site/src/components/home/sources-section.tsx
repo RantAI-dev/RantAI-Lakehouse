@@ -26,7 +26,11 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
 
   return (
     <section ref={ref} id="sources" className="relative h-[230vh] motion-reduce:h-auto">
-      <div className="sticky top-0 flex h-[100svh] flex-col items-center justify-center overflow-hidden motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
+      {/* WEB-5 review fix R4 (spacing only, D6): on phones the stage centres its
+          content below the 64 px top bar (pt-16) instead of under it, and the
+          headline box, the lead's line height and the margins are tighter, so
+          at 360x740 neither the headline nor the caption is clipped. */}
+      <div className="sticky top-0 flex h-[100svh] flex-col items-center justify-center overflow-hidden max-md:pt-16 motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
         <Container className="text-center">
           <m.div
             // WEB-5 D5: scroll fades it in from opacity 0, which the server
@@ -35,24 +39,24 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
             // WEB-1 review round 1 SHOULD-FIX 5: on a phone the copy sits over the
             // glow of the mascot's eye seen through the water, so it gets a dark
             // backing there (body text stays above 4.5:1 on it).
-            className="relative z-10 max-md:rounded-3xl max-md:bg-[#020b2a]/70 max-md:p-4"
+            className="relative z-10 max-md:rounded-3xl max-md:bg-[#020b2a]/70 max-md:p-3"
             // Keyed on `reduced`: before motion's features load an `m` element keeps
             // the style it first rendered (review fix R1), so a switch must remount it.
             key={reduced ? "reduced" : "motion"}
             style={reduced ? { opacity: 1, y: 0 } : { opacity: headOpacity, y: headY }}
           >
             <DisplayHeading>{copy.headline}</DisplayHeading>
-            <LeadText className="mx-auto mt-5 max-w-[36rem]">{copy.sub}</LeadText>
+            <LeadText className="mx-auto mt-3 max-w-[36rem] max-md:leading-[1.45] md:mt-5">{copy.sub}</LeadText>
           </m.div>
           {/* WEB-5 T6: 19 sources instead of 9. On phones the pills, gaps and
               margins are tighter so the pinned 100svh stage still holds the
               headline, every pill and the caption; desktop is unchanged. */}
-          <ul className="relative z-0 mx-auto mt-7 flex max-w-[760px] flex-wrap justify-center gap-1.5 md:mt-12 md:gap-3">
+          <ul className="relative z-0 mx-auto mt-5 flex max-w-[760px] flex-wrap justify-center gap-1.5 md:mt-12 md:gap-3">
             {copy.items.map((item, i) => (
               <SourcePill key={item} label={item} index={i} count={copy.items.length} progress={scrollYProgress} animate={!reduced} />
             ))}
           </ul>
-          <Reveal className="mx-auto mt-6 max-w-[36rem] md:mt-10">
+          <Reveal className="mx-auto mt-4 max-w-[36rem] md:mt-10">
             <p className="lk-mono text-[11px] leading-4 md:text-[12px] md:leading-5 tracking-wide text-[#E8F4FF]/65">{copy.caption}</p>
           </Reveal>
         </Container>
