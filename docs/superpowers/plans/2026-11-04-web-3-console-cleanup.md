@@ -386,6 +386,66 @@ Removed with what they tested: the old `catalog-page.test.tsx` (namespace drawer
 `#section` after a server redirect; the assistant's new page context with a model (no test exists for
 `page-context.ts`, and none was added).
 
+### Fix for review R1 (slice 2) — developer, 2026-11-04
+
+**Commit.** `d448bf38` fix(web-3): no CDC yet reads as no slots, not an outage (WEB-3 review R1). Two files:
+`rust/crates/lakehouse-api/src/routes/governance.rs` and `src/features/governance/replication-slot-health.tsx`.
+
+**What changed.**
+- `replication()` answers `{"replicationSlots": []}` with 200 when the slot query fails with `ClickHouse` error
+  code 60 (`UNKNOWN_TABLE`), read with the existing `ChError::server_code()` (`lakehouse-clickhouse`), which parses
+  the engine's `Code: N.` prefix. No error text is matched. Every other error, including one with no code, still
+  returns the 503. The code is a private const `CH_UNKNOWN_TABLE` in `governance.rs`, with no change to
+  `lakehouse-clickhouse`.
+- The doc comment above `REPLICATION_SLOTS_SQL` now describes this and cites `WEB-3 review R1`. A comment at the
+  match arm cites it too.
+- Three route tests in `governance.rs` go through `get` with a router and a `wiremock` `ClickHouse`:
+  `replication_route_answers_an_empty_list_when_the_slot_table_does_not_exist` (404 `Code: 60 … (UNKNOWN_TABLE)`
+  → 200, `{"replicationSlots": []}`); `replication_route_is_503_when_clickhouse_is_down` (`CH_URL` at
+  `127.0.0.1:1` → 503); `replication_route_is_503_for_any_other_clickhouse_error` (`Code: 497 … (ACCESS_DENIED)`,
+  and a bare `UNKNOWN_TABLE` body with no code → 503 each).
+- Console: `ReplicationSlotHealth`'s error line is now "The slot readings could not be read from ClickHouse." It
+  no longer names the missing table, and the doc comment says the missing table gives the empty line. The same
+  component renders on a connector's page, so the sentence does not point at a Services section.
+
+**Mutation check.** I changed the code-60 arm to `return Err(err.into())`, which brings back the 503 for the
+missing table, and ran `cargo test -p lakehouse-api --lib replication_route`: 2 passed, 1 failed. The failing test
+was `replication_route_answers_an_empty_list_when_the_slot_table_does_not_exist`. The file was then restored and
+the diff checked.
+
+**Commands run (foreground unless noted; `CARGO_TARGET_DIR=/home/uaa/rantai/cargo-target`, `CARGO_BUILD_JOBS=4`).**
+- `cargo fmt --check`: clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: clean.
+- `cargo test -p lakehouse-api --lib replication`: 4 passed, 0 failed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean, exit 0.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 10 warnings, none in the changed file.
+  `bun test src/features/overview`: 18 passed, 0 failed.
+- `cargo test -p lakehouse-api` (background, run alone after a first run was stopped at the 30-minute limit
+  while still compiling next to `bun run test`). `--lib`: 2983 passed, 5 failed, 18 ignored. Cargo stops after a
+  failing binary, so I then ran `cargo test -p lakehouse-api --no-fail-fast --test '*'` (background): 105
+  binaries, 1215 passed, 28 failed, 7 ignored.
+- `bun run test` (background, ran at the same time as the cargo run above): 3229 tests, 3 failed, 2 errors, 1
+  skipped. The 3 failures are timeouts: `CommandPalette catalog search …` and two `UploadsPanel folders …` tests,
+  one of which took 1683 s. Both errors are "unhandled error between tests". Alone, `bun test
+  src/components/command-palette.test.tsx src/features/connectors/uploads-panel.test.tsx` gives 44 passed,
+  0 failed.
+
+**The 33 Rust failures are from this machine, not from R1.**
+- The 5 `--lib` failures are `connector_probe` ×3, `pdf::tests::a_gotenberg_that_is_down_is_unreachable` and
+  `routes::connectors::tests::deprovision_reads_slot_and_publication_from_dial_for_cdc_adapter`. Each expects a
+  closed local port to refuse the connection, and each gets a 5 s timeout instead. Run alone, all 5 fail in 5.01 s.
+  On this WSL machine `exec 3<>/dev/tcp/127.0.0.1/1` hangs instead of being refused.
+- The 28 integration failures are in `agents_approval` (12), `ai_tool` (12), `agents_run`, `embed_tokens`,
+  `pdf_export` and `report_runner` (1 each). 23 of them are a 408 where the test expects 200. None of these tests
+  touches the governance route.
+- With `governance.rs` checked out at `094ac662` (before the fix), `cargo test -p lakehouse-api --test
+  agents_approval` gives the same result as with the fix: 9 passed, 11 failed. The file was then restored.
+- These suites need a host where a closed port refuses the connection; CI should be. *Not verified* green on this
+  machine.
+
+**Not verified.** The page against a real install with no CDC connector (no stack was brought up). The empty line
+was not checked in a browser.
+
 ## 9. Review (planner appends below)
 
 ### Review slice 2, round 1 (planner, 2026-11-04, at `e566187b`)
