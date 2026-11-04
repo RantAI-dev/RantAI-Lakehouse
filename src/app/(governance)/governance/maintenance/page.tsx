@@ -1,8 +1,9 @@
-"use client"
+import { redirect } from "next/navigation"
 
-import { MaintenancePage } from "@/features/governance/maintenance-page"
-
-/** Thin App Router page for MaintenancePage. */
-export default function Page() {
-  return <MaintenancePage />
+/**
+ * Legacy route compatibility redirect (`WEB-3` S2-D2): Table Maintenance is a section of
+ * System status now.
+ */
+export default function LegacyRedirect() {
+  redirect("/health#maintenance")
 }

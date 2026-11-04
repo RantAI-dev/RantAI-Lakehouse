@@ -335,7 +335,7 @@ export function CommandPalette() {
               icon={Search}
               label="See all results"
               value={SEE_ALL_VALUE}
-              onSelect={() => go(`/data?search=${encodeURIComponent(search.trim())}`)}
+              onSelect={() => go(`/catalog?search=${encodeURIComponent(search.trim())}`)}
             />
           </Command.Group>
         ) : null}
