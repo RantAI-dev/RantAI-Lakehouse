@@ -25,7 +25,7 @@ type AssistantCopy = HomeCopy["assistant"];
 
 export function AssistantSection({ copy }: { copy: AssistantCopy }) {
   return (
-    <ProgressSection range={["start start", "end end"]} id="assistant" className="relative h-[260vh] bg-[#050A30] motion-reduce:h-auto">
+    <ProgressSection range={["start start", "end end"]} id="assistant" className="lk-fallback-bg relative h-[260vh] bg-[#050A30] motion-reduce:h-auto">
       <div className="sticky top-0 flex h-[100svh] items-center overflow-hidden motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
         <Caustics />
         <Container className="relative z-10 grid items-center gap-8 pt-16 md:grid-cols-[1fr_1.1fr] md:gap-14 md:pt-0">
@@ -47,15 +47,22 @@ export function AssistantSection({ copy }: { copy: AssistantCopy }) {
 /** Two slow radial lights, like the pattern the sun throws on a pool floor. Off under reduced motion. */
 function Caustics() {
   return (
-    <div aria-hidden="true" className="absolute inset-0 overflow-hidden">
-      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_50%_0%,#0B1A4A_0%,#050A30_55%,#030824_100%)]" />
+    <div
+      aria-hidden="true"
+      // WEB-5 D14 S2: the glow fades in over the stage's first quarter and out
+      // over its last, so it starts and ends softly on the page-wide water
+      // instead of at the stage's edges.
+      className="absolute inset-0 overflow-hidden [mask-image:linear-gradient(to_bottom,transparent,#000_25%,#000_75%,transparent)]"
+    >
+      <div className="lk-fallback-bg absolute inset-0 bg-[radial-gradient(ellipse_at_50%_0%,#0B1A4A_0%,#050A30_55%,#030824_100%)]" />
 
       <div className="lk-caustic-a absolute -top-1/4 -left-1/4 size-[80%] rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.20)_0%,transparent_62%)] blur-2xl" />
       <div className="lk-caustic-b absolute -right-1/4 -bottom-1/3 size-[90%] rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.14)_0%,transparent_60%)] blur-3xl" />
       {/* WEB-1 review round 1 SHOULD-FIX 2: meets the abyss the canvas fades to at
           the end of S3 with no seam. Last, so the glow blobs above cannot show a
           clipped edge at the top of the stage. */}
-      <div className="absolute inset-x-0 top-0 h-[50%] bg-gradient-to-b from-[#020514] via-[#020514]/60 to-transparent" />
+      {/* WEB-5 D14 S2: with the page-wide water this join is no longer needed, so it is part of the no-JS fallback only. */}
+      <div className="lk-fallback-bg absolute inset-x-0 top-0 h-[50%] bg-gradient-to-b from-[#020514] via-[#020514]/60 to-transparent" />
     </div>
   );
 }

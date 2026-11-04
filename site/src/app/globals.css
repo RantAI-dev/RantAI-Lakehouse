@@ -177,6 +177,21 @@ html[data-scene="full"] #hero {
   );
 }
 
+/* WEB-5 D14 S2: the page-wide water (components/home/depth-backdrop.tsx).
+   Its two colours are written by the page as it scrolls; the defaults are
+   the deepest water, where the assistant starts. Once the page has
+   hydrated (`data-scene` is set), the sections from the assistant to the
+   final call drop their own backgrounds and sit in it. Without
+   JavaScript the attribute never appears, and they keep them. */
+.lk-water {
+  --lk-water-top: #020514;
+  --lk-water-bottom: #040a2a;
+  background: linear-gradient(180deg, var(--lk-water-top), var(--lk-water-bottom));
+}
+html[data-scene] .lk-fallback-bg {
+  background: none;
+}
+
 /* Visible focus ring on the dark page (plan §2.8, keyboard). */
 .lk-root :focus-visible {
   outline: 2px solid var(--lk-lake);

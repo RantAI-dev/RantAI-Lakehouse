@@ -21,7 +21,7 @@ export function GovernanceSection({ copy }: { copy: HomeCopy["governance"] }) {
   return (
     <section
       id="governance"
-      className="relative scroll-mt-16 bg-[linear-gradient(180deg,#0d2462_0%,#0B1A4A_22%,#07123a_70%,#050A30_100%)] py-28 md:py-36"
+      className="lk-fallback-bg relative scroll-mt-16 bg-[linear-gradient(180deg,#0d2462_0%,#0B1A4A_22%,#07123a_70%,#050A30_100%)] py-28 md:py-36"
     >
       <Container>
         <DisplayHeading>

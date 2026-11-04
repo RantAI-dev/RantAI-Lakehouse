@@ -9,7 +9,7 @@ import { TiltCard } from "@/components/shared/tilt-card";
 /** S7 — "Yours to keep": open source, open tables, your servers or ours. */
 export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: CommonCopy["cta"] }) {
   return (
-    <section id="open" className="relative scroll-mt-16 bg-[#050A30] py-28 md:py-36">
+    <section id="open" className="lk-fallback-bg relative scroll-mt-16 bg-[#050A30] py-28 md:py-36">
       <Container>
         <DisplayHeading>
           <SplitWords text={copy.headline} />

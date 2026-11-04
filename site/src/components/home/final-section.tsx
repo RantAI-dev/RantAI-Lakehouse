@@ -35,7 +35,7 @@ export function FinalSection({ copy, cta }: { copy: HomeCopy["final"]; cta: Comm
   return (
     <section
       id="final"
-      className="lk-grain relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[linear-gradient(180deg,#020514_0%,#050A30_45%,#0A1F55_72%,#0b2a66_100%)] pt-28 md:pt-32"
+      className="lk-fallback-bg lk-grain relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[linear-gradient(180deg,#020514_0%,#050A30_45%,#0A1F55_72%,#0b2a66_100%)] pt-28 md:pt-32"
     >
       <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10">
         {STARS.map((s, i) => (

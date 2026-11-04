@@ -110,3 +110,26 @@ export const GOVERNANCE_COLUMNS = [
   { key: "city", masked: false },
   { key: "amount", masked: false },
 ] as const;
+
+/**
+ * WEB-5 D14, the journey: the depth (in metres, 0 at the surface) at the
+ * start of each chapter, by section id, in page order. The page dives from
+ * the surface to the deepest point at the assistant, then comes back up to
+ * the surface at the final call. The depth gauge reads these, and the
+ * page-wide water colour follows them (`lib/depth-journey.ts`). The depths
+ * section's own markers stay the three slabs' readings (`DEPTH_LAYERS`).
+ */
+export const JOURNEY = [
+  { id: "hero", depth: 0 },
+  { id: "sources", depth: -5 },
+  { id: "depths", depth: -10 },
+  { id: "assistant", depth: -100 },
+  { id: "dashboards", depth: -100 },
+  { id: "governance", depth: -50 },
+  { id: "open", depth: -15 },
+  { id: "final", depth: -3 },
+] as const;
+
+/** Where the depth reaches 0 again: this far into the final section, as a fraction of its height. */
+export const SURFACE_AT_FINAL = 0.5;
+

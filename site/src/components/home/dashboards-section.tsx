@@ -78,7 +78,8 @@ function Shore() {
     <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 h-[22%]">
       <div className="absolute inset-x-0 bottom-[34%] h-px bg-gradient-to-r from-transparent via-[#44A6FA]/70 to-[#44A6FA]/70" />
       <div className="absolute inset-x-0 bottom-[34%] h-24 bg-gradient-to-t from-transparent to-[#44A6FA]/10" />
-      <div className="absolute inset-x-0 bottom-0 h-[34%] bg-gradient-to-b from-[#44A6FA]/10 to-[#050A30]/40" />
+      {/* WEB-5 D14 S2: fades to nothing rather than to the old section colour, so the shore ends without a band on the page-wide water. */}
+      <div className="absolute inset-x-0 bottom-0 h-[34%] bg-gradient-to-b from-[#44A6FA]/10 to-transparent" />
       <MascotLogo className="absolute right-[5%] bottom-[34%] w-9 translate-y-[2px] opacity-90 md:w-12" />
     </div>
   );
