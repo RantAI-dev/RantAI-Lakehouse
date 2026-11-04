@@ -427,6 +427,11 @@ export interface GovernanceService {
     input: SetQualityScheduleInput,
     signal?: AbortSignal
   ): Promise<QualitySchedule>
+  /**
+   * Put a table back on the default schedule (WEB-3 S3a-D3); needs
+   * `governance:write`. `listQualitySchedules` then carries no row for it.
+   */
+  resetQualitySchedule(asset: string, signal?: AbortSignal): Promise<void>
   /** Whether a table's volume and freshness anomalies are being raised yet. */
   getQualityLearning(asset: string, signal?: AbortSignal): Promise<QualityLearning>
   createClassificationRule(

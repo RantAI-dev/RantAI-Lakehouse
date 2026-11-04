@@ -2287,6 +2287,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         StatusCode::FORBIDDEN,
         "catalog:read alone must NOT be enough to set a schedule"
     );
+    // WEB-3 S3a-D3: resetting a schedule is the same write, both ways.
+    let refused_reset = request_with_cookie(&router, "DELETE", set, &reader_cookie).await;
+    assert_eq!(
+        refused_reset.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must NOT be enough to reset a schedule"
+    );
 
     let admin_cookie = session_cookie_for_user(&pool, admin).await;
     let allowed = request_with_cookie(&router, "PUT", set, &admin_cookie).await;
@@ -2295,6 +2302,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         allowed.status(),
         StatusCode::BAD_REQUEST,
         "governance:write must be enough to reach set handler which answers 400 on empty body"
+    );
+
+    let allowed_reset = request_with_cookie(&router, "DELETE", set, &admin_cookie).await;
+    assert_eq!(
+        allowed_reset.status(),
+        StatusCode::NO_CONTENT,
+        "governance:write must be enough to reset a schedule"
     );
 
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")

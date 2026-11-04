@@ -368,6 +368,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // incidents and alerts) run, so it is a governance decision.
     ("GET",  "/api/governance/quality/schedules", Policy::RequiresAuth),
     ("PUT",  "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
+    // WEB-3 S3a-D3: resetting a schedule is the same governance write as
+    // setting one.
+    ("DELETE", "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
     // DATA-14 (F5): a table's learned-or-learning state; open to any login
     // like the quality list it is shown beside.
     ("GET",  "/api/governance/quality/learning/{asset}", Policy::RequiresAuth),
@@ -1362,6 +1365,11 @@ mod tests {
         );
         assert_eq!(
             policy_for("PUT", "/api/governance/quality/schedules/{asset}"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+        // WEB-3 S3a-D3: resetting takes the permission setting one does.
+        assert_eq!(
+            policy_for("DELETE", "/api/governance/quality/schedules/{asset}"),
             Some(Policy::RequiresPermission("governance:write"))
         );
     }

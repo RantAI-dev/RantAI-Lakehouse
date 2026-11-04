@@ -196,6 +196,13 @@ export const clickhouseGovernanceService: GovernanceService = {
       signal
     )
   },
+  resetQualitySchedule(asset, signal) {
+    return del(
+      `/api/governance/quality/schedules/${encodeURIComponent(asset)}`,
+      "Failed to reset the schedule",
+      signal
+    )
+  },
   getQualityLearning(asset, signal) {
     return get<QualityLearning>(
       `/api/governance/quality/learning/${encodeURIComponent(asset)}`,

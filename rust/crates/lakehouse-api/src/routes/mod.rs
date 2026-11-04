@@ -643,8 +643,10 @@ fn governance_static_router() -> Router<AppState> {
             get(quality_schedules::list_schedules),
         )
         .route(
+            // WEB-3 S3a-D3: a table's own schedule, or its absence (the
+            // default every 60 minutes).
             "/api/governance/quality/schedules/{asset}",
-            put(quality_schedules::put_schedule),
+            put(quality_schedules::put_schedule).delete(quality_schedules::delete_schedule),
         )
         // DATA-14 (F5): whether a table's anomalies are being raised yet.
         .route(
