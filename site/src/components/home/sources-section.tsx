@@ -41,13 +41,16 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
             <DisplayHeading>{copy.headline}</DisplayHeading>
             <LeadText className="mx-auto mt-5 max-w-[36rem]">{copy.sub}</LeadText>
           </m.div>
-          <ul className="relative z-0 mx-auto mt-12 flex max-w-[760px] flex-wrap justify-center gap-2.5 md:gap-3">
+          {/* WEB-5 T6: 19 sources instead of 9. On phones the pills, gaps and
+              margins are tighter so the pinned 100svh stage still holds the
+              headline, every pill and the caption; desktop is unchanged. */}
+          <ul className="relative z-0 mx-auto mt-7 flex max-w-[760px] flex-wrap justify-center gap-1.5 md:mt-12 md:gap-3">
             {copy.items.map((item, i) => (
-              <SourcePill key={item} label={item} index={i} progress={scrollYProgress} animate={!reduced} />
+              <SourcePill key={item} label={item} index={i} count={copy.items.length} progress={scrollYProgress} animate={!reduced} />
             ))}
           </ul>
-          <Reveal className="mx-auto mt-10 max-w-[36rem]">
-            <p className="lk-mono text-[12px] leading-5 tracking-wide text-[#E8F4FF]/65">{copy.caption}</p>
+          <Reveal className="mx-auto mt-6 max-w-[36rem] md:mt-10">
+            <p className="lk-mono text-[11px] leading-4 md:text-[12px] md:leading-5 tracking-wide text-[#E8F4FF]/65">{copy.caption}</p>
           </Reveal>
         </Container>
       </div>
@@ -64,37 +67,46 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
  */
 const settle = (t: number): number => 1 - Math.pow(1 - t, 3);
 
+/** Gap between two droplets' departures, so the last of `count` arrives by 0.80. */
+export const stagger = (count: number): number => (count > 1 ? Math.min(0.034, 0.4 / (count - 1)) : 0);
+
 const PILL_CLASS =
-  "lk-mono rounded-full border px-3.5 py-1.5 text-[12px] text-[#E8F4FF] md:px-4 md:py-2 md:text-[13px]";
+  "lk-mono rounded-full border px-2.5 py-1 text-[11px] text-[#E8F4FF] md:px-4 md:py-2 md:text-[13px]";
 
 function SourcePill({
   label,
   index,
+  count,
   progress,
   animate,
 }: {
   label: string;
   index: number;
+  count: number;
   progress: MotionValue<number>;
   animate: boolean;
 }) {
   if (!animate) {
     return <li className={`${PILL_CLASS} border-[#44A6FA]/30 bg-[#44A6FA]/10`}>{label}</li>;
   }
-  return <FallingPill label={label} index={index} progress={progress} />;
+  return <FallingPill label={label} index={index} count={count} progress={progress} />;
 }
 
 function FallingPill({
   label,
   index,
+  count,
   progress,
 }: {
   label: string;
   index: number;
+  count: number;
   progress: MotionValue<number>;
 }) {
   // Staggered: the first droplet leaves at 0.10, the last arrives by 0.80.
-  const start = 0.1 + index * 0.034;
+  // WEB-5 T6: the step shrinks when the list grows (19 sources now), so the
+  // last droplet still lands inside the pin; nine pills keep the old 0.034.
+  const start = 0.1 + index * stagger(count);
   const end = start + 0.3;
   const dir = index % 2 === 0 ? -1 : 1;
   const y = useTransform(progress, [start, end], ["-110vh", "0vh"], { ease: settle });

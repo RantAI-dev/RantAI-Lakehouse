@@ -7,7 +7,7 @@
   },
   "sources": {
     "headline": "Everything flows in.",
-    "sub": "Databases, files, streams and APIs land in one place, on a schedule or as they change.",
+    "sub": "Databases, files, streams, APIs and business apps land in one place, on a schedule or as they change.",
     "items": [
       "PostgreSQL",
       "MySQL",
@@ -17,9 +17,19 @@
       "Kafka",
       "CSV and TSV files",
       "Excel workbooks",
-      "Parquet files"
+      "Parquet files",
+      "Salesforce",
+      "ServiceNow",
+      "Google Analytics 4",
+      "HubSpot",
+      "Zendesk",
+      "Confluence",
+      "Dynamics 365",
+      "SharePoint",
+      "JSON, JSON Lines and Avro",
+      "gzip and zip archives"
     ],
-    "caption": "Live change capture for PostgreSQL. File upload straight from the console."
+    "caption": "Live change capture for PostgreSQL. Dedupe or keep history on load, discover tables in any source, and upload 10 files at once, in folders."
   },
   "depths": {
     "eyebrow": "Three depths",
@@ -31,17 +41,17 @@
       },
       "silver": {
         "title": "Cleaned and joined.",
-        "body": "Pipelines with schedules, dependencies, retries and version history clean the raw data into tables you can trust."
+        "body": "Pipelines with schedules, dependencies, retries and version history clean the raw data into tables you can trust, and quality checks with anomaly detection watch them."
       },
       "gold": {
         "title": "Ready for answers.",
-        "body": "Curated tables built for the questions your business asks, and published as open tables when you switch it on."
+        "body": "Curated tables built for the questions your business asks. They refresh themselves within the lag you set, and publish as open tables when you switch it on."
       }
     }
   },
   "assistant": {
     "headline": "Ask, don't dig.",
-    "sub": "The assistant works with the same tools as the console. It answers questions, builds charts and dashboards, and runs pipelines. Anything risky waits for a person to approve it.",
+    "sub": "The assistant works with the same tools as the console. It answers questions, builds charts and dashboards, and runs pipelines. Anything risky waits for a person to approve it. Prefer SQL? Query Studio has autocomplete, tabs and a query history.",
     "caption": "Illustration",
     "userOne": "Which region had the most visitors last quarter?",
     "answerOne": "Region North had the most visitors last quarter.",
@@ -60,7 +70,7 @@
   },
   "dashboards": {
     "headline": "Answers come back up as dashboards.",
-    "sub": "About two dozen chart types, maps included. Filter, drill down, share by link, embed in your own site, and get an alert when a number crosses a line.",
+    "sub": "About two dozen chart types, maps on your own boundaries included, with calculated fields, parameters, reusable metrics and results that are remembered and refreshed. Comment with @mentions, set alerts on a chart, export PNG, PDF or Excel, schedule reports, and share by a public link with an expiry and a password, or as an embed.",
     "caption": "Illustrations, not customer data.",
     "tiles": {
       "line": {
@@ -93,7 +103,7 @@
   },
   "governance": {
     "headline": "Guarded by default.",
-    "sub": "Roles decide who sees what. Sensitive columns are classified and masked for everyone who should not see them, and lineage shows which tables each table is built from.",
+    "sub": "Roles decide who sees what. Sensitive columns are classified and masked for everyone who should not see them, and column-level lineage shows where every column comes from.",
     "illustration": "Illustration · fictional people",
     "viewAs": "View as",
     "roles": {
@@ -118,7 +128,15 @@
       },
       {
         "label": "Lineage",
-        "text": "Lineage from raw table to curated table"
+        "text": "Column-level lineage, from raw table to curated table"
+      },
+      {
+        "label": "Catalog",
+        "text": "Catalog search with certified and deprecated marks and governed tags"
+      },
+      {
+        "label": "Access",
+        "text": "Permissions per dashboard and per folder"
       }
     ]
   },

@@ -49,10 +49,11 @@ export function TopBar({
       ref={headerRef}
       className="fixed inset-x-0 top-0 z-50 border-b border-transparent bg-transparent backdrop-blur-0 transition-[background-color,backdrop-filter,border-color] duration-500 data-[scrolled]:border-[#E8F4FF]/10 data-[scrolled]:bg-[#020514]/55 data-[scrolled]:backdrop-blur-xl"
     >
-      <div className="mx-auto flex h-16 w-full max-w-[1280px] items-center justify-between gap-4 px-4 md:px-6">
-        <a href="#hero" className="flex items-center gap-2.5 text-[15px] font-medium tracking-tight text-[#E8F4FF]">
+      <div className="mx-auto flex h-16 w-full max-w-[1280px] items-center justify-between gap-2 px-4 md:gap-4 md:px-6">
+        <a href="#hero" className="flex items-center gap-2 text-[15px] md:gap-2.5 font-medium tracking-tight text-[#E8F4FF]">
           <MascotMark className="size-6" />
-          <span>RantAI Lakehouse</span>
+          {/* Never wraps: beside the language switch a 360 px phone has room for one line. */}
+          <span className="whitespace-nowrap">RantAI Lakehouse</span>
         </a>
         <nav aria-label={nav.label} className="hidden items-center gap-1 md:flex">
           {NAV_ANCHORS.map((l) => (
@@ -65,7 +66,7 @@ export function TopBar({
             </a>
           ))}
         </nav>
-        <div className="flex items-center gap-2 md:gap-3">
+        <div className="flex items-center gap-1.5 md:gap-3">
           <LanguageSwitcher locale={locale} text={language} />
           <CtaLink href={LINKS.install} size="sm">
             {cta.install}

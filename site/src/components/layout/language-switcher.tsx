@@ -60,7 +60,7 @@ export function LanguageSwitcher({
               }
             }}
             className={cn(
-              "rounded-full px-2.5 py-1 text-[12px] font-medium transition-colors",
+              "rounded-full px-2 py-1 text-[12px] font-medium transition-colors md:px-2.5",
               current ? "bg-[#E8F4FF] text-[#020514]" : "text-[#E8F4FF]/70 hover:text-[#E8F4FF]",
             )}
           >
