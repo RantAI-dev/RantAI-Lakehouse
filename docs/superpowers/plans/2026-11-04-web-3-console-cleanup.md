@@ -196,17 +196,158 @@ bun run typecheck && bun run lint && bun run test
 git status
 ```
 
-## 6. Slice 3 (outline; plan check before it starts)
+## 6. Slice 3 plan check (planner, 2026-11-04; anchors at slice 2's branch `2eae89d1`)
 
-- Column sensitivity and masks set on the table's columns; the Classification & Masking page
-  goes; a "sensitive columns" filter in the Catalog. The classification `masking_rule` text
-  field is replaced by a real column-mask policy (it is never applied today).
-- Policies becomes a read-only "Access rules" overview linking to each table.
-- Data Quality gains the check schedules and freshness targets that live only on the table
-  page.
-- Tag keys and Maps become Settings sections; Sessions a tab in Users; "Teams & Roles"
-  becomes "Roles", with edit and delete.
-- The Lineage page's deep links move to the table's Lineage tab; the page goes.
+Split in two, because the screens need API the product does not have yet:
+
+- **3a: API** (DeepSeek developer, bluefin). Branch `feat/web-3-slice-3a-api` from `main`.
+- **3b: the screens** (Opus developer, desktop; owner 2026-11-04). Branch
+  `feat/web-3-slice-3b-screens` from slice 2's branch, with `origin/main` and 3a's branch merged in
+  once they land.
+
+3b starts with the parts that need no new API (S3-T1 to S3-T4) while 3a is built.
+
+### 6.1 Evidence (survey 2026-11-04)
+
+- **Columns.** The Schema tab (`catalog/asset-schema.tsx:132-185`, `asset-columns.tsx:544-575`)
+  shows a `masked` pill and a classification badge per column, with no controls.
+  - `masked` means masked *for the viewer* (`routes/catalog.rs:2360-2366`), not that a mask policy
+    exists. The policies in force are in `AssetDetail.policySummary`.
+  - A classification is set and removed on the Access tab (`asset-access.tsx:108-135`, `:197-290`).
+  - A mask is a policy made by the Access tab's Add policy dialog (`:302-370`), which writes the
+    structured conditions `PolicyCondition::parse` enforces.
+  - The classification `maskingRule` text is never applied anywhere.
+  - Classification keys a table by `lineageKey`; a policy keys it by `policyTable`.
+- **`GET /api/governance/classification`** (`routes/governance.rs:455-481`) emits one row per
+  registry dataset with `classification: "internal"`, hardcoded. The `tier` it selects is unused, and
+  `asset` is the dataset's title, not a key. That is an invented value (principle 2).
+- **Policies.** A policy carries no asset id. The table is only in `conditions.table`.
+  - `silver.*` and `serving.*`: the table is the asset id (`catalog.rs:1726`).
+  - `bronze.<table>`: the asset id is a registry slug that nothing on the policy names.
+  - There is no `PUT /api/governance/policies/{id}`.
+- **Quality.**
+  - Schedules: `GET /api/governance/quality/schedules` lists every table; `PUT .../{asset}` sets one.
+    There is no reset.
+  - Freshness targets: `GET` / `PUT /api/governance/sla` and `DELETE /api/governance/sla/{table}`.
+  - Today both are shown only on the asset page (`quality-schedule.tsx:46`, `asset-activity.tsx:282-430`).
+- **Roles.** Only `GET` / `POST /api/identity/roles`.
+  - The store has `delete_role` (FK violation while a user holds the role) but no `update_role`.
+  - The page is create-only and calls itself "Teams & Roles".
+- **Lineage links.**
+  - The asset page reads `?tab=`, so `/data/assets/<id>?tab=lineage` works.
+  - The asset's own link (`asset-lineage.tsx:298`) can use it.
+  - A pipeline has an optional `targetAssetId`.
+  - A run has none.
+  - A chart's lineage spans several tables.
+  So the Lineage page **stays** for charts, runs and pipelines without a target; only the links
+  that know their asset move to the tab. (This revises section 0's "the page goes".)
+
+### 6.2 Slice 3a: API (DeepSeek)
+
+- **S3a-D1. Policies say which table page they belong to.** The policy views (`PolicyView`, from
+  `SEC-61` #373) gain `assetId: Option<String>`, resolved server-side from `conditions.table`:
+  - `silver.*` / `serving.*`: the table itself;
+  - `bronze.<table>`: the registry slug, from the same registry reader the catalog uses (rule 4);
+  - unparseable conditions, or a table with no catalog entry: `None`.
+  Contract `assetId?: string`. Build on `SEC-61`: merge #373's branch, or main once #373 merges.
+- **S3a-D2. Roles can be edited and deleted.**
+  - `PUT /api/identity/roles/{id}` (name, description, permissions) and
+    `DELETE /api/identity/roles/{id}`, each `POLICY_TABLE`-classified with the permission
+    `POST /api/identity/roles` uses.
+  - Both asserted both ways in `tests/route_auth.rs`.
+  - Both audited, as role creation is.
+  - A store `update_role`.
+  - Delete while users hold the role → 409 with the fixed sentence "This role is still given to
+    N people. Take it away from them first."
+  - A seeded system role (check how the seed marks one) → 409 "A built-in role cannot be deleted."
+  - Never pass an FK violation's text through (principle 4).
+- **S3a-D3. A schedule can go back to the default.** `DELETE /api/governance/quality/schedules/{asset}`
+  → 204, after which `GET` shows the default for that asset. Same permission as `PUT`.
+- **S3a-D4. No invented classification.** `classification()` emits a registry-derived row only
+  when the dataset's `tier` is one of the product's classification levels (read the levels from
+  the code: the classification badge and the `create_rule` validation), with that level as its
+  classification, and `asset` as the same key the stored rules use. Otherwise it emits no row.
+  Report the `tier` values seen in the seed. If the levels and the tiers do not match at all,
+  stop and report: the derived rows are then simply removed (planner default).
+- **S3a-D5. Tests and docs.**
+  - Route tests for each new route, both ways, in `route_auth.rs`.
+  - A unit test for each `assetId` case.
+  - A test that the derived classification row carries the tier, not "internal".
+  - CHANGELOG `### Added` / `### Fixed`.
+  - Mutation check: hardcode `"internal"` again and the D4 test fails.
+- *Verification:* the `AGENTS.md` Rust block for `lakehouse-api` and `lakehouse-store`, scoped
+  per commit; the workspace run once before handoff (`CARGO_BUILD_JOBS=4` on bluefin).
+
+### 6.3 Slice 3b: the screens (Opus)
+
+- **S3-D1. Sensitivity and masks live on the column** (Schema tab). Opening a column shows a
+  "Sensitivity and masking" section:
+  - **Sensitivity:** the column's classification, with Set / Change / Remove. The create and
+    delete classification calls already exist; "change" is delete then create, in that order,
+    with the new value shown only after both succeed.
+  - **Masked for:** the roles of every enforced column-mask policy in `policySummary` that names
+    this column, each linking to its policy.
+    - **Add a mask** writes a Column mask policy for this column and the chosen roles, through the
+      same `createPolicy` call and the same `policyTable` / `policyCondition` builders the Access
+      tab uses today. Move those helpers to one shared module (rule 4); do not copy them.
+    - **Remove** deletes a policy that masks only this column. A policy that also masks other
+      columns is not deleted from here: the row says "Part of <policy name>, which also masks
+      <columns>" with a link to the Access tab.
+  - Needs `governance:write` / `policy:write`, as today. A reader sees the facts without the buttons.
+- **S3-D2. The Access tab** keeps grants, request access and the table's policies (with
+  SEC-61's not-enforced notice). Its Classify dialog and classification card go: one place per
+  fact.
+- **S3-D3. The Classification & Masking page goes.**
+  - `/governance/classification` becomes redirect-only to `/catalog`.
+  - The Catalog gains a "Has sensitive columns" filter **only if** the catalog list carries the
+    asset's classification (`AssetSummary`). If not, the filter is left out and the handoff says
+    so; no new endpoint.
+- **S3-D4. Policies becomes "Access rules"** at `/governance/policies` (the address is kept).
+  - A read-only list: name, table (linking to `/data/assets/<assetId>?tab=access` when `assetId`
+    is known, plain text otherwise), roles, what it does (masks <columns> / filters rows), and
+    enforced or not (SEC-61).
+  - No Enforce, Stop or Delete here: those stay on the table's Access tab. The drawer is read-only
+    and links to the table.
+  - Needs S3a-D1.
+- **S3-D5. Data Quality gains two tabs: Schedules and Freshness targets.**
+  - **Schedules:** every table's schedule from the list endpoint, with Edit (the existing
+    `QualitySchedulePanel` controls, reused) and Reset (S3a-D3).
+  - **Freshness targets:** every target from `GET /api/governance/sla`, with Add, Edit and Remove
+    (the existing dialog, reused).
+  - A table key that is not an asset id shows as plain text (the Bronze slug gap). Do not
+    fabricate a link.
+  - The asset page keeps its own controls.
+- **S3-D6. Settings has sections:** Reporting, Remembered results, Query limits, Sign-in, Tag keys,
+  Maps.
+  - A section list or tabs, and the section is in the URL (`?section=`).
+  - Reuse the Tag keys page body and `MapsAdmin` as they are.
+  - `/governance/tag-keys` and `/admin/maps` become redirect-only to their section.
+- **S3-D7. Users has tabs:** People | Sessions (the Sessions page body).
+  `/admin/sessions` → `/admin/users?tab=sessions`.
+- **S3-D8. "Teams & Roles" becomes "Roles"**, with Edit and Delete (S3a-D2). A 409 shows the
+  API's sentence.
+- **S3-D9. Lineage links:**
+  - the asset page's link → `?tab=lineage`;
+  - a pipeline with a `targetAssetId` → that asset's tab;
+  - everything else keeps `/lineage?focus=`.
+- **S3-D10. The sidebar after slice 3:**
+  - Governance: Access rules, Data Quality, Approvals.
+  - Administration: Users, Roles, Tenants, Service Identities, Settings.
+  - Page context (`copilot/page-context.ts`) follows. No tool or `tool_schemas.json` change.
+- **S3-D11. QA.** The planner updates the Lark QA cases that name the moved pages when 3b merges.
+
+**Tasks** (one commit each, push after each; 3a-dependent ones last):
+
+- **S3-T1** Settings sections (D6).
+- **S3-T2** Users tabs (D7).
+- **S3-T3** Data Quality tabs: schedules Edit and freshness targets (D5, without Reset).
+- **S3-T4** Column sensitivity and masks, the Access tab change, and the page removal (D1–D3).
+- **S3-T5** (after 3a) Access rules (D4), schedule Reset, Roles edit/delete (D8).
+- **S3-T6** Lineage links, sidebar, page context, docs, CHANGELOG (D9, D10).
+
+*Verification:* `bun run typecheck && bun run lint && bun run test`. On the desktop, run Rust
+tests scoped only (its loopback hangs on closed ports), and leave the full run to CI.
+Screenshots: only if `libnss3` / `libnspr4` are installed by then; otherwise *not verified*.
 
 ## 7. Out of scope
 
