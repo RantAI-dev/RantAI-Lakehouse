@@ -15,7 +15,7 @@ byte.
 A real workbook (`../../workbooks/stock.xlsx`) with a shared-strings part
 whose header declares **two billion** strings and holds three.
 
-`calamine` 0.37 reads that header before it reads a single string and
+`calamine` 0.38 reads that header before it reads a single string and
 reserves room for all of them (`src/xlsx/mod.rs`, `read_shared_strings`:
 `self.strings.reserve(n)`), so the file asks for 48 GB — 2,000,000,000
 strings of 24 bytes — before any cell is looked at. The allocation fails and
@@ -76,7 +76,7 @@ Aborted (exit 134)
 ## The `.xls` case needs no fixture
 
 `SEC-22`'s plan asks for an `.xls` whose shared string table declares a huge
-count, *if the reader reads that count*. `calamine` 0.37 does not:
+count, *if the reader reads that count*. `calamine` 0.38 does not:
 `src/xls.rs`, `parse_sst`, skips the `cstTotal` and `cstUnique` headers and
 reads the strings to the end of the record, so the count is never turned
 into a reservation. A count that lies costs a lying count nothing, and there

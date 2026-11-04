@@ -47,7 +47,7 @@ export function QueryStudioPage() {
     setPageContext({
       key: "query",
       title: "Write and run SQL",
-      hint: "Ask about this query or its result, or have Copilot write SQL.",
+      hint: "Ask about this query or its result, or have AI Copilot write SQL.",
       suggest: {
         ask: ["Explain this query", "What does this result show?", "Why might this query be slow?"],
         build: ["Turn this into a chart on a dashboard"],

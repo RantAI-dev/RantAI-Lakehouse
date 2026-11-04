@@ -71,6 +71,12 @@ pub struct DashboardQuery {
     /// recompute a board.
     #[serde(default)]
     fresh: Option<String>,
+    /// `BI-39` D7: read only chart `id` of the board — no built-in tile, no
+    /// other stored chart. `serde(skip)` is the point: no request can narrow a
+    /// dashboard read this way, only a caller inside this crate that decides
+    /// from one tile (a chart alert's check, the PDF's chart image).
+    #[serde(skip)]
+    only: Option<String>,
 }
 
 impl DashboardQuery {
@@ -89,6 +95,7 @@ impl DashboardQuery {
             grain: grain.map(str::to_owned),
             params: params.map(str::to_owned),
             fresh: None,
+            only: None,
         }
     }
 
@@ -112,6 +119,18 @@ impl DashboardQuery {
     #[must_use]
     pub(crate) fn fresh_chart(mut self, id: &str) -> Self {
         self.fresh = Some(id.to_owned());
+        self
+    }
+
+    /// The same read with only chart `id`: `get_body` adds no built-in tile and
+    /// keeps of the board's stored charts only that one (`BI-39` D7). For a
+    /// caller that decides from a single tile — a chart alert's check, the
+    /// PDF's chart image — so a board of twelve charts runs one statement, not
+    /// twelve. Everything else (filters, tabs, parameters, grain, masks, and
+    /// the 404 for a board the person cannot see) is unchanged.
+    #[must_use]
+    pub(crate) fn only_chart(mut self, id: &str) -> Self {
+        self.only = Some(id.to_owned());
         self
     }
 }
@@ -465,9 +484,12 @@ async fn get_body(
     // BUILTIN_DASHBOARD_SPEC actually loaded a non-empty catalog — see
     // lakehouse_bi::specs's module doc for why an empty/missing spec means
     // "disabled" (this replaces the retired BUILTIN_DASHBOARD_ENABLED flag).
-    let on_default =
-        (board == "default" || board == "all") && (!KPIS.is_empty() || !CHARTS.is_empty());
-    let stored_for_board: Vec<&StoredChartSpec> = if board == "all" {
+    // `BI-39` D7: a read of one chart adds no built-in tile and keeps only that
+    // stored chart. Nothing else of the read changes.
+    let on_default = q.only.is_none()
+        && (board == "default" || board == "all")
+        && (!KPIS.is_empty() || !CHARTS.is_empty());
+    let mut stored_for_board: Vec<&StoredChartSpec> = if board == "all" {
         stored.iter().collect()
     } else {
         stored
@@ -475,6 +497,9 @@ async fn get_body(
             .filter(|c| c.board == board || (c.board.is_empty() && board == "default"))
             .collect()
     };
+    if let Some(only) = q.only.as_deref() {
+        stored_for_board.retain(|c| c.spec.id == only);
+    }
 
     // Always loaded now: `filterFields` lists every column of every relation
     // the board reads, not only the ones an active filter touches.
@@ -6338,6 +6363,7 @@ mod typed_filters {
             grain: None,
             params: None,
             fresh: None,
+            only: None,
         };
         let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
         let state = crate::state::AppState::without_a_database();
@@ -7618,6 +7644,7 @@ mod time_grain {
             grain: requested.map(|g| g.as_str().to_owned()),
             params: None,
             fresh: None,
+            only: None,
         };
         let state = crate::state::AppState::without_a_database();
         get_body(
@@ -7741,6 +7768,7 @@ mod time_grain {
             grain: Some("own".to_owned()),
             params: None,
             fresh: None,
+            only: None,
         };
         let state = crate::state::AppState::without_a_database();
         let body = get_body(
@@ -8137,6 +8165,7 @@ mod table_tiles {
             grain: None,
             params: None,
             fresh: None,
+            only: None,
         };
         let state = crate::state::AppState::without_a_database();
         get_body(

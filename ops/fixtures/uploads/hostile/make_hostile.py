@@ -15,7 +15,7 @@ Written here:
   a column chunk of one tebibyte, in a file of a few hundred bytes. A reader
   that trusts the footer reads past the end of the file.
 
-The `.xls` case of the SEC-22 plan needs no fixture: `calamine` 0.37 does not
+The `.xls` case of the SEC-22 plan needs no fixture: `calamine` 0.38 does not
 read the shared string table's count at all (`src/xls.rs`, `parse_sst`: it
 skips the `cstTotal` and `cstUnique` headers and reads the strings to the end
 of the record), so a count that lies costs a lying count nothing. The

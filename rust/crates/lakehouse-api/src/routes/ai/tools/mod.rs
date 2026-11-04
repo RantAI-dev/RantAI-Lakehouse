@@ -17,7 +17,8 @@
 //! - [`reports`] — the scheduled-report tools (`AI-10`, with `RPT-1`).
 //! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
-//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
+//! - [`embed`] — the signed-embed tools (`BI-26` slice 2, with `AI-11-AC3`):
+//!   enable, filter modes, withdraw, and the snippet.//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
 //! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
 //! - [`connectors`] — Tier 1 connector tools (T1.2).
@@ -32,8 +33,10 @@ mod alerts;
 mod ask;
 mod boards;
 mod calc_fields;
+mod comments;
 mod connectors;
 mod dashboards;
+mod embed;
 mod export;
 mod maps;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
@@ -60,7 +63,7 @@ mod tabs;
 
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_bi::access::Viewer;
+use lakehouse_bi::access::{Level, Viewer};
 use serde_json::{Map, Value, json};
 
 use super::registry;
@@ -234,6 +237,10 @@ pub(in crate::routes) async fn run_tool(
         "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,
         "delete_alert_rule" => alerts::delete_alert_rule(state, principal, args).await,
         "run_alert_rule" => alerts::run_alert_rule(state, principal, args).await,
+        n if comments::handles(n) => {
+            comments::list_dashboard_comments(state, principal, args).await
+        }
+        n if embed::handles(n) => embed::run(state, principal, name, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,
         "test_connector" => connectors::test_connector(state, principal, args).await,
@@ -286,6 +293,65 @@ pub(in crate::routes) async fn run_tool(
             )
         }
     }
+}
+
+/// The level on the dashboard a call acts on, for the gate (`BI-37` D10):
+/// worked out on the server before `gate::decide_with`/`decide_by_name`, never
+/// taken from the arguments the model sent. `None` for a tool outside
+/// [`registry::DASHBOARD_SCOPED`], for a call with nobody attached, and for a
+/// dashboard the caller cannot see or the store cannot read — the gate then
+/// falls back to the plain permission (fail closed).
+pub(in crate::routes) async fn dashboard_reach(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Option<Level> {
+    let reach = registry::dashboard_scoped(name)?;
+    let principal = principal?;
+    match reach {
+        registry::Reach::Board(argument) => {
+            crate::routes::dashboard_access::level_on_board(
+                state,
+                principal,
+                &arg_str(args, argument),
+            )
+            .await
+        }
+        registry::Reach::Chart(argument) => {
+            crate::routes::dashboard_access::level_on_chart(
+                state,
+                principal,
+                &arg_str(args, argument),
+            )
+            .await
+        }
+        // `set_cache_rule` names one of the two; the empty one is not filled.
+        registry::Reach::BoardOrChart => {
+            let board = arg_str(args, "board");
+            if board.trim().is_empty() {
+                crate::routes::dashboard_access::level_on_chart(
+                    state,
+                    principal,
+                    &arg_str(args, "chart"),
+                )
+                .await
+            } else {
+                crate::routes::dashboard_access::level_on_board(state, principal, &board).await
+            }
+        }
+        registry::Reach::Anywhere => dashboard_anywhere(state, Some(principal)).await,
+    }
+}
+
+/// The highest level the caller holds on any dashboard (`BI-37` D10): what the
+/// listing tools may be offered for and what an `Anywhere` tool is judged by.
+/// `None` with nobody attached, or when the rules cannot be read.
+pub(in crate::routes) async fn dashboard_anywhere(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Option<Level> {
+    crate::routes::dashboard_access::highest_level(state, principal?).await
 }
 
 /// Who a dashboard tool reads as: the caller's viewer after their rules, the
@@ -394,6 +460,133 @@ pub(super) async fn require_edit_on_chart(
     Ok(())
 }
 
+/// Checks the requester of a `WriteHigh` call before an approval is created
+/// (`BI-26` slice 2 D4, `DEC-8`). The gate answers "pending approval", and
+/// this runs before `request_approval`: an error goes to the model as the tool
+/// result and no approval row is written, so a call that could never run does
+/// not ask a person to approve it.
+///
+/// The two embed writes run the same checks their console routes do: the one
+/// manage guard (`public_links::managed_board`, `BI-26` review fix R6), the
+/// configured `EMBED_SECRET` (`SEC-12` D4), and the argument validation the
+/// route makes (`embed::check_filter_modes`; `embed_access::validate_origins`).
+/// Every other tool is a no-op here: its own tool body checks what it needs.
+///
+/// # Errors
+///
+/// The tool-result JSON the model sees, as the routes' own sentence.
+pub(crate) async fn check_before_approval(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Result<(), Value> {
+    match name {
+        "enable_embed" => {
+            let board = managed_embed_board(state, principal, args).await?;
+            embed_configured(state)?;
+            let sites = arg_string_list(args, "sites")?;
+            let sites = lakehouse_bi::embed_access::validate_origins(&sites)
+                .map_err(|err| json!({ "error": err }))?;
+            // D6: the limit is on the board's list after the addition, so a
+            // call that would be the twenty-first site is refused here too,
+            // before an approval exists.
+            merged_origins(&board, &sites)
+                .map(|_| ())
+                .map_err(|err| json!({ "error": err }))
+        }
+        "set_embed_filter_modes" => {
+            let board = managed_embed_board(state, principal, args).await?;
+            embed_configured(state)?;
+            let modes = arg_filter_modes(args)?;
+            crate::routes::embed::check_filter_modes(&board, &modes)
+                .map_err(|err| json!({ "error": err.to_string() }))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The dashboard an embed tool acts on: the caller must manage it, by the one
+/// guard the embed settings route uses (`BI-26` review fix R6). A call with no
+/// signed-in person is refused: the embed settings are managed as somebody.
+async fn managed_embed_board(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Result<lakehouse_bi::store::Board, Value> {
+    let Some(principal) = principal else {
+        return Err(json!({
+            "error": "the embed tools change a dashboard as the signed-in person, and there is none."
+        }));
+    };
+    let board = arg_str(args, "board");
+    crate::routes::public_links::managed_board(state, principal, Some(&board))
+        .await
+        .map_err(|err| json!({ "error": err.to_string() }))
+}
+
+/// `SEC-12` D4: signed embedding cannot work without `EMBED_SECRET`, so every
+/// embed tool refuses with the one sentence the routes use, before any
+/// approval exists (`BI-26` slice 2 D5).
+fn embed_configured(state: &AppState) -> Result<(), Value> {
+    if state.config.embed_secret.as_deref().is_some() {
+        Ok(())
+    } else {
+        Err(json!({ "error": crate::routes::embed::EMBEDDING_NOT_CONFIGURED }))
+    }
+}
+
+/// `BI-26` slice 2 D6: the sites a board would have after adding `sites` to
+/// the ones it lists now. A site already listed is not an error, and more than
+/// [`lakehouse_bi::embed_access::MAX_ORIGINS`] is refused with the validator's
+/// own sentence. Read at execution from the board the manage guard resolved,
+/// so two approvals in a row cannot lose an earlier site; the pre-approval hook
+/// uses the same function so a call that could never run asks no one.
+fn merged_origins(
+    board: &lakehouse_bi::store::Board,
+    sites: &[String],
+) -> Result<Vec<String>, String> {
+    let mut merged = board.embed_access.origins.clone();
+    for site in sites {
+        if !merged.contains(site) {
+            merged.push(site.clone());
+        }
+    }
+    if merged.len() > lakehouse_bi::embed_access::MAX_ORIGINS {
+        return Err(format!(
+            "at most {} sites can be allowed per dashboard.",
+            lakehouse_bi::embed_access::MAX_ORIGINS
+        ));
+    }
+    Ok(merged)
+}
+
+/// `args[key]` as a list of strings; a missing key, a non-list or a non-string
+/// entry is refused rather than read as empty (`BI-26` slice 2 D4).
+fn arg_string_list(args: &Map<String, Value>, key: &str) -> Result<Vec<String>, Value> {
+    let Some(Value::Array(entries)) = args.get(key) else {
+        return Err(json!({ "error": format!("{key} must be a list.") }));
+    };
+    entries
+        .iter()
+        .map(|entry| entry.as_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| json!({ "error": format!("{key} must be a list of text entries.") }))
+}
+
+/// `args["modes"]` as the map the settings route writes: a column to one of
+/// `locked`, `editable`, `hidden`.
+fn arg_filter_modes(
+    args: &Map<String, Value>,
+) -> Result<std::collections::BTreeMap<String, lakehouse_bi::embed_access::FilterMode>, Value> {
+    let Some(modes) = args.get("modes") else {
+        return Err(json!({ "error": "modes is required." }));
+    };
+    serde_json::from_value(modes.clone()).map_err(
+        |_| json!({ "error": "modes must be {column: \"locked\"|\"editable\"|\"hidden\"}" }),
+    )
+}
+
 /// Checks a chart call before the gate offers it as a draft (plan 18). `None`
 /// when the call is not a chart call, or when the draft can be built; the
 /// error otherwise, so a draft on a mart or column that does not exist is
@@ -467,6 +660,46 @@ mod tests {
         }
         let unknown = run_tool(&state, None, "not_a_real_tool", &Map::new()).await;
         assert_eq!(unknown, json!({ "error": "unknown tool: not_a_real_tool" }));
+    }
+
+    /// BI-26 slice 2 T4 (D4): the pre-approval hook is a no-op for every tool
+    /// that is not one of the two embed writes, so adding it to the dispatch
+    /// sites changes no other call. A tool that is not an embed write is never
+    /// touched by the hook, even with no signed-in person.
+    #[tokio::test]
+    async fn check_before_approval_is_a_no_op_for_every_other_tool() {
+        let state = dispatch_test_state();
+        for spec in registry::TOOLS {
+            if spec.name == "enable_embed" || spec.name == "set_embed_filter_modes" {
+                continue;
+            }
+            assert!(
+                check_before_approval(&state, None, spec.name, &Map::new())
+                    .await
+                    .is_ok(),
+                "{} was checked by the pre-approval hook",
+                spec.name
+            );
+        }
+    }
+
+    /// BI-26 slice 2 T4 (D4): both embed writes are refused with nobody
+    /// signed in, before any approval can be made, because the embed settings
+    /// are managed as somebody (`public_links::managed_board`).
+    #[tokio::test]
+    async fn check_before_approval_refuses_an_embed_write_with_nobody_signed_in() {
+        let state = dispatch_test_state();
+        for name in ["enable_embed", "set_embed_filter_modes"] {
+            let error = check_before_approval(&state, None, name, &Map::new())
+                .await
+                .expect_err("refused");
+            assert!(
+                error["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("there is none")),
+                "{name}: {error}"
+            );
+        }
     }
 
     /// A stand-in `ClickHouse` that holds dashboards `b1` and `b2` (unfiled,

@@ -427,6 +427,50 @@ class ContinuationTests(unittest.TestCase):
 
         self.assertEqual(len(sent), 1)
 
+    def run_after_confirm(self, chart_arg: str) -> dict[str, Any]:
+        """The continuation calls `set_cache_rule` on the chart the confirm
+        made; the case expects `{created:chart}` (`BI-41` T1)."""
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/ai/tool"): confirm_reply(
+                "create_chart", {"created": True, "id": "c1", "title": "Visitors"}
+            ),
+        })
+        drafted = self.body_with_next_step("make it always fresh")
+        fresh = {
+            "answer": "It is always fresh now.",
+            "_status": 200,
+            "toolTrace": [{
+                "tool": "set_cache_rule",
+                "args": {"chart": chart_arg, "rule": "fresh"},
+                "ok": True,
+                "result": {"updated": True},
+            }],
+        }
+        fake_ask, _sent = self.scripted_ask([drafted, fresh])
+        case = {
+            "id": "new-chart-fresh",
+            "mode": "build",
+            "confirm": True,
+            "turns": ["Draw it and make it always fresh."],
+            "expect_tool": {
+                "name": "set_cache_rule",
+                "args_contains": {"chart": "{created:chart}", "rule": "fresh"},
+            },
+        }
+        with mock.patch.object(m, "ask", side_effect=fake_ask):
+            return m.run_case(cfg, session, case)
+
+    def test_the_continuation_s_names_the_created_chart(self) -> None:
+        result = self.run_after_confirm("c1")
+
+        self.assertEqual(result["missing"], [])
+
+    def test_another_chart_id_does_not_stand_in_for_the_created_one(self) -> None:
+        result = self.run_after_confirm("c2")
+
+        self.assertEqual(len(result["missing"]), 1)
+
 
 # ── cleanup ───────────────────────────────────────────────────────────────
 
@@ -613,6 +657,31 @@ class CleanupPlanTests(unittest.TestCase):
             m.collect_created([{"kind": "source", "id": "s9"}], [], []),
             [{"kind": "source", "id": "s9"}],
         )
+
+    # BI-37: the alert the assistant saves is an object the run made, so the
+    # state check counts it and the cleanup deletes it.
+    def test_create_alert_rule_saves_a_rule_that_the_run_collects_and_deletes(self) -> None:
+        reply = {"ok": True, "rule": {"id": "al7", "name": "Visitors", "chart": "c1"}}
+        trace = [{"tool": "create_alert_rule", "result": {"ok": True, "rule": {"id": "al7"}}}]
+        confirms = [{"tool": "create_alert_rule", "result": confirm_reply("create_alert_rule", reply)}]
+        self.assertEqual(m.collect_created([], [trace], []), [{"kind": "alert", "id": "al7"}])
+        self.assertEqual(m.collect_created([], [], confirms), [{"kind": "alert", "id": "al7"}])
+        cfg = make_cfg()
+        session = FakeSession()
+        self.assertEqual(m.run_cleanup(cfg, session, m.collect_created([], [], confirms)), [])
+        self.assertIn(
+            ("DELETE", "http://api.test/api/alerts?id=al7", None), session.calls
+        )
+
+    def test_a_draft_that_only_asks_for_confirmation_collects_no_alert(self) -> None:
+        # The pending confirmation names the tool and its args, never a saved
+        # rule, so the run must not delete an id it never saw.
+        trace = [{"tool": "create_alert_rule", "result": {"needs_confirmation": True, "tool": "create_alert_rule"}}]
+        self.assertEqual(m.collect_created([], [trace], []), [])
+
+    def test_an_alert_is_deleted_before_the_chart_it_watches(self) -> None:
+        created = [{"kind": "chart", "id": "c1"}, {"kind": "alert", "id": "al1"}]
+        self.assertEqual([s["kind"] for s in m.cleanup_plan(created)], ["alert", "chart"])
 
 
 class TeardownTests(unittest.TestCase):
@@ -1686,6 +1755,39 @@ class DashboardCasesTests(unittest.TestCase):
         cases = json.loads((HERE / "dashboard_cases.json").read_text())
         self.assertGreaterEqual(len(cases), 30)
         self.assertEqual(len({c["id"] for c in cases}), len(cases))
+
+    def test_the_new_chart_fresh_case_checks_the_created_chart(self) -> None:
+        # `BI-41` T1: the request drafts a chart and then changes it, so the
+        # case confirms the draft and expects the rule on the chart the
+        # confirm made (`{created:chart}`), never on the board.
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}[
+            "dash_new_chart_then_fresh"
+        ]
+        self.assertIs(case.get("confirm"), True)
+        self.assertEqual(
+            case["expect_tool"],
+            {"name": "set_cache_rule", "args_contains": {"chart": "{created:chart}", "rule": "fresh"}},
+        )
+        where = case["expect_state"][0]["where"]
+        self.assertEqual(where["id"], "{created:chart}")
+        self.assertEqual(where["def.cache.mode"], "fresh")
+        self.assertNotIn("board", json.dumps(case["expect_tool"]))
+
+    def test_the_this_chart_cases_carry_the_page_context_they_ask_about(self) -> None:
+        # `BI-41` T2: "this chart" is only ambiguous with the tiles on the
+        # page, so each case sends the dashboard page's context: two tiles
+        # for the one that must ask, one tile for the one that acts.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        asks = cases["dash_this_chart_fresh_asks"]
+        self.assertEqual(asks["expect_tool"]["name"], "ask_user")
+        self.assertEqual(asks["expect_no_tool"], ["set_cache_rule"])
+        for name in ("{chart_a}", "{chart_b}", "board id: {board}"):
+            self.assertIn(name, asks["context"])
+        one = cases["dash_this_chart_fresh_one_tile"]
+        self.assertIn("{chart_a}", one["context"])
+        self.assertNotIn("{chart_b}", one["context"])
+        self.assertEqual(one["expect_tool"]["args_contains"], {"chart": "{chart_a}", "rule": "fresh"})
+        self.assertNotIn("board", one["expect_tool"]["args_contains"])
 
     def test_every_write_case_confirms_and_checks_state_unless_it_tests_a_refusal_or_approval(self) -> None:
         # The plan's rule (step 2): a write case has `confirm` and `expect_state`,

@@ -294,6 +294,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| err.to_string())",
         "StoreError's Display is fixed text and is the LateSource contract",
     ),
+    // `BI-39` D6: the statement gate's own refusals (SEC-20's 404, D6's 422,
+    // the classified 503) are sentences written in this repository, and the
+    // alerts crate records one as a rule's skipped reason — never engine text.
+    (
+        "alerts.rs",
+        "GateRefusal::Refused(err.to_string())",
+        "StatementGate::check answers with our own fixed sentences, never an upstream payload",
+    ),
     // pipeline_source::SourceError: written in this repository.
     (
         "pipelines.rs",
@@ -381,6 +389,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "ai/tools/look.rs",
         "a formatting field has the wrong shape: ",
         "the same serde error over the model's own formatting arguments, in front of the field's name",
+    ),
+    // BI-26 slice 2 D4: `embed::check_filter_modes` returns an `ApiError` whose
+    // text the settings route writes itself (a column that is no filter, or a
+    // mode on a range filter). It is the route's sentence, not an upstream's.
+    (
+        "ai/tools/embed.rs",
+        "return json!({ \"error\": err.to_string() });",
+        "check_filter_modes' ApiError: the settings route's own fixed sentences, written in this repository",
     ),
 ];
 

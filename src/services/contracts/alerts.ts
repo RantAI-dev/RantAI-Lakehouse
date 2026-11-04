@@ -104,8 +104,21 @@ export type AlertRule = {
   filters?: unknown[]
   /** `above`, `below` or `any_rows` on a chart alert; absent on a legacy rule. */
   condition?: AlertCondition | string
-  /** The person the chart alert reads its data as. */
+  /**
+   * The person the rule reads its data as (`BI-39` D1: every threshold rule,
+   * chart or not). Absent on a rule saved before alerts had owners, which
+   * keeps the Dashboard Viewer role until it is saved again (`BI-39` D4).
+   */
   ownerId?: string
+  /**
+   * `BI-39` D8: the watched chart's title and its dashboard's id and name, read
+   * live when the list is answered. All three are absent together when the
+   * caller cannot see the chart any more (never stored, so a rename shows at
+   * once and a chart they lost access to stops naming itself).
+   */
+  chartTitle?: string
+  dashboardId?: string
+  dashboardTitle?: string
 }
 
 /** The conditions of a chart alert (`BI-19` D12). */

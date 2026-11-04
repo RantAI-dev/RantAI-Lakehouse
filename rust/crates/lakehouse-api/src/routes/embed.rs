@@ -587,6 +587,47 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
 /// locked or editable (`BI-26` review fix R3).
 const ONLY_VALUE_FILTERS: &str = "Only a filter that picks values can be locked or editable in an embed. Leave the others hidden.";
 
+/// The column and operator checks a set of filter modes must pass: every
+/// column is a saved filter of the dashboard, and only a filter that picks
+/// values (`in`) is made locked or editable (`BI-26` review fix R3). One
+/// function for the settings route and the assistant's
+/// `set_embed_filter_modes`, which must refuse the same calls before an
+/// approval exists (`BI-26` slice 2 D4, rule 4).
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] with the sentence the route answers.
+pub(crate) fn check_filter_modes(
+    board: &Board,
+    modes: &std::collections::BTreeMap<String, lakehouse_bi::embed_access::FilterMode>,
+) -> Result<(), ApiError> {
+    let known: std::collections::BTreeSet<&str> = board
+        .filters
+        .iter()
+        .flatten()
+        .map(|f| f.column.as_str())
+        .collect();
+    if modes.keys().any(|c| !known.contains(c.as_str())) {
+        return Err(ApiError::BadRequest(
+            "A mode can only be set for a filter the dashboard has.".to_owned(),
+        ));
+    }
+    let not_values: std::collections::BTreeSet<&str> = board
+        .filters
+        .iter()
+        .flatten()
+        .filter(|f| !f.op.is_in())
+        .map(|f| f.column.as_str())
+        .collect();
+    if modes.iter().any(|(column, mode)| {
+        *mode != lakehouse_bi::embed_access::FilterMode::Hidden
+            && not_values.contains(column.as_str())
+    }) {
+        return Err(ApiError::BadRequest(ONLY_VALUE_FILTERS.to_owned()));
+    }
+    Ok(())
+}
+
 /// `{ board, filterModes }` — the `PUT /api/dashboard/embed-settings` body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -628,38 +669,7 @@ pub async fn put_settings(
     // names and may see" (`public_links::managed_board`), not a second copy.
     let board =
         crate::routes::public_links::managed_board(&state, &principal, Some(&parsed.board)).await?;
-    let known: std::collections::BTreeSet<&str> = board
-        .filters
-        .iter()
-        .flatten()
-        .map(|f| f.column.as_str())
-        .collect();
-    if parsed
-        .filter_modes
-        .keys()
-        .any(|c| !known.contains(c.as_str()))
-    {
-        return Err(ApiError::BadRequest(
-            "A mode can only be set for a filter the dashboard has.".to_owned(),
-        )
-        .into());
-    }
-    // BI-26 review fix (SHOULD-FIX) R3: locked and editable work for a filter that
-    // picks values (`in`). A range, a relative date or a text match has no value a
-    // token can set or a dropdown can offer, so it can only be hidden.
-    let not_values: std::collections::BTreeSet<&str> = board
-        .filters
-        .iter()
-        .flatten()
-        .filter(|f| !f.op.is_in())
-        .map(|f| f.column.as_str())
-        .collect();
-    if parsed.filter_modes.iter().any(|(column, mode)| {
-        *mode != lakehouse_bi::embed_access::FilterMode::Hidden
-            && not_values.contains(column.as_str())
-    }) {
-        return Err(ApiError::BadRequest(ONLY_VALUE_FILTERS.to_owned()).into());
-    }
+    check_filter_modes(&board, &parsed.filter_modes)?;
     // The audit helper is the download audit's single writer; the action name
     // and the arguments make the record this change's own (BI-26 review NOTE).
     crate::routes::dashboard::record_download_audit(
