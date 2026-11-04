@@ -5,6 +5,7 @@ import { m, useMotionValueEvent, useTransform, type MotionValue } from "framer-m
 import type { HomeCopy } from "@/lib/copy";
 import { APPROVAL_TARGET, REGIONS } from "@/lib/home-content";
 import { useProgress } from "@/components/shared/progress-section";
+import { MascotMark } from "@/components/shared/mascot-svg";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
@@ -64,7 +65,7 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
         key={reduced ? "frame-reduced" : "frame-motion"}
         style={reduced ? { opacity: 1 } : { opacity: frame }}
       >
-        <div className="flex items-center justify-between border-b border-[#E8F4FF]/10 px-4 py-3">
+        <div className="flex items-center justify-between border-b border-[#E8F4FF]/10 px-4 py-2 md:py-3">
           <div className="flex items-center gap-1.5">
             <span className="size-2.5 rounded-full bg-[#E8F4FF]/20" />
             <span className="size-2.5 rounded-full bg-[#E8F4FF]/20" />
@@ -73,14 +74,15 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
           <p className="text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">{copy.caption}</p>
         </div>
 
-        <div className="space-y-3 px-4 py-4 md:space-y-4 md:px-5 md:py-5">
+        <div className="space-y-2 px-4 py-3 md:space-y-4 md:px-5 md:py-5">
           {/* Question one */}
           <TypedQuestion text={copy.userOne} beat={T.type1} progress={progress} reduced={reduced} />
 
           {/* Answer one: thinking, then the answer with its chart. Heights are reserved so nothing jumps. */}
-          <div className="relative min-h-[120px] md:min-h-[158px]">
+          <div className="relative min-h-[120px] pl-7 md:min-h-[158px] md:pl-9">
+            <GuideMark />
             <m.div
-              className="absolute top-0 left-0 flex h-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
+              className="absolute top-0 left-7 flex h-9 md:left-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
               key={reduced ? "think1-reduced" : "think1-motion"}
               style={reduced ? { opacity: 0 } : { opacity: think1 }}
             >
@@ -88,7 +90,7 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
             </m.div>
             <m.div
               data-reveal
-              className="max-w-[92%] rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-3.5 py-3 md:px-4"
+              className="rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-3.5 py-3 md:max-w-[92%] md:px-4"
               key={reduced ? "answer-reduced" : "answer-motion"}
               style={reduced ? { opacity: 1, y: 0 } : { opacity: answerO, y: answerY }}
             >
@@ -105,9 +107,10 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
           <TypedQuestion text={copy.userTwo} beat={T.type2} progress={progress} reduced={reduced} />
 
           {/* Answer two: thinking, then the approval card. */}
-          <div className="relative min-h-[92px] md:min-h-[104px]">
+          <div className="relative min-h-[92px] pl-7 md:min-h-[104px] md:pl-9">
+            <GuideMark />
             <m.div
-              className="absolute top-0 left-0 flex h-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
+              className="absolute top-0 left-7 flex h-9 md:left-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
               key={reduced ? "think2-reduced" : "think2-motion"}
               style={reduced ? { opacity: 0 } : { opacity: think2 }}
             >
@@ -173,6 +176,23 @@ function Bar({
         {label} {Math.round(value / 100) / 10}k
       </span>
     </div>
+  );
+}
+
+/**
+ * WEB-5 D14 S4, the guide: the assistant's side of the chat carries the
+ * creature's mark, the same character the visitor met at the surface and
+ * will see rise again at the end. Decorative, like the whole mock, which is
+ * `aria-hidden` and described in words for assistive tech.
+ */
+function GuideMark() {
+  return (
+    // Phones: a 20 px mark and a 28 px indent, with the answer at full width,
+    // so the text has the width it had before the mark (the pinned stage still
+    // fits 360x740).
+    <span className="absolute top-1 left-0 grid size-5 place-items-center rounded-full bg-[#44A6FA]/15 ring-1 ring-[#44A6FA]/35 md:size-7">
+      <MascotMark className="size-3.5 md:size-[18px]" />
+    </span>
   );
 }
 

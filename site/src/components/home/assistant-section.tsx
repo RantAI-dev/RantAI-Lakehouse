@@ -28,12 +28,15 @@ export function AssistantSection({ copy }: { copy: AssistantCopy }) {
     <ProgressSection range={["start start", "end end"]} id="assistant" className="lk-fallback-bg relative h-[260vh] bg-[#050A30] motion-reduce:h-auto">
       <div className="sticky top-0 flex h-[100svh] items-center overflow-hidden motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
         <Caustics />
-        <Container className="relative z-10 grid items-center gap-8 pt-16 md:grid-cols-[1fr_1.1fr] md:gap-14 md:pt-0">
+        {/* WEB-5 D14 S4: tighter phone spacing (gap-4, the lead at mt-3, and the
+            chat's own spacing in assistant-chat.tsx) so the pinned stage fits a
+            360x740 screen, where it overflowed by up to 45 px; desktop is unchanged. */}
+        <Container className="relative z-10 grid items-center gap-4 pt-16 md:grid-cols-[1fr_1.1fr] md:gap-14 md:pt-0">
           <div>
             <DisplayHeading size="lg" className="max-md:text-[clamp(2.6rem,12vw,3.4rem)]">
               <SplitWords text={copy.headline} />
             </DisplayHeading>
-            <LeadText className="mt-4 max-w-[32rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
+            <LeadText className="mt-3 max-w-[32rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
               {copy.sub}
             </LeadText>
           </div>
