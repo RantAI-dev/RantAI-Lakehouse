@@ -1,2 +1,8 @@
 [test]
 preload = ["./happydom.ts", "./testing-cleanup.ts"]
+# WEB-5 D11 (PR #379 review fix B1-B2, blocker 2): the Lakehouse site is its own
+# package with its own `bun test` (site/bunfig.toml). A positional `bun test src`
+# is a substring filter, so it also matched `site/src/...` and loaded the site's
+# tests without the site's node_modules. Ignored here so the console's run never
+# loads a file under site/.
+pathIgnorePatterns = ["site/**"]
