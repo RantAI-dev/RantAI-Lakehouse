@@ -135,7 +135,7 @@ import { useHomeLayout } from "./use-home-layout"
  * others flow in a grid of up to three columns.
  *
  * Removed on the way, so they are not re-added by accident (QA feedback
- * each time): an audit-log activity feed (raw audit text, and `/activity`
+ * each time): an audit-log activity feed (raw audit text, and `/audit`
  * exists) and a card per kind with two-line rows. Pipeline runs are not
  * merged into Recent: jobs on a 15-minute schedule would always be the
  * newest rows and bury the person's own work.
