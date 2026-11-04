@@ -9,6 +9,8 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-04
+
 ### Added
 
 - The assistant handles alerts, files and comments (backlog `BI-37`, assistant parity for `BI-19` parts C to E; plan `docs/superpowers/plans/2026-11-02-bi-37-assistant-alerts-files-comments.md`). It creates and changes a chart alert through the console's own save path, gives a chart as a PNG and a dashboard as a file, and reads a dashboard's comments with a new `list_dashboard_comments` tool. A person with no global dashboard permission can use a dashboard tool on a board they have access to. The live model run of the new standard cases was not run (no model key).
@@ -813,6 +815,7 @@ the CI/security work done to prepare the repository for its first release.
   line; enforced further by a `check-no-secrets.sh` CI script after a
   secret was leaked once during development.
 
-[Unreleased]: https://github.com/RantAI-dev/RantAI-Lakehouse/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/RantAI-dev/RantAI-Lakehouse/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/RantAI-dev/RantAI-Lakehouse/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/RantAI-dev/RantAI-Lakehouse/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/RantAI-dev/RantAI-Lakehouse/releases/tag/v0.1.0
