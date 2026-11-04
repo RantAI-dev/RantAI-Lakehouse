@@ -96,7 +96,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::upload_parquet::{self, GroupRange, ParquetFileError, ParquetInfo};
+use crate::upload_parquet::{self, GroupRange, ParquetFileError, ParquetFooter, ParquetInfo};
 use crate::upload_parquet_parts::{Part, PartsReader};
 use crate::upload_store::{UploadStore, UploadStoreError};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
@@ -533,6 +533,27 @@ pub enum Answer {
         /// Why.
         refusal: Refusal,
     },
+}
+
+/// What a Parquet answer holds: the footer's account of the file and, for the
+/// `inspect-parquet` operation, its first row group's range.
+///
+/// ONE reader of the child's answer (`SEC-55` D3), called by the upload path
+/// (`routes::uploads::parquet_of_answer`) and by an S3 connector's preview
+/// (`connector_listing::preview_s3`). Neither decodes a footer itself: a
+/// footer declares how much memory its reader will want, and that allocation
+/// ends the process that makes it (`SEC-22` P1).
+///
+/// `None` when the answer is not a Parquet one.
+#[must_use]
+pub(crate) fn parquet_footer_of_answer(answer: &Answer) -> Option<ParquetFooter> {
+    match answer {
+        Answer::Parquet { info, group } => Some(ParquetFooter {
+            info: info.clone(),
+            group: *group,
+        }),
+        Answer::Sheets { .. } | Answer::Sheet { .. } | Answer::Refusal { .. } => None,
+    }
 }
 
 /// The limits the child runs under.
