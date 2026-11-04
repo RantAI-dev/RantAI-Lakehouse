@@ -139,4 +139,58 @@ No Rust, Python or compose change is expected; if one happens, stop and report.
 
 ## 8. Handoff (developer appends below)
 
+### Handoff (slice 1) — developer, 2026-11-04
+
+Branch `feat/web-3-slice-1-remove-thin-pages`, one commit per task, pushed after each.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `3ecdd09d` | Pages, feature files, client methods and contract types removed (D1, D3) |
+| T2 | `8fc58d79` | Sidebar, approvals move, SSO into Settings, page context (D4, D6, D8, D9) |
+| T3 | `f80235bc` | Every remaining link moved (D5, D7) |
+| T4 | `983618ec` | User guide, feature page, support model, CHANGELOG (T4) |
+| — | the commit that adds this entry | This handoff |
+
+No Rust, Python or compose change; no `cargo` command was run. Slice 2 and 3 were not started.
+
+**T1 accept.** `bun run typecheck` clean. `bun run lint`: 0 errors, 10 warnings — all in files this slice did not touch (`use-copilot.ts`, `use-data-table.ts`, `dashboard-specs.ts`, `uploads.test.ts`, `http.ts`, chart builder). `git grep` for each removed export (`EmployeesPage`, `EmployeeDetailPage`, `RunsPage`, `ObservabilityPage`, `WorkloadsPage`, `ActivityPage`, `PolicyCreatePage`, `getEmployeeColumns`, `getRunColumns`, `getWorkloadColumns`, `getActivityColumns`, `WorkloadStatusBadge`, `ObservabilitySummary`, `WorkloadItem`, `CreateEmployeeInput`, `RunEmployeeInput`, `WorkloadStatus`, `WORKLOAD_STATUS_LABEL`): zero hits anywhere in `src`. The removed `AgentService`/`OpsService` method names have zero hits too; `listRuns` still exists on `PipelineService` (unrelated).
+
+**T2 accept.** `bun run typecheck` clean. `bun run test src/components/app-shell src/features/admin src/features/agents src/features/copilot` — Bun appended those paths to the script's own `bun test src` and ran the full suite: 3205 pass, 1 skip, 0 fail, 3206 tests, 327 files. The four paths were therefore not proven in isolation. There was no test for `preview`, `SHOW_PREVIEW`, `comingSoon` or the "Soon" rendering, so none was deleted.
+
+**T3 accept.** The line
+
+```
+git grep -nE "/agents/employees|\"/agents/runs\"|/observability|/workloads|\"/activity\"|/governance/policies/create|/admin/sso" -- src
+```
+
+prints:
+
+```
+src/app/(admin)/admin/settings/page.tsx:6:import { SsoPage } from "@/features/admin/sso-page"
+src/lib/status.ts:232: * /api/agents/employees/{id}/run`, copilot-operations-handover plan T3.2).
+src/services/clients/agents.ts:67:      `/api/agents/employees/${encodeURIComponent(id)}`,
+src/services/contracts/agents.ts:24:   * (`GET /api/agents/employees/{id}`), `null` on the LIST route (a list
+src/services/contracts/agents.ts:40:   * /api/agents/employees/{id}/run`) sends to the copilot. `null`/absent
+```
+
+The first is a false positive: the pattern matches the SSO component's own import path (`@/features/admin/sso-page`), which D6 says to reuse rather than rename. The other four are `/api/agents/employees/...` route paths (D2 keeps the backend routes). There is no UI link to a removed page left, and no redirect page contains its old path. `bun run test`: 3205 pass, 1 skip, 0 fail.
+
+**T4 accept (ci.yml "Repo lints").** `./rust/tests/parity/check-no-secrets.sh` — corpus clean. `check_bare_iceberg_count.py`, `check_intra_package_imports.py`, `check_compose_init_readiness.py`, `check_connector_gate_coverage.py` (19 supported types, 19 covered, 0 waived), `check_image_digests.py` (46 pinned, 8 exempt) — all OK. `unittest discover` over `ops/lint` 33 tests OK, `ops/gates` 29 OK, `ops/bench` 18 OK.
+
+**Section 4 block, final commit, foreground.**
+
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 10 pre-existing warnings (same list as T1).
+- `bun run test` — 3205 pass, 1 skip, 0 fail, 8720 expect() calls, 3206 tests, 327 files, 194.43 s.
+- `docker compose --profile '*' config --quiet` — exit 0, with throwaway `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY` **and `CONNECTOR_SECRETS_KEY`** (the last one is not in the SEC-18 note in `AGENTS.md`, but compose refuses without it). No `.env` was written.
+- `git status` — empty.
+
+**Not verified.**
+
+- No browser run. The two redirects (`/agents/approvals`, `/admin/sso`), the new Settings "Sign-in" section and the moved approvals page were checked by typecheck and unit tests only, not in a running console — that is the owner's acceptance checklist.
+- The assistant's page context for `/governance/approvals` has no test; `page-context.ts` has none today, and none was added (D9 asks for no tool change either).
+- The narrow T2 test paths were not proven in isolation (see above).
+
+**Test deletions.** No removed page had a test. No kept page's test asserted a removed link, so no test was updated. `sso-page.test.tsx` still covers the reused SSO component unchanged.
+
 ## 9. Review (planner appends below)
