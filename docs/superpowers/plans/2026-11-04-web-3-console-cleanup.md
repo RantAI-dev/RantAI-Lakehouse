@@ -112,13 +112,89 @@ git status
 ```
 No Rust, Python or compose change is expected; if one happens, stop and report.
 
-## 5. Slice 2 (outline; plan check before it starts)
+## 5. Slice 2 plan check (planner, 2026-11-04, on top of slice 1 `c3d37eeb`)
 
-- **Catalog and Data Explorer become one Catalog page** (both page through
-  `assetService.listAssetsPage`).
-- **System status**: Health, Services, Capacity, Ingestion (CDC) and the Table Maintenance
-  list on one page; CDC health also on its connector in Sources; maintenance status on the
-  table's Overview.
+**Builder: an Opus developer agent** (product owner, 2026-11-04: revamped, merged or new UI is
+built by Opus; `AGENTS.md` "Exception for console design work"). Same developer rules: no
+change of scope or decisions; a mismatch with the code is reported, not improvised. The
+branch is `feat/web-3-slice-2-catalog-and-system-status`, made from slice 1's branch; merge
+`origin/main` into it once slice 1 (#372) merges.
+
+### 5.1 What is wrong
+
+- **Catalog and Data Explorer are one list twice.** `src/features/catalog/catalog-page.tsx`
+  (216 lines) and `data-explorer-page.tsx` (385) both page through
+  `assetService.listAssetsPage`; Catalog only adds a namespace drawer that previews five
+  assets (`catalog-page.tsx:27`). A user has two places to find a table and the same row
+  actions in neither.
+- **"Is the system healthy?" is five read-only pages.** Health (`overview/overview-page.tsx`,
+  244), Services (`ops/services-page.tsx`, 148), Capacity (`lakehouse/capacity-page.tsx`, 87),
+  Ingestion (CDC) (`governance/ingestion-page.tsx`, 91) and Table Maintenance
+  (`governance/maintenance-page.tsx`, 107, with `lakehouse/iceberg-tables-section.tsx`). Health
+  already repeats parts of Services and Capacity as cards.
+
+### 5.2 Decisions
+
+- **S2-D1. One Catalog at `/catalog`.** Search, filters and the asset list in one page:
+  - the search and filters Data Explorer has (name, columns, tags, description, owner;
+    source/namespace, layer, certification), plus the namespace grouping Catalog has, as a
+    filter or a side list, not a drawer of five;
+  - every row action Data Explorer has today, and the row opens the asset page
+    (`/data/assets/[assetId]`, unchanged);
+  - the "supported: false" empty state Data Explorer shows is kept, honestly worded;
+  - `/data` becomes redirect-only to `/catalog` (keep query parameters that still mean
+    something, e.g. a search term; drop the rest).
+  - Sidebar "Data": Catalog, Query Studio, Sources.
+- **S2-D2. One System status page at `/health`** (page title and nav label "System status"):
+  sections, in this order, each from the API it uses today, no new endpoint:
+  1. a one-line overall state (every service up / which is not) and the open alerts count,
+     linking to Alerts;
+  2. **Services**: the probe table from `services-page.tsx` (a value the API does not return —
+     version, latency — shows "Not measured", never a blank or a made-up number);
+  3. **Storage**: capacity (the daily snapshot and ClickHouse disk) from `capacity-page.tsx`;
+  4. **Live change capture**: the replication-slot health from `ingestion-page.tsx`, shown
+     only when at least one CDC connector exists, otherwise one muted line;
+  5. **Table maintenance**: the latest maintenance runs from `maintenance-page.tsx`, each
+     linking to its table; the per-table policy stays on the table's page
+     (`lakehouse/table-detail-page.tsx`, unchanged);
+  6. the freshness strip and the query cards Health has today.
+  - `/services`, `/lakehouse/capacity`, `/governance/ingestion` and `/governance/maintenance`
+    become redirect-only to `/health#<section>`.
+  - The Iceberg table list (maintenance page's "Tables" tab) goes: each table is reached from
+    its asset page; if an Iceberg table has no asset page, say so in the handoff instead of
+    keeping the list.
+  - Sidebar "Monitoring" becomes: System status, Alerts, Audit Log.
+- **S2-D3. CDC health also on its connector.** A CDC connector's page in Sources
+  (`src/features/connectors/*` detail) shows its own slot's health from the same API, filtered
+  to that connector. One component, used by both places (rule 4).
+- **S2-D4. Design.** Use the existing `design-system/` components and `src/components/patterns`
+  (PageHeader, SectionCard, MetricCard, data table, EmptyState, StatusBadge). No new colour or
+  spacing tokens. A section that cannot load shows its own error with Retry; the rest of the
+  page still renders. Layout must work at 1280 px and on a phone width (the sidebar already
+  collapses).
+- **S2-D5. The assistant.** `copilot/page-context.ts`: `/catalog` and `/health` describe the
+  new pages; the removed paths go. No tool change, no `tool_schemas.json` change (if one seems
+  needed, stop and report).
+- **S2-D6. Nothing is deleted from the backend** (D2 of slice 1 holds).
+
+### 5.3 Tasks (one commit each; push after each)
+
+- **S2-T1. Catalog (S2-D1).** *Accept:* `bun run typecheck && bun run lint && bun run test src/features/catalog src/components/app-shell`.
+- **S2-T2. System status (S2-D2).** *Accept:* the same, for `src/features/overview src/features/ops src/features/lakehouse src/features/governance`.
+- **S2-T3. CDC on the connector (S2-D3).** *Accept:* the same, for `src/features/connectors`.
+- **S2-T4. Page context, docs, changelog (S2-D5).** User guide sections for the merged pages;
+  CHANGELOG `## [Unreleased]` → `### Changed`.
+- **S2-T5. Proof in a browser.** Run the console against a dev API (`docs/core/reference/user-guide.md`
+  or the repo's dev instructions) and take a screenshot of `/catalog` and `/health` at
+  1280 px and at 390 px; put them under `docs/plans/web-3-screens/` and list them in the
+  handoff. If no dev stack can be started, write *not verified* with the reason.
+
+### 5.4 Verification before handoff
+
+```bash
+bun run typecheck && bun run lint && bun run test
+git status
+```
 
 ## 6. Slice 3 (outline; plan check before it starts)
 
