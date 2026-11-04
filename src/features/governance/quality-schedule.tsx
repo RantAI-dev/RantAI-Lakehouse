@@ -39,6 +39,81 @@ export function scheduleSentence(
 }
 
 /**
+ * The control that changes one table's schedule: on a timer or on every
+ * load, and how often. Shared by the asset page's panel below and Data
+ * Quality's Schedules tab (`WEB-3` S3-D5), so both save the same way.
+ * It starts on what is saved; `onSaved` runs after the server took it.
+ */
+export function ScheduleControls({
+  asset,
+  current,
+  defaultInterval,
+  onSaved,
+}: {
+  asset: string
+  current: QualitySchedule | undefined
+  defaultInterval: number
+  onSaved: () => void
+}) {
+  const id = React.useId()
+  const [mode, setMode] = React.useState<"interval" | "on_load">(
+    current?.mode === "on_load" ? "on_load" : "interval"
+  )
+  const [minutes, setMinutes] = React.useState<number>(current?.intervalMinutes ?? defaultInterval)
+  const save = useServiceAction((signal, input: Parameters<typeof governanceService.setQualitySchedule>[1]) =>
+    governanceService.setQualitySchedule(asset, input, signal)
+  )
+  const choices = [...new Set<number>([...INTERVAL_CHOICES, minutes])].sort((a, b) => a - b)
+
+  async function submit() {
+    const saved = await save.run(
+      mode === "on_load"
+        ? { mode: "on_load", intervalMinutes: minutes }
+        : { mode: "interval", intervalMinutes: minutes }
+    )
+    if (saved === null) return
+    notifySuccess("Schedule saved")
+    onSaved()
+  }
+
+  return (
+    <div className="flex flex-wrap items-end gap-3">
+      <div className="grid gap-1">
+        <Label htmlFor={`${id}-mode`}>Run the checks</Label>
+        <select
+          id={`${id}-mode`}
+          className={selectClassName}
+          value={mode}
+          onChange={(e) => setMode(e.target.value as "interval" | "on_load")}
+        >
+          <option value="interval">On a timer</option>
+          <option value="on_load">On every load</option>
+        </select>
+      </div>
+      <div className="grid gap-1">
+        <Label htmlFor={`${id}-interval`}>{mode === "on_load" ? "And at least every" : "Every"}</Label>
+        <select
+          id={`${id}-interval`}
+          className={selectClassName}
+          value={minutes}
+          onChange={(e) => setMinutes(Number(e.target.value))}
+        >
+          {choices.map((m) => (
+            <option key={m} value={m}>
+              {intervalLabel(m)}
+            </option>
+          ))}
+        </select>
+      </div>
+      <Button size="sm" variant="outline" onClick={() => void submit()} disabled={save.status === "pending"}>
+        {save.status === "pending" ? "Saving…" : "Save schedule"}
+      </Button>
+      {save.error ? <p className="w-full text-destructive">{save.error.message}</p> : null}
+    </div>
+  )
+}
+
+/**
  * When a table's checks run, and whether its volume and freshness anomalies
  * are being raised yet (`DATA-14`, F3, F5 and F7). Anyone can read both; the
  * control to change the schedule needs `governance:write`.
@@ -59,33 +134,6 @@ export function QualitySchedulePanel({
       : undefined
   const defaultInterval = schedules.status === "success" ? schedules.data.defaultIntervalMinutes : 60
 
-  const [mode, setMode] = React.useState<"interval" | "on_load">("interval")
-  const [minutes, setMinutes] = React.useState<number>(defaultInterval)
-  const [seeded, setSeeded] = React.useState(false)
-  // Start the control on what is saved, once it has loaded.
-  React.useEffect(() => {
-    if (schedules.status !== "success" || seeded) return
-    setMode(current?.mode === "on_load" ? "on_load" : "interval")
-    setMinutes(current?.intervalMinutes ?? defaultInterval)
-    setSeeded(true)
-  }, [schedules.status, seeded, current, defaultInterval])
-
-  const save = useServiceAction((signal, input: Parameters<typeof governanceService.setQualitySchedule>[1]) =>
-    governanceService.setQualitySchedule(asset, input, signal)
-  )
-  const choices = [...new Set<number>([...INTERVAL_CHOICES, minutes])].sort((a, b) => a - b)
-
-  async function submit() {
-    const saved = await save.run(
-      mode === "on_load"
-        ? { mode: "on_load", intervalMinutes: minutes }
-        : { mode: "interval", intervalMinutes: minutes }
-    )
-    if (saved === null) return
-    notifySuccess("Schedule saved")
-    schedules.reload()
-  }
-
   return (
     <div className="mb-3 grid gap-2 rounded-lg border border-border px-3 py-2 text-sm">
       <div>
@@ -101,41 +149,13 @@ export function QualitySchedulePanel({
         )}
       </div>
       {canWrite && schedules.status === "success" ? (
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="grid gap-1">
-            <Label htmlFor="schedule-mode">Run the checks</Label>
-            <select
-              id="schedule-mode"
-              className={selectClassName}
-              value={mode}
-              onChange={(e) => setMode(e.target.value as "interval" | "on_load")}
-            >
-              <option value="interval">On a timer</option>
-              <option value="on_load">On every load</option>
-            </select>
-          </div>
-          <div className="grid gap-1">
-            <Label htmlFor="schedule-interval">
-              {mode === "on_load" ? "And at least every" : "Every"}
-            </Label>
-            <select
-              id="schedule-interval"
-              className={selectClassName}
-              value={minutes}
-              onChange={(e) => setMinutes(Number(e.target.value))}
-            >
-              {choices.map((m) => (
-                <option key={m} value={m}>
-                  {intervalLabel(m)}
-                </option>
-              ))}
-            </select>
-          </div>
-          <Button size="sm" variant="outline" onClick={() => void submit()} disabled={save.status === "pending"}>
-            {save.status === "pending" ? "Saving…" : "Save schedule"}
-          </Button>
-          {save.error ? <p className="w-full text-destructive">{save.error.message}</p> : null}
-        </div>
+        // Mounted once the schedule has loaded, so it starts on what is saved.
+        <ScheduleControls
+          asset={asset}
+          current={current}
+          defaultInterval={defaultInterval}
+          onSaved={schedules.reload}
+        />
       ) : null}
       <div>
         <span className="font-medium">Anomaly detection: </span>
