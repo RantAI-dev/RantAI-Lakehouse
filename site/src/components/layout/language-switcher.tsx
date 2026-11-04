@@ -51,7 +51,10 @@ export function LanguageSwitcher({
             hrefLang={l}
             lang={l}
             aria-current={current ? "true" : undefined}
-            aria-label={current ? text[l] : text.switchTo.replace("{language}", text[l])}
+            // WEB-5 review fix R2 (WCAG 2.5.3, label in name): the accessible name
+            // starts with the visible "EN"/"ID", so a voice command that says what
+            // the link shows still finds it.
+            aria-label={`${text.short[l]}: ${current ? text[l] : text.switchTo.replace("{language}", text[l])}`}
             onClick={() => {
               try {
                 localStorage.setItem(LOCALE_CHOICE_KEY, l);
