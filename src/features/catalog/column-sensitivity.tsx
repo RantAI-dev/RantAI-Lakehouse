@@ -22,7 +22,7 @@ type PolicySummary = AssetDetail["policySummary"][number]
 const selectClassName = "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 /** Least to most restrictive, as the Access tab offered them. */
-const LEVELS: Classification[] = ["public", "internal", "confidential", "restricted"]
+export const SENSITIVITY_LEVELS: Classification[] = ["public", "internal", "confidential", "restricted"]
 
 /** A row of the section: a label on the left, what it says and its controls beside it. */
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -101,7 +101,13 @@ export function ColumnSensitivity({
   )
 }
 
-function SensitivityControls({
+/**
+ * Set / Change / Remove for one classification rule: a column's, or, with no
+ * `column`, the whole table's (`WEB-3` S3-T5a, review round 1 decision 1:
+ * the table-level control moved to the About card, with the same calls and
+ * no column). `level` is the level that rule gives, not the header's.
+ */
+export function SensitivityControls({
   asset: a,
   column,
   level,
@@ -109,14 +115,19 @@ function SensitivityControls({
   onChanged,
 }: {
   asset: AssetDetail
-  column: string
+  /** Absent for the table-level rule. */
+  column?: string
   level: Classification | undefined
   canWrite: boolean
   onChanged: () => void
 }) {
-  // The rule in force for this column; an older API build sends no rules, and
-  // then the level is shown without a Change or Remove that could not work.
+  // The rule in force for this column (or, with no column, for the table:
+  // the API sends a table rule without a `column` key). An older API build
+  // sends no rules, and then the level is shown without a Change or Remove
+  // that could not work.
   const rule = (a.classificationRules ?? []).find((r) => r.column === column)
+  const what = column ? `column ${column}` : "the whole table"
+  const fieldId = column ? `sensitivity-${column}` : "sensitivity-table"
   const [editing, setEditing] = React.useState(false)
   const [choice, setChoice] = React.useState<Classification>(level ?? "confidential")
   const [removing, setRemoving] = React.useState(false)
@@ -133,7 +144,7 @@ function SensitivityControls({
       setOldRemoved(true)
     }
     return governanceService.createClassificationRule(
-      { asset: lineageKey(a), column, classification: next },
+      { asset: lineageKey(a), ...(column ? { column } : {}), classification: next },
       signal
     )
   })
@@ -151,7 +162,11 @@ function SensitivityControls({
       if (rule) onChanged()
       return
     }
-    notifySuccess(`Column ${column} is ${CLASSIFICATION_LABEL[choice]}`)
+    notifySuccess(
+      column
+        ? `Column ${column} is ${CLASSIFICATION_LABEL[choice]}`
+        : `${a.name} as a whole is ${CLASSIFICATION_LABEL[choice]}`
+    )
     setEditing(false)
     onChanged()
   }
@@ -171,7 +186,9 @@ function SensitivityControls({
           <ClassificationBadge classification={level} />
         ) : (
           <span className="text-muted-foreground">
-            Not set for this column. The table as a whole is {CLASSIFICATION_LABEL[a.classification]}.
+            {column
+              ? `Not set for this column. The table as a whole is ${CLASSIFICATION_LABEL[a.classification]}.`
+              : "Not set for the whole table."}
           </span>
         )}
         {canWrite && !editing ? (
@@ -200,16 +217,16 @@ function SensitivityControls({
       {editing ? (
         <div className="flex flex-wrap items-end gap-2">
           <div className="grid gap-1">
-            <Label htmlFor={`sensitivity-${column}`} className="text-xs">
-              Sensitivity of {column}
+            <Label htmlFor={fieldId} className="text-xs">
+              Sensitivity of {column ?? "the whole table"}
             </Label>
             <select
-              id={`sensitivity-${column}`}
+              id={fieldId}
               className={selectClassName}
               value={choice}
               onChange={(e) => setChoice(e.target.value as Classification)}
             >
-              {LEVELS.map((l) => (
+              {SENSITIVITY_LEVELS.map((l) => (
                 <option key={l} value={l}>
                   {CLASSIFICATION_LABEL[l]}
                 </option>
@@ -234,7 +251,7 @@ function SensitivityControls({
       {save.error ? (
         <p className="text-sm text-destructive">
           {oldRemoved
-            ? `The new level was not saved: ${save.error.message} The old level was already removed, so the column shows what is stored now.`
+            ? `The new level was not saved: ${save.error.message} The old level was already removed, so ${column ? "the column" : "the table"} shows what is stored now.`
             : `The level was not saved: ${save.error.message}`}
         </p>
       ) : null}
@@ -242,8 +259,12 @@ function SensitivityControls({
         open={removing}
         onOpenChange={(open) => (open ? undefined : setRemoving(false))}
         title="Remove classification"
-        description={`Remove the ${level ? CLASSIFICATION_LABEL[level] : ""} classification of column ${column}?`}
-        impact="An older rule for the column applies again if there is one. Otherwise the column has no level of its own."
+        description={`Remove the ${level ? CLASSIFICATION_LABEL[level] : ""} classification of ${what}?`}
+        impact={
+          column
+            ? "An older rule for the column applies again if there is one. Otherwise the column has no level of its own."
+            : "An older rule for the table applies again if there is one. Otherwise the table takes its most restrictive column's level, or the default."
+        }
         confirmLabel="Remove"
         confirming={remove.status === "pending"}
         destructive

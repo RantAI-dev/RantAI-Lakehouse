@@ -1044,6 +1044,136 @@ describe("About card", () => {
   })
 })
 
+// WEB-3 S3-T5a (slice 3b review round 1, decision 1): S3-D2 removed the
+// Access tab's Classify dialog, which was the only way to classify the whole
+// table. It moves to the About card, with the same calls and no column.
+describe("About card: sensitivity of the whole table (WEB-3 S3-T5a)", () => {
+  function tableSection() {
+    return screen.getByRole("region", { name: "Sensitivity (whole table)" })
+  }
+
+  it("sets the whole table's sensitivity with a rule for the table key and no column, then reloads", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    renderTabs(BRONZE, reloaded)
+    const section = tableSection()
+    expect(within(section).getByText("Not set for the whole table.")).toBeTruthy()
+    fireEvent.click(await within(section).findByRole("button", { name: "Set" }))
+    fireEvent.change(within(section).getByLabelText("Sensitivity of the whole table"), { target: { value: "internal" } })
+    fireEvent.click(within(section).getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      ["POST", "/api/governance/classification", { asset: "bronze.demo_orders", classification: "internal" }],
+    ])
+  })
+
+  it("changes the table rule by removing it, then adding the new one, and leaves column rules alone", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    renderTabs(
+      {
+        ...BRONZE,
+        classification: "confidential",
+        classificationSource: "rule",
+        classificationRules: [
+          { id: "rule-amount", column: "amount", classification: "public" },
+          { id: "rule-asset", classification: "confidential" },
+        ],
+      },
+      reloaded
+    )
+    const section = tableSection()
+    fireEvent.click(await within(section).findByRole("button", { name: "Change" }))
+    fireEvent.change(within(section).getByLabelText("Sensitivity of the whole table"), { target: { value: "restricted" } })
+    fireEvent.click(within(section).getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      ["DELETE", "/api/governance/classification/rule-asset", undefined],
+      ["POST", "/api/governance/classification", { asset: "bronze.demo_orders", classification: "restricted" }],
+    ])
+  })
+
+  it("removes the table rule after saying what applies instead", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    renderTabs(
+      {
+        ...BRONZE,
+        classification: "confidential",
+        classificationSource: "rule",
+        classificationRules: [{ id: "rule-asset", classification: "confidential" }],
+      },
+      reloaded
+    )
+    fireEvent.click(await within(tableSection()).findByRole("button", { name: "Remove" }))
+    expect(screen.getByText("Remove the Confidential classification of the whole table?")).toBeTruthy()
+    expect(screen.getByText(/Otherwise the table takes its most restrictive column's level, or the default/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([["DELETE", "/api/governance/classification/rule-asset", undefined]])
+  })
+
+  it("says in one line why the header is stricter than the table rule", async () => {
+    stubApi()
+    renderTabs({
+      ...BRONZE,
+      classification: "restricted",
+      classificationSource: "rule",
+      schema: [
+        { name: "amount", dataType: "Decimal(12, 2)", classification: "restricted" },
+        { name: "id", dataType: "Int64" },
+      ],
+      classificationRules: [
+        { id: "rule-asset", classification: "public" },
+        { id: "rule-amount", column: "amount", classification: "restricted" },
+      ],
+    })
+    const section = tableSection()
+    expect(within(section).getByText("Public")).toBeTruthy()
+    expect(
+      within(section).getByText(
+        "The header shows Restricted because column amount is Restricted: a table is never less restrictive than its most restrictive column."
+      )
+    ).toBeTruthy()
+  })
+
+  it("adds no line when the table rule is the strictest level", async () => {
+    stubApi()
+    renderTabs({
+      ...BRONZE,
+      classification: "restricted",
+      classificationSource: "rule",
+      schema: [
+        { name: "amount", dataType: "Decimal(12, 2)", classification: "restricted" },
+        { name: "id", dataType: "Int64" },
+      ],
+      classificationRules: [
+        { id: "rule-asset", classification: "restricted" },
+        { id: "rule-amount", column: "amount", classification: "restricted" },
+      ],
+    })
+    expect(within(tableSection()).queryByText(/The header shows/)).toBeNull()
+  })
+
+  it("shows the level without the buttons without governance:write", async () => {
+    stubApi({ permissions: ["catalog:read", "catalog:write"] })
+    renderTabs({
+      ...BRONZE,
+      classification: "confidential",
+      classificationSource: "rule",
+      classificationRules: [{ id: "rule-asset", classification: "confidential" }],
+    })
+    // Edit needs catalog:write, so its appearing proves the session loaded.
+    await screen.findByText("Edit")
+    const section = tableSection()
+    expect(within(section).getByText("Confidential")).toBeTruthy()
+    expect(within(section).queryByRole("button")).toBeNull()
+  })
+})
+
 describe("Health and classification", () => {
   it("says what the health rests on, signal by signal", async () => {
     stubApi()
