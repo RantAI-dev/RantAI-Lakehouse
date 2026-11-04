@@ -451,3 +451,59 @@ The planner opens it.
 - Evidence screenshots: `docs/plans/web-5-screens/`, 7 files (T3 before/after ×2, T5 three modes, T7 `/id/` ×2).
 
 ## 8. Review (planner appends)
+
+### Review 1: planner, 2026-11-04, at `e78fa90b`
+
+**Re-run by the reviewer** (rule 7; site from a clean `git archive` of `e78fa90b` into a scratch
+folder, fresh `bun install --frozen-lockfile`):
+
+- site: lint exit 0; typecheck exit 0; `bun run test` 45 pass, 0 fail; build exit 0;
+  `bun run size` exit 1 (209.0 KB on both pages; noModule 39.6 KB listed; scene 146.8 KB in one
+  deferred chunk); a build without `NEXT_PUBLIC_SITE_URL` stops with the `SiteUrlError` message;
+  `out/index.html` is `lang="en"`, `out/id/index.html` is `lang="id"`, no `out/en/`.
+- `python3 ops/release/test_release_workflow.py`: 118 tests OK.
+- `scripts/ci/tests/test_detect_change_scope.sh`: 40 passed; `test_required_gate.sh`: 62 passed.
+- Every claim in `claims.ts` checked against `BACKLOG.md`: each cited row has the status it says
+  (Released or In Acceptance; `BI-16` Building, cited only for "your own map boundaries"). None of
+  the "do not add" items appear. `README.md#quickstart` and the user guide path exist.
+- `src/proxy.ts` has no session redirect, so `/landing` stays a server-side 404 after it leaves
+  `PUBLIC_PREFIXES`, and release.yml's install proof still holds.
+
+**Findings:**
+
+- **R1 BLOCKER: the initial JS is 209.0 KB against 200 KB, so the CI site job is red** and the PR
+  would add a failing check (AGENTS.md step 6). A cut without a design change exists that the
+  handoff does not list: motion's async `LazyMotion`,
+  `features={() => import("./dom-animation").then((r) => r.default)}`, which moves the
+  `domAnimation` feature bundle out of the first load. (In the build, chunk `3_fhy…`, 30.9 KB,
+  holds motion's animation code.) Conditions:
+  - the hero `h1` and the CTAs must not wait on the features chunk (LCP);
+  - if the features chunk never loads, revealed content must still become visible. `Reveal`
+    starts at `opacity: 0` once `js` is set, so a failed chunk must not leave the page blank:
+    a CSS fallback, or the `js` class added only once the features have loaded;
+  - the T5 screenshots (no-JS, no-WebGL, reduced motion) are re-taken and unchanged.
+
+  If the page is still over 200 KB after that, the RESULT file records the new number and the
+  owner decides. The budget is not changed in the PR.
+- **R2 SHOULD-FIX: label in name (WCAG 2.5.3) on the EN/ID links.** The fix is known and small;
+  apply it rather than record it. The accessible name must contain the visible "EN"/"ID".
+- **R3 SHOULD-FIX: `codeRepository` is not a `SoftwareApplication` property** in schema.org (it
+  belongs to `SoftwareSourceCode`), so validators warn. Either drop it or add a
+  `SoftwareSourceCode` node with `codeRepository` and `targetProduct` pointing at the
+  application's `@id`. Update `structured-data.test.ts`.
+- **R4 SHOULD-FIX: at 360×740 the sources headline is clipped under the top bar.** 360 px is the
+  most common Android width, so this is in the audience, not an edge case. Fix it with spacing
+  only (D6), and add a CDP screenshot at 360×740, EN and ID.
+
+**Confirmed (no change):**
+- the routing shape (`app/(en)` plus `app/[locale]` with only `id`);
+- plain-href language links and no next-intl navigation or client provider;
+- OG cards as build-time route handlers;
+- Query Studio as the last sentence of the assistant lead;
+- 19 source pills;
+- the dependencies beyond D1, which the moved code needs;
+- the manifest name.
+
+**TBT:** not a finding yet. The VM's load (11–14) makes single runs swing 206–1642 ms. The
+reviewer's Lighthouse run happens on the commit that closes R1, which also shrinks what is
+hydrated, and is recorded under "Reviewer's run" in the RESULT file.
