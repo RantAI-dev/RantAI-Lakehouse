@@ -844,6 +844,89 @@ re-taken).
     was not touched;
   - `git status` is clean.
 
+### Handoff 7: developer (Opus), 2026-11-04, review 5 (R8–R10)
+
+**Commits** (one per finding, in order, each cited at its fix site):
+
+| Commit | Finding | What changed |
+| --- | --- | --- |
+| `fec50461` | R8 (BLOCKER) | The left-edge scale starts at 1360 px instead of `md`. The hairline is used below that. |
+| `55396a17` | R9 (SHOULD-FIX) | `journeyFromBoxes` (pure, `lib/depth-journey.ts`) and `measureJourney` (`lib/measure-journey.ts`) are shared by the gauge and the water. The hero hold is the `holdSurfaceThroughHero` parameter. |
+| `7edae5e8` | R10 (SHOULD-FIX) | `scene-mode.tsx` measures the first section on screen before and after writing `data-scene`, and `scrollBy`s the difference. |
+
+**R8, measured** with `gaugeclear.ts` (CDP, built export on :3460). The gap
+is from the marker's and reading's right edge to the first visible text in
+each section:
+
+| Width | Assistant | Dashboards | Governance | Open |
+| --- | --- | --- | --- | --- |
+| 768, 1024, 1280, 1359 | hairline, nothing at the left | hairline | hairline | hairline |
+| 1360 | 37 px ("−100 m", the widest reading) | 45 px | 45 px | 45 px |
+| 1440 | 77 px | 85 px | 85 px | 85 px |
+
+- At 1320 the gap was 24 px only with a shorter reading, so 1360 is the
+  first width that clears 24 px for every reading.
+- Screenshots: `docs/plans/web-5-screens/r8-gauge-w1024.jpg` and
+  `r8-gauge-w1280.jpg`, every chapter, EN over ID.
+- The hairline readings match the storyboard in both languages:
+  0, −5, −10 / −40 / −90, −100, −96, −45, −13, 0.
+
+**R9, no change in behaviour.**
+- Four new tests cover the pure part:
+  - anchors from boxes, with depths and climb;
+  - the hold adds exactly one anchor;
+  - missing sections;
+  - the one-pixel pin floor.
+- `journeydump.ts` read these every 0.1 screen down the page, at 1280×800:
+  - the gauge's `--lk-gauge-f`, reading and `data-in-depths`;
+  - the water's four CSS variables.
+- The output is byte-identical between `fec50461` and `55396a17`, with and
+  without reduced motion (150 and 82 positions).
+- Scene "none" only: this VM has no GPU. The hold in the live mode is
+  covered by the unit test, *not verified* in a browser.
+
+**R10, the probe** (`r10probe.ts`):
+- Setup: `next dev` with the dev-only WebGL override, on SwiftShader
+  Chrome, at 1280×800.
+- `#governance` is held at y 64 until the mode leaves "pending".
+- "full" then grows the hero from 1200 to 1760 px.
+
+| Scroll anchoring | R10 | `scrollBy` | `#governance` top after | scrollY |
+| --- | --- | --- | --- | --- |
+| on | on | not called (difference 0) | 64 | 9308 → 9868 |
+| off (`overflow-anchor: none` on html) | on | once, +560 | 64 | 9308 → 9868 |
+| off | stubbed (control) | none | 624 | 9308 |
+
+**Checks** on `7edae5e8`, the final code (this handoff is docs only),
+run with `site-checks.sh` from a clean `.next`/`out`:
+- `bun run lint` 0
+- `bun run typecheck` 0
+- `bun run test`: 65 pass, 0 fail
+- build 0
+- `bun run size` 0: 181.3 KB of 200 KB
+- The dev flag's name is absent from `out/` (check-bundle).
+- Lighthouse was not re-run, as asked.
+
+**Not verified, and limits:**
+- **R10 in other browsers:** not run in Safari or Firefox; this VM has only
+  Chrome.
+- **Observed, not changed (outside R10, for the reviewer to triage):** a
+  deep link to `/#governance` lands about 1052 px short, in both the export
+  and dev.
+  - Sequence: the hash scroll is smooth (`scroll-behavior: smooth` on
+    html), and while it runs, hydration grows `#dashboards` from 800 to
+    1852 px (its rail).
+  - The scroll ends at the old target, with `#governance`'s top at 1116
+    instead of 64.
+  - This is not the scene write. The R10 correction runs later and keeps
+    whatever is on screen then.
+- **Process:**
+  - `next dev` wrote `site/AGENTS.md`; I removed it, and it was never
+    committed;
+  - my servers on :3460, :3461, :9555 and :9556 are stopped, and :3400
+    was not touched;
+  - `git status` is clean.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
