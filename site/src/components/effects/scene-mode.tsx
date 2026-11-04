@@ -62,6 +62,56 @@ function subscribeWebgl(onChange: () => void): () => void {
   };
 }
 
+/**
+ * WEB-5 review fix R11 (SHOULD-FIX): a deep link (`/#governance`) used to
+ * land about a screen short. The browser scrolls to the hash smoothly
+ * (`html` has `scroll-behavior: smooth`) while hydration is still growing
+ * the dashboards section from one screen to its measured travel, and the
+ * smooth scroll ends at its old target. It predates D14 (the R7 build does
+ * the same).
+ *
+ * The fix lands on the hash once more after the page has settled, rather
+ * than giving the dashboards their final height before hydration. That
+ * height is measured from the tiles and the fonts (dashboards-scroller.tsx),
+ * so a server-side copy would be a second formula to keep in step, and
+ * without JavaScript it would add a screen of pinned scroll with a rail
+ * that never slides. Landing once after the settle also covers the other
+ * late change, the live hero's extra 70 vh (R10).
+ *
+ * "Settled" is the first mode other than `pending` (after `load` and an
+ * idle period, `afterPaint`), once the fonts are in, one frame later. The
+ * scroll happens only if the hash names a `section` and the visitor has not
+ * scrolled, touched, pressed a key or clicked since hydration, so nobody
+ * who has started moving is moved. It runs once per page load.
+ */
+const VISITOR_INPUT = ["wheel", "touchstart", "keydown", "pointerdown"] as const;
+let visitorMoved = false;
+let watchingVisitor = false;
+let landedOnHash = false;
+function watchVisitor(): void {
+  if (watchingVisitor) return;
+  watchingVisitor = true;
+  const moved = () => {
+    visitorMoved = true;
+    for (const type of VISITOR_INPUT) window.removeEventListener(type, moved, true);
+  };
+  for (const type of VISITOR_INPUT) window.addEventListener(type, moved, { capture: true, passive: true });
+}
+function landOnHash(): void {
+  if (landedOnHash) return;
+  landedOnHash = true;
+  const id = decodeURIComponent(window.location.hash.slice(1));
+  if (!id) return;
+  const target = document.getElementById(id);
+  if (!target || target.tagName !== "SECTION") return;
+  void document.fonts.ready.then(() =>
+    requestAnimationFrame(() => {
+      // `scroll-mt-*` on the section keeps it clear of the fixed top bar.
+      if (!visitorMoved) target.scrollIntoView({ behavior: "instant", block: "start" });
+    }),
+  );
+}
+
 export function LandingModeProvider({ children }: { children: React.ReactNode }) {
   // Both reads are client-only; `useSyncExternalStore` gives the server and the
   // first hydration pass the neutral value and then switches, with no
@@ -106,6 +156,13 @@ export function LandingModeProvider({ children }: { children: React.ReactNode })
     if (!anchor || before === undefined) return;
     const moved = anchor.getBoundingClientRect().top - before;
     if (Math.abs(moved) >= 1) window.scrollBy({ top: moved, behavior: "instant" });
+  }, [mode]);
+
+  // R11: watch for the visitor's own scrolling from hydration on, and land
+  // on a deep link's section once the mode has settled (see `landOnHash`).
+  React.useEffect(watchVisitor, []);
+  React.useEffect(() => {
+    if (mode !== "pending") landOnHash();
   }, [mode]);
 
   const value = React.useMemo<LandingModeValue>(
