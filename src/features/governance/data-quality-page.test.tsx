@@ -27,6 +27,7 @@ afterEach(() => {
   cleanup()
   mock.restore()
   search = new URLSearchParams()
+  resetAnswer = () => new Response(null, { status: 204 })
 })
 
 const json = (body: unknown, status = 200) =>
@@ -34,6 +35,8 @@ const json = (body: unknown, status = 200) =>
 
 /** The `[method, path, body]` of every write the page sent to the stub. */
 let writesSeen: unknown[][] = []
+/** How the stub answers a schedule reset; a test may swap it for a failure. */
+let resetAnswer: () => Response = () => new Response(null, { status: 204 })
 
 /** Answers the session with `permissions`; resolves `sessionRead` once it has. */
 function stubApi(
@@ -71,6 +74,11 @@ function stubApi(
     if (path.includes("/api/governance/quality/") && path.endsWith("/runs")) return json({ runs })
     // WEB-3 S3-D5: the Schedules and Freshness targets tabs.
     if (path.includes("/api/governance/quality/schedules/")) {
+      // S3a-D3: Reset is a DELETE with no body, answered 204.
+      if (init?.method === "DELETE") {
+        writesSeen.push(["DELETE", path])
+        return resetAnswer()
+      }
       const body = JSON.parse(String(init?.body))
       writesSeen.push([init?.method, path, body])
       return json({ asset: "silver.orders", updatedBy: "u1", updatedAt: "2026-11-04T00:00:00.000Z", ...body })
@@ -299,13 +307,39 @@ describe("DataQualityPage: Schedules tab (WEB-3 S3-D5)", () => {
     ])
   })
 
-  it("offers no Edit without governance:write", async () => {
+  it("offers no Edit or Reset without governance:write", async () => {
     search = new URLSearchParams("tab=schedules")
     const done = stubApi(["catalog:read"], { schedules: [schedule({})] })
     renderPage()
     await sessionSettled(done)
     expect(await screen.findByText("Every 3 hours.")).toBeTruthy()
     expect(screen.queryByRole("button", { name: /Edit the schedule/ })).toBeNull()
+    expect(screen.queryByRole("button", { name: /Reset the schedule/ })).toBeNull()
+  })
+
+  it("resets a schedule to the default after confirming (S3a-D3)", async () => {
+    search = new URLSearchParams("tab=schedules")
+    stubApi(["governance:write"], { schedules: [schedule({})] })
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Reset the schedule of silver.orders" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText(/Its checks then run every 1 hour/)).toBeTruthy()
+    expect(writesSeen).toEqual([])
+    fireEvent.click(within(dialog).getByRole("button", { name: "Reset" }))
+    await waitFor(() => expect(writesSeen).toEqual([["DELETE", "/api/governance/quality/schedules/silver.orders"]]))
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
+  })
+
+  it("keeps the dialog open with the API's sentence when a reset fails", async () => {
+    search = new URLSearchParams("tab=schedules")
+    resetAnswer = () => json({ error: "You need governance:write to change a schedule." }, 403)
+    stubApi(["governance:write"], { schedules: [schedule({})] })
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Reset the schedule of silver.orders" }))
+    const dialog = await screen.findByRole("dialog")
+    fireEvent.click(within(dialog).getByRole("button", { name: "Reset" }))
+    expect(await within(dialog).findByRole("alert")).toBeTruthy()
+    expect(within(dialog).getByText("You need governance:write to change a schedule.")).toBeTruthy()
   })
 })
 

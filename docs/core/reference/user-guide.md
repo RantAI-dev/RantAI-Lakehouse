@@ -468,7 +468,8 @@ check opens an incident, listed under **Open incidents**, with
 Two more tabs show what each table's page sets, for every table at once:
 
 - **Schedules**: the tables whose checks run on their own schedule, with
-  **Edit**. Any other table runs its checks every hour.
+  **Edit** and **Reset**. **Reset** puts the table back on the default and
+  takes it off the list. Any other table runs its checks every hour.
 - **Freshness targets**: how often each table must get new data, with
   **Add target**, **Edit** and **Remove**. Past its target a table reads
   as late.
