@@ -2229,6 +2229,20 @@ mod tests {
         );
     }
 
+    /// The third unparseable shape: JSON-looking but truncated. The engine's
+    /// parser gives up rather than guessing, so no table is named and no
+    /// asset id is invented from a substring.
+    #[test]
+    fn malformed_conditions_name_no_asset() {
+        for conditions in [
+            r#"{"roles":["Analyst"],"table":"serving.mart_customer","#,
+            r#"{"roles":["Analyst"],"table":}"#,
+            "{",
+        ] {
+            assert_eq!(PolicyAsset::of(Some(conditions)), None, "{conditions}");
+        }
+    }
+
     #[test]
     fn a_condition_with_no_obligation_names_no_asset() {
         // JSON-shaped, but the engine would enforce nothing from it, so the
