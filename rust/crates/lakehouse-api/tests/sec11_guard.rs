@@ -294,6 +294,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| err.to_string())",
         "StoreError's Display is fixed text and is the LateSource contract",
     ),
+    // `BI-39` D6: the statement gate's own refusals (SEC-20's 404, D6's 422,
+    // the classified 503) are sentences written in this repository, and the
+    // alerts crate records one as a rule's skipped reason — never engine text.
+    (
+        "alerts.rs",
+        "GateRefusal::Refused(err.to_string())",
+        "StatementGate::check answers with our own fixed sentences, never an upstream payload",
+    ),
     // pipeline_source::SourceError: written in this repository.
     (
         "pipelines.rs",
