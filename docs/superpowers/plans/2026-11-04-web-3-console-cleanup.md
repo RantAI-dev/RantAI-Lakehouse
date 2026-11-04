@@ -269,4 +269,121 @@ The first is a false positive: the pattern matches the SSO component's own impor
 
 **Test deletions.** No removed page had a test. No kept page's test asserted a removed link, so no test was updated. `sso-page.test.tsx` still covers the reused SSO component unchanged.
 
+### Handoff (slice 2) — developer (Opus), 2026-11-04
+
+Branch `feat/web-3-slice-2-catalog-and-system-status` on top of slice 1 (`2ef32ef4`), one
+commit per task, pushed after each. `origin/main` was not merged in (#372 not merged yet).
+
+| Task | Commit | What |
+| --- | --- | --- |
+| S2-T1 | `495efab1` | One Catalog at `/catalog`; `/data` redirect; sidebar Data; links (S2-D1) |
+| S2-T2 | `ebcac6e4` | System status at `/health`; four redirects; Iceberg list gone; sidebar Monitoring (S2-D2) |
+| S2-T3 | `a794e4d6` | A CDC connector's page shows its own slot (S2-D3) |
+| S2-T4 | `bb7abba1` | Page context, user guide, CHANGELOG (S2-D5) |
+| S2-T5 | — | *Not verified* (no browser on this machine; see below). No commit: there were no screenshots to add |
+| — | the commit that adds this entry | This handoff |
+
+No Rust, Python or compose change; no `cargo` command was run. Nothing deleted from the backend (S2-D6).
+
+**Per-task accept lines.** `bun run test <paths>` appends the paths to the script's own `bun test src`
+and runs everything (slice 1's handoff says the same), so the scoped runs below used `bun test <paths>`.
+
+- S2-T1: `bun run typecheck` clean; `bun run lint` 0 errors, 10 warnings (the same pre-existing list as slice 1);
+  `bun test src/features/catalog src/lib/table-filter-link.test.ts src/lib/catalog-redirect.test.ts src/components` 400 pass, 0 fail, 24 files.
+- S2-T2: typecheck clean; lint 0 errors, 10 warnings; `bun test src/features/overview src/features/governance src/features/lakehouse src/lib src/components/app-shell` 1194 pass, 0 fail, 132 files (`src/features/ops` no longer exists).
+- S2-T3: typecheck clean; lint 0 errors, 10 warnings; `bun test src/features/connectors` 410 pass, 0 fail, 21 files (the three new slot cases: `-t "replication slot"` 3 pass).
+- S2-T4: `bun test src/features/copilot` 112 pass, 0 fail; `./rust/tests/parity/check-no-secrets.sh` corpus clean; typecheck clean, lint 0 errors.
+
+**Section 5.4, final code commit (`bb7abba1`), foreground.**
+
+- `bun run typecheck` — exit 0, no output.
+- `bun run lint` — exit 0; 0 errors, 10 warnings, all in files this slice did not touch.
+- `bun run test` — first run: 3227 pass, 1 skip, **1 fail**, 3229 tests, 328 files, 193.79 s. The failure was
+  `CommandPalette catalog search > shows an asset the server matched by a term that is in neither its id nor its
+  name` (the file's first test, a `findByText` with the default 1 s wait). It passed 3 of 3 runs of
+  `bun test src/components/command-palette.test.tsx` (17 pass each), and the second full run was green:
+  **3228 pass, 1 skip, 0 fail, 8740 expect() calls, 3229 tests, 328 files, 180.88 s.** The slice touched that
+  file only to move the "See all results" link to `/catalog?search=`. I read it as a timing flake under full-suite
+  load, not proven; the reviewer's own run will say.
+- `git status` — empty.
+
+**S2-T5, screenshots: *not verified*.** The dev stack did start: a throwaway compose project
+(`docker compose -p web3s2 up -d --no-build lakehouse-api`, with `ops/init-env.sh`'s generated `.env`, the
+local `rantai-lakehouse-api:local` image, `oidc-mock` built, API on a spare host port) and
+`next dev` against it. What could not run is a browser: T3's preview and Playwright's Chromium both stop on
+missing system libraries (`libnspr4.so`, `libnss3.so`), and installing them needs sudo. So there are no files
+under `docs/plans/web-3-screens/`, and no look at 1280 px or 390 px was taken. What was checked without a
+browser, against the running dev server: `/catalog` and `/health` compile and answer 200; the redirects
+answer `NEXT_REDIRECT` to `/catalog?search=orders` (from `/data?search=orders&page=3`: search kept, `page`
+dropped), `/health#services`, `/health#storage`, `/health#change-capture`, `/health#maintenance`, and
+`/catalog` (from `/lakehouse/tables`). Not checked: that the browser scrolls to the `#section` after a server
+redirect, and anything signed in. The stack, its volumes, the built image and the `.env` were removed
+afterwards. `next dev` rewrote `AGENTS.md` (its own "agentRules" block); that change was reverted, not committed.
+
+**For the reviewer: choices made inside the decisions.**
+
+1. *Catalog namespace grouping (S2-D1) is a filter row, not a side list.* A side column costs ~240 px, and the
+   explorer's column-hiding thresholds are derived from the window width with the sidebar open
+   (`catalog-page.tsx`, DATA-11/DATA-24 comments); a side list would have invalidated all of them. The row sits
+   with the Layer row (same quick-filter pattern, aligned labels, sideways scroll on a phone). Picking a namespace
+   sets the `namespace` filter to its **id** (DATA-23) and shows a strip with its description, owner, residency,
+   source engine and asset count, so nothing the old drawer showed is lost. The namespaces load on their own and
+   fail alone with Retry.
+2. *`/data` redirect keeps* `search`, `filters`, `sort`, `joinOperator`, `groupBy` and the legacy
+   `q/layer/tier/type` (the Catalog still translates those on arrival); it drops `page`, `perPage`, `view` and
+   column layout (`src/lib/catalog-redirect.ts`).
+3. *Old Catalog's saved table layout.* The asset table keeps the default `persistKey` (the pathname), so
+   `/catalog`'s remembered state from the old namespace table may be read once; `useTableMemory` drops filters on
+   columns that no longer exist, and an unknown column id in a saved order is ignored. A fresh key would have
+   broken the sidebar's "remember my filters" link (`rememberTableHref` keys on the pathname).
+4. *System status is exactly the six sections of S2-D2.* Health's other cards (catalog assets, pipelines running,
+   policy violations, pending approvals, storage by tier) and its "Recent activity" list are **not** on the page.
+   If the owner wants any back, that is a decision change. With them gone, `listActivity` and `listWarehouses`
+   had no consumer and were removed from the contracts and clients (routes untouched).
+5. *Overall state counts only probed services.* `ops.rs` marks unprobed ones `unknown`/`checked: false`; the line
+   says "All N probed services are up", lists the unprobed ones as "not counted", and says "not known" when
+   nothing was probed (`src/lib/system-status.ts`, tested).
+6. *Each slot once, each table once.* `/api/governance/replication` and `/api/governance/maintenance` return
+   history (every 15-minute check; every run). The sections show each slot's newest reading and each table's
+   newest run; the old pages listed every row.
+7. *"Shown only when at least one CDC connector exists" (S2-D2.4): mismatch, resolved without a new endpoint.*
+   The section's API cannot tell whether a CDC connector exists; the connector list has no adapter field, and
+   `/api/connectors/ingestible` needs `ingest:read` (the orchestrator's permission) and is not the API the
+   section used. So: no slot reading → the one muted line. And on a deployment where no CDC connector ever
+   ran, the slot table does not exist and the route answers 503, the same as ClickHouse being down
+   (`routes/governance.rs`). The section then shows its error with Retry plus a sentence saying both causes.
+   Please decide whether that is acceptable or whether the 503 case needs a backend change (out of this
+   slice's scope).
+8. *Iceberg tables without an asset page.* The removed list (`iceberg-tables-section.tsx`) showed every table in
+   the warehouse, "including ones the catalog registry never recorded (Gold export tables, for example)". Those
+   tables now have no list that reaches them; their page `/lakehouse/tables/{ns}/{table}` still works by
+   address, and a maintained Bronze table is linked from System status's maintenance runs. `/lakehouse/tables`
+   now redirects to `/catalog` (it redirected to the removed maintenance page). The table page's back button
+   was "Table Maintenance" → `/governance/maintenance`; it is now "Maintenance runs" → `/health#maintenance`
+   (the only change to `table-detail-page.tsx`).
+9. *CDC on the connector (S2-D3)* is in the connector's **Overview** tab, shown when its ingest spec's adapter or
+   ingest mode is `cdc` (the spec the page already loads, so a non-CDC connector makes no extra request).
+10. *Labels.* "Open in Data Explorer" → "Open in Catalog" (upload result), "Inspect in Data Explorer" →
+    "Find in Catalog" (classification, data quality), "Lands in Data Explorer as" → "Lands in the Catalog as".
+    Several pages in `docs/core/features/` still say "Data Explorer" in decisions and in acceptance rows dated
+    before this slice; they were left as written, because rewriting a passed acceptance row would change a
+    record. Only the user guide and CHANGELOG were in S2-T4.
+11. *System status layout.* A summary card (state pill, sentence, open-alerts button to `/alerts`), a row of
+    section jump links (the redirect anchors), then one `SectionCard` per section using the simple
+    `patterns/data-table`, not the advanced toolbar table: these are short status lists, not something to
+    filter. A page-level Refresh reloads every section. No new colour or spacing token.
+
+**Tests added, moved or removed.** Added: `src/lib/system-status.test.ts` (9), `src/lib/catalog-redirect.test.ts`
+(5), two `setFilter` cases in `table-filter-link.test.ts`, `src/features/overview/system-status-page.test.tsx` (7),
+three slot cases in `connector-detail-page.test.tsx`, four namespace-row cases in `catalog-page.test.tsx`. Moved:
+`data-explorer-page.test.tsx` → `catalog-page.test.tsx` (DATA-24 cases kept; path and layout key now `/catalog`).
+Removed with what they tested: the old `catalog-page.test.tsx` (namespace drawer) and
+`catalog-namespace-columns.test.tsx`. Updated because the link or label they asserted moved:
+`command-palette.test.tsx`, `upload-file-page.test.tsx`, `table-filter-link.test.ts`, `lakehouse-view.test.ts`
+(the removed `lakehouseWarehousesUrl` case). None of the five removed monitoring pages had a test.
+
+**Not verified.** The screenshots and every visual check at 1280 px and 390 px (above); the browser following a
+`#section` after a server redirect; the assistant's new page context with a model (no test exists for
+`page-context.ts`, and none was added).
+
 ## 9. Review (planner appends below)
