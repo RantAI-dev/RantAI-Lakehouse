@@ -843,3 +843,123 @@ This changes D6 for one thing: type.
   - Numbers in the governance table use `tabular-nums` in sans.
   - If Geist Mono is then only used for that one `<code>`, drop the font file and use a system
     monospace stack, as the RantAI site does.
+
+## 9. Addendum: the story, top to bottom (owner, 2026-11-04)
+
+The owner's QA asked:
+
+> "ini landing page udah ada storynya kah? kek user pas buka dari atas sampe bawah tu kek ada
+> ceritanya, jadi ga yang asal muncul muncul ajah"
+
+On the hero-to-dive transition, the owner said it is "too sudden", not laggy. The owner also
+said: "Dikerjain aja semuanya di PR ini." This addendum widens D6 for this PR. The page may now
+change how it moves between sections. The sections, copy structure, palette and claims stay.
+
+### Where the page is today
+
+- The headlines already tell a dive and a return: the surface, "Everything flows in", three
+  depths at −10 / −40 / −90 m, "Ask, don't dig", "Answers come back up", "Guarded by default",
+  "Yours to keep" and "Come on in. The data's fine."
+- The picture tells it only from the hero to the depths (the 3D `SceneZone`).
+- From the assistant on, each section has its own flat background and a generic fade-up reveal.
+  Nothing on screen says where the visitor is in the dive, so the second half reads as cards
+  that "just appear".
+- The dive itself is short. In `scroll-timeline.ts` the camera goes from y 1.15 to 0.05 over
+  0.42 vh, then to −2.4 by 1.0 vh. It crosses the surface in a few dozen pixels of scroll, with
+  a 0.28-unit hop (`avoidSurface`), and the sky-to-underwater colour swap happens in the same
+  stretch. That is the "mendadak" moment.
+
+### D14. One journey: down to the deepest point, then back up to the surface
+
+**Storyboard.** Depth is the thread. The ascent mirrors the descent.
+
+| # | Section | Depth shown | What the visitor sees change |
+| --- | --- | --- | --- |
+| 1 | Hero | 0 m, surface | Night lake, the creature, the moon (as today). |
+| 1→2 | The dive | 0 → −5 m | **New, slower dive.** The camera lingers at the waterline in a half-above, half-below view before going under. The colour, fog and light change over a longer stretch, and the headline fades as the surface closes overhead. |
+| 2 | Sources | −5 m | Pills fall in like droplets (as today). |
+| 3 | Depths | −10 / −40 / −90 m | Bronze, Silver and Gold slabs (as today). The gauge now matches the slab labels. |
+| 4 | Assistant | −100 m, the deepest point | The darkest water. The creature is the guide: it appears beside the chat as the assistant's face. "Ask, don't dig": you don't have to dive yourself. |
+| 5 | Dashboards | −100 → −50 m, ascending | "Answers come back up." The water lightens with scroll and a few bubbles rise. The tile rail slides as today. |
+| 6 | Governance | −50 → −15 m | Lighter water; the masked table as today. |
+| 7 | Open source | −15 → −3 m | Near the surface: moonlight caustics return. |
+| 8 | Final | 0 m, surfacing | The creature rises through the surface into the night sky (the existing final scene). The gauge reads the surface again. |
+
+**Mechanics:**
+
+- **One background for the whole page, driven by scroll.** Sections 4–8 lose their own opaque
+  backgrounds and sit on one fixed layer. That layer's colour follows the depth: the hero's
+  night, then the abyss at the assistant, then lighter water on the way up, then the final's
+  night sky. The section edges no longer show as bands.
+  - The layer is driven by a motion value or a CSS variable written through a ref. There is no
+    React state per scroll event (D5).
+  - The depths section (`SceneZone`) keeps the 3D canvas. The fixed layer starts where the
+    canvas fades and matches its last colour, so there is no seam.
+- **A depth gauge, visible the whole way down and up.** On desktop it is a thin vertical scale
+  on the left edge with the current depth in metres and a marker for each chapter. On phones it
+  is a small reading in the top bar's row, or a hairline at the top. The developer picks the
+  one that does not crowd 360 px and shows both in the evidence.
+  - It is `aria-hidden`. The chapter names it shows are already the section headings.
+  - The depth values are data, in `home-content.ts`. Labels such as "Surface" / "Permukaan"
+    are messages in both languages.
+- **The dive (1→2).**
+  - Give it more scroll: the hero section grows, with a number chosen by the developer and
+    shown in the evidence.
+  - Add a key at the waterline so the camera slows there (PCHIP keeps it monotone, with no
+    bob). Spread the `underwater` / fog / colour change over that longer span instead of a short
+    smoothstep.
+  - Optional, if cheap: a ripple ring at the crossing.
+  - Keep `avoidSurface`, but the hop must not be visible as a jump. If it still is, the
+    half-above view should hide it.
+- **The creature as guide (4, 8).**
+  - In the assistant section, the chat's assistant side gets the creature's mark (the existing
+    `MascotSvg`, small), so the guide is the same character the visitor met at the surface.
+  - In the final, the existing rising creature completes the return.
+- **The ascent (5–7).**
+  - A few bubbles rise at the edges, in a CSS animation or a tiny canvas. They are deferred like
+    the language offer and stop under reduced motion.
+  - Caustic light grows stronger as the depth gets shallower.
+  - The section reveals keep their content but move in the direction of travel: on the way up,
+    content rises in with the bubbles. They are not new elements.
+- **Fallbacks keep the story.**
+  - Without WebGL, the fixed layer and the gauge still run, so the journey reads without the
+    3D scene.
+  - Under reduced motion, the gauge and the colours change per section with no animation, and
+    there are no bubbles.
+  - Without JS, the page reads top to bottom as today, with section colours, and no gauge is
+    needed.
+
+**Limits:**
+- Every spec target still applies: initial JS ≤ 200 KB, TBT ≤ 200 ms, LCP, CLS, SEO and
+  accessibility.
+- The story adds no library. Anything not needed for the first screen is deferred.
+- No new section and no new claim (D7).
+- The copy may change only for gauge labels and, if needed, one line of the assistant's lead
+  linking it to "the deepest point". That line is in both languages.
+
+### Tasks S1–S6 (after R7, one commit each, in order)
+
+1. **S1 The dive.** A longer hero, a waterline key, and the colour, fog and light spread over
+   it.
+   - *Accept:* a CDP frame strip of the crossing. Because the VM has no GPU, run with a
+     test-only override of `hasFastWebGL`: a local patch or an env flag read only in
+     `next dev`, never in the exported build.
+   - There are at least five frames between "above" and "below", and no single scroll step
+     changes the sky to underwater.
+2. **S2 The page-wide depth background** for sections 4–8, with the seam at the end of
+   `SceneZone`.
+   - *Accept:* full-page CDP screenshots, 1440 and 390, show no colour band at any section edge.
+3. **S3 The depth gauge.**
+   - *Accept:* screenshots at 1440, 390 and 360, EN and ID, at each chapter. The reading matches
+     the storyboard.
+4. **S4 The guide:** the creature's mark in the assistant chat. Copy line only if needed.
+5. **S5 The ascent:** bubbles, caustics and the reveal direction for 5–7, and the final
+   surfacing tie-in.
+   - *Accept:* the no-WebGL, reduced-motion and no-JS screenshot sets still read end to end.
+6. **S6 Measure.**
+   - Run `bun run size`.
+   - Run Lighthouse interleaved against the R7 commit, three rounds, EN and ID.
+   - Record the results in RESULT as a dated update.
+   - A miss is written with its number, not lowered.
+
+The owner reviews the result in QA, which can send any of S1–S5 back.
