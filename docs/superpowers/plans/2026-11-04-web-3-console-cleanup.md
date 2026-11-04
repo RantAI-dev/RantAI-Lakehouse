@@ -914,3 +914,99 @@ was not merged and S3-T5 was not started; no API shape was assumed.
 
 **Not verified.** The About card row was not looked at in a running console (no dev stack
 started); it is checked by the tests above only.
+
+### Handoff (slice 3b, round 3) — developer, 2026-11-04
+
+Branch `feat/web-3-slice-3b-screens`, from `91a7e105` (round 2). No rebase, no force-push.
+
+| Commit | Task | What |
+|---|---|---|
+| `cf12097c` | merge | `origin/feat/web-3-slice-3a-api` (at `7f5d6140`, its handoff in) |
+| `de92f504` | merge | `origin/main` (at `c41a5f1f`) |
+| `7ae9023e` | S3-T5 | Access rules, read-only (S3-D4), sidebar "Access rules" |
+| `4566bf7e` | S3-T5 | Reset on Data Quality's Schedules tab (S3-D5, S3a-D3) |
+| `1481bd44` | S3-T5 | Roles: Edit and Delete with the API's 409 sentence (S3-D8), sidebar "Roles" |
+| — | the commit that adds this entry | This handoff |
+
+**Merges.**
+- 3a: one conflict, in this plan file only (section 8, and the end of section 9): both sides only
+  appended. Kept both, hunk by hunk: 3b's handoff, then 3a's handoff, then 3a's side of the
+  section 9 hunk was empty, so 3b's round-1 review and round-2 handoff stay as they were. Every
+  other file (Rust, `CHANGELOG.md`, contracts, clients, `asset-access.tsx`) auto-merged.
+  `bun run typecheck` exit 0 right after.
+- `origin/main`: no conflict. It brings `REL-10` (`lakehousectl`, `.env.example`, docs) and a
+  dependabot `Cargo.lock` bump. Slice 2 (#374) was already in this branch's history. No Rust change
+  was needed from me, so none was made.
+
+**Built (S3-T5).**
+- *Access rules* (`policies-page.tsx`, now `AccessRulesPage`; `policy-columns.tsx`; new
+  `access-rules.ts`). Columns: Rule, Table, Roles, What it does, Status (SEC-61's
+  `PolicyStatusPill`, reused: Draft / Ready / Not enforced). The table links to
+  `/data/assets/<assetId>?tab=access` when `assetId` is present; otherwise it is plain text. The
+  drawer is read-only: it has the same facts plus Kind, Effect, Version, Owner, Updated, SEC-61's
+  notice for an unenforceable rule, and a line linking to the table's Access tab (or to the
+  Catalog when there is no `assetId`). No Enforce, Stop or Delete on the page. `PolicyActions`
+  stays, used by the Access tab only. The sidebar, the Access tab's button ("Open access
+  rules"), the page context and the user guide use the new name.
+- *Reset* (`quality-schedules-tab.tsx`): beside Edit, behind a confirmation ("Its checks then run
+  every <default>"). Calls `resetQualitySchedule`, then reloads, so the table leaves the list. A
+  failure keeps the dialog open and shows the API's sentence. Needs `governance:write`, like Edit.
+- *Roles* (`roles-page.tsx`, `roles-columns.tsx`): titled "Roles". With `identity:write`, the row
+  menu has Edit role (the create sheet's three fields, now one `RoleFields` component, used by
+  both sheets) and Delete role (a confirmation that says how many people hold the role). A 409
+  is shown in the dialog with the API's sentence exactly as sent, and the dialog stays open.
+  Without `identity:write` the menu only copies the name.
+
+**Choices made inside the decisions, for the reviewer.**
+1. *What a rule does* is read from `conditions` only when the API says `enforceable: true`. Any
+   other rule shows its stored `subjects` / `resources` text and "Nothing: written as text, so the
+   engine skips it". So the console never says a rule does something the engine skips (SEC-61
+   D1 stays the server's call). `listOf` is exported from `lib/column-masks.ts` and reused
+   (rule 4).
+2. *Errors in the dialogs come from the next render.* `useServiceAction`'s `error` is read from a
+   closure right after `await run()`, and there it is still the old (stale) value
+   (`lib/notify.ts`'s comment says the same). So Reset and Delete role render `action.error`
+   inside the dialog. `PolicyActions` and others read it right after the `await` (an existing
+   pattern, not changed here). Their failure toasts may lack the sentence. That needs a check
+   and a follow-up of its own.
+3. *A rename warns.* `UpdateRoleInput` says a rename is not carried into policies, and the
+   engine matches `conditions.roles` by name. So once the name field differs, the Edit sheet
+   says: "A rule that names <old> stops applying to this role once it is called <new>." This is
+   a sentence only, with no behaviour change. **Reported:** renaming a role silently lifts every
+   mask and row filter that names it. The planner may want the API to refuse a rename while a
+   rule names the role, or to rewrite the rules. Neither is in S3a-D2.
+4. The Delete role item is offered even when `members > 0` (the confirmation says people hold
+   it). The API's 409 is the source of truth, and the console does not try to decide first.
+
+**Checks per commit** (each: `bun run typecheck` exit 0; `bun run lint` 0 errors, 10 warnings,
+the same pre-existing list, none in a file this round touched):
+- merge 3a: typecheck only before the main merge; merge main:
+  `bun test src/services src/features/governance src/features/identity` 206 pass, 0 fail.
+- Access rules: `bun test src/features/governance src/features/catalog src/lib/column-masks.test.ts src/components/app-shell src/features/copilot`
+  533 pass, 0 fail (new `access-rules.test.tsx`, 8 cases).
+- Reset: `bun test src/features/governance` 58 pass, 0 fail (two new cases, and the reader case
+  also asserts no Reset).
+- Roles: `bun test src/features/admin src/components/app-shell` 77 pass, 0 fail (new
+  `roles-page.test.tsx`, 5 cases).
+
+**Before handoff, on `1481bd44`, foreground.**
+- `bun run typecheck` — exit 0.
+- `bun run lint` — exit 0; 0 errors, 10 warnings.
+- `bun run test` — **3282 pass, 1 skip, 0 fail, 8883 expect() calls, 3283 tests, 334 files,
+  206.98 s.**
+- `git status` — empty.
+- No Rust, Python or compose file changed in this round's own commits, so no cargo, pytest or
+  compose command was run. The Rust that came in with the merges was not built or tested here
+  (no full Rust run on this machine). 3a's handoff and CI cover it.
+
+**Not verified.** No browser: `libnss3` / `libnspr4` are still missing, so there are no screenshots
+and no look at 1280 px or 390 px. The new routes were not called against a running API: the
+pages are tested against stubbed `fetch` with the response shapes 3a's handoff and tests name
+(204 for the deletes, `{ "error": "<sentence>" }` with 409). Nobody has seen the base-ui row menu
+on Roles open in a real browser. In the tests it opens on click.
+
+**Slice 3 against section 6.** With this round, every decision is built: S3a-D1 to D5 (3a);
+S3-D1 to D10 (3b), with the planner's round-1 decisions on the reported mismatches (table-level
+sensitivity on the About card as S3-T5a; the lineage button, the Schedules list, and the dropped
+catalog filter accepted as built). S3-D11 (the Lark QA cases) is the planner's, at merge. Open
+for the planner: choice 3 above (the rename lifts rules), and the stale-error pattern in choice 2.
