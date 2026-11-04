@@ -387,3 +387,41 @@ Removed with what they tested: the old `catalog-page.test.tsx` (namespace drawer
 `page-context.ts`, and none was added).
 
 ## 9. Review (planner appends below)
+
+### Review slice 2, round 1 (planner, 2026-11-04, at `e566187b`)
+
+Read the diff (57 files, +2429/−2716) against S2-D1 to S2-D6 and the handoff. The design
+choices 1–4 and 6–8 the handoff lists are accepted as made: the namespace filter row,
+System status with exactly the six sections, counting only probed services, the latest
+reading per slot and per table, the CDC panel in the connector's Overview, and leaving the
+dated feature-page records alone. The command-palette test that failed once and then passed
+3/3 alone and in the second full run is noted; CI is the judge.
+
+- **R1 (BLOCKER). A healthy install without change capture shows an error on System
+  status.** Handoff point 5: `GET /api/governance/replication` answers 503 when no CDC
+  connector has ever run, because `lake.bronze_meta.replication_slot` does not exist yet
+  (`routes/governance.rs`, the doc comment above `REPLICATION_SLOTS_SQL`: "surfaced as the
+  standard 503"). With slice 2, every fresh install — the customer's first look at the
+  product — opens System status with an error and Retry in one section. The connector list
+  carries no adapter, so the console cannot tell on its own (it would need one ingest-spec
+  read per connector). Fix it at the source:
+  - `replication()` answers `{"replicationSlots": []}` (HTTP 200) when the table does not
+    exist, decided by the engine's own "unknown table" signal — ClickHouse's error **code**
+    (`UNKNOWN_TABLE`, 60) or an `EXISTS TABLE` probe, whichever `lakehouse_clickhouse` exposes;
+    never by matching error text (principle 4), and never for any other failure: a
+    ClickHouse that is down, a permission error or a malformed answer stays a 503.
+  - Update the doc comment above `REPLICATION_SLOTS_SQL`, which says the opposite today, and
+    cite `WEB-3 review R1` there.
+  - Tests: the route with no table → 200 and an empty list; the route with ClickHouse down →
+    503 (keep or add). A mutation check: put back the 503 for the missing table and the first
+    test fails.
+  - The console then shows its muted line for an empty list (already built) and the error
+    only for a real outage; adjust the section's error sentence so it no longer names the
+    missing-table cause.
+  - This is a small Rust change inside the slice; scoped checks:
+    `cargo fmt --check`, `cargo clippy -p lakehouse-api --all-targets -- -D warnings`,
+    `cargo test -p lakehouse-api <filter>`. Use one shared `CARGO_TARGET_DIR`; never
+    `cargo clean`.
+- **Follow-up, not this slice (handoff point 6):** Iceberg tables with no catalog entry
+  (e.g. some Gold export tables) are no longer reachable from any list. The planner files it
+  as a backlog item.
