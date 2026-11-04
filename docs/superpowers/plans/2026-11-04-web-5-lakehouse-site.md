@@ -1007,6 +1007,74 @@ This changes D6 for one thing: type.
   - If Geist Mono is then only used for that one `<code>`, drop the font file and use a system
     monospace stack, as the RantAI site does.
 
+### Review 5: planner, 2026-11-04, at `1f365b3a` (D14, S1–S6)
+
+**What the reviewer re-ran** (clean `git archive`, fresh install):
+- lint 0, typecheck 0;
+- tests: 61 pass, 0 fail;
+- the build exits 0, and a build without `NEXT_PUBLIC_SITE_URL` fails, as it should;
+- `bun run size` exits 0: 181.1 KB initial JS for EN and for ID. The scene chunk is 147.0 KB and deferred. The test-only override is not in the export.
+
+**Read against §9.**
+- **The keys match the storyboard.** `JOURNEY` (`home-content.ts`) reads 0 → −5 → −10 / −40 / −90 → −100 → −50 → −15 → −3 → 0.
+- **No per-scroll React state.** The water, the gauge and the surfacing write CSS variables or a transform through refs, from passive listeners throttled to one per animation frame.
+- **The override cannot ship.** It is behind `NODE_ENV === "development"`, and `check-bundle.mjs` guards it.
+- **The changed tests still check the original intent.** The one that said "crosses in the first viewport" was rewritten for the slow dive, and its comment in the code says why. The `avoidSurface` minimum went from 0.13 to 0.065, and it still clears the 0.05 near plane.
+- **Evidence:**
+  - the dive strip has eight frames between above and below;
+  - the section edges show no colour band;
+  - the gauge was shot at 1440, 390 and 360, in EN and ID;
+  - the guide fits a 360×740 screen;
+  - the ascent set and the three fallback sets were re-taken.
+
+**Probes the reviewer ran.** The build was served on :3402, in headless Chrome with no GPU, so the page ran in the `none` scene mode. The probe script is in the planner's scratchpad and is not committed.
+
+**R8: BLOCKER, the desktop gauge covers text from 768 to about 1280 px.**
+- **What happens:** the scale is `fixed left-8 w-28` from the `md` breakpoint up. Its marker and reading span x 35–92 px.
+- **What was measured**, against the left edge of the first visible text:
+
+  | Width | Dashboards | Governance | Open |
+  | --- | --- | --- | --- |
+  | 1024 | 22 px | 23 px | 23 px |
+  | 800 | 22 px | 23 px | 24 px |
+  | 1280 | 94 px | 95 px | 96 px |
+
+  - At 1024 and 800, the text starts at x 22–24, so the reading lies on top of it.
+  - At 1280 the gap is 2 px.
+  - At 1440, the text starts at x 173 or further right.
+- **Why it matters:** these are tablet and small-laptop widths, and S3's screenshots covered only 1440, 390 and 360.
+- **Fix:** keep the left scale only where it has room, and use the phone hairline below that width. The cut-off is the developer's choice, measured so that the reading clears the container's text by at least 24 px in every section.
+- **Acceptance:**
+  - the same check at 768, 1024, 1280 and 1440 reports no overlap;
+  - screenshots at 1024 and 1280.
+
+**R9: SHOULD-FIX, the journey is measured twice (rule 4).**
+- **What happens:** `depth-backdrop.tsx` and `depth-gauge.tsx` each build the chapter anchors from the page. Each has its own copy of the Gold pin-end key and the surface key.
+- **The copies already differ.** Only the gauge holds 0 m through the hero's pin.
+- **Why it matters:** a later change to one copy will make the water and the gauge disagree about the depth.
+- **Fix:** one function measures the page and returns `{ anchors, depths, climb }`, and both components use it. Any difference in what the two components need, such as the hero hold, becomes a parameter, with a comment saying why.
+- **Acceptance:**
+  - there is one measuring function;
+  - the existing tests pass;
+  - a test covers the pure part, which turns section boxes into anchors.
+
+**R10: SHOULD-FIX, the hero grows by 70 vh after the page loads.**
+- **What happens:** `html[data-scene="full"] #hero { height: 220vh }` applies only once the mode settles, which is after the first paint. A visitor who reloads mid-page or follows a deep link is already scrolled when it applies.
+- **What Chrome does:** scroll anchoring keeps the view in place. The probe set `data-scene="full"` with `#governance` at the top of the screen. Its top stayed at 0, and `scrollY` grew by 630 px, which is the change in the hero's height.
+- **What is not verified:** Safari and other engines. A browser that does no scroll anchoring would move the page by 70 vh under the visitor.
+- **Fix:** where `data-scene` is written, take the top of a section on screen before the write and again after it. If it moved, `scrollBy` the difference. In Chrome the difference is already 0, so this is a no-op there.
+- **Acceptance:**
+  - the same probe with scroll anchoring off (`overflow-anchor: none` on `html`) shows the section's top unchanged.
+
+**Notes. These are not findings.**
+- **The hero headline at 360 px.** The developer saw that the English headline wraps to three lines at 360 px. This is outside D14, and it goes to the owner's QA.
+- **Lighthouse:**
+  - The developer's interleaved rounds against R7 are in RESULT: EN TBT 118.8 ms and ID 119.3 ms, LCP 1.07 s, CLS 0, and 100 in every category.
+  - The reviewer will re-run them on the final commit after R8–R10. A re-run now would be replaced anyway.
+  - As the handoff says, these runs never load the live 3D scene, because this VM has no GPU.
+
+**Open: R8 (BLOCKER), R9 and R10 (SHOULD-FIX).**
+
 ## 9. Addendum: the story, top to bottom (owner, 2026-11-04)
 
 The owner's QA asked:
