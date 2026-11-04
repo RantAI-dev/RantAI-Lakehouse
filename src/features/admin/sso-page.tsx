@@ -27,7 +27,7 @@ export function SsoPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Single Sign-On"
+        title="Sign-in"
         description="OIDC configuration for this deployment."
       />
       {state.status === "loading" ? <LoadingSkeleton /> : null}

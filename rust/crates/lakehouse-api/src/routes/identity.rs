@@ -65,6 +65,7 @@ use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::governance;
 use lakehouse_store::identity::{
     self, CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput, Role,
     RotateServiceIdentityResponse, ServiceIdentity, ServiceIdentityFilter, Tenant, TenantFilter,
@@ -1080,6 +1081,226 @@ pub async fn create_role(
     };
     let role = identity::create_role(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(role)))
+}
+
+/// The `PUT /api/identity/roles/{id}` body. Mirrors `UpdateRoleInput`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRoleBody {
+    /// Role name; must not collide with another role's.
+    name: String,
+    /// Free-text permission list.
+    #[serde(default)]
+    permissions: String,
+    /// Human-readable description.
+    #[serde(default)]
+    description: String,
+}
+
+/// `PUT /api/identity/roles/{id}` — rewrite a role's name, permissions and
+/// description (`WEB-3` S3a-D2). Audited as `identity.role.update`,
+/// naming the old and the new bundle.
+///
+/// # Refusals
+///
+/// A rebuilt bundle that keeps the name is unaffected. A rename is refused
+/// with 409 while any access rule — any status, because a draft becomes
+/// live later — names the OLD name among the roles its structured
+/// [`PolicyCondition`](crate::policy_engine::PolicyCondition) applies to,
+/// and then nothing is written. Rules are matched against a principal's
+/// role NAMES, so a rename would silently stop every mask and row filter
+/// those rules carry from reaching the people who hold this role: data the
+/// role must not see would become visible (`WEB-3` review R2).
+///
+/// # Security
+///
+/// Requires `identity:write`, the permission `POST /api/identity/roles`
+/// uses — this edits the same kind of permission bundle that route mints.
+///
+/// # Errors
+///
+/// 400 on a malformed body or a blank name; 404 when no role has that id;
+/// 409 when another role has the name, or when an access rule names this
+/// one; 503/500 as above.
+pub async fn update_role(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Role>> {
+    let body: UpdateRoleBody = parse_body(&body)?;
+    let input = identity::UpdateRoleInput {
+        name: required("name", &body.name)?,
+        permissions: body.permissions,
+        description: body.description,
+    };
+    let pool = pool(&state)?;
+    let before = identity::get_role(pool, &id).await?;
+    // WEB-3 review R2: a rename would take every mask and row filter the
+    // rules naming this role carry away from its holders, because rules
+    // match on names. Refuse before anything is written, listing the rules
+    // from the stored rows.
+    if input.name != before.name {
+        let naming = policies_naming_role(pool, &before.name).await?;
+        if !naming.is_empty() {
+            return Err(ApiError::Conflict(named_by_rules_sentence(&naming)).into());
+        }
+    }
+    let role = identity::update_role(pool, &id, &input).await?;
+    let audit_event = role_update_audit_event(&principal, &before, &role);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.role.update",
+            role_id = %role.id,
+            "failed to record role-update audit event"
+        );
+    }
+    Ok(ApiJson(role))
+}
+
+/// `DELETE /api/identity/roles/{id}` — remove a role nobody holds
+/// (`WEB-3` S3a-D2). Returns 204. Audited as `identity.role.delete`.
+///
+/// # Refusals
+///
+/// A built-in role (one [`identity::BUILT_IN_ROLE_IDS`] names — the product's
+/// seeded bundles) is refused with 409 "A built-in role cannot be deleted.",
+/// before the members check: it stays a built-in role however many people
+/// hold it. A role people still hold is refused with 409 "This role is
+/// still given to N people. Take it away from them first." — `N` counted
+/// here, never read out of a foreign-key violation's own text (principle 4).
+///
+/// # Security
+///
+/// Requires `identity:write`, the permission `POST /api/identity/roles`
+/// uses.
+///
+/// # Errors
+///
+/// 404 when no role has that id; 409 as above; 503/500 as above.
+pub async fn delete_role(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let pool = pool(&state)?;
+    let role = identity::get_role(pool, &id).await?;
+    if identity::is_built_in_role(&role.id) {
+        return Err(ApiError::Conflict("A built-in role cannot be deleted.".to_owned()).into());
+    }
+    if role.members > 0 {
+        return Err(ApiError::Conflict(still_given_sentence(role.members)).into());
+    }
+    match identity::delete_role(pool, &id).await {
+        Ok(()) => {}
+        // A user was given the role between the count and the delete: the
+        // row is held after all. The fixed sentence, not the constraint's
+        // text (principle 4).
+        Err(StoreError::ForeignKeyViolation) => {
+            return Err(ApiError::Conflict(still_given_sentence(role.members.max(1))).into());
+        }
+        Err(err) => return Err(err.into()),
+    }
+    let audit_event = role_audit_event(
+        &principal,
+        "identity.role.delete",
+        &role.id,
+        serde_json::json!({ "name": role.name, "permissions": role.permissions }),
+    );
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.role.delete",
+            role_id = %role.id,
+            "failed to record role-delete audit event"
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The 409 sentence for a role people still hold (`WEB-3` S3a-D2, fixed by
+/// the plan).
+fn still_given_sentence(members: i64) -> String {
+    format!("This role is still given to {members} people. Take it away from them first.")
+}
+
+/// Every access rule whose structured `conditions` name `role`, in the
+/// store's order (newest first). `policy_engine::condition_names_role` is
+/// the read-time rule, so this asks the engine's own question; every
+/// status is considered, because a draft is enforced the moment someone
+/// makes it ready (`WEB-3` review R2).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the read fails.
+async fn policies_naming_role(
+    pool: &PgPool,
+    role: &str,
+) -> Result<Vec<governance::Policy>, StoreError> {
+    let policies = governance::list_policies(pool).await?;
+    Ok(policies
+        .into_iter()
+        .filter(|policy| {
+            crate::policy_engine::condition_names_role(policy.conditions.as_deref(), role)
+        })
+        .collect())
+}
+
+/// The 409 sentence for a rename an access rule still names (`WEB-3`
+/// review R2, fixed by the plan): how many rules name the role, and the
+/// first three by name — read from the stored rows, never from an
+/// upstream error's own text (principle 4).
+fn named_by_rules_sentence(rules: &[governance::Policy]) -> String {
+    let first_three = rules
+        .iter()
+        .take(3)
+        .map(|rule| rule.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "This role is named by {} access rules ({first_three}…). Change those rules first, or \
+         keep the role's name.",
+        rules.len()
+    )
+}
+
+/// The audit row for a role rewrite: the actor, the role, and the bundle
+/// before and after, so an operator can see what the change took away.
+fn role_update_audit_event(principal: &Principal, before: &Role, after: &Role) -> NewAuditEvent {
+    role_audit_event(
+        principal,
+        "identity.role.update",
+        &after.id,
+        serde_json::json!({
+            "oldName": before.name,
+            "newName": after.name,
+            "oldPermissions": before.permissions,
+            "newPermissions": after.permissions,
+        }),
+    )
+}
+
+/// The audit row for a role change the console makes (`WEB-3` S3a-D2): who
+/// acted, what they did, which role, and the arguments that say what
+/// changed.
+fn role_audit_event(
+    principal: &Principal,
+    action: &str,
+    role_id: &str,
+    args: serde_json::Value,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        action: action.to_owned(),
+        resource_kind: Some("role".to_owned()),
+        resource_id: Some(role_id.to_owned()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(args),
+        ..Default::default()
+    }
 }
 
 // ── Tenants ─────────────────────────────────────────────────────────────

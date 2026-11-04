@@ -582,11 +582,22 @@ export function PipelineDetailPage() {
             setParam("tab", "runs")
             selectRun(id)
           }} />
+          {/* WEB-3 S3-D9: a pipeline that names its target table opens that
+              table's Lineage tab; one that names none keeps the Lineage page. */}
           <p className="mt-3 text-xs text-muted-foreground">
             Lineage for this pipeline:{" "}
-            <Link href={`/lineage?focus=${encodeURIComponent(p.id)}`} className="text-primary hover:underline">
-              open in Lineage
-            </Link>
+            {p.targetAssetId ? (
+              <Link
+                href={`/data/assets/${encodeURIComponent(p.targetAssetId)}?tab=lineage`}
+                className="text-primary hover:underline"
+              >
+                open its target table&apos;s Lineage tab
+              </Link>
+            ) : (
+              <Link href={`/lineage?focus=${encodeURIComponent(p.id)}`} className="text-primary hover:underline">
+                open in Lineage
+              </Link>
+            )}
           </p>
         </TabsContent>
       </Tabs>

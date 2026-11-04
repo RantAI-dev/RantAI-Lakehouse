@@ -31,6 +31,12 @@ export type Policy = {
   // value may be free-text prose rather than JSON — never assume it parses
   // and never crash the policy list page on a `JSON.parse` failure.
   conditions?: string
+  // The catalog asset id of the table the policy governs (WEB-3 S3a-D1),
+  // resolved by the API from `conditions.table`: a Silver/Serving table is
+  // its own id, a Bronze table is its registry slug. Absent when the
+  // conditions do not parse or name no table the catalog addresses — show
+  // the table as plain text then, never a link to an invented page.
+  assetId?: string
 }
 
 export type ClassificationRule = {
@@ -350,7 +356,6 @@ export type DatasetSla = {
 
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
-  listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
   listQuality(signal?: AbortSignal): Promise<QualityRule[]>
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
   /**
@@ -421,6 +426,11 @@ export interface GovernanceService {
     input: SetQualityScheduleInput,
     signal?: AbortSignal
   ): Promise<QualitySchedule>
+  /**
+   * Put a table back on the default schedule (WEB-3 S3a-D3); needs
+   * `governance:write`. `listQualitySchedules` then carries no row for it.
+   */
+  resetQualitySchedule(asset: string, signal?: AbortSignal): Promise<void>
   /** Whether a table's volume and freshness anomalies are being raised yet. */
   getQualityLearning(asset: string, signal?: AbortSignal): Promise<QualityLearning>
   createClassificationRule(

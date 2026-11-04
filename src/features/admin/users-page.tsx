@@ -24,17 +24,29 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { useUrlTab } from "@/hooks/use-url-tab"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
 import type { Role, Tenant, User } from "@/services"
+import { SessionsPanel } from "./sessions-page"
 import { getUserColumns, PillList, UserStatusPill } from "./user-columns"
 
+const USERS_TABS = ["people", "sessions"] as const
+type UsersTab = (typeof USERS_TABS)[number]
+
+/**
+ * Users, in two tabs (`WEB-3` S3-D7): People (the users, their roles,
+ * tenants and status) and Sessions (the browser sessions signed in, which
+ * was its own page). The open tab is in `?tab=`; People is the bare address.
+ */
 export function UsersPage() {
+  const [tab, setTab] = useUrlTab("tab", USERS_TABS)
   const { hasPermission } = useAuth()
   const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listUsers(s), [])
@@ -228,31 +240,45 @@ export function UsersPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Users"
-        description="People, roles, tenant membership, and recent activity."
+        description="People, their roles and tenants, and the browser sessions signed in."
         actions={
-          <Button
-            size="sm"
-            onClick={() => setCreateOpen(true)}
-            disabled={!canWrite}
-            title={canWrite ? undefined : "You don't have permission to invite users."}
-          >
-            <PlusIcon data-icon="inline-start" />
-            Invite User
-          </Button>
+          // Inviting belongs to People; the Sessions tab has nothing to add.
+          tab === "people" ? (
+            <Button
+              size="sm"
+              onClick={() => setCreateOpen(true)}
+              disabled={!canWrite}
+              title={canWrite ? undefined : "You don't have permission to invite users."}
+            >
+              <PlusIcon data-icon="inline-start" />
+              Invite User
+            </Button>
+          ) : null
         }
       />
 
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? (
-        <ErrorState error={state.error} onRetry={state.reload} />
-      ) : null}
-      {state.status === "success" ? (
-        <DataTable table={table}>
-          <DataTableAdvancedToolbar table={table}>
-            <DataTableSearch placeholder="Search name, email, roles, tenants…" />
-          </DataTableAdvancedToolbar>
-        </DataTable>
-      ) : null}
+      <Tabs value={tab} onValueChange={(v) => setTab(v as UsersTab)} className="gap-4">
+        <TabsList>
+          <TabsTrigger value="people">People</TabsTrigger>
+          <TabsTrigger value="sessions">Sessions</TabsTrigger>
+        </TabsList>
+        <TabsContent value="people" className="flex flex-col gap-4">
+          {state.status === "loading" ? <LoadingSkeleton /> : null}
+          {state.status === "error" ? (
+            <ErrorState error={state.error} onRetry={state.reload} />
+          ) : null}
+          {state.status === "success" ? (
+            <DataTable table={table}>
+              <DataTableAdvancedToolbar table={table}>
+                <DataTableSearch placeholder="Search name, email, roles, tenants…" />
+              </DataTableAdvancedToolbar>
+            </DataTable>
+          ) : null}
+        </TabsContent>
+        <TabsContent value="sessions">
+          <SessionsPanel />
+        </TabsContent>
+      </Tabs>
 
       <DetailDrawer
         open={selected !== null}

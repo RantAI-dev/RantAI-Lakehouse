@@ -1,8 +1,8 @@
 "use client"
 
-import { PoliciesPage } from "@/features/governance/policies-page"
+import { AccessRulesPage } from "@/features/governance/policies-page"
 
-/** Thin App Router page for PoliciesPage. */
+/** Thin App Router page for AccessRulesPage. */
 export default function Page() {
-  return <PoliciesPage />
+  return <AccessRulesPage />
 }

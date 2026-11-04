@@ -1,24 +1,12 @@
 "use client"
 
-import { QueryLimitsSettings } from "@/features/admin/query-limits-settings"
-import { RememberedResultsSettings } from "@/features/admin/remembered-results-settings"
-import { ReportingSettingsPage } from "@/features/admin/reporting-settings-page"
-import { SsoPage } from "@/features/admin/sso-page"
+import { SettingsPage } from "@/features/admin/settings-page"
 
 /**
- * Thin App Router page for the settings: reporting (BI-9, BI-17) the
- * remembered results (BI-4), the query limits (BI-5) and sign-in (WEB-3 D6).
+ * Thin App Router page for Settings (`WEB-3` S3-D6): reporting (BI-9,
+ * BI-17), remembered results (BI-4), query limits (BI-5), sign-in (WEB-3
+ * D6), tag keys (DATA-12) and maps (BI-16), one section at a time.
  */
 export default function Page() {
-  return (
-    <div className="flex flex-col gap-8">
-      <ReportingSettingsPage />
-      <RememberedResultsSettings />
-      <QueryLimitsSettings />
-      {/* WEB-3 D6: the old SSO route was one line and a button, so its content
-          moved here as a "Sign-in" section. The component is reused as-is;
-          it reads the live `GET /api/auth/providers` state. */}
-      <SsoPage />
-    </div>
-  )
+  return <SettingsPage />
 }

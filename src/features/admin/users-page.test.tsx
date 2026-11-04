@@ -15,9 +15,11 @@
 // `useTableUrlState` reads it for page/sort/filter state, and the real
 // hook returns `null` outside a Router context, which crashed every test
 // in this file at `searchParams.get`.
+// WEB-3 S3-D7: `search` is the address's query, so a test can open `?tab=sessions`.
+let search = new URLSearchParams()
 mock.module("next/navigation", () => ({
   usePathname: () => "/admin/users",
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => search,
   useRouter: () => ({
     push: () => {},
     replace: () => {},
@@ -117,6 +119,7 @@ afterEach(() => {
   global.fetch = originalFetch
   fetchCalls = []
   localStorage.clear()
+  search = new URLSearchParams()
 })
 
 beforeEach(() => {
@@ -258,6 +261,21 @@ function setupFetch(opts: {
 
       if (url.includes("/api/identity/users")) {
         return jsonResponse([row])
+      }
+
+      // WEB-3 S3-D7: the Sessions tab's list.
+      if (method === "GET" && url.includes("/api/auth/sessions")) {
+        return jsonResponse([
+          {
+            id: "s1",
+            userId: "u1",
+            userName: "Sesi Pengguna",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            expiresAt: "2026-01-02T00:00:00.000Z",
+            createdIp: null,
+            userAgent: null,
+          },
+        ])
       }
 
       return new Response("{}", { status: 200 })
@@ -527,5 +545,26 @@ describe("UsersPage deactivate and reactivate (ADM-4 D3/D7)", () => {
       )
       expect(post).toBeDefined()
     })
+  })
+})
+
+describe("UsersPage tabs (WEB-3 S3-D7)", () => {
+  it("opens on People, offers Invite, and does not read the sessions", async () => {
+    setupFetch()
+    renderPage()
+    expect(await screen.findByText("Rina Wijaya")).toBeTruthy()
+    expect(screen.getByRole("tab", { name: "People" }).getAttribute("aria-selected")).toBe("true")
+    expect(screen.getByRole("button", { name: /invite user/i })).toBeTruthy()
+    expect(fetchCalls.some((c) => c.url.includes("/api/auth/sessions"))).toBe(false)
+  })
+
+  it("opens on Sessions for ?tab=sessions, lists them, and offers no Invite there", async () => {
+    search = new URLSearchParams("tab=sessions")
+    setupFetch()
+    renderPage()
+    expect(await screen.findByText("Sesi Pengguna")).toBeTruthy()
+    expect(screen.getByRole("tab", { name: "Sessions" }).getAttribute("aria-selected")).toBe("true")
+    expect(screen.queryByRole("button", { name: /invite user/i })).toBeNull()
+    expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy()
   })
 })
