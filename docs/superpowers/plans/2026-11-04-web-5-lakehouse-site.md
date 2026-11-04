@@ -681,6 +681,41 @@ measured.
 - The scratch worktree is removed, and my servers on :3460, :3461 and
   :9555 are stopped. `git status` is clean.
 
+### Handoff 5: developer (Opus), 2026-11-04, owner QA note 1 (R7)
+
+**Commit:** `b2634f3d` WEB-5 review fix R7 (owner) (base `56f330d8`), pushed.
+
+**What changed** (the RantAI site's rule, read in `rantai-page` and not
+changed):
+- **The 22 non-code monospace uses are sans:** the 21 `lk-mono` classes
+  and the KPI tile's SVG `<text>`. They cover the eyebrows, labels, source
+  pills, captions, the governance headers, cells and toggle label, the
+  footer, the depth markers and gauge, the tile kinds, the chart labels and
+  the scroll cue. The uppercase tracked labels keep their tracking, size
+  and weight; in the screenshots they read as intentional.
+- **The pipeline name `sales_nightly`** in the approval card stays
+  monospace, through the base `code` rule and the system stack the RantAI
+  site uses.
+- **Governance amounts** use `tabular-nums`.
+- **Geist Mono's woff2 and loader are removed.** Two font files are
+  preloaded now, not three, and `.lk-mono` is gone.
+- The tile SVGs have no text, so they were not regenerated;
+  `tile-svg.test.ts` passes on the unchanged files.
+
+**Verified.**
+- Over CDP on `/` and `/id/`, the only element whose text is in a
+  monospace family is that `<code>`, and the amounts' `font-variant-numeric`
+  is `tabular-nums`.
+- Screenshots of the sources, depths, governance and footer, EN and ID:
+  `docs/plans/web-5-screens/r7-desk.jpg` (1440) and `r7-phone.jpg` (390).
+
+**Commands and counts.**
+- Site block: lint 0, typecheck 0, `bun run test` 49 pass, 0 fail,
+  build 0, `bun run size` 0 (178.5 KB).
+- No Lighthouse rerun, because no font file was added (one was removed).
+- I served on :3460 and :9555 only, and both are stopped; :3400 was not
+  touched. `git status` is clean.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
