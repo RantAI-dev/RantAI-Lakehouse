@@ -86,8 +86,26 @@ export function LandingModeProvider({ children }: { children: React.ReactNode })
   // WEB-5 D14 S1: the mode on <html>, for CSS that depends on it (the hero
   // is longer while the live lake runs, app/globals.css). Written when the
   // mode changes, which is at most a few times per visit, never per scroll.
+  //
+  // WEB-5 review fix R10 (SHOULD-FIX): `full` makes the hero 70 vh longer,
+  // and it lands after the first paint, when a visitor who reloaded
+  // mid-page or followed a deep link is already scrolled. Chrome's scroll
+  // anchoring keeps the view in place; a browser without it would move the
+  // page under the visitor. So the first section on screen is measured
+  // before and after the write, and the page is scrolled by the difference.
+  // Where the browser already anchored, the difference is 0 and this does
+  // nothing. "instant", because `html` scrolls smoothly (app/globals.css).
   React.useEffect(() => {
-    document.documentElement.dataset.scene = mode;
+    const root = document.documentElement;
+    if (root.dataset.scene === mode) return;
+    const anchor = Array.from(document.querySelectorAll<HTMLElement>("section[id]")).find(
+      (s) => s.getBoundingClientRect().bottom > 0,
+    );
+    const before = anchor?.getBoundingClientRect().top;
+    root.dataset.scene = mode;
+    if (!anchor || before === undefined) return;
+    const moved = anchor.getBoundingClientRect().top - before;
+    if (Math.abs(moved) >= 1) window.scrollBy({ top: moved, behavior: "instant" });
   }, [mode]);
 
   const value = React.useMemo<LandingModeValue>(
