@@ -1,5 +1,35 @@
 {
   "skipToContent": "Langsung ke konten",
+  "nav": {
+    "label": "Page sections",
+    "product": "Product",
+    "howItWorks": "How it works",
+    "governance": "Governance",
+    "openSource": "Open source"
+  },
+  "cta": {
+    "install": "Install it",
+    "talk": "Talk to us",
+    "source": "Read the source"
+  },
+  "footer": {
+    "tagline": "RantAI Lakehouse. One lakehouse with dashboards built in.",
+    "columns": {
+      "product": "Product",
+      "rantai": "RantAI",
+      "connect": "Connect"
+    },
+    "sections": {
+      "sources": "Everything flows in",
+      "depths": "Three depths",
+      "assistant": "Ask, don't dig",
+      "dashboards": "Dashboards",
+      "governance": "Guarded by default",
+      "open": "Yours to keep"
+    },
+    "userGuide": "User guide",
+    "legal": "© 2026 RantAI. Depok, West Java, Indonesia."
+  },
   "language": {
     "label": "Bahasa",
     "en": "English",

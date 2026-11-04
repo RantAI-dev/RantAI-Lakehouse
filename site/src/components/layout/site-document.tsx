@@ -1,6 +1,7 @@
 import { NextIntlClientProvider } from "next-intl";
 import { getMessages, getTranslations } from "next-intl/server";
 import { routing, type Locale } from "@/i18n/routing";
+import { fontVariables } from "@/lib/fonts";
 import { LanguageSuggestion, type SuggestionText } from "./language-suggestion";
 
 /**
@@ -26,7 +27,7 @@ export async function SiteDocument({
       : null;
 
   return (
-    <html lang={locale}>
+    <html lang={locale} className={fontVariables}>
       <body>
         <NextIntlClientProvider locale={locale} messages={{ common: messages.common }}>
           {children}

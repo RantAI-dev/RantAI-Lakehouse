@@ -1,4 +1,5 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
+import "./globals.css";
 
 /**
  * The top layout renders no `<html>` of its own: each language writes its
@@ -10,6 +11,11 @@ import type { Metadata } from "next";
  */
 export const metadata: Metadata = {
   title: "RantAI Lakehouse",
+};
+
+/** Browser chrome takes the abyss colour so the page reaches the screen edges. */
+export const viewport: Viewport = {
+  themeColor: "#020514",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

@@ -1,19 +1,61 @@
-import { getTranslations } from "next-intl/server";
-import { LanguageSwitcher } from "@/components/layout/language-switcher";
+import { getMessages } from "next-intl/server";
+import { LandingModeProvider } from "@/components/effects/scene-mode";
+import { SiteFooter } from "@/components/layout/site-footer";
+import { TopBar } from "@/components/layout/top-bar";
 import type { Locale } from "@/i18n/routing";
+import type { CommonCopy, HomeCopy } from "@/lib/copy";
+import { AssistantSection } from "./assistant-section";
+import { DashboardsSection } from "./dashboards-section";
+import { DepthsSection } from "./depths-section";
+import { FinalSection } from "./final-section";
+import { GovernanceSection } from "./governance-section";
+import { HeroSection } from "./hero-section";
+import { OpenSection } from "./open-section";
+import { SceneZone } from "./scene-zone";
+import { SourcesSection } from "./sources-section";
 
 /**
- * The home page, shared by its two routes (`app/(en)/page.tsx` and
- * `app/[locale]/page.tsx`), hence `components/home/` rather than a route's
- * `_components/` (WEB-5 D9). Placeholder until T3 moves the landing here.
+ * The home page (WEB-1's landing page, moved by WEB-5). It is shared by its
+ * two routes, `app/(en)/page.tsx` and `app/[locale]/page.tsx`, so it lives
+ * in `components/home/` rather than in a route's `_components/` (D9).
+ *
+ * It is static and independent of any API. The text is read here, on the
+ * server, from the locale's messages and handed to each section as props,
+ * so no section reads a message on the client (D5).
  */
 export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
-  const t = await getTranslations({ locale, namespace: "home.hero" });
+  const messages = await getMessages({ locale });
+  const home = messages.home as HomeCopy;
+  const common = messages.common as CommonCopy;
+
   return (
-    <main>
-      <LanguageSwitcher />
-      <p>{t("eyebrow")}</p>
-      <h1>{t("headline")}</h1>
-    </main>
+    <LandingModeProvider>
+      <div className="lk-root relative min-h-screen overflow-x-clip">
+        {/* Keeps the scroll-reveal sections readable when JavaScript is off. */}
+        <noscript>
+          <style>{`[data-reveal]{opacity:1!important;transform:none!important;filter:none!important}`}</style>
+        </noscript>
+        <a
+          href="#main"
+          className="sr-only z-[60] rounded-full bg-[#E8F4FF] px-4 py-2 text-[14px] font-medium text-[#020514] focus:not-sr-only focus:fixed focus:top-3 focus:left-3"
+        >
+          {common.skipToContent}
+        </a>
+        <TopBar nav={common.nav} cta={common.cta} />
+        <main id="main" tabIndex={-1}>
+          <SceneZone>
+            <HeroSection copy={home.hero} cta={common.cta} />
+            <SourcesSection copy={home.sources} />
+            <DepthsSection copy={home.depths} />
+          </SceneZone>
+          <AssistantSection copy={home.assistant} />
+          <DashboardsSection copy={home.dashboards} />
+          <GovernanceSection copy={home.governance} />
+          <OpenSection copy={home.open} cta={common.cta} />
+          <FinalSection copy={home.final} cta={common.cta} />
+        </main>
+        <SiteFooter copy={common.footer} />
+      </div>
+    </LandingModeProvider>
   );
 }
