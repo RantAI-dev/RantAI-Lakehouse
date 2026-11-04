@@ -3,7 +3,10 @@ import { LandingModeProvider } from "@/components/effects/scene-mode";
 import { SiteFooter } from "@/components/layout/site-footer";
 import { TopBar } from "@/components/layout/top-bar";
 import type { Locale } from "@/i18n/routing";
+import { JsonLd } from "@/components/shared/json-ld";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
+import { siteUrl } from "@/lib/site-url";
+import { homeStructuredData } from "@/lib/structured-data";
 import { AssistantSection } from "./assistant-section";
 import { DashboardsSection } from "./dashboards-section";
 import { DepthsSection } from "./depths-section";
@@ -27,6 +30,7 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
   const messages = await getMessages({ locale });
   const home = messages.home as HomeCopy;
   const common = messages.common as CommonCopy;
+  const meta = messages.metadata as { home: { description: string } };
 
   return (
     <LandingModeProvider>
@@ -55,6 +59,7 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
           <FinalSection copy={home.final} cta={common.cta} />
         </main>
         <SiteFooter copy={common.footer} />
+        <JsonLd data={homeStructuredData({ locale, siteUrl: siteUrl(), description: meta.home.description })} />
       </div>
     </LandingModeProvider>
   );
