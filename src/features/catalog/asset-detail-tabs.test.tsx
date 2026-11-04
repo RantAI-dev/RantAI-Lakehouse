@@ -2059,7 +2059,7 @@ describe("Access tab: adding a policy", () => {
     url.search = "tab=access"
     renderTabs()
 
-    await screen.findByText("Open policies")
+    await screen.findByText("Open access rules")
     expect(screen.queryByText("Add policy")).toBeNull()
   })
 })
@@ -2187,7 +2187,7 @@ describe("Access tab: enforcing and deleting a policy", () => {
     url.search = "tab=access"
     renderTabs({ ...BRONZE, policySummary: [policy("draft")] })
 
-    await screen.findByText("Open policies")
+    await screen.findByText("Open access rules")
     expect(screen.queryByRole("button", { name: "Enforce" })).toBeNull()
     expect(screen.queryByLabelText("Delete policy mask-amount")).toBeNull()
   })

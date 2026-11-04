@@ -407,16 +407,19 @@ tells you if it is not.
 
 ## 7. Governance
 
-### Policies
+### Access rules
 
-Policies are added on a table's **Access** tab, in the Catalog, where
-the policy engine enforces them (see **Hide sensitive columns** below).
-There is no separate create form: **Policies** lists what exists, and
-clicking a policy lets you **Enforce**, **Stop enforcing** or **Delete**
-it.
+Access rules (policies) are added on a table's **Access** tab, in the
+Catalog, where the policy engine enforces them (see **Hide sensitive
+columns** below). **Access rules** lists every rule, read-only: its
+table, the roles it applies to, what it does (the columns it masks, or
+that it filters rows) and whether it is enforced. Click a table to open
+its **Access** tab, where you **Enforce**, **Stop enforcing** or
+**Delete** the rule. A table the catalog cannot open is named without a
+link.
 
-A policy made with the old **Create Policy** wizard is still listed, but
-it enforces nothing: the wizard saved its subjects, resources and
+A rule made with the old **Create Policy** wizard is still listed, but it
+reads **Not enforced**: the wizard saved its subjects, resources and
 conditions as free text, and the engine reads only structured conditions.
 
 ### Hide sensitive columns

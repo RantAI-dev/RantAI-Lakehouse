@@ -45,7 +45,8 @@ export function sharedMaskSentence(mask: Extract<ColumnMask, { kind: "shared" }>
   return `Part of ${mask.policy.name}, which also ${parts.join(" and ")}.`
 }
 
-function listOf(items: string[]): string {
+/** "a", "a and b", "a, b and c". */
+export function listOf(items: string[]): string {
   if (items.length <= 1) return items.join("")
   return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`
 }

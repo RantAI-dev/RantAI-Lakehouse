@@ -146,7 +146,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
         ask: ["Summarize lakehouse data quality", "Show the lineage of a Gold mart", "Which datasets have quality issues?"],
         build: ["Refresh the lakehouse (Bronze→Silver→Gold)"],
       },
-      system: "The user is in Governance (policies, data quality with its check schedules and freshness targets, lineage, audit). A column's sensitivity and masks are set on its table's Schema tab. Prefer get_quality / get_lineage.",
+      system: "The user is in Governance (access rules, listed read-only and changed on a table's Access tab; data quality with its check schedules and freshness targets, lineage, audit). A column's sensitivity and masks are set on its table's Schema tab. Prefer get_quality / get_lineage.",
     },
   },
 ];

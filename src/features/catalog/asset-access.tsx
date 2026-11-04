@@ -317,7 +317,7 @@ export function AssetAccess({
             ) : null}
             {canOpen ? (
               <Button size="sm" variant="ghost" render={<Link href="/governance/policies" />}>
-                Open policies
+                Open access rules
               </Button>
             ) : null}
           </div>

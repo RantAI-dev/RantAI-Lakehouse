@@ -123,8 +123,9 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       // WEB-3 S3-D3, S3-D6: a column's sensitivity and masks are set on the
       // column (a table's Schema tab), and Tag keys is a section of Settings;
-      // their old addresses redirect.
-      { title: "Policies", href: "/governance/policies", icon: ShieldCheck },
+      // their old addresses redirect. S3-D4: Policies is "Access rules", at
+      // the same address.
+      { title: "Access rules", href: "/governance/policies", icon: ShieldCheck },
       {
         title: "Data Quality",
         href: "/governance/data-quality",
