@@ -557,6 +557,80 @@ Evidence: `docs/plans/web-5-screens/r4-sources-360x740.jpg` (EN and ID).
 Please confirm it or ask for it back. Keeping `motion` means importing
 through its namespace re-export, which brings back the full bundle.
 
+### Handoff 3: developer (Opus), 2026-11-04, review 2 (R5)
+
+**Commit:** `134cf568` WEB-5 review fix R5 (base `9c5b5148`), pushed.
+
+**What changed.**
+- All eight `components/home/*-section.tsx` files are server modules, with
+  `"use client"` only on the leaves:
+  - `hero-motion` (copy fade, cue fade, backdrop fade);
+  - `sources-motion` (headline fade, falling pills);
+  - `depths-stage` (pinned stage);
+  - `assistant-chat`;
+  - `dashboards-scroller` (section height, sliding rail);
+  - `governance-table` (table, toggle, flip);
+  - `final-mascot` (creature, eye).
+- Other pieces:
+  - the shared `ProgressSection` measures a section's scroll progress and
+    provides it to the leaves;
+  - `mascot-svg` is server-only, and the moving creature is in
+    `mascot-rising`;
+  - the dot map and calendar tiles are server SVG
+    (`dashboard-tiles-static`).
+- The text is still server props from `getMessages`; there is no client
+  provider.
+
+**No visual change (D6).**
+- **Server HTML,** R5 against the pre-R5 build, every start tag with its
+  attributes plus every text node: `/` has 1082 tags and 205 text nodes,
+  `/id/` 1068 and 198, on both builds. The only differences are React's
+  `useId` prefix (now a server id) and the static logo's eye `<g>`, which
+  lost motion's inert `transform:none` style (two per page).
+- **The T5 set** (`docs/plans/web-5-screens/t5-*.jpg`) was re-taken and
+  shows the same content.
+- **Mid-pin states** were compared with T8 (`5cf9dfa0`), built in a
+  scratch worktree that has since been removed: sources, depths,
+  assistant, dashboards and the final call match.
+
+**A regression from R1, found and fixed in this commit.** The dashboards
+rail no longer slid. With the animation features loading after hydration,
+a ref on an `m.*` element was not set in time, so the track was never
+measured.
+- At T8: the section is `calc(972px + 100vh)` and the rail is at −292,
+  −680 and −972 px at 0.3, 0.7 and 1.
+- On `d05fde85`: `calc(0px + 100vh)` and no transform.
+- The refs now sit on plain elements, and the probe gives T8's numbers
+  again. No other ref is on an `m.*` element.
+
+**Commands and counts.**
+- Site block on the final code: lint 0, typecheck 0, `bun run test`
+  46 pass, 0 fail, build 0, `bun run size` 0. Initial JS is 178.6 KB on
+  both pages (was 181.2 KB); the scene is 146.8 KB, deferred.
+- Lighthouse 13.6.0, the RESULT's command, three runs per locale. The
+  medians are in `WEB-5-RESULT.md` under "Update: review fix R5";
+  "Reviewer's run 1" is untouched.
+
+| Metric | EN | ID |
+| --- | --- | --- |
+| LCP | 1.07 s | 1.07 s |
+| CLS | 0 | 0 |
+| SEO / accessibility / best practices | 100 | 100 |
+| Performance | 94 | 96 |
+| **TBT** | **284 ms** | **218 ms** |
+
+**TBT is still over 200 ms.**
+- The remaining long task is react-dom's hydration: 229–291 ms in every
+  run, which alone is more than 180 ms of blocking time. EN run 1 also had
+  a 298 ms App Router task, at TBT 592 ms on a VM at load 7.5–10.9.
+- R5 did not shorten hydration. React hydrates every host element, whether
+  a server or a client component rendered it.
+- 420 of the page's 1,088 elements are the two static tiles' SVG shapes
+  (280 circles and 140 rects), and the inline RSC payload is 125.6 KB.
+- **A lever left for you and the owner:** draw those two tiles as one
+  `<img>` each, the same SVG as a data URI or a static file, with no
+  design change. It is not done here; R5 asked to record.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
