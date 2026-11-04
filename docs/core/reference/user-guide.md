@@ -409,21 +409,15 @@ tells you if it is not.
 
 ### Policies
 
-1. In **Policies**, click **Create Policy**.
-2. **Basics:** give it a **Policy name** and choose its **Kind**:
-   - **Row filter**;
-   - **Column mask**;
-   - **Agent autonomy**;
-   - **Retention**;
-   - **Residency**.
-3. **Scope:** fill **Subjects** (who it applies to) and **Resources**
-   (what it covers).
-4. **Rules:** choose the **Effect**, and add **Conditions** if needed.
-5. **Review:** switch on **Activate on create** to enforce it straight
-   away, or leave it off to keep a draft. Then click **Create draft** or
-   **Create & activate**.
+Policies are added on a table's **Access** tab, in Data Explorer, where
+the policy engine enforces them (see **Hide sensitive columns** below).
+There is no separate create form: **Policies** lists what exists, and
+clicking a policy lets you **Enforce**, **Stop enforcing** or **Delete**
+it.
 
-Later, click a policy to **Enforce**, **Stop enforcing** or **Delete** it.
+A policy made with the old **Create Policy** wizard is still listed, but
+it enforces nothing: the wizard saved its subjects, resources and
+conditions as free text, and the engine reads only structured conditions.
 
 ### Hide sensitive columns
 
@@ -470,8 +464,10 @@ check opens an incident, listed under **Open incidents**, with
 
 ### Lineage
 
-In **Lineage**, type a table name. The page shows its **Graph**,
-**Connections**, **Column mappings**, and **What this graph covers**.
+Open the Lineage page from a table's **Lineage** tab, from a chart, from a
+pipeline or from a run, with **Open lineage graph**. It shows the table's
+**Graph**, **Connections**, **Column mappings**, and **What this graph
+covers**.
 
 ### Approvals
 
@@ -528,9 +524,6 @@ It does not yet record every change made in the console.
 | Page | What it shows |
 | --- | --- |
 | **Health** | Platform health across storage, pipelines, queries, agents and governance. |
-| **Activity** | Recent actions from pipelines, queries, schema changes, policies, connectors, agents and approvals. |
-| **Workloads** | Running and queued requests, with their cost. |
-| **Observability** | Service levels, lag, cache behaviour, policy latency and agent performance. There is no log or trace explorer. |
 | **Services** | Whether each component is up, with its version. A component that was never set up shows "unknown", not "down". |
 | **Capacity** | Storage per bucket, from a daily snapshot, plus ClickHouse's live disk use. |
 | **Table Maintenance** | Each table's upkeep and the nightly maintenance runs. The **Dry run (would delete)** column shows what the next run would remove. A table's own page sets **Snapshots to keep**, **Compact small files** and the **Schedule**. |
@@ -546,13 +539,9 @@ These pages are for platform administrators.
 | **Teams & Roles** | **Create Role**: give a **Name**, its **Permissions** (for example `catalog:read, query:run`) and a **Description**. |
 | **Tenants** | **Create Tenant**: an organisation, with its **Name**, **Slug**, **Plan** and **Residency**. |
 | **Service Identities** | **Create Service Identity**: an account for scheduled jobs. Its secret is shown once, when you create a credential. Copy it then. |
-| **SSO** | See the single sign-on setup and click **Test sign-in**. Your operator configures it on the server. |
 | **Sessions** | See who is signed in, and **Revoke** a session. |
-| **Settings** | Report time zone, first day of the week, number format, company palette and fonts, allowed outside sites and email domains, downloads, public links, remembered results, and query limits per role. |
+| **Settings** | Report time zone, first day of the week, number format, company palette and fonts, allowed outside sites and email domains, downloads, public links, remembered results, query limits per role, and sign-in: whether single sign-on is set up (with **Test sign-in**). Your operator configures single sign-on on the server. |
 | **Maps** | **Upload a map** (a GeoJSON file of polygons) for map charts. A map that a chart uses cannot be deleted. |
-
-**Intelligence** (Digital Employees, Agent Runs) is marked **Soon** and
-cannot be opened yet.
 
 ## 10. What the console will always tell you
 
