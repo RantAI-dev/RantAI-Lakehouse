@@ -1,34 +1,34 @@
 {
   "skipToContent": "Langsung ke konten",
   "nav": {
-    "label": "Page sections",
-    "product": "Product",
-    "howItWorks": "How it works",
-    "governance": "Governance",
+    "label": "Bagian halaman",
+    "product": "Produk",
+    "howItWorks": "Cara kerja",
+    "governance": "Tata kelola",
     "openSource": "Open source"
   },
   "cta": {
-    "install": "Install it",
-    "talk": "Talk to us",
-    "source": "Read the source"
+    "install": "Instal",
+    "talk": "Hubungi kami",
+    "source": "Lihat source code"
   },
   "footer": {
-    "tagline": "RantAI Lakehouse. One lakehouse with dashboards built in.",
+    "tagline": "RantAI Lakehouse. Satu lakehouse dengan dashboard bawaan.",
     "columns": {
-      "product": "Product",
+      "product": "Produk",
       "rantai": "RantAI",
-      "connect": "Connect"
+      "connect": "Kontak"
     },
     "sections": {
-      "sources": "Everything flows in",
-      "depths": "Three depths",
-      "assistant": "Ask, don't dig",
-      "dashboards": "Dashboards",
-      "governance": "Guarded by default",
-      "open": "Yours to keep"
+      "sources": "Semua mengalir masuk",
+      "depths": "Tiga kedalaman",
+      "assistant": "Cukup tanya",
+      "dashboards": "Dashboard",
+      "governance": "Aman sejak awal",
+      "open": "Milik Anda"
     },
-    "userGuide": "User guide",
-    "legal": "© 2026 RantAI. Depok, West Java, Indonesia."
+    "userGuide": "Panduan pengguna",
+    "legal": "© 2026 RantAI. Depok, Jawa Barat, Indonesia."
   },
   "language": {
     "label": "Bahasa",

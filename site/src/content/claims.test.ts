@@ -61,5 +61,8 @@ test("resolve follows objects and array indexes, and the forbidden patterns catc
   assert.ok(FORBIDDEN.some((re) => re.test("Live change capture for MySQL and PostgreSQL")));
   assert.ok(FORBIDDEN.some((re) => re.test("Upload over SFTP")));
   assert.ok(FORBIDDEN.some((re) => re.test("every chart type you need")));
+  assert.ok(FORBIDDEN.some((re) => re.test("Change capture langsung untuk MySQL")));
+  assert.ok(FORBIDDEN.some((re) => re.test("semua jenis chart tersedia")));
   assert.ok(!FORBIDDEN.some((re) => re.test("Live change capture for PostgreSQL.")));
+  assert.ok(!FORBIDDEN.some((re) => re.test("Change capture langsung untuk PostgreSQL.")));
 });

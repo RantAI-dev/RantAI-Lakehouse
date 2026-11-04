@@ -72,10 +72,11 @@ export const CLAIMS: readonly Claim[] = [
 /**
  * D7's "do not add" list, as patterns no message may match: change capture
  * for MySQL or SQL Server (SRC-4 Planned, VER-1 Todo), SFTP (VER-1 Todo),
- * and "every chart type" (BI-16 Building).
+ * and "every chart type" (BI-16 Building), in both languages.
  */
 export const FORBIDDEN: readonly RegExp[] = [
-  /change capture for (?:[^.]*\b)?(?:MySQL|SQL Server)/i,
+  // English and Indonesian ("change capture untuk MySQL").
+  /change capture (?:\S+ )?(?:for|untuk) (?:[^.]*\b)?(?:MySQL|SQL Server)/i,
   /\bSFTP\b/i,
-  /every chart type/i,
+  /every chart type|(?:semua|setiap) jenis chart/i,
 ];

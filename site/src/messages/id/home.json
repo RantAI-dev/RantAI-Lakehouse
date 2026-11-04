@@ -1,23 +1,23 @@
 {
   "hero": {
     "eyebrow": "RANTAI LAKEHOUSE",
-    "headline": "Your data has a home now.",
-    "sub": "One lakehouse with dashboards built in. Bring every source in, keep it in open tables, and ask for answers in plain language.",
-    "scrollCue": "Scroll to dive"
+    "headline": "Rumah bagi data Anda.",
+    "sub": "Satu lakehouse dengan dashboard bawaan. Satukan semua sumber, simpan dalam tabel terbuka, dan tanyakan jawabannya dengan bahasa sehari-hari.",
+    "scrollCue": "Gulir untuk menyelam"
   },
   "sources": {
-    "headline": "Everything flows in.",
-    "sub": "Databases, files, streams, APIs and business apps land in one place, on a schedule or as they change.",
+    "headline": "Semua mengalir masuk.",
+    "sub": "Database, file, stream, API, dan aplikasi bisnis masuk ke satu tempat, terjadwal atau setiap kali datanya berubah.",
     "items": [
       "PostgreSQL",
       "MySQL",
       "SQL Server",
       "MongoDB",
-      "REST APIs",
+      "REST API",
       "Kafka",
-      "CSV and TSV files",
-      "Excel workbooks",
-      "Parquet files",
+      "File CSV dan TSV",
+      "Workbook Excel",
+      "File Parquet",
       "Salesforce",
       "ServiceNow",
       "Google Analytics 4",
@@ -26,138 +26,138 @@
       "Confluence",
       "Dynamics 365",
       "SharePoint",
-      "JSON, JSON Lines and Avro",
-      "gzip and zip archives"
+      "JSON, JSON Lines, Avro",
+      "Arsip gzip dan zip"
     ],
-    "caption": "Live change capture for PostgreSQL. Dedupe or keep history on load, discover tables in any source, and upload 10 files at once, in folders."
+    "caption": "Change capture langsung untuk PostgreSQL. Dedupe atau simpan riwayat saat load, temukan tabel di semua sumber, dan unggah 10 file sekaligus ke folder."
   },
   "depths": {
-    "eyebrow": "Three depths",
-    "headline": "Three depths.",
+    "eyebrow": "Tiga kedalaman",
+    "headline": "Tiga kedalaman.",
     "layers": {
       "bronze": {
-        "title": "Raw, kept as it came.",
-        "body": "Every source lands untouched in open Apache Iceberg tables, so nothing is lost and nothing is locked in."
+        "title": "Mentah dan utuh.",
+        "body": "Setiap sumber masuk tanpa diubah ke tabel Apache Iceberg yang terbuka, jadi tak ada yang hilang dan tak ada yang terkunci."
       },
       "silver": {
-        "title": "Cleaned and joined.",
-        "body": "Pipelines with schedules, dependencies, retries and version history clean the raw data into tables you can trust, and quality checks with anomaly detection watch them."
+        "title": "Bersih, terpadu.",
+        "body": "Pipeline dengan jadwal, dependensi, retry, dan riwayat versi membersihkan data mentah menjadi tabel tepercaya, diawasi pemeriksaan kualitas dengan deteksi anomali."
       },
       "gold": {
-        "title": "Ready for answers.",
-        "body": "Curated tables built for the questions your business asks. They refresh themselves within the lag you set, and publish as open tables when you switch it on."
+        "title": "Siap menjawab.",
+        "body": "Tabel terkurasi untuk pertanyaan bisnis Anda. Tabel ini diperbarui sendiri dalam lag yang Anda tetapkan, dan terbit sebagai tabel terbuka bila Anda aktifkan."
       }
     }
   },
   "assistant": {
-    "headline": "Ask, don't dig.",
-    "sub": "The assistant works with the same tools as the console. It answers questions, builds charts and dashboards, and runs pipelines. Anything risky waits for a person to approve it. Prefer SQL? Query Studio has autocomplete, tabs and a query history.",
-    "caption": "Illustration",
-    "userOne": "Which region had the most visitors last quarter?",
-    "answerOne": "Region North had the most visitors last quarter.",
-    "userTwo": "Pause the nightly sales pipeline.",
-    "approvalLabel": "Waiting for approval",
-    "approvalAction": "Pause pipeline",
-    "approve": "Approve",
-    "decline": "Decline",
+    "headline": "Cukup tanya.",
+    "sub": "Asisten memakai tool yang sama dengan konsol. Ia menjawab pertanyaan, membuat chart dan dashboard, serta menjalankan pipeline. Apa pun yang berisiko menunggu persetujuan manusia. Lebih suka SQL? Query Studio punya autocomplete, tab, dan riwayat query.",
+    "caption": "Ilustrasi",
+    "userOne": "Wilayah mana yang paling banyak pengunjungnya kuartal lalu?",
+    "answerOne": "Wilayah Utara paling banyak pengunjungnya kuartal lalu.",
+    "userTwo": "Jeda pipeline penjualan malam.",
+    "approvalLabel": "Menunggu persetujuan",
+    "approvalAction": "Jeda pipeline",
+    "approve": "Setujui",
+    "decline": "Tolak",
     "regions": {
-      "north": "North",
-      "south": "South",
-      "east": "East",
-      "west": "West"
+      "north": "Utara",
+      "south": "Selatan",
+      "east": "Timur",
+      "west": "Barat"
     },
-    "srDescription": "An illustration of the assistant. A person asks which region had the most visitors last quarter and the assistant answers with a small bar chart. The person then asks to pause the nightly sales pipeline, and the assistant shows a card that waits for a person to approve or decline the change. The region names and numbers are illustrative."
+    "srDescription": "Ilustrasi asisten. Seseorang bertanya wilayah mana yang paling banyak pengunjungnya kuartal lalu, dan asisten menjawab dengan bar chart kecil. Lalu ia meminta pipeline penjualan malam dijeda, dan asisten menampilkan kartu yang menunggu seseorang menyetujui atau menolak perubahan itu. Nama wilayah dan angkanya hanya ilustrasi."
   },
   "dashboards": {
-    "headline": "Answers come back up as dashboards.",
-    "sub": "About two dozen chart types, maps on your own boundaries included, with calculated fields, parameters, reusable metrics and results that are remembered and refreshed. Comment with @mentions, set alerts on a chart, export PNG, PDF or Excel, schedule reports, and share by a public link with an expiry and a password, or as an embed.",
-    "caption": "Illustrations, not customer data.",
+    "headline": "Jawabannya naik jadi dashboard.",
+    "sub": "Sekitar dua lusin jenis chart, termasuk peta dengan batas wilayah Anda, plus calculated field, parameter, metrik bersama, dan hasil yang diingat lalu diperbarui. Komentar dengan @mention, alert di chart, ekspor PNG, PDF, atau Excel, laporan terjadwal, dan berbagi lewat tautan publik berbatas waktu dan bersandi, atau embed.",
+    "caption": "Ilustrasi, bukan data pelanggan.",
     "tiles": {
       "line": {
-        "title": "Visits over time",
+        "title": "Kunjungan dari waktu ke waktu",
         "kind": "Line chart",
-        "aria": "Illustrative line chart"
+        "aria": "Ilustrasi line chart"
       },
       "map": {
-        "title": "Visits by region",
-        "kind": "Map",
-        "aria": "Illustrative map of dots"
+        "title": "Kunjungan per wilayah",
+        "kind": "Peta",
+        "aria": "Ilustrasi peta titik"
       },
       "sankey": {
-        "title": "Where visits come from",
+        "title": "Asal kunjungan",
         "kind": "Sankey",
-        "aria": "Illustrative Sankey diagram"
+        "aria": "Ilustrasi diagram Sankey"
       },
       "kpi": {
-        "title": "Visits this week",
+        "title": "Kunjungan minggu ini",
         "kind": "KPI",
-        "aria": "Illustrative KPI tile",
-        "delta": "+8.4% vs last week"
+        "aria": "Ilustrasi tile KPI",
+        "delta": "+8,4% vs minggu lalu"
       },
       "calendar": {
-        "title": "Busy days",
+        "title": "Hari tersibuk",
         "kind": "Calendar heatmap",
-        "aria": "Illustrative calendar heatmap"
+        "aria": "Ilustrasi calendar heatmap"
       }
     }
   },
   "governance": {
-    "headline": "Guarded by default.",
-    "sub": "Roles decide who sees what. Sensitive columns are classified and masked for everyone who should not see them, and column-level lineage shows where every column comes from.",
-    "illustration": "Illustration · fictional people",
-    "viewAs": "View as",
+    "headline": "Aman sejak awal.",
+    "sub": "Peran menentukan siapa melihat apa. Kolom sensitif diklasifikasikan dan disamarkan bagi siapa pun yang tak berhak melihatnya, dan lineage tingkat kolom menunjukkan asal setiap kolom.",
+    "illustration": "Ilustrasi · orang fiktif",
+    "viewAs": "Lihat sebagai",
     "roles": {
-      "analyst": "Analyst",
+      "analyst": "Analis",
       "admin": "Admin"
     },
     "columns": {
-      "name": "Name",
+      "name": "Nama",
       "email": "Email",
-      "city": "City",
-      "amount": "Amount"
+      "city": "Kota",
+      "amount": "Jumlah"
     },
-    "tableCaption": "Five fictional customers. As an analyst the name and email columns are masked; as an admin they are shown in full.",
+    "tableCaption": "Lima pelanggan fiktif. Sebagai analis, kolom nama dan email disamarkan; sebagai admin, keduanya tampil utuh.",
     "facts": [
       {
-        "label": "Proof",
-        "text": "Masking proven end to end in an acceptance gate"
+        "label": "Bukti",
+        "text": "Masking terbukti end to end di acceptance gate"
       },
       {
         "label": "Audit",
-        "text": "Assistant actions logged; risky ones wait for approval"
+        "text": "Aksi asisten tercatat; yang berisiko menunggu persetujuan"
       },
       {
         "label": "Lineage",
-        "text": "Column-level lineage, from raw table to curated table"
+        "text": "Lineage tingkat kolom, dari tabel mentah ke tabel terkurasi"
       },
       {
-        "label": "Catalog",
-        "text": "Catalog search with certified and deprecated marks and governed tags"
+        "label": "Katalog",
+        "text": "Pencarian katalog dengan tanda certified dan deprecated serta tag terkelola"
       },
       {
-        "label": "Access",
-        "text": "Permissions per dashboard and per folder"
+        "label": "Akses",
+        "text": "Izin per dashboard dan per folder"
       }
     ]
   },
   "open": {
-    "headline": "Yours to keep.",
+    "headline": "Milik Anda.",
     "cards": [
       {
         "title": "Open source.",
-        "body": "AGPL-3.0. Read every line, run it yourself."
+        "body": "AGPL-3.0. Baca setiap baris kodenya, jalankan sendiri."
       },
       {
-        "title": "Open tables.",
-        "body": "Raw data in Apache Iceberg. Any engine that reads Iceberg can read it."
+        "title": "Tabel terbuka.",
+        "body": "Data mentah dalam Apache Iceberg. Engine apa pun yang membaca Iceberg bisa membacanya."
       },
       {
-        "title": "Your servers or ours.",
-        "body": "Install it on your own infrastructure, or talk to us about running it for you."
+        "title": "Server Anda atau kami.",
+        "body": "Pasang di infrastruktur Anda sendiri, atau bicarakan dengan kami agar kami yang menjalankannya untuk Anda."
       }
     ]
   },
   "final": {
-    "headline": "Come on in. The data's fine."
+    "headline": "Masuklah. Datanya aman."
   }
 }
