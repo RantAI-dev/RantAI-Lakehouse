@@ -785,6 +785,24 @@
     ]
   },
   {
+    "id": "alert_names_its_chart",
+    "mode": "ask",
+    "note": "BI-39 D8/D9: `list_alert_rules` goes through the same list helper as GET /api/alerts, so a chart rule carries chartTitle and dashboardTitle and the assistant can name the chart an alert is on. Before that the list knew the chart id only.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Alert Names Board"}, "id_at": "board.id"},
+      {"name": "tile", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Alert Names Chart", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
+      {"name": "rule", "method": "POST", "path": "/api/alerts", "body": {"name": "Eval Alert Names Rule", "type": "alert", "chart": "{tile}", "condition": "above", "threshold": 1000, "channel": "email", "target": "e@example.com"}, "id_at": "rule.id"}
+    ],
+    "turns": ["Which chart are my alerts on?"],
+    "expect_tool": {"name": "list_alert_rules"},
+    "facts": [
+      {"label": "chart", "kind": "text", "values": ["Eval Alert Names Chart"]}
+    ],
+    "cleanup": [
+      {"method": "DELETE", "path": "/api/alerts?id={rule}"}
+    ]
+  },
+  {
     "id": "export_chart_png",
     "mode": "ask",
     "context": "The person is on the dashboard page and sees one tile: \"Eval Visitors Chart\" (bar, id {tile}); it shows mart_event.jumlah_event by tahun.",
