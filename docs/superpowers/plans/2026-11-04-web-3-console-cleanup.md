@@ -743,3 +743,30 @@ dated feature-page records alone. The command-palette test that failed once and 
 - **Follow-up, not this slice (handoff point 6):** Iceberg tables with no catalog entry
   (e.g. some Gold export tables) are no longer reachable from any list. The planner files it
   as a backlog item.
+
+### Review slice 3b, round 1 (planner, 2026-11-04, at `03093545`)
+
+S3-T1 to S3-T4 and S3-T6 read against S3-D1 to S3-D11. No BLOCKER. The handoff's design choices
+are accepted: a mask added on a column is enforced at once; a policy that also filters rows is
+not removed from the column; "roles hidden" without `policy:read`; `keepDataOnReload` on the
+asset page; the shared `useUrlTab`, freshness dialog, schedule control and policy builders;
+Bronze keys as plain text. The one full-suite failure (an `uploads-panel` poll count, passing
+3/3 alone and in the second run) is noted; CI judges.
+
+Decisions on the five mismatches the handoff reports:
+
+1. **Table-level sensitivity (S3-D2 removed its only control).** Planner decision: it moves to
+   the asset's About card (`catalog/asset-about.tsx`) as "Sensitivity (whole table)", with
+   Set / Change / Remove, using the same classification calls with no column. The rule is
+   unchanged: a table is never less strict than its strictest column, so the header badge may
+   show a stricter level than the table-level rule, and the card says why in one muted line.
+   Built in the next run, as **S3-T5a**, before S3-T5.
+2. **The asset Lineage tab's "Open lineage graph" button** keeps pointing at
+   `/lineage?focus=`: it opens the full page, so it is not a self-link. Accepted as built.
+3. **Schedules lists only tables with a saved schedule**, with the default line. Accepted. Adding
+   a schedule for another table from this tab is a follow-up (a table picker), not this slice.
+4. **No "Has sensitive columns" filter.** Accepted: the list does not carry it, and an
+   approximate filter would mislead.
+5. **The sidebar renames ship with their pages (S3-T5).** Accepted.
+
+Next run: S3-T5a now; S3-T5 when slice 3a's handoff entry is on its branch.
