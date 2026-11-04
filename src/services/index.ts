@@ -46,16 +46,16 @@ export const pipelineService = dagsterPipelineService
 // the Rust backend (ClickHouse + Postgres + LLM).
 // mock/queries.ts has been deleted.
 export const queryService = clickhouseQueryService
-// Agents is now fully real — employees/tools/workflows/runs/approvals
-// live in Postgres (Task 2.9). There is no agent/tool execution runtime
-// (the contract never asked for one). mock/agents.ts has been deleted.
+// Agents is real — employee definitions, runs and approvals live in
+// Postgres (Task 2.9). WEB-3 slice 1 removed the employee/run-list methods
+// from the client (the pages are gone); run detail and approvals remain.
 export const agentService = postgresAgentService
 // Governance is now fully real — reads from ClickHouse/Dagster,
 // policies + create*Rule from Postgres. mock/governance.ts has been deleted.
 export const governanceService = clickhouseGovernanceService
-// Ops is now fully real — observability/usage/workloads/services from
-// ClickHouse+Dagster, cancelWorkload is a real KILL QUERY. mock/ops.ts
-// has been deleted.
+// Ops is real — the service list from ClickHouse+Dagster. WEB-3 slice 1
+// removed observability/workloads from the client with their pages; the
+// backend routes stay registered (WEB-4 retires them).
 export const opsService = clickhouseOpsService
 // Identity is now real — users/roles/tenants/service identities live in
 // Postgres. Every contract method is served, so mock/identity.ts has been
