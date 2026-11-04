@@ -32,7 +32,7 @@ import { ServiceError } from "../errors";
  * Task 2.3) — replacing all of `mock/governance.ts`.
  *
  * Important note: a rule created via `create*Rule` does NOT appear in
- * `listQuality`/`listClassifications` — the two sides deliberately have
+ * `listQuality` — the two sides deliberately have
  * different data sources (human-authored config vs. ClickHouse observation
  * results), per the Rust backend's design.
  */
@@ -96,9 +96,6 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   async listAudit(signal) {
     return (await get<{ audit: AuditEvent[] }>("/api/governance/audit", signal)).audit;
-  },
-  async listClassifications(signal) {
-    return (await get<{ classifications: ClassificationRule[] }>("/api/governance/classification", signal)).classifications;
   },
   async getLineage(focusId, signal) {
     return get<LineageGraph>(`/api/governance/lineage?focus=${encodeURIComponent(focusId)}`, signal);

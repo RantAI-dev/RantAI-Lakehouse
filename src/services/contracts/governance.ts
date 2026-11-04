@@ -343,7 +343,6 @@ export type DatasetSla = {
 
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
-  listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
   listQuality(signal?: AbortSignal): Promise<QualityRule[]>
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
   /**

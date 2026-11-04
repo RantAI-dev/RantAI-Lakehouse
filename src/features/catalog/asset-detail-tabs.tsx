@@ -145,7 +145,7 @@ export function AssetDetailTabs({
         </TabsContent>
 
         <TabsContent value="schema">
-          <AssetSchema asset={a} iceberg={iceberg} meanings={meanings} />
+          <AssetSchema asset={a} iceberg={iceberg} meanings={meanings} onChanged={onAssetChanged} />
         </TabsContent>
 
         <TabsContent value="sample">
