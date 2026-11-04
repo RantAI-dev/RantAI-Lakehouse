@@ -927,6 +927,68 @@ run with `site-checks.sh` from a clean `.next`/`out`:
     was not touched;
   - `git status` is clean.
 
+### Handoff 8: developer (Opus), 2026-11-04, review 6 (R11)
+
+**Commit:** `a73ed156`, R11 (SHOULD-FIX), cited at the fix site in
+`site/src/components/effects/scene-mode.tsx` (`landOnHash`).
+
+**The choice: land on the hash after the settle.** I did not give the
+dashboards their final height before hydration, because:
+- that height is measured from the tiles and the fonts
+  (`dashboards-scroller.tsx`), so a server-side copy would be a second
+  formula to keep in step;
+- without JavaScript it would add a screen of pinned scroll whose rail
+  never slides;
+- one landing after the settle also covers the live hero's later 70 vh.
+
+**What it does:**
+- It runs once per load, at the first mode other than "pending", after
+  `document.fonts.ready` and one frame.
+- It calls `scrollIntoView({ behavior: "instant" })` only if both hold:
+  - `location.hash` names a `section`;
+  - no wheel, touch, key or pointer input has come since hydration.
+- The section's `scroll-mt-16` keeps it below the bar.
+
+**Probe** (`r11probe.ts`, CDP, built export on :3460, 8 s after load,
+section top in px):
+
+| Viewport | `/#governance` | `/#open` | `/id/#open` |
+| --- | --- | --- | --- |
+| 1440×900 | 64 | 64 | 64 |
+| 390×844 | 64 | 64 | 64 |
+| 1440×900, `scrollIntoView` stubbed (control) | 1036 | 1036 | not run |
+| 1440×900, live scene (`next dev`, dev-only override, SwiftShader, 25 s) | 64 | 64 | 64 |
+
+- The control matches the reviewer's 1036.
+- `/#` (an empty hash) scrolls nothing.
+
+**The early scroller.**
+- Setup: the CPU is throttled 8×, so that real input arrives while the mode
+  is still "pending": a wheel of +300 at 1440, a touch drag at 390.
+- In all six cases (three links, two viewports), `scrollIntoView` was
+  never called, and the page stayed where the input took it.
+- Without throttling, this VM settles before CDP can send input: the
+  landing ran 1–3 frames into the smooth scroll.
+
+**Checks** on `a73ed156`, from a clean `.next`/`out`:
+- `bun run lint` 0
+- `bun run typecheck` 0
+- `bun run test`: 65 pass, 0 fail
+- build 0
+- `bun run size` 0: 181.5 KB of 200 KB
+- Lighthouse not re-run, as asked.
+
+**Not verified, and limits:**
+- **Input before hydration is not seen,** since the listeners attach on
+  hydration. Such a visitor can still be moved to the section once.
+- **Browsers:** not run in Safari or Firefox.
+- **Process:**
+  - `next dev` wrote `site/AGENTS.md`; I removed it, and it was never
+    committed;
+  - my servers on :3460, :3461, :9555 and :9556 are stopped;
+  - :3400, :3402, :3403 and :9557 were not touched;
+  - `git status` is clean.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
