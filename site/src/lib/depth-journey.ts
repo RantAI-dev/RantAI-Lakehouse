@@ -120,3 +120,22 @@ export function formatDepth(depth: number): string {
   return m === 0 ? "0 m" : `\u2212${m} m`;
 }
 
+/**
+ * WEB-5 D14 S5, the ascent: how much of the way-up look to show, 0..1. It is
+ * 1 from where the climb starts (`from`, the dashboards) to just before the
+ * surface (`to`, halfway into the final), with `fade` of scroll to come in
+ * and to go out, and 0 elsewhere (the dive, the deepest point, the night
+ * sky). Bubbles and caustics are scaled by it.
+ */
+export function ascentAt(scrollY: number, from: number, to: number, fade: number): number {
+  if (!(to > from) || fade <= 0) return 0;
+  const rise = Math.min(1, Math.max(0, (scrollY - from) / fade));
+  const fall = Math.min(1, Math.max(0, (to - scrollY) / fade));
+  return Math.min(rise, fall);
+}
+
+/** Caustic light by depth: none at the deepest point, strongest just under the surface. */
+export function causticAt(depth: number): number {
+  return Math.min(1, Math.max(0, (depth + 100) / 97));
+}
+

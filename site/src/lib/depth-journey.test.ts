@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { depthAt, formatDepth, gaugeDepthAt, mixColour, steppedDepthAt, WATER_BY_DEPTH, waterAt } from "./depth-journey";
+import { ascentAt, causticAt, depthAt, formatDepth, gaugeDepthAt, mixColour, steppedDepthAt, WATER_BY_DEPTH, waterAt } from "./depth-journey";
 
 const anchors = [
   { at: 0, depth: 0 },
@@ -70,4 +70,18 @@ test("inside the depths section the gauge reads the lit slab's depth, as its lab
 test("formatDepth writes whole metres with a real minus sign", () => {
   assert.equal(formatDepth(-40.4), "\u221240 m");
   assert.equal(formatDepth(-0.2), "0 m");
+});
+
+test("the ascent look is on only between the climb's start and the surface, fading in and out", () => {
+  assert.equal(ascentAt(900, 1000, 5000, 200), 0);
+  assert.equal(ascentAt(1100, 1000, 5000, 200), 0.5);
+  assert.equal(ascentAt(3000, 1000, 5000, 200), 1);
+  assert.equal(ascentAt(4900, 1000, 5000, 200), 0.5);
+  assert.equal(ascentAt(5100, 1000, 5000, 200), 0);
+});
+
+test("caustic light grows as the water gets shallower", () => {
+  assert.equal(causticAt(-100), 0);
+  assert.ok(causticAt(-50) < causticAt(-15));
+  assert.equal(causticAt(-3), 1);
 });
