@@ -19,7 +19,8 @@
     "lint": "bun --bun eslint",
     "typecheck": "bun --bun tsc --noEmit",
     "test": "bun test src",
-    "size": "node scripts/check-bundle.mjs"
+    "size": "node scripts/check-bundle.mjs",
+    "tiles": "bun scripts/build-tile-svgs.ts"
   },
   "dependencies": {
     "clsx": "^2.1.1",

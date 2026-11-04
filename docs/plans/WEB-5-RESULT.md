@@ -161,6 +161,56 @@ done here, because R5 asked for the client/server split and for the
 remaining long tasks to be recorded. The reviewer's run and this one differ
 (EN 225 / 284 ms); both are on the same loaded VM.
 
+## Update: review fix R6 (static tiles as images), 2026-11-04
+
+The dot map and the calendar heatmap are one `<img>` each: SVG files in
+`public/tiles/`, generated from `site/src/lib/tile-svg.ts`. A page goes
+from 1,088 elements to 670.
+
+**Measured interleaved,** as in "Reviewer's run 2":
+- `382c190d` (before R6) served on :3461, and the R6 build on :3460, both
+  `npx serve` of `out/`;
+- three rounds of pre-EN, R6-EN, pre-ID, R6-ID with the RESULT's
+  Lighthouse command;
+- VM load average 2.5 to 8.3 during the runs.
+
+| Metric | Target | EN before | EN R6 | ID before | ID R6 |
+| --- | --- | --- | --- | --- | --- |
+| TBT (median) | ≤ 200 ms | 202.5 ms | **197.8 ms** | 191.5 ms | **140.1 ms** |
+| TBT (runs) | — | 202.5 / 219.5 / 193.6 | 182.2 / 242.0 / 197.8 | 165.5 / 191.5 / 192.0 | 195.4 / 100.5 / 140.1 |
+| LCP (median) | ≤ 2.5 s | 1.07 s | 1.07 s | 1.07 s | 1.06 s |
+| CLS | ≤ 0.1 | 0 | 0 | 0 | 0 |
+| SEO / accessibility / best practices | 100 / ≥ 95 / — | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 100 / 100 |
+| Performance (median) | — | 97 | 95 | 97 | 99 |
+
+- **EN's median is 197.8 ms**, under the 200 ms target, but by less than
+  the spread between runs (182 to 242 ms). It is a pass on this
+  measurement, not a margin.
+- **ID's median fell by 51 ms.**
+- The longest task is still react-dom's hydration or the App Router
+  (207 to 260 ms in the R6 runs).
+- One R6 EN run had an LCP of 1.35 s; the median is unchanged.
+
+**Pixel check (D6): not pixel-identical, the edges differ.** Both builds
+were captured losslessly (PNG over CDP) with each tile scrolled into view,
+and compared pixel by pixel in the browser:
+
+| Viewport | Pixels per tile | Differing pixels (map / calendar) | Max channel delta |
+| --- | --- | --- | --- |
+| 1440×900 @1x | 72,150 | 4,315 / 3,483 | 53 / 49 |
+| 1440×900 @2x | 288,600 | 15,213 / 9,976 | 142 / 96 |
+| 390×844 @2x | 144,624 | 11,913 / 14,530 | 166 / 126 |
+
+- A 4× zoom with a difference mask shows that only the antialiased rims
+  of the dots and cells differ. Fills, colours, positions and the box size
+  are the same: 370 × 195.27 px at 1440, 262.19 × 138.38 px at 390.
+- The likely cause is that Chrome rasterizes an SVG *image* differently
+  from inline SVG when it scales the 360 × 190 viewBox to a fractional
+  box.
+- The tile and its `<img>` have identical boxes, so there is no layout
+  shift.
+- The owner judges at QA whether the rims count as a visual change.
+
 ## Findings that do not change a score
 
 - Accessibility audit `label-content-name-mismatch` (weight 0, so the score
