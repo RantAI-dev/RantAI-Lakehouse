@@ -1082,6 +1082,164 @@ pub async fn create_role(
     Ok((StatusCode::CREATED, ApiJson(role)))
 }
 
+/// The `PUT /api/identity/roles/{id}` body. Mirrors `UpdateRoleInput`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRoleBody {
+    /// Role name; must not collide with another role's.
+    name: String,
+    /// Free-text permission list.
+    #[serde(default)]
+    permissions: String,
+    /// Human-readable description.
+    #[serde(default)]
+    description: String,
+}
+
+/// `PUT /api/identity/roles/{id}` — rewrite a role's name, permissions and
+/// description (`WEB-3` S3a-D2). Audited as `identity.role.update`,
+/// naming the old and the new bundle.
+///
+/// # Security
+///
+/// Requires `identity:write`, the permission `POST /api/identity/roles`
+/// uses — this edits the same kind of permission bundle that route mints.
+///
+/// # Errors
+///
+/// 400 on a malformed body or a blank name; 404 when no role has that id;
+/// 409 when another role has the name; 503/500 as above.
+pub async fn update_role(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Role>> {
+    let body: UpdateRoleBody = parse_body(&body)?;
+    let input = identity::UpdateRoleInput {
+        name: required("name", &body.name)?,
+        permissions: body.permissions,
+        description: body.description,
+    };
+    let pool = pool(&state)?;
+    let before = identity::get_role(pool, &id).await?;
+    let role = identity::update_role(pool, &id, &input).await?;
+    let audit_event = role_update_audit_event(&principal, &before, &role);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.role.update",
+            role_id = %role.id,
+            "failed to record role-update audit event"
+        );
+    }
+    Ok(ApiJson(role))
+}
+
+/// `DELETE /api/identity/roles/{id}` — remove a role nobody holds
+/// (`WEB-3` S3a-D2). Returns 204. Audited as `identity.role.delete`.
+///
+/// # Refusals
+///
+/// A built-in role (one [`identity::BUILT_IN_ROLE_IDS`] names — the product's
+/// seeded bundles) is refused with 409 "A built-in role cannot be deleted.",
+/// before the members check: it stays a built-in role however many people
+/// hold it. A role people still hold is refused with 409 "This role is
+/// still given to N people. Take it away from them first." — `N` counted
+/// here, never read out of a foreign-key violation's own text (principle 4).
+///
+/// # Security
+///
+/// Requires `identity:write`, the permission `POST /api/identity/roles`
+/// uses.
+///
+/// # Errors
+///
+/// 404 when no role has that id; 409 as above; 503/500 as above.
+pub async fn delete_role(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let pool = pool(&state)?;
+    let role = identity::get_role(pool, &id).await?;
+    if identity::is_built_in_role(&role.id) {
+        return Err(ApiError::Conflict("A built-in role cannot be deleted.".to_owned()).into());
+    }
+    if role.members > 0 {
+        return Err(ApiError::Conflict(still_given_sentence(role.members)).into());
+    }
+    match identity::delete_role(pool, &id).await {
+        Ok(()) => {}
+        // A user was given the role between the count and the delete: the
+        // row is held after all. The fixed sentence, not the constraint's
+        // text (principle 4).
+        Err(StoreError::ForeignKeyViolation) => {
+            return Err(ApiError::Conflict(still_given_sentence(role.members.max(1))).into());
+        }
+        Err(err) => return Err(err.into()),
+    }
+    let audit_event = role_audit_event(
+        &principal,
+        "identity.role.delete",
+        &role.id,
+        serde_json::json!({ "name": role.name, "permissions": role.permissions }),
+    );
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.role.delete",
+            role_id = %role.id,
+            "failed to record role-delete audit event"
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The 409 sentence for a role people still hold (`WEB-3` S3a-D2, fixed by
+/// the plan).
+fn still_given_sentence(members: i64) -> String {
+    format!("This role is still given to {members} people. Take it away from them first.")
+}
+
+/// The audit row for a role rewrite: the actor, the role, and the bundle
+/// before and after, so an operator can see what the change took away.
+fn role_update_audit_event(principal: &Principal, before: &Role, after: &Role) -> NewAuditEvent {
+    role_audit_event(
+        principal,
+        "identity.role.update",
+        &after.id,
+        serde_json::json!({
+            "oldName": before.name,
+            "newName": after.name,
+            "oldPermissions": before.permissions,
+            "newPermissions": after.permissions,
+        }),
+    )
+}
+
+/// The audit row for a role change the console makes (`WEB-3` S3a-D2): who
+/// acted, what they did, which role, and the arguments that say what
+/// changed.
+fn role_audit_event(
+    principal: &Principal,
+    action: &str,
+    role_id: &str,
+    args: serde_json::Value,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        action: action.to_owned(),
+        resource_kind: Some("role".to_owned()),
+        resource_id: Some(role_id.to_owned()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(args),
+        ..Default::default()
+    }
+}
+
 // ── Tenants ─────────────────────────────────────────────────────────────
 
 /// Query parameters for `GET /api/identity/tenants`.

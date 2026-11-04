@@ -853,6 +853,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/identity/users/{id}/reset-password", Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/roles",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/roles",                  Policy::RequiresPermission("identity:write")),
+    // WEB-3 S3a-D2: editing or removing a role is exactly the privilege
+    // bundle write `POST` above is, so it takes `identity:write`, not a new
+    // token (AGENTS.md rule 4).
+    ("PUT",  "/api/identity/roles/{id}",             Policy::RequiresPermission("identity:write")),
+    ("DELETE", "/api/identity/roles/{id}",           Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),
@@ -1468,6 +1473,16 @@ mod tests {
         );
         assert_eq!(
             policy_for("POST", "/api/identity/roles"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+        // WEB-3 S3a-D2: editing or removing a role takes the same
+        // permission as minting one.
+        assert_eq!(
+            policy_for("PUT", "/api/identity/roles/{id}"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+        assert_eq!(
+            policy_for("DELETE", "/api/identity/roles/{id}"),
             Some(Policy::RequiresPermission("identity:write"))
         );
         assert_eq!(

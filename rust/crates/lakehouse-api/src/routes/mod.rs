@@ -1121,6 +1121,12 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),
         )
+        // WEB-3 S3a-D2: a role can be rewritten and removed. `{id}` is
+        // validated inside each handler (404 on an unknown or malformed id).
+        .route(
+            "/api/identity/roles/{id}",
+            axum::routing::put(identity::update_role).delete(identity::delete_role),
+        )
         .route(
             "/api/identity/tenants",
             get(identity::list_tenants).post(identity::create_tenant),

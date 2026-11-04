@@ -404,4 +404,229 @@ mod identity {
         assert_eq!(tenant_row.1.as_deref(), Some(target.to_string().as_str()));
         assert_eq!(tenant_row.2.as_deref(), Some(admin.to_string().as_str()));
     }
+    mod role_admin {
+        //! `WEB-3` S3a-D2: a role can be edited and deleted, and the two
+        //! refusals say what stands in the way.
+
+        use super::*;
+
+        /// The seeded `Analyst` role, which people hold (`0002_seed_identity.sql`).
+        const SEEDED_ANALYST: &str = "22222222-2222-4222-8222-000000000001";
+
+        /// `POST /api/identity/roles` and return the new role's id.
+        async fn create_role(app: &TestApp, cookie: &str, name: &str) -> String {
+            let (status, body) = request(
+                app,
+                "POST",
+                "/api/identity/roles",
+                Some(cookie),
+                Some(json!({ "name": name, "permissions": "query:read", "description": "first" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            body["id"].as_str().expect("the new role's id").to_owned()
+        }
+
+        /// `PUT /api/identity/roles/{id}`.
+        async fn update_role(
+            app: &TestApp,
+            cookie: &str,
+            id: &str,
+            name: &str,
+            permissions: &str,
+        ) -> (StatusCode, Value) {
+            request(
+                app,
+                "PUT",
+                &format!("/api/identity/roles/{id}"),
+                Some(cookie),
+                Some(json!({
+                    "name": name,
+                    "permissions": permissions,
+                    "description": "changed",
+                })),
+            )
+            .await
+        }
+
+        /// `DELETE /api/identity/roles/{id}`.
+        async fn delete_role(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) {
+            request(
+                app,
+                "DELETE",
+                &format!("/api/identity/roles/{id}"),
+                Some(cookie),
+                None,
+            )
+            .await
+        }
+
+        /// The stored name, permissions and description of `id`.
+        async fn stored_role(pool: &PgPool, id: &str) -> Option<(String, String, String)> {
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT name, permissions, description FROM role WHERE id = $1",
+            )
+            .bind(uuid::Uuid::parse_str(id).expect("a uuid"))
+            .fetch_optional(pool)
+            .await
+            .expect("read the role row")
+        }
+
+        #[tokio::test]
+        async fn a_role_is_rewritten_and_both_bundles_are_audited() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let id = create_role(&app, &admin_cookie, "Reviewers").await;
+
+            let (status, body) = update_role(
+                &app,
+                &admin_cookie,
+                &id,
+                "Senior Reviewers",
+                "policy:review",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["name"], json!("Senior Reviewers"));
+            assert_eq!(body["permissions"], json!("policy:review"));
+            assert_eq!(body["description"], json!("changed"));
+            assert_eq!(
+                stored_role(&app.pool, &id).await,
+                Some((
+                    "Senior Reviewers".to_owned(),
+                    "policy:review".to_owned(),
+                    "changed".to_owned()
+                ))
+            );
+
+            let (action, resource_id, principal_id, args): AuditRow = sqlx::query_as(
+                "SELECT action, resource_id, principal_id, args FROM audit_event \
+             WHERE action = 'identity.role.update'",
+            )
+            .fetch_one(&app.pool)
+            .await
+            .expect("the rewrite is audited");
+            assert_eq!(action, "identity.role.update");
+            assert_eq!(resource_id.as_deref(), Some(id.as_str()));
+            assert_eq!(principal_id.as_deref(), Some(admin.to_string().as_str()));
+            let args = args.expect("the audit names what changed");
+            assert_eq!(args["oldName"], json!("Reviewers"));
+            assert_eq!(args["newName"], json!("Senior Reviewers"));
+            assert_eq!(args["oldPermissions"], json!("query:read"));
+            assert_eq!(args["newPermissions"], json!("policy:review"));
+        }
+
+        #[tokio::test]
+        async fn a_rename_onto_a_taken_name_is_409_and_changes_nothing() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let id = create_role(&app, &admin_cookie, "Reviewers").await;
+
+            // `Analyst` is the seeded role's name; `role_name_unique` refuses it.
+            let (status, body) =
+                update_role(&app, &admin_cookie, &id, "Analyst", "query:read").await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(
+                stored_role(&app.pool, &id).await,
+                Some((
+                    "Reviewers".to_owned(),
+                    "query:read".to_owned(),
+                    "first".to_owned()
+                )),
+                "the refused rename leaves the row alone"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_blank_name_is_a_400() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let id = create_role(&app, &admin_cookie, "Reviewers").await;
+
+            let (status, body) = update_role(&app, &admin_cookie, &id, "   ", "query:read").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(
+                stored_role(&app.pool, &id).await.map(|(name, _, _)| name),
+                Some("Reviewers".to_owned())
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unknown_role_id_is_404_for_both_routes() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let unknown = uuid::Uuid::new_v4().to_string();
+
+            let (status, body) = update_role(&app, &admin_cookie, &unknown, "Ghost", "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            let (status, body) = delete_role(&app, &admin_cookie, &unknown).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_role_nobody_holds_is_deleted_and_audited() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let id = create_role(&app, &admin_cookie, "Reviewers").await;
+
+            let (status, body) = delete_role(&app, &admin_cookie, &id).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+            assert_eq!(stored_role(&app.pool, &id).await, None);
+
+            let (action, resource_id, principal_id, _): AuditRow = sqlx::query_as(
+                "SELECT action, resource_id, principal_id, args FROM audit_event \
+             WHERE action = 'identity.role.delete'",
+            )
+            .fetch_one(&app.pool)
+            .await
+            .expect("the delete is audited");
+            assert_eq!(action, "identity.role.delete");
+            assert_eq!(resource_id.as_deref(), Some(id.as_str()));
+            assert_eq!(principal_id.as_deref(), Some(admin.to_string().as_str()));
+        }
+
+        /// The plan's fixed sentence, with the count of people who hold it, and
+        /// never the foreign key's own text (principle 4).
+        #[tokio::test]
+        async fn a_role_people_still_hold_is_refused_with_the_count() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let id = create_role(&app, &admin_cookie, "Reviewers").await;
+            let holder = create_principal_with_permissions(&app.pool, "query:read").await;
+            sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+                .bind(holder)
+                .bind(uuid::Uuid::parse_str(&id).expect("a uuid"))
+                .execute(&app.pool)
+                .await
+                .expect("one person holds the new role");
+
+            let (status, body) = delete_role(&app, &admin_cookie, &id).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(
+                body["error"],
+                json!("This role is still given to 1 people. Take it away from them first.")
+            );
+            assert!(stored_role(&app.pool, &id).await.is_some(), "not deleted");
+        }
+
+        /// The built-in refusal comes first: a seeded role has members too, and
+        /// the answer says the stronger, permanent fact.
+        #[tokio::test]
+        async fn a_built_in_role_cannot_be_deleted() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+            let (status, body) = delete_role(&app, &admin_cookie, SEEDED_ANALYST).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["error"], json!("A built-in role cannot be deleted."));
+            assert!(stored_role(&app.pool, SEEDED_ANALYST).await.is_some());
+        }
+    }
 }
