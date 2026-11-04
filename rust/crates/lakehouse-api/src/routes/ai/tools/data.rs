@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use super::{api_result_to_value, arg_str};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::catalog::apply_serving_certification;
+use crate::routes::catalog::{NOT_IN_PRIMARY, apply_serving_certification};
 use crate::routes::support::{is_numeric_type, strip_non_ident};
 use crate::state::AppState;
 
@@ -474,11 +474,18 @@ pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // DATA-39 (the assistant part of `#315`): the same rule as the DATA
+    // MAP's description read above. `FINAL` makes a column a re-run
+    // registered one row instead of one per run, and the shared clause
+    // takes the primary registry's copy for a slug both registries hold —
+    // a slug the primary owns is not answered from the secondary one
+    // (`DATA-40` D1). `NOT_IN_PRIMARY` is the constant, spliced in, never
+    // retyped.
     let cols = ch
         .rows(
             &format!(
-                "SELECT key_asli AS name, tipe AS type, deskripsi AS description FROM lake.`bronze_meta.dataset_column` WHERE slug={slug} \
-                 UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={slug}"
+                "SELECT key_asli AS name, tipe AS type, deskripsi AS description FROM lake.`bronze_meta.dataset_column` FINAL WHERE slug={slug} \
+                 UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` FINAL WHERE slug={slug} AND slug {NOT_IN_PRIMARY}"
             ),
             None,
         )
@@ -1508,5 +1515,218 @@ mod truncated_note {
         body.as_object_mut().expect("an object").remove("truncated");
         let out = compact_query_result(body);
         assert!(out.get("truncated").is_none(), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod registry_clash {
+    //! `DATA-39` D1: `describe_dataset` reads the Bronze column registries
+    //! ONCE per column.
+    //!
+    //! The registry is a `ReplacingMergeTree ORDER BY (slug, key_asli)`
+    //! that a re-run writes again, and `ClickHouse` merges the copies only
+    //! in the background. Without `FINAL` a re-registered column is one row
+    //! per run — and the tool hands the model a LIST, so the duplicate
+    //! reaches the answer. A slug in BOTH registries was read twice, with
+    //! the secondary's copy answering for a dataset the primary owns.
+    //!
+    //! These tests run against a REAL `ClickHouse` (the compose file's own
+    //! `26.8` tag, through `testcontainers`), because the fix is a
+    //! statement: `FINAL` and the `NOT IN (SELECT slug FROM ...)` clause are
+    //! the engine's, and a fake that answered them would only prove that
+    //! this module asks for what it means to ask for.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_clickhouse::ChClient;
+
+    use super::*;
+    use crate::routes::bronze_registry_fixture::{
+        clickhouse, pinned, seed_catalog, seed_column_with,
+    };
+
+    /// The tool's arguments for one dataset.
+    fn args_for(slug: &str) -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("slug".to_owned(), json!(slug));
+        args
+    }
+
+    /// The columns the tool answered whose name is `name`.
+    fn columns_named<'a>(out: &'a Value, name: &str) -> Vec<&'a Value> {
+        out["columns"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the tool answers with columns: {out}"))
+            .iter()
+            .filter(|column| column["name"] == json!(name))
+            .collect()
+    }
+
+    /// A column a second run registered is ONE column, from the newer row.
+    ///
+    /// This is the test the mutation check removes `FINAL` for: without it
+    /// the two parts the run wrote answer as two columns of the dataset.
+    #[tokio::test]
+    async fn a_column_written_twice_to_the_primary_is_listed_once() {
+        let (url, _container) = clickhouse().await;
+        let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+
+        // The two copies of the row stay apart: no merge may collapse them
+        // before the tool reads them.
+        ch.exec("SYSTEM STOP MERGES lake.`bronze_meta.dataset_column`", None)
+            .await
+            .expect("stop the merges of the column table");
+
+        seed_catalog(
+            &ch,
+            "bronze_meta",
+            "twice_columns",
+            "Twice columns",
+            "twice_columns_raw",
+        )
+        .await;
+        seed_column_with(
+            &ch,
+            "bronze_meta",
+            "twice_columns",
+            "amount",
+            "UInt64",
+            "the first description",
+        )
+        .await;
+        // The same run again, before `ClickHouse` merged the parts.
+        seed_column_with(
+            &ch,
+            "bronze_meta",
+            "twice_columns",
+            "amount",
+            "UInt64",
+            "the second description",
+        )
+        .await;
+
+        let out = describe_dataset(&ch, &args_for("twice_columns")).await;
+        let amount = columns_named(&out, "amount");
+        assert_eq!(
+            amount.len(),
+            1,
+            "the column a second run registered is one column: {out}"
+        );
+        assert_eq!(
+            amount[0]["description"],
+            json!("the second description"),
+            "the newer row's description: {out}"
+        );
+    }
+
+    /// A slug in BOTH registries answers with the PRIMARY's columns.
+    ///
+    /// `max_threads=1` makes a `UNION ALL` answer in the order of its
+    /// branches (a URL setting, so the statement the module sends is the
+    /// statement that runs); the secondary branch is last, so the old
+    /// statement reads the secondary's columns for a dataset the primary
+    /// owns.
+    #[tokio::test]
+    async fn a_slug_in_both_registries_answers_with_the_primary_columns() {
+        let (url, _container) = clickhouse().await;
+        let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+
+        seed_catalog(
+            &ch,
+            "bronze_meta",
+            "clash_columns",
+            "Primary clash",
+            "clash_columns_raw",
+        )
+        .await;
+        seed_column_with(
+            &ch,
+            "bronze_meta",
+            "clash_columns",
+            "id",
+            "UInt64",
+            "the primary id",
+        )
+        .await;
+
+        seed_catalog(
+            &ch,
+            "bronze_meta_sec",
+            "clash_columns",
+            "Secondary clash",
+            "clash_columns_sec_raw",
+        )
+        .await;
+        seed_column_with(
+            &ch,
+            "bronze_meta_sec",
+            "clash_columns",
+            "id",
+            "String",
+            "the secondary id",
+        )
+        .await;
+        seed_column_with(
+            &ch,
+            "bronze_meta_sec",
+            "clash_columns",
+            "note",
+            "String",
+            "the secondary note",
+        )
+        .await;
+
+        let out = describe_dataset(&ch, &args_for("clash_columns")).await;
+        let id = columns_named(&out, "id");
+        assert_eq!(
+            id.len(),
+            1,
+            "the column the two registries both hold is one column: {out}"
+        );
+        assert_eq!(
+            id[0]["description"],
+            json!("the primary id"),
+            "the primary registry's copy: {out}"
+        );
+        assert!(
+            columns_named(&out, "note").is_empty(),
+            "the secondary's own column is not read for a slug the primary \
+             holds: {out}"
+        );
+    }
+
+    /// A dataset only the secondary registry holds still answers: the
+    /// clause hides a clash, not the secondary registry's own datasets.
+    #[tokio::test]
+    async fn a_slug_only_in_the_secondary_registry_still_answers() {
+        let (url, _container) = clickhouse().await;
+        let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+
+        seed_catalog(
+            &ch,
+            "bronze_meta_sec",
+            "sec_only_columns",
+            "Secondary only",
+            "sec_only_columns_raw",
+        )
+        .await;
+        seed_column_with(
+            &ch,
+            "bronze_meta_sec",
+            "sec_only_columns",
+            "id",
+            "UInt64",
+            "the secondary id",
+        )
+        .await;
+
+        let out = describe_dataset(&ch, &args_for("sec_only_columns")).await;
+        let id = columns_named(&out, "id");
+        assert_eq!(id.len(), 1, "the secondary registry's own dataset: {out}");
+        assert_eq!(
+            id[0]["description"],
+            json!("the secondary id"),
+            "the secondary registry's own dataset: {out}"
+        );
     }
 }
