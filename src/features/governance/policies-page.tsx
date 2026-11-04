@@ -13,7 +13,6 @@ import {
   ErrorState,
   LoadingSkeleton,
 } from "@/components/patterns/page-states"
-import { StatusBadge } from "@/components/patterns/status-badge"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
@@ -24,8 +23,8 @@ import { useService } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { governanceService } from "@/services"
 import type { Policy } from "@/services/contracts/governance"
-import { PolicyActions } from "./policy-actions"
-import { getPolicyColumns } from "./policy-columns"
+import { PolicyActions, PolicyNotEnforceableNotice } from "./policy-actions"
+import { PolicyStatusPill, getPolicyColumns } from "./policy-columns"
 
 export function PoliciesPage() {
   const state = useService((s) => governanceService.listPolicies(s), [])
@@ -135,7 +134,7 @@ export function PoliciesPage() {
         {selected ? (
           <>
             <div className="flex flex-wrap items-center gap-2">
-              <StatusBadge status={selected.status} />
+              <PolicyStatusPill policy={selected} />
             </div>
             <MetadataList
               items={[
@@ -151,6 +150,7 @@ export function PoliciesPage() {
                 },
               ]}
             />
+            {selected.enforceable ? null : <PolicyNotEnforceableNotice />}
             <div className="flex flex-wrap gap-2">
               <PolicyActions
                 policy={selected}
