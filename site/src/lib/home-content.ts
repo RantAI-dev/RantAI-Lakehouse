@@ -68,7 +68,7 @@ export type DepthLayer = {
   id: DepthId;
   /** Product name, not translated. */
   label: string;
-  /** Gauge reading, mono. */
+  /** Gauge reading. */
   meters: string;
   accent: string;
 };

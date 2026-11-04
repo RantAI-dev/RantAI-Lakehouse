@@ -119,7 +119,7 @@ export function KpiTile({ tile }: { tile: TileText }) {
       <text x="20" y="62" fill={FOAM} fontSize="54" fontWeight="500" letterSpacing="-2" fontFamily="var(--font-sans), sans-serif">
         24.6k
       </text>
-      <text x="22" y="86" fill={LAKE} fontSize="14" fontFamily="var(--font-mono), monospace">
+      <text x="22" y="86" fill={LAKE} fontSize="14" fontFamily="var(--font-sans), sans-serif">
         {tile.delta}
       </text>
       <m.path d={d} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" {...draw} />

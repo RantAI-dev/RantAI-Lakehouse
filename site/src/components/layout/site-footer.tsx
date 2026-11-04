@@ -34,7 +34,7 @@ export function SiteFooter({ copy }: { copy: CommonCopy["footer"] }) {
         </div>
         {columns.map((col) => (
           <nav key={col.title} aria-label={col.title}>
-            <h2 className="lk-mono text-[11px] leading-4 font-medium tracking-[0.2em] text-[#E8F4FF]/55 uppercase">
+            <h2 className="text-[11px] leading-4 font-medium tracking-[0.2em] text-[#E8F4FF]/55 uppercase">
               {col.title}
             </h2>
             <ul className="mt-4 space-y-2.5">
@@ -55,7 +55,7 @@ export function SiteFooter({ copy }: { copy: CommonCopy["footer"] }) {
       </Container>
       <Container className="mt-14">
         <Reveal y={12}>
-          <p className="lk-mono text-[12px] text-[#E8F4FF]/55">{copy.legal}</p>
+          <p className="text-[12px] text-[#E8F4FF]/55">{copy.legal}</p>
         </Reveal>
       </Container>
     </footer>

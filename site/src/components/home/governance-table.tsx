@@ -46,7 +46,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
       className="overflow-hidden rounded-3xl border border-[#E8F4FF]/12 bg-[#020514]/55 shadow-[0_40px_120px_-50px_rgba(68,166,250,0.45)] backdrop-blur-md"
     >
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E8F4FF]/10 px-4 py-3 md:px-6">
-        <p className="lk-mono text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">
+        <p className="text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">
           {copy.illustration}
         </p>
         <RoleToggle copy={copy} role={role} onChange={choose} />
@@ -55,7 +55,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
         <table className="w-full min-w-[620px] text-left">
           <caption className="sr-only">{copy.tableCaption}</caption>
           <thead>
-            <tr className="lk-mono text-[11px] tracking-[0.16em] text-[#E8F4FF]/60 uppercase">
+            <tr className="text-[11px] tracking-[0.16em] text-[#E8F4FF]/60 uppercase">
               {GOVERNANCE_COLUMNS.map((c) => (
                 <th key={c.key} scope="col" className="px-4 py-3 font-medium md:px-6">
                   <span className="inline-flex items-center gap-1.5">
@@ -81,7 +81,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
                   <Masked value={r.email} masked={maskEmail(r.email)} role={role} animate={!reduced} />
                 </td>
                 <td className="px-4 py-3.5 whitespace-nowrap md:px-6">{r.city}</td>
-                <td className="lk-mono px-4 py-3.5 whitespace-nowrap md:px-6">{r.amount}</td>
+                <td className="px-4 py-3.5 whitespace-nowrap tabular-nums md:px-6">{r.amount}</td>
               </tr>
             ))}
           </tbody>
@@ -98,7 +98,7 @@ function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role
   ];
   return (
     <div className="flex items-center gap-3">
-      <span id="lk-view-as" className="lk-mono text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">
+      <span id="lk-view-as" className="text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">
         {copy.viewAs}
       </span>
       <div
@@ -167,7 +167,7 @@ function Masked({
   // Without animation the cell simply shows the target; with it, the frame.
   const text = animate ? shown : target;
   return (
-    <span className={cn("lk-mono text-[13px]", role === "analyst" && "text-[#E8F4FF]/90")}>
+    <span className={cn("text-[13px]", role === "analyst" && "text-[#E8F4FF]/90")}>
       <span aria-hidden="true">{text}</span>
       <span className="sr-only">{target}</span>
     </span>

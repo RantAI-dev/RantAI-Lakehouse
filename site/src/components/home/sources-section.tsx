@@ -36,7 +36,7 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
             <SourcePills items={copy.items} />
           </ul>
           <Reveal className="mx-auto mt-4 max-w-[36rem] md:mt-10">
-            <p className="lk-mono text-[11px] leading-4 md:text-[12px] md:leading-5 tracking-wide text-[#E8F4FF]/65">{copy.caption}</p>
+            <p className="text-[11px] leading-4 md:text-[12px] md:leading-5 tracking-wide text-[#E8F4FF]/65">{copy.caption}</p>
           </Reveal>
         </Container>
       </div>

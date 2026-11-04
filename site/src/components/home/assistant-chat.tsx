@@ -69,7 +69,7 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
             <span className="size-2.5 rounded-full bg-[#E8F4FF]/20" />
             <span className="size-2.5 rounded-full bg-[#E8F4FF]/20" />
           </div>
-          <p className="lk-mono text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">{copy.caption}</p>
+          <p className="text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">{copy.caption}</p>
         </div>
 
         <div className="space-y-3 px-4 py-4 md:space-y-4 md:px-5 md:py-5">
@@ -120,12 +120,12 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
             >
               <div className="flex items-center gap-2">
                 <span className="lk-pulse size-2 rounded-full bg-[#44A6FA]" />
-                <p className="lk-mono text-[11px] tracking-[0.16em] text-[#44A6FA] uppercase">
+                <p className="text-[11px] tracking-[0.16em] text-[#44A6FA] uppercase">
                   {copy.approvalLabel}
                 </p>
               </div>
               <p className="mt-2 text-[13px] leading-5 text-[#E8F4FF] md:text-[15px]">
-                {copy.approvalAction} <code className="lk-mono text-[#E8F4FF]">{APPROVAL_TARGET}</code>
+                {copy.approvalAction} <code className="text-[#E8F4FF]">{APPROVAL_TARGET}</code>
               </p>
               <div className="mt-3 flex gap-2">
                 <span className="rounded-full bg-[#44A6FA] px-4 py-1.5 text-[12px] font-medium text-[#020514]">
@@ -168,7 +168,7 @@ function Bar({
         key={reduced ? "reduced" : "motion"}
         style={{ height: `${Math.round(height * 100)}%`, scaleY: reduced ? 1 : scaleY }}
       />
-      <span className="lk-mono text-center text-[9px] leading-3 text-[#E8F4FF]/60 md:text-[10px]">
+      <span className="text-center text-[9px] leading-3 text-[#E8F4FF]/60 md:text-[10px]">
         {label} {Math.round(value / 100) / 10}k
       </span>
     </div>

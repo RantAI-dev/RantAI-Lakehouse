@@ -78,7 +78,7 @@ function HeroBackdrop() {
 function ScrollCue({ label }: { label: string }) {
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-6 z-10 flex flex-col items-center gap-3">
-      <span className="lk-mono text-[11px] tracking-[0.24em] text-[#E8F4FF]/60 uppercase">{label}</span>
+      <span className="text-[11px] tracking-[0.24em] text-[#E8F4FF]/60 uppercase">{label}</span>
       <span className="relative block h-12 w-px overflow-hidden bg-[#E8F4FF]/20">
         <span className="lk-drop absolute top-0 left-1/2 block size-1.5 -translate-x-1/2 rounded-full bg-[#44A6FA] shadow-[0_0_10px_2px_rgba(68,166,250,0.8)]" />
       </span>

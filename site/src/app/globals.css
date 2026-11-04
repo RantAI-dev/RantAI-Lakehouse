@@ -91,8 +91,12 @@
     font-size: 14px;
     line-height: 24px;
   }
+  /* WEB-5 review fix R7 (owner): monospace only for code. The one code
+     identifier on the page (the pipeline name in the approval card) uses
+     the system's monospace stack, as the RantAI site's `.code-frame pre
+     code` does; every label, pill and caption is the sans face. */
   code {
-    font-family: var(--font-mono);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
     font-size: 14px;
     line-height: 20px;
   }
@@ -130,9 +134,6 @@ html:has(.lk-root) {
   font-weight: 400;
 }
 
-.lk-mono {
-  font-family: var(--font-mono), ui-monospace, monospace;
-}
 
 /* WEB-5 D5: content is visible without JavaScript. Every reveal starts
    hidden through inline styles (opacity, travel, blur) that the server HTML

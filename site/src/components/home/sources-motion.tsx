@@ -63,7 +63,7 @@ const settle = (t: number): number => 1 - Math.pow(1 - t, 3);
 export const stagger = (count: number): number => (count > 1 ? Math.min(0.034, 0.4 / (count - 1)) : 0);
 
 const PILL_CLASS =
-  "lk-mono rounded-full border px-2.5 py-1 text-[11px] text-[#E8F4FF] md:px-4 md:py-2 md:text-[13px]";
+  "rounded-full border px-2.5 py-1 text-[11px] text-[#E8F4FF] md:px-4 md:py-2 md:text-[13px]";
 
 function SourcePill({
   label,

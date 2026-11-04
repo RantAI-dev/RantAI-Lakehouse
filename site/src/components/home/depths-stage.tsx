@@ -52,7 +52,7 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
                 aria-live="polite"
               >
                 <p
-                  className="lk-mono text-[12px] font-medium tracking-[0.22em] uppercase"
+                  className="text-[12px] font-medium tracking-[0.22em] uppercase"
                   style={{ color: layer.accent }}
                 >
                   {layer.label} · {layer.meters}
@@ -105,7 +105,7 @@ function DepthGauge({ progress, active }: { progress: MotionValue<number>; activ
           />
           <span
             className={cn(
-              "lk-mono hidden text-[11px] tracking-[0.12em] whitespace-nowrap uppercase transition-colors duration-500 md:inline",
+              "hidden text-[11px] tracking-[0.12em] whitespace-nowrap uppercase transition-colors duration-500 md:inline",
             )}
             style={{ color: active === i ? l.accent : "rgba(232,244,255,0.5)" }}
           >

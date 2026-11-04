@@ -38,7 +38,7 @@ export function GovernanceSection({ copy }: { copy: HomeCopy["governance"] }) {
         <ul className="mt-12 grid gap-8 md:grid-cols-3 md:gap-6">
           {copy.facts.map((f, i) => (
             <Reveal as="li" key={f.label} delay={i * 0.1}>
-              <p className="lk-mono text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{f.label}</p>
+              <p className="text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{f.label}</p>
               <p className="mt-2 text-[15px] leading-6 text-[#E8F4FF]/85">{f.text}</p>
             </Reveal>
           ))}

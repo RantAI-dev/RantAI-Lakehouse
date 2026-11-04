@@ -46,7 +46,7 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
       }
       after={
         <Container className="relative z-10 mt-5">
-          <p className="lk-mono text-[12px] text-[#E8F4FF]/65">{copy.caption}</p>
+          <p className="text-[12px] text-[#E8F4FF]/65">{copy.caption}</p>
         </Container>
       }
     >
@@ -56,7 +56,7 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
         return (
           <li key={id} className="w-[78vw] shrink-0 sm:w-[380px] md:w-[420px]">
             <TiltCard className="rounded-3xl border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] backdrop-blur-md md:p-6">
-              <p className="lk-mono text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{tile.kind}</p>
+              <p className="text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{tile.kind}</p>
               <p className="mt-1.5 text-[15px] text-[#E8F4FF]">{tile.title}</p>
               <div className="mt-4">
                 <Visual tile={tile} />
