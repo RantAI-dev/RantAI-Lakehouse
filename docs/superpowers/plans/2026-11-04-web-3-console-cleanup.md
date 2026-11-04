@@ -770,3 +770,49 @@ Decisions on the five mismatches the handoff reports:
 5. **The sidebar renames ship with their pages (S3-T5).** Accepted.
 
 Next run: S3-T5a now; S3-T5 when slice 3a's handoff entry is on its branch.
+
+### Handoff (slice 3b, round 2) — developer, 2026-11-04
+
+Branch `feat/web-3-slice-3b-screens`, on top of review round 1 (`dccddafc`).
+
+| Commit | Task | What |
+|---|---|---|
+| `8d2ce73c` | S3-T5a | "Sensitivity (whole table)" on the About card (review round 1, decision 1) |
+| — | the commit that adds this entry | This handoff |
+
+**Built (S3-T5a), as decision 1 says.**
+- The About card (`catalog/asset-about.tsx`) has a "Sensitivity (whole table)" row with
+  Set / Change / Remove. It uses the same calls as a column: `createClassificationRule` with
+  the table's lineage key and **no `column`**, and `deleteClassificationRule` for the table
+  rule in force (the rule in `classificationRules` without a `column` key). Change removes
+  that rule, then adds the new one; column rules are never touched. Needs `governance:write`;
+  without it the level shows with no buttons.
+- The level shown is the table rule's own, not the header's. When a column makes the header
+  badge stricter, one muted line says so: "The header shows Restricted because column amount
+  is Restricted: a table is never less restrictive than its most restrictive column."
+  (`stricterBecauseOfColumns`). No line when the table rule is already the strictest.
+- No second copy of the controls (rule 4): the column's `SensitivityControls` in
+  `column-sensitivity.tsx` now takes an optional `column`; without it, it writes and words
+  everything for the whole table (label, toast, remove dialog, half-done Change message).
+  `LEVELS` is exported there as `SENSITIVITY_LEVELS`.
+- Six tests in `asset-detail-tabs.test.tsx` ("About card: sensitivity of the whole table"):
+  Set with no column, Change (delete then post, column rule left alone), Remove with what
+  applies instead, the muted line, no line when the table rule is strictest, no buttons
+  without `governance:write`.
+
+**Still waits: S3-T5** (Access rules D4, schedule Reset D5, Roles edit/delete D8, sidebar
+renames to "Access rules" and "Roles"). At this run `origin/feat/web-3-slice-3a-api` is at
+`bf0c1786` with S3a-D1 to S3a-D4 committed, but its plan has no "Handoff (slice 3a)" entry
+(`grep -n -i handoff` on that file finds slice 1 and slice 2 only). Per the brief, the branch
+was not merged and S3-T5 was not started; no API shape was assumed.
+
+**Commands run (foreground, on `8d2ce73c` plus this docs commit):**
+- Per task: `bun run typecheck` (0 errors), `bun run lint` (0 errors, 10 warnings, all in
+  files this slice does not touch), `bun test src/features/catalog/asset-detail-tabs.test.tsx`
+  (143 pass, 0 fail), `bun test src/features/catalog` (350 pass, 0 fail, 14 files).
+- Before handoff: `bun run typecheck && bun run lint && bun run test`: typecheck clean, lint
+  0 errors / 10 warnings, test **3260 pass, 0 fail, 3261 tests across 331 files**.
+- No Rust, Python or compose change, so no cargo, pytest or compose command was run.
+
+**Not verified.** The About card row was not looked at in a running console (no dev stack
+started); it is checked by the tests above only.
