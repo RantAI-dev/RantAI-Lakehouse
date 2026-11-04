@@ -587,6 +587,104 @@ the diff checked.
 **Not verified.** The page against a real install with no CDC connector (no stack was brought up). The empty line
 was not checked in a browser.
 
+### Handoff (slice 3a) — developer, 2026-11-04
+
+Branch `feat/web-3-slice-3a-api`, built on the `SEC-61` merge (`e3f79fac`), one commit per
+task, pushed after each. No migration. At takeover `git status` was clean: the previous
+session's D5 work was already committed and pushed, not left uncommitted.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| S3a-D1 | `632df1df` | `PolicyView.assetId` from `conditions.table`, list/create/status alike |
+| S3a-D2 | `1f279d10` | `PUT`/`DELETE /api/identity/roles/{id}`, `identity:write`, audited, both 409s |
+| S3a-D3 | `359f6de5` | `DELETE /api/governance/quality/schedules/{asset}`, 204, audited |
+| S3a-D4 | `bf0c1786` | Registry-derived classification row only for a real level; `### Fixed` entry |
+| S3a-D5 | `2d9e2203` | Bronze `assetId` integration test (real `ClickHouse` + registry row); `### Added` entry |
+| S3a-D5 | `74995151` | Malformed-conditions `assetId` unit case |
+| — | the commit that adds this entry | This handoff |
+
+**D5 coverage, as the plan asks.**
+
+- Route gates both ways in `tests/route_auth.rs`: `role_edit_and_delete_are_gated_in_both_directions`
+  (`PUT`/`DELETE /api/identity/roles/{id}`: anonymous 401, `identity:read` 403 with the row
+  and membership unchanged, `identity:write` reaching the handler) and the extended
+  `quality_schedule_routes_are_gated_in_both_directions` (`DELETE …/quality/schedules/{asset}`:
+  reader 403, `governance:write` 204). Both entries are also in `POLICY_TABLE` and in the
+  table-driven loops that walk every entry (401/403), plus the registered-route test.
+- `assetId` unit cases in `routes/governance.rs`: `a_silver_or_serving_table_is_its_own_asset_id`
+  (silver and serving), `a_bronze_table_asks_the_registry_for_its_slug`,
+  `absent_conditions_name_no_asset`, `free_text_conditions_name_no_asset`,
+  `malformed_conditions_name_no_asset` (added here), `a_condition_with_no_obligation_names_no_asset`,
+  `a_table_no_zone_addresses_name_no_asset`, `the_wire_shape_omits_an_unknown_asset_id_and_keeps_a_known_one`.
+  The "not catalogued → none" case is the integration test
+  `a_bronze_policy_names_the_registry_slug_of_its_table` (`2d9e2203`): a real `ClickHouse`,
+  a seeded `dataset_catalog` row, `bronze.policy_orders_raw` → `policy_orders`,
+  `bronze.no_such_table` → `None`, `silver.orders` → itself.
+- The tier-carrying classification test is `a_registry_tier_that_is_a_level_is_reported_as_that_level`
+  (`bf0c1786`): a `confidential` tier produces `"classification": "confidential"`, never
+  `"internal"`; `a_source_tier_is_not_a_classification_and_reports_nothing` and
+  `every_product_level_is_accepted` pin the rest.
+- The role-delete 409s are in `tests/identity_roles.rs`:
+  `a_role_people_still_hold_is_refused_with_the_count` ("This role is still given to 1
+  people. Take it away from them first.") and `a_built_in_role_cannot_be_deleted`
+  ("A built-in role cannot be deleted."), with the delete audit test beside them.
+
+**CHANGELOG.** `### Added` names role edit/delete, schedule reset and `assetId` on policies
+(written in `2d9e2203`); `### Fixed` names the invented "internal" classification (written
+in `bf0c1786`, the commit that fixed it). No further entry was needed, so there was no
+separate changelog commit to make: both entries were already in commits pushed before this
+session, and splitting them out would rewrite a pushed branch (forbidden).
+
+**D4 tiers found in the seed, and how they map.**
+
+- `scripts/seed-clickhouse.sql:420-423` — primary registry `bronze_meta.dataset_catalog`:
+  four rows, every one `tier='primer'`.
+- `scripts/seed-clickhouse.sql:452-454` — secondary registry
+  `bronze_meta_sec.dataset_catalog`: two rows, both `tier='sekunder'`.
+- `dagster/dispar_orchestrate/bronze_catalog.py:370` — every real ingest
+  (`register_bronze_table`) writes `'primer'`; the secondary registry has no in-repo
+  writer (the DATA-39 plan says "another producer or by hand"), and the catalog detail
+  read labels it `'sekunder'` (`rust/crates/lakehouse-api/src/routes/catalog.rs:2622`).
+- Map: the product's levels are `public`, `internal`, `confidential`, `restricted`
+  (`CLASSIFICATION_LEVELS`, matching `CLASSIFICATION_LABEL` and the `classification_rule`
+  `CHECK`). `primer` and `sekunder` are source tiers, not levels, so **no seeded dataset
+  produces a derived row** and the list carries the authored rules alone — the plan's D4
+  fallback. The tests seed a level tier (`confidential`) to exercise the branch that is
+  kept.
+- `dataset_sync.klasifikasi` in the same seed carries `'Terbuka'`/`'Internal'`; that column
+  is not what `classification()` reads, and it is not mapped.
+
+**Mutation check (run this session, not taken on trust).** Changed
+`"classification": tier` to `"classification": "internal"` in `registry_classification`;
+`cargo test -p lakehouse-api a_registry_tier_that_is_a_level_is_reported_as_that_level`
+failed: `left: String("internal")`, `right: String("confidential")`. Restored; the
+governance module's 57 tests pass and `git status` is clean.
+
+**Verification, final commit `74995151`, foreground, `CARGO_BUILD_JOBS=4`, the checkout's
+`rust/target` (shared; no `cargo clean`).**
+
+- `cargo fmt --check` — exit 0.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — exit 0, finished
+  in 1m 09s.
+- `cargo test --workspace` — exit 0: **9629 passed, 0 failed, 52 ignored**, 185 result
+  lines over 171 suites. Named: `route_auth` 77, `identity_roles` 17, `quality_schedules` 4,
+  `sec11_guard` 4.
+- `bun run typecheck` — exit 0.
+- `bun run test` — **3212 pass, 1 skip, 0 fail**, 8752 expect() calls, 328 files, 92.41s.
+- `git status` — empty after this handoff commit's parent. The three ClickHouse containers
+  this test run left behind were removed. `dreamy_bouman` (`postgres:16-alpine`, up 3 h
+  before this session) was not started here and was left alone.
+- `docker compose … config` was not run: no compose file changed in slice 3a.
+
+**Not verified.**
+
+- No browser run and no stack brought up: slice 3a is API only; the screens are 3b's.
+- The contract field, client and type were not exercised through a console page (none
+  calls the new routes yet).
+- The D4 fallback (no derived rows in this deployment's seed) is asserted by unit tests and
+  by the seed's `primer`/`sekunder` values, not observed on a running deployment's
+  classification page.
+
 ## 9. Review (planner appends below)
 
 ### Review slice 2, round 1 (planner, 2026-11-04, at `e566187b`)
