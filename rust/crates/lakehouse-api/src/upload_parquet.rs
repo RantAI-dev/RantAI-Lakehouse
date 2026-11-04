@@ -594,16 +594,31 @@ fn type_label(data_type: &DataType) -> String {
 /// What the footer of the file in `bytes` says: its columns and their types and
 /// its row count. No row is decoded.
 ///
+/// No product path reads a Parquet file whole: an upload and an S3
+/// connector's preview both ask the child for the file's tail (`SEC-22` P1,
+/// `SEC-55` D1). This whole-file read is kept because the crate's
+/// `hostile_uploads` integration test uses it to prove what the reader does
+/// to a hostile file, and it is compiled out of the binary where nothing
+/// calls it.
+///
 /// # Errors
 ///
 /// [`ParquetFileError::Unreadable`] when the bytes do not open as a Parquet
 /// file, [`ParquetFileError::Encrypted`], [`ParquetFileError::NoColumns`],
 /// [`ParquetFileError::Unsupported`] for a binary or nested column. There is no
 /// cell cap here: only the footer is read ([`cell_cap_for`]).
+#[allow(
+    dead_code,
+    reason = "the `hostile_uploads` integration test reads a whole fixture through it; no product path does since SEC-55, so the binary has no caller"
+)]
 pub fn inspect<R: ChunkReader + 'static>(reader: &R) -> Result<ParquetInfo, ParquetFileError> {
     inspect_capped(reader, u64::MAX)
 }
 
+#[allow(
+    dead_code,
+    reason = "reached only through `inspect`, which the binary does not call (SEC-55)"
+)]
 fn inspect_capped<R: ChunkReader + 'static>(
     reader: &R,
     cap: u64,
