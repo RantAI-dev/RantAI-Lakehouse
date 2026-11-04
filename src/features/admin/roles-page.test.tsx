@@ -75,14 +75,14 @@ describe("RolesPage (WEB-3 S3-D8)", () => {
     expect(screen.queryByText("Teams & Roles")).toBeNull()
   })
 
-  it("edits a role and says a rename leaves rules naming the old name behind", async () => {
+  it("edits a role and says a rename is refused while a rule names the role", async () => {
     const writes = stubApi(["identity:read", "identity:write"])
     renderPage()
     await openMenuItem("Edit role")
     const name = await screen.findByLabelText("Name")
     expect((name as HTMLInputElement).value).toBe("Analyst")
     fireEvent.change(name, { target: { value: "Data Analyst" } })
-    expect(screen.getByText(/A rule that names Analyst stops applying to this role/)).toBeTruthy()
+    expect(screen.getByText(/A rename is refused while an access rule names Analyst/)).toBeTruthy()
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     await waitFor(() =>
       expect(writes).toEqual([

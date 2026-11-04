@@ -848,10 +848,14 @@ pub struct UpdateRoleInput {
 /// list shows it (with its current member count).
 ///
 /// Memberships join by id, so a rename reaches every user who holds the
-/// role at their next request. A policy's `subjects` is free text and is
-/// NOT rewritten: after a rename, a policy that named the old name stops
-/// applying to that role (the console's Access rules page shows the stored
-/// text, so the old name stays visible).
+/// role at their next request. A policy's free-text `subjects` is NOT
+/// rewritten: the console's Access rules page shows the stored text, so
+/// the old name stays visible. A policy's structured `conditions` is the
+/// dangerous case — a clause names roles by name and carries that role's
+/// masks and row filters — so `routes::identity::update_role` refuses a
+/// rename while one names this role (`WEB-3` review R2) and this function
+/// is never reached with obligations still attached. It rewrites no
+/// `policy` row itself.
 ///
 /// # Errors
 ///

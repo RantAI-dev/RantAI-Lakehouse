@@ -65,6 +65,7 @@ use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::governance;
 use lakehouse_store::identity::{
     self, CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput, Role,
     RotateServiceIdentityResponse, ServiceIdentity, ServiceIdentityFilter, Tenant, TenantFilter,
@@ -1100,6 +1101,17 @@ pub struct UpdateRoleBody {
 /// description (`WEB-3` S3a-D2). Audited as `identity.role.update`,
 /// naming the old and the new bundle.
 ///
+/// # Refusals
+///
+/// A rebuilt bundle that keeps the name is unaffected. A rename is refused
+/// with 409 while any access rule — any status, because a draft becomes
+/// live later — names the OLD name among the roles its structured
+/// [`PolicyCondition`](crate::policy_engine::PolicyCondition) applies to,
+/// and then nothing is written. Rules are matched against a principal's
+/// role NAMES, so a rename would silently stop every mask and row filter
+/// those rules carry from reaching the people who hold this role: data the
+/// role must not see would become visible (`WEB-3` review R2).
+///
 /// # Security
 ///
 /// Requires `identity:write`, the permission `POST /api/identity/roles`
@@ -1108,7 +1120,8 @@ pub struct UpdateRoleBody {
 /// # Errors
 ///
 /// 400 on a malformed body or a blank name; 404 when no role has that id;
-/// 409 when another role has the name; 503/500 as above.
+/// 409 when another role has the name, or when an access rule names this
+/// one; 503/500 as above.
 pub async fn update_role(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
@@ -1123,6 +1136,16 @@ pub async fn update_role(
     };
     let pool = pool(&state)?;
     let before = identity::get_role(pool, &id).await?;
+    // WEB-3 review R2: a rename would take every mask and row filter the
+    // rules naming this role carry away from its holders, because rules
+    // match on names. Refuse before anything is written, listing the rules
+    // from the stored rows.
+    if input.name != before.name {
+        let naming = policies_naming_role(pool, &before.name).await?;
+        if !naming.is_empty() {
+            return Err(ApiError::Conflict(named_by_rules_sentence(&naming)).into());
+        }
+    }
     let role = identity::update_role(pool, &id, &input).await?;
     let audit_event = role_update_audit_event(&principal, &before, &role);
     if let Err(err) = store_audit::insert(pool, audit_event).await {
@@ -1200,6 +1223,46 @@ pub async fn delete_role(
 /// the plan).
 fn still_given_sentence(members: i64) -> String {
     format!("This role is still given to {members} people. Take it away from them first.")
+}
+
+/// Every access rule whose structured `conditions` name `role`, in the
+/// store's order (newest first). `policy_engine::condition_names_role` is
+/// the read-time rule, so this asks the engine's own question; every
+/// status is considered, because a draft is enforced the moment someone
+/// makes it ready (`WEB-3` review R2).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the read fails.
+async fn policies_naming_role(
+    pool: &PgPool,
+    role: &str,
+) -> Result<Vec<governance::Policy>, StoreError> {
+    let policies = governance::list_policies(pool).await?;
+    Ok(policies
+        .into_iter()
+        .filter(|policy| {
+            crate::policy_engine::condition_names_role(policy.conditions.as_deref(), role)
+        })
+        .collect())
+}
+
+/// The 409 sentence for a rename an access rule still names (`WEB-3`
+/// review R2, fixed by the plan): how many rules name the role, and the
+/// first three by name — read from the stored rows, never from an
+/// upstream error's own text (principle 4).
+fn named_by_rules_sentence(rules: &[governance::Policy]) -> String {
+    let first_three = rules
+        .iter()
+        .take(3)
+        .map(|rule| rule.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "This role is named by {} access rules ({first_three}…). Change those rules first, or \
+         keep the role's name.",
+        rules.len()
+    )
 }
 
 /// The audit row for a role rewrite: the actor, the role, and the bundle

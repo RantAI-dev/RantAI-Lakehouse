@@ -449,6 +449,52 @@ mod identity {
             .await
         }
 
+        /// `POST /api/governance/policies` — an access rule whose structured
+        /// `conditions` name `role`, `true` for enforced and `false` for a
+        /// draft. Returns the rule's id.
+        async fn create_rule_naming(
+            app: &TestApp,
+            cookie: &str,
+            name: &str,
+            role: &str,
+            activate: bool,
+        ) -> String {
+            let (status, body) = request(
+                app,
+                "POST",
+                "/api/governance/policies",
+                Some(cookie),
+                Some(json!({
+                    "name": name,
+                    "kind": "Masking",
+                    "subjects": format!("Everyone who holds {role}"),
+                    "resources": "serving.mart_customer_segment",
+                    "effect": "Permit with obligation",
+                    "conditions": json!({
+                        "roles": [role],
+                        "table": "serving.mart_customer_segment",
+                        "mask": ["email"],
+                    })
+                    .to_string(),
+                    "activate": activate,
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            body["id"].as_str().expect("the new rule's id").to_owned()
+        }
+
+        /// The stored name and conditions of an access rule.
+        async fn stored_rule(pool: &PgPool, id: &str) -> (String, Option<String>) {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT name, conditions FROM policy WHERE id = $1",
+            )
+            .bind(uuid::Uuid::parse_str(id).expect("a uuid"))
+            .fetch_one(pool)
+            .await
+            .expect("read the policy row")
+        }
+
         /// `DELETE /api/identity/roles/{id}`.
         async fn delete_role(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) {
             request(
@@ -536,6 +582,129 @@ mod identity {
                     "first".to_owned()
                 )),
                 "the refused rename leaves the row alone"
+            );
+        }
+
+        /// `WEB-3` review R2: an access rule names a role by NAME in its
+        /// structured `conditions`, so renaming the role would take the
+        /// rule's masks and row filters away from everyone who holds it —
+        /// silently, and for data the role must not see. While any rule
+        /// names the old name the rename is refused with 409, and neither
+        /// the role nor the rule is written. A draft counts too: it is
+        /// enforced the moment someone makes it ready.
+        #[tokio::test]
+        async fn a_rename_is_refused_while_an_access_rule_names_the_role() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let id = create_role(&app, &admin_cookie, "Reviewers").await;
+            let draft =
+                create_rule_naming(&app, &admin_cookie, "Draft masking", "Reviewers", false).await;
+            let live =
+                create_rule_naming(&app, &admin_cookie, "Live row filter", "Reviewers", true).await;
+
+            let (status, body) =
+                update_role(&app, &admin_cookie, &id, "Senior Reviewers", "query:read").await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            let sentence = body["error"]
+                .as_str()
+                .expect("the refusal is a fixed sentence");
+            assert!(
+                sentence.starts_with("This role is named by 2 access rules ("),
+                "{sentence}"
+            );
+            assert!(
+                sentence.ends_with("). Change those rules first, or keep the role's name."),
+                "{sentence}"
+            );
+            assert!(sentence.contains("Draft masking"), "{sentence}");
+            assert!(sentence.contains("Live row filter"), "{sentence}");
+
+            assert_eq!(
+                stored_role(&app.pool, &id).await,
+                Some((
+                    "Reviewers".to_owned(),
+                    "query:read".to_owned(),
+                    "first".to_owned()
+                )),
+                "the refused rename leaves the role alone"
+            );
+            assert_eq!(stored_rule(&app.pool, &draft).await.0, "Draft masking");
+            assert!(
+                stored_rule(&app.pool, &live)
+                    .await
+                    .1
+                    .as_deref()
+                    .is_some_and(|conditions| conditions.contains("Reviewers")),
+                "the rule still names the role"
+            );
+            let audits: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_event WHERE action = 'identity.role.update'",
+            )
+            .fetch_one(&app.pool)
+            .await
+            .expect("count the role-update audit rows");
+            assert_eq!(audits, 0, "nothing was written, so nothing is audited");
+        }
+
+        /// `WEB-3` review R2, the other side: nothing names the role, so the
+        /// rename goes through — a rule that names someone else does not
+        /// stand in its way.
+        #[tokio::test]
+        async fn a_rename_is_allowed_when_no_access_rule_names_the_role() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let id = create_role(&app, &admin_cookie, "Reviewers").await;
+            let _elsewhere =
+                create_rule_naming(&app, &admin_cookie, "Analyst masking", "Analyst", true).await;
+
+            let (status, body) = update_role(
+                &app,
+                &admin_cookie,
+                &id,
+                "Senior Reviewers",
+                "policy:review",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["name"], json!("Senior Reviewers"));
+            assert_eq!(
+                stored_role(&app.pool, &id).await,
+                Some((
+                    "Senior Reviewers".to_owned(),
+                    "policy:review".to_owned(),
+                    "changed".to_owned()
+                ))
+            );
+        }
+
+        /// `WEB-3` review R2: only the name is dangerous. The same name kept,
+        /// with a new description and permission list, is still allowed while
+        /// a rule names the role — the rule keeps applying to exactly the
+        /// people it applied to before.
+        #[tokio::test]
+        async fn a_description_only_edit_is_allowed_while_an_access_rule_names_the_role() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+            let id = create_role(&app, &admin_cookie, "Reviewers").await;
+            let _rule =
+                create_rule_naming(&app, &admin_cookie, "Draft masking", "Reviewers", false).await;
+
+            // Same name, same permissions: the description is all that changes.
+            let (status, body) =
+                update_role(&app, &admin_cookie, &id, "Reviewers", "query:read").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["name"], json!("Reviewers"));
+            assert_eq!(body["description"], json!("changed"));
+            assert_eq!(
+                stored_role(&app.pool, &id).await,
+                Some((
+                    "Reviewers".to_owned(),
+                    "query:read".to_owned(),
+                    "changed".to_owned()
+                ))
             );
         }
 

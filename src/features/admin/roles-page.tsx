@@ -228,9 +228,10 @@ function RoleFields({
 
 /**
  * Edit one role (`PUT /api/identity/roles/{id}`). Access rules name roles
- * by name and a rename is not carried into them (`UpdateRoleInput`), so a
- * changed name says, before saving, that rules naming the old one stop
- * applying to this role.
+ * by name, so the API refuses a rename while one of them names this role
+ * (`WEB-3` review R2); a changed name says that before saving, rather than
+ * letting the save come back a 409 the person did not expect. A new
+ * description or permission list is unaffected.
  */
 function EditRoleSheet({
   role,
@@ -285,8 +286,8 @@ function EditRoleSheet({
       />
       {renamed && name.trim() ? (
         <p className="text-sm text-muted-foreground">
-          Access rules name roles by name. A rule that names {role.name} stops applying to this
-          role once it is called {name.trim()}.
+          Access rules name roles by name. A rename is refused while an access rule names{" "}
+          {role.name}; change those rules first, or keep the name.
         </p>
       ) : null}
     </CreateSheet>
