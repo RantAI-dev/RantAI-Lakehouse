@@ -109,6 +109,7 @@ estimate (S, M, L), which the base has no field for.
 
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DATA-44` | Feature | Near real-time analytics, without a stream engine (product owner, 2026-11-04: "write as backlog, but we later support clustering"). A change in a source system shows on a dashboard and can fire an alert within a target time, on one server: (1) measure the end-to-end freshness today, source change → Bronze table → Gold/self-refreshing table (`BLD-2`) → dashboard tile → alert, into a `docs/plans/DATA-44-RESULT.md`, for PostgreSQL live change capture and Kafka; (2) a dashboard refreshes itself on an interval set per dashboard, for a "live" screen; (3) the assistant can set that interval and make a self-refreshing table (assistant parity); (4) target *(proposed, owner to sign)*: a source change visible on a dashboard within 60 seconds at p95, measured. Not in scope: processing over streams (windows, joins over streams; `SRC-2`) and running on several servers (`OPS-3`, later). MySQL and SQL Server change capture come with `SRC-4` (#264) | Data | P2 | Idea |  | owner 2026-11-04; PRODUCT §2 |
 | `RPT-1` | Feature | Scheduled reports with PDF and spreadsheet attachments. **Blocked by `BI-1` (PDF and Excel attachments)** | Dashboards | P2 | In Acceptance | [#204](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/204) | PRODUCT §2 |
 | `BI-1` | Feature | Export a dashboard as a server-made PDF and as Excel | Dashboards | P2 | In Acceptance | [#204](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/204) | PRODUCT §2 |
 | `BI-4` | Feature | Result caching for charts and queries; run a dashboard's tiles in parallel | Dashboards | P2 | In Acceptance | [#245](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/245) | `reference/competitive-comparison.md` (BI matrix) |
@@ -273,7 +274,7 @@ estimate (S, M, L), which the base has no field for.
 
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `OPS-3` | Feature | Run on several servers; high availability | Platform | P3 | Idea |  | PRODUCT §1, §2 |
+| `OPS-3` | Feature | Run on several servers; high availability. The product owner wants clustering supported later (2026-11-04); `DATA-44` stays on one server | Platform | P3 | Idea |  | PRODUCT §1, §2 |
 | `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. `DEC-9` decided 2026-10-19; `SRC-12` merged. Feature page `features/business-app-connectors.md`. Eight of the ten are built and supported (gate-tested on mock vendors only; no real account); Workday Reports and NetSuite are built and stay unsupported until `SRC-27`. Result: `plans/SRC-3-RESULT.md`. Follow-ups: `SRC-26` to `SRC-31`. Accepted by the product owner on 2026-11-02 for the eight supported vendors; Workday Reports and NetSuite wait for `SRC-27` | Data | P3 | Released | #216 | PRODUCT §2 |
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
 | `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. | Build | P3 | Done | #189 | `DATA-19` plan, section 5 |
@@ -291,7 +292,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-3` | Feature | Import dashboards from Tableau and Power BI | Dashboards | P3 | Idea |  | PRODUCT §2 |
 | `BI-20` | Feature | The rest of the BI matrix, to be considered later: field metadata in the BI layer, certified content, BI-specific AI, admin and platform rows, and Slack, Teams, Office and Google integrations | Dashboards | P3 | Idea |  | `reference/competitive-comparison.md` (BI matrix) |
 | `QRY-1` | Feature | Query other systems in place, without loading | Data | P3 | Idea |  | PRODUCT §2 |
-| `SRC-2` | Feature | Processing over streams | Data | P3 | Idea |  | PRODUCT §2 |
+| `SRC-2` | Feature | Processing over streams (windows, joins over streams). Not part of `DATA-44`; revisit with `OPS-3` | Data | P3 | Idea |  | PRODUCT §2 |
 | `INT-2` | Feature | Search over documents | AI Copilot | P3 | Idea |  | PRODUCT §2 |
 | `GOV-3` | Feature | Lineage that reaches outside systems | Governance | P3 | Idea |  | PRODUCT §2 |
 | `GOV-5` | Task | The audit page lists a chat draft waiting for Confirm, and a request waiting for approval, as Denied with policy `deny`: `outcome_of` in `routes/governance.rs` maps every gate outcome that is not a success to `denied`, on purpose, so a decision that is still open cannot read as a success. Decided 2026-10-30 (product owner): both read Pending | Governance | P3 | Done | #282 | `AI-18` checklist row 11, 2026-10-14 |
