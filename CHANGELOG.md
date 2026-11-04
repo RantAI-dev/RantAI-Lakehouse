@@ -29,6 +29,18 @@ once a first release is tagged.
 - The ignores for RUSTSEC-2026-0367, -0368 and -0369 are removed: `zip` 8.6.0 left the dependency tree with `rust_xlsxwriter` 0.102 (backlog `SEC-42`).
 - `calamine` 0.37 -> 0.38 leaves `RUSTSEC-2026-0436` out of the dependency tree (a malformed compound file could panic the reader or ask it for unbounded memory in the CFB/OLE2 parser, the `.xls` path the upload reader takes). No ignore was added, and `zip` stays one version (9.1.2) shared with `calamine` and `rust_xlsxwriter`. A workbook that reads today reads the same: the release notes' changes to what the upload reader touches are the fixed panics and an `.xls` stream name matched without regard to case.
 
+### Changed
+
+- The console shows one place per thing (backlog `WEB-3`, slice 1). **Approvals** moved from `/agents/approvals` to `/governance/approvals` (the old address redirects); **sign-in** moved into Admin > Settings as a **Sign-in** section (`/admin/sso` redirects); **Policies** lost its **Create Policy** button and now says policies are added on a table's Access tab, with a link to the Catalog; **Lineage** left the sidebar and is opened from a table, chart, pipeline or run. Approvals are still the one inbox for assistant tool calls and catalog access requests.
+
+### Removed
+
+- **Digital Employees** and the **Agent Runs list** (backlog `WEB-3`, slice 1): `INT-1` is parked and `routes/agents.rs` says there is no execution runtime for those pages to show. A run's own page (`/agents/runs/[runId]`) stays — an approval from a chat creates a real run and its trace is shown there.
+- **Observability**: `activeIncidents` is always `null` and the two SLOs are fixed in code, so the page could not tell the truth.
+- **Workloads**: class and cost come back `null`, and the one real action, cancelling a running query, is Query Studio's **Stop**.
+- **Activity**: it showed the same audit trail as **Audit Log**.
+- The **Create Policy wizard** (`/governance/policies/create`): it saved free-text subjects, resources and conditions, while the policy engine enforces only structured JSON conditions, so a policy made there was listed as enforced and masked nothing. Policies are added on a table's Access tab. The policies it already made stay listed (no data is deleted).
+
 ## [0.2.0] - 2026-11-02
 
 ### Upgrade notes

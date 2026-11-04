@@ -1,12 +1,14 @@
-import type { OpsService, ObservabilitySummary, WorkloadItem, PlatformService } from "../contracts/ops";
+import type { OpsService, PlatformService } from "../contracts/ops";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * OpsService is now fully real: observability/workloads/services from
- * ClickHouse system.* + Dagster. cancelWorkload is a real `KILL QUERY` via
- * `/api/ops/workloads/{id}/cancel`. mock/ops.ts has been deleted. `usage`
- * was removed in the WS1 honesty pass — nothing measures it.
+ * OpsService is real: the service list comes from ClickHouse system.* +
+ * Dagster. `WEB-3` slice 1 (D1/D2) removed the observability and workloads
+ * reads with their pages — the numbers they showed were nulls and fixed
+ * literals, and the one real action (cancel a running query) is Query
+ * Studio's Stop (`BI-5`). The backend routes stay registered (D2) for the
+ * assistant's tools; `WEB-4` retires them.
  */
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });
@@ -16,23 +18,7 @@ async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
 }
 
 export const clickhouseOpsService: OpsService = {
-  getObservability: (s) => get<ObservabilitySummary>("/api/ops/observability", s),
-  async listWorkloads(s) {
-    return (await get<{ workloads: WorkloadItem[] }>("/api/ops/workloads", s)).workloads;
-  },
   async listServices(s) {
     return (await get<{ services: PlatformService[] }>("/api/ops/services", s)).services;
-  },
-  async cancelWorkload(id, signal) {
-    const res = await apiFetch(`/api/ops/workloads/${encodeURIComponent(id)}/cancel`, {
-      method: "POST",
-      signal,
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
-      throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
-    }
-    return json as WorkloadItem;
   },
 };
