@@ -16,6 +16,14 @@ let cached: boolean | null = null;
 export function hasFastWebGL(): boolean {
   if (cached !== null) return cached;
   if (typeof document === "undefined") return false;
+  // WEB-5 D14 S1, test-only: a machine without a GPU (the developer VM, CI)
+  // can render the lake for frame strips under `next dev` with
+  // NEXT_PUBLIC_WEB5_FORCE_WEBGL=1. The export is built with
+  // NODE_ENV=production, so this branch is removed from it, and
+  // `scripts/check-bundle.mjs` fails if the flag's name reaches `out/`.
+  if (process.env.NODE_ENV === "development" && process.env.NEXT_PUBLIC_WEB5_FORCE_WEBGL === "1") {
+    return (cached = true);
+  }
   try {
     const canvas = document.createElement("canvas");
     const gl = canvas.getContext("webgl2", { failIfMajorPerformanceCaveat: true });

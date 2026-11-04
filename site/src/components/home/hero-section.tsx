@@ -11,11 +11,13 @@ import { BackdropFade, HeroCopyMotion, ScrollCueFade } from "./hero-motion";
  * inline SVG. It is also the permanent fallback when WebGL is missing or the
  * context is lost (plan §2.8), so the copy never depends on the canvas.
  *
- * The section is 150 vh tall with a 100 vh sticky stage: the first 50 vh of
- * scroll pin the hero while its copy lifts and fades and the camera starts
- * to dive; the rest of the dive happens as the stage scrolls away. With
- * `prefers-reduced-motion` the section is a plain 100 vh screen (the CSS
- * `motion-reduce:` variants), so no pinned scroll remains.
+ * The section has a 100 vh sticky stage. With the live lake it is 220 vh
+ * tall (WEB-5 D14 S1, `app/globals.css`): the stage stays pinned while the
+ * camera descends, lingers at the waterline and goes under, and the copy
+ * fades just before the surface closes overhead. Without it (the DOM hero)
+ * it is 150 vh, as before. With `prefers-reduced-motion` the section is a
+ * plain 100 vh screen (the CSS `motion-reduce:` variants), so no pinned
+ * scroll remains.
  *
  * WEB-5 review fix R5: a server component. The copy, the backdrop's drawing
  * and the cue render on the server; `hero-motion.tsx` holds the three

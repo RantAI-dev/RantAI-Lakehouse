@@ -7,16 +7,18 @@ import {
   pchip,
   sceneStateAt,
   smoothstep,
+  DIVE,
   type SceneLayout,
 } from "./scroll-timeline";
 
-// A 900 px tall viewport laid out the way the page is: hero 150 vh, sources
-// 230 vh, then the depths section (300 vh) whose pinned range is 200 vh.
+// A 900 px tall viewport laid out the way the page is with the live lake:
+// hero 220 vh (WEB-5 D14 S1), sources 230 vh, then the depths section
+// (300 vh) whose pinned range is 200 vh.
 const VH = 900;
 const layout: SceneLayout = {
   vh: VH,
   viewportH: VH,
-  depthsTop: VH * 3.8,
+  depthsTop: VH * (DIVE.heroVh + 2.3),
   depthsHeight: VH * 3,
 };
 
@@ -64,11 +66,37 @@ test("the camera only ever sinks as the page scrolls down", () => {
   }
 });
 
-test("the camera crosses the surface during the first viewport of scroll", () => {
-  const before = sceneStateAt(0.1 * VH, layout);
-  const after = sceneStateAt(VH, layout);
-  assert.ok(before.position[1] > 0, "still above at 0.1 vh");
-  assert.ok(after.position[1] < 0, "under at 1 vh");
+// WEB-5 D14 S1 replaces "crosses during the first viewport": the owner asked
+// for a slower dive, so the crossing now sits in a half-viewport waterline
+// stretch inside the 220 vh hero, and these tests guard that it stays slow.
+test("the camera crosses the surface inside the waterline stretch", () => {
+  const before = sceneStateAt(DIVE.waterlineAbove * VH, layout);
+  const after = sceneStateAt(DIVE.waterlineBelow * VH, layout);
+  assert.ok(before.position[1] > 0, "still above where the stretch starts");
+  assert.ok(after.position[1] < 0, "under where it ends");
+  assert.ok(sceneStateAt(0.6 * VH, layout).position[1] > 0, "above at 0.6 vh");
+});
+
+test("the change from sky to underwater spreads over more than one viewport of scroll", () => {
+  let first = -1;
+  let last = -1;
+  for (let y = 0; y <= 3 * VH; y += 1) {
+    const u = sceneStateAt(y, layout).underwater;
+    if (first < 0 && u > 0.01) first = y;
+    if (last < 0 && u > 0.99) last = y;
+  }
+  assert.ok(first >= 0 && last > first, `blend from ${first} to ${last}`);
+  assert.ok(last - first >= 1.0 * VH, `blend spans ${(last - first) / VH} vh`);
+});
+
+test("no small scroll step changes the picture much: at most 2 % underwater per 1 % of a viewport", () => {
+  const step = 0.01 * VH;
+  let prev = sceneStateAt(0, layout).underwater;
+  for (let y = step; y <= 3 * VH; y += step) {
+    const u = sceneStateAt(y, layout).underwater;
+    assert.ok(Math.abs(u - prev) <= 0.02, `jump of ${u - prev} at ${y / VH} vh`);
+    prev = u;
+  }
 });
 
 test("depth progress is 0 before the section and 1 after its pinned range", () => {
@@ -104,7 +132,8 @@ test("a layout that is not measured yet still yields a finite state", () => {
 
 test("the camera never rests on the water plane", () => {
   for (let y = -1; y <= 1; y += 0.01) {
-    assert.ok(Math.abs(avoidSurface(y)) >= 0.13, `y ${y} maps to ${avoidSurface(y)}`);
+    // D14 S1 halved the band (0.14 -> 0.07); it still clears the 0.05 near plane.
+    assert.ok(Math.abs(avoidSurface(y)) >= 0.065, `y ${y} maps to ${avoidSurface(y)}`);
   }
   assert.equal(avoidSurface(5), 5);
   assert.equal(avoidSurface(-5), -5);

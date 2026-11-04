@@ -28,6 +28,12 @@ export type SceneLayout = {
 export type SceneState = {
   position: Vec3;
   look: Vec3;
+  /**
+   * The camera path's height before the anti-clipping hop (`avoidSurface`):
+   * continuous through the surface, so the waterline overlay and the
+   * underwater blend follow it without a jump (D14 S1).
+   */
+  pathY: number;
   /** 0 above the surface, 1 well below it. */
   underwater: number;
   /** 0 at the hero, 1 once the camera has dived through (hero scroll over one `vh`). */
@@ -104,6 +110,39 @@ export function focusFromProgress(progress: number): number {
   return Math.min(2, Math.max(0, clamp01(progress) * 3 - 0.5));
 }
 
+/**
+ * WEB-5 D14 S1, the dive. The owner found the crossing "too sudden": the
+ * camera went from 1.15 to 0.05 in 0.42 vh and under by 1.0 vh, so the sky
+ * became water in a few dozen pixels of scroll. Now:
+ * - the hero is `DIVE.heroVh` viewports tall while the live lake runs (the
+ *   DOM hero keeps 150 vh, see `app/globals.css`);
+ * - the camera eases down to the waterline, then slows across it: two keys
+ *   0.5 vh apart, 0.16 above and 0.16 below the surface, so it crosses at
+ *   about 0.6 units per viewport where it used to cross at about 2.6;
+ * - after the waterline the camera keeps sinking into the sources section
+ *   (the storyboard's −5 m), reaching y -2.4 at 2.7 vh;
+ * - the underwater blend (fog, colour, light) follows the camera from y 0.9
+ *   down to -1.8, over about two viewports of scroll rather than about 0.3.
+ * All in viewport multiples, so the pace is the same on every screen.
+ */
+export const DIVE = {
+  /** Hero section height in viewports, live-lake mode. */
+  heroVh: 2.2,
+  /** Scroll positions of the camera keys, in viewports. */
+  approach: 0.6,
+  waterlineAbove: 1.1,
+  waterlineBelow: 1.6,
+  under: 2.7,
+  /** Camera y at each key (the water plane is y 0). */
+  yApproach: 0.45,
+  yAbove: 0.16,
+  yBelow: -0.16,
+  yUnder: -2.4,
+  /** The underwater blend runs from this camera height down to the next. */
+  blendTop: 0.9,
+  blendBottom: -1.8,
+} as const;
+
 /** Camera height above the slab it is looking at, and its distance from it. */
 const SLAB_CAM_DY = 5;
 const SLAB_CAM_Z = 9.2;
@@ -120,8 +159,11 @@ function keysFor(layout: SceneLayout): Key[] {
   });
   const raw: Key[] = [
     { at: 0, pos: [0, 1.15, 7.2], look: [0, 0.75, 0] },
-    { at: 0.42 * vh, pos: [0, 0.05, 6.6], look: [0, 0.6, 0] },
-    { at: 1.0 * vh, pos: [0, -2.4, 6.4], look: [0, -0.6, 0] },
+    { at: DIVE.approach * vh, pos: [0, DIVE.yApproach, 6.9], look: [0, 0.6, 0] },
+    // The waterline: a slow, half-above, half-below stretch (D14 S1).
+    { at: DIVE.waterlineAbove * vh, pos: [0, DIVE.yAbove, 6.7], look: [0, 0.4, 0] },
+    { at: DIVE.waterlineBelow * vh, pos: [0, DIVE.yBelow, 6.6], look: [0, 0.1, 0] },
+    { at: DIVE.under * vh, pos: [0, DIVE.yUnder, 6.4], look: [0, -0.6, 0] },
     { at: depthsTop, pos: [0, SLAB_Y[0] + 6.4, 10.2], look: [0, SLAB_Y[0] + 1, 0] },
     slabKey(0, depthsTop + span / 6),
     slabKey(1, depthsTop + span / 2),
@@ -139,11 +181,15 @@ function keysFor(layout: SceneLayout): Key[] {
  * Keeps the camera off the water plane itself. Within the camera's near
  * distance of the surface the plane is clipped away and the view opens onto
  * the submerged half of the scene, so the camera hops across a thin band
- * instead of lingering in it. The hop is small (0.28 units) and happens at
- * the moment the picture changes from sky to ceiling anyway.
+ * instead of lingering in it. The hop happens at the moment the picture
+ * changes from sky to ceiling anyway.
+ *
+ * WEB-5 D14 S1: the band is 0.07 (was 0.14), so the hop is 0.14 units, still
+ * above the camera's 0.05 near plane but half as far as before; with the
+ * slow waterline stretch it is one small step inside a long crossing.
  */
 export function avoidSurface(y: number): number {
-  const band = 0.14;
+  const band = 0.07;
   const k = 1 - smoothstep(0, 0.6, Math.abs(y));
   return y + (y >= 0 ? band : -band) * k;
 }
@@ -158,11 +204,8 @@ export function sceneStateAt(scrollY: number, layout: SceneLayout): SceneState {
       keys.map(pick),
       scrollY,
     );
-  const position: Vec3 = [
-    channel((k) => k.pos[0]),
-    avoidSurface(channel((k) => k.pos[1])),
-    channel((k) => k.pos[2]),
-  ];
+  const pathY = channel((k) => k.pos[1]);
+  const position: Vec3 = [channel((k) => k.pos[0]), avoidSurface(pathY), channel((k) => k.pos[2])];
   const look: Vec3 = [channel((k) => k.look[0]), channel((k) => k.look[1]), channel((k) => k.look[2])];
 
   const span = Math.max(1, depthsHeight - viewportH);
@@ -170,14 +213,18 @@ export function sceneStateAt(scrollY: number, layout: SceneLayout): SceneState {
   return {
     position,
     look,
-    // Fully "under" a little below the surface, fully "above" a little above it.
-    underwater: 1 - smoothstep(-0.8, 0.5, position[1]),
-    dive: clamp01(scrollY / Math.max(1, vh)),
+    pathY,
+    // Fully "above" well before the surface and fully "under" well after
+    // it, so fog, colour and light change over the whole slow crossing (S1).
+    // From the path's height, not the hopped one, so the blend never jumps
+    // with the anti-clipping hop (S1).
+    underwater: 1 - smoothstep(DIVE.blendBottom, DIVE.blendTop, pathY),
+    dive: clamp01(scrollY / Math.max(1, DIVE.waterlineBelow * vh)),
     depthProgress,
     focus: focusFromProgress(depthProgress),
     activeLayer: activeLayerIndex(depthProgress),
-    slabsReveal: smoothstep(vh * 1.4, depthsTop, scrollY),
-    heroWeight: 1 - smoothstep(0.2 * vh, 0.9 * vh, scrollY),
+    slabsReveal: smoothstep(vh * DIVE.under, depthsTop, scrollY),
+    heroWeight: 1 - smoothstep(0.4 * vh, DIVE.waterlineBelow * vh, scrollY),
     depthsWeight: smoothstep(depthsTop - 0.9 * vh, depthsTop - 0.1 * vh, scrollY),
   };
 }

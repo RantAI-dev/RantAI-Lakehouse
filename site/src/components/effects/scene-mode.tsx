@@ -83,6 +83,13 @@ export function LandingModeProvider({ children }: { children: React.ReactNode })
   const markReady = React.useCallback(() => setReadyFor(mode), [mode]);
   const markFailed = React.useCallback(() => setFailed(true), []);
 
+  // WEB-5 D14 S1: the mode on <html>, for CSS that depends on it (the hero
+  // is longer while the live lake runs, app/globals.css). Written when the
+  // mode changes, which is at most a few times per visit, never per scroll.
+  React.useEffect(() => {
+    document.documentElement.dataset.scene = mode;
+  }, [mode]);
+
   const value = React.useMemo<LandingModeValue>(
     () => ({
       mode,

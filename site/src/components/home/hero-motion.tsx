@@ -15,12 +15,14 @@ import { cn } from "@/lib/utils";
 /** The copy lifts, fades and blurs as the dive starts, only over the live lake. */
 export function HeroCopyMotion({ children }: { children: React.ReactNode }) {
   const { mode } = useLandingMode();
-  // Over the whole section (150 vh), the copy is gone by 0.28 (about 42 vh).
+  // Over the live hero (220 vh, D14 S1): the copy holds while the camera
+  // descends, fades as it nears the waterline (0.3, about 0.66 vh), and is
+  // gone just before the surface closes overhead (0.55, about 1.2 vh).
   const scrollYProgress = useProgress();
   const live = mode === "full";
-  const copyOpacity = useTransform(scrollYProgress, [0, 0.2, 0.3], live ? [1, 0.7, 0] : [1, 1, 1]);
-  const copyY = useTransform(scrollYProgress, [0, 0.3], live ? [0, -72] : [0, 0]);
-  const copyBlur = useTransform(scrollYProgress, [0.08, 0.3], live ? ["blur(0px)", "blur(8px)"] : ["blur(0px)", "blur(0px)"]);
+  const copyOpacity = useTransform(scrollYProgress, [0, 0.3, 0.55], live ? [1, 0.7, 0] : [1, 1, 1]);
+  const copyY = useTransform(scrollYProgress, [0, 0.55], live ? [0, -72] : [0, 0]);
+  const copyBlur = useTransform(scrollYProgress, [0.2, 0.55], live ? ["blur(0px)", "blur(8px)"] : ["blur(0px)", "blur(0px)"]);
   return (
     <m.div
       className="max-w-[660px]"
@@ -39,7 +41,7 @@ export function HeroCopyMotion({ children }: { children: React.ReactNode }) {
 
 /** The scroll cue fades over the first few percent of the section. */
 export function ScrollCueFade({ children }: { children: React.ReactNode }) {
-  const cueOpacity = useTransform(useProgress(), [0, 0.07], [1, 0]);
+  const cueOpacity = useTransform(useProgress(), [0, 0.05], [1, 0]);
   return <m.div style={{ opacity: cueOpacity }}>{children}</m.div>;
 }
 

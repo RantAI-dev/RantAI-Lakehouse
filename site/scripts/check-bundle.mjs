@@ -93,4 +93,16 @@ if (scene.length === 0) {
   for (const f of scene) console.log(`  ${f} ${kb(gz(f))}`);
 }
 
+// WEB-5 D14 S1: the test-only WebGL override must never reach the export.
+const leaked = readdirSync(OUT, { recursive: true })
+  .map(String)
+  .filter((f) => /\.(js|html|txt)$/.test(f))
+  .filter((f) => readFileSync(join(OUT, f), "utf8").includes("WEB5_FORCE_WEBGL"));
+if (leaked.length) {
+  console.error(`The test-only WebGL override is in the export: ${leaked.join(", ")}`);
+  failed = true;
+} else {
+  console.log("test-only WebGL override: not in the export");
+}
+
 process.exit(failed ? 1 : 0);

@@ -65,6 +65,19 @@ const UNDER_DEEP = new Color("#020b2a");
 export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const { canvas, mode, observe } = opts;
   const host = canvas.parentElement ?? canvas; // the layer div the page sizes
+
+  // WEB-5 D14 S1, the waterline. One water plane cannot be seen from both
+  // sides at once, so as the camera crosses it the picture flips from sky to
+  // ceiling in one frame. Over it, a waterline with an underwater tint below
+  // rises up the screen with the camera's path height, and the flip happens
+  // when three quarters of the screen is already under the tint: the
+  // crossing reads as the water rising past the lens. Two CSS variables per
+  // frame (app/globals.css `.lk-waterline`), no React state.
+  const waterline = document.createElement("div");
+  waterline.className = "lk-waterline";
+  waterline.setAttribute("aria-hidden", "true");
+  if (mode !== "still") host.appendChild(waterline);
+  let lastLine = "";
   const still = mode === "still";
   let phone = window.innerWidth < 768;
 
@@ -238,6 +251,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const underColor = new Color();
   let smoothY = still ? 0 : window.scrollY;
   let lastBob = -1;
+  // Which side of the surface the camera was on, for the crossing ripple (D14 S1).
+  let lastAbove: boolean | null = null;
   let ema = 1 / 60;
   let slow = 0;
   let state: SceneState = sceneStateAt(0, layout);
@@ -262,6 +277,19 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     if (Math.abs(scrollY - smoothY) < 0.05) smoothY = scrollY;
     state = sceneStateAt(smoothY, layout);
     const uw = state.underwater;
+    if (!still) {
+      // Line position: 100 % (bottom edge) at path y +0.35, 25 % at the surface,
+      // 0 % (top edge) just below it. Tint fades out from y -0.35 to -0.9,
+      // where the 3D underwater view carries the picture on its own.
+      const pos = clamp(25 + (state.pathY / 0.35) * 75, -5, 105);
+      const alpha = 0.5 * smoothstep(-0.9, -0.35, state.pathY);
+      const line = `${pos.toFixed(1)}|${alpha.toFixed(3)}`;
+      if (line !== lastLine) {
+        lastLine = line;
+        waterline.style.setProperty("--lk-wl-pos", `${pos.toFixed(1)}%`);
+        waterline.style.setProperty("--lk-wl-a", alpha.toFixed(3));
+      }
+    }
 
     // Camera: the scroll path, plus a small pointer parallax while above the water.
     const heroPointer = 1 - state.dive;
@@ -310,6 +338,12 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     aim.y = lerp(rawY + (wanderY - rawY) * w, -0.8, uw);
     mascot.update(dt, t, aim, 1 - uw * 0.5);
     mascot.foam.visible = uw < 0.95;
+
+    // WEB-5 D14 S1: one ring spreads from the crossing as the camera goes
+    // through the surface (either way), so the moment reads as a dive.
+    const above = camera.position.y >= 0;
+    if (lastAbove !== null && above !== lastAbove) water.spawnRipple(t, 0.5);
+    lastAbove = above;
 
     // One ring per bob, from the waterline at the trough.
     const bobIndex = Math.floor((t - 3) / 4);
@@ -424,6 +458,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   return {
     dispose() {
+      waterline.remove();
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
       ro.disconnect();

@@ -148,6 +148,35 @@ html:not(.motion-ready) [data-reveal] {
   filter: none !important;
 }
 
+/* WEB-5 D14 S1, the slow dive: while the live lake runs the hero is 220 vh
+   (DIVE.heroVh in lib/scroll-timeline.ts), so the camera has room to linger
+   at the waterline. The DOM hero (no fast WebGL, reduced motion, no JS)
+   keeps its 150 vh, because a long pinned screen without the dive would
+   only be a pause. The mode is set after the page is usable, below the
+   fold, so the change shifts nothing on screen. */
+html[data-scene="full"] #hero {
+  height: 220vh;
+}
+
+/* WEB-5 D14 S1: the waterline the lake engine moves up the screen as the
+   camera crosses the surface (lake-engine.ts sets the two variables). Above
+   the line the scene shows as it is; at the line a pale meniscus; below it
+   the lake-blue tint of the water at the lens. */
+.lk-waterline {
+  --lk-wl-pos: 105%;
+  --lk-wl-a: 0;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    transparent calc(var(--lk-wl-pos) - 0.6%),
+    rgba(190, 228, 255, calc(var(--lk-wl-a) * 1.2)) var(--lk-wl-pos),
+    rgba(18, 70, 140, var(--lk-wl-a)) calc(var(--lk-wl-pos) + 1.2%),
+    rgba(7, 31, 82, var(--lk-wl-a)) 100%
+  );
+}
+
 /* Visible focus ring on the dark page (plan §2.8, keyboard). */
 .lk-root :focus-visible {
   outline: 2px solid var(--lk-lake);
