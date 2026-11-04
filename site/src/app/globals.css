@@ -192,6 +192,30 @@ html[data-scene] .lk-fallback-bg {
   background: none;
 }
 
+/* WEB-5 D14 S3: the depth gauge (components/home/depth-gauge.tsx). The page
+   writes --lk-gauge-f, the depth as a fraction of the deepest point. The
+   desktop marker moves down the scale and the phone hairline fills with it.
+   The desktop scale hides inside the depths section, whose own gauge
+   stands there. Without JavaScript there is no reading, so no gauge. */
+.lk-gauge {
+  --lk-gauge-f: 0;
+}
+.lk-gauge-marker {
+  top: calc(var(--lk-gauge-f) * 100%);
+}
+.lk-gauge-fill {
+  transform: scaleX(var(--lk-gauge-f));
+}
+.lk-gauge-scale {
+  transition: opacity 0.4s ease;
+}
+.lk-gauge[data-in-depths] .lk-gauge-scale {
+  opacity: 0;
+}
+html:not([data-scene]) .lk-gauge {
+  display: none;
+}
+
 /* Visible focus ring on the dark page (plan §2.8, keyboard). */
 .lk-root :focus-visible {
   outline: 2px solid var(--lk-lake);

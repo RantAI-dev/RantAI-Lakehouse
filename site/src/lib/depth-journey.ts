@@ -82,3 +82,41 @@ export function steppedDepthAt(scrollY: number, anchors: readonly Anchor[]): num
   for (const a of anchors) if (scrollY >= a.at) depth = a.depth;
   return depth;
 }
+
+/** The pinned depths section, in scroll positions: where its pin starts and how long it lasts. */
+export type DepthsRange = { top: number; span: number };
+
+/** The three slabs' depths, in the order the pin shows them (Bronze, Silver, Gold). */
+export const SLAB_DEPTHS = [-10, -40, -90] as const;
+
+/**
+ * The depth the gauge reads (WEB-5 D14 S3). Inside the pinned depths section
+ * it follows the slab in focus, so it reads −10, −40 and −90 m where those
+ * slabs are lit, the same readings as their labels; elsewhere it is the
+ * chapter anchors' depth. `stepped` (reduced motion) holds each value
+ * instead of blending.
+ */
+export function gaugeDepthAt(
+  scrollY: number,
+  anchors: readonly Anchor[],
+  depths: DepthsRange | null,
+  stepped = false,
+): number {
+  if (depths && scrollY >= depths.top && scrollY <= depths.top + depths.span) {
+    const progress = depths.span > 0 ? (scrollY - depths.top) / depths.span : 0;
+    // The same focus curve as the slabs: each lit in the middle of its third.
+    const focus = Math.min(2, Math.max(0, progress * 3 - 0.5));
+    if (stepped) return SLAB_DEPTHS[Math.min(2, Math.floor(progress * 3))];
+    const i = Math.min(1, Math.floor(focus));
+    const t = focus - i;
+    return SLAB_DEPTHS[i] + (SLAB_DEPTHS[i + 1] - SLAB_DEPTHS[i]) * t;
+  }
+  return (stepped ? steppedDepthAt : depthAt)(scrollY, anchors);
+}
+
+/** "−40 m": a U+2212 minus, whole metres; the surface reads "0 m". */
+export function formatDepth(depth: number): string {
+  const m = Math.round(Math.abs(depth));
+  return m === 0 ? "0 m" : `\u2212${m} m`;
+}
+

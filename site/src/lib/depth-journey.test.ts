@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { depthAt, mixColour, steppedDepthAt, WATER_BY_DEPTH, waterAt } from "./depth-journey";
+import { depthAt, formatDepth, gaugeDepthAt, mixColour, steppedDepthAt, WATER_BY_DEPTH, waterAt } from "./depth-journey";
 
 const anchors = [
   { at: 0, depth: 0 },
@@ -56,4 +56,18 @@ test("mixColour blends, and the stepped reading holds the last anchor reached", 
   assert.equal(mixColour("#000000", "#ffffff", 0.5), "#808080");
   assert.equal(steppedDepthAt(1500, anchors), -100);
   assert.equal(steppedDepthAt(2999, anchors), -50);
+});
+
+test("inside the depths section the gauge reads the lit slab's depth, as its label does", () => {
+  const depths = { top: 10000, span: 600 };
+  assert.equal(gaugeDepthAt(10000 + 100, anchors, depths), -10); // bronze lit (1/6)
+  assert.equal(gaugeDepthAt(10000 + 300, anchors, depths), -40); // silver lit (1/2)
+  assert.equal(gaugeDepthAt(10000 + 500, anchors, depths), -90); // gold lit (5/6)
+  assert.equal(gaugeDepthAt(10000 + 250, anchors, depths, true), -40);
+  assert.equal(gaugeDepthAt(500, anchors, depths), -50); // outside: the chapter anchors
+});
+
+test("formatDepth writes whole metres with a real minus sign", () => {
+  assert.equal(formatDepth(-40.4), "\u221240 m");
+  assert.equal(formatDepth(-0.2), "0 m");
 });
