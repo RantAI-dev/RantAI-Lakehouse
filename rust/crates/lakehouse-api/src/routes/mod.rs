@@ -644,8 +644,10 @@ fn governance_static_router() -> Router<AppState> {
             get(quality_schedules::list_schedules),
         )
         .route(
+            // WEB-3 S3a-D3: a table's own schedule, or its absence (the
+            // default every 60 minutes).
             "/api/governance/quality/schedules/{asset}",
-            put(quality_schedules::put_schedule),
+            put(quality_schedules::put_schedule).delete(quality_schedules::delete_schedule),
         )
         // DATA-14 (F5): whether a table's anomalies are being raised yet.
         .route(
@@ -1151,6 +1153,12 @@ fn identity_router() -> Router<AppState> {
         .route(
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),
+        )
+        // WEB-3 S3a-D2: a role can be rewritten and removed. `{id}` is
+        // validated inside each handler (404 on an unknown or malformed id).
+        .route(
+            "/api/identity/roles/{id}",
+            axum::routing::put(identity::update_role).delete(identity::delete_role),
         )
         .route(
             "/api/identity/tenants",

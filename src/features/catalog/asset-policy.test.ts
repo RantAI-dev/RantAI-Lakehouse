@@ -3,7 +3,7 @@
 // role, and does something — masks a column or filters rows.
 import { describe, expect, it } from "bun:test"
 import type { AssetDetail } from "@/services/contracts/assets"
-import { policyCondition, policyTable } from "./asset-access"
+import { policyCondition, policyTable } from "./asset-policy"
 
 const asset = (a: Partial<AssetDetail>) => a as AssetDetail
 

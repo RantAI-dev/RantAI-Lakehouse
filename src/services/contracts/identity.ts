@@ -107,6 +107,18 @@ export type CreateRoleInput = {
   description: string
 }
 
+/**
+ * What a role is rewritten with (WEB-3 S3a-D2). The name must not collide
+ * with another role's. A rename is not rewritten into a policy's free-text
+ * `subjects`, so a policy that named the old name stops applying to that
+ * role.
+ */
+export type UpdateRoleInput = {
+  name: string
+  permissions: string
+  description: string
+}
+
 export type CreateTenantInput = {
   name: string
   slug: string
@@ -146,6 +158,16 @@ export interface IdentityService {
     signal?: AbortSignal
   ): Promise<InviteUserResponse>
   createRole(input: CreateRoleInput, signal?: AbortSignal): Promise<Role>
+  /**
+   * Rewrite a role's name, permissions and description; needs
+   * `identity:write`. 409 when another role has the name.
+   */
+  updateRole(id: string, input: UpdateRoleInput, signal?: AbortSignal): Promise<Role>
+  /**
+   * Remove a role nobody holds; needs `identity:write`. 409 with the API's
+   * own sentence when people still hold it, or when it is a built-in role.
+   */
+  deleteRole(id: string, signal?: AbortSignal): Promise<void>
   createTenant(input: CreateTenantInput, signal?: AbortSignal): Promise<Tenant>
   createServiceIdentity(
     input: CreateServiceIdentityInput,

@@ -103,6 +103,21 @@ impl PolicyCondition {
     }
 }
 
+/// Whether a policy's authored `conditions` name `role` among the roles it
+/// applies to.
+///
+/// The match is [`PolicyEngineObligations::obligations_for_async`]'s own —
+/// an exact entry in `PolicyCondition::roles` — exposed so the role-rename
+/// refusal (`WEB-3` review R2) asks the engine's question instead of
+/// growing a second parser. `false` for anything
+/// [`PolicyCondition::parse_opt`] does not accept: an unenforceable
+/// condition masks nothing and filters no rows today, so a rename cannot
+/// take an obligation away from the role through it.
+#[must_use]
+pub fn condition_names_role(conditions: Option<&str>, role: &str) -> bool {
+    PolicyCondition::parse_opt(conditions).is_some_and(|cond| cond.roles.iter().any(|r| r == role))
+}
+
 /// Errors resolving real obligations for a principal's query — never
 /// forwarded verbatim to an HTTP response (`AGENTS.md` rule 4); callers
 /// map every variant through [`engine_error_message`] instead.
