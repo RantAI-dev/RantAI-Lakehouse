@@ -120,9 +120,11 @@ run on the R1 commit is the measurement for TBT.
   stays 100) flags the two language links. Their visible text is "EN" or
   "ID", but their accessible names ("English", "Switch to Bahasa
   Indonesia") do not contain it (WCAG 2.5.3, Label in Name). The RantAI
-  site's switcher, which this one copies, has the same pattern. A name such
-  as "Switch to Bahasa Indonesia (ID)" fixes it. Not changed here, so the
-  measured build stays the build that was reviewed.
+  site's switcher, which this one copies, has the same pattern. **Fixed by
+  review fix R2 (`71ae28a4`):** the names now start with the visible label
+  ("EN: English", "ID: Switch to Bahasa Indonesia"). Lighthouse 13.6.0
+  (accessibility only, mobile) then scores the audit 1 on `/` and `/id/`,
+  and accessibility stays 100.
 - SEO: 100 on both pages. Every SEO audit passes (canonical, hreflang, meta
   description, crawlable links, robots).
 
