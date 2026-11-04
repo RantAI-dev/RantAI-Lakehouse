@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { AnimatePresence, motion, useMotionValueEvent, useTransform, type MotionValue } from "motion/react";
+import { AnimatePresence, m, useMotionValueEvent, useTransform, type MotionValue } from "motion/react";
 import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";
 import { DEPTH_LAYERS, type DepthLayer } from "@/lib/home-content";
@@ -24,10 +24,16 @@ export function DepthsSection({ copy }: { copy: HomeCopy["depths"] }) {
   const ref = React.useRef<HTMLElement>(null);
   const { mode } = useLandingMode();
   const progress = useSectionProgress(ref, ["start start", "end end"]);
+  // WEB-5 D5: React state changes only when the lit depth changes (twice
+  // over the whole section), never per scroll event; the ref holds the
+  // current index so the handler can compare without calling setState.
   const [active, setActive] = React.useState<0 | 1 | 2>(0);
+  const activeRef = React.useRef<0 | 1 | 2>(0);
   useMotionValueEvent(progress, "change", (v) => {
     const next = activeLayerIndex(v);
-    setActive((prev) => (prev === next ? prev : next));
+    if (next === activeRef.current) return;
+    activeRef.current = next;
+    setActive(next);
   });
   const layer = DEPTH_LAYERS[active];
   const text = copy.layers[layer.id];
@@ -45,7 +51,7 @@ export function DepthsSection({ copy }: { copy: HomeCopy["depths"] }) {
             <div className="rounded-3xl max-md:bg-[#020514]/55 max-md:p-4 max-md:backdrop-blur-md">
               <Eyebrow aria-hidden="true">{copy.eyebrow}</Eyebrow>
               <AnimatePresence mode="wait" initial={false}>
-                <motion.div
+                <m.div
                   key={layer.id}
                   initial={{ opacity: 0, y: 26, filter: "blur(6px)" }}
                   animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
@@ -64,7 +70,7 @@ export function DepthsSection({ copy }: { copy: HomeCopy["depths"] }) {
                     {text.title}
                   </h3>
                   <p className="mt-4 max-w-[28rem] text-[17px] leading-[1.6] text-[#E8F4FF]/85">{text.body}</p>
-                </motion.div>
+                </m.div>
               </AnimatePresence>
             </div>
             {/* The 3D stack renders on the canvas behind this cell; without one, a CSS stack stands in. */}
@@ -142,7 +148,7 @@ function DepthGauge({ progress, active }: { progress: MotionValue<number>; activ
           </span>
         </div>
       ))}
-      <motion.span
+      <m.span
         className="absolute left-[3px] block size-[9px] -translate-y-1/2 rounded-full"
         style={{
           top,
@@ -175,7 +181,7 @@ function Plate({ layer, index, active }: { layer: DepthLayer; index: number; act
   const isActive = index === active;
   const lift = (index - active) * 70 + (index - 1) * 6;
   return (
-    <motion.div
+    <m.div
       className="absolute inset-x-0 top-1/2 h-[190px] -translate-y-1/2 rounded-[22px] border backdrop-blur-sm"
       initial={false}
       animate={{

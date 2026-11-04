@@ -1,5 +1,3 @@
-"use client";
-
 import * as React from "react";
 import type { CommonCopy } from "@/lib/copy";
 import { CONTACT_EMAIL, FAMILY_LINKS, FOOTER_SECTIONS, LINKS } from "@/lib/home-content";

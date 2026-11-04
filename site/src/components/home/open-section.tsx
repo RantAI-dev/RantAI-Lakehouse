@@ -1,5 +1,3 @@
-"use client";
-
 import * as React from "react";
 import { ArrowUpRight } from "lucide-react";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";

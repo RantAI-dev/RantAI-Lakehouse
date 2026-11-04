@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { motion, type MotionValue } from "motion/react";
+import { m, type MotionValue } from "motion/react";
 
 /**
  * The RantAI Lakehouse creature as inline SVG.
@@ -99,10 +99,10 @@ export function MascotLogo({ className, eyeX, eyeY }: LogoProps) {
       </defs>
       <path d={DOME_PATH} fill={`url(#${body})`} />
       <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth="9" clipPath={`url(#${clip})`} />
-      <motion.g style={{ x: eyeX, y: eyeY }}>
+      <m.g style={{ x: eyeX, y: eyeY }}>
         <ellipse cx={EYE.cx} cy={EYE.cy} rx={EYE.rx * 2.1} ry={EYE.ry * 2.1} fill={`url(#${glow})`} />
         <ellipse {...EYE} fill="#ffffff" />
-      </motion.g>
+      </m.g>
       <path d={BOWL_PATH} fill={`url(#${water})`} />
     </svg>
   );
@@ -170,10 +170,10 @@ export function MascotRising({
             <g transform={`translate(${dx} ${dy})`}>
               <path d={DOME_PATH} fill={`url(#${body})`} />
               <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth="9" clipPath={`url(#${clip})`} />
-              <motion.g style={{ x: eyeX, y: eyeY }}>
+              <m.g style={{ x: eyeX, y: eyeY }}>
                 <ellipse cx={EYE.cx} cy={EYE.cy} rx={EYE.rx * 2.3} ry={EYE.ry * 2.3} fill={`url(#${glow})`} />
                 <ellipse {...EYE} fill="#ffffff" />
-              </motion.g>
+              </m.g>
             </g>
           </svg>
         </div>

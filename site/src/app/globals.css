@@ -134,6 +134,17 @@ html:has(.lk-root) {
   font-family: var(--font-mono), ui-monospace, monospace;
 }
 
+/* WEB-5 D5: content is visible without JavaScript. Every reveal starts
+   hidden through inline styles (opacity, travel, blur) that the server HTML
+   already carries; until the inline script in `site-document.tsx` has put
+   `js` on <html>, those starting states are overridden, so a visitor without
+   JavaScript reads the page in full. (This replaces the `<noscript>` patch.) */
+html:not(.js) [data-reveal] {
+  opacity: 1 !important;
+  transform: none !important;
+  filter: none !important;
+}
+
 /* Visible focus ring on the dark page (plan §2.8, keyboard). */
 .lk-root :focus-visible {
   outline: 2px solid var(--lk-lake);

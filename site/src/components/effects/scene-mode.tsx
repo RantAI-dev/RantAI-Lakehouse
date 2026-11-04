@@ -1,17 +1,20 @@
 "use client";
 
 import * as React from "react";
-import { hasWebGL2 } from "./scene/webgl-support";
+import { afterPaint } from "@/lib/after-paint";
+import { hasFastWebGL } from "./scene/webgl-support";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
  * Which hero the visitor gets, decided once on the client.
  *
- * - `pending`: server render and the first client render. The DOM hero shows.
+ * - `pending`: server render, hydration, and until the page is usable
+ *   (`afterPaint`, WEB-5 D5). The DOM hero shows.
  * - `full`: WebGL works and motion is allowed: the live lake.
  * - `still`: WebGL works but `prefers-reduced-motion: reduce`: one rendered
  *   frame, no dive, no tracking (plan §2.8).
- * - `none`: no WebGL, or the context was lost: the DOM hero stays for good.
+ * - `none`: no fast WebGL (`hasFastWebGL`: no WebGL2, or a software GPU), or
+ *   the context was lost: the DOM hero stays for good.
  *
  * Sections read this to pick their own fallback (for example the depth stack
  * becomes CSS when there is no canvas), so the page reads end to end in every
@@ -36,13 +39,27 @@ const LandingModeContext = React.createContext<LandingModeValue>({
   markFailed: () => {},
 });
 
-const noopSubscribe = () => () => {};
-
-/** Probing creates a context, so it runs once and the answer is kept. */
-let webglProbe: boolean | null = null;
-function probeWebgl(): boolean {
-  if (webglProbe === null) webglProbe = hasWebGL2();
-  return webglProbe;
+/**
+ * The WebGL answer, as a tiny external store: "unknown" until the page is
+ * usable, then the probe's result. Probing creates a context, so it runs
+ * once and the answer is kept; the scene's chunk is only requested once the
+ * answer is "yes", so the `three` download starts after the first paint too.
+ */
+let webglAnswer: "unknown" | "yes" | "no" = "unknown";
+const webglListeners = new Set<() => void>();
+let webglScheduled = false;
+function subscribeWebgl(onChange: () => void): () => void {
+  webglListeners.add(onChange);
+  if (!webglScheduled) {
+    webglScheduled = true;
+    afterPaint(() => {
+      webglAnswer = hasFastWebGL() ? "yes" : "no";
+      for (const l of webglListeners) l();
+    });
+  }
+  return () => {
+    webglListeners.delete(onChange);
+  };
 }
 
 export function LandingModeProvider({ children }: { children: React.ReactNode }) {
@@ -51,8 +68,8 @@ export function LandingModeProvider({ children }: { children: React.ReactNode })
   // mismatch and no setState-in-effect.
   const reduced = useReducedMotionSafe();
   const webgl = React.useSyncExternalStore<"unknown" | "yes" | "no">(
-    noopSubscribe,
-    () => (probeWebgl() ? "yes" : "no"),
+    subscribeWebgl,
+    () => webglAnswer,
     () => "unknown",
   );
   const [failed, setFailed] = React.useState(false);

@@ -1,5 +1,3 @@
-"use client";
-
 import * as React from "react";
 import { cn } from "@/lib/utils";
 
@@ -65,9 +63,11 @@ export function CtaLink({ variant = "solid", size = "md", className, children, .
 
 /**
  * Big serif-italic title. Size and line height travel together as one class
- * string: `tailwind-merge` drops a `leading-*` that precedes a later
- * `text-[size]`, so overriding the size alone used to reset the line height
- * to the console's 48 px h1 rule and stacked the lines on top of each other.
+ * string. In the console, `tailwind-merge` dropped a `leading-*` that
+ * preceded a later `text-[size]`, so overriding the size alone reset the
+ * line height to the 48 px h1 rule and stacked the lines. The site's `cn`
+ * does not merge (WEB-5 T5), and callers override sizes only at a
+ * breakpoint (`max-md:`), which never conflicts with these.
  */
 const HEADING_SIZE = {
   xl: "text-[clamp(4.5rem,9vw,7.5rem)] leading-[1.02]",

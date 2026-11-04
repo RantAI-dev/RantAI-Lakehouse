@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { motion, useMotionValueEvent, useTransform, type MotionValue } from "motion/react";
+import { m, useMotionValueEvent, useTransform, type MotionValue } from "motion/react";
 import type { HomeCopy } from "@/lib/copy";
 import { APPROVAL_TARGET, REGIONS } from "@/lib/home-content";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
@@ -80,15 +80,6 @@ function Caustics() {
 }
 
 function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress: MotionValue<number>; reduced: boolean }) {
-  // Typed characters are React state, but only as the count changes.
-  const [chars, setChars] = React.useState<[number, number]>([0, 0]);
-  useMotionValueEvent(progress, "change", (p) => {
-    const a = Math.round(span(p, T.type1) * copy.userOne.length);
-    const b = Math.round(span(p, T.type2) * copy.userTwo.length);
-    setChars((prev) => (prev[0] === a && prev[1] === b ? prev : [a, b]));
-  });
-  const [n1, n2] = reduced ? [copy.userOne.length, copy.userTwo.length] : chars;
-
   // Opacity and travel of each beat, from the same progress.
   const frame = useTransform(progress, [0, 0.05], [0, 1]);
   const think1 = useTransform(progress, [T.think1[0], T.think1[0] + 0.02, T.think1[1] - 0.02, T.think1[1]], [0, 1, 1, 0]);
@@ -103,7 +94,9 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
   return (
     <div>
       <p className="sr-only">{copy.srDescription}</p>
-      <motion.div
+      {/* `data-reveal`: without JavaScript the finished conversation shows, as with reduced motion (D5). */}
+      <m.div
+        data-reveal
         aria-hidden="true"
         className="overflow-hidden rounded-3xl border border-[#E8F4FF]/12 bg-[#020514]/70 shadow-[0_30px_120px_-30px_rgba(68,166,250,0.35)] backdrop-blur-xl"
         style={reduced ? { opacity: 1 } : { opacity: frame }}
@@ -119,24 +112,18 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
 
         <div className="space-y-3 px-4 py-4 md:space-y-4 md:px-5 md:py-5">
           {/* Question one */}
-          <div className="flex min-h-9 justify-end">
-            <p
-              className={`max-w-[88%] rounded-2xl rounded-br-md bg-[#44A6FA]/20 px-3.5 py-2 text-[13px] leading-5 text-[#E8F4FF] md:text-[15px] md:leading-6 ${n1 === 0 ? "invisible" : ""}`}
-            >
-              {copy.userOne.slice(0, n1)}
-              {n1 > 0 && n1 < copy.userOne.length && <Caret />}
-            </p>
-          </div>
+          <TypedQuestion text={copy.userOne} beat={T.type1} progress={progress} reduced={reduced} />
 
           {/* Answer one: thinking, then the answer with its chart. Heights are reserved so nothing jumps. */}
           <div className="relative min-h-[120px] md:min-h-[158px]">
-            <motion.div
+            <m.div
               className="absolute top-0 left-0 flex h-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
               style={reduced ? { opacity: 0 } : { opacity: think1 }}
             >
               <Dots />
-            </motion.div>
-            <motion.div
+            </m.div>
+            <m.div
+              data-reveal
               className="max-w-[92%] rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-3.5 py-3 md:px-4"
               style={reduced ? { opacity: 1, y: 0 } : { opacity: answerO, y: answerY }}
             >
@@ -146,28 +133,22 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
                   <Bar key={r.key} progress={progress} index={i} height={r.value / max} reduced={reduced} label={copy.regions[r.key]} value={r.value} />
                 ))}
               </div>
-            </motion.div>
+            </m.div>
           </div>
 
           {/* Question two */}
-          <div className="flex min-h-9 justify-end">
-            <p
-              className={`max-w-[88%] rounded-2xl rounded-br-md bg-[#44A6FA]/20 px-3.5 py-2 text-[13px] leading-5 text-[#E8F4FF] md:text-[15px] md:leading-6 ${n2 === 0 ? "invisible" : ""}`}
-            >
-              {copy.userTwo.slice(0, n2)}
-              {n2 > 0 && n2 < copy.userTwo.length && <Caret />}
-            </p>
-          </div>
+          <TypedQuestion text={copy.userTwo} beat={T.type2} progress={progress} reduced={reduced} />
 
           {/* Answer two: thinking, then the approval card. */}
           <div className="relative min-h-[92px] md:min-h-[104px]">
-            <motion.div
+            <m.div
               className="absolute top-0 left-0 flex h-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
               style={reduced ? { opacity: 0 } : { opacity: think2 }}
             >
               <Dots />
-            </motion.div>
-            <motion.div
+            </m.div>
+            <m.div
+              data-reveal
               className="rounded-2xl border border-[#44A6FA]/45 bg-[#44A6FA]/[0.08] p-3.5 md:p-4"
               style={reduced ? { opacity: 1, y: 0, scale: 1 } : { opacity: approvalO, y: approvalY, scale: approvalS }}
             >
@@ -188,10 +169,10 @@ function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress
                   {copy.decline}
                 </span>
               </div>
-            </motion.div>
+            </m.div>
           </div>
         </div>
-      </motion.div>
+      </m.div>
     </div>
   );
 }
@@ -215,7 +196,8 @@ function Bar({
   const scaleY = useTransform(progress, [a, a + 0.08], [0, 1]);
   return (
     <div className="flex h-full flex-1 flex-col justify-end gap-1">
-      <motion.div
+      <m.div
+        data-reveal
         className="w-full origin-bottom rounded-t-md bg-gradient-to-t from-[#44A6FA]/60 to-[#44A6FA]"
         style={{ height: `${Math.round(height * 100)}%`, scaleY: reduced ? 1 : scaleY }}
       />
@@ -240,6 +222,61 @@ function Dots() {
   );
 }
 
-function Caret() {
-  return <span className="lk-twinkle ml-0.5 inline-block h-[1em] w-px translate-y-[2px] bg-[#E8F4FF]" />;
+/**
+ * A question that types itself as the section scrolls, and un-types when it
+ * scrolls back. WEB-5 D5: the typed text, the bubble's visibility and the
+ * caret are written straight to the DOM through refs, and only when the
+ * character count changes, so scrolling never re-renders the chat (it used
+ * to be React state updated from every scroll event). The server HTML holds
+ * the whole question, so it reads without JavaScript; the first effect sets
+ * it to the current scroll position.
+ */
+function TypedQuestion({
+  text,
+  beat,
+  progress,
+  reduced,
+}: {
+  text: string;
+  beat: readonly [number, number];
+  progress: MotionValue<number>;
+  reduced: boolean;
+}) {
+  const bubbleRef = React.useRef<HTMLParagraphElement>(null);
+  const textRef = React.useRef<HTMLSpanElement>(null);
+  const caretRef = React.useRef<HTMLSpanElement>(null);
+  const shown = React.useRef(-1);
+
+  const apply = React.useCallback(
+    (p: number) => {
+      const n = reduced ? text.length : Math.round(span(p, beat) * text.length);
+      if (n === shown.current) return;
+      shown.current = n;
+      if (textRef.current) textRef.current.textContent = text.slice(0, n);
+      bubbleRef.current?.classList.toggle("invisible", n === 0);
+      if (caretRef.current) caretRef.current.hidden = !(n > 0 && n < text.length);
+    },
+    [text, beat, reduced],
+  );
+  React.useEffect(() => {
+    shown.current = -1;
+    apply(progress.get());
+  }, [apply, progress]);
+  useMotionValueEvent(progress, "change", apply);
+
+  return (
+    <div className="flex min-h-9 justify-end">
+      <p
+        ref={bubbleRef}
+        className="max-w-[88%] rounded-2xl rounded-br-md bg-[#44A6FA]/20 px-3.5 py-2 text-[13px] leading-5 text-[#E8F4FF] md:text-[15px] md:leading-6"
+      >
+        <span ref={textRef}>{text}</span>
+        <span
+          ref={caretRef}
+          hidden
+          className="lk-twinkle ml-0.5 inline-block h-[1em] w-px translate-y-[2px] bg-[#E8F4FF]"
+        />
+      </p>
+    </div>
+  );
 }

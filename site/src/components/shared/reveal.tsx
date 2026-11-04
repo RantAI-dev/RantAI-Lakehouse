@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { motion } from "motion/react";
+import { m } from "motion/react";
 import { cn } from "@/lib/utils";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
@@ -9,8 +9,9 @@ import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
  * Scroll-into-view reveals shared by the sections.
  *
  * With `prefers-reduced-motion` they are fades only: no travel, no blur,
- * no stagger (plan §2.8). Every revealed node carries `data-reveal` so the
- * `<noscript>` rule in `components/home/home-page.tsx` can show it without JavaScript.
+ * no stagger (plan §2.8). Every revealed node carries `data-reveal`, which
+ * `app/globals.css` shows in full until the `js` class is on <html> (WEB-5
+ * D5), so the page reads without JavaScript.
  */
 
 /** A cubic ease-out with a long tail; the page's default "arrive" curve. */
@@ -30,7 +31,7 @@ export function Reveal({
   as?: "div" | "p" | "li" | "ul" | "span";
 }) {
   const reduced = useReducedMotionSafe();
-  const Tag = motion[as] as typeof motion.div;
+  const Tag = m[as] as typeof m.div;
   return (
     <Tag
       data-reveal
@@ -75,7 +76,7 @@ export function SplitWords({
   const reduced = useReducedMotionSafe();
   const words = text.split(" ");
   return (
-    <motion.span
+    <m.span
       data-reveal
       className={cn("inline", className)}
       initial="hidden"
@@ -85,7 +86,7 @@ export function SplitWords({
       {words.map((word, i) => (
         <React.Fragment key={`${word}-${i}`}>
           <span className="inline-block overflow-hidden pb-[0.14em] align-bottom">
-            <motion.span
+            <m.span
               data-reveal
               className="inline-block will-change-transform"
               custom={i}
@@ -102,11 +103,11 @@ export function SplitWords({
               }}
             >
               {word}
-            </motion.span>
+            </m.span>
           </span>
           {i < words.length - 1 ? " " : null}
         </React.Fragment>
       ))}
-    </motion.span>
+    </m.span>
   );
 }

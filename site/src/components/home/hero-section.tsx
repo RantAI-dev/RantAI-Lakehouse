@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { motion, useTransform } from "motion/react";
+import { m, useTransform } from "motion/react";
 import { cn } from "@/lib/utils";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { LINKS } from "@/lib/home-content";
@@ -42,9 +42,12 @@ export function HeroSection({ copy, cta }: { copy: HomeCopy["hero"]; cta: Common
           className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.92)_0%,rgba(2,5,20,0.84)_52%,rgba(2,5,20,0.4)_70%,transparent_86%)]"
         />
         <Container className="relative z-10 flex h-full min-h-[100svh] flex-col items-center justify-end pt-24 pb-32 text-center md:items-start md:justify-center md:pb-24 md:text-left">
-          <motion.div
+          <m.div
             className="max-w-[660px]"
-            style={{ opacity: copyOpacity, y: copyY, filter: copyBlur }}
+            // WEB-5 D5: the h1 inside is the page's largest paint, so it gets
+            // no opacity, travel or filter until the live lake runs; the
+            // server HTML and the DOM hero carry no style here at all.
+            style={live ? { opacity: copyOpacity, y: copyY, filter: copyBlur } : undefined}
           >
             {/* WEB-1 review round 1 SHOULD-FIX 4: on a phone the eyebrow sits on the moon's
                 reflection, so it is lighter and carries a dark halo there. */}
@@ -61,11 +64,11 @@ export function HeroSection({ copy, cta }: { copy: HomeCopy["hero"]; cta: Common
                 {cta.talk}
               </CtaLink>
             </div>
-          </motion.div>
+          </m.div>
         </Container>
-        <motion.div style={{ opacity: cueOpacity }}>
+        <m.div style={{ opacity: cueOpacity }}>
           <ScrollCue label={copy.scrollCue} />
-        </motion.div>
+        </m.div>
       </div>
     </section>
   );

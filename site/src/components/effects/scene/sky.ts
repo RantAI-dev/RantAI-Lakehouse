@@ -1,4 +1,25 @@
-import * as THREE from "three";
+// WEB-5 D5: named imports, so the scene chunk carries only what it uses.
+import {
+  AdditiveBlending,
+  BackSide,
+  BufferAttribute,
+  BufferGeometry,
+  Color,
+  DoubleSide,
+  Material,
+  Mesh,
+  MeshBasicMaterial,
+  PMREMGenerator,
+  PlaneGeometry,
+  Points,
+  Scene,
+  ShaderMaterial,
+  SphereGeometry,
+  Vector3,
+  WebGLRenderTarget,
+  WebGLRenderer,
+  type IUniform,
+} from "three";
 import { PALETTE } from "@/lib/palette";
 import { MOON_DIR } from "./scene-config";
 import { SKY_FRAG, SKY_VERT, STARS_FRAG, STARS_VERT } from "./shaders";
@@ -9,42 +30,42 @@ import { SKY_FRAG, SKY_VERT, STARS_FRAG, STARS_VERT } from "./shaders";
  */
 
 export type SkyUniforms = {
-  uSkyHorizon: THREE.IUniform<THREE.Color>;
-  uSkyMid: THREE.IUniform<THREE.Color>;
-  uSkyZenith: THREE.IUniform<THREE.Color>;
-  uMoonDir: THREE.IUniform<THREE.Vector3>;
-  uMoonColor: THREE.IUniform<THREE.Color>;
-  uMoonBoost: THREE.IUniform<number>;
+  uSkyHorizon: IUniform<Color>;
+  uSkyMid: IUniform<Color>;
+  uSkyZenith: IUniform<Color>;
+  uMoonDir: IUniform<Vector3>;
+  uMoonColor: IUniform<Color>;
+  uMoonBoost: IUniform<number>;
   /** The engine's shared fog colour object; the dome shows it when under water. */
-  uFogColor: THREE.IUniform<THREE.Color>;
+  uFogColor: IUniform<Color>;
   /** 0 above the surface, 1 below it. */
-  uUnder: THREE.IUniform<number>;
+  uUnder: IUniform<number>;
 };
 
 export function createSkyUniforms(): SkyUniforms {
   return {
     // The horizon glow is the lake's own blue, very dark; the water fog uses
     // the same value so the far shore dissolves into the sky.
-    uSkyHorizon: { value: new THREE.Color("#0b2257") },
-    uSkyMid: { value: new THREE.Color(PALETTE.navy) },
-    uSkyZenith: { value: new THREE.Color(PALETTE.abyss) },
-    uMoonDir: { value: new THREE.Vector3(...MOON_DIR) },
-    uMoonColor: { value: new THREE.Color("#cfe6ff") },
+    uSkyHorizon: { value: new Color("#0b2257") },
+    uSkyMid: { value: new Color(PALETTE.navy) },
+    uSkyZenith: { value: new Color(PALETTE.abyss) },
+    uMoonDir: { value: new Vector3(...MOON_DIR) },
+    uMoonColor: { value: new Color("#cfe6ff") },
     uMoonBoost: { value: 7 },
-    uFogColor: { value: new THREE.Color("#0b2257") },
+    uFogColor: { value: new Color("#0b2257") },
     uUnder: { value: 0 },
   };
 }
 
-export function createSkyDome(uniforms: SkyUniforms): THREE.Mesh {
-  const material = new THREE.ShaderMaterial({
-    uniforms: uniforms as unknown as Record<string, THREE.IUniform>,
+export function createSkyDome(uniforms: SkyUniforms): Mesh {
+  const material = new ShaderMaterial({
+    uniforms: uniforms as unknown as Record<string, IUniform>,
     vertexShader: SKY_VERT,
     fragmentShader: SKY_FRAG,
-    side: THREE.BackSide,
+    side: BackSide,
     depthWrite: false,
   });
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(60, 48, 24), material);
+  const mesh = new Mesh(new SphereGeometry(60, 48, 24), material);
   mesh.frustumCulled = false;
   mesh.renderOrder = -10;
   return mesh;
@@ -63,8 +84,8 @@ function mulberry32(seed: number): () => number {
 }
 
 export type Stars = {
-  points: THREE.Points;
-  uniforms: { uTime: THREE.IUniform<number>; uPx: THREE.IUniform<number>; uAlpha: THREE.IUniform<number> };
+  points: Points;
+  uniforms: { uTime: IUniform<number>; uPx: IUniform<number>; uAlpha: IUniform<number> };
 };
 
 /** Up to 600 points on the upper hemisphere (300 on phones, plan §4 S1). */
@@ -90,29 +111,29 @@ export function createStars(count: number, pixelRatio: number): Stars {
     phase[i] = rand();
     bright[i] = 0.35 + rand() * 0.65;
   }
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  geometry.setAttribute("aSize", new THREE.BufferAttribute(size, 1));
-  geometry.setAttribute("aPhase", new THREE.BufferAttribute(phase, 1));
-  geometry.setAttribute("aBright", new THREE.BufferAttribute(bright, 1));
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(pos, 3));
+  geometry.setAttribute("aSize", new BufferAttribute(size, 1));
+  geometry.setAttribute("aPhase", new BufferAttribute(phase, 1));
+  geometry.setAttribute("aBright", new BufferAttribute(bright, 1));
   const uniforms = {
     uTime: { value: 0 },
     uPx: { value: pixelRatio },
     uAlpha: { value: 1 },
   };
-  const material = new THREE.ShaderMaterial({
-    uniforms: { ...uniforms, uColor: { value: new THREE.Color(PALETTE.foam) } },
+  const material = new ShaderMaterial({
+    uniforms: { ...uniforms, uColor: { value: new Color(PALETTE.foam) } },
     vertexShader: STARS_VERT,
     fragmentShader: STARS_FRAG,
     transparent: true,
     depthWrite: false,
-    blending: THREE.AdditiveBlending,
+    blending: AdditiveBlending,
   });
   // Share the live uniform objects with the caller.
   material.uniforms.uTime = uniforms.uTime;
   material.uniforms.uPx = uniforms.uPx;
   material.uniforms.uAlpha = uniforms.uAlpha;
-  const points = new THREE.Points(geometry, material);
+  const points = new Points(geometry, material);
   points.frustumCulled = false;
   points.renderOrder = -9;
   return { points, uniforms };
@@ -124,18 +145,18 @@ export function createStars(count: number, pixelRatio: number): Stars {
  * shows its clearcoat where there is something bright to reflect.
  */
 export function buildEnvironment(
-  renderer: THREE.WebGLRenderer,
+  renderer: WebGLRenderer,
   skyUniforms: SkyUniforms,
-): THREE.WebGLRenderTarget {
-  const envScene = new THREE.Scene();
+): WebGLRenderTarget {
+  const envScene = new Scene();
   const dome = createSkyDome(skyUniforms);
   envScene.add(dome);
   const panel = (w: number, h: number, pos: [number, number, number], intensity: number, tint: string) => {
-    const m = new THREE.Mesh(
-      new THREE.PlaneGeometry(w, h),
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color(tint).multiplyScalar(intensity),
-        side: THREE.DoubleSide,
+    const m = new Mesh(
+      new PlaneGeometry(w, h),
+      new MeshBasicMaterial({
+        color: new Color(tint).multiplyScalar(intensity),
+        side: DoubleSide,
         toneMapped: false,
       }),
     );
@@ -149,13 +170,13 @@ export function buildEnvironment(
   // instead of a hot spot. Small bright panels read as stickers on a dark body.
   panel(40, 14, [-18, 20, -36], 4.5, "#cfe6ff");
   panel(70, 40, [10, 8, 40], 0.22, "#44A6FA");
-  const pmrem = new THREE.PMREMGenerator(renderer);
+  const pmrem = new PMREMGenerator(renderer);
   const target = pmrem.fromScene(envScene, 0.035);
   pmrem.dispose();
   envScene.traverse((o) => {
-    const m = o as THREE.Mesh;
+    const m = o as Mesh;
     m.geometry?.dispose();
-    const mat = m.material as THREE.Material | undefined;
+    const mat = m.material as Material | undefined;
     mat?.dispose();
   });
   return target;

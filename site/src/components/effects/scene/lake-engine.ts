@@ -1,4 +1,19 @@
-import * as THREE from "three";
+// WEB-5 D5: named imports, so the scene chunk carries only what it uses.
+import {
+  ACESFilmicToneMapping,
+  AmbientLight,
+  Color,
+  DirectionalLight,
+  FogExp2,
+  Material,
+  MathUtils,
+  PerspectiveCamera,
+  Raycaster,
+  Scene,
+  Vector2,
+  Vector3,
+  WebGLRenderer,
+} from "three";
 import { sceneStateAt, smoothstep, type SceneLayout, type SceneState } from "@/lib/scroll-timeline";
 import { createMascot, type Aim } from "./mascot";
 import { CAMERA_FOV, MASCOT_H, MOON_DIR, STILL_TIME } from "./scene-config";
@@ -39,13 +54,13 @@ export type EngineOptions = {
 
 export type LakeEngine = { dispose: () => void };
 
-const clamp = THREE.MathUtils.clamp;
-const lerp = THREE.MathUtils.lerp;
+const clamp = MathUtils.clamp;
+const lerp = MathUtils.lerp;
 
 /** Fog and background by depth: lake-blue near the surface, abyss at the bottom. */
-const UNDER_NEAR = new THREE.Color("#0b3a74");
-const UNDER_MID = new THREE.Color("#071f52");
-const UNDER_DEEP = new THREE.Color("#020b2a");
+const UNDER_NEAR = new Color("#0b3a74");
+const UNDER_MID = new Color("#071f52");
+const UNDER_DEEP = new Color("#020b2a");
 
 export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const { canvas, mode, observe } = opts;
@@ -56,17 +71,17 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const maxDpr = phone ? 1.25 : 1.75;
   let dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
 
-  const renderer = new THREE.WebGLRenderer({
+  const renderer = new WebGLRenderer({
     canvas,
     antialias: !phone,
     powerPreference: "high-performance",
   });
   renderer.setPixelRatio(dpr);
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMapping = ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
 
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.05, 600);
+  const scene = new Scene();
+  const camera = new PerspectiveCamera(CAMERA_FOV, 1, 0.05, 600);
 
   // ---- Sky, stars, environment ------------------------------------------
   const skyUniforms = createSkyUniforms();
@@ -80,9 +95,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   // One fog colour object shared by the background, three's fog (for the
   // mascot) and the water shader, so they can never disagree at the horizon.
-  const fogColor = new THREE.Color().copy(skyUniforms.uSkyHorizon.value);
+  const fogColor = new Color().copy(skyUniforms.uSkyHorizon.value);
   scene.background = fogColor;
-  scene.fog = new THREE.FogExp2(fogColor, 0.003);
+  scene.fog = new FogExp2(fogColor, 0.003);
   skyUniforms.uFogColor.value = fogColor;
 
   // ---- Water -------------------------------------------------------------
@@ -114,18 +129,18 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   // front fill: a directional light in front of a clearcoated dome shows up as
   // a hot spot on its face. The face is lit by the ambient term, the water
   // bounce (a hemisphere light, diffuse only) and the eye's own glow.
-  const moonLight = new THREE.DirectionalLight(0xbcd8ff, 3.2);
+  const moonLight = new DirectionalLight(0xbcd8ff, 3.2);
   moonLight.position.set(...MOON_DIR).multiplyScalar(10);
   scene.add(moonLight);
-  scene.add(new THREE.AmbientLight(0x1b2f7a, 0.8));
+  scene.add(new AmbientLight(0x1b2f7a, 0.8));
 
   const clock = { t: still ? STILL_TIME : 0, last: 0 };
 
   // ---- Input -------------------------------------------------------------
   const pointer = { x: 0, y: 0, seen: false, lastInput: -100 };
   const tilt = { x: 0, y: 0, active: false };
-  const raycaster = new THREE.Raycaster();
-  const ndc = new THREE.Vector2();
+  const raycaster = new Raycaster();
+  const ndc = new Vector2();
 
   const setPointer = (e: PointerEvent) => {
     pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
@@ -197,7 +212,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     anchorHero.y = wide ? 0 : 0.42;
     anchorDepths.x = wide ? 0.42 : 0;
     anchorDepths.y = wide ? -0.1 : -0.5;
-    const tanV = Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2));
+    const tanV = Math.tan(MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
     distScaleHero = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
     // The slabs shrink sideways to fit a narrow screen rather than pushing the
@@ -218,9 +233,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   // ---- Frame -------------------------------------------------------------
   const aim: Aim = { x: 0, y: 0 };
-  const mascotNdc = new THREE.Vector3();
-  const look = new THREE.Vector3();
-  const underColor = new THREE.Color();
+  const mascotNdc = new Vector3();
+  const look = new Vector3();
+  const underColor = new Color();
   let smoothY = still ? 0 : window.scrollY;
   let lastBob = -1;
   let ema = 1 / 60;
@@ -309,8 +324,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     else underColor.copy(UNDER_MID).lerp(UNDER_DEEP, (depthK - 0.35) / 0.65);
     fogColor.copy(skyUniforms.uSkyHorizon.value).lerp(underColor, smoothstep(0, 1, uw));
     const density = lerp(0.021, 0.036, uw);
-    (scene.fog as THREE.FogExp2).density = lerp(0.003, 0.036, uw);
-    (scene.fog as THREE.FogExp2).color.copy(fogColor);
+    (scene.fog as FogExp2).density = lerp(0.003, 0.036, uw);
+    (scene.fog as FogExp2).color.copy(fogColor);
     water.uniforms.uFogDensity.value = density;
     skyUniforms.uUnder.value = smoothstep(0, 1, uw);
     mascot.setUnderwater(uw);
@@ -425,9 +440,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       snow.dispose();
       slabs.dispose();
       sky.geometry.dispose();
-      (sky.material as THREE.Material).dispose();
+      (sky.material as Material).dispose();
       stars.points.geometry.dispose();
-      (stars.points.material as THREE.Material).dispose();
+      (stars.points.material as Material).dispose();
       envTarget.dispose();
       renderer.dispose();
       // Release the GPU context now rather than at garbage collection, unless

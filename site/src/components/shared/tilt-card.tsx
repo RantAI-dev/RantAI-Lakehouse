@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { motion, useMotionTemplate, useMotionValue, useSpring } from "motion/react";
+import { m, useMotionTemplate, useMotionValue, useSpring } from "motion/react";
 import { cn } from "@/lib/utils";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
@@ -46,7 +46,7 @@ export function TiltCard({
   };
 
   return (
-    <motion.div
+    <m.div
       className={cn("relative [transform-style:preserve-3d]", className)}
       style={reduced ? undefined : { rotateX: rx, rotateY: ry, transformPerspective: 900 }}
       onPointerMove={onMove}
@@ -54,12 +54,12 @@ export function TiltCard({
     >
       {children}
       {!reduced && (
-        <motion.span
+        <m.span
           aria-hidden="true"
           className="pointer-events-none absolute inset-0 rounded-[inherit]"
           style={{ background: gloss, opacity: sheen }}
         />
       )}
-    </motion.div>
+    </m.div>
   );
 }

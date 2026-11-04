@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { motion, useTransform, type MotionValue } from "motion/react";
+import { m, useTransform, type MotionValue } from "motion/react";
 import type { HomeCopy } from "@/lib/copy";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
 import { Reveal } from "@/components/shared/reveal";
@@ -28,7 +28,10 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
     <section ref={ref} id="sources" className="relative h-[230vh] motion-reduce:h-auto">
       <div className="sticky top-0 flex h-[100svh] flex-col items-center justify-center overflow-hidden motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
         <Container className="text-center">
-          <motion.div
+          <m.div
+            // WEB-5 D5: scroll fades it in from opacity 0, which the server
+            // HTML carries; `data-reveal` shows it in full without JavaScript.
+            data-reveal
             // WEB-1 review round 1 SHOULD-FIX 5: on a phone the copy sits over the
             // glow of the mascot's eye seen through the water, so it gets a dark
             // backing there (body text stays above 4.5:1 on it).
@@ -37,7 +40,7 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
           >
             <DisplayHeading>{copy.headline}</DisplayHeading>
             <LeadText className="mx-auto mt-5 max-w-[36rem]">{copy.sub}</LeadText>
-          </motion.div>
+          </m.div>
           <ul className="relative z-0 mx-auto mt-12 flex max-w-[760px] flex-wrap justify-center gap-2.5 md:gap-3">
             {copy.items.map((item, i) => (
               <SourcePill key={item} label={item} index={i} progress={scrollYProgress} animate={!reduced} />
@@ -117,12 +120,12 @@ function FallingPill({
   );
   const fill = useTransform(progress, [start, end], ["rgba(68,166,250,0.35)", "rgba(68,166,250,0.1)"]);
   return (
-    <motion.li
+    <m.li
       data-reveal
       className={PILL_CLASS}
       style={{ y, x, rotate, opacity, filter, scaleY, boxShadow: glow, borderColor: border, backgroundColor: fill }}
     >
       {label}
-    </motion.li>
+    </m.li>
   );
 }

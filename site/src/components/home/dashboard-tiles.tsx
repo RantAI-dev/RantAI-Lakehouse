@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { motion } from "motion/react";
+import { m } from "motion/react";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
@@ -60,9 +60,9 @@ export function LineChartTile({ tile }: { tile: TileText }) {
       {[40, 80, 120, 160].map((y) => (
         <line key={y} x1="10" x2="350" y1={y} y2={y} stroke={FOAM} strokeOpacity="0.08" />
       ))}
-      <motion.path d={`${a} L350 180 L10 180 Z`} fill="url(#lk-area)" initial={{ opacity: 0 }} whileInView={{ opacity: 1 }} viewport={{ once: true, amount: 0.6 }} transition={{ duration: 1.2, delay: 0.5 }} />
-      <motion.path d={a} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" {...draw} />
-      <motion.path d={b} fill="none" stroke={FOAM} strokeOpacity="0.55" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="1 5" {...draw} />
+      <m.path d={`${a} L350 180 L10 180 Z`} fill="url(#lk-area)" initial={{ opacity: 0 }} whileInView={{ opacity: 1 }} viewport={{ once: true, amount: 0.6 }} transition={{ duration: 1.2, delay: 0.5 }} />
+      <m.path d={a} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" {...draw} />
+      <m.path d={b} fill="none" stroke={FOAM} strokeOpacity="0.55" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="1 5" {...draw} />
       <circle cx="350" cy="24" r="4" fill={LAKE} />
       <circle cx="350" cy="24" r="9" fill={LAKE} fillOpacity="0.25" />
     </svg>
@@ -129,7 +129,7 @@ export function SankeyTile({ tile }: { tile: TileText }) {
         usedL[f.from] += f.w * 0.9;
         usedR[f.to] += f.w * 0.9;
         return (
-          <motion.path
+          <m.path
             key={i}
             d={`M44 ${y0} C170 ${y0} 190 ${y1} 316 ${y1}`}
             fill="none"
@@ -162,7 +162,7 @@ export function KpiTile({ tile }: { tile: TileText }) {
       <text x="22" y="86" fill={LAKE} fontSize="14" fontFamily="var(--font-mono), monospace">
         {tile.delta}
       </text>
-      <motion.path d={d} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" {...draw} />
+      <m.path d={d} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" {...draw} />
       <circle cx={20 + 11 * 28} cy={150 - 78} r="4" fill={LAKE} />
     </svg>
   );

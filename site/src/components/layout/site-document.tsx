@@ -1,8 +1,9 @@
-import { NextIntlClientProvider } from "next-intl";
-import { getMessages, getTranslations } from "next-intl/server";
+import { getTranslations } from "next-intl/server";
 import { routing, type Locale } from "@/i18n/routing";
+import { MotionFeatures } from "@/components/shared/motion-features";
 import { fontVariables } from "@/lib/fonts";
-import { LanguageSuggestion, type SuggestionText } from "./language-suggestion";
+import { DeferredLanguageSuggestion } from "./deferred-language-suggestion";
+import type { SuggestionText } from "./language-suggestion";
 
 /**
  * The `<html>` shell of one language, shared by the two layouts that write
@@ -11,15 +12,17 @@ import { LanguageSuggestion, type SuggestionText } from "./language-suggestion";
  * middleware, so each language is its own set of files and `lang` is fixed
  * per file (D10).
  *
- * Only the `common` messages reach the browser: section text is read on the
- * server and handed to the client leaves as props, so the page does not ship
- * its own copy twice (D5).
+ * No messages reach the browser as a whole: every text is read on the
+ * server and handed to the client leaves as props, and there is no
+ * `NextIntlClientProvider`, so neither the message files nor next-intl's
+ * client runtime ship (D5, measured in T5).
  */
+const JS_CLASS_SCRIPT = `document.documentElement.classList.add("js")`;
+
 export async function SiteDocument({
   locale,
   children,
 }: Readonly<{ locale: Locale; children: React.ReactNode }>) {
-  const messages = await getMessages({ locale });
   // The offer of Indonesian is written in Indonesian (see the component).
   const suggestion =
     locale === routing.defaultLocale
@@ -27,12 +30,21 @@ export async function SiteDocument({
       : null;
 
   return (
-    <html lang={locale} className={fontVariables}>
+    // `suppressHydrationWarning`: the inline script below adds `js` to this
+    // element's classes before React hydrates it, on purpose.
+    <html lang={locale} className={fontVariables} suppressHydrationWarning>
       <body>
-        <NextIntlClientProvider locale={locale} messages={{ common: messages.common }}>
+        {/* WEB-5 D5: reveal animations hide their content only once this class
+            is set (globals.css), so the server HTML reads in full without
+            JavaScript, or when the scripts fail to load. A synchronous script
+            at the top of <body> runs before any of the page below it is
+            painted, so a visitor with JavaScript never sees content flash in
+            and out. */}
+        <script dangerouslySetInnerHTML={{ __html: JS_CLASS_SCRIPT }} />
+        <MotionFeatures>
           {children}
-          {suggestion && <LanguageSuggestion text={suggestion} />}
-        </NextIntlClientProvider>
+          {suggestion && <DeferredLanguageSuggestion text={suggestion} />}
+        </MotionFeatures>
       </body>
     </html>
   );

@@ -267,6 +267,12 @@ jobs:
           NEXT_PUBLIC_SITE_URL: https://example.invalid
         run: bun run build
 
+      # D5: the first JavaScript (all initial chunks, gzip) against the
+      # spec's 200 KB, and the deferred 3D scene reported on its own; see
+      # site/scripts/check-bundle.mjs for what counts.
+      - name: Check the bundle size
+        run: bun run size
+
       # D3: English is the root and Indonesian is /id/, as plain files.
       # A routing change that drops a locale, or writes the English page
       # under /en/, fails here rather than on the host.

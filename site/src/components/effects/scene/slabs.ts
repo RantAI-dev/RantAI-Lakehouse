@@ -1,4 +1,18 @@
-import * as THREE from "three";
+// WEB-5 D5: named imports, so the scene chunk carries only what it uses.
+import {
+  AdditiveBlending,
+  BufferAttribute,
+  BufferGeometry,
+  Color,
+  DoubleSide,
+  Group,
+  Mesh,
+  MeshPhysicalMaterial,
+  PlaneGeometry,
+  PointLight,
+  Points,
+  ShaderMaterial,
+} from "three";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import { DEPTH_LAYERS } from "@/lib/home-content";
 import { clamp01 } from "@/lib/scroll-timeline";
@@ -30,41 +44,41 @@ const STREAMS: StreamSpec[] = [
 ];
 
 export type Slabs = {
-  group: THREE.Group;
+  group: Group;
   update: (args: { time: number; focus: number; reveal: number; pixelRatio: number }) => void;
   /** Narrow screens shrink the slabs sideways (x and z) so the stack fits the width. */
   setFootprint: (scale: number) => void;
   /** The light that makes the glass catch something; follows the focus. */
-  light: THREE.PointLight;
+  light: PointLight;
   dispose: () => void;
 };
 
 export function createSlabs(lowQuality: boolean): Slabs {
-  const group = new THREE.Group();
+  const group = new Group();
   const disposables: { dispose: () => void }[] = [];
 
   const bodyGeo = new RoundedBoxGeometry(SLAB_SIZE.w, SLAB_SIZE.h, SLAB_SIZE.d, lowQuality ? 3 : 6, 0.22);
   disposables.push(bodyGeo);
-  const surfaceGeo = new THREE.PlaneGeometry(SLAB_SIZE.w - 0.8, SLAB_SIZE.d - 0.8);
+  const surfaceGeo = new PlaneGeometry(SLAB_SIZE.w - 0.8, SLAB_SIZE.d - 0.8);
   surfaceGeo.rotateX(-Math.PI / 2);
-  const haloGeo = new THREE.PlaneGeometry(SLAB_SIZE.w * 1.7, SLAB_SIZE.d * 1.9);
+  const haloGeo = new PlaneGeometry(SLAB_SIZE.w * 1.7, SLAB_SIZE.d * 1.9);
   haloGeo.rotateX(-Math.PI / 2);
   disposables.push(surfaceGeo, haloGeo);
 
   type SlabParts = {
-    root: THREE.Group;
-    body: THREE.Mesh;
-    bodyMat: THREE.MeshPhysicalMaterial;
-    surfaceMat: THREE.ShaderMaterial;
-    haloMat: THREE.ShaderMaterial;
-    accent: THREE.Color;
+    root: Group;
+    body: Mesh;
+    bodyMat: MeshPhysicalMaterial;
+    surfaceMat: ShaderMaterial;
+    haloMat: ShaderMaterial;
+    accent: Color;
   };
   const slabs: SlabParts[] = DEPTH_LAYERS.map((layer, i) => {
-    const accent = new THREE.Color(layer.accent);
-    const root = new THREE.Group();
+    const accent = new Color(layer.accent);
+    const root = new Group();
     root.position.y = SLAB_Y[i];
 
-    const bodyMat = new THREE.MeshPhysicalMaterial({
+    const bodyMat = new MeshPhysicalMaterial({
       // Glass tinted by its metal: the accent, pulled well towards the dark.
       color: accent.clone().multiplyScalar(0.32),
       transparent: true,
@@ -76,40 +90,40 @@ export function createSlabs(lowQuality: boolean): Slabs {
       envMapIntensity: 1.8,
       emissive: accent,
       emissiveIntensity: 0.06,
-      side: THREE.DoubleSide,
+      side: DoubleSide,
       depthWrite: false,
     });
-    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    const body = new Mesh(bodyGeo, bodyMat);
     root.add(body);
 
-    const surfaceMat = new THREE.ShaderMaterial({
+    const surfaceMat = new ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
         uStyle: { value: i },
         uGlow: { value: 0 },
         uReveal: { value: 0 },
-        uColor: { value: accent.clone().lerp(new THREE.Color("#ffffff"), 0.25) },
+        uColor: { value: accent.clone().lerp(new Color("#ffffff"), 0.25) },
       },
       vertexShader: SLAB_SURFACE_VERT,
       fragmentShader: SLAB_SURFACE_FRAG,
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      blending: AdditiveBlending,
     });
-    const surface = new THREE.Mesh(surfaceGeo, surfaceMat);
+    const surface = new Mesh(surfaceGeo, surfaceMat);
     surface.position.y = SLAB_SIZE.h / 2 + 0.012;
     surface.renderOrder = 3;
     root.add(surface);
 
-    const haloMat = new THREE.ShaderMaterial({
+    const haloMat = new ShaderMaterial({
       uniforms: { uColor: { value: accent.clone() }, uIntensity: { value: 0 } },
       vertexShader: GLOW_VERT,
       fragmentShader: GLOW_FRAG,
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      blending: AdditiveBlending,
     });
-    const halo = new THREE.Mesh(haloGeo, haloMat);
+    const halo = new Mesh(haloGeo, haloMat);
     halo.position.y = -SLAB_SIZE.h / 2 - 0.35;
     halo.renderOrder = 2;
     root.add(halo);
@@ -125,11 +139,11 @@ export function createSlabs(lowQuality: boolean): Slabs {
     const count = Math.max(8, Math.round(spec.count * streamScale));
     const seeds = new Float32Array(count * 4);
     for (let k = 0; k < seeds.length; k++) seeds[k] = Math.random();
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(count * 3), 3));
-    geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 4));
+    const geometry = new BufferGeometry();
+    geometry.setAttribute("position", new BufferAttribute(new Float32Array(count * 3), 3));
+    geometry.setAttribute("aSeed", new BufferAttribute(seeds, 4));
     const accent = slabs[i].accent;
-    const material = new THREE.ShaderMaterial({
+    const material = new ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
         uTop: { value: 0 },
@@ -143,15 +157,15 @@ export function createSlabs(lowQuality: boolean): Slabs {
         uSize: { value: spec.size },
         uPx: { value: 1 },
         uAlpha: { value: 0 },
-        uColor: { value: accent.clone().lerp(new THREE.Color("#ffffff"), 0.35) },
+        uColor: { value: accent.clone().lerp(new Color("#ffffff"), 0.35) },
       },
       vertexShader: STREAM_VERT,
       fragmentShader: STREAM_FRAG,
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      blending: AdditiveBlending,
     });
-    const points = new THREE.Points(geometry, material);
+    const points = new Points(geometry, material);
     points.frustumCulled = false;
     points.renderOrder = 4;
     group.add(points);
@@ -159,7 +173,7 @@ export function createSlabs(lowQuality: boolean): Slabs {
     return { points, material };
   });
 
-  const light = new THREE.PointLight(0x9fd0ff, 0, 40, 2);
+  const light = new PointLight(0x9fd0ff, 0, 40, 2);
   light.position.set(3, SLAB_Y[0] + 4, 5);
   group.add(light);
 

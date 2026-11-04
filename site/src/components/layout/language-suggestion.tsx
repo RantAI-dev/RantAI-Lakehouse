@@ -1,9 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import { AnimatePresence, m, useReducedMotion } from "motion/react";
 import { Languages, X } from "lucide-react";
-import Link from "next/link";
 import { usePathname } from "@/i18n/navigation";
 import { localizedPath } from "@/i18n/paths";
 import { LOCALE_CHOICE_KEY } from "./language-switcher";
@@ -22,7 +21,7 @@ export type SuggestionText = { label: string; text: string; view: string; dismis
  * strings as `text`. Shown once; picking a language or closing it is
  * remembered.
  */
-export function LanguageSuggestion({ text }: Readonly<{ text: SuggestionText }>) {
+export default function LanguageSuggestion({ text }: Readonly<{ text: SuggestionText }>) {
   const pathname = usePathname();
   const reduce = useReducedMotion();
   const [open, setOpen] = React.useState(false);
@@ -55,7 +54,7 @@ export function LanguageSuggestion({ text }: Readonly<{ text: SuggestionText }>)
   return (
     <AnimatePresence>
       {open && (
-        <motion.aside
+        <m.aside
           lang="id"
           aria-label={text.label}
           initial={reduce ? false : { opacity: 0, y: 16 }}
@@ -66,14 +65,15 @@ export function LanguageSuggestion({ text }: Readonly<{ text: SuggestionText }>)
         >
           <Languages className="size-4 shrink-0 text-neutral-500 max-sm:hidden" aria-hidden />
           <p className="min-w-0 flex-1 text-[13.5px] sm:flex-initial sm:text-[14px]">{text.text}</p>
-          <Link
+          {/* A plain link: a language switch is a full page load (other root layout). */}
+          <a
             href={localizedPath("id", pathname)}
             hrefLang="id"
             onClick={() => remember("id")}
             className="inline-flex h-9 shrink-0 items-center rounded-full bg-neutral-950 px-3.5 text-[13px] font-medium text-white transition-colors hover:bg-neutral-800 sm:h-auto sm:px-3.5 sm:py-1.5"
           >
             {text.view}
-          </Link>
+          </a>
           <button
             type="button"
             onClick={() => remember("en")}
@@ -82,7 +82,7 @@ export function LanguageSuggestion({ text }: Readonly<{ text: SuggestionText }>)
           >
             <X className="size-4" />
           </button>
-        </motion.aside>
+        </m.aside>
       )}
     </AnimatePresence>
   );

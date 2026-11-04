@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { motion, useMotionValue, useTransform } from "motion/react";
+import { m, useMotionValue, useTransform } from "motion/react";
 import type { HomeCopy } from "@/lib/copy";
 import { TILE_IDS } from "@/lib/home-content";
 import { CalendarTile, DotMapTile, KpiTile, LineChartTile, SankeyTile } from "./dashboard-tiles";
@@ -56,7 +56,7 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
   }, [travel]);
 
   return (
-    <motion.section
+    <m.section
       ref={ref}
       id="dashboards"
       className="relative h-[240vh] motion-reduce:h-auto!"
@@ -75,7 +75,7 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
 
         {/* The rail. Pinned: transformed by scroll. Reduced motion: a native horizontal scroller. */}
         <div className="relative z-10 mt-8 md:mt-12 motion-reduce:overflow-x-auto motion-reduce:pb-4">
-          <motion.ul
+          <m.ul
             ref={trackRef}
             className="flex w-max gap-4 motion-reduce:transform-none! pr-4 pl-[max(1rem,calc((100vw-1120px)/2+1.5rem))] md:gap-5"
             style={{ x }}
@@ -95,13 +95,13 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
                 </li>
               );
             })}
-          </motion.ul>
+          </m.ul>
         </div>
         <Container className="relative z-10 mt-5">
           <p className="lk-mono text-[12px] text-[#E8F4FF]/65">{copy.caption}</p>
         </Container>
       </div>
-    </motion.section>
+    </m.section>
   );
 }
 

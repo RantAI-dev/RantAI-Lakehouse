@@ -1,6 +1,5 @@
 import { getTranslations, setRequestLocale } from "next-intl/server";
 import { SiteDocument } from "@/components/layout/site-document";
-import Link from "next/link";
 import { routing } from "@/i18n/routing";
 
 /**
@@ -15,7 +14,8 @@ export default async function NotFound() {
       <main>
         <h1>{t("title")}</h1>
         <p>{t("body")}</p>
-        <Link href="/">{t("home")}</Link>
+        {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- the 404 file is served for every path; a plain link is a full load of the home page */}
+        <a href="/">{t("home")}</a>
       </main>
     </SiteDocument>
   );

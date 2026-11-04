@@ -1,4 +1,18 @@
-import * as THREE from "three";
+// WEB-5 D5: named imports, so the scene chunk carries only what it uses.
+import {
+  AdditiveBlending,
+  BufferAttribute,
+  BufferGeometry,
+  Camera,
+  Color,
+  DoubleSide,
+  Group,
+  Mesh,
+  PlaneGeometry,
+  Points,
+  ShaderMaterial,
+  Vector3,
+} from "three";
 import { SHAFT_FRAG, SHAFT_VERT, SNOW_FRAG, SNOW_VERT } from "./shaders";
 
 /**
@@ -8,35 +22,35 @@ import { SHAFT_FRAG, SHAFT_VERT, SNOW_FRAG, SNOW_VERT } from "./shaders";
  */
 
 export type Shafts = {
-  group: THREE.Group;
+  group: Group;
   /** `intensity` 0..1; `camera` orients every shaft towards the viewer. */
-  update: (time: number, intensity: number, camera: THREE.Camera) => void;
+  update: (time: number, intensity: number, camera: Camera) => void;
   dispose: () => void;
 };
 
 export function createShafts(count: number): Shafts {
-  const group = new THREE.Group();
-  const geometry = new THREE.PlaneGeometry(1, 1);
-  const materials: THREE.ShaderMaterial[] = [];
-  const shafts: { mesh: THREE.Mesh; tilt: number }[] = [];
+  const group = new Group();
+  const geometry = new PlaneGeometry(1, 1);
+  const materials: ShaderMaterial[] = [];
+  const shafts: { mesh: Mesh; tilt: number }[] = [];
   for (let i = 0; i < count; i++) {
     const u = (i + 0.5) / count;
-    const material = new THREE.ShaderMaterial({
+    const material = new ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
         uIntensity: { value: 0 },
         uSeed: { value: (i * 0.618) % 1 },
-        uColor: { value: new THREE.Color("#7cc4ff") },
+        uColor: { value: new Color("#7cc4ff") },
       },
       vertexShader: SHAFT_VERT,
       fragmentShader: SHAFT_FRAG,
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
+      blending: AdditiveBlending,
+      side: DoubleSide,
     });
     materials.push(material);
-    const mesh = new THREE.Mesh(geometry, material);
+    const mesh = new Mesh(geometry, material);
     const width = 2.6 + ((i * 7) % 5) * 0.9;
     mesh.scale.set(width, 40, 1);
     // Spread across and behind the scene; the centre stays clearer.
@@ -71,34 +85,34 @@ export function createShafts(count: number): Shafts {
 }
 
 export type Snow = {
-  points: THREE.Points;
-  update: (time: number, alpha: number, camera: THREE.Camera, pixelRatio: number) => void;
+  points: Points;
+  update: (time: number, alpha: number, camera: Camera, pixelRatio: number) => void;
   dispose: () => void;
 };
 
 export function createSnow(count: number): Snow {
   const seeds = new Float32Array(count * 4);
   for (let i = 0; i < seeds.length; i++) seeds[i] = Math.random();
-  const geometry = new THREE.BufferGeometry();
+  const geometry = new BufferGeometry();
   // `position` is required by three even though the vertex shader derives the
   // real position from `aSeed`.
-  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(count * 3), 3));
-  geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 4));
-  const material = new THREE.ShaderMaterial({
+  geometry.setAttribute("position", new BufferAttribute(new Float32Array(count * 3), 3));
+  geometry.setAttribute("aSeed", new BufferAttribute(seeds, 4));
+  const material = new ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
-      uCam: { value: new THREE.Vector3() },
+      uCam: { value: new Vector3() },
       uPx: { value: 1 },
       uAlpha: { value: 0 },
-      uColor: { value: new THREE.Color("#bfe0ff") },
+      uColor: { value: new Color("#bfe0ff") },
     },
     vertexShader: SNOW_VERT,
     fragmentShader: SNOW_FRAG,
     transparent: true,
     depthWrite: false,
-    blending: THREE.AdditiveBlending,
+    blending: AdditiveBlending,
   });
-  const points = new THREE.Points(geometry, material);
+  const points = new Points(geometry, material);
   points.frustumCulled = false;
   points.renderOrder = 6;
   return {
@@ -108,7 +122,7 @@ export function createSnow(count: number): Snow {
       material.uniforms.uTime.value = time;
       material.uniforms.uAlpha.value = alpha;
       material.uniforms.uPx.value = pixelRatio;
-      (material.uniforms.uCam.value as THREE.Vector3).copy(camera.position);
+      (material.uniforms.uCam.value as Vector3).copy(camera.position);
     },
     dispose() {
       geometry.dispose();

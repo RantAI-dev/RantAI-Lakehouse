@@ -35,17 +35,13 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
   return (
     <LandingModeProvider>
       <div className="lk-root relative min-h-screen overflow-x-clip">
-        {/* Keeps the scroll-reveal sections readable when JavaScript is off. */}
-        <noscript>
-          <style>{`[data-reveal]{opacity:1!important;transform:none!important;filter:none!important}`}</style>
-        </noscript>
         <a
           href="#main"
           className="sr-only z-[60] rounded-full bg-[#E8F4FF] px-4 py-2 text-[14px] font-medium text-[#020514] focus:not-sr-only focus:fixed focus:top-3 focus:left-3"
         >
           {common.skipToContent}
         </a>
-        <TopBar nav={common.nav} cta={common.cta} />
+        <TopBar locale={locale} nav={common.nav} cta={common.cta} language={common.language} />
         <main id="main" tabIndex={-1}>
           <SceneZone>
             <HeroSection copy={home.hero} cta={common.cta} />
