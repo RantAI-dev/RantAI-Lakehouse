@@ -61,16 +61,34 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
     },
   },
   {
-    test: (p) => p.startsWith("/data") || p.startsWith("/catalog"),
+    // WEB-3 S2-D5: the Catalog is the one asset list (`/data` only redirects
+    // to it); an asset's own page stays at `/data/assets/{id}`.
+    test: (p) => p.startsWith("/catalog") || p.startsWith("/data/"),
     ctx: {
       key: "data",
-      title: "Explore or build data",
-      hint: "Ask about datasets, schemas, lineage — or refresh/build data.",
+      title: "Find and understand data",
+      hint: "Ask which datasets exist, what a table holds, or where it comes from.",
       suggest: {
         ask: ["Which datasets hold customer data?", "Describe this dataset's columns", "Show this dataset's lineage"],
         build: ["Refresh the lakehouse (Bronze→Silver→Gold)", "Check the latest build status"],
       },
-      system: "The user is exploring Data / Catalog. Help them query, describe datasets, inspect lineage/quality, or build/refresh data.",
+      system: "The user is in the Catalog: every governed table and file, searchable by name, column, tag, description and owner, filterable by namespace and layer, with each asset's own page for schema, quality, lineage and access. Prefer list_datasets / describe_dataset / get_lineage / get_quality.",
+    },
+  },
+  {
+    // WEB-3 S2-D5: System status replaced Health, Services, Capacity,
+    // Ingestion (CDC) and Table Maintenance; their old addresses redirect
+    // here. Every tool named below already exists (no tool change).
+    test: (p) => p === "/health",
+    ctx: {
+      key: "system-status",
+      title: "Check the system",
+      hint: "Ask what is unhealthy, how much is stored, or what maintenance last did.",
+      suggest: {
+        ask: ["Summarize platform health", "How much storage is the lakehouse using?", "Are any CDC replication slots lagging?"],
+        build: ["Create an alert rule for a failing pipeline"],
+      },
+      system: "The user is on System status: service probes, open alerts, storage capacity, CDC replication-slot health, the latest table maintenance runs, table freshness and query volume. Prefer lakehouse_overview / get_capacity / get_cdc_health / get_maintenance_metrics. A value the page shows as Not measured is not measured; never estimate it.",
     },
   },
   {
