@@ -21,8 +21,10 @@
 //!
 //! 1. Self-only target (C3) means the owner's **own email address** only; there
 //!    is no console channel.
-//! 2. C4 applies to chart rules in this part; mart and metric rules keep the
-//!    fixed viewer role (`SqlGate` is unchanged).
+//! 2. C4 started with chart rules in this part; `BI-39` D1 extended it to every
+//!    threshold rule (a mart or metric rule now reads as its owner too), so the
+//!    fixed viewer role is left only to a rule saved before owners existed
+//!    (`BI-39` D4) and to a digest (`BI-39` D1, out of scope).
 //! 3. A chart alert's fired instance detail never carries the value
 //!    (`alert_instance` is one list for everyone).
 //!
@@ -50,7 +52,9 @@ use crate::routes::dashboard_access::{board_is_restricted, viewer_for};
 use crate::state::AppState;
 
 const NO_OWNER: &str = "The alert has no owner, so it does not run.";
-const OWNER_GONE: &str = "The person who set this alert is disabled or no longer exists.";
+/// `BI-39` D5: one sentence for every kind of threshold rule, kept in the
+/// alerts crate next to [`lakehouse_alerts::stop`] (rule 4).
+const OWNER_GONE: &str = lakehouse_alerts::OWNER_GONE;
 const LOST_ACCESS: &str = "The person who set this alert can no longer see this chart.";
 const CHART_GONE: &str = "The chart was deleted.";
 const RESTRICTED: &str = "The dashboard is restricted to the people listed, so its alert is not sent outside the console, except to the person who set it.";
@@ -149,7 +153,10 @@ async fn read(state: &AppState, rule: &AlertRule) -> Result<Reading, Unreadable>
     )
     // BI-19 C (PR #250 CI): a number that decides a send is never a remembered
     // one (the recovery would arrive a cache age late).
-    .fresh_chart(chart_id);
+    .fresh_chart(chart_id)
+    // `BI-39` D7: the alert decides from this one tile, so the board's other
+    // charts are not computed for it.
+    .only_chart(chart_id);
     // `SEC-50` slice 2 M4: the chart alert reads as the person who set it —
     // their first tenant, because the runner sends no `X-Tenant` header.
     // A refusal is the tile's own error, which this module already turns
@@ -319,11 +326,12 @@ pub(crate) fn may_manage(principal: Option<&Principal>, rule: Option<&AlertRule>
 ///   included, is 403 (`BI-19` C review C-R1).
 /// - A chart alert needs the chart visible to the caller (404 as for an unknown
 ///   one) and, on a restricted dashboard, an own-address target (Q-R12).
-/// - Sets `input.owner_id`: the caller for every chart rule that is saved, a new
-///   one or a changed one (`BI-19` C review C-R2: a rule is read as whoever
-///   ends up owning it, and its chart, filters and target were judged as the
-///   caller, so it is not kept as the previous owner); the stored owner for a
-///   changed rule that is not a chart rule; nothing for a new one (decision 2).
+/// - Sets `input.owner_id` (`BI-39` D2): the caller for every `alert` rule that
+///   is saved, a new one or a changed one — chart or not (`BI-19` C review C-R2:
+///   a rule is read as whoever ends up owning it, and its chart, filters and
+///   target were judged as the caller, so it is not kept as the previous
+///   owner). A digest and the event kinds keep the stored owner; nothing for a
+///   new one.
 ///
 /// # Errors
 ///
@@ -364,7 +372,15 @@ pub(crate) async fn authorise_save(
         if !has_write {
             return Err(ApiError::PermissionDenied("alert:write".to_owned()));
         }
-        input.owner_id = stored.and_then(|r| r.owner_id.clone());
+        // `BI-39` D2: a saved alert rule belongs to whoever saved it last, so
+        // `watches_differ` (`owner_id`) starts its state over when the owner
+        // changes — the number is read as somebody else now. A digest and the
+        // event kinds are not threshold rules and keep today's owner.
+        input.owner_id = if kind_is_alert {
+            Some(me)
+        } else {
+            stored.and_then(|r| r.owner_id.clone())
+        };
         return Ok(());
     }
     let Some(chart) = chart else {

@@ -43,6 +43,9 @@ struct FakeCh {
     chart_exists: Arc<Mutex<bool>>,
     /// The stored rule is a mart rule (no chart) instead of a chart rule.
     plain: Arc<Mutex<bool>>,
+    /// How many charts `BOARD` holds (`BI-39` T3: a chart alert reads one
+    /// tile, whatever the board's size). Default 1.
+    charts: Arc<Mutex<usize>>,
     /// The stored rule exists at all (false: an unknown id).
     rule_exists: Arc<Mutex<bool>>,
     log: Arc<Mutex<Vec<String>>>,
@@ -59,17 +62,21 @@ fn rule_row(owner: &str, target: &str) -> Value {
     })
 }
 
-fn chart_row() -> Value {
+/// One chart of `BOARD` reading `measure` of the mart: `BI-39` D7 counts the
+/// tile statements, so a board of several charts must cost one statement each
+/// (the cache computes one statement per key, so the charts differ).
+fn chart_row_for(id: &str, title: &str, measure: &str) -> Value {
     let spec = json!({
-        "id": "c_kpi", "title": "Visitors", "kind": "kpi", "mart": "mart_x",
-        "sql": "SELECT sum(visitors) AS visitors FROM serving.mart_x", "x": "", "y": "visitors"
+        "id": id, "title": title, "kind": "kpi", "mart": "mart_x",
+        "sql": format!("SELECT sum({measure}) AS {measure} FROM serving.mart_x"),
+        "x": "", "y": measure
     });
     let def = json!({
-        "title": "Visitors", "mart": "mart_x", "kind": "kpi", "measures": ["visitors"],
+        "title": title, "mart": "mart_x", "kind": "kpi", "measures": [measure],
         "aggregate": "sum"
     });
     json!({
-        "id": "c_kpi", "board": BOARD, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+        "id": id, "board": BOARD, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
         "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
     })
 }
@@ -113,6 +120,17 @@ fn clause_hides_board(sql: &str) -> bool {
     false
 }
 
+/// The `owner_id` a saved rule's `INSERT` wrote: the rule's last value, a
+/// single-quoted literal (`SqlLiteral` doubles an inner quote; owner ids never
+/// carry one).
+fn inserted_owner(sql: &str) -> Option<String> {
+    // `save_rule` writes `VALUES ('id','name',...)` with no space after a
+    // comma, and `owner_id` is the last column.
+    let values = sql.split(") VALUES (").nth(1)?;
+    let last = values.rsplit("','").next()?;
+    Some(last.strip_suffix("')")?.to_owned())
+}
+
 impl Respond for FakeCh {
     fn respond(&self, request: &MockRequest) -> ResponseTemplate {
         let sql = String::from_utf8_lossy(&request.body).into_owned();
@@ -126,7 +144,23 @@ impl Respond for FakeCh {
             if !*self.rule_exists.lock().unwrap() {
                 return rows(json!([]), vec![]);
             }
-            let mut row = rule_row(&self.owner, &self.target.lock().unwrap());
+            // `ReplacingMergeTree` + `FINAL` sees a just-inserted row on the
+            // same connection immediately, and `save_rule` re-reads the rule it
+            // wrote; the owner it reads is the one just inserted, not the
+            // fixture's (`BI-39` D2: a save sets the owner, so the read after it
+            // must show that).
+            let owner = self.owner.clone();
+            let mut row = rule_row(&owner, &self.target.lock().unwrap());
+            if let Some(saved) = self
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|previous| inserted_owner(previous))
+            {
+                row["owner_id"] = json!(saved);
+            }
             if *self.plain.lock().unwrap() {
                 row["chart"] = json!("");
                 row["condition"] = json!("");
@@ -137,7 +171,17 @@ impl Respond for FakeCh {
         }
         if sql.contains("FROM console.bi_chart") {
             let present = *self.chart_exists.lock().unwrap() && !clause_hides_board(&sql);
-            return rows(json!([]), if present { vec![chart_row()] } else { vec![] });
+            let count = *self.charts.lock().unwrap();
+            let charts: Vec<Value> = [
+                ("c_kpi", "Visitors", "visitors"),
+                ("c_two", "Tile c_two", "visitors_two"),
+                ("c_three", "Tile c_three", "visitors_three"),
+            ]
+            .iter()
+            .take(count)
+            .map(|(id, title, measure)| chart_row_for(id, title, measure))
+            .collect();
+            return rows(json!([]), if present { charts } else { vec![] });
         }
         if sql.contains("FROM console.bi_board") {
             let hidden = clause_hides_board(&sql);
@@ -146,16 +190,26 @@ impl Respond for FakeCh {
         if sql.contains("system.columns") {
             return rows(
                 json!([]),
-                [("region", "String"), ("visitors", "Float64")]
-                    .iter()
-                    .map(|(n, t)| json!({"table": "mart_x", "name": n, "type": t}))
-                    .collect(),
+                [
+                    ("region", "String"),
+                    ("visitors", "Float64"),
+                    ("visitors_two", "Float64"),
+                    ("visitors_three", "Float64"),
+                ]
+                .iter()
+                .map(|(n, t)| json!({"table": "mart_x", "name": n, "type": t}))
+                .collect(),
             );
         }
         if sql.contains("FROM serving.mart_x") {
+            let value = *self.value.lock().unwrap();
             return rows(
-                json!([{"name": "visitors", "type": "Float64"}]),
-                vec![json!({ "visitors": *self.value.lock().unwrap() })],
+                json!([
+                    {"name": "visitors", "type": "Float64"},
+                    {"name": "visitors_two", "type": "Float64"},
+                    {"name": "visitors_three", "type": "Float64"},
+                ]),
+                vec![json!({ "visitors": value, "visitors_two": value, "visitors_three": value })],
             );
         }
         ResponseTemplate::new(200).set_body_string("Ok.\n")
@@ -183,6 +237,7 @@ async fn fixture_in(target: &str, tenant: &str) -> Fixture {
         value: Arc::new(Mutex::new(150.0)),
         chart_exists: Arc::new(Mutex::new(true)),
         plain: Arc::new(Mutex::new(false)),
+        charts: Arc::new(Mutex::new(1)),
         rule_exists: Arc::new(Mutex::new(true)),
         log: Arc::new(Mutex::new(Vec::new())),
     };
@@ -259,7 +314,13 @@ async fn silence(pool: &PgPool) -> String {
 }
 
 async fn run(f: &Fixture) -> Value {
-    let cookie = session_cookie_for_user(&f.app.pool, f.owner).await;
+    run_as(f, f.owner).await
+}
+
+/// The same run, triggered by `who` (the rule's owner need not be the caller:
+/// the scheduled tick is nobody's session).
+async fn run_as(f: &Fixture, who: Uuid) -> Value {
+    let cookie = session_cookie_for_user(&f.app.pool, who).await;
     let resp = f
         .app
         .router
@@ -602,4 +663,288 @@ async fn a_chart_alert_of_another_tenant_fails_and_sends_nothing() {
             .any(|sql| sql.contains("FROM serving.mart_x")),
         "nothing is read when the owner may not read the mart"
     );
+}
+
+// ---- BI-39: every threshold rule is owned by whoever saved it (D1, D2, D5) ----
+
+/// A mart rule body the save routes accept.
+fn mart_rule_body() -> Value {
+    json!({
+        "name": "Visitors over the line", "type": "alert", "mart": "mart_x",
+        "measure": "visitors", "agg": "sum", "op": ">", "threshold": 100.0,
+        "channel": "email", "target": "someone@example.com",
+    })
+}
+
+/// A role named `name` holding `permissions`, and an active person in it.
+async fn writer(pool: &PgPool, name: &str, permissions: &str) -> Uuid {
+    let role = Uuid::new_v4();
+    // Role names are unique, and the seeded deployment already has "Data
+    // Engineer"; the suffix keeps the role this test means distinct from it.
+    let name = format!("{name} {}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions, description) VALUES ($1, $2, $3, 'test')",
+    )
+    .bind(role)
+    .bind(&name)
+    .bind(permissions)
+    .execute(pool)
+    .await
+    .unwrap();
+    let user = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
+        .bind(user)
+        .bind(format!("{name} person"))
+        .bind(format!("{user}@test.invalid"))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+        .bind(user)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    // `SEC-50` slice 2 M11: a writer of the catalog's own tenant, so the save's
+    // tenant gate admits the `serving.*` statement.
+    common::in_the_catalog_tenant(pool, user).await;
+    user
+}
+
+/// `BI-39` D2: a mart rule is owned by whoever saved it — it is not left
+/// without an owner as it was before.
+#[tokio::test]
+async fn a_mart_rule_saved_by_a_writer_stores_that_writer_as_its_owner() {
+    let f = fixture("owner@test.invalid").await;
+    let engineer = writer(&f.app.pool, "Data Engineer", "dashboard:read, alert:write").await;
+
+    let (status, body) = send_alert(&f, engineer, "POST", mart_rule_body()).await;
+
+    assert_eq!(status, 200, "{body}");
+    let inserts = saved(&f);
+    assert_eq!(inserts.len(), 1, "{inserts:?}");
+    assert!(
+        inserts[0].contains(&engineer.to_string()),
+        "the saving person's id is the stored owner: {}",
+        inserts[0]
+    );
+}
+
+/// `BI-39` D2: a writer who saves somebody else's mart rule owns it from then
+/// on, and `watches_differ`'s `owner_id` starts its state over — the number is
+/// read as another person now.
+#[tokio::test]
+async fn re_saving_a_mart_rule_by_another_writer_makes_them_its_owner_and_resets_its_state() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.plain.lock().unwrap() = true;
+    sqlx::query("INSERT INTO alert_rule_state (rule_id, state) VALUES ($1, 'firing')")
+        .bind(RULE)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let engineer = writer(&f.app.pool, "Data Engineer", "dashboard:read, alert:write").await;
+
+    let mut body = mart_rule_body();
+    body["id"] = json!(RULE);
+    let (status, body) = send_alert(&f, engineer, "PUT", body).await;
+
+    assert_eq!(status, 200, "{body}");
+    let inserts = saved(&f);
+    assert_eq!(inserts.len(), 1, "{inserts:?}");
+    assert!(
+        inserts[0].contains(&engineer.to_string()),
+        "the editing person's id is the stored owner: {}",
+        inserts[0]
+    );
+    let state: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM alert_rule_state WHERE rule_id = $1")
+            .bind(RULE)
+            .fetch_optional(&f.app.pool)
+            .await
+            .unwrap();
+    assert!(state.is_none(), "a change of owner starts the state over");
+}
+
+/// `BI-39` D5: a mart rule whose owner is disabled stops with the shared
+/// sentence, reads nothing and sends nothing.
+#[tokio::test]
+async fn a_mart_rules_disabled_owner_stops_it_with_the_sentence_and_sends_nothing() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.plain.lock().unwrap() = true;
+    let owner = f.owner;
+    let trigger = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Trigger', 'trigger@test.invalid', 'active')")
+        .bind(trigger)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_user SET status = 'inactive' WHERE id = $1")
+        .bind(owner)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+
+    let r = run_as(&f, trigger).await;
+
+    assert_eq!(
+        r["skipped"],
+        json!("The person who set this alert is disabled or no longer exists."),
+        "{r}"
+    );
+    assert_eq!(r["fired"], json!(false), "{r}");
+    let (state, reason) = state_of(&f.app.pool).await.unwrap();
+    assert_eq!(state, "stopped");
+    assert!(reason.unwrap().contains("disabled"));
+    assert!(
+        !f.fake
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("FROM serving.mart_x")),
+        "nothing is read for a stopped rule"
+    );
+}
+
+// ---- BI-39 T3: one tile (D7) and the chart's name in the list (D8) ----
+
+/// A `GET` of the console's JSON, as `who`.
+async fn get_json(f: &Fixture, who: Uuid, uri: &str) -> (u16, Value) {
+    let cookie = session_cookie_for_user(&f.app.pool, who).await;
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// How many times a tile was computed in `log`: a tile's own statement, not the
+/// column or table lookup beside it (those name `serving.mart_x` in a list).
+fn tile_statements(log: &[String]) -> usize {
+    log.iter()
+        .filter(|sql| sql.contains("FROM serving.mart_x"))
+        .count()
+}
+
+/// `BI-39` D7: on a board of three charts a chart alert's check computes one
+/// tile, where the board itself computes three — and the number is the same as
+/// before.
+#[tokio::test]
+async fn a_chart_alert_on_a_board_of_three_charts_reads_exactly_one_tile() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.charts.lock().unwrap() = 3;
+    silence(&f.app.pool).await;
+
+    // The board read the browser makes: three tiles. `fresh=1` so none of them
+    // is answered from the in-process cache (the three share one statement).
+    let before = f.fake.log.lock().unwrap().len();
+    let (status, body) = get_json(
+        &f,
+        f.owner,
+        &format!("/api/dashboard?board={BOARD}&fresh=1"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["charts"].as_array().unwrap().len(),
+        3,
+        "the board has three charts: {body}"
+    );
+    let board_log = f.fake.log.lock().unwrap()[before..].to_vec();
+    assert_eq!(
+        tile_statements(&board_log),
+        3,
+        "one statement per chart of the board"
+    );
+
+    // The rule's check: one.
+    let before = f.fake.log.lock().unwrap().len();
+    let r = run(&f).await;
+    let rule_log = f.fake.log.lock().unwrap()[before..].to_vec();
+    let rule_tiles = tile_statements(&rule_log);
+    assert_eq!(
+        rule_tiles, 1,
+        "a chart alert reads the tile it watches: {rule_log:#?} / {r}"
+    );
+    assert_eq!(r["skipped"], Value::Null, "{r}");
+    assert_eq!(r["value"].as_f64(), Some(150.0), "{r}");
+}
+
+/// `BI-39` D7: `only` is `serde(skip)`, so a request cannot narrow a dashboard
+/// read with it — the board still answers every tile.
+#[tokio::test]
+async fn a_query_string_cannot_narrow_a_dashboard_to_one_chart() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.charts.lock().unwrap() = 3;
+
+    let (status, body) = get_json(
+        &f,
+        f.owner,
+        &format!("/api/dashboard?board={BOARD}&only=c_kpi"),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    let ids: Vec<&str> = body["charts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c_kpi", "c_two", "c_three"], "{body}");
+}
+
+/// `BI-39` D8: the list names a chart rule's chart and dashboard, live.
+#[tokio::test]
+async fn the_rule_list_names_the_chart_and_the_dashboard() {
+    let f = fixture("owner@test.invalid").await;
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts").await;
+
+    assert_eq!(status, 200, "{body}");
+    let rule = body["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(RULE))
+        .expect("the chart rule is listed");
+    assert_eq!(rule["chartTitle"], json!("Visitors"), "{rule}");
+    assert_eq!(rule["dashboardId"], json!(BOARD), "{rule}");
+    assert_eq!(rule["dashboardTitle"], json!("Public board"), "{rule}");
+}
+
+/// `BI-39` D8: a chart rule whose chart the caller cannot see carries none of
+/// the three, and the rule itself is still listed.
+#[tokio::test]
+async fn the_rule_list_names_no_chart_the_caller_cannot_see() {
+    let f = fixture("owner@test.invalid").await;
+    *f.fake.chart_exists.lock().unwrap() = false;
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts").await;
+
+    assert_eq!(status, 200, "{body}");
+    let rule = body["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(RULE))
+        .expect("the caller's own rule is still listed");
+    assert_eq!(rule["chart"], json!("c_kpi"), "{rule}");
+    for field in ["chartTitle", "dashboardId", "dashboardTitle"] {
+        assert!(rule.get(field).is_none(), "{field} is absent: {rule}");
+    }
 }

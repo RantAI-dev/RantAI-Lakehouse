@@ -1,21 +1,18 @@
 # Release and versioning
 
-## Where things stand
+## Where things stand (2026-11-04)
 
 | Fact | Source |
 | --- | --- |
-| One tag exists: `v0.1.0` | `git tag` |
-| The changelog has `[0.1.0] - 2026-08-30` and a long `[Unreleased]` section | `CHANGELOG.md` |
-| The changelog follows Keep a Changelog and "intends to adhere to Semantic Versioning once a first release is tagged" | `CHANGELOG.md` |
-| The console package version is `0.1.0` | `package.json` |
+| Two tags exist: `v0.1.0` and `v0.2.0` | `git tag` |
+| `v0.2.0` is the first release built, signed and published as a draft by the release pipeline (`REL-2`); it waits for the product owner to publish it and to make the GHCR images public | `gh release view v0.2.0`; `docs/plans/REL-2-RESULT.md` |
+| The changelog has `[0.2.0] - 2026-11-02` with an "Upgrade notes" section, and an `[Unreleased]` section for what merged after the tag | `CHANGELOG.md` |
+| The console package version is `0.2.0`, the same as the tag, the API crate and the changelog | `package.json`; `ops/release/check_version.py` |
 | `v0.1.0` was Apache-2.0; the project is now AGPL-3.0-or-later | `README.md` |
-| `SECURITY.md` says no `v0.1.0` has been cut | Contradicts the tag; backlog `DOC-1` |
+| `SECURITY.md` still says no `v0.1.0` has been cut | Contradicts the tags; backlog `DOC-1` |
 | `main` is the only supported line | `SECURITY.md` |
-| `main` has no branch protection | Verified 2026-10-02; `docs/CI.md` has the drafted settings |
+| `main` requires five checks and blocks force-pushes | `REL-1`, `docs/CI.md` |
 | Database migrations are forward-only and never edited once applied | `AGENTS.md` |
-
-Everything merged since `v0.1.0` is unreleased. There is no written release
-procedure.
 
 ## Policy (signed by the product owner on 2026-10-31, `REL-2`)
 
@@ -51,6 +48,19 @@ Written for an operator and a customer, not a developer. For each release:
 - What changed that needs action.
 - What was fixed.
 - Known limitations added or removed (from [PRODUCT.md](../PRODUCT.md)).
+
+### Applied: 0.2.0 (2026-11-04)
+
+The product owner signed this policy on 2026-10-31 (`REL-2` decision D4: SemVer as written
+here; the first release through the pipeline is 0.2.0). For 0.2.0:
+
+- `[Unreleased]` became `[0.2.0] - 2026-11-02`, and the version is the same in the tag, the
+  changelog, `package.json` and the API crate (item 5; the release job's version check).
+- The upgrade notes are in the changelog's `[0.2.0]` section (item 4).
+- The release job ran after the product owner approved the `release` environment on
+  2026-11-04 (run 41666401368).
+- Item 1 is not met: no feature in 0.2.0 has passed its acceptance checklist yet (`QA-1`).
+  The release ships as built and unaccepted, as `PRODUCT.md` section 4 says.
 
 ## Upgrade
 

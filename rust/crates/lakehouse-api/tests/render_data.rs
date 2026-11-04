@@ -53,7 +53,10 @@ struct FakeCh {
 fn chart_row(id: &str, board: &str) -> Value {
     let spec = json!({
         "id": id, "title": format!("Tile {id}"), "kind": "bar", "mart": "mart_x",
-        "sql": "SELECT email, region FROM serving.mart_x", "x": "region", "y": "email"
+        // One statement per chart: `BI-39` D7's test counts them, and the
+        // result cache computes one statement per key.
+        "sql": format!("SELECT email, region FROM serving.mart_x WHERE '{}' != ''", id),
+        "x": "region", "y": "email"
     });
     let def = json!({
         "title": format!("Tile {id}"), "mart": "mart_x", "kind": "bar",
@@ -550,6 +553,7 @@ fn chart_token(user: Uuid, board: &str, chart: &str) -> String {
 #[tokio::test]
 async fn a_chart_token_gets_that_chart_only() {
     let f = fixture(Some(SECRET)).await;
+    let before = f.fake.log.lock().unwrap().len();
     let (status, body) = post(
         &f.app,
         &json!({ "token": chart_token(f.owner, PUBLIC_BOARD, "c_two") }),
@@ -557,6 +561,13 @@ async fn a_chart_token_gets_that_chart_only() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // `BI-39` D7: the image's data is read for its chart, so the board's other
+    // tile is not computed for it.
+    let tiles = f.fake.log.lock().unwrap()[before..]
+        .iter()
+        .filter(|sql| sql.contains("FROM serving.mart_x"))
+        .count();
+    assert_eq!(tiles, 1, "one tile statement for a chart image");
     let ids: Vec<&str> = body["charts"]
         .as_array()
         .unwrap()

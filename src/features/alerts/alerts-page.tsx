@@ -462,6 +462,18 @@ type RuleDialogProps = {
   readonly canSeeAllTenants: boolean
 }
 
+/**
+ * `BI-39` D4: a rule saved before alerts had owners still reads as the Dashboard
+ * Viewer role, and the editor says so — saving it makes it read as the person
+ * saving. `null` for a digest, an event rule, a new rule, or an owned one.
+ */
+export function legacyOwnerNote(
+  rule: Pick<AlertRule, "type" | "ownerId"> | null
+): string | null {
+  if (!rule || rule.type !== "alert" || rule.ownerId) return null
+  return "This alert was set before alerts had owners and reads as the Dashboard Viewer role. Saving it makes it read as you."
+}
+
 function RuleEditDialog({
   open,
   onOpenChange,
@@ -489,6 +501,9 @@ function RuleEditDialog({
       ? "boss@company.com"
       : "https://hooks.slack.com/services/…"
   const formFields = alertRuleFormFields(f.type, canSeeAllTenants)
+  // The stored rule, not the form being edited: only the saved rule knows
+  // whether it was ever given an owner.
+  const ownerNote = legacyOwnerNote(edit)
 
   let saveLabel = "Create"
   if (edit) {
@@ -672,6 +687,9 @@ function RuleEditDialog({
             />
           </div>
 
+          {ownerNote ? (
+            <p className="text-xs text-muted-foreground">{ownerNote}</p>
+          ) : null}
           {err ? <p className="text-sm text-destructive">{err}</p> : null}
         </div>
         <DialogFooter>
