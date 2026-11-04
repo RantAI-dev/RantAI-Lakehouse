@@ -606,8 +606,12 @@ pub(crate) fn maintenance_run_row_json(row: &Map<String, Value>) -> Value {
 /// surface. Reads `lake.bronze_meta.replication_slot` directly (Dagster-
 /// written only, same posture as `maintenance` — no `pg` union). On a
 /// deployment where no CDC connector has ever run, this table does not
-/// exist yet and the query fails, surfaced as the standard 503 every other
-/// `kind` already gives — not a special case.
+/// exist yet: that is "no slots", answered as `{"replicationSlots": []}`
+/// with 200, not an outage (`WEB-3 review R1` — a fresh install must not
+/// open System status on an error). The decision is `ClickHouse`'s own
+/// error code ([`CH_UNKNOWN_TABLE`], via [`ChError::server_code`]), never
+/// the error text (principle 4); every other failure — `ClickHouse` down, a
+/// permission error, a malformed answer — is still the standard 503.
 /// The `SELECT` behind [`replication`], pulled out so the
 /// `toString(active)` wrapping is assertable — the bug it fixes is invisible
 /// in the response shape (a slot just reads inactive) and only reproduces
@@ -635,8 +639,19 @@ fn ch_bool(row: &serde_json::Map<String, Value>, key: &str) -> bool {
     matches!(str_col(row, key), "1" | "true")
 }
 
+/// `ClickHouse` error code `UNKNOWN_TABLE`: the table named in the query
+/// does not exist. [`replication`] reads it as "no CDC connector has run
+/// yet" (`WEB-3 review R1`).
+const CH_UNKNOWN_TABLE: u32 = 60;
+
 async fn replication(ch: &ChClient) -> Result<Value, GovError> {
-    let rows = ch.rows(REPLICATION_SLOTS_SQL, None).await?;
+    // WEB-3 review R1: only the engine's UNKNOWN_TABLE code is "no slots
+    // yet"; any other error, including one with no code, stays a 503.
+    let rows = match ch.rows(REPLICATION_SLOTS_SQL, None).await {
+        Ok(rows) => rows,
+        Err(err) if err.server_code() == Some(CH_UNKNOWN_TABLE) => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
     let slots: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -2310,6 +2325,94 @@ mod tests {
         assert_eq!(severity_of("fail"), "high");
         assert_eq!(severity_of("warn"), "medium");
         assert_eq!(severity_of("pass"), "info");
+    }
+
+    /// `GET /api/governance/replication` against a `ClickHouse` stub that
+    /// answers every query with `status` and `body`; returns the route's
+    /// status and JSON body.
+    async fn replication_route_answer(ch: Option<(u16, &str)>) -> (StatusCode, Value) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let server = wiremock::MockServer::start().await;
+        let mut env = std::collections::HashMap::new();
+        match ch {
+            Some((status, body)) => {
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(status).set_body_string(body.to_owned()),
+                    )
+                    .mount(&server)
+                    .await;
+                env.insert("CH_URL".to_owned(), server.uri());
+            }
+            // Nothing listens on port 1: `ClickHouse` is down.
+            None => {
+                env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+            }
+        }
+        let cfg = crate::config::Config::from_map(&env).unwrap();
+        let router = axum::Router::new()
+            .route("/api/governance/{kind}", axum::routing::get(get))
+            .with_state(AppState::new(cfg));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/governance/replication")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// WEB-3 review R1: before any CDC connector has run,
+    /// `bronze_meta.replication_slot` does not exist. That is "no slots", a
+    /// 200 with an empty list, not an outage on a fresh install.
+    #[tokio::test]
+    async fn replication_route_answers_an_empty_list_when_the_slot_table_does_not_exist() {
+        let (status, body) = replication_route_answer(Some((
+            404,
+            "Code: 60. DB::Exception: Unknown table expression identifier \
+             'lake.bronze_meta.replication_slot' in scope SELECT connector_id FROM \
+             lake.`bronze_meta.replication_slot`. (UNKNOWN_TABLE)",
+        )))
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "replicationSlots": [] }));
+    }
+
+    /// WEB-3 review R1: the empty list is for the missing table only.
+    /// `ClickHouse` being unreachable is still a 503.
+    #[tokio::test]
+    async fn replication_route_is_503_when_clickhouse_is_down() {
+        let (status, body) = replication_route_answer(None).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.get("replicationSlots").is_none());
+    }
+
+    /// WEB-3 review R1: another engine error (here a permission error,
+    /// `ACCESS_DENIED`, code 497) is still a 503, and a body that merely
+    /// mentions `UNKNOWN_TABLE` without the code does not count: the
+    /// decision is the code, never the text.
+    #[tokio::test]
+    async fn replication_route_is_503_for_any_other_clickhouse_error() {
+        for body in [
+            "Code: 497. DB::Exception: default: Not enough privileges. (ACCESS_DENIED)",
+            "UNKNOWN_TABLE",
+        ] {
+            let (status, _) = replication_route_answer(Some((500, body))).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        }
     }
 
     /// The bug this guards: `active` is `UInt8`, so `ClickHouse` renders it as

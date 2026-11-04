@@ -280,10 +280,10 @@ export function DataQualityPage() {
                 variant="outline"
                 size="sm"
                 render={
-                  <Link href={`/data?q=${encodeURIComponent(selected.asset)}`} />
+                  <Link href={`/catalog?q=${encodeURIComponent(selected.asset)}`} />
                 }
               >
-                Inspect in Data Explorer
+                Find in Catalog
               </Button>
               {/* `evaluable` is only on an authored rule; a verdict a job
                   recorded is not a rule this page can change or delete. */}

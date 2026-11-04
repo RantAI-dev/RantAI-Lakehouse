@@ -114,8 +114,10 @@ export function LakehouseTableDetailPage() {
         title={`${params.namespace}.${params.table}`}
         description="Iceberg schema, partitioning, snapshots, and maintenance policy."
         actions={
-          <Button variant="outline" size="sm" render={<Link href="/governance/maintenance" />}>
-            <ArrowLeft className="size-4" /> Table Maintenance
+          // WEB-3 S2-D2: Table Maintenance is a section of System status; the
+          // way back goes straight there rather than through the redirect.
+          <Button variant="outline" size="sm" render={<Link href="/health#maintenance" />}>
+            <ArrowLeft className="size-4" /> Maintenance runs
           </Button>
         }
       />
