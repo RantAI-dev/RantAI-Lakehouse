@@ -614,3 +614,44 @@ folder, fresh `bun install --frozen-lockfile`):
 **TBT:** not a finding yet. The VM's load (11–14) makes single runs swing 206–1642 ms. The
 reviewer's Lighthouse run happens on the commit that closes R1, which also shrinks what is
 hydrated, and is recorded under "Reviewer's run" in the RESULT file.
+
+### Review 2: planner, 2026-11-04, at `61b5aa26`
+
+**Re-run by the reviewer:**
+- **Site,** from a clean `git archive` with a fresh install: lint 0; typecheck 0; 46 pass,
+  0 fail; build 0; `bun run size` 0, at 181.2 KB on both pages.
+- A build with no URL set stops with `SiteUrlError`. The pages are `lang="en"` and `lang="id"`.
+- **Lighthouse,** three runs per locale: recorded in `WEB-5-RESULT.md` under "Reviewer's run 1".
+
+**R1–R4: closed.**
+- **R1:** 181.2 KB.
+  - The failed-chunk and reduced-motion conditions are met as the commit describes.
+  - No reveal sits in the hero, so the switch to `motion-ready` after load cannot flash the
+    first screen.
+- **R2:** label in name passes in all six runs.
+- **R3:** the `SoftwareSourceCode` node, with its test.
+- **R4:** the 360×740 screenshot, EN and ID, shows the headline clear of the bar.
+
+**Decision (planner): `framer-motion` 14.9.1 replaces `motion` ^14.9.0 in D1. Accepted.**
+- It is the React package that `motion/react` re-exports, at the same version, from the same
+  maintainers, so there is no new vendor and no API change.
+- The measured reason: the `motion/react` wrapper keeps the full `motion` component.
+- D1 is read with this substitution, and the exact pin stays.
+
+**New finding:**
+- **R5 SHOULD-FIX (before owner QA): the section files are client components, against D5.**
+  - D5: "Sections that only render text are server components. Motion and scroll pieces are
+    client leaves." All nine `components/home/*-section.tsx` files except `open-section` start
+    with `"use client"`.
+  - The reviewer's runs put the EN TBT median at 225 ms against 200 ms. The longest task is
+    react-dom's hydration in every run (234 ms in EN 3).
+  - Ask:
+    - move `"use client"` down to the leaves that need it (`Reveal`, the scroll-driven pieces,
+      the tilt cards, the role toggle, the chat illustration), so headings, lead text, lists and
+      captions render on the server and are not hydrated as client components;
+    - no visual change (D6);
+    - re-take the T5 screenshot set;
+    - run Lighthouse three times per locale and add the medians to the RESULT file as a dated
+      update.
+  - If the EN median is still over 200 ms after the split, write the number and the remaining
+    long tasks. The owner then decides; the target is not lowered.

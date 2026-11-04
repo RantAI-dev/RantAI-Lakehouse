@@ -130,5 +130,42 @@ run on the R1 commit is the measurement for TBT.
 
 ## Reviewer's run
 
-To be filled by the reviewer on the final commit (D5): same command, three
-runs per locale, medians.
+### Reviewer's run 1: `61b5aa26` (after review fixes R1–R4)
+
+- **Build:** a clean `git archive` of `61b5aa26` into a scratch folder, a fresh
+  `bun install --frozen-lockfile`, `NEXT_PUBLIC_SITE_URL=https://example.invalid bun run build`,
+  and `out/` served by `npx serve@14.2.4`.
+- **Lighthouse:** the same command as above (13.6.0, mobile, simulated throttling, headless
+  Chrome 148). Three runs per locale, 2026-11-04 around 16:25 local.
+- **Load:** the VM's load average was 4.9 to 7.5 during the runs, lower than the developer's
+  (11.7 to 14.4). `benchmarkIndex` was 1587 to 1626.
+- **Size:** `bun run size` gives 181.2 KB on both pages (OK), with the scene at 146.8 KB in one
+  deferred chunk.
+
+| Metric | Target | EN `/` | ID `/id/` | Met |
+| --- | --- | --- | --- | --- |
+| Largest Contentful Paint | ≤ 2.5 s | 1.07 s | 1.07 s | Yes |
+| Cumulative Layout Shift | ≤ 0.1 | 0 | 0 | Yes |
+| Total Blocking Time | ≤ 200 ms | **225 ms** | 199 ms | **EN no**, ID yes |
+| Lighthouse SEO | 100 | 100 | 100 | Yes |
+| Lighthouse Accessibility | ≥ 95 | 100 | 100 | Yes |
+| JS before the 3D scene (gzip) | ≤ 200 KB | 181.2 KB | 181.2 KB | Yes |
+| Performance (recorded) | — | 96 | 97 | — |
+
+| Run | Perf | A11y | SEO | BP | LCP | CLS | TBT | FCP | Speed Index | benchmarkIndex |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| EN 1 | 95 | 100 | 100 | 100 | 1.07 s | 0 | 252 ms | 1.07 s | 2.40 s | 1619 |
+| EN 2 | 96 | 100 | 100 | 100 | 1.08 s | 0 | 210 ms | 1.08 s | 2.37 s | 1625 |
+| EN 3 | 96 | 100 | 100 | 100 | 1.07 s | 0 | 225 ms | 1.07 s | 1.07 s | 1606.5 |
+| ID 1 | 97 | 100 | 100 | 100 | 1.07 s | 0 | 199 ms | 1.07 s | 2.56 s | 1587 |
+| ID 2 | 95 | 100 | 100 | 100 | 1.07 s | 0 | 244 ms | 1.07 s | 2.17 s | 1610.5 |
+| ID 3 | 97 | 100 | 100 | 100 | 1.07 s | 0 | 197 ms | 1.07 s | 2.38 s | 1626 |
+
+- `label-content-name-mismatch` passes in every run (R2).
+- **TBT** is now within 197–252 ms on every run, against 206–1642 ms before. The EN median is
+  still over the target by 25 ms.
+- The longest task in every run is hydration in react-dom's chunk (`3wbm…`, 234 ms in EN 3). In
+  ID 1 it is the App Router chunk (`3--x…`, 212 ms).
+- Every home section file is a client component, while D5 says sections that only render text
+  are server components with client leaves. Review 2 finding R5 asks for that split and a
+  re-measure.
