@@ -13,14 +13,21 @@ const FLOOR = 100;
 /**
  * WEB-5 D14 S3: where the visitor is in the dive, the whole way down and
  * back up.
- * - Desktop: a thin scale on the left edge, 0 m at the top and the deepest
+ * - Wide screens (1360 px and up): a thin scale on the left edge, 0 m at the top and the deepest
  *   point at the bottom, with a tick for each chapter, a marker and the
  *   reading in metres. Inside the depths section it hides, because that
  *   section's own gauge stands in the same place with the slabs' labels,
  *   and the readings are the same.
- * - Phone: a hairline under the top bar whose fill is the depth, with the
- *   reading at its right end. It does not crowd a 360 px bar, which is
- *   already full with the wordmark, the language switch and the button.
+ * - Narrower screens, phones included: a hairline under the top bar whose
+ *   fill is the depth, with the reading at its right end. It does not crowd
+ *   a 360 px bar, which is already full with the wordmark, the language
+ *   switch and the button.
+ * - WEB-5 review fix R8 (BLOCKER): the scale used to start at `md` (768 px)
+ *   and covered the sections' text up to about 1280 px. Its reading ends at
+ *   x 92 px, and the 1120 px column's text starts at x 97 at 1280 and x 137
+ *   at 1360 (measured), so the scale starts at 1360 px. There its reading
+ *   clears the text by 44 px, at least 37 px even for "−100 m"; the review
+ *   asks for 24.
  *
  * The values are written through refs from a passive, rAF-throttled scroll
  * listener (no React state per scroll event, D5). Under reduced motion the
@@ -107,8 +114,8 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
 
   return (
     <div ref={rootRef} aria-hidden="true" className="lk-gauge pointer-events-none">
-      {/* Desktop: the scale on the left edge. */}
-      <div className="lk-gauge-scale fixed top-[18%] bottom-[14%] left-8 z-40 hidden w-28 md:block">
+      {/* Wide screens: the scale on the left edge (R8: from 1360 px). */}
+      <div className="lk-gauge-scale fixed top-[18%] bottom-[14%] left-8 z-40 hidden w-28 min-[1360px]:block">
         <span className="absolute top-0 left-[7px] h-full w-px bg-gradient-to-b from-[#E8F4FF]/45 via-[#E8F4FF]/25 to-[#E8F4FF]/10" />
         {TICKS.map((d) => (
           <span
@@ -127,8 +134,8 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
           </span>
         </span>
       </div>
-      {/* Phone: a hairline under the top bar, with the reading at its end. */}
-      <div className="fixed inset-x-0 top-16 z-40 h-4 md:hidden">
+      {/* Below 1360 px: a hairline under the top bar, with the reading at its end. */}
+      <div className="lk-gauge-line fixed inset-x-0 top-16 z-40 h-4 min-[1360px]:hidden">
         <span className="absolute inset-x-0 top-0 h-px bg-[#E8F4FF]/10" />
         <span className="lk-gauge-fill absolute top-0 left-0 h-px w-full origin-left bg-[#44A6FA]/80" />
         <span ref={phoneReadingRef} className="absolute top-1 right-4 text-[10px] font-medium tracking-[0.12em] text-[#E8F4FF]/70 tabular-nums">
