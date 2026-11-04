@@ -325,3 +325,27 @@ Measured on `85187993` (D14 S1–S5), interleaved against the R7 commit
   time.
 - Review 3 finding R6 tries the developer's suggestion: draw the two static tiles as images, to
   cut the elements React hydrates.
+
+### Reviewer's run 3: `1e5b0bf1` (D14 and R8–R11) against `6b1566c9` (R7), interleaved
+
+- **Conditions:**
+  - both builds come from a clean `git archive`, are served side by side, and are run in turn: R7 EN, final EN, R7 ID, final ID, for three rounds;
+  - the Lighthouse command is the same as in "What was measured";
+  - the load average was 4.0 to 6.6.
+- **No GPU:** this VM has none, so these runs measure the page without the 3D scene, as every earlier run did. The 220 vh live hero and the waterline are not part of any number here.
+
+| Build | EN TBT runs | EN median | ID TBT runs | ID median |
+| --- | --- | --- | --- | --- |
+| `6b1566c9` (R7) | 187.0, 95.0, 150.7 ms | **150.7 ms** | 108.8, 103.0, 121.1 ms | **108.8 ms** |
+| `1e5b0bf1` (final) | 108.2, 163.6, 165.1 ms | **163.6 ms** | 200.3, 136.6, 131.8 ms | **136.6 ms** |
+
+- **Every other metric held in all twelve runs:**
+  - LCP 1.06–1.07 s;
+  - CLS 0;
+  - accessibility, SEO and best practices 100;
+  - performance 97–99.
+- **Initial JS:** 181.5 KB at `1e5b0bf1`, against 178.5 KB at R7. The budget is 200 KB.
+- **Reading:** every target is met on the final commit.
+  - The final build's TBT medians are 13 ms (EN) and 28 ms (ID) above R7. Both differences are smaller than the spread of R7's own runs, which is 95–187 ms.
+  - One final ID run reached 200.3 ms. The median is 136.6 ms.
+  - So this is no regression that can be measured on this VM. It is no gain either.

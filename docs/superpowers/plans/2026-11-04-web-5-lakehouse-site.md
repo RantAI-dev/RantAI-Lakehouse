@@ -1259,6 +1259,31 @@ This changes D6 for one thing: type.
 
 **Open: R11 (SHOULD-FIX).** After that: Lighthouse interleaved against R7 on the final commit, owner QA, CI, then the PR marked ready.
 
+### Review 7: planner, 2026-11-04, at `1e5b0bf1` (R11)
+
+**What the reviewer re-ran** (clean `git archive`, fresh install):
+- lint 0, typecheck 0;
+- tests: 65 pass, 0 fail;
+- the build exits 0;
+- `bun run size` exits 0: initial JS is 181.5 KB for EN and for ID, and the override is not in the export.
+
+**R11: closed.**
+- **Deep links land on their section.** On the reviewer's run, 8 s after load, each section's top sits at y 64, which is the top bar's height:
+  - at 1440×900: `/#governance`, `/#open` and `/id/#open`;
+  - at 390×844: `/#governance` and `/id/#open`.
+- **How:** `landOnHash` runs once per load, only for a `section`, and only when there has been no wheel, touch, key or pointer input since hydration.
+- **Not verified:**
+  - Input before hydration is not seen, as Handoff 8 says. A visitor who scrolls that early can be moved to the section once. This is accepted, because it happens only on a deep link and lands where that link points.
+  - Safari and Firefox were not tested.
+
+**Lighthouse** ("Reviewer's run 3" in `WEB-5-RESULT.md`, interleaved against R7):
+- TBT medians: EN 163.6 ms, ID 136.6 ms;
+- LCP about 1.07 s, CLS 0;
+- accessibility, SEO and best practices 100 in all twelve runs;
+- every spec target is met. The difference from R7 is within the run-to-run spread.
+
+**No open finding.** Next: the owner's QA on this build (served on :3400), then CI green, Dependency review included, then the PR marked ready.
+
 ## 9. Addendum: the story, top to bottom (owner, 2026-11-04)
 
 The owner's QA asked:
