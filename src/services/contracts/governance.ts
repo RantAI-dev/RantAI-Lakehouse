@@ -19,6 +19,13 @@ export type Policy = {
   version: number
   owner: string
   updatedAt: string
+  // Whether the policy engine can enforce this row (SEC-61): true only when
+  // its `conditions` parse into the structured clause the read-time engine
+  // applies (roles, a table, and a mask or row filter). Required — every
+  // policy response carries it. Independent of `status`: a `ready` policy
+  // with `enforceable: false` masks nothing and filters no rows, so the
+  // console shows it as "Not enforced", not "Enforced".
+  enforceable: boolean
   // Raw, still-unparsed `conditions` JSON string (WS7 item A2). Absent for
   // a legacy policy authored before conditions were structured. A legacy
   // value may be free-text prose rather than JSON — never assume it parses
