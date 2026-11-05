@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 pub use crate::saved_query_access::SavedQueryViewer;
 use crate::saved_query_access::{
-    AccessGrant, AccessTarget, FolderMap, FolderNode, Level, crosses_space, ensure_personal_space,
+    AccessGrant, AccessTarget, FolderMap, FolderNode, Level, ensure_personal_space,
     escape_like_pattern, grants_for_viewer, list_folders, resolve_level,
 };
 use crate::{PgPool, StoreError};
@@ -647,7 +647,8 @@ pub enum FolderMove {
 /// Change a saved query.
 ///
 /// The caller must hold **edit** on the query: `edit` changes the SQL,
-/// the title, the tags and the folder, `view` may do neither. A caller
+/// the title and the tags, `view` may do neither. A move to another folder
+/// (or to the root) needs **manage**. A caller
 /// that may not change the row finds no row at all, so the answer never
 /// says whether it exists.
 ///
@@ -660,8 +661,8 @@ pub enum FolderMove {
 /// Returns [`StoreError::NotFound`] when the caller may not change the
 /// query, and when the folder a move names belongs to another tenant than
 /// the query's — an unseen folder; [`StoreError::NotAllowed`] when the
-/// move would change the query's space and the caller does not manage the
-/// query; and [`StoreError::Database`] if a query fails.
+/// patch moves the query to a folder other than the one it is in and the
+/// caller does not manage the query; and [`StoreError::Database`] if a query fails.
 pub async fn update_saved_query(
     pool: &PgPool,
     viewer: &SavedQueryViewer,
@@ -690,28 +691,32 @@ pub async fn update_saved_query(
     let sql = patch.sql.as_deref().unwrap_or(&row.sql);
     let tags = patch.tags.as_deref().unwrap_or(&row.tags);
     // A named move is re-checked here, before any write, the way the
-    // edit level above is (`QS-3` review finding 1): the folder a query
-    // moves into belongs to the query's own tenant, and a move whose
-    // target space differs from the query's space needs manage, so an
-    // edit grantee can neither publish a private query to the
-    // organisation nor hide a shared one in a personal space.
+    // edit level above is (`QS-3` review of #382): the folder a query moves into
+    // belongs to the query's own tenant, and a move needs manage on the
+    // query, wherever it goes. Edit changes what the query says; manage
+    // also decides who sees it, so an edit holder can neither publish a
+    // private query, hide a shared one, nor raise edit to manage by moving
+    // the query into a folder of their own.
     let moved = patch.folder.map(|move_to| match move_to {
         FolderMove::Into(folder_id) => Some(folder_id),
         FolderMove::Root => None,
     });
     if let Some(target) = moved {
-        // The same tenant limiting `move_folder` applies to a folder's
-        // new parent: only the row's own tenant's folders are reachable,
-        // so a folder of another tenant is an unseen folder.
+        // The same tenant limiting a folder's new parent gets: only the
+        // row's own tenant's folders are reachable, so a folder of another
+        // tenant is an unseen folder.
         let folders = list_folders(pool, row.tenant_id).await?;
         if let Some(folder_id) = target
             && !folders.iter().any(|folder| folder.id == folder_id)
         {
             return Err(StoreError::NotFound);
         }
-        // The refusal is the store's own fixed sentence, mapped to 403 —
-        // never a 404, which would say the query is not there at all.
-        if crosses_space(&folders, row.folder_id, target) && level < Level::Manage {
+        // A patch that names the folder the query is already in is not a
+        // move, so an editor who renames with the folder sent again is
+        // not refused. The refusal is the store's own fixed sentence,
+        // mapped to 403 — never a 404, which would say the query is not
+        // there at all.
+        if target != row.folder_id && level < Level::Manage {
             return Err(StoreError::NotAllowed);
         }
     }
