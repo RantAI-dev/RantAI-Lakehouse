@@ -386,7 +386,7 @@ keep it there rather than inside components.
 
 Code that changes behaviour changes these in the same commit:
 
-- `README.md` config table: `| Variable | Purpose | Default | Required? |`,
+- `docs/CONFIGURATION.md` config table (moved from `README.md`, 2026-11-05): `| Variable | Purpose | Default | Required? |`,
   purpose cell cites the ADR/finding.
 - `.env.example`: a comment block per variable — what it configures, which
   phase introduced it, cross-refs. Placeholder secrets are the sentinel
@@ -489,4 +489,4 @@ gitleaks git --log-opts="<base>..HEAD" --config .gitleaks.toml --redact
 
 Then read your own diff once as the reviewer will: every new comment true,
 every new error path classified, every new route in `POLICY_TABLE`, every new
-env var in README and `.env.example`, every number traceable.
+env var in `docs/CONFIGURATION.md` and `.env.example`, every number traceable.

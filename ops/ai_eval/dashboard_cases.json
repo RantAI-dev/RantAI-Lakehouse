@@ -321,7 +321,7 @@
     "modes": ["ask", "build"],
     "confirm": true,
     "turns": [
-      "Make a chart of events per year.",
+      "Make a bar chart of events per year.",
       "Go ahead."
     ],
     "expect_state": [
@@ -616,6 +616,26 @@
     "expect_state": [
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "histogram", "def.histogram.count": 20}, "count": 1}
     ]
+  },
+  {
+    "id": "chart_top_n_claimed",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Make a bar chart of foreign visitors by country, top 5 countries only."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "bar", "dimension": "negara", "limit": 5}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "bar", "def.dimension": "negara", "def.limit": 5}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_bin_text_column_asks",
+    "mode": "build",
+    "turns": ["Group the entry point column (pintu_masuk) into bins of 500 and chart foreign visitors for each bin."],
+    "expect_no_tool": ["create_chart"],
+    "facts": [
+      {"label": "ask or refusal", "kind": "text", "values": ["cannot be binned"], "aliases": {"cannot be binned": ["can't be binned", "can\u2019t be binned", "not be binned", "number column", "numeric", "text column", "not a number", "not numbers", "which number", "which column"]}}
+    ],
+    "forbid": ["(?<!be )(?<!not )(?<!n't )(?<!n\u2019t )\\b(binned|grouped|bucketed)\\b[^.?!]{0,30}?\\b(in|into)\\s+(bins|bands|ranges|buckets|groups)\\s+of\\s+500"]
   },
   {
     "id": "chart_bullet_target",
