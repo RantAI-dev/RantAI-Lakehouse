@@ -128,6 +128,22 @@ bootstrap admin account you configured via `AUTH_BOOTSTRAP_EMAIL` /
 no admin account is created and you'll need to seed one directly in
 Postgres.
 
+Some features are off until you set them up. For example, to switch on
+dashboard PDF export (and PDF attachments in scheduled reports), add these
+to `.env` and restart the API and the renderer:
+
+```bash
+CONSOLE_INTERNAL_URL=http://console:3000   # the console as the PDF renderer reaches it
+RENDER_TOKEN_SECRET=...                    # already filled in by sh ops/init-env.sh
+docker compose up -d lakehouse-api gotenberg
+```
+
+Scheduled report emails also need `SMTP_HOST` and `CONSOLE_PUBLIC_URL`.
+Excel, CSV and PNG downloads need nothing. The full list (AI chat, the
+orchestrator, email, embeds, PDFs, single sign-on) is in
+[docs/OPERATIONS.md](docs/OPERATIONS.md), "Features unavailable in the local
+stack".
+
 See [docs/OPERATIONS.md](docs/OPERATIONS.md) for what's in/out of the
 compose stack, what `/health` actually checks, the Lakehouse backup and restore
 procedure, and the biggest operational trap in this codebase (Postgres
@@ -238,6 +254,10 @@ guessed.
 | `AI_RELEVANT_TABLES` | Relevant-tables switch: the copilot's data map writes in full only the tables a question names and the other tables on one line each. `false` turns it off; `true`, empty or unset leaves it on; any other value fails startup | on | No |
 | `EMBED_SECRET` | HMAC signing secret for signed dashboard embeds. The only source: none is generated or stored. Unset or empty: signed embedding is unavailable and says so | unset (signed embedding unavailable) | No |
 | `EMBED_TOKEN_MAX_LIFETIME_SECONDS` | Longest `exp - iat` of a signed embed token, in seconds; a token must carry `exp` and `iat`. A value that is not a positive whole number fails startup | `86400` | No |
+| `GOTENBERG_URL` | Address of the Gotenberg container that makes dashboard PDFs (`BI-1`). Compose sets it to the `gotenberg` service, which has no published port | unset (`http://gotenberg:3000` in compose) | No, but PDF export is off without it |
+| `CONSOLE_INTERNAL_URL` | The console as the PDF renderer reaches it on the compose network, `http://console:3000` in this stack. It is also the only address the renderer may open. Unset or empty: the PDF item says "PDF export is not set up on this deployment" and the browser's print stays | unset | No, but PDF export is off without it (`REL-18` makes it the default) |
+| `RENDER_TOKEN_SECRET` | Server-only key of the 2-minute token the PDF print view reads with. Its own secret, never `EMBED_SECRET`. `sh ops/init-env.sh` generates one | unset (PDF export off) | No, but PDF export is off without it |
+| `CONSOLE_PUBLIC_URL` | The console's address as people open it; a scheduled report's email links to `<this>/dashboards/<id>` (`RPT-1`). Reports are sent only when `SMTP_HOST` is set | unset (the email has no link) | No |
 | `ALERTS_RUN_TOKEN` | Shared bearer token required to call `POST /api/alerts/run`; when set, also seeds the scope-less `alerts-run-scheduler` service identity Dagster's `alerts_run_schedule` authenticates as | unset | No, but unset means the endpoint replies 503 to anyone except an authenticated service-identity principal (not 401) — see Security notes below |
 | `LAKEHOUSE_MAINTENANCE_TOKEN` | Shared bearer token Dagster's maintenance job uses to authenticate against `GET /api/lakehouse/maintenance-policies`; when set, also seeds the scope-less `lakehouse-maintenance-policy-reader` service identity from it | unset | No, but unset means the API seeds no service identity and the maintenance job's policy fetch fails visibly with 401 |
 | `INGEST_SERVICE_TOKEN` | Shared bearer token Dagster's ingest schedule factory uses to authenticate against `GET /api/connectors/ingestible` and a CDC connector's `dial`; when set, also seeds an `ingest-run-service` identity scoped to `ingest:read` ONLY (never `connector:manage`) from it | unset | No, but unset means the API seeds no service identity and the ingest schedule factory's connector fetch fails visibly with 401 |
