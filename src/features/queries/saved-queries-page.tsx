@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { Trash2Icon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSkeleton } from "@/components/data-table/data-table-skeleton"
@@ -24,8 +25,21 @@ import { queryService } from "@/services"
 import type { SavedQuery } from "@/services/contracts/queries"
 import { QueryStudioTabs } from "./query-studio-tabs"
 import { SavedQueryFolderTree } from "./saved-query-folder-tree"
+import { SavedQueryHistoryDialog } from "./saved-query-history-dialog"
+import { SavedQueryMoveDialog } from "./saved-query-move-dialog"
 import { SavedQueryRenameDialog } from "./saved-query-rename-dialog"
+import { SavedQueryTrashDialog } from "./saved-query-trash-dialog"
 import { getSavedQueryColumns, TagPills } from "./saved-query-columns"
+
+/**
+ * The level the caller holds on the trash.
+ *
+ * The server's trash holds only the queries the caller may edit — the same
+ * set that may delete and restore one (plan 55 D5, decision 6) — so the
+ * console shows a Restore for what the server sent and does not filter the
+ * list again (C2).
+ */
+const TRASH_LEVEL = "edit"
 
 function SavedQueryDrawerContent({ query }: { readonly query: SavedQuery }) {
   return (
@@ -70,7 +84,10 @@ export function SavedQueriesPage() {
   const scheduling = useService((s) => queryService.getSchedulingCapability(s), [])
   const [selected, setSelected] = React.useState<SavedQuery | null>(null)
   const [renaming, setRenaming] = React.useState<SavedQuery | null>(null)
+  const [moving, setMoving] = React.useState<SavedQuery | null>(null)
+  const [historyFor, setHistoryFor] = React.useState<SavedQuery | null>(null)
   const [deleting, setDeleting] = React.useState<SavedQuery | null>(null)
+  const [trashOpen, setTrashOpen] = React.useState(false)
 
   const duplicateAct = useServiceAction((signal, id: string) =>
     queryService.duplicateSaved(id, signal),
@@ -78,12 +95,19 @@ export function SavedQueriesPage() {
   const renameAct = useServiceAction((signal, id: string, title: string) =>
     queryService.updateSaved(id, { title }, signal),
   )
+  // A move writes the folder the query lands in: `null` is the shared
+  // space, an id is that folder. The server refuses a move across a
+  // personal space below manage, and says so in its own sentence.
+  const moveAct = useServiceAction((signal, id: string, folderId: string | null) =>
+    queryService.updateSaved(id, { folderId }, signal),
+  )
   const deleteAct = useServiceAction((signal, id: string) =>
     queryService.deleteSaved(id, signal).then(() => true),
   )
   // The action runners and the reload never change identity, so the columns
   // below are built once and not on every render.
   const { run: runDuplicate } = duplicateAct
+  const { run: runMove, reset: resetMove } = moveAct
   const { run: runDelete } = deleteAct
   const { reload } = state
 
@@ -97,9 +121,14 @@ export function SavedQueriesPage() {
           })
         },
         onRename: (query) => setRenaming(query),
+        onMove: (query) => {
+          resetMove()
+          setMoving(query)
+        },
+        onHistory: (query) => setHistoryFor(query),
         onDelete: (query) => setDeleting(query),
       }),
-    [runDuplicate, reload],
+    [runDuplicate, reload, resetMove],
   )
 
   const rawData = React.useMemo(() => state.data ?? [], [state.data])
@@ -144,9 +173,19 @@ export function SavedQueriesPage() {
         title="Saved Queries"
         description="Reusable SQL shared with the team, with owners and tags."
         actions={
-          <Button size="sm" render={<Link href="/query-studio" />}>
-            New query
-          </Button>
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setTrashOpen(true)}
+            >
+              <Trash2Icon data-icon="inline-start" />
+              Trash
+            </Button>
+            <Button size="sm" render={<Link href="/query-studio" />}>
+              New query
+            </Button>
+          </>
         }
       />
       <QueryStudioTabs />
@@ -274,6 +313,43 @@ export function SavedQueriesPage() {
             </p>
           ) : null}
         </ConfirmActionDialog>
+      ) : null}
+      {moving ? (
+        <SavedQueryMoveDialog
+          key={moving.id}
+          folders={folders.data ?? []}
+          subject={moving.title}
+          currentFolderId={moving.folderId}
+          onClose={() => setMoving(null)}
+          onMove={(target) => {
+            void runMove(moving.id, target).then((done) => {
+              if (done) {
+                setMoving(null)
+                state.reload()
+              }
+            })
+          }}
+          busy={moveAct.status === "pending"}
+          error={moveAct.error?.message ?? null}
+        />
+      ) : null}
+      {historyFor ? (
+        <SavedQueryHistoryDialog
+          key={historyFor.id}
+          queryId={historyFor.id}
+          title={historyFor.title}
+          level={historyFor.level}
+          onClose={() => setHistoryFor(null)}
+          onReverted={() => state.reload()}
+        />
+      ) : null}
+      {trashOpen ? (
+        <SavedQueryTrashDialog
+          folders={folders.data ?? []}
+          level={TRASH_LEVEL}
+          onClose={() => setTrashOpen(false)}
+          onRestored={() => state.reload()}
+        />
       ) : null}
     </div>
   )

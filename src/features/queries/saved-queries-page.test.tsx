@@ -413,4 +413,181 @@ describe("the saved-queries console", () => {
       await screen.findByText("You do not have permission to change this folder."),
     ).toBeDefined()
   })
+
+  it("offers the move to an editor and not to a viewer", async () => {
+    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+
+    expect(await screen.findByRole("menuitem", { name: "Move" })).toBeDefined()
+  })
+
+  it("keeps the move away from a viewer, and offers the history to everybody", async () => {
+    stubServices([saved({ id: "q1", title: "Revenue", level: "view" })])
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Revenue" }))
+
+    // Seeing the history is part of seeing the query (C2).
+    expect(await screen.findByRole("menuitem", { name: "History" })).toBeDefined()
+    expect(menuItems("Move")).toBe(0)
+  })
+
+  it("moves a query into the shared space", async () => {
+    stubServices([
+      saved({ id: "q2", title: "Costs", level: "edit", folderId: "team" }),
+    ])
+    const update = spyOn(queryService, "updateSaved").mockResolvedValue(
+      saved({ id: "q2", title: "Costs", level: "edit", folderId: null }),
+    )
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+    fireEvent.change(await screen.findByLabelText("Target folder"), {
+      target: { value: "" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Move" }))
+
+    await waitFor(() => {
+      expect(update.mock.calls.at(-1)?.[0]).toBe("q2")
+      // `null` is the shared space: the server reads it apart from an
+      // absent field.
+      expect(update.mock.calls.at(-1)?.[1]).toEqual({ folderId: null })
+    })
+  })
+
+  it("moves a query into a folder", async () => {
+    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+    const update = spyOn(queryService, "updateSaved").mockResolvedValue(
+      saved({ id: "q2", title: "Costs", level: "edit", folderId: "team" }),
+    )
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+    fireEvent.change(await screen.findByLabelText("Target folder"), {
+      target: { value: "team" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Move" }))
+
+    await waitFor(() => {
+      expect(update.mock.calls.at(-1)?.[0]).toBe("q2")
+      expect(update.mock.calls.at(-1)?.[1]).toEqual({ folderId: "team" })
+    })
+  })
+
+  it("shows the server's sentence when a move across a personal space is refused", async () => {
+    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+    spyOn(queryService, "updateSaved").mockRejectedValue(
+      new ServiceError(
+        "permission_denied",
+        "permission_denied: Only someone who manages this can move it into or out of a personal space.",
+      ),
+    )
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+    fireEvent.change(await screen.findByLabelText("Target folder"), {
+      target: { value: "personal-1" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Move" }))
+
+    // The console does not guess the rule and does not block the move
+    // before the server answers: it shows the sentence the server sent (C6).
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Only someone who manages this can move it into or out of a personal space.",
+    )
+  })
+
+  it("forgets the last refusal when the move dialog opens again", async () => {
+    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+    spyOn(queryService, "updateSaved").mockRejectedValue(
+      new ServiceError(
+        "permission_denied",
+        "permission_denied: Only someone who manages this can move it into or out of a personal space.",
+      ),
+    )
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+    fireEvent.change(await screen.findByLabelText("Target folder"), {
+      target: { value: "personal-1" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Move" }))
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Only someone who manages this can move it into or out of a personal space.",
+    )
+
+    // The person closes the dialog and comes back to it: the refusal of
+    // the last attempt is gone, so it is not read as the answer to this
+    // one.
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+
+    expect(screen.queryAllByRole("alert").length).toBe(0)
+  })
+
+  it("moves a folder under another folder", async () => {
+    stubServices()
+    const update = spyOn(queryService, "updateFolder").mockResolvedValue(FOLDERS[1])
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+    fireEvent.change(await screen.findByLabelText("Target folder"), {
+      target: { value: "quarterly" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Move" }))
+
+    await waitFor(() => {
+      expect(update.mock.calls.at(-1)?.[0]).toBe("team")
+      expect(update.mock.calls.at(-1)?.[1]).toEqual({ parentId: "quarterly" })
+    })
+  })
+
+  it("moves a folder into the shared space", async () => {
+    stubServices()
+    const update = spyOn(queryService, "updateFolder").mockResolvedValue(FOLDERS[1])
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+    fireEvent.change(await screen.findByLabelText("Target folder"), {
+      target: { value: "" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Move" }))
+
+    await waitFor(() => {
+      expect(update.mock.calls.at(-1)?.[0]).toBe("team")
+      expect(update.mock.calls.at(-1)?.[1]).toEqual({ parentId: null })
+    })
+  })
+
+  it("never offers the personal space a move", async () => {
+    stubServices()
+    renderPage()
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Actions for Personal space (only you)" }),
+    )
+
+    // A personal space is one person's own space: it is never moved.
+    expect(await screen.findByRole("menuitem", { name: "New folder" })).toBeDefined()
+    expect(menuItems("Move")).toBe(0)
+  })
+
+  it("opens the trash from the list", async () => {
+    stubServices()
+    spyOn(queryService, "listSavedTrash").mockResolvedValue([])
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Trash" }))
+
+    expect(await screen.findByText("The trash is empty.")).toBeDefined()
+  })
 })

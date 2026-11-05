@@ -10,6 +10,8 @@ import {
   EllipsisIcon,
   ExternalLinkIcon,
   EyeIcon,
+  FolderInputIcon,
+  HistoryIcon,
   PencilIcon,
   Trash2Icon,
 } from "lucide-react"
@@ -33,13 +35,16 @@ import type { SavedQuery } from "@/services/contracts/queries"
  *
  * The menu offers what the caller may do with the query, and the level the
  * server sends with the row decides that (`QS-3` C2): a viewer may open,
- * copy and duplicate it, and an editor may also rename it and take it to
- * the trash. The server refuses the rest, so the console does not offer it.
+ * copy and duplicate it and read its history, and an editor may also rename
+ * it, move it and take it to the trash. The server refuses the rest, so the
+ * console does not offer it.
  */
 export type SavedQueryRowActions = {
   readonly onInspect: (query: SavedQuery) => void
   readonly onDuplicate: (query: SavedQuery) => void
   readonly onRename: (query: SavedQuery) => void
+  readonly onMove: (query: SavedQuery) => void
+  readonly onHistory: (query: SavedQuery) => void
   readonly onDelete: (query: SavedQuery) => void
 }
 
@@ -59,7 +64,7 @@ export function TagPills({ tags }: { readonly tags: readonly string[] }) {
 export function getSavedQueryColumns(
   actions: SavedQueryRowActions
 ): ColumnDef<SavedQuery>[] {
-  const { onInspect, onDuplicate, onRename, onDelete } = actions
+  const { onInspect, onDuplicate, onRename, onMove, onHistory, onDelete } = actions
 
   return [
     {
@@ -187,6 +192,12 @@ export function getSavedQueryColumns(
                   <CopyPlusIcon className="size-3.5" data-icon="inline-start" />
                   Duplicate
                 </DropdownMenuItem>
+                {/* Reading the history is part of reading the query, so it
+                    is offered to a viewer too (C2). */}
+                <DropdownMenuItem onClick={() => onHistory(query)}>
+                  <HistoryIcon className="size-3.5" data-icon="inline-start" />
+                  History
+                </DropdownMenuItem>
                 {/* Editing a query needs **edit**: the server refuses the
                     change below that level (C2). */}
                 {levelAtLeast(query.level, "edit") ? (
@@ -194,6 +205,10 @@ export function getSavedQueryColumns(
                     <DropdownMenuItem onClick={() => onRename(query)}>
                       <PencilIcon className="size-3.5" data-icon="inline-start" />
                       Rename
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => onMove(query)}>
+                      <FolderInputIcon className="size-3.5" data-icon="inline-start" />
+                      Move
                     </DropdownMenuItem>
                     <DropdownMenuItem variant="destructive" onClick={() => onDelete(query)}>
                       <Trash2Icon className="size-3.5" data-icon="inline-start" />

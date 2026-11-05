@@ -3,6 +3,7 @@
 import * as React from "react"
 import {
   FolderIcon,
+  FolderInputIcon,
   FolderPlusIcon,
   LockIcon,
   PencilIcon,
@@ -26,6 +27,7 @@ import {
   SavedQueryFolderNameDialog,
   type SavedQueryFolderNaming,
 } from "./saved-query-folder-dialogs"
+import { SavedQueryMoveDialog } from "./saved-query-move-dialog"
 import { buildSavedQueryTree, type SavedQueryTreeNode } from "./saved-query-tree"
 
 /**
@@ -59,6 +61,12 @@ export function SavedQueryFolderTree({
   const renameAct = useServiceAction((signal, id: string, name: string) =>
     queryService.updateFolder(id, { name }, signal),
   )
+  // A move writes the folder the folder lands in: `null` is the shared
+  // space, an id is that folder. The server refuses a move across a
+  // personal space below manage, and says so in its own sentence.
+  const moveAct = useServiceAction((signal, id: string, parentId: string | null) =>
+    queryService.updateFolder(id, { parentId }, signal),
+  )
   const deleteAct = useServiceAction((signal, id: string) =>
     queryService.deleteFolder(id, signal).then(() => true),
   )
@@ -66,7 +74,9 @@ export function SavedQueryFolderTree({
   // dialog; the delete has no dialog of its own, so it says it here. A
   // sentence said twice is a sentence nobody reads (C6).
   const error = deleteAct.error
+  const { run: runMove, reset: resetMove } = moveAct
   const [naming, setNaming] = React.useState<SavedQueryFolderNaming | null>(null)
+  const [moving, setMoving] = React.useState<QueryFolder | null>(null)
   const [deleting, setDeleting] = React.useState<QueryFolder | null>(null)
 
   async function create(name: string) {
@@ -96,8 +106,22 @@ export function SavedQueryFolderTree({
     }
   }
 
+  async function move(parentId: string | null) {
+    if (!moving) return
+    const done = await runMove(moving.id, parentId)
+    if (done) {
+      setMoving(null)
+      onChanged()
+    }
+  }
+
   const startRename = (folder: QueryFolder) =>
     setNaming({ mode: "rename", id: folder.id, current: folder.name })
+
+  const startMove = (folder: QueryFolder) => {
+    resetMove()
+    setMoving(folder)
+  }
 
   const startCreate = (parentId: string | null, place: string) =>
     setNaming({ mode: "create", parentId, place })
@@ -135,6 +159,7 @@ export function SavedQueryFolderTree({
               onSelect={onSelect}
               onCreate={startCreate}
               onRename={startRename}
+              onMove={startMove}
               onDelete={setDeleting}
             />
           ) : null}
@@ -144,6 +169,7 @@ export function SavedQueryFolderTree({
             onSelect={onSelect}
             onCreate={startCreate}
             onRename={startRename}
+            onMove={startMove}
             onDelete={setDeleting}
           />
         </ul>
@@ -189,6 +215,21 @@ export function SavedQueryFolderTree({
           onConfirm={() => void remove()}
         />
       ) : null}
+
+      {moving ? (
+        <SavedQueryMoveDialog
+          key={moving.id}
+          folders={folders}
+          subject={moving.name}
+          kind="folder"
+          currentFolderId={moving.parentId}
+          excludeId={moving.id}
+          onClose={() => setMoving(null)}
+          onMove={(target) => void move(target)}
+          busy={moveAct.status === "pending"}
+          error={moveAct.error?.message ?? null}
+        />
+      ) : null}
     </div>
   )
 }
@@ -206,6 +247,7 @@ function FolderTreeNode({
   onSelect,
   onCreate,
   onRename,
+  onMove,
   onDelete,
 }: {
   readonly node: SavedQueryTreeNode
@@ -213,14 +255,15 @@ function FolderTreeNode({
   readonly onSelect: (folder: string | undefined) => void
   readonly onCreate: (parentId: string | null, place: string) => void
   readonly onRename: (folder: QueryFolder) => void
+  readonly onMove: (folder: QueryFolder) => void
   readonly onDelete: (folder: QueryFolder) => void
 }) {
   const folder = node.record
   const isShared = node.id === "shared"
   // Filling a folder needs **edit**; deleting one needs **manage**. A
-  // personal space is never renamed or deleted (C2).
+  // personal space is never renamed, moved or deleted (C2).
   const mayFill = !isShared && levelAtLeast(node.level, "edit")
-  const mayRename = mayFill && !node.isPersonal
+  const mayChange = mayFill && !node.isPersonal
   const mayDelete = !isShared && levelAtLeast(node.level, "manage") && !node.isPersonal
   const mayNest = node.depth < MAX_FOLDER_DEPTH
 
@@ -241,7 +284,7 @@ function FolderTreeNode({
           )}
           <span className="truncate">{node.label}</span>
         </button>
-        {mayFill || mayRename || mayDelete ? (
+        {mayFill || mayChange || mayDelete ? (
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
@@ -269,11 +312,17 @@ function FolderTreeNode({
                   {node.isPersonal ? "New folder" : "New subfolder"}
                 </DropdownMenuItem>
               ) : null}
-              {mayRename && folder ? (
-                <DropdownMenuItem onClick={() => onRename(folder)}>
-                  <PencilIcon className="size-3.5" data-icon="inline-start" />
-                  Rename
-                </DropdownMenuItem>
+              {mayChange && folder ? (
+                <>
+                  <DropdownMenuItem onClick={() => onRename(folder)}>
+                    <PencilIcon className="size-3.5" data-icon="inline-start" />
+                    Rename
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onMove(folder)}>
+                    <FolderInputIcon className="size-3.5" data-icon="inline-start" />
+                    Move
+                  </DropdownMenuItem>
+                </>
               ) : null}
               {mayDelete && folder ? (
                 <DropdownMenuItem
@@ -298,6 +347,7 @@ function FolderTreeNode({
               onSelect={onSelect}
               onCreate={onCreate}
               onRename={onRename}
+              onMove={onMove}
               onDelete={onDelete}
             />
           ))}
