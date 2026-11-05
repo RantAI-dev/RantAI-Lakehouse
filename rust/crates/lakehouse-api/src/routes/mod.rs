@@ -1336,10 +1336,10 @@ pub fn router(state: AppState) -> Router {
         )
         // QS-3: the saved-query surface. Every route is `query:read` at
         // the gate; the level the caller holds on the item (view, edit or
-        // manage) is checked in the handler, so a route that changes
-        // something needs `edit` and a route that shares, deletes or
-        // restores needs `manage`. An item the caller may not see is a
-        // 404, never a 403 (no existence leak).
+        // manage) is checked in the handler. A route that moves or shares,
+        // or deletes a folder, needs `manage`; deleting or restoring a
+        // query needs `edit`. An item the caller may not see is a 404,
+        // never a 403 (no existence leak).
         .route(
             "/api/query/saved/{id}",
             get(saved_queries::get_saved)
