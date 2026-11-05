@@ -21,7 +21,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up};
+use common::{TestApp, session_cookie_for_seeded_user, session_cookie_for_user, spin_up};
 
 /// Meridian Group, the tenant the seeded Analyst and the seeded Data
 /// Scientist both act for.
@@ -40,6 +40,12 @@ const QUERY_FORBIDDEN: &str = "You do not have permission to change this saved q
 
 /// The sentence a caller that may not change a folder is told.
 const FOLDER_FORBIDDEN: &str = "You do not have permission to change this folder.";
+
+/// The sentence a move into or out of a personal space at a level below
+/// manage is refused with — the same sentence for a query and for a
+/// folder, so the two moves answer identically (`QS-3` review finding 1).
+const MOVE_ACROSS_SPACES_FORBIDDEN: &str =
+    "Only someone who manages this can move it into or out of a personal space.";
 
 /// The sentence a folder that still holds queries is refused with.
 const FOLDER_HOLDS_QUERIES: &str =
@@ -2146,6 +2152,117 @@ async fn personal_space_id(pool: &PgPool, owner: Uuid) -> String {
     id.to_string()
 }
 
+/// A third reader of the organisation: a plain colleague of the same
+/// tenant as the seeded cast, holding the Analyst role, with no rule of
+/// their own. The session cookie is returned.
+///
+/// The seed gives `query:read` to the Analyst and the Data Scientist
+/// only, and its only two holders in the cast's tenant are Rina and
+/// Reza — the two the move tests already cast — so the colleague who
+/// proves "the organisation still sees it" is written here. What hides
+/// a query or a folder from them is the personal space and nothing
+/// else: no authorship, no grant, one tenant.
+async fn a_third_reader(pool: &PgPool) -> String {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, email, status) \
+                 VALUES ($1, 'Nadia Rahma', 'nadia@meridian.example', 'active')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("insert the third reader");
+    sqlx::query(
+        "INSERT INTO app_user_role (user_id, role_id) \
+         SELECT $1, id FROM role WHERE name = 'Analyst'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("give the third reader the Analyst role");
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) \
+         SELECT $1, id FROM tenant WHERE slug = 'meridian-group'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("put the third reader in the organisation's tenant");
+    session_cookie_for_user(pool, id).await
+}
+
+/// Rina's private query, opened to Reza at the level named.
+///
+/// The query is saved through the route — the save is what creates her
+/// personal space — and the rule is written through the access route,
+/// the way the sharing slice grants it, so the fixture is the product's
+/// own doing. Returns the query's id and the id of the space it sits in.
+async fn rinas_private_query_opened_to_reza(
+    router: &axum::Router,
+    pool: &PgPool,
+    level: &str,
+) -> (String, String) {
+    let rina = session_cookie_for_seeded_user(pool, "rina@meridian.example").await;
+    let reza_id = user_id(pool, "reza@meridian.example").await;
+    let (status, saved) = call(
+        router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Private", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let (status, _) = call(
+        router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": reza_id.to_string(), "level": level}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let space = saved["folderId"]
+        .as_str()
+        .expect("the save created her personal space")
+        .to_owned();
+    (id, space)
+}
+
+/// A shared folder opened to Reza at the level named.
+///
+/// The folder row and the rule are written directly, the way the
+/// fixture helpers in this file write their rows: the folder's creation
+/// and the grant are not what these tests prove, the refusals are.
+/// Returns the folder's id.
+async fn a_shared_folder_opened_to_reza(pool: &PgPool, level: &str) -> String {
+    let folder_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO saved_query_folder (tenant_id, name) \
+         VALUES ($1, 'Reports') RETURNING id",
+    )
+    .bind(Uuid::parse_str(GROUP_TENANT).expect("the group tenant id"))
+    .fetch_one(pool)
+    .await
+    .expect("insert the folder");
+    sqlx::query(
+        "INSERT INTO saved_query_access_rule (folder_id, user_id, level, granted_by) \
+         VALUES ($1, \
+                 (SELECT id FROM app_user WHERE email = 'reza@meridian.example'), \
+                 $2, \
+                 (SELECT id FROM app_user WHERE email = 'rina@meridian.example'))",
+    )
+    .bind(folder_id)
+    .bind(level)
+    .execute(pool)
+    .await
+    .expect("grant the folder rule");
+    folder_id.to_string()
+}
+
 /// The assistant's list does not name another person's personal query.
 ///
 /// The two people act for the same organisation and the same tenant, so
@@ -2503,5 +2620,681 @@ async fn in_a_single_tenant_deployment_a_query_a_copy_and_a_folder_belong_to_tha
         tenant_of_folder(&pool, &folder_id).await,
         Uuid::parse_str(GROUP_TENANT).expect("the group tenant id"),
         "the folder belongs to the tenant of the deployment"
+    );
+}
+
+/// An edit grantee cannot publish a personal query to the organisation:
+/// the move into the shared space needs manage on the query, and the
+/// query stays unseen by everybody else (`QS-3` review finding 1).
+#[tokio::test]
+async fn an_edit_grantee_cannot_move_a_personal_query_into_the_shared_space() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    // The third reader is a plain colleague of the organisation: no
+    // authorship, no grant, one tenant.
+    let colleague = a_third_reader(&pool).await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Private", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    assert!(
+        saved["folderId"].is_string(),
+        "a query saved without a folder sits in the author's personal space: {saved}"
+    );
+
+    // Rina opens the query to Reza at edit, the way the sharing slice
+    // grants it: the grant carries edit, not manage.
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": reza_id.to_string(), "level": "edit"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Moving the query to the shared root would publish it to the whole
+    // organisation, and edit is not manage: refused with the one move
+    // sentence.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        Some(json!({"folderId": "root"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {MOVE_ACROSS_SPACES_FORBIDDEN}")
+    );
+
+    // The organisation still cannot see the query: it never moved.
+    let (status, found) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}"),
+        &colleague,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error(&found), QUERY_NOT_FOUND);
+}
+
+/// An edit grantee on a folder inside a personal space cannot lift the
+/// folder — and the queries inside it — into the shared space: the move
+/// needs manage on the folder (`QS-3` review finding 1).
+#[tokio::test]
+async fn an_edit_grantee_cannot_move_a_personal_sub_folder_into_the_shared_space() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    // The third reader is a plain colleague of the organisation: no
+    // authorship, no grant, one tenant.
+    let colleague = a_third_reader(&pool).await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+
+    // Rina saves a private query first: the save creates her personal
+    // space, and the sub-folder is built inside it.
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Private", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let space = saved["folderId"]
+        .as_str()
+        .expect("the save created her personal space")
+        .to_owned();
+    let (status, folder) = call(
+        &router,
+        "POST",
+        "/api/query/folders",
+        &rina,
+        Some(json!({"name": "Weekly", "parentId": space})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let weekly = folder["id"]
+        .as_str()
+        .expect("the folder has an id")
+        .to_owned();
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Numbers", "sql": "SELECT 1", "folderId": weekly})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let numbers = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+
+    // Reza holds edit on the sub-folder — on that folder alone.
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/folders/{weekly}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": reza_id.to_string(), "level": "edit"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Moving the folder to the shared root would publish it and the
+    // query inside it to the whole organisation: refused with the one
+    // move sentence.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/folders/{weekly}"),
+        &reza,
+        Some(json!({"parentId": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {MOVE_ACROSS_SPACES_FORBIDDEN}")
+    );
+
+    // Nothing moved: the folder and the query inside it stay invisible
+    // to the organisation.
+    let (status, tree) = call(&router, "GET", "/api/query/folders", &colleague, None).await;
+    assert_eq!(status, StatusCode::OK, "{tree}");
+    assert!(
+        !tree
+            .as_array()
+            .expect("the list is an array")
+            .iter()
+            .any(|folder| folder["id"] == weekly.as_str()),
+        "the sub-folder is still nobody else's to see: {tree}"
+    );
+    let (status, found) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{numbers}"),
+        &colleague,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error(&found), QUERY_NOT_FOUND);
+}
+
+/// An edit grantee cannot hide a shared query inside a personal space:
+/// the move out of the shared space needs manage on the query, and the
+/// organisation still sees the query afterwards (`QS-3` review finding 1).
+#[tokio::test]
+async fn an_edit_grantee_cannot_move_a_shared_query_into_a_personal_space() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    // The third reader is a plain colleague of the organisation: no
+    // authorship, no grant, one tenant.
+    let colleague = a_third_reader(&pool).await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+
+    let id = write_a_query_in_the_shared_space(&pool, rina_id, "SharedNumbers").await;
+
+    // Reza's own personal space exists — his first private save creates
+    // it — and the move below names it.
+    let (status, own) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &reza,
+        Some(json!({"title": "Reza's own", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{own}");
+    let reza_space = personal_space_id(&pool, reza_id).await;
+
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": reza_id.to_string(), "level": "edit"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        Some(json!({"folderId": reza_space})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {MOVE_ACROSS_SPACES_FORBIDDEN}")
+    );
+
+    // The organisation still sees the query, still in the shared space.
+    let (status, list) = call(&router, "GET", "/api/query/saved", &colleague, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let shared = list
+        .as_array()
+        .expect("the list is an array")
+        .iter()
+        .find(|query| query["id"] == id.as_str())
+        .unwrap_or_else(|| panic!("the organisation still sees the query: {list}"));
+    assert!(
+        shared["folderId"].is_null(),
+        "the query is still in the shared space: {shared}"
+    );
+}
+
+/// The owner holds manage on their own queries, so the same two moves an
+/// edit grantee is refused land: a private query out to the shared space
+/// and a shared query into the owner's personal space.
+#[tokio::test]
+async fn the_owner_moves_into_and_out_of_a_personal_space_at_manage() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+
+    // Out of the personal space: her private save created it, and the
+    // answer carries the query's new place.
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Private", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let space = saved["folderId"]
+        .as_str()
+        .expect("the save created her personal space")
+        .to_owned();
+    let (status, moved) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{id}"),
+        &rina,
+        Some(json!({"folderId": "root"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    assert!(
+        moved["folderId"].is_null(),
+        "the query is in the shared space now: {moved}"
+    );
+
+    // Into the personal space: the shared query of hers moves into it,
+    // and the moved state is what a later read sees.
+    let shared_id = write_a_query_in_the_shared_space(&pool, rina_id, "SharedNumbers").await;
+    let (status, moved) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{shared_id}"),
+        &rina,
+        Some(json!({"folderId": space})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    assert_eq!(
+        moved["folderId"].as_str(),
+        Some(space.as_str()),
+        "the query is in her personal space now: {moved}"
+    );
+    let (status, found) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{shared_id}"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(
+        found["folderId"].as_str(),
+        Some(space.as_str()),
+        "the moved state is what a read sees: {found}"
+    );
+}
+
+/// A refused move writes nothing: a title in the same PATCH is not
+/// written either, and the query stays where and as it was.
+#[tokio::test]
+async fn a_refused_move_writes_nothing_not_even_the_title_in_the_same_patch() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+
+    let (status, saved) = call(
+        &router,
+        "POST",
+        "/api/query/saved",
+        &rina,
+        Some(json!({"title": "Private", "sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let space = saved["folderId"]
+        .as_str()
+        .expect("the save created her personal space")
+        .to_owned();
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": reza_id.to_string(), "level": "edit"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The move is refused, and the title in the same body is not
+    // written: the check runs before the write.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        Some(json!({"folderId": "root", "title": "Renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {MOVE_ACROSS_SPACES_FORBIDDEN}")
+    );
+
+    let (status, found) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(
+        found["title"], "Private",
+        "the title never changed: {found}"
+    );
+    assert_eq!(
+        found["folderId"].as_str(),
+        Some(space.as_str()),
+        "the query never moved: {found}"
+    );
+}
+
+/// A move that names a folder of another tenant than the item's is a
+/// move into an unseen folder: a 404 for the query move and for the
+/// folder move, never a 403 (`QS-3` review finding 6).
+#[tokio::test]
+async fn another_tenants_folder_is_not_found_on_a_query_move_and_on_a_folder_move() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+
+    // A folder of the tenant next door: it exists, but it is not in the
+    // tree the request acts as, so naming it names an unseen folder.
+    let foreign: Uuid = sqlx::query_scalar(
+        "INSERT INTO saved_query_folder (tenant_id, name) \
+         VALUES ($1, 'Retail shared') RETURNING id",
+    )
+    .bind(Uuid::parse_str("11111111-1111-4111-8111-000000000002").expect("a seeded tenant id"))
+    .fetch_one(&pool)
+    .await
+    .expect("insert the other tenant's folder");
+    let foreign = foreign.to_string();
+
+    // The query move: refused as unseen, not as forbidden.
+    let shared_id = write_a_query_in_the_shared_space(&pool, rina_id, "SharedNumbers").await;
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{shared_id}"),
+        &rina,
+        Some(json!({"folderId": foreign})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(error(&body), FOLDER_NOT_FOUND);
+
+    // The folder move: the same answer for the parent a folder moves
+    // under.
+    let (status, folder) = call(
+        &router,
+        "POST",
+        "/api/query/folders",
+        &rina,
+        Some(json!({"name": "Reports"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let reports = folder["id"]
+        .as_str()
+        .expect("the folder has an id")
+        .to_owned();
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/folders/{reports}"),
+        &rina,
+        Some(json!({"parentId": foreign})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(error(&body), FOLDER_NOT_FOUND);
+}
+
+/// Decision 6 (plan 55 D5): edit may delete and restore a saved query,
+/// and the trash shows the queries the caller may edit — so an edit
+/// grantee on someone's personal query can take it to the trash, find
+/// it waiting there, and bring it back, all without manage.
+#[tokio::test]
+async fn an_edit_grantee_deletes_a_personal_query_and_restores_it_from_their_trash() {
+    let TestApp { router, pool } = spin_up().await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let (id, space) = rinas_private_query_opened_to_reza(&router, &pool, "edit").await;
+
+    // Reza may delete it: edit is enough since decision 6.
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "edit may delete a query");
+
+    // The trash shows it to the edit grantee: the trash lists the
+    // queries the caller may edit.
+    let (status, trash) = call(&router, "GET", "/api/query/saved-trash", &reza, None).await;
+    assert_eq!(status, StatusCode::OK, "{trash}");
+    let entry = trash
+        .as_array()
+        .expect("the trash is an array")
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .expect("the edit grantee sees the query waiting in the trash");
+    assert_eq!(entry["title"], "Private");
+
+    // And edit may restore it, into the folder it was in.
+    let (status, restored) = call(
+        &router,
+        "POST",
+        &format!("/api/query/saved/{id}/restore"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+    assert_eq!(
+        restored["folderId"], space,
+        "it comes back in the folder it was in"
+    );
+
+    // Back where it was: out of the trash and live for the grantee
+    // again.
+    let (status, trash) = call(&router, "GET", "/api/query/saved-trash", &reza, None).await;
+    assert_eq!(status, StatusCode::OK, "{trash}");
+    assert!(
+        !trash
+            .as_array()
+            .expect("the trash is an array")
+            .iter()
+            .any(|entry| entry["id"] == id),
+        "the restored query is out of the trash: {trash}"
+    );
+    let (status, seen) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    assert_eq!(seen["level"], "edit", "the grant still names its level");
+}
+
+/// A view grantee may neither delete nor restore a personal query:
+/// decision 6 lifts a query's delete and restore to edit, and view
+/// stays below edit. The trash does not show it to them either.
+#[tokio::test]
+async fn a_view_grantee_neither_deletes_nor_restores_a_personal_query() {
+    let TestApp { router, pool } = spin_up().await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let (id, _) = rinas_private_query_opened_to_reza(&router, &pool, "view").await;
+
+    // Delete is refused, with the change sentence — the same sentence
+    // the other change routes answer.
+    let (status, body) = call(
+        &router,
+        "DELETE",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {QUERY_FORBIDDEN}")
+    );
+
+    // Restore is refused the same way.
+    let (status, body) = call(
+        &router,
+        "POST",
+        &format!("/api/query/saved/{id}/restore"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {QUERY_FORBIDDEN}")
+    );
+
+    // Nothing was written: the query is still live for the view grantee
+    // and never in their trash.
+    let (status, seen) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    assert_eq!(seen["level"], "view", "the query never left");
+    let (status, trash) = call(&router, "GET", "/api/query/saved-trash", &reza, None).await;
+    assert_eq!(status, StatusCode::OK, "{trash}");
+    assert!(
+        !trash
+            .as_array()
+            .expect("the trash is an array")
+            .iter()
+            .any(|entry| entry["id"] == id),
+        "a view grantee sees no trash entry for it: {trash}"
+    );
+}
+
+/// Review finding 3: decision 6 lifts only a query's delete and restore
+/// to edit. Reading and writing the access list of a query, reading and
+/// writing the access list of a folder, and deleting a folder, all
+/// still need manage — an edit grantee is refused all five, and the
+/// refused writes change nothing.
+#[tokio::test]
+async fn an_edit_grantee_is_refused_the_access_lists_and_a_folder_delete() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let (id, _) = rinas_private_query_opened_to_reza(&router, &pool, "edit").await;
+    let folder_id = a_shared_folder_opened_to_reza(&pool, "edit").await;
+
+    // All five, each refused with its item's own sentence: the sharing
+    // surface keeps manage even after decision 6.
+    for (method, path, body, sentence) in [
+        (
+            "GET",
+            format!("/api/query/saved/{id}/access"),
+            None,
+            QUERY_FORBIDDEN,
+        ),
+        (
+            "PUT",
+            format!("/api/query/saved/{id}/access"),
+            Some(json!({"rules": []})),
+            QUERY_FORBIDDEN,
+        ),
+        (
+            "GET",
+            format!("/api/query/folders/{folder_id}/access"),
+            None,
+            FOLDER_FORBIDDEN,
+        ),
+        (
+            "PUT",
+            format!("/api/query/folders/{folder_id}/access"),
+            Some(json!({"rules": []})),
+            FOLDER_FORBIDDEN,
+        ),
+        (
+            "DELETE",
+            format!("/api/query/folders/{folder_id}"),
+            None,
+            FOLDER_FORBIDDEN,
+        ),
+    ] {
+        let (status, answer) = call(&router, method, &path, &reza, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {answer}");
+        assert_eq!(
+            error(&answer),
+            format!("permission_denied: {sentence}"),
+            "{method} {path}"
+        );
+    }
+
+    // The refused writes changed nothing: the query's rule is still
+    // Rina's edit grant, and the folder still stands.
+    let (status, list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let rules = list["rules"].as_array().expect("the rules are an array");
+    assert_eq!(rules.len(), 1, "the rule is untouched: {list}");
+    assert_eq!(rules[0]["userId"], reza_id.to_string());
+    assert_eq!(rules[0]["level"], "edit");
+    let (status, folders) = call(&router, "GET", "/api/query/folders", &rina, None).await;
+    assert_eq!(status, StatusCode::OK, "{folders}");
+    assert!(
+        folders
+            .as_array()
+            .expect("the tree is an array")
+            .iter()
+            .any(|folder| folder["id"] == folder_id),
+        "the folder is still there: {folders}"
     );
 }

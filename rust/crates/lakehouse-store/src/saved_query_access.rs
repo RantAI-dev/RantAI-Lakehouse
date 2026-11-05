@@ -8,7 +8,8 @@
 //! with no folder sits — that every member of the organisation sees at
 //! `view`, and a **personal space** — one folder per person — that only
 //! its owner sees, at `manage`. A rule is the only way anybody else sees
-//! a query in a personal space.
+//! a query in a personal space, which is why a move into or out of one
+//! needs `manage`: the space rule is written once, as [`crosses_space`].
 //!
 //! # One resolver
 //!
@@ -91,9 +92,10 @@ pub const MAX_FOLDER_NAME_CHARS: usize = 100;
 pub enum Level {
     /// See it and run it.
     View,
-    /// Change its SQL, its title, its tags and the folder it sits in.
+    /// Change its SQL, its title, its tags and the folder it sits in,
+    /// delete it and restore it from the trash.
     Edit,
-    /// Share it, delete it, restore it and see its entry in the trash.
+    /// Share it, move it across a personal space and delete a folder.
     Manage,
 }
 
@@ -337,6 +339,63 @@ pub fn resolve_level(
     }
     // The shared space: every member of the organisation sees the item.
     Some(granted.unwrap_or(Level::View).max(Level::View))
+}
+
+/// The space a location sits in, read the way [`resolve_level`] reads
+/// spaces (its rules 6 and 7): the first personal folder of the
+/// location's chain names the space, and a chain that holds no personal
+/// folder — the root of the tree included — is the shared space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Space {
+    /// The shared space: the root, or a chain with no personal folder.
+    Shared,
+    /// One person's own space, named by its personal folder.
+    Personal(Uuid),
+    /// A folder the map does not hold, or a chain that repeats a folder:
+    /// corrupt data, whose space equals no space, so a move that names it
+    /// counts as a move across spaces — the fail-closed answer
+    /// (principle 3 of `AGENTS.md`).
+    Unknown,
+}
+
+/// The space of one location; `None` names the root of the tree, whose
+/// space is the shared one.
+fn space_of(folders: &[FolderNode], location: Option<Uuid>) -> Space {
+    let Some(mut current) = location else {
+        return Space::Shared;
+    };
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    loop {
+        let Some(folder) = folders.iter().find(|folder| folder.id == current) else {
+            return Space::Unknown;
+        };
+        if !seen.insert(folder.id) {
+            return Space::Unknown;
+        }
+        if folder.is_personal {
+            return Space::Personal(folder.id);
+        }
+        match folder.parent_id {
+            Some(parent) => current = parent,
+            None => return Space::Shared,
+        }
+    }
+}
+
+/// Whether a move from `from` to `to` changes the item's space.
+///
+/// The space of a location is the owner of the personal folder in its
+/// folder chain, or the shared space when the chain holds no personal
+/// folder — the same reading as the resolver's rules 6 and 7 — and
+/// `None` names the root, whose space is the shared one. A move whose
+/// two locations name different spaces needs **manage** on the item
+/// (`QS-3` review finding 1), and a move inside one space does not. The
+/// rule is written once here: the store re-checks it in
+/// [`crate::queries::update_saved_query`] and in [`move_folder_for_viewer`],
+/// and the routes ask it before they write.
+#[must_use]
+pub fn crosses_space(folders: &[FolderNode], from: Option<Uuid>, to: Option<Uuid>) -> bool {
+    space_of(folders, from) != space_of(folders, to)
 }
 
 /// Why a folder cannot be created, renamed or moved as asked. Every
@@ -1101,6 +1160,17 @@ pub async fn move_folder(
     // The name does not change, but the sibling rule still holds: the
     // folder may not land beside a sibling that carries the same name.
     check_placement(&folders, Some(id), &folder.name, new_parent).map_err(FolderError::from)?;
+    write_moved_folder(pool, id, new_parent).await
+}
+
+/// Write the folder's new parent. Every rule the move must hold to has
+/// run by the time this is called; the write itself is the one place both
+/// move paths end at.
+async fn write_moved_folder(
+    pool: &PgPool,
+    id: Uuid,
+    new_parent: Option<Uuid>,
+) -> Result<FolderNode, FolderError> {
     let row: FolderRow = sqlx::query_as(
         "UPDATE saved_query_folder SET parent_id = $2, updated_at = now() WHERE id = $1 \
          RETURNING id, parent_id, is_personal, owner_id, tenant_id, name",
@@ -1110,6 +1180,76 @@ pub async fn move_folder(
     .fetch_one(pool)
     .await?;
     Ok(FolderNode::from(row))
+}
+
+/// Move the folder under `new_parent` (`None` for the root) for the
+/// viewer the write is made for, re-checking the access rule the route
+/// has already applied: a move whose target space differs from the
+/// folder's own space needs **manage** on the folder, and a move inside
+/// one space holds to the placement rules alone (`QS-3` review finding 1).
+///
+/// The placement rules are the same [`move_folder`] applies: the whole
+/// subtree that moves has to fit in [`MAX_FOLDER_DEPTH`] levels, the
+/// folder may not become its own ancestor, the new parent must be a
+/// folder of the same tenant — a folder of another tenant is not found at
+/// all — and the name stays free among the new siblings. The level the
+/// viewer holds is resolved by the one resolver ([`resolve_level`]), with
+/// the same chain and the same rules every other reader uses.
+///
+/// # Errors
+///
+/// Returns [`FolderError::NotFound`] when the folder, the new parent, or
+/// the folder's own chain cannot be found, [`FolderError::PersonalSpace`]
+/// when the folder is a personal space — and also when the move changes
+/// the folder's space and the viewer does not manage it, because that is
+/// the one variant the route already answers "not allowed" (403) with —
+/// [`FolderError::Cycle`] when the move would make the folder its own
+/// ancestor, [`FolderError::TooDeep`] when the subtree would grow past
+/// the depth limit, [`FolderError::DuplicateName`] when a new sibling
+/// carries the name, and [`FolderError::Database`] if a query fails.
+pub async fn move_folder_for_viewer(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    id: Uuid,
+    new_parent: Option<Uuid>,
+) -> Result<FolderNode, FolderError> {
+    let Some(folder) = load_folder(pool, id).await? else {
+        return Err(FolderError::NotFound);
+    };
+    if folder.is_personal {
+        return Err(FolderError::PersonalSpace);
+    }
+    // Only the tenant's own folders are in the tree, so a parent of
+    // another tenant is not found by the placement rule.
+    let folders = list_folders(pool, Some(folder.tenant_id)).await?;
+    check_placement(&folders, Some(id), &folder.name, new_parent).map_err(FolderError::from)?;
+    if crosses_space(&folders, folder.parent_id, new_parent) {
+        // The route answers this refusal with its own fixed sentence
+        // before the write is reached; the store re-checks the rule so
+        // the answer holds for a caller that reached past the route. The
+        // refusal reuses [`FolderError::PersonalSpace`] — the route maps
+        // exactly that variant to 403 — rather than a new variant whose
+        // mapping would live in the route, not here.
+        let map = FolderMap::new(folders.clone());
+        let Some(chain) = map.chain(id) else {
+            // A folder whose chain cannot be built is corrupt data, and
+            // corrupt data answers nothing.
+            return Err(FolderError::NotFound);
+        };
+        let chain: Vec<FolderNode> = chain.into_iter().cloned().collect();
+        let target = AccessTarget {
+            id: folder.id,
+            owner_id: folder.owner_id,
+            folder_id: folder.parent_id,
+            tenant_id: Some(folder.tenant_id),
+        };
+        let grants = grants_for_viewer(pool, viewer).await?;
+        if resolve_level(&target, &chain, &grants, viewer).is_none_or(|level| level < Level::Manage)
+        {
+            return Err(FolderError::PersonalSpace);
+        }
+    }
+    write_moved_folder(pool, id, new_parent).await
 }
 
 /// Delete the folder.
@@ -1735,6 +1875,97 @@ mod tests {
             Ok(personal.name.clone()),
             "the personal space's name is free for an ordinary folder"
         );
+    }
+
+    /// Moving a query from the shared space into a personal space changes
+    /// its space: the move needs manage.
+    #[test]
+    fn a_move_from_the_shared_space_into_a_personal_space_crosses_spaces() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        assert!(crosses_space(
+            std::slice::from_ref(&personal),
+            None,
+            Some(personal.id)
+        ));
+    }
+
+    /// Moving a query out of a personal space to the shared root changes
+    /// its space: the organisation would gain what was one person's.
+    #[test]
+    fn a_move_from_a_personal_space_to_the_shared_root_crosses_spaces() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        assert!(crosses_space(
+            std::slice::from_ref(&personal),
+            Some(personal.id),
+            None
+        ));
+    }
+
+    /// Moving from one person's personal space into another person's
+    /// changes the space, even though both are personal.
+    #[test]
+    fn a_move_from_one_personal_space_to_another_crosses_spaces() {
+        let rinas = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let saris = folder(Uuid::from_u128(201), None, true, Some(OTHER_PERSON));
+        let tree = vec![rinas.clone(), saris.clone()];
+        assert!(crosses_space(&tree, Some(rinas.id), Some(saris.id)));
+    }
+
+    /// A folder and its subfolder are the same personal space: the move
+    /// between them changes nothing about who sees the item.
+    #[test]
+    fn a_move_inside_one_personal_space_crosses_no_space() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let child = folder(Uuid::from_u128(201), Some(personal.id), false, None);
+        let tree = vec![personal.clone(), child.clone()];
+        assert!(!crosses_space(&tree, Some(personal.id), Some(child.id)));
+        assert!(!crosses_space(&tree, Some(child.id), Some(personal.id)));
+    }
+
+    /// The shared space is the root and every chain below it that holds
+    /// no personal folder: moves inside it change no space.
+    #[test]
+    fn a_move_inside_the_shared_space_crosses_no_space() {
+        let shared = folder(Uuid::from_u128(200), None, false, None);
+        let child = folder(Uuid::from_u128(201), Some(shared.id), false, None);
+        let tree = vec![shared.clone(), child.clone()];
+        assert!(!crosses_space(&tree, None, Some(shared.id)));
+        assert!(!crosses_space(&tree, Some(shared.id), Some(child.id)));
+        assert!(!crosses_space(&tree, Some(child.id), None));
+    }
+
+    /// A chain three deep inside one personal space stays in that space,
+    /// whatever moves inside it, and loses it the moment a move names the
+    /// shared root.
+    #[test]
+    fn a_folder_chain_three_deep_stays_in_its_space_until_a_move_leaves_it() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let child = folder(Uuid::from_u128(201), Some(personal.id), false, None);
+        let grandchild = folder(Uuid::from_u128(202), Some(child.id), false, None);
+        let (child_id, grandchild_id) = (child.id, grandchild.id);
+        let tree = vec![personal, child, grandchild];
+        assert!(!crosses_space(&tree, Some(grandchild_id), Some(child_id)));
+        assert!(!crosses_space(&tree, Some(child_id), Some(grandchild_id)));
+        assert!(crosses_space(&tree, Some(grandchild_id), None));
+    }
+
+    /// A location that names a folder the map does not hold has no space
+    /// of its own: it counts as across spaces, the fail-closed answer, so
+    /// corrupt data never lets an edit holder move quietly.
+    #[test]
+    fn a_location_outside_the_map_counts_as_across_spaces() {
+        let personal = folder(Uuid::from_u128(200), None, true, Some(PERSON));
+        let unknown = Uuid::from_u128(999);
+        assert!(crosses_space(
+            std::slice::from_ref(&personal),
+            Some(unknown),
+            None
+        ));
+        assert!(crosses_space(
+            std::slice::from_ref(&personal),
+            Some(unknown),
+            Some(personal.id)
+        ));
     }
 
     /// Every rule the placement breaks has its own answer, so the route

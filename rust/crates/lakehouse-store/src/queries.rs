@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 pub use crate::saved_query_access::SavedQueryViewer;
 use crate::saved_query_access::{
-    AccessGrant, AccessTarget, FolderMap, FolderNode, Level, ensure_personal_space,
+    AccessGrant, AccessTarget, FolderMap, FolderNode, Level, crosses_space, ensure_personal_space,
     escape_like_pattern, grants_for_viewer, list_folders, resolve_level,
 };
 use crate::{PgPool, StoreError};
@@ -658,7 +658,10 @@ pub enum FolderMove {
 /// # Errors
 ///
 /// Returns [`StoreError::NotFound`] when the caller may not change the
-/// query, and [`StoreError::Database`] if a query fails.
+/// query, and when the folder a move names belongs to another tenant than
+/// the query's — an unseen folder; [`StoreError::NotAllowed`] when the
+/// move would change the query's space and the caller does not manage the
+/// query; and [`StoreError::Database`] if a query fails.
 pub async fn update_saved_query(
     pool: &PgPool,
     viewer: &SavedQueryViewer,
@@ -686,11 +689,33 @@ pub async fn update_saved_query(
     let title = patch.title.as_deref().unwrap_or(&row.title);
     let sql = patch.sql.as_deref().unwrap_or(&row.sql);
     let tags = patch.tags.as_deref().unwrap_or(&row.tags);
-    let folder_id = match patch.folder {
-        Some(FolderMove::Into(folder_id)) => Some(folder_id),
-        Some(FolderMove::Root) => None,
-        None => row.folder_id,
-    };
+    // A named move is re-checked here, before any write, the way the
+    // edit level above is (`QS-3` review finding 1): the folder a query
+    // moves into belongs to the query's own tenant, and a move whose
+    // target space differs from the query's space needs manage, so an
+    // edit grantee can neither publish a private query to the
+    // organisation nor hide a shared one in a personal space.
+    let moved = patch.folder.map(|move_to| match move_to {
+        FolderMove::Into(folder_id) => Some(folder_id),
+        FolderMove::Root => None,
+    });
+    if let Some(target) = moved {
+        // The same tenant limiting `move_folder` applies to a folder's
+        // new parent: only the row's own tenant's folders are reachable,
+        // so a folder of another tenant is an unseen folder.
+        let folders = list_folders(pool, row.tenant_id).await?;
+        if let Some(folder_id) = target
+            && !folders.iter().any(|folder| folder.id == folder_id)
+        {
+            return Err(StoreError::NotFound);
+        }
+        // The refusal is the store's own fixed sentence, mapped to 403 —
+        // never a 404, which would say the query is not there at all.
+        if crosses_space(&folders, row.folder_id, target) && level < Level::Manage {
+            return Err(StoreError::NotAllowed);
+        }
+    }
+    let folder_id = moved.unwrap_or(row.folder_id);
     let mut tx = pool.begin().await?;
     let updated: SavedQueryRow = sqlx::query_as(
         "UPDATE saved_query \
@@ -715,8 +740,9 @@ pub async fn update_saved_query(
 
 /// Move a saved query to the trash.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// deleted. Trashing a query that is already in the trash does nothing.
+/// The caller must hold **edit** on the query: decision 6 (plan 55 D5)
+/// puts deleting a query beside changing it. Trashing a query that is
+/// already in the trash does nothing.
 ///
 /// # Errors
 ///
@@ -740,7 +766,8 @@ pub async fn trash_saved_query(
     let Some(level) = visibility.level(&row.target()) else {
         return Err(StoreError::NotFound);
     };
-    if level < Level::Manage {
+    // Edit may delete a query (decision 6, plan 55 D5).
+    if level < Level::Edit {
         return Err(StoreError::NotFound);
     }
     if row.deleted_at.is_some() {
@@ -756,8 +783,8 @@ pub async fn trash_saved_query(
 
 /// Bring a saved query back out of the trash, into the folder it was in.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// restored.
+/// The caller must hold **edit** on the query: whoever may delete it may
+/// bring it back (decision 6, plan 55 D5).
 ///
 /// # Errors
 ///
@@ -781,7 +808,8 @@ pub async fn restore_saved_query(
     let Some(level) = visibility.level(&row.target()) else {
         return Err(StoreError::NotFound);
     };
-    if level < Level::Manage {
+    // Edit may restore a query (decision 6, plan 55 D5).
+    if level < Level::Edit {
         return Err(StoreError::NotFound);
     }
     let restored: SavedQueryRow = sqlx::query_as(
@@ -820,11 +848,13 @@ pub struct SavedQueryTrashEntry {
     pub days_left: i32,
 }
 
-/// The queries in the trash the caller may manage.
+/// The queries in the trash the caller may edit (decision 6, plan 55
+/// D5).
 ///
 /// A trashed query waits here until it is restored or swept away; the
-/// caller sees only the ones it may manage, because the trash entry is
-/// part of managing a query.
+/// caller sees the ones it may edit — the same set that may delete and
+/// restore a query — so what the list shows is what the caller can act
+/// on.
 ///
 /// The days left are counted here rather than by the caller, so the
 /// number the console shows and the number the sweep acts on come from
@@ -857,7 +887,9 @@ pub async fn list_saved_trash_entries(
         .into_iter()
         .filter_map(|row| {
             let level = visibility.level(&row.target())?;
-            if level < Level::Manage {
+            // The trash lists the queries the caller may edit, the same
+            // level delete and restore ask for (decision 6, plan 55 D5).
+            if level < Level::Edit {
                 return None;
             }
             let deleted_at = row.deleted_at?;

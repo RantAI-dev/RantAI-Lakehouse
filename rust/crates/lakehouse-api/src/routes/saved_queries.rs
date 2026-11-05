@@ -70,6 +70,7 @@ use crate::routes::quality::pool;
 use crate::routes::query::{saved_query_scope, saved_query_viewer};
 use crate::sql_guard::is_read_only;
 use crate::state::AppState;
+use crate::upstream_error;
 
 // ── The fixed sentences ──────────────────────────────────────────────────
 //
@@ -93,6 +94,14 @@ pub(crate) const QUERY_FORBIDDEN: &str = "You do not have permission to change t
 
 /// The sentence a caller that may not change a folder is told.
 pub(crate) const FOLDER_FORBIDDEN: &str = "You do not have permission to change this folder.";
+
+/// The sentence a move into or out of a personal space at a level below
+/// manage is refused with — the same sentence for a query move and for a
+/// folder move, and the sentence the store's own refusal carries, so the
+/// route's answer and the store's backstop read identically (`QS-3`
+/// review finding 1).
+pub(crate) const MOVE_ACROSS_SPACES_FORBIDDEN: &str =
+    "Only someone who manages this can move it into or out of a personal space.";
 
 /// The sentence a folder that still holds queries is refused with.
 pub(crate) const FOLDER_HOLDS_QUERIES: &str =
@@ -482,6 +491,30 @@ fn level_of(level: &str) -> Level {
     Level::parse(level).unwrap_or(Level::View)
 }
 
+/// The folder and the level the caller holds on it, or a 404 when the
+/// folder is not theirs to see.
+///
+/// [`folder_level`] answers with the level alone; this returns the folder
+/// with it, for the one handler that needs the folder's own place in the
+/// tree — the move rule reads where the folder sits now (`QS-3` review
+/// finding 1) — so that handler asks the database once, not twice.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
+/// caller may not see; 500 on a database failure.
+async fn folder_with_level(
+    pool: &PgPool,
+    viewer: &queries::SavedQueryViewer,
+    id: Uuid,
+) -> Result<(FolderNode, Level), ApiError> {
+    let folders = saved_query_access::folders_with_levels(pool, viewer).await?;
+    folders
+        .into_iter()
+        .find(|(folder, _level)| folder.id == id)
+        .ok_or_else(|| ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()))
+}
+
 /// The level the caller holds on a folder, or a 404 when the folder is
 /// not theirs to see.
 ///
@@ -499,12 +532,9 @@ async fn folder_level(
     viewer: &queries::SavedQueryViewer,
     id: Uuid,
 ) -> Result<Level, ApiError> {
-    let folders = saved_query_access::folders_with_levels(pool, viewer).await?;
-    folders
-        .into_iter()
-        .find(|(folder, _level)| folder.id == id)
+    folder_with_level(pool, viewer, id)
+        .await
         .map(|(_folder, level)| level)
-        .ok_or_else(|| ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()))
 }
 
 /// The route's own answer to a folder write the store refused.
@@ -524,7 +554,26 @@ fn folder_failure(failure: FolderError) -> ApiError {
         FolderError::TooDeep => ApiError::BadRequest(FOLDER_TOO_DEEP.to_owned()),
         FolderError::Cycle => ApiError::BadRequest(FOLDER_CYCLE.to_owned()),
         FolderError::PersonalSpace => ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()),
-        FolderError::Database(_database) => ApiError::Internal("database error".to_owned()),
+        FolderError::Database(store_error) => {
+            // The body stays the fixed sentence; the cause goes to the log
+            // under a reference id (AGENTS.md principle 4; QS-3 review
+            // finding 7, plan 55 D7). store() itself is not used here: its
+            // Own variant carries caller-facing text, and this arm's
+            // answer must stay the fixed one.
+            match store_error {
+                lakehouse_store::StoreError::Database(source) => {
+                    let _logged = upstream_error::report_sqlx(&upstream_error::STORE, &source);
+                }
+                other => {
+                    let _logged = upstream_error::report(
+                        &upstream_error::STORE,
+                        upstream_error::Class::Failed,
+                        &other,
+                    );
+                }
+            }
+            ApiError::Internal("database error".to_owned())
+        }
     }
 }
 
@@ -859,7 +908,12 @@ pub struct PatchSavedQueryBody {
 /// `PATCH /api/query/saved/{id}` — change a saved query.
 ///
 /// The caller must hold **edit** on the query: `edit` changes the SQL,
-/// the title, the tags and the folder, `view` may do neither. A statement
+/// the title, the tags and the folder, `view` may do neither. A move
+/// that takes the query into or out of a personal space is more than a
+/// change of place — it publishes or hides the query for the whole
+/// organisation — so that one move needs **manage**, and it is asked
+/// before any write: a refused PATCH writes nothing, not the title or
+/// the SQL in the same body (`QS-3` review finding 1). A statement
 /// that is not read-only is refused the same way the save route refuses
 /// it, so nothing that can never run is ever stored.
 ///
@@ -868,7 +922,9 @@ pub struct PatchSavedQueryBody {
 /// 400 for a malformed body or a blank title; 404 with the fixed sentence
 /// of [`QUERY_NOT_FOUND`] for a query the caller may not see; 403 with the
 /// fixed sentence of [`QUERY_FORBIDDEN`] for a query the caller may see
-/// but not change, and for a folder the caller may see but not fill; 422
+/// but not change, and for a folder the caller may see but not fill; 403
+/// with the fixed sentence of [`MOVE_ACROSS_SPACES_FORBIDDEN`] for a move
+/// into or out of a personal space the caller does not manage; 422
 /// with the fixed sentence of [`NOT_READ_ONLY`] for a statement that is
 /// not read-only; 500 on a database failure.
 pub async fn patch_saved(
@@ -920,6 +976,40 @@ pub async fn patch_saved(
             Some(FolderMove::Into(folder_id))
         }
     };
+    // A move across a personal-space boundary needs manage on the query,
+    // asked before the store is reached so a refused PATCH writes nothing
+    // (`QS-3` review finding 1). The store re-checks the same rule on the
+    // write and answers with this same sentence, so a caller that slips
+    // past this route is refused just the same. The list is the caller's
+    // own tenant's: the store pins the row to that tenant before it
+    // re-checks, so the two read the same tree — and a folder of another
+    // tenant is not in the list at all, which the store answers as an
+    // unseen folder (404), so the crossing rule is not asked about it.
+    // A caller that reads across tenants holds a wider list than the
+    // store's — the row's own tenant — so the crossing refusal there is
+    // left to the store alone.
+    if let Some(move_to) = folder
+        && let Some(tenant_id) = viewer.tenant_id
+    {
+        let target = match move_to {
+            FolderMove::Into(folder_id) => Some(folder_id),
+            FolderMove::Root => None,
+        };
+        let folders = saved_query_access::list_folders(pool(&state)?, Some(tenant_id)).await?;
+        let target_seen = target.is_none_or(|id| folders.iter().any(|folder| folder.id == id));
+        // `saved.folder_id` carries the store's own uuid as text, so the
+        // parse cannot fail for a row the store wrote.
+        let from = saved
+            .folder_id
+            .as_deref()
+            .and_then(|raw| Uuid::parse_str(raw).ok());
+        if target_seen
+            && saved_query_access::crosses_space(&folders, from, target)
+            && level_of(&saved.level) < Level::Manage
+        {
+            return Err(ApiError::PermissionDenied(MOVE_ACROSS_SPACES_FORBIDDEN.to_owned()).into());
+        }
+    }
     let patch = SavedQueryPatch {
         title,
         sql,
@@ -934,9 +1024,10 @@ pub async fn patch_saved(
 
 /// `DELETE /api/query/saved/{id}` — move a saved query to the trash.
 ///
-/// The caller must hold **manage** on the query: only then may it be
-/// deleted. The query waits in the trash until it is restored or swept
-/// away; it is not gone yet.
+/// The caller must hold **edit** on the query: decision 6 (plan 55 D5)
+/// puts deleting a query beside changing it, because a person who may
+/// rewrite its SQL may take it to the trash too. The query waits in the
+/// trash until it is restored or swept away; it is not gone yet.
 ///
 /// # Errors
 ///
@@ -957,7 +1048,9 @@ pub async fn delete_saved(
     let saved = queries::get_saved(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if level_of(&saved.level) < Level::Manage {
+    // Edit may delete a query (decision 6, plan 55 D5); the store
+    // re-checks the same level on the write.
+    if level_of(&saved.level) < Level::Edit {
         return Err(ApiError::PermissionDenied(QUERY_FORBIDDEN.to_owned()).into());
     }
     queries::trash_saved_query(pool(&state)?, &viewer, &id)
@@ -1026,7 +1119,8 @@ pub async fn duplicate_saved(
 /// trash.
 ///
 /// The query comes back in the folder it was in. The caller must hold
-/// **manage** on it: the trash entry is part of managing a query.
+/// **edit** on it: whoever may delete a query may bring it back
+/// (decision 6, plan 55 D5).
 ///
 /// # Errors
 ///
@@ -1044,12 +1138,14 @@ pub async fn restore_saved(
     let Some(viewer) = scope.effective_viewer() else {
         return Err(ApiError::NotFound(QUERY_NOT_FOUND.to_owned()).into());
     };
-    // The trash entry is part of managing a query, so it is found with the
-    // same scope and the same resolver the trash list uses.
+    // A trashed query is found with the same scope and the same resolver
+    // the trash list uses: what the list shows is what restore acts on.
     let saved = queries::get_saved_including_trash(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if level_of(&saved.level) < Level::Manage {
+    // Edit may restore a query (decision 6, plan 55 D5); the store
+    // re-checks the same level on the write.
+    if level_of(&saved.level) < Level::Edit {
         return Err(ApiError::PermissionDenied(QUERY_FORBIDDEN.to_owned()).into());
     }
     let restored = queries::restore_saved_query(pool(&state)?, &viewer, &id)
@@ -1060,9 +1156,10 @@ pub async fn restore_saved(
 
 /// `GET /api/query/saved-trash` — the queries waiting in the trash.
 ///
-/// The trash holds what the caller may **manage**: the entry in the trash
-/// is part of managing a query, and a caller that may only see a query
-/// has no business seeing where it waits.
+/// The trash holds what the caller may **edit** (decision 6, plan 55
+/// D5): a query they may delete and restore is theirs to see waiting,
+/// and a caller that may only view a query has no business seeing where
+/// it waits.
 ///
 /// # Errors
 ///
@@ -1284,7 +1381,11 @@ pub struct PatchFolderBody {
 /// `PATCH /api/query/folders/{id}` — rename a folder or move it.
 ///
 /// The caller must hold **edit** on the folder: renaming it and moving it
-/// are changes to the tree the folder sits in. A **personal** space may be
+/// are changes to the tree the folder sits in. A move that takes the
+/// folder into or out of a personal space publishes or hides it — and
+/// every query inside it — for the whole organisation, so that one move
+/// needs **manage**, and it is asked before the move is written
+/// (`QS-3` review finding 1). A **personal** space may be
 /// neither renamed nor moved — it is one person's own space, and moving
 /// it would move their private queries with it.
 ///
@@ -1301,7 +1402,9 @@ pub struct PatchFolderBody {
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
 /// caller may not see and for a parent that does not exist; 403 with the
 /// fixed sentence of [`FOLDER_FORBIDDEN`] for a folder the caller may see
-/// but not change; 409 with the fixed sentence of
+/// but not change; 403 with the fixed sentence of
+/// [`MOVE_ACROSS_SPACES_FORBIDDEN`] for a move into or out of a personal
+/// space the caller does not manage; 409 with the fixed sentence of
 /// [`FOLDER_DUPLICATE_NAME`] for a name a sibling already carries; 500 on
 /// a database failure.
 pub async fn patch_folder(
@@ -1316,7 +1419,10 @@ pub async fn patch_folder(
         return Err(ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()).into());
     };
     let folder_id = folder_id_of(&id)?;
-    let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
+    // The node is kept, not only the level: the move rule reads where the
+    // folder sits now (`QS-3` review finding 1), and this is the same
+    // read the level check needs anyway.
+    let (current, level) = folder_with_level(pool(&state)?, &viewer, folder_id).await?;
     if level < Level::Edit {
         return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
     }
@@ -1348,10 +1454,38 @@ pub async fn patch_folder(
                     Some(parent_id)
                 }
             };
+            // A move across a personal-space boundary needs manage on the
+            // folder, asked before the move is written (`QS-3` review
+            // finding 1); the store re-checks the rule on the write. The
+            // list is the folder's own tenant's — the one
+            // `move_folder_for_viewer` re-checks the write against — and
+            // a parent of another tenant is not in it: the store answers
+            // it as an unseen parent (404), so the crossing rule is not
+            // asked about it either. A personal space is not asked about
+            // at all: the store refuses any move of one outright, and
+            // that refusal keeps its own sentence.
+            let folders =
+                saved_query_access::list_folders(pool(&state)?, Some(current.tenant_id)).await?;
+            let parent_seen =
+                parent_id.is_none_or(|parent| folders.iter().any(|folder| folder.id == parent));
+            if parent_seen
+                && !current.is_personal
+                && saved_query_access::crosses_space(&folders, current.parent_id, parent_id)
+                && level < Level::Manage
+            {
+                return Err(
+                    ApiError::PermissionDenied(MOVE_ACROSS_SPACES_FORBIDDEN.to_owned()).into(),
+                );
+            }
             folder = Some(
-                saved_query_access::move_folder(pool(&state)?, folder_id, parent_id)
-                    .await
-                    .map_err(folder_failure)?,
+                saved_query_access::move_folder_for_viewer(
+                    pool(&state)?,
+                    &viewer,
+                    folder_id,
+                    parent_id,
+                )
+                .await
+                .map_err(folder_failure)?,
             );
         }
     }
@@ -1365,6 +1499,8 @@ pub async fn patch_folder(
 /// A folder is deleted only when it holds nothing: no live query, no
 /// query in the trash and no folder of its own. The caller must hold
 /// **manage** on it, and a **personal** space may not be deleted at all.
+/// Manage, not edit: decision 6 lifted only a query's delete and
+/// restore to edit, and a folder is not a query (plan 55 D5).
 ///
 /// # Errors
 ///
@@ -1402,7 +1538,9 @@ pub async fn delete_folder(
 // who may be given a rule at all. Every route here needs **manage** on
 // the item, and every route reads the item first — a 404 for what the
 // caller may not see, a 403 for what it may see but not manage, and only
-// then the body.
+// then the body. Manage stays the bar here even though decision 6
+// lifted a query's delete and restore to edit (plan 55 D5): sharing is
+// not changing, and edit must not reach it.
 
 /// `GET /api/query/saved/{id}/access` — who has what on one saved query.
 ///

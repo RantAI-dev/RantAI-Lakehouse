@@ -1206,10 +1206,14 @@ pub async fn update_tenant_provisioning_status(
 ///
 /// Returns [`StoreError::NotFound`] if no such tenant exists,
 /// [`StoreError::ForeignKeyViolation`] if a user still belongs to it
-/// (`app_user_tenant.tenant_id` is `ON DELETE RESTRICT`) or a file of the
+/// (`app_user_tenant.tenant_id` is `ON DELETE RESTRICT`), a file of the
 /// tenant still sits in a folder (`file_upload.folder_id` is
 /// `ON DELETE RESTRICT`, `DATA-35` migration `0112`; `PR #259 review
-/// SHOULD-FIX 2`), or
+/// SHOULD-FIX 2`), or a folder still holds a sub-folder or a query in a
+/// folder (`saved_query.folder_id` and `saved_query_folder.parent_id` are
+/// `ON DELETE RESTRICT` in `0122_saved_query_access.sql`; `RESTRICT` is
+/// not deferrable, so the database refuses the delete and it fails
+/// closed, no behaviour change: plan 55 D8), or
 /// [`StoreError::Database`] on any other failure.
 pub async fn delete_tenant(pool: &PgPool, id: &str) -> Result<(), StoreError> {
     let affected = sqlx::query("DELETE FROM tenant WHERE id = $1")
