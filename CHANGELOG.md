@@ -13,6 +13,10 @@ once a first release is tagged.
 
 - An edit grantee of a saved query or folder could move it into or out of a personal space; a move across a personal space now needs manage.
 
+### Added
+
+- The dashboard eval (backlog `AI-15`) leaves out the cases named in `--exclude id1,id2`. `run_dashboard_eval.sh` forwards the flag, an id that names no case exits with code 2, and the result document lists the excluded ids. The `mode_switch` case asks for a bar chart, so a line chart is no longer a failure. It adds two cases: `chart_top_n_claimed`, where a top 5 by country is saved with `limit` 5, and `chart_bin_text_column_asks`, where a bin on a text column is neither claimed nor saved.
+
 ### Changed
 
 - A saved query's delete and restore need edit instead of manage, and the trash list shows what the caller may edit.

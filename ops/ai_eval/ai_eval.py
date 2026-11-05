@@ -1332,6 +1332,11 @@ def main() -> int:
     parser.add_argument("--label", default="run")
     parser.add_argument("--cases", default=str(HERE / "cases.json"))
     parser.add_argument("--only", default="")
+    parser.add_argument(
+        "--exclude",
+        default="",
+        help="case ids to leave out of the run, applied after --only; an id naming no case is a setup error",
+    )
     parser.add_argument("--out", default="")
     parser.add_argument(
         "--rescore",
@@ -1351,10 +1356,20 @@ def main() -> int:
 
     try:
         cfg = Config.from_env()
-        cases = json.loads(Path(args.cases).read_text())
+        cases = all_cases = json.loads(Path(args.cases).read_text())
         if args.only:
             wanted = set(args.only.split(","))
             cases = [c for c in cases if c["id"] in wanted]
+        excluded = args.exclude.split(",") if args.exclude else []
+        # Checked against every case in the file, so a stale or mistyped id
+        # stops the run instead of silently leaving a broken case in the count.
+        known = {c["id"] for c in all_cases}
+        unknown = [i for i in excluded if i not in known]
+        if unknown:
+            raise ValueError(f"--exclude names no case: {', '.join(unknown)}")
+        cases = [c for c in cases if c["id"] not in excluded]
+        if excluded:
+            print(f"excluded: {', '.join(excluded)}")
         baseline = load_baseline(args.baseline) if args.baseline else None
 
         session = requests.Session()
@@ -1408,8 +1423,8 @@ def main() -> int:
     if verdict:
         print(summary_line(verdict))
     out = resolve_out(args.out, args.label)
-    out.write_text(json.dumps(result_document(args.label, results, verdict) | {"summary": summary},
-                              ensure_ascii=False, indent=2))
+    document = result_document(args.label, results, verdict) | {"summary": summary, "excluded": excluded}
+    out.write_text(json.dumps(document, ensure_ascii=False, indent=2))
     print(f"saved {out}")
     return exit_code(setup_error=False, verdict=verdict)
 
