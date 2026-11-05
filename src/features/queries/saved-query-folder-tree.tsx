@@ -1,0 +1,308 @@
+"use client"
+
+import * as React from "react"
+import {
+  FolderIcon,
+  FolderPlusIcon,
+  LockIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
+import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { levelAtLeast } from "@/features/dashboards/access-level"
+import { useServiceAction } from "@/hooks/use-service"
+import { MAX_FOLDER_DEPTH } from "@/lib/folder-tree"
+import { readableErrorMessage } from "@/lib/notify-message"
+import { queryService } from "@/services"
+import type { QueryFolder } from "@/services/contracts/queries"
+import {
+  SavedQueryFolderNameDialog,
+  type SavedQueryFolderNaming,
+} from "./saved-query-folder-dialogs"
+import { buildSavedQueryTree, type SavedQueryTreeNode } from "./saved-query-tree"
+
+/**
+ * The tree of the saved-query spaces (`QS-3` C1): the caller's own space,
+ * the shared space and the folders under each. A node lists the queries it
+ * holds, and the folder actions sit beside it.
+ *
+ * The level the server sends with each folder decides what the tree offers
+ * (C2): a folder may be filled at **edit**, renamed at **edit** and deleted
+ * at **manage**. A personal space is never renamed, moved or deleted — it
+ * is one person's own space — so the tree offers it neither.
+ */
+export function SavedQueryFolderTree({
+  folders,
+  selected,
+  onSelect,
+  onChanged,
+}: {
+  /** The folders the caller may see, as the server sent them. */
+  readonly folders: QueryFolder[]
+  /** The `folder` value the list is asked for; `undefined` for every query. */
+  readonly selected: string | undefined
+  readonly onSelect: (folder: string | undefined) => void
+  /** Called after a change, so the folders and the list are read again. */
+  readonly onChanged: () => void
+}) {
+  const tree = React.useMemo(() => buildSavedQueryTree(folders), [folders])
+  const createAct = useServiceAction((signal, name: string, parentId: string | null) =>
+    queryService.createFolder({ name, parentId }, signal),
+  )
+  const renameAct = useServiceAction((signal, id: string, name: string) =>
+    queryService.updateFolder(id, { name }, signal),
+  )
+  const deleteAct = useServiceAction((signal, id: string) =>
+    queryService.deleteFolder(id, signal).then(() => true),
+  )
+  // The rename and the create say why they were refused inside their own
+  // dialog; the delete has no dialog of its own, so it says it here. A
+  // sentence said twice is a sentence nobody reads (C6).
+  const error = deleteAct.error
+  const [naming, setNaming] = React.useState<SavedQueryFolderNaming | null>(null)
+  const [deleting, setDeleting] = React.useState<QueryFolder | null>(null)
+
+  async function create(name: string) {
+    if (!naming || naming.mode !== "create") return
+    const done = await createAct.run(name, naming.parentId)
+    if (done) {
+      setNaming(null)
+      onChanged()
+    }
+  }
+
+  async function rename(name: string) {
+    if (!naming || naming.mode !== "rename") return
+    const done = await renameAct.run(naming.id, name)
+    if (done) {
+      setNaming(null)
+      onChanged()
+    }
+  }
+
+  async function remove() {
+    if (!deleting) return
+    const done = await deleteAct.run(deleting.id)
+    if (done) {
+      setDeleting(null)
+      onChanged()
+    }
+  }
+
+  const startRename = (folder: QueryFolder) =>
+    setNaming({ mode: "rename", id: folder.id, current: folder.name })
+
+  const startCreate = (parentId: string | null, place: string) =>
+    setNaming({ mode: "create", parentId, place })
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-sm font-medium">Folders</h2>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => startCreate(null, "the shared space")}
+        >
+          <FolderPlusIcon className="size-4" aria-hidden />
+          New folder
+        </Button>
+      </div>
+
+      <nav aria-label="Saved query folders">
+        <ul className="space-y-0.5">
+          <li>
+            <button
+              type="button"
+              onClick={() => onSelect(undefined)}
+              aria-current={selected === undefined ? "true" : undefined}
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm hover:bg-muted"
+            >
+              All queries
+            </button>
+          </li>
+          {tree.personal ? (
+            <FolderTreeNode
+              node={tree.personal}
+              selected={selected}
+              onSelect={onSelect}
+              onCreate={startCreate}
+              onRename={startRename}
+              onDelete={setDeleting}
+            />
+          ) : null}
+          <FolderTreeNode
+            node={tree.shared}
+            selected={selected}
+            onSelect={onSelect}
+            onCreate={startCreate}
+            onRename={startRename}
+            onDelete={setDeleting}
+          />
+        </ul>
+      </nav>
+
+      {error ? (
+        <p role="alert" className="text-sm text-destructive">
+          {readableErrorMessage(error.message)}
+        </p>
+      ) : null}
+
+      {naming ? (
+        <SavedQueryFolderNameDialog
+          key={naming.mode === "rename" ? naming.id : `new-${naming.parentId ?? "root"}`}
+          naming={naming}
+          onClose={() => setNaming(null)}
+          onSubmit={(name) => {
+            if (naming.mode === "rename") void rename(name)
+            else void create(name)
+          }}
+          busy={createAct.status === "pending" || renameAct.status === "pending"}
+          error={
+            createAct.error || renameAct.error
+              ? readableErrorMessage(
+                  (createAct.error ?? renameAct.error)?.message ?? "",
+                )
+              : null
+          }
+        />
+      ) : null}
+
+      {deleting ? (
+        <ConfirmActionDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setDeleting(null)
+          }}
+          title="Delete folder"
+          description={`"${deleting.name}" leaves the tree. It must hold no queries and no folders.`}
+          confirmLabel="Delete"
+          destructive
+          confirming={deleteAct.status === "pending"}
+          onConfirm={() => void remove()}
+        />
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * One node of the tree and the folders under it.
+ *
+ * The shared space has no node of its own on the server, so it carries no
+ * level and offers no folder action of its own: a folder in it is made
+ * with "New folder" above the tree.
+ */
+function FolderTreeNode({
+  node,
+  selected,
+  onSelect,
+  onCreate,
+  onRename,
+  onDelete,
+}: {
+  readonly node: SavedQueryTreeNode
+  readonly selected: string | undefined
+  readonly onSelect: (folder: string | undefined) => void
+  readonly onCreate: (parentId: string | null, place: string) => void
+  readonly onRename: (folder: QueryFolder) => void
+  readonly onDelete: (folder: QueryFolder) => void
+}) {
+  const folder = node.record
+  const isShared = node.id === "shared"
+  // Filling a folder needs **edit**; deleting one needs **manage**. A
+  // personal space is never renamed or deleted (C2).
+  const mayFill = !isShared && levelAtLeast(node.level, "edit")
+  const mayRename = mayFill && !node.isPersonal
+  const mayDelete = !isShared && levelAtLeast(node.level, "manage") && !node.isPersonal
+  const mayNest = node.depth < MAX_FOLDER_DEPTH
+
+  return (
+    <li>
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => onSelect(node.folder)}
+          aria-current={selected === node.folder ? "true" : undefined}
+          title={node.name}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1 text-left text-sm hover:bg-muted"
+        >
+          {node.isPersonal ? (
+            <LockIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+          ) : (
+            <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+          )}
+          <span className="truncate">{node.label}</span>
+        </button>
+        {mayFill || mayRename || mayDelete ? (
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-7"
+                  aria-label={`Actions for ${node.label}`}
+                />
+              }
+            >
+              <FolderPlusIcon className="size-4" aria-hidden />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {mayFill && mayNest ? (
+                <DropdownMenuItem
+                  onClick={() =>
+                    onCreate(
+                      node.id,
+                      node.isPersonal ? "your personal space" : `"${node.label}"`,
+                    )
+                  }
+                >
+                  <FolderPlusIcon className="size-3.5" data-icon="inline-start" />
+                  {node.isPersonal ? "New folder" : "New subfolder"}
+                </DropdownMenuItem>
+              ) : null}
+              {mayRename && folder ? (
+                <DropdownMenuItem onClick={() => onRename(folder)}>
+                  <PencilIcon className="size-3.5" data-icon="inline-start" />
+                  Rename
+                </DropdownMenuItem>
+              ) : null}
+              {mayDelete && folder ? (
+                <DropdownMenuItem
+                  variant="destructive"
+                  onClick={() => onDelete(folder)}
+                >
+                  <Trash2Icon className="size-3.5" data-icon="inline-start" />
+                  Delete
+                </DropdownMenuItem>
+              ) : null}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ) : null}
+      </div>
+      {node.children.length > 0 ? (
+        <ul className="ml-3 space-y-0.5 border-l pl-2">
+          {node.children.map((child) => (
+            <FolderTreeNode
+              key={child.id}
+              node={child}
+              selected={selected}
+              onSelect={onSelect}
+              onCreate={onCreate}
+              onRename={onRename}
+              onDelete={onDelete}
+            />
+          ))}
+        </ul>
+      ) : null}
+    </li>
+  )
+}
