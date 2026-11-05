@@ -27,6 +27,8 @@ use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 const MART: &str = "mart_seeded_sales";
 const COLUMN: &str = "region_code";
 const MEASURE: &str = "sale_total";
+/// A second text column, for a breakdown.
+const SECOND_COLUMN: &str = "sale_month";
 
 /// One model round: the given text and tool calls, as an OpenAI-compatible
 /// `/chat/completions` response.
@@ -83,7 +85,7 @@ fn rows(data: &Value) -> ResponseTemplate {
 }
 
 /// `ClickHouse` for a chart draft. `mart_exists` decides whether the
-/// `serving` count finds the mart; the columns query returns `COLUMN` and no
+/// `serving` count finds the mart; the columns query returns the three columns above and no
 /// other column. Anything else (the saved fields, the `CREATE`/`ALTER` DDL)
 /// gets an empty answer, and an `INSERT` is recorded by `statements`.
 async fn mock_clickhouse(mart_exists: bool) -> MockServer {
@@ -99,6 +101,7 @@ async fn mock_clickhouse(mart_exists: bool) -> MockServer {
         .and(body_string_contains("FROM system.columns"))
         .respond_with(rows(&json!([
             { "name": COLUMN, "type": "String" },
+            { "name": SECOND_COLUMN, "type": "String" },
             { "name": MEASURE, "type": "Float64" },
         ])))
         .mount(&ch)
@@ -400,4 +403,203 @@ async fn the_chat_loop_removes_a_confirmed_flag_of_any_value_from_the_offered_dr
     );
     assert_eq!(step["result"]["args"]["mart"], MART, "{body}");
     assert!(!has_insert(&statements(&ch).await), "nothing was written");
+}
+
+/// A `create_chart` call for the top ten `COLUMN` values by `MEASURE`, split
+/// by `SECOND_COLUMN`: the call the assistant should send for "top 10 regions
+/// by month".
+fn top_ten_args() -> String {
+    json!({
+        "title": "Sales by region and month",
+        "kind": "bar",
+        "mart": MART,
+        "dimension": COLUMN,
+        "breakdown": SECOND_COLUMN,
+        "measures": [MEASURE],
+        "sort": { "by": MEASURE, "dir": "desc" },
+        "limit": 10,
+    })
+    .to_string()
+}
+
+/// The text of the tool message the model reads in the round after `call_id`:
+/// the second request the model received.
+async fn tool_message_the_model_read(llm: &MockServer, call_id: &str) -> String {
+    let requests = llm.received_requests().await.expect("recording is on");
+    let second: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    second["messages"]
+        .as_array()
+        .expect("messages is a list")
+        .iter()
+        .find(|m| m["tool_call_id"] == call_id)
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_else(|| panic!("no tool message for {call_id}: {second}"))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_chart_draft_lists_its_dimension_breakdown_sort_and_limit_for_the_model() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "create_chart", &top_ten_args())]),
+        model_round(Some("Drafted."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = chat(&llm, &ch, "Top 10 regions by month.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let step = traced_step(&body, "create_chart");
+    assert_eq!(step["result"]["needs_confirmation"], json!(true), "{body}");
+    let definition = step["result"]["definition"].as_str().unwrap_or_default();
+    for listed in [
+        "dimension: region_code",
+        "breakdown: sale_month",
+        "measures: sale_total",
+        "sort: sale_total desc",
+        "limit: 10",
+    ] {
+        assert!(definition.contains(listed), "{listed} is missing: {body}");
+    }
+    let read = tool_message_the_model_read(&llm, "call_1").await;
+    assert!(
+        read.contains(definition),
+        "the model's tool message does not carry the digest: {read}"
+    );
+}
+
+#[tokio::test]
+async fn a_chart_draft_with_a_breakdown_and_no_limit_reads_limit_none() {
+    let args = json!({
+        "title": "Sales by region and month",
+        "kind": "bar",
+        "mart": MART,
+        "dimension": SECOND_COLUMN,
+        "breakdown": COLUMN,
+        "measures": [MEASURE],
+    })
+    .to_string();
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "create_chart", &args)]),
+        model_round(Some("Drafted."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = chat(&llm, &ch, "Sales by month and region.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let step = traced_step(&body, "create_chart");
+    let definition = step["result"]["definition"].as_str().unwrap_or_default();
+    assert!(definition.contains("limit: none"), "{body}");
+}
+
+#[tokio::test]
+async fn the_saved_reply_after_confirm_carries_the_digest_the_draft_showed() {
+    let drafted = tool_call(
+        &mock_model(vec![]).await,
+        &mock_clickhouse(true).await,
+        "create_chart",
+        &top_ten_args(),
+    )
+    .await;
+    let draft_digest = drafted.1["result"]["definition"].clone();
+    assert!(
+        draft_digest
+            .as_str()
+            .is_some_and(|d| d.contains("sort: sale_total desc; limit: 10")),
+        "{drafted:?}"
+    );
+
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse(true).await;
+    let mut confirmed: Value = serde_json::from_str(&top_ten_args()).unwrap();
+    confirmed["confirmed"] = json!(true);
+    let (status, saved) = tool_call(&llm, &ch, "create_chart", &confirmed.to_string()).await;
+
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["result"]["created"], json!(true), "{saved}");
+    assert_eq!(saved["result"]["definition"], draft_digest, "{saved}");
+}
+
+/// The card is built from `summary` and the call's args; the digest sits in
+/// its own key so the text the person confirms does not change.
+#[tokio::test]
+async fn the_card_summary_of_a_chart_draft_keeps_its_text() {
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = tool_call(&llm, &ch, "create_chart", &top_ten_args()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["summary"],
+        json!(
+            "Membuat chart baru \"Sales by region and month\" (bar) dari mart mart_seeded_sales."
+        ),
+        "{body}"
+    );
+}
+
+/// `MAX_ITER` rounds that each call `create_chart` with `args`, then a
+/// tool-free last round that answers with `last` (the answer the loop asks
+/// for once its rounds are spent).
+fn spent_rounds(args: &str, last: Option<&str>) -> Vec<Value> {
+    let mut rounds: Vec<Value> = (1..=8)
+        .map(|n| model_round(None, &[(&format!("call_{n}"), "create_chart", args)]))
+        .collect();
+    rounds.push(model_round(last, &[]));
+    rounds
+}
+
+#[tokio::test]
+async fn an_empty_last_answer_after_a_refused_create_chart_names_the_tool_and_its_refusal() {
+    let llm = mock_model(spent_rounds(&chart_args(MART, COLUMN), Some(""))).await;
+    // The mart is not there, so every draft is refused.
+    let ch = mock_clickhouse(false).await;
+
+    let (status, body) = chat(&llm, &ch, "Buat grafik penjualan per wilayah.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answer = body["answer"].as_str().unwrap_or_default();
+    assert!(answer.starts_with("The request was not finished"), "{body}");
+    assert!(answer.contains("`create_chart`"), "{body}");
+    let refusal = traced_step(&body, "create_chart")["result"]["error"]
+        .as_str()
+        .expect("the draft was refused with a sentence")
+        .to_owned();
+    assert!(
+        answer.contains(&refusal.chars().take(200).collect::<String>()),
+        "the reply does not carry the refusal ({refusal}): {body}"
+    );
+    assert_eq!(body["note"], "tool-call limit reached", "{body}");
+}
+
+#[tokio::test]
+async fn an_empty_last_answer_with_no_refused_tool_still_says_the_request_was_not_finished() {
+    let llm = mock_model(spent_rounds(&chart_args(MART, COLUMN), None)).await;
+    // The mart is there, so every draft is offered and none is refused.
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = chat(&llm, &ch, "Buat grafik penjualan per wilayah.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answer = body["answer"].as_str().unwrap_or_default();
+    assert!(answer.starts_with("The request was not finished"), "{body}");
+    assert!(answer.contains("no tool refused a call"), "{body}");
+}
+
+#[tokio::test]
+async fn a_last_answer_that_is_not_empty_is_left_as_the_model_wrote_it() {
+    let llm = mock_model(spent_rounds(
+        &chart_args(MART, COLUMN),
+        Some("Only a draft."),
+    ))
+    .await;
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = chat(&llm, &ch, "Buat grafik penjualan per wilayah.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["answer"], "Only a draft.", "{body}");
 }

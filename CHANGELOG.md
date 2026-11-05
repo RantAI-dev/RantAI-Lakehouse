@@ -30,6 +30,7 @@ once a first release is tagged.
 
 - The assistant's `update_chart` keeps every field the request does not name, and `null` clears one, so a rename no longer empties a chart (backlog `AI-3`). The reply lists the kept fields as `fieldsKept`.
 - The parameter line in a dashboard's context to the assistant is bounded to 600 characters, so a dashboard with many parameters still sends the board id and the last instruction (backlog `AI-14`).
+- The assistant reads back the chart's definition after a chart draft or save, says when a call was refused, and never ends a turn with an empty answer (backlog `AI-6`).
 
 ## [0.2.1] - 2026-11-04
 

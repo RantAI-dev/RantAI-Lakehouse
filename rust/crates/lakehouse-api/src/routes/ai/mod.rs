@@ -971,11 +971,11 @@ async fn run_chat(
                     approval_outcome(state, principal, spec, &args, resource_id.as_deref()).await
                 } else {
                     let outcome = gate::outcome_of(&refusal);
-                    if outcome == "needs_confirmation"
-                        && let Some(error) =
-                            tools::check_draft(state, &call.function.name, &args).await
-                    {
-                        (error, "failed", None, None)
+                    if outcome == "needs_confirmation" {
+                        match tools::check_draft(state, &call.function.name, &args, refusal).await {
+                            Ok(draft) => (draft, outcome, None, None),
+                            Err(error) => (error, "failed", None, None),
+                        }
                     } else {
                         (refusal, outcome, None, None)
                     }
@@ -1088,14 +1088,25 @@ async fn run_chat(
         name: None,
     });
     let final_msg = model_round(state, &messages, &[], progress).await?;
+    let final_answer = final_msg.content.unwrap_or_default();
+    // An empty last answer is never the reply: a model that spent every round
+    // on refused calls came back with nothing, and the person saw nothing. The
+    // fixed text skips the citation check on purpose, since it has no claim to
+    // cite. `chat_response_body` still runs `take_next_step` on it, which
+    // leaves it whole because the text has no `NEXT:` line of its own.
+    if final_answer.trim().is_empty() {
+        return Ok(chat_response_body(
+            &unfinished_reply(&tool_trace),
+            &tool_trace,
+            build_run_id.as_deref(),
+            chart_created,
+            Some("tool-call limit reached"),
+        ));
+    }
     // WS7 item F2: the iteration-budget-exhausted final answer is checked
     // the same way as the normal return path — a model that runs out of
     // tool-calling turns is not exempt from citation checking.
-    let annotated = citations::annotate_answer_in(
-        &final_msg.content.unwrap_or_default(),
-        &tool_trace,
-        &conversation,
-    );
+    let annotated = citations::annotate_answer_in(&final_answer, &tool_trace, &conversation);
     Ok(chat_response_body(
         &annotated,
         &tool_trace,
@@ -1103,6 +1114,38 @@ async fn run_chat(
         chart_created,
         Some("tool-call limit reached"),
     ))
+}
+
+/// How much of a tool's refusal [`unfinished_reply`] repeats.
+const REFUSAL_MAX_CHARS: usize = 200;
+
+/// The reply of a turn that used every round and ended with an empty answer:
+/// it says the request was not finished, and names the last tool a call of
+/// which was refused, with the refusal cut to [`REFUSAL_MAX_CHARS`]. Fixed
+/// text, never a claim that something was done.
+///
+/// A step counts as refused when its result has an `error` key, the same test
+/// the loop uses to set `ok`. The text is the tool's own refusal (the
+/// server's sentence about the model's arguments), never an upstream error's:
+/// the tools classify those before they return. An `error` that is not a
+/// string reads as "no reason given".
+fn unfinished_reply(tool_trace: &[Value]) -> String {
+    let refused = tool_trace.iter().rev().find_map(|step| {
+        let refusal = step["result"].get("error")?;
+        Some((
+            step["tool"].as_str()?,
+            refusal.as_str().unwrap_or("no reason given"),
+        ))
+    });
+    match refused {
+        Some((refused_tool, refusal)) => {
+            let refusal: String = refusal.chars().take(REFUSAL_MAX_CHARS).collect();
+            format!(
+                "The request was not finished: the assistant ran out of steps before it could answer. The last call a tool refused was `{refused_tool}`: {refusal}"
+            )
+        }
+        None => "The request was not finished: the assistant ran out of steps before it could answer, and no tool refused a call. Check what exists before asking again.".to_owned(),
+    }
 }
 
 /// Drops a narrated preamble before a `Final answer:` line. After a repair
@@ -1313,10 +1356,11 @@ pub async fn tool_call(
             .await
         } else {
             let outcome = gate::outcome_of(&refusal);
-            if outcome == "needs_confirmation"
-                && let Some(error) = tools::check_draft(&state, &parsed.tool, &parsed.args).await
-            {
-                (error, "failed", None, None)
+            if outcome == "needs_confirmation" {
+                match tools::check_draft(&state, &parsed.tool, &parsed.args, refusal).await {
+                    Ok(draft) => (draft, outcome, None, None),
+                    Err(error) => (error, "failed", None, None),
+                }
             } else {
                 (refusal, outcome, None, None)
             }
@@ -3319,6 +3363,29 @@ mod tests {
             calls[0].function.arguments,
             r#"{"title":"T","kind":"kpi","mart":"m"}"#
         );
+    }
+
+    #[test]
+    fn the_unfinished_reply_names_the_last_refused_tool_and_cuts_its_refusal_to_200_characters() {
+        let trace = vec![
+            json!({ "tool": "list_boards", "ok": false, "result": { "error": "an older refusal" } }),
+            json!({ "tool": "create_chart", "ok": false, "result": { "error": "x".repeat(250) } }),
+            json!({ "tool": "list_charts", "ok": true, "result": { "charts": [] } }),
+        ];
+        let reply = unfinished_reply(&trace);
+        assert!(reply.contains("`create_chart`"), "{reply}");
+        assert!(!reply.contains("older refusal"), "{reply}");
+        assert!(reply.ends_with(&"x".repeat(200)), "{reply}");
+        assert!(!reply.contains(&"x".repeat(201)), "{reply}");
+    }
+
+    #[test]
+    fn the_unfinished_reply_reads_an_error_that_is_not_a_string_as_no_reason_given() {
+        let trace = vec![
+            json!({ "tool": "create_chart", "ok": false, "result": { "error": { "code": 7 } } }),
+        ];
+        let reply = unfinished_reply(&trace);
+        assert!(reply.contains("`create_chart`: no reason given"), "{reply}");
     }
 
     /// D4 regression: `buildRunId` must be omitted from the response body

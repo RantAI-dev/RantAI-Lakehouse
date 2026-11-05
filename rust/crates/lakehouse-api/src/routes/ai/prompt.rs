@@ -447,7 +447,8 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
 - These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
-- When a tool result says needs_confirmation, call no other tool that needs the drafted object (a chart, a board or a tab that does not exist yet, a calculated field): reply with ONE short sentence that names the draft the result is for (a chart, a board, a tab or a calculated field). Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab): for example a chart on the board being drafted, the charts moved to the tab being drafted, or the cache rule of the chart just drafted; never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.");
+- When a tool result says needs_confirmation, call no other tool that needs the drafted object (a chart, a board or a tab that does not exist yet, a calculated field): reply with ONE short sentence that names the draft the result is for (a chart, a board, a tab or a calculated field). Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab): for example a chart on the board being drafted, the charts moved to the tab being drafted, or the cache rule of the chart just drafted; never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.
+- A `create_chart` draft, and a created or updated chart, has `definition`: describe the chart only by what it lists, because a top N, a bin or a filter it does not list was not made. When a tool refused a call, say so in your first sentence, in plain words, and never present a workaround as what the person asked for. When a refusal says bins are for numbers and names the number columns, call ask_user with those columns as the options; when it says the source has no number column to bin, say that and ask nothing. A chart update draft has no `definition`, its saved result does. \"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N.");
 
 /// Tools offered on every turn: the data tools, and the read-only listings
 /// a general question about the platform needs.
@@ -1246,6 +1247,47 @@ mod tests {
         assert!(
             !SYSTEM_BUILD_SUFFIX.contains("The chart draft is ready"),
             "the old sentence made every draft a chart"
+        );
+    }
+
+    /// A chart the assistant describes is the chart the tool result lists: the
+    /// build prompt names the result's `definition`, says that what it does
+    /// not list was not made, says to state a refusal first and not to pass a
+    /// workaround off as the request, to ask which number column to bin, and
+    /// how "top N of X by Y" is called.
+    #[test]
+    fn the_build_prompt_reads_a_chart_back_from_its_definition_and_says_a_refusal_first() {
+        let line = SYSTEM_BUILD_SUFFIX
+            .lines()
+            .find(|l| l.contains("`definition`"))
+            .unwrap_or_else(|| panic!("the definition rule is not in the build suffix"));
+        for clause in [
+            // 1. Describe only what the definition lists.
+            "describe the chart only by what it lists",
+            "a top N, a bin or a filter it does not list was not made",
+            // 2. A refusal comes first, in plain words, and a workaround is
+            // not the request.
+            "When a tool refused a call, say so in your first sentence",
+            "never present a workaround as what the person asked for",
+            // 3. A column that cannot be binned is asked about, but only
+            // the bin refusal names columns to ask with: the histogram and
+            // Gantt refusals also say "is not a number column" and name none.
+            "When a refusal says bins are for numbers and names the number columns, call ask_user with those columns as the options",
+            "when it says the source has no number column to bin, say that and ask nothing",
+            // 5. An update draft has no definition; its saved result does.
+            "A chart update draft has no `definition`, its saved result does",
+            // 4. How a top N is called.
+            "\"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N",
+        ] {
+            assert!(
+                line.contains(clause),
+                "the rule must say: {clause} -- got: {line}"
+            );
+        }
+        // The one-short-sentence rule for a plain draft stays.
+        assert!(
+            SYSTEM_BUILD_SUFFIX.contains("reply with ONE short sentence that names the draft"),
+            "the plain-draft rule is gone"
         );
     }
 
