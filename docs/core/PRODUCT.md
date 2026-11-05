@@ -162,7 +162,7 @@ hands-on testing.
 | Lineage | **Partial** | Yes, including outside systems | Depth |
 | Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
 | Audit trail | **Partial.** Pipeline runs and assistant actions; not every console change | Yes | Full coverage |
-| Single sign-on | **Partial.** The sign-in start, callback and provider-list routes exist in the API; not tested against a real identity provider. `README.md` still describes this as unbuilt | Yes | Test it |
+| Single sign-on | **Partial.** The sign-in start, callback and provider-list routes exist in the API; not tested against a real identity provider. | Yes | Test it |
 
 #### Business intelligence
 
@@ -230,7 +230,7 @@ hands-on testing.
 ## 3. What it does not do
 
 Stated plainly, for anyone describing the product to a customer. More detail
-in `README.md` ("Status / Known limitations").
+in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
 
 **Data**
 - Business-app connectors (Salesforce, ServiceNow, Google Analytics 4,

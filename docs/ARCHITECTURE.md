@@ -4,8 +4,8 @@ This document maps the Rust workspace, traces a request end to end, explains
 the Postgres/ClickHouse data-model split, and calls out the seams that make
 the system extensible without a rewrite.
 
-For environment variables and a running-system quickstart, see
-[README.md](../README.md). For contribution mechanics, see
+For environment variables, see [CONFIGURATION.md](CONFIGURATION.md); to
+install or run the system, see [README.md](../README.md). For contribution mechanics, see
 [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Module map
@@ -253,8 +253,8 @@ schema/codegen enforcing this today; it is convention plus the (now
 historical) parity harness.
 
 `src/services/mock/*` remains the implementation for domains that are
-still mocked rather than backed by a real Rust route — see README's
-"Status / Known limitations" for exactly which ones (`knowledge.search`).
+still mocked rather than backed by a real Rust route — see
+[KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) for exactly which ones (`knowledge.search`).
 The `streaming` domain was removed outright rather than kept mocked —
 there is no streaming engine anywhere in this stack, so faking one in the
 UI was a locked-decision violation, not a limitation to document.
