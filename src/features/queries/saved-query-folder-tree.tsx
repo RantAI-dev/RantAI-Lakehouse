@@ -7,6 +7,7 @@ import {
   FolderPlusIcon,
   LockIcon,
   PencilIcon,
+  Share2Icon,
   Trash2Icon,
 } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
@@ -27,6 +28,7 @@ import {
   SavedQueryFolderNameDialog,
   type SavedQueryFolderNaming,
 } from "./saved-query-folder-dialogs"
+import { SavedQueryAccessPanel } from "./saved-query-access-panel"
 import { SavedQueryMoveDialog } from "./saved-query-move-dialog"
 import { buildSavedQueryTree, type SavedQueryTreeNode } from "./saved-query-tree"
 
@@ -36,9 +38,10 @@ import { buildSavedQueryTree, type SavedQueryTreeNode } from "./saved-query-tree
  * holds, and the folder actions sit beside it.
  *
  * The level the server sends with each folder decides what the tree offers
- * (C2): a folder may be filled at **edit**, renamed at **edit** and deleted
- * at **manage**. A personal space is never renamed, moved or deleted — it
- * is one person's own space — so the tree offers it neither.
+ * (C2): a folder may be filled at **edit**, renamed at **edit**, shared
+ * and deleted at **manage**. A personal space is never renamed, moved,
+ * deleted or shared — it is one person's own space — so the tree offers it
+ * none of those.
  */
 export function SavedQueryFolderTree({
   folders,
@@ -78,6 +81,7 @@ export function SavedQueryFolderTree({
   const [naming, setNaming] = React.useState<SavedQueryFolderNaming | null>(null)
   const [moving, setMoving] = React.useState<QueryFolder | null>(null)
   const [deleting, setDeleting] = React.useState<QueryFolder | null>(null)
+  const [sharing, setSharing] = React.useState<QueryFolder | null>(null)
 
   async function create(name: string) {
     if (!naming || naming.mode !== "create") return
@@ -161,6 +165,7 @@ export function SavedQueryFolderTree({
               onRename={startRename}
               onMove={startMove}
               onDelete={setDeleting}
+              onShare={setSharing}
             />
           ) : null}
           <FolderTreeNode
@@ -171,6 +176,7 @@ export function SavedQueryFolderTree({
             onRename={startRename}
             onMove={startMove}
             onDelete={setDeleting}
+            onShare={setSharing}
           />
         </ul>
       </nav>
@@ -230,6 +236,16 @@ export function SavedQueryFolderTree({
           error={moveAct.error?.message ?? null}
         />
       ) : null}
+
+      {sharing ? (
+        <SavedQueryAccessPanel
+          key={sharing.id}
+          kind="folder"
+          id={sharing.id}
+          title={sharing.name}
+          onClose={() => setSharing(null)}
+        />
+      ) : null}
     </div>
   )
 }
@@ -249,6 +265,7 @@ function FolderTreeNode({
   onRename,
   onMove,
   onDelete,
+  onShare,
 }: {
   readonly node: SavedQueryTreeNode
   readonly selected: string | undefined
@@ -257,14 +274,17 @@ function FolderTreeNode({
   readonly onRename: (folder: QueryFolder) => void
   readonly onMove: (folder: QueryFolder) => void
   readonly onDelete: (folder: QueryFolder) => void
+  readonly onShare: (folder: QueryFolder) => void
 }) {
   const folder = node.record
   const isShared = node.id === "shared"
-  // Filling a folder needs **edit**; deleting one needs **manage**. A
-  // personal space is never renamed, moved or deleted (C2).
+  // Filling a folder needs **edit**; sharing and deleting one need
+  // **manage**. A personal space is never renamed, moved, deleted or
+  // shared (C2): it is one person's own space, and a rule on it would
+  // reach everything inside it.
   const mayFill = !isShared && levelAtLeast(node.level, "edit")
   const mayChange = mayFill && !node.isPersonal
-  const mayDelete = !isShared && levelAtLeast(node.level, "manage") && !node.isPersonal
+  const mayManage = !isShared && levelAtLeast(node.level, "manage") && !node.isPersonal
   const mayNest = node.depth < MAX_FOLDER_DEPTH
 
   return (
@@ -284,7 +304,7 @@ function FolderTreeNode({
           )}
           <span className="truncate">{node.label}</span>
         </button>
-        {mayFill || mayChange || mayDelete ? (
+        {mayFill || mayChange || mayManage ? (
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
@@ -324,14 +344,20 @@ function FolderTreeNode({
                   </DropdownMenuItem>
                 </>
               ) : null}
-              {mayDelete && folder ? (
-                <DropdownMenuItem
-                  variant="destructive"
-                  onClick={() => onDelete(folder)}
-                >
-                  <Trash2Icon className="size-3.5" data-icon="inline-start" />
-                  Delete
-                </DropdownMenuItem>
+              {mayManage && folder ? (
+                <>
+                  <DropdownMenuItem onClick={() => onShare(folder)}>
+                    <Share2Icon className="size-3.5" data-icon="inline-start" />
+                    Share
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    variant="destructive"
+                    onClick={() => onDelete(folder)}
+                  >
+                    <Trash2Icon className="size-3.5" data-icon="inline-start" />
+                    Delete
+                  </DropdownMenuItem>
+                </>
               ) : null}
             </DropdownMenuContent>
           </DropdownMenu>
@@ -349,6 +375,7 @@ function FolderTreeNode({
               onRename={onRename}
               onMove={onMove}
               onDelete={onDelete}
+              onShare={onShare}
             />
           ))}
         </ul>

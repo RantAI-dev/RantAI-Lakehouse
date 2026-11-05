@@ -24,6 +24,7 @@ import { readableErrorMessage } from "@/lib/notify-message"
 import { queryService } from "@/services"
 import type { SavedQuery } from "@/services/contracts/queries"
 import { QueryStudioTabs } from "./query-studio-tabs"
+import { SavedQueryAccessPanel } from "./saved-query-access-panel"
 import { SavedQueryFolderTree } from "./saved-query-folder-tree"
 import { SavedQueryHistoryDialog } from "./saved-query-history-dialog"
 import { SavedQueryMoveDialog } from "./saved-query-move-dialog"
@@ -87,6 +88,7 @@ export function SavedQueriesPage() {
   const [moving, setMoving] = React.useState<SavedQuery | null>(null)
   const [historyFor, setHistoryFor] = React.useState<SavedQuery | null>(null)
   const [deleting, setDeleting] = React.useState<SavedQuery | null>(null)
+  const [sharing, setSharing] = React.useState<SavedQuery | null>(null)
   const [trashOpen, setTrashOpen] = React.useState(false)
 
   const duplicateAct = useServiceAction((signal, id: string) =>
@@ -127,6 +129,7 @@ export function SavedQueriesPage() {
         },
         onHistory: (query) => setHistoryFor(query),
         onDelete: (query) => setDeleting(query),
+        onShare: (query) => setSharing(query),
       }),
     [runDuplicate, reload, resetMove],
   )
@@ -349,6 +352,15 @@ export function SavedQueriesPage() {
           level={TRASH_LEVEL}
           onClose={() => setTrashOpen(false)}
           onRestored={() => state.reload()}
+        />
+      ) : null}
+      {sharing ? (
+        <SavedQueryAccessPanel
+          key={sharing.id}
+          kind="query"
+          id={sharing.id}
+          title={sharing.title}
+          onClose={() => setSharing(null)}
         />
       ) : null}
     </div>

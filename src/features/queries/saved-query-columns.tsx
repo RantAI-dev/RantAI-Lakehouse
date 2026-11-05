@@ -13,6 +13,7 @@ import {
   FolderInputIcon,
   HistoryIcon,
   PencilIcon,
+  Share2Icon,
   Trash2Icon,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -35,9 +36,9 @@ import type { SavedQuery } from "@/services/contracts/queries"
  *
  * The menu offers what the caller may do with the query, and the level the
  * server sends with the row decides that (`QS-3` C2): a viewer may open,
- * copy and duplicate it and read its history, and an editor may also rename
- * it, move it and take it to the trash. The server refuses the rest, so the
- * console does not offer it.
+ * copy and duplicate it and read its history, an editor may also rename
+ * it, move it and take it to the trash, and a manager may also share it.
+ * The server refuses the rest, so the console does not offer it.
  */
 export type SavedQueryRowActions = {
   readonly onInspect: (query: SavedQuery) => void
@@ -46,6 +47,7 @@ export type SavedQueryRowActions = {
   readonly onMove: (query: SavedQuery) => void
   readonly onHistory: (query: SavedQuery) => void
   readonly onDelete: (query: SavedQuery) => void
+  readonly onShare: (query: SavedQuery) => void
 }
 
 export function TagPills({ tags }: { readonly tags: readonly string[] }) {
@@ -64,7 +66,7 @@ export function TagPills({ tags }: { readonly tags: readonly string[] }) {
 export function getSavedQueryColumns(
   actions: SavedQueryRowActions
 ): ColumnDef<SavedQuery>[] {
-  const { onInspect, onDuplicate, onRename, onMove, onHistory, onDelete } = actions
+  const { onInspect, onDuplicate, onRename, onMove, onHistory, onDelete, onShare } = actions
 
   return [
     {
@@ -215,6 +217,15 @@ export function getSavedQueryColumns(
                       Delete
                     </DropdownMenuItem>
                   </>
+                ) : null}
+                {/* Sharing needs **manage**: both access routes of a saved
+                    query ask for it, so the console offers the panel only
+                    where the server would answer (C3). */}
+                {levelAtLeast(query.level, "manage") ? (
+                  <DropdownMenuItem onClick={() => onShare(query)}>
+                    <Share2Icon className="size-3.5" data-icon="inline-start" />
+                    Share
+                  </DropdownMenuItem>
                 ) : null}
               </DropdownMenuContent>
             </DropdownMenu>

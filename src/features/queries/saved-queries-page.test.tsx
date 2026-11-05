@@ -244,6 +244,65 @@ describe("the saved-queries console", () => {
     expect(screen.getByRole("menuitem", { name: "Rename" })).toBeDefined()
   })
 
+  it("offers the share to a manager and not to an editor", async () => {
+    stubServices([saved({ id: "q1", title: "Revenue", level: "manage" })])
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Revenue" }))
+
+    // Both access routes of a query ask for **manage** (C3).
+    expect(await screen.findByRole("menuitem", { name: "Share" })).toBeDefined()
+  })
+
+  it("keeps the share away from an editor", async () => {
+    stubServices([saved({ id: "q1", title: "Revenue", level: "edit" })])
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Revenue" }))
+
+    expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeDefined()
+    expect(menuItems("Share")).toBe(0)
+  })
+
+  it("opens the share panel of a query from its row menu", async () => {
+    stubServices([saved({ id: "q1", title: "Revenue", level: "manage" })])
+    const access = spyOn(queryService, "getSavedAccess").mockResolvedValue({
+      itemType: "query",
+      itemId: "q1",
+      yourLevel: "manage",
+      rules: [],
+      inherited: [],
+    })
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Revenue" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Share" }))
+
+    await waitFor(() => {
+      expect(access.mock.calls.at(-1)?.[0]).toBe("q1")
+    })
+    expect(await screen.findByText("Share query")).toBeDefined()
+  })
+
+  it("offers a folder's share to a manager", async () => {
+    stubServices()
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
+
+    expect(await screen.findByRole("menuitem", { name: "Share" })).toBeDefined()
+  })
+
+  it("keeps a folder's share away from an editor", async () => {
+    stubServices()
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Quarterly" }))
+
+    expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeDefined()
+    expect(menuItems("Share")).toBe(0)
+  })
+
   it("offers an editor a folder's rename but no folder's delete", async () => {
     stubServices()
     renderPage()
@@ -267,6 +326,8 @@ describe("the saved-queries console", () => {
     expect(await screen.findByRole("menuitem", { name: "New folder" })).toBeDefined()
     expect(menuItems("Rename")).toBe(0)
     expect(menuItems("Delete")).toBe(0)
+    // Nor is it shared: it is one person's own space.
+    expect(menuItems("Share")).toBe(0)
   })
 
   it("makes a folder in the shared space with the name typed in the dialog", async () => {
