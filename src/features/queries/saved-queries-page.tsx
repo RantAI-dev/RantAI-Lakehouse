@@ -174,7 +174,7 @@ export function SavedQueriesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Saved Queries"
-        description="Reusable SQL shared with the team, with owners and tags."
+        description="Reusable SQL in a personal and a shared space, with owners and tags."
         actions={
           <>
             <Button

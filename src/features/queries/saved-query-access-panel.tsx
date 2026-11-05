@@ -23,6 +23,7 @@ import type {
   SavedQueryAccessList,
   SavedQueryLevel,
 } from "@/services/contracts/queries"
+import { toServiceError } from "@/services/errors"
 
 /** The levels a rule may carry, from the weakest to the strongest. */
 const LEVELS: readonly SavedQueryLevel[] = ["view", "edit", "manage"]
@@ -196,7 +197,11 @@ export function SavedQueryAccessPanel({
         .catch((error: unknown) => {
           if (controller.signal.aborted) return
           setMatches({ people: [], roles: [] })
-          setSearchError(error instanceof Error ? error : new Error("The search failed."))
+          // A refusal is the server's sentence (C6): the shared narrowing
+          // helper keeps it and falls back to the repo's own sentence for
+          // a thrown value that is not an error (plan 47 review fix
+          // (SHOULD-FIX)).
+          setSearchError(toServiceError(error))
         })
     }, 250)
     return () => {

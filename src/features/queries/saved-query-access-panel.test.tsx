@@ -137,6 +137,23 @@ describe("the share panel", () => {
     })
   })
 
+  it("shows the shared fallback when the grantee search fails with something that is not an error", async () => {
+    stubAccess()
+    spyOn(queryService, "findGrantees").mockRejectedValue("not an error")
+    renderPanel()
+
+    fireEvent.change(await screen.findByLabelText("Add a person or role"), {
+      target: { value: "reza" },
+    })
+
+    // A refusal is the server's sentence (C6): a thrown value that is not
+    // an error has no sentence of its own, so the console shows the shared
+    // fallback and makes up none of its own.
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("Unexpected error.")
+    expect(screen.queryAllByText("The search failed.").length).toBe(0)
+  })
+
   it("writes the whole list when a person and a role are added", async () => {
     stubAccess()
     stubGrantees()
