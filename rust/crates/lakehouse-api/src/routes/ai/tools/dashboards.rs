@@ -30,6 +30,12 @@ pub(super) fn refused(gate: Gate) -> Value {
     }
 }
 
+/// What a refused `compare` is followed by. Serde says which key is missing
+/// but not where `compare` goes, and a model that sent `kind: "previous"` at
+/// the top of the call, then `compare: {}`, was refused until its rounds ran
+/// out. The names are those of `lakehouse_bi::tables::Compare`.
+const COMPARE_EXAMPLE: &str = r#"`compare` sits inside the chart call, not at its top level, and a KPI that compares with its previous period reads: {"compare": {"kind": "previous", "dateColumn": "<date column>", "period": "month"}}"#;
+
 /// Parse a tool call's raw args `Value` into a [`ChartInput`], the same way
 /// `args as unknown as ChartInput` casts in `ai-tools.ts` (no validation at
 /// this boundary — `spec_from_input` validates for real).
@@ -49,11 +55,93 @@ fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
             // arguments are flat on the wire.
             let candidates: Vec<&str> = args.keys().map(String::as_str).collect();
             match wrong_field(&def, &candidates).filter(|field| !cause.contains(*field)) {
-                Some(field) => Err(format!("\"{field}\": {cause}")),
+                Some(field) => {
+                    let sentence = format!("\"{field}\": {cause}");
+                    if field == "compare" {
+                        Err(format!("{sentence}. {COMPARE_EXAMPLE}"))
+                    } else {
+                        Err(sentence)
+                    }
+                }
                 None => Err(cause),
             }
         }
     }
+}
+
+/// The longest digest, in characters.
+const DIGEST_MAX: usize = 300;
+
+/// What a chart holds, in one line the model can read back: the fields that
+/// decide what the chart shows, and only those that are set. A model told
+/// "saved" and nothing else describes the arguments it meant to send; this
+/// line is what it must describe instead, so a top N, a bin or a filter that
+/// is not listed was not made.
+///
+/// The fields are `dimension`, `breakdown`, `measures` (names), `sort`,
+/// `limit`, `bin`, `grain`, and the number of `filters` and `joins`.
+/// `limit` is the exception to "set only": beside a sort or a breakdown it
+/// reads `none (default applies)` when the chart sets none, because a missing
+/// limit there is the difference between a top N and the builder's own cap,
+/// and the cap depends on the kind, so no number is named. The line is cut to
+/// [`DIGEST_MAX`] characters, the last one `…`.
+///
+/// It reads the definition the save is built from, not the one it stores: the
+/// store fills every chart's `limit` with the one it built with, which would
+/// hide whether the call set one. A create draft and its saved reply pass the
+/// same `ChartInput`, so one chart gives one line. An update gets its line
+/// only in its saved reply, where the input is the stored chart merged with
+/// the call, read as the caller; its draft carries none.
+pub(super) fn definition_digest(def: &ChartInput) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !def.dimension.is_empty() {
+        parts.push(format!("dimension: {}", def.dimension));
+    }
+    let breakdown = def.breakdown.as_deref().filter(|b| !b.is_empty());
+    if let Some(breakdown) = breakdown {
+        parts.push(format!("breakdown: {breakdown}"));
+    }
+    if !def.measures.is_empty() {
+        parts.push(format!("measures: {}", def.measures.join(", ")));
+    }
+    if let Some(sort) = &def.shape.sort {
+        parts.push(format!("sort: {} {}", sort.by, sort.dir));
+    }
+    match &def.limit {
+        Some(lakehouse_bi::params::Limit::Fixed(n)) => parts.push(format!("limit: {n}")),
+        Some(lakehouse_bi::params::Limit::Param(p)) => {
+            parts.push(format!("limit: parameter {}", p.param));
+        }
+        None if def.shape.sort.is_some() || breakdown.is_some() => {
+            parts.push("limit: none (default applies)".to_owned());
+        }
+        None => {}
+    }
+    if let Some(bin) = &def.shape.bin {
+        parts.push(match (bin.mode.as_str(), bin.width, bin.count) {
+            ("width", Some(width), _) => format!("bin: width {width}"),
+            ("count", _, Some(count)) => format!("bin: {count} bins"),
+            (mode, _, _) => format!("bin: {mode}"),
+        });
+    }
+    if let Some(grain) = def.grain.as_deref().filter(|g| !g.is_empty()) {
+        parts.push(format!("grain: {grain}"));
+    }
+    let filters = def.shape.filters.as_deref().map_or(0, <[_]>::len);
+    if filters > 0 {
+        parts.push(format!("filters: {filters}"));
+    }
+    let joins = def.shape.joins_list().len();
+    if joins > 0 {
+        parts.push(format!("joins: {joins}"));
+    }
+    let digest = parts.join("; ");
+    if digest.chars().count() <= DIGEST_MAX {
+        return digest;
+    }
+    let mut cut: String = digest.chars().take(DIGEST_MAX - 1).collect();
+    cut.push('…');
+    cut
 }
 
 /// The call's args with the formatting the call does not name filled in from
@@ -406,6 +494,7 @@ pub(super) async fn create_chart(
                 "kind": spec.spec.kind,
                 "mart": spec.spec.mart,
                 "board": spec.board,
+                "definition": definition_digest(&input),
                 "url": "/dashboards",
                 "note": "Chart tersimpan & langsung tampil di halaman Dashboards.",
                 })
@@ -422,40 +511,42 @@ pub(super) async fn create_chart(
 /// so it writes nothing.
 ///
 /// `id` is `None` for a create and `Some` for an update; an update with no
-/// `id` is refused here, as the tool refuses it. Returns `None` when the
-/// draft can be built, and the error the tool would return otherwise.
+/// `id` is refused here, as the tool refuses it. A create draft that builds
+/// returns the digest of the call's own definition. An update draft returns
+/// `None`: the stored chart is read as the server here, so a digest of it
+/// would show a caller fields of a chart the caller may not see.
+///
+/// # Errors
+///
+/// The error the tool would return when the draft cannot be built.
 pub(super) async fn check_chart_draft(
     ch: &ChClient,
     args: &Map<String, Value>,
     id: Option<String>,
     time: &lakehouse_bi::grain::TimeContext,
-) -> Option<Value> {
+) -> Result<Option<String>, Value> {
     if id.as_deref().is_some_and(str::is_empty) {
-        return Some(json!({ "error": "id is required" }));
+        return Err(json!({ "error": "id is required" }));
     }
     // The stored chart is read as the server (`Viewer::system()`): this check
-    // has no principal of its own. It only answers whether the draft builds;
-    // `update_chart` reads the chart again as the caller and refuses a chart
-    // the caller may not edit, and a chart id is never listed to a caller who
-    // cannot see the chart.
+    // has no principal of its own, so it only answers whether the draft
+    // builds. That is why an update draft carries no digest: the merged
+    // definition would come from a chart the caller may not see. The digest
+    // in `update_chart`'s saved reply is read as the caller, after
+    // `require_editable_chart` has refused a chart the caller may not edit.
     let viewer = Viewer::system();
     // The same carry-over `update_chart` does, so the card and the save
     // agree. A chart that is not found, or one in the trash, is checked as it
     // came.
-    let kept = match Box::pin(kept_formatting(ch, &viewer, id.as_deref(), args)).await {
-        Ok(kept) => kept,
-        Err(reply) => return Some(reply),
-    };
-    let input = match parse_chart_input(&kept.args) {
-        Ok(i) => i,
-        Err(e) => return Some(json!({ "error": e })),
-    };
+    let kept = Box::pin(kept_formatting(ch, &viewer, id.as_deref(), args)).await?;
+    let input = parse_chart_input(&kept.args).map_err(|e| json!({ "error": e }))?;
     if let Err(sentence) = check_layers_name_a_source(&input) {
-        return Some(json!({ "error": sentence }));
+        return Err(json!({ "error": sentence }));
     }
+    let is_create = id.is_none();
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
-        Ok(_) => None,
-        Err(err) => Some(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
+        Ok(_) => Ok(is_create.then(|| definition_digest(&input))),
+        Err(err) => Err(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
     }
 }
 
@@ -537,6 +628,7 @@ pub(super) async fn update_chart(
                     "kind": spec.spec.kind,
                     "mart": spec.spec.mart,
                     "board": spec.board,
+                    "definition": definition_digest(&input),
                     "formattingKept": formatting_kept,
                 });
                 if source_kept {
@@ -1817,7 +1909,7 @@ mod tests {
             &time,
         )
         .await;
-        let draft = draft.expect("the draft is refused");
+        let draft = draft.expect_err("the draft is refused");
         assert_eq!(
             draft["error"],
             json!(
@@ -1975,7 +2067,7 @@ mod tests {
             &lakehouse_bi::grain::TimeContext::default(),
         )
         .await;
-        assert!(draft.is_none(), "{draft:?}");
+        assert!(draft.is_ok(), "{draft:?}");
     }
 
     // ── A call that names only id, title and kind keeps the rest ───────────
@@ -2277,7 +2369,7 @@ mod tests {
             &lakehouse_bi::grain::TimeContext::default(),
         )
         .await;
-        assert!(draft.is_none(), "{draft:?}");
+        assert!(draft.is_ok(), "{draft:?}");
     }
 
     /// The card and the save agree: the draft check of a rename that names
@@ -2293,7 +2385,7 @@ mod tests {
             &lakehouse_bi::grain::TimeContext::default(),
         )
         .await;
-        assert!(draft.is_none(), "{draft:?}");
+        assert!(draft.is_ok(), "{draft:?}");
     }
 
     /// A title is required, and `null` is not a title: the call is refused and
@@ -2464,5 +2556,230 @@ mod tests {
         assert_eq!(chart["style"], json!({}), "{reply}");
         assert!(chart.get("referenceLines").is_none(), "{reply}");
         assert_eq!(chart["seriesNames"], json!(["visitors"]), "{reply}");
+    }
+
+    // ── What a chart holds, read back ──────────────────────────────────────
+
+    fn input(def: Value) -> ChartInput {
+        serde_json::from_value(def).expect("the definition reads")
+    }
+
+    /// A field the chart does not hold is left out, so a model that reads the
+    /// digest cannot take it for something that was made.
+    #[test]
+    fn a_definition_digest_leaves_out_what_the_chart_does_not_hold() {
+        let digest = definition_digest(&input(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+        })));
+        assert_eq!(digest, "dimension: province; measures: visitors");
+    }
+
+    #[test]
+    fn a_definition_digest_lists_every_field_it_covers_when_the_chart_holds_them_all() {
+        let digest = definition_digest(&input(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "arrival",
+            "breakdown": "province",
+            "measures": ["visitors", { "column": "spend", "aggregate": "avg" }],
+            "sort": { "by": "visitors", "dir": "desc" },
+            "limit": 10,
+            "grain": "month",
+            "filters": [
+                { "column": "province", "values": ["a"] },
+                { "column": "region", "values": ["b"] },
+            ],
+        })));
+        assert_eq!(
+            digest,
+            "dimension: arrival; breakdown: province; measures: visitors, spend; \
+             sort: visitors desc; limit: 10; grain: month; filters: 2"
+        );
+    }
+
+    #[test]
+    fn a_definition_digest_names_a_bin_by_its_width_or_count() {
+        let wide = definition_digest(&input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+            "measures": ["spend"],
+            "bin": { "mode": "width", "width": 500 },
+        })));
+        assert!(wide.contains("bin: width 500"), "{wide}");
+        let counted = definition_digest(&input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+            "measures": ["spend"],
+            "bin": { "mode": "count", "count": 10 },
+        })));
+        assert!(counted.contains("bin: 10 bins"), "{counted}");
+    }
+
+    /// A breakdown with no limit keeps every value of the dimension: the
+    /// digest says so, because that is what "top N" is not.
+    #[test]
+    fn a_definition_digest_reads_limit_none_beside_a_breakdown_or_a_sort() {
+        let with_breakdown = definition_digest(&input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+            "breakdown": "province", "measures": ["visitors"],
+        })));
+        assert!(with_breakdown.contains("limit: none"), "{with_breakdown}");
+        let with_sort = definition_digest(&input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "province",
+            "measures": ["visitors"], "sort": { "by": "visitors", "dir": "asc" },
+        })));
+        assert!(with_sort.contains("limit: none"), "{with_sort}");
+    }
+
+    #[test]
+    fn a_definition_digest_over_three_hundred_characters_is_cut_with_an_ellipsis() {
+        let names: Vec<String> = (0..12)
+            .map(|i| format!("{i:02}_{}", "x".repeat(37)))
+            .collect();
+        let digest = definition_digest(&input(json!({
+            "title": "T", "kind": "stacked", "mart": "mart_x", "dimension": "province",
+            "measures": names,
+        })));
+        assert_eq!(digest.chars().count(), 300, "{digest}");
+        assert!(digest.ends_with('…'), "{digest}");
+        assert!(
+            digest.starts_with("dimension: province; measures: 00_x"),
+            "{digest}"
+        );
+    }
+
+    /// An update draft carries no digest, and the saved reply carries the
+    /// digest of the chart the save stored: the stored chart merged with the
+    /// call.
+    #[tokio::test]
+    async fn the_draft_of_an_update_carries_no_digest_and_the_saved_reply_digests_the_merged_chart()
+    {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let draft = check_chart_draft(
+            &ch,
+            &bare_rename_call(json!({})),
+            Some("c_1".to_owned()),
+            &time,
+        )
+        .await
+        .expect("the draft builds");
+        let saved = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({})),
+            &time,
+        )
+        .await;
+        assert_eq!(draft, None);
+        // The call names neither a breakdown nor a filter: the stored chart's
+        // are what the saved chart holds, so a digest of the call alone would
+        // have left them out.
+        assert_eq!(
+            saved["definition"],
+            json!(
+                "dimension: province; breakdown: region; measures: visitors; limit: none (default applies); filters: 1"
+            ),
+            "{saved}"
+        );
+    }
+
+    /// The draft check reads the stored chart as the server, so it must not
+    /// hand any of that chart back for a chart on somebody else's private
+    /// board: the update tool refuses that chart, and the draft says nothing
+    /// about it.
+    #[tokio::test]
+    async fn the_draft_of_an_update_of_a_chart_on_somebody_elses_private_board_exposes_no_stored_field()
+     {
+        let server = wide_mart_server().await;
+        rows_first(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 0, "owner_id": "someone-else" })],
+        )
+        .await;
+        let server = stored_chart_server_on(server, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let draft = check_chart_draft(
+            &ch,
+            &bare_rename_call(json!({})),
+            Some("c_1".to_owned()),
+            &time,
+        )
+        .await;
+        let saved = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({})),
+            &time,
+        )
+        .await;
+        assert_eq!(saved["error"], json!("this tile does not exist"), "{saved}");
+        assert!(saved.get("definition").is_none(), "{saved}");
+        assert_eq!(draft, Ok(None), "{draft:?}");
+    }
+
+    /// A create draft carries the digest of the call's own definition: there
+    /// is no stored chart to read.
+    #[tokio::test]
+    async fn the_draft_of_a_create_carries_the_digest_of_the_call() {
+        let server = wide_mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let draft = check_chart_draft(
+            &ch,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "breakdown": "region", "measures": ["visitors"],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
+        .expect("the draft builds");
+        assert_eq!(
+            draft.as_deref(),
+            Some(
+                "dimension: province; breakdown: region; measures: visitors; limit: none (default applies)"
+            )
+        );
+    }
+
+    // ── A call whose `compare` does not read ────────────────────────────────
+
+    #[test]
+    fn a_compare_that_does_not_read_is_refused_with_a_valid_example() {
+        let reply = parse_chart_input(&arguments(json!({
+            "title": "Visitors", "kind": "kpi", "mart": "mart_x", "measures": ["visitors"],
+            "compare": {},
+        })))
+        .expect_err("an empty compare does not read");
+        assert!(reply.contains("\"compare\""), "{reply}");
+        assert!(
+            reply.contains(
+                r#"{"compare": {"kind": "previous", "dateColumn": "<date column>", "period": "month"}}"#
+            ),
+            "{reply}"
+        );
+        assert!(reply.contains("inside the chart call"), "{reply}");
+    }
+
+    /// The example is for `compare` alone: another field's error is not
+    /// followed by it.
+    #[test]
+    fn a_field_other_than_compare_that_does_not_read_gets_no_compare_example() {
+        let reply = parse_chart_input(&arguments(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_x", "measures": ["visitors"],
+            "limit": "ten",
+        })))
+        .expect_err("a text limit does not read");
+        assert!(reply.contains("\"limit\""), "{reply}");
+        assert!(!reply.contains("dateColumn"), "{reply}");
     }
 }

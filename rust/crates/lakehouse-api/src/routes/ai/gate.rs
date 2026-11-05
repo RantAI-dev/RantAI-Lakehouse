@@ -1083,6 +1083,34 @@ mod tests {
         assert!(summary.contains("mart_wisman"));
     }
 
+    /// The card the person confirms shows this sentence. The model reads the
+    /// chart's definition from its own `definition` key, so the sentence must
+    /// not change with it: a change here is a change to the card.
+    #[test]
+    fn the_create_chart_card_summary_keeps_its_exact_text() {
+        let perms = admin_perms();
+        let mut args = Map::new();
+        args.insert("title".to_owned(), json!("Kunjungan Harian"));
+        args.insert("kind".to_owned(), json!("bar"));
+        args.insert("mart".to_owned(), json!("mart_wisman"));
+        args.insert("dimension".to_owned(), json!("provinsi"));
+        args.insert("limit".to_owned(), json!(10));
+        let result =
+            decide(true, Some(&perms), spec("create_chart"), &args).expect("must not execute");
+        assert_eq!(
+            result["summary"],
+            json!("Membuat chart baru \"Kunjungan Harian\" (bar) dari mart mart_wisman.")
+        );
+        args.remove("mart");
+        args.insert("sqlSource".to_owned(), json!("s_1"));
+        let result =
+            decide(true, Some(&perms), spec("create_chart"), &args).expect("must not execute");
+        assert_eq!(
+            result["summary"],
+            json!("Membuat chart baru \"Kunjungan Harian\" (bar) dari SQL source s_1.")
+        );
+    }
+
     /// F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
     /// f2-tenant-scope-and-run-config.md` Part D): `trigger_pipeline`'s
     /// gate summary names the id AND the top-level keys of `runConfig`

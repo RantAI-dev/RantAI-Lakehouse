@@ -156,8 +156,10 @@ carries; a part the result does not carry is left out) and says not to
 draft those objects again, then "Continue:" with the steps that are left;
 it names what was saved, it does not re-send the tool results. A
 cancelled or failed draft sends nothing, so a refused step stops the
-request there. At most three such continuations follow one typed
-message.
+request there. At most three such continuations follow one typed message.
+A chart draft carries a short `definition` line with the chart's fields (a
+chart update carries it in the saved result), and the prompt tells the
+assistant to describe only what that line lists.
 
 ## Decisions
 
