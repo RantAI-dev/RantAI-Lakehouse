@@ -12,15 +12,13 @@ once a first release is tagged.
 ### Added
 
 - The saved-queries console (backlog `QS-3`): the saved-queries page gains folders with a personal and a shared space, server-side search over name and SQL, move, a trash with restore at edit, version history with revert, and sharing for queries and folders at view, edit and manage. The studio saves back into the saved query it came from at edit or manage, and a link to a query the caller may not see opens no tab.
+- The dashboard eval (backlog `AI-15`) leaves out the cases named in `--exclude id1,id2`. `run_dashboard_eval.sh` forwards the flag, an id that names no case exits with code 2, and the result document lists the excluded ids. The `mode_switch` case asks for a bar chart, so a line chart is no longer a failure. It adds two cases: `chart_top_n_claimed`, where a top 5 by country is saved with `limit` 5, and `chart_bin_text_column_asks`, where a bin on a text column is neither claimed nor saved.
 
 ### Security
 
 - An edit grantee of a saved query or folder could move it into or out of a personal space; a move across a personal space now needs manage.
+- Moving a saved query or a folder needs manage on everything moved. That is the query itself, or the folder and every sub-folder and query under it, trashed ones included. This closes a path where an editor could publish, hide or raise a query through a folder of their own (`QS-3` review of #382). A personal space can no longer be shared, and a rule already stored on one is ignored; share a query or a folder inside it instead.
 - `RUSTSEC-2026-0440` (`astral-tokio-tar`, unmaintained since 2026-11-03, no fixed release) is waived in `cargo deny`: only the `testcontainers` test dependencies reach it, and no shipped binary links it.
-
-### Added
-
-- The dashboard eval (backlog `AI-15`) leaves out the cases named in `--exclude id1,id2`. `run_dashboard_eval.sh` forwards the flag, an id that names no case exits with code 2, and the result document lists the excluded ids. The `mode_switch` case asks for a bar chart, so a line chart is no longer a failure. It adds two cases: `chart_top_n_claimed`, where a top 5 by country is saved with `limit` 5, and `chart_bin_text_column_asks`, where a bin on a text column is neither claimed nor saved.
 
 ### Changed
 

@@ -6,7 +6,7 @@
 | Backlog | `QS-3` |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-3.md` |
-| Status | Building |
+| Status | In Acceptance |
 | Priority | P2 |
 | Owner | Held in the base. |
 | Acceptor | Held in the base. |
@@ -31,7 +31,7 @@ and, in open PR #250, per-item access in Postgres with three levels (`dashboard_
 
 ## What the user can do when this is done
 
-1. Edit a saved query's SQL and title, rename, duplicate and move it.
+1. Edit a saved query's SQL and title, rename and duplicate it, and move it at manage.
 2. Keep queries in folders, in a personal space only they see, or in the organisation's shared space.
 3. Share a query or a folder with a person or a role at one of three levels.
 4. See the last 15 versions with author and time, and go back to any of them.
@@ -53,7 +53,7 @@ saves into the person's personal space. No new tool: organising and sharing are 
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Three levels, the same as dashboards (`BI-19`): view (see and run), edit (change SQL, title, folder), manage (also share, and delete a folder). The spec's separate "run" level is dropped: anyone who can see a query's SQL can copy it and run it under their own `query:read`, so view-but-not-run would protect nothing | 3 levels | Owner, 2026-10-30 |
+| 1 | Three levels, the same as dashboards (`BI-19`): view (see and run), edit (change SQL, title and tags; rename a folder), manage (also move, share, and delete a folder). The spec's separate "run" level is dropped: anyone who can see a query's SQL can copy it and run it under their own `query:read`, so view-but-not-run would protect nothing | 3 levels | Owner, 2026-11-05 |
 | 2 | A level is granted to a person or a role of the same organisation, on a query or a folder. A folder's grant covers what is inside it | none | Owner, 2026-10-30 |
 | 3 | A new saved query goes to the author's personal space unless they pick a folder. Only the author sees the personal space. The **shared space** is the root of the tree, a query that sits in no folder. Every holder of `query:read` in the organisation sees what is in it, at **view**. The **personal space** is one folder per person, and only its owner sees it | personal | Owner, 2026-10-30 |
 | 4 | Every query saved before this release moves to the organisation's shared space with view for everyone in the organisation and manage for its author, so nobody loses a query they see today. A query with no author (seeded, or saved by the assistant before this release) gets manage for administrators only. A grant adds a person or a role to an item in either space. In the shared space it raises the level; in a personal space it is the only way anybody else sees the item. So the acceptance check `QS-3-AC1` (share at view with a second user) is a personal query shared with them | none | Owner, 2026-10-30 |
@@ -74,9 +74,13 @@ saves into the person's personal space. No new tool: organising and sharing are 
   "This folder still holds queries, some of them in the trash. Move or restore them first." No query is ever moved
   silently into a shared place.
 - A folder tree is at most four levels deep.
-- Moving a query or a folder into or out of a personal space needs manage on the item; an edit grantee's move across a
-  personal space is refused with 403 and the body "permission_denied: Only someone who manages this can move it into
-  or out of a personal space." A move inside one space still needs only edit.
+- A move needs manage on everything moved. Moving a query needs manage on it. Moving a folder needs manage on the
+  folder and on every sub-folder and query under it, trashed ones included. Either move also needs edit on the target
+  folder. Otherwise the move is refused with 403 and "Only someone who manages this can move it." A request that names
+  the folder a query is already in is not a move.
+- A personal space itself is not shared. Setting access on it is refused with 403 and "A personal space is not shared:
+  share a query or a folder inside it."; a rule already stored on one is ignored.
+- Search matches a query's title and SQL text. It does not match the owner or the tags.
 - Deleting a tenant fails while any of its folders still holds a sub-folder or a query in a folder
   (`saved_query.folder_id` and `saved_query_folder.parent_id` are `ON DELETE RESTRICT` in
   `0122_saved_query_access.sql`; `RESTRICT` is not deferrable, so the database refuses the delete).
