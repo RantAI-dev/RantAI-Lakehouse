@@ -9,6 +9,23 @@ import type { Asset } from "./assets"
  */
 export type QueryEngine = "clickhouse" | "trino"
 
+/**
+ * The level the caller holds on a saved query or on a folder (`QS-3`).
+ *
+ * The server writes the level as a word — "view", "edit" or "manage" —
+ * and reads nothing else as a level. The console widens it so that a
+ * level it does not know is shown rather than dropped.
+ */
+export type SavedQueryLevel = "view" | "edit" | "manage"
+
+/**
+ * One saved query, as the server sends it (`QS-3`).
+ *
+ * The nine fields are the server's own: `folderId` says where the query
+ * sits (`null` is the shared space), `ownerId` names the author and
+ * `level` says what the caller may do with it. The console needs the
+ * level to offer the right row actions and the folder to draw the tree.
+ */
 export type SavedQuery = {
   id: string
   title: string
@@ -16,7 +33,159 @@ export type SavedQuery = {
   owner: string
   updatedAt: string
   tags: string[]
+  /** The folder the query sits in; `null` is the shared space. */
+  folderId: string | null
+  /** The author's user id, when the query has one. */
+  ownerId: string | null
+  /** The level the caller holds on it. */
+  level: SavedQueryLevel | string
 }
+
+/**
+ * The filter the saved-query list takes (`GET /api/query/saved`): the
+ * text typed in the search box and the folder asked for. Both are the
+ * server's to apply — the console never filters the list in the browser,
+ * because it may not see every row the server would send.
+ */
+export type SavedQueryFilter = {
+  /** The text typed in the search box: the server matches it against the title and the SQL. */
+  q?: string
+  /** The folder asked for: an id, or "root" for the shared space. */
+  folder?: string
+}
+
+/**
+ * One entry in the trash (`GET /api/query/saved-trash`): a query that
+ * waits to be restored or to be swept away, with the days it has left.
+ */
+export type SavedQueryTrashEntry = {
+  id: string
+  title: string
+  /** The folder it waits in; `null` is the shared space. */
+  folderId: string | null
+  /** When it went to the trash, ISO 8601. */
+  deletedAt: string
+  /** How many days it has left before the sweep takes it away. */
+  daysLeft: number
+}
+
+/**
+ * One version of a saved query (`GET /api/query/saved/{id}/versions`).
+ *
+ * A change writes a version, so going back to an earlier one is itself
+ * undoable: the version says what the query looked like then, and
+ * `label` says why it was written ("Restored version 3").
+ */
+export type SavedQueryVersion = {
+  /** The version's number: 1 for the first. */
+  version: number
+  title: string
+  sql: string
+  /** The author's user id, when the version has one. */
+  authorId: string | null
+  /** The author's name, as the history shows it. */
+  authorName: string
+  /** What the history says about this version; empty for a plain change. */
+  label: string
+  /** When it was written, ISO 8601. */
+  createdAt: string
+}
+
+/**
+ * One folder of the saved-query tree (`GET /api/query/folders`).
+ *
+ * The tree holds the shared space as its root and one personal space
+ * per person; the shared space has no node of its own, so a folder with
+ * no parent sits in the shared space.
+ */
+export type QueryFolder = {
+  id: string
+  /** The folder this one sits in; `null` at the root. */
+  parentId: string | null
+  name: string
+  /** Whether this is a personal space: one person's own space. */
+  isPersonal: boolean
+  /** The owner of a personal space, the creator of an ordinary folder. */
+  ownerId: string | null
+  /** The level the caller holds on it. */
+  level: SavedQueryLevel | string
+}
+
+/** The kind of item an access list belongs to. */
+export type AccessItemKind = "query" | "folder"
+
+/** One rule of an item's own access list (`GET|PUT …/access`). */
+export type SavedQueryAccessRule = {
+  id: string
+  /** The person the rule names; `null` when the rule names a role. */
+  userId: string | null
+  /** The role the rule names; `null` when the rule names a person. */
+  roleId: string | null
+  /** What the rule gives. */
+  level: SavedQueryLevel | string
+  /** Who wrote the rule; `null` when nobody is recorded. */
+  grantedBy: string | null
+  /** When the rule was written, ISO 8601. */
+  grantedAt: string
+}
+
+/** One rule an item inherits from a folder above it. */
+export type InheritedAccessRule = {
+  /** The folder the rule sits on. */
+  folderId: string
+  /** The folder's name, as the tree shows it. */
+  folderName: string
+  /** The person the rule names; `null` when the rule names a role. */
+  userId: string | null
+  /** The role the rule names; `null` when the rule names a person. */
+  roleId: string | null
+  /** What the rule gives. */
+  level: SavedQueryLevel | string
+}
+
+/**
+ * The access list of one saved query or one folder
+ * (`GET|PUT /api/query/saved/{id}/access`, `GET|PUT
+ * /api/query/folders/{id}/access`).
+ *
+ * `yourLevel` is the level the caller held before the write: a rule the
+ * caller writes for somebody else cannot change the caller's own level.
+ */
+export type SavedQueryAccessList = {
+  itemType: AccessItemKind
+  itemId: string
+  /** The level the caller holds on the item. */
+  yourLevel: SavedQueryLevel | string
+  /** The item's own rules. */
+  rules: SavedQueryAccessRule[]
+  /** The rules of the folders above the item, the nearest folder first. */
+  inherited: InheritedAccessRule[]
+}
+
+/** One rule of a `PUT …/access` body: exactly one grantee and one level. */
+export type AccessRuleInput = {
+  /** The person the rule names. */
+  userId?: string
+  /** The role the rule names. */
+  roleId?: string
+  /** What the rule gives. */
+  level: SavedQueryLevel
+}
+
+/**
+ * The body a `PUT …/access` sends: the rules the item shall carry, and
+ * nothing else — the server refuses a body of another shape.
+ */
+export type SavedQueryAccessInput = { rules: AccessRuleInput[] }
+
+/** One person the caller may share a saved query with (`GET /api/query/grantees`). */
+export type GranteePerson = { id: string; name: string; email: string }
+
+/** One role the caller may share a saved query with. */
+export type GranteeRole = { id: string; name: string }
+
+/** The people and the roles the caller may share with. */
+export type GranteeList = { people: GranteePerson[]; roles: GranteeRole[] }
 
 /** One result cell, in whatever type ClickHouse reported it as. */
 export type QueryCell = string | number | boolean | null
@@ -178,11 +347,64 @@ export type QueryResult = {
  */
 export type QuerySchedulingCapability = { supported: false; reason: string }
 
-/** What "Save query" in Query Studio sends. */
+/**
+ * What "Save query" in Query Studio sends.
+ *
+ * The folder is three answers, not two: an id puts the query in that
+ * folder, `null` puts it in the shared space, and an absent field puts
+ * it in the caller's own personal space. The server reads the three
+ * apart, so the console may not fold them into one.
+ */
 export type SaveQueryInput = {
   title: string
   sql: string
   tags: string[]
+  /**
+   * The folder the query lands in: an id, `null` for the shared space,
+   * absent for the caller's own personal space.
+   */
+  folderId?: string | null
+}
+
+/**
+ * What a change of a saved query sends (`PATCH /api/query/saved/{id}`).
+ *
+ * Every field is optional and every absent field means "leave it as it
+ * is" — the one exception is `folderId`, where an absent field and a
+ * `null` one are two different answers: absent leaves the query where
+ * it is, `null` moves it to the shared space.
+ */
+export type UpdateSavedQueryInput = {
+  /** A new title. */
+  title?: string
+  /** New SQL. */
+  sql?: string
+  /** New tags; an empty list clears them. */
+  tags?: string[]
+  /** The folder the query moves to: an id, `null` for the shared space, absent to leave it where it is. */
+  folderId?: string | null
+}
+
+/**
+ * What "New folder" sends (`POST /api/query/folders`): a name and the
+ * folder it sits in. The root is named by an absent field or by `null`.
+ */
+export type CreateFolderInput = {
+  name: string
+  /** The folder it sits in: an id, `null` or absent for the root. */
+  parentId?: string | null
+}
+
+/**
+ * What a change of a folder sends (`PATCH /api/query/folders/{id}`): a
+ * new name, a new place, or both. An absent `parentId` leaves the
+ * folder where it is; `null` moves it to the root.
+ */
+export type UpdateFolderInput = {
+  /** A new name. */
+  name?: string
+  /** The folder it moves to: an id, `null` for the root, absent to leave it where it is. */
+  parentId?: string | null
 }
 
 /** One tool call the chat made while answering a question typed in words. */
@@ -243,7 +465,60 @@ export type QueryDownload = {
 
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
+  /**
+   * The saved queries the caller may see, filtered by the server
+   * (`GET /api/query/saved?q=&folder=`). The console asks the server
+   * for the folder it shows and for the text typed in the search box,
+   * because it may not see every row the server would send.
+   */
+  listSavedFiltered(filter: SavedQueryFilter, signal?: AbortSignal): Promise<SavedQuery[]>
+  /** One saved query the caller may see. */
+  getSaved(id: string, signal?: AbortSignal): Promise<SavedQuery>
   saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
+  /**
+   * Change a saved query. A refusal throws with the server's own
+   * sentence: a move into or out of a personal space needs manage and
+   * is refused with the sentence that says so.
+   */
+  updateSaved(id: string, input: UpdateSavedQueryInput, signal?: AbortSignal): Promise<SavedQuery>
+  /** Take a saved query to the trash. The server answers with nothing. */
+  deleteSaved(id: string, signal?: AbortSignal): Promise<void>
+  /** Copy a saved query into the caller's own personal space. */
+  duplicateSaved(id: string, signal?: AbortSignal): Promise<SavedQuery>
+  /** Bring a trashed saved query back. */
+  restoreSaved(id: string, signal?: AbortSignal): Promise<SavedQuery>
+  /** The queries in the trash the caller may edit, with the days they have left. */
+  listSavedTrash(signal?: AbortSignal): Promise<SavedQueryTrashEntry[]>
+  /** The versions of a saved query, newest first. */
+  listSavedVersions(id: string, signal?: AbortSignal): Promise<SavedQueryVersion[]>
+  /** Go back to an earlier version of a saved query. */
+  revertSavedVersion(id: string, version: number, signal?: AbortSignal): Promise<SavedQuery>
+  /** The folders the caller may see, each with the level the caller holds on it. */
+  listFolders(signal?: AbortSignal): Promise<QueryFolder[]>
+  /** Make a folder. */
+  createFolder(input: CreateFolderInput, signal?: AbortSignal): Promise<QueryFolder>
+  /** Rename a folder or move it. */
+  updateFolder(id: string, input: UpdateFolderInput, signal?: AbortSignal): Promise<QueryFolder>
+  /** Delete a folder. The server answers with nothing. */
+  deleteFolder(id: string, signal?: AbortSignal): Promise<void>
+  /** Who has what on one saved query. */
+  getSavedAccess(id: string, signal?: AbortSignal): Promise<SavedQueryAccessList>
+  /** Replace the rules on one saved query. */
+  putSavedAccess(
+    id: string,
+    input: SavedQueryAccessInput,
+    signal?: AbortSignal
+  ): Promise<SavedQueryAccessList>
+  /** Who has what on one folder. */
+  getFolderAccess(id: string, signal?: AbortSignal): Promise<SavedQueryAccessList>
+  /** Replace the rules on one folder. */
+  putFolderAccess(
+    id: string,
+    input: SavedQueryAccessInput,
+    signal?: AbortSignal
+  ): Promise<SavedQueryAccessList>
+  /** The people and the roles the caller may share with, at most 20 of each. */
+  findGrantees(query: string, signal?: AbortSignal): Promise<GranteeList>
   /**
    * The caller's own recorded runs, newest first, one page of 50. The
    * filter is optional: without it the endpoint answers the newest page

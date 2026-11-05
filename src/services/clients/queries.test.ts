@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { ServiceError } from "../errors"
+import type { SavedQueryAccessList } from "../contracts/queries"
 import { clickhouseQueryService } from "./queries"
 
 const originalFetch = global.fetch
@@ -416,5 +417,461 @@ describe("clickhouseQueryService.listHistory", () => {
     const calls = stubFetch(() => json([]))
     await clickhouseQueryService.listHistory({ table: "" })
     expect(calls[0]!.url).toBe("/api/query/history")
+  })
+})
+
+/**
+ * The saved-query console (`QS-3`). Every route the console uses is
+ * here: the list and its filters, one query, the trash, the versions,
+ * the folders and the access lists. The tests pin the URL, the body and
+ * the refusal of each one, because the console shows the server's own
+ * sentence and never a sentence of its own.
+ */
+describe("the saved-query console client (QS-3)", () => {
+  const SAVED_QUERY = {
+    id: "q-1",
+    title: "Orders by day",
+    sql: "SELECT count(*) FROM silver.orders",
+    owner: "Rina Wijaya",
+    updatedAt: "2026-11-04T10:00:00.000Z",
+    tags: ["daily"],
+    folderId: null,
+    ownerId: "u-1",
+    level: "manage",
+  }
+
+  const FOLDER = {
+    id: "f-1",
+    parentId: null,
+    name: "Reports",
+    isPersonal: false,
+    ownerId: "u-1",
+    level: "manage",
+  }
+
+  const ACCESS_LIST: SavedQueryAccessList = {
+    itemType: "query",
+    itemId: "q-1",
+    yourLevel: "manage",
+    rules: [
+      {
+        id: "rule-1",
+        userId: "u-2",
+        roleId: null,
+        level: "edit",
+        grantedBy: "u-1",
+        grantedAt: "2026-11-04T10:00:00Z",
+      },
+    ],
+    inherited: [
+      { folderId: "f-1", folderName: "Reports", userId: null, roleId: "r-1", level: "view" },
+    ],
+  }
+
+  it("lists the saved queries the caller may see", async () => {
+    const calls = stubFetch(() => json([SAVED_QUERY]))
+    const rows = await clickhouseQueryService.listSaved()
+    expect(rows).toEqual([SAVED_QUERY])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe("/api/query/saved")
+  })
+
+  it("asks the server for the queries of one folder and the text typed in the search box", async () => {
+    const calls = stubFetch(() => json([SAVED_QUERY]))
+    await clickhouseQueryService.listSavedFiltered({ q: "orders", folder: "f-1" })
+    expect(calls[0]!.url).toBe("/api/query/saved?q=orders&folder=f-1")
+  })
+
+  it("asks for the shared space with the word the server reads as the root", async () => {
+    const calls = stubFetch(() => json([]))
+    await clickhouseQueryService.listSavedFiltered({ folder: "root" })
+    expect(calls[0]!.url).toBe("/api/query/saved?folder=root")
+  })
+
+  it("encodes the text typed in the search box", async () => {
+    const calls = stubFetch(() => json([]))
+    await clickhouseQueryService.listSavedFiltered({ q: "last 30 days" })
+    expect(calls[0]!.url).toBe("/api/query/saved?q=last+30+days")
+  })
+
+  it("adds no query string for a filter with nothing in it", async () => {
+    const calls = stubFetch(() => json([]))
+    await clickhouseQueryService.listSavedFiltered({})
+    expect(calls[0]!.url).toBe("/api/query/saved")
+  })
+
+  it("reads one saved query", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY))
+    const query = await clickhouseQueryService.getSaved("q-1")
+    expect(query).toEqual(SAVED_QUERY)
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1")
+  })
+
+  it("escapes the id of the query it reads", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY))
+    await clickhouseQueryService.getSaved("q 1")
+    expect(calls[0]!.url).toBe("/api/query/saved/q%201")
+  })
+
+  it("saves a query with its title, its statement and its tags", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY, 201))
+    const saved = await clickhouseQueryService.saveQuery({
+      title: "Orders by day",
+      sql: "SELECT count(*) FROM silver.orders",
+      tags: ["daily"],
+    })
+    expect(saved).toEqual(SAVED_QUERY)
+    expect(calls[0]!.url).toBe("/api/query/saved")
+    expect(calls[0]!.init.method).toBe("POST")
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      title: "Orders by day",
+      sql: "SELECT count(*) FROM silver.orders",
+      tags: ["daily"],
+    })
+  })
+
+  it("saves a query in the caller's own space when the body names no folder", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY, 201))
+    await clickhouseQueryService.saveQuery({
+      title: "Orders by day",
+      sql: "SELECT 1",
+      tags: [],
+      folderId: undefined,
+    })
+    const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown>
+    expect("folderId" in body).toBe(false)
+  })
+
+  it("saves a query in the shared space", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY, 201))
+    await clickhouseQueryService.saveQuery({
+      title: "Orders by day",
+      sql: "SELECT 1",
+      tags: [],
+      folderId: null,
+    })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      title: "Orders by day",
+      sql: "SELECT 1",
+      tags: [],
+      folderId: null,
+    })
+  })
+
+  it("saves a query in a folder", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY, 201))
+    await clickhouseQueryService.saveQuery({
+      title: "Orders by day",
+      sql: "SELECT 1",
+      tags: [],
+      folderId: "f-1",
+    })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      title: "Orders by day",
+      sql: "SELECT 1",
+      tags: [],
+      folderId: "f-1",
+    })
+  })
+
+  it("changes the title, the statement and the tags of a query", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY))
+    const changed = await clickhouseQueryService.updateSaved("q-1", {
+      title: "Orders by week",
+      sql: "SELECT 2",
+      tags: [],
+    })
+    expect(changed).toEqual(SAVED_QUERY)
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1")
+    expect(calls[0]!.init.method).toBe("PATCH")
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      title: "Orders by week",
+      sql: "SELECT 2",
+      tags: [],
+    })
+  })
+
+  it("leaves a query where it is when the change names no folder", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY))
+    await clickhouseQueryService.updateSaved("q-1", { title: "Orders by week" })
+    const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown>
+    expect("folderId" in body).toBe(false)
+  })
+
+  it("moves a query to the shared space", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY))
+    await clickhouseQueryService.updateSaved("q-1", { folderId: null })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({ folderId: null })
+  })
+
+  it("moves a query into a folder", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY))
+    await clickhouseQueryService.updateSaved("q-1", { folderId: "f-1" })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({ folderId: "f-1" })
+  })
+
+  it("takes a query to the trash and answers with nothing", async () => {
+    const calls = stubFetch(() => new Response(null, { status: 204 }))
+    await expect(clickhouseQueryService.deleteSaved("q-1")).resolves.toBeUndefined()
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1")
+    expect(calls[0]!.init.method).toBe("DELETE")
+  })
+
+  it("copies a query into the caller's own space", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY, 201))
+    const copy = await clickhouseQueryService.duplicateSaved("q-1")
+    expect(copy).toEqual(SAVED_QUERY)
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1/duplicate")
+    expect(calls[0]!.init.method).toBe("POST")
+  })
+
+  it("brings a trashed query back", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY))
+    const restored = await clickhouseQueryService.restoreSaved("q-1")
+    expect(restored).toEqual(SAVED_QUERY)
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1/restore")
+    expect(calls[0]!.init.method).toBe("POST")
+  })
+
+  it("lists the queries in the trash with the days they have left", async () => {
+    const calls = stubFetch(() =>
+      json([
+        {
+          id: "q-9",
+          title: "Old orders",
+          folderId: "f-1",
+          deletedAt: "2026-11-04T10:00:00.000Z",
+          daysLeft: 29,
+        },
+      ]),
+    )
+    const rows = await clickhouseQueryService.listSavedTrash()
+    expect(rows).toEqual([
+      {
+        id: "q-9",
+        title: "Old orders",
+        folderId: "f-1",
+        deletedAt: "2026-11-04T10:00:00.000Z",
+        daysLeft: 29,
+      },
+    ])
+    expect(calls[0]!.url).toBe("/api/query/saved-trash")
+  })
+
+  it("lists the versions of a query, newest first", async () => {
+    const calls = stubFetch(() =>
+      json([
+        {
+          version: 2,
+          title: "Orders by day",
+          sql: "SELECT 1",
+          authorId: "u-1",
+          authorName: "Rina Wijaya",
+          label: "Restored version 1",
+          createdAt: "2026-11-04T10:00:00.000Z",
+        },
+      ]),
+    )
+    const versions = await clickhouseQueryService.listSavedVersions("q-1")
+    expect(versions).toEqual([
+      {
+        version: 2,
+        title: "Orders by day",
+        sql: "SELECT 1",
+        authorId: "u-1",
+        authorName: "Rina Wijaya",
+        label: "Restored version 1",
+        createdAt: "2026-11-04T10:00:00.000Z",
+      },
+    ])
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1/versions")
+  })
+
+  it("goes back to an earlier version of a query", async () => {
+    const calls = stubFetch(() => json(SAVED_QUERY))
+    const reverted = await clickhouseQueryService.revertSavedVersion("q-1", 1)
+    expect(reverted).toEqual(SAVED_QUERY)
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1/versions/1/revert")
+    expect(calls[0]!.init.method).toBe("POST")
+  })
+
+  it("lists the folders the caller may see", async () => {
+    const calls = stubFetch(() => json([FOLDER]))
+    const folders = await clickhouseQueryService.listFolders()
+    expect(folders).toEqual([FOLDER])
+    expect(calls[0]!.url).toBe("/api/query/folders")
+  })
+
+  it("makes a folder in the root", async () => {
+    const calls = stubFetch(() => json(FOLDER, 201))
+    const folder = await clickhouseQueryService.createFolder({ name: "Reports" })
+    expect(folder).toEqual(FOLDER)
+    expect(calls[0]!.url).toBe("/api/query/folders")
+    expect(calls[0]!.init.method).toBe("POST")
+    const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown>
+    expect("parentId" in body).toBe(false)
+  })
+
+  it("makes a folder inside another folder", async () => {
+    const calls = stubFetch(() => json(FOLDER, 201))
+    await clickhouseQueryService.createFolder({ name: "Reports", parentId: "f-0" })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      name: "Reports",
+      parentId: "f-0",
+    })
+  })
+
+  it("renames a folder", async () => {
+    const calls = stubFetch(() => json(FOLDER))
+    const folder = await clickhouseQueryService.updateFolder("f-1", { name: "Weekly reports" })
+    expect(folder).toEqual(FOLDER)
+    expect(calls[0]!.url).toBe("/api/query/folders/f-1")
+    expect(calls[0]!.init.method).toBe("PATCH")
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({ name: "Weekly reports" })
+  })
+
+  it("moves a folder to the root", async () => {
+    const calls = stubFetch(() => json(FOLDER))
+    await clickhouseQueryService.updateFolder("f-1", { parentId: null })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({ parentId: null })
+  })
+
+  it("leaves a folder where it is when the change names no parent", async () => {
+    const calls = stubFetch(() => json(FOLDER))
+    await clickhouseQueryService.updateFolder("f-1", { name: "Weekly reports" })
+    const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown>
+    expect("parentId" in body).toBe(false)
+  })
+
+  it("deletes a folder and answers with nothing", async () => {
+    const calls = stubFetch(() => new Response(null, { status: 204 }))
+    await expect(clickhouseQueryService.deleteFolder("f-1")).resolves.toBeUndefined()
+    expect(calls[0]!.url).toBe("/api/query/folders/f-1")
+    expect(calls[0]!.init.method).toBe("DELETE")
+  })
+
+  it("reads who has what on a query", async () => {
+    const calls = stubFetch(() => json(ACCESS_LIST))
+    const access = await clickhouseQueryService.getSavedAccess("q-1")
+    expect(access).toEqual(ACCESS_LIST)
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1/access")
+  })
+
+  it("replaces the rules on a query", async () => {
+    const calls = stubFetch(() => json(ACCESS_LIST))
+    const access = await clickhouseQueryService.putSavedAccess("q-1", {
+      rules: [{ userId: "u-2", level: "edit" }],
+    })
+    expect(access).toEqual(ACCESS_LIST)
+    expect(calls[0]!.url).toBe("/api/query/saved/q-1/access")
+    expect(calls[0]!.init.method).toBe("PUT")
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      rules: [{ userId: "u-2", level: "edit" }],
+    })
+  })
+
+  it("reads who has what on a folder", async () => {
+    const calls = stubFetch(() => json({ ...ACCESS_LIST, itemType: "folder", itemId: "f-1" }))
+    const access = await clickhouseQueryService.getFolderAccess("f-1")
+    expect(access.itemType).toBe("folder")
+    expect(calls[0]!.url).toBe("/api/query/folders/f-1/access")
+  })
+
+  it("replaces the rules on a folder", async () => {
+    const calls = stubFetch(() => json({ ...ACCESS_LIST, itemType: "folder", itemId: "f-1" }))
+    await clickhouseQueryService.putFolderAccess("f-1", {
+      rules: [{ roleId: "r-1", level: "view" }],
+    })
+    expect(calls[0]!.url).toBe("/api/query/folders/f-1/access")
+    expect(calls[0]!.init.method).toBe("PUT")
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      rules: [{ roleId: "r-1", level: "view" }],
+    })
+  })
+
+  it("searches the people and the roles the caller may share with", async () => {
+    const calls = stubFetch(() =>
+      json({
+        people: [{ id: "u-2", name: "Reza Hakim", email: "reza@example.com" }],
+        roles: [{ id: "r-1", name: "Analyst" }],
+      }),
+    )
+    const grantees = await clickhouseQueryService.findGrantees("reza")
+    expect(grantees).toEqual({
+      people: [{ id: "u-2", name: "Reza Hakim", email: "reza@example.com" }],
+      roles: [{ id: "r-1", name: "Analyst" }],
+    })
+    expect(calls[0]!.url).toBe("/api/query/grantees?q=reza")
+  })
+
+  it("refuses a move across a personal space with the server's own sentence", async () => {
+    stubFetch(() =>
+      json(
+        {
+          error:
+            "permission_denied: Only someone who manages this can move it into or out of a personal space.",
+        },
+        403,
+      ),
+    )
+    const err = await rejection(clickhouseQueryService.updateSaved("q-1", { folderId: "f-2" }))
+    expect(err.code).toBe("permission_denied")
+    expect(err.message).toBe(
+      "Only someone who manages this can move it into or out of a personal space.",
+    )
+  })
+
+  it("refuses a change of a query the caller may not change with the server's own sentence", async () => {
+    stubFetch(() =>
+      json(
+        { error: "permission_denied: You do not have permission to change this saved query." },
+        403,
+      ),
+    )
+    const err = await rejection(clickhouseQueryService.updateSaved("q-1", { title: "New" }))
+    expect(err.code).toBe("permission_denied")
+    expect(err.message).toBe("You do not have permission to change this saved query.")
+  })
+
+  it("reports a query the caller may not see as not found", async () => {
+    stubFetch(() => json({ error: "That saved query could not be found." }, 404))
+    const err = await rejection(clickhouseQueryService.getSaved("q-9"))
+    expect(err.code).toBe("not_found")
+    expect(err.message).toBe("That saved query could not be found.")
+  })
+
+  it("reports a body of another shape as an invalid request", async () => {
+    stubFetch(() =>
+      json({ error: "Body must be JSON {rules: [{userId?, roleId?, level}]}." }, 400),
+    )
+    const err = await rejection(
+      clickhouseQueryService.putSavedAccess("q-1", { rules: [{ userId: "u-2", level: "edit" }] }),
+    )
+    expect(err.code).toBe("invalid_request")
+    expect(err.message).toBe("Body must be JSON {rules: [{userId?, roleId?, level}]}.")
+  })
+
+  it("reports a name a sibling already carries as an invalid request", async () => {
+    stubFetch(() => json({ error: "A folder with that name already exists here." }, 409))
+    const err = await rejection(clickhouseQueryService.createFolder({ name: "Reports" }))
+    expect(err.code).toBe("invalid_request")
+    expect(err.message).toBe("A folder with that name already exists here.")
+  })
+
+  it("reports a folder that still holds queries as an invalid request", async () => {
+    stubFetch(() =>
+      json(
+        {
+          error:
+            "This folder still holds queries, some of them in the trash. Move or restore them first.",
+        },
+        409,
+      ),
+    )
+    const err = await rejection(clickhouseQueryService.deleteFolder("f-1"))
+    expect(err.code).toBe("invalid_request")
+    expect(err.message).toBe(
+      "This folder still holds queries, some of them in the trash. Move or restore them first.",
+    )
   })
 })

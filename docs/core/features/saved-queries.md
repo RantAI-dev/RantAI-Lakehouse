@@ -12,7 +12,7 @@
 | Acceptor | Held in the base. |
 | Started | 2026-10-30; also in `BACKLOG.md` Dates |
 | Shipped | Not yet |
-| Evidence | |
+| Evidence | API in #361 (2026-11-03) and its review fixes in #382 (2026-11-05); console in this branch (plan 47): the folder tree with the personal and the shared space, server-side search, the level-gated row and folder actions, the move dialog, the trash with restore at edit, version history with revert behind a confirmation, the share panel for queries and folders at manage, and the studio saving back into the query it came from; TypeScript suite 3449 pass / 1 skip / 0 fail on the branch head; every refusal surfaces the server's own sentence through the standard renderer, and the console writes none of its own. |
 | Plan | Plan files are not kept in the repository. |
 
 ## Problem

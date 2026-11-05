@@ -35,6 +35,16 @@ export type QueryTab = {
   name: string
   sql: string
   engine: QueryEngine
+  /**
+   * The saved query this tab came from, when it came from one (`QS-3` C4).
+   * Absent for a tab that holds a query nobody saved.
+   */
+  savedId?: string
+  /**
+   * The level the caller held on that saved query when the tab was opened.
+   * It decides whether "Save" changes that query or makes a copy of it.
+   */
+  level?: string
 }
 
 /** The tabs as they are kept in the browser. */
@@ -79,7 +89,14 @@ function parseTab(value: unknown): QueryTab | null {
   if (typeof tab.name !== "string") return null
   if (typeof tab.sql !== "string") return null
   if (!isEngine(tab.engine)) return null
-  return { id: tab.id, name: tab.name, sql: tab.sql, engine: tab.engine }
+  const parsed: QueryTab = { id: tab.id, name: tab.name, sql: tab.sql, engine: tab.engine }
+  // A tab that came from a saved query keeps its id and the caller's level:
+  // they say what "Save" may do with the query. A draft written before this
+  // change has neither and stays usable, and a field that is not one of
+  // ours is left out rather than guessed at.
+  if (typeof tab.savedId === "string" && tab.savedId.trim()) parsed.savedId = tab.savedId
+  if (typeof tab.level === "string") parsed.level = tab.level
+  return parsed
 }
 
 /**

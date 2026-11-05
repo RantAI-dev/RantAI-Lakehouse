@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Added
+
+- The saved-queries console (backlog `QS-3`): the saved-queries page gains folders with a personal and a shared space, server-side search over name and SQL, move, a trash with restore at edit, version history with revert, and sharing for queries and folders at view, edit and manage. The studio saves back into the saved query it came from at edit or manage, and a link to a query the caller may not see opens no tab.
+
 ### Security
 
 - An edit grantee of a saved query or folder could move it into or out of a personal space; a move across a personal space now needs manage.
