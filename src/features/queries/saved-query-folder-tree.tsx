@@ -38,8 +38,8 @@ import { buildSavedQueryTree, type SavedQueryTreeNode } from "./saved-query-tree
  * holds, and the folder actions sit beside it.
  *
  * The level the server sends with each folder decides what the tree offers
- * (C2): a folder may be filled at **edit**, renamed at **edit**, shared
- * and deleted at **manage**. A personal space is never renamed, moved,
+ * (C2): a folder may be filled at **edit**, renamed at **edit**, moved,
+ * shared and deleted at **manage**. A personal space is never renamed, moved,
  * deleted or shared — it is one person's own space — so the tree offers it
  * none of those.
  */
@@ -65,19 +65,19 @@ export function SavedQueryFolderTree({
     queryService.updateFolder(id, { name }, signal),
   )
   // A move writes the folder the folder lands in: `null` is the shared
-  // space, an id is that folder. The server refuses a move across a
-  // personal space below manage, and says so in its own sentence.
+  // space, an id is that folder. The server refuses a move below manage,
+  // and says so in its own sentence.
   const moveAct = useServiceAction((signal, id: string, parentId: string | null) =>
     queryService.updateFolder(id, { parentId }, signal),
   )
   const deleteAct = useServiceAction((signal, id: string) =>
     queryService.deleteFolder(id, signal).then(() => true),
   )
-  // The rename and the create say why they were refused inside their own
-  // dialog; the delete has no dialog of its own, so it says it here. A
-  // sentence said twice is a sentence nobody reads (C6).
-  const error = deleteAct.error
+  // Each refusal is said inside the dialog the person is looking at: the
+  // rename and the create in their own, the delete in its confirm dialog.
+  // A sentence said twice is a sentence nobody reads (C6).
   const { run: runMove, reset: resetMove } = moveAct
+  const { reset: resetDelete } = deleteAct
   const [naming, setNaming] = React.useState<SavedQueryFolderNaming | null>(null)
   const [moving, setMoving] = React.useState<QueryFolder | null>(null)
   const [deleting, setDeleting] = React.useState<QueryFolder | null>(null)
@@ -127,6 +127,13 @@ export function SavedQueryFolderTree({
     setMoving(folder)
   }
 
+  // The refusal of the last delete belongs to that attempt, so a dialog
+  // that opens again starts without it (#389 SHOULD-FIX 1).
+  const startDelete = (folder: QueryFolder) => {
+    resetDelete()
+    setDeleting(folder)
+  }
+
   const startCreate = (parentId: string | null, place: string) =>
     setNaming({ mode: "create", parentId, place })
 
@@ -164,7 +171,7 @@ export function SavedQueryFolderTree({
               onCreate={startCreate}
               onRename={startRename}
               onMove={startMove}
-              onDelete={setDeleting}
+              onDelete={startDelete}
               onShare={setSharing}
             />
           ) : null}
@@ -175,17 +182,11 @@ export function SavedQueryFolderTree({
             onCreate={startCreate}
             onRename={startRename}
             onMove={startMove}
-            onDelete={setDeleting}
+            onDelete={startDelete}
             onShare={setSharing}
           />
         </ul>
       </nav>
-
-      {error ? (
-        <p role="alert" className="text-sm text-destructive">
-          {readableErrorMessage(error.message)}
-        </p>
-      ) : null}
 
       {naming ? (
         <SavedQueryFolderNameDialog
@@ -219,7 +220,13 @@ export function SavedQueryFolderTree({
           destructive
           confirming={deleteAct.status === "pending"}
           onConfirm={() => void remove()}
-        />
+        >
+          {deleteAct.error ? (
+            <p role="alert" className="text-sm text-destructive">
+              {readableErrorMessage(deleteAct.error.message)}
+            </p>
+          ) : null}
+        </ConfirmActionDialog>
       ) : null}
 
       {moving ? (
@@ -278,10 +285,10 @@ function FolderTreeNode({
 }) {
   const folder = node.record
   const isShared = node.id === "shared"
-  // Filling a folder needs **edit**; sharing and deleting one need
-  // **manage**. A personal space is never renamed, moved, deleted or
-  // shared (C2): it is one person's own space, and a rule on it would
-  // reach everything inside it.
+  // Filling and renaming a folder need **edit**; moving, sharing and
+  // deleting one need **manage**. A personal space is never renamed,
+  // moved, deleted or shared (C2): it is one person's own space, and a
+  // rule on it would reach everything inside it.
   const mayFill = !isShared && levelAtLeast(node.level, "edit")
   const mayChange = mayFill && !node.isPersonal
   const mayManage = !isShared && levelAtLeast(node.level, "manage") && !node.isPersonal
@@ -333,19 +340,17 @@ function FolderTreeNode({
                 </DropdownMenuItem>
               ) : null}
               {mayChange && folder ? (
+                <DropdownMenuItem onClick={() => onRename(folder)}>
+                  <PencilIcon className="size-3.5" data-icon="inline-start" />
+                  Rename
+                </DropdownMenuItem>
+              ) : null}
+              {mayManage && folder ? (
                 <>
-                  <DropdownMenuItem onClick={() => onRename(folder)}>
-                    <PencilIcon className="size-3.5" data-icon="inline-start" />
-                    Rename
-                  </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => onMove(folder)}>
                     <FolderInputIcon className="size-3.5" data-icon="inline-start" />
                     Move
                   </DropdownMenuItem>
-                </>
-              ) : null}
-              {mayManage && folder ? (
-                <>
                   <DropdownMenuItem onClick={() => onShare(folder)}>
                     <Share2Icon className="size-3.5" data-icon="inline-start" />
                     Share

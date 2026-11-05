@@ -22,7 +22,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { queryService } from "@/services"
@@ -206,7 +206,7 @@ describe("the saved-queries console", () => {
     expect(menuItems("Delete")).toBe(0)
   })
 
-  it("offers an editor the rename and the delete", async () => {
+  it("offers an editor the rename and the delete, and keeps the move away", async () => {
     stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
     renderPage()
 
@@ -214,6 +214,9 @@ describe("the saved-queries console", () => {
 
     expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeDefined()
     expect(screen.getByRole("menuitem", { name: "Delete" })).toBeDefined()
+    // A move needs **manage**: an editor changes the query, not where it
+    // is seen from (plan 60 D8).
+    expect(menuItems("Move")).toBe(0)
   })
 
   it("offers a manager everything this step ships", async () => {
@@ -228,6 +231,7 @@ describe("the saved-queries console", () => {
       "Copy Query ID",
       "Duplicate",
       "Rename",
+      "Move",
       "Delete",
     ]) {
       expect(await screen.findByRole("menuitem", { name: label })).toBeDefined()
@@ -440,7 +444,7 @@ describe("the saved-queries console", () => {
     spyOn(queryService, "deleteSaved").mockRejectedValue(
       new ServiceError(
         "permission_denied",
-        "Only someone who manages this can move it into or out of a personal space.",
+        "Only someone who manages this can move it.",
       ),
     )
     renderPage()
@@ -451,12 +455,12 @@ describe("the saved-queries console", () => {
 
     expect(
       await screen.findByText(
-        "Only someone who manages this can move it into or out of a personal space.",
+        "Only someone who manages this can move it.",
       ),
     ).toBeDefined()
   })
 
-  it("shows the server's sentence when it refuses a folder change", async () => {
+  it("shows the refusal of a folder delete inside its confirm dialog", async () => {
     stubServices()
     spyOn(queryService, "deleteFolder").mockRejectedValue(
       new ServiceError(
@@ -468,18 +472,49 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }))
-    fireEvent.click(await screen.findByRole("button", { name: "Delete" }))
+    const dialog = await screen.findByRole("dialog")
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }))
 
+    // The dialog is where the person is looking: the sentence is said
+    // there, not below the tree behind it (#389 SHOULD-FIX 1).
     expect(
-      await screen.findByText("You do not have permission to change this folder."),
-    ).toBeDefined()
+      (await within(dialog).findByRole("alert")).textContent,
+    ).toBe("You do not have permission to change this folder.")
   })
 
-  it("offers the move to an editor and not to a viewer", async () => {
-    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+  it("forgets the last folder-delete refusal when the confirm dialog opens again", async () => {
+    stubServices()
+    spyOn(queryService, "deleteFolder").mockRejectedValue(
+      new ServiceError(
+        "permission_denied",
+        "You do not have permission to change this folder.",
+      ),
+    )
     renderPage()
 
-    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }))
+    const first = await screen.findByRole("dialog")
+    fireEvent.click(within(first).getByRole("button", { name: "Delete" }))
+    await within(first).findByRole("alert")
+
+    fireEvent.click(within(first).getByRole("button", { name: "Cancel" }))
+    await waitFor(() => {
+      expect(screen.queryAllByRole("dialog").length).toBe(0)
+    })
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }))
+    const second = await screen.findByRole("dialog")
+
+    // The refusal belonged to the last attempt, not to this one.
+    expect(within(second).queryAllByRole("alert").length).toBe(0)
+  })
+
+  it("offers the move of a query to a manager", async () => {
+    stubServices([saved({ id: "q3", title: "Forecast", level: "manage" })])
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Forecast" }))
 
     expect(await screen.findByRole("menuitem", { name: "Move" })).toBeDefined()
   })
@@ -497,10 +532,10 @@ describe("the saved-queries console", () => {
 
   it("moves a query into the shared space", async () => {
     stubServices([
-      saved({ id: "q2", title: "Costs", level: "edit", folderId: "team" }),
+      saved({ id: "q2", title: "Costs", level: "manage", folderId: "team" }),
     ])
     const update = spyOn(queryService, "updateSaved").mockResolvedValue(
-      saved({ id: "q2", title: "Costs", level: "edit", folderId: null }),
+      saved({ id: "q2", title: "Costs", level: "manage", folderId: null }),
     )
     renderPage()
 
@@ -520,9 +555,9 @@ describe("the saved-queries console", () => {
   })
 
   it("moves a query into a folder", async () => {
-    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+    stubServices([saved({ id: "q2", title: "Costs", level: "manage" })])
     const update = spyOn(queryService, "updateSaved").mockResolvedValue(
-      saved({ id: "q2", title: "Costs", level: "edit", folderId: "team" }),
+      saved({ id: "q2", title: "Costs", level: "manage", folderId: "team" }),
     )
     renderPage()
 
@@ -539,12 +574,12 @@ describe("the saved-queries console", () => {
     })
   })
 
-  it("shows the server's sentence when a move across a personal space is refused", async () => {
-    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+  it("shows the server's sentence when a move is refused", async () => {
+    stubServices([saved({ id: "q2", title: "Costs", level: "manage" })])
     spyOn(queryService, "updateSaved").mockRejectedValue(
       new ServiceError(
         "permission_denied",
-        "permission_denied: Only someone who manages this can move it into or out of a personal space.",
+        "permission_denied: Only someone who manages this can move it.",
       ),
     )
     renderPage()
@@ -559,16 +594,16 @@ describe("the saved-queries console", () => {
     // The console does not guess the rule and does not block the move
     // before the server answers: it shows the sentence the server sent (C6).
     expect((await screen.findByRole("alert")).textContent).toBe(
-      "Only someone who manages this can move it into or out of a personal space.",
+      "Only someone who manages this can move it.",
     )
   })
 
   it("forgets the last refusal when the move dialog opens again", async () => {
-    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+    stubServices([saved({ id: "q2", title: "Costs", level: "manage" })])
     spyOn(queryService, "updateSaved").mockRejectedValue(
       new ServiceError(
         "permission_denied",
-        "permission_denied: Only someone who manages this can move it into or out of a personal space.",
+        "permission_denied: Only someone who manages this can move it.",
       ),
     )
     renderPage()
@@ -580,7 +615,7 @@ describe("the saved-queries console", () => {
     })
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
     expect((await screen.findByRole("alert")).textContent).toBe(
-      "Only someone who manages this can move it into or out of a personal space.",
+      "Only someone who manages this can move it.",
     )
 
     // The person closes the dialog and comes back to it: the refusal of
@@ -629,6 +664,27 @@ describe("the saved-queries console", () => {
     })
   })
 
+  it("offers a folder's move to a manager and its rename to an editor", async () => {
+    stubServices()
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
+    expect(await screen.findByRole("menuitem", { name: "Move" })).toBeDefined()
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeDefined()
+  })
+
+  it("keeps a folder's move away from an editor, who may still rename it", async () => {
+    stubServices()
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Quarterly" }))
+
+    // A folder move changes who sees everything inside it: it needs
+    // **manage**, where a rename needs **edit** (plan 60 D8).
+    expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeDefined()
+    expect(menuItems("Move")).toBe(0)
+  })
+
   it("never offers the personal space a move", async () => {
     stubServices()
     renderPage()
@@ -640,6 +696,52 @@ describe("the saved-queries console", () => {
     // A personal space is one person's own space: it is never moved.
     expect(await screen.findByRole("menuitem", { name: "New folder" })).toBeDefined()
     expect(menuItems("Move")).toBe(0)
+  })
+
+  it("says no saved query matches when a search finds none, and not that none exist", async () => {
+    spyOn(queryService, "listSavedFiltered").mockImplementation(
+      (async (filter?: { q?: string }) =>
+        filter?.q ? [] : [saved({ id: "q1", title: "Zebra" })]) as typeof queryService.listSavedFiltered,
+    )
+    spyOn(queryService, "listFolders").mockResolvedValue(FOLDERS)
+    spyOn(queryService, "getSchedulingCapability").mockResolvedValue({
+      supported: false,
+      reason: "not yet",
+    })
+    renderPage()
+    await screen.findByText("Zebra")
+
+    fireEvent.change(screen.getByLabelText("Search saved queries"), {
+      target: { value: "nothing like this" },
+    })
+
+    expect(await screen.findByText("No saved queries match.", {}, { timeout: 2000 })).toBeDefined()
+    // The Studio hint is for a caller who has saved nothing.
+    expect(screen.queryAllByText(/Write a query in the Studio/).length).toBe(0)
+  })
+
+  it("says no saved query matches when the folder selected holds none", async () => {
+    const { list } = stubServices([])
+    list.mockImplementation(
+      (async (filter?: { folder?: string }) =>
+        filter?.folder ? [] : [saved({ id: "q1", title: "Zebra" })]) as typeof queryService.listSavedFiltered,
+    )
+    renderPage()
+    await screen.findByText("Zebra")
+
+    fireEvent.click(screen.getByRole("button", { name: "Quarterly" }))
+
+    expect(await screen.findByText("No saved queries match.")).toBeDefined()
+    expect(screen.queryAllByText(/Write a query in the Studio/).length).toBe(0)
+  })
+
+  it("keeps the Studio hint for a caller who has saved nothing", async () => {
+    stubServices([])
+    renderPage()
+
+    expect(await screen.findByText("No saved queries")).toBeDefined()
+    expect(screen.getByText(/Write a query in the Studio/)).toBeDefined()
+    expect(screen.queryAllByText("No saved queries match.").length).toBe(0)
   })
 
   it("opens the trash from the list", async () => {

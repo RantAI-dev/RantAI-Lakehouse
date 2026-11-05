@@ -116,13 +116,13 @@ describe("the move dialog", () => {
   it("shows the server's sentence when the move is refused", () => {
     renderDialog({
       error:
-        "permission_denied: Only someone who manages this can move it into or out of a personal space.",
+        "permission_denied: Only someone who manages this can move it.",
     })
 
     // The server's own sentence, word for word: the console writes none of
     // its own (C6).
     expect(screen.getByRole("alert").textContent).toBe(
-      "Only someone who manages this can move it into or out of a personal space.",
+      "Only someone who manages this can move it.",
     )
   })
 })
