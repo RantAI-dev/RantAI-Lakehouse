@@ -12,6 +12,7 @@ once a first release is tagged.
 ### Security
 
 - An edit grantee of a saved query or folder could move it into or out of a personal space; a move across a personal space now needs manage.
+- `RUSTSEC-2026-0440` (`astral-tokio-tar`, unmaintained since 2026-11-03, no fixed release) is waived in `cargo deny`: only the `testcontainers` test dependencies reach it, and no shipped binary links it.
 
 ### Added
 

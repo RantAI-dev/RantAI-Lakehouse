@@ -123,6 +123,47 @@ targets = []
 #
 # Drop when `iceberg` releases a version on parquet >= 60 and
 # apache-avro on zstd >= 0.14.3, then `cargo update`.
+#
+# RUSTSEC-2026-0440 (`astral-tokio-tar` is unmaintained): the advisory is
+# `informational = "unmaintained"` with `patched = []`, not a
+# vulnerability. Astral ended maintenance on 2026-11-03, and the advisory
+# says all versions are deprecated, 0.7.1 included, so moving to 0.7.x
+# would not help. The semver bound below is the reason the workspace stays
+# on 0.6.x.
+#
+# `testcontainers` 0.27.3 requires `astral-tokio-tar` `^0.6.0` and is the
+# only route to the crate. Five crates take it, each directly, through
+# `testcontainers-modules`, or through `lakehouse-test-support`:
+#
+#   - `lakehouse-test-support`, under `[dependencies]`
+#     (crates/lakehouse-test-support/Cargo.toml:18-19), takes
+#     `testcontainers` and `testcontainers-modules` 0.15.0.
+#   - `lakehouse-api`, under `[dev-dependencies]`
+#     (crates/lakehouse-api/Cargo.toml:237-238), takes `testcontainers`
+#     and `testcontainers-modules`. It also takes `lakehouse-test-support`
+#     under `[dev-dependencies]` (crates/lakehouse-api/Cargo.toml:214).
+#   - `lakehouse-notify`, under `[dev-dependencies]`
+#     (crates/lakehouse-notify/Cargo.toml:36), takes `testcontainers`
+#     directly. It starts its own container, so it reaches the crate
+#     without `lakehouse-test-support`.
+#   - `lakehouse-auth` and `lakehouse-store` take `lakehouse-test-support`
+#     under `[dev-dependencies]` (lines 32 and 27), so they reach the
+#     crate through it.
+#
+# No crate depends on `lakehouse-test-support` over a normal edge:
+# `cargo tree -i lakehouse-test-support --workspace -e normal` prints only
+# the crate itself. `cargo tree -i astral-tokio-tar -e normal -p <crate>`
+# prints nothing for `lakehouse-api`, `lakehouse-auth`, `lakehouse-store`
+# and `lakehouse-notify`, and `lakehousectl` does not contain the crate.
+# The workspace-wide normal tree ends at `lakehouse-test-support`, which
+# has no dependents over a normal edge, so no shipped binary links it.
+#
+# No newer release escapes the chain. `testcontainers` 0.28.0 requires
+# `astral-tokio-tar` `^0.6.1`, which excludes 0.7.x, and the newest
+# `testcontainers-modules`, 0.15.0, requires `testcontainers` `^0.27.0`,
+# which excludes 0.28. Re-evaluate when `testcontainers` moves to a
+# maintained tar codec (the advisory suggests `tar-codec`), then drop this
+# entry.
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
@@ -130,6 +171,7 @@ ignore = [
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",
     "RUSTSEC-2026-0410",
+    "RUSTSEC-2026-0440",
 ]
 
 [licenses]
