@@ -17,6 +17,7 @@ compares every score with the values the code printed before the change
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import sys
@@ -1450,6 +1451,53 @@ class ExitCodeTests(unittest.TestCase):
         path.write_text(json.dumps(cases))
         return path
 
+    def test_main_an_excluded_case_is_not_run_not_counted_and_cannot_fail_the_set(self) -> None:
+        self.cases_path = self.write_cases([{"id": "kept", "turns": ["t"]}, {"id": "broken", "turns": ["t"]}])
+        # The script hands out results in call order: the second one is the
+        # failing result the excluded case would produce if it ran.
+        runs = [self.scored(False) | {"id": "kept"}, self.scored(True) | {"id": "broken"}]
+        code, doc = self.run_main(["--exclude", "broken"], runs)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["id"] for r in doc["results"]], ["kept"])
+        self.assertEqual(doc["verdict"]["total"], 1)
+
+    def test_main_an_excluded_id_that_names_no_case_is_a_setup_error(self) -> None:
+        self.cases_path = self.write_cases([{"id": "kept", "turns": ["t"]}])
+        out = Path(tempfile.mkdtemp()) / "out.json"
+        argv = ["ai_eval.py", "--cases", str(self.cases_path), "--out", str(out), "--exclude", "nope"]
+        env = {"AI_EVAL_EMAIL": "e@example.com", "AI_EVAL_PASSWORD": "p", "AI_EVAL_API_URL": "http://api.test"}
+        stderr = io.StringIO()
+
+        # A login that succeeds, so an exit 2 can only come from the unknown
+        # id and never from an unreachable stack; and no network call is made.
+        def login_ok(_self: Any, url: str, **_k: Any) -> FakeResponse:
+            return FakeResponse(200, {"ok": True})
+
+        with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(m.requests.Session, "post", login_ok), \
+                mock.patch.object(m, "run_case") as run_case, mock.patch("sys.stderr", stderr):
+            self.assertEqual(m.main(), 2)
+        self.assertIn("--exclude names no case: nope", stderr.getvalue())
+        run_case.assert_not_called()
+        self.assertFalse(out.exists())
+
+    def test_main_the_result_document_lists_the_excluded_ids(self) -> None:
+        self.cases_path = self.write_cases([{"id": "a", "turns": ["t"]}, {"id": "b", "turns": ["t"]},
+                                            {"id": "c", "turns": ["t"]}])
+        _code, doc = self.run_main(["--exclude", "b,c"], [self.scored(False) | {"id": "a"}])
+        self.assertEqual(doc["excluded"], ["b", "c"])
+
+    def test_main_an_exclusion_applies_after_only(self) -> None:
+        self.cases_path = self.write_cases([{"id": "a", "turns": ["t"]}, {"id": "b", "turns": ["t"]},
+                                            {"id": "c", "turns": ["t"]}])
+        _code, doc = self.run_main(["--only", "a,b", "--exclude", "b"], [self.scored(False) | {"id": "a"}])
+        self.assertEqual([r["id"] for r in doc["results"]], ["a"])
+
+    def test_main_a_run_with_no_exclusion_lists_none(self) -> None:
+        self.cases_path = self.write_cases([{"id": "a", "turns": ["t"]}])
+        _code, doc = self.run_main([], [self.scored(False) | {"id": "a"}])
+        self.assertEqual(doc["excluded"], [])
+
     def test_the_output_keeps_the_old_keys_and_adds_verdict_and_runs(self) -> None:
         cases = [{"id": "a", "runs": [{"problems": [], "missing": [], "overall": 1.0}], "passed": True,
                   "completeness": 1.0, "accuracy": 1.0, "experience": 1.0, "overall": 1.0}]
@@ -1755,6 +1803,60 @@ class DashboardCasesTests(unittest.TestCase):
         cases = json.loads((HERE / "dashboard_cases.json").read_text())
         self.assertGreaterEqual(len(cases), 30)
         self.assertEqual(len({c["id"] for c in cases}), len(cases))
+
+    def test_mode_switch_asks_for_a_bar_so_a_line_is_not_a_fair_answer(self) -> None:
+        # "a chart of events per year" let the model pick a line, and the case
+        # then failed on a kind it never asked for.
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}["mode_switch"]
+        self.assertEqual(case["turns"][0], "Make a bar chart of events per year.")
+        self.assertEqual(case["expect_state"][0]["where"]["kind"], "bar")
+
+    def test_the_top_n_case_checks_the_limit_and_the_dimension_the_chart_was_saved_with(self) -> None:
+        # A chart that shows every country while the answer says "top 5" is the
+        # claim this case catches: the saved definition must carry the limit.
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}["chart_top_n_claimed"]
+        self.assertIs(case.get("confirm"), True)
+        self.assertEqual(
+            case["expect_state"][0]["where"],
+            {"mart": "mart_wisman", "kind": "bar", "def.dimension": "negara", "def.limit": 5},
+        )
+        self.assertEqual(case["expect_tool"]["args_contains"]["limit"], 5)
+
+    def test_the_bin_case_saves_no_chart_and_forbids_a_claim_that_the_text_column_was_binned(self) -> None:
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}[
+            "chart_bin_text_column_asks"
+        ]
+        self.assertEqual(case["expect_no_tool"], ["create_chart"])
+        self.assertIn("pintu_masuk", case["turns"][0])
+        claims = case["forbid"]
+
+        def claimed(answer: str) -> bool:
+            return any(re.search(pattern, answer, re.IGNORECASE) for pattern in claims)
+
+        self.assertTrue(claimed("Done, the entry points are binned in bands of 500."))
+        self.assertTrue(claimed("I grouped pintu_masuk into bins of 500 and drew the chart."))
+        # A plain refusal may repeat the phrase of the request.
+        self.assertFalse(claimed("pintu_masuk is text, so it cannot be binned in bands of 500."))
+        self.assertFalse(claimed("The entry points are not binned into bins of 500 because they are names."))
+        self.assertFalse(claimed("Which column do you want in bins of 500?"))
+        # The answer is not normalised, so a curly apostrophe must negate too.
+        self.assertFalse(claimed("The entry points aren\u2019t binned in bands of 500, they are names."))
+        self.assertFalse(claimed("pintu_masuk isn\u2019t binned into bins of 500 because it is text."))
+
+    def test_the_bin_case_passes_an_ask_or_a_plain_refusal_and_fails_a_false_claim_or_an_irrelevant_answer(self) -> None:
+        case = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}[
+            "chart_bin_text_column_asks"
+        ]
+
+        def passes(answer: str) -> bool:
+            scored = m.score_case(make_cfg(), None, case, [ScoreCaseTests.body(answer)])
+            return m.run_passed(scored)
+
+        self.assertTrue(passes("pintu_masuk holds names. Which number column should I put in bins of 500?"))
+        self.assertTrue(passes("pintu_masuk is a text column, so it cannot be binned in bands of 500."))
+        self.assertTrue(passes("Entry points are text, so that column can\u2019t be binned. Pick a number column."))
+        self.assertFalse(passes("Done. I binned pintu_masuk in bands of 500 and saved the chart."))
+        self.assertFalse(passes("Here are the foreign visitors for 2024."))
 
     def test_the_new_chart_fresh_case_checks_the_created_chart(self) -> None:
         # `BI-41` T1: the request drafts a chart and then changes it, so the
