@@ -1,11 +1,21 @@
 import type {
   QueryService,
   SaveQueryInput,
+  UpdateSavedQueryInput,
+  CreateFolderInput,
+  UpdateFolderInput,
+  SavedQueryAccessInput,
+  SavedQueryFilter,
   QueryResult,
   QueryEstimate,
   QueryDownload,
   QueryDownloadFormat,
   SavedQuery,
+  SavedQueryAccessList,
+  SavedQueryTrashEntry,
+  SavedQueryVersion,
+  QueryFolder,
+  GranteeList,
   QueryHistoryItem,
   QuerySchedulingCapability,
   NlAnswer,
@@ -13,6 +23,7 @@ import type {
   SqlFixOutcome,
 } from "../contracts/queries";
 import { historyQueryString } from "@/lib/history-query-params";
+import { readableErrorMessage } from "@/lib/notify-message";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 import { chatAnswerFromBody } from "./chat-answer";
@@ -33,21 +44,40 @@ import { fileNameOf, refusalOf } from "@/lib/browser-file";
  * so the history shown is genuine execution history.
  */
 
-/** Map an error response body onto the ServiceError code its status implies. */
+/**
+ * Map an error response body onto the ServiceError code its status implies.
+ *
+ * The message is the server's own sentence, with the API's own code
+ * prefix (`permission_denied: `) taken off: the code is for the log,
+ * the sentence is for the reader (`readableErrorMessage`, `QS-3` C6).
+ */
 function errorFor(status: number, message: string): ServiceError {
-  if (status === 404) return new ServiceError("not_found", message);
+  const sentence = readableErrorMessage(message);
+  if (status === 404) return new ServiceError("not_found", sentence);
   if (status === 400 || status === 409 || status === 422)
-    return new ServiceError("invalid_request", message);
+    return new ServiceError("invalid_request", sentence);
   if (status === 401 || status === 403)
-    return new ServiceError("permission_denied", message);
-  return new ServiceError("unavailable", message);
+    return new ServiceError("permission_denied", sentence);
+  return new ServiceError("unavailable", sentence);
+}
+
+/**
+ * One call, and the answer it carries: the JSON body when the call
+ * went through, the refusal as a `ServiceError` when it did not. Every
+ * method here goes through this one, so every route of this client
+ * reads its refusal the same way.
+ */
+async function send<T>(url: string, init: RequestInit, signal?: AbortSignal): Promise<T> {
+  const res = await apiFetch(url, { ...init, signal });
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw errorFor(res.status, json?.error ?? `Query failed (${res.status})`);
+  }
+  return json as T;
 }
 
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await apiFetch(url, { signal });
-  const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? `Query failed (${res.status})`);
-  return json as T;
+  return send<T>(url, {}, signal);
 }
 
 async function postJson<T>(
@@ -56,17 +86,74 @@ async function postJson<T>(
   signal?: AbortSignal,
   extraHeaders?: Record<string, string>
 ): Promise<T> {
-  const res = await apiFetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...extraHeaders },
-    body: JSON.stringify(body),
+  return send<T>(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...extraHeaders },
+      body: JSON.stringify(body),
+    },
     signal,
-  });
-  const json = await res.json().catch(() => null);
+  );
+}
+
+/** A change that answers with the thing it changed (`PATCH`). */
+async function patchJson<T>(
+  url: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<T> {
+  return send<T>(
+    url,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    signal,
+  );
+}
+
+/** A change that answers with the thing it changed (`PUT`). */
+async function putJson<T>(
+  url: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<T> {
+  return send<T>(
+    url,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    signal,
+  );
+}
+
+/**
+ * A removal that answers with nothing: the server sends 204 and an empty
+ * body, so there is no JSON to read and none is asked for.
+ */
+async function deleteEmpty(url: string, signal?: AbortSignal): Promise<void> {
+  const res = await apiFetch(url, { method: "DELETE", signal });
   if (!res.ok) {
+    const json = await res.json().catch(() => null);
     throw errorFor(res.status, json?.error ?? `Query failed (${res.status})`);
   }
-  return json as T;
+}
+
+/**
+ * The query string the saved-query list takes (`GET /api/query/saved`):
+ * the text typed in the search box and the folder asked for, each
+ * dropped when it is empty (the server reads an empty value as "no
+ * filter"), and no `?` at all when both are empty.
+ */
+function savedQueryQueryString(filter: SavedQueryFilter): string {
+  const params = new URLSearchParams();
+  if (filter.q) params.set("q", filter.q);
+  if (filter.folder) params.set("folder", filter.folder);
+  return params.toString();
 }
 
 /**
@@ -245,8 +332,90 @@ export const clickhouseQueryService: QueryService = {
   listSaved(signal) {
     return get<SavedQuery[]>("/api/query/saved", signal);
   },
+  // ── the saved-query console (QS-3) ─────────────────────────────────────
+  listSavedFiltered(filter, signal) {
+    const query = savedQueryQueryString(filter);
+    return get<SavedQuery[]>(`/api/query/saved${query ? `?${query}` : ""}`, signal);
+  },
+  getSaved(id, signal) {
+    return get<SavedQuery>(`/api/query/saved/${encodeURIComponent(id)}`, signal);
+  },
   saveQuery(input: SaveQueryInput, signal) {
     return postJson<SavedQuery>("/api/query/saved", input, signal);
+  },
+  updateSaved(id, input: UpdateSavedQueryInput, signal) {
+    return patchJson<SavedQuery>(`/api/query/saved/${encodeURIComponent(id)}`, input, signal);
+  },
+  deleteSaved(id, signal) {
+    return deleteEmpty(`/api/query/saved/${encodeURIComponent(id)}`, signal);
+  },
+  duplicateSaved(id, signal) {
+    return send<SavedQuery>(
+      `/api/query/saved/${encodeURIComponent(id)}/duplicate`,
+      { method: "POST" },
+      signal,
+    );
+  },
+  restoreSaved(id, signal) {
+    return send<SavedQuery>(
+      `/api/query/saved/${encodeURIComponent(id)}/restore`,
+      { method: "POST" },
+      signal,
+    );
+  },
+  listSavedTrash(signal) {
+    return get<SavedQueryTrashEntry[]>("/api/query/saved-trash", signal);
+  },
+  listSavedVersions(id, signal) {
+    return get<SavedQueryVersion[]>(
+      `/api/query/saved/${encodeURIComponent(id)}/versions`,
+      signal,
+    );
+  },
+  revertSavedVersion(id, version, signal) {
+    return send<SavedQuery>(
+      `/api/query/saved/${encodeURIComponent(id)}/versions/${encodeURIComponent(String(version))}/revert`,
+      { method: "POST" },
+      signal,
+    );
+  },
+  listFolders(signal) {
+    return get<QueryFolder[]>("/api/query/folders", signal);
+  },
+  createFolder(input: CreateFolderInput, signal) {
+    return postJson<QueryFolder>("/api/query/folders", input, signal);
+  },
+  updateFolder(id, input: UpdateFolderInput, signal) {
+    return patchJson<QueryFolder>(`/api/query/folders/${encodeURIComponent(id)}`, input, signal);
+  },
+  deleteFolder(id, signal) {
+    return deleteEmpty(`/api/query/folders/${encodeURIComponent(id)}`, signal);
+  },
+  getSavedAccess(id, signal) {
+    return get<SavedQueryAccessList>(`/api/query/saved/${encodeURIComponent(id)}/access`, signal);
+  },
+  putSavedAccess(id, input: SavedQueryAccessInput, signal) {
+    return putJson<SavedQueryAccessList>(
+      `/api/query/saved/${encodeURIComponent(id)}/access`,
+      input,
+      signal,
+    );
+  },
+  getFolderAccess(id, signal) {
+    return get<SavedQueryAccessList>(`/api/query/folders/${encodeURIComponent(id)}/access`, signal);
+  },
+  putFolderAccess(id, input: SavedQueryAccessInput, signal) {
+    return putJson<SavedQueryAccessList>(
+      `/api/query/folders/${encodeURIComponent(id)}/access`,
+      input,
+      signal,
+    );
+  },
+  findGrantees(query, signal) {
+    const params = new URLSearchParams();
+    if (query) params.set("q", query);
+    const search = params.toString();
+    return get<GranteeList>(`/api/query/grantees${search ? `?${search}` : ""}`, signal);
   },
   listHistory(filter, signal) {
     const query = historyQueryString(filter);
