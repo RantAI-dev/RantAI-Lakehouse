@@ -17,7 +17,7 @@ import {
   PERSONAL_SPACE_LABEL,
   SHARED_SPACE_LABEL,
   buildSavedQueryTree,
-  type SavedQueryTreeNode,
+  flattenTreeFolders,
 } from "./saved-query-tree"
 
 /** One place a query or a folder may go. */
@@ -26,26 +26,6 @@ type MoveTarget = {
   readonly value: string
   /** What the picker shows: the folder's path from its space. */
   readonly label: string
-}
-
-/**
- * The folders under a node, each with the path that leads to it.
- *
- * The tree is what the console already shows, so the picker names a folder
- * the way the tree does: "Team" and "Team / Quarterly", and "Personal space
- * (only you) / Reports" for a folder in the caller's own space.
- */
-function flattenTargets(
-  node: SavedQueryTreeNode,
-  prefix: string,
-  into: MoveTarget[],
-): MoveTarget[] {
-  for (const child of node.children) {
-    const label = prefix ? `${prefix} / ${child.label}` : child.label
-    into.push({ value: child.id, label })
-    flattenTargets(child, label, into)
-  }
-  return into
 }
 
 /**
@@ -65,10 +45,10 @@ function moveTargets(
   const shared: MoveTarget[] = []
   if (tree.personal) {
     personal.push({ value: tree.personal.id, label: PERSONAL_SPACE_LABEL })
-    flattenTargets(tree.personal, PERSONAL_SPACE_LABEL, personal)
+    personal.push(...flattenTreeFolders(tree.personal, PERSONAL_SPACE_LABEL))
   }
   shared.push({ value: "", label: SHARED_SPACE_LABEL })
-  flattenTargets(tree.shared, "", shared)
+  shared.push(...flattenTreeFolders(tree.shared, ""))
   const without = (list: MoveTarget[]) =>
     list.filter((target) => target.value !== excludeId)
   return { personal: without(personal), shared: without(shared) }

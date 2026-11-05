@@ -57,6 +57,27 @@ export type SavedQueryTree = {
 }
 
 /**
+ * The folders under a node, each with the path that leads to it.
+ *
+ * The tree is what the console already shows, so a picker names a folder
+ * the way the tree does: "Team" and "Team / Quarterly", and "Personal space
+ * (only you) / Reports" for a folder in the caller's own space. The node
+ * itself is not in the list: the caller says which node it is.
+ */
+export function flattenTreeFolders(
+  node: SavedQueryTreeNode,
+  prefix: string
+): { value: string; label: string }[] {
+  const into: { value: string; label: string }[] = []
+  for (const child of node.children) {
+    const label = prefix ? `${prefix} / ${child.label}` : child.label
+    into.push({ value: child.id, label })
+    into.push(...flattenTreeFolders(child, label))
+  }
+  return into
+}
+
+/**
  * The tree of the folders the caller may see.
  *
  * A folder whose parent is not in the list shows at the shared root: the

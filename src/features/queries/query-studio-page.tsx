@@ -65,6 +65,16 @@ export function QueryStudioPage() {
         title="Query Studio"
         description="Ask questions or write SQL, then run it against the hot analytical store."
       />
+      {/* A `?saved=` link that names a query the caller may not see opens no
+          tab: the studio says so instead of an empty editor (`QS-3` C5). */}
+      {studio.savedLinkError ? (
+        <p
+          role="alert"
+          className="rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+        >
+          {studio.savedLinkError}
+        </p>
+      ) : null}
       <QueryStudioTabs />
       <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
         <div className="min-w-0 space-y-4">
@@ -195,6 +205,8 @@ export function QueryStudioPage() {
         saving={studio.saveAct.status === "pending"}
         error={studio.saveAct.error?.message ?? null}
         onSave={studio.save}
+        mode={studio.saveTarget.mode}
+        savedId={studio.saveTarget.savedId}
       />
       {canAuthorSources ? (
         <SaveSqlSourceSheet
