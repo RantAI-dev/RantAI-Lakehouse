@@ -57,6 +57,21 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 - 1,000,000 rows at most per download.
 - A PDF takes a few seconds per tab and fails after 60 seconds.
 
+## Switching it on
+
+A new install has the PDF export off. Set two values in `.env` and restart
+the API and the renderer:
+
+```bash
+CONSOLE_INTERNAL_URL=http://console:3000   # the console as the renderer reaches it
+RENDER_TOKEN_SECRET=<long random value>    # `sh ops/init-env.sh` generates one
+docker compose up -d lakehouse-api gotenberg
+```
+
+Excel, CSV and PNG downloads need nothing. Scheduled reports also need SMTP
+(`docs/OPERATIONS.md`, "Features unavailable in the local stack").
+`REL-18` makes the address the default so a fresh install has PDFs on.
+
 ## Asking the assistant
 
 A new tool `export_dashboard { board, format: pdf, paper?, orientation? }`
