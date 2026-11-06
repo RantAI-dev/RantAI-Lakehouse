@@ -1,4 +1,8 @@
 import type {
+  DeploymentSettings,
+  EmailSettings,
+  EmailSettingsInput,
+  EmailTestResult,
   QueryLimits,
   QueryLimitsInput,
   ReportingSettings,
@@ -13,7 +17,7 @@ import { apiFetch } from "../http"
  * so it is safe to show.
  */
 async function call<T = ReportingSettings>(
-  method: "GET" | "PUT",
+  method: "GET" | "PUT" | "POST",
   body: unknown,
   signal?: AbortSignal,
   path = "/api/settings/reporting"
@@ -43,10 +47,22 @@ async function call<T = ReportingSettings>(
  * could not load, which is true.
  */
 const LIMITS_PATH = "/api/settings/limits"
+/** The deployment's email settings (`ADM-7`). */
+const EMAIL_PATH = "/api/settings/email"
+/** The test email (`ADM-7`). */
+const EMAIL_TEST_PATH = "/api/settings/email/test"
+/** The deployment's feature list (`ADM-6`). */
+const DEPLOYMENT_PATH = "/api/settings/deployment"
 
 export const settingsService: SettingsService = {
   getLimits: (signal) => call<QueryLimits>("GET", undefined, signal, LIMITS_PATH),
   saveLimits: (input: QueryLimitsInput, signal) => call<QueryLimits>("PUT", input, signal, LIMITS_PATH),
   getReporting: (signal) => call("GET", undefined, signal),
   saveReporting: (input, signal) => call("PUT", input, signal),
+  getEmail: (signal) => call<EmailSettings>("GET", undefined, signal, EMAIL_PATH),
+  saveEmail: (input: EmailSettingsInput, signal) =>
+    call<EmailSettings>("PUT", input, signal, EMAIL_PATH),
+  sendTestEmail: (signal) =>
+    call<EmailTestResult>("POST", undefined, signal, EMAIL_TEST_PATH),
+  getDeployment: (signal) => call<DeploymentSettings>("GET", undefined, signal, DEPLOYMENT_PATH),
 }
