@@ -468,9 +468,12 @@ async fn subscription_json(
     }))
 }
 
-fn settings_flags(state: &AppState) -> Value {
+/// What the console shows above the subscription list: whether email is set
+/// up (the resolver's answer, not the environment's alone — `ADM-7` D3) and
+/// whether PDF export is supported.
+async fn settings_flags(state: &AppState) -> Value {
     json!({
-        "emailSetUp": state.config.smtp_host.is_some(),
+        "emailSetUp": crate::runtime_settings::email(state).await.host.is_some(),
         "pdfSupported": crate::routes::dashboard::pdf_supported(&state.config),
     })
 }
@@ -590,7 +593,7 @@ pub async fn list(
         item["canEdit"] = json!(admin || sub.owner_id == principal.id.uuid());
         items.push(item);
     }
-    let mut body = settings_flags(&state);
+    let mut body = settings_flags(&state).await;
     body["items"] = Value::Array(items);
     Ok(ApiJson(body))
 }
@@ -807,7 +810,7 @@ pub async fn send_now(
         return Err(ApiError::PermissionDenied(NOT_THE_OWNER.to_owned()).into());
     }
     let mailer =
-        lakehouse_notify::EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
+        lakehouse_notify::EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
     let delivery = run_subscription(&state, &mailer, &sub, true)
         .await
         .map_err(|e| store_failed(&e))?;

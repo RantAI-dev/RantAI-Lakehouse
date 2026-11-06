@@ -314,15 +314,40 @@ impl EmailSender {
     /// `DeliverResult { ok: false, .. }`, matching the TypeScript, which
     /// never throws from `sendEmail`.
     pub async fn send(&self, to: &str, subject: &str, html: &str) -> DeliverResult {
+        match self.send_classified(to, subject, html).await {
+            Ok(()) => DeliverResult::ok(),
+            Err(failure) => DeliverResult::err(failure),
+        }
+    }
+
+    /// Send one email and report the failure as its [`DeliveryFailure`]
+    /// KIND, not as its message.
+    ///
+    /// The same send as [`Self::send`], for a caller that words its own
+    /// answer: the console's test email (`ADM-7` plan D7) maps each kind to
+    /// its own sentence, and matching this crate's message text instead
+    /// would tie that answer to this crate's wording.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`DeliveryFailure`] that stopped the send. Never an
+    /// upstream's own text: the transport's message is dropped, as in
+    /// [`Self::send`].
+    pub async fn send_classified(
+        &self,
+        to: &str,
+        subject: &str,
+        html: &str,
+    ) -> Result<(), DeliveryFailure> {
         let Some(host) = &self.config.host else {
-            return DeliverResult::err(DeliveryFailure::EmailNotConfigured);
+            return Err(DeliveryFailure::EmailNotConfigured);
         };
         if to.is_empty() || !to.contains('@') {
-            return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
+            return Err(DeliveryFailure::EmailAddressRefused);
         }
 
         let Ok(message) = build_message(&self.config.from, to, subject, html) else {
-            return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
+            return Err(DeliveryFailure::EmailAddressRefused);
         };
         self.transmit(host, message).await
     }
@@ -343,16 +368,40 @@ impl EmailSender {
         html: &str,
         attachments: &[Attachment],
     ) -> DeliverResult {
+        match self
+            .send_with_attachments_classified(bcc, subject, html, attachments)
+            .await
+        {
+            Ok(()) => DeliverResult::ok(),
+            Err(failure) => DeliverResult::err(failure),
+        }
+    }
+
+    /// Send one email with files attached and report the failure as its
+    /// [`DeliveryFailure`] kind — the same split as
+    /// [`Self::send_classified`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`DeliveryFailure`] that stopped the send; never an
+    /// upstream's own text.
+    pub async fn send_with_attachments_classified(
+        &self,
+        bcc: &[String],
+        subject: &str,
+        html: &str,
+        attachments: &[Attachment],
+    ) -> Result<(), DeliveryFailure> {
         let Some(host) = &self.config.host else {
-            return DeliverResult::err(DeliveryFailure::EmailNotConfigured);
+            return Err(DeliveryFailure::EmailNotConfigured);
         };
         if bcc.iter().any(|to| to.is_empty() || !to.contains('@')) {
-            return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
+            return Err(DeliveryFailure::EmailAddressRefused);
         }
         let Ok(message) =
             build_message_with_attachments(&self.config.from, bcc, subject, html, attachments)
         else {
-            return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
+            return Err(DeliveryFailure::EmailAddressRefused);
         };
         self.transmit(host, message).await
     }
@@ -360,14 +409,14 @@ impl EmailSender {
     /// Connect to `host` and hand over `message`, classifying a failure into
     /// the fixed set (`SRC-17` F1: the transport's own message is never
     /// returned).
-    async fn transmit(&self, host: &str, message: Message) -> DeliverResult {
+    async fn transmit(&self, host: &str, message: Message) -> Result<(), DeliveryFailure> {
         let builder = if self.config.secure {
             AsyncSmtpTransport::<Tokio1Executor>::relay(host)
         } else {
             AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
         };
         let Ok(builder) = builder else {
-            return DeliverResult::err(DeliveryFailure::MailServerUnreachable);
+            return Err(DeliveryFailure::MailServerUnreachable);
         };
         let mut builder = builder.port(self.config.port);
         // `SEC-56` D1: with no bundle the transport is the one built above,
@@ -378,7 +427,7 @@ impl EmailSender {
         // never opportunistic (D3, D4).
         if let Some(bundle) = &self.config.ca_bundle {
             let Ok(parameters) = smtp_tls::parameters(host, bundle) else {
-                return DeliverResult::err(DeliveryFailure::MailServerTlsFailed);
+                return Err(DeliveryFailure::MailServerTlsFailed);
             };
             builder = builder.tls(smtp_tls::mode(self.config.secure, parameters));
         }
@@ -388,22 +437,20 @@ impl EmailSender {
         let transport = builder.build();
 
         match transport.send(message).await {
-            Ok(_) => DeliverResult::ok(),
+            Ok(_) => Ok(()),
             // `SEC-56` D7: a failed handshake has its own reason, so an
             // operator is told to look at `SMTP_CA_FILE` and `SMTP_HOST`
             // instead of "the mail server could not be reached". Checked
             // before the reply branch: a TLS failure is neither a
             // transient nor a permanent reply.
-            Err(err) if smtp_tls::is_failure(&err) => {
-                DeliverResult::err(DeliveryFailure::MailServerTlsFailed)
-            }
+            Err(err) if smtp_tls::is_failure(&err) => Err(DeliveryFailure::MailServerTlsFailed),
             // `SRC-17` F1: an `SMTP` reply (transient or permanent) means
             // the server answered and refused; anything else (connect, TLS,
             // timeout) means it was not reached. The reply text is dropped.
             Err(err) if err.is_permanent() || err.is_transient() => {
-                DeliverResult::err(DeliveryFailure::MailServerRefused)
+                Err(DeliveryFailure::MailServerRefused)
             }
-            Err(_) => DeliverResult::err(DeliveryFailure::MailServerUnreachable),
+            Err(_) => Err(DeliveryFailure::MailServerUnreachable),
         }
     }
 

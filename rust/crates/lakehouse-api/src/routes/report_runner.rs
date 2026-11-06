@@ -1374,13 +1374,17 @@ pub fn spawn(state: &AppState) {
     }
     let state = state.clone();
     tokio::spawn(async move {
-        let mailer =
-            lakehouse_notify::EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
         let mut interval = tokio::time::interval(TICK_EVERY);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_cleanup: Option<OffsetDateTime> = None;
         loop {
             interval.tick().await;
+            // The mailer is built per tick, not once at start-up: the console
+            // may have set the mail server since (`ADM-7` D3 — the next send
+            // uses the saved settings, with no restart).
+            let mailer = lakehouse_notify::EmailSender::new(
+                crate::runtime_settings::email(&state).await.smtp(),
+            );
             let taken = tick(&state, &mailer).await;
             if taken > 0 {
                 tracing::info!(taken, "scheduled reports run");
