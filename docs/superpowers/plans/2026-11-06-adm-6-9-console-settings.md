@@ -424,6 +424,362 @@ The rule was put back and all three pass again.
 - R3 was accepted by the planner and needed no code; the limit is in the
   feature page's Limits.
 
+### Handoff (slice 2) — developer, 2026-11-07
+
+Branch `feat/adm-8-9-console-settings`, base `7ac42f25` (slice 1 merged on
+`main`). Slice 2: `ADM-8` and `ADM-9`. The previous developer's session
+ended before this handoff was written; this round adds the R4 fix, the
+merge of `main`, and the handoff itself.
+
+**Commits** (one per task, in plan order, plus the fix round; every one
+pushed):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `09076fb0` | S2-T1 | the two settings tables (`0129_sign_in_settings`, `0130_assistant_settings`) and the two store modules |
+| `afd675af` | S2-T2 | the sign-in and assistant resolvers, the swappable `AppState::llm`, and every reader that now asks the resolver |
+| `48e3b8c4` | S2-T3 | `GET`/`PUT /api/settings/sign-in`, `GET`/`PUT /api/settings/assistant`, `POST …/assistant/test`, the policy rows, `route_auth.rs` |
+| `d3a1631f` | S2-T4 | the console: the Sign-in form, the Assistant tab, `setting-field.tsx` |
+| `ccafe9e9` | S2-T5 | `docs/CONFIGURATION.md`, `docs/OPERATIONS.md`, `CHANGELOG.md` |
+| `1d49afe7` | R4 | the environment's `LLM_URL` and `LLM_MODEL` win on their own (`ADM-9 review R4`) |
+| `754a4532` | — | `git merge --no-ff origin/main` (no rebase) |
+
+**Migration.** `0129_sign_in_settings.sql` and `0130_assistant_settings.sql`,
+as the slice 2 commits named them. `main` did **not** take those numbers:
+its last migration is still `0128_email_settings.sql` (slice 1's), so
+nothing was renumbered. The merged tree carries `0128`, `0129`, `0130` in
+that order.
+
+**The merge of `main`.** `git merge --no-ff origin/main` (no rebase) at
+`754a4532`, `main` at `ce1601b1`. **Nothing conflicted**: git merged every
+file, and the two sides' changes to the files both sides touched are both
+in the merged tree:
+
+- `rust/crates/lakehouse-api/src/routes/ai/semantic.rs` — this branch
+  reads the key and the model from the resolver (`ADM-9`), `main` widened
+  the timeout budget of the flaky timeout test (`REL-21`). Both hunks are
+  in the result.
+- `CHANGELOG.md` — this branch's slice 2 entry and `main`'s two
+  saved-queries security entries and its `QS-1` "Open in Query Studio"
+  entry are all kept.
+- `rust/crates/lakehouse-api/tests/sec11_guard.rs` — `main`'s change only;
+  the slice's guard needs no change there.
+
+`--ours`/`--theirs` was not used on any file.
+
+**R4 — the fix.** `Config` records whether `LLM_URL` and `LLM_MODEL` were
+set and non-empty (`llm_url_from_env`, `llm_model_from_env`), the same
+rule slice 1 uses for `SMTP_PORT` (`smtp_port_from_env`). `resolve_assistant`
+then gives each field to the environment on its own: the environment's
+value is the effective one, its source is `server`, the console's saved
+value of that field is not used, and a save that sends it is the existing
+409. The GET and the PUT both read the sources from the resolver, so both
+follow from the one rule. The key rule stays: an environment key
+(`LLM_KEY` or `MINIMAX_API_KEY`) still makes all three the server's. An
+empty `LLM_URL` is no address, and the console may set one.
+
+The test harness changed with it: it points `LLM_URL` at a dead upstream
+so that a test which reaches for the model fails fast instead of calling a
+real provider, and under R4 that also made the environment own the
+address in every test. `spin_up_without_env_llm_url` (and
+`spin_up_with_state_without_env_llm_url`) leave it out, so the tests that
+must prove the CONSOLE owns the address can still do so. The other
+`spin_up*` functions behave exactly as before.
+
+**Tests added for R4** (the three cases the finding names):
+
+- `the_environments_own_address_is_refused_and_nothing_is_written` — env
+  `LLM_URL` only: a PUT of `url` is 409, nothing is written, and the GET
+  reports the environment's address as `server` while the model stays the
+  console's.
+- `the_environments_own_model_is_refused_and_nothing_is_written` — env
+  `LLM_MODEL` only: a PUT of `model` is 409, nothing is written, and the
+  GET reports the environment's model as `server` while the address stays
+  the console's.
+- `the_console_owns_the_provider_when_the_environment_says_nothing` — env
+  none: the console's address, model and key are used.
+- `the_environments_own_address_wins_on_its_own`,
+  `the_environments_own_model_wins_on_its_own`,
+  `an_empty_environments_address_is_not_the_environments_own`
+  (`runtime_settings.rs`'s own tests) — the rule at the resolver.
+
+**Mutation checks.** Done and restored in this round:
+
+- **R4.** With the `llm_url_from_env` branch dropped from
+  `resolve_assistant`, `the_environments_own_address_is_refused_and_nothing_is_written`
+  fails (the save is accepted, 200 instead of 409, and the console's
+  address is written) and
+  `runtime_settings::tests::the_environments_own_address_wins_on_its_own`
+  fails (the console's address is used). The branch was put back and both
+  pass again.
+- **Slice 2, the internal-address check.** The commit `48e3b8c4` claims
+  this one in its message; a claim in a message is not evidence, so it was
+  run again in this round: with the internal-address check removed from
+  `check_assistant_address`, `an_address_that_is_not_https_or_is_internal_is_refused`
+  fails (the address is accepted, 200 instead of 400). The check was put
+  back and the file passes again (12 passed).
+- **Slice 2, the 409 guard.** Also claimed in `48e3b8c4` and re-run here:
+  with the 409 guard for the environment's own fields removed from
+  `put_assistant`, three tests fail —
+  `the_environments_key_owns_the_whole_provider`,
+  `the_environments_own_address_is_refused_and_nothing_is_written` and
+  `the_environments_own_model_is_refused_and_nothing_is_written` (each a
+  200 instead of a 409). The guard was put back and the file passes again.
+
+**Commands run, with their counts** (foreground, on the branch's head
+`754a4532`, `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target-adm67`,
+`CARGO_BUILD_JOBS=2`):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean (2 m 39 s).
+- `cargo test -p lakehouse-api -p lakehouse-store -p lakehouse-llm` — **5580 passed, 0 failed, 25 ignored** across 156 test binaries (the api lib alone: 3214 passed, 18 ignored).
+- `bun run typecheck` — clean.
+- `bun run lint` — **0 errors**, 10 pre-existing warnings in files this slice does not touch.
+- `bun run test` — **3537 passed, 1 skipped, 0 failed** (350 files).
+- `python3 ops/lint/check_intra_package_imports.py` — OK; `python3 ops/lint/check_bare_iceberg_count.py` — OK.
+- `docker compose --profile '*' config --quiet` — OK, with throwaway values for the four variables SEC-18 requires (`POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY`) and for `CONNECTOR_SECRETS_KEY`; no compose file was changed.
+- `git status` — clean, nothing generated staged.
+
+Scoped commands run while fixing R4, before the merge:
+
+- `cargo clippy -p lakehouse-api --all-targets --all-features -- -D warnings` — clean.
+- `cargo test -p lakehouse-api --lib runtime_settings` — **22 passed** (19 before, 3 new).
+- `cargo test -p lakehouse-api --test assistant_settings_route` — **12 passed** (9 before, 3 new).
+- `cargo test -p lakehouse-api --test settings_resolvers` — **5 passed**.
+- `cargo test -p lakehouse-api --test deployment_settings_route` — **7 passed**.
+- `cargo test -p lakehouse-api --test email_settings_route` — **13 passed**.
+- `cargo test -p lakehouse-api --test route_auth` — **82 passed**.
+- `cargo test -p lakehouse-api --test sec11_guard` — **4 passed**.
+- `bun test src/features/admin` — **86 passed, 0 failed** (14 files).
+
+**What R4 means for a deployment that keeps `.env.example` as it is.**
+`.env.example` sets `LLM_URL` and `LLM_MODEL` (uncommented), so on such a
+deployment the console's Assistant tab shows the address and the model
+read-only ("Set by the server") and only the key is the console's to set.
+That is D1 ("the server file wins", shown read-only) and the finding, read
+literally; `.env.example` was not touched, because which settings the
+deployment keeps in its files is the owner's call. The docs
+(`docs/CONFIGURATION.md`, `docs/OPERATIONS.md`, the CHANGELOG entry and
+the feature page's Limits) now say it.
+
+**Not verified:**
+
+- `cargo test --workspace` (every crate) was NOT run: the block was
+  scoped to the three crates this slice touches (`lakehouse-api`,
+  `lakehouse-store`, `lakehouse-llm`). `cargo clippy --workspace` was run
+  over the whole workspace and is clean; CI runs the whole workspace on
+  the pull request.
+- The Dagster suite (`pytest dispar_orchestrate`) and a real
+  `docker compose up` were not run: this slice changed no Python and no
+  compose file. `docker compose --profile '*' config --quiet` passes.
+- The console's own screens were not looked at in a browser. R4 changed
+  no console behaviour — the console already disables a field the server
+  owns and leaves it out of the save body, one field at a time — so the
+  only console change is a comment. What is new is that the API may
+  report the address `server` while the model is `console`.
+- R5 was accepted by the planner and needed no code; the limit is in the
+  feature page's Limits.
+
+### Handoff (R6) — developer, 2026-11-07
+
+Branch `feat/adm-8-9-console-settings`, at `b2b4f8af` (the planner's R6
+finding). The fix is the finding's four steps and nothing else.
+
+**Commits** (one per step, each pushed; no force, no rebase):
+
+| Commit | Step | What |
+| --- | --- | --- |
+| `0a2eeb13` | R6.1 | `config.rs`: an EMPTY value means "not set" for `LLM_URL`, `LLM_MODEL`, `SMTP_PORT` and `SMTP_FROM` |
+| `8751126a` | R6.2 | `docker-compose.yml`: the four pass empty (`${X:-}`), with the comment that says what empty means |
+| `1c26ba5c` | R6.3 | `tests/assistant_settings_route.rs`: the route test that builds the config the way compose now does |
+
+**The fix, in one paragraph.** Compose hands the API those four as empty
+strings when the operator set none, and the code now reads an empty value
+as "not set": the code's own default applies and the environment does not
+own the field. `llm_url`/`llm_model` use `truthy(..).unwrap_or_else(..)`
+instead of `or_default(..)`; an empty `SMTP_PORT` is 587 **with no
+warning** (a warning would name a value the operator never chose); an
+empty `SMTP_FROM` falls through to `SMTP_USER` and then to the literal.
+The `*_from_env` flags were already right (they already read an empty
+value as unset) — the VALUES were the ones that kept the empty string,
+and the resolver then called the field `default` while the environment
+still owned it. The doc comments that described the old `??` behaviour
+are updated, and the module doc now names the four fields that read an
+empty value as unset.
+
+**Why the old behaviour was wrong, per field** (rule 2, also in the
+commit body): an empty `LLM_URL` built an assistant client with no
+address, an empty `LLM_MODEL` named no model, an empty `SMTP_FROM` was
+kept as an empty `From` (mail sent with no sender — no mail server
+accepts one), and an empty `SMTP_PORT` was resolved through the "not a
+valid u16" path and logged a warning naming it, so an operator who set
+nothing was told their own deployment had a bad port. The test that
+pinned that last case (`empty_smtp_port_falls_back_to_default_instead_of_erroring`)
+now reads `an_empty_smtp_port_is_unset_and_the_default_applies` and
+asserts what the rule says: 587, and not the environment's own. No other
+config test pinned the old behaviour.
+
+**Tests added for R6** (the cases the finding names):
+
+- `an_empty_llm_url_is_unset_and_the_default_applies`,
+  `an_empty_llm_model_is_unset_and_the_default_applies`,
+  `an_empty_smtp_port_is_unset_and_the_default_applies`,
+  `an_empty_smtp_from_falls_through_to_smtp_user_then_the_literal` and
+  `the_four_empty_values_compose_passes_are_all_unset`
+  (`config.rs`'s own tests) — the four separately, and the four together
+  the way compose hands them over.
+- `a_deployment_built_the_way_compose_builds_it_may_set_the_address_and_the_port`
+  (`tests/assistant_settings_route.rs`) — the route test: the env map
+  carries all four as empty strings, and the console may set the
+  assistant's address and the email's port. The four are one
+  deployment's environment, so the one case asks both routes.
+
+**Mutation checks.** Done and restored, both on the route test:
+
+- with `llm_url_from_env` and `smtp_port_from_env` reading an empty value
+  as the environment's own (`contains_key` instead of "present and
+  non-empty"), the case FAILS: the address's source is `server` instead
+  of `default`, and the save that sends it is refused;
+- with `llm_url`, `llm_model` and `smtp_from` keeping the empty string
+  instead of the code's default (`or_default` instead of `truthy(..)`),
+  the case FAILS: the address's value is `""` instead of
+  `https://api.minimax.io/v1`.
+
+Both mutations were put back and the file passes again (13 passed).
+
+**Commands run, with their counts** (foreground, on the branch's head
+`1c26ba5c`, `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target-adm67`,
+`CARGO_BUILD_JOBS=2`):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean
+  (2 m 37 s cold, 7 s incremental).
+- `cargo test -p lakehouse-api --lib config` — **170 passed, 0 failed**
+  (3066 filtered out). The `config::tests` module alone: **92 passed**.
+- `cargo test -p lakehouse-api --test assistant_settings_route` —
+  **13 passed** (12 before, 1 new).
+- `cargo test -p lakehouse-api --test email_settings_route` — **13
+  passed**.
+- `docker compose --profile '*' config --quiet` — OK, with throwaway
+  values for the variables SEC-18 requires (`POSTGRES_PASSWORD`,
+  `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY`,
+  `CONNECTOR_SECRETS_KEY`).
+- `docker compose --profile '*' config` — the four are empty for
+  `lakehouse-api`: `LLM_MODEL: ""`, `LLM_URL: ""`, `SMTP_FROM: ""`,
+  `SMTP_PORT: ""`.
+- `python3 ops/lint/check_compose_init_readiness.py` — OK;
+  `python3 ops/lint/check_image_digests.py` — OK (45 pinned, 8 exempt).
+- `git status` — clean, nothing generated staged.
+
+**Every other place that passes the four** (step 2's "check every other
+service block"): `docker-compose.yml` is the only Compose file that names
+them (`grep` over every `*.yml`/`*.yaml` in the repository), and the
+release's Compose file is RENDERED from that template by
+`ops/release/render_compose.py`, so it inherits the change — checked by
+rendering it with throwaway image digests: the four are `${X:-}` in the
+rendered file too. The one comment that became false is in
+`ops/ai_eval/run_dashboard_eval.sh` ("Compose resolves `LLM_URL` and
+`LLM_MODEL` itself, from the caller's `.env` or its own default"); it is
+corrected in `8751126a`. The script's behaviour is unchanged: it exports
+the two only when the caller set them.
+
+**The proof (rule 8), in the foreground.** A real stack, project
+`adm9r6`, from the worktree, with the image built from this branch:
+
+- `sh ops/init-env.sh` wrote `.env` (there was none in the worktree
+  before, and none after — it was removed again at the end). The four
+  assignments that `.env.example` carries (`LLM_URL`, `LLM_MODEL`,
+  `SMTP_PORT`, `SMTP_FROM`) were taken OUT of the generated `.env`, and
+  the file was checked: none of the four is in it.
+- `docker compose -p adm9r6 build lakehouse-api` — the API image was
+  rebuilt from this branch (18 m 56 s). It was tagged `adm9r6-api:local`
+  through `LAKEHOUSE_API_IMAGE`, so the shared `rantai-lakehouse-api:local`
+  that other worktrees use was not overwritten; the throwaway tag was
+  removed at the end.
+- `docker compose -p adm9r6 up -d` — the stack came up (1 m 47 s), the
+  API reported healthy. The host's default ports (8080, 5432, 8123, 9000,
+  3000) were free, so nothing had to be moved.
+- Inside the container the four are empty, checked with
+  `docker compose -p adm9r6 exec -T lakehouse-api printenv`:
+  `LLM_URL=`, `LLM_MODEL=`, `SMTP_PORT=`, `SMTP_FROM=` (all empty), next
+  to `SMTP_HOST=`, `SMTP_USER=`, `SMTP_PASS=` (also empty).
+- Sign in as the bootstrap admin through the API: `POST
+  /api/auth/login` → **HTTP 200**,
+  `{"name":"Bootstrap Admin","mustChangePassword":true}`; the forced
+  rotation `POST /api/auth/change-password` → **HTTP 204**; the sign in
+  again (the rotation revokes every session) → **HTTP 200** with
+  `mustChangePassword:false`. The password was read from `.env` into a
+  shell variable, written to a mode-600 file and passed to curl with
+  `--data-binary @file`, so it was never in argv and never printed.
+- `GET /api/settings/assistant` → **HTTP 200**:
+
+  ```json
+  { "url": { "value": "https://api.minimax.io/v1", "source": "default" },
+    "model": { "value": "MiniMax-M3", "source": "default" },
+    "key": { "set": false, "source": "default" } }
+  ```
+
+- `GET /api/settings/email` → **HTTP 200**:
+
+  ```json
+  { "host": { "value": null, "source": "default" },
+    "port": { "value": 587, "source": "default" },
+    "security": { "value": "starttls", "source": "default" },
+    "user": { "value": null, "source": "default" },
+    "password": { "set": false, "source": "default" },
+    "from": { "value": "rantai-lake@localhost", "source": "default" },
+    "consolePublicUrl": { "value": null, "source": "default" } }
+  ```
+
+  The four fields the finding names — `url`, `model`, `port`, `from` —
+  all report `source: "default"`, which is what the console's form shows
+  before a save: the console's to change, not the server's.
+
+- What the fix is for, shown on the same install: `PUT
+  /api/settings/email` with `{"port":2525}` → **HTTP 200**, and the port's
+  source becomes `console`; `PUT /api/settings/assistant` with
+  `{"url":"https://example.com/v1"}` → **HTTP 200**, and the address's
+  source becomes `console`. Before the fix both were refused with a 409
+  ("Set by the server") on every compose install.
+
+- Teardown: `docker compose -p adm9r6 down -v` → every container, volume
+  and network of the project is gone (`docker ps -a`, `docker volume ls`
+  and `docker network ls` filtered on `adm9r6` all empty), the two
+  throwaway images (`adm9r6-api:local`, `adm9r6-oidc-mock:latest`) were
+  removed, the generated `.env` was removed and the proof's temporary
+  files (which held the rotated password) were deleted.
+
+**What R6 does not change for an operator.** A deployment that names one
+of the four in `.env` keeps the old behaviour: the environment owns it,
+the console shows it read-only and a save that sends it is refused with a
+409. `.env.example` still carries `LLM_URL`, `LLM_MODEL`, `SMTP_PORT` and
+`SMTP_FROM`, so an installation that follows `ops/init-env.sh` as it
+stands still names all four — which is the owner's call, and the same
+rule the R4 handoff described. What changes is the installation that
+names none: the console's own fields are the console's.
+
+**Not verified:**
+
+- `cargo test --workspace` (every crate) was NOT run: the block was
+  scoped to `lakehouse-api`, the only crate this fix touches.
+  `cargo clippy -p lakehouse-api --all-targets` covers the crate's own
+  tests; CI runs the whole workspace on the pull request.
+- The Dagster suite (`pytest dispar_orchestrate`) was not run: this fix
+  changed no Python. `ops/ai_eval/run_dashboard_eval.sh` was NOT
+  executed against a stack — only its one stale comment was corrected.
+- The release's Compose file was rendered (with throwaway image
+  digests) and the four read empty in it, but no release bundle was
+  installed and started.
+- The console's own screens were not looked at in a browser. R6 changed
+  no console code: the console already disables a field the server owns
+  and leaves it out of the save body, and the API now reports these four
+  as `default` on a compose install without the four named.
+- The `dagster`, `trino`, `seaweedfs`, `cdc` and `backups` profiles were
+  not started: the proof brought up the default profile, which is what
+  the finding's proof needs.
+- The API image build took 18 m 56 s on this machine; a cold build on a
+  machine without the cargo layer cache will take longer.
+
 ## 5. Review
 
 ### Review of slice 1 (planner, 2026-11-06, at `b1d022fc`)
@@ -460,3 +816,65 @@ fixed sentences match D1–D10.
   says whether something answered. That is needed (on-premises mail relays are usually
   internal), the route needs `settings:write`, and it is limited to one try per 10 s per
   person. Written into the feature page's Limits; no code change.
+
+### Review of slice 2 (planner, 2026-11-06, at `ccafe9e9`)
+
+Checked: `resolve_sign_in` and its readers (`AppState::throttle_policy` → `routes/auth.rs`,
+the cleanup sweep in `lib.rs`, both embed checks in `routes/embed.rs`); `resolve_assistant`,
+`assistant()` (rebuild only on change, the address check before a console address is used)
+and every caller (`routes/ai/mod.rs`, `agents.rs`, `pipelines.rs`, `semantic.rs`,
+`settings.rs`); `check_assistant_address` (https, host, `resolve_checked`); `put_assistant`
+(409 loop, the key sealed, the URL-cleared-while-a-key-is-set refusal). The slice-1 R1
+lesson is applied: an environment key makes url, model and key all `server`.
+
+- **R4 (BLOCKER) The environment's `LLM_URL` and `LLM_MODEL` do not win when it sets no
+  key.** `resolve_assistant` only checks `llm_key`; with `LLM_URL` or `LLM_MODEL` set and no
+  key, the console's value replaces the operator's and the GET calls the environment's value
+  `default`. That breaks D1 ("the server file wins", shown read-only) and the feature page.
+  Fix like slice 1's `smtp_port_from_env`: `Config` records whether `LLM_URL` / `LLM_MODEL`
+  were set and non-empty; each is then `server` on its own (409 on PUT, read-only), and the
+  existing key rule stays (an environment key makes all three `server`). Tests: env
+  `LLM_URL` only → PUT `url` 409, nothing written, GET source `server`; same for
+  `LLM_MODEL`; env none → console values used. Mutation check on the first. Cite
+  `ADM-9 review R4`.
+- **R5 (accepted, documented) The address check is not pinned to the dial.** The console's
+  address is resolved and checked when it is saved and when the client is rebuilt, but the
+  client then resolves the name again when it dials, so a name whose DNS answer changes
+  afterwards (rebinding) is not caught. The route needs `settings:write`, and the assistant
+  client has no pinned-address mode today. Written into the feature page's Limits; a pinned
+  dialer would be its own task.
+- **Missing: the slice 2 handoff.** The developer's session ended before it was written.
+  The fix round must add "Handoff (slice 2)" with the commands and counts, the migration
+  numbers (`0129`, `0130`) and the mutation checks done.
+
+- **R6 (BLOCKER, planner, after R4) Compose hands the API four values, so the console can
+  never set them.** `docker-compose.yml` passes `LLM_URL: ${LLM_URL:-https://api.minimax.io/v1}`,
+  `LLM_MODEL: ${LLM_MODEL:-MiniMax-M3}`, `SMTP_PORT: ${SMTP_PORT:-587}` and
+  `SMTP_FROM: ${SMTP_FROM:-rantai-lake@localhost}`. Inside the container each is therefore
+  always set and non-empty, so `llm_url_from_env`, `llm_model_from_env`,
+  `smtp_port_from_env` and `smtp_from_from_env` are always true: on every compose install
+  the console's assistant address and model (ADM-9) and the email port and sender (ADM-7,
+  already merged in #404) are read-only. Tests pass because they build `Config` from a map,
+  not from compose. Fix, behaviour unchanged for an operator:
+  1. `config.rs`: an EMPTY value means unset for these four. `LLM_URL`/`LLM_MODEL` use
+     `truthy(..).unwrap_or_else(default)` instead of `or_default` (an empty `LLM_URL` today
+     builds a client with no address); `SMTP_PORT` empty is 587 with no warning;
+     `SMTP_FROM` empty falls through to `SMTP_USER` / the literal (today an empty one is kept
+     as an empty `From`, which no mail server accepts). Update the doc comments that
+     describe the old `??` behaviour; adjust the existing config tests that pinned
+     "empty `SMTP_FROM` is preserved" (rule 2: say why in the commit — the old behaviour
+     sent mail with an empty sender).
+  2. `docker-compose.yml`: those four become `${X:-}`, with a comment: empty means "not set
+     here", the code's own defaults apply, and the console may set them (`ADM-7`, `ADM-9`).
+     Check every other service block that passes them (grep) and the release compose
+     template if it renders them (`ops/release`).
+  3. Tests: config — empty `LLM_URL` gives the default URL and `llm_url_from_env` false; the
+     same for `LLM_MODEL`, `SMTP_PORT`, `SMTP_FROM`. One route test that builds the config
+     the way compose now does (all four present and empty) and shows the console may set
+     the assistant address and the email port. Mutation check on it.
+  4. Proof (rule 8): `docker compose --profile '*' config` shows the four empty for
+     `lakehouse-api`; a real `up` of the stack from `ops/init-env.sh` with none of the four
+     in `.env`, then `GET /api/settings/assistant` and `GET /api/settings/email` as the
+     bootstrap admin show `url`, `model`, `port` and `from` with source `default`. Tear down
+     with `down -v`.
+  Cite `ADM-9 review R6` (and `ADM-7`) at each site.

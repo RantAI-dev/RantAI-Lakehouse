@@ -105,12 +105,37 @@ async fn every_feature_is_off_and_names_what_is_missing() {
             "where": "server",
         })
     );
+    // `ADM-9`: the assistant's key is the console's to set when the
+    // environment holds none, so the missing setting is named the way the
+    // console names it ("key"), and the console may fix it here.
     assert_eq!(
         feature(&features, "assistant"),
         json!({
             "feature": "assistant",
             "on": false,
-            "missing": ["LLM_KEY"],
+            "missing": ["key"],
+            "where": "console",
+        })
+    );
+}
+
+/// `ADM-9`: with the environment holding the key, the assistant is the
+/// server's — the whole provider unit is read-only in the console.
+#[tokio::test]
+async fn an_assistant_the_environment_owns_is_named_the_way_the_operator_sets_it() {
+    let mut env = HashMap::new();
+    env.insert("LLM_KEY".to_owned(), "a-test-llm-key".to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let features = features(&router, &cookie).await;
+
+    assert_eq!(
+        feature(&features, "assistant"),
+        json!({
+            "feature": "assistant",
+            "on": true,
+            "missing": [],
             "where": "server",
         })
     );

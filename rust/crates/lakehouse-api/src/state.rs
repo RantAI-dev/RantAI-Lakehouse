@@ -18,10 +18,8 @@ use lakehouse_core::secret::{
 };
 use lakehouse_dagster::DgClient;
 use lakehouse_iceberg::IcebergClient;
-use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
 use lakehouse_trino::{TrinoClient, TrinoConfig};
-use time::Duration;
 use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
@@ -81,7 +79,13 @@ pub struct AppState {
     /// `Dagster` GraphQL client.
     pub dagster: Arc<DgClient>,
     /// `OpenAI`-compatible chat-completions client.
-    pub llm: Arc<LlmClient>,
+    ///
+    /// Swappable (`ADM-9`): the resolver in `crate::runtime_settings`
+    /// rebuilds it when the effective provider settings change, so a save in
+    /// the console takes effect on the next message with no restart. A
+    /// `RwLock` over an `Arc`, so a reader takes the client out and never
+    /// holds the lock across a model call.
+    pub llm: Arc<RwLock<Arc<crate::runtime_settings::AssistantClient>>>,
     /// Phase 2 OLTP pool (`lakehouse-store`).
     ///
     /// `Option`, not a bare `Arc<PgPool>`: `lakehouse_store::connect_lazy`
@@ -226,10 +230,6 @@ pub struct AppState {
     /// field carried while nothing read it yet is removed now that a
     /// reader exists.
     pub lakekeeper_admin: Option<Arc<LakekeeperAdminClient>>,
-    /// Login-throttle policy resolved from config — shared (via
-    /// [`Arc`]) across every clone of [`AppState`] so the login
-    /// handler reads it without copying.
-    pub throttle_policy: Arc<ThrottlePolicy>,
     /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
     /// per user and in total. Shared across clones; always populated.
     pub upload_receive: ReceiveLimiter,
@@ -258,6 +258,20 @@ pub struct AppState {
     /// an alert or a scheduled report does not read Postgres per send. The
     /// email `PUT` clears it on this process. Shared across clones.
     pub email_settings_cache: Arc<crate::runtime_settings::EmailSettingsCache>,
+    /// The 30-second memo of the saved sign-in limits (`ADM-8` plan D3), so
+    /// a sign-in does not read Postgres per try. The sign-in `PUT` clears it
+    /// on this process. Shared across clones.
+    pub sign_in_settings_cache: Arc<
+        crate::runtime_settings::SettingsCache<lakehouse_store::sign_in_settings::SignInSettings>,
+    >,
+    /// The 30-second memo of the saved assistant settings (`ADM-9` plan D3),
+    /// so an assistant message does not read Postgres per round. The
+    /// assistant `PUT` clears it on this process. Shared across clones.
+    pub assistant_settings_cache: Arc<
+        crate::runtime_settings::SettingsCache<
+            lakehouse_store::assistant_settings::AssistantSettings,
+        >,
+    >,
     /// How often each caller may ask for a test email (`ADM-7` plan D10).
     /// Shared across clones.
     pub email_test_limiter: Arc<crate::runtime_settings::TestEmailLimiter>,
@@ -693,19 +707,21 @@ fn postgres_pool(config: &Config) -> Option<Arc<PgPool>> {
     }
 }
 
-/// The login-throttle policy [`AppState::new`] stores (`SEC-5`): the three
-/// configured numbers, converted to the shape the login handler reads.
-/// A free function only so the state constructor stays inside clippy's
-/// line budget as the state grows; behaviour is unchanged.
-fn login_throttle_policy(config: &Config) -> ThrottlePolicy {
-    ThrottlePolicy {
-        max_failures: config.login_max_failures,
-        window: Duration::seconds(i64::from(config.login_failure_window_secs)),
-        lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
-    }
-}
-
 impl AppState {
+    /// The login-throttle policy in effect (`SEC-5`): the environment's
+    /// numbers, else the console's saved ones, else the code defaults
+    /// (`ADM-8` plan D12).
+    ///
+    /// A method, not a field: the numbers may now come from the console,
+    /// and a save there must reach the next sign-in without a restart. The
+    /// resolver reads the saved row through its 30-second cache, so this
+    /// costs a lock, not a query, on the common path.
+    pub async fn throttle_policy(&self) -> ThrottlePolicy {
+        crate::runtime_settings::sign_in(self)
+            .await
+            .throttle_policy()
+    }
+
     /// A state with no database at all: for the unit tests that run a
     /// statement against a mock `ClickHouse` and ask the unrestricted
     /// tenant gate (`SEC-50` slice 2 T1).
@@ -746,11 +762,6 @@ impl AppState {
             config.dagster_url.clone(),
             config.dagster_repo.clone(),
             config.dagster_location.clone(),
-        );
-        let llm = LlmClient::new(
-            config.llm_url.clone(),
-            config.llm_model.clone(),
-            config.llm_key.clone(),
         );
         // `connect_lazy` performs no I/O, so this never blocks on, or fails
         // because of, Postgres being down — see the field doc comment and
@@ -818,7 +829,20 @@ impl AppState {
         let secret_manager = config.secret_manager.clone();
         warn_if_no_reference_prefixes(&secret_manager);
         let secrets_keyring = connector_secrets_keyring(&config);
-        let throttle_policy = login_throttle_policy(&config);
+        // `ADM-9`: the secret store is built before the assistant client,
+        // because the store's keyring opens the console's saved key.
+        let connector_secret_store = Arc::new(ConnectorSecretStore::new(
+            secrets_dir.clone(),
+            secrets_keyring.clone(),
+        ));
+        // The assistant client is swappable, and the resolver rebuilds it
+        // when the effective provider settings change. The client this
+        // process starts with is built from the environment's values (there
+        // is no saved row at start-up).
+        let llm = crate::runtime_settings::initial_assistant_client(
+            &config,
+            connector_secret_store.keyring().ok(),
+        );
         let upload_receive = ReceiveLimiter::new(
             config.upload_max_concurrent_per_user,
             config.upload_max_concurrent,
@@ -843,19 +867,16 @@ impl AppState {
             config: Arc::new(config),
             clickhouse,
             dagster: Arc::new(dagster),
-            llm: Arc::new(llm),
+            llm: Arc::new(RwLock::new(llm)),
             pg,
             db_ready: Arc::new(AtomicBool::new(false)),
             connector_secret_resolver: connector_secret_resolver(
                 EnvSecretResolver::new(),
                 &secrets_dir,
-                secrets_keyring.clone(),
+                secrets_keyring,
                 &secret_manager,
             ),
-            connector_secret_store: Arc::new(ConnectorSecretStore::new(
-                secrets_dir,
-                secrets_keyring,
-            )),
+            connector_secret_store,
             auth,
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
@@ -867,7 +888,6 @@ impl AppState {
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
-            throttle_policy: Arc::new(throttle_policy),
             upload_receive,
             conversion_runner,
             pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
@@ -879,6 +899,8 @@ impl AppState {
             )),
             query_limits: crate::query_limits::QueryLimitsMemo::default(),
             email_settings_cache: crate::runtime_settings::email_cache(),
+            sign_in_settings_cache: crate::runtime_settings::sign_in_cache(),
+            assistant_settings_cache: crate::runtime_settings::assistant_cache(),
             email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
             #[cfg(test)]
             webhook_sender_override: None,

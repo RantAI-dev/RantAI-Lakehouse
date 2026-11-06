@@ -247,8 +247,16 @@ services:
       # ── LLM: out of scope for the local stack. Needs a real API key, so
       #    AI/agent routes degrade to 503 unless you set LLM_KEY yourself
       #    (e.g. in a local .env). See docs/OPERATIONS.md. ──
-      LLM_URL: ${LLM_URL:-https://api.minimax.io/v1}
-      LLM_MODEL: ${LLM_MODEL:-MiniMax-M3}
+      # ADM-9 review R6: an empty value here means "not set in this file" —
+      # the code's own default applies, and the console may set the
+      # address and the model (Settings → Assistant). A value set here is
+      # the server's: it is shown read-only and a save that sends it is
+      # refused with a 409. The mail settings below answer the same way
+      # (ADM-7). The four are empty here on purpose: a value that is
+      # always set would make the console's own settings read-only on
+      # every compose installation.
+      LLM_URL: ${LLM_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
       LLM_KEY: ${LLM_KEY:-}
       # Copilot chat request timeout in seconds (default 120, clamped
       # 30..1800). Raise it only for a slow self-hosted model, e.g. a
@@ -317,12 +325,17 @@ services:
       # the default; a value that is not a whole number of 1 or more stops
       # the API at start (see config.rs).
       UPLOAD_CONVERT_MEMORY_MB: ${UPLOAD_CONVERT_MEMORY_MB:-}
+      # ADM-7 and ADM-9 review R6: an empty value here means "not set in
+      # this file" — the code's own default applies, and the console may
+      # set the port and the sender (Settings → Email). A value set here
+      # is the server's: it is shown read-only and a save that sends it
+      # is refused with a 409.
       SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_PORT: ${SMTP_PORT:-}
       SMTP_SECURE: ${SMTP_SECURE:-false}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
-      SMTP_FROM: ${SMTP_FROM:-rantai-lake@localhost}
+      SMTP_FROM: ${SMTP_FROM:-}
       # SEC-56 (D1/D2/D3/D5): the CA bundle for an internal mail relay --
       # the path, INSIDE this container, of a PEM file with one or more CA
       # certificates. Unset or empty: the sender trusts the built-in roots

@@ -714,14 +714,9 @@ const RETRY_DELAYS: [std::time::Duration; 2] = [
 fn is_transient(err: &lakehouse_llm::LlmError) -> bool {
     match err {
         lakehouse_llm::LlmError::Transport(_) => true,
-        lakehouse_llm::LlmError::Api(msg) => {
-            let status: u16 = msg
-                .strip_prefix("LLM ")
-                .and_then(|rest| rest.split(':').next())
-                .and_then(|code| code.trim().parse().ok())
-                .unwrap_or(0);
-            status == 408 || status == 429 || (500..=599).contains(&status)
-        }
+        lakehouse_llm::LlmError::Api(_) => err
+            .status()
+            .is_some_and(|status| status == 408 || status == 429 || (500..=599).contains(&status)),
     }
 }
 
@@ -747,9 +742,13 @@ async fn model_round_once(
     tools: &[Value],
     progress: Progress<'_>,
 ) -> Result<LlmMessage, lakehouse_llm::LlmError> {
+    // `ADM-9`: the client comes from the resolver, which rebuilds it when
+    // the effective provider settings change — so a save in the console
+    // takes effect on this message.
+    let assistant = crate::runtime_settings::assistant(state).await;
     if progress.is_none() {
-        return state
-            .llm
+        return assistant
+            .client
             .chat_with_tools(messages, tools, round_options())
             .await;
     }
@@ -757,8 +756,8 @@ async fn model_round_once(
         ("<minimax:tool_call>", "</minimax:tool_call>"),
         ("<invoke ", "</invoke>"),
     ]);
-    state
-        .llm
+    assistant
+        .client
         .chat_with_tools_streamed(messages, tools, round_options(), |piece| match piece {
             StreamPiece::Text(text) => {
                 let visible = tool_xml.push(text);
@@ -1567,14 +1566,10 @@ fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
         lakehouse_llm::LlmError::Transport(_) => {
             "The AI service could not be reached. Try again later.".to_owned()
         }
-        lakehouse_llm::LlmError::Api(msg) => msg
-            .strip_prefix("LLM ")
-            .and_then(|rest| rest.split(':').next())
-            .and_then(|code| code.trim().parse::<u16>().ok())
-            .map_or_else(
-                || "The AI service returned an error. Try again later.".to_owned(),
-                |code| format!("The AI service returned an error (HTTP {code}). Try again later."),
-            ),
+        lakehouse_llm::LlmError::Api(_) => err.status().map_or_else(
+            || "The AI service returned an error. Try again later.".to_owned(),
+            |code| format!("The AI service returned an error (HTTP {code}). Try again later."),
+        ),
     }
 }
 

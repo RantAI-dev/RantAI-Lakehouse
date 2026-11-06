@@ -125,7 +125,10 @@ async fn run_pass(
     call_timeout: Duration,
 ) -> PassReport {
     let mut report = PassReport::default();
-    if !state.config.ai_semantic_layer || state.config.llm_key.is_empty() {
+    // `ADM-9`: the key may now come from the console, so the check reads
+    // the resolver's answer and not the environment's value.
+    let assistant = crate::runtime_settings::assistant(state).await;
+    if !state.config.ai_semantic_layer || !assistant.settings.key_set {
         return report;
     }
     let Some(pg) = state.pg.as_deref() else {
@@ -263,12 +266,16 @@ async fn draft_table(
         temperature: Some(0.0),
         max_tokens: Some(MAX_TOKENS),
     };
-    let reply = match tokio::time::timeout(call_timeout, state.llm.chat(&messages, options)).await {
-        Err(_) => return Err("model call timed out"),
-        Ok(Err(LlmError::Transport(_))) => return Err("model call failed in transport"),
-        Ok(Err(LlmError::Api(_))) => return Err("model answered with an error status"),
-        Ok(Ok(reply)) => reply,
-    };
+    // `ADM-9`: the client and the model name come from the resolver, so a
+    // console's saved provider is the one that describes the table.
+    let assistant = crate::runtime_settings::assistant(state).await;
+    let reply =
+        match tokio::time::timeout(call_timeout, assistant.client.chat(&messages, options)).await {
+            Err(_) => return Err("model call timed out"),
+            Ok(Err(LlmError::Transport(_))) => return Err("model call failed in transport"),
+            Ok(Err(LlmError::Api(_))) => return Err("model answered with an error status"),
+            Ok(Ok(reply)) => reply,
+        };
     let draft: Value = extract_json_object(&reply)
         .and_then(|json| serde_json::from_str(json).ok())
         .ok_or("reply was not a JSON object")?;
@@ -276,7 +283,7 @@ async fn draft_table(
     // is what marks it as asked, so a write that fails halfway leaves the
     // table to be drafted again (the rows already written are kept).
     for entry in entries_from(&draft, table) {
-        semantic::insert_draft(pg, &entry, &state.config.llm_model)
+        semantic::insert_draft(pg, &entry, &assistant.settings.model)
             .await
             .map_err(|_| "storing the draft failed")?;
     }

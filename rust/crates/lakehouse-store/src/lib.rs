@@ -35,6 +35,7 @@
 pub mod agents;
 pub mod alert_state;
 pub mod annotation;
+pub mod assistant_settings;
 pub mod audit;
 pub mod capture_lag;
 pub mod cdc;
@@ -75,6 +76,7 @@ pub mod schema_change;
 pub mod schema_diff;
 pub mod semantic;
 pub mod sessions;
+pub mod sign_in_settings;
 pub mod storage;
 pub mod upload_folders;
 pub mod uploads;

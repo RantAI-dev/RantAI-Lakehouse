@@ -5,8 +5,18 @@
 //! interchangeable: JavaScript's `??` falls back only when the variable is
 //! `undefined` (an explicitly-set empty string is preserved), while `||`
 //! also falls back on the empty string. [`Config::llm_key`] is the one field
-//! in this module that uses `||` semantics — see
-//! `src/services/clients/llm.ts:10`. Every other field uses `??` semantics.
+//! that uses `||` semantics — see `src/services/clients/llm.ts:10`. Every
+//! other field uses `??` semantics.
+//!
+//! Four fields are `||` fields too, on purpose (`ADM-9 review R6`):
+//! [`Config::llm_url`], [`Config::llm_model`], [`Config::smtp_port`] and
+//! [`Config::smtp_from`] read an EMPTY value as "not set", so the code's own
+//! default applies and the environment does not own the field. The reason is
+//! the deployment: `docker-compose.yml` passes these four to the API as empty
+//! strings when the operator set none, and a value that reads as a value
+//! made the console's own fields read-only on every compose installation.
+//! An empty address is no address, an empty port is no port and an empty
+//! `From` is no sender — none of the three is worth keeping.
 //!
 //! Sources ported (see doc comments on each field for the exact line):
 //! `src/services/clients/clickhouse.ts`, `src/services/clients/dagster.ts`,
@@ -39,6 +49,19 @@ use uuid::Uuid;
 /// 15x over release. Stack is reserved as address space and committed only as
 /// used, so the cost is nil for threads that never recurse deeply.
 pub const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// The provider address the assistant uses when neither the environment's
+/// `LLM_URL` nor the console's saved row names one (`ADM-9`).
+///
+/// The code's own default, kept here so the resolver and the config resolve
+/// to the same address: the console's Assistant tab may set the address, and
+/// the deployment's own files may name one, but the value neither of them
+/// names is this one.
+pub const DEFAULT_LLM_URL: &str = "https://api.minimax.io/v1";
+
+/// The model the assistant uses when neither the environment's `LLM_MODEL`
+/// nor the console's saved row names one (`ADM-9`).
+pub const DEFAULT_LLM_MODEL: &str = "MiniMax-M3";
 
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
@@ -378,9 +401,27 @@ pub struct Config {
     pub dagster_location: String,
     /// LLM chat-completions base URL. Default
     /// `"https://api.minimax.io/v1"` (`llm.ts:7`, `??`).
+    ///
+    /// An EMPTY `LLM_URL` is "not set": the default applies, and the
+    /// environment does not own the address (`ADM-9 review R6`), so the
+    /// console may set one.
     pub llm_url: String,
+    /// Whether `LLM_URL` was set and non-empty. `llm_url` is the
+    /// environment's value or the code default, so it alone cannot tell an
+    /// operator who set `LLM_URL` from one who never set it; the
+    /// console-settings resolver (`ADM-9`) needs exactly that to answer a
+    /// field's `source` and refuse a console write over an environment
+    /// value (`ADM-9 review R4`, the same rule as
+    /// [`Config::smtp_port_from_env`]).
+    pub llm_url_from_env: bool,
     /// LLM model name. Default `"MiniMax-M3"` (`llm.ts:8`, `??`).
+    ///
+    /// An EMPTY `LLM_MODEL` is "not set", like [`Config::llm_url`]
+    /// (`ADM-9 review R6`).
     pub llm_model: String,
+    /// Whether `LLM_MODEL` was set and non-empty — the model half of
+    /// [`Config::llm_url_from_env`] (`ADM-9 review R4`).
+    pub llm_model_from_env: bool,
     /// LLM API key: `LLM_KEY`, falling back to `MINIMAX_API_KEY`, falling
     /// back to `""` (`llm.ts:10`, `||` — an explicitly *empty* `LLM_KEY`
     /// also falls through to `MINIMAX_API_KEY`, unlike every other field
@@ -437,6 +478,10 @@ pub struct Config {
     /// cutover a stray `SMTP_PORT=` must not take the whole process down;
     /// `PORT` (below) is the one field that legitimately still hard-fails,
     /// since it is Rust-only and load-bearing.
+    ///
+    /// An EMPTY `SMTP_PORT` is "not set" and NOT a bad value
+    /// (`ADM-9 review R6`): the default applies and nothing is logged — a
+    /// warning would name a value the operator never chose.
     pub smtp_port: u16,
     /// Whether `SMTP_PORT` was set and non-empty (and parsed). `smtp_port`
     /// is the parsed value or the 587 default, so it alone cannot tell an
@@ -465,6 +510,10 @@ pub struct Config {
     /// SMTP `From` header. `SMTP_FROM`, falling back to `SMTP_USER`,
     /// falling back to `"rantai-lake@localhost"` (`notify.ts:44`, `??`
     /// chain).
+    ///
+    /// An EMPTY value at any step of the chain is "not set" at that step
+    /// (`ADM-9 review R6`): an empty `From` is no sender, and no mail
+    /// server accepts one.
     pub smtp_from: String,
     /// Whether `SMTP_FROM` was set and non-empty. `smtp_from` is the
     /// fallback-chain result, so it alone cannot tell `SMTP_FROM` from the
@@ -994,6 +1043,32 @@ pub struct Config {
     /// task deletes them. Zero, negative, or unparseable values fall back
     /// to the default (30).
     pub auth_retention_days: u32,
+    /// Whether the environment names [`Self::login_max_failures`] with a
+    /// whole number of 1 or more (`ADM-8`).
+    ///
+    /// The flag, not the value: the console may not change a setting the
+    /// environment owns (plan D1), and the value alone cannot say whether
+    /// the environment named it or the code default supplied it. An
+    /// unparseable value does not count — the operator's value is invalid,
+    /// the code default is in effect, and the console is free to set a real
+    /// one (the same rule as [`Self::smtp_port_from_env`]).
+    pub login_max_failures_from_env: bool,
+    /// Whether the environment names
+    /// [`Self::login_failure_window_secs`] with a whole number of 1 or more
+    /// (`ADM-8`). See [`Self::login_max_failures_from_env`].
+    pub login_failure_window_secs_from_env: bool,
+    /// Whether the environment names [`Self::login_lockout_secs`] with a
+    /// whole number of 1 or more (`ADM-8`). See
+    /// [`Self::login_max_failures_from_env`].
+    pub login_lockout_secs_from_env: bool,
+    /// Whether the environment names [`Self::auth_retention_days`] with a
+    /// whole number of 1 or more (`ADM-8`). See
+    /// [`Self::login_max_failures_from_env`].
+    pub auth_retention_days_from_env: bool,
+    /// Whether the environment names
+    /// [`Self::embed_token_max_lifetime_seconds`] with a whole number of 1
+    /// or more (`ADM-8`). See [`Self::login_max_failures_from_env`].
+    pub embed_token_max_lifetime_from_env: bool,
     /// Files one user may have being received, and loads one user may have
     /// running, at once: `UPLOAD_MAX_CONCURRENT_PER_USER`, default 4
     /// (`SEC-17`). A value that is not a whole number of 1 or more fails
@@ -1067,7 +1142,9 @@ impl std::fmt::Debug for Config {
             .field("dagster_repo", &self.dagster_repo)
             .field("dagster_location", &self.dagster_location)
             .field("llm_url", &self.llm_url)
+            .field("llm_url_from_env", &self.llm_url_from_env)
             .field("llm_model", &self.llm_model)
+            .field("llm_model_from_env", &self.llm_model_from_env)
             .field("llm_key", &REDACTED)
             .field(
                 "embed_secret",
@@ -1275,9 +1352,29 @@ impl std::fmt::Debug for Config {
             .field("ai_relevant_tables", &self.ai_relevant_tables)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
+            .field(
+                "login_max_failures_from_env",
+                &self.login_max_failures_from_env,
+            )
             .field("login_failure_window_secs", &self.login_failure_window_secs)
+            .field(
+                "login_failure_window_secs_from_env",
+                &self.login_failure_window_secs_from_env,
+            )
             .field("login_lockout_secs", &self.login_lockout_secs)
+            .field(
+                "login_lockout_secs_from_env",
+                &self.login_lockout_secs_from_env,
+            )
             .field("auth_retention_days", &self.auth_retention_days)
+            .field(
+                "auth_retention_days_from_env",
+                &self.auth_retention_days_from_env,
+            )
+            .field(
+                "embed_token_max_lifetime_from_env",
+                &self.embed_token_max_lifetime_from_env,
+            )
             .field(
                 "upload_max_concurrent_per_user",
                 &self.upload_max_concurrent_per_user,
@@ -1347,6 +1444,30 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .filter(|v| *v > 0)
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default)
+}
+
+/// Whether the environment names `key` with a whole number of 1 or more
+/// (`ADM-8`): a setting the environment owns is read-only in the console, and
+/// the value alone cannot say whether the environment named it or the code
+/// default supplied it.
+///
+/// The same rule as [`parse_positive_u32_or_default`]: an unparseable value
+/// does not count, because the operator's value is invalid and the code
+/// default is in effect.
+fn env_sets_positive_u32(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key)
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .is_some_and(|value| u32::try_from(value).is_ok())
+}
+
+/// Whether the environment names `key` with a whole number of 1 or more
+/// (`ADM-8`), for a setting counted in seconds as a `u64`. See
+/// [`env_sets_positive_u32`].
+fn env_sets_positive_u64(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .is_some_and(|value| value > 0)
 }
 
 /// Parses `key` as a whole number of 1 or more, `default` when unset or
@@ -1549,7 +1670,13 @@ impl Config {
                   crossing the 100-line lint threshold)"
     )]
     pub fn from_map(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
-        let smtp_port = match env.get("SMTP_PORT") {
+        // `SMTP_PORT`: an empty value is "not set", not a bad value
+        // (`ADM-9 review R6`). Compose passes the variable as an empty
+        // string when the operator set none, and an empty port is no
+        // port: the code's own 587 applies, with no warning — a warning
+        // would name a value the operator never chose. A value that IS set
+        // and unparseable still warns and falls back to 587, as before.
+        let smtp_port = match truthy(env, "SMTP_PORT") {
             Some(raw) => raw.parse::<u16>().unwrap_or_else(|_| {
                 tracing::warn!(
                     smtp_port = %raw,
@@ -1562,7 +1689,9 @@ impl Config {
         // `SMTP_PORT` set, non-empty and parseable — the console may not
         // override it (`ADM-7` D1). An unparseable `SMTP_PORT` does not
         // count: the operator's value is invalid, and `smtp_port` already
-        // fell back to 587, so the console is free to set a real port.
+        // fell back to 587, so the console is free to set a real port. An
+        // EMPTY one does not count either (`ADM-9 review R6`): it is not
+        // set at all.
         let smtp_port_from_env = env
             .get("SMTP_PORT")
             .is_some_and(|raw| !raw.is_empty() && raw.parse::<u16>().is_ok());
@@ -1582,14 +1711,25 @@ impl Config {
             .or_else(|| truthy(env, "MINIMAX_API_KEY"))
             .unwrap_or_default();
 
-        // SMTP_FROM ?? SMTP_USER ?? "rantai-lake@localhost" — a `??` chain,
-        // so an explicitly empty SMTP_FROM is preserved and does NOT fall
-        // through to SMTP_USER.
-        let smtp_from = env.get("SMTP_FROM").cloned().unwrap_or_else(|| {
-            env.get("SMTP_USER")
-                .cloned()
-                .unwrap_or_else(|| "rantai-lake@localhost".to_owned())
-        });
+        // `LLM_URL` and `LLM_MODEL` set and non-empty: the environment owns
+        // that field, so the console shows it read-only and a save that
+        // sends it is refused (`ADM-9 review R4`). The same rule as
+        // `SMTP_PORT`: the value alone cannot tell an operator who set it
+        // from one who never did. An EMPTY value is "not set"
+        // (`ADM-9 review R6`): compose passes both as empty strings when
+        // the operator set none, and an empty address or model is no
+        // address or model at all.
+        let llm_url_from_env = env.get("LLM_URL").is_some_and(|raw| !raw.is_empty());
+        let llm_model_from_env = env.get("LLM_MODEL").is_some_and(|raw| !raw.is_empty());
+
+        // `SMTP_FROM` → `SMTP_USER` → "rantai-lake@localhost", with an EMPTY
+        // value meaning "not set" at every step (`ADM-9 review R6`):
+        // compose passes `SMTP_FROM` as an empty string when the operator
+        // set none, and an empty `From` is no sender — the old behaviour
+        // kept it as an empty address and sent mail with no sender.
+        let smtp_from = truthy(env, "SMTP_FROM")
+            .or_else(|| truthy(env, "SMTP_USER"))
+            .unwrap_or_else(|| "rantai-lake@localhost".to_owned());
 
         // `CONNECTOR_TLS_CA_FILE`: read the file now so an unreadable path
         // stops the API at start, not on the first connector dial (T1).
@@ -1610,8 +1750,13 @@ impl Config {
             dagster_url: or_default(env, "DAGSTER_URL", "http://localhost:13030/graphql"),
             dagster_repo: or_default(env, "DAGSTER_REPO", "__repository__"),
             dagster_location: or_default(env, "DAGSTER_LOCATION", "dispar_orchestrate.definitions"),
-            llm_url: or_default(env, "LLM_URL", "https://api.minimax.io/v1"),
-            llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
+            // `ADM-9 review R6`: an empty value is "not set", so the code's
+            // own default applies (an empty `LLM_URL` used to build a
+            // client with no address at all).
+            llm_url: truthy(env, "LLM_URL").unwrap_or_else(|| DEFAULT_LLM_URL.to_owned()),
+            llm_url_from_env,
+            llm_model: truthy(env, "LLM_MODEL").unwrap_or_else(|| DEFAULT_LLM_MODEL.to_owned()),
+            llm_model_from_env,
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
             render_token_secret: truthy(env, "RENDER_TOKEN_SECRET")
@@ -1622,6 +1767,10 @@ impl Config {
                 .map(|url| url.trim_end_matches('/').to_owned())
                 .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
             embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
+            embed_token_max_lifetime_from_env: env_sets_positive_u64(
+                env,
+                "EMBED_TOKEN_MAX_LIFETIME_SECONDS",
+            ),
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
             smtp_port,
@@ -1811,13 +1960,20 @@ impl Config {
             )?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
             login_max_failures: parse_positive_u32_or_default(env, "LOGIN_MAX_FAILURES", 5),
+            login_max_failures_from_env: env_sets_positive_u32(env, "LOGIN_MAX_FAILURES"),
             login_failure_window_secs: parse_positive_u32_or_default(
                 env,
                 "LOGIN_FAILURE_WINDOW_SECS",
                 900,
             ),
+            login_failure_window_secs_from_env: env_sets_positive_u32(
+                env,
+                "LOGIN_FAILURE_WINDOW_SECS",
+            ),
             login_lockout_secs: parse_positive_u32_or_default(env, "LOGIN_LOCKOUT_SECS", 300),
+            login_lockout_secs_from_env: env_sets_positive_u32(env, "LOGIN_LOCKOUT_SECS"),
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
+            auth_retention_days_from_env: env_sets_positive_u32(env, "AUTH_RETENTION_DAYS"),
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
             upload_max_concurrent_large: parse_limit(env, "UPLOAD_MAX_CONCURRENT_LARGE", 2)?,
@@ -2497,6 +2653,90 @@ mod tests {
         assert_eq!(cfg.smtp_from, "bot@example.com");
     }
 
+    /// `ADM-9 review R6`: an EMPTY value means "not set" for the four
+    /// variables `docker-compose.yml` hands to the API — `LLM_URL`,
+    /// `LLM_MODEL`, `SMTP_PORT` and `SMTP_FROM`. Compose passes them as
+    /// empty strings when the operator set none, and a value that read as
+    /// a value made the console's own fields read-only on every compose
+    /// installation.
+    ///
+    /// Each of the four was wrong on its own terms before the fix, which is
+    /// why the empty value cannot simply be kept: an empty `LLM_URL` built
+    /// a client with no address, an empty `LLM_MODEL` named no model, and
+    /// an empty `SMTP_FROM` was kept as an empty `From` — mail sent with no
+    /// sender, which no mail server accepts.
+    #[test]
+    fn an_empty_llm_url_is_unset_and_the_default_applies() {
+        let env = map(&[("LLM_URL", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_url, DEFAULT_LLM_URL);
+        // The environment says nothing about the address, so the console
+        // owns it.
+        assert!(!cfg.llm_url_from_env);
+    }
+
+    /// The model half of the same rule (`ADM-9 review R6`).
+    #[test]
+    fn an_empty_llm_model_is_unset_and_the_default_applies() {
+        let env = map(&[("LLM_MODEL", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_model, DEFAULT_LLM_MODEL);
+        assert!(!cfg.llm_model_from_env);
+    }
+
+    /// An empty `SMTP_PORT` is "not set", not a bad value
+    /// (`ADM-9 review R6`): the default applies, no warning is logged (a
+    /// warning would name a value the operator never chose), and the
+    /// environment does not own the port, so the console may set one.
+    ///
+    /// The old behaviour treated the empty value as an unparseable one and
+    /// logged a warning naming it — an operator who set nothing was told
+    /// their own deployment had a bad port.
+    #[test]
+    fn an_empty_smtp_port_is_unset_and_the_default_applies() {
+        let env = map(&[("SMTP_PORT", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_port, 587);
+        assert!(!cfg.smtp_port_from_env);
+    }
+
+    /// An empty `SMTP_FROM` is no sender: it falls through to `SMTP_USER`,
+    /// and to the literal when there is no account either (`ADM-9 review
+    /// R6`).
+    #[test]
+    fn an_empty_smtp_from_falls_through_to_smtp_user_then_the_literal() {
+        let env = map(&[("SMTP_FROM", ""), ("SMTP_USER", "bot@example.com")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_from, "bot@example.com");
+        assert!(!cfg.smtp_from_from_env);
+
+        let env = map(&[("SMTP_FROM", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
+        assert!(!cfg.smtp_from_from_env);
+    }
+
+    /// The four together, the way compose hands them over: present, empty,
+    /// and therefore unset (`ADM-9 review R6`).
+    #[test]
+    fn the_four_empty_values_compose_passes_are_all_unset() {
+        let env = map(&[
+            ("LLM_URL", ""),
+            ("LLM_MODEL", ""),
+            ("SMTP_PORT", ""),
+            ("SMTP_FROM", ""),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_url, DEFAULT_LLM_URL);
+        assert_eq!(cfg.llm_model, DEFAULT_LLM_MODEL);
+        assert_eq!(cfg.smtp_port, 587);
+        assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
+        assert!(!cfg.llm_url_from_env);
+        assert!(!cfg.llm_model_from_env);
+        assert!(!cfg.smtp_port_from_env);
+        assert!(!cfg.smtp_from_from_env);
+    }
+
     #[test]
     fn smtp_secure_requires_exact_string_true() {
         let env = map(&[("SMTP_SECURE", "TRUE")]);
@@ -2532,15 +2772,9 @@ mod tests {
         assert_eq!(cfg.smtp_port, 587);
     }
 
-    #[test]
-    fn empty_smtp_port_falls_back_to_default_instead_of_erroring() {
-        let env = map(&[("SMTP_PORT", "")]);
-        let cfg = Config::from_map(&env).unwrap();
-        assert_eq!(cfg.smtp_port, 587);
-    }
-
     /// A wildly out-of-range value (`u16::MAX` + 1) also falls back rather
-    /// than erroring, exactly like the empty/non-numeric cases above.
+    /// than erroring, exactly like the non-numeric case above. It is a
+    /// value the operator DID set, so it still warns.
     #[test]
     fn out_of_range_smtp_port_falls_back_to_default_instead_of_erroring() {
         let env = map(&[("SMTP_PORT", "70000")]);

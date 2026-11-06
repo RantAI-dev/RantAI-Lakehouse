@@ -41,20 +41,20 @@ Each commented block in `.env.example` ends by pointing here:
 | `DAGSTER_URL` | Dagster GraphQL endpoint | `http://localhost:13030/graphql` (the code's default for a host-dev process); `http://dagster-webserver:3000/graphql` in compose, the in-network service name (`REL-19` review R1) | No | no |
 | `DAGSTER_REPO` | Dagster repository name | `__repository__` | No | no |
 | `DAGSTER_LOCATION` | Dagster repository location | `dispar_orchestrate.definitions` | No | no |
-| `LLM_URL` | LLM chat-completions base URL (OpenAI-compatible) | `https://api.minimax.io/v1` | No | commented |
-| `LLM_MODEL` | LLM model name | `MiniMax-M3` | No | commented |
-| `LLM_KEY` | LLM API key. Falls back to `MINIMAX_API_KEY` if unset **or empty** (`||` semantics, not `??`) | `""` | No (but AI features won't work without it) | commented |
+| `LLM_URL` | LLM chat-completions base URL (OpenAI-compatible). Settable in the console (Settings → Assistant) only when the environment sets neither this variable nor a key — see "Settings the console owns" below | `https://api.minimax.io/v1` | No | commented |
+| `LLM_MODEL` | LLM model name. Settable in the console (Settings → Assistant) only when the environment sets neither this variable nor a key | `MiniMax-M3` | No | commented |
+| `LLM_KEY` | LLM API key. Falls back to `MINIMAX_API_KEY` if unset **or empty** (`||` semantics, not `??`). Settable in the console (Settings → Assistant) only when the environment holds none; the console's own copy is sealed with `CONNECTOR_SECRETS_KEY` | `""` | No (but AI features won't work without it) | commented |
 | `MINIMAX_API_KEY` | Fallback for `LLM_KEY` | — | No | commented |
 | `AI_DEFAULT_REPLY_LANGUAGE` | Language the copilot answers in when a chat message is too short to detect its language: `id` (Indonesian) or `en` (English); any other non-empty value fails startup | — | No | no |
 | `AI_SEMANTIC_LAYER` | Semantic layer switch: the model drafts a description of each table and column in the background and the copilot reads them. When on, the chat's system prompt also gets the rules for counting in a table grouped by several columns. `false` turns it off; `true`, empty or unset leaves it on; any other value fails startup | on | No | no |
 | `AI_ASK_BACK` | Ask-back switch: the copilot may ask once, with options, which reading of an unclear word the person means (the `ask_user` tool), and reads the words that person answered before. `false` turns it off; `true`, empty or unset leaves it on; any other value fails startup | on | No | no |
 | `AI_RELEVANT_TABLES` | Relevant-tables switch: the copilot's data map writes in full only the tables a question names and the other tables on one line each. `false` turns it off; `true`, empty or unset leaves it on; any other value fails startup | on | No | no |
 | `EMBED_SECRET` | HMAC signing secret for signed dashboard embeds. The only source: none is generated or stored. Unset or empty: signed embedding is unavailable and says so | unset (signed embedding unavailable) | No | no |
-| `EMBED_TOKEN_MAX_LIFETIME_SECONDS` | Longest `exp - iat` of a signed embed token, in seconds; a token must carry `exp` and `iat`. A value that is not a positive whole number fails startup | `86400` | No | no |
+| `EMBED_TOKEN_MAX_LIFETIME_SECONDS` | Longest `exp - iat` of a signed embed token, in seconds; a token must carry `exp` and `iat`. A value that is not a positive whole number fails startup. Settable in the console (Settings → Sign-in) only when this is unset | `86400` | No | no |
 | `GOTENBERG_URL` | Address of the Gotenberg container that makes dashboard PDFs (`BI-1`). Compose sets it to the `gotenberg` service, which has no published port | unset (`http://gotenberg:3000` in compose) | No, but PDF export is off without it | no |
 | `CONSOLE_INTERNAL_URL` | The console as the PDF renderer reaches it on the compose network, `http://console:3000` in this stack. It is also the only address the renderer may open. Unset or empty both mean the `console` service (`REL-18`), so PDF export is on by default; a deployment that turns downloads off for a role does so with `downloadDeniedRoles` | `http://console:3000` (compose) | No | no |
 | `RENDER_TOKEN_SECRET` | Server-only key of the 2-minute token the PDF print view reads with. Its own secret, never `EMBED_SECRET`. `sh ops/init-env.sh` generates one | unset (PDF export off) | No, but PDF export is off without it | yes |
-| `CONSOLE_PUBLIC_URL` | The console's address as people open it; a scheduled report's email links to `<this>/dashboards/<id>` (`RPT-1`). Reports are sent only when `SMTP_HOST` is set | unset (the email has no link) | No | yes |
+| `CONSOLE_PUBLIC_URL` | The console's address as people open it; a scheduled report's email links to `<this>/dashboards/<id>` (`RPT-1`). Reports are sent only when `SMTP_HOST` is set. Also settable in the console when this is unset | unset (the email has no link) | No | yes |
 | `ALERTS_RUN_TOKEN` | Shared bearer token required to call `POST /api/alerts/run`; when set, also seeds the scope-less `alerts-run-scheduler` service identity Dagster's `alerts_run_schedule` authenticates as | unset | No, but unset means the endpoint replies 503 to anyone except an authenticated service-identity principal (not 401) — see Security notes below | no |
 | `LAKEHOUSE_MAINTENANCE_TOKEN` | Shared bearer token Dagster's maintenance job uses to authenticate against `GET /api/lakehouse/maintenance-policies`; when set, also seeds the scope-less `lakehouse-maintenance-policy-reader` service identity from it | unset | No, but unset means the API seeds no service identity and the maintenance job's policy fetch fails visibly with 401 | no |
 | `INGEST_SERVICE_TOKEN` | Shared bearer token Dagster's ingest schedule factory uses to authenticate against `GET /api/connectors/ingestible` and a CDC connector's `dial`; when set, also seeds an `ingest-run-service` identity scoped to `ingest:read` ONLY (never `connector:manage`) from it | unset | No, but unset means the API seeds no service identity and the ingest schedule factory's connector fetch fails visibly with 401 | no |
@@ -72,10 +72,10 @@ Each commented block in `.env.example` ends by pointing here:
 | `NODE_ENV` | Fallback for `APP_ENV` | — | No | no |
 | `AUTH_BOOTSTRAP_EMAIL` | Email for the idempotent bootstrap admin account created at startup | unset (no bootstrap admin) | No, but recommended for first run | yes |
 | `AUTH_BOOTSTRAP_PASSWORD` | Password for the bootstrap admin account | unset | No, but required alongside `AUTH_BOOTSTRAP_EMAIL` to actually create one | yes |
-| `LOGIN_MAX_FAILURES` | Failed password login attempts tolerated per email within `LOGIN_FAILURE_WINDOW_SECS` before lockout. There is no off switch: `0`, negative, and unparseable values all fall back to the default, so an operator can never accidentally silence the throttle | `5` | No | no |
-| `LOGIN_FAILURE_WINDOW_SECS` | Rolling window (seconds) counted for login failures. Invalid values fall back to the default | `900` (15 min) | No | no |
-| `LOGIN_LOCKOUT_SECS` | Duration (seconds) a locked-out email stays locked. Invalid values fall back to the default | `300` (5 min) | No | no |
-| `AUTH_RETENTION_DAYS` | How many days to keep expired sessions and revoked credentials before the background cleanup job purges them. Throttle rows are not gated by this — an unlocked row with a lapsed window is purged as soon as its window lapses | `30` | No | no |
+| `LOGIN_MAX_FAILURES` | Failed password login attempts tolerated per email within `LOGIN_FAILURE_WINDOW_SECS` before lockout. There is no off switch: `0`, negative, and unparseable values all fall back to the default, so an operator can never accidentally silence the throttle. Settable in the console (Settings → Sign-in) only when this is unset | `5` | No | no |
+| `LOGIN_FAILURE_WINDOW_SECS` | Rolling window (seconds) counted for login failures. Invalid values fall back to the default. Settable in the console (Settings → Sign-in) only when this is unset | `900` (15 min) | No | no |
+| `LOGIN_LOCKOUT_SECS` | Duration (seconds) a locked-out email stays locked. Invalid values fall back to the default. Settable in the console (Settings → Sign-in) only when this is unset | `300` (5 min) | No | no |
+| `AUTH_RETENTION_DAYS` | How many days to keep expired sessions and revoked credentials before the background cleanup job purges them. Throttle rows are not gated by this — an unlocked row with a lapsed window is purged as soon as its window lapses. Settable in the console (Settings → Sign-in) only when this is unset | `30` | No | no |
 | `OIDC_ISSUER` | OIDC provider issuer URL | unset | No — OIDC requires both this and `OIDC_CLIENT_ID` | commented |
 | `OIDC_CLIENT_ID` | This app's client id as registered with the OIDC provider | unset | No — see above | commented |
 | `OIDC_CLIENT_SECRET` | Client secret sent as `client_secret` in the authorization-code exchange at `OIDC_TOKEN_URL` (`routes/auth.rs`); leave unset for a public client | unset | No | commented |
@@ -316,7 +316,9 @@ and the API and the applier find them through `KAFKA_CONNECT_URL` and
 `CDC_KAFKA_BOOTSTRAP` (both empty by default, which turns change capture off;
 see `docs/OPERATIONS.md`).
 
-## Settings the console owns (`ADM-7`)
+## Settings the console owns (`ADM-7`, `ADM-8`, `ADM-9`)
+
+### Email (`ADM-7`)
 
 The mail server, its port, the security mode, the account and its password,
 the `From` address and the console's public address can be set from the
@@ -354,6 +356,69 @@ The process that saved sees its own change immediately.
 (`SMTP_CA_FILE`) stays a file and is still read at start; the start-up
 secrets and the encryption keys stay in the environment; single sign-on
 stays in the environment (the console only says whether it is set up).
+
+### Sign-in limits (`ADM-8`)
+
+The failed-login limit (`LOGIN_MAX_FAILURES`), the window it is counted in
+(`LOGIN_FAILURE_WINDOW_SECS`), the lockout (`LOGIN_LOCKOUT_SECS`), how long
+sign-in records are kept (`AUTH_RETENTION_DAYS`) and the longest life of a
+signed embed link (`EMBED_TOKEN_MAX_LIFETIME_SECONDS`) can be set from the
+console (**Settings → Sign-in**) by a holder of `settings:write`. The next
+sign-in uses them without a restart.
+
+**The environment wins, one limit at a time.** Each limit follows the rule
+above on its own: the environment's value when it is set and non-empty, else
+the console's saved value, else the code default. A limit the environment
+owns is shown read-only in the console ("Set by the server"), and a save
+that sends it is refused with a 409 and writes nothing.
+
+**The ranges.** The console accepts 3 to 20 failed tries, a window and a
+lockout of 60 to 86400 seconds, 7 to 3650 days of records and an embed link
+of 300 to 86400 seconds; a value outside its range is refused with a
+sentence that names the field. The environment is not bound by those
+ranges: it may set a longer window or a shorter lockout.
+
+### The assistant's provider (`ADM-9`)
+
+The provider address (`LLM_URL`), the model (`LLM_MODEL`) and the API key
+(`LLM_KEY` or `MINIMAX_API_KEY`) can be set from the console (**Settings →
+Assistant**) by a holder of `settings:write`. The next message uses them
+without a restart.
+
+**The provider is one unit.** The address, the model and the key belong
+together: they are how the assistant reaches one provider. When the
+environment holds a key — `LLM_KEY` or `MINIMAX_API_KEY`, whatever
+`LLM_URL` and `LLM_MODEL` say — all three are the environment's, the
+console shows them read-only, and a save that sends any of them is refused
+with a 409 and writes nothing. So a key kept in files is never sent to an
+address chosen in the console.
+
+**Without a key, the address and the model answer for themselves.** The
+environment owns `LLM_URL` and `LLM_MODEL` one at a time: a value set in
+`.env` is used as it is, shown read-only, and a save that sends that field
+is refused with a 409 — the console's saved value of it is ignored while
+the environment's is set. Where the environment names neither, the console
+owns the field and its saved value is used.
+
+**The address the console sends** must be an `https://` address, and its
+host must pass the same internal-address check the connector dials use
+(`CONNECTOR_PROBE_ALLOWED_CIDRS`, `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`):
+an address that points inside the deployment's network is refused, so an
+administrator's account cannot make the API call a service inside it. The
+environment's own address is not checked — it is the operator's file, and
+an on-premises deployment may point its assistant at a gateway inside its
+own network.
+
+**The key.** The console's copy is sealed with the installation key
+(`CONNECTOR_SECRETS_KEY`) before it is stored, and it never comes back: an
+answer says only whether one is set, and the audit row names the field, not
+its value. The address cannot be cleared while a key is set — the key would
+go to the deployment's default provider.
+
+**The test button** makes one minimal request with the saved values and
+answers with one of four fixed sentences ("The assistant answered.", "Could
+not reach the provider.", "The provider refused the key.", "The provider
+does not know that model.") — never the provider's own words.
 
 See `docs/OPERATIONS.md` for the operator's view of the same thing, and
 `docs/core/features/console-settings.md` for the feature page.

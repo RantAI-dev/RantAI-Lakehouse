@@ -72,7 +72,9 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::runtime_settings::{EffectiveEmail, Source};
+use crate::runtime_settings::{
+    EffectiveAssistant, EffectiveEmail, EffectiveSignIn, Source, check_assistant_address,
+};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -753,18 +755,30 @@ const EMAIL_FIELDS: [&str; 7] = [
 /// A map, not a struct: a struct with `Option` fields cannot tell a field
 /// that was not sent from a field that was sent as `null`, and the two mean
 /// different things (keep the stored value, or clear it — plan D5).
-fn parse_email_body(body: &Bytes) -> Result<serde_json::Map<String, Value>, ApiError> {
-    let parsed: Value = serde_json::from_slice(body)
-        .map_err(|_| ApiError::BadRequest(EMAIL_BODY_SHAPE.to_owned()))?;
-    let Value::Object(fields) = parsed else {
-        return Err(ApiError::BadRequest(EMAIL_BODY_SHAPE.to_owned()));
+///
+/// `fields` are the names the body may carry; anything else is refused with
+/// `shape`, the fixed sentence that names them.
+fn parse_body(
+    body: &Bytes,
+    fields: &[&str],
+    shape: &str,
+) -> Result<serde_json::Map<String, Value>, ApiError> {
+    let parsed: Value =
+        serde_json::from_slice(body).map_err(|_| ApiError::BadRequest(shape.to_owned()))?;
+    let Value::Object(sent) = parsed else {
+        return Err(ApiError::BadRequest(shape.to_owned()));
     };
-    for key in fields.keys() {
-        if !EMAIL_FIELDS.contains(&key.as_str()) {
-            return Err(ApiError::BadRequest(EMAIL_BODY_SHAPE.to_owned()));
+    for key in sent.keys() {
+        if !fields.contains(&key.as_str()) {
+            return Err(ApiError::BadRequest(shape.to_owned()));
         }
     }
-    Ok(fields)
+    Ok(sent)
+}
+
+/// The body of an email save, read as a map of the fields it carries.
+fn parse_email_body(body: &Bytes) -> Result<serde_json::Map<String, Value>, ApiError> {
+    parse_body(body, &EMAIL_FIELDS, EMAIL_BODY_SHAPE)
 }
 
 /// The string a field carries, or `None` when it carries an explicit `null`
@@ -868,21 +882,26 @@ fn port_field(sent: Option<&Value>, old: Option<i32>) -> Result<(Option<i32>, bo
     Ok((Some(number), old != Some(number)))
 }
 
-/// The new sealed password, and whether the stored password moves.
+/// The new sealed secret, and whether the stored one moves.
 ///
 /// The plaintext is sealed before it is stored and never reaches a row, a
 /// log or a response (plan D5). The sealed bytes are never compared (the
-/// seal is randomised), so a password that is sent always counts as
-/// changed.
-fn password_field(
+/// seal is randomised), so a secret that is sent always counts as changed.
+///
+/// `seal_name` is the associated-data name the secret is sealed under (plan
+/// D2) and `refused` the fixed sentence the person is told when the value
+/// is not text.
+fn secret_field(
     state: &AppState,
     sent: Option<&Value>,
     old: Option<&[u8]>,
+    seal_name: &str,
+    refused: &str,
 ) -> Result<(Option<Vec<u8>>, bool), ApiError> {
     let Some(value) = sent else {
         return Ok((old.map(<[u8]>::to_vec), false));
     };
-    let Some(plain) = string_field(USER_REFUSED, value)? else {
+    let Some(plain) = string_field(refused, value)? else {
         return Ok((None, old.is_some()));
     };
     let keyring = state
@@ -890,10 +909,7 @@ fn password_field(
         .keyring()
         .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
     let sealed = keyring
-        .seal(
-            crate::runtime_settings::EMAIL_PASSWORD_SEAL_NAME,
-            plain.as_bytes(),
-        )
+        .seal(seal_name, plain.as_bytes())
         .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
     Ok((Some(sealed), true))
 }
@@ -945,7 +961,13 @@ fn email_row_to_save(
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_owned())
     })?;
-    let (password, password_changed) = password_field(state, parsed.get("password"), old_password)?;
+    let (password, password_changed) = secret_field(
+        state,
+        parsed.get("password"),
+        old_password,
+        crate::runtime_settings::EMAIL_PASSWORD_SEAL_NAME,
+        USER_REFUSED,
+    )?;
     let (from, from_changed) = text_field(parsed.get("from"), old_from, FROM_REFUSED, |text| {
         // The workspace's one address rule
         // (`routes::report_runner::normalise_address`).
@@ -1018,7 +1040,11 @@ fn feature(name: &str, on: bool, missing: &[&str], source: &str) -> Value {
 /// variable for a setting only the server owns, the console's own field
 /// name for a setting the console can set. `where` says which of the two
 /// it is — a feature the server owns is read-only in the console.
-fn deployment_features(state: &AppState, email: &EffectiveEmail) -> Vec<Value> {
+fn deployment_features(
+    state: &AppState,
+    email: &EffectiveEmail,
+    assistant: &EffectiveAssistant,
+) -> Vec<Value> {
     let config = &state.config;
     // PDF export needs all three of these (feature decision 6).
     let mut pdf_missing: Vec<&str> = Vec::new();
@@ -1043,13 +1069,16 @@ fn deployment_features(state: &AppState, email: &EffectiveEmail) -> Vec<Value> {
     } else {
         vec!["OIDC_ISSUER", "OIDC_CLIENT_ID"]
     };
-    // The assistant is on when it has a key (`ADM-9` reads the saved one
-    // in slice 2; today the environment owns it).
-    let assistant = !config.llm_key.is_empty();
-    let assistant_missing: Vec<&str> = if assistant {
+    // The assistant is on when it has a key — the environment's or the
+    // console's (`ADM-9` reads the saved one; the environment owns the key
+    // whenever it holds one).
+    let assistant_on = assistant.key_set;
+    let assistant_missing: Vec<&str> = if assistant_on {
         Vec::new()
-    } else {
+    } else if assistant.key_source == Source::Server {
         vec!["LLM_KEY"]
+    } else {
+        vec!["key"]
     };
     vec![
         feature("pdfExport", pdf_missing.is_empty(), &pdf_missing, "server"),
@@ -1087,7 +1116,16 @@ fn deployment_features(state: &AppState, email: &EffectiveEmail) -> Vec<Value> {
             },
         ),
         feature("singleSignOn", single_sign_on, &sso_missing, "server"),
-        feature("assistant", assistant, &assistant_missing, "server"),
+        feature(
+            "assistant",
+            assistant_on,
+            &assistant_missing,
+            if assistant.key_source == Source::Server {
+                "server"
+            } else {
+                "console"
+            },
+        ),
     ]
 }
 
@@ -1107,8 +1145,11 @@ pub async fn get_deployment(State(state): State<AppState>) -> ApiResult<ApiJson<
     let email = crate::runtime_settings::email_or_fail(&state)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let assistant = crate::runtime_settings::assistant_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     Ok(ApiJson(json!({
-        "features": deployment_features(&state, &email),
+        "features": deployment_features(&state, &email, &assistant),
     })))
 }
 
@@ -1171,38 +1212,12 @@ pub async fn put_email(
     // The save is visible to the next send on this process at once (D3).
     state.email_settings_cache.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
-    audit_email_update(pool, &principal, &changed).await;
+    audit_settings_update(pool, &principal, "settings.email.update", "email", &changed).await;
 
     let effective = crate::runtime_settings::email_or_fail(&state)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     Ok(ApiJson(email_settings_json(&effective)))
-}
-
-/// One audit row for a save of the email settings (plan D6): the action and
-/// the NAMES of the fields that changed, never a value and never the
-/// password.
-///
-/// Best effort, like every other audit write: a failed audit write never
-/// fails, or undoes, the save it records.
-async fn audit_email_update(pool: &PgPool, principal: &Principal, fields: &[&str]) {
-    let event = NewAuditEvent {
-        principal_id: Some(principal.id.uuid().to_string()),
-        principal_kind: Some(principal.kind_for_audit().to_owned()),
-        actor_label: Some(principal.display_name.clone()),
-        action: "settings.email.update".to_owned(),
-        resource_kind: Some("settings".to_owned()),
-        resource_id: Some("email".to_owned()),
-        args: Some(json!({ "fields": fields })),
-        outcome: "executed".to_owned(),
-        detail: None,
-        run_id: None,
-        approval_id: None,
-        session_id: None,
-    };
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, "failed to record the email settings audit event");
-    }
 }
 
 /// `POST /api/settings/email/test` — send one short email to the caller's
@@ -1315,6 +1330,546 @@ fn test_email_html(console_public_url: Option<&str>) -> String {
     format!(
         "<div style=\"font-family:system-ui,sans-serif\"><p>This is a test email from your RantAI Lakehouse console.</p>{link}</div>"
     )
+}
+
+// ── ADM-8: the deployment's sign-in limits ───────────────────────────────
+
+/// What the person is told when the body is not the sign-in fields.
+const SIGN_IN_BODY_SHAPE: &str = "body must be {\"maxFailures\"?: number|null, \
+\"failureWindowSecs\"?: number|null, \"lockoutSecs\"?: number|null, \
+\"retentionDays\"?: number|null, \"embedMaxLifetimeSecs\"?: number|null}";
+
+/// The fields the body of a sign-in save may carry (plan D12).
+const SIGN_IN_FIELDS: [&str; 5] = [
+    "maxFailures",
+    "failureWindowSecs",
+    "lockoutSecs",
+    "retentionDays",
+    "embedMaxLifetimeSecs",
+];
+
+/// What the person is told when the failed-login limit is out of range.
+const MAX_FAILURES_REFUSED: &str = "maxFailures must be a whole number from 3 to 20.";
+
+/// What the person is told when the failure window is out of range.
+const FAILURE_WINDOW_REFUSED: &str = "failureWindowSecs must be a whole number from 60 to 86400.";
+
+/// What the person is told when the lockout is out of range.
+const LOCKOUT_REFUSED: &str = "lockoutSecs must be a whole number from 60 to 86400.";
+
+/// What the person is told when the retention is out of range.
+const RETENTION_REFUSED: &str = "retentionDays must be a whole number from 7 to 3650.";
+
+/// What the person is told when the embed lifetime is out of range.
+const EMBED_LIFETIME_REFUSED: &str =
+    "embedMaxLifetimeSecs must be a whole number from 300 to 86400.";
+
+/// The sign-in limits answer: every field's effective value and its source
+/// (plan D1).
+fn sign_in_settings_json(effective: &EffectiveSignIn) -> Value {
+    json!({
+        "maxFailures": field_json(effective.max_failures, effective.max_failures_source),
+        "failureWindowSecs": field_json(
+            effective.failure_window_secs,
+            effective.failure_window_secs_source,
+        ),
+        "lockoutSecs": field_json(effective.lockout_secs, effective.lockout_secs_source),
+        "retentionDays": field_json(effective.retention_days, effective.retention_days_source),
+        "embedMaxLifetimeSecs": field_json(
+            effective.embed_max_lifetime_secs,
+            effective.embed_max_lifetime_secs_source,
+        ),
+    })
+}
+
+/// `GET /api/settings/sign-in` — the effective sign-in limits, and where each
+/// value comes from (plan D12).
+///
+/// Reading needs `settings:write` like changing does (plan D4): the limits
+/// are the deployment's own.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the saved row cannot be read: the
+/// answer must not claim a value is "not set" when the database could not
+/// be asked.
+pub async fn get_sign_in(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let effective = crate::runtime_settings::sign_in_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    Ok(ApiJson(sign_in_settings_json(&effective)))
+}
+
+/// The new value of a whole-number field, and whether the stored value moves.
+///
+/// `range` is the range plan D12 names; a value outside it is refused with
+/// `refused`, the fixed sentence that names the field.
+fn number_field(
+    sent: Option<&Value>,
+    old: Option<i32>,
+    refused: &str,
+    range: std::ops::RangeInclusive<i64>,
+) -> Result<(Option<i32>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old, false));
+    };
+    if value.is_null() {
+        return Ok((None, old.is_some()));
+    }
+    let number = value
+        .as_i64()
+        .filter(|number| range.contains(number))
+        .ok_or_else(|| ApiError::BadRequest(refused.to_owned()))?;
+    let number = i32::try_from(number).map_err(|_| ApiError::BadRequest(refused.to_owned()))?;
+    Ok((Some(number), old != Some(number)))
+}
+
+/// The row a sign-in save writes, and the names of the fields it changes
+/// (plan D6).
+fn sign_in_row_to_save(
+    parsed: &serde_json::Map<String, Value>,
+    current: Option<&lakehouse_store::sign_in_settings::SignInSettings>,
+) -> Result<
+    (
+        lakehouse_store::sign_in_settings::SignInSettings,
+        Vec<&'static str>,
+    ),
+    ApiError,
+> {
+    let old_max_failures = current.and_then(|c| c.max_failures);
+    let old_window = current.and_then(|c| c.failure_window_secs);
+    let old_lockout = current.and_then(|c| c.lockout_secs);
+    let old_retention = current.and_then(|c| c.retention_days);
+    let old_embed = current.and_then(|c| c.embed_max_lifetime_secs);
+
+    let (max_failures, max_failures_changed) = number_field(
+        parsed.get("maxFailures"),
+        old_max_failures,
+        MAX_FAILURES_REFUSED,
+        3..=20,
+    )?;
+    let (failure_window_secs, failure_window_changed) = number_field(
+        parsed.get("failureWindowSecs"),
+        old_window,
+        FAILURE_WINDOW_REFUSED,
+        60..=86_400,
+    )?;
+    let (lockout_secs, lockout_changed) = number_field(
+        parsed.get("lockoutSecs"),
+        old_lockout,
+        LOCKOUT_REFUSED,
+        60..=86_400,
+    )?;
+    let (retention_days, retention_changed) = number_field(
+        parsed.get("retentionDays"),
+        old_retention,
+        RETENTION_REFUSED,
+        7..=3650,
+    )?;
+    let (embed_max_lifetime_secs, embed_changed) = number_field(
+        parsed.get("embedMaxLifetimeSecs"),
+        old_embed,
+        EMBED_LIFETIME_REFUSED,
+        300..=86_400,
+    )?;
+
+    let mut changed: Vec<&'static str> = Vec::new();
+    if max_failures_changed {
+        changed.push("maxFailures");
+    }
+    if failure_window_changed {
+        changed.push("failureWindowSecs");
+    }
+    if lockout_changed {
+        changed.push("lockoutSecs");
+    }
+    if retention_changed {
+        changed.push("retentionDays");
+    }
+    if embed_changed {
+        changed.push("embedMaxLifetimeSecs");
+    }
+    Ok((
+        lakehouse_store::sign_in_settings::SignInSettings {
+            max_failures,
+            failure_window_secs,
+            lockout_secs,
+            retention_days,
+            embed_max_lifetime_secs,
+        },
+        changed,
+    ))
+}
+
+/// `PUT /api/settings/sign-in` — save the sign-in limits (plan D12).
+///
+/// A field that is not sent keeps what is stored; a field sent as `null` is
+/// cleared; a field sent with a value replaces what is stored (plan D5). A
+/// field the server's environment owns is refused with a 409 and nothing is
+/// written (plan D1). A value outside the range plan D12 names is refused
+/// with a 400 and the sentence that names the field.
+///
+/// # Errors
+///
+/// 400 with a fixed sentence when the body is not the sign-in fields or a
+/// value is out of range; 409 when the environment owns a field the body
+/// sends; 503 without a Postgres pool; 5xx through `upstream_error` when the
+/// database fails.
+pub async fn put_sign_in(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let parsed = parse_body(&body, &SIGN_IN_FIELDS, SIGN_IN_BODY_SHAPE)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+    // The effective values, to know which fields the environment owns.
+    let effective = crate::runtime_settings::sign_in_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    for (sent, source) in [
+        (
+            parsed.contains_key("maxFailures"),
+            effective.max_failures_source,
+        ),
+        (
+            parsed.contains_key("failureWindowSecs"),
+            effective.failure_window_secs_source,
+        ),
+        (
+            parsed.contains_key("lockoutSecs"),
+            effective.lockout_secs_source,
+        ),
+        (
+            parsed.contains_key("retentionDays"),
+            effective.retention_days_source,
+        ),
+        (
+            parsed.contains_key("embedMaxLifetimeSecs"),
+            effective.embed_max_lifetime_secs_source,
+        ),
+    ] {
+        if sent && source == Source::Server {
+            return Err(ApiError::Conflict(SET_BY_THE_SERVER.to_owned()).into());
+        }
+    }
+
+    let current = lakehouse_store::sign_in_settings::get(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let (row, changed) = sign_in_row_to_save(&parsed, current.as_ref())?;
+
+    lakehouse_store::sign_in_settings::upsert(pool, &row, &principal.id.uuid().to_string())
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    // The save is visible to the next sign-in on this process at once (D3).
+    state.sign_in_settings_cache.clear().await;
+    // One audit row for the save, naming the fields that changed (D6).
+    audit_settings_update(
+        pool,
+        &principal,
+        "settings.sign_in.update",
+        "sign-in",
+        &changed,
+    )
+    .await;
+
+    let effective = crate::runtime_settings::sign_in_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    Ok(ApiJson(sign_in_settings_json(&effective)))
+}
+
+// ── ADM-9: the deployment's assistant provider ───────────────────────────
+
+/// What the person is told when the body is not the assistant fields.
+const ASSISTANT_BODY_SHAPE: &str = "body must be {\"url\"?: string|null, \"model\"?: string|null, \
+\"key\"?: string|null}";
+
+/// The fields the body of an assistant save may carry (plan D13).
+const ASSISTANT_FIELDS: [&str; 3] = ["url", "model", "key"];
+
+/// What the person is told when the provider address is not an address this
+/// deployment may dial.
+const URL_REFUSED: &str =
+    "url must be an https:// address of the provider, such as https://api.example.com/v1.";
+
+/// What the person is told when the provider address points inside this
+/// deployment's network.
+const URL_INTERNAL_REFUSED: &str = "url must not point inside this deployment's network.";
+
+/// What the person is told when the provider address does not resolve.
+const URL_UNRESOLVED_REFUSED: &str =
+    "url must be an address this deployment can reach: its name did not resolve.";
+
+/// What the person is told when the model name is not text.
+const MODEL_REFUSED: &str = "model must be the provider's model name.";
+
+/// What the person is told when the key is not text.
+const KEY_REFUSED: &str = "key must be text.";
+
+/// What the person is told when the address is cleared while a key is set.
+const URL_CLEARED_REFUSED: &str = "The provider address cannot be cleared while a key is set: \
+the key would go to the default provider.";
+
+/// The sentence for each way a provider address is refused (plan D13).
+fn assistant_url_sentence(problem: crate::runtime_settings::AddressProblem) -> &'static str {
+    use crate::runtime_settings::AddressProblem;
+    match problem {
+        AddressProblem::NotHttps | AddressProblem::NoHost => URL_REFUSED,
+        AddressProblem::Unresolved => URL_UNRESOLVED_REFUSED,
+        AddressProblem::Internal => URL_INTERNAL_REFUSED,
+    }
+}
+
+/// The assistant answer: the effective address and model, and whether a key
+/// is in effect (plan D5: the key itself never comes back).
+fn assistant_settings_json(effective: &EffectiveAssistant) -> Value {
+    json!({
+        "url": field_json(effective.url.clone(), effective.url_source),
+        "model": field_json(effective.model.clone(), effective.model_source),
+        "key": {
+            "set": effective.key_set,
+            "source": effective.key_source.as_str(),
+        },
+    })
+}
+
+/// `GET /api/settings/assistant` — the effective provider address, model and
+/// key, and where each comes from (plan D13).
+///
+/// Reading needs `settings:write` like changing does (plan D4): a provider
+/// address and a key are the deployment's own.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the saved row cannot be read: the
+/// answer must not claim a value is "not set" when the database could not
+/// be asked.
+pub async fn get_assistant(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let effective = crate::runtime_settings::assistant_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    Ok(ApiJson(assistant_settings_json(&effective)))
+}
+
+/// The new provider address, and whether the stored one moves.
+///
+/// The address is checked here, at save time, with the same
+/// internal-address check the connector dials use: an administrator's
+/// account must not be able to point the API at a service inside the
+/// deployment's network (plan D13).
+async fn assistant_url(
+    state: &AppState,
+    sent: Option<&Value>,
+    old: Option<&str>,
+) -> Result<(Option<String>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old.map(str::to_owned), false));
+    };
+    let Some(text) = string_field(URL_REFUSED, value)? else {
+        // An explicit `null` clears the address.
+        return Ok((None, old.is_some()));
+    };
+    let text = text.trim().trim_end_matches('/');
+    check_assistant_address(text, &state.config.connector_internal_hosts())
+        .await
+        .map_err(|problem| ApiError::BadRequest(assistant_url_sentence(problem).to_owned()))?;
+    Ok((Some(text.to_owned()), old != Some(text)))
+}
+
+/// `PUT /api/settings/assistant` — save the provider address, the model and
+/// the key (plan D13).
+///
+/// A field that is not sent keeps what is stored; a field sent as `null` is
+/// cleared; a field sent with a value replaces what is stored (plan D5). A
+/// field the server's environment owns is refused with a 409 and nothing is
+/// written (plan D1) — and the environment owns all three of them as soon
+/// as it holds a key, so a key kept in files is never sent to an address
+/// chosen here.
+///
+/// # Errors
+///
+/// 400 with a fixed sentence when the body is not the assistant fields, the
+/// address is not one this deployment may dial, or a value is not usable;
+/// 409 when the environment owns a field the body sends; 503 without a
+/// Postgres pool or without the installation key; 5xx through
+/// `upstream_error` when the database fails.
+pub async fn put_assistant(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let parsed = parse_body(&body, &ASSISTANT_FIELDS, ASSISTANT_BODY_SHAPE)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+    // The effective values, to know which fields the environment owns.
+    let effective = crate::runtime_settings::assistant_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    for (sent, source) in [
+        (parsed.contains_key("url"), effective.url_source),
+        (parsed.contains_key("model"), effective.model_source),
+        (parsed.contains_key("key"), effective.key_source),
+    ] {
+        if sent && source == Source::Server {
+            return Err(ApiError::Conflict(SET_BY_THE_SERVER.to_owned()).into());
+        }
+    }
+
+    let current = lakehouse_store::assistant_settings::get(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let old_url = current.as_ref().and_then(|c| c.llm_url.as_deref());
+    let old_model = current.as_ref().and_then(|c| c.llm_model.as_deref());
+    let old_key = current.as_ref().and_then(|c| c.llm_key.as_deref());
+
+    let (url, url_changed) = assistant_url(&state, parsed.get("url"), old_url).await?;
+    let (model, model_changed) =
+        text_field(parsed.get("model"), old_model, MODEL_REFUSED, |text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        })?;
+    let (key, key_changed) = secret_field(
+        &state,
+        parsed.get("key"),
+        old_key,
+        crate::runtime_settings::ASSISTANT_KEY_SEAL_NAME,
+        KEY_REFUSED,
+    )?;
+
+    // The provider is one unit: an address cleared while a key is set would
+    // send that key to the deployment's default provider.
+    let clears_the_key = parsed.get("key").is_some_and(Value::is_null);
+    if url.is_none() && effective.key_set && !clears_the_key {
+        return Err(ApiError::BadRequest(URL_CLEARED_REFUSED.to_owned()).into());
+    }
+
+    let mut changed: Vec<&'static str> = Vec::new();
+    if url_changed {
+        changed.push("url");
+    }
+    if model_changed {
+        changed.push("model");
+    }
+    if key_changed {
+        changed.push("key");
+    }
+
+    lakehouse_store::assistant_settings::upsert(
+        pool,
+        &lakehouse_store::assistant_settings::AssistantSettings {
+            llm_url: url,
+            llm_model: model,
+            llm_key: key,
+        },
+        &principal.id.uuid().to_string(),
+    )
+    .await
+    .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    // The save is visible to the next message on this process at once (D3).
+    state.assistant_settings_cache.clear().await;
+    // One audit row for the save, naming the fields that changed (D6).
+    audit_settings_update(
+        pool,
+        &principal,
+        "settings.assistant.update",
+        "assistant",
+        &changed,
+    )
+    .await;
+
+    let effective = crate::runtime_settings::assistant_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    Ok(ApiJson(assistant_settings_json(&effective)))
+}
+
+/// The one sentence for each way the provider can answer the test (plan
+/// D13). The provider's own words never reach it.
+fn assistant_test_sentence(err: &lakehouse_llm::LlmError) -> &'static str {
+    match err.status() {
+        // The provider refused the key.
+        Some(401 | 403) => "The provider refused the key.",
+        // The provider did not accept the request: a model name it does not
+        // know, or an address it does not serve.
+        Some(400 | 404 | 422) => "The provider does not know that model.",
+        // A connection that failed, or a status that says nothing about the
+        // key or the model: the provider was not reached.
+        _ => "Could not reach the provider.",
+    }
+}
+
+/// `POST /api/settings/assistant/test` — one minimal request with the saved
+/// values, and what came of it (plan D13).
+///
+/// The request is made with the effective settings — the saved ones where the
+/// console has them — never with the unsaved form. The answer is one of the
+/// fixed sentences, never the provider's own words.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the saved row cannot be read.
+pub async fn post_assistant_test(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    // The client the assistant itself uses: the saved provider, rebuilt when
+    // it changed, and its address checked again.
+    let assistant = crate::runtime_settings::assistant(&state).await;
+    let messages = [lakehouse_llm::ChatMessage {
+        role: lakehouse_llm::ChatRole::User,
+        content: "ping".to_owned(),
+    }];
+    let options = lakehouse_llm::ChatOptions {
+        temperature: Some(0.0),
+        max_tokens: Some(8),
+    };
+    let answer = assistant.client.chat(&messages, options).await;
+    let message = match &answer {
+        Ok(_) => "The assistant answered.",
+        Err(err) => assistant_test_sentence(err),
+    };
+    Ok(ApiJson(json!({
+        "answered": answer.is_ok(),
+        "message": message,
+    })))
+}
+
+/// One audit row for a save of a settings section (plan D6): the action and
+/// the NAMES of the fields that changed, never a value and never a secret.
+///
+/// Best effort, like every other audit write: a failed audit write never
+/// fails, or undoes, the save it records.
+async fn audit_settings_update(
+    pool: &PgPool,
+    principal: &Principal,
+    action: &str,
+    resource: &str,
+    fields: &[&str],
+) {
+    let event = NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: action.to_owned(),
+        resource_kind: Some("settings".to_owned()),
+        resource_id: Some(resource.to_owned()),
+        args: Some(json!({ "fields": fields })),
+        outcome: "executed".to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::warn!(%err, action, "failed to record the settings audit event");
+    }
 }
 
 #[cfg(test)]

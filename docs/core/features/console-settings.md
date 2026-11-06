@@ -74,10 +74,16 @@ features are off or why.
   are). The test button, which only an administrator can press, can therefore
   tell whether something answers at an internal address; it is limited to one
   try every 10 seconds per person.
+- The assistant's address is checked (an `https://` address, not inside the
+  network) when it is saved and when the assistant is reconnected, not at every
+  call: a name whose address changes afterwards is not caught at that moment.
 - When the server's `.env` sets the mail server, user or password, the whole
   connection (server, port, security, user, password) comes from `.env` and
   is read-only here, so a password kept in files is never sent to a server
   chosen in the console.
+- When the server's `.env` sets the assistant's address or its model, that
+  field comes from `.env` and is read-only here; a key in `.env` makes the
+  whole provider (address, model, key) read-only.
 
 ## Acceptance checklist (owner)
 

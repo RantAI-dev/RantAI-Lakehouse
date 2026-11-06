@@ -142,6 +142,28 @@ export interface SettingsService {
   sendTestEmail(signal?: AbortSignal): Promise<EmailTestResult>
   /** Which of the deployment's features are set up, and what is missing. */
   getDeployment(signal?: AbortSignal): Promise<DeploymentSettings>
+  /** The deployment's sign-in limits. */
+  getSignIn(signal?: AbortSignal): Promise<SignInSettings>
+  /**
+   * A limit the server's environment owns is refused with a 409 and the
+   * server's own sentence; a value outside its range is a 400 with a
+   * sentence that names the field.
+   */
+  saveSignIn(input: SignInSettingsInput, signal?: AbortSignal): Promise<SignInSettings>
+  /** The assistant's provider address, model and key. */
+  getAssistant(signal?: AbortSignal): Promise<AssistantSettings>
+  /**
+   * A field the server's environment owns is refused with a 409; an address
+   * that is not `https://`, or that points inside the deployment's network,
+   * is a 400 with a sentence that names the field.
+   */
+  saveAssistant(input: AssistantSettingsInput, signal?: AbortSignal): Promise<AssistantSettings>
+  /**
+   * One minimal request to the provider, with the saved values. The answer
+   * is one of the server's fixed sentences, whether the provider answered
+   * or not.
+   */
+  testAssistant(signal?: AbortSignal): Promise<AssistantTestResult>
 }
 
 /**
@@ -217,6 +239,82 @@ export type EmailSettingsInput = {
 export type EmailTestResult = {
   /** Whether the mail went out. */
   sent: boolean
+  /** The server's sentence about it, in its own words. */
+  message: string
+}
+
+/**
+ * `GET`/`PUT /api/settings/sign-in` (`ADM-8`): the deployment's sign-in
+ * limits — the failed-login limit, the window it is counted in, the
+ * lockout, how long sign-in records are kept and the longest life of a
+ * signed embed link.
+ *
+ * The next sign-in uses them, with no restart. A limit the server's
+ * environment owns is read-only here and is refused with a 409 by the
+ * server.
+ */
+export type SignInSettings = {
+  /** Failed password tries tolerated per key before the lockout: 3 to 20. */
+  maxFailures: SettingField<number>
+  /** The window (seconds) the failed tries are counted in: 60 to 86400. */
+  failureWindowSecs: SettingField<number>
+  /** How long (seconds) a locked key stays locked: 60 to 86400. */
+  lockoutSecs: SettingField<number>
+  /** How long (days) sign-in records are kept: 7 to 3650. */
+  retentionDays: SettingField<number>
+  /** The longest life (seconds) of a signed embed link: 300 to 86400. */
+  embedMaxLifetimeSecs: SettingField<number>
+}
+
+/**
+ * What a save sends (`ADM-8`): a field left out keeps what is stored,
+ * `null` clears it, a value replaces it.
+ */
+export type SignInSettingsInput = {
+  maxFailures?: number | null
+  failureWindowSecs?: number | null
+  lockoutSecs?: number | null
+  retentionDays?: number | null
+  embedMaxLifetimeSecs?: number | null
+}
+
+/**
+ * `GET`/`PUT /api/settings/assistant` (`ADM-9`): the assistant's provider
+ * address, model and key.
+ *
+ * The address, the model and the key are one unit: when the server's
+ * environment holds a key, all three are the server's and the server
+ * refuses a save that sends any of them. The address the console sends must
+ * be an `https://` address that does not point inside the deployment's
+ * network.
+ */
+export type AssistantSettings = {
+  /** The provider's base URL, e.g. `https://api.example.com/v1`. */
+  url: SettingField<string>
+  /** The provider's model name. */
+  model: SettingField<string>
+  /** The provider's API key: only whether one is set. */
+  key: SecretSetting
+}
+
+/**
+ * What a save sends (`ADM-9`): a field left out keeps what is stored,
+ * `null` clears it, a value replaces it. The key is write-only.
+ */
+export type AssistantSettingsInput = {
+  url?: string | null
+  model?: string | null
+  key?: string | null
+}
+
+/**
+ * The answer of `POST /api/settings/assistant/test` (`ADM-9`): one of the
+ * server's fixed sentences, in `message`. `answered` says whether the
+ * provider answered.
+ */
+export type AssistantTestResult = {
+  /** Whether the provider answered. */
+  answered: boolean
   /** The server's sentence about it, in its own words. */
   message: string
 }

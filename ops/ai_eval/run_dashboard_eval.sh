@@ -174,9 +174,10 @@ dc() { docker compose -p "$PROJECT" "$@"; }
 export API_HOST_PORT CH_HTTP_HOST_PORT CH_NATIVE_HOST_PORT POSTGRES_HOST_PORT
 export AUTH_BOOTSTRAP_EMAIL="$ADMIN_EMAIL" AUTH_BOOTSTRAP_PASSWORD="$ADMIN_PASSWORD"
 export CH_USER CH_PASSWORD EMBED_SECRET
-# Compose resolves LLM_URL and LLM_MODEL itself, from the caller's .env or its
-# own default. An exported variable outranks .env in compose, so export them
-# only when the caller set them; never write a default here (S1).
+# Compose resolves LLM_URL and LLM_MODEL itself, from the caller's .env, and
+# passes them on empty when the caller set none — the API's own default then
+# applies (ADM-9 review R6). An exported variable outranks .env in compose, so
+# export them only when the caller set them; never write a default here (S1).
 if [ -n "${LLM_URL:-}" ]; then export LLM_URL; fi
 if [ -n "${LLM_MODEL:-}" ]; then export LLM_MODEL; fi
 export LLM_KEY

@@ -1267,8 +1267,11 @@ async fn run_headless_loop_inner(
             return HeadlessOutcome::Terminal("budget_exhausted");
         }
 
-        let msg = match state
-            .llm
+        // `ADM-9`: the client comes from the resolver, which rebuilds it
+        // when the effective provider settings change.
+        let assistant = crate::runtime_settings::assistant(state).await;
+        let msg = match assistant
+            .client
             .chat_with_tools_metered(&messages, &tools, ChatOptions::default())
             .await
         {

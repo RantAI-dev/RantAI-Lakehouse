@@ -161,6 +161,23 @@ export type {
   SettingField,
   SettingSource,
 } from "./contracts/settings"
+/**
+ * The deployment's sign-in limits (`ADM-8`): the failed-login limit, the
+ * window, the lockout, the retention and the longest life of a signed embed
+ * link, each with the source of its effective value.
+ */
+export type { SignInSettings, SignInSettingsInput } from "./contracts/settings"
+/**
+ * The assistant's provider (`ADM-9`): the address, the model and the key,
+ * each with the source of its effective value, and the test's answer. The
+ * contract owns the shapes, and they are exported here so a feature imports
+ * them from `@/services`.
+ */
+export type {
+  AssistantSettings,
+  AssistantSettingsInput,
+  AssistantTestResult,
+} from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService

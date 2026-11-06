@@ -177,9 +177,13 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
     // count within the limit and reach Argon2; the rest answer exactly as
     // a locked key does, without a hash. A missing user still hashes
     // (`DUMMY_HASH`) while within the limit, so timing is unchanged.
-    let (attempt, attempt_lock) =
-        throttle::record_attempt(pool, &key, &state.throttle_policy).await?;
-    if attempt > state.throttle_policy.max_failures {
+    //
+    // `ADM-8`: the policy is resolved once per try, so every number this
+    // try uses — the count, the limit and the refund — comes from the same
+    // answer, even if a save lands in the console while the try runs.
+    let policy = state.throttle_policy().await;
+    let (attempt, attempt_lock) = throttle::record_attempt(pool, &key, &policy).await?;
+    if attempt > policy.max_failures {
         return Err(locked_response(attempt_lock).into());
     }
 
@@ -232,7 +236,7 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
         Err(AuthError::InvalidCredentials) => {
             // SEC-49: the try was already counted before hashing; the try
             // that reached the limit is the one that set the lock.
-            if attempt_lock.is_some() && attempt == state.throttle_policy.max_failures {
+            if attempt_lock.is_some() && attempt == policy.max_failures {
                 let event = NewAuditEvent {
                     action: "auth.login_locked".to_owned(),
                     outcome: "refused".to_owned(),
@@ -254,9 +258,7 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
             // review SHOULD-FIX 1): the try that reaches the limit locks
             // the key, and a storage error after that must not leave a real
             // user locked out over a database hiccup.
-            if let Err(refund_err) =
-                throttle::refund_attempt(pool, &key, &state.throttle_policy).await
-            {
+            if let Err(refund_err) = throttle::refund_attempt(pool, &key, &policy).await {
                 tracing::warn!(%refund_err, "failed to refund a login attempt");
             }
             tracing::warn!(error = %err, "login failed with a non-credential error");

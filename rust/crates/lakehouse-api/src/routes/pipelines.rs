@@ -3475,8 +3475,11 @@ async fn llm_pipeline_draft(
     // Generous enough for a model that thinks before it answers: a reply
     // cut off mid-JSON parses as nothing, and the caller then silently
     // gets the fallback draft.
-    let reply = match state
-        .llm
+    // `ADM-9`: the client comes from the resolver, which rebuilds it when
+    // the effective provider settings change.
+    let assistant = crate::runtime_settings::assistant(state).await;
+    let reply = match assistant
+        .client
         .chat(
             &messages,
             ChatOptions {

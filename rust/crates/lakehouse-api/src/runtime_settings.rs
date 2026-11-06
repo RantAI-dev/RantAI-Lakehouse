@@ -1,66 +1,89 @@
 //! Effective deployment settings, resolved in exactly one place and read
-//! through a short cache (`ADM-6`/`ADM-7`, slice 1 of
+//! through a short cache (`ADM-6` to `ADM-9`, slices 1 and 2 of
 //! `docs/superpowers/plans/2026-11-06-adm-6-9-console-settings.md`).
 //!
 //! # One merge rule
 //!
 //! For each field the effective value is the environment's when it is set
 //! and non-empty, else the console's saved value, else the code default
-//! (plan D1). That precedence is implemented ONLY in [`resolve_email`].
-//! The pre-`ADM-7` merge (`routes::alerts::smtp_config`, six fields read
-//! straight from [`Config`]) is gone: every sender builds its
-//! [`SmtpConfig`] from this resolver, and every "is email set up" check
-//! reads this resolver's answer, so there is no second place where
-//! environment and saved values are combined (rule 4: no duplicated
-//! guard).
+//! (plan D1). That precedence is implemented ONLY in this module: the
+//! pre-`ADM-7` merge (`routes::alerts::smtp_config`, six fields read
+//! straight from [`Config`]) is gone, and every reader — every sender, the
+//! login throttle, the retention sweep, the embed lifetime and the
+//! assistant's client — asks this module, so there is no second place where
+//! environment and saved values are combined (rule 4: no duplicated guard).
 //!
-//! The connection fields — the host, the port, the security, the account
-//! and the password — are one unit (`ADM-7 review R1`): when the
-//! environment sets any one of them, all five are the server's and the
-//! console may change none of them. A per-field merge let the
-//! environment's password be sent to a host the console chose. `from` and
-//! `consolePublicUrl` stay per field.
+//! # The units
+//!
+//! Two groups of settings are ONE unit each, because a per-field merge would
+//! let a secret kept in the server's files be sent to an address the console
+//! chose (`ADM-7 review R1`):
+//!
+//! * the email connection — the host, the port, the security, the account
+//!   and the password: when the environment sets any one of them, all five
+//!   are the server's and the console may change none of them;
+//! * the assistant's provider — the address, the model and the key: when
+//!   the environment holds a key (`LLM_KEY` or `MINIMAX_API_KEY`), all three
+//!   are the server's, so the environment's key is never sent to an address
+//!   the console chose (`ADM-9`). With no key in the environment the key is
+//!   the console's, and the address and the model are per field: an
+//!   environment that sets `LLM_URL` owns the address alone, and one that
+//!   sets `LLM_MODEL` owns the model alone (`ADM-9 review R4`).
 //!
 //! # The cache
 //!
-//! [`EmailSettingsCache`] holds the saved row for at most
-//! [`EMAIL_CACHE_TTL`] per process (a `tokio::sync::RwLock` with the read
-//! time). The email `PUT` (the console's email screen) drops the cached row
-//! at once, so a save on this process is visible to the next send without
-//! waiting for the TTL. Other processes re-read within the TTL; pushing a
-//! change across processes faster than 30 s is out of scope (plan §3).
+//! [`SettingsCache`] holds a saved row for at most [`SETTINGS_CACHE_TTL`] per
+//! process (a `tokio::sync::RwLock` with the read time). The email `PUT` (the
+//! console's email screen) drops the cached row at once, so a save on this
+//! process is visible to the next send without waiting for the TTL. Other
+//! processes re-read within the TTL; pushing a change across processes faster
+//! than 30 s is out of scope (plan §3).
 //!
 //! # Secrets
 //!
-//! The resolved password is held as a [`SecretValue`] (redacting `Debug`, no
+//! A resolved secret is held as a [`SecretValue`] (redacting `Debug`, no
 //! `Serialize`). It never appears in a log, an error or a response; a GET
 //! answers `set` only, and the audit row records only the field NAME. The
-//! saved password is sealed with the installation keyring under
-//! [`EMAIL_PASSWORD_SEAL_NAME`]; a row that does not open (the key changed)
-//! is read as "not set" and logged, never returned.
+//! saved password and key are sealed with the installation keyring under
+//! [`EMAIL_PASSWORD_SEAL_NAME`] and [`ASSISTANT_KEY_SEAL_NAME`]; a row that
+//! does not open (the key changed) is read as "not set" and logged, never
+//! returned.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use lakehouse_auth::throttle::ThrottlePolicy;
 use lakehouse_core::secret::SecretValue;
+use lakehouse_llm::LlmClient;
 use lakehouse_notify::{SmtpCaBundle, SmtpConfig};
+use lakehouse_store::assistant_settings::AssistantSettings;
 use lakehouse_store::email_settings::EmailSettings;
+use lakehouse_store::sign_in_settings::SignInSettings;
 use lakehouse_store::{PgPool, StoreError};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::internal_hosts::InternalHosts;
 use crate::secret_crypto::Keyring;
 use crate::state::AppState;
 
+/// How long one read of a saved settings row is reused before the store is
+/// asked again (plan D3).
+pub const SETTINGS_CACHE_TTL: Duration = Duration::from_secs(30);
+
 /// How long one read of the saved email row is reused before the store is
 /// asked again (plan D3).
-pub const EMAIL_CACHE_TTL: Duration = Duration::from_secs(30);
+pub const EMAIL_CACHE_TTL: Duration = SETTINGS_CACHE_TTL;
 
 /// The associated-data name the email password is sealed under (plan D2).
 pub const EMAIL_PASSWORD_SEAL_NAME: &str = "settings/email/password";
+
+/// The associated-data name the assistant's key is sealed under (plan D2).
+pub const ASSISTANT_KEY_SEAL_NAME: &str = "settings/assistant/key";
 
 /// Where a field's effective value comes from (plan D1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,14 +206,24 @@ impl EffectiveEmail {
     }
 }
 
-/// The saved email row, cached for [`EMAIL_CACHE_TTL`] (plan D3). Cheap to
-/// clone: one `Arc`-shared [`RwLock`].
-#[derive(Debug)]
-pub struct EmailSettingsCache {
-    inner: RwLock<Option<(Instant, Option<EmailSettings>)>>,
+/// A saved settings row the API caches (plan D3).
+///
+/// Each section's row is read at most once per [`SETTINGS_CACHE_TTL`] per
+/// process. One trait, so the three sections (email, sign-in, assistant)
+/// share one cache and one read rule instead of three copies of it.
+pub trait SettingsRow: Clone + Send + Sync + 'static {
+    /// Read the saved row from the store.
+    fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send;
 }
 
-impl EmailSettingsCache {
+/// The saved row of one settings section, cached for [`SETTINGS_CACHE_TTL`]
+/// (plan D3). Cheap to clone: one `Arc`-shared [`RwLock`].
+#[derive(Debug)]
+pub struct SettingsCache<T: SettingsRow> {
+    inner: RwLock<Option<(Instant, Option<T>)>>,
+}
+
+impl<T: SettingsRow> SettingsCache<T> {
     /// An empty cache.
     #[must_use]
     pub fn new() -> Self {
@@ -205,39 +238,61 @@ impl EmailSettingsCache {
     /// # Errors
     ///
     /// Returns [`StoreError::Database`] when the store read fails.
-    pub async fn row(&self, pool: &PgPool) -> Result<Option<EmailSettings>, StoreError> {
+    pub async fn row(&self, pool: &PgPool) -> Result<Option<T>, StoreError> {
         if let Some(row) = self.fresh_row().await {
             return Ok(row);
         }
         let mut guard = self.inner.write().await;
         if let Some((at, row)) = guard.as_ref()
-            && at.elapsed() < EMAIL_CACHE_TTL
+            && at.elapsed() < SETTINGS_CACHE_TTL
         {
             return Ok(row.clone());
         }
-        let row = lakehouse_store::email_settings::get(pool).await?;
+        let row = T::read(pool).await?;
         *guard = Some((Instant::now(), row.clone()));
         Ok(row)
     }
 
-    /// The cached row when it is still within [`EMAIL_CACHE_TTL`].
-    async fn fresh_row(&self) -> Option<Option<EmailSettings>> {
+    /// The cached row when it is still within [`SETTINGS_CACHE_TTL`].
+    async fn fresh_row(&self) -> Option<Option<T>> {
         let guard = self.inner.read().await;
         let (at, row) = guard.as_ref()?;
-        (at.elapsed() < EMAIL_CACHE_TTL).then(|| row.clone())
+        (at.elapsed() < SETTINGS_CACHE_TTL).then(|| row.clone())
     }
 
-    /// Drop the cached row, so the next read asks the store again. The email
-    /// `PUT` calls this on the process that saved, so a change is visible to
-    /// the next send there without waiting for the TTL (plan D3).
+    /// Drop the cached row, so the next read asks the store again. A
+    /// settings `PUT` calls this on the process that saved, so a change is
+    /// visible to the next reader there without waiting for the TTL (plan
+    /// D3).
     pub async fn clear(&self) {
         *self.inner.write().await = None;
     }
 }
 
-impl Default for EmailSettingsCache {
+impl<T: SettingsRow> Default for SettingsCache<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The saved email row, cached for [`SETTINGS_CACHE_TTL`] (plan D3).
+pub type EmailSettingsCache = SettingsCache<EmailSettings>;
+
+impl SettingsRow for EmailSettings {
+    fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
+        lakehouse_store::email_settings::get(pool)
+    }
+}
+
+impl SettingsRow for SignInSettings {
+    fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
+        lakehouse_store::sign_in_settings::get(pool)
+    }
+}
+
+impl SettingsRow for AssistantSettings {
+    fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
+        lakehouse_store::assistant_settings::get(pool)
     }
 }
 
@@ -517,6 +572,10 @@ fn open_console_password(
 /// process (plan D2: "logged once, never returned").
 static NO_KEY_LOGGED: AtomicBool = AtomicBool::new(false);
 static UNOPENABLE_PASSWORD_LOGGED: AtomicBool = AtomicBool::new(false);
+/// The same two failures for the assistant's key, which is a different
+/// secret and a different row.
+static NO_ASSISTANT_KEY_LOGGED: AtomicBool = AtomicBool::new(false);
+static UNOPENABLE_ASSISTANT_KEY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Log `message` the first time this process sees this failure.
 fn log_once(flag: &AtomicBool, message: &str) {
@@ -530,6 +589,486 @@ fn log_once(flag: &AtomicBool, message: &str) {
 #[must_use]
 pub fn email_cache() -> Arc<EmailSettingsCache> {
     Arc::new(EmailSettingsCache::new())
+}
+
+/// A fresh, empty sign-in cache as an [`Arc`] — the value
+/// [`crate::state::AppState`] holds.
+#[must_use]
+pub fn sign_in_cache() -> Arc<SettingsCache<SignInSettings>> {
+    Arc::new(SettingsCache::new())
+}
+
+/// A fresh, empty assistant cache as an [`Arc`] — the value
+/// [`crate::state::AppState`] holds.
+#[must_use]
+pub fn assistant_cache() -> Arc<SettingsCache<AssistantSettings>> {
+    Arc::new(SettingsCache::new())
+}
+
+// ── The sign-in limits (`ADM-8`) ──────────────────────────────────────────
+
+/// The resolved sign-in limits: the effective value of every field plus
+/// where it came from (plan D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveSignIn {
+    /// Failed password tries tolerated per key before the lockout.
+    pub max_failures: u32,
+    /// Where [`Self::max_failures`] came from.
+    pub max_failures_source: Source,
+    /// The window (seconds) the failed tries are counted in.
+    pub failure_window_secs: u32,
+    /// Where [`Self::failure_window_secs`] came from.
+    pub failure_window_secs_source: Source,
+    /// How long (seconds) a locked key stays locked.
+    pub lockout_secs: u32,
+    /// Where [`Self::lockout_secs`] came from.
+    pub lockout_secs_source: Source,
+    /// How long (days) sign-in records are kept.
+    pub retention_days: u32,
+    /// Where [`Self::retention_days`] came from.
+    pub retention_days_source: Source,
+    /// The longest life (seconds) a signed embed link may have.
+    pub embed_max_lifetime_secs: u64,
+    /// Where [`Self::embed_max_lifetime_secs`] came from.
+    pub embed_max_lifetime_secs_source: Source,
+}
+
+impl EffectiveSignIn {
+    /// The login-throttle policy these limits describe (`SEC-5`).
+    ///
+    /// One place builds it: the login handler, the retention sweep and the
+    /// console's Sign-in tab all read the same numbers.
+    #[must_use]
+    pub fn throttle_policy(&self) -> ThrottlePolicy {
+        ThrottlePolicy {
+            max_failures: self.max_failures,
+            window: time::Duration::seconds(i64::from(self.failure_window_secs)),
+            lockout: time::Duration::seconds(i64::from(self.lockout_secs)),
+        }
+    }
+}
+
+/// The one merge for the sign-in limits (plan D1): the environment wins,
+/// then the saved row, then the code default. Pure, so it is unit-tested
+/// without a database.
+#[must_use]
+pub fn resolve_sign_in(config: &Config, stored: Option<&SignInSettings>) -> EffectiveSignIn {
+    let (max_failures, max_failures_source) = if config.login_max_failures_from_env {
+        (config.login_max_failures, Source::Server)
+    } else if let Some(value) = stored.and_then(|s| s.max_failures) {
+        (
+            u32::try_from(value).unwrap_or(config.login_max_failures),
+            Source::Console,
+        )
+    } else {
+        (config.login_max_failures, Source::Default)
+    };
+    let (failure_window_secs, failure_window_secs_source) =
+        if config.login_failure_window_secs_from_env {
+            (config.login_failure_window_secs, Source::Server)
+        } else if let Some(value) = stored.and_then(|s| s.failure_window_secs) {
+            (
+                u32::try_from(value).unwrap_or(config.login_failure_window_secs),
+                Source::Console,
+            )
+        } else {
+            (config.login_failure_window_secs, Source::Default)
+        };
+    let (lockout_secs, lockout_secs_source) = if config.login_lockout_secs_from_env {
+        (config.login_lockout_secs, Source::Server)
+    } else if let Some(value) = stored.and_then(|s| s.lockout_secs) {
+        (
+            u32::try_from(value).unwrap_or(config.login_lockout_secs),
+            Source::Console,
+        )
+    } else {
+        (config.login_lockout_secs, Source::Default)
+    };
+    let (retention_days, retention_days_source) = if config.auth_retention_days_from_env {
+        (config.auth_retention_days, Source::Server)
+    } else if let Some(value) = stored.and_then(|s| s.retention_days) {
+        (
+            u32::try_from(value).unwrap_or(config.auth_retention_days),
+            Source::Console,
+        )
+    } else {
+        (config.auth_retention_days, Source::Default)
+    };
+    let (embed_max_lifetime_secs, embed_max_lifetime_secs_source) =
+        if config.embed_token_max_lifetime_from_env {
+            (config.embed_token_max_lifetime_seconds, Source::Server)
+        } else if let Some(value) = stored.and_then(|s| s.embed_max_lifetime_secs) {
+            (
+                u64::try_from(value).unwrap_or(config.embed_token_max_lifetime_seconds),
+                Source::Console,
+            )
+        } else {
+            (config.embed_token_max_lifetime_seconds, Source::Default)
+        };
+    EffectiveSignIn {
+        max_failures,
+        max_failures_source,
+        failure_window_secs,
+        failure_window_secs_source,
+        lockout_secs,
+        lockout_secs_source,
+        retention_days,
+        retention_days_source,
+        embed_max_lifetime_secs,
+        embed_max_lifetime_secs_source,
+    }
+}
+
+/// The saved sign-in row for a request, or `None` when no Postgres pool is
+/// configured (a Phase 1 deployment) or nothing was saved.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the store read fails.
+pub async fn sign_in_row(state: &AppState) -> Result<Option<SignInSettings>, StoreError> {
+    match state.pg.as_deref() {
+        Some(pool) => state.sign_in_settings_cache.row(pool).await,
+        None => Ok(None),
+    }
+}
+
+/// The effective sign-in limits. A store read that fails degrades to the
+/// environment's values (logged), never fails the reader: the login
+/// throttle must keep working when the settings database is briefly down.
+pub async fn sign_in(state: &AppState) -> EffectiveSignIn {
+    match sign_in_or_fail(state).await {
+        Ok(effective) => effective,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "reading saved sign-in settings failed; using the environment's values"
+            );
+            resolve_sign_in(&state.config, None)
+        }
+    }
+}
+
+/// The effective sign-in limits, with the store's failure reported instead
+/// of hidden behind the environment's values.
+///
+/// The console's Sign-in tab uses this: answering "not set" for a value that
+/// IS set (because the database could not be asked) would be a lie.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the saved row cannot be read.
+pub async fn sign_in_or_fail(state: &AppState) -> Result<EffectiveSignIn, StoreError> {
+    let stored = sign_in_row(state).await?;
+    Ok(resolve_sign_in(&state.config, stored.as_ref()))
+}
+
+// ── The assistant's provider (`ADM-9`) ────────────────────────────────────
+
+/// The resolved assistant settings: the effective address, model and key,
+/// and where each came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveAssistant {
+    /// The provider's base URL, e.g. `https://api.example.com/v1`.
+    pub url: String,
+    /// Where [`Self::url`] came from.
+    pub url_source: Source,
+    /// The provider's model name.
+    pub model: String,
+    /// Where [`Self::model`] came from.
+    pub model_source: Source,
+    /// The provider's key, as a [`SecretValue`]: redacting `Debug`, no
+    /// `Serialize`, never logged or returned.
+    pub key: SecretValue,
+    /// Whether a key is in effect at all (the value itself is never
+    /// serialized).
+    pub key_set: bool,
+    /// Where the key came from.
+    pub key_source: Source,
+}
+
+/// The assistant client and the settings it was built from (`ADM-9`).
+///
+/// The settings are kept beside the client so the resolver can tell whether
+/// the client is still the one the effective values describe — and so the
+/// answer the console gets names the provider the assistant really uses.
+#[derive(Clone)]
+pub struct AssistantClient {
+    /// The client the assistant talks through.
+    pub client: Arc<LlmClient>,
+    /// The effective settings it was built from.
+    pub settings: EffectiveAssistant,
+}
+
+/// The one merge for the assistant's provider (plan D1, D13), with the
+/// `ADM-7 review R1` lesson applied: the address, the model and the key are
+/// ONE unit.
+///
+/// When the environment holds a key (`LLM_KEY` or `MINIMAX_API_KEY`), the
+/// whole unit is the server's: the effective address and model are the
+/// environment's, the console may change none of the three, and the
+/// environment's key is never sent to an address the console chose. The
+/// console's saved values are not used at all in that case.
+///
+/// With no key in the environment, the key is the console's, but the
+/// address and the model are per field (`ADM-9 review R4`): an environment
+/// that sets `LLM_URL` owns the address alone, and one that sets
+/// `LLM_MODEL` owns the model alone — the same rule slice 1 uses for
+/// `SMTP_PORT` (`smtp_port_from_env`). The console's saved value of that
+/// field is then not used, the GET reports it `server`, and a save that
+/// sends it is the existing 409. Where the environment names neither, the
+/// console's saved value is used, and where it has saved none the code's
+/// default is; the source of such a value is `default`, which means "the
+/// console has not set this" — the console may change it.
+#[must_use]
+pub fn resolve_assistant(
+    config: &Config,
+    stored: Option<&AssistantSettings>,
+    keyring: Option<&Keyring>,
+) -> EffectiveAssistant {
+    if !config.llm_key.is_empty() {
+        return EffectiveAssistant {
+            url: config.llm_url.clone(),
+            url_source: Source::Server,
+            model: config.llm_model.clone(),
+            model_source: Source::Server,
+            key: SecretValue::new(config.llm_key.clone()),
+            key_set: true,
+            key_source: Source::Server,
+        };
+    }
+    // `ADM-9 review R4`: the environment's own address and model win on
+    // their own, each by itself. The console's saved value of that field is
+    // not used, so the operator's file stays the operator's.
+    let (url, url_source) = if config.llm_url_from_env {
+        (config.llm_url.clone(), Source::Server)
+    } else {
+        match stored.and_then(|s| s.llm_url.as_deref()) {
+            Some(url) => (url.to_owned(), Source::Console),
+            None => (config.llm_url.clone(), Source::Default),
+        }
+    };
+    let (model, model_source) = if config.llm_model_from_env {
+        (config.llm_model.clone(), Source::Server)
+    } else {
+        match stored.and_then(|s| s.llm_model.as_deref()) {
+            Some(model) => (model.to_owned(), Source::Console),
+            None => (config.llm_model.clone(), Source::Default),
+        }
+    };
+    let (key, key_set, key_source) = match open_console_key(stored, keyring) {
+        Some(key) => (SecretValue::new(key), true, Source::Console),
+        None => (SecretValue::new(""), false, Source::Default),
+    };
+    EffectiveAssistant {
+        url,
+        url_source,
+        model,
+        model_source,
+        key,
+        key_set,
+        key_source,
+    }
+}
+
+/// Open the saved assistant key, or `None` when it is not set, does not open
+/// (the key changed or is missing), or is not UTF-8. The two failure shapes
+/// are logged once per process and never returned (plan D2).
+fn open_console_key(
+    stored: Option<&AssistantSettings>,
+    keyring: Option<&Keyring>,
+) -> Option<String> {
+    let sealed = stored.and_then(|s| s.llm_key.as_deref())?;
+    let Some(ring) = keyring else {
+        log_once(
+            &NO_ASSISTANT_KEY_LOGGED,
+            "no installation key is configured; the saved assistant key is treated as not set",
+        );
+        return None;
+    };
+    let Ok(opened) = ring.open(ASSISTANT_KEY_SEAL_NAME, sealed) else {
+        log_once(
+            &UNOPENABLE_ASSISTANT_KEY_LOGGED,
+            "the saved assistant key does not open with the configured key; treating it as not set",
+        );
+        return None;
+    };
+    let Ok(plain) = String::from_utf8(opened.plaintext) else {
+        log_once(
+            &UNOPENABLE_ASSISTANT_KEY_LOGGED,
+            "the saved assistant key is not UTF-8; treating it as not set",
+        );
+        return None;
+    };
+    // An empty key is no key: the console's "Clear" sends `null`, but a save
+    // that sent an empty string must not look like a set one.
+    if plain.is_empty() {
+        return None;
+    }
+    Some(plain)
+}
+
+/// The saved assistant row for a request, or `None` when no Postgres pool is
+/// configured (a Phase 1 deployment) or nothing was saved.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the store read fails.
+pub async fn assistant_row(state: &AppState) -> Result<Option<AssistantSettings>, StoreError> {
+    match state.pg.as_deref() {
+        Some(pool) => state.assistant_settings_cache.row(pool).await,
+        None => Ok(None),
+    }
+}
+
+/// The effective assistant settings: the environment's, else the console's
+/// saved ones, else the code's defaults.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the saved row cannot be read.
+pub async fn assistant_or_fail(state: &AppState) -> Result<EffectiveAssistant, StoreError> {
+    let stored = assistant_row(state).await?;
+    let keyring = state.connector_secret_store.keyring().ok();
+    Ok(resolve_assistant(&state.config, stored.as_ref(), keyring))
+}
+
+/// The assistant client for the effective settings, rebuilt when they
+/// change.
+///
+/// The client is swappable (`AppState::llm`), so a save in the console takes
+/// effect on the next message without a restart. A rebuild checks the
+/// address again: a name that resolved publicly when it was saved may
+/// resolve inside the deployment's network now, and an address the console
+/// chose must never become one (plan D13).
+///
+/// When the check refuses the address, the client this process already has
+/// stays in use and the answer keeps naming it — the console is told what
+/// the assistant really uses, not what was asked for.
+pub async fn assistant(state: &AppState) -> Arc<AssistantClient> {
+    let desired = match assistant_or_fail(state).await {
+        Ok(effective) => effective,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "reading saved assistant settings failed; using the environment's values"
+            );
+            resolve_assistant(&state.config, None, None)
+        }
+    };
+    let current = state.llm.read().await.clone();
+    if current.settings == desired {
+        return current;
+    }
+    // The address the console chose is checked again before it is used.
+    // The environment's own address is not checked: it is the operator's
+    // file, and a deployment may point its assistant at a gateway inside
+    // its own network (plan D1: the server's file wins).
+    if desired.url_source == Source::Console {
+        let internal_hosts = state.config.connector_internal_hosts();
+        if let Err(problem) = check_assistant_address(&desired.url, &internal_hosts).await {
+            tracing::error!(
+                %problem,
+                "the assistant's provider address is not one this deployment may reach; \
+                 the client was not rebuilt"
+            );
+            return current;
+        }
+    }
+    let client = Arc::new(LlmClient::new(
+        desired.url.clone(),
+        desired.model.clone(),
+        desired.key.expose_secret().to_owned(),
+    ));
+    let built = Arc::new(AssistantClient {
+        client,
+        settings: desired,
+    });
+    *state.llm.write().await = built.clone();
+    built
+}
+
+/// The assistant client this process starts with: the effective settings
+/// from the environment (there is no saved row at start-up), and the client
+/// built from them.
+#[must_use]
+pub fn initial_assistant_client(
+    config: &Config,
+    keyring: Option<&Keyring>,
+) -> Arc<AssistantClient> {
+    let settings = resolve_assistant(config, None, keyring);
+    let client = Arc::new(LlmClient::new(
+        settings.url.clone(),
+        settings.model.clone(),
+        settings.key.expose_secret().to_owned(),
+    ));
+    Arc::new(AssistantClient { client, settings })
+}
+
+/// Why a provider address was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressProblem {
+    /// The address is not an `https://` address.
+    NotHttps,
+    /// The address names no host the check can look up.
+    NoHost,
+    /// The name does not resolve to any address.
+    Unresolved,
+    /// The name resolves inside this deployment's network.
+    Internal,
+}
+
+impl std::fmt::Display for AddressProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::NotHttps => "the address is not an https:// address",
+            Self::NoHost => "the address names no host",
+            Self::Unresolved => "the address does not resolve to any address",
+            Self::Internal => "the address resolves inside this deployment's network",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Check the provider address the console chose: it must be an `https://`
+/// address, and its host must pass the same internal-address check the
+/// connector dials use (`connector_probe::resolve_checked`), so an
+/// administrator's account cannot be used to make the API call a service
+/// inside the deployment's network (plan D13).
+///
+/// The environment's own address is NOT checked here: it is the operator's
+/// file, and an on-premises deployment may point its assistant at a gateway
+/// inside its own network.
+///
+/// # Errors
+///
+/// The [`AddressProblem`] that refused the address. The caller turns it into
+/// a fixed sentence; the reason never carries an address the caller did not
+/// send.
+pub async fn check_assistant_address(
+    url: &str,
+    internal_hosts: &InternalHosts,
+) -> Result<(), AddressProblem> {
+    if !url.starts_with("https://") {
+        return Err(AddressProblem::NotHttps);
+    }
+    let Some((host, port)) = crate::connector_probe::parse_endpoint_host_port(url) else {
+        return Err(AddressProblem::NoHost);
+    };
+    // `resolve_checked` answers two failures with one message — a name that
+    // does not resolve, and a name that resolves inside the network — so
+    // the name is resolved once here to tell them apart. The DECISION (is
+    // this address inside the network?) is `resolve_checked`'s, the same
+    // check the connector dials use.
+    let mut resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| AddressProblem::Unresolved)?;
+    if resolved.next().is_none() {
+        return Err(AddressProblem::Unresolved);
+    }
+    crate::connector_probe::resolve_checked(host, port, internal_hosts)
+        .await
+        .map(|_| ())
+        .map_err(|_| AddressProblem::Internal)
 }
 
 #[cfg(test)]
@@ -789,5 +1328,297 @@ mod tests {
         assert_eq!(eff.security_source, Source::Console);
         assert_eq!(eff.user.as_deref(), Some("console-user"));
         assert_eq!(eff.user_source, Source::Console);
+    }
+
+    // ── The sign-in limits (`ADM-8`) ──────────────────────────────────────
+
+    fn stored_sign_in(over: impl Fn(&mut SignInSettings)) -> SignInSettings {
+        let mut s = SignInSettings {
+            max_failures: None,
+            failure_window_secs: None,
+            lockout_secs: None,
+            retention_days: None,
+            embed_max_lifetime_secs: None,
+        };
+        over(&mut s);
+        s
+    }
+
+    /// The environment wins over the console's saved numbers, and the GET
+    /// says so (plan D1).
+    #[test]
+    fn the_environment_wins_over_the_console_for_the_sign_in_limits() {
+        let cfg = config(&[
+            ("LOGIN_MAX_FAILURES", "7"),
+            ("LOGIN_FAILURE_WINDOW_SECS", "1200"),
+            ("LOGIN_LOCKOUT_SECS", "600"),
+            ("AUTH_RETENTION_DAYS", "60"),
+            ("EMBED_TOKEN_MAX_LIFETIME_SECONDS", "7200"),
+        ]);
+        let saved = stored_sign_in(|s| {
+            s.max_failures = Some(3);
+            s.failure_window_secs = Some(600);
+            s.lockout_secs = Some(120);
+            s.retention_days = Some(14);
+            s.embed_max_lifetime_secs = Some(3600);
+        });
+        let eff = resolve_sign_in(&cfg, Some(&saved));
+
+        assert_eq!(eff.max_failures, 7);
+        assert_eq!(eff.max_failures_source, Source::Server);
+        assert_eq!(eff.failure_window_secs, 1200);
+        assert_eq!(eff.failure_window_secs_source, Source::Server);
+        assert_eq!(eff.lockout_secs, 600);
+        assert_eq!(eff.lockout_secs_source, Source::Server);
+        assert_eq!(eff.retention_days, 60);
+        assert_eq!(eff.retention_days_source, Source::Server);
+        assert_eq!(eff.embed_max_lifetime_secs, 7200);
+        assert_eq!(eff.embed_max_lifetime_secs_source, Source::Server);
+    }
+
+    /// With nothing in the environment, the console's saved numbers are used.
+    #[test]
+    fn the_console_owns_the_sign_in_limits_when_the_environment_says_nothing() {
+        let cfg = config(&[]);
+        let saved = stored_sign_in(|s| {
+            s.max_failures = Some(3);
+            s.failure_window_secs = Some(600);
+            s.lockout_secs = Some(120);
+            s.retention_days = Some(14);
+            s.embed_max_lifetime_secs = Some(3600);
+        });
+        let eff = resolve_sign_in(&cfg, Some(&saved));
+
+        assert_eq!(eff.max_failures, 3);
+        assert_eq!(eff.max_failures_source, Source::Console);
+        assert_eq!(eff.failure_window_secs, 600);
+        assert_eq!(eff.failure_window_secs_source, Source::Console);
+        assert_eq!(eff.lockout_secs, 120);
+        assert_eq!(eff.lockout_secs_source, Source::Console);
+        assert_eq!(eff.retention_days, 14);
+        assert_eq!(eff.retention_days_source, Source::Console);
+        assert_eq!(eff.embed_max_lifetime_secs, 3600);
+        assert_eq!(eff.embed_max_lifetime_secs_source, Source::Console);
+    }
+
+    /// Neither the environment nor the console: the code's own numbers, said
+    /// as such.
+    #[test]
+    fn the_defaults_apply_when_neither_sets_a_sign_in_limit() {
+        let cfg = config(&[]);
+        let eff = resolve_sign_in(&cfg, None);
+
+        assert_eq!(eff.max_failures, 5);
+        assert_eq!(eff.max_failures_source, Source::Default);
+        assert_eq!(eff.failure_window_secs, 900);
+        assert_eq!(eff.failure_window_secs_source, Source::Default);
+        assert_eq!(eff.lockout_secs, 300);
+        assert_eq!(eff.lockout_secs_source, Source::Default);
+        assert_eq!(eff.retention_days, 30);
+        assert_eq!(eff.retention_days_source, Source::Default);
+        assert_eq!(eff.embed_max_lifetime_secs, 86_400);
+        assert_eq!(eff.embed_max_lifetime_secs_source, Source::Default);
+    }
+
+    /// An environment value that does not parse is not the environment's
+    /// value: the code default is in effect, and the console may set a real
+    /// one (the rule the email connection uses for an unparseable port).
+    #[test]
+    fn an_unparseable_environment_limit_does_not_own_the_setting() {
+        let cfg = config(&[("LOGIN_MAX_FAILURES", "many")]);
+        let saved = stored_sign_in(|s| s.max_failures = Some(3));
+        let eff = resolve_sign_in(&cfg, Some(&saved));
+
+        assert_eq!(eff.max_failures, 3);
+        assert_eq!(eff.max_failures_source, Source::Console);
+    }
+
+    /// The throttle policy the login handler uses is built from the resolved
+    /// numbers, so a console's saved limit is the one that locks a key.
+    #[test]
+    fn the_throttle_policy_follows_the_resolved_limits() {
+        let cfg = config(&[]);
+        let saved = stored_sign_in(|s| {
+            s.max_failures = Some(3);
+            s.failure_window_secs = Some(600);
+            s.lockout_secs = Some(120);
+        });
+        let eff = resolve_sign_in(&cfg, Some(&saved));
+        let policy = eff.throttle_policy();
+
+        assert_eq!(policy.max_failures, 3);
+        assert_eq!(policy.window, time::Duration::seconds(600));
+        assert_eq!(policy.lockout, time::Duration::seconds(120));
+    }
+
+    // ── The assistant's provider (`ADM-9`) ───────────────────────────────
+
+    fn stored_assistant(over: impl Fn(&mut AssistantSettings)) -> AssistantSettings {
+        let mut s = AssistantSettings {
+            llm_url: None,
+            llm_model: None,
+            llm_key: None,
+        };
+        over(&mut s);
+        s
+    }
+
+    /// `ADM-7 review R1`'s lesson, applied to the assistant: the address,
+    /// the model and the key are ONE unit, and the environment owns the
+    /// whole of it as soon as it holds a key. The console's saved address
+    /// is NOT used, so the environment's key is never sent to an address the
+    /// console chose.
+    #[test]
+    fn the_environments_key_owns_the_assistants_whole_unit() {
+        let cfg = config(&[
+            ("LLM_KEY", "an-environment-key"),
+            ("LLM_URL", "https://env.example.com/v1"),
+            ("LLM_MODEL", "env-model"),
+        ]);
+        let saved = stored_assistant(|s| {
+            s.llm_url = Some("https://console.example.com/v1".to_owned());
+            s.llm_model = Some("console-model".to_owned());
+            s.llm_key = Some(
+                keyring()
+                    .seal(ASSISTANT_KEY_SEAL_NAME, b"console-key")
+                    .unwrap(),
+            );
+        });
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.url, "https://env.example.com/v1");
+        assert_eq!(eff.url_source, Source::Server);
+        assert_eq!(eff.model, "env-model");
+        assert_eq!(eff.model_source, Source::Server);
+        assert!(eff.key_set);
+        assert_eq!(eff.key.expose_secret(), "an-environment-key");
+        assert_eq!(eff.key_source, Source::Server);
+    }
+
+    /// `MINIMAX_API_KEY` is the other name of the environment's key, and it
+    /// owns the unit the same way.
+    #[test]
+    fn the_environments_minimax_key_owns_the_assistants_whole_unit() {
+        let cfg = config(&[("MINIMAX_API_KEY", "an-environment-key")]);
+        let saved =
+            stored_assistant(|s| s.llm_url = Some("https://console.example.com/v1".to_owned()));
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.url_source, Source::Server);
+        assert!(eff.key_set);
+        assert_eq!(eff.key.expose_secret(), "an-environment-key");
+    }
+
+    /// With no key in the environment, the console owns the unit: its saved
+    /// address, model and key are used.
+    #[test]
+    fn the_console_owns_the_assistant_when_the_environment_holds_no_key() {
+        let cfg = config(&[]);
+        let saved = stored_assistant(|s| {
+            s.llm_url = Some("https://console.example.com/v1".to_owned());
+            s.llm_model = Some("console-model".to_owned());
+            s.llm_key = Some(
+                keyring()
+                    .seal(ASSISTANT_KEY_SEAL_NAME, b"console-key")
+                    .unwrap(),
+            );
+        });
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.url, "https://console.example.com/v1");
+        assert_eq!(eff.url_source, Source::Console);
+        assert_eq!(eff.model, "console-model");
+        assert_eq!(eff.model_source, Source::Console);
+        assert!(eff.key_set);
+        assert_eq!(eff.key.expose_secret(), "console-key");
+        assert_eq!(eff.key_source, Source::Console);
+    }
+
+    /// `ADM-9 review R4`: the environment's own address wins on its own,
+    /// with no key beside it. The console's saved address is NOT used, and
+    /// the address is the server's (`server`), so the console shows it
+    /// read-only and refuses a save that sends it.
+    #[test]
+    fn the_environments_own_address_wins_on_its_own() {
+        let cfg = config(&[("LLM_URL", "https://env.example.com/v1")]);
+        let saved = stored_assistant(|s| {
+            s.llm_url = Some("https://console.example.com/v1".to_owned());
+            s.llm_model = Some("console-model".to_owned());
+        });
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.url, "https://env.example.com/v1");
+        assert_eq!(eff.url_source, Source::Server);
+        // The model is still the console's: the environment named none.
+        assert_eq!(eff.model, "console-model");
+        assert_eq!(eff.model_source, Source::Console);
+        // And the key is still the console's.
+        assert!(!eff.key_set);
+        assert_eq!(eff.key_source, Source::Default);
+    }
+
+    /// The model half of the same rule (`ADM-9 review R4`).
+    #[test]
+    fn the_environments_own_model_wins_on_its_own() {
+        let cfg = config(&[("LLM_MODEL", "env-model")]);
+        let saved = stored_assistant(|s| {
+            s.llm_url = Some("https://console.example.com/v1".to_owned());
+            s.llm_model = Some("console-model".to_owned());
+        });
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.model, "env-model");
+        assert_eq!(eff.model_source, Source::Server);
+        // The address is still the console's.
+        assert_eq!(eff.url, "https://console.example.com/v1");
+        assert_eq!(eff.url_source, Source::Console);
+    }
+
+    /// An empty `LLM_URL` is no address: the console may set one, and the
+    /// code's default is used until it does.
+    #[test]
+    fn an_empty_environments_address_is_not_the_environments_own() {
+        let cfg = config(&[("LLM_URL", "")]);
+        let saved =
+            stored_assistant(|s| s.llm_url = Some("https://console.example.com/v1".to_owned()));
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.url, "https://console.example.com/v1");
+        assert_eq!(eff.url_source, Source::Console);
+    }
+
+    /// Neither the environment's key nor the console's: the code's default
+    /// address and model, and no key at all (the assistant is off).
+    #[test]
+    fn the_assistant_defaults_apply_when_nothing_is_set() {
+        let cfg = config(&[]);
+        let eff = resolve_assistant(&cfg, None, Some(&keyring()));
+
+        assert_eq!(eff.url, crate::config::DEFAULT_LLM_URL);
+        assert_eq!(eff.url_source, Source::Default);
+        assert_eq!(eff.model, crate::config::DEFAULT_LLM_MODEL);
+        assert_eq!(eff.model_source, Source::Default);
+        assert!(!eff.key_set);
+        assert_eq!(eff.key.expose_secret(), "");
+        assert_eq!(eff.key_source, Source::Default);
+    }
+
+    /// A saved key sealed with another installation key reads as not set,
+    /// and is never returned.
+    #[test]
+    fn an_assistant_key_sealed_with_another_key_reads_as_not_set() {
+        let cfg = config(&[]);
+        let ring_a = keyring();
+        let sealed = ring_a.seal(ASSISTANT_KEY_SEAL_NAME, b"secret").unwrap();
+        let saved = stored_assistant(|s| s.llm_key = Some(sealed.clone()));
+
+        // A different key (base64 of 0x2b) does not open the row.
+        let other = base64::engine::general_purpose::STANDARD.encode([0x2b_u8; 32]);
+        let ring_b = Keyring::from_values(Some(&other), None).unwrap();
+
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&ring_b));
+        assert!(!eff.key_set);
+        assert_eq!(eff.key.expose_secret(), "");
+        assert_eq!(eff.key_source, Source::Default);
     }
 }

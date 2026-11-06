@@ -1674,6 +1674,25 @@ pub fn router(state: AppState) -> Router {
         // Which of the deployment's features are set up (`ADM-6`); see
         // `routes::settings`.
         .route("/api/settings/deployment", get(settings::get_deployment))
+        // The deployment's sign-in limits (`ADM-8`): the failed-login
+        // limit, the window, the lockout, the retention and the longest
+        // life of a signed embed link. See `routes::settings`.
+        .route(
+            "/api/settings/sign-in",
+            get(settings::get_sign_in).put(settings::put_sign_in),
+        )
+        // The deployment's assistant provider (`ADM-9`): the address, the
+        // model and the key. See `routes::settings`.
+        .route(
+            "/api/settings/assistant",
+            get(settings::get_assistant).put(settings::put_assistant),
+        )
+        // One minimal request to the assistant's provider, with the saved
+        // values (`ADM-9`).
+        .route(
+            "/api/settings/assistant/test",
+            axum::routing::post(settings::post_assistant_test),
+        )
         // Time and row limits of charts and Query Studio (`BI-5`); see
         // `routes::query_limits`.
         // Stop (`BI-5`): ends the caller's own queries of one run.

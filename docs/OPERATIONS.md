@@ -1441,6 +1441,73 @@ are set up and what is missing for the ones that are not; it reports the
 configuration, never whether the relay really answers — the test email
 answers that.
 
+## Setting the sign-in limits from the console (`ADM-8`)
+
+The failed-login limit, the window it is counted in, the lockout, how long
+sign-in records are kept and the longest life of a signed embed link can be
+set in the console (**Settings → Sign-in**) by a holder of `settings:write`.
+The next sign-in uses them, with no restart: a limit of 3 locks the fourth
+wrong password.
+
+**The environment still wins, one limit at a time.** A limit that is set in
+`.env` is used as it is, and the console shows it read-only ("Set by the
+server"); a save that sends it is refused with a 409 and nothing is written.
+The other four limits are the console's to set.
+
+**The ranges.** The console accepts 3 to 20 failed tries, a window and a
+lockout of 60 to 86400 seconds, 7 to 3650 days of records and an embed link
+of 300 to 86400 seconds. A value outside its range is refused with a
+sentence that names the field, and nothing is written. `.env` is not bound
+by those ranges: it may set a longer window or a shorter lockout.
+
+**To move a limit from the environment to the console:** remove it from
+`.env` and restart the API. **To move it back:** put it in `.env` (and
+restart), and clear it in the console — the console's value is ignored
+while the environment's is set.
+
+## Giving the assistant its key from the console (`ADM-9`)
+
+The provider address, the model and the API key can be set in the console
+(**Settings → Assistant**) by a holder of `settings:write`. The next
+message uses them, with no restart.
+
+**The provider is one unit.** When `.env` holds a key — `LLM_KEY` or
+`MINIMAX_API_KEY`, whatever `LLM_URL` and `LLM_MODEL` say — all three are
+the environment's and the console shows them read-only; a save that sends
+any of them is refused with a 409 and writes nothing. So a key kept in
+files is never sent to an address chosen in the console. To move the
+provider to the console, remove the key from `.env` and restart the API.
+
+**Without a key, `LLM_URL` and `LLM_MODEL` answer for themselves.** A value
+set in `.env` is used as it is and shown read-only, and a save that sends
+that field is refused with a 409 — the console's saved value of it is
+ignored while the environment's is set. To move the address or the model to
+the console, remove that variable from `.env` and restart the API.
+
+**The address the console sends** must be an `https://` address, and it must
+not point inside the deployment's network: the same check the connector
+dials use (`CONNECTOR_PROBE_ALLOWED_CIDRS`,
+`CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`) refuses an internal address, so an
+administrator's account cannot make the API call a service inside it. The
+environment's own address is not checked — an on-premises deployment may
+point its assistant at a gateway inside its own network.
+
+**The key** is sealed with the installation key (`CONNECTOR_SECRETS_KEY`)
+and never comes back: the screen says only whether one is set, and the
+audit row (`settings.assistant.update`) names the fields that changed,
+never a value. The address cannot be cleared while a key is set: the key
+would go to the deployment's default provider.
+
+**The test button** makes one minimal request with the saved values and
+answers with one of four fixed sentences ("The assistant answered.", "Could
+not reach the provider.", "The provider refused the key.", "The provider
+does not know that model.") — never the provider's own words.
+
+**Several API processes.** A setting saved in the console reaches the other
+processes within 30 seconds, not at once — each process re-reads the saved
+row at most every 30 seconds. The process that saved sees its own change
+immediately.
+
 ## Features unavailable in the local stack
 
 | Feature | Needs | Symptom without it | To enable |

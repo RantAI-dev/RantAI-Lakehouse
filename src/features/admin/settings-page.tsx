@@ -9,6 +9,7 @@ import {
   MailIcon,
   MapIcon,
   RocketIcon,
+  SparklesIcon,
   TagsIcon,
 } from "lucide-react"
 import { LineTabsList, type LineTab } from "@/components/patterns/line-tabs"
@@ -17,12 +18,14 @@ import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { useUrlTab } from "@/hooks/use-url-tab"
 import { useAuth } from "@/features/auth/auth-provider"
 import { TagKeysPage } from "@/features/governance/tag-keys-page"
+import { AssistantSettings } from "./assistant-settings"
 import { DeploymentSettings } from "./deployment-settings"
 import { EmailSettings } from "./email-settings"
 import { MapsPage } from "./maps-page"
 import { QueryLimitsSettings } from "./query-limits-settings"
 import { RememberedResultsSettings } from "./remembered-results-settings"
 import { ReportingSettingsPage } from "./reporting-settings-page"
+import { SignInSettings } from "./sign-in-settings"
 import { SsoPage } from "./sso-page"
 
 export const SETTINGS_SECTIONS = [
@@ -36,11 +39,12 @@ export const SETTINGS_SECTIONS = [
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number]
 
 /**
- * The sections only a holder of `settings:write` sees (`ADM-6`, `ADM-7`):
- * they name the deployment's own settings — the mail server, the account,
- * the console's address — which are not every signed-in person's business.
+ * The sections only a holder of `settings:write` sees (`ADM-6`, `ADM-7`,
+ * `ADM-9`): they name the deployment's own settings — the mail server, the
+ * account, the console's address, the assistant's provider — which are not
+ * every signed-in person's business.
  */
-export const ADMIN_SETTINGS_SECTIONS = ["deployment", "email"] as const
+export const ADMIN_SETTINGS_SECTIONS = ["deployment", "email", "assistant"] as const
 export type AdminSettingsSection = (typeof ADMIN_SETTINGS_SECTIONS)[number]
 
 /** Every section of the page, administrator's or not. */
@@ -58,6 +62,7 @@ const TABS: LineTab[] = [
 const ADMIN_TABS: LineTab[] = [
   { value: "deployment", label: "Deployment", icon: RocketIcon },
   { value: "email", label: "Email", icon: MailIcon },
+  { value: "assistant", label: "Assistant", icon: SparklesIcon },
 ]
 
 /**
@@ -100,12 +105,20 @@ export function SettingsPage() {
         <LineTabsList tabs={tabs} active={section} />
         {canAdminister ? (
           <TabsContent value="deployment">
-            <DeploymentSettings onOpenEmail={() => setSection("email")} />
+            <DeploymentSettings
+              onOpenEmail={() => setSection("email")}
+              onOpenAssistant={() => setSection("assistant")}
+            />
           </TabsContent>
         ) : null}
         {canAdminister ? (
           <TabsContent value="email">
             <EmailSettings />
+          </TabsContent>
+        ) : null}
+        {canAdminister ? (
+          <TabsContent value="assistant">
+            <AssistantSettings />
           </TabsContent>
         ) : null}
         <TabsContent value="reporting">
@@ -118,7 +131,13 @@ export function SettingsPage() {
           <QueryLimitsSettings />
         </TabsContent>
         <TabsContent value="sign-in">
-          <SsoPage />
+          {/* `ADM-8`: the SSO status stays on top, and the deployment's own
+              sign-in limits are below it — for a holder of `settings:write`,
+              because the server refuses the read to anybody else. */}
+          <div className="flex flex-col gap-6">
+            <SsoPage />
+            {canAdminister ? <SignInSettings /> : null}
+          </div>
         </TabsContent>
         <TabsContent value="tag-keys">
           <TagKeysPage />
