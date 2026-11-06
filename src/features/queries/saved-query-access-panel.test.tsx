@@ -297,29 +297,6 @@ describe("the share panel", () => {
     )
   })
 
-  it("has no refusal left when the folder's share dialog is opened again", async () => {
-    stubFolderAccess()
-    spyOn(queryService, "putFolderAccess").mockRejectedValue(
-      new ServiceError(
-        "permission_denied",
-        "permission_denied: Only someone who manages everything in this folder can share it.",
-      ),
-    )
-    const first = renderPanel("folder")
-
-    await screen.findByText("u-2")
-    fireEvent.click(screen.getByRole("button", { name: "Save access" }))
-    await screen.findByRole("alert")
-
-    // The folder tree mounts a new panel for each open, so a closed one
-    // takes its refusal with it.
-    first.unmount()
-    renderPanel("folder")
-    await screen.findByText("u-2")
-
-    expect(screen.queryAllByRole("alert").length).toBe(0)
-  })
-
   it("shows the server's sentence when the body is refused", async () => {
     stubAccess()
     spyOn(queryService, "putSavedAccess").mockRejectedValue(

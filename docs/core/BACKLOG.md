@@ -728,8 +728,8 @@ builds it (`AGENTS.md`).
 
 | ID | Spec | When | Size |
 | --- | --- | --- | --- |
-| [`QS-1`](specs/qs-1.md) | Editor basics | In Acceptance | M |
-| [`QS-2`](specs/qs-2.md) | Results you can use | In Acceptance | M |
-| [`QS-3`](specs/qs-3.md) | Saved queries done properly | In Acceptance | M |
-| [`QS-4`](specs/qs-4.md) | History and query profile | In Acceptance | M |
+| [`QS-1`](specs/qs-1.md) | Editor basics | Next | M |
+| [`QS-2`](specs/qs-2.md) | Results you can use | Next | M |
+| [`QS-3`](specs/qs-3.md) | Saved queries done properly | Next | M |
+| [`QS-4`](specs/qs-4.md) | History and query profile | Next | M |
 | [`QS-5`](specs/qs-5.md) | Parameters, snippets and charts from results | Next | L |

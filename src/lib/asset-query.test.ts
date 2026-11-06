@@ -108,21 +108,6 @@ describe("assetQueryStudioHref", () => {
 describe("assetSnapshotQueryHref", () => {
   const sqlOf = (href: string | null) => new URL(href ?? "", "http://x").searchParams.get("sql")
 
-  // A Bronze table is opened on Trino now (see `assetStudioTarget`); the
-  // ClickHouse pin is what a row keeps whose Bronze table Trino does not
-  // read, so this test names that case with a stand-in for another table.
-  it("pins a ClickHouse read of an Iceberg table that is not opened on Trino", () => {
-    const target = {
-      engine: "clickhouse",
-      table: "icecat_api.`bronze.demo_orders_param`",
-      policyTable: "bronze.other_table",
-    } as const
-    const asset = { ...iceberg, tableKey: "bronze.demo_orders_param", queryTarget: target }
-    const href = assetSnapshotQueryHref(asset, "248842615326512766")
-    expect(sqlOf(href)).toEndWith("LIMIT 100\nSETTINGS iceberg_snapshot_id = 248842615326512766")
-    expect(href).toContain("engine=clickhouse")
-  })
-
   // `DATA-16` F6 had the API refuse `FOR VERSION AS OF` on Trino, so a
   // Trino asset got no link. `DATA-21` made the API read it, and the owner
   // decided on 2026-11-06 that these links open a Trino tab.

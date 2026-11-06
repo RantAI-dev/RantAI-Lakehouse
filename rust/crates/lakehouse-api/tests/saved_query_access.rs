@@ -4279,6 +4279,90 @@ async fn a_folder_holding_another_persons_query_is_not_shared_with_a_colleague()
     );
 }
 
+/// Review scenario (b) in the place where it matters: `X` sits in Rina's
+/// PERSONAL space, under her `Weekly` folder that she shares with Reza at
+/// edit. Reza created `X` (he manages it) and Rina saved a query into it.
+/// A colleague holds no level anywhere in that space, so sharing `X` with
+/// the colleague would turn her invisible query into a visible one: it is
+/// refused with the contents sentence, no rule is written, and the
+/// colleague still gets the 404 on the query. Reza giving himself manage on
+/// `X` is refused the same way.
+#[tokio::test]
+async fn a_folder_in_a_personal_space_holding_another_persons_query_is_not_shared_with_a_colleague()
+{
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let bob = a_third_reader(&pool).await;
+    let bob_id = user_id(&pool, "nadia@meridian.example").await;
+
+    let (_, space) = query_saved(&router, &rina, "Private", None).await;
+    let weekly = folder_created(&router, &rina, "Weekly", Some(&space)).await;
+    let (status, body) = put_folder_rules(
+        &router,
+        &rina,
+        &weekly,
+        json!([{"userId": reza_id.to_string(), "level": "edit"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let x = folder_created(&router, &reza, "X", Some(&weekly)).await;
+    let (query, _) = query_saved(&router, &rina, "Rina's numbers", Some(&x)).await;
+
+    let (status, found) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{query}"),
+        &bob,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{found}");
+    let before = stored_rules(&pool, &x).await;
+    assert!(before.is_empty(), "X has no rule yet: {before:?}");
+
+    let (status, body) = put_folder_rules(
+        &router,
+        &reza,
+        &x,
+        json!([{"userId": bob_id.to_string(), "level": "view"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {SHARE_NEEDS_MANAGE_OF_CONTENTS}")
+    );
+    let (status, body) = put_folder_rules(
+        &router,
+        &reza,
+        &x,
+        json!([{"userId": reza_id.to_string(), "level": "manage"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {SHARE_NEEDS_MANAGE_OF_CONTENTS}")
+    );
+
+    assert!(
+        stored_rules(&pool, &x).await.is_empty(),
+        "no rule was written on X"
+    );
+    let (status, found) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{query}"),
+        &bob,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{found}");
+    assert_eq!(error(&found), QUERY_NOT_FOUND);
+}
+
 /// CONTROL for (a) and (b), review scenario (c): a folder that holds only
 /// the caller's own queries and sub-folders is shared.
 #[tokio::test]

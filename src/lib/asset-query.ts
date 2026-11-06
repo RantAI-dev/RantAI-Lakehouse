@@ -100,17 +100,17 @@ export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema" | "t
 }
 
 /**
- * Query Studio, opened on the starter query pinned to one Iceberg snapshot
- * — the table as it was after that load. `null` when the asset is not
- * read from its Iceberg table (a `silver.*` read has no snapshots to go
- * back to), or when the id is not the plain number Iceberg issues.
+ * Query Studio, opened on a Trino tab with the starter query pinned to one
+ * Iceberg snapshot, the table as it was after that load. `null` when the
+ * asset is not an Iceberg candidate, when its rows do not open on Trino (a
+ * Silver stand-in has no snapshots to go back to), or when the id is not
+ * the plain number Iceberg issues.
  *
- * `pinSnapshot` writes the pin, so the two callers of it cannot drift. A
- * Bronze table opens on Trino and is pinned on its own reference, the one
- * `FOR VERSION AS OF` belongs to (`DATA-21` D5). Past this link the API
- * reads that clause on Trino (`DATA-21`), which is why it is no longer
- * withheld as it was while `DATA-16` F6 refused it. A row that keeps its
- * ClickHouse name is pinned with the query-wide setting.
+ * `pinSnapshot` writes the pin, so the two callers of it cannot drift. The
+ * pin is on the table's own reference, the one `FOR VERSION AS OF` belongs
+ * to (`DATA-21` D5). Past this link the API reads that clause on Trino
+ * (`DATA-21`), which is why it is no longer withheld as it was while
+ * `DATA-16` F6 refused it.
  */
 export function assetSnapshotQueryHref(
   a: Target & Pick<AssetDetail, "schema" | "tableKey">,
@@ -118,14 +118,8 @@ export function assetSnapshotQueryHref(
 ): string | null {
   if (!isIcebergCandidate(a)) return null
   const target = assetStudioTarget(a)
-  let sql: string | null
-  if (target.engine === "trino") {
-    sql = pinSnapshot(assetStarterSql(a), "trino", snapshotId, target.table)
-  } else {
-    // The `DataLakeCatalog` name, e.g. icecat_api.`bronze.orders`.
-    if (!target.table.includes("`bronze.")) return null
-    sql = pinSnapshot(assetStarterSql(a), target.engine, snapshotId)
-  }
+  if (target.engine !== "trino") return null
+  const sql = pinSnapshot(assetStarterSql(a), "trino", snapshotId, target.table)
   if (sql === null) return null
   const params = new URLSearchParams({ sql, engine: target.engine })
   return `/query-studio?${params.toString()}`
