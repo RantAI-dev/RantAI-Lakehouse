@@ -254,6 +254,13 @@ pub struct AppState {
     /// The 30-second memo of the query limits (`BI-5` plan D2), so a
     /// dashboard does not read Postgres per tile. Shared across clones.
     pub query_limits: crate::query_limits::QueryLimitsMemo,
+    /// The 30-second memo of the saved email settings (`ADM-7` plan D3), so
+    /// an alert or a scheduled report does not read Postgres per send. The
+    /// email `PUT` clears it on this process. Shared across clones.
+    pub email_settings_cache: Arc<crate::runtime_settings::EmailSettingsCache>,
+    /// How often each caller may ask for a test email (`ADM-7` plan D10).
+    /// Shared across clones.
+    pub email_test_limiter: Arc<crate::runtime_settings::TestEmailLimiter>,
     /// Test seam for the alert webhook sender (merge of `SEC-10` into the
     /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
     /// listener on loopback, which the real address policy refuses by
@@ -871,6 +878,8 @@ impl AppState {
                 ),
             )),
             query_limits: crate::query_limits::QueryLimitsMemo::default(),
+            email_settings_cache: crate::runtime_settings::email_cache(),
+            email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
             #[cfg(test)]
             webhook_sender_override: None,
         }

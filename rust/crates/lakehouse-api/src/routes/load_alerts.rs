@@ -78,7 +78,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use super::pipelines::RunFailedBody;
-use crate::routes::alerts::{ApiSilenceSource, smtp_config};
+use crate::routes::alerts::ApiSilenceSource;
 use crate::routes::{connectors as connector_routes, uploads as upload_routes};
 use crate::state::AppState;
 
@@ -305,7 +305,7 @@ async fn deliver_with_rules(
     // same address-checking sender as every other alert delivery, never a
     // bare `reqwest` client.
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(state).await.smtp());
     let silence = ApiSilenceSource { pg: pool };
     let attempted = lakehouse_alerts::deliver_connector_event_to(
         rules,
@@ -340,7 +340,7 @@ pub(crate) async fn deliver_quality_incident_with_rules(
     text: &str,
 ) -> usize {
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(state).await.smtp());
     let silence = ApiSilenceSource { pg: pool };
     let attempted = lakehouse_alerts::deliver_quality_incident_to(
         rules,

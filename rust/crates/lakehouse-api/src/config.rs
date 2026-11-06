@@ -438,6 +438,13 @@ pub struct Config {
     /// `PORT` (below) is the one field that legitimately still hard-fails,
     /// since it is Rust-only and load-bearing.
     pub smtp_port: u16,
+    /// Whether `SMTP_PORT` was set and non-empty (and parsed). `smtp_port`
+    /// is the parsed value or the 587 default, so it alone cannot tell an
+    /// operator who set `SMTP_PORT=587` from one who never set it; the
+    /// console-settings resolver (`ADM-7`) needs exactly that to answer a
+    /// field's `source` and refuse a console write over an environment
+    /// value.
+    pub smtp_port_from_env: bool,
     /// Whether to use implicit TLS: the *effective* value nodemailer would
     /// use, matching `notify.ts:40` in full —
     /// `SMTP_SECURE === "true" || port === 465`, not just the raw env var.
@@ -459,6 +466,12 @@ pub struct Config {
     /// falling back to `"rantai-lake@localhost"` (`notify.ts:44`, `??`
     /// chain).
     pub smtp_from: String,
+    /// Whether `SMTP_FROM` was set and non-empty. `smtp_from` is the
+    /// fallback-chain result, so it alone cannot tell `SMTP_FROM` from the
+    /// `SMTP_USER`/literal fallback; the console-settings resolver (`ADM-7`)
+    /// needs that to answer `from`'s `source` (the `From` address is its own
+    /// console field, independent of the auth `SMTP_USER`).
+    pub smtp_from_from_env: bool,
     /// Port this service listens on. Default `8080`. Not derived from the
     /// TypeScript (which runs under Next.js), specific to this Rust
     /// service.
@@ -1077,10 +1090,12 @@ impl std::fmt::Debug for Config {
             )
             .field("smtp_host", &self.smtp_host)
             .field("smtp_port", &self.smtp_port)
+            .field("smtp_port_from_env", &self.smtp_port_from_env)
             .field("smtp_secure", &self.smtp_secure)
             .field("smtp_user", &self.smtp_user)
             .field("smtp_pass", &REDACTED)
             .field("smtp_from", &self.smtp_from)
+            .field("smtp_from_from_env", &self.smtp_from_from_env)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
             .field("outside_s3_endpoint", &self.outside_s3_endpoint)
@@ -1544,6 +1559,16 @@ impl Config {
             }),
             None => 587,
         };
+        // `SMTP_PORT` set, non-empty and parseable — the console may not
+        // override it (`ADM-7` D1). An unparseable `SMTP_PORT` does not
+        // count: the operator's value is invalid, and `smtp_port` already
+        // fell back to 587, so the console is free to set a real port.
+        let smtp_port_from_env = env
+            .get("SMTP_PORT")
+            .is_some_and(|raw| !raw.is_empty() && raw.parse::<u16>().is_ok());
+        // `SMTP_FROM` set and non-empty — the one env value the `From` field
+        // owns; the `SMTP_USER`/literal fallback is not it.
+        let smtp_from_from_env = env.get("SMTP_FROM").is_some_and(|raw| !raw.is_empty());
         let port = match env.get("PORT") {
             Some(raw) => raw
                 .parse::<u16>()
@@ -1600,11 +1625,13 @@ impl Config {
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
             smtp_port,
+            smtp_port_from_env,
             // notify.ts:40 in full: `SMTP_SECURE === "true" || port === 465`.
             smtp_secure: env.get("SMTP_SECURE").is_some_and(|v| v == "true") || smtp_port == 465,
             smtp_user: truthy(env, "SMTP_USER"),
             smtp_pass: or_default(env, "SMTP_PASS", ""),
             smtp_from,
+            smtp_from_from_env,
             port,
             is_dev: env
                 .get("APP_ENV")

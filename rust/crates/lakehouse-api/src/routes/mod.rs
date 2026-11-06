@@ -1658,6 +1658,22 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/reporting",
             get(settings::get_reporting).put(settings::put_reporting),
         )
+        // The deployment's mail server, account and console address
+        // (`ADM-7`); see `routes::settings`. Reading needs
+        // `settings:write` like changing does (plan D4): a mail server's
+        // name and account are not for every signed-in person.
+        .route(
+            "/api/settings/email",
+            get(settings::get_email).put(settings::put_email),
+        )
+        // One test email to the caller's own address (`ADM-7` plan D10).
+        .route(
+            "/api/settings/email/test",
+            axum::routing::post(settings::post_email_test),
+        )
+        // Which of the deployment's features are set up (`ADM-6`); see
+        // `routes::settings`.
+        .route("/api/settings/deployment", get(settings::get_deployment))
         // Time and row limits of charts and Query Studio (`BI-5`); see
         // `routes::query_limits`.
         // Stop (`BI-5`): ends the caller's own queries of one run.

@@ -5,6 +5,11 @@
 //! concerns (inspect-upload child process dispatch, `rustls` crypto provider
 //! installation, runtime thread stack configuration) before handing off to
 //! [`lakehouse_api::run`].
+//!
+//! `ADM-7 review R2`: this binary declares no module of its own since
+//! `REL-20` (#397) moved the process into the library target
+//! (`lakehouse_api::run`). The module tree lives only in `src/lib.rs`, so
+//! `runtime_settings` is declared there and not here.
 
 use anyhow::Context;
 
