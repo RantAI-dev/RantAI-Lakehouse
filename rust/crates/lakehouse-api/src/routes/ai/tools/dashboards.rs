@@ -615,37 +615,52 @@ pub(super) async fn update_chart(
         return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
     }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
-        Ok(spec) => match store::insert_chart(ch, &spec).await {
-            Ok(()) => {
-                if old_board != spec.board {
-                    snapshot_as(ch, &old_board, principal).await;
-                }
-                snapshot_as(ch, &spec.board, principal).await;
-                let mut reply = json!({
-                    "updated": true,
-                    "id": spec.spec.id,
-                    "title": spec.spec.title,
-                    "kind": spec.spec.kind,
-                    "mart": spec.spec.mart,
-                    "board": spec.board,
-                    "definition": definition_digest(&input),
-                    "formattingKept": formatting_kept,
-                });
-                if source_kept {
-                    reply["sourceKept"] = json!(true);
-                }
-                if !fields_kept.is_empty() {
-                    reply["fieldsKept"] = json!(fields_kept);
-                }
-                if !formatting_kept {
-                    reply["note"] = json!(
-                        "the chart's kind changed, so its formatting was reset; send the formatting again if the new kind takes it."
-                    );
-                }
-                reply
+        Ok(spec) => {
+            // The new row takes a new version, which sorts the chart last on
+            // a board where its tile has no stored box. When the chart stays
+            // on its board, the board is boxed first so the tile stays where
+            // it is, and a failure here stops the update before the chart row
+            // is written. A chart that leaves needs no freeze: the order of
+            // the tiles that stay does not change, and a box left behind
+            // would be a hole the page never fills. A chart arriving on
+            // another board is a new tile there and goes last.
+            if store::canonical_board_id(&old_board) == store::canonical_board_id(&spec.board)
+                && let Err(err) = store::freeze_board_layout(ch, &old_board).await
+            {
+                return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
             }
-            Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
-        },
+            match store::insert_chart(ch, &spec).await {
+                Ok(()) => {
+                    if old_board != spec.board {
+                        snapshot_as(ch, &old_board, principal).await;
+                    }
+                    snapshot_as(ch, &spec.board, principal).await;
+                    let mut reply = json!({
+                        "updated": true,
+                        "id": spec.spec.id,
+                        "title": spec.spec.title,
+                        "kind": spec.spec.kind,
+                        "mart": spec.spec.mart,
+                        "board": spec.board,
+                        "definition": definition_digest(&input),
+                        "formattingKept": formatting_kept,
+                    });
+                    if source_kept {
+                        reply["sourceKept"] = json!(true);
+                    }
+                    if !fields_kept.is_empty() {
+                        reply["fieldsKept"] = json!(fields_kept);
+                    }
+                    if !formatting_kept {
+                        reply["note"] = json!(
+                            "the chart's kind changed, so its formatting was reset; send the formatting again if the new kind takes it."
+                        );
+                    }
+                    reply
+                }
+                Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+            }
+        }
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
@@ -2781,5 +2796,269 @@ mod tests {
         .expect_err("a text limit does not read");
         assert!(reply.contains("\"limit\""), "{reply}");
         assert!(!reply.contains("dateColumn"), "{reply}");
+    }
+
+    // ── An updated chart keeps its place on the dashboard ───────────────────
+
+    /// The definition the charts of these tests were built from, on `board`.
+    fn kept_place_def(board: &str) -> Value {
+        json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": board,
+        })
+    }
+
+    /// The stored document of chart `id`.
+    fn stored_document_of(id: &str, board: &str) -> String {
+        let mut document: Value =
+            serde_json::from_str(&stored_document(kept_place_def(board))).unwrap();
+        document["spec"]["id"] = json!(id);
+        document.to_string()
+    }
+
+    /// A server where chart `c_1` is the middle one of three live charts of
+    /// `board`, listed `c_a`, `c_1`, `c_z`, and the board has the row
+    /// `board_row` (none: the board has no row). The board's writes fail when
+    /// `board_write_fails`.
+    async fn three_charts_server(
+        board: &str,
+        board_row: Option<Value>,
+        board_write_fails: bool,
+    ) -> MockServer {
+        let server = mart_server().await;
+        if board_write_fails {
+            Mock::given(method("POST"))
+                .and(body_string_contains("INSERT INTO console.bi_board "))
+                .respond_with(
+                    ResponseTemplate::new(500).set_body_string("planted-marker upstream text"),
+                )
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        rows_first(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": board })],
+        )
+        .await;
+        rows_first(
+            &server,
+            "FROM console.bi_chart FINAL WHERE is_deleted = 0",
+            ["c_a", "c_1", "c_z"]
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "spec_json": stored_document_of(id, board),
+                        "board": board,
+                        "created_by": "ai",
+                        "created_at": "2026-10-22 00:00:00",
+                    })
+                })
+                .collect(),
+        )
+        .await;
+        rows_first(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 0, "owner_id": "" })],
+        )
+        .await;
+        rows_first(
+            &server,
+            "FROM console.bi_board FINAL WHERE is_deleted = 0 AND id=",
+            board_row.into_iter().collect(),
+        )
+        .await;
+        server
+    }
+
+    /// A row of board `b_board` that nobody has arranged: no tile has a box.
+    fn unarranged_board() -> Value {
+        json!({
+            "id": "b_board", "name": "Sales", "description": "", "created_by": "Ann",
+            "layout_json": "{}", "filters_json": "[]", "public_token": "",
+            "embed_enabled": 0, "folder_id": "", "refresh_seconds": 0, "grain": "",
+            "params_json": "[]", "tabs_json": "[]", "phone_layout_json": "[]",
+            "theme": "", "font": "", "cache_json": "", "owner_id": "",
+            "created_at": "2026-10-22 00:00:00",
+        })
+    }
+
+    async fn update_middle_chart(server: &MockServer) -> Value {
+        update_middle_chart_with(server, json!({})).await
+    }
+
+    /// [`update_middle_chart`] with the fields of `extra` named in the call.
+    async fn update_middle_chart_with(server: &MockServer, extra: Value) -> Value {
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &rename_call(extra),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
+    }
+
+    /// The position of the first write that goes into `table`, among `writes`.
+    fn write_position(writes: &[&String], table: &str) -> usize {
+        writes
+            .iter()
+            .position(|s| s.contains(table))
+            .unwrap_or_else(|| panic!("nothing was written into {table}: {writes:#?}"))
+    }
+
+    /// Rewriting a chart gives its row a new version, which sends a tile with
+    /// no stored box to the end of the list. The board is therefore saved
+    /// with a box for every tile, in the order they are drawn now, before the
+    /// chart row is written; the updated chart keeps the place it had.
+    #[tokio::test]
+    async fn an_update_boxes_the_tiles_of_an_unarranged_board_before_it_rewrites_the_chart() {
+        let server = three_charts_server("b_board", Some(unarranged_board()), false).await;
+        let reply = update_middle_chart(&server).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        let board_at = write_position(&w, "INTO console.bi_board ");
+        let chart_at = write_position(&w, "INTO console.bi_chart");
+        assert!(board_at < chart_at, "{w:#?}");
+        assert_eq!(
+            w.iter()
+                .filter(|s| s.contains("INTO console.bi_board "))
+                .count(),
+            1,
+            "{w:#?}"
+        );
+        assert!(
+            w[board_at].contains(
+                r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_1":{"x":6,"y":0,"w":6,"h":6},"c_z":{"x":0,"y":6,"w":6,"h":6}}'"#
+            ),
+            "{}",
+            w[board_at]
+        );
+    }
+
+    /// A board whose tiles all have a box is not written by an update.
+    #[tokio::test]
+    async fn an_update_does_not_write_a_board_whose_tiles_all_have_a_box() {
+        let mut board = unarranged_board();
+        board["layout_json"] = json!(
+            r#"{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_1":{"x":6,"y":0,"w":6,"h":6},"c_z":{"x":0,"y":6,"w":6,"h":6}}"#
+        );
+        let server = three_charts_server("b_board", Some(board), false).await;
+        let reply = update_middle_chart(&server).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        assert!(
+            w.iter().all(|s| !s.contains("INTO console.bi_board ")),
+            "{w:#?}"
+        );
+        write_position(&w, "INTO console.bi_chart");
+    }
+
+    /// The update never half-applies: when the board cannot be saved, the
+    /// chart row is not written and the reply is the fixed message with a
+    /// reference, not the store's text.
+    #[tokio::test]
+    async fn an_update_whose_board_write_fails_leaves_the_chart_alone_and_leaks_nothing() {
+        let server = three_charts_server("b_board", Some(unarranged_board()), true).await;
+        let reply = update_middle_chart(&server).await;
+        let text = reply.to_string();
+        assert!(reply["errorId"].is_string(), "{text}");
+        assert!(reply.get("updated").is_none(), "{text}");
+        assert!(!text.contains("planted-marker"), "leaked: {text}");
+        let all = sent(&server).await;
+        assert!(
+            writes(&all)
+                .iter()
+                .all(|s| !s.contains("INTO console.bi_chart")),
+            "{all:#?}"
+        );
+    }
+
+    /// A chart saved with no board is on the built-in board, which has no row
+    /// until something about it is saved: its tiles are boxed on that row.
+    #[tokio::test]
+    async fn an_update_of_a_chart_with_no_board_boxes_the_built_in_boards_tiles() {
+        let server = three_charts_server("", None, false).await;
+        let reply = update_middle_chart(&server).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        let board_at = write_position(&w, "INTO console.bi_board ");
+        assert!(
+            board_at < write_position(&w, "INTO console.bi_chart"),
+            "{w:#?}"
+        );
+        assert!(
+            w[board_at].contains("VALUES ('default', 'Dashboard',"),
+            "{}",
+            w[board_at]
+        );
+        assert!(
+            w[board_at].contains(
+                r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_1":{"x":6,"y":0,"w":6,"h":6},"c_z":{"x":0,"y":6,"w":6,"h":6}}'"#
+            ),
+            "{}",
+            w[board_at]
+        );
+    }
+
+    /// A board with no live row does not stop the update, and the update does
+    /// not make a row for it.
+    #[tokio::test]
+    async fn an_update_on_a_board_with_no_row_still_saves_the_chart() {
+        let server = three_charts_server("b_board", None, false).await;
+        let reply = update_middle_chart(&server).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        assert!(
+            w.iter().all(|s| !s.contains("INTO console.bi_board ")),
+            "{w:#?}"
+        );
+        write_position(&w, "INTO console.bi_chart");
+    }
+
+    /// Naming the board the chart is already on is the same as naming none:
+    /// the chart stays, so the board is boxed first.
+    #[tokio::test]
+    async fn an_update_that_names_the_boards_own_id_boxes_its_tiles_first() {
+        let server = three_charts_server("b_board", Some(unarranged_board()), false).await;
+        let reply = update_middle_chart_with(&server, json!({ "board": "b_board" })).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        assert!(
+            write_position(&w, "INTO console.bi_board ")
+                < write_position(&w, "INTO console.bi_chart"),
+            "{w:#?}"
+        );
+    }
+
+    /// A chart that moves to another board leaves the tiles that stay in
+    /// their order, so the old board is not written: a box saved for the
+    /// leaving chart would stay as a hole the page never closes.
+    #[tokio::test]
+    async fn an_update_that_moves_the_chart_to_another_board_writes_no_board() {
+        let server = three_charts_server("b_board", Some(unarranged_board()), false).await;
+        let reply = update_middle_chart_with(&server, json!({ "board": "b_other" })).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["board"], json!("b_other"), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        assert!(
+            w.iter().all(|s| !s.contains("INTO console.bi_board ")),
+            "{w:#?}"
+        );
+        write_position(&w, "INTO console.bi_chart");
     }
 }
