@@ -72,3 +72,15 @@ Running fewer tests per PR (changed-crate selection). Speeding up `upload_routes
 (next step if needed). The gates (`ops/g*`).
 
 ## 4. Handoff
+
+## 5. Review
+
+- **R1 (BLOCKER, fixed by the planner in CI config).** The three partitions uploaded their
+  count under one artifact name, `test-counts`; `upload-artifact` v4 and later refuse a
+  second upload under an existing name, so partitions 2 and 3 would fail. Now one artifact
+  per partition (`test-counts-N`), downloaded with `pattern: test-counts-*`.
+- **R2 (SHOULD-FIX, for whichever slice merges second).** The sum check's floor is 9921, the
+  count with the API's unit tests run twice. Slice A removes the duplicate copy (about
+  3,100 tests), so the floor must be lowered in the same PR to the new measured total from
+  that PR's CI, with the before/after numbers in the comment. Never lower it for any other
+  reason (AGENTS.md rule 2).

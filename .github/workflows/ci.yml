@@ -513,13 +513,15 @@ jobs:
           echo "## Nextest partition ${{ matrix.partition }}/3: $count tests" >> "$GITHUB_STEP_SUMMARY"
         working-directory: rust
 
-      # REL-20 (D4): all three partitions upload to the same artifact name
-      # with a unique file per partition; `ci-required` merges them and sums.
+      # REL-20 (D4): one artifact per partition (`test-counts-N`):
+      # `upload-artifact` v4 and later refuse a second upload under a name
+      # that already exists in the run, so the three cannot share one name.
+      # `ci-required` downloads them by pattern, merges them and sums.
       - name: Upload nextest partition count (REL-20)
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: test-counts
+          name: test-counts-${{ matrix.partition }}
           path: ${{ runner.temp }}/partition-${{ matrix.partition }}.txt
           retention-days: 1
           if-no-files-found: error
@@ -3947,8 +3949,8 @@ jobs:
         run: ./scripts/ci/required_gate.sh
 
       # REL-20 (D4): the three nextest partitions each upload their test
-      # count under one artifact name with a unique file per partition
-      # (`partition-{1,2,3}.txt`). Merge them and sum, failing the job if the
+      # count as their own artifact (`test-counts-{1,2,3}`, one file
+      # `partition-N.txt` each). Merge them and sum, failing the job if the
       # total dropped below `main`'s single-run count (9921 passed, plan §0).
       # A dropped partition removes roughly a third of ~9900 tests, well
       # below the floor; the floor is the real measured number, not a guess.
@@ -3957,7 +3959,7 @@ jobs:
         if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
         uses: actions/download-artifact@v8
         with:
-          pattern: test-counts
+          pattern: test-counts-*
           merge-multiple: true
           path: ${{ runner.temp }}/counts
 
