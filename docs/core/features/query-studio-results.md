@@ -69,7 +69,8 @@ No new tool. The chat's `run_sql` keeps its own limit. Downloads are a console a
 ## Limits to tell a customer
 
 - Statistics and filters in the grid cover the rows shown, up to 64,000, not the whole result. A numeric column's
-  histogram has ten equal-width buckets, a text column's the ten most frequent values.
+  histogram has ten equal-width buckets, or one bucket per distinct value when the column has fewer than ten distinct
+  values; a text column's has the ten most frequent values.
 - A result is cut at 64,000 rows or at 10 MB of row data; the banner says which limit cut it. The product's "MB"
   is MiB: 10 MB is 10,485,760 bytes.
 - A download re-runs the query. If the data changed since the run, the file shows the new data.

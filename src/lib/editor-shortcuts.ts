@@ -5,6 +5,9 @@
  * extensions in `use-query-studio.ts`: the `Mod-Enter` binding from the
  * hook itself, and the bindings from `basicSetup` in `sql-editor.tsx`
  * (`defaultKeymap`, `searchKeymap`, `foldKeymap`, `completionKeymap`).
+ * The fold and unfold entries are also matched by key code in `sql-editor.tsx`,
+ * so a browser that reports `[` for Ctrl+Shift+[ still folds (QS-1 QA of
+ * 2026-11-05).
  * The test in `keyboard-shortcuts.test.tsx` checks every entry here against
  * the keymap that is actually installed in the editor, so a typo or drift
  * is caught at test time.
