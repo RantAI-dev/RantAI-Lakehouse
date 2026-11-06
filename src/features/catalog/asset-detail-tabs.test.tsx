@@ -483,7 +483,10 @@ describe("Activity tab", () => {
     expect(within(row).getByText("+2,000")).toBeTruthy()
     expect(within(row).getByText("248842615326512766")).toBeTruthy()
     const href = within(row).getByText("Query this version").closest("a")?.getAttribute("href") ?? ""
-    expect(decodeURIComponent(href)).toContain("iceberg_snapshot_id+=+248842615326512766")
+    // A Bronze table opens on Trino, pinned on its own reference.
+    const params = new URL(href, "http://x").searchParams
+    expect(params.get("engine")).toBe("trino")
+    expect(params.get("sql")).toContain("FROM iceberg.bronze.demo_orders FOR VERSION AS OF 248842615326512766")
   })
 
   it("says how far back versions go from the list itself, with no day count (DATA-16 D2)", async () => {
@@ -2190,6 +2193,35 @@ describe("Access tab: enforcing and deleting a policy", () => {
     await screen.findByText("Open access rules")
     expect(screen.queryByRole("button", { name: "Enforce" })).toBeNull()
     expect(screen.queryByLabelText("Delete policy mask-amount")).toBeNull()
+  })
+})
+
+describe("Overview: the starter query", () => {
+  const useData = async () =>
+    (await screen.findByText("Use this data")).closest("[data-slot=card]") as HTMLElement
+
+  it("says Trino and opens Query Studio on Trino for a Bronze table the API can read", async () => {
+    stubApi()
+    renderTabs()
+
+    const card = await useData()
+    expect(within(card).getByText(/^A starter query for Trino\./)).toBeTruthy()
+    const href = within(card).getByText("Open in Query Studio").closest("a")?.getAttribute("href") ?? ""
+    expect(new URL(href, "http://x").searchParams.get("engine")).toBe("trino")
+    expect(within(card).getByText(/FROM iceberg\.bronze\.demo_orders/)).toBeTruthy()
+  })
+
+  it("says ClickHouse for the Silver model that stands in for a Bronze table", async () => {
+    stubApi()
+    renderTabs({
+      ...BRONZE,
+      queryTarget: { engine: "clickhouse", table: "silver.`demo_orders`", policyTable: "silver.demo_orders" },
+    })
+
+    const card = await useData()
+    expect(within(card).getByText(/^A starter query for ClickHouse\./)).toBeTruthy()
+    const href = within(card).getByText("Open in Query Studio").closest("a")?.getAttribute("href") ?? ""
+    expect(new URL(href, "http://x").searchParams.get("engine")).toBe("clickhouse")
   })
 })
 
