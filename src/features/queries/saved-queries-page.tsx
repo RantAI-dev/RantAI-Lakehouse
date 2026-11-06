@@ -36,7 +36,7 @@ import { getSavedQueryColumns, TagPills } from "./saved-query-columns"
  * The level the caller holds on the trash.
  *
  * The server's trash holds only the queries the caller may edit — the same
- * set that may delete and restore one (plan 55 D5, decision 6) — so the
+ * set that may delete and restore one (`QS-3` review of #382) — so the
  * console shows a Restore for what the server sent and does not filter the
  * list again (C2).
  */
@@ -110,7 +110,7 @@ export function SavedQueriesPage() {
   // below are built once and not on every render.
   const { run: runDuplicate } = duplicateAct
   const { run: runMove, reset: resetMove } = moveAct
-  const { run: runDelete } = deleteAct
+  const { run: runDelete, reset: resetDelete } = deleteAct
   const { reload } = state
 
   const columns = React.useMemo(
@@ -128,10 +128,14 @@ export function SavedQueriesPage() {
           setMoving(query)
         },
         onHistory: (query) => setHistoryFor(query),
-        onDelete: (query) => setDeleting(query),
+        onDelete: (query) => {
+          // The dialog shows the last refusal; it belonged to an earlier attempt.
+          resetDelete()
+          setDeleting(query)
+        },
         onShare: (query) => setSharing(query),
       }),
-    [runDuplicate, reload, resetMove],
+    [runDuplicate, reload, resetMove, resetDelete],
   )
 
   const rawData = React.useMemo(() => state.data ?? [], [state.data])

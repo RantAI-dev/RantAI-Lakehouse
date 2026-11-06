@@ -56,7 +56,7 @@ recorded the same way; the chat's `run_sql` is not recorded, as today.
 | 5 | The filters run on the server, extending the existing `GET /api/query/history` with query parameters; no new route. Pages are numbered, 50 rows per page, newest first: the request takes `page` (1-based) and the answer is `{ runs, total, page, pageSize }`. The page shows Previous, numbered buttons, Next and "Page N of M"; there is no "Load more" | 50 per page | Owner, 2026-10-24; changed: Owner, 2026-11-05 |
 | 6 | The side panel stays as it is (the last runs, now including failed ones) with a "View all" link to the page | none | Owner, 2026-10-24 |
 | 7 | The table filter matches a table name containing the text typed, case-insensitive | none | Owner, 2026-10-24 |
-| 8 | Bronze tables in the editor (`QS-1` review fix): a Bronze table has two names. The ClickHouse name the server sends (`queryTarget`) stays for the catalog page, the policy and the starter SQL. Its Trino name, `iceberg.bronze.<table>`, is built from the table's detail (on expand, or when the statement names it). A Trino tab inserts the Trino name from the schema browser and from the autocomplete, and after `FROM iceberg.bronze.<table> b` the alias `b.` offers that table's columns. A ClickHouse tab inserts and offers no Bronze table; the table's row says "Bronze tables are read with Trino: switch this tab to Trino to insert it.", also before its detail has loaded | none | Owner, 2026-10-24; changed: Owner, 2026-11-05 |
+| 8 | Bronze tables in the editor (`QS-1` review fix): a Bronze table has two names. The ClickHouse name the server sends (`queryTarget`) stays for the catalog page, the policy and the starter SQL. Its Trino name, `iceberg.bronze.<table>`, is built from the table's detail (on expand, or when the statement names it). A Trino tab inserts the Trino name from the schema browser and from the autocomplete, and after `FROM iceberg.bronze.<table> b` the alias `b.` offers that table's columns. A ClickHouse tab inserts and offers no Bronze table; the table's row says "Bronze tables are read with Trino: switch this tab to Trino to insert it.", also before its detail has loaded. The catalog's "Open in Query Studio" and snapshot links for a Bronze table open a Trino tab for `iceberg.bronze.<table>` | none | Owner, 2026-10-24; changed: Owner, 2026-11-05; changed: Owner, 2026-11-06 |
 
 ## Limits to tell a customer
 
@@ -65,8 +65,7 @@ recorded the same way; the chat's `run_sql` is not recorded, as today.
 - A failed Trino run recorded before the classification keeps its old message, which can hold the engine's first line. Failed ClickHouse runs from before it show the same default sentence, not their cause. Both age out of the 14-day window.
 - History covers 14 days. Runs from before this release have no table list, so the table filter misses them.
 - A `DESCRIBE` or `SHOW COLUMNS FROM` statement records the table it names. A `SHOW TABLES` statement records no table.
-- A Bronze table's name is known once its detail is loaded, so the first suggestion for a new Bronze table may wait
-  for that request.
+- On a Trino tab, an alias on `iceberg.bronze.<table>` offers no columns until the table's detail loads, when the table's registry id differs from its table name.
 - An alias on a quoted Bronze table name, one whose table name is not a plain identifier (for example
   `iceberg.bronze."order lines" b`), does not resolve its columns. The name is still inserted.
 - History is per user, not per tenant: a user who changes tenant still sees their own earlier runs from the

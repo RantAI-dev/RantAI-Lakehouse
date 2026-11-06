@@ -71,8 +71,10 @@ answer, not while the API is still applying migrations. The console's
 `/api/*` proxy target is baked into its image at build time
 (`RUST_API_URL`, the `lakehouse-api` service's address on the compose
 network); `CONSOLE_INTERNAL_URL` is the address the OTHER way round (the
-console as the PDF renderer reaches it), and it is empty by default — set
-it to `http://console:3000` to switch the PDF export on in this stack.
+console as the PDF renderer reaches it). It defaults to
+`http://console:3000` (`REL-18`), so dashboard PDFs work without setting
+anything; `RENDER_TOKEN_SECRET` is the one PDF setting a fresh install
+still needs, and `sh ops/init-env.sh` generates it.
 
 `rustfs`, `lakekeeper`, and their bootstrap jobs are **still not called
 from any `lakehouse-api` route as of P6** — see the module map in
@@ -405,20 +407,28 @@ scripts/compose.sh --profile dagster up -d --build \
   lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 ```
 
-`lakehouse-api`'s own default (`http://dagster.invalid:13030/graphql`) is a
-deliberately-unreachable placeholder (see the service definition's comment),
-so pipeline routes stay `503` unless an operator opts in explicitly.
+`lakehouse-api`'s own compose default is the in-network service name
+(`http://dagster-webserver:3000/graphql`, `REL-19` review R1), so with the
+`dagster` profile up the API reaches the webserver without any setting at
+all. Without that profile the name does not resolve, so the same routes
+still answer `503` — the degradation the API is built for (see the service
+definition's comment).
 
 **Why `.env` and not a one-off `VAR=… docker compose up`:** a later
 `docker compose run` (for example the `g3a-test-runner`) re-creates
 `lakehouse-api` as part of resolving its `depends_on` chain. A value that
 existed only in the environment of the earlier `up` invocation is not
-present for that re-creation, so the container comes back on the
-`dagster.invalid` default and every Dagster-backed route silently reverts to
-`503`. This was observed as `GET /api/governance/audit` returning
+present for that re-creation, so the container comes back on compose's
+default and every Dagster-backed route silently reverts to `503`. This was
+observed as `GET /api/governance/audit` returning
 `503 {"error":"Error: fetch failed"}` mid-way through an otherwise-passing
 G3a run — the ingest itself succeeded, so the symptom appears only on the
-routes that reach Dagster, not on the ones that read ClickHouse.
+routes that reach Dagster, not on the ones that read ClickHouse. (Back
+then the default was the deliberately-unreachable
+`http://dagster.invalid:13030/graphql` placeholder; since `REL-19` review
+R1 it is the in-network name, so a re-creation finds the webserver again —
+but an operator who points `DAGSTER_URL` somewhere else still needs the
+line in `.env`.)
 
 **Failure mode:** if `dagster-webserver`/`dagster-code-location` are down,
 `lakehouse-dagster::DgClient` calls fail exactly the way they already do
@@ -446,17 +456,23 @@ docker compose -p <project> down -v   # tear down when done
 **`LAKEKEEPER_BASE_URI` gotcha, specific to dlt/pyiceberg (not just
 ClickHouse's DNS quirk above).** pyiceberg's `RestCatalog` honors the
 canonical catalog URI Lakekeeper reports in its own `/v1/config` response
-(driven by `LAKEKEEPER__BASE_URI`) for every subsequent call. If
-`LAKEKEEPER_BASE_URI` is left at its host-facing default
-(`http://localhost:8181`), a catalog client running **inside** the
-compose network (the dlt pipeline, in `dagster-code-location`) times out
-resolving/connecting to that address — this was reproduced directly
-during P3 verification. `docker-compose.yml`'s own defaults are
-unaffected in the default (non-`dagster`) stack; when bringing up the
-`dagster` profile, set `LAKEKEEPER_BASE_URI=http://lakekeeper:8181`
-(matching the compose-internal name), exactly as `.github/workflows/
-ci.yml`'s `g1-rustfs`/`g2-seaweedfs`/`g3a-dagster` jobs already do for
-the same underlying reason.
+(driven by `LAKEKEEPER__BASE_URI`) for every subsequent call, and so does
+the Rust client `iceberg-catalog-rest` the API itself uses. Both defaults
+are therefore the in-network name (`http://lakekeeper:8181`, `REL-19`
+review R1): the clients of this stack all run inside the compose network,
+and a client that is handed `http://localhost:8181` fails there — measured
+on a running stack with only the advertised URI changed:
+`GET /api/lakehouse/namespaces` answers 503 ("lakehouse catalog
+unavailable") and `POST /api/gold/export/{mart}` answers 500 ("The catalog
+request failed"), because the client switched to the advertised
+`localhost:8181` (`error sending request for url
+(http://localhost:8181/catalog/v1/.../namespaces)` in the API log). With the
+in-network value: 200 and 200. A client on
+the HOST (a `pyiceberg` run outside the network, the G1 test in its
+host-side form) needs the host mapping instead: set
+`LAKEKEEPER_BASE_URI=http://localhost:8181` in `.env` before
+`docker compose up`. The same reasoning is why `.github/workflows/
+ci.yml`'s jobs and `.env.staging` name the in-network value explicitly.
 
 ### Pipeline-failure alerts (plan 1e)
 
@@ -651,8 +667,8 @@ Iceberg table. What that asks of the operator:
   bucket root (`client.list_with_delimiter(None)`), so a credential limited
   to `uploads/` can store files but would show that tile as failing; that is
   the cost of the narrower grant, not a fault. Whether the pinned RustFS can mint
-  such an identity is the open question the `CONNECTOR_S3_*` note in
-  `.env.example` records; for a throwaway local stack you may set the two
+  such an identity is the open question `docs/CONFIGURATION.md` records
+  under `CONNECTOR_S3_ACCESS_KEY`; for a throwaway local stack you may set the two
   to the same value as `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`. A
   `docker compose up` with these settings was not run for this document.
 - **`ICEBERG_QUERY_DB` must be set**, because a load into a table name that
@@ -1003,8 +1019,8 @@ Instead of typing a password, a connector can reference a secret in the
 installation's secret manager. One manager per installation:
 
 - `SECRET_MANAGER` = `vault`, `aws`, `gcp` or `azure`, plus that manager's
-  sign-in for the API and the orchestrator (`.env.example` lists each:
-  Vault address and token or AppRole; AWS region and role or keys; a
+  sign-in for the API and the orchestrator (`docs/CONFIGURATION.md` lists
+  each: Vault address and token or AppRole; AWS region and role or keys; a
   Google service-account file, mounted into both services, or the
   platform identity; Azure tenant and client, or a managed identity).
 - **`SECRET_MANAGER_ALLOWED_PREFIXES` is required for references to work.**
@@ -1432,8 +1448,7 @@ answers that.
 | Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay; for a relay behind a private CA, set `SMTP_CA_FILE` as well (see "Email through an internal relay" above) |
-| Dashboard PDF export and PDF report attachments (`BI-1`, `RPT-1`) | The `gotenberg` service (runs by default), `CONSOLE_INTERNAL_URL`, `RENDER_TOKEN_SECRET` | The PDF item says "PDF export is not set up on this deployment"; the browser's print still works. Excel, CSV and PNG downloads are not affected | Set `CONSOLE_INTERNAL_URL=http://console:3000` and a `RENDER_TOKEN_SECRET` (`sh ops/init-env.sh` generates one) in `.env`, then `docker compose up -d lakehouse-api gotenberg` so both re-read it (`REL-18` makes the address the default) |
-| Scheduled reports by email (`RPT-1`) | SMTP, plus the PDF row above for PDF attachments | A subscription can be saved but nothing is sent | Set `SMTP_HOST` (and friends) and `CONSOLE_PUBLIC_URL` (the link in the email) |
+| Scheduled reports by email (`RPT-1`) | SMTP, plus `RENDER_TOKEN_SECRET` for PDF attachments | A subscription can be saved but nothing is sent | Set `SMTP_HOST` (and friends) and `CONSOLE_PUBLIC_URL` (the link in the email) |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs); `OIDC_JWKS_URL` is optional — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 

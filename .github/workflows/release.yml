@@ -2138,11 +2138,11 @@ jobs:
           # The tenant ROW is written here, and not through `POST
           # /api/identity/tenants`, because that route PROVISIONS a tenant:
           # it drives a Lakekeeper warehouse create and a set of grants
-          # (`routes::identity::provision_tenant`), and the API container
-          # of a release install cannot reach Lakekeeper at all — the
-          # install's `.env` names the host-facing
-          # `LAKEKEEPER_BASE_URI=http://localhost:8181` (`.env.example`),
-          # and `localhost` inside the API container is the API itself. The
+          # (`routes::identity::provision_tenant`), and a release install
+          # runs no Lakekeeper to create them — the install's `.env` names
+          # no `LAKEKEEPER_BASE_URI`, and the `lakekeeper` service is not
+          # part of a release install at all, so the API container has no
+          # Lakekeeper to reach. The
           # proof needs the tenant ROW, not a warehouse, and a tenant that
           # is not on the provisioning state machine says so
           # (`provisioning_status = 'not_applicable'`, the state the seeded

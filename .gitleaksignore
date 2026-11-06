@@ -112,3 +112,14 @@ b9c71cb33dd7f90d4bbf071a8ee282478117e8e4:docs/superpowers/plans/2026-10-08-sec-1
 # still turns the scan red.
 d16d0082c42c84c79128dc186f55dbe3379c46bc:src/features/admin/users-page.test.tsx:generic-api-key:46
 d16d0082c42c84c79128dc186f55dbe3379c46bc:src/features/admin/users-page.test.tsx:generic-api-key:47
+
+# Fixed dummy values in `ops/release/env-example-equivalence.sh` (REL-19),
+# used only to fill compose's five must-set variables when two templates are
+# compared; never a credential anywhere. Replaced by plain words at the
+# branch head (`not-a-secret-*`) and redacted from the plan's quoted output;
+# these two commits still carry the old values in history, which is never
+# rewritten. Lines 48 and 50 are the dummy RustFS secret and connector key;
+# plan line 303 quoted the compose output holding the RustFS one. PR #406.
+4ca4836c65d9bbcdea16acf8a290bd3b06f05085:ops/release/env-example-equivalence.sh:generic-api-key:48
+4ca4836c65d9bbcdea16acf8a290bd3b06f05085:ops/release/env-example-equivalence.sh:generic-api-key:50
+85738c2aa3431c1102b2efa7307922417be4ebb0:docs/superpowers/plans/2026-11-06-rel-19-env-cleanup.md:generic-api-key:303

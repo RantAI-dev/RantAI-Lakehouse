@@ -599,7 +599,8 @@ fn the_scan_flags_the_shapes_the_audit_found() {
 
 #[test]
 fn the_scan_flags_the_query_author_exception_wherever_it_is_called() {
-    let line = "        .map_err(|e| upstream_error::ch_error_for_author(&DATABASE, &e))?;";
+    let line =
+        "        .map_err(|e| upstream_error::ch_failure_for_author(&DATABASE, &e).response)?;";
     assert_eq!(scan("dashboard.rs", line).len(), 1);
 }
 
