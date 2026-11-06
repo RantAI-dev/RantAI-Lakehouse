@@ -215,7 +215,7 @@ describe("the saved-queries console", () => {
     expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeDefined()
     expect(screen.getByRole("menuitem", { name: "Delete" })).toBeDefined()
     // A move needs **manage**: an editor changes the query, not where it
-    // is seen from (plan 60 D8).
+    // is seen from (`QS-3` review of #382).
     expect(menuItems("Move")).toBe(0)
   })
 
@@ -680,7 +680,7 @@ describe("the saved-queries console", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Quarterly" }))
 
     // A folder move changes who sees everything inside it: it needs
-    // **manage**, where a rename needs **edit** (plan 60 D8).
+    // **manage**, where a rename needs **edit** (`QS-3` review of #382).
     expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeDefined()
     expect(menuItems("Move")).toBe(0)
   })

@@ -722,7 +722,7 @@ impl AccessItem {
 ///
 /// A personal space is left out of the chain: the resolver ignores a rule
 /// stored on one (`resolve_level`, `QS-3` review of #382), so listing it
-/// would show access that grants nothing (plan 60 review S1).
+/// would show access that grants nothing (`QS-3` review of #382, follow-up).
 ///
 /// A chain that cannot be built is corrupt data, and corrupt data
 /// inherits nothing.
@@ -761,7 +761,7 @@ fn chain_of(map: &FolderMap, item: AccessItem) -> Vec<Uuid> {
 /// chain the resolver used to decide the level. The list names a folder
 /// only when the resolver reads its rules: a rule stored on a personal
 /// space grants nothing, so it is listed neither as inherited nor as the
-/// space's own (plan 60 review S1).
+/// space's own (`QS-3` review of #382, follow-up).
 async fn access_list(
     pool: &PgPool,
     viewer: &queries::SavedQueryViewer,
@@ -1389,7 +1389,7 @@ pub struct PatchFolderBody {
 /// across the two writes, so two things between them leave the folder moved
 /// and not renamed: a database failure, and a concurrent request that
 /// creates or renames a sibling to the same name, which makes the rename
-/// answer 409 (plan 60 review S2). The store judges the move by the
+/// answer 409 (`QS-3` review of #382, follow-up). The store judges the move by the
 /// folder's current name, so a body that moves a folder under a sibling of
 /// its current name and renames it to a free one at the same time is
 /// refused as a duplicate; two requests do it. The answer is the folder as

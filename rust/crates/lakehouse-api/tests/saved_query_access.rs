@@ -3303,7 +3303,7 @@ async fn an_edit_grantee_is_refused_the_access_lists_and_a_folder_delete() {
     );
 }
 
-// ── A move needs manage (`QS-3` review of #382, plan 60) ─────────────────
+// ── A move needs manage (`QS-3` review of #382) ─────────────────
 
 /// The folder with `id` in the tree the caller sees, or a panic when it is
 /// not there.
@@ -3534,7 +3534,7 @@ async fn an_edit_holder_cannot_move_a_query_into_a_folder_of_their_own() {
     assert_eq!(error(&found), QUERY_NOT_FOUND);
 }
 
-/// Review scenario (a) as the review wrote it (plan 60 review P1): the
+/// Review scenario (a) as the review wrote it (`QS-3` review of #382, follow-up): the
 /// folder `X` sits in Rina's PERSONAL space, under `Weekly`, and Rina
 /// herself puts her query into it. Reza, who created `X` and manages it,
 /// holds only edit on that query through the rule on `Weekly`. Moving `X`
@@ -4049,9 +4049,9 @@ async fn a_rule_stored_on_a_personal_space_opens_nothing() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
-/// The access list names only rules that grant something (plan 60 review
-/// S1). A rule stored on a personal space gives nobody anything, so the
-/// list of a query, of a folder inside the space and of the space itself
+/// The access list names only rules that grant something (`QS-3` review of
+/// #382, follow-up). A rule stored on a personal space gives nobody anything,
+/// so the list of a query, of a folder inside the space and of the space itself
 /// does not show it. CONTROL: a rule on a folder inside the space still
 /// shows as inherited on what sits below that folder.
 #[tokio::test]

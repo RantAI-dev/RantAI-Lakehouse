@@ -209,7 +209,7 @@ export function getSavedQueryColumns(
                   </DropdownMenuItem>
                 ) : null}
                 {/* A move changes who can see the query, so it needs
-                    **manage**, as the server's rule does (plan 60 D1). */}
+                    **manage**, as the server's rule does (`QS-3` review of #382). */}
                 {levelAtLeast(query.level, "manage") ? (
                   <DropdownMenuItem onClick={() => onMove(query)}>
                     <FolderInputIcon className="size-3.5" data-icon="inline-start" />
