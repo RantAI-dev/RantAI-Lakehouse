@@ -15,6 +15,9 @@
 //!   own, each by itself (`ADM-9 review R4`): the field is the server's,
 //!   the console's saved value of it is not used, and a save that sends it
 //!   is refused with a 409;
+//! * a deployment whose environment is built the way `docker-compose.yml`
+//!   builds it — the four variables present and empty — may set the
+//!   console's own address and port (`ADM-9 review R6`);
 //! * the address must be `https://` and must not point inside the
 //!   deployment's network (plan D13);
 //! * every save writes one audit row, naming the fields that changed and
@@ -45,6 +48,10 @@ const SET_BY_THE_SERVER: &str =
 const ASSISTANT: &str = "/api/settings/assistant";
 /// The assistant test route.
 const ASSISTANT_TEST: &str = "/api/settings/assistant/test";
+/// The email settings route. It is here for one case only: the four
+/// variables of `ADM-9 review R6` are ONE deployment's environment, so the
+/// case that proves the console may set them asks both routes.
+const EMAIL: &str = "/api/settings/email";
 
 /// The provider address the tests save. `localhost` resolves without a DNS
 /// lookup, so the address check never needs a network — and the deployment's
@@ -545,4 +552,79 @@ async fn a_field_that_is_not_sent_keeps_its_value_and_null_clears_it() {
     .await;
     assert_eq!(status, StatusCode::OK, "{cleared}");
     assert_eq!(cleared["key"], json!({"set": false, "source": "default"}));
+}
+
+/// `ADM-9 review R6`: a deployment whose environment is built the way
+/// `docker-compose.yml` builds it — `LLM_URL`, `LLM_MODEL`, `SMTP_PORT`
+/// and `SMTP_FROM` all present and EMPTY — may set the console's own
+/// address and port.
+///
+/// Before the fix an empty value still read as a value, so the environment
+/// owned all four and both fields were read-only on every compose
+/// installation: a save that sent them was refused with a 409 and nothing
+/// was written. The four are one deployment's environment, so this one
+/// case asks both routes — the assistant's address (`ADM-9`) and the
+/// email's port (`ADM-7`).
+#[tokio::test]
+async fn a_deployment_built_the_way_compose_builds_it_may_set_the_address_and_the_port() {
+    let mut env = env_with_internal_hosts();
+    // Exactly what compose passes when the operator set none.
+    env.insert("LLM_URL".to_owned(), String::new());
+    env.insert("LLM_MODEL".to_owned(), String::new());
+    env.insert("SMTP_PORT".to_owned(), String::new());
+    env.insert("SMTP_FROM".to_owned(), String::new());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    // Before anything is saved, the four are the code's own defaults and
+    // the console's to change: the environment says nothing about them.
+    let (status, read) = call(&router, "GET", ASSISTANT, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        read["url"],
+        json!({"value": lakehouse_api::config::DEFAULT_LLM_URL, "source": "default"})
+    );
+    assert_eq!(
+        read["model"],
+        json!({"value": lakehouse_api::config::DEFAULT_LLM_MODEL, "source": "default"})
+    );
+    let (status, read) = call(&router, "GET", EMAIL, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["port"], json!({"value": 587, "source": "default"}));
+    assert_eq!(
+        read["from"],
+        json!({"value": "rantai-lake@localhost", "source": "default"})
+    );
+
+    // The address is the console's to set.
+    let (status, body) = call(
+        &router,
+        "PUT",
+        ASSISTANT,
+        &cookie,
+        r#"{"url":"https://localhost:8443/v1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["url"],
+        json!({"value": CONSOLE_PROVIDER, "source": "console"})
+    );
+
+    // And so is the port.
+    let (status, body) = call(&router, "PUT", EMAIL, &cookie, r#"{"port":2525}"#).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["port"], json!({"value": 2525, "source": "console"}));
+
+    // The reads say the same.
+    let (status, read) = call(&router, "GET", ASSISTANT, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        read["url"],
+        json!({"value": CONSOLE_PROVIDER, "source": "console"})
+    );
+    let (status, read) = call(&router, "GET", EMAIL, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["port"], json!({"value": 2525, "source": "console"}));
 }
