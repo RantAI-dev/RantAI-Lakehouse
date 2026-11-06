@@ -107,10 +107,10 @@ estimate (S, M, L), which the base has no field for.
 | `ADM-4` | Task | An administrator can change a user's roles and tenants and deactivate or reactivate a user: a deactivated user's sessions end at once and every sign-in path refuses them; only a full administrator changes another, nobody deactivates themselves, and a change that would leave no active full administrator is refused (409); every change is audited | Administration & Security | P1 | Done | #348 | Owner QA-1 2026-11-02 |
 | `SEC-57` | Task | The person who asked the assistant for an action may not approve or reject it, the same rule as catalog access (product owner, 2026-11-02): a tool-call approval records who asked (migration `0118`), and one `refuse_own_request` check guards both decide routes | Administration & Security | P1 | Done | #342 | Owner decision 2026-11-02 |
 | `ADM-5` | Feature | Switch modules and connector types off for an installation through `.env` (`LAKEHOUSE_DISABLED_MODULES`, `LAKEHOUSE_DISABLED_CONNECTOR_TYPES`): hidden in the console, the palette, the picker and the assistant, and refused by the API. Spec, feature page and plan on branch `docs/adm-5-hide-modules`; eight decisions wait for the product owner | Administration & Security | P1 | Planned |  | Owner request 2026-11-02 |
-| `ADM-6` | Feature | An administrator sees, in Settings → Deployment, which features are set up (PDF export, email, console address, single sign-on, assistant) and which setting is missing for each one that is off | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
-| `ADM-7` | Feature | Email (mail server, port, security, user, password, sender, console address) set in Settings → Email and used from the next send without a restart, with a test email to the administrator's own address; a value set in `.env` wins and is shown read-only; the password is sealed and never sent back | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
-| `ADM-8` | Feature | Sign-in limits (failed logins, window, lockout, how long sign-in records are kept, longest embed link life) set in Settings → Sign-in, used from the next sign-in. **Blocked by `ADM-7`** | Administration & Security | P2 | Planned |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
-| `ADM-9` | Feature | The assistant's provider address, model and key set in Settings → Assistant with a check button, used from the next message; the address must be `https://` and not internal. **Blocked by `ADM-7`** | Administration & Security | P2 | Planned |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-6` | Feature | An administrator sees, in Settings → Deployment, which features are set up (PDF export, email, console address, single sign-on, assistant) and which setting is missing for each one that is off | Administration & Security | P2 | In Acceptance | #404 | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-7` | Feature | Email (mail server, port, security, user, password, sender, console address) set in Settings → Email and used from the next send without a restart, with a test email to the administrator's own address; a value set in `.env` wins and is shown read-only; the password is sealed and never sent back | Administration & Security | P2 | In Acceptance | #404 | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-8` | Feature | Sign-in limits (failed logins, window, lockout, how long sign-in records are kept, longest embed link life) set in Settings → Sign-in, used from the next sign-in. | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-9` | Feature | The assistant's provider address, model and key set in Settings → Assistant with a check button, used from the next message; the address must be `https://` and not internal. | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
 
 ## Next (P2)
 
@@ -376,9 +376,6 @@ parity), built after it.
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | — | `AI-12` (variables part) |
-| `ADM-7` | Building | — | `ADM-8`, `ADM-9` |
-| `ADM-8` | Planned | `ADM-7` | — |
-| `ADM-9` | Planned | `ADM-7` | — |
 | `AI-11` | Planned | `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
@@ -562,8 +559,8 @@ set by the product owner and are left empty until they are.
 | `SEC-55` | 2026-11-04 | 2026-11-04 | |
 | `DATA-39` | 2026-11-01 | data part 2026-11-01; assistant part 2026-11-04 | |
 | `ADM-5` | 2026-11-02 |  | |
-| `ADM-6` | 2026-11-06 |  | |
-| `ADM-7` | 2026-11-06 |  | |
+| `ADM-6` | 2026-11-06 | 2026-11-06 | |
+| `ADM-7` | 2026-11-06 | 2026-11-06 | |
 | `ADM-8` | 2026-11-06 |  | |
 | `ADM-9` | 2026-11-06 |  | |
 | `REL-18` | 2026-11-06 |  | |
