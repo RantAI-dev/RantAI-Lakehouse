@@ -513,46 +513,110 @@ fn looks_like_address(text: &str) -> bool {
     }
 }
 
-/// Logs `raw` under a fresh reference and returns the author's message: the
-/// trimmed diagnosis followed by the reference.
-fn author_message(ctx: &Context, raw: &str) -> String {
+/// Logs `raw` under a fresh reference and returns the author's message (the
+/// trimmed diagnosis followed by the reference) and the reference itself.
+fn author_message(ctx: &Context, raw: &str) -> (String, String) {
     let failure = report(ctx, Class::Failed, &raw);
-    format!(
-        "{} Reference: {}",
-        author_diagnosis(raw),
-        failure.reference()
+    let reference = failure.reference().to_owned();
+    (
+        format!("{} Reference: {reference}", author_diagnosis(raw)),
+        reference,
     )
 }
 
-/// [`ch_error`] for the person who wrote the statement: a statement error
-/// (see [`is_statement_error`]) is shown as the trimmed diagnosis and a
-/// reference at `422`; anything else (unreachable, timeout, a non-query
-/// failure) is the fixed message exactly as [`ch_error`] gives it.
-#[must_use]
-pub fn ch_error_for_author(ctx: &Context, err: &ChError) -> ApiError {
-    match err {
-        ChError::Server(text) if is_statement_error(text) => {
-            ApiError::Unprocessable(author_message(ctx, text))
-        }
-        _ => ch_error(ctx, err),
-    }
-}
-
-/// [`ch_error_for_author`] returning the message instead of an [`ApiError`],
-/// for the cost estimate, which answers `200` with the message in `error`.
+/// [`ch_failure_for_author`] returning the message instead of an
+/// [`ApiError`], for the cost estimate, which answers `200` with the message
+/// in `error`.
 #[must_use]
 pub fn ch_message_for_author(ctx: &Context, err: &ChError) -> String {
     match err {
-        ChError::Server(text) if is_statement_error(text) => author_message(ctx, text),
+        ChError::Server(text) if is_statement_error(text) => author_message(ctx, text).0,
         _ => report_ch(ctx, err).to_string(),
     }
 }
 
-/// The same for an engine that already told statement errors from outages
-/// (`Trino`'s `TrinoError::Query`): `raw` is the engine's query-error text.
+/// The sentence a History row keeps for a statement the engine refused, and
+/// the one for every cause this module does not name.
+pub const STATEMENT_FAILED_SENTENCE: &str = "The engine could not run this statement.";
+
+/// The cause of a `ClickHouse` statement error, by the engine's own error
+/// code, as one fixed sentence (`QS-4` QA, 2026-11-05: History keeps a
+/// classified message, never the engine's text or a catalog name).
+///
+/// The codes: `60` `UNKNOWN_TABLE` and `81` `UNKNOWN_DATABASE`; `47`
+/// `UNKNOWN_IDENTIFIER` and `16` `NO_SUCH_COLUMN_IN_TABLE`; `62`
+/// `SYNTAX_ERROR`; `43` `ILLEGAL_TYPE_OF_ARGUMENT`, `53` `TYPE_MISMATCH` and
+/// `386` `NO_COMMON_TYPE`; `241` `MEMORY_LIMIT_EXCEEDED`. Any other code is
+/// [`STATEMENT_FAILED_SENTENCE`].
+const fn clickhouse_statement_sentence(code: Option<u32>) -> &'static str {
+    match code {
+        Some(60 | 81) => "This query reads a table that does not exist or that you cannot read.",
+        Some(47 | 16) => "This query names a column that does not exist.",
+        Some(62) => "The statement could not be read: check its syntax.",
+        Some(43 | 53 | 386) => "A value in this query has the wrong type.",
+        Some(241) => "The query needed more memory than it is allowed.",
+        _ => STATEMENT_FAILED_SENTENCE,
+    }
+}
+
+/// A statement the engine refused, as the two messages that must not drift
+/// apart: what the response tells the author and what the History row keeps.
+///
+/// Both carry the same `Reference: <id>`, so a History row, the response the
+/// author saw and the log line match.
+#[derive(Debug)]
+pub struct StatementFailure {
+    /// The response: for a statement error the author's diagnosis (see
+    /// [`ch_failure_for_author`]), for anything else the fixed message.
+    pub response: ApiError,
+    /// The History row's message: the cause as a fixed sentence, then the
+    /// reference. No engine text, no catalog name (`AGENTS.md` principle 4).
+    pub recorded: String,
+}
+
+/// [`ch_error`] for the person who wrote the statement, with the message
+/// History keeps beside it.
+///
+/// A statement error (see [`is_statement_error`]) is shown to the author as
+/// the trimmed diagnosis and a reference at `422`. It is logged once, and
+/// its reference goes into both messages; `recorded` is the sentence for its
+/// error code. Anything else (unreachable engine, timeout, a non-query
+/// failure) is the fixed message in both, exactly as [`ch_error`] gives it.
 #[must_use]
-pub fn query_error_for_author(ctx: &Context, raw: &str) -> ApiError {
-    ApiError::Unprocessable(author_message(ctx, raw))
+pub fn ch_failure_for_author(ctx: &Context, err: &ChError) -> StatementFailure {
+    match err {
+        ChError::Server(text) if is_statement_error(text) => {
+            statement_failure(ctx, text, clickhouse_statement_sentence(err.server_code()))
+        }
+        _ => {
+            let response = ch_error(ctx, err);
+            let recorded = response.to_string();
+            StatementFailure { response, recorded }
+        }
+    }
+}
+
+/// The same for `Trino`'s `TrinoError::Query` (`raw` is the engine's
+/// query-error text).
+///
+/// `lakehouse-trino` keeps the message and drops the engine's `errorName`
+/// (`SYNTAX_ERROR`, `TABLE_NOT_FOUND`, ...), so there is no cause to read
+/// here: `recorded` is always [`STATEMENT_FAILED_SENTENCE`] with the
+/// reference. Parsing the message for a cause would be guessing
+/// (`AGENTS.md` principle 2); naming the cause needs `lakehouse-trino` to
+/// carry the name.
+#[must_use]
+pub fn query_failure_for_author(ctx: &Context, raw: &str) -> StatementFailure {
+    statement_failure(ctx, raw, STATEMENT_FAILED_SENTENCE)
+}
+
+/// Logs `raw` once and builds both messages around the one reference.
+fn statement_failure(ctx: &Context, raw: &str, sentence: &str) -> StatementFailure {
+    let (shown, reference) = author_message(ctx, raw);
+    StatementFailure {
+        response: ApiError::Unprocessable(shown),
+        recorded: format!("{sentence} Reference: {reference}"),
+    }
 }
 
 /// What an error enum that mixes our own text with an upstream's becomes.
@@ -953,7 +1017,7 @@ mod tests {
     #[test]
     fn the_author_exception_leaves_an_outage_as_the_fixed_message() {
         let down = ChError::Server("ClickHouse HTTP 503".to_owned());
-        let api = ch_error_for_author(&DATABASE, &down);
+        let api = ch_failure_for_author(&DATABASE, &down).response;
         assert!(
             api.to_string()
                 .starts_with("The database request failed. Reference: ")
@@ -1079,5 +1143,138 @@ mod tests {
         assert!(!api.to_string().contains("planted-marker"), "{api}");
         assert!(log.contains("planted-marker"), "{log}");
         assert!(log.contains("ERROR"), "{log}");
+    }
+
+    /// A `ClickHouse` statement error as the engine words it, with the
+    /// catalog name, a column and a host the History row must never keep.
+    fn engine_statement_error(code: u32) -> ChError {
+        ChError::Server(format!(
+            "Code: {code}. DB::Exception: Unknown table expression identifier 'icecat_api.orders' in scope SELECT secret_col FROM icecat_api.orders, reached via ch-internal.example.net:8123. (SOME_NAME) (version 25.8.1.3 (official build))"
+        ))
+    }
+
+    /// The reference id a message ends with.
+    fn reference_of(message: &str) -> &str {
+        message
+            .rsplit_once("Reference: ")
+            .map(|(_, id)| id)
+            .expect("a message with a reference")
+    }
+
+    #[test]
+    fn each_clickhouse_statement_code_is_recorded_as_its_own_sentence() {
+        for (code, sentence) in [
+            (
+                60,
+                "This query reads a table that does not exist or that you cannot read.",
+            ),
+            (
+                81,
+                "This query reads a table that does not exist or that you cannot read.",
+            ),
+            (47, "This query names a column that does not exist."),
+            (16, "This query names a column that does not exist."),
+            (62, "The statement could not be read: check its syntax."),
+            (43, "A value in this query has the wrong type."),
+            (53, "A value in this query has the wrong type."),
+            (386, "A value in this query has the wrong type."),
+            (241, "The query needed more memory than it is allowed."),
+        ] {
+            let failure = ch_failure_for_author(&DATABASE, &engine_statement_error(code));
+            let reference = reference_of(&failure.recorded).to_owned();
+            assert_eq!(
+                failure.recorded,
+                format!("{sentence} Reference: {reference}"),
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_this_module_does_not_name_is_recorded_as_the_default_sentence() {
+        let failure = ch_failure_for_author(&DATABASE, &engine_statement_error(999));
+        let reference = reference_of(&failure.recorded).to_owned();
+        assert_eq!(
+            failure.recorded,
+            format!("The engine could not run this statement. Reference: {reference}")
+        );
+    }
+
+    #[test]
+    fn the_response_and_the_record_share_one_reference_and_the_response_keeps_the_diagnosis() {
+        let (failure, log) =
+            with_captured_log(|| ch_failure_for_author(&DATABASE, &engine_statement_error(60)));
+        let response = failure.response.to_string();
+        assert!(matches!(failure.response, ApiError::Unprocessable(_)));
+        assert!(response.contains("Code: 60. DB::Exception"), "{response}");
+        assert_eq!(
+            reference_of(&response),
+            reference_of(&failure.recorded),
+            "{response} / {}",
+            failure.recorded
+        );
+        assert!(
+            log.contains(reference_of(&failure.recorded)),
+            "the raw error is logged under that reference: {log}"
+        );
+        assert_eq!(
+            log.matches("upstream request failed").count(),
+            1,
+            "one failure is logged once: {log}"
+        );
+    }
+
+    #[test]
+    fn the_record_carries_no_engine_text_and_no_catalog_name() {
+        for code in [60, 47, 62, 43, 241, 999] {
+            let failure = ch_failure_for_author(&DATABASE, &engine_statement_error(code));
+            for gone in [
+                "Code:",
+                "DB::Exception",
+                "icecat_api",
+                "orders",
+                "secret_col",
+                "ch-internal",
+                "version",
+                "SOME_NAME",
+            ] {
+                assert!(
+                    !failure.recorded.contains(gone),
+                    "code {code}: {gone} in {}",
+                    failure.recorded
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_outage_is_recorded_as_the_fixed_message_the_response_carries() {
+        let down = ChError::Server("ClickHouse HTTP 503".to_owned());
+        let failure = ch_failure_for_author(&DATABASE, &down);
+        assert!(
+            failure
+                .recorded
+                .starts_with("The database request failed. Reference: "),
+            "{}",
+            failure.recorded
+        );
+        assert_eq!(failure.recorded, failure.response.to_string());
+        assert!(!failure.recorded.contains("503"));
+    }
+
+    #[test]
+    fn a_trino_statement_error_is_recorded_as_the_default_sentence_with_its_reference() {
+        let raw = "line 1:15: Table 'icecat.api.orders' does not exist";
+        let (failure, _log) = with_captured_log(|| query_failure_for_author(&DATABASE, raw));
+        let response = failure.response.to_string();
+        assert!(response.contains("does not exist"), "{response}");
+        assert_eq!(reference_of(&response), reference_of(&failure.recorded));
+        assert_eq!(
+            failure.recorded,
+            format!(
+                "The engine could not run this statement. Reference: {}",
+                reference_of(&response)
+            )
+        );
     }
 }

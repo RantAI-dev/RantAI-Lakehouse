@@ -438,7 +438,7 @@ pub struct HistoryMention {
     pub owner_id: Option<Uuid>,
     /// When it ran, ISO 8601.
     pub at: String,
-    /// `completed | failed | cancelled | blocked`.
+    /// `completed | failed | stopped | blocked`, or `cancelled` on a row an older build wrote.
     pub status: String,
     /// How long it took, in milliseconds.
     pub duration_ms: i64,
@@ -1184,7 +1184,8 @@ pub struct QueryHistoryItem {
     pub user: String,
     /// When the query ran, ISO 8601.
     pub at: String,
-    /// `"completed" | "failed" | "cancelled" | "blocked"`.
+    /// `"completed" | "failed" | "stopped" | "blocked"`, or `"cancelled"` on
+    /// a row an older build wrote (`0127_query_history_stopped.sql`).
     pub status: String,
     /// Wall-clock execution time. Serializes as `durationMs`.
     pub duration_ms: i64,
@@ -1279,9 +1280,9 @@ impl From<QueryHistoryRow> for QueryHistoryItem {
 /// and the page's first view: the newest page of the last 14 days.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HistoryFilter<'a> {
-    /// `completed | failed | cancelled | blocked` — the statuses the
-    /// table's own check allows. The route rejects anything else with a
-    /// 400 before this is built.
+    /// `completed | failed | stopped | blocked` — the statuses `run`
+    /// records. The route rejects anything else (`cancelled`, which only
+    /// older rows carry, included) with a 400 before this is built.
     pub status: Option<&'a str>,
     /// `clickhouse | trino` — the engines `run` records. The route
     /// rejects anything else with a 400 before this is built.
@@ -1470,7 +1471,7 @@ pub struct RecordHistoryInput<'a> {
     /// The user the row belongs to. `None` for a run with no authenticated
     /// caller, which [`list_history`] then shows to nobody.
     pub owner_id: Option<Uuid>,
-    /// `"completed" | "failed" | "cancelled" | "blocked"`.
+    /// `"completed" | "failed" | "stopped" | "blocked"`.
     pub status: &'a str,
     /// Wall-clock execution time, in milliseconds.
     pub duration_ms: i64,
