@@ -34,6 +34,7 @@ once a first release is tagged.
 - The assistant reads back the chart's definition after a chart draft or save, says when a call was refused, and never ends a turn with an empty answer (backlog `AI-6`).
 - The chat shows `Saved: <title>` (or `Not saved: <error>`) under a reply once its draft is confirmed, as the console's own status line; the model's text is not edited and the line is not sent back to the model (backlog `AI-6`).
 - The assistant's prompt gains five rules: a map by a region name (province, city, country) is a `geomap`, and a point or heat map only for coordinates or when the person asks for one; a field that `describe_mart` does not list is checked with `list_calculated_fields` before the assistant says it is missing; a person who cannot change dashboards gets the refusal before any analysis; "Which queries are running right now?" offers `list_workloads`, and a count of running queries comes only from that tool, with no count when it fails; a question about a timeout is answered from `get_query_limits`, with no SQL against `system.*` tables (backlog `AI-4`, `AI-6`, `AI-15`).
+- The assistant's tool descriptions are shorter. A build turn offers 56 tools in 57,764 characters, down from 59,753, under the 60,000 bar (backlog `AI-15`).
 
 ## [0.2.1] - 2026-11-04
 
