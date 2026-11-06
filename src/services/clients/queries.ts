@@ -16,7 +16,8 @@ import type {
   SavedQueryVersion,
   QueryFolder,
   GranteeList,
-  QueryHistoryItem,
+  QueryHistoryFilter,
+  QueryHistoryPage,
   QuerySchedulingCapability,
   NlAnswer,
   QueryEngine,
@@ -297,6 +298,12 @@ async function download(
   };
 }
 
+/** `GET /api/query/history`: one numbered page with the total (QS-2/QS-4 QA of 2026-11-05). */
+function getHistoryPage(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryPage> {
+  const query = historyQueryString(filter);
+  return get<QueryHistoryPage>(`/api/query/history${query ? `?${query}` : ""}`, signal);
+}
+
 export const clickhouseQueryService: QueryService = {
   // ── real (ClickHouse / Trino) ────────────────────────────────────────────
   run(sql, options, signal) {
@@ -417,9 +424,11 @@ export const clickhouseQueryService: QueryService = {
     const search = params.toString();
     return get<GranteeList>(`/api/query/grantees${search ? `?${search}` : ""}`, signal);
   },
-  listHistory(filter, signal) {
-    const query = historyQueryString(filter);
-    return get<QueryHistoryItem[]>(`/api/query/history${query ? `?${query}` : ""}`, signal);
+  async listHistory(filter, signal) {
+    return (await getHistoryPage(filter, signal)).runs;
+  },
+  listHistoryPage(filter, signal) {
+    return getHistoryPage(filter, signal);
   },
   getSchedulingCapability(signal) {
     return get<QuerySchedulingCapability>("/api/query/scheduling", signal);

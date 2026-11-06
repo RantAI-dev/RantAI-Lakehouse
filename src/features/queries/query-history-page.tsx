@@ -7,7 +7,7 @@ import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/p
 import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { useService, useServiceAction } from "@/hooks/use-service"
+import { useService } from "@/hooks/use-service"
 import { formatDateTime, formatDuration } from "@/lib/format"
 import { HISTORY_PAGE_LIMIT, historyQueryString } from "@/lib/history-query-params"
 import { cn } from "@/lib/utils"
@@ -15,7 +15,18 @@ import { queryService } from "@/services"
 import type { QueryHistoryFilter, QueryHistoryItem } from "@/services/contracts/queries"
 import { QueryStudioTabs } from "./query-studio-tabs"
 
-const STATUSES = ["completed", "failed", "cancelled", "blocked"] as const
+/**
+ * The status pills: the word the person reads and the value the server
+ * filters on. A run stopped with Stop is `stopped`; a policy refusal is
+ * stored as `blocked` and reads "Refused" here (`query-history.md`
+ * decision 3). `cancelled` is not a pill: nothing writes it any more.
+ */
+const STATUSES = [
+  { value: "completed", label: "Completed" },
+  { value: "failed", label: "Failed" },
+  { value: "stopped", label: "Stopped" },
+  { value: "blocked", label: "Refused" },
+] as const
 const ENGINES = ["clickhouse", "trino"] as const
 
 /** The studio link every row carries: the SQL and its engine (QS-4, D1). */
@@ -27,6 +38,22 @@ function studioHref(run: QueryHistoryItem): string {
  * the RFC 3339 the server parses. A date means its UTC day. */
 function dayBound(date: string, edge: "start" | "end"): string {
   return edge === "start" ? `${date}T00:00:00Z` : `${date}T23:59:59.999Z`
+}
+
+/**
+ * The page numbers to draw: the first, the last, and the pages next to
+ * the current one, with `"gap"` where numbers are left out. Seven pages
+ * or fewer are all drawn.
+ */
+function pageNumbers(current: number, last: number): (number | "gap")[] {
+  const shown = new Set([1, last, current - 1, current, current + 1])
+  const numbers = [...shown].filter((n) => n >= 1 && n <= last).sort((a, b) => a - b)
+  const out: (number | "gap")[] = []
+  numbers.forEach((n, i) => {
+    if (i > 0 && n - numbers[i - 1]! > 1) out.push("gap")
+    out.push(n)
+  })
+  return out
 }
 
 /** One pill of the status / engine bars. A native button, pressed or not. */
@@ -59,8 +86,8 @@ function Pill({
 /**
  * Every run this caller made in the last 14 days, filtered, newest first
  * (`QS-4`, D1/D2/D5/D6). The server owns the window and the page size;
- * "Load more" walks backwards with the cursor. A row's SQL opens a new
- * Query Studio tab with the engine it ran on.
+ * the page numbers walk its 1-based `page` (QS-2/QS-4 QA of 2026-11-05).
+ * A row's SQL opens a new Query Studio tab with the engine it ran on.
  */
 export function QueryHistoryPage() {
   const [status, setStatus] = React.useState<QueryHistoryItem["status"] | "all">("all")
@@ -83,67 +110,32 @@ export function QueryHistoryPage() {
   )
   const query = historyQueryString(filter)
 
-  const state = useService((s) => queryService.listHistory(filter, s), [query])
+  // The page number belongs to the question it was chosen under. A new
+  // filter is a new question, so it starts on page 1: the stored page is
+  // reset while rendering (React re-renders at once, with no frame that
+  // asks for the old page under the new filter).
+  const [pageAt, setPageAt] = React.useState({ query, page: 1 })
+  if (pageAt.query !== query) setPageAt({ query, page: 1 })
+  const page = pageAt.query === query ? pageAt.page : 1
+  const goToPage = (next: number) => setPageAt({ query, page: next })
 
-  // "Load more" appends the page before the oldest row shown. A new
-  // filter is a new question, so what an older question appended is
-  // dropped when the query string changes.
-  const [older, setOlder] = React.useState<QueryHistoryItem[]>([])
-  // Whether the newest answer still promises an older page: only a page
-  // of HISTORY_PAGE_LIMIT rows does. A shorter page — including the
-  // first — was the last one, and the button stays hidden.
-  const [lastPageFull, setLastPageFull] = React.useState(false)
-
-  // The older page is a call the person asks for, so it goes through the
-  // action hook: the button reads its pending state, and a refusal
-  // carries the server's sentence.
-  const loadMoreAction = useServiceAction(
-    (signal, nextFilter: QueryHistoryFilter, before: { at: string; id: string }) =>
-      queryService.listHistory({ ...nextFilter, before }, signal),
-  )
-  const { reset: resetLoadMore } = loadMoreAction
-
-  // The question the older page was asked for. The answer arrives after
-  // the render that asked for it, so the question is kept in a ref; it is
-  // written outside the render, never during it.
-  const queryRef = React.useRef(query)
-
-  React.useEffect(() => {
-    // The question changed: what the older question appended is dropped,
-    // the refusal that belonged to it goes with it, and the ref remembers
-    // the new question for the guard in loadMore.
-    queryRef.current = query
-    setOlder([])
-    setLastPageFull(false)
-    resetLoadMore()
-  }, [query, resetLoadMore])
-
-  // The first page lands through the hook, not through loadMore, so its
-  // fullness is read here.
-  React.useEffect(() => {
-    if (state.status === "success") {
-      setLastPageFull(state.data.length >= HISTORY_PAGE_LIMIT)
-    }
-  }, [state])
-
-  const rows = React.useMemo(
-    () => [...(state.status === "success" ? state.data : []), ...older],
-    [state.status, state.data, older],
+  const state = useService(
+    (s) => queryService.listHistoryPage({ ...filter, page }, s),
+    [query, page],
   )
 
-  async function loadMore() {
-    const last = rows[rows.length - 1]
-    if (!last || loadMoreAction.status === "pending") return
-    const forQuery = queryRef.current
-    // The hook owns the call: it aborts it, holds the refusal, and hands
-    // back the page. A failure resolves to null and keeps the rows.
-    const next = await loadMoreAction.run(filter, { at: last.at, id: last.id })
-    if (next === null) return
-    if (queryRef.current !== forQuery) return // the question changed under us
-    const seen = new Set(rows.map((r) => r.id))
-    setOlder((prev) => [...prev, ...next.filter((r) => !seen.has(r.id))])
-    setLastPageFull(next.length >= HISTORY_PAGE_LIMIT)
-  }
+  const rows = state.status === "success" ? state.data.runs : []
+  const pageSize = state.status === "success" ? state.data.pageSize : HISTORY_PAGE_LIMIT
+  const total = state.status === "success" ? state.data.total : 0
+  const lastPage = Math.max(1, Math.ceil(total / pageSize))
+
+  // The data shrank while the person was on a later page: it answers no
+  // runs for a page that is gone, but still counts some. Step back to the
+  // last page that exists instead of showing an empty table.
+  const pastTheEnd = state.status === "success" && rows.length === 0 && total > 0 && page > lastPage
+  React.useEffect(() => {
+    if (pastTheEnd) setPageAt({ query, page: lastPage })
+  }, [pastTheEnd, query, lastPage])
 
   const hasFilter = query !== ""
 
@@ -160,8 +152,8 @@ export function QueryHistoryPage() {
             All statuses
           </Pill>
           {STATUSES.map((s) => (
-            <Pill key={s} pressed={status === s} onClick={() => setStatus(s)}>
-              {s[0]!.toUpperCase() + s.slice(1)}
+            <Pill key={s.value} pressed={status === s.value} onClick={() => setStatus(s.value)}>
+              {s.label}
             </Pill>
           ))}
         </div>
@@ -232,7 +224,7 @@ export function QueryHistoryPage() {
       </div>
       {state.status === "loading" ? <LoadingSkeleton rows={6} /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
-      {state.status === "success" ? (
+      {state.status === "success" && !pastTheEnd ? (
         rows.length === 0 ? (
           <EmptyState
             title="No runs in the last 14 days"
@@ -267,7 +259,7 @@ export function QueryHistoryPage() {
                       {formatDateTime(run.at)}
                     </td>
                     <td className="px-3 py-2">
-                      <StatusBadge status={run.status} />
+                      <StatusBadge status={run.status} label={run.status === "blocked" ? "Refused" : undefined} />
                     </td>
                     <td className="px-3 py-2 text-xs">{run.engine}</td>
                     <td className="px-3 py-2 text-xs whitespace-nowrap">
@@ -303,21 +295,45 @@ export function QueryHistoryPage() {
           </div>
         )
       ) : null}
-      {loadMoreAction.status === "error" ? (
-        <p className="text-sm text-destructive">{loadMoreAction.error.message}</p>
-      ) : null}
-      {state.status === "success" && rows.length > 0 && lastPageFull ? (
-        <Button
-          variant="outline"
-          size="sm"
-          className="self-center"
-          disabled={loadMoreAction.status === "pending"}
-          onClick={() => {
-            void loadMore()
-          }}
-        >
-          {loadMoreAction.status === "pending" ? "Loading…" : "Load more"}
-        </Button>
+      {state.status === "success" && rows.length > 0 ? (
+        <nav aria-label="History pages" className="flex items-center justify-center gap-1">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page <= 1}
+            onClick={() => goToPage(page - 1)}
+          >
+            Previous
+          </Button>
+          {pageNumbers(page, lastPage).map((n, i) =>
+            n === "gap" ? (
+              <span key={`gap-${i}`} className="px-1 text-xs text-muted-foreground" aria-hidden>
+                …
+              </span>
+            ) : (
+              <Button
+                key={n}
+                variant={n === page ? "default" : "ghost"}
+                size="sm"
+                aria-current={n === page ? "page" : undefined}
+                onClick={() => goToPage(n)}
+              >
+                {n}
+              </Button>
+            ),
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page >= lastPage}
+            onClick={() => goToPage(page + 1)}
+          >
+            Next
+          </Button>
+          <span className="ml-2 text-xs text-muted-foreground">
+            Page {page} of {lastPage}
+          </span>
+        </nav>
       ) : null}
     </div>
   )

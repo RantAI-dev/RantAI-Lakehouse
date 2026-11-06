@@ -195,7 +195,11 @@ export type QueryHistoryItem = {
   sql: string
   user: string
   at: string
-  status: Extract<EntityStatus, "completed" | "failed" | "cancelled" | "blocked">
+  /**
+   * `stopped` is a run ended with Stop; `cancelled` stays for rows
+   * written before that status existed, and nothing writes it now.
+   */
+  status: Extract<EntityStatus, "completed" | "failed" | "stopped" | "cancelled" | "blocked">
   durationMs: number
   scannedBytes: number
   costUnits: number
@@ -223,11 +227,9 @@ export type QueryHistoryItem = {
 /**
  * The history page's filters (`QS-4`, decision 5): every field is
  * optional, and an absent or empty field filters nothing. `from` and `to`
- * are RFC 3339 strings — the shape a row's `at` carries, so a cursor cut
- * from a listed row parses back. `before` is the page cursor: the `at`
- * and `id` of the last row seen; the server answers with the page before
- * it. The server clamps `from` to the last 14 days whatever the caller
- * sends (decision 2).
+ * are RFC 3339 strings, the shape a row's `at` carries. `page` is
+ * 1-based and defaults to the first page. The server clamps `from` to the
+ * last 14 days whatever the caller sends (decision 2).
  */
 export type QueryHistoryFilter = {
   status?: QueryHistoryItem["status"]
@@ -236,7 +238,20 @@ export type QueryHistoryFilter = {
   table?: string
   from?: string
   to?: string
-  before?: { at: string; id: string }
+  page?: number
+}
+
+/**
+ * One numbered page of the history (`GET /api/query/history`): the runs
+ * of that page, newest first, the count of every run the filter matches,
+ * the page the server answered and its size. A page past the end has no
+ * runs and the true `total`.
+ */
+export type QueryHistoryPage = {
+  runs: QueryHistoryItem[]
+  total: number
+  page: number
+  pageSize: number
 }
 
 /** Simple federated / multi-source execution plan stage for UI. */
@@ -520,11 +535,17 @@ export interface QueryService {
   /** The people and the roles the caller may share with, at most 20 of each. */
   findGrantees(query: string, signal?: AbortSignal): Promise<GranteeList>
   /**
-   * The caller's own recorded runs, newest first, one page of 50. The
+   * The runs of the first page of the caller's own history, newest first,
+   * 50 at most. The studio and the side panel show this page only. The
    * filter is optional: without it the endpoint answers the newest page
    * of the last 14 days (`QS-4`, decision 5).
    */
   listHistory(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryItem[]>
+  /**
+   * One numbered page of the history with the total count, for the
+   * History page's page numbers. `filter.page` is 1-based.
+   */
+  listHistoryPage(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryPage>
   estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
   /**
    * `runId` (`BI-5` plan D5) goes out as `X-Run-Id`, so a Stop can name the
