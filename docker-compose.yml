@@ -3408,8 +3408,13 @@ services:
     # pre-release that must not ship. Quay still serves the version SRC-4
     # measured, so the pin names it: `DEBEZIUM_VERSION=3.7.0.Final`, jars
     # `3.7.0.Final`.
-    # Digest re-pinned 2026-11-05: quay.io dropped the previous 3.7.0.Final digest (404 manifest unknown), which failed every G4 CI pull (run 41943745994).
-    image: quay.io/debezium/connect:3.7.0.Final@sha256:9716a72bce5313186d7528cf5ea00f3e2d1a0a71ba84156d38417d0262cf3599
+    # Digest re-pinned 2026-11-06 to the OCI index digest quay serves for the
+    # tag. quay.io has now withdrawn the digest pinned here three times (commit
+    # fb25b0c0, #383 and this change), each time with 404 manifest unknown,
+    # which failed every G4 CI pull. Expect a future repin. REL-17 tracks a CI
+    # check that every pinned digest still resolves and names the version its
+    # tag says.
+    image: quay.io/debezium/connect:3.7.0.Final@sha256:b9b983eda59570c526ddffa86ff73e56c53180d2676158ba5a5184cfd1b59a79
     restart: unless-stopped
     depends_on:
       kafka:
