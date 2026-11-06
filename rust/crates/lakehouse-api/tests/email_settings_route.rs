@@ -10,6 +10,9 @@
 //!   password (plan D1, D5);
 //! * a field the server's environment owns is refused with a 409 and
 //!   nothing is written (plan D1);
+//! * the connection fields are one unit: the environment sets one of them
+//!   and it owns all five, so a saved host is not used for a send
+//!   (`ADM-7 review R1`);
 //! * every save writes one audit row, naming the fields that changed and
 //!   never a secret (plan D6);
 //! * the test email goes to the caller's own account address and to nobody
@@ -232,6 +235,103 @@ async fn a_field_the_environment_owns_is_refused_and_nothing_is_written() {
     assert_eq!(
         read["host"],
         json!({"value": "smtp.example.com", "source": "server"})
+    );
+}
+
+/// `ADM-7 review R1`: the connection fields are ONE unit. The environment
+/// sets only the password, so it owns the whole connection — the host, the
+/// port, the security, the account and the password are the server's — and
+/// a save that sends any of them is refused with a 409. Nothing is written.
+#[tokio::test]
+async fn a_save_of_a_connection_field_is_refused_when_the_environment_owns_the_connection() {
+    let mut env = HashMap::new();
+    env.insert("SMTP_PASS".to_owned(), "an-environment-password".to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    let (status, body) = call(
+        &router,
+        "PUT",
+        EMAIL,
+        &cookie,
+        r#"{"host":"smtp.example.com"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"].as_str(), Some(SET_BY_THE_SERVER), "{body}");
+    // Nothing was written.
+    assert!(
+        lakehouse_store::email_settings::get(&pool)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Every field of the connection says the server owns it now, and the
+    // console may change none of them.
+    let (status, read) = call(&router, "GET", EMAIL, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["host"], json!({"value": null, "source": "server"}));
+    assert_eq!(read["port"], json!({"value": 587, "source": "server"}));
+    assert_eq!(
+        read["security"],
+        json!({"value": "starttls", "source": "server"})
+    );
+    assert_eq!(read["user"], json!({"value": null, "source": "server"}));
+    assert_eq!(read["password"], json!({"set": true, "source": "server"}));
+}
+
+/// `ADM-7 review R1`: a host saved in the console is NOT used for a send
+/// when the environment owns the connection. The row is written directly
+/// into the store, the way a row saved before the operator put `SMTP_PASS`
+/// in the environment looks.
+#[tokio::test]
+async fn a_saved_console_host_is_not_used_when_the_environment_owns_the_connection() {
+    let mut env = HashMap::new();
+    env.insert("SMTP_PASS".to_owned(), "an-environment-password".to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    // A row saved before the environment owned the connection.
+    lakehouse_store::email_settings::upsert(
+        &pool,
+        &lakehouse_store::email_settings::EmailSettings {
+            smtp_host: Some("smtp.example.com".to_owned()),
+            smtp_port: Some(2525),
+            smtp_security: Some("tls".to_owned()),
+            smtp_user: Some("console-user".to_owned()),
+            smtp_pass: None,
+            smtp_from: Some("reports@example.com".to_owned()),
+            console_public_url: None,
+        },
+        &admin.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // The answer reports the environment's values, not the saved ones.
+    let (status, read) = call(&router, "GET", EMAIL, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["host"], json!({"value": null, "source": "server"}));
+    assert_eq!(read["port"], json!({"value": 587, "source": "server"}));
+    assert_eq!(read["user"], json!({"value": null, "source": "server"}));
+    // `from` is not part of the login, so it stays the console's.
+    assert_eq!(
+        read["from"],
+        json!({"value": "reports@example.com", "source": "console"})
+    );
+
+    // And the send does not use the saved host: the environment names no
+    // mail server, so email is not set up.
+    let (status, body) = call(&router, "POST", EMAIL_TEST, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sent"], json!(false), "{body}");
+    assert_eq!(
+        body["message"],
+        json!("Email is not set up: the mail server is missing."),
+        "{body}"
     );
 }
 

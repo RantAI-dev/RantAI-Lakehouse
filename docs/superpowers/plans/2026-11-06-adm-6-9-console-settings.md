@@ -284,6 +284,146 @@ builds of this branch failed with "could not find `email_settings` in
 `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target-adm67` (a cold, empty
 directory for this branch) and every command above ran there.
 
+### Handoff (review fixes R1, R2) — developer, 2026-11-06
+
+Branch `feat/adm-6-7-console-settings`, at `a971571e` (the planner's review of
+slice 1). Two commits, one per finding: the merge (R2), then the fix (R1).
+Nothing else of slice 2 was started.
+
+| Commit | Finding | What |
+| --- | --- | --- |
+| `d822b6fd` | R2 | `git merge --no-ff origin/main` (no rebase): `REL-20` (#397) moved the process into the library target |
+| (this one) | R1 | the connection fields are one unit: the environment owns all five of them as soon as it sets one |
+
+**R2 — what conflicted in the merge, and how it was resolved.**
+
+Three files were changed on both sides; one conflicted.
+
+- `rust/crates/lakehouse-api/src/main.rs` — **one conflict hunk**, the
+  file header and the whole module block. `REL-20` (#397) emptied
+  `main.rs` of every `mod` line and moved the process into the library
+  target (`lakehouse_api::run`), while this branch had added
+  `mod runtime_settings;` to that block. Resolved by hand, hunk by hunk:
+  the header is `main`'s (the binary is the process entry point), and
+  every `mod` line is gone — including this branch's — because the module
+  tree lives only in `src/lib.rs` now. A short note at the top of the file
+  says so and cites the finding. `--ours`/`--theirs` was not used on any
+  file both sides changed.
+- `rust/crates/lakehouse-api/src/lib.rs` — merged by git; the result is
+  `main`'s file plus this branch's `pub mod runtime_settings;`, so the new
+  module is declared exactly once (`lib.rs:51`).
+- `CHANGELOG.md` — merged by git; both sides' entries under `[Unreleased]`
+  are kept.
+
+One more thing `main` moved onto us: `main` took migration number `0127`
+(`0127_query_history_stopped.sql`), and this branch's migration was
+`0127_email_settings.sql`. Two migrations cannot share a version, so ours
+is renumbered to `0128_email_settings.sql` — the plan says to take the
+next free number on `main` at build time and to renumber before the merge
+when `main` moved. The migration is not applied anywhere yet, so nothing
+was edited in place; the store module's doc comment now says `0128`, and
+the CHANGELOG entry names `0128`.
+
+**R1 — the fix.**
+
+The connection fields — the mail server, the port, the security, the
+account and the password — are now ONE unit
+(`runtime_settings.rs`, `resolve_email`): when the environment sets any
+one of `SMTP_HOST`, `SMTP_USER` or `SMTP_PASS`, all five are the server's.
+The resolver then uses only the environment's values for them (the code
+default where the environment names none), the GET reports them `server`,
+and a PUT that sends any of them is the existing 409 — the GET and the PUT
+read the sources from the resolver, so both follow from the one rule.
+`from` and `consolePublicUrl` stay per field: they are not part of the
+login and cannot receive a secret.
+
+With the rule in place, the hole the finding names is closed: with
+`SMTP_PASS` set and `SMTP_HOST` unset, the effective host is the
+environment's — none — so the console's saved host is **not** used for a
+send, and the test button answers "Email is not set up: the mail server
+is missing." instead of logging in to the console's host with the
+operator's password.
+
+Two consequences of the rule that the code answers honestly, and that the
+feature page already describes (the planner added the limit to
+`docs/core/features/console-settings.md`):
+
+- The Deployment tab names a missing mail server `SMTP_HOST` (not
+  `host`) when the environment owns the connection — the answer's rule is
+  "the environment variable for a setting only the server owns, the
+  console's own field name for a setting the console can set"
+  (`routes/settings.rs`, `deployment_features`).
+- `docs/CONFIGURATION.md` and `docs/OPERATIONS.md` said the environment
+  wins field by field, and that the console's host is settable while
+  `SMTP_HOST` is unset. Both now say the connection is one unit.
+
+**Tests added** (the finding names the first one):
+
+- `a_save_of_a_connection_field_is_refused_when_the_environment_owns_the_connection`
+  (`tests/email_settings_route.rs`) — env `SMTP_PASS` only: a PUT of
+  `host` is 409, nothing is written, and the GET reports all five fields
+  as `server`.
+- `a_saved_console_host_is_not_used_when_the_environment_owns_the_connection`
+  (`tests/email_settings_route.rs`) — a row saved straight into the store
+  (as a row saved before the operator added `SMTP_PASS` looks) is not used
+  for a send: the GET reports the environment's values, and the test
+  email answers "Email is not set up: the mail server is missing."
+- `the_environments_connection_is_one_unit`,
+  `the_from_address_and_the_console_address_stay_per_field`,
+  `the_console_owns_the_connection_when_the_environment_says_nothing`
+  (`runtime_settings.rs`'s own tests) — the unit rule, the two fields
+  that stay per field, and the case the finding names as unchanged (env
+  none → the console's five fields are used, as before).
+- `a_mail_server_the_environment_owns_is_named_the_way_the_operator_sets_it`
+  (`tests/deployment_settings_route.rs`).
+
+**Mutation check (R1).** Done and restored: with the unit rule dropped
+(`server_owns_connection` forced to false) three tests fail —
+
+- `a_save_of_a_connection_field_is_refused_when_the_environment_owns_the_connection`
+  (the answer is 200 instead of 409, and the console's host was written),
+- `a_saved_console_host_is_not_used_when_the_environment_owns_the_connection`
+  (the host is the console's, not the environment's),
+- `runtime_settings::tests::the_environments_connection_is_one_unit` (the
+  console's host is used).
+
+The rule was put back and all three pass again.
+
+**Commands run, with their counts** (foreground, on the branch's head,
+`CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target-adm67`,
+`CARGO_BUILD_JOBS=2`):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean.
+- `cargo test -p lakehouse-api --lib runtime_settings` — **9 passed**
+  (6 before, 3 new).
+- `cargo test -p lakehouse-api --test email_settings_route` — **13 passed**
+  (11 before, 2 new).
+- `cargo test -p lakehouse-api --test deployment_settings_route` — **6
+  passed** (5 before, 1 new).
+- `cargo test -p lakehouse-api --test route_auth` — **80 passed**.
+- `cargo check -p lakehouse-api` (on the merged tree, before R1) — clean.
+- `bun run typecheck` — clean.
+- `bun test src/features/admin` — **77 passed, 0 failed** (12 files).
+
+**Not verified:**
+
+- The workspace-wide block (`cargo clippy --workspace --all-targets
+  --all-features -- -D warnings` and `cargo test --workspace`) was NOT
+  run on this branch: the task scoped the checks to `lakehouse-api`, and
+  CI runs the rest on the pull request. The merge brought in `main`'s code
+  unchanged, and `main` is green in CI.
+- The Dagster suite (`pytest dispar_orchestrate`), a real `docker compose
+  up` and `docker compose --profile '*' config --quiet` were not run:
+  these two commits changed no Python and no compose file.
+- The console's own screens were not looked at in a browser. The console's
+  contract did not change — the sources are still `server`, `console` and
+  `default`, and the console already disables a field the server owns and
+  leaves it out of the save body — so no console code was touched. What is
+  new is that the API may report five fields as `server` at once.
+- R3 was accepted by the planner and needed no code; the limit is in the
+  feature page's Limits.
+
 ## 5. Review
 
 ### Review of slice 1 (planner, 2026-11-06, at `b1d022fc`)

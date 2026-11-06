@@ -14,6 +14,13 @@
 //! environment and saved values are combined (rule 4: no duplicated
 //! guard).
 //!
+//! The connection fields — the host, the port, the security, the account
+//! and the password — are one unit (`ADM-7 review R1`): when the
+//! environment sets any one of them, all five are the server's and the
+//! console may change none of them. A per-field merge let the
+//! environment's password be sent to a host the console chose. `from` and
+//! `consolePublicUrl` stay per field.
+//!
 //! # The cache
 //!
 //! [`EmailSettingsCache`] holds the saved row for at most
@@ -338,8 +345,36 @@ pub fn resolve_email(
     stored: Option<&EmailSettings>,
     keyring: Option<&Keyring>,
 ) -> EffectiveEmail {
+    // `ADM-7 review R1`: the connection fields are ONE unit.
+    //
+    // The host, the port, the security, the account and the password are
+    // how the sender logs in to a mail server; they belong together. When
+    // the environment sets any one of `SMTP_HOST`, `SMTP_USER` or
+    // `SMTP_PASS`, the whole unit belongs to the server: the resolver uses
+    // only the environment's values for the five, the GET reports them
+    // `server`, and a PUT that sends any of them is the existing 409.
+    //
+    // Why one unit and not one field: with `SMTP_PASS` set and `SMTP_HOST`
+    // unset, the host's source was `default`, so a holder of
+    // `settings:write` could save a host of their choosing — and every
+    // send, the test button included, would then log in to that host with
+    // the environment's account and password. The operator's secret would
+    // have gone to whoever holds that permission, which is what plan D1
+    // ("the server's file wins") exists to prevent. The server's file wins
+    // for the connection as a whole, or not at all.
+    //
+    // `from` and `consolePublicUrl` stay per field: they are not part of
+    // the login, and a `From` address or a public address on their own
+    // cannot receive a secret.
+    let server_owns_connection =
+        config.smtp_host.is_some() || config.smtp_user.is_some() || !config.smtp_pass.is_empty();
+
     let (host, host_source) = if config.smtp_host.is_some() {
         (config.smtp_host.clone(), Source::Server)
+    } else if server_owns_connection {
+        // The environment owns the connection and names no host: there is
+        // no host to use, and the console's saved one is not used.
+        (None, Source::Server)
     } else if let Some(host) = stored.and_then(|s| s.smtp_host.as_deref()) {
         (Some(host.to_owned()), Source::Console)
     } else {
@@ -347,6 +382,10 @@ pub fn resolve_email(
     };
 
     let (port, port_source) = if config.smtp_port_from_env {
+        (config.smtp_port, Source::Server)
+    } else if server_owns_connection {
+        // `config.smtp_port` is the environment's port, or the code default
+        // when the environment named none.
         (config.smtp_port, Source::Server)
     } else if let Some(port) = stored.and_then(|s| s.smtp_port) {
         (u16::try_from(port).unwrap_or(587), Source::Console)
@@ -359,6 +398,8 @@ pub fn resolve_email(
     // implicit TLS"; a console save never changes this field.
     let (security, security_source) = if config.smtp_secure {
         (EmailSecurity::Tls, Source::Server)
+    } else if server_owns_connection {
+        (EmailSecurity::Starttls, Source::Server)
     } else if let Some(security) = stored
         .and_then(|s| s.smtp_security.as_deref())
         .and_then(EmailSecurity::parse)
@@ -370,6 +411,8 @@ pub fn resolve_email(
 
     let (user, user_source) = if config.smtp_user.is_some() {
         (config.smtp_user.clone(), Source::Server)
+    } else if server_owns_connection {
+        (None, Source::Server)
     } else if let Some(user) = stored.and_then(|s| s.smtp_user.as_deref()) {
         (Some(user.to_owned()), Source::Console)
     } else {
@@ -382,6 +425,10 @@ pub fn resolve_email(
             true,
             Source::Server,
         )
+    } else if server_owns_connection {
+        // The environment owns the connection and sets no password: the
+        // console's saved one is not used.
+        (SecretValue::new(""), false, Source::Server)
     } else if let Some(opened) = open_console_password(stored, keyring) {
         (SecretValue::new(opened), true, Source::Console)
     } else {
@@ -662,5 +709,85 @@ mod tests {
         let eff = resolve_email(&cfg, None, Some(&keyring()));
         assert_eq!(eff.security, EmailSecurity::Tls);
         assert_eq!(eff.security_source, Source::Server);
+    }
+
+    /// `ADM-7 review R1`: the connection fields are one unit. The
+    /// environment sets only the password, so it owns the whole connection:
+    /// the console's saved host is not used, and every one of the five
+    /// fields says where it comes from.
+    #[test]
+    fn the_environments_connection_is_one_unit() {
+        let cfg = config(&[("SMTP_PASS", "env-pass")]);
+        let saved = stored(|s| {
+            s.smtp_host = Some("console.example.com".to_owned());
+            s.smtp_port = Some(465);
+            s.smtp_security = Some("tls".to_owned());
+            s.smtp_user = Some("console-user".to_owned());
+            s.smtp_pass = Some(
+                keyring()
+                    .seal(EMAIL_PASSWORD_SEAL_NAME, b"console-pass")
+                    .unwrap(),
+            );
+        });
+        let eff = resolve_email(&cfg, Some(&saved), Some(&keyring()));
+
+        // The environment's host is none, so email is not set up — the
+        // console's host is NOT used for the send.
+        assert_eq!(eff.host, None, "the console's host is not used");
+        assert_eq!(eff.host_source, Source::Server);
+        assert_eq!(eff.port, 587);
+        assert_eq!(eff.port_source, Source::Server);
+        assert_eq!(eff.security, EmailSecurity::Starttls);
+        assert_eq!(eff.security_source, Source::Server);
+        assert_eq!(eff.user, None, "the console's account is not used");
+        assert_eq!(eff.user_source, Source::Server);
+        assert!(eff.password_set);
+        assert_eq!(eff.password.expose_secret(), "env-pass");
+        assert_eq!(eff.password_source, Source::Server);
+    }
+
+    /// `ADM-7 review R1`: `from` and `consolePublicUrl` are not part of the
+    /// login, so they stay per field: the console may still set them while
+    /// the environment owns the connection.
+    #[test]
+    fn the_from_address_and_the_console_address_stay_per_field() {
+        let cfg = config(&[("SMTP_PASS", "env-pass")]);
+        let saved = stored(|s| {
+            s.smtp_from = Some("console@example.com".to_owned());
+            s.console_public_url = Some("https://console.example.com".to_owned());
+        });
+        let eff = resolve_email(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.from, "console@example.com");
+        assert_eq!(eff.from_source, Source::Console);
+        assert_eq!(
+            eff.console_public_url.as_deref(),
+            Some("https://console.example.com")
+        );
+        assert_eq!(eff.console_public_url_source, Source::Console);
+    }
+
+    /// `ADM-7 review R1`: the unit rule is about the connection only. With
+    /// nothing in the environment, the console's five fields are used, as
+    /// before.
+    #[test]
+    fn the_console_owns_the_connection_when_the_environment_says_nothing() {
+        let cfg = config(&[]);
+        let saved = stored(|s| {
+            s.smtp_host = Some("console.example.com".to_owned());
+            s.smtp_port = Some(465);
+            s.smtp_security = Some("tls".to_owned());
+            s.smtp_user = Some("console-user".to_owned());
+        });
+        let eff = resolve_email(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.host.as_deref(), Some("console.example.com"));
+        assert_eq!(eff.host_source, Source::Console);
+        assert_eq!(eff.port, 465);
+        assert_eq!(eff.port_source, Source::Console);
+        assert_eq!(eff.security, EmailSecurity::Tls);
+        assert_eq!(eff.security_source, Source::Console);
+        assert_eq!(eff.user.as_deref(), Some("console-user"));
+        assert_eq!(eff.user_source, Source::Console);
     }
 }

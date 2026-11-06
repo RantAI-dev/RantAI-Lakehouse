@@ -202,6 +202,29 @@ async fn a_feature_the_console_owns_says_where_it_is_set() {
     assert_eq!(email["where"], json!("console"), "{email}");
 }
 
+/// `ADM-7 review R1`: when the environment owns the connection, the mail
+/// server is the server's to set. The answer names the environment variable
+/// the operator sets it with, and says the console may not change it.
+#[tokio::test]
+async fn a_mail_server_the_environment_owns_is_named_the_way_the_operator_sets_it() {
+    let mut env = HashMap::new();
+    env.insert("SMTP_PASS".to_owned(), "an-environment-password".to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let features = features(&router, &cookie).await;
+
+    assert_eq!(
+        feature(&features, "email"),
+        json!({
+            "feature": "email",
+            "on": false,
+            "missing": ["SMTP_HOST"],
+            "where": "server",
+        })
+    );
+}
+
 /// The route needs `settings:write` like the other settings routes (plan
 /// D4): it names the deployment's own settings.
 #[tokio::test]

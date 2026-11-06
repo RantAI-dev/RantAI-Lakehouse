@@ -42,11 +42,11 @@ guessed.
 | `PIPELINE_RUN_TOKEN` | Shared bearer token Dagster's authored-pipeline schedule factory (`authored_factory.py`, Phase E) uses to authenticate against `lakehouse-api`; when set, also seeds an `authored-pipeline-scheduler` identity scoped to `pipeline:write` ONLY (never `*:*`) from it | unset | No, but unset means the API seeds no service identity and the schedule factory's pipeline calls fail visibly with 401 |
 | `TRINO_URL` | Base URL of the Trino coordinator `POST /api/query/run`'s `engine: "trino"` path talks to | `http://trino:8080` | No, but unreachable means that path replies 503 |
 | `TRINO_MAX_ROWS` | Hard cap on rows a single Trino statement may accumulate across pages before the query is cancelled and refused | `10000` | No |
-| `SMTP_HOST` | SMTP host for alert/digest email delivery. Also settable in the console (Settings → Email) when this is unset — see "Settings the console owns" below | unset (email disabled) | No |
-| `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot. Also settable in the console when this is unset | `587` | No |
-| `SMTP_SECURE` | Force implicit TLS (`"true"`). Effective value is also `true` whenever `SMTP_PORT` is `465`, even if this is unset. Also settable in the console when this is unset | `false` | No |
-| `SMTP_USER` | SMTP auth username. Also settable in the console when this is unset | unset (no SMTP auth) | No |
-| `SMTP_PASS` | SMTP auth password. Also settable in the console when this is unset; the console's own copy is sealed with `CONNECTOR_SECRETS_KEY` | `""` | No |
+| `SMTP_HOST` | SMTP host for alert/digest email delivery. Settable in the console (Settings → Email) only when the whole connection is unset in the environment — see "Settings the console owns" below | unset (email disabled) | No |
+| `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | `587` | No |
+| `SMTP_SECURE` | Force implicit TLS (`"true"`). Effective value is also `true` whenever `SMTP_PORT` is `465`, even if this is unset. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | `false` | No |
+| `SMTP_USER` | SMTP auth username. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | unset (no SMTP auth) | No |
+| `SMTP_PASS` | SMTP auth password. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment; the console's own copy is sealed with `CONNECTOR_SECRETS_KEY` | `""` | No |
 | `SMTP_FROM` | `From` header for outgoing email. Falls back to `SMTP_USER`, then to `rantai-lake@localhost`. Also settable in the console when this is unset | `rantai-lake@localhost` | No |
 | `PORT` | Port `lakehouse-api` listens on | `8080` | No (but an invalid value fails to boot — the one field that does) |
 | `APP_ENV` | `"development"` or `"local"` relaxes the session cookie's `Secure` attribute for local HTTP dev. Falls back to `NODE_ENV`. Never bypasses authentication | unset (defaults closed/`Secure`) | No |
@@ -224,6 +224,14 @@ read-only in the console ("Set by the server"), and a save that sends it is
 refused with a 409 and writes nothing. To hand a setting back to the
 console, remove it from the environment (and restart the API); to hand it
 back to the environment, set it there and remove it in the console.
+
+**The connection is one unit.** The mail server, the port, the security,
+the account and the password belong together: they are how the sender logs
+in to a mail server. When the environment sets any one of `SMTP_HOST`,
+`SMTP_USER` or `SMTP_PASS`, all five come from the environment and are
+read-only in the console — so a password kept in files is never sent to a
+mail server chosen in the console. `SMTP_FROM` and `CONSOLE_PUBLIC_URL` are
+settings of their own and follow the rule above on their own.
 
 **The password.** The console's copy is sealed with the installation key
 (`CONNECTOR_SECRETS_KEY`) before it is stored, and it never comes back: an

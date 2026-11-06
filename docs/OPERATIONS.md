@@ -1384,6 +1384,15 @@ that sends it is refused with a 409 and nothing is written. So a team that
 keeps its configuration in files keeps control: set the value in `.env` and
 the console will not move it.
 
+**The connection is one unit.** The mail server, its port, the security
+mode, the account and the password belong together: they are how the API
+logs in to the relay. When `.env` sets any one of `SMTP_HOST`, `SMTP_USER`
+or `SMTP_PASS`, all five come from `.env` and the console shows them
+read-only — so a password kept in files is never sent to a relay chosen in
+the console. To move the connection to the console, remove all three from
+`.env` and restart the API. `SMTP_FROM` and `CONSOLE_PUBLIC_URL` are
+settings of their own and move one by one.
+
 **To move a setting from the environment to the console:** remove it from
 `.env` and restart the API. **To move it back:** put it in `.env` (and
 restart), and clear it in the console — the console's value is ignored

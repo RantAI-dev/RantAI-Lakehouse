@@ -1056,7 +1056,16 @@ fn deployment_features(state: &AppState, email: &EffectiveEmail) -> Vec<Value> {
         feature(
             "email",
             email.host.is_some(),
-            if email.host.is_some() { &[] } else { &["host"] },
+            if email.host.is_some() {
+                &[]
+            } else if email.host_source == Source::Server {
+                // The environment owns the connection (`ADM-7 review R1`),
+                // so the host is set in the environment, and the name says
+                // where the operator sets it.
+                &["SMTP_HOST"]
+            } else {
+                &["host"]
+            },
             if email.host_source == Source::Server {
                 "server"
             } else {
