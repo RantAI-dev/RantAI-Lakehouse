@@ -107,6 +107,10 @@ estimate (S, M, L), which the base has no field for.
 | `ADM-4` | Task | An administrator can change a user's roles and tenants and deactivate or reactivate a user: a deactivated user's sessions end at once and every sign-in path refuses them; only a full administrator changes another, nobody deactivates themselves, and a change that would leave no active full administrator is refused (409); every change is audited | Administration & Security | P1 | Done | #348 | Owner QA-1 2026-11-02 |
 | `SEC-57` | Task | The person who asked the assistant for an action may not approve or reject it, the same rule as catalog access (product owner, 2026-11-02): a tool-call approval records who asked (migration `0118`), and one `refuse_own_request` check guards both decide routes | Administration & Security | P1 | Done | #342 | Owner decision 2026-11-02 |
 | `ADM-5` | Feature | Switch modules and connector types off for an installation through `.env` (`LAKEHOUSE_DISABLED_MODULES`, `LAKEHOUSE_DISABLED_CONNECTOR_TYPES`): hidden in the console, the palette, the picker and the assistant, and refused by the API. Spec, feature page and plan on branch `docs/adm-5-hide-modules`; eight decisions wait for the product owner | Administration & Security | P1 | Planned |  | Owner request 2026-11-02 |
+| `ADM-6` | Feature | An administrator sees, in Settings → Deployment, which features are set up (PDF export, email, console address, single sign-on, assistant) and which setting is missing for each one that is off | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-7` | Feature | Email (mail server, port, security, user, password, sender, console address) set in Settings → Email and used from the next send without a restart, with a test email to the administrator's own address; a value set in `.env` wins and is shown read-only; the password is sealed and never sent back | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-8` | Feature | Sign-in limits (failed logins, window, lockout, how long sign-in records are kept, longest embed link life) set in Settings → Sign-in, used from the next sign-in. **Blocked by `ADM-7`** | Administration & Security | P2 | Planned |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-9` | Feature | The assistant's provider address, model and key set in Settings → Assistant with a check button, used from the next message; the address must be `https://` and not internal. **Blocked by `ADM-7`** | Administration & Security | P2 | Planned |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
 
 ## Next (P2)
 
@@ -115,7 +119,8 @@ estimate (S, M, L), which the base has no field for.
 | `AI-26` | Feature | *Proposed.* Mention data in the chat: `@` opens a Catalog search and a picked table becomes a chip the assistant answers or builds from. A table's own page (`/data/assets/<id>`) sends that table as the page context, as a dashboard already sends its board (`dashboard-page.tsx:919`); today an asset page sends only "the Catalog", so "Describe this dataset's columns" there does not name the dataset. A mention offers only tables the person may read and never widens access | AI Copilot | P2 | Idea |  | owner question 2026-11-04 |
 | `AI-27` | Task | The assistant's `draft_policy` declares `conditions` as a bare string (`routes/ai/registry.rs`, near line 1552) and passes it straight to `create_policy` (`routes/ai/tools/governance.rs`, near line 110), so every policy it drafts is not enforceable and `SEC-61` shows it as "Not enforced". Give the tool the structured shape `PolicyCondition` parses, or say in its result that the draft enforces nothing | AI Copilot | P2 | Todo |  | `SEC-61` handoff D4 (#373) |
 | `REL-17` | Task | A CI check that every pinned third-party image digest still resolves and that its config names the version the pin's tag says. `quay.io/debezium/connect:3.8@sha256:d67d…` was withdrawn upstream and the `3.8` tag moved to 3.8.0.Alpha1 (#264, 2026-11-04; re-pinned to `3.7.0.Final`) | Delivery | P2 | Todo |  | #264 CI, 2026-11-04 |
-| `REL-18` | Task | PDF export (`BI-1`) and PDF report attachments (`RPT-1`) are off on a fresh install: `CONSOLE_INTERNAL_URL` defaults to empty in `docker-compose.yml` and `.env.example`, a leftover from before the console was a compose service (REL-2 S1-T2). Default it to `http://console:3000` (the service name on the compose network), keep an explicit empty value meaning "off", and update the comments in both files and `docs/OPERATIONS.md`. `RENDER_TOKEN_SECRET` is already generated by `ops/init-env.sh`. Prove it with a real `up` and one PDF | Delivery | P2 | Todo |  | Owner question, 2026-11-05 |
+| `REL-18` | Task | PDF export (`BI-1`) and PDF report attachments (`RPT-1`) are off on a fresh install: `CONSOLE_INTERNAL_URL` defaults to empty in `docker-compose.yml` and `.env.example`, a leftover from before the console was a compose service (REL-2 S1-T2). Default it to `http://console:3000` (the service name on the compose network), treat an empty value the same as unset, so an install that copied the old empty line gets PDFs after update too (downloads are switched off per role with `downloadDeniedRoles`; planner, 2026-11-06), and update the comments in both files and `docs/OPERATIONS.md`. `RENDER_TOKEN_SECRET` is already generated by `ops/init-env.sh`. Prove it with a real `up` and one PDF | Delivery | P2 | In Progress |  | Owner question, 2026-11-05 |
+| `REL-19` | Task | `.env.example` has 187 settings, most of them internal wiring, tuning already defaulted in code, or test-only. Cut it to about 25 visible lines (installer-generated secrets and operator choices) plus commented blocks per optional feature; everything stays documented in `docs/CONFIGURATION.md`; a script proves a fresh install gets the same values as before. Built together with `REL-18` | Delivery | P2 | In Progress |  | Owner question, 2026-11-06; `superpowers/plans/2026-11-06-rel-19-env-cleanup.md` |
 | `DATA-44` | Feature | Near real-time analytics, without a stream engine (product owner, 2026-11-04: "write as backlog, but we later support clustering"). A change in a source system shows on a dashboard and can fire an alert within a target time, on one server: (1) measure the end-to-end freshness today, source change → Bronze table → Gold/self-refreshing table (`BLD-2`) → dashboard tile → alert, into a `docs/plans/DATA-44-RESULT.md`, for PostgreSQL live change capture and Kafka; (2) a dashboard refreshes itself on an interval set per dashboard, for a "live" screen; (3) the assistant can set that interval and make a self-refreshing table (assistant parity); (4) target *(proposed, owner to sign)*: a source change visible on a dashboard within 60 seconds at p95, measured. Not in scope: processing over streams (windows, joins over streams; `SRC-2`) and running on several servers (`OPS-3`, later). MySQL and SQL Server change capture come with `SRC-4` (#264) | Data | P2 | Idea |  | owner 2026-11-04; PRODUCT §2 |
 | `WEB-4` | Task | Retire the API routes only removed console pages called (`WEB-3` D2): `/api/ops/observability`, `/api/agents/employees*`, the runs list, `/api/agents/workflows` (no page since WS1 1.11), after checking the assistant's tools do not use them | Platform | P2 | Todo |  | `WEB-3` plan D2 |
 | `RPT-1` | Feature | Scheduled reports with PDF and spreadsheet attachments. **Blocked by `BI-1` (PDF and Excel attachments)** | Dashboards | P2 | In Acceptance | [#204](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/204) | PRODUCT §2 |
@@ -309,7 +314,8 @@ estimate (S, M, L), which the base has no field for.
 | `GOV-3` | Feature | Lineage that reaches outside systems | Governance | P3 | Idea |  | PRODUCT §2 |
 | `GOV-5` | Task | The audit page lists a chat draft waiting for Confirm, and a request waiting for approval, as Denied with policy `deny`: `outcome_of` in `routes/governance.rs` maps every gate outcome that is not a success to `denied`, on purpose, so a decision that is still open cannot read as a success. Decided 2026-10-30 (product owner): both read Pending | Governance | P3 | Done | #282 | `AI-18` checklist row 11, 2026-10-14 |
 | `ADM-1` | Feature | Several organisations in one install | Administration & Security | P3 | Idea |  | PRODUCT §2 |
-| `ADM-2` | Feature | Workspace settings that can be changed | Administration & Security | P3 | Idea |  | `README.md` |
+| `ADM-2` | Feature | Workspace settings that can be changed. Deployment settings are covered by `ADM-6` to `ADM-10` | Administration & Security | P3 | Idea |  | `README.md` |
+| `ADM-10` | Feature | Backup schedule, retention and S3 target set in the console. The backup job runs in its own container, which the API does not configure today | Administration & Security | P3 | Idea |  | Owner request 2026-11-06 |
 | `OPS-2` | Feature | Install with no internet access | Platform | P3 | Idea |  | Sales playbook (older; re-check) |
 | `SRC-23` | Task | `route_auth.rs` `run_history_log_and_resume_need_connector_manage_...` passes without proving its claim: the `connector:manage` principal is in no tenant, so the tenant gate answers 404 before the permission gate and `assert_ne!(.., FORBIDDEN)` holds either way. Join both principals to the seeded tenant, as the discovery and OAuth tests do (the defect `SRC-13` review 3 BLOCKER 2 fixed there). Found in the #144 review | Sources | P3 | Todo |  | #144 review |
 | `SRC-24` | Task | `SRC-11` plan task 9 asks `docs/plans/SRC-11-RESULT.md` for the time to auto-disable and a run log's size; the RESULT has neither and does not list them under "Not measured". Measure them or list them (principle 2). Found in the #144 review | Sources | P3 | Todo |  | #144 review |
@@ -369,6 +375,9 @@ parity), built after it.
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | — | `AI-12` (variables part) |
+| `ADM-7` | Building | — | `ADM-8`, `ADM-9` |
+| `ADM-8` | Planned | `ADM-7` | — |
+| `ADM-9` | Planned | `ADM-7` | — |
 | `AI-11` | Planned | `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
@@ -381,7 +390,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-42`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-4`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `REL-18`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-4`, `WEB-6`
+`ADM-1`, `ADM-10`, `ADM-2`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-42`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-4`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `QS-5`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-4`, `WEB-6`
 
 ## Dates
 
@@ -552,6 +561,12 @@ set by the product owner and are left empty until they are.
 | `SEC-55` | 2026-11-04 | 2026-11-04 | |
 | `DATA-39` | 2026-11-01 | data part 2026-11-01; assistant part 2026-11-04 | |
 | `ADM-5` | 2026-11-02 |  | |
+| `ADM-6` | 2026-11-06 |  | |
+| `ADM-7` | 2026-11-06 |  | |
+| `ADM-8` | 2026-11-06 |  | |
+| `ADM-9` | 2026-11-06 |  | |
+| `REL-18` | 2026-11-06 |  | |
+| `REL-19` | 2026-11-06 |  | |
 
 ## Decide
 
@@ -625,6 +640,7 @@ builds it (`AGENTS.md`).
 | [`SEC-23`](specs/sec-23.md) | Adding a governance rule needs the permission changing one needs | Now | S |
 | [`SEC-41`](specs/sec-41.md) | Connector dials can verify a CA: upgrade `sqlx` to 0.9 | Now | M |
 | [`REL-9`](specs/rel-9.md) | The Rust workspace builds on the latest stable Rust | Now | M |
+| [`ADM-6` to `ADM-9`](specs/console-settings.md) | Deployment settings in the console: status, email, sign-in limits, assistant key | Next | M |
 
 ### Dashboards (BI)
 
