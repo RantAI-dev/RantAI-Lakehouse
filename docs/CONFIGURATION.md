@@ -35,19 +35,19 @@ guessed.
 | `GOTENBERG_URL` | Address of the Gotenberg container that makes dashboard PDFs (`BI-1`). Compose sets it to the `gotenberg` service, which has no published port | unset (`http://gotenberg:3000` in compose) | No, but PDF export is off without it |
 | `CONSOLE_INTERNAL_URL` | The console as the PDF renderer reaches it on the compose network, `http://console:3000` in this stack. It is also the only address the renderer may open. Unset or empty: the PDF item says "PDF export is not set up on this deployment" and the browser's print stays | unset | No, but PDF export is off without it (`REL-18` makes it the default) |
 | `RENDER_TOKEN_SECRET` | Server-only key of the 2-minute token the PDF print view reads with. Its own secret, never `EMBED_SECRET`. `sh ops/init-env.sh` generates one | unset (PDF export off) | No, but PDF export is off without it |
-| `CONSOLE_PUBLIC_URL` | The console's address as people open it; a scheduled report's email links to `<this>/dashboards/<id>` (`RPT-1`). Reports are sent only when `SMTP_HOST` is set | unset (the email has no link) | No |
+| `CONSOLE_PUBLIC_URL` | The console's address as people open it; a scheduled report's email links to `<this>/dashboards/<id>` (`RPT-1`). Reports are sent only when `SMTP_HOST` is set. Also settable in the console when this is unset | unset (the email has no link) | No |
 | `ALERTS_RUN_TOKEN` | Shared bearer token required to call `POST /api/alerts/run`; when set, also seeds the scope-less `alerts-run-scheduler` service identity Dagster's `alerts_run_schedule` authenticates as | unset | No, but unset means the endpoint replies 503 to anyone except an authenticated service-identity principal (not 401) — see Security notes below |
 | `LAKEHOUSE_MAINTENANCE_TOKEN` | Shared bearer token Dagster's maintenance job uses to authenticate against `GET /api/lakehouse/maintenance-policies`; when set, also seeds the scope-less `lakehouse-maintenance-policy-reader` service identity from it | unset | No, but unset means the API seeds no service identity and the maintenance job's policy fetch fails visibly with 401 |
 | `INGEST_SERVICE_TOKEN` | Shared bearer token Dagster's ingest schedule factory uses to authenticate against `GET /api/connectors/ingestible` and a CDC connector's `dial`; when set, also seeds an `ingest-run-service` identity scoped to `ingest:read` ONLY (never `connector:manage`) from it | unset | No, but unset means the API seeds no service identity and the ingest schedule factory's connector fetch fails visibly with 401 |
 | `PIPELINE_RUN_TOKEN` | Shared bearer token Dagster's authored-pipeline schedule factory (`authored_factory.py`, Phase E) uses to authenticate against `lakehouse-api`; when set, also seeds an `authored-pipeline-scheduler` identity scoped to `pipeline:write` ONLY (never `*:*`) from it | unset | No, but unset means the API seeds no service identity and the schedule factory's pipeline calls fail visibly with 401 |
 | `TRINO_URL` | Base URL of the Trino coordinator `POST /api/query/run`'s `engine: "trino"` path talks to | `http://trino:8080` | No, but unreachable means that path replies 503 |
 | `TRINO_MAX_ROWS` | Hard cap on rows a single Trino statement may accumulate across pages before the query is cancelled and refused | `10000` | No |
-| `SMTP_HOST` | SMTP host for alert/digest email delivery | unset (email disabled) | No |
-| `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot | `587` | No |
-| `SMTP_SECURE` | Force implicit TLS (`"true"`). Effective value is also `true` whenever `SMTP_PORT` is `465`, even if this is unset | `false` | No |
-| `SMTP_USER` | SMTP auth username | unset (no SMTP auth) | No |
-| `SMTP_PASS` | SMTP auth password | `""` | No |
-| `SMTP_FROM` | `From` header for outgoing email. Falls back to `SMTP_USER`, then to `rantai-lake@localhost` | `rantai-lake@localhost` | No |
+| `SMTP_HOST` | SMTP host for alert/digest email delivery. Settable in the console (Settings → Email) only when the whole connection is unset in the environment — see "Settings the console owns" below | unset (email disabled) | No |
+| `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | `587` | No |
+| `SMTP_SECURE` | Force implicit TLS (`"true"`). Effective value is also `true` whenever `SMTP_PORT` is `465`, even if this is unset. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | `false` | No |
+| `SMTP_USER` | SMTP auth username. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | unset (no SMTP auth) | No |
+| `SMTP_PASS` | SMTP auth password. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment; the console's own copy is sealed with `CONNECTOR_SECRETS_KEY` | `""` | No |
+| `SMTP_FROM` | `From` header for outgoing email. Falls back to `SMTP_USER`, then to `rantai-lake@localhost`. Also settable in the console when this is unset | `rantai-lake@localhost` | No |
 | `PORT` | Port `lakehouse-api` listens on | `8080` | No (but an invalid value fails to boot — the one field that does) |
 | `APP_ENV` | `"development"` or `"local"` relaxes the session cookie's `Secure` attribute for local HTTP dev. Falls back to `NODE_ENV`. Never bypasses authentication | unset (defaults closed/`Secure`) | No |
 | `NODE_ENV` | Fallback for `APP_ENV` | — | No |
@@ -208,3 +208,45 @@ Change capture (`SRC-4`, ADR 0016) runs on Kafka Connect: the `cdc` profile's
 and the API and the applier find them through `KAFKA_CONNECT_URL` and
 `CDC_KAFKA_BOOTSTRAP` (both empty by default, which turns change capture off;
 see `docs/OPERATIONS.md`).
+
+## Settings the console owns (`ADM-7`)
+
+The mail server, its port, the security mode, the account and its password,
+the `From` address and the console's public address can be set from the
+console (**Settings → Email**) by a holder of `settings:write`. The next
+send — an alert, a scheduled report, a comment mention — uses them without
+a restart.
+
+**The environment wins.** For each of those settings the effective value is
+the environment's when it is set and non-empty, else the console's saved
+value, else the code default. A setting the environment owns is shown
+read-only in the console ("Set by the server"), and a save that sends it is
+refused with a 409 and writes nothing. To hand a setting back to the
+console, remove it from the environment (and restart the API); to hand it
+back to the environment, set it there and remove it in the console.
+
+**The connection is one unit.** The mail server, the port, the security,
+the account and the password belong together: they are how the sender logs
+in to a mail server. When the environment sets any one of `SMTP_HOST`,
+`SMTP_USER` or `SMTP_PASS`, all five come from the environment and are
+read-only in the console — so a password kept in files is never sent to a
+mail server chosen in the console. `SMTP_FROM` and `CONSOLE_PUBLIC_URL` are
+settings of their own and follow the rule above on their own.
+
+**The password.** The console's copy is sealed with the installation key
+(`CONNECTOR_SECRETS_KEY`) before it is stored, and it never comes back: an
+answer says only whether one is set, and the audit row names the field, not
+its value. A password saved with a key the installation no longer has is
+read as "not set" and logged once.
+
+**Other API processes.** The saved settings reach them within 30 seconds,
+not at once: each process re-reads the saved row at most every 30 seconds.
+The process that saved sees its own change immediately.
+
+**What is not in the console.** The CA bundle of a private relay
+(`SMTP_CA_FILE`) stays a file and is still read at start; the start-up
+secrets and the encryption keys stay in the environment; single sign-on
+stays in the environment (the console only says whether it is set up).
+
+See `docs/OPERATIONS.md` for the operator's view of the same thing, and
+`docs/core/features/console-settings.md` for the feature page.

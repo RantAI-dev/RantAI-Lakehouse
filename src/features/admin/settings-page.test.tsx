@@ -7,7 +7,7 @@ mock.module("next/navigation", () => ({
   useRouter: () => ({ push: () => {}, replace: () => {}, refresh: () => {}, back: () => {}, forward: () => {}, prefetch: () => {} }),
 }))
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { SettingsPage } from "./settings-page"
@@ -22,16 +22,27 @@ const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
 
 /** Records every path the page read, and answers each with what it needs to render. */
-function stubApi() {
+function stubApi(permissions = ["settings:write", "governance:write"]) {
   const paths: string[] = []
   spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
     const path = String(input)
     paths.push(path)
     if (path.includes("/api/auth/me"))
-      return json({ id: "u1", name: "Admin", email: null, roles: ["Admin"], permissions: ["settings:write", "governance:write"], tenants: [] })
+      return json({ id: "u1", name: "Admin", email: null, roles: ["Admin"], permissions, tenants: [] })
     if (path.includes("/api/auth/providers")) return json({ oidc: false })
     if (path.includes("/api/governance/tag-keys")) return json([])
     if (path.includes("/api/maps")) return json({ maps: [] })
+    if (path.includes("/api/settings/deployment")) return json({ features: [] })
+    if (path.includes("/api/settings/email"))
+      return json({
+        host: { value: null, source: "default" },
+        port: { value: 587, source: "default" },
+        security: { value: "starttls", source: "default" },
+        user: { value: null, source: "default" },
+        password: { set: false, source: "default" },
+        from: { value: null, source: "default" },
+        consolePublicUrl: { value: null, source: "default" },
+      })
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
   return paths
@@ -46,13 +57,45 @@ function renderPage() {
 }
 
 describe("Settings sections (WEB-3 S3-D6)", () => {
-  it("offers the six sections and opens Reporting on the bare address", () => {
+  it("offers the six sections and the two administrator ones, and opens Deployment for an administrator", async () => {
     stubApi()
     renderPage()
-    for (const name of ["Reporting", "Remembered results", "Query limits", "Sign-in", "Tag keys", "Maps"]) {
-      expect(screen.getByRole("tab", { name })).toBeTruthy()
+    for (const name of [
+      "Reporting",
+      "Remembered results",
+      "Query limits",
+      "Sign-in",
+      "Tag keys",
+      "Maps",
+      "Deployment",
+      "Email",
+    ]) {
+      expect(await screen.findByRole("tab", { name })).toBeTruthy()
     }
-    expect(screen.getByRole("tab", { name: "Reporting" }).getAttribute("aria-selected")).toBe("true")
+    // `ADM-6`, `ADM-7`: the deployment's own sections come first, so the
+    // bare address opens the Deployment one.
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Deployment" }).getAttribute("aria-selected")).toBe("true")
+    )
+  })
+
+  it("shows only the six sections to a caller without settings:write", async () => {
+    stubApi(["dashboard:read"])
+    renderPage()
+    for (const name of ["Reporting", "Remembered results", "Query limits", "Sign-in", "Tag keys", "Maps"]) {
+      expect(await screen.findByRole("tab", { name })).toBeTruthy()
+    }
+    await waitFor(() => expect(screen.queryByRole("tab", { name: "Deployment" })).toBeNull())
+    expect(screen.queryByRole("tab", { name: "Email" })).toBeNull()
+  })
+
+  it("opens Reporting on the bare address for everybody else", async () => {
+    stubApi(["dashboard:read"])
+    renderPage()
+    await screen.findByRole("tab", { name: "Reporting" })
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Reporting" }).getAttribute("aria-selected")).toBe("true")
+    )
   })
 
   it("opens the section the URL names, and loads only that section", async () => {

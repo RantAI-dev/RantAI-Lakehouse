@@ -27,14 +27,13 @@ use lakehouse_alerts::{
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_iceberg::IcebergClient;
-use lakehouse_notify::{EmailSender, SmtpConfig};
+use lakehouse_notify::EmailSender;
 use lakehouse_store::PgPool;
 use lakehouse_store::overview::{self, FiredRule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-use crate::config::Config;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -837,25 +836,6 @@ fn check_run_token(
     }
 }
 
-/// `pub(in crate::routes)`: reused by `routes::ai::tools::alerts::run_alert_rule`
-/// (T1.1 of the copilot-operations-handover plan) so the copilot's
-/// `run_alert_rule` tool delivers through the exact same `SmtpConfig` the
-/// `/api/alerts/run` route builds, rather than a second, possibly-drifting
-/// copy of this six-field mapping.
-pub(crate) fn smtp_config(config: &Config) -> SmtpConfig {
-    SmtpConfig {
-        host: config.smtp_host.clone(),
-        port: config.smtp_port,
-        secure: config.smtp_secure,
-        user: config.smtp_user.clone(),
-        pass: config.smtp_pass.clone(),
-        from: config.smtp_from.clone(),
-        // `SEC-56` D1/D6: the bundle is read once, at start-up, and handed
-        // to the sender as it is.
-        ca_bundle: config.smtp_ca.clone(),
-    }
-}
-
 /// [`FreshnessSource`] backed by real Postgres `dataset_sla` rows and
 /// WS2's Iceberg REST surface — the in-process path, not an HTTP call to
 /// this crate's own `/api/lakehouse/tables/{ns}/{table}` route (which
@@ -1415,7 +1395,7 @@ pub(crate) async fn run_one(
 ) -> Result<Vec<lakehouse_alerts::RunResult>, ApiError> {
     // SEC-10: the sender checks every webhook target and never follows a redirect.
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(state).await.smtp());
     // `freshness`/`silence` sources are real, Postgres/Iceberg-backed
     // implementations when both dependencies are configured for this
     // request; otherwise `None` — every `Freshness` rule then reports
@@ -1548,7 +1528,7 @@ pub async fn run(
     // of the same configuration (`BI-40` D4).
     // SEC-10: the sender checks every webhook target and never follows a redirect.
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
 
     // Plan 1f: `pipeline_late` rules fire from this op, not from the
@@ -1999,6 +1979,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::config::Config;
 
     fn service_principal() -> Principal {
         Principal {
@@ -2483,7 +2464,7 @@ mod tests {
     /// run id must not re-deliver, via `pipeline_run_event`).
     mod late_pass {
         use lakehouse_clickhouse::ChClient;
-        use lakehouse_notify::EmailSender;
+        use lakehouse_notify::{EmailSender, SmtpConfig};
         use wiremock::MockServer;
         use wiremock::matchers::method;
         use wiremock::{Mock, ResponseTemplate};
@@ -2717,6 +2698,7 @@ mod sql_gate_enforcement {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::ApiSqlGate;
+    use crate::config::Config;
 
     /// The tenant that owns the shared catalog in these tests — the first
     /// one `0002_seed_identity.sql` creates (`SEC-50` slice 2 M11).
@@ -2755,7 +2737,7 @@ mod sql_gate_enforcement {
         if let Some(tenant) = catalog_tenant {
             env.insert("CATALOG_TENANT_ID".to_owned(), tenant.to_owned());
         }
-        super::AppState::new(super::Config::from_map(&env).expect("a valid test Config"))
+        super::AppState::new(Config::from_map(&env).expect("a valid test Config"))
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3235,6 +3217,7 @@ mod save_tenant_scope {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::config::Config;
 
     /// The tenant that owns the shared catalog in this deployment.
     const CATALOG_TENANT: &str = "11111111-1111-4111-8111-000000000001";
@@ -3486,6 +3469,7 @@ mod rule_scope_authorisation {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::config::Config;
 
     const OWN_TENANT: &str = "11111111-1111-4111-8111-000000000001";
     const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
@@ -4022,6 +4006,7 @@ mod run_events_configured {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::config::Config;
 
     async fn reported(token: Option<&str>) -> Value {
         let mut env = HashMap::new();
