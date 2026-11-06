@@ -1244,6 +1244,31 @@ async fn manages_everything_under(
     Ok(true)
 }
 
+/// Whether the viewer manages the folder `folder_id`, every sub-folder
+/// under it and every query under it, the ones in the trash included.
+///
+/// A rule on a folder covers everything inside it, so sharing the folder
+/// is held to the same bar as moving it: the viewer who authored the folder
+/// does not hand out what other people put in it (`QS-3` review of #393).
+/// The walk is [`manages_everything_under`], the one [`move_folder_for_viewer`]
+/// uses. A folder that does not exist answers `false`, and the route
+/// has already found it before it asks.
+///
+/// # Errors
+///
+/// Returns [`FolderError::Database`] if a query fails.
+pub async fn manages_folder_and_contents(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    folder_id: Uuid,
+) -> Result<bool, FolderError> {
+    let Some(folder) = load_folder(pool, folder_id).await? else {
+        return Ok(false);
+    };
+    let folders = list_folders(pool, Some(folder.tenant_id)).await?;
+    manages_everything_under(pool, viewer, &folders, folder_id).await
+}
+
 /// Move the folder under `new_parent` (`None` for the root) for the
 /// viewer the write is made for.
 ///

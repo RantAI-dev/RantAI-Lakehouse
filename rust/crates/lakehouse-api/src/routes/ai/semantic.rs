@@ -882,10 +882,18 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_timeout_writes_nothing_and_the_next_table_is_drafted(pool: PgPool) {
+        // `REL-21`: the timeout is per model call, so it bounds the second
+        // table's call too, and that reply is answered at once. A loaded
+        // runner (nextest runs many test processes at once) can miss a 200 ms
+        // budget, and the second call then timed out as well: the pass
+        // reported two failures instead of one. Two seconds is still five
+        // times shorter than the 10 s delay below, so the first call still
+        // times out and the test still proves that a timed-out call writes
+        // nothing.
         a_failing_call_writes_nothing_and_the_next_table_is_drafted(
             pool,
             chat_ok(GOOD_REPLY).set_delay(Duration::from_secs(10)),
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         )
         .await;
     }

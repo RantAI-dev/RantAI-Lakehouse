@@ -30,8 +30,8 @@ use lakehouse_store::queries::{
 };
 use lakehouse_store::saved_query_access::{
     FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
-    grants_for_viewer, move_folder_for_viewer, rename_folder, replace_grants, rules_for_item,
-    search_grantees,
+    grants_for_viewer, manages_folder_and_contents, move_folder_for_viewer, rename_folder,
+    replace_grants, rules_for_item, search_grantees,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -3376,6 +3376,108 @@ async fn a_folder_move_succeeds_when_the_mover_manages_everything_in_it(
     let moved = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
     assert!(moved.is_ok(), "the mover manages all of it: {moved:?}");
     assert_eq!(moved.unwrap().parent_id, Some(tree.target));
+    Ok(())
+}
+
+/// Sharing a folder is held to the bar of a move (`QS-3` review of #393):
+/// the viewer manages the folder, every sub-folder and every query under
+/// it, the ones in the trash included. An own tree answers `true`; a live
+/// query, a trashed query and an empty sub-folder of somebody else's each
+/// answer `false`, and a folder that is not there answers `false`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_and_its_contents_are_managed_only_when_every_part_is(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    // Own tree: a sub-folder, a live query and a trashed query, all Sari's.
+    let own = carried_tree(&pool, tenant_id, "own").await;
+    let inner = create_folder(&pool, tenant_id, Some(person(SARI)), "Inner", Some(own.x))
+        .await
+        .unwrap();
+    create_saved_query(
+        &pool,
+        &sari,
+        "Live",
+        "SELECT 1",
+        "Sari",
+        &[],
+        Some(inner.id),
+    )
+    .await
+    .unwrap();
+    let trashed = create_saved_query(&pool, &sari, "Gone", "SELECT 2", "Sari", &[], Some(own.x))
+        .await
+        .unwrap();
+    trash_saved_query(&pool, &sari, &trashed.id).await.unwrap();
+    assert!(
+        manages_folder_and_contents(&pool, &sari, own.x)
+            .await
+            .unwrap(),
+        "Sari manages every part of her own tree"
+    );
+
+    // A live query of Rina's.
+    let live = carried_tree(&pool, tenant_id, "live").await;
+    create_saved_query(
+        &pool,
+        &rina,
+        "Rina's",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(live.x),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !manages_folder_and_contents(&pool, &sari, live.x)
+            .await
+            .unwrap(),
+        "a live query of somebody else's is not managed"
+    );
+
+    // A trashed query of Rina's.
+    let gone = carried_tree(&pool, tenant_id, "gone").await;
+    let rinas = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's, trashed",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(gone.x),
+    )
+    .await
+    .unwrap();
+    trash_saved_query(&pool, &rina, &rinas.id).await.unwrap();
+    assert!(
+        !manages_folder_and_contents(&pool, &sari, gone.x)
+            .await
+            .unwrap(),
+        "a trashed query of somebody else's is not managed"
+    );
+
+    // An empty sub-folder of Rina's.
+    let sub = carried_tree(&pool, tenant_id, "sub").await;
+    create_folder(&pool, tenant_id, Some(person(RINA)), "Hers", Some(sub.x))
+        .await
+        .unwrap();
+    assert!(
+        !manages_folder_and_contents(&pool, &sari, sub.x)
+            .await
+            .unwrap(),
+        "an empty sub-folder of somebody else's is not managed"
+    );
+
+    assert!(
+        !manages_folder_and_contents(&pool, &sari, Uuid::new_v4())
+            .await
+            .unwrap(),
+        "a folder that is not there is not managed"
+    );
     Ok(())
 }
 

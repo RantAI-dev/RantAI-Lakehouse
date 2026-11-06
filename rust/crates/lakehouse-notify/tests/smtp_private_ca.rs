@@ -42,6 +42,8 @@
 
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, BufReader};
+
 use lakehouse_notify::{DeliveryFailure, EmailSender, SmtpCaBundle, SmtpConfig};
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
@@ -246,19 +248,55 @@ async fn start_relay(mode: TlsMode) -> Relay {
         http_port,
         pki,
     };
-    wait_for_the_smtp_port(&relay.host, relay.smtp_port).await;
+    wait_for_the_smtp_port(&relay.host, relay.smtp_port, mode).await;
     relay
 }
 
-/// Wait until the relay listens: a container that is up is not yet a relay
-/// that answers, and a dial that arrives too early is a connection error,
-/// not a TLS one.
-async fn wait_for_the_smtp_port(host: &str, port: u16) {
+/// Wait until the relay listens: the port proxy accepts before the relay
+/// listens; a greeting is the relay itself answering (`REL-22`). A dial that
+/// arrives too early is a connection error rather than the expected TLS
+/// handshake failure.
+///
+/// In [`TlsMode::StarttlsRequired`], the relay sends an SMTP greeting line
+/// starting with `220` upon connection. In [`TlsMode::TlsRequired`] (implicit
+/// TLS), the transport layer is TLS from the first byte, so the relay expects
+/// a TLS `ClientHello` before sending application data.
+async fn wait_for_the_smtp_port(host: &str, port: u16, mode: TlsMode) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if tokio::net::TcpStream::connect((host, port)).await.is_ok() {
+        let ready = match mode {
+            TlsMode::StarttlsRequired => {
+                if let Ok(stream) = tokio::net::TcpStream::connect((host, port)).await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    let mut greeted = false;
+                    while let Ok(Ok(n)) = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        reader.read_line(&mut line),
+                    )
+                    .await
+                    {
+                        if n == 0 {
+                            break;
+                        }
+                        if line.starts_with("220") {
+                            greeted = true;
+                            break;
+                        }
+                        line.clear();
+                    }
+                    greeted
+                } else {
+                    false
+                }
+            }
+            TlsMode::TlsRequired => tokio::net::TcpStream::connect((host, port)).await.is_ok(),
+        };
+
+        if ready {
             return;
         }
+
         assert!(
             std::time::Instant::now() < deadline,
             "the relay never started listening on {host}:{port}"

@@ -451,13 +451,42 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }))
-    fireEvent.click(await screen.findByRole("button", { name: "Delete" }))
+    const dialog = await screen.findByRole("dialog")
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }))
 
+    // The dialog is where the person is looking: the sentence is said
+    // there, not somewhere behind it.
     expect(
-      await screen.findByText(
+      (await within(dialog).findByRole("alert")).textContent,
+    ).toBe("Only someone who manages this can move it.")
+  })
+
+  it("forgets the last query-delete refusal when the confirm dialog opens again", async () => {
+    stubServices([saved({ id: "q2", title: "Costs", level: "edit" })])
+    spyOn(queryService, "deleteSaved").mockRejectedValue(
+      new ServiceError(
+        "permission_denied",
         "Only someone who manages this can move it.",
       ),
-    ).toBeDefined()
+    )
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }))
+    const first = await screen.findByRole("dialog")
+    fireEvent.click(within(first).getByRole("button", { name: "Delete" }))
+    await within(first).findByRole("alert")
+
+    fireEvent.click(within(first).getByRole("button", { name: "Cancel" }))
+    await waitFor(() => {
+      expect(screen.queryAllByRole("dialog").length).toBe(0)
+    })
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }))
+    const second = await screen.findByRole("dialog")
+
+    // The refusal belonged to the last attempt, not to this one.
+    expect(within(second).queryAllByRole("alert").length).toBe(0)
   })
 
   it("shows the refusal of a folder delete inside its confirm dialog", async () => {
