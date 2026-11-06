@@ -89,3 +89,145 @@ Changing any default value (D1). Moving settings into the console (`ADM-6` to `A
 Sizing limits from the host. `lakehousectl` keeping itself on the host.
 
 ## 4. Handoff
+
+Developer: DeepSeek (opencode), 2026-11-06. Branch
+`feat/rel-19-env-cleanup`, five commits on top of
+`origin/docs/console-settings-and-env-cleanup`:
+
+| Task | Commit | What it did |
+| --- | --- | --- |
+| T1 | `4ca4836c` | `ops/release/env-example-equivalence.sh <old> <new>` |
+| T2 | `3086f708` | `CONSOLE_INTERNAL_URL` defaults to `http://console:3000` (API and Gotenberg), comments updated |
+| T3 | `b0f8de82` | `.env.example` rewritten (26 set lines), two compose defaults kept equal to the old template's values |
+| T4 | `f240285d` | reader comments fixed; no value moved (D6 needed no move) |
+| T5 | `38c381e1` | `docs/CONFIGURATION.md` column + missing rows + anchors, `docs/OPERATIONS.md`, `export-pdf-excel.md`, `docs/DEVELOPMENT.md` |
+
+### Commands and results
+
+All run from the repository root unless noted.
+
+```bash
+# T1 acceptance: main's file against itself.
+sh ops/release/env-example-equivalence.sh .env.example .env.example
+# env-example-equivalence: identical (.env.example vs .env.example)   exit 0
+
+# T3/T4/T5 D1 proof: old template vs the new one.
+git show 4ca4836c:.env.example > /tmp/rel19-old.env.example
+sh ops/release/env-example-equivalence.sh /tmp/rel19-old.env.example .env.example
+# env-example-equivalence: identical (/tmp/rel19-old.env.example vs .env.example)   exit 0
+```
+
+The diff is **empty**, not "only `CONSOLE_INTERNAL_URL`" as the task table
+expected: D4 makes an unset and an empty `CONSOLE_INTERNAL_URL` resolve the
+same way, so removing the old empty line changes no rendered config. That is
+stronger than the acceptance line, not a weaker check.
+
+```bash
+# Every commit (throwaway must-set values, the SEC-18 rule in AGENTS.md).
+POSTGRES_PASSWORD=rel19 RUSTFS_ACCESS_KEY=rel19 RUSTFS_SECRET_KEY=rel19 \
+  LAKEKEEPER_ENCRYPTION_KEY=rel19 CONNECTOR_SECRETS_KEY=rel19 \
+  docker compose --profile '*' config --quiet
+# exit 0 on every commit.
+
+# T2 acceptance: line absent and line empty both resolve to the console.
+docker compose --env-file <absent.env> --profile '*' config | grep CONSOLE_INTERNAL_URL:
+#   CONSOLE_INTERNAL_URL: http://console:3000
+docker compose --env-file <empty.env>  --profile '*' config | grep CONSOLE_INTERNAL_URL:
+#   CONSOLE_INTERNAL_URL: http://console:3000
+# Gotenberg: --chromium-allow-list=^http://console:3000(/|$)
+
+# T3 visible-line count.
+grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' .env.example
+# 26        (the plan's limit is <= 30; 26 lines, 0 duplicate names)
+
+# T4 readers.
+bash scripts/ci/tests/test_detect_change_scope.sh
+# === Results: 33 passed, 0 failed ===
+# ops/init-env.sh into an empty temp dir (copy of ops/init-env.sh and .env.example):
+sh "$tmp/ops/init-env.sh"
+# exit 0; filled 11 names: POSTGRES_PASSWORD CONNECTOR_SECRETS_KEY
+# LAKEKEEPER_ENCRYPTION_KEY RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY
+# SEAWEEDFS_ACCESS_KEY SEAWEEDFS_SECRET_KEY AUTH_BOOTSTRAP_PASSWORD
+# RENDER_TOKEN_SECRET TENANT_WAREHOUSE_S3_ACCESS_KEY TENANT_WAREHOUSE_S3_SECRET_KEY
+# Every `${X:?}` variable in the written .env is non-empty.
+
+# lakehousectl embeds .env.example with include_str! (D8 reader):
+cd rust && cargo test -p lakehousectl
+# test result: ok. 197 passed; 0 failed; 0 ignored
+cargo fmt --check
+# exit 0 (comment-only Rust edits in T4)
+
+# T5 acceptance: every name of the old template still in CONFIGURATION.md.
+while read -r n; do grep -q "\b$n\b" docs/CONFIGURATION.md || echo "$n"; done \
+  < /tmp/rel19-old-names.txt
+# 0 missing of 187 names
+# Marker check: every table row's "yes/commented/no" matches the new file: 0 mismatches.
+```
+
+### T6 — real proof (rule 8)
+
+Project `rel19t6`, unique name, torn down with `down -v` afterwards. From a
+clean checkout directory with **no** `.env`:
+
+```bash
+sh ops/init-env.sh            # the new template -> .env with generated secrets
+# Test accommodation only, not a template default: every published port moved
+# off this machine's defaults (15432, 18123, 19000, 18080, 13000, 19010,
+# 19011, 18181, 13001, 18091, 18333) so the stack does not clash with the
+# host's other containers.
+docker compose -p rel19t6 up -d
+# 9 services Up (healthy): clickhouse, console, lakehouse-api, lakekeeper,
+# postgres, rustfs; gotenberg, oidc-mock, openfga Up.
+
+curl -X POST -H 'content-type: application/json' \
+  -d '{"email":"admin@example.com","password":"<generated>"}' \
+  http://localhost:18080/api/auth/login            # HTTP 200
+# The bootstrap credential must be rotated before other routes are reachable
+# (product rule), so: POST /api/auth/change-password -> HTTP 204, then login again.
+# CATALOG_TENANT_ID was set to 11111111-1111-4111-8111-000000000001 (the group
+# tenant; `lakehousectl install`/`update` set it for an install, REL-10) because
+# the seeded stack has four tenants and SEC-50 refuses the shared catalog otherwise.
+
+curl -b cookies 'http://localhost:18080/api/dashboard?board=default'
+# HTTP 200
+curl -b cookies -o /tmp/rel19-dash.pdf \
+  'http://localhost:18080/api/dashboard/export/pdf?board=default&paper=a4&orientation=portrait'
+# HTTP 200, content-type application/pdf, 265705 bytes
+head -c 8 /tmp/rel19-dash.pdf
+# %PDF-1.4
+```
+
+D4's "empty line still works" case was also proved at runtime: append
+`CONSOLE_INTERNAL_URL=` to that `.env`, recreate only `lakehouse-api`, repeat
+the request → **HTTP 200**, `application/pdf`, 265707 bytes, starts `%PDF-`.
+Then `docker compose -p rel19t6 down -v` (0 containers, 0 volumes left).
+
+### D6 — test-only values, and the moves made
+
+No workflow or gate read any of these from `.env.example`, so **no value was
+moved** into a workflow `env:` or a gate script. Evidence: greps over
+`.github/workflows/`, `ops/g*` and `scripts/` find no `env.example` reader
+except `ops/init-env.sh` and `lakehousectl`; the gates default each setting
+in code (`os.environ.get(..., default)`), and compose defaults `APP_ENV`,
+`BRONZE_*` and `CONSOLE_ALLOWED_DEV_ORIGINS` itself. All are now recorded in
+`docs/DEVELOPMENT.md` ("Test-only settings") and `docs/CONFIGURATION.md`.
+
+D8 reader comments that named a removed line now name
+`docs/CONFIGURATION.md`, `config.rs` or the compose default:
+`.env.staging`, `.github/workflows/deploy-staging.yml`,
+`.github/workflows/release.yml`, `docker-compose.yml`, `next.config.ts`,
+`dagster/dispar_orchestrate/definitions.py`,
+`rust/crates/lakehouse-api/src/main.rs`,
+`rust/crates/lakehouse-core/src/secret.rs`.
+
+### Not verified
+
+- Full workspace `cargo clippy`/`cargo test`, `bun run typecheck/lint/test`,
+  and the Python gates: not run, per the plan's per-commit scope (no code
+  changed beyond comments; the one Rust reader, `lakehousectl`, was tested).
+- A second full `up` from scratch to prove an *existing install's* old
+  `.env` keeps PDFs: not run. The config-level proof (empty and unset both
+  resolve to the console) and the runtime empty-line case cover decision D4.
+
+No plan/code mismatch was found; the only deviation from the written
+acceptance is the empty rather than single-line T1 diff explained above.
