@@ -285,3 +285,38 @@ builds of this branch failed with "could not find `email_settings` in
 directory for this branch) and every command above ran there.
 
 ## 5. Review
+
+### Review of slice 1 (planner, 2026-11-06, at `b1d022fc`)
+
+Checked: the migration; `runtime_settings.rs` (`resolve_email`, the cache, the open-once
+logging); `routes/settings.rs` (`put_email`, `password_field`, `email_row_to_save`,
+`audit_email_update`, `post_email_test`, `test_email_sentence`); the policy rows; the
+config flags. The 409 loop, the absent/null/string password rule, the audit row (field
+names only), the recipient (the caller's own account address, body never read) and the
+fixed sentences match D1–D10.
+
+- **R1 (BLOCKER) A server-owned password can be sent to a console-chosen server.**
+  `resolve_email` merges per field. With `SMTP_PASS` (or `SMTP_USER`) set in the
+  environment and `SMTP_HOST` unset, the host source is `default`, so an administrator may
+  save a host of their choosing, and every send (and the test button) then logs in to that
+  host with the environment's user and password. That hands a secret the operator kept in
+  files to whoever holds `settings:write`, which is what D1 ("the server file wins") exists
+  to prevent. Fix: the connection fields are one unit. When the environment sets any of
+  `SMTP_HOST`, `SMTP_USER` or `SMTP_PASS`, then host, port, security, user and password
+  are all `server`: the resolver uses only the environment's values for them, the GET
+  reports them `server`, and a PUT that sends any of them is the existing 409. `from` and
+  `consolePublicUrl` stay per field. Tests: env `SMTP_PASS` only → a PUT of `host` is 409
+  and nothing is written; a stored console host is NOT used for a send when env
+  `SMTP_PASS` is set (the effective host is the environment's, here none, so email is not
+  set up); env none → the console's five fields are used as today. Mutation check: drop
+  the unit rule, the first test fails. Cite `ADM-7 review R1`.
+- **R2 (BLOCKER, mechanical) Merge `origin/main`.** `REL-20` (#397) removed every `mod`
+  line from `src/main.rs`; the module tree lives only in `src/lib.rs`. This branch adds
+  `mod runtime_settings;` to both. Merge `origin/main` (no rebase), keep the declaration in
+  `lib.rs` only, resolve hunk by hunk, and say what conflicted. CI now runs nextest in
+  three partitions; the sum floor is 6,826 and this branch only adds tests.
+- **R3 (accepted, documented) The mail server may be an internal address.** The host is
+  checked as a hostname only, so the test button can dial internal hosts and its sentence
+  says whether something answered. That is needed (on-premises mail relays are usually
+  internal), the route needs `settings:write`, and it is limited to one try per 10 s per
+  person. Written into the feature page's Limits; no code change.
