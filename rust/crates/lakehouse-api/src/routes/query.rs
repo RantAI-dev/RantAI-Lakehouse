@@ -23,7 +23,7 @@ use lakehouse_store::queries::{
 };
 use lakehouse_store::uploads::TableClaim;
 use lakehouse_trino::{TrinoError, TrinoResult};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -1116,17 +1116,30 @@ fn referenced_table_names(sql: &str, trino: bool) -> Vec<String> {
     // `DATA-21` D2: a `Trino` statement is read with `TrinoDialect` (the
     // one that reads a table version) and in the form that dialect
     // parses, so the tables it names are the tables it reads.
-    let mut tables = if trino {
+    if trino {
         let normalized = crate::sql_rewrite::normalize_past_version_clause(sql)
             .unwrap_or_else(|_| sql.to_owned());
-        crate::sql_rewrite::referenced_tables(
-            &normalized,
-            &crate::sql_rewrite::TrinoDialect::default(),
-        )
+        tables_named(&normalized, &crate::sql_rewrite::TrinoDialect::default())
     } else {
-        crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::ClickHouseDialect {})
+        tables_named(sql, &sqlparser::dialect::ClickHouseDialect {})
     }
-    .unwrap_or_default();
+}
+
+/// [`referenced_table_names`] for one dialect.
+///
+/// `referenced_tables` reads `Query` nodes only, so `DESCRIBE t` and
+/// `SHOW COLUMNS FROM t` give it nothing. The tenant gate already names the
+/// table of those forms (`gate_targets`); History lists the same table
+/// (`QS-4` QA, 2026-11-05) instead of an empty list. A listing such as
+/// `SHOW TABLES` names none and stays empty.
+fn tables_named(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> Vec<String> {
+    let mut tables = crate::sql_rewrite::referenced_tables(sql, dialect).unwrap_or_default();
+    if tables.is_empty()
+        && let Some(crate::sql_rewrite::GateTargets::Tables(named)) =
+            crate::sql_rewrite::gate_targets(sql, dialect)
+    {
+        tables = named;
+    }
     tables.sort();
     tables
 }
@@ -1257,6 +1270,55 @@ fn refuse_unlisted_settings(sql: &str) -> Result<(), ApiError> {
     }
 }
 
+/// A run the engine did not complete: the error the response carries and
+/// what the History row keeps for it.
+///
+/// The two differ on purpose (`QS-4` QA, 2026-11-05). The response may show
+/// the author the engine's diagnosis of their own statement (SEC-11, the
+/// query-author exception); the row is read back through the History list,
+/// so it keeps a fixed sentence by cause instead, with the same reference
+/// id (`upstream_error::StatementFailure`).
+struct EngineFailure {
+    /// What `run` answers with.
+    response: ApiError,
+    /// `failed`, or `stopped` when the person ended the run with Stop.
+    status: &'static str,
+    /// What the History row says.
+    message: String,
+}
+
+impl EngineFailure {
+    /// A failure whose response text is already fixed, so the row keeps the
+    /// same text: the time limit, an outage, a row cap.
+    fn fixed(response: ApiError) -> Self {
+        let message = response.to_string();
+        Self {
+            response,
+            status: "failed",
+            message,
+        }
+    }
+
+    /// A statement the engine refused: the author's diagnosis in the
+    /// response, the classified sentence in the row.
+    fn statement(failure: upstream_error::StatementFailure) -> Self {
+        Self {
+            response: failure.response,
+            status: "failed",
+            message: failure.recorded,
+        }
+    }
+
+    /// The engine killed the query because of a Stop (`QUERY_WAS_CANCELLED`).
+    fn stopped() -> Self {
+        Self {
+            response: ApiError::Unprocessable(crate::query_limits::STOPPED_SENTENCE.to_owned()),
+            status: "stopped",
+            message: crate::query_limits::STOPPED_SENTENCE.to_owned(),
+        }
+    }
+}
+
 /// Runs the already-rewritten `sql` against whichever engine `engine`
 /// names, returning `(columns, rows, duration_ms, scanned_bytes)`. Split
 /// out of [`run`] purely to keep that function under
@@ -1272,7 +1334,7 @@ async fn execute_query_against_engine(
         &crate::query_limits::QueryRun,
         &crate::query_limits::TileLimits,
     ),
-) -> Result<(Vec<String>, Vec<Value>, u64, u64), ApiError> {
+) -> Result<(Vec<String>, Vec<Value>, u64, u64), EngineFailure> {
     if engine == "trino" {
         let trino_user = format!("console-{user_id}");
         let result = state
@@ -1288,7 +1350,8 @@ async fn execute_query_against_engine(
         // engine's diagnosis of it (version and addresses trimmed); the full
         // text is logged under the reference. An unreachable engine or a
         // non-query failure stays the fixed message. See
-        // `upstream_error::ch_error_for_author`.
+        // `upstream_error::ch_failure_for_author`, which also gives the
+        // classified sentence the History row keeps instead.
         //
         // SEC-21: the engine stops producing rows past the cap, so a huge
         // result never reaches this process. One row more than the route
@@ -1306,11 +1369,16 @@ async fn execute_query_against_engine(
             .await
             .map_err(|e| {
                 if e.is_time_limit() {
-                    ApiError::Unprocessable(crate::query_limits::time_sentence("query", limits))
+                    EngineFailure::fixed(ApiError::Unprocessable(
+                        crate::query_limits::time_sentence("query", limits),
+                    ))
                 } else if e.is_killed_on_engine() {
-                    ApiError::Unprocessable(crate::query_limits::STOPPED_SENTENCE.to_owned())
+                    EngineFailure::stopped()
                 } else {
-                    upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e)
+                    EngineFailure::statement(upstream_error::ch_failure_for_author(
+                        &upstream_error::DATABASE,
+                        &e,
+                    ))
                 }
             })?;
 
@@ -1595,7 +1663,9 @@ pub async fn run(
     // answered or not. BI-5's limits travel with the call, so a run the time
     // limit or a Stop ended ends here with the limit's own fixed sentence —
     // and that sentence, not the engine's text, is what the history row
-    // carries, exactly as the response does.
+    // carries, exactly as the response does. A Stop is recorded `stopped`; a
+    // statement the engine refused is recorded as a classified sentence with
+    // the reference the response carries (`EngineFailure`).
     let (columns, mut rows, duration_ms, scanned_bytes) = match execute_query_against_engine(
         &state,
         &engine,
@@ -1607,19 +1677,19 @@ pub async fn run(
     .await
     {
         Ok(result) => result,
-        Err(err) => {
+        Err(failure) => {
             record_uncompleted_run(
                 &state,
                 &p,
                 &statement,
                 &engine,
-                "failed",
-                &err.to_string(),
+                failure.status,
+                &failure.message,
                 &tables_read,
                 started.elapsed().as_millis(),
             )
             .await;
-            return Err(err.into());
+            return Err(failure.response.into());
         }
     };
 
@@ -1866,33 +1936,40 @@ fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
     (columns, rows)
 }
 
-/// Map a [`TrinoError`] to the [`ApiError`] `run` returns.
+/// Map a [`TrinoError`] to the [`EngineFailure`] `run` returns.
 ///
 /// SEC-11: [`TrinoError::Query`] is the one variant whose engine text
 /// reaches the caller, trimmed and with a reference id (the query-author
 /// exception, product owner decision 2026-10-10: the person who wrote the
 /// statement is entitled to the engine's diagnosis of it). Timeouts,
 /// transport and HTTP failures stay fixed messages.
-fn map_trino_error(err: TrinoError) -> ApiError {
+fn map_trino_error(err: TrinoError) -> EngineFailure {
     match err {
         // SEC-11, query-author exception (product owner, 2026-10-10): `Query`
         // is Trino answering that the statement is wrong, and this route's
-        // caller wrote the statement; trimmed, with the reference.
-        TrinoError::Query(msg) => upstream_error::query_error_for_author(
-            &upstream_error::Context::new(
-                "trino query",
-                "The Trino query failed.",
-                "Trino is unavailable.",
-            ),
-            &msg,
-        ),
-        TrinoError::Timeout => ApiError::Unavailable("trino query timed out".to_owned()),
+        // caller wrote the statement; trimmed, with the reference. The
+        // History row keeps the default sentence with the same reference:
+        // `lakehouse-trino` drops the engine's error name, so no cause is
+        // known (see `upstream_error::query_failure_for_author`).
+        TrinoError::Query(msg) => {
+            EngineFailure::statement(upstream_error::query_failure_for_author(
+                &upstream_error::Context::new(
+                    "trino query",
+                    "The Trino query failed.",
+                    "Trino is unavailable.",
+                ),
+                &msg,
+            ))
+        }
+        TrinoError::Timeout => {
+            EngineFailure::fixed(ApiError::Unavailable("trino query timed out".to_owned()))
+        }
         TrinoError::Transport(_) | TrinoError::HttpStatus(_) => {
-            ApiError::Unavailable("trino unavailable".to_owned())
+            EngineFailure::fixed(ApiError::Unavailable("trino unavailable".to_owned()))
         }
-        TrinoError::TooManyRows { cap } => {
-            ApiError::Unprocessable(format!("trino result exceeded the {cap}-row cap"))
-        }
+        TrinoError::TooManyRows { cap } => EngineFailure::fixed(ApiError::Unprocessable(format!(
+            "trino result exceeded the {cap}-row cap"
+        ))),
     }
 }
 
@@ -2423,14 +2500,31 @@ pub struct HistoryQueryRaw {
     table: Option<String>,
     from: Option<String>,
     to: Option<String>,
-    /// The page cursor: `<at>,<id>` — the `at` and `id` of the last row
-    /// the caller has already seen.
-    before: Option<String>,
+    /// The 1-based page number. A leftover `before=` from a client cached
+    /// before pages were numbered is an unknown key, so it is ignored.
+    page: Option<String>,
 }
 
-/// The statuses `query_history`'s own check allows — the set [`run`]
-/// records, and nothing else.
-const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "blocked"];
+/// The largest page the route passes on. A page no 14-day history could
+/// fill is an empty page whatever its number, so a larger one is clamped
+/// here: the number echoed back stays one a JSON client reads exactly.
+const HISTORY_MAX_PAGE: i64 = 1_000_000;
+
+/// The answer of `GET /api/query/history` (`QS-4` QA of 2026-11-05): one
+/// page of runs, newest first, and the numbers a pager needs.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPage {
+    runs: Vec<QueryHistoryItem>,
+    /// Every row the filters keep, whichever page this is.
+    total: i64,
+    page: i64,
+    page_size: i64,
+}
+
+/// The statuses [`run`] records, which the filter accepts. The table's check
+/// also allows `cancelled` for older rows, and the filter does not accept it.
+const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "stopped", "blocked"];
 
 /// The engines [`run`] records.
 const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
@@ -2448,7 +2542,7 @@ fn parse_history_query(raw: &HistoryQueryRaw) -> Result<HistoryFilter<'_>, ApiEr
     if let Some(status) = raw.status.as_deref().filter(|s| !s.is_empty()) {
         if !HISTORY_STATUSES.contains(&status) {
             return Err(ApiError::BadRequest(
-                "status must be one of completed, failed, cancelled, blocked".to_owned(),
+                "status must be one of completed, failed, stopped, blocked".to_owned(),
             ));
         }
         filter.status = Some(status);
@@ -2475,19 +2569,19 @@ fn parse_history_query(raw: &HistoryQueryRaw) -> Result<HistoryFilter<'_>, ApiEr
     }
     filter.from = history_time("from", raw.from.as_deref())?;
     filter.to = history_time("to", raw.to.as_deref())?;
-    if let Some(before) = raw.before.as_deref().filter(|s| !s.is_empty()) {
-        let bad_before = || {
-            ApiError::BadRequest(
-                "before must be <at>,<id>: the at and the id of the last row you have seen"
-                    .to_owned(),
-            )
-        };
-        let (at, id) = before.split_once(',').ok_or_else(bad_before)?;
-        if id.is_empty() {
-            return Err(bad_before());
+    if let Some(page) = raw.page.as_deref().filter(|s| !s.is_empty()) {
+        let bad_page =
+            || ApiError::BadRequest("page must be a whole number of 1 or more".to_owned());
+        // Digits only, so a failed parse below can only be a number too big
+        // for 64 bits; that is a page past the end, not a bad request.
+        if !page.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad_page());
         }
-        filter.before_at = Some(OffsetDateTime::parse(at, &Rfc3339).map_err(|_| bad_before())?);
-        filter.before_id = Some(id);
+        let page = page.parse::<i64>().unwrap_or(HISTORY_MAX_PAGE);
+        if page < 1 {
+            return Err(bad_page());
+        }
+        filter.page = page.min(HISTORY_MAX_PAGE);
     }
     Ok(filter)
 }
@@ -2505,13 +2599,15 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 }
 
 /// `GET /api/query/history` — the caller's own recorded query executions,
-/// filtered, inside the last 14 days, one page at a time (`QS-4`).
+/// filtered, inside the last 14 days, one numbered page at a time (`QS-4`).
+/// The answer is a [`HistoryPage`]: the page's runs and the true total.
 ///
 /// # Errors
 ///
 /// 401 when nobody is signed in — history belongs to a person, so there is
-/// no sensible answer for "everyone's". 400 for a bad filter value, with a
-/// fixed message naming the field, and for a query string the route cannot
+/// no sensible answer for "everyone's". 400 for a bad filter value or a
+/// `page` that is not a whole number from 1, with a fixed message naming
+/// the field, and for a query string the route cannot
 /// read (a parameter sent twice), with the fixed sentence of
 /// [`QUERY_STRING_UNREADABLE`]. 503 if no pool is configured; 500 on a
 /// database failure.
@@ -2519,7 +2615,7 @@ pub async fn list_history(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     query: Result<Query<HistoryQueryRaw>, axum::extract::rejection::QueryRejection>,
-) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
+) -> ApiResult<ApiJson<HistoryPage>> {
     let owner = caller_id(principal.as_ref())?;
     // A query string the extractor cannot read — a parameter sent twice, for
     // instance — is refused with this route's own sentence. The rejection's
@@ -2530,9 +2626,17 @@ pub async fn list_history(
         ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let filter = parse_history_query(&raw)?;
-    Ok(ApiJson(
-        queries::list_history(pool(&state)?, owner, &filter).await?,
-    ))
+    let pool = pool(&state)?;
+    // The list and the count share one `WHERE` in the store, so `total`
+    // counts exactly the rows the pages walk.
+    let runs = queries::list_history(pool, owner, &filter).await?;
+    let total = queries::count_history(pool, owner, &filter).await?;
+    Ok(ApiJson(HistoryPage {
+        runs,
+        total,
+        page: filter.page,
+        page_size: queries::HISTORY_PAGE_LIMIT,
+    }))
 }
 
 /// The signed-in caller's id, or a 401.
@@ -4697,7 +4801,8 @@ mod tests {
             // message for their own statement, trimmed, with a reference.
             let err = map_trino_error(TrinoError::Query(
                 "line 1:1: mismatched input 'x' at trino-1.internal:8080".to_owned(),
-            ));
+            ))
+            .response;
             assert_eq!(err.status(), 422);
             let text = err.to_string();
             assert!(text.contains("line 1:1: mismatched input"), "{text}");
@@ -4707,19 +4812,19 @@ mod tests {
 
         #[test]
         fn maps_timeout_to_503() {
-            let err = map_trino_error(TrinoError::Timeout);
+            let err = map_trino_error(TrinoError::Timeout).response;
             assert_eq!(err.status(), 503);
         }
 
         #[test]
         fn maps_http_status_to_503() {
-            let err = map_trino_error(TrinoError::HttpStatus(500));
+            let err = map_trino_error(TrinoError::HttpStatus(500)).response;
             assert_eq!(err.status(), 503);
         }
 
         #[test]
         fn maps_too_many_rows_to_422_naming_the_cap() {
-            let err = map_trino_error(TrinoError::TooManyRows { cap: 10_000 });
+            let err = map_trino_error(TrinoError::TooManyRows { cap: 10_000 }).response;
             assert_eq!(err.status(), 422);
             assert!(err.to_string().contains("10000") || err.to_string().contains("10,000"));
         }
@@ -6100,7 +6205,7 @@ mod history_query_tests {
         table: Option<&str>,
         from: Option<&str>,
         to: Option<&str>,
-        before: Option<&str>,
+        page: Option<&str>,
     ) -> HistoryQueryRaw {
         HistoryQueryRaw {
             status: status.map(str::to_owned),
@@ -6109,7 +6214,7 @@ mod history_query_tests {
             table: table.map(str::to_owned),
             from: from.map(str::to_owned),
             to: to.map(str::to_owned),
-            before: before.map(str::to_owned),
+            page: page.map(str::to_owned),
         }
     }
 
@@ -6124,19 +6229,15 @@ mod history_query_tests {
             Some("orders"),
             Some("2026-10-11T00:00:00Z"),
             Some("2026-10-20T12:00:00.500Z"),
-            Some("2026-10-20T11:59:59.999Z,q-1729"),
+            Some("3"),
         );
         let filter = parse_history_query(&query).unwrap();
         assert_eq!(filter.status, Some("failed"));
         assert_eq!(filter.engine, Some("trino"));
         assert_eq!(filter.min_duration_ms, Some(1500));
         assert_eq!(filter.table, Some("orders"));
-        assert_eq!(
-            filter.before_id,
-            Some("q-1729"),
-            "the cursor's id half is everything after the first comma"
-        );
-        assert!(filter.from.is_some() && filter.to.is_some() && filter.before_at.is_some());
+        assert_eq!(filter.page, 3);
+        assert!(filter.from.is_some() && filter.to.is_some());
 
         let empty_query = raw(None, None, None, None, None, None, None);
         let empty = parse_history_query(&empty_query).unwrap();
@@ -6168,7 +6269,7 @@ mod history_query_tests {
         let err = parse_history_query(&bad_status).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "status must be one of completed, failed, cancelled, blocked"
+            "status must be one of completed, failed, stopped, blocked"
         );
         let bad_engine = raw(None, Some("presto"), None, None, None, None, None);
         let err = parse_history_query(&bad_engine).unwrap_err();
@@ -6176,11 +6277,10 @@ mod history_query_tests {
     }
 
     /// A value that does not parse is a 400 whose message names the field:
-    /// the duration's number, the window's times, and the cursor's two
-    /// halves.
+    /// the duration's number, the window's times, and the page number.
     #[test]
-    fn a_bad_duration_time_or_cursor_is_a_400_naming_the_field() {
-        let cases: [(HistoryQueryRaw, &str); 6] = [
+    fn a_bad_duration_time_or_page_is_a_400_naming_the_field() {
+        let cases: [(HistoryQueryRaw, &str); 8] = [
             (
                 raw(None, None, Some("soon"), None, None, None, None),
                 "minDurationMs",
@@ -6205,30 +6305,10 @@ mod history_query_tests {
                 ),
                 "to",
             ),
-            (
-                raw(
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("2026-10-20T00:00:00Z"),
-                ),
-                "before",
-            ),
-            (
-                raw(
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("2026-10-20T00:00:00Z,"),
-                ),
-                "before",
-            ),
+            (raw(None, None, None, None, None, None, Some("0")), "page"),
+            (raw(None, None, None, None, None, None, Some("abc")), "page"),
+            (raw(None, None, None, None, None, None, Some("-1")), "page"),
+            (raw(None, None, None, None, None, None, Some("1.5")), "page"),
         ];
         for (query, field) in &cases {
             let err = parse_history_query(query).unwrap_err();
@@ -6236,5 +6316,32 @@ mod history_query_tests {
             assert!(message.starts_with(field), "{message} must name {field:?}");
             assert_eq!(err.status(), 400, "a bad value is a 400: {message}");
         }
+    }
+
+    /// No `page` is page 1; a page too large for a 64-bit number is the
+    /// clamp, an empty page for the store and not a 400 (`QS-4` QA of
+    /// 2026-11-05).
+    #[test]
+    fn a_missing_page_is_page_one_and_a_huge_one_is_clamped() {
+        let none = raw(None, None, None, None, None, None, None);
+        assert_eq!(parse_history_query(&none).unwrap().page, 1);
+        let huge = raw(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("99999999999999999999999"),
+        );
+        assert_eq!(
+            parse_history_query(&huge).unwrap().page,
+            super::HISTORY_MAX_PAGE
+        );
+        let just_over = raw(None, None, None, None, None, None, Some("1000001"));
+        assert_eq!(
+            parse_history_query(&just_over).unwrap().page,
+            super::HISTORY_MAX_PAGE
+        );
     }
 }

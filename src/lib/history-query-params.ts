@@ -6,9 +6,9 @@ import type { QueryHistoryFilter } from "@/services/contracts/queries";
  * fields percent-encoded in the contract's order, empty strings dropped
  * (the server reads an empty value as "no filter"), and an empty result
  * for an absent or all-empty filter so the caller adds no stray `?`.
- * `before` is the page cursor — the `at` and `id` of the last row seen,
- * joined with the comma the server splits on; an ISO `at` carries no
- * comma of its own.
+ * `page` is the 1-based page number; the first page is the server's
+ * default, so `page` is written only from the second page on, and a
+ * first-page query stays `""` when nothing else is set.
  */
 export function historyQueryString(filter?: QueryHistoryFilter): string {
   if (!filter) return "";
@@ -21,14 +21,14 @@ export function historyQueryString(filter?: QueryHistoryFilter): string {
   if (filter.table) params.set("table", filter.table);
   if (filter.from) params.set("from", filter.from);
   if (filter.to) params.set("to", filter.to);
-  if (filter.before) params.set("before", `${filter.before.at},${filter.before.id}`);
+  if (filter.page !== undefined && filter.page > 1) params.set("page", String(filter.page));
   return params.toString();
 }
 
 /**
- * The page size the history endpoint answers with — the server's
- * `HISTORY_PAGE_LIMIT` (`routes/query.rs`). The page's "Load more"
- * infers the end of the trail from it: a page that comes back with
- * fewer rows was the last one, so no older page can exist.
+ * The page size the history endpoint answers with, the server's
+ * `HISTORY_PAGE_LIMIT` (`routes/query.rs`). The response also carries
+ * `pageSize`; this constant is the fallback the page uses before the
+ * first answer lands.
  */
 export const HISTORY_PAGE_LIMIT = 50

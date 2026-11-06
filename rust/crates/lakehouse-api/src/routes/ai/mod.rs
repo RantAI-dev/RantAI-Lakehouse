@@ -972,7 +972,15 @@ async fn run_chat(
                 } else {
                     let outcome = gate::outcome_of(&refusal);
                     if outcome == "needs_confirmation" {
-                        match tools::check_draft(state, &call.function.name, &args, refusal).await {
+                        match tools::check_draft(
+                            state,
+                            principal,
+                            &call.function.name,
+                            &args,
+                            refusal,
+                        )
+                        .await
+                        {
                             Ok(draft) => (draft, outcome, None, None),
                             Err(error) => (error, "failed", None, None),
                         }
@@ -1357,7 +1365,8 @@ pub async fn tool_call(
         } else {
             let outcome = gate::outcome_of(&refusal);
             if outcome == "needs_confirmation" {
-                match tools::check_draft(&state, &parsed.tool, &parsed.args, refusal).await {
+                match tools::check_draft(&state, caller, &parsed.tool, &parsed.args, refusal).await
+                {
                     Ok(draft) => (draft, outcome, None, None),
                     Err(error) => (error, "failed", None, None),
                 }

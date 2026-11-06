@@ -4,6 +4,7 @@ import {
   assetQueryTarget,
   assetSnapshotQueryHref,
   assetStarterSql,
+  trinoBronzeName,
 } from "./asset-query"
 
 type Target = Parameters<typeof assetStarterSql>[0]
@@ -35,6 +36,16 @@ describe("assetQueryTarget", () => {
       engine: "clickhouse",
       table: 'primer."Demo Orders Param"',
     })
+  })
+})
+
+describe("trinoBronzeName", () => {
+  it("is the iceberg catalog's bronze schema and the table", () => {
+    expect(trinoBronzeName("orders")).toBe("iceberg.bronze.orders")
+  })
+
+  it("quotes a table name that is not a plain identifier", () => {
+    expect(trinoBronzeName("order lines")).toBe('iceberg.bronze."order lines"')
   })
 })
 

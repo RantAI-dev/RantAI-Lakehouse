@@ -1,8 +1,8 @@
 // The history page's own behaviour, against the real component: its
-// filters reach the client call, "Load more" walks the cursor, a row's
-// SQL builds the studio link, a refused row shows what the server told
-// it, a refused older page says why there is none, and the empty state
-// says what the window is. The service is spied; nothing leaves the
+// filters reach the client call, the page numbers walk `page`, a filter
+// change returns to page 1, a row's SQL builds the studio link, a refused
+// row shows what the server told it, a refused page shows the permission
+// state, and the empty state says what the window is. The service is spied; nothing leaves the
 // test. `next/navigation` is stubbed before any import resolves
 // (`mock.module` is hoisted), for the tabs' pathname.
 mock.module("next/navigation", () => ({
@@ -12,7 +12,7 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { queryService } from "@/services"
-import type { QueryHistoryItem } from "@/services/contracts/queries"
+import type { QueryHistoryItem, QueryHistoryPage as HistoryPage } from "@/services/contracts/queries"
 import { ServiceError } from "@/services/errors"
 import { QueryHistoryPage } from "./query-history-page"
 
@@ -39,41 +39,61 @@ function row(over: Partial<QueryHistoryItem> = {}): QueryHistoryItem {
   }
 }
 
+/** The envelope the server answers with. */
+function pageOf(runs: QueryHistoryItem[], total: number, page = 1): HistoryPage {
+  return { runs, total, page, pageSize: 50 }
+}
+
 /**
- * A full page, the size the server answers with, ids q-001..q-050. Each
- * row's SQL names its number: the visible marker a test can look for (a
- * row's id is a React key, never rendered text).
+ * A page of `count` rows. Each row's SQL names its number: the visible
+ * marker a test can look for (a row's id is a React key, never rendered
+ * text).
  */
-function fullPage(): QueryHistoryItem[] {
-  return Array.from({ length: 50 }, (_, i) =>
-    row({ id: `q-${String(i + 1).padStart(3, "0")}`, sql: `SELECT ${i + 1}` }),
+function rowsFrom(first: number, count = 50): QueryHistoryItem[] {
+  return Array.from({ length: count }, (_, i) =>
+    row({ id: `q-${String(first + i).padStart(3, "0")}`, sql: `SELECT ${first + i}` }),
   )
+}
+
+/** A server of 120 runs: page N holds rows 50(N-1)+1 onward, as the real one pages. */
+function server120() {
+  return spyOn(queryService, "listHistoryPage").mockImplementation((async (filter?: {
+    page?: number
+  }) => {
+    const page = filter?.page ?? 1
+    return pageOf(page > 3 ? [] : rowsFrom(50 * (page - 1) + 1, page === 3 ? 20 : 50), 120, page)
+  }) as unknown as typeof queryService.listHistoryPage)
 }
 
 describe("QueryHistoryPage", () => {
   it("says the window in the empty state, filtered or not", async () => {
-    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf([], 0))
     render(<QueryHistoryPage />)
     const title = await screen.findByText("No runs in the last 14 days")
     expect(title).toBeDefined()
   })
 
   it("renders the runs, the refused row's message, and the studio link with the engine", async () => {
-    spyOn(queryService, "listHistory").mockResolvedValue([
-      row({
-        id: "q-ok",
-        sql: "SELECT 1",
-        tablesRead: ["marts.retails"],
-        durationMs: 42,
-      }),
-      row({
-        id: "q-no",
-        sql: "SELECT * FROM bronze.orders",
-        status: "blocked",
-        message: "Table not found or not available to your organisation: bronze.orders",
-        tablesRead: ["bronze.orders"],
-      }),
-    ])
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(
+      pageOf(
+        [
+          row({
+            id: "q-ok",
+            sql: "SELECT 1",
+            tablesRead: ["marts.retails"],
+            durationMs: 42,
+          }),
+          row({
+            id: "q-no",
+            sql: "SELECT * FROM bronze.orders",
+            status: "blocked",
+            message: "Table not found or not available to your organisation: bronze.orders",
+            tablesRead: ["bronze.orders"],
+          }),
+        ],
+        2,
+      ),
+    )
     render(<QueryHistoryPage />)
 
     const refused = await screen.findByText(
@@ -81,10 +101,11 @@ describe("QueryHistoryPage", () => {
     )
     expect(refused).toBeDefined()
     expect(screen.getByText("marts.retails")).toBeDefined()
-    // The badge carries the status label, in the refused run's own row.
+    // The badge carries the History wording, in the refused run's own row.
     const refusedRow = refused.closest("tr")
     expect(refusedRow).not.toBeNull()
-    expect(within(refusedRow!).getByText("Blocked")).toBeDefined()
+    expect(within(refusedRow!).getByText("Refused")).toBeDefined()
+    expect(within(refusedRow!).queryByText("Blocked")).toBeNull()
 
     const link = screen.getByRole("link", { name: "SELECT * FROM bronze.orders" })
     expect(link.getAttribute("href")).toBe(
@@ -92,8 +113,35 @@ describe("QueryHistoryPage", () => {
     )
   })
 
+  it("shows Stopped on a stopped run's row", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(
+      pageOf([row({ id: "q-st", sql: "SELECT sleep(9)", status: "stopped", message: "Stopped" })], 1),
+    )
+    render(<QueryHistoryPage />)
+    const link = await screen.findByRole("link", { name: "SELECT sleep(9)" })
+    expect(within(link.closest("tr")!).getAllByText("Stopped").length).toBeGreaterThan(0)
+    expect(within(link.closest("tr")!).queryByText("Cancelled")).toBeNull()
+  })
+
+  it("reads Completed, Failed, Stopped and Refused on the status pills and sends the server's words", async () => {
+    const spy = spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf([], 0))
+    render(<QueryHistoryPage />)
+    await screen.findByText("No runs in the last 14 days")
+
+    const group = screen.getByRole("group", { name: "Filter by status" })
+    const labels = within(group)
+      .getAllByRole("button")
+      .map((b) => b.textContent)
+    expect(labels).toEqual(["All statuses", "Completed", "Failed", "Stopped", "Refused"])
+
+    fireEvent.click(within(group).getByRole("button", { name: "Stopped" }))
+    await waitFor(() => expect(spy.mock.calls.at(-1)![0]?.status).toBe("stopped"))
+    fireEvent.click(within(group).getByRole("button", { name: "Refused" }))
+    await waitFor(() => expect(spy.mock.calls.at(-1)![0]?.status).toBe("blocked"))
+  })
+
   it("sends the filters to the client call", async () => {
-    const spy = spyOn(queryService, "listHistory").mockResolvedValue([])
+    const spy = spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf([], 0))
     render(<QueryHistoryPage />)
     await screen.findByText("No runs in the last 14 days")
 
@@ -121,64 +169,121 @@ describe("QueryHistoryPage", () => {
         table: "orders",
         from: "2026-10-11T00:00:00Z",
         to: "2026-10-20T23:59:59.999Z",
+        page: 1,
       })
     })
   })
 
-  it("appends the older page and walks the cursor on Load more", async () => {
-    const spy = spyOn(queryService, "listHistory").mockImplementation(
-      (async (filter?: { before?: { at: string; id: string } }) => {
-        if (filter?.before) {
-          return [row({ id: "q-051", sql: "SELECT 51" }), row({ id: "q-052", sql: "SELECT 52" })]
-        }
-        return fullPage()
-      }) as unknown as typeof queryService.listHistory,
-    )
+  it("says Page 1 of 3 for 120 runs and walks the page number with the page buttons", async () => {
+    const spy = server120()
     render(<QueryHistoryPage />)
 
     await screen.findByText("SELECT 50")
+    expect(screen.getByText("Page 1 of 3")).toBeDefined()
     expect(screen.queryByText("SELECT 51")).toBeNull()
+    expect((screen.getByRole("button", { name: "Previous" }) as HTMLButtonElement).disabled).toBe(true)
 
-    // The button turns on one commit after the rows: the page marks a
-    // full page in an effect after the fetch lands.
-    fireEvent.click(await screen.findByRole("button", { name: "Load more" }))
+    // A page number goes straight to that page; the rows replace, not append.
+    fireEvent.click(screen.getByRole("button", { name: "2" }))
+    await screen.findByText("SELECT 51")
+    expect(spy.mock.calls.at(-1)![0]?.page).toBe(2)
+    expect(screen.getByText("Page 2 of 3")).toBeDefined()
+    expect(screen.queryByText("SELECT 50")).toBeNull()
 
-    await screen.findByText("SELECT 52")
-    expect(screen.getByText("SELECT 50")).toBeDefined()
-    // The cursor is the at and id of the last row the first page ended on.
-    const last = spy.mock.calls.at(-1)!
-    expect(last[0]?.before).toEqual({ at: "2026-10-25T03:00:00.000Z", id: "q-050" })
+    fireEvent.click(screen.getByRole("button", { name: "Next" }))
+    await screen.findByText("SELECT 101")
+    expect(spy.mock.calls.at(-1)![0]?.page).toBe(3)
+    expect(screen.getByText("Page 3 of 3")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole("button", { name: "Previous" }))
+    await screen.findByText("SELECT 51")
+    expect(spy.mock.calls.at(-1)![0]?.page).toBe(2)
+    expect(screen.getByText("Page 2 of 3")).toBeDefined()
   })
 
-  it("hides Load more once a page comes back short", async () => {
-    spyOn(queryService, "listHistory").mockResolvedValue([row()])
+  it("has no Load more button", async () => {
+    server120()
     render(<QueryHistoryPage />)
-    await screen.findByText("SELECT 1")
-    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull()
+    await screen.findByText("SELECT 50")
+    expect(screen.queryByRole("button", { name: /load more/i })).toBeNull()
   })
 
-  it("a 403 from the history call shows the permission message", async () => {
-    spyOn(queryService, "listHistory").mockImplementation(
-      (async (filter?: { before?: { at: string; id: string } }) => {
-        if (filter?.before) {
-          throw new ServiceError(
-            "permission_denied",
-            "You do not have access to the query history.",
-            403,
-          )
-        }
-        return fullPage()
-      }) as unknown as typeof queryService.listHistory,
-    )
+  it("rounds the page count up: 51 runs make 2 pages and 50 make 1", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf(rowsFrom(1), 51))
+    render(<QueryHistoryPage />)
+    expect(await screen.findByText("Page 1 of 2")).toBeDefined()
+    cleanup()
+    mock.restore()
+
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf(rowsFrom(1), 50))
+    render(<QueryHistoryPage />)
+    expect(await screen.findByText("Page 1 of 1")).toBeDefined()
+  })
+
+  it("returns to page 1 when a filter changes", async () => {
+    const spy = server120()
+    render(<QueryHistoryPage />)
+    await screen.findByText("SELECT 50")
+    fireEvent.click(screen.getByRole("button", { name: "2" }))
+    await screen.findByText("SELECT 51")
+
+    fireEvent.click(screen.getByRole("button", { name: "Failed" }))
+
+    await waitFor(() => {
+      const last = spy.mock.calls.at(-1)![0]
+      expect(last?.status).toBe("failed")
+      expect(last?.page).toBe(1)
+    })
+    await screen.findByText("Page 1 of 3")
+    // No call ever asked for page 2 with the new filter.
+    expect(
+      spy.mock.calls.some(([f]) => f?.status === "failed" && (f?.page ?? 1) > 1),
+    ).toBe(false)
+  })
+
+  it("steps back to the last page when the page asked for is past the end", async () => {
+    // The data shrinks to 100 runs (2 pages) after page 1 was drawn with a
+    // "3" button, so the click on 3 asks for a page that is gone.
+    let total = 120
+    const spy = spyOn(queryService, "listHistoryPage").mockImplementation((async (filter?: {
+      page?: number
+    }) => {
+      const page = filter?.page ?? 1
+      const last = Math.ceil(total / 50)
+      return page > last
+        ? pageOf([], total, page)
+        : pageOf(rowsFrom(50 * (page - 1) + 1, Math.min(50, total - 50 * (page - 1))), total, page)
+    }) as unknown as typeof queryService.listHistoryPage)
+    render(<QueryHistoryPage />)
+    await screen.findByText("Page 1 of 3")
+
+    total = 100
+    fireEvent.click(screen.getByRole("button", { name: "3" }))
+
+    expect(await screen.findByText("Page 2 of 2")).toBeDefined()
+    await screen.findByText("SELECT 51")
+    expect(spy.mock.calls.map(([f]) => f?.page)).toEqual([1, 3, 2])
+  })
+
+  it("a 403 from the history call shows the permission state", async () => {
+    spyOn(queryService, "listHistoryPage").mockImplementation((async (filter?: {
+      page?: number
+    }) => {
+      if ((filter?.page ?? 1) > 1) {
+        throw new ServiceError(
+          "permission_denied",
+          "You do not have access to the query history.",
+          403,
+        )
+      }
+      return pageOf(rowsFrom(1), 120)
+    }) as unknown as typeof queryService.listHistoryPage)
     render(<QueryHistoryPage />)
 
     await screen.findByText("SELECT 50")
-    fireEvent.click(await screen.findByRole("button", { name: "Load more" }))
+    fireEvent.click(screen.getByRole("button", { name: "2" }))
 
-    const message = await screen.findByText("You do not have access to the query history.")
-    expect(message).toBeDefined()
-    // The rows the page has stay: the failure only says there is no
-    // older page yet.
-    expect(screen.getByText("SELECT 50")).toBeDefined()
+    expect(await screen.findByText("You don't have access")).toBeDefined()
   })
 })

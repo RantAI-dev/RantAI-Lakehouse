@@ -511,16 +511,21 @@ pub(super) async fn create_chart(
 /// so it writes nothing.
 ///
 /// `id` is `None` for a create and `Some` for an update; an update with no
-/// `id` is refused here, as the tool refuses it. A create draft that builds
-/// returns the digest of the call's own definition. An update draft returns
-/// `None`: the stored chart is read as the server here, so a digest of it
-/// would show a caller fields of a chart the caller may not see.
+/// `id` is refused here, as the tool refuses it. An update reads the stored
+/// chart as `viewer`, which must be the caller's own (`scope_for_write`, as
+/// the tool builds it), and refuses a chart the caller cannot edit with the
+/// sentence the tool gives, so the draft says nothing about a chart the
+/// caller cannot see. A create reads no stored chart and ignores `viewer`.
+/// A create draft that builds returns the digest of the call's own
+/// definition. An update draft returns `None`: the save's reply carries the
+/// digest of the merged chart.
 ///
 /// # Errors
 ///
 /// The error the tool would return when the draft cannot be built.
 pub(super) async fn check_chart_draft(
     ch: &ChClient,
+    viewer: &Viewer,
     args: &Map<String, Value>,
     id: Option<String>,
     time: &lakehouse_bi::grain::TimeContext,
@@ -528,17 +533,17 @@ pub(super) async fn check_chart_draft(
     if id.as_deref().is_some_and(str::is_empty) {
         return Err(json!({ "error": "id is required" }));
     }
-    // The stored chart is read as the server (`Viewer::system()`): this check
-    // has no principal of its own, so it only answers whether the draft
-    // builds. That is why an update draft carries no digest: the merged
-    // definition would come from a chart the caller may not see. The digest
-    // in `update_chart`'s saved reply is read as the caller, after
-    // `require_editable_chart` has refused a chart the caller may not edit.
-    let viewer = Viewer::system();
-    // The same carry-over `update_chart` does, so the card and the save
-    // agree. A chart that is not found, or one in the trash, is checked as it
-    // came.
-    let kept = Box::pin(kept_formatting(ch, &viewer, id.as_deref(), args)).await?;
+    // The gate `update_chart` runs first: a chart that is missing, in the
+    // trash, purged or on a board the caller cannot see answers one sentence,
+    // here and at the save, before any stored field is read.
+    if let Some(id) = id.as_deref() {
+        require_editable_chart(ch, id, viewer)
+            .await
+            .map_err(refused)?;
+    }
+    // The same carry-over `update_chart` does, as the same viewer, so the card
+    // and the save agree.
+    let kept = Box::pin(kept_formatting(ch, viewer, id.as_deref(), args)).await?;
     let input = parse_chart_input(&kept.args).map_err(|e| json!({ "error": e }))?;
     if let Err(sentence) = check_layers_name_a_source(&input) {
         return Err(json!({ "error": sentence }));
@@ -615,37 +620,52 @@ pub(super) async fn update_chart(
         return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
     }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
-        Ok(spec) => match store::insert_chart(ch, &spec).await {
-            Ok(()) => {
-                if old_board != spec.board {
-                    snapshot_as(ch, &old_board, principal).await;
-                }
-                snapshot_as(ch, &spec.board, principal).await;
-                let mut reply = json!({
-                    "updated": true,
-                    "id": spec.spec.id,
-                    "title": spec.spec.title,
-                    "kind": spec.spec.kind,
-                    "mart": spec.spec.mart,
-                    "board": spec.board,
-                    "definition": definition_digest(&input),
-                    "formattingKept": formatting_kept,
-                });
-                if source_kept {
-                    reply["sourceKept"] = json!(true);
-                }
-                if !fields_kept.is_empty() {
-                    reply["fieldsKept"] = json!(fields_kept);
-                }
-                if !formatting_kept {
-                    reply["note"] = json!(
-                        "the chart's kind changed, so its formatting was reset; send the formatting again if the new kind takes it."
-                    );
-                }
-                reply
+        Ok(spec) => {
+            // The new row takes a new version, which sorts the chart last on
+            // a board where its tile has no stored box. When the chart stays
+            // on its board, the board is boxed first so the tile stays where
+            // it is, and a failure here stops the update before the chart row
+            // is written. A chart that leaves needs no freeze: the order of
+            // the tiles that stay does not change, and a box left behind
+            // would be a hole the page never fills. A chart arriving on
+            // another board is a new tile there and goes last.
+            if store::canonical_board_id(&old_board) == store::canonical_board_id(&spec.board)
+                && let Err(err) = store::freeze_board_layout(ch, &old_board).await
+            {
+                return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
             }
-            Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
-        },
+            match store::insert_chart(ch, &spec).await {
+                Ok(()) => {
+                    if old_board != spec.board {
+                        snapshot_as(ch, &old_board, principal).await;
+                    }
+                    snapshot_as(ch, &spec.board, principal).await;
+                    let mut reply = json!({
+                        "updated": true,
+                        "id": spec.spec.id,
+                        "title": spec.spec.title,
+                        "kind": spec.spec.kind,
+                        "mart": spec.spec.mart,
+                        "board": spec.board,
+                        "definition": definition_digest(&input),
+                        "formattingKept": formatting_kept,
+                    });
+                    if source_kept {
+                        reply["sourceKept"] = json!(true);
+                    }
+                    if !fields_kept.is_empty() {
+                        reply["fieldsKept"] = json!(fields_kept);
+                    }
+                    if !formatting_kept {
+                        reply["note"] = json!(
+                            "the chart's kind changed, so its formatting was reset; send the formatting again if the new kind takes it."
+                        );
+                    }
+                    reply
+                }
+                Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+            }
+        }
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
@@ -1900,7 +1920,14 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let args = rename_call(json!({}));
         let time = lakehouse_bi::grain::TimeContext::default();
-        let draft = check_chart_draft(&ch, &args, Some("c_1".to_owned()), &time).await;
+        let draft = check_chart_draft(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            &args,
+            Some("c_1".to_owned()),
+            &time,
+        )
+        .await;
         let saved = update_chart(
             &ch,
             &as_viewer(Some(&person(7))),
@@ -2062,6 +2089,7 @@ mod tests {
         args.remove("mart");
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &args,
             Some("c_1".to_owned()),
             &lakehouse_bi::grain::TimeContext::default(),
@@ -2348,15 +2376,16 @@ mod tests {
         assert!(!row.contains("Section A"), "{row}");
     }
 
-    /// The draft check of an update whose chart is not found reads the call
-    /// as the tool does: `null` clears a field of any type, so a `null` list
-    /// or map does not make the draft unreadable.
+    /// The draft check of an update reads the call as the tool does: `null`
+    /// clears a field of any type, so a `null` list or map does not make the
+    /// draft unreadable.
     #[tokio::test]
-    async fn the_draft_check_of_an_update_of_a_missing_chart_reads_null_as_a_cleared_field() {
-        let server = wide_mart_server().await;
+    async fn the_draft_check_of_an_update_reads_null_as_a_cleared_field() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &arguments(json!({
                 "title": "Visitors",
                 "kind": "bar",
@@ -2365,11 +2394,46 @@ mod tests {
                 "measures": ["visitors"],
                 "valueFormats": null,
             })),
-            Some("c_gone".to_owned()),
+            Some("c_1".to_owned()),
             &lakehouse_bi::grain::TimeContext::default(),
         )
         .await;
         assert!(draft.is_ok(), "{draft:?}");
+    }
+
+    /// The draft of an update of a chart that is not there, one in the trash
+    /// and one purged for good all answer the sentence `update_chart` answers,
+    /// so the card is never offered for a save that cannot happen and the
+    /// draft says nothing about a chart the caller cannot edit.
+    #[tokio::test]
+    async fn the_draft_check_of_an_update_of_a_chart_that_cannot_be_edited_answers_that_the_tile_does_not_exist()
+     {
+        let call = arguments(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"],
+        }));
+        let time = lakehouse_bi::grain::TimeContext::default();
+        // No row at all, a chart in the trash (2) and one purged for good (1).
+        for row in [None, Some(2), Some(1)] {
+            let server = wide_mart_server().await;
+            if let Some(state) = row {
+                rows_first(
+                    &server,
+                    "SELECT is_deleted, board FROM console.bi_chart",
+                    vec![json!({ "is_deleted": state, "board": "b_board" })],
+                )
+                .await;
+            }
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let viewer = as_viewer(Some(&person(7)));
+            let draft =
+                check_chart_draft(&ch, &viewer, &call, Some("c_gone".to_owned()), &time).await;
+            assert_eq!(
+                draft,
+                Err(json!({ "error": "this tile does not exist" })),
+                "chart row {row:?}"
+            );
+        }
     }
 
     /// The card and the save agree: the draft check of a rename that names
@@ -2380,6 +2444,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &bare_rename_call(json!({})),
             Some("c_1".to_owned()),
             &lakehouse_bi::grain::TimeContext::default(),
@@ -2662,6 +2727,7 @@ mod tests {
         let time = lakehouse_bi::grain::TimeContext::default();
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &bare_rename_call(json!({})),
             Some("c_1".to_owned()),
             &time,
@@ -2689,10 +2755,22 @@ mod tests {
         );
     }
 
-    /// The draft check reads the stored chart as the server, so it must not
-    /// hand any of that chart back for a chart on somebody else's private
-    /// board: the update tool refuses that chart, and the draft says nothing
-    /// about it.
+    /// A stored bar whose formatting names a column the chart no longer
+    /// returns, over a mart no other test uses: the draft of a rename that
+    /// merges it is refused with a sentence that names that column, which is
+    /// how a draft read as the server would show a caller a chart they may not
+    /// see.
+    fn stored_bar_with_stale_format() -> Value {
+        let mut stored = stored_bar_with_data();
+        stored["valueFormats"] = json!({ "hidden_revenue": { "style": "number" } });
+        stored["mart"] = json!("mart_hidden_source");
+        stored
+    }
+
+    /// The draft check reads the stored chart as the caller, so a chart on
+    /// somebody else's private board is refused with the sentence the update
+    /// tool answers, and the answer names nothing of the chart: not its
+    /// columns, its formatting keys or its source.
     #[tokio::test]
     async fn the_draft_of_an_update_of_a_chart_on_somebody_elses_private_board_exposes_no_stored_field()
      {
@@ -2703,11 +2781,12 @@ mod tests {
             vec![json!({ "is_deleted": 0, "owner_id": "someone-else" })],
         )
         .await;
-        let server = stored_chart_server_on(server, stored_bar_with_data()).await;
+        let server = stored_chart_server_on(server, stored_bar_with_stale_format()).await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let time = lakehouse_bi::grain::TimeContext::default();
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &bare_rename_call(json!({})),
             Some("c_1".to_owned()),
             &time,
@@ -2723,7 +2802,39 @@ mod tests {
         .await;
         assert_eq!(saved["error"], json!("this tile does not exist"), "{saved}");
         assert!(saved.get("definition").is_none(), "{saved}");
-        assert_eq!(draft, Ok(None), "{draft:?}");
+        // The draft answers what the save answers, and the answer is the whole
+        // reply: it carries none of the hidden chart.
+        let text = format!("{draft:?}");
+        for hidden in ["hidden_revenue", "mart_hidden_source", "region", "province"] {
+            assert!(!text.contains(hidden), "{hidden} leaked: {text}");
+        }
+        assert_eq!(draft, Err(saved));
+    }
+
+    /// The counterpart for a chart the caller sees: the same stored chart on
+    /// a shared board is merged into the draft as before, so the caller
+    /// gets the refusal about their own chart's formatting. The draft read the
+    /// chart as the caller, not as nobody.
+    #[tokio::test]
+    async fn the_draft_of_an_update_of_a_chart_the_caller_sees_still_merges_the_stored_chart() {
+        let server =
+            stored_chart_server_on(wide_mart_server().await, stored_bar_with_stale_format()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let draft = check_chart_draft(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            &bare_rename_call(json!({})),
+            Some("c_1".to_owned()),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        let error = draft.expect_err("the stale format is refused");
+        assert!(
+            error["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("hidden_revenue")),
+            "{error}"
+        );
     }
 
     /// A create draft carries the digest of the call's own definition: there
@@ -2732,8 +2843,10 @@ mod tests {
     async fn the_draft_of_a_create_carries_the_digest_of_the_call() {
         let server = wide_mart_server().await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        // A create reads no stored chart, so it needs no one to read it as.
         let draft = check_chart_draft(
             &ch,
+            &Viewer::nothing(),
             &arguments(json!({
                 "title": "Visitors", "kind": "bar", "mart": "mart_x",
                 "dimension": "province", "breakdown": "region", "measures": ["visitors"],
@@ -2781,5 +2894,269 @@ mod tests {
         .expect_err("a text limit does not read");
         assert!(reply.contains("\"limit\""), "{reply}");
         assert!(!reply.contains("dateColumn"), "{reply}");
+    }
+
+    // ── An updated chart keeps its place on the dashboard ───────────────────
+
+    /// The definition the charts of these tests were built from, on `board`.
+    fn kept_place_def(board: &str) -> Value {
+        json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": board,
+        })
+    }
+
+    /// The stored document of chart `id`.
+    fn stored_document_of(id: &str, board: &str) -> String {
+        let mut document: Value =
+            serde_json::from_str(&stored_document(kept_place_def(board))).unwrap();
+        document["spec"]["id"] = json!(id);
+        document.to_string()
+    }
+
+    /// A server where chart `c_1` is the middle one of three live charts of
+    /// `board`, listed `c_a`, `c_1`, `c_z`, and the board has the row
+    /// `board_row` (none: the board has no row). The board's writes fail when
+    /// `board_write_fails`.
+    async fn three_charts_server(
+        board: &str,
+        board_row: Option<Value>,
+        board_write_fails: bool,
+    ) -> MockServer {
+        let server = mart_server().await;
+        if board_write_fails {
+            Mock::given(method("POST"))
+                .and(body_string_contains("INSERT INTO console.bi_board "))
+                .respond_with(
+                    ResponseTemplate::new(500).set_body_string("planted-marker upstream text"),
+                )
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        rows_first(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": board })],
+        )
+        .await;
+        rows_first(
+            &server,
+            "FROM console.bi_chart FINAL WHERE is_deleted = 0",
+            ["c_a", "c_1", "c_z"]
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "spec_json": stored_document_of(id, board),
+                        "board": board,
+                        "created_by": "ai",
+                        "created_at": "2026-10-22 00:00:00",
+                    })
+                })
+                .collect(),
+        )
+        .await;
+        rows_first(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 0, "owner_id": "" })],
+        )
+        .await;
+        rows_first(
+            &server,
+            "FROM console.bi_board FINAL WHERE is_deleted = 0 AND id=",
+            board_row.into_iter().collect(),
+        )
+        .await;
+        server
+    }
+
+    /// A row of board `b_board` that nobody has arranged: no tile has a box.
+    fn unarranged_board() -> Value {
+        json!({
+            "id": "b_board", "name": "Sales", "description": "", "created_by": "Ann",
+            "layout_json": "{}", "filters_json": "[]", "public_token": "",
+            "embed_enabled": 0, "folder_id": "", "refresh_seconds": 0, "grain": "",
+            "params_json": "[]", "tabs_json": "[]", "phone_layout_json": "[]",
+            "theme": "", "font": "", "cache_json": "", "owner_id": "",
+            "created_at": "2026-10-22 00:00:00",
+        })
+    }
+
+    async fn update_middle_chart(server: &MockServer) -> Value {
+        update_middle_chart_with(server, json!({})).await
+    }
+
+    /// [`update_middle_chart`] with the fields of `extra` named in the call.
+    async fn update_middle_chart_with(server: &MockServer, extra: Value) -> Value {
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &rename_call(extra),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
+    }
+
+    /// The position of the first write that goes into `table`, among `writes`.
+    fn write_position(writes: &[&String], table: &str) -> usize {
+        writes
+            .iter()
+            .position(|s| s.contains(table))
+            .unwrap_or_else(|| panic!("nothing was written into {table}: {writes:#?}"))
+    }
+
+    /// Rewriting a chart gives its row a new version, which sends a tile with
+    /// no stored box to the end of the list. The board is therefore saved
+    /// with a box for every tile, in the order they are drawn now, before the
+    /// chart row is written; the updated chart keeps the place it had.
+    #[tokio::test]
+    async fn an_update_boxes_the_tiles_of_an_unarranged_board_before_it_rewrites_the_chart() {
+        let server = three_charts_server("b_board", Some(unarranged_board()), false).await;
+        let reply = update_middle_chart(&server).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        let board_at = write_position(&w, "INTO console.bi_board ");
+        let chart_at = write_position(&w, "INTO console.bi_chart");
+        assert!(board_at < chart_at, "{w:#?}");
+        assert_eq!(
+            w.iter()
+                .filter(|s| s.contains("INTO console.bi_board "))
+                .count(),
+            1,
+            "{w:#?}"
+        );
+        assert!(
+            w[board_at].contains(
+                r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_1":{"x":6,"y":0,"w":6,"h":6},"c_z":{"x":0,"y":6,"w":6,"h":6}}'"#
+            ),
+            "{}",
+            w[board_at]
+        );
+    }
+
+    /// A board whose tiles all have a box is not written by an update.
+    #[tokio::test]
+    async fn an_update_does_not_write_a_board_whose_tiles_all_have_a_box() {
+        let mut board = unarranged_board();
+        board["layout_json"] = json!(
+            r#"{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_1":{"x":6,"y":0,"w":6,"h":6},"c_z":{"x":0,"y":6,"w":6,"h":6}}"#
+        );
+        let server = three_charts_server("b_board", Some(board), false).await;
+        let reply = update_middle_chart(&server).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        assert!(
+            w.iter().all(|s| !s.contains("INTO console.bi_board ")),
+            "{w:#?}"
+        );
+        write_position(&w, "INTO console.bi_chart");
+    }
+
+    /// The update never half-applies: when the board cannot be saved, the
+    /// chart row is not written and the reply is the fixed message with a
+    /// reference, not the store's text.
+    #[tokio::test]
+    async fn an_update_whose_board_write_fails_leaves_the_chart_alone_and_leaks_nothing() {
+        let server = three_charts_server("b_board", Some(unarranged_board()), true).await;
+        let reply = update_middle_chart(&server).await;
+        let text = reply.to_string();
+        assert!(reply["errorId"].is_string(), "{text}");
+        assert!(reply.get("updated").is_none(), "{text}");
+        assert!(!text.contains("planted-marker"), "leaked: {text}");
+        let all = sent(&server).await;
+        assert!(
+            writes(&all)
+                .iter()
+                .all(|s| !s.contains("INTO console.bi_chart")),
+            "{all:#?}"
+        );
+    }
+
+    /// A chart saved with no board is on the built-in board, which has no row
+    /// until something about it is saved: its tiles are boxed on that row.
+    #[tokio::test]
+    async fn an_update_of_a_chart_with_no_board_boxes_the_built_in_boards_tiles() {
+        let server = three_charts_server("", None, false).await;
+        let reply = update_middle_chart(&server).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        let board_at = write_position(&w, "INTO console.bi_board ");
+        assert!(
+            board_at < write_position(&w, "INTO console.bi_chart"),
+            "{w:#?}"
+        );
+        assert!(
+            w[board_at].contains("VALUES ('default', 'Dashboard',"),
+            "{}",
+            w[board_at]
+        );
+        assert!(
+            w[board_at].contains(
+                r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_1":{"x":6,"y":0,"w":6,"h":6},"c_z":{"x":0,"y":6,"w":6,"h":6}}'"#
+            ),
+            "{}",
+            w[board_at]
+        );
+    }
+
+    /// A board with no live row does not stop the update, and the update does
+    /// not make a row for it.
+    #[tokio::test]
+    async fn an_update_on_a_board_with_no_row_still_saves_the_chart() {
+        let server = three_charts_server("b_board", None, false).await;
+        let reply = update_middle_chart(&server).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        assert!(
+            w.iter().all(|s| !s.contains("INTO console.bi_board ")),
+            "{w:#?}"
+        );
+        write_position(&w, "INTO console.bi_chart");
+    }
+
+    /// Naming the board the chart is already on is the same as naming none:
+    /// the chart stays, so the board is boxed first.
+    #[tokio::test]
+    async fn an_update_that_names_the_boards_own_id_boxes_its_tiles_first() {
+        let server = three_charts_server("b_board", Some(unarranged_board()), false).await;
+        let reply = update_middle_chart_with(&server, json!({ "board": "b_board" })).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        assert!(
+            write_position(&w, "INTO console.bi_board ")
+                < write_position(&w, "INTO console.bi_chart"),
+            "{w:#?}"
+        );
+    }
+
+    /// A chart that moves to another board leaves the tiles that stay in
+    /// their order, so the old board is not written: a box saved for the
+    /// leaving chart would stay as a hole the page never closes.
+    #[tokio::test]
+    async fn an_update_that_moves_the_chart_to_another_board_writes_no_board() {
+        let server = three_charts_server("b_board", Some(unarranged_board()), false).await;
+        let reply = update_middle_chart_with(&server, json!({ "board": "b_other" })).await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["board"], json!("b_other"), "{reply}");
+        let all = sent(&server).await;
+        let w = writes(&all);
+        assert!(
+            w.iter().all(|s| !s.contains("INTO console.bi_board ")),
+            "{w:#?}"
+        );
+        write_position(&w, "INTO console.bi_chart");
     }
 }

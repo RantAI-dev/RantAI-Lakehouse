@@ -196,6 +196,17 @@ describe("the statistics panel", () => {
     expect(screen.getByText(/of the 3 rows shown/)).toBeTruthy()
   })
 
+  it("says 'the 1 row shown' for one row", () => {
+    renderSection(result({ rows: [{ city: "Jakarta", amount: 10 }], rowCount: 1 }))
+    expect(screen.getByText(/of the 1 row shown/)).toBeTruthy()
+    expect(screen.queryByText(/1 rows shown/)).toBeNull()
+  })
+
+  it("says 'the 0 rows shown' for none", () => {
+    renderSection(result({ rows: [], rowCount: 0 }))
+    expect(screen.queryByText(/of the 0 rows shown/)).toBeTruthy()
+  })
+
   it("counts the rows that are left after the filter", () => {
     renderSection(result())
     fireEvent.change(screen.getByLabelText("Filter city"), {

@@ -16,6 +16,7 @@ export type EntityStatus =
   | "degraded"
   | "failed"
   | "completed"
+  | "stopped"
   | "cancelled"
   | "blocked"
   | "partial"
@@ -31,6 +32,7 @@ export const ENTITY_STATUS_LABEL: Record<EntityStatus, string> = {
   degraded: "Degraded",
   failed: "Failed",
   completed: "Completed",
+  stopped: "Stopped",
   cancelled: "Cancelled",
   blocked: "Blocked",
   partial: "Partial success",
@@ -61,6 +63,7 @@ export const ENTITY_STATUS_DESCRIPTION: Record<EntityStatus, string> = {
   degraded: "Operating with reduced health or delayed output.",
   failed: "The last execution ended with an error.",
   completed: "Finished successfully.",
+  stopped: "Stopped by the person who ran it.",
   cancelled: "Stopped before completion.",
   blocked: "Stopped by policy, quota, or approval gate.",
   partial: "Finished with some accepted and some rejected work.",

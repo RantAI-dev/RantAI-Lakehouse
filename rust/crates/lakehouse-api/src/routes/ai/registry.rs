@@ -471,6 +471,16 @@ fn style_properties() -> Value {
         "min": { "type": "number" }, "max": { "type": "number" },
         "log": { "type": "boolean", "description": "logarithmic scale; every value must be above zero" },
         "rotate": { "type": "integer", "enum": [0, 45, 90], "description": "label rotation, category axis" } } });
+    // `x` carries the meaning of `title`, `log` and `rotate`; `y` and `y2` are
+    // the same shape and would repeat it word for word, so they keep only the
+    // types (`AI-15`). `create_chart` drops every description and
+    // `update_chart` keeps only types, so this changes `format_chart` alone.
+    let mut later_axis = axis.clone();
+    for name in ["title", "log", "rotate"] {
+        if let Some(Value::Object(field)) = later_axis.pointer_mut(&format!("/properties/{name}")) {
+            field.remove("description");
+        }
+    }
     json!({
         "format": { "oneOf": [value_format, { "type": "null" }], "description": "how every number of the chart is written (the number format). null removes it. Changing it with format_chart keeps everything else of the chart" },
         "valueFormats": { "type": ["object", "null"], "additionalProperties": value_format, "description": "a number format per value, keyed by the value's result name; replaces `format` for that value" },
@@ -484,7 +494,7 @@ fn style_properties() -> Value {
             "byValue": { "type": "array", "minItems": 2, "maxItems": 3, "items": { "type": "string" }, "description": "colour by value: 2 or 3 #rrggbb stops (one value, no breakdown; bar, hbar, pie, treemap, geomap)" } },
             "description": "colours; a field given here replaces the whole colors setting" },
         "axes": { "type": ["object", "null"], "properties": {
-            "x": axis, "y": axis, "y2": axis,
+            "x": axis, "y": later_axis, "y2": later_axis,
             "rightValues": { "type": "array", "items": { "type": "string" }, "description": "result names drawn against a second Y axis (bar, line, area, combo with at least two values)" } },
             "description": "axis titles, limits, log scale, label rotation, hiding; bar, hbar, line, area, stacked, combo, scatter, bubble, waterfall, boxplot" },
         "labels": { "type": ["object", "null"], "properties": { "show": { "type": "boolean" } }, "description": "write each value on its bar or point, in its format" },
@@ -661,6 +671,22 @@ fn strip_descriptions(node: &mut Value) {
     }
 }
 
+/// Drops the `description` of each field of a `properties` object, and only
+/// of the field itself, which is word for word the create tool's. The
+/// descriptions nested inside a field (the parts of `filters`, for example)
+/// stay: the create tool carries them too, but this trim covers the
+/// field-level prose only.
+fn without_field_descriptions(mut properties: Value) -> Value {
+    if let Some(fields) = properties.as_object_mut() {
+        for field in fields.values_mut() {
+            if let Some(field) = field.as_object_mut() {
+                field.remove("description");
+            }
+        }
+    }
+    properties
+}
+
 /// Puts back the descriptions of the fields named in `kept`, each at its
 /// JSON Pointer. A pointer that names nothing is a mistake in the table
 /// above, so the field is left without a description rather than the whole
@@ -792,7 +818,7 @@ fn suggest_dashboard_schema() -> Value {
 
 fn list_maps_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_maps",
-        "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console (Jakarta, Indonesia, the world, and the states or provinces of any country) and the ones an administrator uploaded, with the id to put in `map` and a label. Call it before setting `map`.",
+        "description": "List the maps a geomap, pointmap or geoheat chart can be drawn on: the ones that ship with the console and the ones an administrator uploaded, with the id to put in `map` and a label. Call it before setting `map`.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -804,7 +830,7 @@ fn list_charts_schema() -> Value {
 
 fn suggest_join_schema() -> Value {
     json!({ "type": "function", "function": { "name": "suggest_join",
-        "description": "Candidate column pairs for joining two Gold marts in a chart (`joins` of create_chart), best first: both columns in their tables' sorting keys with the same name and kind, then the same name and kind, then the same name. `suggested` marks the pairs to use; `coversRightKey` false means a row of the first mart may match several rows of the second, so sums of the second mart's columns multiply. Reads column metadata only.",
+        "description": "Candidate column pairs for joining two Gold marts in a chart (`joins` of create_chart), best first. `suggested` marks the pairs to use; `coversRightKey` false means a row of the first mart may match several rows of the second, so sums of the second mart's columns multiply. Reads column metadata only.",
         "parameters": { "type": "object", "properties": {
             "left": { "type": "string", "description": "the chart's mart, e.g. mart_visits" },
             "right": { "type": "string", "description": "the mart to join to it" } },
@@ -894,7 +920,7 @@ fn delete_tab_schema() -> Value {
 /// every tool that takes one.
 fn calc_source_properties() -> Value {
     json!({
-        "mart": { "type": "string", "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both" },
+        "mart": { "type": "string", "description": "Gold mart name (from describe_mart)" },
         "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart" }
     })
 }
@@ -953,10 +979,12 @@ fn create_metric_schema() -> Value {
 }
 
 fn update_metric_schema() -> Value {
-    let mut properties = metric_properties();
+    // The fields mean what they mean in `create_metric`, which the same turn
+    // offers, so only their types and enums are repeated here (`AI-15`).
+    let mut properties = without_field_descriptions(metric_properties());
     properties["id"] = json!({ "type": "string", "description": "from list_metrics" });
     json!({ "type": "function", "function": { "name": "update_metric",
-        "description": "Change a metric (by id). The name and the source stay; every chart that uses it follows the change at once, so say so. Send the whole definition.",
+        "description": "Change a metric (by id). The name and the source stay; every chart that uses it follows the change at once, so say so. Send the whole definition. The fields are those of create_metric.",
         "parameters": { "type": "object", "properties": properties, "required": ["id", "label", "formula"] } } })
 }
 
@@ -1093,7 +1121,7 @@ fn arrange_board_schema() -> Value {
                     },
                     "required": ["x", "y", "w", "h"]
                 },
-                "description": "Map of chart id to its new box on the 12-column grid. Each box is {x, y, w, h}; the tool refuses a chart not on this board, a box that does not fit the grid, or w or h below 1."
+                "description": "Map of chart id to its new box {x, y, w, h} on the 12-column grid."
             } },
             "required": ["board", "tiles"] } } })
 }
@@ -1198,10 +1226,12 @@ fn create_parameter_schema() -> Value {
 }
 
 fn update_parameter_schema() -> Value {
-    let mut properties = parameter_properties();
+    // As `update_metric`: the meanings are those of `create_parameter`, which
+    // the same turn offers (`AI-15`).
+    let mut properties = without_field_descriptions(parameter_properties());
     properties["id"] = json!({ "type": "string", "description": "from list_parameters" });
     json!({ "type": "function", "function": { "name": "update_parameter",
-        "description": "Change a parameter (by id): its label, default, bounds or values. Send every field. Its name and type stay.",
+        "description": "Change a parameter (by id): its label, default, bounds or values. Send every field. Its name and type stay. The fields are those of create_parameter.",
         "parameters": { "type": "object", "properties": properties,
             "required": ["id", "name", "type", "default"] } } })
 }
@@ -3311,6 +3341,78 @@ mod tests {
                 .contains("those of create_chart"),
             "update_chart does not point at create_chart: {update}"
         );
+    }
+
+    /// `AI-15`: `update_metric` and `update_parameter` leave the meaning of
+    /// their fields to `create_metric` and `create_parameter`, which the same
+    /// turn offers, and say so. Each field keeps its type and enum, and the
+    /// required lists are asserted at the end, so only the repeated prose
+    /// goes. `id`, the one field new on the update tool, keeps its description.
+    #[test]
+    fn update_metric_and_update_parameter_point_at_their_create_tool() {
+        for (update_name, create_name) in [
+            ("update_metric", "create_metric"),
+            ("update_parameter", "create_parameter"),
+        ] {
+            let create = (find(create_name).expect("registered tool").schema)();
+            let update = (find(update_name).expect("registered tool").schema)();
+            assert!(
+                update["function"]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&format!("those of {create_name}")),
+                "{update_name} does not point at {create_name}: {update}"
+            );
+            let create_properties = create["function"]["parameters"]["properties"]
+                .as_object()
+                .expect("an object");
+            let update_properties = update["function"]["parameters"]["properties"]
+                .as_object()
+                .expect("an object");
+            for (name, property) in update_properties {
+                if name == "id" {
+                    assert!(
+                        property.get("description").is_some(),
+                        "{update_name}.id lost its description"
+                    );
+                    continue;
+                }
+                assert!(
+                    property.get("description").is_none(),
+                    "{update_name}.{name} repeats the description of {create_name}"
+                );
+                // Everything but the prose is the create tool's.
+                let mut expected = create_properties[name].clone();
+                if let Value::Object(map) = &mut expected {
+                    map.remove("description");
+                }
+                assert_eq!(property, &expected, "{update_name}.{name} changed shape");
+            }
+        }
+        let required = |name: &str| {
+            let spec = (find(name).expect("registered tool").schema)();
+            spec["function"]["parameters"]["required"].clone()
+        };
+        assert_eq!(required("update_metric"), json!(["id", "label", "formula"]));
+        assert_eq!(
+            required("update_parameter"),
+            json!(["id", "name", "type", "default"])
+        );
+    }
+
+    /// `AI-15`: `format_chart` states the meaning of an axis title once, on
+    /// `x`; `y` and `y2` keep the field and its type.
+    #[test]
+    fn format_chart_describes_an_axis_title_once() {
+        let schema = (find("format_chart").expect("registered tool").schema)();
+        let axes = &schema["function"]["parameters"]["properties"]["axes"]["properties"];
+        assert!(axes["x"]["properties"]["title"]["description"].is_string());
+        for axis in ["y", "y2"] {
+            assert_eq!(
+                axes[axis]["properties"]["title"],
+                json!({ "type": "string" })
+            );
+        }
     }
 
     /// `AI-15`: `update_chart`'s fields carry the type and list shape of the
