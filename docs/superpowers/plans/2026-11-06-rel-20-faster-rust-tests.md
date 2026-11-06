@@ -72,3 +72,47 @@ Running fewer tests per PR (changed-crate selection). Speeding up `upload_routes
 (next step if needed). The gates (`ops/g*`).
 
 ## 4. Handoff
+
+### Handoff (slice A)
+
+Developer: DeepSeek / Antigravity
+Branch: `ci/rel-20-faster-rust-tests`
+Decisions implemented: D1, D2 (Tasks A1, A2)
+
+#### 1. Module tree reduction (D1)
+- `rust/crates/lakehouse-api/src/main.rs`: removed all 68 `mod` redeclarations; `main.rs` is now a thin wrapper invoking `lakehouse_api::run()`.
+- Module counts (`grep -cE '^\s*(pub )?mod ' rust/crates/lakehouse-api/src/main.rs rust/crates/lakehouse-api/src/lib.rs`):
+  - Before: `main.rs: 68`, `lib.rs: 67`
+  - After: `main.rs: 0`, `lib.rs: 69`
+
+#### 2. Test counts before and after (D2)
+Command: `cargo test -p lakehouse-api --lib --bins -- --list 2>&1 | grep -E 'Running|tests, [0-9]+ benchmarks'`
+
+Before:
+```
+     Running unittests src/lib.rs (target/debug/deps/lakehouse_api-d988df818378896b)
+3139 tests, 0 benchmarks
+     Running unittests src/main.rs (target/debug/deps/lakehouse_api-1838147501e0edcb)
+3177 tests, 0 benchmarks
+```
+Distinct unit tests before: 3191 tests (3125 common + 14 `csv_safe` only in lib + 52 in main tests).
+
+After:
+```
+     Running unittests src/lib.rs (target/debug/deps/lakehouse_api-d988df818378896b)
+3191 tests, 0 benchmarks
+     Running unittests src/main.rs (target/debug/deps/lakehouse_api-1838147501e0edcb)
+0 tests, 0 benchmarks
+```
+Test execution result (`cargo test -p lakehouse-api --lib --bins`):
+```
+test result: ok. 3173 passed; 0 failed; 18 ignored; 0 measured; 0 filtered out; finished in 341.54s
+```
+No unit tests lost; all 3191 distinct unit tests run under `src/lib.rs`.
+
+#### 3. Verification
+- `cargo fmt --check`: passed cleanly.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: passed cleanly.
+- `cargo run -p lakehouse-api`: reaches identical startup config error:
+  `Error: CONNECTOR_SECRETS_KEY must be set to 32 random bytes in base64 (generate one with: openssl rand -base64 32)`
+- Full integration test execution across all 50+ `tests/*.rs` integration targets in `lakehouse-api`: *not verified* locally due to per-command timeout constraints on this worker machine (CI runs the full workspace). All targets verified to compile cleanly with `cargo check -p lakehouse-api --all-targets`.
