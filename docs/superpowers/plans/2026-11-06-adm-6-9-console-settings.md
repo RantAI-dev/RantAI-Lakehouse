@@ -159,4 +159,129 @@ to other API processes faster than the 30 s cache.
 
 ## 4. Handoff
 
+### Handoff (slice 1) — developer, 2026-11-06
+
+Branch `feat/adm-6-7-console-settings`, base `446eb551` (the previous
+developer's `S1-T1`: migration `0127` `email_settings` + the store module).
+Slice 1 only: `ADM-6` and `ADM-7`. Nothing of slice 2 (`ADM-8`, `ADM-9`)
+was started.
+
+**Commits** (one per task, in plan order; every one pushed):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `91267502` | S1-T2 + S1-T3 | `runtime_settings.rs`: the one resolver (env → console → default) with its 30-second cache, and every sender and every "is email set up" check reading it. `routes::alerts::smtp_config` is gone |
+| `b1e16437` | S1-T4 | `GET`/`PUT /api/settings/email`, `POST /api/settings/email/test`, the policy rows, `route_auth.rs`, and `lakehouse_notify`'s `send_classified` |
+| `50459855` | S1-T5 | `GET /api/settings/deployment` |
+| `e97b0601` | S1-T6 | the console: contracts, client, registry, the Deployment and Email sections |
+| `5025dd25` | S1-T7 | `docs/CONFIGURATION.md`, `docs/OPERATIONS.md`, `CHANGELOG.md` |
+
+**Migration**: `0127_email_settings.sql` (from `S1-T1`, already on the
+branch). No migration was added in this slice.
+
+**Commands run, with their counts** (foreground, from the branch's head):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean (4 m 31 s).
+- `cargo test -p lakehouse-api -p lakehouse-store -p lakehouse-notify` — **8609 passed, 0 failed, 43 ignored** across 151 test binaries (42 m 58 s, exit 0).
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean.
+- `cargo clippy -p lakehouse-notify --all-targets -- -D warnings` — clean.
+- `cargo test -p lakehouse-api --test email_settings_route` — **11 passed** (S1-T4).
+- `cargo test -p lakehouse-api --test deployment_settings_route` — **5 passed** (S1-T5).
+- `cargo test -p lakehouse-api --test route_auth` — **80 passed** (the two new named tests among them).
+- `cargo test -p lakehouse-api --test sec11_guard` — **4 passed**.
+- `cargo test -p lakehouse-api --lib -- routes:: settings:: runtime_settings:: policy` — **2048 passed** (includes `every_policy_table_entry_is_mounted_and_gated_as_declared`).
+- `cargo test -p lakehouse-api --lib route_policy` — **2 passed**.
+- `cargo test -p lakehouse-api --lib runtime_settings` — **6 passed** (the resolver's own tests).
+- `cargo test -p lakehouse-notify` — **32 passed** (lib) + **6 passed** (`smtp_private_ca`).
+- `bun run typecheck` — clean.
+- `bun --bun eslint src` — **0 errors**, 10 pre-existing warnings in files this slice does not touch.
+- `bun run test` — **3476 passed, 1 skipped, 0 failed** (347 files).
+- `python3 ops/lint/check_intra_package_imports.py` — OK; `python3 ops/lint/check_bare_iceberg_count.py` — OK.
+- `docker compose --profile '*' config --quiet` — OK (no compose file was changed).
+- `git status` — clean, nothing generated staged.
+
+**Mutation check (S1-T4).** Done and restored: with the 409 guard in
+`routes::settings::put_email` removed, `a_field_the_environment_owns_is_refused_and_nothing_is_written`
+fails (the answer is 200 instead of 409, and the console's own port was
+written). The guard was put back and the whole file passed again (11
+passed).
+
+**What the reviewer checks, and where it is proved:**
+
+- *The password never appears in a GET, a log, an error or an audit row* —
+  the answer carries `{"set": bool, "source": …}` only, the password is
+  sealed before it is stored, the audit row names the field and not its
+  value, and the row holds the sealed bytes: `the_password_never_comes_back_in_an_answer`,
+  `a_save_writes_one_audit_row_naming_the_fields_and_never_the_secret`.
+- *A PUT on a `server`-sourced field is 409 and writes nothing* — the guard
+  runs before the row is read or written, and the whole save is refused:
+  `a_field_the_environment_owns_is_refused_and_nothing_is_written` (the
+  mutation check above).
+- *Every new route needs `settings:write`, GET included* — the three
+  policy rows and the two named tests in `tests/route_auth.rs`
+  (`the_email_settings_routes_are_refused_without_settings_write`,
+  `a_platform_admin_is_not_refused_the_email_settings_routes`).
+- *The test email goes only to the caller's own address* — the request
+  carries no address; the recipient is the caller's own account address,
+  and the test proves it against a real relay:
+  `the_test_email_goes_to_the_callers_own_address_and_to_nobody_else`
+  (a `Mailpit` container behind a private CA, the `smtp_private_ca.rs`
+  pattern: the relay holds exactly one message and its one recipient is
+  the caller's address).
+- *Only fixed sentences in responses (D7)* — the answer is one of five
+  fixed sentences, mapped from `lakehouse_notify`'s failure **kinds**
+  (never from message text: `lakehouse_notify` grew `send_classified` for
+  this). The refusal sentences name the field they are about.
+
+**Decisions the code makes where the plan left room** (all in the plan's
+spirit, none contradicting it):
+
+1. **S1-T2 and S1-T3 are one commit.** The resolver is dead code until
+   every call site reads it, and `clippy -D warnings` — which this
+   repository runs on every commit — refuses a commit that leaves a module
+   unused. Splitting them would have needed an `allow(dead_code)`, which
+   rule 2 forbids.
+2. **A missing setting is named the way the operator sets it**: the
+   environment variable for a setting only the server owns
+   (`GOTENBERG_URL`, `OIDC_ISSUER`, `LLM_KEY`), the console's own field
+   name for a setting the console can set (`host`, `consolePublicUrl`).
+   `where` says which of the two it is.
+3. **The deployment answer is `{"features": [ … ]}`** — the list under a
+   key, like every other answer in this API.
+4. **The test email answers 200** with `{"sent": bool, "message": "…"}`:
+   the request was accepted and performed, and the outcome is in the body,
+   in one of D7's sentences. A failed send says `sent: false`, never a
+   success.
+5. **The audit row lists the fields whose value the save changes.** A
+   password that is sent always counts as changed (the sealed bytes are
+   never compared, the seal is randomised).
+6. **The console never sends a field the server owns** — it would be
+   refused with a 409 — so the form disables it, says "Set by the server",
+   and leaves it out of the save body.
+7. **An empty password is no password**: the resolver reads it as "not
+   set", so a save that sent `""` cannot look like a set one.
+
+**Not verified:**
+
+- The two new console sections were not looked at in a browser; their
+  behaviour is proved by `bun test` (9 new tests) and by the API's own
+  tests.
+- `bun run lint` over the whole checkout fails on the files under
+  `dagster/.venv/` (a local Python virtualenv, not in git, not touched by
+  this slice). `bun --bun eslint src` is clean.
+- The Dagster test suite (`pytest dispar_orchestrate`) and a real
+  `docker compose up` were not run: this slice changed no Python and no
+  compose file. `docker compose --profile '*' config --quiet` passes.
+- Slice 2 (`ADM-8`, `ADM-9`) was not started, as instructed.
+
+**Note for the reviewer about the build directory.** The shared
+`CARGO_TARGET_DIR` (`/home/shiro/rantai/cargo-target`) is used by another
+worktree at the same time (`/var/home/shiro/wt/rel-20-b`), and cargo linked
+that worktree's older `lakehouse-store`/`lakehouse-notify` artifacts —
+builds of this branch failed with "could not find `email_settings` in
+`lakehouse_store`". No `cargo clean` was run; this slice's builds ran in
+`CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target-adm67` (a cold, empty
+directory for this branch) and every command above ran there.
+
 ## 5. Review
