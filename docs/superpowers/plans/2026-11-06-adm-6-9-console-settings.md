@@ -580,6 +580,206 @@ the feature page's Limits) now say it.
 - R5 was accepted by the planner and needed no code; the limit is in the
   feature page's Limits.
 
+### Handoff (R6) — developer, 2026-11-07
+
+Branch `feat/adm-8-9-console-settings`, at `b2b4f8af` (the planner's R6
+finding). The fix is the finding's four steps and nothing else.
+
+**Commits** (one per step, each pushed; no force, no rebase):
+
+| Commit | Step | What |
+| --- | --- | --- |
+| `0a2eeb13` | R6.1 | `config.rs`: an EMPTY value means "not set" for `LLM_URL`, `LLM_MODEL`, `SMTP_PORT` and `SMTP_FROM` |
+| `8751126a` | R6.2 | `docker-compose.yml`: the four pass empty (`${X:-}`), with the comment that says what empty means |
+| `1c26ba5c` | R6.3 | `tests/assistant_settings_route.rs`: the route test that builds the config the way compose now does |
+
+**The fix, in one paragraph.** Compose hands the API those four as empty
+strings when the operator set none, and the code now reads an empty value
+as "not set": the code's own default applies and the environment does not
+own the field. `llm_url`/`llm_model` use `truthy(..).unwrap_or_else(..)`
+instead of `or_default(..)`; an empty `SMTP_PORT` is 587 **with no
+warning** (a warning would name a value the operator never chose); an
+empty `SMTP_FROM` falls through to `SMTP_USER` and then to the literal.
+The `*_from_env` flags were already right (they already read an empty
+value as unset) — the VALUES were the ones that kept the empty string,
+and the resolver then called the field `default` while the environment
+still owned it. The doc comments that described the old `??` behaviour
+are updated, and the module doc now names the four fields that read an
+empty value as unset.
+
+**Why the old behaviour was wrong, per field** (rule 2, also in the
+commit body): an empty `LLM_URL` built an assistant client with no
+address, an empty `LLM_MODEL` named no model, an empty `SMTP_FROM` was
+kept as an empty `From` (mail sent with no sender — no mail server
+accepts one), and an empty `SMTP_PORT` was resolved through the "not a
+valid u16" path and logged a warning naming it, so an operator who set
+nothing was told their own deployment had a bad port. The test that
+pinned that last case (`empty_smtp_port_falls_back_to_default_instead_of_erroring`)
+now reads `an_empty_smtp_port_is_unset_and_the_default_applies` and
+asserts what the rule says: 587, and not the environment's own. No other
+config test pinned the old behaviour.
+
+**Tests added for R6** (the cases the finding names):
+
+- `an_empty_llm_url_is_unset_and_the_default_applies`,
+  `an_empty_llm_model_is_unset_and_the_default_applies`,
+  `an_empty_smtp_port_is_unset_and_the_default_applies`,
+  `an_empty_smtp_from_falls_through_to_smtp_user_then_the_literal` and
+  `the_four_empty_values_compose_passes_are_all_unset`
+  (`config.rs`'s own tests) — the four separately, and the four together
+  the way compose hands them over.
+- `a_deployment_built_the_way_compose_builds_it_may_set_the_address_and_the_port`
+  (`tests/assistant_settings_route.rs`) — the route test: the env map
+  carries all four as empty strings, and the console may set the
+  assistant's address and the email's port. The four are one
+  deployment's environment, so the one case asks both routes.
+
+**Mutation checks.** Done and restored, both on the route test:
+
+- with `llm_url_from_env` and `smtp_port_from_env` reading an empty value
+  as the environment's own (`contains_key` instead of "present and
+  non-empty"), the case FAILS: the address's source is `server` instead
+  of `default`, and the save that sends it is refused;
+- with `llm_url`, `llm_model` and `smtp_from` keeping the empty string
+  instead of the code's default (`or_default` instead of `truthy(..)`),
+  the case FAILS: the address's value is `""` instead of
+  `https://api.minimax.io/v1`.
+
+Both mutations were put back and the file passes again (13 passed).
+
+**Commands run, with their counts** (foreground, on the branch's head
+`1c26ba5c`, `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target-adm67`,
+`CARGO_BUILD_JOBS=2`):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean
+  (2 m 37 s cold, 7 s incremental).
+- `cargo test -p lakehouse-api --lib config` — **170 passed, 0 failed**
+  (3066 filtered out). The `config::tests` module alone: **92 passed**.
+- `cargo test -p lakehouse-api --test assistant_settings_route` —
+  **13 passed** (12 before, 1 new).
+- `cargo test -p lakehouse-api --test email_settings_route` — **13
+  passed**.
+- `docker compose --profile '*' config --quiet` — OK, with throwaway
+  values for the variables SEC-18 requires (`POSTGRES_PASSWORD`,
+  `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY`,
+  `CONNECTOR_SECRETS_KEY`).
+- `docker compose --profile '*' config` — the four are empty for
+  `lakehouse-api`: `LLM_MODEL: ""`, `LLM_URL: ""`, `SMTP_FROM: ""`,
+  `SMTP_PORT: ""`.
+- `python3 ops/lint/check_compose_init_readiness.py` — OK;
+  `python3 ops/lint/check_image_digests.py` — OK (45 pinned, 8 exempt).
+- `git status` — clean, nothing generated staged.
+
+**Every other place that passes the four** (step 2's "check every other
+service block"): `docker-compose.yml` is the only Compose file that names
+them (`grep` over every `*.yml`/`*.yaml` in the repository), and the
+release's Compose file is RENDERED from that template by
+`ops/release/render_compose.py`, so it inherits the change — checked by
+rendering it with throwaway image digests: the four are `${X:-}` in the
+rendered file too. The one comment that became false is in
+`ops/ai_eval/run_dashboard_eval.sh` ("Compose resolves `LLM_URL` and
+`LLM_MODEL` itself, from the caller's `.env` or its own default"); it is
+corrected in `8751126a`. The script's behaviour is unchanged: it exports
+the two only when the caller set them.
+
+**The proof (rule 8), in the foreground.** A real stack, project
+`adm9r6`, from the worktree, with the image built from this branch:
+
+- `sh ops/init-env.sh` wrote `.env` (there was none in the worktree
+  before, and none after — it was removed again at the end). The four
+  assignments that `.env.example` carries (`LLM_URL`, `LLM_MODEL`,
+  `SMTP_PORT`, `SMTP_FROM`) were taken OUT of the generated `.env`, and
+  the file was checked: none of the four is in it.
+- `docker compose -p adm9r6 build lakehouse-api` — the API image was
+  rebuilt from this branch (18 m 56 s). It was tagged `adm9r6-api:local`
+  through `LAKEHOUSE_API_IMAGE`, so the shared `rantai-lakehouse-api:local`
+  that other worktrees use was not overwritten; the throwaway tag was
+  removed at the end.
+- `docker compose -p adm9r6 up -d` — the stack came up (1 m 47 s), the
+  API reported healthy. The host's default ports (8080, 5432, 8123, 9000,
+  3000) were free, so nothing had to be moved.
+- Inside the container the four are empty, checked with
+  `docker compose -p adm9r6 exec -T lakehouse-api printenv`:
+  `LLM_URL=`, `LLM_MODEL=`, `SMTP_PORT=`, `SMTP_FROM=` (all empty), next
+  to `SMTP_HOST=`, `SMTP_USER=`, `SMTP_PASS=` (also empty).
+- Sign in as the bootstrap admin through the API: `POST
+  /api/auth/login` → **HTTP 200**,
+  `{"name":"Bootstrap Admin","mustChangePassword":true}`; the forced
+  rotation `POST /api/auth/change-password` → **HTTP 204**; the sign in
+  again (the rotation revokes every session) → **HTTP 200** with
+  `mustChangePassword:false`. The password was read from `.env` into a
+  shell variable, written to a mode-600 file and passed to curl with
+  `--data-binary @file`, so it was never in argv and never printed.
+- `GET /api/settings/assistant` → **HTTP 200**:
+
+  ```json
+  { "url": { "value": "https://api.minimax.io/v1", "source": "default" },
+    "model": { "value": "MiniMax-M3", "source": "default" },
+    "key": { "set": false, "source": "default" } }
+  ```
+
+- `GET /api/settings/email` → **HTTP 200**:
+
+  ```json
+  { "host": { "value": null, "source": "default" },
+    "port": { "value": 587, "source": "default" },
+    "security": { "value": "starttls", "source": "default" },
+    "user": { "value": null, "source": "default" },
+    "password": { "set": false, "source": "default" },
+    "from": { "value": "rantai-lake@localhost", "source": "default" },
+    "consolePublicUrl": { "value": null, "source": "default" } }
+  ```
+
+  The four fields the finding names — `url`, `model`, `port`, `from` —
+  all report `source: "default"`, which is what the console's form shows
+  before a save: the console's to change, not the server's.
+
+- What the fix is for, shown on the same install: `PUT
+  /api/settings/email` with `{"port":2525}` → **HTTP 200**, and the port's
+  source becomes `console`; `PUT /api/settings/assistant` with
+  `{"url":"https://example.com/v1"}` → **HTTP 200**, and the address's
+  source becomes `console`. Before the fix both were refused with a 409
+  ("Set by the server") on every compose install.
+
+- Teardown: `docker compose -p adm9r6 down -v` → every container, volume
+  and network of the project is gone (`docker ps -a`, `docker volume ls`
+  and `docker network ls` filtered on `adm9r6` all empty), the two
+  throwaway images (`adm9r6-api:local`, `adm9r6-oidc-mock:latest`) were
+  removed, the generated `.env` was removed and the proof's temporary
+  files (which held the rotated password) were deleted.
+
+**What R6 does not change for an operator.** A deployment that names one
+of the four in `.env` keeps the old behaviour: the environment owns it,
+the console shows it read-only and a save that sends it is refused with a
+409. `.env.example` still carries `LLM_URL`, `LLM_MODEL`, `SMTP_PORT` and
+`SMTP_FROM`, so an installation that follows `ops/init-env.sh` as it
+stands still names all four — which is the owner's call, and the same
+rule the R4 handoff described. What changes is the installation that
+names none: the console's own fields are the console's.
+
+**Not verified:**
+
+- `cargo test --workspace` (every crate) was NOT run: the block was
+  scoped to `lakehouse-api`, the only crate this fix touches.
+  `cargo clippy -p lakehouse-api --all-targets` covers the crate's own
+  tests; CI runs the whole workspace on the pull request.
+- The Dagster suite (`pytest dispar_orchestrate`) was not run: this fix
+  changed no Python. `ops/ai_eval/run_dashboard_eval.sh` was NOT
+  executed against a stack — only its one stale comment was corrected.
+- The release's Compose file was rendered (with throwaway image
+  digests) and the four read empty in it, but no release bundle was
+  installed and started.
+- The console's own screens were not looked at in a browser. R6 changed
+  no console code: the console already disables a field the server owns
+  and leaves it out of the save body, and the API now reports these four
+  as `default` on a compose install without the four named.
+- The `dagster`, `trino`, `seaweedfs`, `cdc` and `backups` profiles were
+  not started: the proof brought up the default profile, which is what
+  the finding's proof needs.
+- The API image build took 18 m 56 s on this machine; a cold build on a
+  machine without the cargo layer cache will take longer.
+
 ## 5. Review
 
 ### Review of slice 1 (planner, 2026-11-06, at `b1d022fc`)
