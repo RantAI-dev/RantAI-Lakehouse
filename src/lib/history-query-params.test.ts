@@ -11,12 +11,12 @@ describe("historyQueryString", () => {
         table: "bronze.orders",
         from: "2026-10-11T00:00:00Z",
         to: "2026-10-20T12:00:00.500Z",
-        before: { at: "2026-10-20T11:59:59.999Z", id: "q-1729" },
+        page: 3,
       }),
     ).toBe(
       "status=failed&engine=trino&minDurationMs=1500&table=bronze.orders" +
         "&from=2026-10-11T00%3A00%3A00Z&to=2026-10-20T12%3A00%3A00.500Z" +
-        "&before=2026-10-20T11%3A59%3A59.999Z%2Cq-1729",
+        "&page=3",
     )
   })
 
@@ -24,6 +24,11 @@ describe("historyQueryString", () => {
     expect(historyQueryString(undefined)).toBe("")
     expect(historyQueryString({})).toBe("")
     expect(historyQueryString({ table: "" })).toBe("")
+  })
+
+  it("leaves the page out for the first page and writes it from the second", () => {
+    expect(historyQueryString({ status: "failed" })).toBe("status=failed")
+    expect(historyQueryString({ page: 2 })).toBe("page=2")
   })
 
   it("keeps a zero minimum duration but drops empty text fields", () => {

@@ -22,10 +22,11 @@ use lakehouse_test_support as _;
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
     FolderMove, HistoryFilter, RecordHistoryInput, SavedQueryPatch, SavedQueryPlacement,
-    SavedQueryScope, SavedQueryViewer, VERSION_KEEP, create_saved_query, create_saved_query_at,
-    get_history_item, get_saved, history_mentioning, history_recent, list_history, list_saved,
-    list_saved_matching, list_saved_trash_entries, list_versions, purge_trashed_before,
-    record_history, restore_saved_query, trash_saved_query, update_saved_query,
+    SavedQueryScope, SavedQueryViewer, VERSION_KEEP, count_history, create_saved_query,
+    create_saved_query_at, get_history_item, get_saved, history_mentioning, history_recent,
+    list_history, list_saved, list_saved_matching, list_saved_trash_entries, list_versions,
+    purge_trashed_before, record_history, restore_saved_query, trash_saved_query,
+    update_saved_query,
 };
 use lakehouse_store::saved_query_access::{
     FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
@@ -922,11 +923,13 @@ async fn a_row_fifteen_days_old_is_never_listed_even_when_from_asks_for_it(
     Ok(())
 }
 
-/// The cursor pages by the `at` *and* `id` of the last row seen: 55 rows
-/// that share one `at` come back as 50 then 5, with nothing repeated and
-/// nothing skipped — the millisecond tie is what the id half is for.
+/// Numbered pages walk the rows: 55 rows that share one `at` come back as
+/// 50 then 5, with nothing repeated and nothing skipped — the `id`
+/// tie-break in the order is what keeps the page boundary stable inside
+/// one millisecond. (`QS-4` QA of 2026-11-05 replaced the `before` cursor
+/// with `page`; the no-repeat, no-skip assertions stayed.)
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_cursor_pages_without_repeats_or_skips(pool: PgPool) -> sqlx::Result<()> {
+async fn numbered_pages_walk_the_rows_without_repeats_or_skips(pool: PgPool) -> sqlx::Result<()> {
     let owner = Uuid::new_v4();
     for i in 0..55 {
         insert_history_row(
@@ -947,16 +950,12 @@ async fn the_cursor_pages_without_repeats_or_skips(pool: PgPool) -> sqlx::Result
         .await
         .unwrap();
     assert_eq!(page_one.len(), 50);
-    let last = page_one.last().unwrap();
-    let cursor_at =
-        OffsetDateTime::parse(&last.at, &time::format_description::well_known::Rfc3339).unwrap();
 
     let page_two = list_history(
         &pool,
         owner,
         &HistoryFilter {
-            before_at: Some(cursor_at),
-            before_id: Some(&last.id),
+            page: 2,
             ..Default::default()
         },
     )
@@ -973,6 +972,265 @@ async fn the_cursor_pages_without_repeats_or_skips(pool: PgPool) -> sqlx::Result
     assert_eq!(sorted.len(), 55, "no skips");
     assert_eq!(sorted[0], "q-00");
     assert_eq!(sorted[54], "q-54");
+    Ok(())
+}
+
+/// Page 2 of 120 rows is rows 51 to 100, newest first; page 3 is the
+/// remaining 20; the count is 120 whichever page is asked for. The rows sit
+/// one second apart so the expected ids are a literal order, not something
+/// the test recomputes the way the store does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn page_two_of_120_rows_is_rows_51_to_100_newest_first(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    let base = OffsetDateTime::now_utc() - time::Duration::hours(2);
+    for i in 0..120 {
+        insert_history_row_at(
+            &pool,
+            &format!("q-{i:03}"),
+            owner,
+            base + time::Duration::seconds(i),
+        )
+        .await;
+    }
+    let page = |n: i64| HistoryFilter {
+        page: n,
+        ..Default::default()
+    };
+
+    let one = list_history(&pool, owner, &page(1)).await.unwrap();
+    let two = list_history(&pool, owner, &page(2)).await.unwrap();
+    let three = list_history(&pool, owner, &page(3)).await.unwrap();
+    assert_eq!(one.len(), 50);
+    assert_eq!(row_ids(&one)[0], "q-119", "page 1 starts at the newest row");
+    assert_eq!(row_ids(&one)[49], "q-070");
+    assert_eq!(two.len(), 50);
+    assert_eq!(row_ids(&two)[0], "q-069", "page 2 is rows 51 to 100");
+    assert_eq!(row_ids(&two)[49], "q-020");
+    assert_eq!(
+        row_ids(&three),
+        (0..20)
+            .rev()
+            .map(|i| format!("q-{i:03}"))
+            .collect::<Vec<_>>()
+    );
+
+    for n in 1..=3 {
+        assert_eq!(
+            count_history(&pool, owner, &page(n)).await.unwrap(),
+            120,
+            "the total does not depend on the page"
+        );
+    }
+    Ok(())
+}
+
+/// A page past the end is an empty page, not an error, and the count stays
+/// true; so does a page so large that its offset would overflow.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_page_past_the_end_is_empty_and_the_count_stays_true(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    for i in 0..3 {
+        insert_history_row(
+            &pool,
+            &format!("q-{i}"),
+            owner,
+            "completed",
+            "clickhouse",
+            1,
+            &[],
+            None,
+            0,
+        )
+        .await;
+    }
+    for page in [2, 3, 1_000_000, i64::MAX] {
+        let filter = HistoryFilter {
+            page,
+            ..Default::default()
+        };
+        assert!(
+            list_history(&pool, owner, &filter)
+                .await
+                .unwrap()
+                .is_empty(),
+            "page {page} is past the end"
+        );
+        assert_eq!(count_history(&pool, owner, &filter).await.unwrap(), 3);
+    }
+    Ok(())
+}
+
+/// The count carries the same `WHERE` as the list: each filter alone, the
+/// 14-day window, and the owner scope, so `total` can never count a row the
+/// list would not show.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_count_follows_every_filter_the_list_follows(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    insert_history_row(
+        &pool,
+        "q-a",
+        owner,
+        "completed",
+        "clickhouse",
+        100,
+        &["marts.retails"],
+        None,
+        0,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-b",
+        owner,
+        "failed",
+        "clickhouse",
+        5_000,
+        &["bronze.orders"],
+        Some("Arrow table is missing"),
+        3,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-c",
+        owner,
+        "blocked",
+        "trino",
+        2_500,
+        &["marts.retails", "bronze.orders"],
+        Some("another tenant claims orders"),
+        10,
+    )
+    .await;
+    insert_history_row(
+        &pool,
+        "q-d",
+        owner,
+        "stopped",
+        "clickhouse",
+        7_000,
+        &[],
+        Some("Stopped"),
+        1,
+    )
+    .await;
+    // Outside the 14-day window: listed by nobody, counted by nobody.
+    insert_history_row(
+        &pool,
+        "q-old",
+        owner,
+        "failed",
+        "trino",
+        9_000,
+        &["bronze.orders"],
+        None,
+        20,
+    )
+    .await;
+    // Another user's row.
+    insert_history_row(
+        &pool,
+        "q-other",
+        Uuid::new_v4(),
+        "failed",
+        "trino",
+        9_000,
+        &["bronze.orders"],
+        None,
+        0,
+    )
+    .await;
+
+    let count = |filter: HistoryFilter<'static>| {
+        let pool = pool.clone();
+        async move { count_history(&pool, owner, &filter).await.unwrap() }
+    };
+    let list = |filter: HistoryFilter<'static>| {
+        let pool = pool.clone();
+        async move {
+            let rows = list_history(&pool, owner, &filter).await.unwrap();
+            i64::try_from(rows.len()).unwrap()
+        }
+    };
+    let filters: [(&str, HistoryFilter<'static>, i64); 8] = [
+        (
+            "no filter: the window and the owner only",
+            HistoryFilter::default(),
+            4,
+        ),
+        (
+            "status",
+            HistoryFilter {
+                status: Some("failed"),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "status stopped",
+            HistoryFilter {
+                status: Some("stopped"),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "engine",
+            HistoryFilter {
+                engine: Some("trino"),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "min duration",
+            HistoryFilter {
+                min_duration_ms: Some(2_000),
+                ..Default::default()
+            },
+            3,
+        ),
+        (
+            "table",
+            HistoryFilter {
+                table: Some("orders"),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            "from and to",
+            HistoryFilter {
+                from: Some(OffsetDateTime::now_utc() - time::Duration::days(5)),
+                to: Some(OffsetDateTime::now_utc() - time::Duration::days(2)),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "several at once",
+            HistoryFilter {
+                engine: Some("clickhouse"),
+                min_duration_ms: Some(2_000),
+                table: Some("orders"),
+                ..Default::default()
+            },
+            1,
+        ),
+    ];
+    for (name, filter, expected) in filters {
+        assert_eq!(count(filter.clone()).await, expected, "count: {name}");
+        assert_eq!(
+            list(filter).await,
+            expected,
+            "list agrees with count: {name}"
+        );
+    }
+
+    let stranger = count_history(&pool, Uuid::new_v4(), &HistoryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(stranger, 0, "a user with no runs has a total of 0");
     Ok(())
 }
 
@@ -1093,20 +1351,19 @@ async fn a_percent_or_underscore_in_the_table_filter_is_literal(pool: PgPool) ->
 }
 
 /// Two rows of one owner inside one millisecond come back exactly once
-/// across the page boundary.
+/// across the page boundary, in the order a row's `at` shows.
 ///
-/// The value a row's `at` leaves the store with is cut to milliseconds, so
-/// the cursor the console carries for the last row of a page is that
-/// millisecond. The page after it must compare on the same value: a
-/// comparison against the stored microsecond `at` skips every row inside
-/// the last page's millisecond, and those rows are never seen again.
+/// The value a row's `at` leaves the store with is cut to milliseconds
+/// (`iso_millis`), so two rows inside one millisecond look equal to the
+/// caller and only the id tells them apart. The order therefore cuts `at` to
+/// the millisecond and falls back to the id, so the page boundary is
+/// stable and matches what the console shows (`QS-4` QA of 2026-11-05: the
+/// `before` cursor is gone, this ordering assertion stays).
 ///
 /// The two rows are placed so their ids disagree with their microseconds:
-/// `q-a` is the newer of the two by a microsecond and the older by id. The
-/// order therefore has to cut to the millisecond and fall back to the id,
-/// the way the comparison does. An order on the raw microsecond puts `q-a`
-/// at the end of the page and leaves `q-b` behind the cursor, so `q-b` is
-/// never seen again.
+/// `q-a` is the newer of the two by a microsecond and the older by id. An
+/// order on the raw microsecond puts `q-a` at the end of the page, which
+/// shows two rows of one displayed millisecond out of id order.
 #[sqlx::test(migrations = "../../migrations")]
 async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boundary(
     pool: PgPool,
@@ -1120,7 +1377,7 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
         - time::Duration::hours(1);
     // A page holds 50 rows, so 49 newer rows put the two rows of one
     // millisecond at the end of the first page and at the start of the
-    // next — the boundary the console's cursor is built from.
+    // next — the boundary between page 1 and page 2.
     for i in 0..49 {
         insert_history_row_at(
             &pool,
@@ -1133,7 +1390,7 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
     // The newer of the two by microsecond is the older one by id: only an
     // order that cuts to the millisecond and falls back to the id puts `q-b`
     // at the end of the page. An order on the raw microsecond puts `q-a`
-    // there and leaves `q-b` behind the cursor.
+    // there.
     insert_history_row_at(
         &pool,
         "q-a",
@@ -1154,17 +1411,9 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
         .unwrap();
     assert_eq!(page_one.len(), 50);
     let last = page_one.last().unwrap();
-    let cursor_at =
-        OffsetDateTime::parse(&last.at, &time::format_description::well_known::Rfc3339).unwrap();
     assert!(
         last.at.ends_with('Z'),
-        "the cursor carries an ISO timestamp: {}",
-        last.at
-    );
-    assert_eq!(
-        cursor_at.millisecond(),
-        0,
-        "the cursor carries whole milliseconds: {}",
+        "a row's at is an ISO timestamp: {}",
         last.at
     );
 
@@ -1172,8 +1421,7 @@ async fn two_rows_in_one_millisecond_come_back_exactly_once_across_the_page_boun
         &pool,
         owner,
         &HistoryFilter {
-            before_at: Some(cursor_at),
-            before_id: Some(&last.id),
+            page: 2,
             ..Default::default()
         },
     )

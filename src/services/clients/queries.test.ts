@@ -391,32 +391,57 @@ describe("the query download", () => {
   })
 })
 
-describe("clickhouseQueryService.listHistory", () => {
+describe("clickhouseQueryService.listHistoryPage", () => {
+  const page = (runs: unknown[] = [], total = 0, number = 1) => ({
+    runs,
+    total,
+    page: number,
+    pageSize: 50,
+  })
+
   it("asks /api/query/history with no query string when no filter is given", async () => {
-    const calls = stubFetch(() => json([]))
-    const rows = await clickhouseQueryService.listHistory()
-    expect(rows).toEqual([])
+    const calls = stubFetch(() => json(page()))
+    const out = await clickhouseQueryService.listHistoryPage()
+    expect(out).toEqual({ runs: [], total: 0, page: 1, pageSize: 50 })
     expect(calls[0]!.url).toBe("/api/query/history")
   })
 
   it("appends the filter's query string, encoded, after a single ?", async () => {
-    const calls = stubFetch(() => json([]))
-    await clickhouseQueryService.listHistory({
-      status: "failed",
+    const calls = stubFetch(() => json(page()))
+    await clickhouseQueryService.listHistoryPage({
+      status: "stopped",
       table: "ord%",
       minDurationMs: 0,
-      before: { at: "2026-10-20T11:59:59.999Z", id: "q-1729" },
+      page: 3,
     })
     expect(calls[0]!.url).toBe(
-      "/api/query/history?status=failed&minDurationMs=0&table=ord%25" +
-        "&before=2026-10-20T11%3A59%3A59.999Z%2Cq-1729",
+      "/api/query/history?status=stopped&minDurationMs=0&table=ord%25&page=3",
     )
   })
 
   it("adds no query string for a filter of empty strings", async () => {
-    const calls = stubFetch(() => json([]))
-    await clickhouseQueryService.listHistory({ table: "" })
+    const calls = stubFetch(() => json(page()))
+    await clickhouseQueryService.listHistoryPage({ table: "" })
     expect(calls[0]!.url).toBe("/api/query/history")
+  })
+
+  it("hands back the envelope as the server sent it", async () => {
+    stubFetch(() => json(page([{ id: "q-1" }], 120, 2)))
+    const out = await clickhouseQueryService.listHistoryPage({ page: 2 })
+    expect(out.total).toBe(120)
+    expect(out.page).toBe(2)
+    expect(out.pageSize).toBe(50)
+    expect(out.runs).toHaveLength(1)
+  })
+})
+
+describe("clickhouseQueryService.listHistory", () => {
+  it("returns the first page's runs, not the envelope", async () => {
+    stubFetch(() =>
+      json({ runs: [{ id: "q-1" }, { id: "q-2" }], total: 2, page: 1, pageSize: 50 }),
+    )
+    const rows = await clickhouseQueryService.listHistory()
+    expect(rows.map((r) => r.id)).toEqual(["q-1", "q-2"])
   })
 })
 

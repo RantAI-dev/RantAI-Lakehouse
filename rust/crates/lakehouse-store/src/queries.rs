@@ -438,7 +438,7 @@ pub struct HistoryMention {
     pub owner_id: Option<Uuid>,
     /// When it ran, ISO 8601.
     pub at: String,
-    /// `completed | failed | cancelled | blocked`.
+    /// `completed | failed | stopped | blocked`, or `cancelled` on a row an older build wrote.
     pub status: String,
     /// How long it took, in milliseconds.
     pub duration_ms: i64,
@@ -1184,7 +1184,8 @@ pub struct QueryHistoryItem {
     pub user: String,
     /// When the query ran, ISO 8601.
     pub at: String,
-    /// `"completed" | "failed" | "cancelled" | "blocked"`.
+    /// `"completed" | "failed" | "stopped" | "blocked"`, or `"cancelled"` on
+    /// a row an older build wrote (`0127_query_history_stopped.sql`).
     pub status: String,
     /// Wall-clock execution time. Serializes as `durationMs`.
     pub duration_ms: i64,
@@ -1277,11 +1278,11 @@ impl From<QueryHistoryRow> for QueryHistoryItem {
 /// every value, so its SQL is one constant statement. `None` means "no
 /// filter on this axis", and the all-`None` default is the side panel's
 /// and the page's first view: the newest page of the last 14 days.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HistoryFilter<'a> {
-    /// `completed | failed | cancelled | blocked` — the statuses the
-    /// table's own check allows. The route rejects anything else with a
-    /// 400 before this is built.
+    /// `completed | failed | stopped | blocked` — the statuses `run`
+    /// records. The route rejects anything else (`cancelled`, which only
+    /// older rows carry, included) with a 400 before this is built.
     pub status: Option<&'a str>,
     /// `clickhouse | trino` — the engines `run` records. The route
     /// rejects anything else with a 400 before this is built.
@@ -1298,22 +1299,51 @@ pub struct HistoryFilter<'a> {
     pub from: Option<OffsetDateTime>,
     /// The window's end, inclusive.
     pub to: Option<OffsetDateTime>,
-    /// The page cursor's `at` half: the `at` of the last row the caller
-    /// has already seen. With [`HistoryFilter::before_id`] it pages
-    /// without repeats or skips.
-    pub before_at: Option<OffsetDateTime>,
-    /// The page cursor's `id` half, breaking ties between rows that share
-    /// an `at` (rows land in one millisecond more often than a cursor
-    /// built on `at` alone could survive).
-    pub before_id: Option<&'a str>,
+    /// The 1-based page number: page N is rows (N-1)*50 to N*50 of the
+    /// newest-first list. A value below 1 reads as page 1, and an offset
+    /// too large for the database saturates, so a huge page is an empty
+    /// page, not an error.
+    pub page: i64,
+}
+
+impl Default for HistoryFilter<'_> {
+    /// No filter, first page: the side panel's and the page's first view.
+    fn default() -> Self {
+        Self {
+            status: None,
+            engine: None,
+            min_duration_ms: None,
+            table: None,
+            from: None,
+            to: None,
+            page: 1,
+        }
+    }
 }
 
 /// The page size of [`list_history`]: the most rows any one answer
-/// carries. "Load more" asks for the next page with the cursor (decision
-/// 5), so no answer grows as `routes::query::run` keeps inserting, and
-/// reaching an older row is what the filters are for — the side panel's
-/// old first bite of 200 is not kept.
-const HISTORY_PAGE_LIMIT: i64 = 50;
+/// carries, and the `pageSize` the route reports. Pages are numbered
+/// (`QS-4` QA of 2026-11-05), so no answer grows as `routes::query::run`
+/// keeps inserting, and reaching an older row is what the filters and the
+/// page number are for — the side panel's old first bite of 200 is not
+/// kept.
+pub const HISTORY_PAGE_LIMIT: i64 = 50;
+
+/// The `WHERE` of [`list_history`] and [`count_history`], written once so
+/// `total` can never count a row the list would not show. It reads
+/// `$1..$7` — owner, status, engine, minimum duration, table, `from`,
+/// `to` — and both statements bind them in that order. The text is a
+/// constant: every value is bound, none is interpolated.
+const HISTORY_WHERE: &str = "q.owner_id = $1 \
+           AND ($2::text IS NULL OR q.status = $2) \
+           AND ($3::text IS NULL OR q.engine = $3) \
+           AND ($4::bigint IS NULL OR q.duration_ms >= $4) \
+           AND ($5::text IS NULL OR EXISTS ( \
+               SELECT 1 FROM unnest(q.tables_read) AS t(t) \
+                WHERE t.t ILIKE '%' || replace(replace(replace($5, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%')) \
+           AND q.at >= GREATEST(COALESCE($6::timestamptz, now() - interval '14 days'), \
+                                now() - interval '14 days') \
+           AND ($7::timestamptz IS NULL OR q.at <= $7)";
 
 /// List one user's recorded query executions, filtered, most recent
 /// first, one page at a time.
@@ -1325,11 +1355,12 @@ const HISTORY_PAGE_LIMIT: i64 = 50;
 ///
 /// # One constant statement
 ///
-/// Every filter is a `$n IS NULL OR ...` arm, so the SQL never changes
-/// shape and every value is bound — `format!` has nothing to do here
-/// (decision 5; the repo rule that only constant identifiers may be
-/// interpolated). An absent filter costs Postgres one null test per row
-/// and buys a statement whose shape Postgres can learn once.
+/// Every filter is a `$n IS NULL OR ...` arm of [`HISTORY_WHERE`], so the
+/// SQL never changes shape and every value is bound. `format!` only joins
+/// that constant to the constant select list (decision 5; the repo rule
+/// that only constants may be interpolated). An absent filter costs
+/// Postgres one null test per row and buys a statement whose shape
+/// Postgres can learn once.
 ///
 /// # The 14-day window (decision 2)
 ///
@@ -1339,20 +1370,15 @@ const HISTORY_PAGE_LIMIT: i64 = 50;
 /// and a `from` older than the floor is clamped to it. Nothing is
 /// deleted — an older row is still in the table, it is just not listed.
 ///
-/// # The cursor (decision 5)
+/// # Numbered pages (`QS-4` QA of 2026-11-05)
 ///
-/// `(date_trunc('milliseconds', q.at), q.id) < ($8::timestamptz, $9::text)`
-/// under `ORDER BY date_trunc('milliseconds', q.at) DESC, q.id DESC` pages
-/// by the `at` *and* `id` of the last row seen: a cursor on `at` alone
-/// would repeat or skip every row that shares its millisecond.
-///
-/// The millisecond is the value the cursor carries: a row's `at` leaves
-/// the store cut to milliseconds ([`iso_millis`]), so the console's cursor
-/// holds `T.000` for a row at `T.000150`. Comparing that millisecond
-/// against the stored microsecond `at` skips every row inside the last
-/// page's millisecond — `T.000100` is not below `T.000` — so the order
-/// and the comparison both run on `date_trunc('milliseconds', q.at)`, the
-/// value the cursor holds.
+/// `LIMIT 50 OFFSET (page - 1) * 50` under `ORDER BY
+/// date_trunc('milliseconds', q.at) DESC, q.id DESC`. A row's `at` leaves
+/// the store cut to milliseconds ([`iso_millis`]), so the order cuts to the
+/// same value and falls back to the id: rows inside one displayed
+/// millisecond keep a fixed order and a page boundary never repeats or
+/// skips one. The offset saturates instead of overflowing, so a page no
+/// table could reach is an empty page.
 ///
 /// # The `table` match (decision 7)
 ///
@@ -1384,7 +1410,13 @@ pub async fn list_history(
     owner_id: Uuid,
     filter: &HistoryFilter<'_>,
 ) -> Result<Vec<QueryHistoryItem>, StoreError> {
-    let rows: Vec<QueryHistoryRow> = sqlx::query_as(
+    let offset = filter
+        .page
+        .max(1)
+        .saturating_sub(1)
+        .saturating_mul(HISTORY_PAGE_LIMIT);
+    // safe: only the constant `HISTORY_WHERE` is formatted in; every value is bound.
+    let sql = format!(
         "SELECT q.id, q.sql, q.user_name, q.at, q.status, q.duration_ms, q.scanned_bytes, \
          q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id, \
          q.owner_id, q.tables_read, q.message \
@@ -1394,33 +1426,51 @@ pub async fn list_history(
               WHERE ae.resource_kind = 'query_history' AND ae.resource_id = q.id \
               ORDER BY ae.at DESC LIMIT 1 \
          ) ae ON true \
-         WHERE q.owner_id = $1 \
-           AND ($2::text IS NULL OR q.status = $2) \
-           AND ($3::text IS NULL OR q.engine = $3) \
-           AND ($4::bigint IS NULL OR q.duration_ms >= $4) \
-           AND ($5::text IS NULL OR EXISTS ( \
-               SELECT 1 FROM unnest(q.tables_read) AS t(t) \
-                WHERE t.t ILIKE '%' || replace(replace(replace($5, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%')) \
-           AND q.at >= GREATEST(COALESCE($6::timestamptz, now() - interval '14 days'), \
-                                now() - interval '14 days') \
-           AND ($7::timestamptz IS NULL OR q.at <= $7) \
-           AND ($8::timestamptz IS NULL OR (date_trunc('milliseconds', q.at), q.id) < ($8::timestamptz, $9::text)) \
+         WHERE {HISTORY_WHERE} \
          ORDER BY date_trunc('milliseconds', q.at) DESC, q.id DESC \
-         LIMIT $10",
-    )
-    .bind(owner_id)
-    .bind(filter.status)
-    .bind(filter.engine)
-    .bind(filter.min_duration_ms)
-    .bind(filter.table)
-    .bind(filter.from)
-    .bind(filter.to)
-    .bind(filter.before_at)
-    .bind(filter.before_id)
-    .bind(HISTORY_PAGE_LIMIT)
-    .fetch_all(pool)
-    .await?;
+         LIMIT $8 OFFSET $9"
+    );
+    let rows: Vec<QueryHistoryRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(owner_id)
+        .bind(filter.status)
+        .bind(filter.engine)
+        .bind(filter.min_duration_ms)
+        .bind(filter.table)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(HISTORY_PAGE_LIMIT)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(QueryHistoryItem::from).collect())
+}
+
+/// Count the rows [`list_history`] pages through: the same owner scope, the
+/// same 14-day window and every filter, from the one [`HISTORY_WHERE`], with
+/// `filter.page` ignored. The history page's "Page N of M" and its empty
+/// state read this, so it must not count a row the list would not show.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn count_history(
+    pool: &PgPool,
+    owner_id: Uuid,
+    filter: &HistoryFilter<'_>,
+) -> Result<i64, StoreError> {
+    // safe: only the constant `HISTORY_WHERE` is formatted in; every value is bound.
+    let sql = format!("SELECT COUNT(*) FROM query_history q WHERE {HISTORY_WHERE}");
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(owner_id)
+        .bind(filter.status)
+        .bind(filter.engine)
+        .bind(filter.min_duration_ms)
+        .bind(filter.table)
+        .bind(filter.from)
+        .bind(filter.to)
+        .fetch_one(pool)
+        .await?;
+    Ok(total)
 }
 
 /// Fetch one query-history row by id — added for an owner-scoped lookup
@@ -1470,7 +1520,7 @@ pub struct RecordHistoryInput<'a> {
     /// The user the row belongs to. `None` for a run with no authenticated
     /// caller, which [`list_history`] then shows to nobody.
     pub owner_id: Option<Uuid>,
-    /// `"completed" | "failed" | "cancelled" | "blocked"`.
+    /// `"completed" | "failed" | "stopped" | "blocked"`.
     pub status: &'a str,
     /// Wall-clock execution time, in milliseconds.
     pub duration_ms: i64,

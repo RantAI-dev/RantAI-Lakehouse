@@ -25,9 +25,9 @@ producer. The tables a run read are not recorded either, so nobody can find "the
 ## What the user can do when this is done
 
 1. Open Query Studio > History and see their own runs of the last 14 days, newest first, 50 per page.
-2. Filter by status (completed, failed, refused), engine, minimum duration, a table the run read, and a
+2. Filter by status (completed, failed, stopped, refused), engine, minimum duration, a table the run read, and a
    time range within the 14 days.
-3. See failed and refused runs as well as completed ones, each with the message they saw at the time.
+3. See failed, stopped and refused runs as well as completed ones, each with a plain sentence that says why.
 4. Click a run to open its SQL in a new Query Studio tab.
 5. In the Query Studio editor, insert and complete Bronze tables too (`QS-1` review fix).
 
@@ -51,9 +51,9 @@ recorded the same way; the chat's `run_sql` is not recorded, as today.
 | --- | --- | --- | --- |
 | 1 | The page is `/query-studio/history`, a third tab beside Studio and Saved Queries; it shows the caller's own runs only, as the side panel does | none | Owner, 2026-10-24 |
 | 2 | 14 days are shown (Snowflake). Older rows stay in the database, unseen | 14 days | Owner, 2026-10-24 |
-| 3 | Every run that reaches the server's answer is recorded: completed, failed, and refused (`blocked`: a policy, the tenant gate or the read-only guard said no). Each keeps the message the person saw, which is already the fixed, classified text; the engine's own text is never stored (principle 4). A run stopped with Stop is not recorded: Stop only closes the browser's request today, so the server never learns of it. It is recorded once `QS-2` stops the query on the server | none | Owner, 2026-10-24; the stopped case corrected by the planner the same day |
+| 3 | Every run that reaches the server's answer is recorded: completed, failed, stopped, and refused (`blocked`: a policy, the tenant gate or the read-only guard said no). A run ended with Stop is recorded as **Stopped**; a run the time limit ended stays failed, with its own sentence. The stored message is a fixed sentence, never the engine's own text, `Code:` or catalog names (principle 4). A run that fails in the engine keeps the sentence for its cause (a missing table or database, a missing column, a syntax error, a wrong type, too little memory, or "The engine could not run this statement.") followed by `Reference: <id>`, the id in the log. The result tab and the run endpoint's 422 body still show the engine's diagnosis (`QS-1-AC5`) | none | Owner, 2026-10-24; changed: Owner, 2026-11-05 |
 | 4 | Each run records the tables it read, from the parser the policy step already uses (`sql_rewrite::referenced_tables`). A statement that does not parse records none | none | Owner, 2026-10-24 |
-| 5 | The filters run on the server, extending the existing `GET /api/query/history` with query parameters; no new route. 50 rows per page, newest first | 50 per page | Owner, 2026-10-24 |
+| 5 | The filters run on the server, extending the existing `GET /api/query/history` with query parameters; no new route. Pages are numbered, 50 rows per page, newest first: the request takes `page` (1-based) and the answer is `{ runs, total, page, pageSize }`. The page shows Previous, numbered buttons, Next and "Page N of M"; there is no "Load more" | 50 per page | Owner, 2026-10-24; changed: Owner, 2026-11-05 |
 | 6 | The side panel stays as it is (the last runs, now including failed ones) with a "View all" link to the page | none | Owner, 2026-10-24 |
 | 7 | The table filter matches a table name containing the text typed, case-insensitive | none | Owner, 2026-10-24 |
 | 8 | Bronze tables in the editor (`QS-1` review fix): their SQL name comes from the existing `assetQueryTarget` once the table's detail is loaded (on expand, or when the statement names it) | none | Owner, 2026-10-24 |
@@ -61,8 +61,10 @@ recorded the same way; the chat's `run_sql` is not recorded, as today.
 ## Limits to tell a customer
 
 - History shows your own runs only. An administrator's view of everyone's runs is not built yet.
-- A run stopped with Stop is not in History until the server can stop a query (`QS-2`).
+- A statement the Trino engine rejects shows "The engine could not run this statement." plus a reference id, whatever the cause: the Trino client does not keep the error name, so History cannot tell a missing table from a syntax error.
+- A failed Trino run recorded before the classification keeps its old message, which can hold the engine's first line. Failed ClickHouse runs from before it show the same default sentence, not their cause. Both age out of the 14-day window.
 - History covers 14 days. Runs from before this release have no table list, so the table filter misses them.
+- A `DESCRIBE` or `SHOW COLUMNS FROM` statement records the table it names. A `SHOW TABLES` statement records no table.
 - A Bronze table's name is known once its detail is loaded, so the first suggestion for a new Bronze table may wait
   for that request.
 - History is per user, not per tenant: a user who changes tenant still sees their own earlier runs from the
@@ -75,7 +77,7 @@ Run on a running console by the product owner. A step not performed is never a p
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
 | `QS-4-AC1` | (operator) Have a run on a table recorded 10 days ago; open History and filter on that table | The run is listed | Not run |
-| `QS-4-AC2` | Run SQL that fails, then SQL a policy refuses; open History | Two rows, failed and refused, each with the message shown at the time | Not run |
+| `QS-4-AC2` | Run SQL that fails, then SQL a policy refuses; open History | Two rows, Failed and Refused, each with a sentence that says why; the failed row ends with a reference id and holds no `Code:` or catalog name | Not run |
 | `QS-4-AC3` | Sign in as a user without `query:read` and open History | Refused with a permission message | Not run |
 | `QS-4-AC4` | Sign in as a second user and open History | None of the first user's runs is listed | Not run |
 | `QS-4-AC5` | (operator) Have a run recorded 15 days ago | It is not listed | Not run |
