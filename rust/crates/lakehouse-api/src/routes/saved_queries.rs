@@ -720,6 +720,10 @@ impl AccessItem {
 /// parents; a folder inherits from its parents only, because its own
 /// rules are its own and sit in the list beside them.
 ///
+/// A personal space is left out of the chain: the resolver ignores a rule
+/// stored on one (`resolve_level`, `QS-3` review of #382), so listing it
+/// would show access that grants nothing (plan 60 review S1).
+///
 /// A chain that cannot be built is corrupt data, and corrupt data
 /// inherits nothing.
 fn chain_of(map: &FolderMap, item: AccessItem) -> Vec<Uuid> {
@@ -735,21 +739,29 @@ fn chain_of(map: &FolderMap, item: AccessItem) -> Vec<Uuid> {
     let Some(chain) = map.chain(folder_id) else {
         return Vec::new();
     };
-    let chain: Vec<Uuid> = chain.iter().map(|folder| folder.id).collect();
-    match item {
-        // The folder's own rules are its own: only its parents are
-        // inherited.
-        AccessItem::Folder { .. } => chain.into_iter().skip(1).collect(),
-        AccessItem::Query { .. } => chain,
-    }
+    // The folder's own rules are its own: only its parents are inherited.
+    // The folder itself is skipped before the personal spaces are filtered,
+    // so the chain's first folder is never mistaken for a parent.
+    let skip = match item {
+        AccessItem::Folder { .. } => 1,
+        AccessItem::Query { .. } => 0,
+    };
+    chain
+        .iter()
+        .skip(skip)
+        .filter(|folder| !folder.is_personal)
+        .map(|folder| folder.id)
+        .collect()
 }
 
 /// The access list of one item: its own rules, the rules it inherits
 /// from the folders above it, and the level the caller holds on it.
 ///
 /// The folders are read with the viewer's own tenant, so the chain is the
-/// chain the resolver used to decide the level: the list cannot name a
-/// folder the level did not come from.
+/// chain the resolver used to decide the level. The list names a folder
+/// only when the resolver reads its rules: a rule stored on a personal
+/// space grants nothing, so it is listed neither as inherited nor as the
+/// space's own (plan 60 review S1).
 async fn access_list(
     pool: &PgPool,
     viewer: &queries::SavedQueryViewer,
@@ -759,7 +771,17 @@ async fn access_list(
     let folders = saved_query_access::list_folders(pool, viewer.tenant_id).await?;
     let map = FolderMap::new(folders);
     let chain = chain_of(&map, item);
-    let own = saved_query_access::rules_for_item(pool, item.query_id(), item.folder_id()).await?;
+    // The resolver ignores a rule stored on a personal space, so the space
+    // lists none of its own.
+    let own = if item
+        .folder_id()
+        .and_then(|id| map.get(id))
+        .is_some_and(|folder| folder.is_personal)
+    {
+        Vec::new()
+    } else {
+        saved_query_access::rules_for_item(pool, item.query_id(), item.folder_id()).await?
+    };
     let inherited = saved_query_access::rules_for_folders(pool, &chain).await?;
     Ok(AccessListWire {
         item_type: item.item_type().to_owned(),
@@ -1364,8 +1386,10 @@ pub struct PatchFolderBody {
 /// store's placement rule at the folder's new place. Everything that can
 /// refuse is settled before the first write, so a refused PATCH changes
 /// nothing (`QS-3` review of #382, SHOULD-FIX 2). There is no transaction
-/// across the two writes: only a database failure between them can leave
-/// the folder moved and not renamed. The store judges the move by the
+/// across the two writes, so two things between them leave the folder moved
+/// and not renamed: a database failure, and a concurrent request that
+/// creates or renames a sibling to the same name, which makes the rename
+/// answer 409 (plan 60 review S2). The store judges the move by the
 /// folder's current name, so a body that moves a folder under a sibling of
 /// its current name and renames it to a free one at the same time is
 /// refused as a duplicate; two requests do it. The answer is the folder as

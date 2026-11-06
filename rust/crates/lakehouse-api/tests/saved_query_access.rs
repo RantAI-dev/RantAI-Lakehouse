@@ -3318,6 +3318,53 @@ async fn folder_in_tree(router: &axum::Router, cookie: &str, id: &str) -> Value 
         .clone()
 }
 
+/// A folder `name` created by the caller under `parent` (the root when
+/// `None`); its id.
+async fn folder_created(
+    router: &axum::Router,
+    cookie: &str,
+    name: &str,
+    parent: Option<&str>,
+) -> String {
+    // No `parentId` key makes a root folder.
+    let mut body = json!({"name": name});
+    if let Some(parent) = parent {
+        body["parentId"] = json!(parent);
+    }
+    let (status, folder) = call(router, "POST", "/api/query/folders", cookie, Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    folder["id"]
+        .as_str()
+        .expect("the folder has an id")
+        .to_owned()
+}
+
+/// A query `title` saved by the caller into `folder` (their personal space
+/// when `None`); its id and the folder it landed in.
+async fn query_saved(
+    router: &axum::Router,
+    cookie: &str,
+    title: &str,
+    folder: Option<&str>,
+) -> (String, String) {
+    // No `folderId` key saves into the caller's personal space.
+    let mut body = json!({"title": title, "sql": "SELECT 1"});
+    if let Some(folder) = folder {
+        body["folderId"] = json!(folder);
+    }
+    let (status, saved) = call(router, "POST", "/api/query/saved", cookie, Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned();
+    let folder_id = saved["folderId"]
+        .as_str()
+        .expect("the query sits in a folder")
+        .to_owned();
+    (id, folder_id)
+}
+
 /// A shared folder `Reports` that Reza edits, a folder `X` that Reza
 /// created inside it (so he manages `X`), and a query of Rina's saved
 /// into `X` — Rina holds edit on `X` through a rule Reza wrote. Reza's
@@ -3485,6 +3532,100 @@ async fn an_edit_holder_cannot_move_a_query_into_a_folder_of_their_own() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error(&found), QUERY_NOT_FOUND);
+}
+
+/// Review scenario (a) as the review wrote it (plan 60 review P1): the
+/// folder `X` sits in Rina's PERSONAL space, under `Weekly`, and Rina
+/// herself puts her query into it. Reza, who created `X` and manages it,
+/// holds only edit on that query through the rule on `Weekly`. Moving `X`
+/// to the shared root would publish Rina's query to the organisation, so
+/// it is refused with the move sentence, and a colleague with no grant
+/// still neither finds the query by id nor in their list.
+#[tokio::test]
+async fn an_author_of_a_folder_in_a_personal_space_cannot_publish_it_with_her_query_inside() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let colleague = a_third_reader(&pool).await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+
+    let (_private, space) = query_saved(&router, &rina, "Private", None).await;
+    let weekly = folder_created(&router, &rina, "Weekly", Some(&space)).await;
+    let (status, body) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/folders/{weekly}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": reza_id.to_string(), "level": "edit"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Reza creates X inside Weekly: he is its author, so he manages it.
+    let x = folder_created(&router, &reza, "X", Some(&weekly)).await;
+    let tree_x = folder_in_tree(&router, &reza, &x).await;
+    assert_eq!(tree_x["level"], "manage", "{tree_x}");
+
+    // Rina manages the whole of her space, so she saves a query into X.
+    let (numbers, _) = query_saved(&router, &rina, "Rina's numbers", Some(&x)).await;
+    let (status, found) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{numbers}"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(
+        found["level"], "edit",
+        "authoring X does not reach Rina's query: {found}"
+    );
+
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/folders/{x}"),
+        &reza,
+        Some(json!({"parentId": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {MOVE_NEEDS_MANAGE}")
+    );
+
+    // X is still in Weekly, and the organisation does not see the query.
+    let tree_x = folder_in_tree(&router, &reza, &x).await;
+    assert_eq!(
+        tree_x["parentId"].as_str(),
+        Some(weekly.as_str()),
+        "{tree_x}"
+    );
+    let (status, found) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{numbers}"),
+        &colleague,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{found}");
+    assert_eq!(error(&found), QUERY_NOT_FOUND);
+    let (status, listed) = call(
+        &router,
+        "GET",
+        "/api/query/saved?q=numbers",
+        &colleague,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(
+        listed.as_array().expect("the list is an array").is_empty(),
+        "the colleague's list does not hold the query: {listed}"
+    );
 }
 
 /// Review scenario (b): Reza created `X` inside `Reports` (so he manages
@@ -3906,4 +4047,91 @@ async fn a_rule_stored_on_a_personal_space_opens_nothing() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// The access list names only rules that grant something (plan 60 review
+/// S1). A rule stored on a personal space gives nobody anything, so the
+/// list of a query, of a folder inside the space and of the space itself
+/// does not show it. CONTROL: a rule on a folder inside the space still
+/// shows as inherited on what sits below that folder.
+#[tokio::test]
+async fn a_rule_stored_on_a_personal_space_is_not_listed_as_access() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let yoga = user_id(&pool, "yoga@meridian.example").await;
+    let (private, space) = query_saved(&router, &rina, "Private", None).await;
+    let weekly = folder_created(&router, &rina, "Weekly", Some(&space)).await;
+    let archive = folder_created(&router, &rina, "Archive", Some(&weekly)).await;
+    let (numbers, _) = query_saved(&router, &rina, "Numbers", Some(&archive)).await;
+    // The rule on `Weekly` is real: the route accepts it.
+    let (status, body) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/folders/{weekly}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": yoga.to_string(), "level": "view"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The rule on the space is the leftover the resolver ignores; the
+    // route refuses to write one, so it is seeded.
+    sqlx::query(
+        "INSERT INTO saved_query_access_rule (folder_id, user_id, level, granted_by) \
+         VALUES ($1, $2, 'manage', $2)",
+    )
+    .bind(Uuid::parse_str(&space).expect("the space id"))
+    .bind(reza_id)
+    .execute(&pool)
+    .await
+    .expect("seed the rule on the personal space");
+
+    // The query in the space, the sub-folder and the space itself list no
+    // rule from the space.
+    for path in [
+        format!("/api/query/saved/{private}/access"),
+        format!("/api/query/folders/{weekly}/access"),
+    ] {
+        let (status, list) = call(&router, "GET", &path, &rina, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert!(
+            list["inherited"]
+                .as_array()
+                .expect("the inherited list is an array")
+                .is_empty(),
+            "{path} inherits nothing from the space: {list}"
+        );
+    }
+    let (status, list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{space}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(
+        list["rules"]
+            .as_array()
+            .expect("the rules are an array")
+            .is_empty(),
+        "the space lists no rule of its own: {list}"
+    );
+
+    // CONTROL: below `Weekly` the real rule is inherited, and the space's
+    // rule is still left out.
+    for path in [
+        format!("/api/query/saved/{numbers}/access"),
+        format!("/api/query/folders/{archive}/access"),
+    ] {
+        let (status, list) = call(&router, "GET", &path, &rina, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let inherited = list["inherited"]
+            .as_array()
+            .expect("the inherited list is an array");
+        assert_eq!(inherited.len(), 1, "{path} inherits only Weekly: {list}");
+        assert_eq!(inherited[0]["folderId"], weekly, "{list}");
+        assert_eq!(inherited[0]["userId"], yoga.to_string(), "{list}");
+    }
 }
