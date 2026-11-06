@@ -26,6 +26,25 @@ this checkout, which the pipeline page's source view needs. The API listens on
 and the console on `:3000` once the API is. Sign in with `AUTH_BOOTSTRAP_EMAIL`
 and `AUTH_BOOTSTRAP_PASSWORD`.
 
+### Test-only settings
+
+A few settings the acceptance gates and the tests use are deliberately not
+in `.env.example` any more (`REL-19`, decision D6). A normal run sets none of
+them; each is defaulted where it is read, so nothing changes when the line
+is absent:
+
+| Setting | Read by | Default |
+| --- | --- | --- |
+| `GOLD_MART_NAME`, `GOLD_EXPORT_ROW_COUNT` | Gold export acceptance test (`ops/gold_export`); compose passes them to `dagster-code-location` | `gold_export_smoke`, `7` |
+| `BRONZE_SOURCE_SCHEMA`, `BRONZE_SOURCE_TABLE`, `BRONZE_TABLE_NAME` | Bronze ingest (`dagster/dispar_orchestrate/dlt_pipeline.py`) and the G3/G7/G8 gates | `ingest_demo`, `orders`, `g3a_orders` |
+| `BRONZE_CURATED_SLUGS` | The API's catalog | empty |
+| `CONSOLE_ALLOWED_DEV_ORIGINS` | `next.config.ts`, `next dev` only (`OPS-11`) | empty (localhost only) |
+| `APP_ENV` | The API's session-cookie posture; compose defaults it | `local` under compose |
+
+No workflow or gate read these from `.env.example`: the CI jobs write their
+own throwaway `.env`, and each gate defaults them in its own script or gets
+the compose default. `docs/CONFIGURATION.md` documents every one.
+
 ### Developing: the console and the API on the host
 
 Prefer running the console and the API on the host (e.g. for faster

@@ -442,46 +442,10 @@ pub(super) async fn create_chart(
     id: Option<String>,
     time: &lakehouse_bi::grain::TimeContext,
 ) -> Value {
-    let mut input = match parse_chart_input(args) {
-        Ok(i) => i,
-        Err(e) => return json!({ "error": e }),
+    let PreparedChart { input, .. } = match prepare_chart(ch, viewer, None, args, time).await {
+        Ok(prepared) => prepared,
+        Err(reply) => return reply,
     };
-    if let Err(sentence) = check_layers_name_a_source(&input) {
-        return json!({ "error": sentence });
-    }
-    // BI-17 part A, decision 6 (`PR #199 review M SHOULD-FIX BI-17 4`): a new
-    // chart in a deployment with a company palette draws with it. A palette
-    // the model chose is kept, and a chart that already exists keeps what it
-    // has (that is `update_chart`, which does not come here).
-    //
-    // `PR #199 review O BLOCKER 2`: only a kind that takes colours gets one.
-    // The style check refuses colours on a table, a KPI or a static tile, so
-    // setting the palette on every kind made the assistant unable to create
-    // any of them in a deployment with a company palette.
-    if time.company_palette().len() >= 2
-        && lakehouse_bi::style::is_chart(input.kind)
-        && input
-            .style
-            .colors
-            .as_ref()
-            .is_none_or(|colors| colors.palette.is_none())
-    {
-        input
-            .style
-            .colors
-            .get_or_insert_with(Default::default)
-            .palette = Some("company".to_owned());
-    }
-    // BI-18 part C, part 2: not onto a dashboard in the trash or in somebody
-    // else's personal space.
-    if let Err(err) = require_chart_board(ch, input.board.as_deref(), viewer).await {
-        return refused(err);
-    }
-    // BI-19 B2 re-review S4-b: a source in a folder the caller cannot see is the
-    // unknown-source answer, as for the console's create.
-    if let Err(err) = store::ensure_sources_visible(ch, &input, viewer, &[]).await {
-        return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
-    }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
             Ok(()) => {
@@ -505,96 +469,103 @@ pub(super) async fn create_chart(
     }
 }
 
-/// Checks a chart draft before the gate offers it: a draft that cannot be
-/// built must not be offered as a card the person can confirm. It runs the
-/// same validation as the tools (`store::spec_from_input`) and stops there,
-/// so it writes nothing.
-///
-/// `id` is `None` for a create and `Some` for an update; an update with no
-/// `id` is refused here, as the tool refuses it. An update reads the stored
-/// chart as `viewer`, which must be the caller's own (`scope_for_write`, as
-/// the tool builds it), and refuses a chart the caller cannot edit with the
-/// sentence the tool gives, so the draft says nothing about a chart the
-/// caller cannot see. A create reads no stored chart and ignores `viewer`.
-/// A create draft that builds returns the digest of the call's own
-/// definition. An update draft returns `None`: the save's reply carries the
-/// digest of the merged chart.
-///
-/// # Errors
-///
-/// The error the tool would return when the draft cannot be built.
-pub(super) async fn check_chart_draft(
-    ch: &ChClient,
-    viewer: &Viewer,
-    args: &Map<String, Value>,
-    id: Option<String>,
-    time: &lakehouse_bi::grain::TimeContext,
-) -> Result<Option<String>, Value> {
-    if id.as_deref().is_some_and(str::is_empty) {
-        return Err(json!({ "error": "id is required" }));
-    }
-    // The gate `update_chart` runs first: a chart that is missing, in the
-    // trash, purged or on a board the caller cannot see answers one sentence,
-    // here and at the save, before any stored field is read.
-    if let Some(id) = id.as_deref() {
-        require_editable_chart(ch, id, viewer)
-            .await
-            .map_err(refused)?;
-    }
-    // The same carry-over `update_chart` does, as the same viewer, so the card
-    // and the save agree.
-    let kept = Box::pin(kept_formatting(ch, viewer, id.as_deref(), args)).await?;
-    let input = parse_chart_input(&kept.args).map_err(|e| json!({ "error": e }))?;
-    if let Err(sentence) = check_layers_name_a_source(&input) {
-        return Err(json!({ "error": sentence }));
-    }
-    let is_create = id.is_none();
-    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
-        Ok(_) => Ok(is_create.then(|| definition_digest(&input))),
-        Err(err) => Err(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
-    }
+/// What `create_chart` and `update_chart` build before the chart is
+/// stored. The fields after `input` describe the stored chart an update
+/// changes. On a create they hold neutral values (an empty old board,
+/// `formatting_kept` true, nothing kept) that the create path ignores.
+struct PreparedChart {
+    /// The definition the chart is built from and the digest describes.
+    input: ChartInput,
+    /// The board the chart is on now (an update's).
+    old_board: String,
+    /// The stored formatting was kept.
+    formatting_kept: bool,
+    /// The stored data source was kept.
+    source_kept: bool,
+    /// The names of the stored fields carried over, sorted.
+    fields_kept: Vec<String>,
 }
 
-pub(super) async fn update_chart(
+/// Every check the two chart tools run before `store::spec_from_input`, in
+/// one place, so the save and the draft check (`check_chart_draft`) cannot
+/// drift apart (`PR #391 review`, `PR #402 review`: the draft ran fewer checks
+/// than the save and named the columns of a SQL source the caller cannot see).
+/// `id` is `None` for a create and `Some` for an update. The order is the
+/// save's: for an update the chart's own gate first, then the carry-over, then
+/// the board, then the sources the caller may see.
+///
+/// `viewer` must be the caller's own (`scope_for_write`).
+async fn prepare_chart(
     ch: &ChClient,
     viewer: &Viewer,
-    principal: Option<&Principal>,
+    id: Option<&str>,
     args: &Map<String, Value>,
     time: &lakehouse_bi::grain::TimeContext,
-) -> Value {
-    let id = arg_str(args, "id");
+) -> Result<PreparedChart, Value> {
+    let Some(id) = id else {
+        let mut input = parse_chart_input(args).map_err(|e| json!({ "error": e }))?;
+        check_layers_name_a_source(&input).map_err(|sentence| json!({ "error": sentence }))?;
+        // BI-17 part A, decision 6 (`PR #199 review M SHOULD-FIX BI-17 4`): a new
+        // chart in a deployment with a company palette draws with it. A palette
+        // the model chose is kept, and a chart that already exists keeps what it
+        // has (that is an update, which does not come here).
+        //
+        // `PR #199 review O BLOCKER 2`: only a kind that takes colours gets one.
+        // The style check refuses colours on a table, a KPI or a static tile, so
+        // setting the palette on every kind made the assistant unable to create
+        // any of them in a deployment with a company palette.
+        if time.company_palette().len() >= 2
+            && lakehouse_bi::style::is_chart(input.kind)
+            && input
+                .style
+                .colors
+                .as_ref()
+                .is_none_or(|colors| colors.palette.is_none())
+        {
+            input
+                .style
+                .colors
+                .get_or_insert_with(Default::default)
+                .palette = Some("company".to_owned());
+        }
+        // BI-18 part C, part 2: not onto a dashboard in the trash or in somebody
+        // else's personal space.
+        require_chart_board(ch, input.board.as_deref(), viewer)
+            .await
+            .map_err(refused)?;
+        // BI-19 B2 re-review S4-b: a source in a folder the caller cannot see is the
+        // unknown-source answer, as for the console's create.
+        store::ensure_sources_visible(ch, &input, viewer, &[])
+            .await
+            .map_err(|err| upstream_error::bi(&upstream_error::DATABASE, &err).to_json())?;
+        return Ok(PreparedChart {
+            input,
+            old_board: String::new(),
+            formatting_kept: true,
+            source_kept: false,
+            fields_kept: Vec::new(),
+        });
+    };
     if id.is_empty() {
-        return json!({ "error": "id is required" });
+        return Err(json!({ "error": "id is required" }));
     }
     // The gate comes before the args are parsed: the carry-over below needs
     // the chart's stored definition and the board it is on.
     // BI-18 part C, part 2: a chart in the trash or on somebody else's
     // personal board cannot be edited, nor moved onto such a board.
-    let old_board = match require_editable_chart(ch, &id, viewer).await {
-        Ok(board) => board,
-        Err(gate) => return refused(gate),
-    };
+    let old_board = require_editable_chart(ch, id, viewer)
+        .await
+        .map_err(refused)?;
     // The stored chart, read as the caller: the gate above has refused a
     // chart the caller may not see, so this reads only what the caller may.
     // The read is boxed, so this future does not carry every chart on the
     // board.
-    let kept = match Box::pin(kept_formatting(ch, viewer, Some(id.as_str()), args)).await {
-        Ok(kept) => kept,
-        Err(reply) => return reply,
-    };
-    let formatting_kept = kept.kept;
-    let source_kept = kept.source_kept;
-    let fields_kept = kept.fields_kept;
-    let mut input = match parse_chart_input(&kept.args) {
-        Ok(i) => i,
-        Err(e) => return json!({ "error": e }),
-    };
-    if let Err(sentence) = check_layers_name_a_source(&input) {
-        return json!({ "error": sentence });
-    }
-    if let Err(err) = require_chart_board(ch, input.board.as_deref(), viewer).await {
-        return refused(err);
-    }
+    let kept = Box::pin(kept_formatting(ch, viewer, Some(id), args)).await?;
+    let mut input = parse_chart_input(&kept.args).map_err(|e| json!({ "error": e }))?;
+    check_layers_name_a_source(&input).map_err(|sentence| json!({ "error": sentence }))?;
+    require_chart_board(ch, input.board.as_deref(), viewer)
+        .await
+        .map_err(refused)?;
     // The chart stays on the board it is on when the call does not name one:
     // without this it would move to the built-in dashboard.
     if input
@@ -614,11 +585,75 @@ pub(super) async fn update_chart(
             .find(|c| c.spec.id == id)
             .map(|c| store::sql_sources_named(&c.def))
             .unwrap_or_default(),
-        Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+        Err(err) => {
+            return Err(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json());
+        }
     };
-    if let Err(err) = store::ensure_sources_visible(ch, &input, viewer, &already).await {
-        return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
+    store::ensure_sources_visible(ch, &input, viewer, &already)
+        .await
+        .map_err(|err| upstream_error::bi(&upstream_error::DATABASE, &err).to_json())?;
+    Ok(PreparedChart {
+        input,
+        old_board,
+        formatting_kept: kept.kept,
+        source_kept: kept.source_kept,
+        fields_kept: kept.fields_kept,
+    })
+}
+
+/// Checks a chart draft before the gate offers it: a draft that cannot be
+/// built must not be offered as a card the person can confirm. It runs the
+/// checks of the save, the one [`prepare_chart`] and then
+/// `store::spec_from_input`, and stops there, so it writes nothing and is
+/// refused with the reply the save gives.
+///
+/// `id` is `None` for a create and `Some` for an update; an update with no
+/// `id` is refused here, as the tool refuses it. `viewer` must be the
+/// caller's own (`scope_for_write`, as the tool builds it): the draft reads
+/// the stored chart and the sources as the caller, so it says nothing about
+/// a chart, a dashboard or a SQL source the caller cannot see. The level
+/// checks (`edit` on the dashboards) are the dispatcher's and are not part
+/// of this function: `check_draft` runs them first.
+///
+/// A draft that builds returns the digest of the definition the save would
+/// store, for a create the call's own and for an update the stored chart
+/// merged with the call.
+///
+/// # Errors
+///
+/// The error the tool would return when the draft cannot be built.
+pub(super) async fn check_chart_draft(
+    ch: &ChClient,
+    viewer: &Viewer,
+    args: &Map<String, Value>,
+    id: Option<String>,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Result<String, Value> {
+    let PreparedChart { input, .. } = prepare_chart(ch, viewer, id.as_deref(), args, time).await?;
+    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
+        Ok(_) => Ok(definition_digest(&input)),
+        Err(err) => Err(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
     }
+}
+
+pub(super) async fn update_chart(
+    ch: &ChClient,
+    viewer: &Viewer,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Value {
+    let id = arg_str(args, "id");
+    let PreparedChart {
+        input,
+        old_board,
+        formatting_kept,
+        source_kept,
+        fields_kept,
+    } = match prepare_chart(ch, viewer, Some(id.as_str()), args, time).await {
+        Ok(prepared) => prepared,
+        Err(reply) => return reply,
+    };
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
         Ok(spec) => {
             // The new row takes a new version, which sorts the chart last on
@@ -2716,12 +2751,13 @@ mod tests {
         );
     }
 
-    /// An update draft carries no digest, and the saved reply carries the
-    /// digest of the chart the save stored: the stored chart merged with the
-    /// call.
+    /// An update draft carries the digest of the merged chart, as a create
+    /// draft carries its own, and it is the digest the saved reply carries:
+    /// the stored chart merged with the call. The draft reads the stored chart
+    /// as the caller and runs the save's checks (`PR #391 review`, `PR #402
+    /// review`), so the digest says nothing a caller may not read.
     #[tokio::test]
-    async fn the_draft_of_an_update_carries_no_digest_and_the_saved_reply_digests_the_merged_chart()
-    {
+    async fn the_draft_of_an_update_digests_the_merged_chart_as_the_saved_reply_does() {
         let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let time = lakehouse_bi::grain::TimeContext::default();
@@ -2742,7 +2778,6 @@ mod tests {
             &time,
         )
         .await;
-        assert_eq!(draft, None);
         // The call names neither a breakdown nor a filter: the stored chart's
         // are what the saved chart holds, so a digest of the call alone would
         // have left them out.
@@ -2753,6 +2788,7 @@ mod tests {
             ),
             "{saved}"
         );
+        assert_eq!(saved["definition"].as_str(), Some(draft.as_str()));
     }
 
     /// A stored bar whose formatting names a column the chart no longer
@@ -2838,15 +2874,15 @@ mod tests {
     }
 
     /// A create draft carries the digest of the call's own definition: there
-    /// is no stored chart to read.
+    /// is no stored chart to read. It reads the dashboards as the caller, as
+    /// the save does.
     #[tokio::test]
     async fn the_draft_of_a_create_carries_the_digest_of_the_call() {
         let server = wide_mart_server().await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        // A create reads no stored chart, so it needs no one to read it as.
         let draft = check_chart_draft(
             &ch,
-            &Viewer::nothing(),
+            &as_viewer(Some(&person(7))),
             &arguments(json!({
                 "title": "Visitors", "kind": "bar", "mart": "mart_x",
                 "dimension": "province", "breakdown": "region", "measures": ["visitors"],
@@ -2857,11 +2893,172 @@ mod tests {
         .await
         .expect("the draft builds");
         assert_eq!(
-            draft.as_deref(),
-            Some(
-                "dimension: province; breakdown: region; measures: visitors; limit: none (default applies)"
-            )
+            draft,
+            "dimension: province; breakdown: region; measures: visitors; limit: none (default applies)"
         );
+    }
+
+    // ── The draft runs the checks of the save (`PR #391 review`, `PR #402 review`) ──
+
+    /// A caller who sees every dashboard and every folder except `folder`,
+    /// the way a deployment with one folder marked "only the people listed"
+    /// reads a person with no rule on it.
+    fn viewer_without_folder(folder: &str) -> Viewer {
+        use lakehouse_bi::access::{AccessMap, ItemKind, Level};
+        let tree = vec![lakehouse_bi::folders::Folder {
+            id: folder.to_owned(),
+            name: "Restricted".to_owned(),
+            parent_id: String::new(),
+            created_by: String::new(),
+            updated_at: None,
+            owner_id: String::new(),
+        }];
+        AccessMap::new(
+            "u7",
+            false,
+            Some(Level::View),
+            &tree,
+            &[],
+            &[(ItemKind::Folder, folder.to_owned())],
+        )
+        .viewer(&[])
+        .expect("one folder fits")
+    }
+
+    /// The source `s_hidden`, filed in the folder `f_hidden`, with a text
+    /// column and two number columns, added to `server`.
+    async fn with_hidden_source(server: MockServer) -> MockServer {
+        rows_first(
+            &server,
+            "FROM console.bi_source FINAL",
+            vec![json!({
+                "id": "s_hidden",
+                "title": "Payroll",
+                "sql": "SELECT city, salary, bonus FROM payroll",
+                "columns_json": r#"[{"name":"city","type":"String"},{"name":"salary","type":"UInt64"},{"name":"bonus","type":"UInt64"}]"#,
+                "folder_id": "f_hidden",
+                "created_by": "",
+                "updated_at": "2026-10-22 00:00:00",
+            })],
+        )
+        .await;
+        server
+    }
+
+    /// A chart over the hidden source that bins its text column: the refusal
+    /// of that bin names the source's number columns (`number_columns_sentence`).
+    fn binned_text_column_of_the_hidden_source() -> Value {
+        json!({
+            "title": "Spread", "kind": "bar", "sqlSource": "s_hidden",
+            "dimension": "city", "measures": ["salary"],
+            "bin": { "mode": "width", "width": 10 },
+        })
+    }
+
+    fn assert_names_nothing_of_the_hidden_source(reply: &impl std::fmt::Debug) {
+        let text = format!("{reply:?}");
+        for hidden in ["salary", "bonus", "city", "number column"] {
+            assert!(!text.contains(hidden), "{hidden} leaked: {text}");
+        }
+    }
+
+    /// A create draft naming a SQL source in a folder the caller cannot see is
+    /// answered as the save answers it, and the answer names none of the
+    /// source's columns. Before, the draft got as far as the bin and listed
+    /// the source's number columns.
+    #[tokio::test]
+    async fn the_draft_of_a_create_on_a_hidden_sql_source_is_refused_as_the_save_refuses() {
+        let server = with_hidden_source(mart_server().await).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let viewer = viewer_without_folder("f_hidden");
+        let args = arguments(binned_text_column_of_the_hidden_source());
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let draft = check_chart_draft(&ch, &viewer, &args, None, &time).await;
+        let saved = create_chart(&ch, &viewer, Some(&person(7)), &args, None, &time).await;
+        assert_eq!(
+            saved["error"],
+            json!("SQL source 's_hidden' not found."),
+            "{saved}"
+        );
+        assert_names_nothing_of_the_hidden_source(&draft);
+        assert_eq!(draft, Err(saved));
+    }
+
+    /// The same for an update that adds such a source to a chart that reads a
+    /// mart.
+    #[tokio::test]
+    async fn the_draft_of_an_update_that_adds_a_hidden_sql_source_is_refused_as_the_save_refuses() {
+        let server = stored_chart_server_on(
+            with_hidden_source(wide_mart_server().await).await,
+            stored_bar_with_data(),
+        )
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let viewer = viewer_without_folder("f_hidden");
+        let mut args = arguments(binned_text_column_of_the_hidden_source());
+        args.insert("id".to_owned(), json!("c_1"));
+        args.insert("board".to_owned(), json!("b_board"));
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let draft = check_chart_draft(&ch, &viewer, &args, Some("c_1".to_owned()), &time).await;
+        let saved = update_chart(&ch, &viewer, Some(&person(7)), &args, &time).await;
+        assert_eq!(
+            saved["error"],
+            json!("SQL source 's_hidden' not found."),
+            "{saved}"
+        );
+        assert_names_nothing_of_the_hidden_source(&draft);
+        assert_eq!(draft, Err(saved));
+    }
+
+    /// A chart that already reads a source keeps reading it when its folder is
+    /// hidden from the caller: the dashboard governs, not the folder of the
+    /// source. The draft is accepted, and so is the save.
+    #[tokio::test]
+    async fn the_draft_of_an_update_of_a_chart_that_already_reads_a_hidden_source_is_accepted() {
+        let server = stored_chart_server_on(
+            with_hidden_source(wide_mart_server().await).await,
+            json!({
+                "title": "Payroll", "kind": "bar", "sqlSource": "s_hidden",
+                "dimension": "city", "measures": ["salary"], "board": "b_board",
+            }),
+        )
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let viewer = viewer_without_folder("f_hidden");
+        let args = arguments(json!({
+            "id": "c_1", "title": "Payroll 2024", "kind": "bar", "sqlSource": "s_hidden",
+            "dimension": "city", "measures": ["salary"], "board": "b_board",
+        }));
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let draft = check_chart_draft(&ch, &viewer, &args, Some("c_1".to_owned()), &time).await;
+        let saved = update_chart(&ch, &viewer, Some(&person(7)), &args, &time).await;
+        assert_eq!(saved["updated"], json!(true), "{saved}");
+        assert!(draft.is_ok(), "{draft:?}");
+    }
+
+    /// A create draft onto a dashboard in the trash is refused as the save
+    /// refuses it.
+    #[tokio::test]
+    async fn the_draft_of_a_create_onto_a_dashboard_in_the_trash_is_refused_as_the_save_refuses() {
+        let server = mart_server().await;
+        rows_first(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 2, "owner_id": "" })],
+        )
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let args = arguments(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"], "board": "b_trash",
+        }));
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let viewer = as_viewer(Some(&person(7)));
+        let draft = check_chart_draft(&ch, &viewer, &args, None, &time).await;
+        let saved = create_chart(&ch, &viewer, Some(&person(7)), &args, None, &time).await;
+        assert!(saved["error"].is_string(), "{saved}");
+        assert!(saved.get("created").is_none(), "{saved}");
+        assert_eq!(draft, Err(saved));
     }
 
     // ── A call whose `compare` does not read ────────────────────────────────

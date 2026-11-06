@@ -680,6 +680,19 @@ async fn mock_clickhouse_with_stored_chart(owner: &str, stale_format: bool) -> M
         .respond_with(rows(&json!([{ "is_deleted": 0, "owner_id": owner }])))
         .mount(&ch)
         .await;
+    // The level check of the save, which the draft runs too, reads the board
+    // itself. It is mounted after the state read above, whose statement it
+    // would also match.
+    Mock::given(method("POST"))
+        .and(body_string_contains("FROM console.bi_board FINAL"))
+        .respond_with(rows(&json!([{
+            "id": STORED_BOARD,
+            "name": "Sales",
+            "folder_id": "",
+            "owner_id": owner,
+        }])))
+        .mount(&ch)
+        .await;
     Mock::given(method("POST"))
         .and(body_string_contains("FROM system.tables"))
         .respond_with(rows(&json!([{ "n": "1" }])))
@@ -791,7 +804,8 @@ async fn the_chat_loop_draft_of_an_update_of_a_chart_on_a_private_board_says_the
 /// The control for the two tests above: the same update of a chart on a
 /// shared board is merged with the stored chart and offered as a draft, so
 /// the refusals above come from the caller's reach and not from a draft that
-/// refuses every update. It carries no digest.
+/// refuses every update. It carries the digest of the merged chart, as the
+/// saved reply does.
 #[tokio::test]
 async fn the_draft_of_an_update_of_a_chart_on_a_shared_board_is_still_offered() {
     let llm = mock_model(vec![]).await;
@@ -802,7 +816,11 @@ async fn the_draft_of_an_update_of_a_chart_on_a_shared_board_is_still_offered() 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["outcome"], "needs_confirmation", "{body}");
     assert_eq!(body["result"]["needs_confirmation"], json!(true), "{body}");
-    assert!(body["result"].get("definition").is_none(), "{body}");
+    assert_eq!(
+        body["result"]["definition"],
+        json!("dimension: region_code; measures: sale_total"),
+        "{body}"
+    );
     assert!(
         !has_insert(&statements(&ch).await),
         "a draft writes nothing"

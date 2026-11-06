@@ -35,6 +35,15 @@
 //! from INSIDE the compose network, because that is where the `clickhouse`
 //! container itself resolves `lakekeeper`/`rustfs` — see [`G1Env`].
 //!
+//! One caveat for the HOST-side form above: the REST catalog client
+//! follows the canonical catalog URI Lakekeeper ADVERTISES in its
+//! `/v1/config` (`LAKEKEEPER__BASE_URI`), so the stack must advertise
+//! the host mapping for a test process outside the network to use it —
+//! `LAKEKEEPER_BASE_URI=http://localhost:8181` in that stack's `.env`.
+//! The compose default advertises the in-network name
+//! (`http://lakekeeper:8181`), which is what the in-network form of this
+//! test (`g1-test-runner`) needs.
+//!
 //! The `lakekeeper-warehouse-init` compose service (see
 //! `docker-compose.yml`) bootstraps the Lakekeeper server and creates the
 //! `LAKEKEEPER_WAREHOUSE` warehouse automatically on `docker compose up`;
