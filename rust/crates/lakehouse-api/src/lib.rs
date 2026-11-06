@@ -48,6 +48,7 @@ pub mod query_limits;
 pub mod readiness;
 pub mod result_cache;
 pub mod routes;
+pub mod runtime_settings;
 pub mod rustfs_client;
 pub mod secret_crypto;
 pub mod secret_manager;

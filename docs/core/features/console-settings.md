@@ -70,6 +70,14 @@ features are off or why.
   its own container, which the API does not configure.
 - Single sign-on stays in `.env`; the Sign-in page shows only whether it is
   set up.
+- The mail server may be an internal address (on-premises relays usually
+  are). The test button, which only an administrator can press, can therefore
+  tell whether something answers at an internal address; it is limited to one
+  try every 10 seconds per person.
+- When the server's `.env` sets the mail server, user or password, the whole
+  connection (server, port, security, user, password) comes from `.env` and
+  is read-only here, so a password kept in files is never sent to a server
+  chosen in the console.
 
 ## Acceptance checklist (owner)
 

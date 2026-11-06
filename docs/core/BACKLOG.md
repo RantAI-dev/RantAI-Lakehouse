@@ -107,10 +107,10 @@ estimate (S, M, L), which the base has no field for.
 | `ADM-4` | Task | An administrator can change a user's roles and tenants and deactivate or reactivate a user: a deactivated user's sessions end at once and every sign-in path refuses them; only a full administrator changes another, nobody deactivates themselves, and a change that would leave no active full administrator is refused (409); every change is audited | Administration & Security | P1 | Done | #348 | Owner QA-1 2026-11-02 |
 | `SEC-57` | Task | The person who asked the assistant for an action may not approve or reject it, the same rule as catalog access (product owner, 2026-11-02): a tool-call approval records who asked (migration `0118`), and one `refuse_own_request` check guards both decide routes | Administration & Security | P1 | Done | #342 | Owner decision 2026-11-02 |
 | `ADM-5` | Feature | Switch modules and connector types off for an installation through `.env` (`LAKEHOUSE_DISABLED_MODULES`, `LAKEHOUSE_DISABLED_CONNECTOR_TYPES`): hidden in the console, the palette, the picker and the assistant, and refused by the API. Spec, feature page and plan on branch `docs/adm-5-hide-modules`; eight decisions wait for the product owner | Administration & Security | P1 | Planned |  | Owner request 2026-11-02 |
-| `ADM-6` | Feature | An administrator sees, in Settings → Deployment, which features are set up (PDF export, email, console address, single sign-on, assistant) and which setting is missing for each one that is off | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
-| `ADM-7` | Feature | Email (mail server, port, security, user, password, sender, console address) set in Settings → Email and used from the next send without a restart, with a test email to the administrator's own address; a value set in `.env` wins and is shown read-only; the password is sealed and never sent back | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
-| `ADM-8` | Feature | Sign-in limits (failed logins, window, lockout, how long sign-in records are kept, longest embed link life) set in Settings → Sign-in, used from the next sign-in. **Blocked by `ADM-7`** | Administration & Security | P2 | Planned |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
-| `ADM-9` | Feature | The assistant's provider address, model and key set in Settings → Assistant with a check button, used from the next message; the address must be `https://` and not internal. **Blocked by `ADM-7`** | Administration & Security | P2 | Planned |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-6` | Feature | An administrator sees, in Settings → Deployment, which features are set up (PDF export, email, console address, single sign-on, assistant) and which setting is missing for each one that is off | Administration & Security | P2 | In Acceptance | #404 | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-7` | Feature | Email (mail server, port, security, user, password, sender, console address) set in Settings → Email and used from the next send without a restart, with a test email to the administrator's own address; a value set in `.env` wins and is shown read-only; the password is sealed and never sent back | Administration & Security | P2 | In Acceptance | #404 | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-8` | Feature | Sign-in limits (failed logins, window, lockout, how long sign-in records are kept, longest embed link life) set in Settings → Sign-in, used from the next sign-in. | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-9` | Feature | The assistant's provider address, model and key set in Settings → Assistant with a check button, used from the next message; the address must be `https://` and not internal. | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
 
 ## Next (P2)
 
@@ -122,6 +122,8 @@ estimate (S, M, L), which the base has no field for.
 | `REL-18` | Task | PDF export (`BI-1`) and PDF report attachments (`RPT-1`) are off on a fresh install: `CONSOLE_INTERNAL_URL` defaults to empty in `docker-compose.yml` and `.env.example`, a leftover from before the console was a compose service (REL-2 S1-T2). Default it to `http://console:3000` (the service name on the compose network), treat an empty value the same as unset, so an install that copied the old empty line gets PDFs after update too (downloads are switched off per role with `downloadDeniedRoles`; planner, 2026-11-06), and update the comments in both files and `docs/OPERATIONS.md`. `RENDER_TOKEN_SECRET` is already generated by `ops/init-env.sh`. Prove it with a real `up` and one PDF | Delivery | P2 | In Progress |  | Owner question, 2026-11-05 |
 | `REL-19` | Task | `.env.example` has 187 settings, most of them internal wiring, tuning already defaulted in code, or test-only. Cut it to about 25 visible lines (installer-generated secrets and operator choices) plus commented blocks per optional feature; everything stays documented in `docs/CONFIGURATION.md`; a script proves a fresh install gets the same values as before. Built together with `REL-18` | Delivery | P2 | In Progress |  | Owner question, 2026-11-06; `superpowers/plans/2026-11-06-rel-19-env-cleanup.md` |
 | `REL-20` | Task | Rust tests take 40 to 50 minutes per PR: the API crate is compiled twice (`main.rs` re-declares the lib's modules, so 3,100 unit tests run twice) and 185 test binaries run one after another. One module tree, and cargo-nextest across three runners; no test removed | Delivery | P1 | Done | #397 | Owner request 2026-11-06; `superpowers/plans/2026-11-06-rel-20-faster-rust-tests.md` |
+| `REL-21` | Task | A flaky test: `routes::ai::semantic::tests::a_timeout_writes_nothing_and_the_next_table_is_drafted` gave every model call 200 ms, so the second table's immediate reply also had to arrive inside 200 ms, which a loaded CI runner sometimes missed (PR #404, 2026-11-06). The test now gives 2 s, still five times shorter than the 10 s delay it proves times out | Delivery | P2 | Done | #405 | PR #404 CI, 2026-11-06 |
+| `REL-22` | Task | A flaky test: `lakehouse-notify` `smtp_private_ca` waited only for a TCP connect to the relay's published port, which Docker's port proxy accepts before the relay listens, so on a loaded runner a case's dial was reset ("could not be reached" instead of the TLS failure under test; PR #405, 2026-11-06). The STARTTLS cases now wait for the `220` greeting. The implicit-TLS cases still wait for a TCP connect only (no greeting before the handshake); if they flake, wait on the relay's HTTP API as well | Delivery | P2 | Done | #407 | PR #405 CI, 2026-11-06 |
 | `DATA-44` | Feature | Near real-time analytics, without a stream engine (product owner, 2026-11-04: "write as backlog, but we later support clustering"). A change in a source system shows on a dashboard and can fire an alert within a target time, on one server: (1) measure the end-to-end freshness today, source change → Bronze table → Gold/self-refreshing table (`BLD-2`) → dashboard tile → alert, into a `docs/plans/DATA-44-RESULT.md`, for PostgreSQL live change capture and Kafka; (2) a dashboard refreshes itself on an interval set per dashboard, for a "live" screen; (3) the assistant can set that interval and make a self-refreshing table (assistant parity); (4) target *(proposed, owner to sign)*: a source change visible on a dashboard within 60 seconds at p95, measured. Not in scope: processing over streams (windows, joins over streams; `SRC-2`) and running on several servers (`OPS-3`, later). MySQL and SQL Server change capture come with `SRC-4` (#264) | Data | P2 | Idea |  | owner 2026-11-04; PRODUCT §2 |
 | `WEB-4` | Task | Retire the API routes only removed console pages called (`WEB-3` D2): `/api/ops/observability`, `/api/agents/employees*`, the runs list, `/api/agents/workflows` (no page since WS1 1.11), after checking the assistant's tools do not use them | Platform | P2 | Todo |  | `WEB-3` plan D2 |
 | `RPT-1` | Feature | Scheduled reports with PDF and spreadsheet attachments. **Blocked by `BI-1` (PDF and Excel attachments)** | Dashboards | P2 | In Acceptance | [#204](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/204) | PRODUCT §2 |
@@ -376,9 +378,6 @@ parity), built after it.
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `QS-5` | Planned | — | `AI-12` (variables part) |
-| `ADM-7` | Building | — | `ADM-8`, `ADM-9` |
-| `ADM-8` | Planned | `ADM-7` | — |
-| `ADM-9` | Planned | `ADM-7` | — |
 | `AI-11` | Planned | `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
@@ -562,13 +561,15 @@ set by the product owner and are left empty until they are.
 | `SEC-55` | 2026-11-04 | 2026-11-04 | |
 | `DATA-39` | 2026-11-01 | data part 2026-11-01; assistant part 2026-11-04 | |
 | `ADM-5` | 2026-11-02 |  | |
-| `ADM-6` | 2026-11-06 |  | |
-| `ADM-7` | 2026-11-06 |  | |
+| `ADM-6` | 2026-11-06 | 2026-11-06 | |
+| `ADM-7` | 2026-11-06 | 2026-11-06 | |
 | `ADM-8` | 2026-11-06 |  | |
 | `ADM-9` | 2026-11-06 |  | |
 | `REL-18` | 2026-11-06 |  | |
 | `REL-19` | 2026-11-06 |  | |
 | `REL-20` | 2026-11-06 | 2026-11-06 | |
+| `REL-21` | 2026-11-06 | 2026-11-06 | |
+| `REL-22` | 2026-11-06 | 2026-11-06 | |
 
 ## Decide
 

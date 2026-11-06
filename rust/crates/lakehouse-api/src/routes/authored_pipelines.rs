@@ -1182,7 +1182,7 @@ pub async fn lag_check(
         // a redirect, like every other rule evaluation in this crate.
         let http = state.webhook_sender();
         let email =
-            lakehouse_notify::EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
+            lakehouse_notify::EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
         let silence_source: Option<Box<dyn lakehouse_alerts::SilenceSource>> =
             state.pg.as_deref().map(|pg| {
                 Box::new(crate::routes::alerts::ApiSilenceSource { pg })

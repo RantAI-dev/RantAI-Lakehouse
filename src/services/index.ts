@@ -145,6 +145,22 @@ export const reportService = reportClientService
  * feature imports it from `@/services` (`PR #199 review M SHOULD-FIX BI-17 7`).
  */
 export type { ReportingSettingsInput } from "./contracts/settings"
+/**
+ * The deployment's email settings (`ADM-7`): the mail server, the account
+ * and the console's public address, each with the source of its effective
+ * value, and the test email's answer. The contract owns the shapes, and
+ * they are exported here so a feature imports them from `@/services`.
+ */
+export type {
+  DeploymentFeature,
+  DeploymentSettings,
+  EmailSettings,
+  EmailSettingsInput,
+  EmailTestResult,
+  SecretSetting,
+  SettingField,
+  SettingSource,
+} from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService

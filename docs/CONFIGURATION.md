@@ -61,12 +61,12 @@ Each commented block in `.env.example` ends by pointing here:
 | `PIPELINE_RUN_TOKEN` | Shared bearer token Dagster's authored-pipeline schedule factory (`authored_factory.py`, Phase E) uses to authenticate against `lakehouse-api`; when set, also seeds an `authored-pipeline-scheduler` identity scoped to `pipeline:write` ONLY (never `*:*`) from it | unset | No, but unset means the API seeds no service identity and the schedule factory's pipeline calls fail visibly with 401 | no |
 | `TRINO_URL` | Base URL of the Trino coordinator `POST /api/query/run`'s `engine: "trino"` path talks to | `http://trino:8080` | No, but unreachable means that path replies 503 | no |
 | `TRINO_MAX_ROWS` | Hard cap on rows a single Trino statement may accumulate across pages before the query is cancelled and refused | `10000` | No | no |
-| `SMTP_HOST` | SMTP host for alert/digest email delivery | unset (email disabled) | No | commented |
-| `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot | `587` | No | commented |
-| `SMTP_SECURE` | Force implicit TLS (`"true"`). Effective value is also `true` whenever `SMTP_PORT` is `465`, even if this is unset | `false` | No | commented |
-| `SMTP_USER` | SMTP auth username | unset (no SMTP auth) | No | commented |
-| `SMTP_PASS` | SMTP auth password | `""` | No | commented |
-| `SMTP_FROM` | `From` header for outgoing email. Falls back to `SMTP_USER`, then to `rantai-lake@localhost` | `rantai-lake@localhost` | No | commented |
+| `SMTP_HOST` | SMTP host for alert/digest email delivery. Settable in the console (Settings → Email) only when the whole connection is unset in the environment — see "Settings the console owns" below | unset (email disabled) | No | commented |
+| `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | `587` | No | commented |
+| `SMTP_SECURE` | Force implicit TLS (`"true"`). Effective value is also `true` whenever `SMTP_PORT` is `465`, even if this is unset. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | `false` | No | commented |
+| `SMTP_USER` | SMTP auth username. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment | unset (no SMTP auth) | No | commented |
+| `SMTP_PASS` | SMTP auth password. Part of the connection, so it is settable in the console only when the whole connection is unset in the environment; the console's own copy is sealed with `CONNECTOR_SECRETS_KEY` | `""` | No | commented |
+| `SMTP_FROM` | `From` header for outgoing email. Falls back to `SMTP_USER`, then to `rantai-lake@localhost`. Also settable in the console when this is unset | `rantai-lake@localhost` | No | commented |
 | `PORT` | Port `lakehouse-api` listens on | `8080` | No (but an invalid value fails to boot — the one field that does) | no |
 | `APP_ENV` | `"development"` or `"local"` relaxes the session cookie's `Secure` attribute for local HTTP dev. Falls back to `NODE_ENV`. Never bypasses authentication | unset (defaults closed/`Secure`) | No | no |
 | `NODE_ENV` | Fallback for `APP_ENV` | — | No | no |
@@ -315,3 +315,45 @@ Change capture (`SRC-4`, ADR 0016) runs on Kafka Connect: the `cdc` profile's
 and the API and the applier find them through `KAFKA_CONNECT_URL` and
 `CDC_KAFKA_BOOTSTRAP` (both empty by default, which turns change capture off;
 see `docs/OPERATIONS.md`).
+
+## Settings the console owns (`ADM-7`)
+
+The mail server, its port, the security mode, the account and its password,
+the `From` address and the console's public address can be set from the
+console (**Settings → Email**) by a holder of `settings:write`. The next
+send — an alert, a scheduled report, a comment mention — uses them without
+a restart.
+
+**The environment wins.** For each of those settings the effective value is
+the environment's when it is set and non-empty, else the console's saved
+value, else the code default. A setting the environment owns is shown
+read-only in the console ("Set by the server"), and a save that sends it is
+refused with a 409 and writes nothing. To hand a setting back to the
+console, remove it from the environment (and restart the API); to hand it
+back to the environment, set it there and remove it in the console.
+
+**The connection is one unit.** The mail server, the port, the security,
+the account and the password belong together: they are how the sender logs
+in to a mail server. When the environment sets any one of `SMTP_HOST`,
+`SMTP_USER` or `SMTP_PASS`, all five come from the environment and are
+read-only in the console — so a password kept in files is never sent to a
+mail server chosen in the console. `SMTP_FROM` and `CONSOLE_PUBLIC_URL` are
+settings of their own and follow the rule above on their own.
+
+**The password.** The console's copy is sealed with the installation key
+(`CONNECTOR_SECRETS_KEY`) before it is stored, and it never comes back: an
+answer says only whether one is set, and the audit row names the field, not
+its value. A password saved with a key the installation no longer has is
+read as "not set" and logged once.
+
+**Other API processes.** The saved settings reach them within 30 seconds,
+not at once: each process re-reads the saved row at most every 30 seconds.
+The process that saved sees its own change immediately.
+
+**What is not in the console.** The CA bundle of a private relay
+(`SMTP_CA_FILE`) stays a file and is still read at start; the start-up
+secrets and the encryption keys stay in the environment; single sign-on
+stays in the environment (the console only says whether it is set up).
+
+See `docs/OPERATIONS.md` for the operator's view of the same thing, and
+`docs/core/features/console-settings.md` for the feature page.
