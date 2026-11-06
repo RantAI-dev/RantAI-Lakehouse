@@ -27,6 +27,7 @@ once a first release is tagged.
 ### Fixed
 
 - The assistant's `update_chart` keeps every field the request does not name, and `null` clears one, so a rename no longer empties a chart (backlog `AI-3`). The reply lists the kept fields as `fieldsKept`.
+- A chart the assistant changes keeps its place on the dashboard instead of moving to the last tile (backlog `AI-3`).
 - The parameter line in a dashboard's context to the assistant is bounded to 600 characters, so a dashboard with many parameters still sends the board id and the last instruction (backlog `AI-14`).
 - The assistant reads back the chart's definition after a chart draft or save, says when a call was refused, and never ends a turn with an empty answer (backlog `AI-6`).
 - The chat shows `Saved: <title>` (or `Not saved: <error>`) under a reply once its draft is confirmed, as the console's own status line; the model's text is not edited and the line is not sent back to the model (backlog `AI-6`).
