@@ -23,7 +23,7 @@ use lakehouse_store::queries::{
 };
 use lakehouse_store::uploads::TableClaim;
 use lakehouse_trino::{TrinoError, TrinoResult};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -2500,9 +2500,26 @@ pub struct HistoryQueryRaw {
     table: Option<String>,
     from: Option<String>,
     to: Option<String>,
-    /// The page cursor: `<at>,<id>` — the `at` and `id` of the last row
-    /// the caller has already seen.
-    before: Option<String>,
+    /// The 1-based page number. A leftover `before=` from a client cached
+    /// before pages were numbered is an unknown key, so it is ignored.
+    page: Option<String>,
+}
+
+/// The largest page the route passes on. A page no 14-day history could
+/// fill is an empty page whatever its number, so a larger one is clamped
+/// here: the number echoed back stays one a JSON client reads exactly.
+const HISTORY_MAX_PAGE: i64 = 1_000_000;
+
+/// The answer of `GET /api/query/history` (`QS-4` QA of 2026-11-05): one
+/// page of runs, newest first, and the numbers a pager needs.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPage {
+    runs: Vec<QueryHistoryItem>,
+    /// Every row the filters keep, whichever page this is.
+    total: i64,
+    page: i64,
+    page_size: i64,
 }
 
 /// The statuses `query_history`'s own check allows — the set [`run`]
@@ -2552,19 +2569,19 @@ fn parse_history_query(raw: &HistoryQueryRaw) -> Result<HistoryFilter<'_>, ApiEr
     }
     filter.from = history_time("from", raw.from.as_deref())?;
     filter.to = history_time("to", raw.to.as_deref())?;
-    if let Some(before) = raw.before.as_deref().filter(|s| !s.is_empty()) {
-        let bad_before = || {
-            ApiError::BadRequest(
-                "before must be <at>,<id>: the at and the id of the last row you have seen"
-                    .to_owned(),
-            )
-        };
-        let (at, id) = before.split_once(',').ok_or_else(bad_before)?;
-        if id.is_empty() {
-            return Err(bad_before());
+    if let Some(page) = raw.page.as_deref().filter(|s| !s.is_empty()) {
+        let bad_page =
+            || ApiError::BadRequest("page must be a whole number of 1 or more".to_owned());
+        // Digits only, so a failed parse below can only be a number too big
+        // for 64 bits; that is a page past the end, not a bad request.
+        if !page.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad_page());
         }
-        filter.before_at = Some(OffsetDateTime::parse(at, &Rfc3339).map_err(|_| bad_before())?);
-        filter.before_id = Some(id);
+        let page = page.parse::<i64>().unwrap_or(HISTORY_MAX_PAGE);
+        if page < 1 {
+            return Err(bad_page());
+        }
+        filter.page = page.min(HISTORY_MAX_PAGE);
     }
     Ok(filter)
 }
@@ -2582,13 +2599,15 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 }
 
 /// `GET /api/query/history` — the caller's own recorded query executions,
-/// filtered, inside the last 14 days, one page at a time (`QS-4`).
+/// filtered, inside the last 14 days, one numbered page at a time (`QS-4`).
+/// The answer is a [`HistoryPage`]: the page's runs and the true total.
 ///
 /// # Errors
 ///
 /// 401 when nobody is signed in — history belongs to a person, so there is
-/// no sensible answer for "everyone's". 400 for a bad filter value, with a
-/// fixed message naming the field, and for a query string the route cannot
+/// no sensible answer for "everyone's". 400 for a bad filter value or a
+/// `page` that is not a whole number from 1, with a fixed message naming
+/// the field, and for a query string the route cannot
 /// read (a parameter sent twice), with the fixed sentence of
 /// [`QUERY_STRING_UNREADABLE`]. 503 if no pool is configured; 500 on a
 /// database failure.
@@ -2596,7 +2615,7 @@ pub async fn list_history(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     query: Result<Query<HistoryQueryRaw>, axum::extract::rejection::QueryRejection>,
-) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
+) -> ApiResult<ApiJson<HistoryPage>> {
     let owner = caller_id(principal.as_ref())?;
     // A query string the extractor cannot read — a parameter sent twice, for
     // instance — is refused with this route's own sentence. The rejection's
@@ -2607,9 +2626,17 @@ pub async fn list_history(
         ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let filter = parse_history_query(&raw)?;
-    Ok(ApiJson(
-        queries::list_history(pool(&state)?, owner, &filter).await?,
-    ))
+    let pool = pool(&state)?;
+    // The list and the count share one `WHERE` in the store, so `total`
+    // counts exactly the rows the pages walk.
+    let runs = queries::list_history(pool, owner, &filter).await?;
+    let total = queries::count_history(pool, owner, &filter).await?;
+    Ok(ApiJson(HistoryPage {
+        runs,
+        total,
+        page: filter.page,
+        page_size: queries::HISTORY_PAGE_LIMIT,
+    }))
 }
 
 /// The signed-in caller's id, or a 401.
@@ -6178,7 +6205,7 @@ mod history_query_tests {
         table: Option<&str>,
         from: Option<&str>,
         to: Option<&str>,
-        before: Option<&str>,
+        page: Option<&str>,
     ) -> HistoryQueryRaw {
         HistoryQueryRaw {
             status: status.map(str::to_owned),
@@ -6187,7 +6214,7 @@ mod history_query_tests {
             table: table.map(str::to_owned),
             from: from.map(str::to_owned),
             to: to.map(str::to_owned),
-            before: before.map(str::to_owned),
+            page: page.map(str::to_owned),
         }
     }
 
@@ -6202,19 +6229,15 @@ mod history_query_tests {
             Some("orders"),
             Some("2026-10-11T00:00:00Z"),
             Some("2026-10-20T12:00:00.500Z"),
-            Some("2026-10-20T11:59:59.999Z,q-1729"),
+            Some("3"),
         );
         let filter = parse_history_query(&query).unwrap();
         assert_eq!(filter.status, Some("failed"));
         assert_eq!(filter.engine, Some("trino"));
         assert_eq!(filter.min_duration_ms, Some(1500));
         assert_eq!(filter.table, Some("orders"));
-        assert_eq!(
-            filter.before_id,
-            Some("q-1729"),
-            "the cursor's id half is everything after the first comma"
-        );
-        assert!(filter.from.is_some() && filter.to.is_some() && filter.before_at.is_some());
+        assert_eq!(filter.page, 3);
+        assert!(filter.from.is_some() && filter.to.is_some());
 
         let empty_query = raw(None, None, None, None, None, None, None);
         let empty = parse_history_query(&empty_query).unwrap();
@@ -6254,11 +6277,10 @@ mod history_query_tests {
     }
 
     /// A value that does not parse is a 400 whose message names the field:
-    /// the duration's number, the window's times, and the cursor's two
-    /// halves.
+    /// the duration's number, the window's times, and the page number.
     #[test]
-    fn a_bad_duration_time_or_cursor_is_a_400_naming_the_field() {
-        let cases: [(HistoryQueryRaw, &str); 6] = [
+    fn a_bad_duration_time_or_page_is_a_400_naming_the_field() {
+        let cases: [(HistoryQueryRaw, &str); 8] = [
             (
                 raw(None, None, Some("soon"), None, None, None, None),
                 "minDurationMs",
@@ -6283,30 +6305,10 @@ mod history_query_tests {
                 ),
                 "to",
             ),
-            (
-                raw(
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("2026-10-20T00:00:00Z"),
-                ),
-                "before",
-            ),
-            (
-                raw(
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("2026-10-20T00:00:00Z,"),
-                ),
-                "before",
-            ),
+            (raw(None, None, None, None, None, None, Some("0")), "page"),
+            (raw(None, None, None, None, None, None, Some("abc")), "page"),
+            (raw(None, None, None, None, None, None, Some("-1")), "page"),
+            (raw(None, None, None, None, None, None, Some("1.5")), "page"),
         ];
         for (query, field) in &cases {
             let err = parse_history_query(query).unwrap_err();
@@ -6314,5 +6316,32 @@ mod history_query_tests {
             assert!(message.starts_with(field), "{message} must name {field:?}");
             assert_eq!(err.status(), 400, "a bad value is a 400: {message}");
         }
+    }
+
+    /// No `page` is page 1; a page too large for a 64-bit number is the
+    /// clamp, an empty page for the store and not a 400 (`QS-4` QA of
+    /// 2026-11-05).
+    #[test]
+    fn a_missing_page_is_page_one_and_a_huge_one_is_clamped() {
+        let none = raw(None, None, None, None, None, None, None);
+        assert_eq!(parse_history_query(&none).unwrap().page, 1);
+        let huge = raw(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("99999999999999999999999"),
+        );
+        assert_eq!(
+            parse_history_query(&huge).unwrap().page,
+            super::HISTORY_MAX_PAGE
+        );
+        let just_over = raw(None, None, None, None, None, None, Some("1000001"));
+        assert_eq!(
+            parse_history_query(&just_over).unwrap().page,
+            super::HISTORY_MAX_PAGE
+        );
     }
 }

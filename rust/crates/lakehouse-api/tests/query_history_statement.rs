@@ -168,9 +168,10 @@ async fn history_sql(router: &axum::Router, cookie: &str, id: &str) -> String {
         .await
         .expect("router never fails a request outright");
     assert_eq!(resp.status(), StatusCode::OK);
-    let rows = json_body(resp).await;
+    let body = json_body(resp).await;
+    let rows = &body["runs"];
     rows.as_array()
-        .expect("history is an array")
+        .expect("history answers its rows under runs")
         .iter()
         .find(|r| r["id"] == id)
         .unwrap_or_else(|| panic!("history holds the run {id}: {rows}"))["sql"]

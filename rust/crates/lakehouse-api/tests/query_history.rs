@@ -59,6 +59,9 @@ mod filters {
     /// sentence, byte for byte.
     const QUERY_UNREADABLE: &str = "The query string could not be read.";
 
+    /// What a `page` that is not a whole number from 1 is told.
+    const PAGE_REFUSAL: &str = "page must be a whole number of 1 or more";
+
     /// One recorded run for the pass-through test, written the way `run`
     /// writes them — the caller is the owner, the status is whatever the run
     /// reached.
@@ -150,10 +153,10 @@ mod filters {
                 "minDurationMs must be a non-negative whole number of milliseconds",
             ),
             ("from=not-a-time", "from must be an RFC 3339 time"),
-            (
-                "before=2026-10-20T00:00:00Z",
-                "before must be <at>,<id>: the at and the id of the last row you have seen",
-            ),
+            ("page=0", PAGE_REFUSAL),
+            ("page=abc", PAGE_REFUSAL),
+            ("page=-2", PAGE_REFUSAL),
+            ("page=1.5", PAGE_REFUSAL),
         ] {
             let (status, body) = get_history(&app, &cookie, query).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
@@ -232,7 +235,7 @@ mod filters {
 
         let (status, body) = get_history(&app, &cookie, "").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let ids: Vec<&str> = body
+        let ids: Vec<&str> = body["runs"]
             .as_array()
             .unwrap()
             .iter()
@@ -242,30 +245,149 @@ mod filters {
 
         let (status, body) = get_history(&app, &cookie, "status=failed").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body.as_array().unwrap().len(), 1);
-        assert_eq!(body[0]["id"], "q-b");
-        assert_eq!(body[0]["message"], "Arrow table is missing");
-        assert_eq!(body[0]["tablesRead"], json!(["bronze.orders"]));
+        let runs = &body["runs"];
+        assert_eq!(runs.as_array().unwrap().len(), 1);
+        assert_eq!(body["total"], 1);
+        assert_eq!(runs[0]["id"], "q-b");
+        assert_eq!(runs[0]["message"], "Arrow table is missing");
+        assert_eq!(runs[0]["tablesRead"], json!(["bronze.orders"]));
 
         let (status, body) = get_history(&app, &cookie, "table=orders").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
-            body.as_array().unwrap().len(),
+            body["runs"].as_array().unwrap().len(),
             2,
             "any element of tablesRead"
         );
+        assert_eq!(body["total"], 2);
 
         let (status, body) = get_history(&app, &cookie, "minDurationMs=1000").await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body.as_array().unwrap().len(), 2);
+        assert_eq!(body["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(body["total"], 2);
 
         let (_, body) = get_history(&app, &cookie, "status=completed").await;
-        assert_eq!(body[0]["id"], "q-a");
+        let runs = &body["runs"];
+        assert_eq!(runs[0]["id"], "q-a");
         assert!(
-            body[0].get("message").is_none(),
+            runs[0].get("message").is_none(),
             "a completed run has nothing to say, and the key is omitted: {body}"
         );
-        assert_eq!(body[0]["tablesRead"], json!(["marts.retails"]));
+        assert_eq!(runs[0]["tablesRead"], json!(["marts.retails"]));
+    }
+
+    /// The answer is an envelope, not a bare list (`QS-4` QA of 2026-11-05):
+    /// `runs` is one page of 50, `total` counts every row the filters keep,
+    /// and `page` and `pageSize` say which slice this is.
+    #[tokio::test]
+    async fn the_answer_is_an_envelope_of_one_page_and_the_true_total() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+        for i in 0..55 {
+            let status = if i % 5 == 0 { "stopped" } else { "completed" };
+            insert_row(
+                &app.pool,
+                &format!("q-{i:02}"),
+                user,
+                status,
+                "clickhouse",
+                1,
+                &[],
+                None,
+            )
+            .await;
+        }
+
+        let (status, body) = get_history(&app, &cookie, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["page", "pageSize", "runs", "total"], "{body}");
+        assert_eq!(body["runs"].as_array().unwrap().len(), 50);
+        assert_eq!(body["runs"][0]["id"], "q-54");
+        assert_eq!(body["total"], 55);
+        assert_eq!(body["page"], 1);
+        assert_eq!(body["pageSize"], 50);
+
+        let (_, body) = get_history(&app, &cookie, "page=2").await;
+        let ids: Vec<&str> = body["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["q-04", "q-03", "q-02", "q-01", "q-00"]);
+        assert_eq!(body["total"], 55);
+        assert_eq!(body["page"], 2);
+
+        // The status filter reaches both the rows and the total.
+        let (_, body) = get_history(&app, &cookie, "status=stopped").await;
+        assert_eq!(body["total"], 11, "{body}");
+        let runs = body["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 11);
+        assert!(runs.iter().all(|r| r["status"] == "stopped"), "{body}");
+        let (_, body) = get_history(&app, &cookie, "status=completed&page=2").await;
+        assert_eq!(body["total"], 44, "{body}");
+        assert_eq!(body["runs"], json!([]), "44 rows fit on page 1");
+    }
+
+    /// A page past the end is an empty `runs` with the true `total`; a page
+    /// no table could hold (more digits than a 64-bit number) is the same
+    /// empty page, not a 400 or a 500.
+    #[tokio::test]
+    async fn a_page_past_the_end_is_empty_with_the_true_total() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+        for i in 0..3 {
+            insert_row(
+                &app.pool,
+                &format!("q-{i}"),
+                user,
+                "completed",
+                "clickhouse",
+                1,
+                &[],
+                None,
+            )
+            .await;
+        }
+        for page in ["2", "999", "99999999999999999999999999"] {
+            let (status, body) = get_history(&app, &cookie, &format!("page={page}")).await;
+            assert_eq!(status, StatusCode::OK, "page={page}: {body}");
+            assert_eq!(body["runs"], json!([]), "page={page}");
+            assert_eq!(body["total"], 3, "page={page}");
+        }
+    }
+
+    /// A `before=` an old cached client still sends is ignored, like every
+    /// unknown key (the cursor it carried is gone): the first page answers.
+    #[tokio::test]
+    async fn a_leftover_before_cursor_is_ignored() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+        insert_row(
+            &app.pool,
+            "q-a",
+            user,
+            "completed",
+            "clickhouse",
+            1,
+            &[],
+            None,
+        )
+        .await;
+
+        let (status, body) = get_history(&app, &cookie, "before=2020-01-01T00:00:00Z,q-zzz").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["runs"][0]["id"], "q-a", "{body}");
     }
 }
 
@@ -607,8 +729,9 @@ mod recording {
             "the row keeps the cause as a fixed sentence and the same reference"
         );
 
-        let (status, runs) = crate::filters::get_history(&app, &cookie, "").await;
-        assert_eq!(status, StatusCode::OK, "{runs}");
+        let (status, body) = crate::filters::get_history(&app, &cookie, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let runs = &body["runs"];
         assert_eq!(runs[0]["message"], expected.as_str(), "{runs}");
         // The run's own `sql` and `tablesRead` name the table: the person
         // wrote that. The message is the engine's side.
@@ -639,12 +762,14 @@ mod recording {
         assert_eq!(recorded_status, "stopped");
         assert_eq!(message.as_deref(), Some("Stopped"));
 
-        let (status, runs) = crate::filters::get_history(&app, &cookie, "status=stopped").await;
-        assert_eq!(status, StatusCode::OK, "{runs}");
-        assert_eq!(runs[0]["status"], "stopped", "{runs}");
-        let (status, runs) = crate::filters::get_history(&app, &cookie, "status=failed").await;
-        assert_eq!(status, StatusCode::OK, "{runs}");
-        assert_eq!(runs, json!([]), "a stopped run is not a failed one");
+        let (status, body) = crate::filters::get_history(&app, &cookie, "status=stopped").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["runs"][0]["status"], "stopped", "{body}");
+        assert_eq!(body["total"], 1, "{body}");
+        let (status, body) = crate::filters::get_history(&app, &cookie, "status=failed").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["runs"], json!([]), "a stopped run is not a failed one");
+        assert_eq!(body["total"], 0, "{body}");
     }
 
     /// A run the time limit ended stays `failed` with the limit's own
