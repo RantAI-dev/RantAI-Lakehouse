@@ -233,8 +233,13 @@ services:
       # ── Dagster: out of scope for the local stack. Left unset/unreachable
       #    on purpose — orchestration-backed routes (pipeline trigger/runs)
       #    degrade to 503 rather than the API refusing to boot. See
-      #    docs/OPERATIONS.md "Unavailable in the local stack". ──
-      DAGSTER_URL: ${DAGSTER_URL:-http://dagster.invalid:13030/graphql}
+      #    docs/OPERATIONS.md "Unavailable in the local stack". The default
+      #    is the value `.env.example` used to set, kept here so removing
+      #    that line changes nothing (REL-19 D1): `localhost` inside this
+      #    container reaches no Dagster either. Set the in-network address
+      #    (`http://dagster-webserver:3000/graphql`) for the dagster
+      #    profile, as docs/OPERATIONS.md says. ──
+      DAGSTER_URL: ${DAGSTER_URL:-http://localhost:13030/graphql}
       DAGSTER_REPO: ${DAGSTER_REPO:-__repository__}
       DAGSTER_LOCATION: ${DAGSTER_LOCATION:-dispar_orchestrate.definitions}
       # ── LLM: out of scope for the local stack. Needs a real API key, so
@@ -369,9 +374,10 @@ services:
       # runner`); this key only forwards whatever `LAKEKEEPER_BASE_URI`
       # the shell/.env already sets (previously this service's block did
       # not reference the var at all, so it was unreachable here even
-      # when set) — empty by default, matching `Config::lakekeeper_base_url`'s
-      # own documented fallback.
-      LAKEKEEPER_BASE_URI: ${LAKEKEEPER_BASE_URI:-}
+      # when set) — and it defaults to the same `http://localhost:8181`
+      # `Config::lakekeeper_base_url` does, the value `.env.example` used
+      # to set, so removing that line changes nothing (REL-19 D1).
+      LAKEKEEPER_BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
       # WS3 item 28 (plan review X7) — same shape again —
       # `main::bootstrap_ingest_run_service` seeds an "ingest-run-service"
       # service identity scoped to `ingest:read` ONLY (never
@@ -1764,7 +1770,12 @@ services:
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
-      DAGSTER_URL: ${DAGSTER_URL:-http://dagster-webserver:3000/graphql}
+      # REL-19 D1: the value `.env.example` used to set, kept as the
+      # default so removing that line changes nothing. This container
+      # reads no `DAGSTER_URL` of its own; Dagster's schedulers reach the
+      # webserver through `DAGSTER_HOME` and the API through
+      # `LAKEHOUSE_API_URL`.
+      DAGSTER_URL: ${DAGSTER_URL:-http://localhost:13030/graphql}
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       # DATA-2 review BLOCKER 2: no default credentials in compose (AGENTS rule 5)
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-}
