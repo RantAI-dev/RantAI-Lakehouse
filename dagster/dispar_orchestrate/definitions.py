@@ -81,7 +81,7 @@ from dispar_orchestrate.replication_metrics import (
 # also launchable on demand from the Dagster UI, same as before.
 # `agent_run_job`'s own schedules are no longer permanently empty: with
 # `AGENT_RUN_TOKEN` set (see `lakehouse-api::main::bootstrap_agent_run_service`
-# and this repo's `.env.example`), `agent_run_schedules` holds one entry
+# and docs/CONFIGURATION.md), `agent_run_schedules` holds one entry
 # per scheduled employee; with it unset, `agent_run_schedules` is `[]` and
 # `agent_run_job` stays launchable on demand only, exactly like
 # `gold_export_job`.

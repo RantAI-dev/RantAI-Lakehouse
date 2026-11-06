@@ -4,7 +4,7 @@ import { devOrigins } from "./src/lib/dev-origins";
 // `OPS-11`: Next.js 16.4 serves the dev server's own resources (HMR, chunks)
 // only to `localhost` unless the host is listed here, so a dev console opened
 // by a LAN address never finishes loading. `CONSOLE_ALLOWED_DEV_ORIGINS`
-// (comma-separated hostnames, `*.` wildcards allowed, see `.env.example`) adds
+// (comma-separated hostnames, `*.` wildcards allowed, see docs/CONFIGURATION.md) adds
 // hosts; `127.0.0.1` is always allowed (`BI-1 QA fix`, see `src/lib/dev-origins.ts`).
 // It affects `next dev` only: a production build ignores it.
 const allowedDevOrigins = devOrigins(process.env.CONSOLE_ALLOWED_DEV_ORIGINS);

@@ -59,18 +59,25 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 
 ## Switching it on
 
-A new install has the PDF export off. Set two values in `.env` and restart
-the API and the renderer:
+A new install has the PDF export **on** (`REL-18`): the console is a compose
+service at `http://console:3000`, and that is what `CONSOLE_INTERNAL_URL`
+defaults to. `sh ops/init-env.sh` generates `RENDER_TOKEN_SECRET`, the other
+value the export needs. Nothing has to be set for Excel, CSV and PNG
+downloads.
+
+To point the renderer at a console outside this compose network (staging
+runs it as `lakehouse-frontend`), set the address in `.env` and restart the
+API and the renderer:
 
 ```bash
-CONSOLE_INTERNAL_URL=http://console:3000   # the console as the renderer reaches it
-RENDER_TOKEN_SECRET=<long random value>    # `sh ops/init-env.sh` generates one
+CONSOLE_INTERNAL_URL=http://lakehouse-frontend:3000   # the console as the renderer reaches it
+RENDER_TOKEN_SECRET=<long random value>              # its own secret, never EMBED_SECRET
 docker compose up -d lakehouse-api gotenberg
 ```
 
-Excel, CSV and PNG downloads need nothing. Scheduled reports also need SMTP
-(`docs/OPERATIONS.md`, "Features unavailable in the local stack").
-`REL-18` makes the address the default so a fresh install has PDFs on.
+Scheduled reports also need SMTP (`docs/OPERATIONS.md`, "Features unavailable
+in the local stack"). Downloads can be switched off per role with
+`downloadDeniedRoles`; the export itself stays set up.
 
 ## Asking the assistant
 

@@ -27,10 +27,14 @@ this dlt pipeline's own working directory.
 This must run **inside the compose network** — Lakekeeper's `/v1/config`
 response includes the server's own canonical catalog URI
 (`LAKEKEEPER__BASE_URI`), which pyiceberg's `RestCatalog` honors and uses
-for every subsequent call. If `LAKEKEEPER__BASE_URI` is a host-facing
-address (`http://localhost:8181`, `docker-compose.yml`'s default), a
-catalog client running outside the compose network hangs/times out
-resolving that address's Docker-internal counterpart, or vice versa. The
+for every subsequent call (and so does the Rust client
+`iceberg-catalog-rest` the API itself uses). The compose default for that
+URI is the in-network name `http://lakekeeper:8181` (REL-19 review R1) —
+the address a client inside the network can reach. A client OUTSIDE the
+compose network — a `pyiceberg` run on the host, the host-side form of the
+G1 test — hangs or times out resolving that address's Docker-internal
+counterpart, and needs the host mapping
+(`LAKEKEEPER_BASE_URI=http://localhost:8181`) instead. The
 `g3a-test-runner` compose service (see `docker-compose.yml`) — like
 `g1-test-runner` before it — runs this pipeline as a container attached
 to the compose network, with `LAKEKEEPER_BASE_URI` set to the
