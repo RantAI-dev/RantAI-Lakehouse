@@ -55,6 +55,7 @@ mod query_limits;
 mod readiness;
 mod result_cache;
 mod routes;
+mod runtime_settings;
 mod rustfs_client;
 mod secret_crypto;
 mod secret_manager;

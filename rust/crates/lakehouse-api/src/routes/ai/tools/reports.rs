@@ -187,10 +187,13 @@ async fn brief(state: &AppState, sub: &Subscription) -> Value {
     })
 }
 
-fn email_note(state: &AppState) -> Option<&'static str> {
-    state
-        .config
-        .smtp_host
+/// Whether the deployment can send at all: the resolver's answer, not the
+/// environment's alone (`ADM-7` D3) — the console may have set the mail
+/// server.
+async fn email_note(state: &AppState) -> Option<&'static str> {
+    crate::runtime_settings::email(state)
+        .await
+        .host
         .is_none()
         .then_some("Email is not set up on this deployment, so nothing is sent until it is.")
 }
@@ -297,7 +300,7 @@ async fn create(state: &AppState, owner: &Principal, args: &Map<String, Value>) 
     match subscriptions::create(pool, &new).await {
         Ok(made) => {
             let mut out = json!({ "created": true, "subscription": brief(state, &made).await });
-            if let Some(note) = email_note(state) {
+            if let Some(note) = email_note(state).await {
                 out["warning"] = json!(note);
             }
             out
