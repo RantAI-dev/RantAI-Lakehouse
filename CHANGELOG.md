@@ -20,6 +20,7 @@ once a first release is tagged.
 - Moving a saved query or a folder needs manage on everything moved. That is the query itself, or the folder and every sub-folder and query under it, trashed ones included. This closes a path where an editor could publish, hide or raise a query through a folder of their own (`QS-3` review of #382). A personal space can no longer be shared, and a rule already stored on one is ignored; share a query or a folder inside it instead.
 - `RUSTSEC-2026-0440` (`astral-tokio-tar`, unmaintained since 2026-11-03, no fixed release) is waived in `cargo deny`: only the `testcontainers` test dependencies reach it, and no shipped binary links it.
 - History and the history API no longer keep the engine's error text (backlog `QS-4`). A run that fails in the engine records a fixed sentence by cause and a `Reference: <id>`, with no `Code:` and no catalog name; the result tab still shows the engine's diagnosis. Migration `0127` replaces the engine text already stored for ClickHouse runs with the default sentence and keeps the reference id. Stored Trino messages are not changed, and a Trino statement error shows the default sentence because the Trino client does not keep the error name.
+- The assistant's draft check of a chart change reads the chart as the person asking, so a draft cannot reveal a chart they cannot see (backlog `AI-3`).
 
 ### Changed
 
