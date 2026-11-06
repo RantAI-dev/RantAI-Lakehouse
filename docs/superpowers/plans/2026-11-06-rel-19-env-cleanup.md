@@ -232,6 +232,99 @@ D8 reader comments that named a removed line now name
 No plan/code mismatch was found; the only deviation from the written
 acceptance is the empty rather than single-line T1 diff explained above.
 
+### Handoff (R1)
+
+Developer: test sub-agent, 2026-11-06. Branch `feat/rel-19-env-cleanup`.
+Fix commit: `2aeaad00` (`fix(compose): the in-network service names are the container defaults (REL-19 review R1)`).
+
+#### Proof commands and results
+
+1. Compose config check:
+```bash
+POSTGRES_PASSWORD=rel19 RUSTFS_ACCESS_KEY=rel19 RUSTFS_SECRET_KEY=rel19 \
+  LAKEKEEPER_ENCRYPTION_KEY=rel19 CONNECTOR_SECRETS_KEY=rel19 \
+  docker compose --profile '*' config --quiet
+# exit 0
+```
+
+2. Equivalence script diff against `origin/main:.env.example`:
+```bash
+git show origin/main:.env.example > /tmp/rel19-old-main.env.example
+sh ops/release/env-example-equivalence.sh /tmp/rel19-old-main.env.example .env.example
+```
+Output:
+```diff
+--- old.yml
++++ new.yml
+@@ -953,7 +953,7 @@
+       CH_USER: default
+       CONNECTOR_S3_ACCESS_KEY: ""
+       CONNECTOR_S3_SECRET_KEY: ""
+-      DAGSTER_URL: http://localhost:13030/graphql
++      DAGSTER_URL: http://dagster-webserver:3000/graphql
+       GOLD_EXPORT_ROW_COUNT: "7"
+       GOLD_EXPORT_RUN_TOKEN: ""
+       GOLD_MART_NAME: gold_export_smoke
+@@ -1182,7 +1182,7 @@
+       CONSOLE_PUBLIC_URL: ""
+       DAGSTER_LOCATION: dispar_orchestrate.definitions
+       DAGSTER_REPO: __repository__
+-      DAGSTER_URL: http://localhost:13030/graphql
++      DAGSTER_URL: http://dagster-webserver:3000/graphql
+       DATABASE_URL: postgres://lakehouse:rel19-equivalence-postgres@postgres:5432/lakehouse
+       EMBED_SECRET: ""
+       EMBED_TOKEN_MAX_LIFETIME_SECONDS: ""
+@@ -1196,7 +1196,7 @@
+       LAKEHOUSE_MAINTENANCE_TOKEN: ""
+       LAKEHOUSE_WAREHOUSE_BUCKET: lakehouse-warehouse
+       LAKEKEEPER_ADMIN_TOKEN_FILE: /tokens/admin.jwt
+-      LAKEKEEPER_BASE_URI: http://localhost:8181
++      LAKEKEEPER_BASE_URI: http://lakekeeper:8181
+       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+       LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
+       LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE: /tokens/outside-readers.jwt
+@@ -1339,7 +1339,7 @@
+       - .
+     environment:
+       LAKEKEEPER__AUTHZ_BACKEND: openfga
+-      LAKEKEEPER__BASE_URI: http://localhost:8181
++      LAKEKEEPER__BASE_URI: http://lakekeeper:8181
+       LAKEKEEPER__INSTANCE_ADMINS: '["oidc~admin"]'
+       LAKEKEEPER__OPENFGA__ENDPOINT: http://openfga:8081
+       LAKEKEEPER__OPENFGA__STORE_NAME: lakekeeper
+@@ -1693,7 +1693,7 @@
+       - -c
+     environment:
+       LAKEHOUSE_WAREHOUSE_BUCKET: lakehouse-warehouse
+-      LAKEKEEPER_BASE_URI: http://localhost:8181
++      LAKEKEEPER_BASE_URI: http://lakekeeper:8181
+       LAKEKEEPER_WAREHOUSE: default
+       RUSTFS_ACCESS_KEY: rel19-equivalence-access
+       RUSTFS_SECRET_KEY: rel19-equivalence-secret
+```
+Shows only the in-network container defaults for `DAGSTER_URL` and `LAKEKEEPER_BASE_URI` (plus `LAKEKEEPER__BASE_URI` which reads `LAKEKEEPER_BASE_URI`).
+
+3. Clean install (`rel19r1` project):
+- Wrote `.env` with `sh ops/init-env.sh`. Verified: `grep -E '^(DAGSTER_URL|LAKEKEEPER_BASE_URI)=' .env` returned 0 matches (neither variable is set in `.env`).
+- Port accommodation: moved published ports to 15432, 18123, 19000, 18080, 13000, 19010, 19011, 18181, 13001, 18091, 18333, and set `CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001`.
+- Stack brought up with `docker compose -p rel19r1 up -d` and `docker compose -p rel19r1 --profile dagster up -d`. All core and Dagster services became healthy/up. ClickHouse seeded with `COMPOSE_PROJECT=rel19r1 scripts/seed-clickhouse.sh`.
+- Authenticated through API:
+  - Initial login: `POST http://localhost:18080/api/auth/login` -> HTTP 200 (`mustChangePassword: true`).
+  - Rotated password: `POST http://localhost:18080/api/auth/change-password` -> HTTP 204.
+  - Re-authenticated: `POST http://localhost:18080/api/auth/login` -> HTTP 200 (`mustChangePassword: false`).
+- Verified endpoints:
+  - `GET http://localhost:18080/api/overview` -> **HTTP 200** (not 503).
+  - `GET http://localhost:18080/api/dashboard/export/pdf?board=default&paper=a4&orientation=portrait` -> **HTTP 200**, 401182 bytes, starts `%PDF-1.4`.
+
+4. Teardown:
+- `docker compose -p rel19r1 down -v` -> 0 containers, 0 volumes remaining.
+- Generated `.env` removed; host `.env` restored.
+
+#### Not verified
+
+- Full workspace Rust clippy/tests, bun typecheck/lint/test, and python gates: not re-run for this review verification (no product code modified; compose defaults and docs only).
+- No passwords or secrets logged or stored.
+
 ## 5. Review
 
 **R1 (BLOCKER), planner 2026-11-06.** To keep D1, commit `b0f8de82` moved the old template's host-side addresses into compose's container defaults: `DAGSTER_URL` → `http://localhost:13030/graphql` (lakehouse-api, and dagster-code-location, whose default was the correct `http://dagster-webserver:3000/graphql`) and `LAKEKEEPER_BASE_URI` → `http://localhost:8181` (lakehouse-api and the second service). Inside a container `localhost` is the container itself, so these are broken values: CI (`.github/workflows/ci.yml`, e.g. `:767-768`) and `.env.staging` override both with the service names for exactly this reason. The old template carried a bug; D1 is not a reason to bake it into compose. **D1 is amended:** a removed line whose old value was a host-side `localhost` address that compose services cannot use gets the in-network default instead, listed in the handoff. Fix: every container default becomes `http://dagster-webserver:3000/graphql` and `http://lakekeeper:8181`; the comments say why (in-network service names; `localhost` is the container itself; host-dev processes use `config.rs`'s own defaults and do not read compose). The T1 script's expected diff is now exactly these values; the `.env.staging` and staging-workflow overrides may stay (harmless), but fix their comments if they now say the compose default is localhost.
