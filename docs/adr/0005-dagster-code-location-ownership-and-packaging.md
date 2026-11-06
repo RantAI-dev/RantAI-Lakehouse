@@ -170,15 +170,15 @@ regardless of which phase added which function to it.
 - `lakehouse-api`'s `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION`
   defaults (`http://localhost:13030/graphql` / `__repository__` /
   `dispar_orchestrate.definitions`) now correspond to a real, buildable
-  code location for the first time — the compose defaults for
-  `lakehouse-api` itself stay pointed at the deliberately-unreachable
-  `http://dagster.invalid:13030/graphql` placeholder (Dagster is still
+  code location for the first time. The compose default for
+  `lakehouse-api` itself is the in-network service name
+  (`http://dagster-webserver:3000/graphql`, `REL-19` review R1), so it
+  resolves only while the `dagster` profile is up: Dagster is still
   profile-gated, so a plain `docker compose up` still gets 503s on
   pipeline routes, per `docs/OPERATIONS.md`'s existing "what's
-  deliberately NOT in the stack" posture) — an operator who brings up the
-  `dagster` profile overrides `DAGSTER_URL` to
-  `http://dagster-webserver:3000/graphql` (in-network) or
-  `http://localhost:3001/graphql` (host; the webserver is published on the host's loopback
+  deliberately NOT in the stack" posture. An operator who wants the API
+  to reach a Dagster on the HOST instead overrides `DAGSTER_URL` to
+  `http://localhost:3001/graphql` (the webserver is published on the host's loopback
   only, at 3001, since REL-2 S4b decision D23) themselves.
 - A future P4 (maintenance job) and P5 (Debezium/CDC config generation)
   add modules under the same `dispar_orchestrate` package and the same

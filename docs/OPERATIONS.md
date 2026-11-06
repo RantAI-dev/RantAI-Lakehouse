@@ -407,20 +407,28 @@ scripts/compose.sh --profile dagster up -d --build \
   lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 ```
 
-`lakehouse-api`'s own default (`http://dagster.invalid:13030/graphql`) is a
-deliberately-unreachable placeholder (see the service definition's comment),
-so pipeline routes stay `503` unless an operator opts in explicitly.
+`lakehouse-api`'s own compose default is the in-network service name
+(`http://dagster-webserver:3000/graphql`, `REL-19` review R1), so with the
+`dagster` profile up the API reaches the webserver without any setting at
+all. Without that profile the name does not resolve, so the same routes
+still answer `503` — the degradation the API is built for (see the service
+definition's comment).
 
 **Why `.env` and not a one-off `VAR=… docker compose up`:** a later
 `docker compose run` (for example the `g3a-test-runner`) re-creates
 `lakehouse-api` as part of resolving its `depends_on` chain. A value that
 existed only in the environment of the earlier `up` invocation is not
-present for that re-creation, so the container comes back on the
-`dagster.invalid` default and every Dagster-backed route silently reverts to
-`503`. This was observed as `GET /api/governance/audit` returning
+present for that re-creation, so the container comes back on compose's
+default and every Dagster-backed route silently reverts to `503`. This was
+observed as `GET /api/governance/audit` returning
 `503 {"error":"Error: fetch failed"}` mid-way through an otherwise-passing
 G3a run — the ingest itself succeeded, so the symptom appears only on the
-routes that reach Dagster, not on the ones that read ClickHouse.
+routes that reach Dagster, not on the ones that read ClickHouse. (Back
+then the default was the deliberately-unreachable
+`http://dagster.invalid:13030/graphql` placeholder; since `REL-19` review
+R1 it is the in-network name, so a re-creation finds the webserver again —
+but an operator who points `DAGSTER_URL` somewhere else still needs the
+line in `.env`.)
 
 **Failure mode:** if `dagster-webserver`/`dagster-code-location` are down,
 `lakehouse-dagster::DgClient` calls fail exactly the way they already do
@@ -448,13 +456,14 @@ docker compose -p <project> down -v   # tear down when done
 **`LAKEKEEPER_BASE_URI` gotcha, specific to dlt/pyiceberg (not just
 ClickHouse's DNS quirk above).** pyiceberg's `RestCatalog` honors the
 canonical catalog URI Lakekeeper reports in its own `/v1/config` response
-(driven by `LAKEKEEPER__BASE_URI`) for every subsequent call. If
-`LAKEKEEPER_BASE_URI` is left at its host-facing default
-(`http://localhost:8181`), a catalog client running **inside** the
-compose network (the dlt pipeline, in `dagster-code-location`) times out
-resolving/connecting to that address — this was reproduced directly
-during P3 verification. `docker-compose.yml`'s own defaults are
-unaffected in the default (non-`dagster`) stack; when bringing up the
+(driven by `LAKEKEEPER__BASE_URI`) for every subsequent call. The API and
+the Lakekeeper init job default to the in-network name
+(`http://lakekeeper:8181`, `REL-19` review R1), but the `lakekeeper`
+service still advertises the host-facing `http://localhost:8181` unless
+`LAKEKEEPER_BASE_URI` is set. A catalog client running **inside** the
+compose network (the dlt pipeline, in `dagster-code-location`) that
+resolves that host-facing address times out resolving/connecting to it —
+this was reproduced directly during P3 verification. When bringing up the
 `dagster` profile, set `LAKEKEEPER_BASE_URI=http://lakekeeper:8181`
 (matching the compose-internal name), exactly as `.github/workflows/
 ci.yml`'s `g1-rustfs`/`g2-seaweedfs`/`g3a-dagster` jobs already do for
