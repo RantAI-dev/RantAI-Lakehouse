@@ -92,6 +92,7 @@ const STATUS_TONE: Record<EntityStatus, Tone> = {
   degraded: "warning",
   failed: "destructive",
   completed: "success",
+  stopped: "neutral",
   cancelled: "neutral",
   blocked: "warning",
   partial: "warning",
@@ -101,9 +102,16 @@ const STATUS_TONE: Record<EntityStatus, Tone> = {
 /** Shared lifecycle badge for pipelines, jobs, runs, policies, and agents. */
 export function StatusBadge({
   status,
+  label,
   className,
 }: {
   status: EntityStatus
+  /**
+   * A page's own word for the status, for a page whose spec names it
+   * differently (History says "Refused" for `blocked`). The tone and the
+   * description stay the shared ones.
+   */
+  label?: string
   className?: string
 }) {
   return (
@@ -115,7 +123,7 @@ export function StatusBadge({
       {status === "running" ? (
         <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
       ) : null}
-      {ENTITY_STATUS_LABEL[status]}
+      {label ?? ENTITY_STATUS_LABEL[status]}
     </Pill>
   )
 }

@@ -1,5 +1,5 @@
 //! The deployment's email settings, saved from the console (`ADM-7`,
-//! migration `0127`): the mail server, the account, the password and the
+//! migration `0128`): the mail server, the account, the password and the
 //! `From` address, plus the public address the console uses in links.
 //!
 //! At most one row exists (`singleton`). No row is not an error: it means
