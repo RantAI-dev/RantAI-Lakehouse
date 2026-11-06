@@ -18,6 +18,19 @@ export function quoteIdent(part: string) {
 }
 
 /**
+ * A Bronze table's name in Trino: `iceberg.bronze.<table>`, the form Query
+ * Studio's time-travel control also writes.
+ *
+ * A table name that is not a plain identifier comes out quoted
+ * (`iceberg.bronze."order lines"`). Completion reads such a name only up to
+ * the quote, so an alias on it does not resolve; plain names are the
+ * supported case.
+ */
+export function trinoBronzeName(tableName: string): string {
+  return `iceberg.bronze.${quoteIdent(tableName)}`
+}
+
+/**
  * Where a starter query for this asset should run, and what to call it
  * there. The API's own `queryTarget` wins whenever it sent one — it knows
  * which table actually exists (an Iceberg-only dataset is read through
@@ -34,7 +47,7 @@ export function assetQueryTarget(a: Target): {
 } {
   if (a.queryTarget) return a.queryTarget
   if (isIcebergCandidate(a) && a.tableName) {
-    return { engine: "trino", table: `iceberg.bronze.${quoteIdent(a.tableName)}` }
+    return { engine: "trino", table: trinoBronzeName(a.tableName) }
   }
   return { engine: "clickhouse", table: `${quoteIdent(a.namespace)}.${quoteIdent(a.name)}` }
 }

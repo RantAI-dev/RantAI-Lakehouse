@@ -25,8 +25,14 @@ export type CompletionTable = {
   reference: string
   /** The layer the catalog files the table under; the schema browser groups by it, the completion ignores it. */
   layer: DataLayer
-  /** Every name the table answers to: its id and its display name (`namespace.name`). */
+  /** Every name the table answers to: its id and its display name (`namespace.name`), and a Bronze table's Trino names. */
   names: string[]
+  /**
+   * A Bronze table: only Trino reads it. Its `reference` is then the Trino name,
+   * already formed and quoted (insert it as it is), and empty on a ClickHouse
+   * tab, where the table is not offered.
+   */
+  trinoOnly?: boolean
 }
 
 /** What the console knows about one table's columns right now. */

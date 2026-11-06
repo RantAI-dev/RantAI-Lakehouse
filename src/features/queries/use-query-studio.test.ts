@@ -366,6 +366,59 @@ describe("useQueryStudio columns", () => {
   })
 })
 
+describe("useQueryStudio Bronze tables", () => {
+  /** A Bronze table's detail as the API sends it: ClickHouse `queryTarget`, plus the registry `tableName`. */
+  const BRONZE_DETAIL = {
+    schema: [{ name: "oid", dataType: "String" }],
+    layer: "raw",
+    type: "iceberg-table",
+    tableName: "orders",
+    namespace: "bronze",
+    name: "Demo Orders",
+    queryTarget: { engine: "clickhouse", table: "icecat_api.`bronze.orders`" },
+  }
+
+  function mountWithBronze() {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([
+      { id: "demo_orders", name: "Demo Orders", namespace: "bronze", layer: "raw" },
+    ] as never)
+    spyOn(assetService, "getAsset").mockResolvedValue(BRONZE_DETAIL as never)
+    return renderHook(() => useQueryStudio())
+  }
+
+  it("names the table by its Trino name on a Trino tab, and answers to it by any spelling", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const hook = mountWithBronze()
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+    expect(hook.result.current.engine).toBe("trino")
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+
+    await waitFor(() =>
+      expect(hook.result.current.tables[0]).toMatchObject({
+        reference: "iceberg.bronze.orders",
+        trinoOnly: true,
+      })
+    )
+    expect(hook.result.current.tables[0]?.names).toContain("iceberg.bronze.orders")
+    expect(hook.result.current.tables[0]?.names).toContain("bronze.orders")
+  })
+
+  it("gives the table no name on a ClickHouse tab, whatever the ClickHouse name the detail carries", async () => {
+    const hook = mountWithBronze()
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+    expect(hook.result.current.engine).toBe("clickhouse")
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+    await waitFor(() => expect(hook.result.current.columns["demo_orders"]?.status).toBe("ready"))
+
+    expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
+  })
+})
+
 describe("useQueryStudio statements", () => {
   it("runs every statement of the tab, one request each, in the order written", async () => {
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
