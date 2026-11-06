@@ -65,11 +65,14 @@ use lakehouse_bi::formatting::{COMPANY_PALETTE_LEN, NUMBER_LOCALES, SHIPPED_FONT
 use lakehouse_bi::grain::{TimeContext, WeekStart};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
+use lakehouse_store::PgPool;
+use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::runtime_settings::{EffectiveEmail, Source};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -685,6 +688,518 @@ async fn engine_knows_zone(state: &AppState, zone: &str) -> Result<bool, ApiErro
         })
         .unwrap_or(0);
     Ok(n > 0)
+}
+
+// ── ADM-7: the deployment's email settings ───────────────────────────────
+
+/// What the person is told when the body is not the email fields.
+const EMAIL_BODY_SHAPE: &str = "body must be {\"host\"?: string|null, \"port\"?: number|null, \
+\"security\"?: \"tls\"|\"starttls\"|null, \"user\"?: string|null, \"password\"?: string|null, \
+\"from\"?: string|null, \"consolePublicUrl\"?: string|null}";
+
+/// What the person is told when the body sends a field the server's
+/// environment owns (plan D1). Nothing is written.
+const SET_BY_THE_SERVER: &str =
+    "This setting is set in the server's environment and cannot be changed here.";
+
+/// What the person is told when the mail server's name is not a host name.
+const HOST_REFUSED: &str = "host must be a mail server name, such as smtp.example.com.";
+
+/// What the person is told when the port is not a port number.
+const PORT_REFUSED: &str = "port must be a whole number from 1 to 65535.";
+
+/// What the person is told when the security mode is not one of the two.
+const SECURITY_REFUSED: &str = "security must be tls or starttls.";
+
+/// What the person is told when the user name is not text.
+const USER_REFUSED: &str = "user must be text.";
+
+/// What the person is told when the sender address is not an address.
+const FROM_REFUSED: &str = "from must be an email address, such as reports@example.com.";
+
+/// What the person is told when the console's public address is not an
+/// http(s) address.
+const CONSOLE_URL_REFUSED: &str = "consolePublicUrl must start with http:// or https://.";
+
+/// What the person is told when the caller's account has no address a test
+/// email could go to.
+const NO_ACCOUNT_ADDRESS: &str = "This account has no email address, so no test email can be sent.";
+
+/// What the person is told when they ask for too many test emails.
+const TEST_EMAIL_TOO_SOON: &str = "Wait a moment before asking for another test email.";
+
+/// What the person is told when the installation key that seals the password
+/// is not configured.
+const NO_INSTALLATION_KEY: &str =
+    "The installation key is not configured, so a password cannot be saved.";
+
+/// The subject of the test email (plan D10).
+const TEST_EMAIL_SUBJECT: &str = "Test email from RantAI Lakehouse";
+
+/// The fields the body of a save may carry (plan D9). A field that is not
+/// there keeps what is stored; a field that is there and `null` clears it.
+const EMAIL_FIELDS: [&str; 7] = [
+    "host",
+    "port",
+    "security",
+    "user",
+    "password",
+    "from",
+    "consolePublicUrl",
+];
+
+/// The body of a save, read as a map of the fields it carries.
+///
+/// A map, not a struct: a struct with `Option` fields cannot tell a field
+/// that was not sent from a field that was sent as `null`, and the two mean
+/// different things (keep the stored value, or clear it — plan D5).
+fn parse_email_body(body: &Bytes) -> Result<serde_json::Map<String, Value>, ApiError> {
+    let parsed: Value = serde_json::from_slice(body)
+        .map_err(|_| ApiError::BadRequest(EMAIL_BODY_SHAPE.to_owned()))?;
+    let Value::Object(fields) = parsed else {
+        return Err(ApiError::BadRequest(EMAIL_BODY_SHAPE.to_owned()));
+    };
+    for key in fields.keys() {
+        if !EMAIL_FIELDS.contains(&key.as_str()) {
+            return Err(ApiError::BadRequest(EMAIL_BODY_SHAPE.to_owned()));
+        }
+    }
+    Ok(fields)
+}
+
+/// The string a field carries, or `None` when it carries an explicit `null`
+/// (which clears the setting). `refused` is the fixed sentence the person
+/// is told when the value is not text (plan D9).
+fn string_field(refused: &str, value: &Value) -> Result<Option<String>, ApiError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(text) => Ok(Some(text.clone())),
+        _ => Err(ApiError::BadRequest(refused.to_owned())),
+    }
+}
+
+/// One field of the answer: its effective value and where it came from
+/// (plan D1).
+fn field_json(value: impl Into<Value>, source: Source) -> Value {
+    json!({ "value": value.into(), "source": source.as_str() })
+}
+
+/// The email settings answer: every field's effective value and its source.
+///
+/// The password is never in it — only whether one is set (plan D5). The
+/// console shows a field the server owns as read-only, and this is where it
+/// learns that.
+fn email_settings_json(effective: &EffectiveEmail) -> Value {
+    json!({
+        "host": field_json(effective.host.clone(), effective.host_source),
+        "port": field_json(effective.port, effective.port_source),
+        "security": field_json(effective.security.as_str(), effective.security_source),
+        "user": field_json(effective.user.clone(), effective.user_source),
+        "password": {
+            "set": effective.password_set,
+            "source": effective.password_source.as_str(),
+        },
+        "from": field_json(effective.from.clone(), effective.from_source),
+        "consolePublicUrl": field_json(
+            effective.console_public_url.clone(),
+            effective.console_public_url_source,
+        ),
+    })
+}
+
+/// `GET /api/settings/email` — the effective email settings, and where each
+/// value comes from (plan D1).
+///
+/// Reading needs `settings:write` like changing does (plan D4): a mail
+/// server's name and account are not for every signed-in person.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the saved row cannot be read: the
+/// answer must not claim a value is "not set" when the database could not
+/// be asked.
+pub async fn get_email(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let effective = crate::runtime_settings::email_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    Ok(ApiJson(email_settings_json(&effective)))
+}
+
+/// The new value of a text field, and whether the stored value moves.
+///
+/// `sent` is `None` when the body did not send the field (keep what is
+/// stored), `Some(Value::Null)` when it sent an explicit null (clear it),
+/// and a value when it sent one. `check` validates the text and returns the
+/// value to store, or `None` when the text is not usable (which is refused
+/// with `refused`, the fixed sentence that names the field).
+fn text_field(
+    sent: Option<&Value>,
+    old: Option<&str>,
+    refused: &str,
+    check: impl Fn(&str) -> Option<String>,
+) -> Result<(Option<String>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old.map(str::to_owned), false));
+    };
+    let Some(text) = string_field(refused, value)? else {
+        return Ok((None, old.is_some()));
+    };
+    let checked = check(&text).ok_or_else(|| ApiError::BadRequest(refused.to_owned()))?;
+    let changed = old != Some(checked.as_str());
+    Ok((Some(checked), changed))
+}
+
+/// The new port, and whether the stored port moves.
+fn port_field(sent: Option<&Value>, old: Option<i32>) -> Result<(Option<i32>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old, false));
+    };
+    if value.is_null() {
+        return Ok((None, old.is_some()));
+    }
+    let number = value
+        .as_i64()
+        .ok_or_else(|| ApiError::BadRequest(PORT_REFUSED.to_owned()))?;
+    let number = u16::try_from(number)
+        .ok()
+        .filter(|port| *port > 0)
+        .map(i32::from)
+        .ok_or_else(|| ApiError::BadRequest(PORT_REFUSED.to_owned()))?;
+    Ok((Some(number), old != Some(number)))
+}
+
+/// The new sealed password, and whether the stored password moves.
+///
+/// The plaintext is sealed before it is stored and never reaches a row, a
+/// log or a response (plan D5). The sealed bytes are never compared (the
+/// seal is randomised), so a password that is sent always counts as
+/// changed.
+fn password_field(
+    state: &AppState,
+    sent: Option<&Value>,
+    old: Option<&[u8]>,
+) -> Result<(Option<Vec<u8>>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old.map(<[u8]>::to_vec), false));
+    };
+    let Some(plain) = string_field(USER_REFUSED, value)? else {
+        return Ok((None, old.is_some()));
+    };
+    let keyring = state
+        .connector_secret_store
+        .keyring()
+        .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
+    let sealed = keyring
+        .seal(
+            crate::runtime_settings::EMAIL_PASSWORD_SEAL_NAME,
+            plain.as_bytes(),
+        )
+        .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
+    Ok((Some(sealed), true))
+}
+
+/// The row a save writes, and the names of the fields it changes (plan D6).
+///
+/// Every field follows the same rule (plan D5): not sent keeps what is
+/// stored, an explicit `null` clears it, a value replaces it.
+fn email_row_to_save(
+    state: &AppState,
+    parsed: &serde_json::Map<String, Value>,
+    current: Option<&lakehouse_store::email_settings::EmailSettings>,
+) -> Result<
+    (
+        lakehouse_store::email_settings::EmailSettings,
+        Vec<&'static str>,
+    ),
+    ApiError,
+> {
+    let old_host = current.and_then(|c| c.smtp_host.as_deref());
+    let old_port = current.and_then(|c| c.smtp_port);
+    let old_security = current.and_then(|c| c.smtp_security.as_deref());
+    let old_user = current.and_then(|c| c.smtp_user.as_deref());
+    let old_password = current.and_then(|c| c.smtp_pass.as_deref());
+    let old_from = current.and_then(|c| c.smtp_from.as_deref());
+    let old_url = current.and_then(|c| c.console_public_url.as_deref());
+
+    let (host, host_changed) = text_field(parsed.get("host"), old_host, HOST_REFUSED, |text| {
+        let text = text.trim();
+        // The workspace's one hostname rule
+        // (`lakehouse_store::ingest_spec::validate_hostname`).
+        lakehouse_store::ingest_spec::validate_hostname("host", text)
+            .ok()
+            .map(|()| text.to_owned())
+    })?;
+    let (port, port_changed) = port_field(parsed.get("port"), old_port)?;
+    let (security, security_changed) = text_field(
+        parsed.get("security"),
+        old_security,
+        SECURITY_REFUSED,
+        |text| {
+            let text = text.trim().to_ascii_lowercase();
+            crate::runtime_settings::EmailSecurity::parse(&text).map(|_| text)
+        },
+    )?;
+    let (user, user_changed) = text_field(parsed.get("user"), old_user, USER_REFUSED, |text| {
+        // An empty name means "no account": the sender then sends no
+        // credentials at all.
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    })?;
+    let (password, password_changed) = password_field(state, parsed.get("password"), old_password)?;
+    let (from, from_changed) = text_field(parsed.get("from"), old_from, FROM_REFUSED, |text| {
+        // The workspace's one address rule
+        // (`routes::report_runner::normalise_address`).
+        crate::routes::report_runner::normalise_address(text)
+    })?;
+    let (console_public_url, url_changed) = text_field(
+        parsed.get("consolePublicUrl"),
+        old_url,
+        CONSOLE_URL_REFUSED,
+        |text| {
+            let text = text.trim().trim_end_matches('/');
+            (text.starts_with("https://") || text.starts_with("http://")).then(|| text.to_owned())
+        },
+    )?;
+
+    let mut changed: Vec<&'static str> = Vec::new();
+    if host_changed {
+        changed.push("host");
+    }
+    if port_changed {
+        changed.push("port");
+    }
+    if security_changed {
+        changed.push("security");
+    }
+    if user_changed {
+        changed.push("user");
+    }
+    if password_changed {
+        changed.push("password");
+    }
+    if from_changed {
+        changed.push("from");
+    }
+    if url_changed {
+        changed.push("consolePublicUrl");
+    }
+    Ok((
+        lakehouse_store::email_settings::EmailSettings {
+            smtp_host: host,
+            smtp_port: port,
+            smtp_security: security,
+            smtp_user: user,
+            smtp_pass: password,
+            smtp_from: from,
+            console_public_url,
+        },
+        changed,
+    ))
+}
+
+/// `PUT /api/settings/email` — save the mail server, the account, the
+/// password, the `From` address and the console's public address (plan D9).
+///
+/// A field that is not sent keeps what is stored; a field sent as `null` is
+/// cleared; a field sent with a value replaces what is stored (plan D5).
+/// A field the server's environment owns is refused with a 409 and nothing
+/// is written (plan D1).
+///
+/// # Errors
+///
+/// 400 with a fixed sentence when the body is not the email fields or a
+/// value is not usable; 409 when the environment owns a field the body
+/// sends; 503 without a Postgres pool or without the installation key;
+/// 5xx through `upstream_error` when the database fails.
+pub async fn put_email(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // Parsed by hand so a malformed body gets this module's message.
+    let parsed = parse_email_body(&body)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+    // The effective values, to know which fields the environment owns.
+    let effective = crate::runtime_settings::email_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    for (sent, source) in [
+        (parsed.contains_key("host"), effective.host_source),
+        (parsed.contains_key("port"), effective.port_source),
+        (parsed.contains_key("security"), effective.security_source),
+        (parsed.contains_key("user"), effective.user_source),
+        (parsed.contains_key("password"), effective.password_source),
+        (parsed.contains_key("from"), effective.from_source),
+        (
+            parsed.contains_key("consolePublicUrl"),
+            effective.console_public_url_source,
+        ),
+    ] {
+        if sent && source == Source::Server {
+            return Err(ApiError::Conflict(SET_BY_THE_SERVER.to_owned()).into());
+        }
+    }
+
+    let current = lakehouse_store::email_settings::get(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let (row, changed) = email_row_to_save(&state, &parsed, current.as_ref())?;
+
+    lakehouse_store::email_settings::upsert(pool, &row, &principal.id.uuid().to_string())
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    // The save is visible to the next send on this process at once (D3).
+    state.email_settings_cache.clear().await;
+    // One audit row for the save, naming the fields that changed (D6).
+    audit_email_update(pool, &principal, &changed).await;
+
+    let effective = crate::runtime_settings::email_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    Ok(ApiJson(email_settings_json(&effective)))
+}
+
+/// One audit row for a save of the email settings (plan D6): the action and
+/// the NAMES of the fields that changed, never a value and never the
+/// password.
+///
+/// Best effort, like every other audit write: a failed audit write never
+/// fails, or undoes, the save it records.
+async fn audit_email_update(pool: &PgPool, principal: &Principal, fields: &[&str]) {
+    let event = NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: "settings.email.update".to_owned(),
+        resource_kind: Some("settings".to_owned()),
+        resource_id: Some("email".to_owned()),
+        args: Some(json!({ "fields": fields })),
+        outcome: "executed".to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::warn!(%err, "failed to record the email settings audit event");
+    }
+}
+
+/// `POST /api/settings/email/test` — send one short email to the caller's
+/// own account address, with the effective settings (plan D10).
+///
+/// The body carries no address: the recipient is the caller's own account
+/// address, so the button cannot be used to send mail to anyone else. At
+/// most one per caller every ten seconds (a 429 with a `Retry-After`).
+///
+/// The answer is one of the fixed sentences of plan D7, mapped from
+/// `lakehouse_notify`'s failure kinds — never from the mail server's own
+/// words.
+///
+/// # Errors
+///
+/// 400 when the caller's account has no address a test email could go to;
+/// 429 when the caller asked too soon; 503 without a Postgres pool; 5xx
+/// through `upstream_error` when the database fails.
+pub async fn post_email_test(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    if let Err(wait) = state
+        .email_test_limiter
+        .claim(principal.id.uuid(), std::time::Instant::now())
+        .await
+    {
+        return Err(ApiError::TooManyRequests {
+            message: TEST_EMAIL_TOO_SOON.to_owned(),
+            retry_after_secs: wait,
+        }
+        .into());
+    }
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+    // The recipient: the caller's own account address, and nothing else.
+    let Some(user_id) = principal.user_id() else {
+        return Err(ApiError::BadRequest(NO_ACCOUNT_ADDRESS.to_owned()).into());
+    };
+    let user = lakehouse_store::identity::get_user(pool, &user_id.to_string())
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let Some(address) = crate::routes::report_runner::normalise_address(&user.email) else {
+        return Err(ApiError::BadRequest(NO_ACCOUNT_ADDRESS.to_owned()).into());
+    };
+    // The effective settings: what a send would use, saved or from the
+    // environment. The body of this request is never read.
+    let effective = crate::runtime_settings::email_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let sender = lakehouse_notify::EmailSender::new(effective.smtp());
+    let html = test_email_html(effective.console_public_url.as_deref());
+    match sender
+        .send_classified(&address, TEST_EMAIL_SUBJECT, &html)
+        .await
+    {
+        Ok(()) => Ok(ApiJson(json!({
+            "sent": true,
+            "message": format!("Sent to {address}."),
+        }))),
+        Err(failure) => Ok(ApiJson(json!({
+            "sent": false,
+            "message": test_email_sentence(failure),
+        }))),
+    }
+}
+
+/// The one sentence for each way a test email can fail (plan D7). The
+/// `lakehouse_notify` kind decides the sentence; the mail server's own
+/// words never reach it.
+fn test_email_sentence(failure: lakehouse_notify::DeliveryFailure) -> &'static str {
+    match failure {
+        lakehouse_notify::DeliveryFailure::EmailNotConfigured => {
+            "Email is not set up: the mail server is missing."
+        }
+        // The webhook kinds cannot happen on an email send. They share the
+        // one sentence so that a kind this feature does not know still
+        // answers with a fixed sentence (plan D7), never with a new one.
+        lakehouse_notify::DeliveryFailure::MailServerUnreachable
+        | lakehouse_notify::DeliveryFailure::WebhookUnreachable
+        | lakehouse_notify::DeliveryFailure::WebhookAddressRefused
+        | lakehouse_notify::DeliveryFailure::WebhookServerError
+        | lakehouse_notify::DeliveryFailure::WebhookRedirected
+        | lakehouse_notify::DeliveryFailure::ChannelUnsupported => {
+            "Could not reach the mail server."
+        }
+        lakehouse_notify::DeliveryFailure::MailServerRefused => {
+            "The mail server refused the user name or password."
+        }
+        lakehouse_notify::DeliveryFailure::MailServerTlsFailed => {
+            "The secure connection to the mail server failed."
+        }
+        // The address was refused before the message left: the account has
+        // no address this deployment can send to.
+        lakehouse_notify::DeliveryFailure::EmailAddressRefused => NO_ACCOUNT_ADDRESS,
+    }
+}
+
+/// The body of the test email: short, and carrying the console's public
+/// address when one is set.
+fn test_email_html(console_public_url: Option<&str>) -> String {
+    let link = match console_public_url {
+        Some(url) => format!("<p>Open the console at <a href=\"{url}\">{url}</a>.</p>"),
+        None => "<p>Open the console to see your dashboards.</p>".to_owned(),
+    };
+    format!(
+        "<div style=\"font-family:system-ui,sans-serif\"><p>This is a test email from your RantAI Lakehouse console.</p>{link}</div>"
+    )
 }
 
 #[cfg(test)]

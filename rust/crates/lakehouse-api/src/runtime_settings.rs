@@ -32,6 +32,7 @@
 //! [`EMAIL_PASSWORD_SEAL_NAME`]; a row that does not open (the key changed)
 //! is read as "not set" and logged, never returned.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -40,7 +41,8 @@ use lakehouse_core::secret::SecretValue;
 use lakehouse_notify::{SmtpCaBundle, SmtpConfig};
 use lakehouse_store::email_settings::EmailSettings;
 use lakehouse_store::{PgPool, StoreError};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::secret_crypto::Keyring;
@@ -64,6 +66,18 @@ pub enum Source {
     Default,
 }
 
+impl Source {
+    /// The wire string the console reads: which of the three it is.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Console => "console",
+            Self::Default => "default",
+        }
+    }
+}
+
 /// The two ways the sender may secure the connection, matching the console's
 /// `security` field (`"tls"` = implicit TLS, `"starttls"` = STARTTLS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +89,15 @@ pub enum EmailSecurity {
 }
 
 impl EmailSecurity {
+    /// The wire string the console reads and sends back.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::Starttls => "starttls",
+        }
+    }
+
     /// The `SmtpConfig::secure` boolean this maps onto.
     #[must_use]
     pub const fn secure(self) -> bool {
@@ -196,11 +219,65 @@ impl EmailSettingsCache {
         let (at, row) = guard.as_ref()?;
         (at.elapsed() < EMAIL_CACHE_TTL).then(|| row.clone())
     }
+
+    /// Drop the cached row, so the next read asks the store again. The email
+    /// `PUT` calls this on the process that saved, so a change is visible to
+    /// the next send there without waiting for the TTL (plan D3).
+    pub async fn clear(&self) {
+        *self.inner.write().await = None;
+    }
 }
 
 impl Default for EmailSettingsCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// How often one caller may ask for a test email (`ADM-7` plan D10).
+pub const TEST_EMAIL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often each caller may ask for a test email (`ADM-7` plan D10: at most
+/// one per caller per [`TEST_EMAIL_INTERVAL`]).
+///
+/// Per process, and per caller: the counter keeps the button from turning
+/// into a mail cannon, and says so with a `429` and a `Retry-After`. It is
+/// not a shared quota, so two API processes each allow their own.
+#[derive(Debug, Default)]
+pub struct TestEmailLimiter {
+    /// When each caller last asked.
+    last: Mutex<HashMap<Uuid, Instant>>,
+}
+
+impl TestEmailLimiter {
+    /// A limiter no caller has used yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim the right to send a test email to `caller` at `now`.
+    ///
+    /// `Ok(())` when the caller may send now; `Err(seconds)` when it asked
+    /// too soon, with the whole seconds it has to wait.
+    ///
+    /// # Errors
+    ///
+    /// `Err(seconds)` — not a failure but the answer: the caller asked
+    /// again within [`TEST_EMAIL_INTERVAL`], and the number is how long it
+    /// has to wait.
+    pub async fn claim(&self, caller: Uuid, now: Instant) -> Result<(), u64> {
+        let mut last = self.last.lock().await;
+        // Entries older than the interval are of no use any more; dropping
+        // them keeps the map as small as the number of callers who asked
+        // recently.
+        last.retain(|_, at| now.duration_since(*at) < TEST_EMAIL_INTERVAL);
+        if let Some(at) = last.get(&caller) {
+            let wait = TEST_EMAIL_INTERVAL.saturating_sub(now.duration_since(*at));
+            return Err(wait.as_secs().max(1));
+        }
+        last.insert(caller, now);
+        Ok(())
     }
 }
 
@@ -222,18 +299,33 @@ pub async fn email_row(state: &AppState) -> Result<Option<EmailSettings>, StoreE
 /// load-bearing for the API surface, and an alert must still go out on the
 /// environment's `SMTP_*` when the settings database is briefly down.
 pub async fn email(state: &AppState) -> EffectiveEmail {
-    let stored = match email_row(state).await {
-        Ok(row) => row,
+    match email_or_fail(state).await {
+        Ok(effective) => effective,
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 "reading saved email settings failed; using the environment's values"
             );
-            None
+            let keyring = state.connector_secret_store.keyring().ok();
+            resolve_email(&state.config, None, keyring)
         }
-    };
+    }
+}
+
+/// The effective email settings, with the store's failure reported instead of
+/// hidden behind the environment's values.
+///
+/// The settings screen uses this: answering "not set" for a value that IS
+/// set (because the database could not be asked) would be a lie. A send
+/// uses [`email`], which degrades instead.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the saved row cannot be read.
+pub async fn email_or_fail(state: &AppState) -> Result<EffectiveEmail, StoreError> {
+    let stored = email_row(state).await?;
     let keyring = state.connector_secret_store.keyring().ok();
-    resolve_email(&state.config, stored.as_ref(), keyring)
+    Ok(resolve_email(&state.config, stored.as_ref(), keyring))
 }
 
 /// The one merge (plan D1): environment wins, then the saved row, then the
@@ -365,6 +457,11 @@ fn open_console_password(
         );
         return None;
     };
+    // An empty password is no password: the console's "Clear" sends `null`,
+    // but a save that sent an empty string must not look like a set one.
+    if plain.is_empty() {
+        return None;
+    }
     Some(plain)
 }
 

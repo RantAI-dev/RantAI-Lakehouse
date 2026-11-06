@@ -784,6 +784,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    `settings_write_needs_no_seed_change_and_no_seeded_role_has_it`. ────
     ("GET",    "/api/settings/reporting",     Policy::RequiresAuth),
     ("PUT",    "/api/settings/reporting",     Policy::RequiresPermission("settings:write")),
+    // ── Email settings (`ADM-7`, `routes::settings`). Reading needs
+    //    `settings:write` too, unlike the reporting settings above: a mail
+    //    server's name, the account's user name and the console's public
+    //    address are the deployment's own, not everybody's (plan D4). The
+    //    test email goes to the caller's own address and nothing else
+    //    (plan D10), so it is the same permission. ──────────────────────────
+    ("GET",    "/api/settings/email",         Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/email",         Policy::RequiresPermission("settings:write")),
+    ("POST",   "/api/settings/email/test",   Policy::RequiresPermission("settings:write")),
     // ── Query limits (`BI-5`, `routes::query_limits`): anyone signed in reads
     //    the limits that apply to them; changing them is `settings:write`. ──
     ("GET",    "/api/settings/limits",        Policy::RequiresAuth),

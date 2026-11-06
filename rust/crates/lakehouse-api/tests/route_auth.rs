@@ -619,6 +619,47 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     }
 }
 
+/// `ADM-7` plan D4: all three email-settings routes need `settings:write`,
+/// the `GET` included — a mail server's name and the account's user name
+/// are the deployment's own, not every signed-in person's. The table-driven
+/// loops above walk the new `POLICY_TABLE` rows both ways; this names the
+/// case the decision exists for.
+#[tokio::test]
+async fn the_email_settings_routes_are_refused_without_settings_write() {
+    let TestApp { router, pool } = spin_up().await;
+    // A seeded Analyst holds no `settings:write`.
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    for (method, path) in [
+        ("GET", "/api/settings/email"),
+        ("PUT", "/api/settings/email"),
+        ("POST", "/api/settings/email/test"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, &analyst).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} must need settings:write, reading included"
+        );
+    }
+}
+
+/// The other half of the same decision: a holder of `settings:write` is
+/// never refused by the gate.
+#[tokio::test]
+async fn a_platform_admin_is_not_refused_the_email_settings_routes() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    for (method, path) in [
+        ("GET", "/api/settings/email"),
+        ("PUT", "/api/settings/email"),
+        ("POST", "/api/settings/email/test"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, &admin).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
 /// `DATA-12` D1: `PUT /api/catalog/{id}/certification` needs
 /// `governance:write`. A seeded Data Engineer holds `catalog:write` (which
 /// edits the details) but not `governance:write`, so the permission
