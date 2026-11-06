@@ -167,23 +167,11 @@ pub(in crate::routes) async fn run_tool(
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(state, principal, args).await,
         "create_chart" | "update_chart" => {
-            // BI-19 B2 review B2-1: the level checks of the console's write
-            // routes (`specs_create`/`specs_update`) apply to the assistant too:
-            // `edit` on the dashboard the chart is on and on the one it moves to.
-            let scope = match scope_for_write(state, principal).await {
+            let scope = match require_chart_call_allowed(state, principal, name, args).await {
                 Ok(scope) => scope,
                 Err(error) => return error,
             };
             let viewer = &scope.viewer;
-            if name == "create_chart" {
-                if let Err(error) = require_edit_on(state, &scope, &arg_str(args, "board")).await {
-                    return error;
-                }
-            } else if let Err(error) =
-                require_edit_on_chart(state, &scope, &arg_str(args, "id"), Some(args)).await
-            {
-                return error;
-            }
             // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
             let Ok(time) = crate::routes::settings::time_context(state).await else {
                 // The cause was logged under a reference by `time_context`.
@@ -410,6 +398,31 @@ pub(super) async fn scope_for_write(
         .map_err(|err| json!({ "error": err.to_string() }))
 }
 
+/// Who may make a `create_chart` or `update_chart` call and on which
+/// dashboards: a signed-in person ([`scope_for_write`]), then the level checks
+/// of the console's write routes (`specs_create`/`specs_update`), `edit` on the
+/// dashboard the chart is on and on the one it moves to (`BI-19` B2 review
+/// B2-1). The one copy of these checks: the dispatcher runs it before the save
+/// and [`check_draft`] runs it before the draft, so a draft is refused with the
+/// reply the save gives (`PR #391 review`, `PR #402 review`).
+///
+/// Returns the caller's [`Scope`](crate::routes::dashboard_access::Scope),
+/// the viewer both the save and the draft read as.
+async fn require_chart_call_allowed(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Result<crate::routes::dashboard_access::Scope, Value> {
+    let scope = scope_for_write(state, principal).await?;
+    if name == "create_chart" {
+        require_edit_on(state, &scope, &arg_str(args, "board")).await?;
+    } else {
+        require_edit_on_chart(state, &scope, &arg_str(args, "id"), Some(args)).await?;
+    }
+    Ok(scope)
+}
+
 /// `edit` on the dashboard `board` (blank = the built-in one), the answer of a
 /// refusal as a tool error: the same 404 sentence for one the caller cannot see
 /// and the 403 sentence for one they see and may not edit (`BI-19` B2 review
@@ -589,17 +602,21 @@ fn arg_filter_modes(
 
 /// Checks a chart call before the gate offers it as a draft, and
 /// adds what the draft holds to it. `draft` is the gate's `needs_confirmation`
-/// answer; a call that is not a chart call, or a draft that builds, comes back
-/// as the draft (a create's with a `definition` key, the digest of what it
-/// would save: the card reads `args`, so the key changes nothing the person
-/// sees; an update's draft has no `definition`: the saved reply carries the
-/// digest of the merged chart). The error otherwise, so a draft on a mart or
-/// column that does not exist is refused rather than offered. Writes nothing.
+/// answer; a call that is not a chart call is returned as it came. A chart
+/// call that builds comes back as the draft with a `definition` key, the
+/// digest of what the save would store (for an update the stored chart merged
+/// with the call): the card reads `args`, so the key changes nothing the
+/// person sees. The error otherwise, so a draft that the save would refuse (a
+/// mart or column that does not exist, a dashboard the caller may not edit, a
+/// SQL source they cannot see) is refused rather than offered. Writes nothing.
 ///
-/// An update's draft reads the stored chart as `principal`, through the same
-/// [`scope_for_write`] the save uses, so a chart the caller cannot see answers
-/// what the save answers and nothing of the chart. With nobody attached an
-/// update is refused (fail closed); a create reads no stored chart.
+/// The draft runs the save's checks, from the same code and in the save's
+/// order: [`require_chart_call_allowed`] here, then the preparation the save
+/// shares with `dashboards::check_chart_draft`. It reads as `principal`,
+/// through the same [`scope_for_write`] the save uses, so a chart, a dashboard
+/// or a SQL source the caller cannot see answers what the save answers and
+/// nothing of it. With nobody attached the call is refused (fail closed), for
+/// a create as for an update.
 ///
 /// When the reporting settings cannot be read, this returns the same error
 /// the dispatch arm returns, instead of skipping the check.
@@ -620,23 +637,16 @@ pub(crate) async fn check_draft(
     if name != "create_chart" && name != "update_chart" {
         return Ok(draft);
     }
-    // Built before anything else is read, as the dispatcher does, so a caller
-    // the save would refuse is refused here with the same sentence.
-    let viewer = if name == "update_chart" {
-        scope_for_write(state, principal).await?.viewer
-    } else {
-        // A create reads no stored chart; `check_chart_draft` ignores this.
-        Viewer::nothing()
-    };
+    // Built and judged before anything else is read, as the dispatcher does,
+    // so a caller the save would refuse is refused here with the same reply.
+    let scope = require_chart_call_allowed(state, principal, name, args).await?;
     let Ok(time) = crate::routes::settings::time_context(state).await else {
         return Err(json!({ "error": "The reporting settings could not be read." }));
     };
     let id = (name == "update_chart").then(|| arg_str(args, "id"));
-    if let Some(definition) =
-        dashboards::check_chart_draft(&state.clickhouse, &viewer, args, id, &time).await?
-    {
-        draft["definition"] = Value::String(definition);
-    }
+    let definition =
+        dashboards::check_chart_draft(&state.clickhouse, &scope.viewer, args, id, &time).await?;
+    draft["definition"] = Value::String(definition);
     Ok(draft)
 }
 
@@ -764,7 +774,12 @@ mod tests {
     /// A stand-in `ClickHouse` that holds dashboards `b1` and `b2` (unfiled,
     /// unowned) and the chart `c1` on `b1`, enough for the write tools' level
     /// checks, which run before anything is written.
-    struct TwoBoards;
+    #[derive(Default)]
+    struct TwoBoards {
+        /// The owner of `b2`: empty for a dashboard nobody owns, otherwise
+        /// somebody's personal space.
+        b2_owner: &'static str,
+    }
 
     impl wiremock::Respond for TwoBoards {
         fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
@@ -776,19 +791,27 @@ mod tests {
                 ["b1", "b2"]
                     .iter()
                     .filter(|id| sql.contains(&format!("id = '{id}'")))
-                    .map(|_| json!({ "is_deleted": 0, "owner_id": "" }))
+                    .map(|id| json!({ "is_deleted": 0, "owner_id": self.owner_of(id) }))
                     .collect()
             } else if sql.contains("FROM console.bi_board FINAL") {
                 ["b1", "b2"]
                     .iter()
                     .filter(|id| sql.contains(&format!("id='{id}'")))
-                    .map(|id| json!({ "id": id, "name": id, "folder_id": "", "owner_id": "" }))
+                    .map(|id| {
+                        json!({ "id": id, "name": id, "folder_id": "", "owner_id": self.owner_of(id) })
+                    })
                     .collect()
             } else {
                 Vec::new()
             };
             wiremock::ResponseTemplate::new(200)
                 .set_body_json(json!({ "meta": [], "data": rows, "rows": rows.len() }))
+        }
+    }
+
+    impl TwoBoards {
+        fn owner_of(&self, board: &str) -> &'static str {
+            if board == "b2" { self.b2_owner } else { "" }
         }
     }
 
@@ -829,7 +852,7 @@ mod tests {
     async fn a_caller_at_view_level_is_refused_by_all_five_chart_write_tools() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(TwoBoards)
+            .respond_with(TwoBoards::default())
             .mount(&server)
             .await;
         let state = state_over_two_boards(&server.uri());
@@ -852,7 +875,7 @@ mod tests {
     async fn a_caller_at_manage_level_passes_the_level_check_of_the_five_tools() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(TwoBoards)
+            .respond_with(TwoBoards::default())
             .mount(&server)
             .await;
         let state = state_over_two_boards(&server.uri());
@@ -873,7 +896,7 @@ mod tests {
     async fn the_chart_write_tools_change_nothing_with_nobody_attached() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(TwoBoards)
+            .respond_with(TwoBoards::default())
             .mount(&server)
             .await;
         let state = state_over_two_boards(&server.uri());
@@ -882,6 +905,107 @@ mod tests {
             assert!(reply["error"].is_string(), "{tool}: {reply}");
             assert!(reply.get("created").is_none() && reply.get("updated").is_none());
         }
+    }
+
+    /// The draft of a chart call gets the save's answer, whole: the same value
+    /// `run_tool` gives, and no draft (`PR #391 review`, `PR #402 review`).
+    async fn assert_the_draft_is_refused_as_the_save_is(
+        state: &AppState,
+        principal: Option<&Principal>,
+        tool: &str,
+        args: &Map<String, Value>,
+    ) -> Value {
+        let saved = run_tool(state, principal, tool, args).await;
+        assert!(saved["error"].is_string(), "{tool}: {saved}");
+        let draft = json!({ "needs_confirmation": true });
+        let refused = check_draft(state, principal, tool, args, draft)
+            .await
+            .expect_err("the draft is refused");
+        assert_eq!(refused, saved, "the draft and the save give one reply");
+        saved
+    }
+
+    /// A chart the caller sees and may not edit gets the 403 sentence from the
+    /// draft check, not a Confirm card that the save then refuses.
+    #[tokio::test]
+    async fn the_draft_of_an_update_of_a_chart_the_caller_may_not_edit_is_refused_as_the_save_is() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let reader = caller_with("dashboard:read");
+        let args = json!({
+            "id": "c1", "title": "T", "kind": "bar", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = assert_the_draft_is_refused_as_the_save_is(
+            &state,
+            Some(&reader),
+            "update_chart",
+            &args,
+        )
+        .await;
+        assert!(
+            saved["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("edit on this dashboard")),
+            "{saved}"
+        );
+    }
+
+    /// An update that moves the chart onto a dashboard the caller cannot reach
+    /// is refused by the draft check as the save refuses it.
+    #[tokio::test]
+    async fn the_draft_of_an_update_that_moves_the_chart_onto_a_foreign_dashboard_is_refused_as_the_save_is()
+     {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards {
+                b2_owner: "somebody-else",
+            })
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "id": "c1", "title": "T", "kind": "bar", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"], "board": "b2",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = assert_the_draft_is_refused_as_the_save_is(
+            &state,
+            Some(&writer),
+            "update_chart",
+            &args,
+        )
+        .await;
+        assert_eq!(saved["error"], json!("dashboard not found."), "{saved}");
+    }
+
+    /// A create draft with nobody attached is refused with the save's
+    /// sentence; it used to read as nobody and carry on.
+    #[tokio::test]
+    async fn the_draft_of_a_create_with_nobody_signed_in_is_refused_as_the_save_is() {
+        let state = dispatch_test_state();
+        let args = json!({ "title": "T", "kind": "bar", "mart": "mart_x" })
+            .as_object()
+            .cloned()
+            .unwrap();
+        let saved =
+            assert_the_draft_is_refused_as_the_save_is(&state, None, "create_chart", &args).await;
+        assert!(
+            saved["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("there is none")),
+            "{saved}"
+        );
     }
 
     // PR review fix (SHOULD-FIX): `AI_ASK_BACK=false` only hid `ask_user` from

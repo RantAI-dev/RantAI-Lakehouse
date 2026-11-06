@@ -54,6 +54,20 @@ impl Respond for Store {
         // The statements are told apart by their own SELECT list: a viewer
         // clause may itself name `console.bi_board`, so a bare table name would
         // answer the wrong statement.
+        // The chart's own row and the state of the dashboards, which the chart
+        // tools read before they change or move a chart: `c1` is on `b1`, `c2`
+        // on `b2`, and both dashboards are live and unowned.
+        if sql.contains("SELECT is_deleted, board FROM console.bi_chart") {
+            let board = if sql.contains("id = 'c2'") {
+                "b2"
+            } else {
+                "b1"
+            };
+            return rows(vec![json!({ "is_deleted": 0, "board": board })]);
+        }
+        if sql.contains("SELECT is_deleted, owner_id FROM console.bi_board") {
+            return rows(vec![json!({ "is_deleted": 0, "owner_id": "" })]);
+        }
         if sql.contains("SELECT id, spec_json, board") {
             return rows(vec![chart_row("c1", "b1"), chart_row("c2", "b2")]);
         }
@@ -259,6 +273,47 @@ async fn edit_on_the_dashboard_lets_the_write_tools_reach_their_handler() {
     )
     .await;
     assert_eq!(elsewhere["outcome"], "refused", "{elsewhere}");
+}
+
+/// A person who may edit the dashboard a chart is on and only view the one the
+/// update moves it to: the draft is refused with the sentence the save gives,
+/// and no Confirm card is offered. The dashboard is one the caller sees, so
+/// `require_chart_board` lets it pass and only the `edit` check on the target
+/// refuses it (`PR #391 review`, `PR #402 review`).
+#[tokio::test]
+async fn the_draft_of_an_update_that_moves_a_chart_onto_a_view_only_dashboard_is_refused_as_the_save_is()
+ {
+    let (app, _ch, _llm) = app().await;
+    let editor = create_principal_with_permissions(&app.pool, "").await;
+    replace_item(&app.pool, "board", "b1", &[edit(editor)], false, None)
+        .await
+        .unwrap();
+    replace_item(&app.pool, "board", "b2", &[view(editor)], false, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&app.pool, editor).await;
+    let mut args = json!({
+        "id": "c1", "title": "T", "kind": "bar", "mart": "mart_x",
+        "dimension": "region", "measures": ["n"], "board": "b2",
+    });
+
+    let draft = call(&app, &cookie, "update_chart", args.clone(), "build").await;
+    args["confirmed"] = json!(true);
+    let saved = call(&app, &cookie, "update_chart", args, "build").await;
+
+    assert_eq!(saved["outcome"], "failed", "{saved}");
+    assert!(
+        saved["result"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("edit on this dashboard")),
+        "{saved}"
+    );
+    assert_eq!(draft["outcome"], "failed", "{draft}");
+    assert!(
+        draft["result"].get("needs_confirmation").is_none(),
+        "{draft}"
+    );
+    assert_eq!(draft["result"], saved["result"], "one reply for both");
 }
 
 /// The offered list: a chat with a grant-only person carries the listed tools
