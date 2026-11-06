@@ -108,6 +108,13 @@ pub(crate) const MOVE_NEEDS_MANAGE: &str = "Only someone who manages this can mo
 pub(crate) const PERSONAL_SPACE_NOT_SHARED: &str =
     "A personal space is not shared: share a query or a folder inside it.";
 
+/// The sentence a share of a folder is refused with when the caller does
+/// not manage everything in it: a rule on a folder covers every sub-folder
+/// and every query under it, so sharing it is held to the bar of a move
+/// (`QS-3` review of #393).
+pub(crate) const SHARE_NEEDS_MANAGE_OF_CONTENTS: &str =
+    "Only someone who manages everything in this folder can share it.";
+
 /// The sentence a folder that still holds queries is refused with.
 pub(crate) const FOLDER_HOLDS_QUERIES: &str =
     "This folder still holds queries, some of them in the trash. Move or restore them first.";
@@ -1688,7 +1695,9 @@ pub async fn get_folder_access(
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
 /// caller may not see; 403 with the fixed sentence of [`FOLDER_FORBIDDEN`]
 /// for a folder the caller may see but not manage; 403 with the fixed
-/// sentence of [`PERSONAL_SPACE_NOT_SHARED`] for a personal space; 400 for
+/// sentence of [`PERSONAL_SPACE_NOT_SHARED`] for a personal space; 403 with
+/// the fixed sentence of [`SHARE_NEEDS_MANAGE_OF_CONTENTS`] for a folder
+/// whose sub-folders or queries the caller does not all manage; 400 for
 /// a body of another shape, for a rule that names two grantees or none,
 /// for a grantee that is listed twice and for a grantee that is not of the
 /// caller's organisation; 500 on a database failure.
@@ -1713,6 +1722,17 @@ pub async fn put_folder_access(
     // manage check, so a person who may not see the space learns nothing.
     if folder.is_personal {
         return Err(ApiError::PermissionDenied(PERSONAL_SPACE_NOT_SHARED.to_owned()).into());
+    }
+    // A rule on a folder covers what is inside it, so the caller manages
+    // the folder and everything under it, the trash included, or shares
+    // nothing: a PUT that only removes rules is a share too (`QS-3` review
+    // of #393). Asked before the body is read, so a refused PUT writes
+    // nothing.
+    if !saved_query_access::manages_folder_and_contents(pool(&state)?, &viewer, folder_id)
+        .await
+        .map_err(folder_failure)?
+    {
+        return Err(ApiError::PermissionDenied(SHARE_NEEDS_MANAGE_OF_CONTENTS.to_owned()).into());
     }
     // The body is read only now: a folder the caller may not see is a
     // 404 and a folder it may not manage is a 403, whatever the body

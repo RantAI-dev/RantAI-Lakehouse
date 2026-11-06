@@ -51,6 +51,11 @@ const MOVE_NEEDS_MANAGE: &str = "Only someone who manages this can move it.";
 const PERSONAL_SPACE_NOT_SHARED: &str =
     "A personal space is not shared: share a query or a folder inside it.";
 
+/// The sentence a share of a folder is refused with when the caller does
+/// not manage everything in it (`QS-3` review of #393).
+const SHARE_NEEDS_MANAGE_OF_CONTENTS: &str =
+    "Only someone who manages everything in this folder can share it.";
+
 /// The sentence a folder that still holds queries is refused with.
 const FOLDER_HOLDS_QUERIES: &str =
     "This folder still holds queries, some of them in the trash. Move or restore them first.";
@@ -4119,6 +4124,22 @@ async fn a_rule_stored_on_a_personal_space_is_not_listed_as_access() {
         "the space lists no rule of its own: {list}"
     );
 
+    // `Weekly` still lists the rule seeded for it, as its own rule and not
+    // as an inherited one.
+    let (status, list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{weekly}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let rules = list["rules"].as_array().expect("the rules are an array");
+    assert_eq!(rules.len(), 1, "Weekly lists its own rule: {list}");
+    assert_eq!(rules[0]["userId"], yoga.to_string(), "{list}");
+    assert_eq!(rules[0]["level"], "view", "{list}");
+
     // CONTROL: below `Weekly` the real rule is inherited, and the space's
     // rule is still left out.
     for path in [
@@ -4134,4 +4155,320 @@ async fn a_rule_stored_on_a_personal_space_is_not_listed_as_access() {
         assert_eq!(inherited[0]["folderId"], weekly, "{list}");
         assert_eq!(inherited[0]["userId"], yoga.to_string(), "{list}");
     }
+}
+
+// ── Sharing a folder needs manage on what it holds (`QS-3` review of #393) ──
+
+/// `PUT /api/query/folders/{folder}/access` with `rules`.
+async fn put_folder_rules(
+    router: &axum::Router,
+    cookie: &str,
+    folder: &str,
+    rules: Value,
+) -> (StatusCode, Value) {
+    call(
+        router,
+        "PUT",
+        &format!("/api/query/folders/{folder}/access"),
+        cookie,
+        Some(json!({ "rules": rules })),
+    )
+    .await
+}
+
+/// The rules written on `folder` itself, read from the database.
+async fn stored_rules(pool: &PgPool, folder: &str) -> Vec<(Uuid, String)> {
+    sqlx::query_as(
+        "SELECT user_id, level::text FROM saved_query_access_rule \
+         WHERE folder_id = $1 AND user_id IS NOT NULL ORDER BY user_id",
+    )
+    .bind(Uuid::parse_str(folder).expect("the folder id"))
+    .fetch_all(pool)
+    .await
+    .expect("read the stored rules")
+}
+
+/// The level `cookie` holds on the saved query `query`.
+async fn level_on_query(router: &axum::Router, cookie: &str, query: &str) -> Value {
+    let (status, found) = call(
+        router,
+        "GET",
+        &format!("/api/query/saved/{query}"),
+        cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    found["level"].clone()
+}
+
+/// Review scenario (a): Reza created `X` inside `Reports` (so he manages
+/// it) and Rina's query sits in it. Giving himself manage on `X` would make
+/// Rina's query his to manage, so the share is refused, no rule is
+/// written and his level on her query is what it was.
+#[tokio::test]
+async fn an_author_of_a_folder_cannot_give_himself_manage_over_another_persons_query_in_it() {
+    let TestApp { router, pool } = spin_up().await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+    let (_reports, x, query) = x_in_reports_holding_rinas_query(&router, &pool).await;
+    let before = stored_rules(&pool, &x).await;
+    assert_eq!(before.len(), 1, "Rina's edit rule is the only one");
+    assert_eq!(level_on_query(&router, &reza, &query).await, "edit");
+
+    let (status, body) = put_folder_rules(
+        &router,
+        &reza,
+        &x,
+        json!([
+            {"userId": rina_id.to_string(), "level": "edit"},
+            {"userId": reza_id.to_string(), "level": "manage"}
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {SHARE_NEEDS_MANAGE_OF_CONTENTS}")
+    );
+
+    assert_eq!(stored_rules(&pool, &x).await, before, "nothing was written");
+    assert_eq!(
+        level_on_query(&router, &reza, &query).await,
+        "edit",
+        "his level on her query is unchanged"
+    );
+}
+
+/// Review scenario (b): sharing `X` with a colleague would change what the
+/// colleague may do with Rina's query, so it is refused and the colleague's
+/// level on it is what it was. (The organisation reads a query that sits in
+/// a shared folder, so the colleague holds view before and after.)
+#[tokio::test]
+async fn a_folder_holding_another_persons_query_is_not_shared_with_a_colleague() {
+    let TestApp { router, pool } = spin_up().await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+    let bob = a_third_reader(&pool).await;
+    let bob_id = user_id(&pool, "nadia@meridian.example").await;
+    let (_reports, x, query) = x_in_reports_holding_rinas_query(&router, &pool).await;
+    assert_eq!(level_on_query(&router, &bob, &query).await, "view");
+    let before = stored_rules(&pool, &x).await;
+
+    let (status, body) = put_folder_rules(
+        &router,
+        &reza,
+        &x,
+        json!([
+            {"userId": rina_id.to_string(), "level": "edit"},
+            {"userId": bob_id.to_string(), "level": "edit"}
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {SHARE_NEEDS_MANAGE_OF_CONTENTS}")
+    );
+    assert_eq!(stored_rules(&pool, &x).await, before, "nothing was written");
+    assert_eq!(
+        level_on_query(&router, &bob, &query).await,
+        "view",
+        "the colleague's level on her query is unchanged"
+    );
+}
+
+/// CONTROL for (a) and (b), review scenario (c): a folder that holds only
+/// the caller's own queries and sub-folders is shared.
+#[tokio::test]
+async fn a_folder_holding_only_the_callers_own_work_is_shared() {
+    let TestApp { router, pool } = spin_up().await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let bob = a_third_reader(&pool).await;
+    let bob_id = user_id(&pool, "nadia@meridian.example").await;
+    let reports = a_shared_folder_opened_to_reza(&pool, "edit").await;
+    let x = folder_created(&router, &reza, "X", Some(&reports)).await;
+    let inner = folder_created(&router, &reza, "Inner", Some(&x)).await;
+    let (own, _) = query_saved(&router, &reza, "Reza's own", Some(&x)).await;
+    query_saved(&router, &reza, "Reza's deeper", Some(&inner)).await;
+
+    let (status, body) = put_folder_rules(
+        &router,
+        &reza,
+        &x,
+        json!([{"userId": bob_id.to_string(), "level": "view"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(stored_rules(&pool, &x).await.len(), 1);
+    assert_eq!(level_on_query(&router, &bob, &own).await, "view");
+}
+
+/// Review scenario (d): a query of Rina's that is in the trash still
+/// counts, because a restore brings it back into the folder.
+#[tokio::test]
+async fn a_trashed_query_of_another_person_blocks_the_share_of_its_folder() {
+    let TestApp { router, pool } = spin_up().await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    a_third_reader(&pool).await;
+    let bob_id = user_id(&pool, "nadia@meridian.example").await;
+    let (_reports, x, query) = x_in_reports_holding_rinas_query(&router, &pool).await;
+    sqlx::query("UPDATE saved_query SET deleted_at = now() WHERE id = $1")
+        .bind(Uuid::parse_str(&query).expect("the query id"))
+        .execute(&pool)
+        .await
+        .expect("move Rina's query to the trash");
+    let before = stored_rules(&pool, &x).await;
+
+    let (status, body) = put_folder_rules(
+        &router,
+        &reza,
+        &x,
+        json!([{"userId": bob_id.to_string(), "level": "view"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {SHARE_NEEDS_MANAGE_OF_CONTENTS}")
+    );
+    assert_eq!(stored_rules(&pool, &x).await, before, "nothing was written");
+}
+
+/// Review scenario (e): a sub-folder that Rina authored under `X`, with
+/// nothing in it, still blocks the share of `X`: Reza holds only edit on it.
+#[tokio::test]
+async fn an_empty_sub_folder_of_another_person_blocks_the_share_of_its_parent() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+    a_third_reader(&pool).await;
+    let bob_id = user_id(&pool, "nadia@meridian.example").await;
+    let reports = a_shared_folder_opened_to_reza(&pool, "edit").await;
+    let x = folder_created(&router, &reza, "X", Some(&reports)).await;
+    let (status, body) = put_folder_rules(
+        &router,
+        &reza,
+        &x,
+        json!([{"userId": rina_id.to_string(), "level": "edit"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    folder_created(&router, &rina, "Rina's sub-folder", Some(&x)).await;
+    let before = stored_rules(&pool, &x).await;
+
+    let (status, body) = put_folder_rules(
+        &router,
+        &reza,
+        &x,
+        json!([{"userId": bob_id.to_string(), "level": "view"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {SHARE_NEEDS_MANAGE_OF_CONTENTS}")
+    );
+    assert_eq!(stored_rules(&pool, &x).await, before, "nothing was written");
+}
+
+/// Review scenario (f): Rina manages everything under her own folder, so
+/// she shares it.
+#[tokio::test]
+async fn someone_who_manages_everything_in_a_folder_shares_it() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let weekly = folder_created(&router, &rina, "Weekly", None).await;
+    let inner = folder_created(&router, &rina, "Inner", Some(&weekly)).await;
+    query_saved(&router, &rina, "Top", Some(&weekly)).await;
+    let (deep, _) = query_saved(&router, &rina, "Deep", Some(&inner)).await;
+
+    let (status, body) = put_folder_rules(
+        &router,
+        &rina,
+        &weekly,
+        json!([{"userId": reza_id.to_string(), "level": "view"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(level_on_query(&router, &reza, &deep).await, "view");
+}
+
+/// Review scenario (g): a PUT with no rule at all removes the rules of the
+/// folder, which changes who is covered, so it is refused in the same way.
+#[tokio::test]
+async fn an_empty_rule_list_is_refused_for_a_folder_holding_another_persons_query() {
+    let TestApp { router, pool } = spin_up().await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let (_reports, x, _query) = x_in_reports_holding_rinas_query(&router, &pool).await;
+    let before = stored_rules(&pool, &x).await;
+    assert_eq!(before.len(), 1, "Rina's edit rule is there to be removed");
+
+    let (status, body) = put_folder_rules(&router, &reza, &x, json!([])).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {SHARE_NEEDS_MANAGE_OF_CONTENTS}")
+    );
+    assert_eq!(stored_rules(&pool, &x).await, before, "nothing was written");
+}
+
+/// Review scenario (h): the checks before the new one keep their order. A
+/// caller who may not see the folder gets the 404, a caller who may see it
+/// but not manage it gets the manage 403, and a personal space gets its own
+/// 403, even when the folder holds what the caller does not manage.
+#[tokio::test]
+async fn the_earlier_refusals_of_a_folder_share_win_over_the_contents_rule() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let bob = a_third_reader(&pool).await;
+    let (reports, x, _query) = x_in_reports_holding_rinas_query(&router, &pool).await;
+
+    // Manage 403: Reza edits `Reports` and Bob sees `X` through the
+    // organisation, and neither manages what they ask to share.
+    let (status, body) = put_folder_rules(&router, &reza, &reports, json!([])).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {FOLDER_FORBIDDEN}")
+    );
+    let (status, body) = put_folder_rules(&router, &bob, &x, json!([])).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {FOLDER_FORBIDDEN}")
+    );
+
+    // Rina's personal space holds a folder Reza made inside her shared
+    // `Weekly`, which she does not manage.
+    let (_private, space) = query_saved(&router, &rina, "Private", None).await;
+    let weekly = folder_created(&router, &rina, "Weekly", Some(&space)).await;
+    let (status, body) = put_folder_rules(
+        &router,
+        &rina,
+        &weekly,
+        json!([{"userId": reza_id.to_string(), "level": "edit"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    folder_created(&router, &reza, "Reza's folder", Some(&weekly)).await;
+
+    // 404: Reza cannot see the space at all.
+    let (status, body) = put_folder_rules(&router, &reza, &space, json!([])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(error(&body), FOLDER_NOT_FOUND);
+
+    // Personal-space 403 for Rina, whose contents rule would also refuse.
+    let (status, body) = put_folder_rules(&router, &rina, &space, json!([])).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        error(&body),
+        format!("permission_denied: {PERSONAL_SPACE_NOT_SHARED}")
+    );
 }
