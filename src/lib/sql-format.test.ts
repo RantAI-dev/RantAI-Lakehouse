@@ -103,3 +103,27 @@ test("formatSql tidak menyentuh string, identifier, dan komentar di mode mana pu
     'select\n    "select"\nfrom\n    t'
   )
 })
+
+test("formatSql writes no space before a semicolon", () => {
+  assert.equal(formatSql("select 1;"), "SELECT 1;")
+  assert.equal(formatSql("select a from t where a > 1 ;"), "SELECT a\nFROM t\nWHERE a > 1;")
+})
+
+test("formatSql starts each statement after a semicolon on its own line", () => {
+  assert.equal(
+    formatSql("select 1; drop table x; select a from t;"),
+    "SELECT 1;\ndrop table x;\nSELECT a\nFROM t;"
+  )
+})
+
+test("formatSql keeps a semicolon inside a string or a comment where it is", () => {
+  assert.equal(formatSql("select 'a;b' from t"), "SELECT 'a;b'\nFROM t")
+  assert.equal(formatSql("select 1 -- a; b\n"), "SELECT 1 -- a; b")
+})
+
+test("formatSql indents every statement from the left margin", () => {
+  assert.equal(
+    formatSql("select a from t; select b from u", { indent: 2 }),
+    "SELECT\n  a\nFROM\n  t;\nSELECT\n  b\nFROM\n  u"
+  )
+})

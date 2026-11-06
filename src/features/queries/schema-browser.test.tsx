@@ -17,7 +17,38 @@ afterEach(() => {
   cleanup()
   mock.restore()
   window.localStorage.clear()
+  visit("/query-studio")
 })
+
+/** Points the browser at a Query Studio address, the way an href does. */
+function visit(path: string) {
+  const url = new URL(path, "http://localhost:3000").href
+  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(url)
+}
+
+/** Opens the studio on a Trino tab, the way an asset's "Open in Query Studio" link does. */
+function visitTrinoTab() {
+  visit("/query-studio?sql=SELECT%20*%20FROM%20&engine=trino")
+}
+
+const BRONZE_NEEDS_TRINO = "Bronze tables are read with Trino: switch this tab to Trino to insert it."
+
+/**
+ * A Bronze table's detail as the API sends it: the registry slug `demo_orders`
+ * is its id, `queryTarget` is the ClickHouse `DataLakeCatalog` name (never a
+ * Trino one), and `tableName` is what the Trino name is built from.
+ */
+function bronzeDetail(tableName = "orders") {
+  return {
+    schema: [{ name: "oid", dataType: "String" }],
+    layer: "raw",
+    type: "iceberg-table",
+    tableName,
+    namespace: "bronze",
+    name: "Demo Orders",
+    queryTarget: { engine: "clickhouse", table: `icecat_api.\`bronze.${tableName}\`` },
+  } as never
+}
 
 const ASSETS = [
   { id: "silver.orders", name: "Orders", namespace: "silver", layer: "silver" },
@@ -148,7 +179,7 @@ describe("SchemaBrowser", () => {
     await act(async () => {})
   })
 
-  it("does not insert a Bronze registry slug as if it were a table name", async () => {
+  it("says a Bronze table is read with Trino, and inserts nothing, on a ClickHouse tab before its detail loads", async () => {
     stubServices()
     const { container } = render(<Harness />)
     const view = editorView(container)
@@ -158,49 +189,70 @@ describe("SchemaBrowser", () => {
     fireEvent.click(row)
 
     expect(view.state.doc.toString()).toBe("SELECT * FROM ")
-    expect(row.getAttribute("title") ?? "").toContain("SQL name")
+    expect(row.getAttribute("title")).toBe(BRONZE_NEEDS_TRINO)
   })
 
-  it("makes a Bronze table insertable once its detail names the table", async () => {
+  it("keeps saying so on a ClickHouse tab once the detail has loaded, and offers no ClickHouse name", async () => {
     const getAsset = stubServices()
-    getAsset.mockResolvedValueOnce({
-      schema: [],
-      queryTarget: { engine: "clickhouse", table: "icecat_api.bronze.orders" },
-    } as never)
+    getAsset.mockResolvedValueOnce(bronzeDetail())
     const { container } = render(<Harness />)
     const view = editorView(container)
     setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
 
     fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
 
-    const insert = await screen.findByRole("button", {
-      name: "Insert icecat_api.bronze.orders",
-    })
-    fireEvent.click(insert)
-
-    expect(view.state.doc.toString()).toBe("SELECT * FROM icecat_api.bronze.orders")
+    // The detail landed: its column is listed.
+    expect(await screen.findByText("oid")).toBeTruthy()
+    const row = screen.getByRole("button", { name: "Demo Orders" })
+    fireEvent.click(row)
+    expect(row.getAttribute("title")).toBe(BRONZE_NEEDS_TRINO)
+    expect(screen.queryByRole("button", { name: /^Insert (iceberg|icecat_api)/ })).toBeNull()
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
   })
 
-  it("does not offer a Trino-only Bronze name on a ClickHouse tab", async () => {
+  it("inserts a Bronze table's Trino name on a Trino tab once its detail names the table", async () => {
+    visitTrinoTab()
     const getAsset = stubServices()
-    getAsset.mockResolvedValueOnce({
-      schema: [{ name: "oid", dataType: "String" }],
-      layer: "bronze",
-      type: "iceberg-table",
-      tableName: "orders",
-      namespace: "bronze",
-      name: "Demo Orders",
-    } as never)
-    render(<Harness />)
+    getAsset.mockResolvedValueOnce(bronzeDetail())
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
 
     fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
 
-    // The detail landed: its column is listed.
-    expect(await screen.findByText("oid")).toBeTruthy()
-    // The tab is ClickHouse and this name is Trino's, so it is not offered
-    // here; the row still says its SQL name is not known.
-    expect(screen.queryByRole("button", { name: "Insert iceberg.bronze.orders" })).toBeNull()
-    const row = screen.getByRole("button", { name: "Demo Orders" })
+    const insert = await screen.findByRole("button", { name: "Insert iceberg.bronze.orders" })
+    fireEvent.click(insert)
+
+    expect(view.state.doc.toString()).toBe("SELECT * FROM iceberg.bronze.orders")
+    await act(async () => {})
+  })
+
+  it("inserts a quoted Trino name as it is formed, without quoting its parts again", async () => {
+    visitTrinoTab()
+    const getAsset = stubServices()
+    getAsset.mockResolvedValueOnce(bronzeDetail("order lines"))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+    fireEvent.click(await screen.findByRole("button", { name: 'Insert iceberg.bronze."order lines"' }))
+
+    expect(view.state.doc.toString()).toBe('SELECT * FROM iceberg.bronze."order lines"')
+    await act(async () => {})
+  })
+
+  it("keeps the table's name unknown on a Trino tab until its detail loads", async () => {
+    visitTrinoTab()
+    stubServices()
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    const row = await screen.findByRole("button", { name: "Demo Orders" })
+    fireEvent.click(row)
+
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
     expect(row.getAttribute("title") ?? "").toContain("SQL name")
   })
 

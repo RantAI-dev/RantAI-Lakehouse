@@ -14,6 +14,13 @@ import type { useQueryStudio } from "./use-query-studio"
 const NO_SQL_NAME =
   "Its SQL name is not known here: the Trino name is on the asset's detail page."
 
+/**
+ * Why a Bronze table is not inserted on a ClickHouse tab: its only SQL name
+ * is Trino's (QS-4 QA of 2026-11-05).
+ */
+const BRONZE_NEEDS_TRINO =
+  "Bronze tables are read with Trino: switch this tab to Trino to insert it."
+
 /** The layers in the order the console lists them everywhere. */
 const LAYERS = Object.keys(DATA_LAYER_LABEL) as DataLayer[]
 
@@ -37,7 +44,7 @@ export function SchemaBrowser({
   readonly studio: ReturnType<typeof useQueryStudio>
   readonly onClose: () => void
 }) {
-  const { assetsState, tables, columns, loadColumns, insertAtCursor } = studio
+  const { assetsState, tables, columns, engine, loadColumns, insertAtCursor } = studio
   const [expanded, setExpanded] = React.useState<ReadonlySet<string>>(new Set())
 
   const toggle = (id: string) => {
@@ -101,6 +108,7 @@ export function SchemaBrowser({
                     <TableRow
                       key={table.id}
                       table={table}
+                      engine={engine}
                       open={expanded.has(table.id)}
                       state={columns[table.id]}
                       onToggle={() => toggle(table.id)}
@@ -120,6 +128,7 @@ export function SchemaBrowser({
 
 function TableRow({
   table,
+  engine,
   open,
   state,
   onToggle,
@@ -127,6 +136,7 @@ function TableRow({
   onRetry,
 }: {
   readonly table: CompletionTable
+  readonly engine: ReturnType<typeof useQueryStudio>["engine"]
   readonly open: boolean
   readonly state: ReturnType<typeof useQueryStudio>["columns"][string] | undefined
   readonly onToggle: () => void
@@ -134,6 +144,7 @@ function TableRow({
   readonly onRetry: () => void
 }) {
   const insertable = table.reference !== ""
+  const missingReason = table.trinoOnly && engine !== "trino" ? BRONZE_NEEDS_TRINO : NO_SQL_NAME
   return (
     <li>
       <div className="flex items-center gap-1">
@@ -156,9 +167,15 @@ function TableRow({
           type="button"
           className="min-w-0 flex-1 truncate rounded px-1 py-1 text-left hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-60 aria-disabled:hover:bg-transparent"
           aria-disabled={!insertable}
-          title={insertable ? `Insert ${table.reference}` : NO_SQL_NAME}
+          title={insertable ? `Insert ${table.reference}` : missingReason}
           aria-label={insertable ? `Insert ${table.reference}` : table.label}
-          onClick={insertable ? () => onInsert(quotedReference(table.reference)) : undefined}
+          onClick={
+            insertable
+              ? // A Trino name is formed and quoted already; splitting it on
+                // its dots would quote the quotes.
+                () => onInsert(table.trinoOnly ? table.reference : quotedReference(table.reference))
+              : undefined
+          }
         >
           <span>{table.label}</span>
           {insertable ? (

@@ -5,7 +5,8 @@ import * as React from "react"
 import { Prec } from "@codemirror/state"
 import { EditorView, keymap } from "@codemirror/view"
 
-import { assetQueryTarget } from "@/lib/asset-query"
+import { assetQueryTarget, trinoBronzeName } from "@/lib/asset-query"
+import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { levelAtLeast } from "@/features/dashboards/access-level"
@@ -316,35 +317,55 @@ export function useQueryStudio() {
   // The query target a table's detail named, keyed by the catalog id. The
   // detail is already fetched for a table a person expands or a statement
   // names; the same answer carries the SQL form.
+  // A Bronze table also keeps its registry `tableName`: that is what its
+  // Trino name is built from, and it is only on the detail.
   const [targets, setTargets] = React.useState<
-    Record<string, ReturnType<typeof assetQueryTarget>>
+    Record<string, { target: ReturnType<typeof assetQueryTarget>; bronzeTable: string | null }>
   >({})
 
   // The tables in the shape the completion needs: the SQL name to insert,
   // the name a person reads, and every name the table answers to.
   //
   // A Bronze asset's registry slug is not a SQL name, so such a table has
-  // no reference until its detail is loaded; the target the detail names
-  // is offered on the engine it serves — a Trino-only name on a Trino tab
-  // only. An id that reads as a SQL name keeps being the reference, as it
-  // always was.
+  // no reference until its detail is loaded. A Bronze table has two names:
+  // the ClickHouse one the server names (`queryTarget`, for the catalog
+  // page) and its Trino name, built here from the detail. The studio offers
+  // only the Trino one, and only on a Trino tab; on a ClickHouse tab the
+  // reference stays empty (`trinoOnly` tells the schema browser why). An id
+  // that reads as a SQL name keeps being the reference, as it always was.
+  // (QS-4 QA of 2026-11-05)
   const tables = React.useMemo<CompletionTable[]>(() => {
     if (assetsState.status !== "success") return []
     return assetsState.data.map((asset) => {
-      const fallback = SQL_TABLE_NAME.test(asset.id) ? asset.id : ""
-      const target = targets[asset.id]
-      const reference =
-        fallback !== ""
-          ? fallback
-          : target && (target.engine !== "trino" || engine === "trino")
-            ? target.table
-            : ""
+      const names = [asset.id, `${asset.namespace}.${asset.name}`]
+      if (SQL_TABLE_NAME.test(asset.id)) {
+        return { id: asset.id, label: asset.name, reference: asset.id, layer: asset.layer, names }
+      }
+      const detail = targets[asset.id]
+      // Before the detail, the layer is all there is to tell a Bronze table.
+      const trinoOnly = detail
+        ? detail.bronzeTable !== null
+        : asset.layer === "raw" || asset.layer === "bronze"
+      if (trinoOnly) {
+        const trino = detail?.bronzeTable ? trinoBronzeName(detail.bronzeTable) : ""
+        // Both spellings of a Trino name resolve to this table, whatever its id.
+        if (detail?.bronzeTable) names.push(trino, `bronze.${detail.bronzeTable}`)
+        return {
+          id: asset.id,
+          label: asset.name,
+          reference: engine === "trino" ? trino : "",
+          layer: asset.layer,
+          names,
+          trinoOnly: true,
+        }
+      }
+      const target = detail?.target
       return {
         id: asset.id,
         label: asset.name,
-        reference,
+        reference: target && (target.engine !== "trino" || engine === "trino") ? target.table : "",
         layer: asset.layer,
-        names: [asset.id, `${asset.namespace}.${asset.name}`],
+        names,
       }
     })
   }, [assetsState.status, assetsState.data, targets, engine])
@@ -393,7 +414,11 @@ export function useQueryStudio() {
           // form; an id that already reads as one keeps being the
           // reference and the answer is not read for names.
           if (!SQL_TABLE_NAME.test(id)) {
-            setTargets((previous) => ({ ...previous, [id]: assetQueryTarget(detail) }))
+            const bronzeTable = isIcebergCandidate(detail) ? (detail.tableName ?? null) : null
+            setTargets((previous) => ({
+              ...previous,
+              [id]: { target: assetQueryTarget(detail), bronzeTable },
+            }))
           }
           rememberColumns(id, {
             status: "ready",

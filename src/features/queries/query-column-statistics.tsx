@@ -79,7 +79,8 @@ export function QueryColumnStatistics({
       </div>
 
       <p className="text-xs text-muted-foreground">
-        Statistics for {column} of the {formatNumber(rows.length)} rows shown.
+        Statistics for {column} of the {formatNumber(rows.length)}{" "}
+        {rows.length === 1 ? "row" : "rows"} shown.
       </p>
 
       <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-4">
