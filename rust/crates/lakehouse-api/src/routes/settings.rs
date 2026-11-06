@@ -997,6 +997,112 @@ fn email_row_to_save(
     ))
 }
 
+/// One feature of the deployment, as the console shows it (plan D8).
+fn feature(name: &str, on: bool, missing: &[&str], source: &str) -> Value {
+    json!({
+        "feature": name,
+        "on": on,
+        "missing": missing,
+        "where": source,
+    })
+}
+
+/// Which of the deployment's features are set up, and what is missing for
+/// the ones that are not (plan D8).
+///
+/// It reports CONFIGURATION, never health: "on" means the settings are in
+/// place, which is what the console can honestly say. Whether the mail
+/// server really answers is the test email's question.
+///
+/// A missing setting is named the way the operator sets it: the environment
+/// variable for a setting only the server owns, the console's own field
+/// name for a setting the console can set. `where` says which of the two
+/// it is — a feature the server owns is read-only in the console.
+fn deployment_features(state: &AppState, email: &EffectiveEmail) -> Vec<Value> {
+    let config = &state.config;
+    // PDF export needs all three of these (feature decision 6).
+    let mut pdf_missing: Vec<&str> = Vec::new();
+    if config.gotenberg_url.is_none() {
+        pdf_missing.push("GOTENBERG_URL");
+    }
+    if config.console_internal_url.is_none() {
+        pdf_missing.push("CONSOLE_INTERNAL_URL");
+    }
+    if config.render_token_secret.is_none() {
+        pdf_missing.push("RENDER_TOKEN_SECRET");
+    }
+    // Single sign-on is on when the `OIDC` authenticator was built, which
+    // needs an issuer and a client id (`state.rs`'s `oidc_config`).
+    let single_sign_on = state
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.oidc.as_ref())
+        .is_some();
+    let sso_missing: Vec<&str> = if single_sign_on {
+        Vec::new()
+    } else {
+        vec!["OIDC_ISSUER", "OIDC_CLIENT_ID"]
+    };
+    // The assistant is on when it has a key (`ADM-9` reads the saved one
+    // in slice 2; today the environment owns it).
+    let assistant = !config.llm_key.is_empty();
+    let assistant_missing: Vec<&str> = if assistant {
+        Vec::new()
+    } else {
+        vec!["LLM_KEY"]
+    };
+    vec![
+        feature("pdfExport", pdf_missing.is_empty(), &pdf_missing, "server"),
+        feature(
+            "email",
+            email.host.is_some(),
+            if email.host.is_some() { &[] } else { &["host"] },
+            if email.host_source == Source::Server {
+                "server"
+            } else {
+                "console"
+            },
+        ),
+        feature(
+            "consoleAddress",
+            email.console_public_url.is_some(),
+            if email.console_public_url.is_some() {
+                &[]
+            } else {
+                &["consolePublicUrl"]
+            },
+            if email.console_public_url_source == Source::Server {
+                "server"
+            } else {
+                "console"
+            },
+        ),
+        feature("singleSignOn", single_sign_on, &sso_missing, "server"),
+        feature("assistant", assistant, &assistant_missing, "server"),
+    ]
+}
+
+/// `GET /api/settings/deployment` — which of the deployment's features are
+/// set up, and what is missing for the ones that are not (plan D8).
+///
+/// It reports configuration, never health: a feature is "on" when its
+/// settings are in place. Backups are not in the list — the API cannot see
+/// the backup container's settings (feature page, Limits).
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the saved email settings cannot be
+/// read: the answer must not claim a feature is off when the database
+/// could not be asked.
+pub async fn get_deployment(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let email = crate::runtime_settings::email_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    Ok(ApiJson(json!({
+        "features": deployment_features(&state, &email),
+    })))
+}
+
 /// `PUT /api/settings/email` — save the mail server, the account, the
 /// password, the `From` address and the console's public address (plan D9).
 ///

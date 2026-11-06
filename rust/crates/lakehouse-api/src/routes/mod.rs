@@ -1671,6 +1671,9 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/email/test",
             axum::routing::post(settings::post_email_test),
         )
+        // Which of the deployment's features are set up (`ADM-6`); see
+        // `routes::settings`.
+        .route("/api/settings/deployment", get(settings::get_deployment))
         // Time and row limits of charts and Query Studio (`BI-5`); see
         // `routes::query_limits`.
         // Stop (`BI-5`): ends the caller's own queries of one run.

@@ -793,6 +793,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/settings/email",         Policy::RequiresPermission("settings:write")),
     ("PUT",    "/api/settings/email",         Policy::RequiresPermission("settings:write")),
     ("POST",   "/api/settings/email/test",   Policy::RequiresPermission("settings:write")),
+    // ── The deployment's feature list (`ADM-6`, `routes::settings`): which
+    //    features are set up and what is missing for the ones that are not.
+    //    It names the deployment's own settings, so it needs the same
+    //    permission as the email screen (plan D4). ────────────────────────
+    ("GET",    "/api/settings/deployment",    Policy::RequiresPermission("settings:write")),
     // ── Query limits (`BI-5`, `routes::query_limits`): anyone signed in reads
     //    the limits that apply to them; changing them is `settings:write`. ──
     ("GET",    "/api/settings/limits",        Policy::RequiresAuth),
