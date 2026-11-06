@@ -183,6 +183,50 @@ main checkout at the same time. The same test passes in isolation and on the
 base commit, and the second full-crate run with the fix in place is **3121
 passed; 0 failed; 18 ignored**. Nothing in this slice touches that path.
 
+### Handoff (slice A)
+
+Developer: DeepSeek / Antigravity
+Branch: `ci/rel-20-faster-rust-tests`
+Decisions implemented: D1, D2 (Tasks A1, A2)
+
+#### 1. Module tree reduction (D1)
+- `rust/crates/lakehouse-api/src/main.rs`: removed all 68 `mod` redeclarations; `main.rs` is now a thin wrapper invoking `lakehouse_api::run()`.
+- Module counts (`grep -cE '^\s*(pub )?mod ' rust/crates/lakehouse-api/src/main.rs rust/crates/lakehouse-api/src/lib.rs`):
+  - Before: `main.rs: 68`, `lib.rs: 67`
+  - After: `main.rs: 0`, `lib.rs: 69`
+
+#### 2. Test counts before and after (D2)
+Command: `cargo test -p lakehouse-api --lib --bins -- --list 2>&1 | grep -E 'Running|tests, [0-9]+ benchmarks'`
+
+Before:
+```
+     Running unittests src/lib.rs (target/debug/deps/lakehouse_api-d988df818378896b)
+3139 tests, 0 benchmarks
+     Running unittests src/main.rs (target/debug/deps/lakehouse_api-1838147501e0edcb)
+3177 tests, 0 benchmarks
+```
+Distinct unit tests before: 3191 tests (3125 common + 14 `csv_safe` only in lib + 52 in main tests).
+
+After:
+```
+     Running unittests src/lib.rs (target/debug/deps/lakehouse_api-d988df818378896b)
+3191 tests, 0 benchmarks
+     Running unittests src/main.rs (target/debug/deps/lakehouse_api-1838147501e0edcb)
+0 tests, 0 benchmarks
+```
+Test execution result (`cargo test -p lakehouse-api --lib --bins`):
+```
+test result: ok. 3173 passed; 0 failed; 18 ignored; 0 measured; 0 filtered out; finished in 341.54s
+```
+No unit tests lost; all 3191 distinct unit tests run under `src/lib.rs`.
+
+#### 3. Verification
+- `cargo fmt --check`: passed cleanly.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: passed cleanly.
+- `cargo run -p lakehouse-api`: reaches identical startup config error:
+  `Error: CONNECTOR_SECRETS_KEY must be set to 32 random bytes in base64 (generate one with: openssl rand -base64 32)`
+- Full integration test execution across all 50+ `tests/*.rs` integration targets in `lakehouse-api`: *not verified* locally due to per-command timeout constraints on this worker machine (CI runs the full workspace). All targets verified to compile cleanly with `cargo check -p lakehouse-api --all-targets`.
+
 ## 5. Review
 
 - **R1 (BLOCKER, fixed by the planner in CI config).** The three partitions uploaded their
@@ -194,3 +238,11 @@ passed; 0 failed; 18 ignored**. Nothing in this slice touches that path.
   3,100 tests), so the floor must be lowered in the same PR to the new measured total from
   that PR's CI, with the before/after numbers in the comment. Never lower it for any other
   reason (AGENTS.md rule 2).
+- **R2 resolved (planner, 2026-11-06).** Slice A was merged into this branch so one PR
+  carries both. The floor is now 6,826: 9,935 run on PR #397 run 42197087127, minus the
+  binary's 3,161, plus the 52 tests that existed only in the binary (counted by test name
+  across the three partition logs).
+- Reviewed slice A (`072e8942`): `main.rs` is 42 lines and calls `lakehouse_api::run()`;
+  the code moved into `lib.rs` matches what left `main.rs` line for line except new doc
+  comments and `run` becoming `pub`. Reviewed the D6 fix (`574b8133`): test-only, answers
+  the bootstrap's DDL and its `system.columns` read; no assertion changed.

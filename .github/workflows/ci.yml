@@ -3951,9 +3951,13 @@ jobs:
       # REL-20 (D4): the three nextest partitions each upload their test
       # count as their own artifact (`test-counts-{1,2,3}`, one file
       # `partition-N.txt` each). Merge them and sum, failing the job if the
-      # total dropped below `main`'s single-run count (9921 passed, plan §0).
-      # A dropped partition removes roughly a third of ~9900 tests, well
-      # below the floor; the floor is the real measured number, not a guess.
+      # total dropped below the floor. The floor is measured, not guessed:
+      # 9,935 tests ran on PR #397 (run 42197087127) while the API's unit
+      # tests still ran twice; REL-20 slice A removed the binary's copy
+      # (3,161 tests run there), keeping the 52 that existed only in it, so
+      # 9,935 - 3,161 + 52 = 6,826 (review R2). A dropped partition removes
+      # about a third of that, well below the floor. Raise it as tests are
+      # added; lower it only with a measured reason like this one.
       # Same scope as the `test` job: only when it actually ran.
       - name: Download nextest partition counts (REL-20)
         if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
@@ -3978,9 +3982,9 @@ jobs:
             echo "partition $p: $n tests run"
             total=$((total + n))
           done
-          echo "nextest total across partitions: $total (main: 9921 passed)"
-          echo "## Nextest partition sum: $total (vs main 9921 passed)" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$total" -lt 9921 ]; then
-            echo "::error::nextest total $total is below main's 9921 passed"
+          echo "nextest total across partitions: $total (floor 6826)"
+          echo "## Nextest partition sum: $total (floor 6826)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$total" -lt 6826 ]; then
+            echo "::error::nextest total $total is below the floor of 6826 (a partition or tests went missing)"
             exit 1
           fi
