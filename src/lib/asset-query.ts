@@ -18,8 +18,7 @@ export function quoteIdent(part: string) {
 }
 
 /**
- * A Bronze table's name in Trino: `iceberg.bronze.<table>`, the form Query
- * Studio's time-travel control also writes.
+ * A Bronze table's name in Trino: `iceberg.bronze.<table>`.
  *
  * A table name that is not a plain identifier comes out quoted
  * (`iceberg.bronze."order lines"`). Completion reads such a name only up to
@@ -35,11 +34,10 @@ export function trinoBronzeName(tableName: string): string {
  * there. The API's own `queryTarget` wins whenever it sent one — it knows
  * which table actually exists (an Iceberg-only dataset is read through
  * ClickHouse's `DataLakeCatalog` database). Without it: an Iceberg
- * candidate is addressed through Trino's `iceberg` catalog, the same
- * `iceberg.bronze.<table>` form Query Studio's time-travel control writes,
- * and anything else keeps the `namespace.name` form Query Studio's
- * autocomplete offers, quoted where needed (double quotes, which both
- * ClickHouse and Trino accept).
+ * candidate is addressed through Trino's `iceberg` catalog
+ * (`iceberg.bronze.<table>`), and anything else keeps the `namespace.name`
+ * form Query Studio's autocomplete offers, quoted where needed (double
+ * quotes, which both ClickHouse and Trino accept).
  */
 export function assetQueryTarget(a: Target): {
   engine: QueryEngine

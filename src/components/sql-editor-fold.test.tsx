@@ -4,8 +4,9 @@
 // fold binding and the test would prove nothing.
 import { cleanup, fireEvent, render } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
-import { foldedRanges } from "@codemirror/language"
+import { foldCode, foldedRanges } from "@codemirror/language"
 import type { EditorView } from "@codemirror/view"
+import { EDITOR_SHORTCUTS } from "@/lib/editor-shortcuts"
 import { SqlEditor } from "./sql-editor"
 
 afterEach(cleanup)
@@ -29,6 +30,35 @@ function press(view: EditorView, bracket: Bracket, shiftedKey = true) {
     ctrlKey: true,
     shiftKey: true,
   })
+}
+
+const BRACKET_KEY_CODES = { "[": 219, "]": 221 } as const
+const SHIFTED_BRACKETS = { "[": "{", "]": "}" } as const
+
+/**
+ * The keydown a browser sends for a chord string of `EDITOR_SHORTCUTS`
+ * ("Ctrl-Shift-[", "Cmd-Alt-]"). It throws on a shape it does not know, so a
+ * new modifier or key makes the test fail instead of silently pressing nothing.
+ */
+function chordToKeyDown(chord: string): KeyboardEventInit & { keyCode: number } {
+  const parts = chord.split("-")
+  const bracket = parts.pop()
+  if (bracket !== "[" && bracket !== "]") {
+    throw new Error(`fold chord "${chord}" does not end in a bracket key`)
+  }
+  const init = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false }
+  for (const modifier of parts) {
+    if (modifier === "Ctrl") init.ctrlKey = true
+    else if (modifier === "Shift") init.shiftKey = true
+    else if (modifier === "Alt") init.altKey = true
+    else if (modifier === "Cmd") init.metaKey = true
+    else throw new Error(`fold chord "${chord}" has an unknown modifier "${modifier}"`)
+  }
+  return {
+    ...init,
+    key: init.shiftKey ? SHIFTED_BRACKETS[bracket] : bracket,
+    keyCode: BRACKET_KEY_CODES[bracket],
+  }
 }
 
 function mount(cursorLine: number, doc = SQL) {
@@ -93,5 +123,30 @@ describe("SqlEditor fold keys", () => {
       }
     }
     expect(foldedCount(view)).toBe(0)
+  })
+
+  // `foldKeys` in `sql-editor.tsx` matches the physical keys itself, so a
+  // change to the chords `EDITOR_SHORTCUTS` shows to a person has to reach it.
+  describe("matches the chords listed in EDITOR_SHORTCUTS", () => {
+    for (const action of ["Fold", "Unfold"] as const) {
+      const entry = EDITOR_SHORTCUTS.find((e) => e.action === action)
+      if (!entry) throw new Error(`EDITOR_SHORTCUTS has no "${action}" entry`)
+      if (!entry.macKey) throw new Error(`the "${action}" entry has no macKey`)
+
+      for (const chord of [entry.key, entry.macKey]) {
+        it(`${action.toLowerCase()}s on ${chord}, leaving the text and indentation alone`, () => {
+          const view = mount(1)
+          // Start folded for Unfold, so the key has something to undo.
+          if (action === "Unfold") {
+            foldCode(view)
+            expect(foldedCount(view)).toBe(1)
+          }
+
+          fireEvent.keyDown(view.contentDOM, chordToKeyDown(chord))
+          expect(foldedCount(view)).toBe(action === "Fold" ? 1 : 0)
+          expect(view.state.doc.toString()).toBe(SQL)
+        })
+      }
+    }
   })
 })
