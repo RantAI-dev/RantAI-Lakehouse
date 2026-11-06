@@ -4502,9 +4502,11 @@ async fn an_empty_rule_list_is_refused_for_a_folder_holding_another_persons_quer
 }
 
 /// Review scenario (h): the checks before the new one keep their order. A
-/// caller who may not see the folder gets the 404, a caller who may see it
-/// but not manage it gets the manage 403, and a personal space gets its own
-/// 403, even when the folder holds what the caller does not manage.
+/// caller who may not see the folder gets the 404, and a caller who may see
+/// it but not manage it gets the manage 403; both win over the contents 403
+/// for a folder that holds another person's query. A personal space gets its
+/// own 403. Its owner manages all content in the space, so the contents rule
+/// cannot also refuse there.
 #[tokio::test]
 async fn the_earlier_refusals_of_a_folder_share_win_over_the_contents_rule() {
     let TestApp { router, pool } = spin_up().await;
@@ -4529,8 +4531,8 @@ async fn the_earlier_refusals_of_a_folder_share_win_over_the_contents_rule() {
         format!("permission_denied: {FOLDER_FORBIDDEN}")
     );
 
-    // Rina's personal space holds a folder Reza made inside her shared
-    // `Weekly`, which she does not manage.
+    // Rina shares `Weekly`, a folder inside her personal space, with Reza.
+    // Reza holds edit on it and still gets the 404 for the space below.
     let (_private, space) = query_saved(&router, &rina, "Private", None).await;
     let weekly = folder_created(&router, &rina, "Weekly", Some(&space)).await;
     let (status, body) = put_folder_rules(
@@ -4541,14 +4543,14 @@ async fn the_earlier_refusals_of_a_folder_share_win_over_the_contents_rule() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    folder_created(&router, &reza, "Reza's folder", Some(&weekly)).await;
 
     // 404: Reza cannot see the space at all.
     let (status, body) = put_folder_rules(&router, &reza, &space, json!([])).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(error(&body), FOLDER_NOT_FOUND);
 
-    // Personal-space 403 for Rina, whose contents rule would also refuse.
+    // Personal-space 403 for Rina, the owner. She manages all content in her
+    // space, so the contents rule cannot also refuse here.
     let (status, body) = put_folder_rules(&router, &rina, &space, json!([])).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(
