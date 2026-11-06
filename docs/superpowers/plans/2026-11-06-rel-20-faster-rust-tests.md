@@ -73,6 +73,116 @@ Running fewer tests per PR (changed-crate selection). Speeding up `upload_routes
 
 ## 4. Handoff
 
+### Handoff (slice B, D6)
+
+**Developer report, 2026-11-06.** Branch `ci/rel-20-nextest`, off
+`origin/ci/rel-20-nextest` `5b9025ba` ("ci(rel-20): one count artifact per
+partition (review R1)"). Two commits: the fix, then this entry. No PR opened
+or merged.
+
+#### The two failures (D6)
+
+Both in `rust/crates/lakehouse-api/src/routes/metrics.rs`, `mod tests`:
+
+| Test | The `unwrap` that failed (before the fix) |
+|---|---|
+| `a_chart_the_caller_cannot_see_blocks_a_delete_without_being_named` | `metrics.rs:1075` |
+| `a_chart_on_a_restricted_dashboard_blocks_a_delete_without_being_named` | `metrics.rs:1142` |
+
+Both failed with `Unprocessable("The metric could not be read or saved.")` —
+the fixed message of `classify_ch` (`routes/metrics.rs:52-54`), so no
+upstream error text reached the assertion.
+
+#### Cause
+
+`lakehouse_bi::store::ensure_bi_table` runs the BI DDL bootstrap at most once
+per PROCESS, guarded by the `BI_TABLE_ENSURED` atomic
+(`rust/crates/lakehouse-bi/src/store.rs:676`). Both tests read through
+`Seen::read` (`routes/dashboard_organise.rs:314`), which calls
+`store::list_stored_charts` and `store::list_boards`; each of those calls
+`ensure_bi_table` first (`store.rs:3041`, `store.rs:1328`).
+
+Under `cargo test` one process runs the whole binary, so an earlier test had
+already run the bootstrap and the guard was set: the DDL never reached the
+test's `wiremock` server. `cargo-nextest` gives every test its own process,
+so the guard starts "not started", the DDL goes to THIS test's mock server,
+the unanswered statement is a 404, and the read that follows it fails.
+
+#### The fix (in the test, not in production code)
+
+One helper, `answer_bi_ddl`, in the same `mod tests`, answers the bootstrap:
+
+- the 36 DDL statements of `ensure_bi_table_uncached` and its three helpers
+  (`store.rs:989`, `:728`, `:923`, `:1121`). Every one of them carries `IF NOT
+  EXISTS` (checked statement by statement), and `ChClient::exec` discards the
+  body (`lakehouse-clickhouse/src/lib.rs:453-470`), so an empty 200 is enough;
+- the bootstrap's last step, `copy_legacy_embed_state`'s read of
+  `system.columns` (`store.rs:818-825`), which asks whether the legacy embed
+  columns are still on `console.bi_board`. It is a read, so it needs a body:
+  no rows means "no legacy columns", the copy is skipped, exactly as on a
+  fresh database.
+
+Both tests call it before they read. No assertion was changed, no test was
+skipped or `#[ignore]`d, and no production file was touched: D6 fixes the
+test, not the code.
+
+#### Commands, as run
+
+All from `rust/`, with `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target` (the
+shared target dir) and `CARGO_BUILD_JOBS=2` (the memory cap on this machine).
+
+- **Before the fix** — the nextest condition reproduced locally by running
+  the one test in its own process (`cargo test -p lakehouse-api --lib
+  routes::metrics::tests::a_chart_the_caller_cannot_see_blocks_a_delete_without_being_named
+  -- --exact`): **FAILED** with
+  `called 'Result::unwrap()' on an 'Err' value: Unprocessable("The metric could not be read or saved. Reference: 1e7792a948")`
+  at `metrics.rs:1075:63`.
+- `cargo fmt --check` — no output, exit 0.
+- `cargo test -p lakehouse-api --lib routes::metrics` — **3 passed; 0 failed;
+  0 ignored; 3136 filtered out**.
+- `cargo test -p lakehouse-api --lib routes::metrics::tests::a_chart_the_caller_cannot_see_blocks_a_delete_without_being_named -- --exact` —
+  **1 passed; 0 failed; 0 ignored; 3138 filtered out**. Its own process, so
+  the `BI_TABLE_ENSURED` guard starts unset, exactly as under nextest.
+- `cargo test -p lakehouse-api --lib routes::metrics::tests::a_chart_on_a_restricted_dashboard_blocks_a_delete_without_being_named -- --exact` —
+  **1 passed; 0 failed; 0 ignored; 3138 filtered out**. Same.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean, no
+  warnings.
+- `cargo test -p lakehouse-api --lib` (the whole crate's unit tests, with the
+  fix) — **3121 passed; 0 failed; 18 ignored** (401.89 s). The base commit
+  `5b9025ba` gives the same count on the same machine: **3121 passed; 0
+  failed; 18 ignored** (412.51 s).
+
+#### Not verified
+
+- **`cargo nextest run` itself.** cargo-nextest is not installed on this
+  machine and the task says not to install it, so this is **not verified
+  locally, CI proves it**. The local stand-in for "each test in its own
+  process" is `cargo test --lib <one test> -- --exact`: the test binary
+  starts fresh, so `BI_TABLE_ENSURED` starts "not started" and the bootstrap
+  reaches the test's own mock server, which is the condition nextest
+  creates. That is how the failure was reproduced before the fix and shown to
+  be gone after it. The CI `test` job runs `cargo nextest run --workspace
+  --locked --profile ci --color never --partition "count:N/3"`
+  (`.github/workflows/ci.yml:486-490`) and is the real proof.
+- **The three partitions' counts** are not moved by this slice: the commit
+  touches no test, it fixes two of them.
+
+#### One note for the reviewer
+
+The FIRST full-crate run of `cargo test -p lakehouse-api --lib` with the fix
+in place had one failure,
+`routes::alerts::alert_run_tenant_scope::every_mart_rule_is_refused_with_d6_and_the_next_rule_still_runs`
+(a `#[sqlx::test]`): `failed to connect test pool: database "_sqlx_test_..."
+does not exist. It seems to have just been dropped or renamed.` That is the
+test-database sweeper of `lakehouse-test-support` racing with another cargo
+process on the shared Postgres container — the repo documents the hazard
+(`lakehouse-test-support/src/lib.rs:77-87`, and `:100-105`: "the sweep of one
+process can drop a database that a test of another process has just created
+and has not connected to yet"), and another developer was running cargo in the
+main checkout at the same time. The same test passes in isolation and on the
+base commit, and the second full-crate run with the fix in place is **3121
+passed; 0 failed; 18 ignored**. Nothing in this slice touches that path.
+
 ## 5. Review
 
 - **R1 (BLOCKER, fixed by the planner in CI config).** The three partitions uploaded their
