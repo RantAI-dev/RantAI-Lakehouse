@@ -117,6 +117,84 @@ test("sqlCompletionOptions memberi kolom tabel Bronze yang ditulis dengan namesp
   assert.deepEqual(options.map((option) => option.label), ["oid"])
 })
 
+/**
+ * A Bronze table as the studio hands it over on a Trino tab: the registry slug
+ * is not the table's name in Trino, so the Trino name is one of its names.
+ */
+const BRONZE_ON_TRINO: CompletionTable = {
+  id: "demo_orders",
+  label: "Demo Orders",
+  reference: "iceberg.bronze.orders",
+  layer: "raw",
+  names: ["demo_orders", "bronze.Demo Orders", "iceberg.bronze.orders", "bronze.orders"],
+  trinoOnly: true,
+}
+const BRONZE_COLUMNS: Record<string, ColumnState> = {
+  demo_orders: { status: "ready", columns: [{ name: "oid", dataType: "String" }] },
+}
+
+test("sqlCompletionOptions offers the columns after an alias on a Bronze table's Trino name, whatever its id", () => {
+  const sql = "SELECT b. FROM iceberg.bronze.orders b"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "b."),
+    tables: [BRONZE_ON_TRINO],
+    columns: BRONZE_COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["oid"])
+})
+
+test("sqlCompletionOptions finds a Bronze table by its Trino name even when it has no reference of its own", () => {
+  const sql = "SELECT b. FROM iceberg.bronze.orders b"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "b."),
+    tables: [{ ...BRONZE_ON_TRINO, reference: "" }],
+    columns: BRONZE_COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["oid"])
+})
+
+test("sqlCompletionOptions offers the columns after an alias on bronze.<table>", () => {
+  const sql = "SELECT b. FROM bronze.orders AS b"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "b."),
+    tables: [BRONZE_ON_TRINO],
+    columns: BRONZE_COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["oid"])
+})
+
+test("sqlCompletionOptions offers a Bronze table by its Trino name after FROM on a Trino tab", () => {
+  const sql = "SELECT * FROM "
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: [BRONZE_ON_TRINO],
+    columns: {},
+  })
+  assert.deepEqual(options, [
+    {
+      label: "iceberg.bronze.orders",
+      kind: "table",
+      detail: "Demo Orders",
+      apply: "iceberg.bronze.orders",
+    },
+  ])
+})
+
+test("sqlCompletionOptions offers no Bronze table after FROM on a ClickHouse tab", () => {
+  const sql = "SELECT * FROM "
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: [{ ...BRONZE_ON_TRINO, reference: "" }, TABLES[0] as CompletionTable],
+    columns: {},
+  })
+  assert.deepEqual(options.map((option) => option.label), ["silver.orders"])
+})
+
 test("sqlCompletionOptions tidak mencampur kolom dua tabel yang nama kolomnya sama", () => {
   const sql = "SELECT a., b. FROM silver.orders a JOIN serving.customers b"
   const first = sqlCompletionOptions({
