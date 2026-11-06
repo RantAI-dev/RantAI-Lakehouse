@@ -271,7 +271,7 @@ Output:
        DAGSTER_REPO: __repository__
 -      DAGSTER_URL: http://localhost:13030/graphql
 +      DAGSTER_URL: http://dagster-webserver:3000/graphql
-       DATABASE_URL: postgres://lakehouse:rel19-equivalence-postgres@postgres:5432/lakehouse
+       DATABASE_URL: postgres://lakehouse:<dummy>@postgres:5432/lakehouse
        EMBED_SECRET: ""
        EMBED_TOKEN_MAX_LIFETIME_SECONDS: ""
 @@ -1196,7 +1196,7 @@
@@ -299,8 +299,8 @@ Output:
 -      LAKEKEEPER_BASE_URI: http://localhost:8181
 +      LAKEKEEPER_BASE_URI: http://lakekeeper:8181
        LAKEKEEPER_WAREHOUSE: default
-       RUSTFS_ACCESS_KEY: rel19-equivalence-access
-       RUSTFS_SECRET_KEY: rel19-equivalence-secret
+       RUSTFS_ACCESS_KEY: <dummy>
+       RUSTFS_SECRET_KEY: <dummy>
 ```
 Shows only the in-network container defaults for `DAGSTER_URL` and `LAKEKEEPER_BASE_URI` (plus `LAKEKEEPER__BASE_URI` which reads `LAKEKEEPER_BASE_URI`).
 
