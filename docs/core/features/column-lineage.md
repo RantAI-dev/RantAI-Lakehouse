@@ -96,3 +96,8 @@ to the AI team in [`AI-16`](ai-16.md).
 
 This page's decisions need the product owner's signature; the plan follows
 (`AGENTS.md`).
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- The lineage panel states the retention (365 days) and the oldest visible record.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

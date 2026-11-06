@@ -82,12 +82,6 @@ export type AgentRun = {
   auditEventId?: string
 }
 
-/** Optional body for `POST /api/agents/employees/{id}/run`. */
-export type RunEmployeeInput = {
-  /** Overrides the employee's own `prompt` for this run only. */
-  prompt?: string
-}
-
 export type ApprovalItem = {
   id: string
   employeeId: string
@@ -117,14 +111,17 @@ export type ApprovalItem = {
    */
   kind: "tool_call" | "access"
   /**
-   * The human who requested this approval — set only for `kind =
-   * "access"`, `undefined` for `kind = "tool_call"` (a digital employee
-   * acted; no single human requester exists). Used to disable the decide
-   * button for the requester's own pending request — see
-   * `isOwnAccessRequest` in `@/lib/access-requests`. The server-side
-   * refusal (`routes::catalog::decide_access_request`, WS7 item E3) is
-   * what actually enforces self-approval refusal; this is belt-and-
-   * suspenders only.
+   * The human who requested this approval — set for `kind = "access"`
+   * (a catalog access request) AND for a `kind = "tool_call"` a person
+   * asked for (`SEC-57`: the chat and `POST /api/ai/tool` record the
+   * signed-in principal, a headless run started by a person records that
+   * run's principal). `undefined` for a `kind = "tool_call"` nobody asked
+   * for in person — a scheduled run or a service identity.
+   *
+   * Used to disable the decision buttons for the requester's own pending
+   * request — see `isOwnRequest` in `@/lib/access-requests`. The
+   * server-side refusal (`routes::agents::refuse_own_request`, `SEC-57`)
+   * is what actually enforces it; this is belt-and-suspenders only.
    */
   requestedByUserId?: string
 }
@@ -152,20 +149,15 @@ export type DecideApprovalResult = {
   result?: unknown
 }
 
-export type CreateEmployeeInput = {
-  name: string
-  purpose: string
-  autonomy: AutonomyLevel
-  allowedTools: string[]
-  dataScope: string
-  budgetLimit: number
-  owner?: string
-}
-
 export interface AgentService {
-  listEmployees(signal?: AbortSignal): Promise<DigitalEmployee[]>
+  /**
+   * Employee definitions are read by a run's detail page (`/agents/runs/[runId]`
+   * shows whose run it was). Run detail is the only remaining consumer: the
+   * employee list and detail pages were removed by `WEB-3` slice 1, along with
+   * their create/suspend/resume/revoke/run actions and the runs list. The
+   * backend routes stay registered (`WEB-3` D2, `WEB-4` retires them).
+   */
   getEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
-  listRuns(employeeId?: string, signal?: AbortSignal): Promise<AgentRun[]>
   getRun(id: string, signal?: AbortSignal): Promise<AgentRun>
   listApprovals(employeeId?: string, signal?: AbortSignal): Promise<ApprovalItem[]>
   decideApproval(
@@ -173,23 +165,4 @@ export interface AgentService {
     input: DecideApprovalInput,
     signal?: AbortSignal
   ): Promise<DecideApprovalResult>
-  createEmployee(
-    input: CreateEmployeeInput,
-    signal?: AbortSignal
-  ): Promise<DigitalEmployee>
-  suspendEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
-  resumeEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
-  revokeEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
-  /**
-   * `POST /api/agents/employees/{id}/run` — runs the employee headlessly
-   * ("Run now"). Refuses with `invalid_request` for a suspended/revoked
-   * employee (409), a missing prompt with no override (400), and the
-   * reserved `emp-copilot` row (400) — the thrown `ServiceError.message`
-   * is the backend's own specific reason in every case.
-   */
-  runEmployee(
-    id: string,
-    input?: RunEmployeeInput,
-    signal?: AbortSignal
-  ): Promise<AgentRun>
 }

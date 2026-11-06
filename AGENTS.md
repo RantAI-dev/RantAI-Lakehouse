@@ -31,6 +31,12 @@ rule, not a preference:
   all product code and tests, and it does **not** change the plan's scope
   or decisions. If the plan is wrong against the code, it stops and reports
   the mismatch instead of improvising.
+  - **Exception for console design work** (product owner, 2026-11-04): a
+    task that revamps screens, merges pages or creates new UI is built by
+    an **Opus developer agent** — a separate session from the planner, with
+    the same developer rules. Removing UI and small fixes stay with the
+    other agents. The planner still plans and reviews; it never builds
+    the slice it reviews.
 
 The reason is independence: an author reviewing its own diff confirms its
 own assumptions. Keeping the roles in separate agents is what makes the

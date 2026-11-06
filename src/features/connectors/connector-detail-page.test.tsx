@@ -652,6 +652,67 @@ describe("ConnectorDetailPage", () => {
     expect(screen.getByRole("link", { name: "ingest_demo" }).getAttribute("href")).toBe("/pipelines/pl-1")
   })
 
+  // WEB-3 S2-D3: a CDC connector shows its own replication slot's health,
+  // from the same component and API as System status.
+  describe("the replication slot of a CDC connector", () => {
+    const CDC_SPEC = {
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { ...SPEC.dial, slotName: "rantai_slot", publicationName: "rantai_pub" },
+    }
+    const slot = (connectorId: string, slotName: string, checkedAt: string, active: boolean) => ({
+      connectorId,
+      slotName,
+      checkedAt,
+      active,
+      walRetainedBytes: "1024",
+      confirmedFlushLagBytes: "0",
+      status: active ? "ok" : "critical",
+    })
+
+    it("shows this connector's slot as last checked, and no other connector's", async () => {
+      stubFetch({
+        "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+        "GET /api/governance/replication": () =>
+          json({
+            replicationSlots: [
+              slot("conn-a", "rantai_slot", "2026-11-04T10:00:00Z", false),
+              slot("conn-b", "other_slot", "2026-11-04T10:00:00Z", true),
+              slot("conn-a", "rantai_slot", "2026-11-04T09:45:00Z", true),
+            ],
+          }),
+      })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+
+      expect(await screen.findByText("rantai_slot")).toBeDefined()
+      // The newest reading only: disconnected at 10:00, not connected at 09:45.
+      expect(screen.getAllByText("rantai_slot")).toHaveLength(1)
+      expect(screen.getByText("Disconnected")).toBeDefined()
+      expect(screen.queryByText("other_slot")).toBeNull()
+    })
+
+    it("says there is no reading yet, in one line, when the connector has none", async () => {
+      stubFetch({
+        "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+        "GET /api/governance/replication": () => json({ replicationSlots: [] }),
+      })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+
+      expect(await screen.findByText(/No replication-slot reading for this connector yet/)).toBeDefined()
+    })
+
+    it("does not ask for slot health for a connector that is not CDC", async () => {
+      const { count } = stubFetch()
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+      await screen.findByRole("button", { name: "Delete" })
+      await settle()
+
+      expect(count("GET /api/governance/replication")).toBe(0)
+      expect(screen.queryByText("Replication slot")).toBeNull()
+    })
+  })
+
   it("goes back to Sources after the connector is deleted", async () => {
     const { count } = stubFetch()
     render(<ConnectorDetailPage connectorId="conn-a" />)
@@ -663,5 +724,98 @@ describe("ConnectorDetailPage", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }))
     await waitFor(() => expect(pushed).toEqual(["/connectors"]))
     expect(count("DELETE /api/connectors/conn-a")).toBe(1)
+  })
+})
+
+/**
+ * `SRC-4` slice 4 (S4-g): a change-capture connector has a Change capture tab with its state, the lag of each
+ * table and the lag limit; any other connector has none. A connection test of such a connector lists what the
+ * source must have switched on, the missing settings first (S4-f).
+ */
+describe("ConnectorDetailPage change capture", () => {
+  const CDC_SPEC = { ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "orders" }] }
+  const CAPTURE = {
+    supported: true,
+    state: "running",
+    lag: {
+      tables: [
+        { table: "public.orders", status: "behind", seconds: 125 },
+        { table: "public.items", status: "up_to_date" },
+      ],
+      worst: { table: "public.orders", seconds: 125 },
+      limitMinutes: 15,
+      alertOpen: false,
+    },
+  }
+
+  it("has a Change capture tab for a change-capture connector, between Ingest and Schema changes", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "GET /api/connectors/conn-a/change-capture": () => json(CAPTURE),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await settle()
+    await waitFor(() => expect(screen.getAllByRole("tab").map((t) => t.textContent ?? "")[2]).toBe("Change capture"))
+  })
+
+  it("has no Change capture tab for any other connector, and ?tab=capture lands on the Overview", async () => {
+    url.search = "tab=capture"
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await settle()
+    expect(screen.queryByRole("tab", { name: "Change capture" })).toBeNull()
+    await waitFor(() => expect(selected("Overview")).toBe("true"))
+  })
+
+  it("opens the tab for ?tab=capture and words each table's lag", async () => {
+    url.search = "tab=capture"
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "GET /api/connectors/conn-a/change-capture": () => json(CAPTURE),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    expect(await screen.findByText("Behind by 2m")).toBeDefined()
+    expect(screen.getByText("Up to date")).toBeDefined()
+    expect(screen.getByText("Running")).toBeDefined()
+    expect((screen.getByLabelText("Alert after (minutes)") as HTMLInputElement).value).toBe("15")
+  })
+
+  it("lists the setup checks after a test, the missing one first with its command", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "POST /api/connectors/conn-a/test": () =>
+        json({
+          ok: true,
+          supported: true,
+          latencyMs: 5,
+          message: "Connected via PostgreSQL",
+          testedAt: "2026-10-30T01:00:00.000Z",
+          setupChecks: [
+            { setting: "wal_level", status: "ok", message: "wal_level is logical." },
+            {
+              setting: "publication",
+              status: "missing",
+              message: "The publication named in the connector does not exist.",
+              command: 'CREATE PUBLICATION "orders_pub" FOR TABLE "public"."orders";',
+            },
+          ],
+        }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+    const section = await screen.findByRole("region", { name: "Source setup" })
+    const settings = within(section).getAllByRole("listitem").map((li) => li.textContent ?? "")
+    expect(settings[0]).toContain("publication")
+    expect(settings[1]).toContain("wal_level")
+    expect(within(section).getByText(/CREATE PUBLICATION/)).toBeDefined()
+    expect(within(section).getByText(/1 setting missing/)).toBeDefined()
+  })
+
+  it("shows no setup list for a test that sent none", async () => {
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+    await screen.findByText("Connection test passed")
+    expect(screen.queryByRole("region", { name: "Source setup" })).toBeNull()
   })
 })

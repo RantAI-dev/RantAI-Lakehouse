@@ -135,7 +135,7 @@ export function RenameSessionDialog({
         <form onSubmit={(e) => void submit(e)} className="space-y-4">
           <DialogHeader>
             <DialogTitle>Rename conversation</DialogTitle>
-            <DialogDescription>Shown in your history and the Copilot header.</DialogDescription>
+            <DialogDescription>Shown in your history and the AI Copilot header.</DialogDescription>
           </DialogHeader>
           <Input
             autoFocus

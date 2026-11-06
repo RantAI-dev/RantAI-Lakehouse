@@ -12,10 +12,11 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use lakehouse_auth::Principal;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::StoreError;
 use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::queries::{
     self, HistoryFilter, QueryHistoryItem, RecordHistoryInput, SavedQuery,
@@ -30,6 +31,11 @@ use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::QUERY_STRING_UNREADABLE;
+use crate::routes::saved_queries::{
+    FolderField, NOT_READ_ONLY, SavedQueryListQuery, TITLE_AND_SQL_REQUIRED, parse_folder_filter,
+    parse_folder_reference, require_query_placement,
+};
 use crate::sql_guard::{is_read_only, is_trino_safe};
 use crate::state::AppState;
 use crate::upstream_error;
@@ -127,8 +133,12 @@ pub(crate) async fn rewrite_sql_for_principal_with_headers(
 /// `sql_rewrite`'s own `generic_dialect_parses_a_representative_trino_shape`
 /// test); every other engine value (including the `"clickhouse"` default)
 /// uses `ClickHouseDialect`, matching `run`'s own engine dispatch.
+///
+/// The ONE place that decides which engine a request names — the same
+/// decision `sql_rewrite::Engine::from_name` makes, so the rewrite and the
+/// dispatch can never disagree about the engine (`DATA-21` D1).
 fn is_trino_engine(engine: &str) -> bool {
-    engine == "trino"
+    crate::sql_rewrite::Engine::from_name(engine) == crate::sql_rewrite::Engine::Trino
 }
 
 async fn rewrite_sql_for_principal_inner(
@@ -138,6 +148,21 @@ async fn rewrite_sql_for_principal_inner(
     principal: &Principal,
     headers: &HeaderMap,
 ) -> Result<String, ApiError> {
+    let engine_kind = crate::sql_rewrite::Engine::from_name(engine);
+    // DATA-21 D2: `Trino`'s own past-version clause (`FOR VERSION AS OF
+    // <id>`) is not a form `sqlparser` parses — it reads `VERSION AS OF
+    // <id>`, and only in a dialect whose `supports_table_versioning()` is
+    // true. The token pass turns the one into the other BEFORE the gate
+    // (so the tenant gate sees the tables the statement reads) and the
+    // reverse pass restores `Trino`'s own form AFTER the rewrite (so the
+    // engine reads the form it wrote).
+    let sql = match engine_kind {
+        crate::sql_rewrite::Engine::ClickHouse => sql.to_owned(),
+        crate::sql_rewrite::Engine::Trino => crate::sql_rewrite::normalize_past_version_clause(sql)
+            .map_err(|err| {
+                ApiError::Unprocessable(crate::policy_engine::refusal_message(&err).to_owned())
+            })?,
+    };
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -148,7 +173,7 @@ async fn rewrite_sql_for_principal_inner(
     };
     let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(state);
 
-    // SEC-20: the tenant gate runs BEFORE the policy rewrite, so a
+    // SEC-20/SEC-50: the tenant gate runs BEFORE the policy rewrite, so a
     // statement that reads a table the caller may not read is refused
     // before the policy's own prefetch asks the engine about that table,
     // and before the statement reaches the engine at all.
@@ -159,13 +184,17 @@ async fn rewrite_sql_for_principal_inner(
     // lists objects without naming one. A statement that does not parse
     // has no targets at all: the policy rewrite refuses it with a 422 of
     // its own, so there is nothing here to gate.
-    let gate_dialect: &dyn sqlparser::dialect::Dialect = if is_trino_engine(engine) {
-        &sqlparser::dialect::GenericDialect {}
+    let actor = GateActor::Caller { principal, headers };
+    if engine_kind == crate::sql_rewrite::Engine::Trino {
+        gate_statement(
+            state,
+            &sql,
+            &crate::sql_rewrite::TrinoDialect::default(),
+            actor,
+        )
+        .await?;
     } else {
-        &sqlparser::dialect::ClickHouseDialect {}
-    };
-    if let Some(targets) = crate::sql_rewrite::gate_targets(sql, gate_dialect) {
-        refuse_unreachable_tables(state, principal, headers, &targets).await?;
+        gate_statement(state, &sql, &CLICKHOUSE_DIALECT, actor).await?;
     }
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
@@ -174,12 +203,13 @@ async fn rewrite_sql_for_principal_inner(
     // `routes::support::run_spec_sql` (dashboards/embeds) and
     // `gold_export::export_batch_sql` (Gold export), never a parallel
     // copy of this logic. Only the per-engine dialect *selection*
-    // (`ClickHouseDialect` vs. `GenericDialect`) stays here, since the
+    // (`ClickHouseDialect` vs. `TrinoDialect`) stays here, since the
     // two are different concrete types.
-    if is_trino_engine(engine) {
+    if engine_kind == crate::sql_rewrite::Engine::Trino {
         crate::policy_engine::rewrite_sql_for_roles(
-            sql,
-            &sqlparser::dialect::GenericDialect {},
+            &sql,
+            &crate::sql_rewrite::TrinoDialect::default(),
+            crate::sql_rewrite::Engine::Trino,
             &principal.role_names,
             &placeholders,
             &obligations_source,
@@ -187,8 +217,9 @@ async fn rewrite_sql_for_principal_inner(
         .await
     } else {
         crate::policy_engine::rewrite_sql_for_roles(
-            sql,
+            &sql,
             &sqlparser::dialect::ClickHouseDialect {},
+            crate::sql_rewrite::Engine::ClickHouse,
             &principal.role_names,
             &placeholders,
             &obligations_source,
@@ -196,26 +227,303 @@ async fn rewrite_sql_for_principal_inner(
         .await
     }
     .map_err(|err| {
-        // DATA-16 F3: on Trino a past-version clause makes the parse fail
-        // (`GenericDialect` reads no table version), and the generic
-        // answer talks about policies. Say what is actually wrong. This
-        // runs only after a parse failure, so a query that parses is
-        // never affected, and it is a message, not a gate: the query was
-        // already refused.
-        if is_trino_engine(engine)
+        // DATA-16 F3, narrowed by `DATA-21` D4: on Trino a past version
+        // BY TIMESTAMP makes the parse fail (no engine reads a timestamp
+        // form), and the generic answer talks about policies. Say what is
+        // actually wrong. This runs only after a parse failure, so a
+        // query that parses is never affected, and it is a message, not a
+        // gate: the query was already refused. A past version by its id
+        // parses on Trino now, and never reaches here.
+        if engine_kind == crate::sql_rewrite::Engine::Trino
             && matches!(
                 err,
                 crate::policy_engine::EnforcementError::Engine(
                     crate::policy_engine::PolicyEngineError::Unparseable
                 )
             )
-            && uses_past_version_clause(sql)
+            && uses_past_timestamp_clause(&sql)
         {
             return ApiError::Unprocessable(PAST_VERSION_TRINO_MESSAGE.to_owned());
         }
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
     })
+    // DATA-21 D2: the statement the engine reads is `Trino`'s own form
+    // again — the reverse of the pass that made it parseable.
+    .map(|rewritten| match engine_kind {
+        crate::sql_rewrite::Engine::ClickHouse => rewritten,
+        crate::sql_rewrite::Engine::Trino => {
+            crate::sql_rewrite::denormalize_past_version_clause(&rewritten)
+        }
+    })
 }
+
+/// `SEC-50` slice 2 M1: the dialect every site of slice 2 reads its
+/// statement with — the engine they all run (`ClickHouse`).
+///
+/// A `static`, so the carrier can hold the dialect without borrowing a
+/// temporary: the sites that run `ClickHouse` statements share one dialect,
+/// exactly as the policy rewrite does.
+pub(crate) static CLICKHOUSE_DIALECT: sqlparser::dialect::ClickHouseDialect =
+    sqlparser::dialect::ClickHouseDialect {};
+
+/// `SEC-50`: who a gated statement acts as.
+///
+/// The gate is ONE rule with three actors, not three rules: every site
+/// that runs a statement through the policy rewrite asks this gate
+/// first, and the actor says whose reach the statement is measured
+/// against. Nobody writes a second copy of the reach logic
+/// (`AGENTS.md` rule 4).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GateActor<'a> {
+    /// The signed-in caller, with the request's headers: the tenant is
+    /// the `X-Tenant` header when the caller sent one, else the
+    /// caller's first tenant. `SEC-20`'s rule, unchanged.
+    Caller {
+        principal: &'a Principal,
+        headers: &'a HeaderMap,
+    },
+    /// A named tenant, resolved as if it had been sent in `X-Tenant`:
+    /// the site acts as that tenant, and a principal that does not
+    /// belong to it is refused with the same 404 an `X-Tenant` header
+    /// naming a foreign tenant gets. `None` means the site has no
+    /// tenant at all, and reaches nothing.
+    ///
+    /// `SEC-50` R1: a principal holding the unrestricted (`"*:*"`) grant
+    /// passes this actor TOO, in both cases — with a tenant and without
+    /// one, whether or not the principal belongs to that tenant. That is
+    /// `SEC-20`'s own signed rule ("a principal holding `*:*` passes"),
+    /// and it is safe here for the same reason it is safe in Query
+    /// Studio: an unrestricted principal already reads everything there,
+    /// so a statement running as that principal reaches no more than the
+    /// principal itself reaches.
+    AsTenant {
+        principal: &'a Principal,
+        tenant_id: Option<Uuid>,
+    },
+    /// The deployment's own catalog tenant: a job with no user (an
+    /// alert, the scheduled Gold export, an embed token).
+    CatalogTenant,
+    /// `SEC-50` slice 2 M8: a site whose owner is gone — a public link
+    /// whose creator was deleted, disabled or never existed.
+    ///
+    /// The reach is `All` when the deployment holds a single tenant (there
+    /// is no other tenant's table to reach, so the link behaves as it did
+    /// before the gate) and `NoTenant` otherwise: a deployment with
+    /// several tenants has no owner to act as, and failing closed is the
+    /// only honest answer.
+    ///
+    /// The tenant count is the same one [`GateActor::CatalogTenant`] reads,
+    /// and the no-database rule is R5's: a deployment that cannot count its
+    /// tenants refuses (a 503, with `SEC-20`'s own sentence).
+    Ownerless,
+    /// `SEC-50` slice 2 T1: the unrestricted gate, for the unit tests
+    /// that run a statement against a mock engine.
+    ///
+    /// A `*:*` principal reaches everything without a database (`SEC-20`'s
+    /// own rule), so a test that is about the runner and not about the
+    /// gate needs no database at all. It exists only under `#[cfg(test)]`:
+    /// no production path may act as it.
+    #[cfg(test)]
+    Unrestricted,
+}
+
+/// `SEC-50`: the ONE gate every statement passes before it is rewritten.
+///
+/// `SEC-20` put the tenant gate inside the query path; this is that
+/// gate, lifted out of it so that every site which runs a statement
+/// through [`crate::policy_engine::rewrite_sql_for_roles`] asks it
+/// first — the query path, the authored pipelines, the Gold export, and
+/// (from slice 2) the dashboards, the embeds, the public links and the
+/// alerts. The gate is the same code for all of them; only the actor
+/// differs, and the actor says whose reach the statement is measured
+/// against.
+///
+/// The targets come from ONE parse, with the dialect of the engine the
+/// statement names (the same choice the policy rewrite makes): the
+/// tables the statement names, or the fact that it lists objects
+/// without naming one. A statement that does not parse has no targets
+/// at all: the policy rewrite refuses it with a 422 of its own, so
+/// there is nothing here to gate.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`table_not_available`] for a table
+/// the actor may not read; 422 with the fixed sentence of
+/// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
+/// actor may not list them; 404 for a tenant the actor may not act as;
+/// 422 with the fixed sentence of [`JOB_NEEDS_CATALOG_TENANT`] for a
+/// job with no user in a deployment that holds several tenants and no
+/// `CATALOG_TENANT_ID`; 503 when the deployment's own answers cannot be
+/// read.
+pub(crate) async fn gate_statement<D>(
+    state: &AppState,
+    sql: &str,
+    dialect: &D,
+    actor: GateActor<'_>,
+) -> Result<(), ApiError>
+where
+    D: sqlparser::dialect::Dialect + Sync,
+{
+    // `SEC-50` slice 2 M1: the one-shot entry point and the carrier are the
+    // SAME gate — one copy of the reach logic (D1). The carrier keeps the
+    // reach for a whole request; here the request is one statement, so the
+    // cell is used once and thrown away.
+    StatementGate::new(state, actor, dialect).check(sql).await
+}
+
+/// `SEC-50`: the reach of an actor — whose tables the statement may
+/// read.
+///
+/// Each actor answers the same question with the answers the service
+/// already has (the shared catalog's own gate, the acting tenant, the
+/// deployment's tenant count, and the setting that names the catalog's
+/// tenant), never with a rule of its own.
+///
+/// # Errors
+///
+/// 404 for a tenant the actor may not act as; 422 with the fixed
+/// sentence of [`JOB_NEEDS_CATALOG_TENANT`] for a job with no user in a
+/// deployment that holds several tenants and no `CATALOG_TENANT_ID`;
+/// 503 when the deployment's own answers cannot be read.
+async fn reach_for_actor(state: &AppState, actor: GateActor<'_>) -> Result<TenantReach, ApiError> {
+    match actor {
+        GateActor::Caller { principal, headers } => resolve_reach(state, principal, headers).await,
+        GateActor::AsTenant {
+            principal,
+            tenant_id,
+        } => {
+            // `SEC-50` R1 (review round 1, BLOCKER 1): the unrestricted
+            // grant is checked FIRST, before the tenant is looked at at
+            // all. `SEC-20`'s own rule is that a principal holding
+            // `*:*` passes, and it is the same rule here: an
+            // unrestricted principal reads every table in Query Studio
+            // already, so a statement that runs as that principal
+            // reaches no more than the principal itself reaches.
+            //
+            // Checked first, this also answers the case of a site with
+            // NO tenant of its own (a pipeline whose `tenant_id` is
+            // NULL): an unrestricted author reads everything, so the
+            // pipeline is not refused for the tenant it never had.
+            // Without this, the G7 harness's bootstrap-admin pipelines
+            // (created by a `*:*` admin that belongs to no tenant) would
+            // be refused for a tenant they never had.
+            if crate::routes::catalog::is_unrestricted(principal) {
+                return Ok(TenantReach::All);
+            }
+            match tenant_id {
+                // D5: the site has no tenant at all (a pipeline whose own
+                // `tenant_id` is NULL). It reaches nothing — the
+                // migration's own fail-closed rule.
+                None => Ok(TenantReach::NoTenant),
+                // D5: the tenant is checked and resolved exactly as an
+                // `X-Tenant` header is, so the reach is the one the
+                // principal would have with that header — one rule, not
+                // two.
+                Some(tenant_id) => {
+                    let headers = crate::tenant_scope::headers_for_tenant(tenant_id)?;
+                    resolve_reach(state, principal, &headers).await
+                }
+            }
+        }
+        GateActor::CatalogTenant => {
+            let tenant_count = deployment_tenant_count(state).await?;
+            catalog_tenant_reach(tenant_count, state.config.catalog_tenant_id)
+        }
+        GateActor::Ownerless => {
+            // `SEC-50` slice 2 M8: the same count the job-with-no-user
+            // actor reads, and the same no-database rule (R5).
+            let tenant_count = deployment_tenant_count(state).await?;
+            ownerless_reach(tenant_count)
+        }
+        #[cfg(test)]
+        GateActor::Unrestricted => Ok(TenantReach::All),
+    }
+}
+
+/// `SEC-50` slice 2 M8: the reach of a site whose owner is gone, as a pure
+/// function of the one answer it needs.
+///
+/// A deployment with a single tenant holds no other tenant's table to reach,
+/// so the link behaves exactly as it did before the gate — D2's "one tenant
+/// behaves as before". A deployment with several tenants has no owner to act
+/// as, and the site reaches nothing: failing closed is the only honest
+/// answer, and it is the same one a caller in no tenant gets.
+///
+/// `None` means there is no database to count in, so the deployment cannot
+/// say that it holds a single tenant — and cannot say that it holds several
+/// either. That is R5's rule: the deployment refuses, with `SEC-20`'s own
+/// sentence for that state.
+fn ownerless_reach(tenant_count: Option<i64>) -> Result<TenantReach, ApiError> {
+    let Some(tenant_count) = tenant_count else {
+        return Err(ApiError::Unavailable(
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT.to_owned(),
+        ));
+    };
+    if tenant_count <= 1 {
+        return Ok(TenantReach::All);
+    }
+    Ok(TenantReach::NoTenant)
+}
+
+/// `SEC-50` D3: the reach of a job with no user, as a pure function of
+/// the two answers it needs.
+///
+/// The job reads the SHARED catalog (`serving.*`, Silver, Gold), so the
+/// only tenant whose reach can cover it is the tenant that owns that
+/// catalog — which is why the job acts as the catalog's tenant and not
+/// as any person.
+///
+/// The reach is `All` when the deployment holds a single tenant (there is
+/// no other tenant's table to reach), the catalog's own tenant when
+/// `CATALOG_TENANT_ID` names it, and a refusal otherwise: a deployment
+/// with several tenants and no catalog tenant has no tenant whose reach
+/// covers the shared catalog, and failing closed is the only honest
+/// answer (D6).
+///
+/// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment that
+/// cannot COUNT its tenants refuses too — and with `SEC-20`'s OWN sentence
+/// for that state,
+/// [`crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT`] ("could not
+/// verify tenant count"), not D6's. D6 names a setting to set, and that is
+/// the wrong instruction here: the setting may ALREADY be set (naming a
+/// catalog tenant in a deployment that cannot count its tenants is a claim
+/// nobody can check), and what is missing is the deployment's own answer,
+/// not the setting.
+///
+/// `None` means there is no database to count in, so the deployment cannot
+/// say that it holds a single tenant — and it cannot say that it holds
+/// several either. "Cannot verify it is safe" is the same answer as
+/// "verified unsafe", which is `SEC-20`'s own rule: the shared catalog's
+/// own gate refuses every principal without the unrestricted grant when
+/// there is no pool (`routes::catalog::catalog_tenant_refusal`).
+fn catalog_tenant_reach(
+    tenant_count: Option<i64>,
+    catalog_tenant_id: Option<Uuid>,
+) -> Result<TenantReach, ApiError> {
+    let Some(tenant_count) = tenant_count else {
+        return Err(ApiError::Unavailable(
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT.to_owned(),
+        ));
+    };
+    if tenant_count <= 1 {
+        return Ok(TenantReach::All);
+    }
+    match catalog_tenant_id {
+        Some(tenant_id) => Ok(TenantReach::Tenant {
+            tenant_id,
+            owns_catalog: true,
+        }),
+        None => Err(ApiError::Unprocessable(JOB_NEEDS_CATALOG_TENANT.to_owned())),
+    }
+}
+
+/// `SEC-50` D6: the one sentence a job with no user is refused with when
+/// the deployment holds several tenants and no tenant owns the shared
+/// catalog.
+///
+/// It names the setting and what to do with it, and says nothing about
+/// the deployment's data (`AGENTS.md` principle 4).
+pub(crate) const JOB_NEEDS_CATALOG_TENANT: &str = "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog.";
 
 /// `SEC-20`: how far the caller's reach extends over the tables a
 /// statement reads.
@@ -383,6 +691,32 @@ fn reach_from(
     }
 }
 
+/// The viewer the saved-query resolver asks about: who is asking, with
+/// the roles they hold and the tenant they act as.
+///
+/// This is the one place a [`Principal`] becomes a
+/// [`queries::SavedQueryViewer`], so a read path and a write path cannot
+/// disagree about who the caller is: the console's own save and the
+/// assistant's save build the same viewer from the same principal.
+///
+/// A service identity is nobody's personal space's owner and nobody's
+/// query's author — it has no `app_user` row — so its id is not carried
+/// over.
+pub(crate) fn saved_query_viewer(
+    principal: &Principal,
+    tenant_id: Option<Uuid>,
+) -> queries::SavedQueryViewer {
+    queries::SavedQueryViewer {
+        id: match principal.id {
+            PrincipalId::User(id) => Some(id),
+            PrincipalId::Service(_) => None,
+        },
+        role_names: principal.role_names.clone(),
+        tenant_id,
+        all: crate::routes::catalog::is_unrestricted(principal),
+    }
+}
+
 /// `SEC-20`: the saved queries the caller may read.
 ///
 /// The same reach the same request resolves for the tables a statement
@@ -393,6 +727,10 @@ fn reach_from(
 /// reach over saved queries end in the same place — and there is only
 /// one rule that says which tenant a request acts as
 /// ([`crate::tenant_scope::resolve`]).
+///
+/// The scope also carries the **viewer**: the resolver answers "at what
+/// level may this caller do this", and a scope that cannot say who reads
+/// cannot answer it.
 ///
 /// # Errors
 ///
@@ -405,7 +743,9 @@ pub(crate) async fn saved_query_scope(
 ) -> Result<queries::SavedQueryScope, ApiError> {
     Ok(match resolve_reach(state, principal, headers).await? {
         // Every permission, or a deployment with one tenant: every row.
-        TenantReach::All => queries::SavedQueryScope::All,
+        TenantReach::All => queries::SavedQueryScope::All {
+            viewer: saved_query_viewer(principal, None),
+        },
         // One tenant's rows; the rows that belong to no tenant are the
         // shared catalog's own, and the catalog's tenant reads them.
         TenantReach::Tenant {
@@ -414,6 +754,7 @@ pub(crate) async fn saved_query_scope(
         } => queries::SavedQueryScope::Tenant {
             tenant_id,
             include_tenantless: owns_catalog,
+            viewer: saved_query_viewer(principal, Some(tenant_id)),
         },
         // A caller in no tenant owns no saved query and reads none.
         TenantReach::NoTenant => queries::SavedQueryScope::None,
@@ -523,75 +864,233 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
         })
 }
 
-/// `SEC-20`: refuse a statement the caller's tenant may not run.
+/// `SEC-50` slice 2 M1/M2: the tables a statement names, checked against a
+/// reach that is already resolved.
 ///
-/// The targets are what the statement means to the gate: the tables it
-/// names — canonicalised the way the policy rewrite canonicalises them
+/// This is the half of the gate that decides about NAMED tables. The
+/// targets are what the statement means to the gate: the tables it names —
+/// canonicalised the way the policy rewrite canonicalises them
 /// ([`crate::sql_rewrite::canonicalize`]), so a `CTE`'s own name is not a
-/// table — or the fact that it lists objects without naming one table.
+/// table.
 ///
 /// A named table is checked one by one, and the first table out of reach
-/// is the one the refusal names. A listing names no table, so there is
-/// nothing to check table by table: it passes for the catalog's own
-/// tenant (and for a deployment with one tenant) and is refused
-/// otherwise.
+/// is the one the refusal names.
 ///
 /// # Errors
 ///
-/// 404 with the fixed sentence of [`table_not_available`] for a table the
-/// caller may not read; 422 with the fixed sentence of
-/// [`LISTING_NOT_AVAILABLE`] for a statement that lists objects and the
-/// caller may not list them; 404 for an `X-Tenant` header the caller does
-/// not belong to; 503 when a claim cannot be read.
-async fn refuse_unreachable_tables(
+/// 404 with the fixed sentence of [`table_not_available`] for the first
+/// table out of reach; 503 when a claim cannot be read.
+async fn check_tables_against_reach(
     state: &AppState,
-    principal: &Principal,
-    headers: &HeaderMap,
-    targets: &crate::sql_rewrite::GateTargets,
+    reach: TenantReach,
+    tables: &[String],
 ) -> Result<(), ApiError> {
-    match targets {
-        crate::sql_rewrite::GateTargets::Tables(tables) => {
-            if tables.is_empty() {
-                return Ok(());
+    let tenant_id = match reach {
+        TenantReach::All => return Ok(()),
+        TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
+        TenantReach::Tenant { tenant_id, .. } => tenant_id,
+    };
+    let mut claims = Vec::with_capacity(tables.len());
+    for table in tables {
+        claims.push(claim_on(state, tenant_id, table).await?);
+    }
+    match first_unreachable(reach, &claims) {
+        Some(at) => Err(table_not_available(&tables[at])),
+        None => Ok(()),
+    }
+}
+
+/// `SEC-50` slice 2 M1/M2: a statement that lists objects, checked against a
+/// reach that is already resolved.
+///
+/// This is the half of the gate that decides about LISTINGS. A listing names
+/// no table, so there is nothing to check table by table: it passes for the
+/// catalog's own tenant (and for a deployment with one tenant) and is refused
+/// otherwise.
+///
+/// The reach is resolved BEFORE this check, so a header naming a tenant the
+/// caller does not belong to is a 404 everywhere else, and it must not be
+/// answered with the listing's own 422.
+///
+/// # Errors
+///
+/// 422 with the fixed sentence of [`LISTING_NOT_AVAILABLE`].
+fn check_listing_against_reach(reach: TenantReach) -> Result<(), ApiError> {
+    match reach {
+        // Every permission, or a deployment with one tenant: there
+        // is no other tenant's listing to keep. The catalog's own
+        // tenant may list the shared catalog.
+        TenantReach::All
+        | TenantReach::Tenant {
+            owns_catalog: true, ..
+        } => Ok(()),
+        // A member of another tenant, or a caller in no tenant.
+        TenantReach::Tenant {
+            owns_catalog: false,
+            ..
+        }
+        | TenantReach::NoTenant => Err(ApiError::Unprocessable(LISTING_NOT_AVAILABLE.to_owned())),
+    }
+}
+
+/// `SEC-50` slice 2 M1: a refusal the gate keeps, so every statement of one
+/// request is refused the same way.
+///
+/// [`ApiError`] is not `Clone`, so the gate's cell keeps the refusal as its
+/// status and its sentence and rebuilds the error for each statement. The
+/// sentence is one this code base wrote (a fixed refusal, never upstream
+/// text), so nothing about the deployment's data is kept here.
+#[derive(Debug, Clone)]
+struct GateRefusal {
+    status: u16,
+    message: String,
+}
+
+impl GateRefusal {
+    /// The refusal as it is kept.
+    fn of(err: &ApiError) -> Self {
+        Self {
+            status: err.status(),
+            message: err.to_string(),
+        }
+    }
+
+    /// The refusal as the error a caller sees, rebuilt from what was kept.
+    fn into_error(self) -> ApiError {
+        match self.status {
+            404 => ApiError::NotFound(self.message),
+            422 => ApiError::Unprocessable(self.message),
+            503 => ApiError::Unavailable(self.message),
+            _ => ApiError::Internal(self.message),
+        }
+    }
+}
+
+/// `SEC-50` slice 2 M1/M2: the ONE gate every statement passes, carried by
+/// the site that runs it.
+///
+/// The sites of slice 2 take a `&ChClient` (and sometimes a pool), never
+/// the whole state — but the gate needs the state: the pool (the tenant
+/// count, the claims) and the `CATALOG_TENANT_ID` setting. This carrier
+/// holds both, so a site can ask the gate without being rewritten to take
+/// a state it does not need.
+///
+/// The reach is resolved ONCE per request (M2): a board's tiles run side by
+/// side, and the reach is the same answer for all of them. The cell keeps a
+/// refusal too, so every tile of a refused request is refused the same way.
+///
+/// The gate is still ONE rule: [`gate_statement`] (the one-shot entry point
+/// the query path uses) and this carrier share the same internals — the
+/// reach ([`reach_for_actor`]) and the check ([`check_tables_against_reach`]
+/// and [`check_listing_against_reach`]) — so nobody writes a second copy of
+/// the reach logic (D1).
+///
+/// Every site of slice 2 runs a `ClickHouse` statement, so the targets are
+/// read with the `ClickHouse` dialect — the same choice the policy rewrite
+/// makes for those statements.
+pub(crate) struct StatementGate<'a> {
+    state: &'a AppState,
+    actor: GateActor<'a>,
+    dialect: &'a (dyn sqlparser::dialect::Dialect + Sync),
+    reach: tokio::sync::OnceCell<Result<TenantReach, GateRefusal>>,
+}
+
+impl<'a> StatementGate<'a> {
+    /// A gate that asks as `actor`, reading the statement with `dialect`.
+    ///
+    /// The dialect is the one the engine the statement runs uses — the same
+    /// choice the policy rewrite makes for that statement.
+    pub(crate) fn new(
+        state: &'a AppState,
+        actor: GateActor<'a>,
+        dialect: &'a (dyn sqlparser::dialect::Dialect + Sync),
+    ) -> Self {
+        Self {
+            state,
+            actor,
+            dialect,
+            reach: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// `SEC-50` slice 2 M2: a gate that asks as `actor` and reads the
+    /// statement as `ClickHouse` does — the engine every site of slice 2
+    /// runs.
+    pub(crate) fn clickhouse(state: &'a AppState, actor: GateActor<'a>) -> Self {
+        Self::new(state, actor, &CLICKHOUSE_DIALECT)
+    }
+
+    /// The gate's answer for `sql`: nothing to refuse, or the refusal.
+    ///
+    /// The statement is read for its targets before the reach is resolved
+    /// (M2): a statement that names no table reads nothing, so it is let
+    /// through without asking the deployment anything — the same laziness
+    /// the query path has always had.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`check_tables_against_reach`] and
+    /// [`check_listing_against_reach`], and the errors of
+    /// [`reach_for_actor`] (404 for a tenant the actor may not act as, 422
+    /// for a job with no user in a deployment with several tenants and no
+    /// `CATALOG_TENANT_ID`, 503 when the deployment cannot count its
+    /// tenants).
+    pub(crate) async fn check(&self, sql: &str) -> Result<(), ApiError> {
+        let Some(targets) = crate::sql_rewrite::gate_targets(sql, self.dialect) else {
+            // A statement that does not parse has no targets: the policy
+            // rewrite refuses it with a 422 of its own, so there is nothing
+            // here to gate.
+            return Ok(());
+        };
+        match &targets {
+            crate::sql_rewrite::GateTargets::Tables(tables) => {
+                if tables.is_empty() {
+                    return Ok(());
+                }
+                let reach = self.reach().await?;
+                check_tables_against_reach(self.state, reach, tables).await
             }
-            let reach = resolve_reach(state, principal, headers).await?;
-            let tenant_id = match reach {
-                TenantReach::All => return Ok(()),
-                TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
-                TenantReach::Tenant { tenant_id, .. } => tenant_id,
-            };
-            let mut claims = Vec::with_capacity(tables.len());
-            for table in tables {
-                claims.push(claim_on(state, tenant_id, table).await?);
-            }
-            match first_unreachable(reach, &claims) {
-                Some(at) => Err(table_not_available(&tables[at])),
-                None => Ok(()),
+            crate::sql_rewrite::GateTargets::ListsObjects => {
+                let reach = self.reach().await?;
+                check_listing_against_reach(reach)
             }
         }
-        crate::sql_rewrite::GateTargets::ListsObjects => {
-            // The reach is resolved FIRST: a header naming a tenant the
-            // caller does not belong to is a 404 everywhere else, and it
-            // must not be answered with the listing's own 422.
-            let reach = resolve_reach(state, principal, headers).await?;
-            match reach {
-                // Every permission, or a deployment with one tenant: there
-                // is no other tenant's listing to keep. The catalog's own
-                // tenant may list the shared catalog.
-                TenantReach::All
-                | TenantReach::Tenant {
-                    owns_catalog: true, ..
-                } => Ok(()),
-                // A member of another tenant, or a caller in no tenant.
-                TenantReach::Tenant {
-                    owns_catalog: false,
-                    ..
-                }
-                | TenantReach::NoTenant => {
-                    Err(ApiError::Unprocessable(LISTING_NOT_AVAILABLE.to_owned()))
-                }
-            }
+    }
+
+    /// The reach of this gate's actor, resolved once and kept.
+    async fn reach(&self) -> Result<TenantReach, ApiError> {
+        let refusal = self
+            .reach
+            .get_or_init(|| async {
+                reach_for_actor(self.state, self.actor)
+                    .await
+                    .map_err(|err| GateRefusal::of(&err))
+            })
+            .await
+            .clone();
+        match refusal {
+            Ok(reach) => Ok(reach),
+            Err(refusal) => Err(refusal.into_error()),
         }
+    }
+
+    /// Whether the reach has been resolved already — for the tests that
+    /// prove it is read once per request (M2).
+    #[cfg(test)]
+    pub(crate) fn reach_resolved(&self) -> bool {
+        self.reach.get().is_some()
+    }
+}
+
+#[cfg(test)]
+impl<'a> StatementGate<'a> {
+    /// A gate that reaches everything, for the unit tests that run a
+    /// statement against a mock engine.
+    ///
+    /// It exists only under `#[cfg(test)]`: no production path may act as
+    /// it.
+    pub(crate) fn unrestricted(state: &'a AppState) -> Self {
+        Self::new(state, GateActor::Unrestricted, &CLICKHOUSE_DIALECT)
     }
 }
 
@@ -614,27 +1113,38 @@ fn first_unreachable(reach: TenantReach, claims: &[TableClaim]) -> Option<usize>
 /// A statement that does not parse has no table list: the policy rewrite
 /// refuses it with a 422 of its own, so there is nothing here to gate.
 fn referenced_table_names(sql: &str, trino: bool) -> Vec<String> {
-    let dialect: &dyn sqlparser::dialect::Dialect = if trino {
-        &sqlparser::dialect::GenericDialect {}
+    // `DATA-21` D2: a `Trino` statement is read with `TrinoDialect` (the
+    // one that reads a table version) and in the form that dialect
+    // parses, so the tables it names are the tables it reads.
+    let mut tables = if trino {
+        let normalized = crate::sql_rewrite::normalize_past_version_clause(sql)
+            .unwrap_or_else(|_| sql.to_owned());
+        crate::sql_rewrite::referenced_tables(
+            &normalized,
+            &crate::sql_rewrite::TrinoDialect::default(),
+        )
     } else {
-        &sqlparser::dialect::ClickHouseDialect {}
-    };
-    let mut tables = crate::sql_rewrite::referenced_tables(sql, dialect).unwrap_or_default();
+        crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::ClickHouseDialect {})
+    }
+    .unwrap_or_default();
     tables.sort();
     tables
 }
 
-/// Fixed text for `DATA-16` F3: past versions are queried on `ClickHouse`
-/// only (the `Trino` side is `DATA-21`).
+/// Fixed text for `DATA-16` F3, narrowed by `DATA-21` D4: a past version
+/// BY TIMESTAMP is still refused on `Trino` — no engine has a timestamp
+/// form, `ClickHouse` included — while a past version by its id runs on
+/// both engines now.
 const PAST_VERSION_TRINO_MESSAGE: &str =
     "Querying a past version of a table is available on the ClickHouse engine only.";
 
-/// Whether `sql`'s tokens contain the keyword run `VERSION AS OF` or
-/// `TIMESTAMP AS OF`. Reads tokens (not the raw text) so the same words in
-/// a string literal, a quoted identifier or a comment are not mistaken for
-/// the clause. A tokenizer failure answers `false`: the caller then keeps
-/// today's message.
-fn uses_past_version_clause(sql: &str) -> bool {
+/// Whether `sql`'s tokens contain the keyword run `TIMESTAMP AS OF` —
+/// the one past-version form no engine has (`DATA-21` D2/D4). Reads
+/// tokens (not the raw text) so the same words in a string literal, a
+/// quoted identifier or a comment are not mistaken for the clause. A
+/// tokenizer failure answers `false`: the caller then keeps today's
+/// message.
+fn uses_past_timestamp_clause(sql: &str) -> bool {
     use sqlparser::tokenizer::{Token, Tokenizer};
 
     let dialect = sqlparser::dialect::GenericDialect {};
@@ -653,7 +1163,7 @@ fn uses_past_version_clause(sql: &str) -> bool {
         .collect();
     words
         .windows(3)
-        .any(|w| (w[0] == "VERSION" || w[0] == "TIMESTAMP") && w[1] == "AS" && w[2] == "OF")
+        .any(|w| w[0] == "TIMESTAMP" && w[1] == "AS" && w[2] == "OF")
 }
 
 /// The one answer to a statement the settings rule refuses. It names no word
@@ -812,7 +1322,7 @@ async fn execute_query_against_engine(
                 let mut out = Map::new();
                 for c in &columns {
                     let v = row.get(c);
-                    out.insert(c.clone(), Value::String(stringify_cell(v)));
+                    out.insert(c.clone(), cell_value(v));
                 }
                 Value::Object(out)
             })
@@ -1316,15 +1826,24 @@ fn query_run_audit_event(principal: &Principal, query_id: &str, sql: &str) -> Ne
     }
 }
 
-/// Coerce one cell to the string-everything shape both `run_result_json`
-/// row shapes use, matching the `TypeScript`'s implicit stringification.
-fn stringify_cell(v: Option<&Value>) -> String {
+/// One cell of a result row, in the shape the run result carries it.
+///
+/// `DATA-29`: a `NULL` cell is JSON `null`, not an empty string — a
+/// missing value and an empty text are told apart, which is what the
+/// console's `QueryCell` contract (`string | number | boolean | null`)
+/// already expects. Every other value keeps the text it had before this
+/// change (decision D1), so a non-null cell does not change.
+///
+/// A cell the engine left out entirely is a `NULL` as well (`None` and
+/// `Some(Value::Null)` answer the same): the engine said nothing, so
+/// there is no value to report.
+fn cell_value(v: Option<&Value>) -> Value {
     match v {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(other) => other.to_string(),
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::String(s)) => Value::String(s.clone()),
+        Some(Value::Bool(b)) => Value::String(b.to_string()),
+        Some(Value::Number(n)) => Value::String(n.to_string()),
+        Some(other) => Value::String(other.to_string()),
     }
 }
 
@@ -1339,7 +1858,7 @@ fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
         .map(|row| {
             let mut out = Map::new();
             for (i, c) in columns.iter().enumerate() {
-                out.insert(c.clone(), Value::String(stringify_cell(row.get(i))));
+                out.insert(c.clone(), cell_value(row.get(i)));
             }
             Value::Object(out)
         })
@@ -1380,6 +1899,12 @@ fn map_trino_error(err: TrinoError) -> ApiError {
 /// The byte cost of one cell: the length of its text — a JSON string's own
 /// bytes without the quotes, any other value's compact JSON text — plus one
 /// byte for the separator (`QS-2`).
+///
+/// `DATA-29` (decision D2): a `null` cell is charged its compact JSON text
+/// (`null`, four bytes) and the separator, so five bytes a cell. The rule
+/// already said that; what this change changed is that a `NULL` cell is
+/// sent as `null` and no longer as the empty string, so the cap now counts
+/// the bytes the answer really carries.
 fn cell_byte_cost(cell: &Value) -> usize {
     let text = match cell {
         Value::String(text) => text.len(),
@@ -1845,21 +2370,41 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
 /// the caller's tenant's rows, and the rows that belong to no tenant
 /// when that tenant owns the shared catalog (see [`saved_query_scope`]).
 ///
+/// The list is filtered by the text typed in the search box (`?q=`, which
+/// matches the title or the SQL) and by the folder asked for (`?folder=`,
+/// an id or `"root"` for the shared space). Both filters are the store's
+/// own, applied to the visible rows only.
+///
 /// # Errors
 ///
 /// 401 when nobody is signed in — a saved query belongs to a tenant, so
-/// there is no sensible answer for "everybody's"; 404 for an `X-Tenant`
-/// header the caller does not belong to; 503 if no pool is configured;
-/// 500 on a database failure.
+/// there is no sensible answer for "everybody's"; 400 for a folder filter
+/// that is neither an id nor `"root"`, and for a query string the route
+/// cannot read; 404 for an `X-Tenant` header the caller does not belong
+/// to; 503 if no pool is configured; 500 on a database failure.
 pub async fn list_saved(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     headers: HeaderMap,
+    query: Result<Query<SavedQueryListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<Vec<SavedQuery>>> {
     let Extension(principal) =
         principal.ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?;
+    // A query string the extractor cannot read — a parameter sent twice,
+    // for instance — is refused with this surface's own sentence. The
+    // rejection's own text is serde's, and it stays in the log: a
+    // response never carries a library's rendering of the caller's
+    // request.
+    let Query(raw) = query.map_err(|rejection| {
+        tracing::warn!(%rejection, "a saved-query query string could not be read");
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
+    })?;
+    let needle = raw.q.as_deref().filter(|needle| !needle.is_empty());
+    let folder = parse_folder_filter(raw.folder.as_deref())?;
     let scope = saved_query_scope(&state, &principal, &headers).await?;
-    Ok(ApiJson(queries::list_saved(pool(&state)?, scope).await?))
+    Ok(ApiJson(
+        queries::list_saved_filtered(pool(&state)?, &scope, needle, folder).await?,
+    ))
 }
 
 /// The `GET /api/query/history` query string (`QS-4`, decision 5). Every
@@ -1868,7 +2413,7 @@ pub async fn list_saved(
 /// fixed message in [`parse_history_query`] — never `serde_urlencoded`'s
 /// rendering of a serde error. A query string the extractor itself cannot
 /// read (a parameter sent twice) never reaches this struct: it is refused
-/// with the fixed sentence of [`HISTORY_QUERY_UNREADABLE`].
+/// with the fixed sentence of [`QUERY_STRING_UNREADABLE`].
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryQueryRaw {
@@ -1889,14 +2434,6 @@ const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "blocke
 
 /// The engines [`run`] records.
 const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
-
-/// What a query string the route cannot read is told.
-///
-/// The twin of this sentence lives in `routes/uploads.rs`
-/// (`QUERY_UNREADABLE`). The two cannot be one constant yet: the place
-/// both could share is `routes/mod.rs`, and that file is held by another
-/// open pull request.
-const HISTORY_QUERY_UNREADABLE: &str = "The query string could not be read.";
 
 /// Parse the history query string into a [`HistoryFilter`], refusing a
 /// bad value with a fixed 400 before the store sees it.
@@ -1976,7 +2513,7 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 /// no sensible answer for "everyone's". 400 for a bad filter value, with a
 /// fixed message naming the field, and for a query string the route cannot
 /// read (a parameter sent twice), with the fixed sentence of
-/// [`HISTORY_QUERY_UNREADABLE`]. 503 if no pool is configured; 500 on a
+/// [`QUERY_STRING_UNREADABLE`]. 503 if no pool is configured; 500 on a
 /// database failure.
 pub async fn list_history(
     State(state): State<AppState>,
@@ -1990,7 +2527,7 @@ pub async fn list_history(
     // carries a library's rendering of the caller's request.
     let Query(raw) = query.map_err(|err| {
         tracing::warn!(%err, "a query history query string could not be read");
-        ApiError::BadRequest(HISTORY_QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let filter = parse_history_query(&raw)?;
     Ok(ApiJson(
@@ -2013,6 +2550,10 @@ pub struct CreateSavedQueryBody {
     sql: String,
     #[serde(default)]
     tags: Vec<String>,
+    /// The folder the query lands in: an id, `null` for the shared space,
+    /// or absent for the caller's own personal space.
+    #[serde(default)]
+    folder_id: FolderField,
 }
 
 /// `POST /api/query/saved` — save the SQL in the editor under a name.
@@ -2021,14 +2562,19 @@ pub struct CreateSavedQueryBody {
 /// tenant is the one the request acts as — the `X-Tenant` header when the
 /// caller sends one, the caller's first tenant otherwise — and the row is
 /// that tenant's alone; the rows that belong to no tenant are the shared
-/// catalog's own. The author is recorded all the same.
+/// catalog's own. The author is recorded all the same, and the query
+/// lands in the folder the body names: the shared space, a folder the
+/// caller may fill, or — when the body names none — the caller's own
+/// personal space (`QS-3`).
 ///
 /// # Errors
 ///
-/// 400 on a malformed body or a blank title/SQL; 401 when nobody is signed
-/// in; 404 for an `X-Tenant` header the caller does not belong to; 422
-/// when the SQL is not read-only — a saved query is run through the same
-/// guard as anything else, so refusing it here is better than storing
+/// 400 on a malformed body, a blank title/SQL or a folder that is neither
+/// an id nor the root; 401 when nobody is signed in; 404 for an
+/// `X-Tenant` header the caller does not belong to, and for a folder the
+/// caller may not see; 403 for a folder the caller may see but not fill;
+/// 422 when the SQL is not read-only — a saved query is run through the
+/// same guard as anything else, so refusing it here is better than storing
 /// something that can never run; 503/500 as above.
 pub async fn create_saved(
     State(state): State<AppState>,
@@ -2041,36 +2587,40 @@ pub async fn create_saved(
     let title = body.title.trim().to_owned();
     let sql = body.sql.trim().to_owned();
     if title.is_empty() || sql.is_empty() {
-        return Err(ApiError::BadRequest("title and sql are required".to_owned()).into());
+        return Err(ApiError::BadRequest(TITLE_AND_SQL_REQUIRED.to_owned()).into());
     }
     if !is_read_only(&sql) {
-        return Err(ApiError::Unprocessable(
-            "only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) can be saved".to_owned(),
-        )
-        .into());
+        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
-    let owner_id = caller_id(principal.as_ref())?;
+    let principal = principal
+        .as_ref()
+        .map(|Extension(p)| p)
+        .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?;
     // The tenant the row belongs to is the tenant the request acts as,
     // answered by the one resolver every caller without a header gets
     // (`tenant_scope::resolve`). A caller in no tenant writes a row that
     // belongs to no tenant: nobody can say whose query it is, so it is
     // not anybody's to read but the shared catalog's owner's.
-    let tenant_id = crate::tenant_scope::resolve(
-        principal
-            .as_ref()
-            .map(|Extension(p)| p)
-            .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))?,
-        &headers,
-    )?;
-    let owner = principal.map_or_else(|| "anonymous".to_owned(), |Extension(p)| p.display_name);
-    let saved = queries::create_saved_query(
+    let tenant_id = crate::tenant_scope::resolve(principal, &headers)?;
+    let owner = principal.display_name.clone();
+    let viewer = saved_query_viewer(principal, tenant_id);
+    // The place the row lands is the caller's to choose: the shared
+    // space, one of the folders they may fill, or — when the body names
+    // no folder — their own personal space (`QS-3`).
+    let placement = require_query_placement(
         pool(&state)?,
+        &viewer,
+        parse_folder_reference(body.folder_id)?,
+    )
+    .await?;
+    let saved = queries::create_saved_query_at(
+        pool(&state)?,
+        &viewer,
         &title,
         &sql,
         &owner,
         &body.tags,
-        Some(owner_id),
-        tenant_id,
+        placement,
     )
     .await?;
     Ok((StatusCode::CREATED, ApiJson(saved)))
@@ -2201,15 +2751,6 @@ const DOWNLOAD_BYTE_CAP: u64 = 5 * 1024 * 1024 * 1024;
 const DOWNLOAD_TOO_LARGE: &str =
     "This result is larger than 5 GB. Add a filter or download it as CSV.";
 
-/// What a query string the download route cannot read is told.
-///
-/// The twin of this sentence lives in `routes/uploads.rs`
-/// (`QUERY_UNREADABLE`), and this file's history route has its own copy of
-/// it (`HISTORY_QUERY_UNREADABLE`). The three cannot be one constant yet:
-/// the place they could share is `routes/mod.rs`, and that file is held by
-/// another open pull request.
-const DOWNLOAD_QUERY_UNREADABLE: &str = "The query string could not be read.";
-
 /// The name the download's query carries on the engine: the caller's own id,
 /// the run, and what the query is. Stop's pattern
 /// (`<caller uuid>:<runId>:%`) finds it, so Stop reaches the download's
@@ -2334,21 +2875,7 @@ async fn download_engine_file<S: crate::export::ByteSource>(
     match crate::export::write_bytes_file(source, Some(byte_cap)).await {
         Ok(Some(file)) => Ok(file),
         Ok(None) => Err(ApiError::Unprocessable(DOWNLOAD_TOO_LARGE.to_owned())),
-        Err(err) => Err(download_failure(&err)),
-    }
-}
-
-/// A failure of the file itself, reported under a reference with a fixed
-/// sentence (`SEC-11`).
-///
-/// The dashboard's own export has the same mapping in
-/// `routes::dashboard::export_failure`, which is private to that module.
-fn download_failure(err: &crate::export::ExportError) -> ApiError {
-    match err {
-        crate::export::ExportError::Source(ch) => {
-            upstream_error::ch_error(&upstream_error::DATABASE, ch)
-        }
-        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+        Err(err) => Err(super::export_failure(&upstream_error::DATABASE, &err)),
     }
 }
 
@@ -2461,7 +2988,7 @@ fn download_response(
 ///   match the `query_history.id` shape (`q-<digits>` or
 ///   `q-<digits>-<32 lowercase hex>`), or when the query string cannot be
 ///   read at all — a repeated parameter, or no `format` — with the fixed
-///   sentence of [`DOWNLOAD_QUERY_UNREADABLE`].
+///   sentence of [`QUERY_STRING_UNREADABLE`].
 /// - 403 [`ApiError::PermissionDenied`] when every role of the caller is
 ///   switched off from downloading.
 /// - 404 [`ApiError::NotFound`] when no history row matches `id`, or when
@@ -2489,7 +3016,7 @@ pub async fn download(
     // never carries a library's rendering of the caller's request.
     let Query(query) = query.map_err(|err| {
         tracing::warn!(%err, "a download query string could not be read");
-        ApiError::BadRequest(DOWNLOAD_QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
     let Some(format) = DownloadFormat::parse(&query.format) else {
         return Err(
@@ -2597,7 +3124,7 @@ pub async fn download(
         .map_err(|err| upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
     let written = write_download_rows(&mut rows, row_format, &locale, DOWNLOAD_BYTE_CAP)
         .await
-        .map_err(|err| download_failure(&err))?;
+        .map_err(|err| super::export_failure(&upstream_error::DATABASE, &err))?;
     // Which limit cut the file: the rows the format allows, or the bytes the
     // cap allows. A file that was not cut names no limit.
     let cut_by = written.cut.then(|| cut_by(format, written.rows));
@@ -2646,6 +3173,143 @@ fn scheduling_capability_body() -> Value {
 /// This handler never fails — it reports a fixed, static capability.
 pub async fn scheduling(State(_state): State<AppState>) -> ApiResult<ApiJson<Value>> {
     Ok(ApiJson(scheduling_capability_body()))
+}
+
+// ── The trash sweep (QS-3) ───────────────────────────────────────────────
+
+/// Remove the saved queries that waited in the trash longer than
+/// [`TRASH_RETENTION_DAYS`](lakehouse_store::queries::TRASH_RETENTION_DAYS)
+/// days, and answer how many went.
+///
+/// The cutoff is the store's own constant, the same one the trash list
+/// counts its days from: the number the console shows and the number this
+/// pass acts on are one number.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the delete fails. Nothing is deleted when
+/// it does.
+pub(crate) async fn purge_expired_saved_queries(pool: &PgPool) -> Result<u64, StoreError> {
+    let cutoff =
+        OffsetDateTime::now_utc() - time::Duration::days(i64::from(queries::TRASH_RETENTION_DAYS));
+    queries::purge_trashed_before(pool, cutoff).await
+}
+
+/// Spawn the sweep that removes the saved queries that waited in the trash
+/// longer than
+/// [`TRASH_RETENTION_DAYS`](lakehouse_store::queries::TRASH_RETENTION_DAYS)
+/// days.
+///
+/// It runs once at start (the first tick is immediate) and then every
+/// hour, missed ticks skipped. An error is logged at `warn` and never
+/// takes the process down; the next pass removes what this one missed.
+/// Without a Postgres pool, it logs once and spawns nothing.
+///
+/// `pub` and not `pub(crate)`: `routes/mod.rs` re-exports it, because the
+/// binary's `main` is its only caller and the library target would
+/// otherwise call it dead code — and a re-export of a `pub(crate)` item
+/// is refused by the compiler.
+pub fn spawn_saved_query_trash_sweep(state: &AppState) {
+    let Some(pool) = state.pg.clone() else {
+        tracing::warn!("no Postgres pool configured; the saved-query trash sweep will not run");
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match purge_expired_saved_queries(&pool).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "saved-query trash sweep removed expired queries");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(%err, "saved-query trash sweep failed; nothing was deleted");
+                }
+            }
+        }
+    });
+}
+
+/// The trash sweep (`QS-3`): a saved query that waited in the trash for
+/// more than 30 days is gone for good, and one that waited a day is
+/// still there.
+///
+/// The test calls the pass itself and not the hourly loop: a test that
+/// waits an hour proves nothing, and the loop is the same one the
+/// run-log cleanup uses.
+#[cfg(test)]
+mod trash_sweep_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_store::PgPool;
+    // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+    // testcontainer bootstrap runs for this test binary, the same reason
+    // `tests`'s own `source_marks` module does it.
+    use lakehouse_test_support as _;
+    use time::Duration;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::purge_expired_saved_queries;
+
+    /// A saved query that went to the trash `days` days ago, and the id
+    /// it got.
+    async fn trashed_query(pool: &PgPool, title: &str, days: i64) -> Uuid {
+        let id = Uuid::new_v4();
+        let deleted_at = OffsetDateTime::now_utc() - Duration::days(days);
+        sqlx::query(
+            "INSERT INTO saved_query (id, title, sql, owner, deleted_at) \
+             VALUES ($1, $2, 'SELECT 1', 'Rina Wijaya', $3)",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(deleted_at)
+        .execute(pool)
+        .await
+        .expect("the trashed query is written");
+        id
+    }
+
+    /// Whether the saved query with this id is still in the table.
+    async fn is_there(pool: &PgPool, id: Uuid) -> bool {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM saved_query WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the saved queries are counted");
+        count > 0
+    }
+
+    /// The sweep takes the query that waited in the trash for more than 30
+    /// days and leaves the one that waited a day alone, and it says how
+    /// many it took.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_sweep_removes_only_the_queries_trashed_more_than_thirty_days_ago(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let old = trashed_query(&pool, "In the trash for 31 days", 31).await;
+        let fresh = trashed_query(&pool, "In the trash for a day", 1).await;
+
+        let removed = purge_expired_saved_queries(&pool)
+            .await
+            .expect("the sweep runs");
+
+        assert!(
+            !is_there(&pool, old).await,
+            "the query trashed 31 days ago is gone for good"
+        );
+        assert!(
+            is_there(&pool, fresh).await,
+            "the query trashed a day ago is still in the trash"
+        );
+        assert_eq!(
+            removed, 1,
+            "the sweep answers how many queries it took: the one that waited 31 days"
+        );
+        Ok(())
+    }
 }
 
 /// The SEC-21 settings rule, tested on its own. A separate module from
@@ -2885,8 +3549,88 @@ mod tests {
     use lakehouse_auth::{PermissionSet, PrincipalId};
     use uuid::Uuid;
 
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
     use crate::sql_guard::strip_sql_noise;
+
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// The shared catalog belongs to one tenant, and the query path
+    /// is scoped to the tenant: this fixture principal is the
+    /// catalog's own member, so the shared tables stay reachable.
+    const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
+    fn analyst_principal() -> Extension<Principal> {
+        Extension(Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
+            display_name: "alice".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: vec!["Analyst".to_owned()],
+        })
+    }
+
+    async fn mount_governed_table_responses(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                {"name": "name", "type": "String"},
+                {"name": "default_kind", "type": "String"},
+                {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                {"name": "id", "default_kind": "", "default_expression": ""},
+                {"name": "email", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 2,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+        .and(body_string_contains("system.tables"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+            {"name": "database", "type": "String"},
+            {"name": "name", "type": "String"},
+            {"name": "engine", "type": "String"},
+            {"name": "create_table_query", "type": "String"},
+            ],
+            "data": [
+            {"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""},
+            ],
+            "rows": 1,
+        })))
+        .mount(server)
+        .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpOne"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                {"name": "id", "type": "UInt64"},
+                {"name": "email", "type": "String"},
+                ],
+                "data": [{"id": "1", "email": "***"}],
+                "rows": 1,
+            })))
+            .mount(server)
+            .await;
+    }
 
     /// A logged-in human principal — `PrincipalId::User`.
     fn fixture_user_principal() -> Principal {
@@ -3030,36 +3774,39 @@ mod tests {
         assert_eq!(strip_sql_noise("SELECT 'unterminated"), "SELECT  ");
     }
 
+    /// `DATA-21` D2/D4: only the TIMESTAMP form is refused now — a past
+    /// version by its id runs on `Trino` too.
     #[test]
-    fn a_past_version_clause_is_found_in_the_tokens() {
-        // DATA-16 F3.
-        assert!(uses_past_version_clause(
+    fn a_past_timestamp_clause_is_found_in_the_tokens() {
+        assert!(uses_past_timestamp_clause(
+            "SELECT * FROM iceberg.bronze.orders FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'"
+        ));
+        assert!(uses_past_timestamp_clause(
+            "select * from t timestamp\n/* c */ as of 1"
+        ));
+        // A past version by its id is not a timestamp clause.
+        assert!(!uses_past_timestamp_clause(
             "SELECT * FROM iceberg.bronze.orders FOR VERSION AS OF 1"
         ));
-        assert!(uses_past_version_clause(
-            "SELECT * FROM t FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'"
-        ));
-        assert!(uses_past_version_clause(
-            "select * from t version\n/* c */ as of 1"
-        ));
-        assert!(uses_past_version_clause("SELECT * FROM t VERSION AS OF 1"));
     }
 
     #[test]
     fn the_same_words_in_a_string_or_comment_are_not_a_clause() {
-        assert!(!uses_past_version_clause(
-            "SELECT 'FOR VERSION AS OF 1' FROM t WHERE ("
+        assert!(!uses_past_timestamp_clause(
+            "SELECT 'FOR TIMESTAMP AS OF 1' FROM t WHERE ("
         ));
-        assert!(!uses_past_version_clause(
-            "SELECT 1 -- VERSION AS OF 1\nWHERE ("
+        assert!(!uses_past_timestamp_clause(
+            "SELECT 1 -- TIMESTAMP AS OF 1\nWHERE ("
         ));
-        assert!(!uses_past_version_clause(
-            "SELECT \"version\" AS of_x FROM t"
+        assert!(!uses_past_timestamp_clause(
+            "SELECT \"timestamp\" AS of_x FROM t"
         ));
-        assert!(!uses_past_version_clause("SELECT version, x AS of FROM t"));
-        assert!(!uses_past_version_clause("SELECT FROM WHERE ("));
+        assert!(!uses_past_timestamp_clause(
+            "SELECT timestamp, x AS of FROM t"
+        ));
+        assert!(!uses_past_timestamp_clause("SELECT FROM WHERE ("));
         // An unterminated literal fails to tokenize: today's message stays.
-        assert!(!uses_past_version_clause("SELECT 'VERSION AS OF"));
+        assert!(!uses_past_timestamp_clause("SELECT 'TIMESTAMP AS OF"));
     }
 
     #[test]
@@ -3143,6 +3890,31 @@ mod tests {
         assert_eq!(v["metrics"]["engine"], json!("hot-store"));
     }
 
+    // ── `DATA-29`: a NULL cell is `null`, not an empty string ───────────
+
+    #[test]
+    fn a_null_cell_is_null_and_every_other_cell_keeps_its_text() {
+        // The two halves of the rule: a cell the engine left out and a cell
+        // it reported as NULL are both `null`, and a cell with a value
+        // keeps the text it had before this change (decision D1).
+        assert_eq!(cell_value(None), Value::Null);
+        assert_eq!(cell_value(Some(&Value::Null)), Value::Null);
+        assert_eq!(cell_value(Some(&json!(""))), json!(""));
+        assert_eq!(cell_value(Some(&json!("abc"))), json!("abc"));
+        assert_eq!(cell_value(Some(&json!(5))), json!("5"));
+        assert_eq!(cell_value(Some(&json!(true))), json!("true"));
+        // A value the engines never send (an object, an array) keeps the
+        // compact JSON text it had before as well.
+        assert_eq!(cell_value(Some(&json!({"a": 1}))), json!(r#"{"a":1}"#));
+    }
+
+    #[test]
+    fn a_null_cell_and_an_empty_cell_are_told_apart() {
+        // The point of the change: a missing value and an empty text are
+        // two different answers, not one empty string.
+        assert_ne!(cell_value(Some(&Value::Null)), cell_value(Some(&json!(""))));
+    }
+
     // ── The server-side byte cap (`QS-2`) ────────────────────────────────
 
     #[test]
@@ -3152,13 +3924,28 @@ mod tests {
         // Any other value's compact JSON text.
         assert_eq!(cell_byte_cost(&json!(5)), 2);
         assert_eq!(cell_byte_cost(&json!(true)), 5);
+        // A null cell costs its compact JSON text (`null`, four bytes) and
+        // the separator (`DATA-29`, decision D2): the rule already said
+        // that, and a NULL cell is now sent as `null` and not as the empty
+        // string, so the cap counts the bytes the answer carries.
         assert_eq!(cell_byte_cost(&json!(null)), 5);
+    }
+
+    #[test]
+    fn a_null_cell_costs_more_than_an_empty_one() {
+        // The empty string is one byte (its own text plus the separator);
+        // a null cell is five. A result of null cells is therefore bigger
+        // than the same result of empty strings — as it is on the wire.
+        assert_eq!(cell_byte_cost(&json!(null)), 5);
+        assert_eq!(cell_byte_cost(&json!("")), 1);
     }
 
     #[test]
     fn a_row_costs_the_sum_of_its_cells() {
         assert_eq!(row_byte_cost(&json!({"a": "xx", "b": "yyy"})), 3 + 4);
         assert_eq!(row_byte_cost(&json!(["xx", "yyy"])), 3 + 4);
+        // A row with a null cell costs the null's five bytes (`DATA-29`).
+        assert_eq!(row_byte_cost(&json!({"a": null})), 5);
     }
 
     #[test]
@@ -3537,6 +4324,7 @@ mod tests {
         use std::collections::HashMap;
 
         use lakehouse_auth::{PermissionSet, PrincipalId};
+        use lakehouse_store::governance::CreatePolicyInput;
         use uuid::Uuid;
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3685,6 +4473,172 @@ mod tests {
 
             assert_eq!(value["engine"], json!("trino"));
             assert_eq!(value["rows"], json!([{"n": "1"}]));
+        }
+
+        /// The state a `Trino` test runs against: the seeded deployment's
+        /// database (the policy engine reads a principal's obligations
+        /// from Postgres), the mock `ClickHouse` (the policy engine asks
+        /// it for a table's real columns and for its views) and the mock
+        /// `Trino`.
+        fn state_with_trino(pool: &PgPool, ch_url: &str, trino_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert("TRINO_URL".to_owned(), trino_uri.to_owned());
+            env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+            AppState::new(Config::from_map(&env).expect("valid config from a plain map"))
+        }
+
+        /// `DATA-21` S1-T3: a masked table reads on `Trino` — the mask is
+        /// `Trino`'s own form, and the answer is `***`.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_masked_table_on_trino_answers_with_stars(pool: PgPool) -> sqlx::Result<()> {
+            lakehouse_store::governance::create_policy(
+                &pool,
+                &CreatePolicyInput {
+                    name: "query-run-trino-masking-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "serving.mart_x".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+
+            // The policy engine asks `ClickHouse` for the table's real
+            // columns and for its views.
+            let ch = MockServer::start().await;
+            mount_governed_table_responses(&ch).await;
+            let trino = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [
+                        {"name": "id", "type": "bigint"},
+                        {"name": "email", "type": "varchar"}
+                    ],
+                    "data": [[1, "***"]],
+                })))
+                .mount(&trino)
+                .await;
+
+            let state = state_with_trino(&pool, &ch.uri(), &trino.uri());
+            let ApiJson(value) = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                trino_body("SELECT * FROM serving.mart_x"),
+            )
+            .await
+            .expect("a masked run on Trino must succeed");
+
+            assert_eq!(value["engine"], json!("trino"));
+            assert_eq!(value["rows"], json!([{"id": "1", "email": "***"}]));
+            let requests = trino
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests.iter().any(|r| String::from_utf8_lossy(&r.body)
+                    .contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\"")),
+                "the statement Trino received must be the masked one: {:?}",
+                requests
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(&r.body).to_string())
+                    .collect::<Vec<_>>()
+            );
+            Ok(())
+        }
+
+        /// `DATA-21` D2/D4: a past version runs on `Trino` — the clause
+        /// is `Trino`'s own form, and the engine receives it back in that
+        /// form.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_past_version_on_trino_runs(pool: PgPool) -> sqlx::Result<()> {
+            let ch = MockServer::start().await;
+            mount_governed_table_responses(&ch).await;
+            let trino = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [{"name": "id", "type": "bigint"}],
+                    "data": [[1]],
+                })))
+                .mount(&trino)
+                .await;
+
+            let state = state_with_trino(&pool, &ch.uri(), &trino.uri());
+            let ApiJson(value) = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                trino_body("SELECT * FROM serving.mart_x FOR VERSION AS OF 12345"),
+            )
+            .await
+            .expect("a past-version run on Trino must succeed");
+
+            assert_eq!(value["engine"], json!("trino"));
+            let requests = trino
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| String::from_utf8_lossy(&r.body).contains("FOR VERSION AS OF 12345")),
+                "the statement Trino received must carry the version: {:?}",
+                requests
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(&r.body).to_string())
+                    .collect::<Vec<_>>()
+            );
+            Ok(())
+        }
+
+        /// `DATA-29`: the Trino branch answers a `NULL` cell as JSON `null`
+        /// and an empty text as `""`, so the two are told apart in the very
+        /// same row — the answer says "no value" and "an empty value", not
+        /// two empty values.
+        #[tokio::test]
+        async fn a_null_cell_is_null_and_an_empty_cell_is_an_empty_string() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [
+                        {"name": "maybe", "type": "varchar"},
+                        {"name": "text", "type": "varchar"},
+                    ],
+                    "data": [[null, ""]],
+                })))
+                .mount(&server)
+                .await;
+
+            let state = test_state_with_trino(&server.uri());
+            let ApiJson(value) = run(
+                State(state),
+                Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
+                trino_body("SELECT 1"),
+            )
+            .await
+            .expect("ok");
+
+            assert_eq!(
+                value["rows"],
+                json!([{"maybe": null, "text": ""}]),
+                "a NULL cell must be null and an empty cell must stay an empty string"
+            );
         }
 
         #[tokio::test]
@@ -4077,9 +5031,12 @@ mod tests {
         /// caller gets a fixed sentence and a reference id.
         #[test]
         fn an_engine_failure_answers_a_fixed_sentence_with_a_reference() {
-            let err = download_failure(&crate::export::ExportError::Source(ChError::Server(
-                "Code: 47. Unknown identifier: nope".to_owned(),
-            )));
+            let err = crate::routes::export_failure(
+                &upstream_error::DATABASE,
+                &crate::export::ExportError::Source(ChError::Server(
+                    "Code: 47. Unknown identifier: nope".to_owned(),
+                )),
+            );
             assert_eq!(err.status(), 422);
             let text = err.to_string();
             assert!(
@@ -4091,7 +5048,10 @@ mod tests {
 
         #[test]
         fn an_unreachable_engine_answers_503() {
-            let err = download_failure(&crate::export::ExportError::Source(ChError::Cancelled));
+            let err = crate::routes::export_failure(
+                &upstream_error::DATABASE,
+                &crate::export::ExportError::Source(ChError::Cancelled),
+            );
             assert_eq!(err.status(), 503);
         }
 
@@ -4176,27 +5136,10 @@ mod tests {
 
         use std::collections::HashMap;
 
-        use lakehouse_auth::{PermissionSet, PrincipalId};
         use lakehouse_store::governance::CreatePolicyInput;
-        use uuid::Uuid;
-        use wiremock::matchers::{body_string_contains, method};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         use super::*;
         use crate::config::Config;
-
-        fn database_url_for(pool: &PgPool) -> String {
-            let options = pool.connect_options();
-            format!(
-                "postgres://{}:postgres@{}:{}/{}",
-                options.get_username(),
-                options.get_host(),
-                options.get_port(),
-                options
-                    .get_database()
-                    .expect("#[sqlx::test] always targets a named database"),
-            )
-        }
 
         /// The state these tests run against: the seeded deployment's
         /// database, the mock engine, and the shared catalog's own
@@ -4208,70 +5151,6 @@ mod tests {
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
             env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
             AppState::new(Config::from_map(&env).expect("valid config from a map"))
-        }
-
-        /// The shared catalog belongs to one tenant, and the query path
-        /// is scoped to the tenant: this fixture principal is the
-        /// catalog's own member, so the shared tables stay reachable.
-        const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
-
-        fn analyst_principal() -> Extension<Principal> {
-            Extension(Principal {
-                id: PrincipalId::User(Uuid::nil()),
-                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
-                display_name: "alice".to_owned(),
-                permissions: PermissionSet::parse("query:read"),
-                provider: "session".to_owned(),
-                must_change_password: false,
-                role_names: vec!["Analyst".to_owned()],
-            })
-        }
-
-        async fn mount_governed_table_responses(server: &MockServer) {
-            Mock::given(method("POST"))
-                .and(body_string_contains("system.columns"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "meta": [
-                        {"name": "name", "type": "String"},
-                        {"name": "default_kind", "type": "String"},
-                        {"name": "default_expression", "type": "String"},
-                    ],
-                    "data": [
-                        {"name": "id", "default_kind": "", "default_expression": ""},
-                        {"name": "email", "default_kind": "", "default_expression": ""},
-                    ],
-                    "rows": 2,
-                })))
-                .mount(server)
-                .await;
-            Mock::given(method("POST"))
-                .and(body_string_contains("system.tables"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "meta": [
-                        {"name": "database", "type": "String"},
-                        {"name": "name", "type": "String"},
-                        {"name": "engine", "type": "String"},
-                        {"name": "create_table_query", "type": "String"},
-                    ],
-                    "data": [
-                        {"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""},
-                    ],
-                    "rows": 1,
-                })))
-                .mount(server)
-                .await;
-            Mock::given(method("POST"))
-                .and(body_string_contains("replaceRegexpOne"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "meta": [
-                        {"name": "id", "type": "UInt64"},
-                        {"name": "email", "type": "String"},
-                    ],
-                    "data": [{"id": "1", "email": "***"}],
-                    "rows": 1,
-                })))
-                .mount(server)
-                .await;
         }
 
         /// Failing-test-first for WS7 item C2: before this task wired
@@ -4787,6 +5666,422 @@ mod tenant_scope_tests {
                 owns_catalog: false,
             }
         );
+    }
+}
+
+/// `SEC-50`: the shared tenant gate's actors, on their own — which reach
+/// each actor gets, and what the gate refuses.
+#[cfg(test)]
+mod sec50_gate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use axum::http::HeaderMap;
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use lakehouse_store::PgPool;
+    use lakehouse_store::uploads::claim_table;
+    use uuid::Uuid;
+
+    use super::{
+        CLICKHOUSE_DIALECT, GateActor, JOB_NEEDS_CATALOG_TENANT, StatementGate, TenantReach,
+        catalog_tenant_reach, gate_statement, ownerless_reach, reach_for_actor,
+    };
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    /// The tenant that owns the shared catalog in these tests.
+    const CATALOG_TENANT: Uuid = uuid::uuid!("11111111-1111-4111-8111-000000000001");
+    /// Another tenant of the same deployment.
+    const OTHER_TENANT: Uuid = uuid::uuid!("11111111-1111-4111-8111-000000000002");
+    /// The upload table the claims below are about.
+    const CLAIMED_TABLE: &str = "group_orders";
+    /// The statement that reads it.
+    const STATEMENT: &str = "SELECT * FROM bronze.group_orders";
+    /// The refusal of that statement, byte for byte.
+    const REFUSAL: &str =
+        "Table not found or not available to your organisation: bronze.group_orders";
+
+    /// A principal that belongs to exactly one tenant.
+    fn principal_in(tenant_id: Uuid) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: vec![tenant_id],
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// `SEC-50` R1: a principal holding the unrestricted (`"*:*"`) grant.
+    /// It belongs to no tenant at all, exactly like the bootstrap admin
+    /// the G7 harness creates its pipelines as.
+    fn unrestricted_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(2)),
+            tenant_ids: Vec::new(),
+            display_name: "Bootstrap Admin".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A state with no pool at all: the deployment's own answers are
+    /// missing, so the gate must fail closed rather than guess.
+    fn state_without_a_database() -> AppState {
+        AppState::without_a_database()
+    }
+
+    /// The pool's own URL, for a state that reads it.
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    #[test]
+    fn a_job_with_no_user_reaches_everything_in_a_one_tenant_deployment() {
+        assert_eq!(
+            catalog_tenant_reach(Some(1), None).expect("a deployment with one tenant"),
+            TenantReach::All
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_user_acts_as_the_tenant_that_owns_the_shared_catalog() {
+        assert_eq!(
+            catalog_tenant_reach(Some(4), Some(CATALOG_TENANT)).expect("the catalog's own tenant"),
+            TenantReach::Tenant {
+                tenant_id: CATALOG_TENANT,
+                owns_catalog: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_user_is_refused_when_no_tenant_owns_the_shared_catalog() {
+        let err = catalog_tenant_reach(Some(4), None)
+            .expect_err("several tenants and no tenant that owns the shared catalog");
+        assert_eq!(err.status(), 422);
+        assert_eq!(err.to_string(), JOB_NEEDS_CATALOG_TENANT);
+        // The sentence names the setting and what to do with it, and
+        // nothing about the deployment's data.
+        assert_eq!(
+            JOB_NEEDS_CATALOG_TENANT,
+            "This job reads the shared catalog, and no tenant owns it here. Set CATALOG_TENANT_ID to the tenant that owns this deployment's shared catalog."
+        );
+    }
+
+    /// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment
+    /// that cannot COUNT its tenants refuses the job, even with the setting
+    /// named. "Cannot verify it is safe" is the same answer as "verified
+    /// unsafe" — `SEC-20`'s own rule, the one the shared catalog's own gate
+    /// already follows with no pool.
+    ///
+    /// The sentence is `SEC-20`'s own for that state ("could not verify
+    /// tenant count", a 503), NOT D6's: D6 tells the operator to set a
+    /// setting that may already be set, and the thing that is missing here
+    /// is the deployment's own answer, not the setting.
+    #[test]
+    fn a_job_with_no_user_is_refused_in_a_deployment_that_cannot_count_its_tenants() {
+        let err = catalog_tenant_reach(None, Some(CATALOG_TENANT))
+            .expect_err("a deployment that cannot say how many tenants it holds");
+        assert_eq!(err.status(), 503);
+        assert_eq!(
+            err.to_string(),
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT
+        );
+        assert_eq!(
+            err.to_string(),
+            "could not verify tenant count",
+            "the sentence names the count, not a setting to set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_site_that_acts_as_no_tenant_reaches_nothing() {
+        let state = state_without_a_database();
+        let principal = principal_in(CATALOG_TENANT);
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: None,
+            },
+        )
+        .await
+        .expect("the reach of a site with no tenant at all");
+        assert_eq!(reach, TenantReach::NoTenant);
+    }
+
+    /// `SEC-50` R1 (review round 1, BLOCKER 1): a principal holding the
+    /// unrestricted grant reaches everything, even through a site that
+    /// acts as no tenant at all. `SEC-20`'s own rule is that such a
+    /// principal passes, and it reads every table in Query Studio
+    /// already.
+    #[tokio::test]
+    async fn an_unrestricted_principal_reaches_everything_even_as_a_site_with_no_tenant() {
+        let state = state_without_a_database();
+        let principal = unrestricted_principal();
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: None,
+            },
+        )
+        .await
+        .expect("the reach of an unrestricted principal");
+        assert_eq!(reach, TenantReach::All);
+    }
+
+    /// `SEC-50` R1: the same rule for a site that acts as a NAMED tenant
+    /// the principal does not belong to — the unrestricted grant is
+    /// checked before the tenant, so the principal is not refused for a
+    /// tenant it never had.
+    #[tokio::test]
+    async fn an_unrestricted_principal_reaches_everything_even_as_a_tenant_it_is_not_in() {
+        let state = state_without_a_database();
+        let principal = unrestricted_principal();
+        let reach = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await
+        .expect("the reach of an unrestricted principal");
+        assert_eq!(reach, TenantReach::All);
+    }
+
+    #[tokio::test]
+    async fn a_site_that_acts_as_a_tenant_it_may_not_act_as_is_refused() {
+        let state = state_without_a_database();
+        let principal = principal_in(CATALOG_TENANT);
+        let err = reach_for_actor(
+            &state,
+            GateActor::AsTenant {
+                principal: &principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await
+        .expect_err("a principal that is not a member of that tenant");
+        // The same 404 an `X-Tenant` header naming a foreign tenant
+        // gets — never a 403, which would confirm the tenant exists.
+        assert_eq!(err.status(), 404);
+        assert_eq!(err.to_string(), "tenant not found");
+    }
+
+    /// `SEC-50` R5 (amended, PR #281 review round 2 NIT): a deployment
+    /// with no database at all cannot say who owns the shared catalog, so
+    /// the job-with-no-user actor is refused with `SEC-20`'s own sentence
+    /// for that state (a 503) — not D6's, which names a setting to set.
+    #[tokio::test]
+    async fn a_job_with_no_user_in_a_deployment_that_cannot_say_who_owns_the_catalog_is_refused() {
+        let state = state_without_a_database();
+        let err = reach_for_actor(&state, GateActor::CatalogTenant)
+            .await
+            .expect_err("a deployment that cannot say who owns the shared catalog");
+        assert_eq!(err.status(), 503);
+        assert_eq!(
+            err.to_string(),
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT
+        );
+    }
+
+    /// The gate itself, over a real deployment: the upload table another
+    /// tenant claimed is out of reach for every actor that does not own
+    /// it, and in reach for the tenant that does.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_gate_refuses_another_tenants_upload_table_for_every_actor(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_string());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+        let claimed = claim_table(&pool, OTHER_TENANT, CLAIMED_TABLE, "upload-other")
+            .await
+            .expect("claim the upload table for the other tenant");
+        assert!(claimed, "the other tenant must hold the claim");
+
+        let catalog_principal = principal_in(CATALOG_TENANT);
+        let other_principal = principal_in(OTHER_TENANT);
+
+        // The caller in the catalog's own tenant may not read the other
+        // tenant's upload.
+        let refused = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::Caller {
+                principal: &catalog_principal,
+                headers: &HeaderMap::new(),
+            },
+        )
+        .await
+        .expect_err("another tenant's upload table");
+        assert_eq!(refused.to_string(), REFUSAL);
+
+        // A job with no user acts as the catalog's tenant, so the other
+        // tenant's upload is out of ITS reach too.
+        let refused = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::CatalogTenant,
+        )
+        .await
+        .expect_err("another tenant's upload table");
+        assert_eq!(refused.to_string(), REFUSAL);
+
+        // The tenant that holds the table reads it — as a caller acting
+        // as itself, and as a site acting as that tenant.
+        let allowed = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::AsTenant {
+                principal: &other_principal,
+                tenant_id: Some(OTHER_TENANT),
+            },
+        )
+        .await;
+        assert!(allowed.is_ok(), "the owning tenant reads its own upload");
+        Ok(())
+    }
+
+    /// `SEC-50` slice 2 M8: a site whose owner is gone reaches everything
+    /// in a deployment with one tenant — there is no other tenant's table
+    /// to reach — and nothing at all in a deployment with several.
+    #[test]
+    fn an_ownerless_site_reaches_everything_in_a_one_tenant_deployment() {
+        assert_eq!(
+            ownerless_reach(Some(1)).expect("a deployment with one tenant"),
+            TenantReach::All
+        );
+    }
+
+    #[test]
+    fn an_ownerless_site_reaches_nothing_in_a_deployment_with_several_tenants() {
+        assert_eq!(
+            ownerless_reach(Some(4)).expect("a deployment with several tenants"),
+            TenantReach::NoTenant
+        );
+    }
+
+    /// `SEC-50` slice 2 M8 with R5: a deployment that cannot count its
+    /// tenants refuses, with `SEC-20`'s own sentence for that state (a
+    /// 503) — not D6's, which names a setting to set.
+    #[test]
+    fn an_ownerless_site_is_refused_in_a_deployment_that_cannot_count_its_tenants() {
+        let err = ownerless_reach(None)
+            .expect_err("a deployment that cannot say how many tenants it holds");
+        assert_eq!(err.status(), 503);
+        assert_eq!(
+            err.to_string(),
+            crate::routes::catalog::COULD_NOT_VERIFY_TENANT_COUNT
+        );
+    }
+
+    /// `SEC-50` slice 2 M8, over a real deployment: the ownerless actor
+    /// refuses another tenant's upload table, and lets a deployment with
+    /// one tenant through.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_ownerless_site_is_refused_for_another_tenants_upload_table(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), "http://127.0.0.1:1".to_owned());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_string());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+        let claimed = claim_table(&pool, OTHER_TENANT, CLAIMED_TABLE, "upload-other")
+            .await
+            .expect("claim the upload table for the other tenant");
+        assert!(claimed, "the other tenant must hold the claim");
+
+        let refused = gate_statement(
+            &state,
+            STATEMENT,
+            &sqlparser::dialect::ClickHouseDialect {},
+            GateActor::Ownerless,
+        )
+        .await
+        .expect_err("another tenant's upload table");
+        assert_eq!(refused.to_string(), REFUSAL);
+        Ok(())
+    }
+
+    /// `SEC-50` slice 2 T1: the unrestricted gate reaches everything without
+    /// a database — a `*:*` principal passes `SEC-20`'s own rule — so a test
+    /// that is about the runner and not about the gate needs no deployment.
+    #[tokio::test]
+    async fn the_unrestricted_gate_reaches_everything() {
+        let state = state_without_a_database();
+        let gate = StatementGate::unrestricted(&state);
+        gate.check(STATEMENT)
+            .await
+            .expect("an unrestricted principal reads every table");
+    }
+
+    /// `SEC-50` slice 2 M2: the carrier resolves the reach ONCE for a
+    /// request and keeps it, so a board's tiles do not each read it.
+    ///
+    /// The count is the carrier's own state, which is what the plan asks
+    /// for ("count the Postgres reads or the `OnceCell` state"): a second
+    /// statement does not resolve the reach again.
+    #[tokio::test]
+    async fn the_gate_resolves_the_reach_once_for_a_request() {
+        let state = state_without_a_database();
+        let gate = StatementGate::new(&state, GateActor::Ownerless, &CLICKHOUSE_DIALECT);
+        assert!(!gate.reach_resolved(), "the reach is resolved lazily");
+        // A statement that names no table asks the deployment nothing.
+        gate.check("SELECT 1")
+            .await
+            .expect("a statement that names no table");
+        assert!(
+            !gate.reach_resolved(),
+            "a statement that names no table reads nothing, so nothing is resolved"
+        );
+        // One that names a table resolves it, and the next one reuses it.
+        gate.check(STATEMENT).await.expect_err("the owner's table");
+        assert!(gate.reach_resolved(), "the reach is resolved once");
+    }
+
+    /// `SEC-50` slice 2 M2: a refused request is refused the same way for
+    /// every statement of it — the refusal is kept, not re-decided.
+    #[tokio::test]
+    async fn a_refused_gate_refuses_the_next_statement_the_same_way() {
+        let state = state_without_a_database();
+        let gate = StatementGate::new(&state, GateActor::Ownerless, &CLICKHOUSE_DIALECT);
+        let first = gate
+            .check(STATEMENT)
+            .await
+            .expect_err("a deployment that cannot count its tenants");
+        let second = gate
+            .check(STATEMENT)
+            .await
+            .expect_err("the same refusal for the next statement");
+        assert_eq!(first.status(), second.status());
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(first.status(), 503);
     }
 }
 

@@ -98,15 +98,24 @@ impl PolicyCondition {
     /// [`Self::parse`] over an `Option<&str>`, for the common
     /// `policy.conditions: Option<String>` shape.
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "no read-time caller exists yet in Phase A; Phase B's sql_rewrite \
-                  enforcement path (and WS7 item A5's preview route) call this on every \
-                  policy.conditions it loads"
-    )]
     pub fn parse_opt(raw: Option<&str>) -> Option<Self> {
         raw.and_then(Self::parse)
     }
+}
+
+/// Whether a policy's authored `conditions` name `role` among the roles it
+/// applies to.
+///
+/// The match is [`PolicyEngineObligations::obligations_for_async`]'s own —
+/// an exact entry in `PolicyCondition::roles` — exposed so the role-rename
+/// refusal (`WEB-3` review R2) asks the engine's question instead of
+/// growing a second parser. `false` for anything
+/// [`PolicyCondition::parse_opt`] does not accept: an unenforceable
+/// condition masks nothing and filters no rows today, so a rename cannot
+/// take an obligation away from the role through it.
+#[must_use]
+pub fn condition_names_role(conditions: Option<&str>, role: &str) -> bool {
+    PolicyCondition::parse_opt(conditions).is_some_and(|cond| cond.roles.iter().any(|r| r == role))
 }
 
 /// Errors resolving real obligations for a principal's query — never
@@ -179,6 +188,9 @@ pub fn refusal_message(err: &sql_rewrite::RewriteError) -> &'static str {
         sql_rewrite::RewriteError::ViewOverGovernedTable { .. } => {
             "Query membaca view yang menyingkap tabel yang diatur kebijakan; tidak didukung."
         }
+        sql_rewrite::RewriteError::InvalidPastVersion => {
+            "Versi lampau dipilih dengan id versinya, bukan dengan timestamp."
+        }
     }
 }
 
@@ -230,6 +242,12 @@ pub fn enforcement_error_message(err: &EnforcementError) -> &'static str {
 /// by constructing two separate `&dyn Dialect` locals, one on each side
 /// of the `.await`, before this shared function existed).
 ///
+/// `engine` says which engine's SQL the rewrite is written in
+/// (`DATA-21` D1): the same obligations, the engine's own identifiers and
+/// functions. Every `ClickHouse` caller passes
+/// [`sql_rewrite::Engine::ClickHouse`] and gets the text it got before
+/// the argument existed.
+///
 /// # Errors
 /// [`EnforcementError::Engine`] if obligations cannot be resolved;
 /// [`EnforcementError::Rewrite`] if `sql` fails classification or
@@ -237,6 +255,7 @@ pub fn enforcement_error_message(err: &EnforcementError) -> &'static str {
 pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
     sql: &str,
     dialect: &D,
+    engine: sql_rewrite::Engine,
     roles: &[String],
     placeholders: &sql_rewrite::PlaceholderValues,
     obligations_source: &PolicyEngineObligations<'_>,
@@ -249,6 +268,7 @@ pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
     Ok(sql_rewrite::enforce(
         sql,
         dialect,
+        engine,
         roles,
         placeholders,
         &obligations,
@@ -923,6 +943,7 @@ mod tests {
             let sql = rewrite_sql_for_roles(
                 "SELECT * FROM icecat_api.`bronze.orders`",
                 &sqlparser::dialect::ClickHouseDialect {},
+                sql_rewrite::Engine::ClickHouse,
                 &["Analyst".to_owned()],
                 &sql_rewrite::PlaceholderValues::none(),
                 &source,

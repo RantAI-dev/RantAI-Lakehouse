@@ -8,7 +8,6 @@ import {
   lakehouseTableDetailUrl,
   lakehouseTableHref,
   lakehouseTablesUrl,
-  lakehouseWarehousesUrl,
   maintenanceSummary,
   msToIso,
   snapshotRelativeTime,
@@ -33,11 +32,6 @@ function snapshot(partial: Partial<LakehouseSnapshot>): LakehouseSnapshot {
   }
 }
 
-describe("lakehouseWarehousesUrl", () => {
-  it("has no query parameters", () => {
-    expect(lakehouseWarehousesUrl()).toBe("/api/lakehouse/warehouses")
-  })
-})
 
 describe("lakehouseNamespacesUrl", () => {
   it("omits the warehouse query when unset", () => {

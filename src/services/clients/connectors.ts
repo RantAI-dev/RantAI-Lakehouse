@@ -10,7 +10,8 @@ import type {
   ConnectorType,
   CreateConnectorInput,
   CreateConnectorResponse,
-  DebeziumProperties,
+  ChangeCaptureState,
+  LagLimitResponse,
   DiscoveryAnswer,
   IngestibleConnector,
   IngestRunResult,
@@ -20,6 +21,7 @@ import type {
   OAuthStart,
   OAuthStatus,
   ProbeHistoryResponse,
+  PauseConnectorResponse,
   ResumeConnectorResponse,
   RotateConnectorSecretRequest,
   RotateConnectorSecretResponse,
@@ -185,10 +187,24 @@ export const postgresConnectorService: ConnectorService = {
       signal
     );
   },
-  getDebeziumProperties(id, table, signal) {
-    return getJson<DebeziumProperties>(
-      `/api/connectors/${encodeURIComponent(id)}/debezium-properties?table=${encodeURIComponent(table)}`,
+  pauseConnector(connectorId, signal) {
+    return postJson<PauseConnectorResponse>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/pause`,
+      undefined,
+      signal
+    );
+  },
+  getChangeCapture(connectorId, signal) {
+    return getJson<ChangeCaptureState>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/change-capture`,
       { signal }
+    );
+  },
+  setLagLimit(connectorId, minutes, signal) {
+    return putJson<LagLimitResponse>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/lag-limit`,
+      { minutes },
+      signal
     );
   },
   listProbeHistory(id, limit, signal) {

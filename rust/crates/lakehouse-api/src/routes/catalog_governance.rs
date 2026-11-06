@@ -29,7 +29,7 @@ use serde_json::{Map, Value, json};
 use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
 
 use crate::policy_engine::PolicyCondition;
-use crate::routes::dashboard_organise::viewer_of;
+use crate::routes::dashboard_access::viewer_for;
 use crate::routes::governance::observed_quality;
 use crate::routes::quality::{LatestRun, latest_runs, threshold_hint};
 use crate::state::AppState;
@@ -237,7 +237,15 @@ pub(crate) async fn dependents(
         }
     }
     if principal.has("dashboard:read") {
-        out.extend(dashboard_dependents(state, tables, &viewer_of(principal)).await);
+        // BI-19 part B1: through the caller's rules, so a dashboard restricted
+        // to other people is not named here either. If the rules cannot be
+        // read the list is left out, never shown unfiltered.
+        match viewer_for(state, principal).await {
+            Ok(viewer) => out.extend(dashboard_dependents(state, tables, &viewer).await),
+            Err(_unreadable) => {
+                tracing::warn!("catalog detail: dashboard dependents unavailable");
+            }
+        }
     }
     out
 }

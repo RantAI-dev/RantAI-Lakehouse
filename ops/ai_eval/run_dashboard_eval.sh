@@ -11,6 +11,11 @@
 # Usage:
 #   LLM_KEY=<key> ops/ai_eval/run_dashboard_eval.sh [--baseline results.json]
 #                                            [--out results.json] [--image tag]
+#                                            [--exclude id1,id2]
+#
+# --exclude leaves the named cases out of the run and the count, and lists them
+# in the results file. Nothing is excluded by default. An id that names no case
+# is a setup error, so a stale exclusion cannot hide a typo.
 #
 # Env the caller sets (all optional except LLM_KEY):
 #   LLM_KEY         required; no model, no run
@@ -48,11 +53,13 @@ usage() {
 BASELINE=""
 OUT=""
 IMAGE=""
+EXCLUDE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --baseline) BASELINE="${2:?--baseline needs a file}"; shift 2 ;;
         --out)      OUT="${2:?--out needs a file}"; shift 2 ;;
         --image)    IMAGE="${2:?--image needs a tag}"; shift 2 ;;
+        --exclude)  EXCLUDE="${2:?--exclude needs a comma-separated list of case ids}"; shift 2 ;;
         -h|--help)  usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -128,6 +135,13 @@ for name in $(required_compose_vars); do
 done
 unset name value
 
+# BI-26 slice 2: the signed-embed tools refuse with `embedding is not
+# configured` when EMBED_SECRET is unset, so the set that reaches
+# `enable_embed`, `set_embed_filter_modes` and `get_embed_snippet` needs one.
+# Made for this run like the must-set values above, and never printed. Compose
+# has no default for it (rule 5).
+EMBED_SECRET="$(random_hex 32)"
+
 # The api image. Without --image the run builds its own, so it never measures
 # an image left by an earlier build, and removes it at teardown. With --image
 # the caller's image is used and left alone.
@@ -159,7 +173,7 @@ dc() { docker compose -p "$PROJECT" "$@"; }
 
 export API_HOST_PORT CH_HTTP_HOST_PORT CH_NATIVE_HOST_PORT POSTGRES_HOST_PORT
 export AUTH_BOOTSTRAP_EMAIL="$ADMIN_EMAIL" AUTH_BOOTSTRAP_PASSWORD="$ADMIN_PASSWORD"
-export CH_USER CH_PASSWORD
+export CH_USER CH_PASSWORD EMBED_SECRET
 # Compose resolves LLM_URL and LLM_MODEL itself, from the caller's .env or its
 # own default. An exported variable outranks .env in compose, so export them
 # only when the caller set them; never write a default here (S1).
@@ -255,6 +269,7 @@ export AI_EVAL_CH_URL="http://127.0.0.1:${CH_HTTP_HOST_PORT}"
 set -- --cases "$SCRIPT_DIR/dashboard_cases.json" --repeat 3 --need 2 --label "dashboard"
 [ -n "$BASELINE" ] && set -- "$@" --baseline "$BASELINE"
 [ -n "$OUT" ] && set -- "$@" --out "$OUT"
+[ -n "$EXCLUDE" ] && set -- "$@" --exclude "$EXCLUDE"
 
 python3 "$SCRIPT_DIR/ai_eval.py" "$@"
 exit $?

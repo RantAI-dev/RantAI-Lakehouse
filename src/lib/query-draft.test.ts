@@ -43,6 +43,68 @@ test("parseTabs memulihkan tab yang tersimpan dalam bentuk baru", () => {
   })
 })
 
+test("parseTabs memulihkan tab yang menyimpan id kueri tersimpan dan levelnya", () => {
+  const tabs = parseTabs(
+    JSON.stringify({
+      tabs: [
+        {
+          id: "a",
+          name: "Orders",
+          sql: "SELECT 1",
+          engine: "clickhouse",
+          savedId: "q1",
+          level: "edit",
+        },
+      ],
+      activeId: "a",
+    })
+  )
+  assert.deepEqual(tabs?.tabs, [
+    {
+      id: "a",
+      name: "Orders",
+      sql: "SELECT 1",
+      engine: "clickhouse",
+      savedId: "q1",
+      level: "edit",
+    },
+  ])
+})
+
+test("parseTabs membaca tab yang tidak menyimpan id kueri tersimpan", () => {
+  const tabs = parseTabs(
+    JSON.stringify({
+      tabs: [{ id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse" }],
+      activeId: "a",
+    })
+  )
+  assert.deepEqual(tabs?.tabs, [
+    { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse" },
+  ])
+  assert.equal("savedId" in (tabs?.tabs[0] ?? {}), false)
+})
+
+test("parseTabs mengabaikan medan yang tidak dikenal", () => {
+  const tabs = parseTabs(
+    JSON.stringify({
+      tabs: [
+        {
+          id: "a",
+          name: "Orders",
+          sql: "SELECT 1",
+          engine: "clickhouse",
+          warna: "merah",
+          savedId: 42,
+        },
+      ],
+      activeId: "a",
+    })
+  )
+  assert.deepEqual(tabs?.tabs, [
+    { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse" },
+  ])
+})
+
 test("parseTabs membuang entri yang tidak bisa dipakai", () => {
   const tabs = parseTabs(
     JSON.stringify({

@@ -88,6 +88,7 @@ export function SqlPanel({
     runSelectionOrAll,
     reEstimate,
     explain,
+    saveTarget,
   } = studio
   const explainBusy = explain.busy
   const explainRun = explain.run
@@ -179,7 +180,7 @@ export function SqlPanel({
           title={oneStatement ? undefined : "Select one statement"}
         >
           <Save className="size-4" aria-hidden />
-          Save query
+          {saveTarget.label}
         </Button>
         {onSaveAsSource ? (
           <Button

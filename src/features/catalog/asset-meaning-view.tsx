@@ -61,7 +61,7 @@ export function MeaningBadge({ state, columns }: { state: MeaningState; columns:
       ? {
           tone: "warning" as const,
           text: "Meaning: AI draft",
-          title: "The assistant drafted this table's meanings. Nobody has confirmed them yet.",
+          title: "AI Copilot drafted this table's meanings. Nobody has confirmed them yet.",
         }
       : summary.kind === "partial"
         ? {
@@ -92,12 +92,12 @@ function ProvenanceLine({ entry }: { entry: SemanticEntry }) {
     entry.status === "draft"
       ? entry.model
         ? `Drafted by ${entry.model}`
-        : "Drafted by the assistant"
+        : "Drafted by AI Copilot"
       : "Confirmed by a person"
   return <p className="text-xs text-muted-foreground">{`${who} · ${when}`}</p>
 }
 
-const TABLE_DESCRIPTION = "What this table is, in plain words. The assistant reads it when it answers a question."
+const TABLE_DESCRIPTION = "What this table is, in plain words. AI Copilot reads it when it answers a question."
 
 /**
  * The table's own meaning, above the Columns card. Every state the page can
@@ -485,7 +485,7 @@ function MeaningDialog({ state, target, onClose }: { state: Ready; target: Dialo
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
-            Saving marks this as confirmed by a person. The assistant uses it from its next answer.
+            Saving marks this as confirmed by a person. AI Copilot uses it from its next answer.
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
@@ -604,7 +604,7 @@ export function MeaningView({ rows, state }: { rows: SchemaRow[]; state: Ready }
         </p>
       ) : null}
       <p className="text-xs text-muted-foreground">
-        Saving a row marks it as confirmed by a person. The assistant uses it from its next answer.
+        Saving a row marks it as confirmed by a person. AI Copilot uses it from its next answer.
       </p>
       {editing ? (
         // Mounted only while open, so each opening starts from the saved values.

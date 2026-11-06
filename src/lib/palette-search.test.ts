@@ -41,6 +41,12 @@ describe("matchedOnLabel", () => {
     )
   })
 
+  it("says only that a name match was approximate, the name being on screen (DATA-32)", () => {
+    expect(matchedOnLabel({ field: "name", value: "", approximate: true })).toBe(
+      "approximate match",
+    )
+  })
+
   it("has nothing to say when the server sent no reason", () => {
     expect(matchedOnLabel(undefined)).toBeNull()
   })

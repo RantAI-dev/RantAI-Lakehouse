@@ -11,12 +11,13 @@ describe("backfillTriggerMessage", () => {
     }
   })
 
-  it("cites ADR 0008 rather than an untracked plan document", () => {
+  it("no longer sends anyone to bring up a Debezium compose service", () => {
     const msg = backfillTriggerMessage("postgres")
-    expect(msg).toContain("docs/adr/0008-initial-snapshot-backfill.md")
+    expect(msg).not.toContain("compose service")
+    expect(msg).toContain("docs/adr/0016-change-capture-per-connector-on-kafka-connect.md")
   })
 
-  it("says Oracle CDC is unsupported instead of implying the generic Debezium story applies to it", () => {
+  it("says Oracle change capture is unsupported instead of implying the generic story applies to it", () => {
     const msg = backfillTriggerMessage("oracle")
     expect(msg).not.toContain("snapshot.mode=initial")
     expect(msg.toLowerCase()).toContain("not supported")

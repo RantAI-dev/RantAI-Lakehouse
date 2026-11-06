@@ -9,7 +9,7 @@
 #   docker compose -p g6oracleci -f docker-compose.yml \
 #     -f ops/g6/docker-compose.g6-oracle.override.yml \
 #     --profile g6-oracle --profile dagster up -d --build \
-#     lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6
+#     lakehouse-api dagster-code-location dagster-webserver dagster-daemon oracle-g6 oracle-tls-g6
 # It does NOT combine with ops/g6/docker-compose.g6.override.yml: that file
 # makes the passwords of mysql, mssql, mongo, kafka, mariadb and sftp `:?`,
 # which compose interpolates for every service whatever the profile, so
@@ -25,15 +25,32 @@
 # values into its own `.env`.
 volumes:
   g6_secrets:
+  # SRC-4 T1.4: the gate's own CA and the TLS front's certificate.
+  oracle_g6_tls:
 
 services:
   dagster-code-location:
+    depends_on:
+      oracle-g6-cert-init:
+        condition: service_completed_successfully
     environment:
       INGEST_ALLOW_INTERNAL_HOSTS: "true"
+      # SRC-4 T1.4, GATE-ONLY: OpenSSL (which Python's `ssl`, and so thin-mode
+      # `oracledb`, uses for the default trust store) honours SSL_CERT_FILE.
+      # It is pointed at the CA this gate generates, so the real chain check of
+      # a `tcps` dial has a CA to verify `oracle-tls-g6`'s certificate against,
+      # the way `SSL_CERT_FILE` is set for the SQL Server fixture in
+      # docker-compose.g6.override.yml. A real deployment dials certificates
+      # from a CA its trust store knows and needs no override.
+      SSL_CERT_FILE: /etc/oracle-tls/ca.crt
     volumes:
       - type: volume
         source: g6_secrets
         target: /run/secrets
+        read_only: true
+      - type: volume
+        source: oracle_g6_tls
+        target: /etc/oracle-tls
         read_only: true
 
   lakehouse-api:
@@ -87,6 +104,66 @@ services:
       retries: 60
       start_period: 60s
 
+  # SRC-4 T1.4: mints a CA and a server certificate for the TLS front below
+  # (CN and SAN `oracle-tls-g6`, the name the gate's dial gives as host and
+  # whose DN, `CN=oracle-tls-g6`, it gives as `sslServerCertDn`), the way
+  # `mssql-g6-cert-init` does for SQL Server: nothing certificate-shaped is
+  # committed, the CA's private key and serial are deleted after signing, and
+  # nothing is minted a second time when the volume already holds a set (a
+  # second `docker compose run` re-walks this graph, and a new certificate
+  # under a running proxy would be a mismatch of the gate's own making).
+  # `apk add` is retried for the one-off mirror errors that job documents.
+  oracle-g6-cert-init:
+    image: alpine:3.20
+    profiles: ["g6-oracle"]
+    restart: "no"
+    volumes:
+      - oracle_g6_tls:/out
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        test -f /out/ca.crt && test -f /out/server.pem && test -f /out/server.key ||
+        { for i in 1 2 3 4 5; do apk add --no-cache openssl >/dev/null && break; sleep 3; done;
+        command -v openssl >/dev/null &&
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650
+        -keyout /out/ca.key -out /out/ca.crt
+        -subj "/CN=oracle-g6-ca"
+        -addext "basicConstraints=critical,CA:TRUE"
+        -addext "keyUsage=critical,keyCertSign,cRLSign" &&
+        openssl req -new -newkey rsa:2048 -nodes
+        -keyout /out/server.key -out /out/server.csr
+        -subj "/CN=oracle-tls-g6" &&
+        printf "subjectAltName=DNS:oracle-tls-g6\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n" > /out/server.ext &&
+        openssl x509 -req -in /out/server.csr -days 3650
+        -CA /out/ca.crt -CAkey /out/ca.key -CAcreateserial
+        -out /out/server.pem
+        -extfile /out/server.ext &&
+        rm -f /out/server.csr /out/server.ext /out/ca.key /out/ca.srl &&
+        chmod 644 /out/ca.crt /out/server.key /out/server.pem; }
+
+  # SRC-4 T1.4: the TLS front of `oracle-g6` (`oracle-tls-proxy.conf` says why
+  # a proxy and what it leaves unproven). `nginx:1.27-alpine` has the stream
+  # module; pinned by tag and digest (the multi-architecture index, read from
+  # the Docker Hub registry API on 2026-10-29). Healthcheck on the TLS port.
+  oracle-tls-g6:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    profiles: ["g6-oracle"]
+    restart: "no"
+    depends_on:
+      oracle-g6-cert-init:
+        condition: service_completed_successfully
+      oracle-g6:
+        condition: service_healthy
+    volumes:
+      - oracle_g6_tls:/etc/oracle-tls:ro
+      - ./ops/g6/oracle-tls-proxy.conf:/etc/nginx/oracle-tls-proxy.conf:ro
+    command: ["nginx", "-c", "/etc/nginx/oracle-tls-proxy.conf", "-g", "daemon off;"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 2484"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   # Same image, mounts and credentials-handling as `g6-test-runner` (the
   # dagster image carries `oracledb==2.5.1`, pinned in dagster/pyproject.toml,
   # and `requests`), with only Oracle to wait for. Defined here and not in
@@ -120,6 +197,8 @@ services:
       dagster-code-location:
         condition: service_started
       oracle-g6:
+        condition: service_healthy
+      oracle-tls-g6:
         condition: service_healthy
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080

@@ -41,6 +41,8 @@ describe("brandMarkForTypeName", () => {
   it("gives a CDC type its database's mark", () => {
     expect(brandMarkForTypeName("PostgreSQL CDC")).toBe(brandMarkForTypeName("PostgreSQL"))
     expect(brandMarkForTypeName("MySQL CDC")).toBe(brandMarkForTypeName("MySQL"))
+    expect(brandMarkForTypeName("MongoDB CDC")).toBe(brandMarkForTypeName("MongoDB"))
+    expect(brandMarkForTypeName("MongoDB CDC")?.title).toBe("MongoDB")
   })
 
   it("gives no mark to Oracle, SQL Server, SQL Server CDC, Object storage, SFTP and REST API", () => {

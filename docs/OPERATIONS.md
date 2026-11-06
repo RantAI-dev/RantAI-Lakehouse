@@ -45,6 +45,7 @@ The stack:
 | `postgres` | `postgres:16` | OLTP store (identity, governance, pipelines, connectors, alerts, ...) |
 | `clickhouse` | `clickhouse/clickhouse-server:26.8` | Analytics store (catalog, overview, governance, dashboards, ...); also the Iceberg query engine once `DataLakeCatalog` is wired up in P1b |
 | `lakehouse-api` | built from `rust/Dockerfile` | the axum API, port 8080 |
+| `console` | built from `Dockerfile.frontend` | the Next.js console, port 3000 (REL-2 S1-T2) — waits for `lakehouse-api` to report healthy, and proxies `/api/*` to it |
 | `rustfs` | `rustfs/rustfs:1.0.0-rc.4` | S3-compatible object store for the lakehouse warehouse (P1 infrastructure; not yet wired into `lakehouse-api`) |
 | `rustfs-bucket-init` | `amazon/aws-cli:2.36.34` | One-shot: creates the warehouse bucket via the plain S3 API (`s3api create-bucket`) — never RustFS's admin API |
 | `lakekeeper-db-init` | `postgres:16` | One-shot: creates Lakekeeper's own database on the existing `postgres` service |
@@ -63,6 +64,15 @@ Postgres) get a real chance to run instead of racing container startup.
 This is a start-order convenience, not a hard runtime dependency — see
 "Postgres: unreachable is loud, a mismatched schema refuses to start,"
 below.
+
+`lakehouse-api` carries a healthcheck of its own (`/health`, liveness), and
+the `console` waits for it — so the console starts after the API can
+answer, not while the API is still applying migrations. The console's
+`/api/*` proxy target is baked into its image at build time
+(`RUST_API_URL`, the `lakehouse-api` service's address on the compose
+network); `CONSOLE_INTERNAL_URL` is the address the OTHER way round (the
+console as the PDF renderer reaches it), and it is empty by default — set
+it to `http://console:3000` to switch the PDF export on in this stack.
 
 `rustfs`, `lakekeeper`, and their bootstrap jobs are **still not called
 from any `lakehouse-api` route as of P6** — see the module map in
@@ -279,30 +289,72 @@ refuses `expire_snapshots` on catalog-backed tables. If the `trino` profile is
 down or unconfigured, snapshot expiry logs a warning and skips cleanly, leaving
 snapshots unexpired without failing the maintenance job.
 
-### Debezium Server (opt-in, `dagster` profile — P5, CDC)
+### Change capture: Kafka and Kafka Connect (opt-in, `cdc` profile — `SRC-4`, ADR 0016)
 
-`debezium-server`, pinned by **digest** (not `:latest` — no versioned tag
-is published upstream for `ghcr.io/memiiso/debezium-server-iceberg`, see R4
-in the risk register). Captures Postgres logical-replication changes
-(initial snapshot, then streaming; ADR 0008) and writes them into Bronze
-Iceberg through the same Lakekeeper REST catalog every other writer uses —
-upsert mode with merge-on-read equality deletes. Config is rendered from
-the connector registry (ADR 0007) into
-`ops/debezium/application.properties.tmpl`, mounted at
-`/debezium/config/application.properties` (this is a Quarkus app, not a
-classic Kafka Connect worker — `conf/` is the wrong path and does not exist
-in the image). Needs `postgres` running with `wal_level=logical` (already
-the compose default, unconditionally, not profile-gated) and a replication
-slot on the source (see `g4-source-init`/`ops/debezium/
-deprovision_connector.sh` for provision/deprovision). **Failure mode:** if
-`debezium-server` is down, CDC simply stops flowing — no new rows land in
-the affected Bronze tables — while its Postgres replication slot keeps
-existing and pinning WAL at its last `restart_lsn` regardless (R5); this is
-exactly why slot-lag/WAL-retention are first-class metrics
-(`dagster/dispar_orchestrate/replication_metrics.py`, surfaced via `GET
-/api/governance/replication`, console page Governance → "Ingestion
-(CDC)") rather than something only discovered when the source disk fills
-up. Does not affect `lakehouse-api`'s own boot.
+`kafka` (one KRaft broker) and `kafka-connect` (Debezium's distribution, one
+worker for every change-capture connector), both pinned by tag and digest, with
+no published ports: Kafka Connect's REST API can start any connector class and
+has no authentication, so it is reachable only inside the compose network. Start
+them with `--profile cdc` and set in `.env`:
+
+- `KAFKA_CONNECT_URL=http://kafka-connect:8083` (the API is the worker's only
+  client: it creates, pauses, resumes and deletes a connector when a person
+  saves, pauses, resumes or deletes it in the console);
+- `CDC_KAFKA_BOOTSTRAP=kafka:9092` (the Dagster applier reads the topics and
+  writes Bronze).
+
+`MySQL`, `SQL Server` and `Oracle` connectors also keep a schema-history topic on the
+broker, so the API needs `CDC_KAFKA_BOOTSTRAP` too (compose passes it to both).
+An `Oracle CDC` source needs `ARCHIVELOG` (a restart of the database), minimal
+supplemental logging and a common user with Debezium's documented LogMiner grants;
+the connection test lists what is missing, with the commands. Archived redo logs must
+be kept as long as a stopped connector may need to catch up. Oracle's JDBC driver is
+in the pinned `kafka-connect` image: nothing is downloaded. The Oracle setup checks
+are read by the orchestrator over an **unencrypted** session limited to the data
+dictionary (an owner-signed exception to `SEC-14`, 2026-10-31); the connector itself
+requires Oracle native network encryption unless its TLS mode is "Disable". The
+old `ORACLE_CDC_LOGMINER_ENABLED` setting is gone: nothing read it since slice 2.
+Both unset means change capture is off: a change-capture connector answers
+`supported: false` and nothing is started. The source password never appears in
+a connector's JSON: `lakehouse-api` writes it to `/run/cdc-secrets/<connector id>`
+on the `lakehouse_cdc_secrets` volume (tmpfs, memory only, read-only in
+`kafka-connect`) and the connector names the file. After a restart of the stack
+the volume is empty and the API rewrites every file at start and on every
+provisioning call. Needs `postgres` with `wal_level=logical` (the compose
+default). **Failure modes:** if `kafka-connect` is down, capture stops while the
+source's replication slot keeps pinning WAL at its last `restart_lsn` (R5), which
+is why slot lag and WAL retention are first-class metrics
+(`dagster/dispar_orchestrate/replication_metrics.py`, `GET
+/api/governance/replication`, System status > "Live change capture",
+`/health#change-capture`); if the applier is
+down, changes wait in the topics, which the broker keeps 7 days
+(`KAFKA_LOG_RETENTION_HOURS`), then are gone, and a connector deleted in the
+console leaves its topics to that retention. The two services use about
+1.2 GiB together (`docs/plans/SRC-4-RESULT.md`). The fixed `debezium-server` demo
+pipeline that this replaces is gone, with `ops/debezium/` and the
+`debezium-properties` route. A deployment upgraded from it keeps the Lakekeeper
+`debezium` principal and its warehouse grant (nothing removes them); once no
+older stack uses them they can be revoked by hand.
+
+**MongoDB change capture (`SRC-4` slice 5).** Needs a MongoDB **replica set** (change streams do not exist on a
+standalone server) and a user with the `read` role on the captured database; sharded clusters are not supported.
+Nothing to add to the stack: the same `kafka-connect` worker runs it (the MongoDB connector ships in its image).
+The connector takes one host, which must be a member of the replica set that change streams can be read from; the
+connection string is built from it and the replica set name, always with `directConnection=true`, and holds no
+password. The worker needs the source's CA in its trust store for `verify-ca`, `verify-full` and also `require`.
+The connection test and the collection list run in the orchestrator (`dagster-code-location` must reach the host).
+
+**Lag and its alert (`SRC-4` slice 4).** The Dagster sensor `cdc_apply_sensor` posts every
+change-capture connector's per-table backlog to the API every 30 seconds (paused and failed
+connectors too), and the applier posts the source time of the last change it applied after each
+batch (`POST /api/connectors/{id}/capture/observations`, the `INGEST_SERVICE_TOKEN` identity). The
+API turns those into the lag the connector's Change capture tab shows and sends the
+`connector_lag` alert (limit per connector, 1 to 1440 minutes, default 15, set with `PUT
+/api/connectors/{id}/lag-limit` or on the tab). Add an alert rule of kind `connector_lag` (Alerts)
+or nobody is told. **Failure mode:** with the orchestrator down nothing posts, so no lag alert
+fires and the tab reads "Not known since <time>" after two minutes; monitor the code location
+itself. A connector a person paused is not evaluated: an alert already open stays open until the
+connector is resumed and its lag is evaluated again.
 
 **DNS gotcha found during verification:** on a host whose own
 `/etc/resolv.conf` carries a DNS search domain (VPN/corporate DNS,
@@ -325,7 +377,21 @@ compose up`. Brings up `dagster-db-init` (one-shot: creates Dagster's own
 `dagster` database on the existing `postgres` service), `dagster-code-location`
 (a gRPC server serving `dispar_orchestrate.definitions`, built from
 `dagster/Dockerfile` — see ADR 0005), `dagster-webserver` (GraphQL API +
-UI, port `3000`), and `dagster-daemon` (schedules/sensors/run queueing).
+UI, container port `3000`), and `dagster-daemon` (schedules/sensors/run
+queueing).
+
+**The Dagster UI is published on the host's loopback only**
+(`127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, REL-2 S4b review
+round 4, D23). Its UI has no sign-in: anyone who can reach the port can
+launch runs. Nothing outside the compose network needs it — the API and
+the jobs reach the GraphQL API in-network, at
+`http://dagster-webserver:3000/graphql` — and the default port `3001`
+keeps it clear of the console's `3000`. An operator reaches the UI
+through an SSH tunnel:
+
+```bash
+ssh -L 3001:127.0.0.1:3001 <host>   # then open http://127.0.0.1:3001
+```
 
 Put `DAGSTER_URL` in `.env` — do **not** rely on prefixing it onto a single
 command:
@@ -991,14 +1057,18 @@ turn each one on.
 ## Healthcheck: what `GET /health` actually checks
 
 `GET /health` answers `200` with a JSON body — `{"status": "ok",
-"database": "ok" | "unavailable"}` — and it is still a **liveness plus
-application-database check**, not a full readiness probe
+"database": "ok" | "unavailable", "version": "0.1.0"}` — and it is still a
+**liveness plus application-database check**, not a full readiness probe
 (`rust/crates/lakehouse-api/src/routes/mod.rs`, `async fn health`). It
 does not dial ClickHouse, Dagster, Lakekeeper or the LLM: the status code
 stays `200` whenever the process can answer at all, because a deployment
 with no usable Postgres still serves every Phase 1 route (catalog,
 overview, query, storage), and the ops gates (`ops/g*/`) and
 `ops/ai_eval` poll this endpoint for a `200` to decide the API is up.
+
+`version` is this build's version (`CARGO_PKG_VERSION`), added with the
+readiness route below (REL-2 decision D7): the console compares it with
+its own version and says so when the two differ.
 
 `database` is what `OPS-4` added:
 
@@ -1017,10 +1087,38 @@ the gates, so a probe that waits out a dead database's 30 s acquire
 timeout would stall them. An operator diagnosing "the database died" has
 to read the log (below), not only this endpoint.
 
-**There is no `GET /health/ready`.** This section used to propose adding
-one; `OPS-4` instead extended the one health route with the
-application-database state, which is the dependency that actually
-changes what the console can do.
+## Readiness: `GET /health/ready`
+
+`GET /health/ready` answers the other question — "can this stack serve
+traffic?" — and it is the route an installer or an updater waits on (REL-2
+decision D7). It answers `200` with
+
+```json
+{"ready": true, "version": "0.1.0",
+ "checks": {"postgres": "ok", "clickhouse": "ok", "lakekeeper": "ok"}}
+```
+
+when all three hold, and `503` with **the same body shape** otherwise, so
+a caller still learns which dependency is not ready:
+
+- `postgres` — the database answers AND its schema is at this build's
+  version: the highest applied migration equals the highest migration
+  embedded in the binary. A database one migration behind (or ahead) is
+  not ready for this build.
+- `clickhouse` — `ClickHouse` answers `SELECT 1`.
+- `lakekeeper` — the Iceberg REST catalog answers its config request
+  (`GET {catalog}/v1/config`), the same call the catalog client makes
+  when it connects.
+
+Every check is only `"ok"` or `"failed"`. The reason a check failed is in
+the log, never in the body: the route is public, so it must not carry
+upstream text (AGENTS.md rule 4). Each check is bounded by 3 s, so the
+answer does not wait on a dead dependency.
+
+This section used to say there was no such route; `OPS-4` had extended
+the one health route with the application-database state instead. REL-2
+decision D7 adds the readiness probe next to it, and leaves `/health` as
+the liveness probe the gates poll.
 
 ## Bootstrap admin: there is no default credential
 
@@ -1038,6 +1136,141 @@ response includes `mustChangePassword: true` and the client is expected to
 force a password change before continuing (see
 `routes::auth::change_password`, which enforces this server-side, not
 just as a UI hint).
+
+## Adding a user without SSO
+
+The bootstrap admin above is the only account the deployment creates by
+itself. Every other account is created by an administrator, and since
+ADM-3 every account created that way comes with a password — **no
+identity provider is required**.
+
+**In the console (the normal way).** Administration → Users → **Invite
+User**: fill in the name, the email, the roles and the tenants, and press
+**Invite**. The console shows a **temporary password** once, in a dialog,
+with a Copy button and the line "Shown once. The user must change it at
+first sign-in."
+
+The temporary password:
+
+- is generated by the **server**, from the operating system's random
+  source — neither the administrator nor the person signing in chooses it;
+- is shown **once**. The server keeps only the `Argon2id` hash, so it
+  cannot be shown again, and it is never logged, never audited, and never
+  listed on the Users page;
+- forces a change at the first sign-in. The user signs in with it and is
+  taken to the change-password screen; every other page is refused until
+  the password is changed.
+
+**Resetting a lost password.** The row's **⋮** menu → **Reset password**.
+The reset hands out a **new** temporary password, shows it once the same
+way, and **ends every session that user holds** — including the one they
+were using. The user signs in again with the new password and changes it.
+
+**From the API.** The same two calls, with the same one-shot answer. Both
+need a session that holds `identity:write` (Platform Admin does):
+
+```bash
+# Sign in first, and keep the session cookie.
+curl -sS -X POST "$LAKEHOUSE_URL/api/auth/login" \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@example.com","password":"…"}' -c cookies.txt
+
+# Invite. The response carries `temporaryPassword` ONCE.
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"name":"Rina Wijaya","email":"rina@example.com","roles":["Analyst"],"tenants":[]}'
+
+# Reset. The response carries `temporaryPassword` ONCE.
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users/<user-id>/reset-password" \
+  -H 'content-type: application/json' -b cookies.txt
+```
+
+Both writes are audited: one `identity.user.invite` row and one
+`identity.user.password_reset` row, each naming the administrator who
+acted and the user affected. Neither carries the password.
+
+**Two rules worth knowing before you use the reset.**
+
+- **The reset is not an escalation path.** Only an administrator holding
+  the unrestricted `*:*` grant may reset the password of a user who holds
+  `*:*`. Anyone else gets the same "not found" answer as for a user id
+  that does not exist, so the answer never reveals which accounts exist.
+- **Nobody may reset their own password this way.** That is what the
+  change-password form on the user's own account is for: it asks for the
+  old password first. A self-reset is refused with a 400 naming that
+  route.
+
+## Changing what a user may do, and switching a user off
+
+`app_user.status` has been in the schema since `0001_init.sql`, but
+until ADM-4 nothing enforced it: an inactive user still signed in with a
+password, kept working sessions, and signed in through single sign-on.
+ADM-4 makes the column mean what it says, and adds the three changes an
+administrator needs after the invite.
+
+**In the console.** Administration → Users → the row's **⋮** menu:
+
+- **Edit roles** replaces the user's **whole local role set**. The ticked
+  roles are the roles the user holds; a role left unticked is a role they
+  no longer hold. Roles mapped from the identity provider's groups
+  (`OIDC_ROLE_MAP`) are not stored and are not touched — they are
+  re-resolved from the provider's claims on every request, so the user
+  keeps the union of the two, exactly as before.
+- **Remove from tenant** takes the user out of one tenant. Their data,
+  dashboards and audit history stay.
+- **Deactivate** / **Reactivate** switches the user off and on again.
+
+**From the API.** The same four calls, with the same permission
+(`identity:write` — Platform Admin holds it):
+
+```bash
+# Replace a user's local role set. The list is the user's COMPLETE set.
+curl -sS -X PUT "$LAKEHOUSE_URL/api/identity/users/<user-id>/roles" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"roles":["Analyst"]}'
+
+# Take a user out of a tenant.
+curl -sS -X DELETE "$LAKEHOUSE_URL/api/identity/users/<user-id>/tenants/<tenant-id>" \
+  -b cookies.txt
+
+# Switch a user off, and back on again.
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users/<user-id>/deactivate" \
+  -H 'content-type: application/json' -b cookies.txt
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users/<user-id>/reactivate" \
+  -H 'content-type: application/json' -b cookies.txt
+```
+
+All four writes are audited: one `identity.user.roles.set` row (with the
+old and the new role names), one `identity.user.tenant.remove` row, and
+one `identity.user.deactivate` / `identity.user.reactivate` row, each
+naming the administrator who acted and the user affected.
+
+**Three rules worth knowing before you use them.**
+
+- **They are not an escalation path.** Only an administrator holding the
+  unrestricted `*:*` grant may change the roles of a user who holds
+  `*:*`, grant a role that holds `*:*`, or switch an unrestricted user
+  off or on. Anyone else gets the same "not found" answer as for a user
+  id that does not exist, so the answer never reveals which accounts
+  exist.
+- **The deployment keeps an administrator.** A change that would leave no
+  active user holding `*:*` is refused with a 409, in the same
+  transaction as the change. Nobody may switch themselves off either.
+- **Switching a user off ends every session they hold, at once.** It
+  also refuses the account on every path: the password sign-in answers
+  exactly as a wrong password does, an existing session cookie stops
+  working, and single sign-on refuses them — and does **not** create a
+  new account for them, so the identity provider cannot be used to walk
+  around the deactivation. The user's data is untouched: deactivation is
+  not deletion.
+
+A user with no personal API token owns none to revoke: `service_credential`
+belongs to `service_identity`, and a service identity is a separate
+principal that no user route touches.
+
+The bootstrap admin is **not** re-activated by a restart: it is seeded
+only when an account with that email does not exist yet, so a bootstrap
+admin an administrator deliberately switched off stays off.
 
 ## Postgres: unreachable is loud, a mismatched schema refuses to start
 
@@ -1084,13 +1317,69 @@ wired into `depends_on: condition: service_healthy`, so this specific
 failure mode is less likely to bite you locally than in a deployment that
 skips that check.
 
+## Email through an internal relay (SEC-56)
+
+Alerts, digests, chart alerts, scheduled reports, comment mentions and
+pipeline notifications all go out through one sender, and it talks to one
+relay: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`,
+`SMTP_FROM`. A relay whose certificate chains to a **private** CA (a
+company CA, a service-mesh CA) used to be unreachable: the sender trusted
+the built-in root store only, so the handshake failed and every send said
+"the mail server could not be reached" — the same sentence as a wrong
+host, and no clue about the file that is missing.
+
+**The CA bundle.** `SMTP_CA_FILE` is the path, inside the API container, of
+a PEM file with one or more CA certificates:
+
+```bash
+# the file goes into the host directory the API mounts, read-only
+cp /path/to/your/ca.pem ops/smtp-ca/ca.pem
+# and the API is told where to read it — the path INSIDE the container
+SMTP_CA_FILE=/run/certs/smtp/ca.pem
+```
+
+Under Compose the mount is `${SMTP_CA_DIR:-./ops/smtp-ca}` at
+`/run/certs/smtp`, so the default path above is the one the stack gives
+you. The CAs are **added** to the built-in roots, never put in their
+place: a deployment that trusts a private CA can still reach a public
+relay. The file is read once, at start — replace it and restart the API.
+A path that cannot be read, or that holds no PEM certificate, **stops the
+API at start** with a message naming `SMTP_CA_FILE`; the API never
+starts with a CA bundle it could not read.
+
+**What the relay must look like.**
+
+- The name on the relay's certificate must match `SMTP_HOST`. The
+  hostname check stays on: there is no way to turn it off, and no way to
+  accept a certificate that does not carry the name.
+- Port **587** with `STARTTLS` (the default), or port **465** with
+  `SMTP_SECURE=true` (implicit TLS). A relay **without** TLS is not
+  supported: the connection is never plaintext, so `SMTP_PASS` is never
+  sent in the clear.
+
+**When a send fails.** The failure reasons are a closed set, and a failed
+handshake has its own:
+
+> a secure connection to the mail server could not be made
+
+That is the reason stored on the alert and shown on the Alerts page (the
+report runner says the same thing as "The email was not sent: a secure
+connection to the mail server could not be made."). It means the TLS
+handshake failed: the relay's certificate is not trusted — is
+`SMTP_CA_FILE` the right file, and does it hold the CA that signed that
+certificate? — or the name does not match — is `SMTP_HOST` the name on
+the certificate? "The mail server could not be reached" still means the
+relay could not be dialled at all.
+
 ## Features unavailable in the local stack
 
 | Feature | Needs | Symptom without it | To enable |
 | --- | --- | --- | --- |
 | Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
-| Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
+| Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay; for a relay behind a private CA, set `SMTP_CA_FILE` as well (see "Email through an internal relay" above) |
+| Dashboard PDF export and PDF report attachments (`BI-1`, `RPT-1`) | The `gotenberg` service (runs by default), `CONSOLE_INTERNAL_URL`, `RENDER_TOKEN_SECRET` | The PDF item says "PDF export is not set up on this deployment"; the browser's print still works. Excel, CSV and PNG downloads are not affected | Set `CONSOLE_INTERNAL_URL=http://console:3000` and a `RENDER_TOKEN_SECRET` (`sh ops/init-env.sh` generates one) in `.env`, then `docker compose up -d lakehouse-api gotenberg` so both re-read it (`REL-18` makes the address the default) |
+| Scheduled reports by email (`RPT-1`) | SMTP, plus the PDF row above for PDF attachments | A subscription can be saved but nothing is sent | Set `SMTP_HOST` (and friends) and `CONSOLE_PUBLIC_URL` (the link in the email) |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs); `OIDC_JWKS_URL` is optional — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 
@@ -1531,6 +1820,78 @@ state was **82 seconds** (94 seconds total to full API readiness). See
 [docs/plans/OPS-7-RESULT.md](plans/OPS-7-RESULT.md) for the complete drill
 report and component timing table.
 
+## Local-disk backup (REL-2 S1-T4)
+
+The bucket job above needs an S3-compatible bucket. An air-gapped host has
+none, so there is a second target: the local disk. One command, no bucket,
+no network.
+
+### What one backup is
+
+A directory `backups/<UTC timestamp>-<version>/` (the version is the
+API's own, read from `GET /health`):
+
+| Part | What it is |
+| --- | --- |
+| `postgres.dump` | `pg_dumpall` of the whole Postgres instance: the application database, Lakekeeper's, OpenFGA's, Dagster's, and the roles. |
+| `clickhouse/<timestamp>/<db>/` | `ClickHouse`'s own `BACKUP DATABASE ... TO Disk('backups', ...)` output, per database. The disk is configured in `ops/backups/clickhouse/backups.xml` and mounted into the `clickhouse` service. |
+| `connector-secrets.tar.gz` | The `lakehouse_connector_secrets` volume — every stored connector credential, **sealed**. Without it, a restored deployment has no working connector credential. |
+| `env` | A copy of the deployment's `.env` — the generated secrets, including the key those credentials are sealed with. |
+| `manifest.json` | Each part's size and SHA-256. |
+
+The restore checks those checksums **before** it restores anything: a
+backup that was cut short is refused, not restored as if it were whole.
+
+**What it does not carry yet:** `release.json` and `state.json` (the
+release manifest and the installed-version state) are part of the same
+backup set in the plan, but they do not exist yet — REL-2 S2 publishes the
+release manifest and S4 writes the state file. The backup script says so
+in its output rather than pretending.
+
+### Run
+
+```bash
+# One backup into ./backups/<timestamp>-<version>/
+ops/backups/backup-local.sh
+
+# Into another directory
+ops/backups/backup-local.sh /mnt/backups
+
+# A stack that is not named after its directory
+COMPOSE_PROJECT=my-stack ops/backups/backup-local.sh
+```
+
+It needs Docker, `docker compose`, `curl`, `jq` and `sha256sum` on the
+host — the PostgreSQL and ClickHouse clients are the ones in the running
+containers, so the host needs no database client of its own.
+
+### Restore
+
+```bash
+# The backup's checksums are checked first; nothing is written before they pass.
+scripts/restore-from-backup.sh --local backups/20261031T090000Z-0.1.0
+
+# Force it on top of volumes that are not empty
+scripts/restore-from-backup.sh --force --local backups/20261031T090000Z-0.1.0
+```
+
+The order is: the empty-volume safety check (the same one the bucket
+restore has), the manifest's checksums, Postgres, ClickHouse, the
+connector secrets, the `.env` (the previous one is kept beside it as
+`.env.before-restore-<timestamp>`), and the stack bring-up.
+
+**The connector credentials only decrypt with the `.env` they were sealed
+with.** A restore whose `.env` is not the one the backup carries leaves
+every connector unreadable — which is why the `.env` is part of the backup
+and why the restore puts it back.
+
+**Measured** (REL-2 S1-T4's own drill, on a clean `-p rel2` project):
+Postgres 8 s, ClickHouse 7 s, the connector secrets 1 s, the stack
+bring-up 16 s — **32 s** in total, and the restored connector's credential
+still decrypted: the API's own key-rotation command opened the restored
+sealed file with the restored key and reported `1 already under the
+current key, 0 failed`.
+
 ## Upgrade note: set `CATALOG_TENANT_ID` before deploying multi-tenant admin support
 
 Migration `0042_tenant_provisioning.sql` and its route-level tenant scoping
@@ -1551,7 +1912,11 @@ the deployment has more than one tenant.
 **What this means for an existing deployment.** `0002_seed_identity.sql` seeds
 four tenants, and its users belong to several of them — so on upgrade,
 Analysts, Data Engineers and Governance Admins lose the catalog and the job
-list until you say who owns them:
+list until you say who owns them. `lakehousectl install` writes this setting
+as the group tenant on a fresh install, and `lakehousectl update` fills it
+when the line is empty — so a stack made or updated by the tool needs no hand
+edit (`REL-10`). Set it by hand only on a stack not made by `lakehousectl`,
+where a value is not already there:
 
 ```
 CATALOG_TENANT_ID=<the id of the tenant that owns this deployment's shared catalog>
@@ -1568,6 +1933,116 @@ present.
 
 A malformed value fails startup rather than quietly disabling the check. With
 the setting unset, the API logs one warning at boot naming it.
+
+### Where the setting is described
+
+`CATALOG_TENANT_ID` is one environment variable of the API service. It is
+declared in `docker-compose.yml` with an empty default — an unset value
+degrades to the documented refusal, not a boot failure — and listed in
+`.env.example` with a comment that says the same thing as this section
+and this page's "What the setting is for now" below. The API reads it
+at startup (`Config::catalog_tenant_id`), and every route that answers
+"may this caller read the shared catalog" asks the same question of it —
+there is no second setting and no second rule.
+
+### What the setting is for now (`SEC-50`)
+
+The setting is no longer about two lists. Every statement that reads
+the shared catalog passes one tenant gate, and the deployment's shared
+catalog belongs to the tenant this setting names:
+
+- **the authored pipelines** act as their own tenant
+  (`pipeline_definition.tenant_id`), so a pipeline of tenant B can no
+  longer read a `bronze.*` upload table that tenant A claimed;
+- **the Gold export** is gated by whoever asked for it: a signed-in
+  person acts as themselves, so their own tenant must own the shared
+  catalog, while a service identity or the shared run token — the
+  scheduled export, a manual trigger done as a service — has no user
+  behind it and acts as the tenant that owns the shared catalog. The
+  assistant's own tool is a **signed-in person's** call, so it is gated as
+  that person, not as the catalog's tenant. A deployment with several
+  tenants and no `CATALOG_TENANT_ID` **refuses the job-with-no-user
+  export outright**, with a 422 that names this setting; a signed-in
+  person of another tenant is refused too, but with the gate's own 404
+  (the mart reads "not available to your organisation");
+- **the dashboards** are gated as the person looking (`SEC-50` slice 2):
+  the tiles, the drill-through rows, the downloaded CSV/chart files, the
+  filter values and the SQL sources. A member of another tenant sees the
+  refusal in each tile's own `error` slot — "Table not found or not
+  available to your organisation: `serving.<mart>`" — and the mart is
+  never queried;
+- **the embeds** are read by nobody in particular, so they act as the
+  deployment's catalog tenant: with several tenants and no
+  `CATALOG_TENANT_ID`, every data tile carries the 422 that names this
+  setting (`JOB_NEEDS_CATALOG_TENANT`'s sentence);
+- **the public links** act as the tenant that made the link. A link made
+  by a member of another tenant shows that member's refusals; a link whose
+  creator has been removed from that tenant is refused; a link with no
+  creator (`created_by` NULL, e.g. one copied from before `BI-19`) still
+  works on a **one-tenant** deployment and is refused on a deployment with
+  several;
+- **the alerts and digests** are read as the catalog's tenant when the
+  scheduler runs them, and a person who **saves** a mart or metric rule
+  must be able to read what the rule reads (the save answers `SEC-20`'s
+  404 otherwise, and nothing is written). A **chart alert** reads as the
+  person who set it, and a **report** as its owner;
+- **the PDF and chart-image (`format=png`) exports** act as the person the
+  token names — their **first** tenant, because the token carries no
+  `X-Tenant` — so an export made while working as another tenant can
+  differ from the screen.
+
+**What this means for an operator.** On a deployment with more than one
+tenant, this setting is **required** for every path above to work at all:
+without it there is no catalog tenant in the first place, so a job with
+no user (the Gold export, the alert scheduler, an embed) is refused with
+the 422 that names this setting, and a signed-in person reads the shared
+catalog only if their own tenant is the one named here — through the
+tenant gate a member of another tenant reads only the uploads their own
+tenant claimed, and every dashboard, alert or report over `serving.*`
+shows the gate's 404. With the setting set, the members of that tenant
+read the shared catalog as before, and the other tenants read only their
+own uploads. A **single-tenant** deployment is unaffected either way.
+
+### Authored pipelines with no tenant (`SEC-50`)
+
+Migration `0042_tenant_provisioning.sql` added `tenant_id` to
+`pipeline_definition` and **backfilled nothing**: every pipeline created
+before that migration has a NULL tenant, and so has every pipeline an
+operator created without a tenant. `SEC-50` refuses such a pipeline — its
+enforce call (`POST /api/pipelines/runnable/{id}/enforce`, the one the
+orchestrator makes) answers **409** with:
+
+```
+This pipeline belongs to no tenant. An administrator assigns one with PUT /api/pipelines/{id}/tenant.
+```
+
+A pipeline whose **author** holds the unrestricted (`*:*`) grant is
+exempt: such an author reads every table anyway, so its pipeline is not
+refused for a tenant it never had.
+
+**How to find them.** `GET /api/pipelines` is scoped to the caller's own
+tenant, so an unassigned pipeline is invisible there — that is the point
+of the scoping, and it is also why the database is the place to look:
+
+```sql
+SELECT id, name, run_as FROM pipeline_definition WHERE tenant_id IS NULL;
+```
+
+One exception, so the sentence above is not read as "nobody can see them":
+a Platform Admin (`*:*`) who belongs to no tenant of their own sees every
+authored pipeline on that list, unassigned ones included (PR #281 review
+round 2 NIT).
+
+**How to assign one.** `PUT /api/pipelines/{id}/tenant` with the tenant's
+id — the route requires the `identity:write` permission (PR #281 review
+round 2 NIT):
+
+```json
+{ "tenantId": "11111111-1111-4111-8111-000000000001" }
+```
+
+The route answers 404 for an unknown pipeline id or an unknown tenant id
+(the same status for both), and 204 on success.
 
 ## Gold export: growth and background merges
 
@@ -1591,3 +2066,214 @@ A mart over the row cap (`GOLD_EXPORT_MAX_ROWS`, default 5,000,000) is
 refused outright — the export names the mart and the cap in its error,
 never silently truncating. Raise the cap only when you have measured the
 memory pressure of a true full re-copy at the new size.
+
+## Outside tools read published tables (DATA-5, ADR 0016)
+
+A published Gold mart lives in the catalog's `gold` namespace, and until
+DATA-5 nobody outside this deployment could read it: the catalog vends the
+storage address `http://rustfs:9000`, which resolves only inside the
+deployment. This section is how an OUTSIDE tool — a BI tool, a notebook,
+DuckDB — reads a published mart, and how the console counts who does.
+
+**The API is the only door.** The tool talks to the console's own
+`/api/iceberg` — the read side of the Iceberg REST catalog — and the API
+forwards each allowed call to the catalog under one read-only principal of
+its own. The tool's own key never reaches the catalog, so a tool cannot
+widen its own reach, and every read through the door is counted.
+
+### 1. Publish the storage address
+
+`OUTSIDE_S3_ENDPOINT` is the address an outside tool can REACH: the
+RustFS (or S3) host and port, behind TLS, on the public side of the
+deployment. It is empty by default, and empty means outside reading is
+OFF — every door route answers 503 naming that setting, and the API
+reports the read count as not measured, with the same reason. Never a
+count of zero.
+
+```bash
+# .env, or the deployment's own configuration
+OUTSIDE_S3_ENDPOINT=https://storage.example.com
+```
+
+Restart `lakehouse-api` afterwards. The API swaps the vended `s3.endpoint`
+for this one in a table-load and a credentials response; the vended KEYS
+stay the catalog's own short-lived, table-scoped ones.
+
+Two addresses, two situations:
+
+- A tool running OUTSIDE the deployment needs the published address
+  (`https://storage.example.com`).
+- A tool running INSIDE the deployment's network — the acceptance test is
+  one — needs the in-network name. In the local compose stack that is
+  `http://rustfs:9000` (or `http://localhost:9010`, the host port
+  RustFS publishes, for a tool on the same machine as the browser).
+
+### 2. Create the identity and get its key
+
+An outside tool is a service identity with the `iceberg:read` scope. On
+the console's **Administration → Service Identities** page: create one,
+name it after the tool (`Finance DuckDB`), add the scope `iceberg:read`,
+then press **Rotate**. The key is shown ONCE — copy it then. Rotating
+again issues a fresh key and kills the old one immediately; deleting the
+identity stops the tool as well, and its past reads stay listed under the
+name it had.
+
+The same two calls over HTTP (what the acceptance test does):
+
+```bash
+# Create the identity. Needs the `identity:write` permission.
+curl -X POST "$CONSOLE/api/identity/service-identities" \
+  -H "Content-Type: application/json" \
+  -b cookies.txt \
+  -d '{"name":"Finance DuckDB","scopes":["iceberg:read"],"environment":"production"}'
+
+# Rotate it for the key. The key is in `secret`, and is never served again.
+curl -X POST "$CONSOLE/api/identity/service-identities/<id>/rotate" -b cookies.txt
+```
+
+### 3. Point the tool at the door
+
+**pyiceberg.** `load_catalog("rest", …)` builds pyiceberg's
+`RestCatalog`:
+
+```python
+from pyiceberg.catalog import load_catalog
+
+catalog = load_catalog(
+    "rest",
+    uri="https://console.example.com/api/iceberg",  # the DOOR, not the catalog
+    token="<the key>",
+    warehouse="default",                            # the warehouse's name
+)
+table = catalog.load_table(("gold", "gold_export_smoke"))
+print(table.scan().to_arrow().num_rows)
+```
+
+**DuckDB.** The `iceberg` extension attaches the REST catalog as a
+database:
+
+```sql
+INSTALL iceberg;
+LOAD iceberg;
+
+ATTACH 'lakehouse' AS cat (
+    TYPE iceberg,
+    URI 'https://console.example.com/api/iceberg',
+    AUTHORIZATION_TYPE 'OAUTH2',
+    TOKEN '<the key>'
+);
+
+SELECT count(*) FROM cat.gold.gold_export_smoke;
+```
+
+Both examples were run against this stack: pyiceberg read the published
+table and was refused 403 on a write and on another namespace; DuckDB
+read the published table.
+
+Two things worth knowing about the door, because they surprise clients:
+
+- The **warehouse** in the request is the deployment's own
+  (`LAKEKEEPER_WAREHOUSE`, `default` in this stack). The door serves that
+  one warehouse and replaces whatever the client asked for, so a client
+  cannot reach another one by naming it.
+- The door answers the client's config call with the warehouse's own
+  prefix, which the client then uses in every path. That is why the
+  client needs no Lakekeeper knowledge at all.
+
+### 4. What the tool may read
+
+- Only the `gold` namespace. Every other namespace, and every write, is
+  refused 403 with the Iceberg error shape.
+- Only a service identity may use the door. A browser session is refused:
+  the count is per tool, and a session is not a tool.
+
+### 5. The count
+
+The count shows up in the console on a published table as "Readers (7
+days)": each tool, its reads and its last read. A table nobody read says
+"No reads in 7 days"; a deployment with outside reading off says "Not
+measured" with the reason. The API behind it is
+`GET /api/gold/export/{mart}/consumers`, which answers the same three
+states: the list, an empty list with `supported: true` (measured, and
+nobody read it), or `supported: false` with the reason.
+
+The count is the API's own: one read per table load through the door. A
+read that skips the door — internal storage keys, or the catalog's own
+published port — is NOT counted. Those credentials are for internal
+services only.
+
+### Limits
+
+- Only the catalog tenant's warehouse is served. Tenant warehouses are not.
+- Tools pass the key as a bearer token. The OAuth2 client-credentials
+  exchange is not offered.
+- A tool that skips the door is not counted.
+- Each publish of a changed mart appends a full copy, so a tool must
+  select the latest export time (`_exported_at`) or it sees every past
+  copy — see "Gold export: growth and background merges" above.
+- The read history is kept for 90 days; the page shows 7.
+
+## Releases: where a release comes from
+
+A release is produced by the pipeline in `release.yml`, not by hand: the four images are
+built and pushed, signed, and given a CycloneDX SBOM; the Compose file an operator
+deploys is RENDERED from this repository's template with every image pinned by digest;
+and one signed manifest, `release.json`, names the version, every image's digest, the
+Compose file's checksum and the upgrade path. Everything an installer needs is checked
+through that one file.
+
+What that means for an operator:
+
+- the Compose file in a release is NOT this repository's `docker-compose.yml`. It is the
+  rendered one, and it names published images instead of building them;
+- the images are signed, and the manifest is signed with the release key. The public key
+  is `ops/release/release.pub`;
+- the offline bundle holds the Compose file, the manifest, its signature, one image per
+  file, the SBOMs and the checksums.
+
+The pipeline itself, the key, the draft release and the one manual step after the first
+release are documented in [CI.md](CI.md#release-pipeline). The tooling is in
+`ops/release/`.
+
+### The offline bundle is published in parts
+
+GitHub refuses a release asset of 2 GiB or more, and the bundle holds every image the
+release runs, so it is bigger than that (0.2.0's was 3,794,642,569 bytes — the run failed
+with `size must be less than 2147483648`). The release therefore attaches the bundle in
+parts and NOT the whole file (REL-7 D1):
+
+```
+rantai-lakehouse-<version>-linux-x86_64.tar.zst.part-00
+rantai-lakehouse-<version>-linux-x86_64.tar.zst.part-01
+…
+```
+
+Each part is at most 1900 MiB. Two checksums cover them: `SHA256SUMS` lists every part
+beside the release's other assets, and the whole file's own checksum is still an asset,
+`rantai-lakehouse-<version>-linux-x86_64.tar.zst.sha256` — the joined file must match it.
+A part is checked before the parts are joined, and the joined file before it is unpacked,
+so a damaged download is refused at the step that would otherwise install it.
+
+**Join them in name order.** The parts are numbered with `-d` and padded to two digits
+(`-a 2`), so the name order is the byte order:
+
+```bash
+version=0.2.0
+gh release download "v$version"                 # every asset, so SHA256SUMS can be checked
+bundle="rantai-lakehouse-$version-linux-x86_64.tar.zst"
+sha256sum -c SHA256SUMS                         # every part, and the release's other files
+cat "$bundle".part-* > "$bundle"                # name order: part-00, part-01, …
+sha256sum -c "$bundle.sha256"                   # the joined file, as the release published it
+mkdir -p bundle
+tar --zstd -xf "$bundle" -C bundle
+./bundle/lakehousectl install --bundle bundle   # the bundle carries the installer
+```
+
+A part that does not match is named by `sha256sum -c SHA256SUMS` before anything is
+joined, so the failure says which download to repeat. Joining a set of parts that came
+from two different releases fails the `.sha256` check instead: the joined file is not the
+one the release published, and it is not unpacked.
+
+That is one way to join, and the whole of it (REL-7 D2). `lakehousectl` changes nothing:
+it still reads an UNPACKED bundle directory (`install --bundle <dir>`), so the join is
+the operator's step and the tool never sees the parts.

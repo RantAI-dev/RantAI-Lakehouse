@@ -12,11 +12,10 @@ This repo's CI is split into workflows under `.github/workflows/`:
   full-git-history `history-scan` job, which reports only findings outside
   the `.gitleaksignore` baseline (see below) and is deliberately excluded from
   required checks.
-- **`docker.yml`** — runs on `v*` tag pushes only: builds `rust/Dockerfile`
-  to check that a release tag still builds. A GHCR push job exists but is
-  gated on tag pushes and is currently inert (no registry login
-  configured). The `/health` smoke test that used to live here is the
-  `image-smoke` job in `ci.yml`.
+- **`release.yml`** — the release pipeline (REL-2 S2). On a `v*` tag push it
+  builds, signs and packages a release; on a pull request that touches the
+  pipeline, or on demand, it runs the same pipeline as a dry run against a
+  throwaway registry and a throwaway key. See "Release pipeline" below.
 - **`coverage.yml`** — `cargo llvm-cov` (lcov, uploaded as a workflow
   artifact) and a CycloneDX SBOM per crate (also uploaded as an artifact,
   for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
@@ -54,7 +53,7 @@ Downstream jobs execute according to scope:
 - **`g6-saas-a`** and **`g6-saas-b`** (`SRC-3` AD9 amended before slice 6, `ops/g6/g6_saas_test.py`): the gate of the business-app (`saas`) connectors is two jobs that run in parallel on the same scripts, each given the vendors it owns by `SAAS_GATE_VENDORS` (comma separated vendor ids, or `--vendors=`; empty means every vendor, as in a local run). `g6-saas-a` owns HubSpot, Zendesk, Salesforce, Google Analytics 4 and ServiceNow; `g6-saas-b` owns Confluence, SharePoint, Dynamics 365, Workday and NetSuite. One job with eight vendors took 16m17s of the signed 20 minutes (`7a8af090`), so ten would not fit; no step was removed to make them fit, and each job has its own compose project (`saasagci`, `saasbgci`). Both are in `ci-required` and `scripts/ci/required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_SAAS_B_RESULT`), and `coverage.json` (slice 7) names the job each type is proven in. The rest of this entry describes what either job runs for its vendors. It is a gate in jobs of their own so that no existing connector gate grows (`g6-ingest-other` measured 14m53s to 18m36s of its 20 minutes, `docs/plans/SRC-9-RESULT.md`). One mock vendor server (`ops/g6/saas_stub.py`, stdlib only, service `saas-stub-g6`, profile `g6-saas`) answers for every vendor on the vendor's own port (the vendor's real paths, `VENDOR_PORTS` in the stub; `GET /health` and the `/__admin/<vendor>` state controls on 8080). **Through the product (slice 2 review BLOCKER 4):** the job runs the Dagster stack as `g6-ingest-other` does (`--profile dagster`: API, `dagster-code-location`, `dagster-webserver`, `dagster-daemon`, ClickHouse and the catalog as dependencies) with `ops/g6/docker-compose.g6-saas.override.yml` layered on `docker-compose.g6.override.yml`; that file turns on, for the API and the code location only, the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP` and `SAAS_GATE_ORIGINS` (vendor id to the mock's origin; a no-op without the switch, in Rust and in Python, both tested) so that the product dials the mock. For every vendor in `PRODUCT_VENDORS` the gate: creates the connector through the API (a type that is `supported = false` is not refused) and saves its ingest spec; runs the API's connection test (passes, names the account, repeats none of the mock's words); lists the objects through the orchestrator (the object says it loads incrementally) and previews it (HubSpot's properties API, Zendesk honestly `not_supported`); loads with `ingest_job` into Bronze Iceberg and reads the rows back through ClickHouse; changes the vendor, reloads, and reads back the merged table (no key twice; Zendesk's deleted ticket says `status = deleted`; HubSpot's archived deal stays because HubSpot reports no deletes); revokes the sign-in and checks the API's test and a run fail without the vendor's words. The browser sign-in has no browser here, so it stays a vendor-level step, and the vendor-level steps (the vendor module and `SaasSession` run in the runner against the mock) stay as well: HubSpot connect with the private-app token and the browser sign-in, discover, load, reload through search, a new property in describe, a 429 with `Retry-After` waited out and one that never lifts, a revoked token and refresh token; Zendesk connect with an email and API token and with the browser sign-in (the token request is JSON and the refresh token rotates), the mock's time-based export repeating tickets at page boundaries (upstream #659) and the connector reading each once, a cursor reload with a changed, a new and a deleted ticket, a new field, rate limits, a forbidden and a revoked sign-in. `--vendors-only` runs the vendor-level steps with no API against a local `python ops/g6/saas_stub.py` (set `PORT` if 8080 is taken). The API steps first assert the ten types are `supported: false`. ServiceNow (client credentials; Table API paged by the `Link` header; the dictionary describes the table) and Confluence (email + API token for the product steps; the browser sign-in behind Atlassian's gateway, with its cloud id, at vendor level; a reload that must stop near the cursor, `max_reads`) joined in slice 4. SharePoint (Graph delta feed, its link kept in dlt state; a delete marked; a 410 Gone resync at vendor level and in the dlt-state pytest) and Dynamics 365 (an untracked table filtered by `modifiedon`, a tracked table read by its change-tracking delta link) joined in slice 5; each has a product entry for client credentials and one for the browser sign-in's connection test and load, with Entra's token endpoint in the mock at the customer's tenant. Workday (a report read once and replaced; Basic for the integration user, the refresh grant with the client in the Basic header) and NetSuite (SuiteQL pages by `offset` and `hasMore`; the certificate way, whose PS256 assertion the mock verifies with the public key the gate registers, and the browser sign-in) joined in slice 6, each with a vendor-level run and two product entries in `g6-saas-b`; both are models of documentation that could not be run against a real account. Each later vendor adds an entry to `PRODUCT_VENDORS`, its mock and its vendor-level steps in its own slice, and the types stay `supported = false` until slice 7. Budget: the signed 20 minutes per job (each job's cut-off is 25, as `g6-ingest-other`'s); the first CI runs are its measurement and the job summary has each vendor's product steps time.
 - **`g6-discovery-scale`** (`SRC-13` decisions D9 and D12, `ops/g6/src13_discovery_scale_test.py`): creates a PostgreSQL schema of 10,000 tables in the stack's own database, lists it through `POST /api/connectors/conn-pg-lakehouse/discovery/list`, searches one table by part of its name, previews it, and prints each call's seconds on `[src13]` lines that are copied to the job summary. **Fails if the listing takes more than 120 seconds** (the feature page's "10,000 tables in 2 minutes", D9) or does not return exactly the 10,000 names. The stack is the API and its PostgreSQL only (with ClickHouse and `oidc-mock`, which the API depends on): no Dagster, because the API lists PostgreSQL itself. Its own job, so no existing connector gate grows past its 20 minutes (the type-by-type `discover` steps of `g6-ingest`, `g6-ingest-other`, `g4-cdc` and `g6-oracle` are quick calls, and the ones the orchestrator answers run after the loads). Estimated 8 to 12 minutes; the first CI runs are its measurement. The measured seconds are for a CI runner against a local PostgreSQL, not a customer's database. Not run against a real stack before it reached CI.
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
 - **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
 `ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the
@@ -74,7 +73,7 @@ jobs built the Dagster image as well. Now:
   (`image-lakehouse-api`, `image-lakehouse-dagster`): `docker buildx` with
   `outputs: type=docker`, compressed with `zstd`, one-day retention, no second
   compression by the artifact service. It prints each archive's size in the log.
-- Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`,
+- Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`,
   `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`,
   `image-smoke`) `needs: [changes, images]`, downloads the artifact(s) it
   uses, `docker load`s them, and starts the stack with `up -d --no-build`. `gold-export`,
@@ -271,11 +270,6 @@ remains true).
 
 ## Docker
 
-`docker.yml` runs on `v*` tag pushes only and builds `rust/Dockerfile` with the same build
-arguments as the `images` job, reading (never writing) its `api-image` layer cache. It no
-longer runs on pushes to `main` or on pull requests: the API image is built, shared and smoke
-tested by `ci.yml` (`images`, `image-smoke`).
-
 `image-smoke` runs the image standalone (no Postgres/ClickHouse containers), because
 `lakehouse-api` is designed to boot and serve its DB-independent routes — including
 `/health` — without either dependency (`entrypoint.api.sh` skips migrations when
@@ -283,10 +277,155 @@ tested by `ci.yml` (`images`, `image-smoke`).
 smoke test of the container's own boot path, not a substitute for `docker compose up`
 against the full stack.
 
-The `push-ghcr` job is gated on `startsWith(github.ref, 'refs/tags/')` and,
-even when that condition is met, does not actually push anywhere — there is
-no `docker/login-action` step and no registry credential configured. Wiring
-up real publishing is an explicit, separate decision for a later phase.
+The build that used to live here — `docker.yml`, which built `rust/Dockerfile` on a tag
+push and never published anything — is now the release pipeline below. It builds the same
+image, with the same build arguments, and then does the rest.
+
+## Release pipeline
+
+`release.yml` builds, signs and packages a release (REL-2 S2). One file holds the whole
+release, and everything else is checked through it: `release.json`, the release manifest,
+signed with the release key. The signature is a **Sigstore bundle**,
+`release.json.sigstore.json`: cosign v3 writes the signature and the manifest's digest into
+one JSON file, and that is what `lakehousectl` reads (REL-2 S2 D3a).
+
+| Trigger | What runs |
+|---|---|
+| `push` of a `v*` tag | The real release: the four images go to `ghcr.io/rantai-dev`, the manifest is signed with the release key, and a **draft** GitHub Release is created |
+| `workflow_dispatch` | The dry run |
+| `pull_request` on `.github/workflows/release.yml`, `ops/release/**`, `Dockerfile.frontend`, `.dockerignore`, `rust/Dockerfile`, `dagster/Dockerfile`, `ops/oidc-mock/**` | The dry run |
+
+The real job never runs for a pull request: it is gated on a tag push, and it is the only
+job in this repository that can see the release key.
+
+### The dry run
+
+The dry run is the whole pipeline with two things changed, so that a change to the pipeline
+can be proved before it can cut a release:
+
+- its images go to a `registry:2` service container of the job, so the digests it records
+  are real digests of a real registry;
+- its key is generated in the job, in the runner's working directory, and thrown away
+  with the job: the file leaves the working directory with the step that generated it,
+  and the PEM travels on as that step's output. It reaches the three steps that sign,
+  and no other step — the same shape as the real job, where the release key comes
+  from the `release` environment's secrets (REL-2 S2 review round 4 SHOULD-FIX 1).
+  It is never the release key and it never leaves the runner.
+
+Nothing is published. The bundle, the manifest, its Sigstore bundle, the rendered Compose
+file, the installer and the SBOMs are uploaded as a workflow artifact (`release-dry-run`),
+and the run's summary prints the bundle's size — the number the release notes quote.
+The dry run also SPLITS the bundle into parts and joins them back (REL-7 D4), and fails
+unless the joined file matches the checksum `make_bundle.sh` wrote: the release attaches
+parts, so a split that does not round-trip is a release nobody can install.
+
+### The installer
+
+Both jobs build `lakehousectl` — the operator's install and update tool (REL-2 S3) — as a
+**static** binary for `x86_64-unknown-linux-musl`, so it runs on a host that has nothing but
+a Linux kernel: that is the air-gapped host. The binary joins the offline bundle and the
+release's assets, and the signed manifest names its checksum, so the bundle's copy is the
+file the release published.
+
+The build is **without** the `test-key` feature: a release build verifies a manifest against
+the release key compiled into it and against no other. The feature exists for the CI dry
+run's own proof, whose bundle is signed with the throwaway key the job generates — and that
+proof builds its own binary with the feature, in the proof's own job.
+
+### The real release
+
+The real job runs in the `release` **environment**, so the owner's approval (a required
+reviewer on that environment) stands between the tag and the signing key. The key is a
+secret of that environment and of no other:
+
+| Secret | What it is |
+|---|---|
+| `COSIGN_PRIVATE_KEY` | the cosign private key PEM (ECDSA P-256) |
+| `COSIGN_PASSWORD` | the password that opens it, if the key is encrypted |
+
+The secret holds the private key as the PEM text — what `cosign generate-key-pair`
+writes — and `env://` reads it as it is: not base64 of it, and not a path to a file
+(REL-2 S2 review BLOCKER 1).
+
+The public key is committed at `ops/release/release.pub`, and it is the one
+`lakehousectl` compiles in — so a signature made in this pipeline verifies on an air-gapped
+host with nothing but the key and the manifest. The pipeline verifies every signature it
+makes before it publishes anything: each image with `cosign sign`, the manifest with
+`cosign sign-blob` and then `cosign verify-blob` against the committed public key.
+
+**Nothing is uploaded to the public transparency log (Rekor), in either job** (REL-2 S2
+D3a). The dry run would publish throwaway entries signed with a key that is thrown away
+with the job, and the manifest's signature has to verify on an air-gapped host, where no log
+is reachable. The mechanism is cosign v3's `--tlog-upload=false`, which v3 accepts only
+together with `--use-signing-config=false`: on its own, v3 refuses the flag, because the
+signing config it would otherwise use names the public log service ("`--tlog-upload=false`
+is not supported with --signing-config or --use-signing-config`"). With both flags cosign
+signs from the key alone, contacts no log and no timestamp service, and writes a bundle
+that carries the signature and the digest and nothing else. The verification right after
+signing therefore skips the log check (`--insecure-ignore-tlog`) and runs offline
+(`--offline`).
+
+The images carry the same consequence: their signatures are in the registry, with no log
+entry, so an operator verifying one by hand passes `--insecure-ignore-tlog` too —
+`cosign verify --key ops/release/release.pub --insecure-ignore-tlog <image>@<digest>`. The
+key is what the check is about; the log was never the identity here, because the images are
+signed with the release key and not with a keyless identity.
+
+cosign v3 prints `--tlog-upload has been deprecated, prefer using a signing-config file with
+no transparency log services`. The flag still works, so the pipeline keeps it and the
+proxy-logged proof stands; replacing it with a `--signing-config` file is left for when the
+flag is removed (REL-2 S2 review round 5).
+
+The release is created as a **draft**. The product owner publishes it.
+
+### The one manual step after the first real release
+
+GHCR packages are private by default, so after the first real release the four published
+images have to be made public — or the operators have to be given read access another way.
+The documented way is the package's own page:
+
+1. open <https://github.com/orgs/RantAI-dev/packages> (or the package's page);
+2. for each of `rantai-lakehouse-api`, `rantai-lakehouse-console`,
+   `rantai-lakehouse-dagster` and `rantai-lakehouse-oidc-mock`: **Package settings** →
+   **Change visibility** → **Public**.
+
+Until that is done, `docker pull ghcr.io/rantai-dev/rantai-lakehouse-api:<version>` answers
+`401` for an operator who is not logged in to GHCR.
+
+### What the pipeline runs, in order
+
+1. `ops/release/check_version.py` — the tag, `package.json`, the API crate's
+   `Cargo.toml` and the changelog must name the same version;
+2. the four images are built and pushed (`lakehouse-api`, the Dagster image, `oidc-mock`,
+   the console), each by digest;
+3. each image is signed with cosign, and a CycloneDX SBOM is written for it and attested
+   to it;
+4. the release's Compose file is RENDERED from the template
+   (`ops/release/render_compose.py`): every image the repository builds names the
+   published image at its digest, and the gate and test services are gone;
+5. the THIRD-PARTY images the rendered file runs (Postgres, ClickHouse, Lakekeeper,
+   OpenFGA, RustFS, Gotenberg, the init images, and the `trino`, `seaweedfs` and
+   `backups` profiles) are pulled by digest, and a CycloneDX SBOM is written for each of
+   them with the same syft the SBOM action installs. They are **not** signed: we cannot
+   sign another project's image in its own registry, so their integrity comes from the
+   digest in the signed manifest (`ops/release/compose_images.py` says which images are
+   whose);
+6. `ops/release/make_manifest.py` writes `release.json` — the version, every image's
+   digest (ours from the published digests, the third-party ones from the rendered
+   Compose file), the Compose file's checksum, and the upgrade path;
+7. the manifest is signed into `release.json.sigstore.json` and the bundle verified at once,
+   offline;
+8. `ops/release/make_bundle.sh` writes the offline bundle and prints its size;
+9. the bundle is split into parts of at most 1900 MiB — GitHub refuses a release asset
+   of 2 GiB or more (REL-7 D1) — and the parts are attached to the draft release, with
+   their checksums in `SHA256SUMS` and the whole file's `.sha256` beside them; the
+   operator joins them in name order (`docs/OPERATIONS.md`, REL-7 D2);
+10. the release is created as a draft, or a draft that already exists for the tag is
+    written into (`gh release upload --clobber`), so the job can be re-run (REL-7 D5).
+    A published release is never rewritten.
+
+The tooling is under `ops/release/`, and its own tests run in the `Repo lints` job of
+`ci.yml` (`python -m pytest ops/release`) and at the start of both pipeline jobs.
 
 ## Dependency review: now works, verified on a real PR
 
@@ -340,8 +479,9 @@ The check names above reflect the real `name:` values from
 guessed. `ci-required` consolidates and enforces all scope-dependent tests
 in `ci.yml`, including the image build and `/health` smoke test
 (`images`, `image-smoke`). The check `Build lakehouse-api image · smoke test
-/health` that used to be listed here no longer reports on PRs (`docker.yml` is
-tag-only), so it must NOT be required: a required check that never reports
+/health` that used to be listed here no longer reports on PRs (it lived in
+`docker.yml`, which was tag-only, and `docker.yml` is now the release
+pipeline), so it must NOT be required: a required check that never reports
 blocks every merge under `strict` mode. If a workflow's job names change, this list needs to be updated to
 match, or `strict` mode will block merges on a check that no longer reports.
 

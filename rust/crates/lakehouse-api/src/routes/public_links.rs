@@ -53,6 +53,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::throttle::{self, ThrottlePolicy};
 use lakehouse_auth::{Principal, PrincipalId, Secret};
+use lakehouse_bi::access::Level;
 use lakehouse_bi::store::{self, Board};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -64,7 +65,6 @@ use time::{Duration, OffsetDateTime};
 
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -181,6 +181,31 @@ fn pool_of(state: &AppState) -> Result<&PgPool, ApiError> {
 
 fn store_failure(err: &lakehouse_store::StoreError) -> ApiError {
     upstream_error::internal_error(&upstream_error::STORE, err)
+}
+
+/// `SEC-50` slice 2 D4/M8: the creator of a public link, as they are now.
+///
+/// `None` for a link with no creator (the links that predate the tenant
+/// column, and the links a service identity made) and for a creator who was
+/// deleted or disabled: such a link has no owner, and it reaches nothing
+/// (`GateActor::Ownerless`).
+///
+/// # Errors
+///
+/// The response a store failure answers with.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the caller returns verbatim; boxing it \
+              would change every call site for no gain on the success path"
+)]
+pub(crate) async fn creator_of(
+    state: &AppState,
+    link: &PublicLink,
+) -> Result<Option<Principal>, Response> {
+    let Some(id) = link.created_by else {
+        return Ok(None);
+    };
+    crate::routes::render::principal_of(state, &id.to_string()).await
 }
 
 /// Judge a token: the link, the administrator's switch, then the dashboard.
@@ -488,27 +513,28 @@ fn link_json(link: &PublicLink) -> Value {
 }
 
 /// The dashboard a management call is about: named, not the built-in one, and
-/// visible to the caller (an unknown, trashed or somebody else's personal board
-/// is the same "not found"). Shared with the embed settings route (`BI-26`
-/// review fix R6, rule 4).
+/// managed by the caller (an unknown, trashed or somebody else's personal board
+/// is the same "not found"; one they see without `manage` is a 403). Shared
+/// with the embed settings route (`BI-26` review fix R6, rule 4).
 pub(crate) async fn managed_board(
     state: &AppState,
     principal: &Principal,
     id: Option<&str>,
 ) -> Result<Board, ApiError> {
+    // Refused first when the caller manages nothing, whatever dashboard they name.
+    crate::routes::dashboard_access::require_can_ever(state, principal, Level::Manage).await?;
     let id = id.map(str::trim).unwrap_or_default();
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()));
     }
-    store::get_board(&state.clickhouse, id, &viewer_of(principal))
-        .await
-        .map_err(|err| {
-            upstream_error::ch_error_as(
-                &upstream_error::DATABASE,
-                &err,
-                upstream_error::FailedAs::Internal,
-            )
-        })?
+    // BI-19 B1 review R5 and B2 (plan D5, D8): the link, the embed and their
+    // settings are managed by somebody with `manage` on the dashboard. One that
+    // the caller's rules and the restrictions leave out is the same 404 as an
+    // unknown one (the GET returns, and the PUT makes, a live token); one they
+    // see and do not manage is a 403.
+    let scope = crate::routes::dashboard_access::scope_for_write(state, principal).await?;
+    crate::routes::dashboard_access::require_board_level(state, &scope, id, Level::Manage)
+        .await?
         .ok_or_else(|| ApiError::NotFound(BOARD_NOT_FOUND.to_owned()))
 }
 
@@ -604,8 +630,11 @@ async fn audit(
 pub async fn put_link(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // Before the body is read: a caller who manages nothing is refused as such.
+    crate::routes::dashboard_access::require_can_ever(&state, &principal, Level::Manage).await?;
     let parsed: PutBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BODY_SHAPE.to_owned()))?;
     let board = managed_board(&state, &principal, Some(&parsed.board)).await?;
@@ -653,6 +682,15 @@ pub async fn put_link(
         // `created_by` points at a person; a service identity is not one.
         PrincipalId::Service(_) => None,
     };
+    // `SEC-50` slice 2 D4: the link acts as the tenant of the person who
+    // made it — the `X-Tenant` header when they sent one, else their first
+    // tenant. A service identity is not a person and has no tenant of its
+    // own, so its link names none (and reads as the creator's first tenant,
+    // which is no tenant at all).
+    let tenant_id = match principal.id {
+        PrincipalId::User(_) => crate::tenant_scope::resolve(&principal, &headers)?,
+        PrincipalId::Service(_) => None,
+    };
     let saved = if replace {
         // A new link starts from a clean count of wrong tries.
         throttle::clear(pool, &lock_key(&board.id)).await?;
@@ -664,6 +702,7 @@ pub async fn put_link(
                 expires_at,
                 new_hash.as_deref(),
                 created_by,
+                tenant_id,
             )
             .await
             .map_err(|err| store_failure(&err))?,
@@ -816,6 +855,7 @@ mod tests {
     fn only_a_link_that_has_not_expired_counts_as_a_link() {
         let now = OffsetDateTime::now_utc();
         let link = |expires_at| PublicLink {
+            tenant_id: None,
             board_id: "b_1".to_owned(),
             token: "p_token".to_owned(),
             expires_at,
@@ -860,6 +900,7 @@ mod tests {
     #[test]
     fn the_link_json_never_carries_the_password_or_its_hash() {
         let link = PublicLink {
+            tenant_id: None,
             board_id: "b_1".to_owned(),
             token: "p_token".to_owned(),
             expires_at: OffsetDateTime::now_utc() + Duration::days(1),

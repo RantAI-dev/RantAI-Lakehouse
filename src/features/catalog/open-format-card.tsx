@@ -15,12 +15,18 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { useService, useServiceAction } from "@/hooks/use-service"
+import { useService, useServiceAction, type ServiceState } from "@/hooks/use-service"
 import { formatDateTime } from "@/lib/format"
 import { freshnessLine } from "@/lib/gold-freshness"
+import { READERS_SHOWN, consumerLine, consumerState } from "@/lib/gold-consumers"
 import { fmtMeasured } from "@/lib/measured"
 import { goldService } from "@/services"
-import type { GoldExportRun, GoldPublication, GoldReadBack } from "@/services/contracts/gold"
+import type {
+  GoldConsumers,
+  GoldExportRun,
+  GoldPublication,
+  GoldReadBack,
+} from "@/services/contracts/gold"
 
 function trimmedMart(assetId: string): string {
   return assetId.startsWith("serving.") ? assetId.slice("serving.".length) : assetId
@@ -74,6 +80,55 @@ const stateLabelClass = (label: string): string => {
   return "font-medium text-muted-foreground"
 }
 
+/**
+ * The "Readers (7 days)" value: who read the published table through the
+ * API's Iceberg door, and how often (DATA-5 D10).
+ *
+ * The same three states as the Gold Exports table: the tools that read
+ * it (each with its reads and its last read, five at most, then "and N
+ * more"), "No reads in 7 days" for a measured zero, and "Not measured"
+ * with the route's reason when outside reading is not set up.
+ */
+function ReadersValue({ state }: { state: ServiceState<GoldConsumers> }) {
+  if (state.status === "loading") {
+    return <span className="text-muted-foreground">…</span>
+  }
+  if (state.status === "error") {
+    return <span className="text-destructive">—</span>
+  }
+  const readers = consumerState(state.data)
+  if (readers.kind === "not_measured") {
+    return (
+      <span className="text-muted-foreground" title={readers.reason}>
+        Not measured
+      </span>
+    )
+  }
+  if (readers.kind === "unknown") {
+    return (
+      <span
+        className="text-muted-foreground"
+        title="Outside reading is set up, but the route sent no reader list."
+      >
+        —
+      </span>
+    )
+  }
+  if (readers.kind === "no_reads") {
+    return <span className="text-muted-foreground">No reads in 7 days</span>
+  }
+  const shown = readers.readers.slice(0, READERS_SHOWN)
+  const rest = readers.readers.length - shown.length
+  return (
+    <ul className="list-inside list-disc">
+      {shown.map((reader) => (
+        <li key={reader.identityId}>{consumerLine(reader)}</li>
+      ))}
+      {rest > 0 ? <li>and {rest} more</li> : null}
+    </ul>
+  )
+}
+
 export function OpenFormatCard({ assetId }: { assetId: string }) {
   const mart = trimmedMart(assetId)
   const pub = useService<GoldPublication>(
@@ -87,6 +142,10 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
       return null
     }
   }, [mart])
+  const readers = useService<GoldConsumers>(
+    (signal) => goldService.getConsumers(mart, signal),
+    [mart]
+  )
   const toggle = useServiceAction(
     (signal, enabled: boolean) => goldService.setPublication(mart, enabled, signal)
   )
@@ -150,7 +209,10 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
         )}
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <span>Status:</span>
-          <span className={stateLabelClass(line)}>
+          {/* `data-testid` so a test can name THIS status line: the
+              readers row below can also read "Not measured", and the
+              two must not be confused. */}
+          <span className={stateLabelClass(line)} data-testid="publication-status">
             {line}
           </span>
         </div>
@@ -159,37 +221,39 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             Publishing is off; this copy is no longer updated.
           </p>
         )}
-        {(showHistory || p.trim) && (
-          <dl className="grid grid-cols-3 gap-1 text-sm">
-            {showHistory && (
-              <>
-                <dt className="text-muted-foreground">Last published</dt>
-                <dd className="col-span-2">{lastExport.data!.exportedAt ? formatDateTime(lastExport.data!.exportedAt) : "—"}</dd>
-                <dt className="text-muted-foreground">Snapshot</dt>
-                <dd className="col-span-2 font-mono text-xs">
-                  {fmtMeasured(lastExport.data!.snapshotId, (v) => String(v))}
-                </dd>
-              </>
-            )}
-            {p.trim && (p.trim.status === "success" || p.trim.status === "nothing_to_trim") && p.trim.copiesKept !== null && (
-              <>
-                <dt className="text-muted-foreground">Copies kept</dt>
-                <dd className="col-span-2">
-                  {p.trim.copiesKept}
-                  {p.trim.oldestKeptExportedAt ? ` (oldest ${formatDateTime(p.trim.oldestKeptExportedAt)})` : ""}
-                </dd>
-              </>
-            )}
-            {p.trim && p.trim.status === "failed" && (
-              <>
-                <dt className="text-muted-foreground">Trim</dt>
-                <dd className="col-span-2 text-destructive">
-                  Trim failed{p.trim.reason ? `: ${p.trim.reason}` : ""}
-                </dd>
-              </>
-            )}
-          </dl>
-        )}
+        <dl className="grid grid-cols-3 gap-1 text-sm">
+          <dt className="text-muted-foreground">Readers (7 days)</dt>
+          <dd className="col-span-2">
+            <ReadersValue state={readers} />
+          </dd>
+          {showHistory && (
+            <>
+              <dt className="text-muted-foreground">Last published</dt>
+              <dd className="col-span-2">{lastExport.data!.exportedAt ? formatDateTime(lastExport.data!.exportedAt) : "—"}</dd>
+              <dt className="text-muted-foreground">Snapshot</dt>
+              <dd className="col-span-2 font-mono text-xs">
+                {fmtMeasured(lastExport.data!.snapshotId, (v) => String(v))}
+              </dd>
+            </>
+          )}
+          {p.trim && (p.trim.status === "success" || p.trim.status === "nothing_to_trim") && p.trim.copiesKept !== null && (
+            <>
+              <dt className="text-muted-foreground">Copies kept</dt>
+              <dd className="col-span-2">
+                {p.trim.copiesKept}
+                {p.trim.oldestKeptExportedAt ? ` (oldest ${formatDateTime(p.trim.oldestKeptExportedAt)})` : ""}
+              </dd>
+            </>
+          )}
+          {p.trim && p.trim.status === "failed" && (
+            <>
+              <dt className="text-muted-foreground">Trim</dt>
+              <dd className="col-span-2 text-destructive">
+                Trim failed{p.trim.reason ? `: ${p.trim.reason}` : ""}
+              </dd>
+            </>
+          )}
+        </dl>
         {enabled && (
           <>
             <div className="flex flex-col items-start gap-1">

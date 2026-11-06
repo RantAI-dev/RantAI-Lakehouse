@@ -181,7 +181,9 @@ pub async fn create(
     let (tenant_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM tenant")
         .fetch_one(pool)
         .await
-        .map_err(|_err| ApiError::Unavailable("could not verify tenant count".to_owned()))?;
+        .map_err(|_err| {
+            ApiError::Unavailable(super::catalog::COULD_NOT_VERIFY_TENANT_COUNT.to_owned())
+        })?;
     if tenant_count > 1
         && let Some(catalog_tenant_id) = state.config.catalog_tenant_id
         && !held.in_tenant(catalog_tenant_id)

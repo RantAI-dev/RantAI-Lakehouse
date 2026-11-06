@@ -2,11 +2,10 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Check, Minus, Plus, Tag, Trash2 } from "lucide-react"
-import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
+import { Check, Minus, Plus } from "lucide-react"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { ClassificationBadge, Pill } from "@/components/patterns/status-badge"
+import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -22,17 +21,12 @@ import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { PolicyActions } from "@/features/governance/policy-actions"
 import { useServiceAction } from "@/hooks/use-service"
-import { notifyError, notifySuccess } from "@/lib/notify"
-import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
+import { notifySuccess } from "@/lib/notify"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
-import type {
-  CreateClassificationRuleInput,
-  CreatePolicyInput,
-} from "@/services/contracts/governance"
-import { classificationTitle } from "./asset-badges"
+import type { CreatePolicyInput } from "@/services/contracts/governance"
 import { AssetGrants } from "./asset-grants"
-import { lineageKey } from "./asset-lineage"
+import { policyCondition, policyTable, type PolicyForm } from "./asset-policy"
 
 type PolicySummary = AssetDetail["policySummary"][number]
 
@@ -93,236 +87,6 @@ function YourAccess({ asset: a }: { asset: AssetDetail }) {
       </ul>
     </SectionCard>
   )
-}
-
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
-
-/** Least to most restrictive. */
-const LEVELS: Classification[] = ["public", "internal", "confidential", "restricted"]
-
-/**
- * Classifies the asset, or one of its columns, by adding a classification
- * rule for its table key. The newest rule wins, so this is also how a
- * wrong classification is corrected.
- */
-function ClassifyDialog({
-  asset: a,
-  onClose,
-  onSaved,
-}: {
-  asset: AssetDetail
-  onClose: () => void
-  onSaved: () => void
-}) {
-  // "" is the asset as a whole.
-  const [column, setColumn] = React.useState("")
-  const [level, setLevel] = React.useState<Classification>(a.classification)
-  const save = useServiceAction((signal, input: CreateClassificationRuleInput) =>
-    governanceService.createClassificationRule(input, signal)
-  )
-
-  async function submit() {
-    const saved = await save.run({
-      asset: lineageKey(a),
-      ...(column ? { column } : {}),
-      classification: level,
-    })
-    if (saved === null) return
-    notifySuccess("Classification saved")
-    onSaved()
-  }
-
-  return (
-    <Dialog open onOpenChange={(next) => (next ? undefined : onClose())}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Classify</DialogTitle>
-          <DialogDescription>
-            How sensitive {a.name} is. An asset is never less restrictive than its most
-            restrictive column.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="grid gap-3">
-          <div className="grid gap-1.5">
-            <Label htmlFor="classify-target">Applies to</Label>
-            <select
-              id="classify-target"
-              className={selectClassName}
-              value={column}
-              onChange={(e) => setColumn(e.target.value)}
-            >
-              <option value="">The whole asset</option>
-              {a.schema.map((c) => (
-                <option key={c.name} value={c.name}>
-                  Column {c.name}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="classify-level">Classification</Label>
-            <select
-              id="classify-level"
-              className={selectClassName}
-              value={level}
-              onChange={(e) => setLevel(e.target.value as Classification)}
-            >
-              {LEVELS.map((l) => (
-                <option key={l} value={l}>
-                  {CLASSIFICATION_LABEL[l]}
-                </option>
-              ))}
-            </select>
-          </div>
-          {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
-        </div>
-        <DialogFooter>
-          <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-          <Button size="sm" onClick={() => void submit()} disabled={save.status === "pending"}>
-            {save.status === "pending" ? "Saving…" : "Save"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-type ClassificationRuleInForce = NonNullable<AssetDetail["classificationRules"]>[number]
-
-/**
- * How sensitive the asset and its columns are, and on whose word. A
- * classification is a rule, and the rule in force can be removed — which
- * is the way to take one back, where adding a newer rule only overrides.
- */
-function ClassificationCard({ asset: a, onChanged }: { asset: AssetDetail; onChanged: () => void }) {
-  const { hasPermission } = useAuth()
-  const [classifying, setClassifying] = React.useState(false)
-  const [removing, setRemoving] = React.useState<ClassificationRuleInForce | null>(null)
-  const remove = useServiceAction((signal, id: string) =>
-    governanceService.deleteClassificationRule(id, signal)
-  )
-  const columns = a.schema.filter((c) => c.classification)
-  const rules = a.classificationRules ?? []
-  const canRemove = hasPermission("governance:write")
-  const ruleOf = (column?: string) => rules.find((r) => r.column === column)
-  const removeButton = (rule: ClassificationRuleInForce | undefined, what: string) =>
-    rule && canRemove ? (
-      <Button
-        size="icon-sm"
-        variant="ghost"
-        aria-label={`Remove the classification of ${what}`}
-        onClick={() => setRemoving(rule)}
-      >
-        <Trash2 />
-      </Button>
-    ) : null
-
-  async function confirmRemove() {
-    if (!removing) return
-    // `run` resolves to `null` only on failure.
-    if ((await remove.run(removing.id)) === null) {
-      notifyError("Failed to remove the classification", remove.error)
-      return
-    }
-    notifySuccess("Classification removed")
-    setRemoving(null)
-    onChanged()
-  }
-
-  return (
-    <SectionCard
-      size="sm"
-      title="Classification"
-      description={classificationTitle(a)}
-      action={
-        // SEC-23 (F4): adding a classification rule needs governance:write,
-        // the same grant as removing one (`canRemove`).
-        canRemove ? (
-          <Button size="sm" variant="outline" onClick={() => setClassifying(true)}>
-            <Tag />
-            Classify
-          </Button>
-        ) : null
-      }
-    >
-      <ul className="divide-y divide-border text-sm">
-        <li className="flex items-center gap-2 py-1.5">
-          <span>This asset</span>
-          <span className="ml-auto flex items-center gap-1">
-            <ClassificationBadge classification={a.classification} />
-            {removeButton(ruleOf(undefined), "this asset")}
-          </span>
-        </li>
-        {columns.map((c) => (
-          <li key={c.name} className="flex items-center gap-2 py-1.5">
-            <span className="font-mono text-xs">{c.name}</span>
-            <span className="text-xs text-muted-foreground">column</span>
-            <span className="ml-auto flex items-center gap-1">
-              {c.classification ? <ClassificationBadge classification={c.classification} /> : null}
-              {removeButton(ruleOf(c.name), `column ${c.name}`)}
-            </span>
-          </li>
-        ))}
-      </ul>
-      <ConfirmActionDialog
-        open={removing !== null}
-        onOpenChange={(open) => (open ? undefined : setRemoving(null))}
-        title="Remove classification"
-        description={`Remove the ${
-          removing ? CLASSIFICATION_LABEL[removing.classification] : ""
-        } classification of ${removing?.column ? `column ${removing.column}` : "this asset"}?`}
-        impact="An older rule for it applies again if there is one. Otherwise it goes back to the default level, Internal."
-        confirmLabel="Remove"
-        confirming={remove.status === "pending"}
-        destructive
-        onConfirm={() => void confirmRemove()}
-      />
-      {columns.length === 0 ? (
-        <p className="mt-2 text-xs text-muted-foreground">No column is classified on its own.</p>
-      ) : null}
-      {classifying ? (
-        <ClassifyDialog
-          asset={a}
-          onClose={() => setClassifying(false)}
-          onSaved={() => {
-            setClassifying(false)
-            onChanged()
-          }}
-        />
-      ) : null}
-    </SectionCard>
-  )
-}
-
-/**
- * The table a policy must bind to govern this asset's rows: the one its
- * reads actually go to (`queryTarget` — a Bronze dataset with a Silver
- * model is read from Silver), named the way policies name tables.
- */
-export function policyTable(a: AssetDetail): string {
-  if (a.queryTarget?.policyTable) return a.queryTarget.policyTable
-  const target = a.queryTarget?.table
-  if (!target) return lineageKey(a)
-  // An API build older than `policyTable`: icecat_api.`bronze.orders` and
-  // silver.`orders` both end in zone.table.
-  return target.replace(/`/g, "").split(".").slice(-2).join(".")
-}
-
-type PolicyForm = { roles: string; mask: string[]; rowFilter: string }
-
-/**
- * The enforceable condition (`policy_engine::PolicyCondition`) the form
- * describes, or `null` while it describes none: a policy needs a role,
- * and at least one thing to do — a column to mask or a row filter.
- */
-export function policyCondition(table: string, f: PolicyForm) {
-  const roles = f.roles
-    .split(",")
-    .map((r) => r.trim())
-    .filter((r) => r.length > 0)
-  const rowFilter = f.rowFilter.trim()
-  if (roles.length === 0 || (f.mask.length === 0 && rowFilter === "")) return null
-  return { roles, table, mask: f.mask, ...(rowFilter ? { rowFilter } : {}) }
 }
 
 /**
@@ -472,7 +236,11 @@ function PolicyItem({
         {p.appliesToYou ? <Pill tone="info">Applies to you</Pill> : null}
         <span className="ml-auto text-xs text-muted-foreground">{p.effect}</span>
         <PolicyActions
-          policy={{ id: p.id, name: p.name, status: p.status ?? "draft" }}
+          // Every `policySummary` entry passed `PolicyCondition::parse_opt`
+          // in `routes::catalog_governance::summarize_policies` — a policy
+          // with no enforceable condition binds no table and is left out —
+          // so these rows are enforceable by construction.
+          policy={{ id: p.id, name: p.name, status: p.status ?? "draft", enforceable: true }}
           onChanged={onChanged}
         />
       </div>
@@ -513,16 +281,18 @@ function PolicyItem({
 }
 
 /**
- * The Access tab: what the signed-in person may do with the asset, how
- * sensitive it is, then the policies that mask its columns or filter its
- * rows, and for whom.
+ * The Access tab: what the signed-in person may do with the asset, its
+ * grants, then the policies that mask its columns or filter its rows, and
+ * for whom. How sensitive a column is, and a mask on one column, are set on
+ * the column itself in the Schema tab (`WEB-3` S3-D1, S3-D2: one place per
+ * fact); this tab keeps the policies, which may span several columns.
  */
 export function AssetAccess({
   asset: a,
   onChanged,
 }: {
   asset: AssetDetail
-  /** Reloads the asset after it was classified. */
+  /** Reloads the asset after a policy changed. */
   onChanged: () => void
 }) {
   const { hasPermission } = useAuth()
@@ -533,7 +303,6 @@ export function AssetAccess({
     <div className="flex flex-col gap-2">
       <YourAccess asset={a} />
       <AssetGrants asset={a} />
-      <ClassificationCard asset={a} onChanged={onChanged} />
       <SectionCard
         size="sm"
         title="Policies"
@@ -548,7 +317,7 @@ export function AssetAccess({
             ) : null}
             {canOpen ? (
               <Button size="sm" variant="ghost" render={<Link href="/governance/policies" />}>
-                Open policies
+                Open access rules
               </Button>
             ) : null}
           </div>

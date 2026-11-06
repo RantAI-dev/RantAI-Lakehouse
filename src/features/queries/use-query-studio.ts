@@ -8,8 +8,10 @@ import { EditorView, keymap } from "@codemirror/view"
 import { assetQueryTarget } from "@/lib/asset-query"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { levelAtLeast } from "@/features/dashboards/access-level"
 import { catalogRefusal } from "@/lib/catalog-refusal"
 import { notifyInfo } from "@/lib/notify"
+import { readableErrorMessage } from "@/lib/notify-message"
 import { newRunId } from "@/lib/run-id"
 import {
   MAX_QUERY_TABS,
@@ -36,6 +38,7 @@ import type {
   QueryEngine,
   QueryResult,
   SaveQueryInput,
+  SavedQuery,
   SqlFixOutcome,
 } from "@/services/contracts/queries"
 import {
@@ -59,6 +62,16 @@ const DRAFT_DEBOUNCE_MS = 400
  * id, so the two live side by side in the browser.
  */
 const FIRST_TAB_ID = "tab-1"
+
+/**
+ * What the studio says when a `?saved=` link names a query the caller may
+ * not see (or one that is in the trash).
+ *
+ * The console's own sentence, not the server's: the link is the same for
+ * a query that was deleted and for one nobody may read, and the person
+ * following it learns that the query is not there for them (`QS-3` C5).
+ */
+export const SAVED_QUERY_UNAVAILABLE = "This query is not available to you."
 
 /**
  * The shape of a catalog id that is a SQL table name: `silver.orders`.
@@ -231,6 +244,17 @@ export function useQueryStudio() {
   const sql = activeTab?.sql ?? ""
   const engine = activeTab?.engine ?? "clickhouse"
 
+  // The saved query the open tab came from, when it came from one (`QS-3`
+  // C4). Its level says what "Save" may do with it.
+  const activeSaved = React.useMemo(() => {
+    const savedId = activeTab?.savedId
+    if (!savedId) return null
+    return { id: savedId, level: activeTab?.level }
+  }, [activeTab])
+  // "Save" changes the saved query when the caller may edit it, and makes a
+  // copy of it otherwise: a level the console cannot read widens nothing.
+  const savesSavedQuery = activeSaved !== null && levelAtLeast(activeSaved.level, "edit")
+
   // A proposal is a diff against the editor as it was when it came back.
   // Once the editor changes, the diff describes something else, so it goes.
   const [fixResult, setFixResult] = React.useState<SqlFixOutcome | null>(null)
@@ -267,9 +291,18 @@ export function useQueryStudio() {
   const estimateAct = useServiceAction((signal, s: string) =>
     queryService.estimate(s, signal)
   )
-  const saveAct = useServiceAction((signal, input: SaveQueryInput) =>
-    queryService.saveQuery(input, signal)
-  )
+  const saveAct = useServiceAction((signal: AbortSignal, input: SaveQueryInput) => {
+    // A change of a saved query leaves it where it is: the folder is the
+    // Move dialog's business, so the body carries no folder at all.
+    if (savesSavedQuery && activeSaved) {
+      return queryService.updateSaved(
+        activeSaved.id,
+        { title: input.title, sql: input.sql, tags: input.tags },
+        signal
+      )
+    }
+    return queryService.saveQuery(input, signal)
+  })
   const savedState = useService((s) => queryService.listSaved(s), [])
   const historyState = useService((s) => queryService.listHistory(undefined, s), [])
 
@@ -900,10 +933,20 @@ export function useQueryStudio() {
   const save = React.useCallback(
     async (input: SaveQueryInput) => {
       const saved = await saveAct.run(input)
-      if (saved) savedState.reload()
+      if (!saved) return null
+      savedState.reload()
+      // The tab is the query the server made: a copy made from a saved query
+      // becomes one of its own, and a change keeps the id it had.
+      setTabs((previous) =>
+        previous.map((open) =>
+          open.id === activeTabId
+            ? { ...open, savedId: saved.id, level: saved.level }
+            : open
+        )
+      )
       return saved
     },
-    [saveAct, savedState]
+    [saveAct, savedState, activeTabId]
   )
 
   // Agentic ask: one call to the chat's engine, which writes the SQL, runs
@@ -1006,34 +1049,68 @@ export function useQueryStudio() {
   // Handoff from Saved Queries: /query-studio?saved=<id> opens that query
   // in a tab of its own, so the tabs that were there stay where they were.
   // Read from window.location to avoid a useSearchParams Suspense boundary.
+  //
+  // The query is asked for by id, not looked for in the list the console
+  // holds (`QS-3` C4): the list may not hold that query at all, and a query
+  // the caller may not see is a 404 rather than a missing row.
+  const [linkedSaved, setLinkedSaved] = React.useState<SavedQuery | null>(null)
+  const [savedLinkError, setSavedLinkError] = React.useState<string | null>(null)
   const appliedSavedRef = React.useRef(false)
   React.useEffect(() => {
-    if (appliedSavedRef.current || savedState.status !== "success") return
-    appliedSavedRef.current = true
+    if (appliedSavedRef.current) return
     const savedId = new URLSearchParams(window.location.search).get("saved")
     if (!savedId) return
-    const match = savedState.data.find((q) => q.id === savedId)
-    if (!match) return
-    const opened: QueryTab = {
-      id: newTabId(),
-      // The saved query's own name is a better one than "Query 3".
-      name: match.title.trim() || nextTabName(tabs),
-      sql: match.sql,
-      engine: "clickhouse",
-    }
-    if (placeholderRef.current && tabs.length === 1) {
-      // Nothing was stored and no link came first: the saved query takes
-      // the empty tab's place instead of sitting next to it.
-      placeholderRef.current = false
-      setTabs([{ ...tabs[0], sql: opened.sql, name: opened.name }])
-      setActiveTabId(tabs[0].id)
-    } else {
-      placeholderRef.current = false
-      setTabs([...tabs, opened])
-      setActiveTabId(opened.id)
-    }
+    // The link is read once: StrictMode runs this effect a second time
+    // right after the first one, and the second run must not ask for the
+    // query again.
+    appliedSavedRef.current = true
+    void queryService.getSaved(savedId).then(
+      (saved) => {
+        // The hook's own "mounted" flag and not one of this effect's own:
+        // StrictMode's second run would take a flag of this effect's own
+        // down with it, and the answer of the only request that was made
+        // would be dropped with it.
+        if (mountedRef.current) setLinkedSaved(saved)
+      },
+      (error: unknown) => {
+        if (!mountedRef.current) return
+        const failure = toServiceError(error)
+        // A query the caller may not see and one in the trash are the same
+        // answer for them: the studio says so and opens no tab (C5).
+        setSavedLinkError(
+          failure.code === "not_found"
+            ? SAVED_QUERY_UNAVAILABLE
+            : readableErrorMessage(failure.message)
+        )
+      }
+    )
+  }, [])
+
+  React.useEffect(() => {
+    if (!linkedSaved) return
+    const openedId = newTabId()
+    // The empty tab that was there before anything was read takes the saved
+    // query's place instead of sitting next to it.
+    const takesPlaceholder = placeholderRef.current
+    placeholderRef.current = false
+    setTabs((previous) => {
+      const name = linkedSaved.title.trim() || nextTabName(previous)
+      const opened: QueryTab = {
+        id: openedId,
+        name,
+        sql: linkedSaved.sql,
+        engine: "clickhouse",
+        savedId: linkedSaved.id,
+        level: linkedSaved.level,
+      }
+      if (takesPlaceholder && previous.length === 1 && previous[0].id === FIRST_TAB_ID) {
+        return [opened]
+      }
+      return [...previous, opened]
+    })
+    setActiveTabId(openedId)
     setTab("sql")
-  }, [savedState, tabs])
+  }, [linkedSaved])
 
   // The rows on screen for each tab: the result of the statement that is
   // open on it. The per-statement state behind it is `runs`.
@@ -1143,5 +1220,20 @@ export function useQueryStudio() {
       if (targetText !== null) void runEstimate(targetText)
     },
     save,
+    /**
+     * What the Save button on the open tab does: "Save" changes the saved
+     * query the tab came from, "Save as new" makes a copy of it.
+     */
+    saveTarget: {
+      mode: savesSavedQuery ? ("update" as const) : ("create" as const),
+      label: savesSavedQuery ? ("Save" as const) : ("Save as new" as const),
+      savedId: activeSaved?.id ?? null,
+      level: activeSaved?.level,
+    },
+    /**
+     * What a `?saved=` link answered: the sentence the studio shows when
+     * the query is not there for the caller, or `null` when it opened.
+     */
+    savedLinkError,
   }
 }

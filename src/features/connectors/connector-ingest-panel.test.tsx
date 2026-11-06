@@ -12,6 +12,10 @@ import {
   REST_OLD_OBJECT_NOTE,
   targetProblem,
 } from "./connector-ingest-panel"
+import type { SourceObject } from "@/services/contracts/connectors"
+
+/** A saved object as the server sends it: the same fields as the contract, with the mode a plain string so fixtures stay literals. */
+type WireSourceObject = Omit<SourceObject, "loadMode"> & { loadMode?: string }
 
 const originalFetch = global.fetch
 
@@ -28,7 +32,7 @@ const SPEC = {
   adapter: "sql",
   ingestMode: "batch",
   dial: { driver: "postgres", host: "192.168.18.205", port: 55432, database: "northwind", user: "postgres", sslMode: null },
-  sourceObjects: [] as { name: string; target: string }[],
+  sourceObjects: [] as WireSourceObject[],
   scheduleCron: null as string | null,
   secretRefs: { primary: "file:/run/secrets/connector_managed_x_password", secondary: null },
   nextRunAt: null as string | null,
@@ -81,9 +85,6 @@ function stubFetch(
       return body ? json(body) : json({ error: "not found" }, 404)
     }
     if (url.endsWith("/resume") && method === "POST") return options.onResume ? options.onResume() : json({ resumed: true })
-    if (url.includes("/debezium-properties")) {
-      return json({ table: "public.orders", properties: "database.password=${DB_PASSWORD}", note: "References only." })
-    }
     // SRC-13: names first (`/discovery/list`), the columns of one object when it is opened (`/discovery/preview`).
     if (url.endsWith("/discovery/list") && method === "POST") {
       return json({
@@ -125,6 +126,10 @@ describe("ingest panel helpers", () => {
     // ... and a key (the two lines below named no key before the key field existed).
     expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["id"] })).toBeNull()
     expect(loadModeProblem({ loadMode: "replace_dedup", primaryKey: ["id"] })).toBeNull()
+    // SRC-4 S2-g: change capture needs a key and no cursor.
+    expect(loadModeProblem({ loadMode: "incremental_dedup", primaryKey: ["id"], adapter: "cdc" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "history", primaryKey: ["id"], adapter: "cdc" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "incremental_dedup", adapter: "cdc" })).toMatch(/cannot follow a table without a key/)
     // PR #216 final review BLOCKER 18: `incremental` appends a changed business-app record as a second row.
     expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "saas" })).toMatch(/one per key/)
     expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "sql" })).toBeNull()
@@ -435,7 +440,7 @@ describe("ConnectorIngestPanel layout", () => {
     const { container } = render(
       <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
     )
-    await screen.findByText(/Debezium properties/)
+    await screen.findByText("public.orders")
     expect(cardTitles(container)).toEqual(["Tables to ingest", "Runs"])
     const tables = (screen.getByText("Tables to ingest", { selector: "[data-slot=card-title]" }).closest(
       "[data-slot=card]"
@@ -943,6 +948,22 @@ describe("ConnectorIngestPanel refresh and clear", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull())
   })
 
+  it("offers a change-capture table the current row per key and history only, and asks for no cursor", async () => {
+    stubFetch({
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { ...SPEC.dial, driver: "postgres" },
+      sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "incremental_dedup", primaryKey: ["id"] }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
+    expect([...mode.options].map((o) => o.text)).toEqual(["Current row per key", "Keep history"])
+    expect(mode.value).toBe("incremental_dedup")
+    expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
+    expect(screen.getByText(/The table holds the current row of each key/)).toBeDefined()
+  })
+
   it("has no table menu for a CDC connector, whose tables stream", async () => {
     stubFetch({ ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
@@ -1318,7 +1339,7 @@ describe("ConnectorIngestPanel column choice", () => {
     expect(await screen.findByText(/Left out: discount\. Cannot read the columns · The source could not be read\./)).toBeDefined()
   })
 
-  it.each(["mysql", "mssql"])("is offered for the %s driver too", async (driver) => {
+  it.each(["mysql", "mssql", "oracle"])("is offered for the %s driver too", async (driver) => {
     stubFetch(saved({}, { ...SPEC, dial: { ...SPEC.dial, driver } }), undefined, { discovered: FOUND })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
     await openColumns()
@@ -1326,7 +1347,6 @@ describe("ConnectorIngestPanel column choice", () => {
   })
 
   it.each([
-    ["Oracle", { ...SPEC, dial: { ...SPEC.dial, driver: "oracle" } }],
     ["files", { ...SPEC, adapter: "files", dial: {} }],
     ["REST", { ...SPEC, adapter: "rest", dial: {} }],
   ])("says column choice is not available for a %s source and offers no column list", async (_label, spec) => {
@@ -1408,6 +1428,28 @@ describe("ConnectorIngestPanel table discovery", () => {
     expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
       { name: "SALES.ORDERS", target: "erp_orders", loadMode: "replace" },
     ])
+  })
+
+  it("an Oracle change-capture connector lists nothing: its tables are typed by hand, in upper case (SRC-4 Amendment 10)", async () => {
+    const calls = stubFetch({
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { driver: "oracle", host: "h", port: 1521, database: "FREE", pdbName: "FREEPDB1", user: "c##dbzuser", sslMode: "require" } as unknown as typeof SPEC.dial,
+      sourceObjects: [],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-ora-cdc" connectorName="erp" />)
+    fireEvent.change(await screen.findByLabelText("Add by name"), { target: { value: "shop.orders" } })
+    expect(screen.queryByRole("button", { name: "Find tables" })).toBeNull()
+    expect(screen.getByText(/not checked against the source until you test the connection/)).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Add" }))
+    expect(screen.getByLabelText("Bronze table for SHOP.ORDERS")).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Key columns for SHOP.ORDERS"), { target: { value: "ID" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: { name: string }[] }).sourceObjects[0].name).toBe(
+      "SHOP.ORDERS"
+    )
   })
 
   it("gives a SQL source no add-by-name field, since its list is the whole source", async () => {

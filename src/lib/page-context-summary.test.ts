@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import {
+  buildDashboardPageContext,
   summarizeFilterJson,
   summarizeFilters,
   summarizeGrain,
@@ -140,6 +141,68 @@ test("BI-11: summarizeParams lists each shown parameter with its value and type,
   )
 })
 
+test("AI-14: summarizeParams keeps the parameter line inside its budget, keeping the first whole entries and counting the rest", () => {
+  // 100 parameters with 20-character names: together far over the 600-character budget.
+  const controls = Array.from({ length: 100 }, (_, i) => ({
+    param: { name: `p${String(i + 1).padStart(3, "0")}`.padEnd(20, "x"), type: "number" },
+    value: i + 1,
+  }))
+  const entries = controls.map((c) => `${c.param.name} = ${c.value} (${c.param.type})`)
+  const uncut = entries.join("; ")
+  assert.ok(uncut.length > 600, String(uncut.length))
+  const out = summarizeParams(controls)
+  assert.ok(out.length <= 600, String(out.length))
+  const note = /; … \(\+(\d+) more\)$/.exec(out)
+  assert.ok(note, out.slice(-40))
+  const left = Number(note![1])
+  const kept = controls.length - left
+  assert.ok(kept >= 1, String(kept))
+  // The result is exactly the first `kept` entries, whole, plus the note.
+  const keptLine = entries.slice(0, kept).join("; ")
+  assert.equal(out, `${keptLine}; … (+${left} more)`)
+  assert.ok(uncut.startsWith(keptLine))
+  // The first left-out entry is not in the result.
+  assert.ok(!out.includes(entries[kept]))
+  // The kept count is the largest that fits: one more entry would pass the budget.
+  assert.ok(`${keptLine}; ${entries[kept]}; … (+${left - 1} more)`.length > 600)
+})
+
+test("AI-14: summarizeParams cuts a single parameter that does not fit and counts the entries left out", () => {
+  const long = { param: { name: "n".repeat(1000), type: "number" }, value: 1 }
+  const single = summarizeParams([long])
+  assert.ok(single.length <= 600, String(single.length))
+  assert.ok(single.endsWith("… (truncated)"))
+  assert.ok(!single.includes("more)"))
+  // The same long name followed by two short parameters: they are counted, not named.
+  const twoMore = summarizeParams([long, { param: { name: "a", type: "list" }, value: "x" }, { param: { name: "b", type: "list" }, value: "y" }])
+  assert.ok(twoMore.length <= 600, String(twoMore.length))
+  assert.ok(twoMore.endsWith("; … (+2 more)"), twoMore.slice(-40))
+})
+
+test("AI-14: buildDashboardPageContext stays inside the API cap when hundreds of parameters crowd the parameter line", () => {
+  const controls = Array.from({ length: 200 }, (_, i) => ({
+    param: { name: `p${String(i + 1).padStart(3, "0")}`.padEnd(20, "x"), type: "number" },
+    value: i + 1,
+  }))
+  const chips = `region is ${"n".repeat(6990)}`
+  assert.equal(chips.length, 7000)
+  const tiles = `- "Tile" (bar, id u_1; mart_m): ${"t".repeat(4968)}`
+  assert.equal(tiles.length, 5000)
+  const out = buildDashboardPageContext({
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: chips,
+    filterJson: null,
+    params: summarizeParams(controls),
+    tabs: "none (the dashboard has no tabs)",
+    tiles,
+  })
+  assert.ok(out.length <= 6000, String(out.length))
+  assert.ok(out.startsWith("The user is viewing the dashboard"))
+  assert.ok(out.endsWith("You can also explain what the charts show."))
+})
+
 test("a chart's other questions are listed beside its own rows, with their reason when they failed (BI-13)", () => {
   const tile = { id: "c_1", title: "Visitors and rooms", kind: "bar", source: "ui", mart: "mart_x" }
   const cell = {
@@ -187,4 +250,113 @@ test("summarizeTabs stays inside its budget: it counts the charts per tab when t
     '"Overview" (id t_1, open; charts a, b, c); "Maps" (id t_2; charts m, n); "Detail" (id t_3; no charts)'
   )
   assert.doesNotMatch(full, /list_charts/)
+})
+
+test("buildDashboardPageContext returns today's joined string when everything fits", () => {
+  const parts = {
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: "region is north",
+    filterJson: null,
+    params: "target = 1000 (number)",
+    tabs: "none (the dashboard has no tabs)",
+    tiles: '- "Sales" (bar, id u_1; mart_sales): rows: north=5',
+  }
+  const expected =
+    'The user is viewing the dashboard "Sales" (board id: b_1). ' +
+    "Time grain: Day. " +
+    "Active filters: region is north. " +
+    "Parameters shown (a formula reads one as {name}; list_parameters has them all): target = 1000 (number). " +
+    "Tabs: none (the dashboard has no tabs). " +
+    "Tiles and the data they currently show (built-in tiles are not editable):\n" +
+    '- "Sales" (bar, id u_1; mart_sales): rows: north=5\n' +
+    'When creating a chart use board="b_1". To change a tile you created, use update_chart with its id. ' +
+    "You can also explain what the charts show."
+  assert.equal(buildDashboardPageContext(parts), expected)
+  // The raw filters ride along in the filter line, as the page writes them.
+  const json = '[{"column":"region"}]'
+  assert.equal(
+    buildDashboardPageContext({ ...parts, filterJson: json }),
+    expected.replace(
+      "Active filters: region is north.",
+      `Active filters: region is north (raw: ${json}).`
+    )
+  )
+})
+
+test("buildDashboardPageContext gives up the raw filter JSON first", () => {
+  const json = `[{"column":"region","values":["${"y".repeat(3965)}"]}]`
+  assert.equal(json.length, 4000)
+  const tiles = `- "Tile" (bar, id u_1; mart_m): ${"t".repeat(4968)}`
+  assert.equal(tiles.length, 5000)
+  const out = buildDashboardPageContext({
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: "region is north",
+    filterJson: json,
+    params: "target = 1000 (number)",
+    tabs: "none (the dashboard has no tabs)",
+    tiles,
+  })
+  assert.ok(out.length <= 6000, String(out.length))
+  assert.ok(!out.includes(json))
+  // The chip text stays; the raw JSON is what goes.
+  assert.ok(out.includes("Active filters: region is north."))
+  assert.ok(out.startsWith("The user is viewing the dashboard"))
+  assert.ok(out.includes('When creating a chart use board="b_1".'))
+  assert.ok(out.endsWith("You can also explain what the charts show."))
+})
+
+test("buildDashboardPageContext cuts the end of the tile list when the rest still does not fit", () => {
+  const json = `[{"column":"region","values":["${"y".repeat(2965)}"]}]`
+  assert.equal(json.length, 3000)
+  const chips = `region is ${"n".repeat(1990)}`
+  assert.equal(chips.length, 2000)
+  const tiles = `- "Tile" (bar, id u_1; mart_m): ${"t".repeat(4968)}`
+  assert.equal(tiles.length, 5000)
+  const out = buildDashboardPageContext({
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: chips,
+    filterJson: json,
+    params: "target = 1000 (number)",
+    tabs: "none (the dashboard has no tabs)",
+    tiles,
+  })
+  assert.ok(out.length <= 6000, String(out.length))
+  assert.ok(!out.includes(json))
+  // The tile list gives way, and says where the rest of it is.
+  assert.ok(
+    out.includes('… (more tiles; list_charts lists every chart)\nWhen creating a chart use board="b_1".')
+  )
+  // The tile list is cut, not dropped: its beginning stays.
+  assert.ok(out.includes('- "Tile" (bar, id u_1; mart_m): '))
+  // The chip text still fits, so it stays whole.
+  assert.ok(out.includes(chips))
+  assert.ok(!out.includes("… (more filters)"))
+})
+
+test("buildDashboardPageContext cuts the filter chip text last and keeps the board id and the instruction", () => {
+  const chips = `region is ${"n".repeat(6990)}`
+  assert.equal(chips.length, 7000)
+  const out = buildDashboardPageContext({
+    dashName: "Sales",
+    board: "b_1",
+    grainText: "Time grain: Day",
+    filterChips: chips,
+    filterJson: null,
+    params: "target = 1000 (number)",
+    tabs: "none (the dashboard has no tabs)",
+    tiles: '- "Tile" (bar, id u_1; mart_m): rows: north=5',
+  })
+  assert.ok(out.length <= 6000, String(out.length))
+  assert.ok(out.includes("… (more filters)"))
+  assert.ok(out.startsWith('The user is viewing the dashboard "Sales" (board id: b_1).'))
+  assert.ok(out.includes('When creating a chart use board="b_1".'))
+  assert.ok(out.endsWith("You can also explain what the charts show."))
+  // The tile list is short, so it stays whole: the chips are what did not fit.
+  assert.ok(out.includes('- "Tile" (bar, id u_1; mart_m): rows: north=5'))
 })

@@ -71,7 +71,6 @@ Each default was the planner's recommendation.
 - Replacing an uploaded table with different types can break a pipeline that reads it; its next run fails and says why.
 - Adding to an existing table keeps that table's names and types.
 - The size of a typed load is the same as for any upload: 2 GB, one load at a time measured (`docs/plans/DATA-17-RESULT.md`); the harness sends no column list, so no typed load was measured at full size.
-- For an Excel workbook loaded with types, the report of values that did not fit is written but not read back, so the person sees no list of them (`DATA-31`).
 - A query through the console shows a NULL as an empty string (`DATA-29`); use `IS NULL` to tell them apart.
 
 ## Spec targets, row by row
@@ -82,7 +81,7 @@ Against `docs/core/specs/data-18.md`, as built in #186. "Met" means built and co
 | --- | --- | --- |
 | Type detection | Integer, decimal, boolean, date, timestamp, text from a sample of 10,000 rows *(proposed)* | Met (decision 1; the sample is also cut at 16 MB) |
 | Edit before loading | Name and type per column in the preview | Met (decision 8) |
-| Bad values | Counted, first 100 listed, choose null or stop | Met for the load, with the gap for workbooks above (`DATA-31`) |
+| Bad values | Counted, first 100 listed, choose null or stop | Met for the load, workbooks included since `DATA-31` |
 | Date formats | ISO, dd/mm/yyyy, mm/dd/yyyy; ask when ambiguous | Met (decision 4) |
 
 No spec target is left unmet, so there is no "Spec targets this feature does not meet" section.
@@ -98,24 +97,24 @@ No spec target is left unmet, so there is no "Spec targets this feature does not
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `DATA-18-AC1` | Upload a CSV with an ISO date column and load it | The preview guesses Date; the Catalog shows the column as a date; a query can filter it by date range | Not run |
-| `DATA-18-AC2` | In the preview, change a column holding some words to Integer | The failing rows are listed (up to 100) before loading | Not run |
-| `DATA-18-AC3` | Sign in as a user without the connector-manage permission and try to upload; then make a load fail | The upload is refused for the permission; the failed load shows an honest reason | Not run |
-| `DATA-18-AC4` | Upload a file whose dates are all like `01/02/2026` | The preview asks "day first or month first?" and Load stays off until answered | Not run |
-| `DATA-18-AC5` | Upload a file whose row 20,000 has `abc` in an integer column; keep "stop the load" | The load stops, the table is unchanged, and the count and row are shown | Not run |
-| `DATA-18-AC6` | The same file with "load them as empty" | The table loads with that cell empty, and the report shows one value made empty | Not run |
-| `DATA-18-AC7` | Rename a column in the preview and load | The table has the new name | Not run |
-| `DATA-18-AC8` | Add a file to an existing table where one column holds text the table stores as integers | The mismatch is listed before loading | Not run |
-| `DATA-18-AC9` | Upload a file with `007` in one column and `1`/`0` in another | The first is guessed Text, the second Integer | Not run |
+| `DATA-18-AC1` | Upload a CSV with an ISO date column and load it | The preview guesses Date; the Catalog shows the column as a date; a query can filter it by date range | Pass (product owner, 2026-11-02) |
+| `DATA-18-AC2` | In the preview, change a column holding some words to Integer | The failing rows are listed (up to 100) before loading | Pass (product owner, 2026-11-02) |
+| `DATA-18-AC3` | Sign in as a user without the connector-manage permission and try to upload; then make a load fail | The upload is refused for the permission; the failed load shows an honest reason | Pass (product owner, 2026-11-02) |
+| `DATA-18-AC4` | Upload a file whose dates are all like `01/02/2026` | The preview asks "day first or month first?" and Load stays off until answered | Pass (product owner, 2026-11-02) |
+| `DATA-18-AC5` | Upload a file whose row 20,000 has `abc` in an integer column; keep "stop the load" | The load stops, the table is unchanged, and the count and row are shown | Pass (product owner, 2026-11-02) |
+| `DATA-18-AC6` | The same file with "load them as empty" | The table loads with that cell empty, and the report shows one value made empty | Pass (product owner, 2026-11-02) |
+| `DATA-18-AC7` | Rename a column in the preview and load | The table has the new name | Pass (product owner, 2026-11-02) |
+| `DATA-18-AC8` | Add a file to an existing table where one column holds text the table stores as integers | The mismatch is listed before loading | Pass (product owner, 2026-11-02) |
+| `DATA-18-AC9` | Upload a file with `007` in one column and `1`/`0` in another | The first is guessed Text, the second Integer | Pass (product owner, 2026-11-02) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): the product owner **Date:** 2026-11-02 **Build:** not recorded by the acceptor
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
-- [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
+- [x] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
 - [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read

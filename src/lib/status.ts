@@ -283,12 +283,14 @@ export const ACTOR_KIND_LABEL: Record<ActorKind, string> = {
 }
 
 /** Outcome of an audited action after policy evaluation. */
-export type AuditOutcome = "success" | "denied" | "error"
+export type AuditOutcome = "success" | "denied" | "error" | "pending"
 
 export const AUDIT_OUTCOME_LABEL: Record<AuditOutcome, string> = {
   success: "Success",
   denied: "Denied",
   error: "Error",
+  // A decision still waiting on a person: open, not refused (GOV-5).
+  pending: "Pending",
 }
 
 /** Alert triage lifecycle shared by alerts and incidents. */
@@ -298,14 +300,4 @@ export const ALERT_STATUS_LABEL: Record<AlertStatus, string> = {
   open: "Open",
   acknowledged: "Acknowledged",
   resolved: "Resolved",
-}
-
-/** Request lifecycle in the workload admission queue. */
-export type WorkloadStatus = "queued" | "running" | "completed" | "cancelled"
-
-export const WORKLOAD_STATUS_LABEL: Record<WorkloadStatus, string> = {
-  queued: "Queued",
-  running: "Running",
-  completed: "Completed",
-  cancelled: "Cancelled",
 }

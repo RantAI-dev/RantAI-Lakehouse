@@ -9,17 +9,6 @@ import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import {
   Table,
   TableBody,
   TableCell,
@@ -47,12 +36,12 @@ import {
   snapshotsNewestFirst,
 } from "@/lib/lakehouse-view"
 import { fmtMeasured, type Measured } from "@/lib/measured"
-import { notifyError, notifySuccess, withNotify } from "@/lib/notify"
+import { withNotify } from "@/lib/notify"
 import { schemaHistory } from "@/lib/schema-history"
-import { assetService, governanceService } from "@/services"
+import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
-import type { DatasetSla } from "@/services/contracts/governance"
 import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
+import { FreshnessTargetDialog } from "@/features/governance/freshness-target-dialog"
 import { lineageKey } from "./asset-lineage"
 import type { IcebergTableState } from "./asset-storage"
 import { ALL, CountToggle } from "./count-toggle"
@@ -256,138 +245,6 @@ function IcebergSnapshots({
   )
 }
 
-const selectClassName = "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
-
-const UNIT_MINUTES = { minutes: 1, hours: 60, days: 1440 } as const
-type Unit = keyof typeof UNIT_MINUTES
-
-/**
- * How often the table is expected to refresh, as the whole number of
- * minutes the SLA stores — or `null` while the form does not say one.
- */
-export function slaMinutes(amount: string, unit: Unit): number | null {
-  const n = Number(amount)
-  if (amount.trim() === "" || !Number.isInteger(n) || n <= 0) return null
-  return n * UNIT_MINUTES[unit]
-}
-
-/** The largest unit a number of minutes is a whole count of. */
-function inLargestUnit(minutes: number): { amount: string; unit: Unit } {
-  for (const unit of ["days", "hours"] as const) {
-    if (minutes % UNIT_MINUTES[unit] === 0) return { amount: String(minutes / UNIT_MINUTES[unit]), unit }
-  }
-  return { amount: String(minutes), unit: "minutes" }
-}
-
-function SetTargetDialog({
-  asset: a,
-  onClose,
-  onSaved,
-}: {
-  asset: AssetDetail
-  onClose: () => void
-  onSaved: () => void
-}) {
-  // Start from the SLA in force; a target taken from the registry's
-  // frequency is not an SLA, so the form then starts from a day.
-  const current =
-    a.freshnessTargetSource === "sla" && a.freshnessTargetSeconds
-      ? inLargestUnit(Math.round(a.freshnessTargetSeconds / 60))
-      : { amount: "1", unit: "days" as Unit }
-  const [amount, setAmount] = React.useState(current.amount)
-  const [unit, setUnit] = React.useState<Unit>(current.unit)
-  const save = useServiceAction((signal, input: DatasetSla) =>
-    governanceService.putDatasetSla(input, signal)
-  )
-  const remove = useServiceAction((signal, table: string) =>
-    governanceService.deleteDatasetSla(table, signal)
-  )
-  const minutes = slaMinutes(amount, unit)
-  // Only an SLA can be removed: a target the registry's refresh frequency
-  // gives is not something this dialog set.
-  const hasSla = a.freshnessTargetSource === "sla"
-
-  async function removeTarget() {
-    // `run` resolves to `null` only on failure.
-    if ((await remove.run(lineageKey(a))) === null) {
-      notifyError("Failed to remove the freshness target", remove.error)
-      return
-    }
-    notifySuccess("Freshness target removed")
-    onSaved()
-  }
-
-  async function submit() {
-    if (minutes === null) return
-    const saved = await save.run({ tableName: lineageKey(a), expectedIntervalMinutes: minutes })
-    if (saved === null) return
-    notifySuccess("Freshness target saved")
-    onSaved()
-  }
-
-  return (
-    <Dialog open onOpenChange={(next) => (next ? undefined : onClose())}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Set freshness target</DialogTitle>
-          <DialogDescription>
-            How often {a.name} must receive new data. Past that, it reads as late and its
-            health as degraded.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="grid gap-1.5">
-          <Label htmlFor="sla-amount">New data at least every</Label>
-          <div className="flex gap-2">
-            <Input
-              id="sla-amount"
-              inputMode="numeric"
-              className="w-24"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              aria-invalid={minutes === null}
-            />
-            <select
-              aria-label="Unit"
-              className={selectClassName}
-              value={unit}
-              onChange={(e) => setUnit(e.target.value as Unit)}
-            >
-              {(Object.keys(UNIT_MINUTES) as Unit[]).map((u) => (
-                <option key={u} value={u}>
-                  {u}
-                </option>
-              ))}
-            </select>
-          </div>
-          {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
-        </div>
-        <DialogFooter>
-          {hasSla ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="mr-auto text-destructive"
-              onClick={() => void removeTarget()}
-              disabled={remove.status === "pending" || save.status === "pending"}
-              title="The asset goes back to having no target of its own"
-            >
-              {remove.status === "pending" ? "Removing…" : "Remove target"}
-            </Button>
-          ) : null}
-          <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-          <Button
-            size="sm"
-            onClick={() => void submit()}
-            disabled={minutes === null || save.status === "pending" || remove.status === "pending"}
-          >
-            {save.status === "pending" ? "Saving…" : "Save target"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 /**
  * How fresh the asset is against how fresh it is meant to be, and the way
  * to say how fresh that is. Without a target an age is only an age — which
@@ -429,8 +286,16 @@ function FreshnessCard({ asset: a, onChanged }: { asset: AssetDetail; onChanged:
         className="text-sm"
       />
       {setting ? (
-        <SetTargetDialog
-          asset={a}
+        <FreshnessTargetDialog
+          table={lineageKey(a)}
+          label={a.name}
+          // A target taken from the registry's frequency is not an SLA, so
+          // the form then starts from a day and offers no Remove.
+          currentMinutes={
+            a.freshnessTargetSource === "sla" && a.freshnessTargetSeconds
+              ? Math.round(a.freshnessTargetSeconds / 60)
+              : null
+          }
           onClose={() => setSetting(false)}
           onSaved={() => {
             setSetting(false)
@@ -596,13 +461,13 @@ export function AssetActivity({
         <SectionCard
           size="sm"
           title={`Usage (${a.usage?.days ?? 30}d)`}
-          description="Queries run in Query Studio or by the copilot that read this asset, by anyone. Only your own query text is shown in full; everyone's frequent queries are shown without their values."
+          description="Queries run in Query Studio or by AI Copilot that read this asset, by anyone. Only your own query text is shown in full; everyone's frequent queries are shown without their values."
         >
           {a.usage === null ? (
             <QuietEmpty title="Usage not measured" description="The query history could not be read." />
           ) : a.usage.queries === 0 ? (
             <QuietEmpty
-              title={`No Query Studio or copilot query in the last ${a.usage.days} days`}
+              title={`No Query Studio or AI Copilot query in the last ${a.usage.days} days`}
               description={uncounted ?? undefined}
             />
           ) : (

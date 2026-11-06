@@ -122,6 +122,27 @@ describe("DashboardActionsMenu downloads (BI-1)", () => {
   })
 })
 
+describe("DashboardActionsMenu Export dashboard file (BI-19 part D)", () => {
+  it("offers the file on a saved dashboard and not on the built-in one", async () => {
+    const onExportFile = mock(() => {})
+    renderMenu({ isDefault: false, onExportFile })
+    fireEvent.click(await screen.findByText("Export dashboard file"))
+    expect(onExportFile).toHaveBeenCalledTimes(1)
+    cleanup()
+    renderMenu({ isDefault: true, onExportFile })
+    await screen.findByText("Print…")
+    expect(screen.queryByText("Export dashboard file")).toBeNull()
+  })
+
+  // BI-19 Q-D1 (owner decision 2026-10-27).
+  it("hides both exports when downloads are switched off for the viewer", async () => {
+    renderMenu({ isDefault: false, onExportFile: () => {}, canDownload: false })
+    await screen.findByText("Print…")
+    expect(screen.queryByText("Export dashboard file")).toBeNull()
+    expect(screen.queryByText("Export YAML")).toBeNull()
+  })
+})
+
 describe("DashboardActionsMenu Subscriptions… (RPT-1)", () => {
   it("opens the subscriptions for a viewer who may download", async () => {
     const onSubscriptions = mock(() => {})
@@ -143,9 +164,18 @@ describe("write controls (R18)", () => {
     renderMenu({ canWrite: false })
     await screen.findByText("Manual")
     for (const label of ["Rename", "Duplicate", "Delete dashboard"]) expect(screen.queryByText(label)).toBeNull()
-    for (const label of ["Refresh now", "Fullscreen", "Print…", "Export YAML", "Share…"]) {
+    for (const label of ["Refresh now", "Fullscreen", "Print…", "Export YAML"]) {
       expect(screen.getByText(label)).toBeTruthy()
     }
+    // BI-19 B2: sharing needs manage, so a viewer is not offered it either.
+    expect(screen.queryByText("Share…")).toBeNull()
+  })
+
+  it("an editor without manage is offered Rename and Duplicate but not Share or Delete (BI-19 B2)", async () => {
+    renderMenu({ canWrite: true, canManage: false })
+    expect(await screen.findByText("Rename")).toBeTruthy()
+    expect(screen.getByText("Duplicate")).toBeTruthy()
+    for (const label of ["Share…", "Delete dashboard"]) expect(screen.queryByText(label)).toBeNull()
   })
 
   it("the dashboard menu shows Rename, Duplicate and Delete to an editor", async () => {

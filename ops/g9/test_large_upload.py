@@ -217,3 +217,275 @@ def test_each_phase_window_starts_empty_with_a_baseline_and_a_peak_reset(monkeyp
         pass
     assert sampler.baselines["api"] == 50 and sampler.maxima["api"] == 50  # nothing carried over
     assert sampler.peak_reset == {"api": False}
+
+
+# ── DATA-33 and DATA-34: the concurrent loads and the formats not yet measured ──
+
+
+def test_the_harness_loads_once_and_skips_the_three_new_formats_by_default():
+    args = lu.parse_args([])
+    assert args.concurrent == 1
+    assert args.avro_mb == 0
+    assert args.zip_mb == 0
+    assert args.parquet_one_group_mb == 0
+
+
+def test_the_harness_reads_the_concurrency_and_the_new_sizes_from_the_command_line():
+    args = lu.parse_args(["--concurrent", "4", "--avro-mb", "128", "--zip-mb", "64", "--parquet-one-group-mb", "32"])
+    assert args.concurrent == 4
+    assert args.avro_mb == 128
+    assert args.zip_mb == 64
+    assert args.parquet_one_group_mb == 32
+
+
+def test_the_harness_refuses_a_concurrency_below_one(capsys):
+    assert lu.main(["--concurrent", "0"]) == 2
+    assert "--concurrent" in capsys.readouterr().err
+
+
+def test_a_new_format_is_measured_at_the_sizes_of_the_list_and_is_skipped_when_it_is_zero():
+    assert lu.sizes_for(0, [256, 512]) == []
+    assert lu.sizes_for(2048, [256, 512]) == [256, 512]
+    assert lu.sizes_for(2048, []) == [2048]
+
+
+def test_the_generated_avro_file_is_readable_and_holds_the_records_it_reports(tmp_path):
+    import fastavro
+
+    path = tmp_path / "a.avro"
+    records = lu.write_avro(path, 1 * lu.MIB)
+    assert 0 < records <= lu.JOB_MAX_ROWS
+    assert path.stat().st_size <= 1 * lu.MIB
+    with path.open("rb") as handle:
+        reader = fastavro.reader(handle)
+        assert reader.metadata["avro.codec"] == "null"
+        read = list(reader)
+    assert len(read) == records
+    assert list(read[0]) == [f"c{n}" for n in range(10)]
+    assert all(isinstance(value, str) for value in read[0].values())
+
+
+def test_the_generated_zip_unpacks_to_about_the_size_and_holds_the_rows_it_reports(tmp_path):
+    import zipfile
+
+    path = tmp_path / "a.zip"
+    rows = lu.write_csv_zip(path, 1 * lu.MIB)
+    unpacked = 0
+    read_rows = 0
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        for name in names:
+            data = archive.read(name)
+            unpacked += len(data)
+            lines = data.decode("utf-8").splitlines()
+            assert lines[0] == ",".join(f"c{n}" for n in range(10))
+            read_rows += len(lines) - 1
+    assert len(names) == lu.ZIP_FILES  # the API reads ten files at most
+    assert abs(unpacked - 1 * lu.MIB) < 0.05 * 1 * lu.MIB
+    assert read_rows == rows
+
+
+def test_the_generated_parquet_file_of_one_group_holds_exactly_one_row_group(tmp_path):
+    path = tmp_path / "a.parquet"
+    rows = lu.write_parquet_one_group(path, 1 * lu.MIB)
+    metadata = pq.ParquetFile(path).metadata
+    assert metadata.num_row_groups == 1
+    assert metadata.num_rows == rows
+    assert path.stat().st_size <= 1 * lu.MIB
+
+
+def test_the_generated_files_are_never_larger_than_the_size_asked_for(tmp_path):
+    """The API refuses a session above its cap, so a generated file may not cross it."""
+    avro = tmp_path / "a.avro"
+    lu.write_avro(avro, 1 * lu.MIB)
+    assert avro.stat().st_size <= 1 * lu.MIB
+    zip_file = tmp_path / "a.zip"
+    lu.write_csv_zip(zip_file, 1 * lu.MIB)
+    import zipfile
+
+    with zipfile.ZipFile(zip_file) as archive:
+        unpacked = sum(info.file_size for info in archive.infolist())
+    assert unpacked <= 1 * lu.MIB
+
+
+class _LoadStub(BaseHTTPRequestHandler):
+    """The ingest and the poll of two loads: one succeeds, one is refused."""
+
+    calls: list = []
+
+    def _send(self, status, body=None):
+        data = json.dumps(body or {}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        _LoadStub.calls.append(f"POST {self.path}")
+        if self.path == "/api/uploads/up-1/ingest":
+            return self._send(200, {"upload": {"id": "up-1"}})
+        if self.path == "/api/uploads/up-2/ingest":
+            return self._send(429, {"error": "too many loads at once"})
+        if self.path == "/api/query/run":
+            return self._send(200, {"rows": [{"n": 10}]})
+        self._send(404)
+
+    def do_GET(self):
+        _LoadStub.calls.append(f"GET {self.path}")
+        if self.path == "/api/uploads/up-1":
+            return self._send(200, {"id": "up-1", "status": "ingested"})
+        self._send(404)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_the_loads_of_a_phase_start_together_and_a_load_that_fails_is_recorded(monkeypatch):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _LoadStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _LoadStub.calls = []
+    try:
+        monkeypatch.setattr(lu, "API_URL", f"http://127.0.0.1:{server.server_port}")
+        loads = lu.run_loads(
+            requests.Session(), [{"id": "up-1"}, {"id": "up-2"}], "t", dialect=True, rows=10
+        )
+    finally:
+        server.shutdown()
+    assert [load.status for load in loads] == ["ok", "failed"]
+    assert loads[0].rows == 10
+    assert "429" in loads[1].detail
+    # Every load is started before any of them is waited for.
+    ingests = [index for index, call in enumerate(_LoadStub.calls) if call.endswith("/ingest")]
+    polls = [index for index, call in enumerate(_LoadStub.calls) if call.startswith("GET ")]
+    assert len(ingests) == 2 and polls
+    assert max(ingests) < min(polls)
+
+
+def test_a_phase_line_names_every_load_with_its_time_and_its_result():
+    phase = lu.Phase(
+        "csv x2",
+        400 * lu.MIB,
+        10,
+        5.0,
+        {},
+        {},
+        {},
+        {},
+        [lu.Load(0, 4.0, "ok", 10), lu.Load(1, 2.0, "failed", None, "the load failed")],
+    )
+    line = lu.phase_line(phase, [], None)
+    assert "#1 ok in 4.0 s, 10 rows" in line
+    assert "#2 failed in 2.0 s (the load failed)" in line
+    assert "10 rows per load" in line
+
+
+def test_the_report_counts_the_loads_that_held_every_row():
+    phase = lu.Phase(
+        "csv x2",
+        400 * lu.MIB,
+        10,
+        5.0,
+        {},
+        {},
+        {},
+        {},
+        [lu.Load(0, 4.0, "ok", 10), lu.Load(1, 2.0, "failed", None, "the load failed")],
+    )
+    row = lu.render([phase], [], None).splitlines()[1].split()
+    assert row[-1] == "1/2"
+
+
+def test_the_oom_check_reads_the_state_of_the_container(monkeypatch):
+    class _Done:
+        returncode = 0
+        stdout = "true\n"
+
+    monkeypatch.setattr(lu.subprocess, "run", lambda *args, **kwargs: _Done())
+    assert lu._docker_oom_killed("g9large-dagster-code-location-1") is True
+
+    class _Alive:
+        returncode = 0
+        stdout = "false\n"
+
+    monkeypatch.setattr(lu.subprocess, "run", lambda *args, **kwargs: _Alive())
+    assert lu._docker_oom_killed("g9large-dagster-code-location-1") is False
+
+
+class _PhaseStub(BaseHTTPRequestHandler):
+    """The whole route of one phase: the chunked transport, the ingest, the poll and the
+    count. Every upload it serves ends up `ingested`."""
+
+    sessions: dict = {}
+    counter = 0
+
+    def _send(self, status, body=None):
+        data = json.dumps(body or {}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        if self.path == "/api/uploads/sessions":
+            _PhaseStub.counter += 1
+            name = f"up-{_PhaseStub.counter}"
+            _PhaseStub.sessions[name] = {"parts": {}, "size": body["sizeBytes"], "table": None}
+            return self._send(201, {"upload": {"id": name}, "partSize": 1024, "partCount": -(-body["sizeBytes"] // 1024)})
+        if self.path.startswith("/api/uploads/") and self.path.endswith("/ingest"):
+            name = self.path.split("/")[3]
+            _PhaseStub.sessions[name]["table"] = body["bronzeTable"]
+            return self._send(200, {"upload": {"id": name}})
+        if self.path.startswith("/api/uploads/") and self.path.endswith("/complete"):
+            name = self.path.split("/")[3]
+            session = _PhaseStub.sessions[name]
+            whole = b"".join(session["parts"][n] for n in sorted(session["parts"]))
+            return self._send(200, {"id": name, "sizeBytes": len(whole), "sha": hashlib.sha256(whole).hexdigest()})
+        if self.path == "/api/query/run":
+            return self._send(200, {"rows": [{"n": 3}]})
+        self._send(404)
+
+    def do_PUT(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        data = self.rfile.read(length)
+        name, number = self.path.split("/")[3], int(self.path.rsplit("/", 1)[1])
+        _PhaseStub.sessions[name]["parts"][number] = data
+        self._send(200, {"partNumber": number})
+
+    def do_GET(self):
+        if self.path.startswith("/api/uploads/"):
+            return self._send(200, {"id": self.path.split("/")[3], "status": "ingested"})
+        self._send(404)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_a_phase_sends_the_file_loads_it_and_reports_the_load(tmp_path, monkeypatch):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _PhaseStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _PhaseStub.sessions = {}
+    _PhaseStub.counter = 0
+    try:
+        monkeypatch.setattr(lu, "API_URL", f"http://127.0.0.1:{server.server_port}")
+        path = tmp_path / "a.csv"
+        path.write_text("c0,c1\n1,2\n3,4\n5,6\n")
+        phase = lu.run_phase(
+            requests.Session(), "csv", path, 3, "g9_large_test_csv", True, lu.Sampler({}), concurrency=2
+        )
+    finally:
+        server.shutdown()
+    assert len(phase.loads) == 2
+    assert all(load.status == "ok" and load.rows == 3 for load in phase.loads)
+    assert phase.name == "csv x2"
+    assert phase.bytes == 2 * path.stat().st_size
+    # Every load wrote into its own table.
+    assert {session["table"] for session in _PhaseStub.sessions.values()} == {
+        "g9_large_test_csv_0",
+        "g9_large_test_csv_1",
+    }

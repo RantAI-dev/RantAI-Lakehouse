@@ -212,6 +212,22 @@ describe("QueryStudioPage query tabs", () => {
   })
 })
 
+describe("QueryStudioPage saved-query link", () => {
+  it("says the query is not available and opens no tab when the caller may not see it", async () => {
+    stubNetwork()
+    spyOn(queryService, "getSaved").mockRejectedValue(
+      new ServiceError("not_found", "That saved query could not be found.")
+    )
+    seedDraft("SELECT 1")
+    visit("/query-studio?saved=q1")
+    renderPage()
+
+    await screen.findByText("This query is not available to you.")
+    // No tab was opened for it: the tab bar still holds the draft's one.
+    expect(screen.getAllByRole("button", { name: /^Query \d+$/ }).length).toBe(1)
+  })
+})
+
 describe("QueryStudioPage statements", () => {
   it("disables the actions that work on one statement when the tab holds several", async () => {
     stubNetwork()
@@ -226,7 +242,7 @@ describe("QueryStudioPage statements", () => {
     expect((estimate as HTMLButtonElement).disabled).toBe(true)
     expect(estimate.getAttribute("title")).toBe("Select one statement")
 
-    const save = screen.getByRole("button", { name: "Save query" })
+    const save = screen.getByRole("button", { name: "Save as new" })
     expect((save as HTMLButtonElement).disabled).toBe(true)
     expect(save.getAttribute("title")).toBe("Select one statement")
   })

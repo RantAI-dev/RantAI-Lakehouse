@@ -26,8 +26,10 @@ import { reportService as reportClientService } from "./clients/reports"
 import { settingsService as settingsClientService } from "./clients/settings"
 import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
+import { chatSessionService as chatSessionClientService } from "./clients/chat-sessions"
 import { semanticService as semanticClientService } from "./clients/semantic"
 import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
+import { httpVersionService } from "./clients/version"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -44,21 +46,37 @@ export const pipelineService = dagsterPipelineService
 // the Rust backend (ClickHouse + Postgres + LLM).
 // mock/queries.ts has been deleted.
 export const queryService = clickhouseQueryService
-// Agents is now fully real — employees/tools/workflows/runs/approvals
-// live in Postgres (Task 2.9). There is no agent/tool execution runtime
-// (the contract never asked for one). mock/agents.ts has been deleted.
+// Agents is real — employee definitions, runs and approvals live in
+// Postgres (Task 2.9). WEB-3 slice 1 removed the employee/run-list methods
+// from the client (the pages are gone); run detail and approvals remain.
 export const agentService = postgresAgentService
 // Governance is now fully real — reads from ClickHouse/Dagster,
 // policies + create*Rule from Postgres. mock/governance.ts has been deleted.
 export const governanceService = clickhouseGovernanceService
-// Ops is now fully real — observability/usage/workloads/services from
-// ClickHouse+Dagster, cancelWorkload is a real KILL QUERY. mock/ops.ts
-// has been deleted.
+// Ops is real — the service list from ClickHouse+Dagster. WEB-3 slice 1
+// removed the observability and workloads reads with their pages; the
+// backend routes stay registered (WEB-4 retires them).
 export const opsService = clickhouseOpsService
 // Identity is now real — users/roles/tenants/service identities live in
 // Postgres. Every contract method is served, so mock/identity.ts has been
 // deleted.
 export const identityService = postgresIdentityService
+/**
+ * The identity directory's shapes (ADM-4). The contract owns them, and
+ * they are exported here so a feature imports them from `@/services` and
+ * not from `services/contracts/identity` directly (`PR #199 review M
+ * SHOULD-FIX BI-16 7`).
+ */
+export type {
+  InviteUserInput,
+  InviteUserResponse,
+  ResetPasswordResponse,
+  Role,
+  ServiceIdentity,
+  SetUserRolesInput,
+  Tenant,
+  User,
+} from "./contracts/identity"
 // Connectors is now real — connector definitions (CRUD + testConnection) live
 // in Postgres (Task 2.7). Credentials are NEVER stored or returned: only the
 // `secretRef` (a reference, e.g. "env:FOO"); see
@@ -78,7 +96,8 @@ export const dashboardService = clickhouseDashboardService
  * (`PR #199 review M SHOULD-FIX BI-16 7`).
  */
 export type {
-  Board, BoardChart, BoardTab, EmbedInfo, FilterMode, LayoutMap, PhoneTile, PublicLink, PublicLinkState, TileBox,
+  AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
+  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
 } from "./contracts/dashboards"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService
@@ -129,6 +148,14 @@ export type { ReportingSettingsInput } from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
+// The AI Copilot's saved conversations (`/api/ai/sessions`): list, open,
+// save, rename and delete (AI-24). No mock ever existed for this domain.
+export const chatSessionService = chatSessionClientService
+/** The conversation shapes the Copilot feature reads from `@/services`. */
+export type {
+  ChatSession, ChatSessionPage, ChatSessionSaved, ChatSessionService, ChatSessionSummary,
+  ListChatSessionsQuery, SaveChatSessionInput,
+} from "./contracts/chat-sessions"
 // The semantic entries of a table and its columns (`/api/semantic/{asset}`):
 // the drafted meaning and role, and the person's confirmed corrections. No
 // mock ever existed.
@@ -136,6 +163,16 @@ export const semanticService = semanticClientService
 // The governed tag keys and their allowed values (`/api/governance/tag-keys`,
 // `DATA-12` part 2). Free tags are not part of this.
 export const tagKeysService = tagKeysClientService
+// The server's own health answer (`/api/health` — the API's `/health`,
+// exposed through the console's rewrite), read for the version it runs so
+// the console can say when it and the server are not the same build
+// (REL-2 S1-T5). No mock ever existed for this domain.
+export const versionService = httpVersionService
+/**
+ * The server's health answer. The contract owns the shape, and it is
+ * exported here so a feature imports it from `@/services`.
+ */
+export type { ServerHealth } from "./contracts/version"
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and

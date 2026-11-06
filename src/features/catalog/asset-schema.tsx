@@ -22,6 +22,7 @@ import { TableMeaningCard } from "./asset-meaning-view"
 import type { MeaningState } from "./asset-meaning"
 import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { StandInNotice } from "./asset-stand-in"
+import { ColumnSensitivity } from "./column-sensitivity"
 
 function ColumnCells({ row }: { row: SchemaRow }) {
   const c = row.column
@@ -126,18 +127,26 @@ function SchemaVersions({ asset: a, table }: { asset: AssetDetail; table: Lakeho
 /**
  * The Schema tab: the asset's columns as a column explorer (type, nullability,
  * sensitivity, and what the data in each actually looks like; see
- * `asset-columns.tsx`), then the table's own bookkeeping columns and its
+ * `asset-columns.tsx`); an opened column also says how sensitive it is and
+ * for whom it is masked, with the controls to change both
+ * (`column-sensitivity.tsx`, `WEB-3` S3-D1), then the table's own bookkeeping columns and its
  * schema history.
  */
 export function AssetSchema({
   asset: a,
   iceberg,
   meanings = { kind: "none" },
+  onChanged,
 }: {
   asset: AssetDetail
   iceberg: IcebergTableState
   /** Read by the page, so the header and this tab share one request. Absent means no meaning to show. */
   meanings?: MeaningState
+  /**
+   * Reloads the asset after a column's sensitivity or mask changed. Absent,
+   * an opened column shows no "Sensitivity and masking" section.
+   */
+  onChanged?: () => void
 }) {
   const profile = useProfile(a.id)
   const table = icebergTableOf(iceberg)
@@ -150,7 +159,17 @@ export function AssetSchema({
     <div className="flex flex-col gap-2">
       <StandInNotice asset={a} />
       {meanings.kind === "none" ? null : <TableMeaningCard state={meanings} />}
-      <ColumnsCard rows={rows} profile={profile} sortingKey={a.storage?.sortingKey} meanings={meanings} />
+      <ColumnsCard
+        rows={rows}
+        profile={profile}
+        sortingKey={a.storage?.sortingKey}
+        meanings={meanings}
+        columnExtra={
+          onChanged
+            ? (row) => <ColumnSensitivity asset={a} column={row.column.name} onChanged={onChanged} />
+            : undefined
+        }
+      />
 
       {system.length > 0 ? (
         <SectionCard

@@ -2197,11 +2197,48 @@ pub async fn set_target_lag(
     Ok(Some(Pipeline::from(row)))
 }
 
+/// The one predicate that answers "does a pipeline with a target lag read
+/// this candidate's target, either as its `source` or through `depends_on`?"
+///
+/// BLD-6 D1: [`count_lag_pipelines_reading`] (one candidate at a time) and
+/// [`lag_pipelines_without_readers`] (the batch) used to carry a hand-copied
+/// copy of this predicate each — the per-row one spelled with `$1`/`$2`/`$3`,
+/// the batched one with `c.id`/`c.target`/`c.tenant_id` — so a change to one
+/// silently broke the other while the batched doc still claimed the two
+/// answers "cannot drift". They now build their SQL from this one function,
+/// so they cannot drift by construction.
+///
+/// The three arguments are SQL *expressions* naming the candidate, never
+/// values: the per-row query passes `"$1"`, `"$2"`, `"$3"`, the batch passes
+/// `"c.id"`, `"c.target"`, `"c.tenant_id"`. Every one of them is a
+/// compile-time constant, which is what makes the `format!` at the two call
+/// sites safe — the candidate's own values stay bound.
+fn lag_reader_predicate(
+    candidate_id: &str,
+    candidate_target: &str,
+    candidate_tenant: &str,
+) -> String {
+    format!(
+        "p.tenant_id = {candidate_tenant} \
+         AND p.id != {candidate_id} \
+         AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
+         AND (p.source = {candidate_target} OR EXISTS ( \
+                SELECT 1 FROM unnest(p.depends_on) AS up(id) \
+                JOIN pipeline_definition u ON u.id = up.id \
+                WHERE u.tenant_id = {candidate_tenant} AND u.target = {candidate_target}))"
+    )
+}
+
 // BLD-2 review R3 SHOULD-FIX 5: an orphaned `lag_pipelines_reading` paragraph
 // (the function it described no longer exists) was glued onto this doc.
 /// How many pipelines with a target lag read `target` (other than `pipeline_id`
 /// itself) — plan D7's honest note ("Downstream: no pipeline with a target lag
 /// reads this table") needs this number, and the page must not have to infer it.
+///
+/// BLD-6 D1: the reader predicate is written once, in
+/// [`lag_reader_predicate`]; the batched form
+/// ([`lag_pipelines_without_readers`]) builds its SQL from the same
+/// function, so the two answers cannot drift.
 ///
 /// # Errors
 ///
@@ -2216,21 +2253,18 @@ pub async fn count_lag_pipelines_reading(
     let Some(tenant_id) = tenant_id else {
         return Ok(0);
     };
-    let count: i64 = sqlx::query_scalar(
+    let sql = format!(
         "SELECT count(*)::bigint FROM pipeline_definition p \
-         WHERE p.tenant_id = $3 \
-           AND p.id != $1 \
-           AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
-           AND (p.source = $2 OR EXISTS ( \
-                  SELECT 1 FROM unnest(p.depends_on) AS up(id) \
-                  JOIN pipeline_definition u ON u.id = up.id \
-                  WHERE u.tenant_id = $3 AND u.target = $2))",
-    )
-    .bind(pipeline_id)
-    .bind(target)
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await?;
+         WHERE {}",
+        lag_reader_predicate("$1", "$2", "$3")
+    );
+    // safe: only constant expressions are formatted in; values are bound (SEC-41).
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(pipeline_id)
+        .bind(target)
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await?;
     Ok(count)
 }
 
@@ -2249,6 +2283,13 @@ pub async fn count_lag_pipelines_reading(
 /// A tenantless candidate (`tenant_id` NULL) matches no reader, exactly as
 /// `count_lag_pipelines_reading` answers `0` for one without querying.
 ///
+/// BLD-6 D1: the predicate is written once, in [`lag_reader_predicate`], and
+/// both queries build their SQL from it — that is what makes "cannot drift"
+/// true rather than merely intended. D3: the store test
+/// `the_batched_lag_reader_check_agrees_with_the_per_row_count` is what
+/// keeps the two answers in step, one fixture covering every clause of the
+/// predicate.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
@@ -2262,25 +2303,22 @@ pub async fn lag_pipelines_without_readers(
     let ids: Vec<&str> = candidates.iter().map(|c| c.0).collect();
     let targets: Vec<&str> = candidates.iter().map(|c| c.1).collect();
     let tenants: Vec<Option<Uuid>> = candidates.iter().map(|c| c.2).collect();
-    let rows: Vec<String> = sqlx::query_scalar(
+    let sql = format!(
         "SELECT c.id FROM unnest($1::text[], $2::text[], $3::uuid[]) \
          AS c(id, target, tenant_id) \
          WHERE NOT EXISTS ( \
            SELECT 1 FROM pipeline_definition p \
-           WHERE p.tenant_id = c.tenant_id \
-             AND p.id != c.id \
-             AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
-             AND (p.source = c.target OR EXISTS ( \
-                    SELECT 1 FROM unnest(p.depends_on) AS up(id) \
-                    JOIN pipeline_definition u ON u.id = up.id \
-                    WHERE u.tenant_id = c.tenant_id AND u.target = c.target))) \
+           WHERE {}) \
          ORDER BY c.id",
-    )
-    .bind(&ids)
-    .bind(&targets)
-    .bind(&tenants)
-    .fetch_all(pool)
-    .await?;
+        lag_reader_predicate("c.id", "c.target", "c.tenant_id")
+    );
+    // safe: only constant expressions are formatted in; values are bound (SEC-41).
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(&ids)
+        .bind(&targets)
+        .bind(&tenants)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 

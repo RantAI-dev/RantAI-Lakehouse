@@ -58,6 +58,8 @@ And ask the assistant to switch embedding on (it asks a person to approve first)
 | 10 | An embed always reads data as the fixed viewer role, never more. A token cannot name a role or a person; such a claim is ignored. Expiry, withdrawal and allowed sites stay as `SEC-12` decided | `SEC-12`, signed 2026-10-10 | 2026-10-10 |
 | 11 | Who sets embed modes and turns embedding on: someone with manage on the dashboard (`BI-19` part B); until part B ships, `dashboard:write`, as today | Planner default | Owner to confirm at QA |
 | 12 | Public-link embeds (`/embed/dashboard/<link>`) get the look and the height messages too. Filter modes apply to signed embeds only | Planner default | Owner to confirm at QA |
+| 13 | Our name shows in both frames (a whole dashboard and one chart) as a one-line footer, "Rantai Lake" (a link, "Rantai Lake ↗", on a public link; plain text for a signed token, which has no address to link to), inside the measured root, so the height messages include it; `logo=none` hides it (`BI-26` slice 2 D1) | Planner default | Owner to confirm at QA |
+| 14 | `background=transparent` makes the page behind the tiles transparent in both frames; each tile keeps its card (`BI-26` slice 2 D2) | Planner default | Owner to confirm at QA |
 
 ## Limits to tell a customer
 
@@ -74,10 +76,16 @@ And ask the assistant to switch embedding on (it asks a person to approve first)
 - "Let example.com embed this dashboard." `enable_embed` switches signed
   embedding on and adds the site to the allowed list. It waits for a
   person to approve it (`DEC-8`: making a dashboard embeddable).
-- The assistant never signs a token and never sees `EMBED_SECRET`. It
-  returns the embed snippet with a placeholder where the customer's server
-  puts the token. (This replaces the `SEC-12` page's "the assistant cannot
-  configure embeds", now that `DEC-8` says how.)
+- The assistant never signs a token and never sees one or `EMBED_SECRET`.
+  `get_embed_snippet` answers with the facts a host needs: whether embedding
+  is on, the allowed sites, the address template
+  `/embed/signed/<TOKEN FROM YOUR SERVER>` with the look options, and the
+  locked columns the token must set; the copyable snippet with the resize
+  listener stays in Share > Embed (`BI-26` slice 2 D7, D8). (This replaces
+  the `SEC-12` page's "the assistant cannot configure embeds", now that
+  `DEC-8` says how.)
+- With `EMBED_SECRET` unset, all four tools refuse with the same sentence
+  the embed routes use.
 - "Make the region filter editable in the embed." `set_embed_filter_modes`
   changes what a viewer can do, so it waits for approval too.
 - "Withdraw all embed tokens." `withdraw_embed_tokens` narrows access, so it
@@ -95,7 +103,12 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-26-AC2` An embed's height matches its content in the host page.
 - `BI-26-AC3` A locked filter cannot be changed by the viewer.
 - `BI-26-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4).
-- `BI-26-AC5` `theme=dark`, `logo=none` and `background=transparent` each change the frame as named. *(proposed)*
-- `BI-26-AC6` An editable filter changes the data when the viewer changes it; a hidden filter is not shown; a token that leaves out a locked filter is refused. *(proposed)*
-- `BI-26-AC7` An old token that locks `region` by name still shows only that region. *(proposed)*
-- `AI-11-AC3` "Let example.com embed this dashboard." waits for approval, then switches embedding on with example.com listed. *(proposed)*
+- `BI-26-AC5` `theme=dark`, `logo=none` and `background=transparent` each change the frame as named.
+- `BI-26-AC6` An editable filter changes the data when the viewer changes it; a hidden filter is not shown; a token that leaves out a locked filter is refused.
+- `BI-26-AC7` An old token that locks `region` by name still shows only that region.
+- `AI-11-AC3` "Let example.com embed this dashboard." waits for approval, then switches embedding on with example.com listed.
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- The rows marked *(proposed)*: AC5 (theme, logo, background), AC6 (editable, hidden and locked filters), AC7 (old tokens still work) and `AI-11-AC3` (the assistant enables embedding with approval). They **must be built before this feature is accepted**. `BI-26` stays out of the QA-1 round until then.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

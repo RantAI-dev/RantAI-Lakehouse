@@ -47,7 +47,7 @@ use tower::ServiceExt;
 
 use common::{
     TestApp, create_principal_with_permissions, create_zero_permission_principal,
-    session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
+    session_cookie_for_seeded_user, session_cookie_for_user, spin_up, spin_up_with_env,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -231,7 +231,6 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
         ("POST", "/api/identity/roles"),
         ("POST", "/api/agents/employees/x/suspend"),
         ("POST", "/api/storage/restore"),
-        ("POST", "/api/alerts"),
     ] {
         let resp = request_with_cookie(&router, method, path, &cookie).await;
         assert_eq!(
@@ -240,6 +239,81 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
             "{method} {path}: a seeded Analyst must be denied"
         );
     }
+}
+
+/// `BI-19` part C (C3): `/api/alerts` is "signed in" at the router, because a
+/// person who can view a chart may alert on it for themselves; the handler asks
+/// for `alert:write` for everything else. Both directions, with real principals:
+/// the seeded Analyst (no `alert:write`) is refused a plain threshold rule and a
+/// chart alert to somebody else's address; the Data Engineer (has it) is not
+/// refused by the auth gate; with no session the router answers 401.
+#[tokio::test]
+async fn the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right() {
+    // `SEC-50` slice 2 review round 2 BLOCKER 1, the same fixture rule as
+    // `tests/dashboard_export.rs`: the mart rule below reads the shared
+    // catalog, and the tenant gate runs before the `alert:write` check this
+    // test is about. Without a catalog tenant the gate answers `SEC-20`'s
+    // 404 for `serving.m` and the Analyst never reaches the 403. The
+    // deployment names the catalog's tenant and both seeded readers are in
+    // it, so the only refusal left is the permission.
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    for method in ["POST", "PUT", "DELETE"] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == "/api/alerts")
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth)
+        );
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/api/alerts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} with no session"
+        );
+    }
+    for email in ["sari@meridian.example", "bayu@meridian.example"] {
+        let (id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind(email)
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded reader (0002_seed_identity.sql)");
+        common::in_the_catalog_tenant(&pool, id).await;
+    }
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let plain = br#"{"name":"n","type":"alert","mart":"m","measure":"x","target":"https://hooks.example.com/x"}"#.to_vec();
+    let to_someone_else = br#"{"name":"n","type":"alert","chart":"c1","condition":"any_rows","channel":"email","target":"other@example.com"}"#.to_vec();
+    for body in [plain.clone(), to_someone_else] {
+        let resp =
+            request_with_cookie_and_body(&router, "POST", "/api/alerts", &analyst, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an Analyst without alert:write"
+        );
+    }
+    let resp = request_with_cookie_and_body(&router, "POST", "/api/alerts", &engineer, plain).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a holder of alert:write got {}",
+        resp.status()
+    );
 }
 
 /// A seeded Analyst (no `identity:write`) is denied
@@ -257,6 +331,44 @@ async fn a_seeded_analyst_is_denied_adding_a_user_to_a_tenant() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "a seeded Analyst must be denied identity:write"
+    );
+}
+
+/// ADM-3 D2: `POST /api/identity/users/{id}/reset-password` hands out a
+/// new credential, so it is `identity:write` — the same permission every
+/// other write-side identity route uses, and no new token minted for it.
+///
+/// Both directions are named here with a real principal: a seeded Analyst
+/// (no `identity:write`) is refused with 403, a Platform Admin is not
+/// refused by the auth gate at all (the handler then answers 404 for the
+/// unknown id the request names, which is the handler's business, not the
+/// gate's). The two loops over [`POLICY_TABLE`] above walk this entry
+/// too; this one names it.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_resetting_a_password_and_a_platform_admin_is_not() {
+    let TestApp { router, pool } = spin_up().await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let path = format!(
+        "/api/identity/users/{}/reset-password",
+        Uuid::new_v4().simple()
+    );
+
+    let denied = request_with_cookie(&router, "POST", &path, &analyst).await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied identity:write"
+    );
+
+    let allowed = request_with_cookie(&router, "POST", &path, &admin).await;
+    assert!(
+        !matches!(
+            allowed.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "a Platform Admin must never be refused by the auth gate, got {}",
+        allowed.status()
     );
 }
 
@@ -924,9 +1036,11 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
 }
 
 /// `SRC-11` decisions D9 and D11 at the route: leaving columns out is refused
-/// with a 422 for a source type that cannot list its columns (Oracle) and for a
-/// key column of a deduplicating table, and a malformed list is a 400. All
-/// three are refused before the address check or any write, so no connection
+/// with a 422 for the key column of a deduplicating table (on `PostgreSQL`, and
+/// on Oracle since `SRC-4` T1.2 made column choice available for it; the
+/// refusal for a source that cannot list its columns is the unit test
+/// `excluded_columns_are_accepted_only_for_sources_that_list_their_columns`),
+/// and a malformed list is a 400. All three are refused before the address check or any write, so no connection
 /// is made and nothing is stored.
 #[tokio::test]
 async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
@@ -956,7 +1070,8 @@ async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
         (
             "oracle",
             serde_json::json!([{
-                "name": "APP.ORDERS", "target": "orders", "excludedColumns": ["NOTE"]
+                "name": "APP.ORDERS", "target": "orders", "loadMode": "replace_dedup",
+                "primaryKey": ["ID"], "excludedColumns": ["ID"]
             }]),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
@@ -1054,6 +1169,51 @@ async fn run_history_log_and_resume_need_connector_manage_and_run_reports_need_i
             "passed the gate, refused by the handler: {text}"
         );
     }
+}
+
+/// `SRC-4` slice 4: the lag limit is a person's (`connector:manage`); the capture
+/// observations are the orchestrator's (`ingest:read`, then the handler's
+/// service-identity check). Both ways: a `connector:manage`-only principal passes
+/// the gate of the limit route and is refused by the gate on the observations; an
+/// `ingest:read`-only principal is refused by the gate on the limit route and, on
+/// the observations, passes the gate and is refused by the handler (a user, not
+/// the service identity). The table-driven loops above cover the zero-permission
+/// and Platform-Admin directions for both entries.
+#[tokio::test]
+async fn the_lag_limit_needs_connector_manage_and_capture_observations_need_ingest_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let base = "/api/connectors/conn-pg-lakehouse";
+    let limit = ("PUT", format!("{base}/lag-limit"));
+    let observations = ("POST", format!("{base}/capture/observations"));
+
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, limit.0, &limit.1, &cookie).await;
+    assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{}", limit.1);
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{}", limit.1);
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, limit.0, &limit.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{}", limit.1);
+
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, observations.0, &observations.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("ingest:read"),
+        "the gate names the permission: {text}"
+    );
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, observations.0, &observations.1, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("service identity"),
+        "passed the gate, refused by the handler: {text}"
+    );
 }
 
 /// `SRC-13` (decision D11): the discovery routes are a person's
@@ -1739,7 +1899,11 @@ fn every_registered_route_has_a_policy_entry() {
             break;
         };
         let pattern = &rest[open + 1..open + 1 + close];
-        if !pattern.starts_with("/api/") && pattern != "/health" {
+        // Only the routes this file cares about: the `/api/*` surface and
+        // the two health routes (`/health` and, since REL-2 decision D7,
+        // `/health/ready` — the readiness probe is public too, so it must
+        // be classified like every other route).
+        if !pattern.starts_with("/api/") && pattern != "/health" && pattern != "/health/ready" {
             continue;
         }
         // Method handlers appear between the pattern and the closing paren of
@@ -2171,6 +2335,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         StatusCode::FORBIDDEN,
         "catalog:read alone must NOT be enough to set a schedule"
     );
+    // WEB-3 S3a-D3: resetting a schedule is the same write, both ways.
+    let refused_reset = request_with_cookie(&router, "DELETE", set, &reader_cookie).await;
+    assert_eq!(
+        refused_reset.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must NOT be enough to reset a schedule"
+    );
 
     let admin_cookie = session_cookie_for_user(&pool, admin).await;
     let allowed = request_with_cookie(&router, "PUT", set, &admin_cookie).await;
@@ -2179,6 +2350,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         allowed.status(),
         StatusCode::BAD_REQUEST,
         "governance:write must be enough to reach set handler which answers 400 on empty body"
+    );
+
+    let allowed_reset = request_with_cookie(&router, "DELETE", set, &admin_cookie).await;
+    assert_eq!(
+        allowed_reset.status(),
+        StatusCode::NO_CONTENT,
+        "governance:write must be enough to reset a schedule"
     );
 
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")
@@ -2244,7 +2422,8 @@ fn the_sec12_embed_routes_are_registered_with_the_policies_the_plan_names() {
     );
     assert_eq!(
         policy_of("POST", "/api/dashboard/embed-revoke"),
-        Some(Policy::RequiresPermission("dashboard:write")),
+        // BI-19 B2: "signed in" at the router, `manage` on the dashboard in the handler.
+        Some(Policy::RequiresAuth),
         "withdrawing a token is a write"
     );
 }
@@ -2261,7 +2440,9 @@ async fn the_table_export_needs_dashboard_read_and_not_query_read() {
             .iter()
             .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/table-export")
             .map(|(_, _, policy)| *policy),
-        Some(Policy::RequiresPermission("dashboard:read"))
+        // BI-19 part B1 (plan D8): "signed in" at the router, `dashboard:read`
+        // or a rule in the handler (see `the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one`).
+        Some(Policy::RequiresAuth)
     );
     let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
     let cookie = common::session_cookie_for_user(&pool, viewer).await;
@@ -2299,7 +2480,9 @@ async fn the_chart_export_needs_dashboard_read_and_not_query_read() {
             .iter()
             .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/chart-export")
             .map(|(_, _, policy)| *policy),
-        Some(Policy::RequiresPermission("dashboard:read"))
+        // BI-19 part B1 (plan D8): "signed in" at the router, `dashboard:read`
+        // or a rule in the handler (see `the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one`).
+        Some(Policy::RequiresAuth)
     );
     let uri = "/api/dashboard/chart-export?chart=x&format=xlsx";
     let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
@@ -2368,7 +2551,8 @@ async fn the_join_suggestions_need_dashboard_read_and_not_query_read() {
             .iter()
             .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/join-suggestions")
             .map(|(_, _, policy)| *policy),
-        Some(Policy::RequiresPermission("dashboard:read"))
+        // BI-19 B2: "signed in" at the router, the entry check in the handler.
+        Some(Policy::RequiresAuth)
     );
     let uri = "/api/dashboard/join-suggestions?left=a&right=b";
     let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
@@ -2410,7 +2594,12 @@ async fn hierarchies_are_read_with_dashboard_read_and_defined_with_dashboard_wri
                 .iter()
                 .find(|(m, p, _)| *m == method && *p == "/api/dashboard/hierarchies")
                 .map(|(_, _, policy)| *policy),
-            Some(Policy::RequiresPermission(needs)),
+            // BI-19 part B1: the read is "signed in" plus the handler's entry check.
+            Some(if needs == "dashboard:read" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission(needs)
+            }),
             "{method}"
         );
         let allowed = if needs == "dashboard:read" {
@@ -2468,7 +2657,15 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
                 .iter()
                 .find(|(m, p, _)| *m == method && *p == path)
                 .map(|(_, _, policy)| *policy),
-            Some(Policy::RequiresPermission(needs)),
+            // BI-19 B1/B2: the reads and the writes on a dashboard are "signed in" plus
+            // the handler's check; only the personal space keeps a permission.
+            Some(
+                if needs == "dashboard:read" || path != "/api/dashboard/personal" {
+                    Policy::RequiresAuth
+                } else {
+                    Policy::RequiresPermission(needs)
+                }
+            ),
             "{method} {path}"
         );
         let (allowed, other) = if needs == "dashboard:read" {
@@ -2499,6 +2696,284 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
     }
 }
 
+/// BI-19 part B1 (plan D8): the reads a person needs to see a dashboard are
+/// `RequiresAuth` at the router and refuse in the handler. Asserted both ways
+/// for every moved row: a principal with no `dashboard:read` and no rule is
+/// refused with 403 (as before the floor moved), one holding only
+/// `dashboard:write` is refused too (it was never a way to read), and one with
+/// no permission at all but a rule on one dashboard gets past the guard (what
+/// follows is the unreachable `ClickHouse` of this harness, never 401/403).
+#[tokio::test]
+async fn the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one() {
+    let TestApp { router, pool } = spin_up().await;
+    let moved: [(&str, &str); 21] = [
+        ("GET", "/api/dashboard"),
+        ("GET", "/api/dashboard/boards"),
+        ("GET", "/api/dashboard/folders"),
+        ("GET", "/api/dashboard/versions?board=b1"),
+        ("GET", "/api/dashboard/shortcuts"),
+        ("PUT", "/api/dashboard/favourites"),
+        ("POST", "/api/dashboard/recent"),
+        ("GET", "/api/dashboard/search?q=a"),
+        // BI-19 B1 review R4: a rule alone must name a tile / a dashboard.
+        ("GET", "/api/dashboard/records?mart=m&chart=x"),
+        ("GET", "/api/dashboard/values?mart=m&column=c&board=b1"),
+        ("GET", "/api/dashboard/export"),
+        ("GET", "/api/dashboard/table-export?chart=x"),
+        ("GET", "/api/dashboard/chart-export?chart=x&format=xlsx"),
+        ("GET", "/api/dashboard/export/pdf?board=b1"),
+        ("GET", "/api/dashboard/fields"),
+        ("GET", "/api/dashboard/metrics"),
+        ("GET", "/api/dashboard/segments"),
+        ("GET", "/api/dashboard/params"),
+        ("GET", "/api/dashboard/calc-fields?mart=m"),
+        ("GET", "/api/dashboard/hierarchies?mart=m"),
+        // BI-19 B1 review R9: the Trash dialog works for a rule-only person.
+        ("GET", "/api/dashboard/trash"),
+    ];
+    let nothing = common::create_principal_with_permissions(&pool, "query:read").await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let ruled = common::create_principal_with_permissions(&pool, "query:read").await;
+    lakehouse_store::dashboard_access::replace_item(
+        &pool,
+        "board",
+        "b1",
+        &[lakehouse_store::dashboard_access::NewRule {
+            user_id: Some(ruled),
+            role_id: None,
+            level: "view".to_owned(),
+        }],
+        false,
+        None,
+    )
+    .await
+    .expect("give the principal view on one dashboard");
+    for (method, uri) in moved {
+        let path = uri.split('?').next().unwrap_or(uri);
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth),
+            "{method} {path}"
+        );
+        let anonymous = request_with_cookie(&router, method, uri, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+        for who in [nothing, writer] {
+            let cookie = common::session_cookie_for_user(&pool, who).await;
+            let resp = request_with_cookie(&router, method, uri, &cookie).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri}: no dashboard:read and no rule"
+            );
+        }
+        let cookie = common::session_cookie_for_user(&pool, ruled).await;
+        let resp = request_with_cookie(&router, method, uri, &cookie).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} {uri}: a rule must get past the guard, got {}",
+            resp.status()
+        );
+    }
+}
+
+/// BI-19 part B2 (plan D8): the write routes of a dashboard are `RequiresAuth`
+/// at the router and judge the caller's level in the handler. Both ways for
+/// every moved row: no session is 401; no permission and no rule is 403;
+/// `dashboard:read` alone (view) is 403 on every write; a rule giving `edit`
+/// is past the guard on the edit rows and still 403 on the manage rows; a rule
+/// giving `manage` is past on all (what follows is the harness's unreachable
+/// `ClickHouse`, never 401 or 403).
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the table of moved rows is the test; splitting it would hide a row from one of the four checks"
+)]
+async fn the_moved_dashboard_writes_need_edit_or_manage_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    // (method, uri, body, needs manage)
+    let moved: [(&str, &str, &str, bool); 16] = [
+        ("POST", "/api/dashboard/specs", r#"{"board":"b1"}"#, false),
+        // BI-19 part D (plan D14): importing a dashboard file is creating one.
+        (
+            "POST",
+            "/api/dashboard/import/preview",
+            r#"{"file":{}}"#,
+            false,
+        ),
+        ("POST", "/api/dashboard/import", r#"{"file":{}}"#, false),
+        (
+            "PUT",
+            "/api/dashboard/specs",
+            r#"{"id":"c1","board":"b1"}"#,
+            false,
+        ),
+        ("DELETE", "/api/dashboard/specs?id=c1", "", false),
+        ("POST", "/api/dashboard/boards", r#"{"name":"x"}"#, false),
+        (
+            "PUT",
+            "/api/dashboard/boards",
+            r#"{"id":"b1","name":"x"}"#,
+            false,
+        ),
+        ("DELETE", "/api/dashboard/boards?id=b1", "", true),
+        (
+            "POST",
+            "/api/dashboard/versions/revert",
+            r#"{"board":"b1","version":1}"#,
+            false,
+        ),
+        (
+            "POST",
+            "/api/dashboard/trash/restore",
+            r#"{"kind":"chart","id":"c1"}"#,
+            false,
+        ),
+        ("GET", "/api/dashboard/public-link?board=b1", "", true),
+        (
+            "PUT",
+            "/api/dashboard/public-link",
+            r#"{"board":"b1"}"#,
+            true,
+        ),
+        ("DELETE", "/api/dashboard/public-link?board=b1", "", true),
+        ("GET", "/api/dashboard/embed-info?board=b1", "", true),
+        (
+            "PUT",
+            "/api/dashboard/embed-settings",
+            r#"{"board":"b1","filterModes":{}}"#,
+            true,
+        ),
+        (
+            "POST",
+            "/api/dashboard/embed-revoke",
+            r#"{"board":"b1","token":"t"}"#,
+            true,
+        ),
+    ];
+    let nothing = common::create_principal_with_permissions(&pool, "query:read").await;
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let editor = common::create_principal_with_permissions(&pool, "query:read").await;
+    let manager = common::create_principal_with_permissions(&pool, "query:read").await;
+    for (who, level, board) in [(editor, "edit", "b1"), (manager, "manage", "b2")] {
+        lakehouse_store::dashboard_access::replace_item(
+            &pool,
+            "board",
+            board,
+            &[lakehouse_store::dashboard_access::NewRule {
+                user_id: Some(who),
+                role_id: None,
+                level: level.to_owned(),
+            }],
+            false,
+            None,
+        )
+        .await
+        .expect("give the principal a level on one dashboard");
+    }
+    for (method, uri, body, manage) in moved {
+        let path = uri.split('?').next().unwrap_or(uri);
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth),
+            "{method} {path}"
+        );
+        let send = |cookie: String| {
+            let router = router.clone();
+            async move {
+                request_with_cookie_and_body(
+                    &router,
+                    method,
+                    uri,
+                    &cookie,
+                    body.as_bytes().to_vec(),
+                )
+                .await
+                .status()
+            }
+        };
+        assert_eq!(
+            send(String::new()).await,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+        for who in [nothing, viewer] {
+            let cookie = common::session_cookie_for_user(&pool, who).await;
+            assert_eq!(
+                send(cookie).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}: no write level"
+            );
+        }
+        let cookie = common::session_cookie_for_user(&pool, editor).await;
+        let status = send(cookie).await;
+        if manage {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}: edit is not manage"
+            );
+        } else {
+            assert!(
+                status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                "{method} {uri}: edit must get past the guard, got {status}"
+            );
+        }
+        let cookie = common::session_cookie_for_user(&pool, manager).await;
+        let status = send(cookie).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "{method} {uri}: manage must get past the guard, got {status}"
+        );
+    }
+}
+
+/// BI-19 part B1 (plan D10): the permissions routes are `RequiresAuth` at the
+/// router and "manage on the item" in the handler. Both ways: no session is
+/// 401, no `dashboard:read` and no rule is 403, and a principal holding
+/// `dashboard:read` + `dashboard:write` (manage on every unrestricted item) is
+/// past the guard (what follows is the harness's unreachable `ClickHouse`).
+#[tokio::test]
+async fn the_access_routes_need_manage_on_the_item_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/dashboard/access?kind=board&id=b1";
+    let manager =
+        common::create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let nobody = common::create_principal_with_permissions(&pool, "query:read").await;
+    for method in ["GET", "PUT"] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == "/api/dashboard/access")
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth),
+            "{method}"
+        );
+        let anonymous = request_with_cookie(&router, method, uri, "").await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{method}");
+        let cookie = common::session_cookie_for_user(&pool, nobody).await;
+        let body = br#"{"kind":"board","id":"b1","rules":[],"restricted":false}"#.to_vec();
+        let resp = request_with_cookie_and_body(&router, method, uri, &cookie, body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} (nobody)");
+        let cookie = common::session_cookie_for_user(&pool, manager).await;
+        let resp = request_with_cookie_and_body(&router, method, uri, &cookie, body).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method}: a manager must get past the guard, got {}",
+            resp.status()
+        );
+    }
+}
+
 /// BI-11: parameters are read with `dashboard:read` and defined, changed and
 /// deleted with `dashboard:write`. Asserted both ways for every method: a
 /// reader gets past the gate on `GET` and is refused on the writes, a writer
@@ -2524,7 +2999,12 @@ async fn parameters_are_read_with_dashboard_read_and_defined_with_dashboard_writ
                 .iter()
                 .find(|(m, p, _)| *m == method && *p == "/api/dashboard/params")
                 .map(|(_, _, policy)| *policy),
-            Some(Policy::RequiresPermission(needs)),
+            // BI-19 part B1: the read is "signed in" plus the handler's entry check.
+            Some(if needs == "dashboard:read" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission(needs)
+            }),
             "{method}"
         );
         let allowed = if needs == "dashboard:read" {
@@ -2576,7 +3056,9 @@ async fn the_pdf_export_needs_dashboard_read_and_not_query_read() {
             .iter()
             .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/export/pdf")
             .map(|(_, _, policy)| *policy),
-        Some(Policy::RequiresPermission("dashboard:read"))
+        // BI-19 part B1 (plan D8): "signed in" at the router, `dashboard:read`
+        // or a rule in the handler (see `the_moved_dashboard_reads_are_refused_without_a_rule_and_pass_with_one`).
+        Some(Policy::RequiresAuth)
     );
     let uri = "/api/dashboard/export/pdf?board=x";
     let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
@@ -2606,11 +3088,17 @@ async fn the_report_routes_need_dashboard_read_both_ways() {
         .iter()
         .filter(|(_, p, _)| p.starts_with("/api/reports/"))
         .map(|(m, p, policy)| {
-            assert_eq!(
-                *policy,
-                Policy::RequiresPermission("dashboard:read"),
-                "{m} {p}"
-            );
+            // BI-19 B2 (D10, PR #250 CI): the picker is `RequiresAuth` at the
+            // router because the People panel asks it with `roles=1` for a
+            // caller who manages a dashboard by a rule alone; its handler still
+            // asks `dashboard:read` and the download right for the report
+            // picker, which the loop below proves (analyst 403, viewer past).
+            let expected = if *p == "/api/reports/recipients" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission("dashboard:read")
+            };
+            assert_eq!(*policy, expected, "{m} {p}");
             (*m, *p)
         })
         .collect();
@@ -2698,7 +3186,8 @@ async fn the_public_link_routes_are_gated_in_both_directions() {
         let pattern = uri.split('?').next().unwrap();
         assert_eq!(
             policy_of(method, pattern),
-            Some(Policy::RequiresPermission("dashboard:write")),
+            // BI-19 B2: "signed in" at the router, `manage` on the dashboard in the handler.
+            Some(Policy::RequiresAuth),
             "{method} {pattern}"
         );
         let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
@@ -2737,6 +3226,93 @@ async fn the_public_link_routes_are_gated_in_both_directions() {
     }
 }
 
+/// `BI-19` part E (D15): the six comment routes are in `POLICY_TABLE` as
+/// "signed in" (the level is the dashboard's, checked in the handler), and the
+/// gate agrees both ways: no session is 401, a person with neither
+/// `dashboard:read` nor a rule is 403, and `dashboard:read` gets past the gate
+/// (the handler then answers for the dashboard, never 401 or 403).
+#[tokio::test]
+async fn the_comment_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let id = "00000000-0000-0000-0000-000000000001";
+    let comment_routes = [
+        (
+            "GET",
+            "/api/dashboard/comments",
+            "/api/dashboard/comments?board=b_x",
+        ),
+        ("POST", "/api/dashboard/comments", "/api/dashboard/comments"),
+        (
+            "GET",
+            "/api/dashboard/comments/people",
+            "/api/dashboard/comments/people?board=b_x",
+        ),
+        (
+            "POST",
+            "/api/dashboard/comments/mentions/read",
+            "/api/dashboard/comments/mentions/read",
+        ),
+        (
+            "PUT",
+            "/api/dashboard/comments/{id}",
+            "/api/dashboard/comments/00000000-0000-0000-0000-000000000001",
+        ),
+        (
+            "DELETE",
+            "/api/dashboard/comments/{id}",
+            "/api/dashboard/comments/00000000-0000-0000-0000-000000000001",
+        ),
+    ];
+    let nothing = create_principal_with_permissions(&pool, "query:read").await;
+    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    for (method, pattern, uri) in comment_routes {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == pattern)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresAuth),
+            "{method} {pattern}"
+        );
+        let body = format!("{{\"board\":\"b_x\",\"body\":\"hi\",\"id\":\"{id}\"}}");
+        let send = |cookie: String| {
+            let router = router.clone();
+            let body = body.clone();
+            async move {
+                request_with_cookie_and_body(&router, method, uri, &cookie, body.into_bytes())
+                    .await
+                    .status()
+            }
+        };
+        assert_eq!(
+            send(String::new()).await,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+        let cookie = session_cookie_for_user(&pool, nothing).await;
+        let status = send(cookie).await;
+        // The mark-read route belongs to the caller alone, so it has no
+        // dashboard to refuse on; every other route is refused for them.
+        if pattern.ends_with("/mentions/read") {
+            assert!(
+                status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                "{method} {uri}: {status}"
+            );
+        } else {
+            assert!(
+                status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+                "{method} {uri}: no access got {status}"
+            );
+        }
+        let cookie = session_cookie_for_user(&pool, reader).await;
+        let status = send(cookie).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "{method} {uri}: reader got {status}"
+        );
+    }
+}
+
 /// `BI-26` (D5, D8): the values route is public (the signed token is the
 /// credential: with no token it answers 400, never 401 or 403, and nothing is
 /// read), and the settings route is `dashboard:write`: no session is 401,
@@ -2759,7 +3335,8 @@ async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
     let path = "/api/dashboard/embed-settings";
     assert_eq!(
         policy_of("PUT", path),
-        Some(Policy::RequiresPermission("dashboard:write"))
+        // BI-19 B2: `manage` on the dashboard, in the handler.
+        Some(Policy::RequiresAuth)
     );
     let body = br#"{"board":"b_x","filterModes":{}}"#.to_vec();
     let resp = request_with_cookie_and_body(&router, "PUT", path, "", body.clone()).await;
@@ -2775,6 +3352,69 @@ async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
         resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
         "a writer got {}",
         resp.status()
+    );
+}
+
+/// BI-19 B1 review R2/R9: `POST /api/dashboard/specs/preview` is "signed in"
+/// at the router. A drill goes through the resolved viewer (a rule is enough);
+/// any other preview reads any table and needs `dashboard:read` in the handler.
+#[tokio::test]
+async fn the_spec_preview_lets_a_rule_drill_but_only_dashboard_read_preview_anything() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/dashboard/specs/preview")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresAuth)
+    );
+    let nothing = common::create_principal_with_permissions(&pool, "query:read").await;
+    let ruled = common::create_principal_with_permissions(&pool, "query:read").await;
+    lakehouse_store::dashboard_access::replace_item(
+        &pool,
+        "board",
+        "b1",
+        &[lakehouse_store::dashboard_access::NewRule {
+            user_id: Some(ruled),
+            role_id: None,
+            level: "view".to_owned(),
+        }],
+        false,
+        None,
+    )
+    .await
+    .expect("give the principal view on one dashboard");
+    let post = |cookie: String, body: &'static str| {
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/dashboard/specs/preview")
+                        .header("cookie", cookie)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let drill = r#"{"drillOf":"c1","level":1}"#;
+    let plain = r#"{"title":"t","kind":"bar","mart":"m"}"#;
+    let nobody = common::session_cookie_for_user(&pool, nothing).await;
+    let guest = common::session_cookie_for_user(&pool, ruled).await;
+    // No permission and no rule: refused before anything is read.
+    assert_eq!(post(nobody.clone(), drill).await, StatusCode::FORBIDDEN);
+    assert_eq!(post(nobody, plain).await, StatusCode::FORBIDDEN);
+    // A rule alone: the plain preview is refused, a drill gets past the guard.
+    assert_eq!(post(guest.clone(), plain).await, StatusCode::FORBIDDEN);
+    let status = post(guest, drill).await;
+    assert!(
+        status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+        "a drill must get past the guard, got {status}"
     );
 }
 
@@ -2903,4 +3543,423 @@ async fn the_public_map_boundary_routes_are_not_refused_by_the_auth_gate() {
             "{method} {path}: a public route must not answer 403 with no credentials"
         );
     }
+}
+
+/// # DATA-5 / ADR 0016: the door for outside readers
+///
+/// The door (`/api/iceberg/*`) is gated by `iceberg:read`, a scope a
+/// service identity holds (D1). This asserts both directions the plan
+/// names: a caller WITHOUT the scope is refused with 403, and a service
+/// identity WITH it is not refused by the auth gate.
+///
+/// What the door answers afterwards is not asserted here: with no
+/// `OUTSIDE_S3_ENDPOINT` in `spin_up`, every door route answers 503
+/// ("Outside reading is not set up: `OUTSIDE_S3_ENDPOINT` is not set.") —
+/// which is a deployment answer, not an authorization one.
+/// `tests/iceberg_door.rs` covers the rest.
+#[tokio::test]
+async fn the_door_needs_the_iceberg_read_scope_and_a_service_identity() {
+    /// A service identity holding `scopes`, and a live bearer token for it.
+    async fn service_identity_with_scopes(pool: &PgPool, scopes: &[&str]) -> String {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO service_identity (id, name, scopes, environment, expires_at) \
+             VALUES ($1, $2, $3, 'production', now() + interval '1 day')",
+        )
+        .bind(id)
+        .bind(format!("route-auth-tool-{id}"))
+        .bind(scopes)
+        .execute(pool)
+        .await
+        .expect("create the service identity");
+        let token = lakehouse_auth::service_token::create_service_credential(pool, id)
+            .await
+            .expect("mint the service identity's credential");
+        token.expose().to_owned()
+    }
+
+    async fn request_with_bearer(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        token: &str,
+    ) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright")
+    }
+
+    let TestApp { router, pool } = spin_up().await;
+    let with_scope = service_identity_with_scopes(&pool, &["iceberg:read"]).await;
+    let without_scope = service_identity_with_scopes(&pool, &["catalog:read"]).await;
+
+    for (method, path) in [
+        ("GET", "/api/iceberg/v1/config"),
+        ("GET", "/api/iceberg/v1/x/namespaces"),
+        ("GET", "/api/iceberg/v1/x/namespaces/gold"),
+        ("GET", "/api/iceberg/v1/x/namespaces/gold/tables"),
+        ("GET", "/api/iceberg/v1/x/namespaces/gold/tables/orders"),
+        (
+            "GET",
+            "/api/iceberg/v1/x/namespaces/gold/tables/orders/credentials",
+        ),
+        ("GET", "/api/iceberg/x"),
+    ] {
+        let resp = request_with_bearer(&router, method, path, &without_scope).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: a service identity without the iceberg:read scope must be refused"
+        );
+
+        let resp = request_with_bearer(&router, method, path, &with_scope).await;
+        assert!(
+            !matches!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a service identity holding iceberg:read must pass the gate, got {}",
+            resp.status()
+        );
+    }
+}
+
+// `BI-40` T2 (`D1`, `D2`, `D6`): `POST /api/alerts/test` is a person's door, so
+// it is `RequiresAuth` at the router and the handler decides who may run which
+// rule. The `ClickHouse` below serves the two rule reads the guard makes: a
+// plain threshold rule and a chart rule the Analyst owns.
+mod alert_test_fixture {
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+    use wiremock::{Request as MockRequest, Respond, ResponseTemplate};
+
+    /// The two rules this fixture's `ClickHouse` serves.
+    pub struct TwoRules {
+        pub owner: Uuid,
+    }
+
+    impl TwoRules {
+        fn plain() -> Value {
+            json!({
+                "id": "al_plain", "name": "Visitors", "type": "alert", "mart": "mart_x",
+                "measure": "visitors", "agg": "sum", "op": ">", "threshold": "100",
+                "board": "", "channel": "email", "target": "someone@test.invalid",
+                "enabled": "1", "created_at": "2026-11-02 00:00:00", "severity": "",
+                "pipeline": "", "metric": "", "connector": "", "asset": "", "chart": "",
+                "series": "", "condition": "", "owner_id": "", "filters_json": "[]",
+            })
+        }
+
+        fn mine(owner: Uuid) -> Value {
+            json!({
+                "id": "al_chart", "name": "Visitors in Bali", "type": "alert", "mart": "",
+                "measure": "", "agg": "sum", "op": ">", "threshold": "100", "board": "",
+                "channel": "email", "target": "sari@meridian.example", "enabled": "1",
+                "created_at": "2026-11-02 00:00:00", "severity": "", "pipeline": "",
+                "metric": "", "connector": "", "asset": "", "chart": "c_kpi", "series": "",
+                "condition": "above", "owner_id": owner.to_string(), "filters_json": "[]",
+            })
+        }
+    }
+
+    impl Respond for TwoRules {
+        fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+            let sql = String::from_utf8_lossy(&request.body).into_owned();
+            let data = if sql.contains("FROM console.alert_rule") {
+                if sql.contains("id='al_plain'") {
+                    vec![Self::plain()]
+                } else if sql.contains("id='al_chart'") {
+                    vec![Self::mine(self.owner)]
+                } else {
+                    Vec::new()
+                }
+            } else if sql.contains("system.columns") {
+                vec![json!({ "table": "mart_x", "name": "visitors", "type": "Float64" })]
+            } else if sql.contains("FROM serving.mart_x") {
+                vec![json!({ "v": 0.0 })]
+            } else {
+                return ResponseTemplate::new(200).set_body_string("Ok.\n");
+            };
+            let n = data.len();
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
+        }
+    }
+}
+
+/// A test app whose `ClickHouse` serves [`alert_test_fixture::TwoRules`].
+async fn alert_test_app() -> TestApp {
+    use std::collections::HashMap;
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer};
+
+    let sari = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM app_user WHERE email = 'sari@meridian.example'",
+    )
+    .fetch_one(&spin_up().await.pool)
+    .await
+    .expect("seeded sari@meridian.example");
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(alert_test_fixture::TwoRules { owner: sari })
+        .mount(&ch)
+        .await;
+    let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    spin_up_with_env(&env).await
+}
+
+/// `BI-40` D2, both directions with real principals: no session is 401; the
+/// seeded Analyst (no `alert:write`) is refused a mart rule with the
+/// permission's own name and is let through on their own chart rule; a Data
+/// Engineer, who holds `alert:write`, is not refused either.
+#[tokio::test]
+async fn testing_an_alert_is_signed_in_at_the_router_and_asks_for_alert_write() {
+    use serde_json::json;
+
+    let TestApp { router, pool } = alert_test_app().await;
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/alerts/test")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresAuth)
+    );
+
+    let no_session = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerts/test?id=al_plain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_session.status(), StatusCode::UNAUTHORIZED);
+
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    // A seeded Analyst has no `alert:write`, and a mart rule is nobody's chart
+    // alert: refused with the permission's own name, never a 401.
+    let denied =
+        request_with_cookie(&router, "POST", "/api/alerts/test?id=al_plain", &analyst).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(denied.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], json!("permission_denied: alert:write"));
+
+    // Their own chart alert is theirs to run (C3): not refused by the guard.
+    let own = request_with_cookie(&router, "POST", "/api/alerts/test?id=al_chart", &analyst).await;
+    assert!(
+        !matches!(
+            own.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "an Analyst's own chart rule must pass the guard, got {}",
+        own.status()
+    );
+
+    // A Data Engineer holds `alert:write` and is not refused by the guard.
+    let allowed =
+        request_with_cookie(&router, "POST", "/api/alerts/test?id=al_plain", &engineer).await;
+    assert!(
+        !matches!(
+            allowed.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "a holder of alert:write must pass the guard, got {}",
+        allowed.status()
+    );
+}
+
+/// `BI-40` D1 and D4 kept: the new door opens for a person and the scheduler's
+/// door stays shut to one.
+#[tokio::test]
+async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_open() {
+    let TestApp { router, pool } = alert_test_app().await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let scheduler = request_with_cookie(&router, "POST", "/api/alerts/run", &analyst).await;
+    assert!(
+        matches!(
+            scheduler.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "POST /api/alerts/run must stay closed to a person, got {}",
+        scheduler.status()
+    );
+
+    let tested =
+        request_with_cookie(&router, "POST", "/api/alerts/test?id=al_chart", &analyst).await;
+    assert!(
+        !matches!(
+            tested.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "POST /api/alerts/test is a person's door, got {}",
+        tested.status()
+    );
+}
+
+/// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
+/// as `identity:write`, and the gate agrees both ways: no session is 401,
+/// a principal without `identity:write` is 403, and one holding it gets
+/// past the gate (what follows is the handler's own answer — 400 for the
+/// concretized ids used here — never 401 or 403).
+#[tokio::test]
+async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    for (method, path) in [
+        ("PUT", "/api/identity/users/{id}/roles"),
+        ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
+        ("POST", "/api/identity/users/{id}/deactivate"),
+        ("POST", "/api/identity/users/{id}/reactivate"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("identity:write")),
+            "{method} {path}"
+        );
+        let concrete = concretize(path);
+        let anonymous = request_with_cookie(&router, method, &concrete, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+        let plain = create_principal_with_permissions(&pool, "query:read").await;
+        let cookie = session_cookie_for_user(&pool, plain).await;
+        let refused = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let writer = create_principal_with_permissions(&pool, "identity:write").await;
+        let cookie = session_cookie_for_user(&pool, writer).await;
+        let allowed = request_with_cookie(&router, method, &concrete, &cookie).await;
+        assert!(
+            !matches!(
+                allowed.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a caller holding identity:write must get past the gate, got {}",
+            allowed.status()
+        );
+    }
+}
+
+/// `WEB-3` S3a-D2: editing or removing a role needs `identity:write`, the
+/// permission creating one needs, and the gate agrees both ways. A reader
+/// is refused (403) and nothing changes; a writer gets the handler's own
+/// answer — here the built-in refusal for the seeded `Analyst` role — never
+/// 401 or 403, and the row stays.
+#[tokio::test]
+async fn role_edit_and_delete_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    // The seeded `Analyst` role (`0002_seed_identity.sql`).
+    let built_in = "22222222-2222-4222-8222-000000000001";
+    let url = format!("/api/identity/roles/{built_in}");
+
+    let members_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM app_user_role WHERE role_id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("count the role's members");
+
+    for (method, path) in [
+        ("PUT", "/api/identity/roles/{id}"),
+        ("DELETE", "/api/identity/roles/{id}"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission("identity:write")),
+            "{method} {path}"
+        );
+        let anonymous = request_with_cookie(&router, method, &url, "").await;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+        let reader = create_principal_with_permissions(&pool, "identity:read").await;
+        let cookie = session_cookie_for_user(&pool, reader).await;
+        let refused = request_with_cookie(&router, method, &url, &cookie).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: identity:read alone must not change a role"
+        );
+    }
+
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>("SELECT name, permissions FROM role WHERE id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("read the role"),
+        (
+            "Analyst".to_owned(),
+            "query:read, catalog:read, lineage:read".to_owned()
+        ),
+        "a refused caller must not rewrite the role"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM app_user_role WHERE role_id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("count the role's members"),
+        members_before,
+        "a refused caller must not change who holds the role"
+    );
+
+    let writer = create_principal_with_permissions(&pool, "identity:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let allowed = request_with_cookie(&router, "DELETE", &url, &cookie).await;
+    assert_eq!(
+        allowed.status(),
+        StatusCode::CONFLICT,
+        "identity:write reaches the delete handler, which refuses a built-in role"
+    );
+    let body = to_bytes(allowed.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("the body is JSON");
+    assert_eq!(
+        body["error"],
+        serde_json::json!("A built-in role cannot be deleted.")
+    );
+
+    let blank =
+        request_with_cookie_and_body(&router, "PUT", &url, &cookie, br#"{"name":"   "}"#.to_vec())
+            .await;
+    assert_eq!(
+        blank.status(),
+        StatusCode::BAD_REQUEST,
+        "identity:write reaches the update handler, which refuses a blank name"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT name FROM role WHERE id = $1")
+            .bind(Uuid::parse_str(built_in).expect("a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("read the role"),
+        "Analyst",
+        "a refused update leaves the role alone"
+    );
 }

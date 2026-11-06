@@ -4,10 +4,13 @@ import type {
   CreateTenantInput,
   IdentityService,
   InviteUserInput,
+  InviteUserResponse,
+  ResetPasswordResponse,
   Role,
   RotateServiceIdentityResponse,
   ServiceIdentity,
   Tenant,
+  UpdateRoleInput,
   User,
 } from "../contracts/identity";
 import { apiFetch } from "../http";
@@ -73,6 +76,34 @@ function post<T>(
   );
 }
 
+/** `PUT` a JSON body. ADM-4 D1's role change is the only caller today. */
+function put<T>(
+  url: string,
+  body: unknown,
+  signal: AbortSignal | undefined,
+  fallback: string
+): Promise<T> {
+  return request<T>(
+    url,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    },
+    fallback
+  );
+}
+
+/** `DELETE` a resource. ADM-4 D2's tenant removal is the only caller. */
+function del<T>(
+  url: string,
+  signal: AbortSignal | undefined,
+  fallback: string
+): Promise<T> {
+  return request<T>(url, { method: "DELETE", signal }, fallback);
+}
+
 export const postgresIdentityService: IdentityService = {
   listUsers(signal) {
     return get<User[]>("/api/identity/users", signal, "Failed to load user list");
@@ -90,11 +121,37 @@ export const postgresIdentityService: IdentityService = {
       "Failed to load service identity list"
     );
   },
+  // ADM-3 D1: the invite comes back as the created user PLUS the
+  // server-generated temporary password, shown once. The password is never
+  // persisted client-side beyond the one-shot dialog that displays it.
   inviteUser(input: InviteUserInput, signal) {
-    return post<User>("/api/identity/users", input, signal, "Failed to invite user");
+    return post<InviteUserResponse>(
+      "/api/identity/users",
+      input,
+      signal,
+      "Failed to invite user"
+    );
   },
   createRole(input: CreateRoleInput, signal) {
     return post<Role>("/api/identity/roles", input, signal, "Failed to create role");
+  },
+  // WEB-3 S3a-D2: a role can be rewritten and removed. The API's 409
+  // sentence (still held / built-in) reaches the console through
+  // `ServiceError.message` unchanged.
+  updateRole(id, input: UpdateRoleInput, signal) {
+    return put<Role>(
+      `/api/identity/roles/${encodeURIComponent(id)}`,
+      input,
+      signal,
+      "Failed to update role"
+    );
+  },
+  deleteRole(id, signal) {
+    return del<void>(
+      `/api/identity/roles/${encodeURIComponent(id)}`,
+      signal,
+      "Failed to delete role"
+    );
   },
   createTenant(input: CreateTenantInput, signal) {
     return post<Tenant>("/api/identity/tenants", input, signal, "Failed to create tenant");
@@ -118,6 +175,55 @@ export const postgresIdentityService: IdentityService = {
       null,
       signal,
       "Failed to rotate service identity"
+    );
+  },
+  // ADM-3 D2: hand an existing user a new temporary password. The server
+  // generates it and returns it exactly once — see the contract type's
+  // doc comment. The route takes no body, so this is an empty-body POST
+  // like `rotateServiceIdentity`.
+  resetPassword(id: string, signal) {
+    return post<ResetPasswordResponse>(
+      `/api/identity/users/${id}/reset-password`,
+      null,
+      signal,
+      "Failed to reset password"
+    );
+  },
+  // ADM-4 D1: replace a user's local role set. The body carries the
+  // user's COMPLETE set of role names — a role left out is a role the
+  // user no longer holds.
+  setUserRoles(id: string, roles: string[], signal) {
+    return put<User>(
+      `/api/identity/users/${id}/roles`,
+      { roles },
+      signal,
+      "Failed to update roles"
+    );
+  },
+  // ADM-4 D2: take a user out of a tenant.
+  removeUserFromTenant(id: string, tenantId: string, signal) {
+    return del<User>(
+      `/api/identity/users/${id}/tenants/${tenantId}`,
+      signal,
+      "Failed to remove the user from the tenant"
+    );
+  },
+  // ADM-4 D3: switch a user off, and back on again. Both routes take no
+  // body, so both are empty-body POSTs.
+  deactivateUser(id: string, signal) {
+    return post<User>(
+      `/api/identity/users/${id}/deactivate`,
+      null,
+      signal,
+      "Failed to deactivate the user"
+    );
+  },
+  reactivateUser(id: string, signal) {
+    return post<User>(
+      `/api/identity/users/${id}/reactivate`,
+      null,
+      signal,
+      "Failed to reactivate the user"
     );
   },
 };

@@ -91,6 +91,9 @@ pub(crate) trait LayerRunner {
 /// arguments every tile statement is run with.
 pub(crate) struct RoleRunner<'a> {
     pub ch: &'a ChClient,
+    /// `SEC-50` slice 2 M1: the tenant gate every layer statement passes
+    /// before its rewrite — the same gate the tile's own statement passes.
+    pub gate: &'a crate::routes::query::StatementGate<'a>,
     pub roles: &'a [String],
     pub placeholders: &'a crate::sql_rewrite::PlaceholderValues,
     pub obligations: &'a crate::policy_engine::PolicyEngineObligations<'a>,
@@ -100,6 +103,7 @@ impl LayerRunner for RoleRunner<'_> {
     async fn run(&self, sql: &str) -> Result<Value, SpecRunFailure> {
         try_run_spec_sql(
             self.ch,
+            self.gate,
             sql,
             self.roles,
             self.placeholders,
@@ -248,6 +252,9 @@ fn failure_of(failure: SpecRunFailure) -> Failure {
     let value = match failure {
         SpecRunFailure::Refused(message) => json!({ "error": message }),
         SpecRunFailure::Tile(answer) => answer,
+        // `SEC-50` slice 2 M3: the gate's own refusal, in the layer's own
+        // error slot — the same sentence the tile's would carry.
+        SpecRunFailure::Gated(err) => json!({ "error": err.to_string() }),
         // SEC-11: the database's text goes to the log under the reference.
         SpecRunFailure::Clickhouse(err) => {
             upstream_error::report_ch(&upstream_error::TILE, &err).to_json()

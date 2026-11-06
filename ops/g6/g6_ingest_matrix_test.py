@@ -45,10 +45,7 @@ anything but a name the server itself returned, and refuses anything not
 shaped `file:/run/secrets/connector_*`.
 
 For connectors whose ingest/run NEVER resolves a secret at all (the
-`kafka`, `auth.type = "none"` PLAINTEXT fixture; the CDC-template-only
-`g6-mongo-cdc` connector below, whose route only checks the ref's
-`env:`-scheme SHAPE, never its value -- `routes::connectors::
-debezium_properties`, read in full), this gate still supplies a
+`kafka`, `auth.type = "none"` PLAINTEXT fixture), this gate still supplies a
 syntactically valid `credential` (the field is required on
 `POST /api/connectors`) but never provisions a real value for it -- that
 would be pretending a credential exists where the code path never reads
@@ -2201,47 +2198,6 @@ def step_cdc_reports_unsupported_not_a_launch() -> None:
     print(f"[g6] cdc ingest/run: honest supported:false ({run_body.get('reason')})")
 
 
-def step_cdc_mongo_debezium_properties() -> None:
-    """`GET .../debezium-properties` for a `mongodb`-adapter connector --
-    NOT `dial.driver = "mongo"` (there is no such `SqlDriver` variant;
-    read `rust/crates/lakehouse-api/src/routes/connectors.rs`'s
-    `resolve_debezium_source_target` before trusting a plan's snippet on
-    this route). The `mongodb` branch there dispatches on the `adapter`
-    STRING itself and never resolves the connector's `secretRef` value
-    (it only requires the `env:` SCHEME, to interpolate `${...}` into the
-    rendered template -- see that function's own doc comment) -- so
-    `credential: {source: "env", ...}` is supplied for its required
-    shape but never needs a real, provisioned value."""
-    body = _create_connector(
-        name="g6-mongo-cdc", kind="MongoDB", host="mongo-g6:27017",
-        credential={"source": "env", "primary": "password"},
-    )
-    connector_id = body["id"]
-    spec_resp = API.put(
-        f"{API_URL}/api/connectors/{connector_id}/ingest-spec",
-        json={
-            "adapter": "mongodb", "ingestMode": "batch",
-            "dial": {"hosts": ["mongo-g6:27017"], "database": "g6_ingest", "username": "g6_reader",
-                     "directConnection": True},
-            "sourceObjects": [],
-        },
-        timeout=10,
-    )
-    if not spec_resp.ok:
-        raise G6Failure(f"set ingest-spec for g6-mongo-cdc failed: {spec_resp.status_code} {spec_resp.text}")
-
-    props_resp = API.get(
-        f"{API_URL}/api/connectors/{connector_id}/debezium-properties", params={"table": "g6_ingest.orders"},
-        timeout=10,
-    )
-    if not props_resp.ok:
-        raise G6Failure(f"debezium-properties for g6-mongo-cdc failed: {props_resp.status_code} {props_resp.text}")
-    properties = props_resp.json().get("properties", "")
-    if "io.debezium.connector.mongodb.MongoDbConnector" not in properties:
-        raise G6Failure(f"expected the MongoDB Debezium connector class in the rendered template, got: {properties}")
-    print("[g6] debezium-properties for a mongodb-adapter connector: MongoDbConnector class present")
-
-
 def step_sheets_reports_unsupported() -> None:
     """`google-auth` is not installed in this image, so the `sheets`
     adapter's own `build_source` reports `supported: false` -- but,
@@ -2337,8 +2293,9 @@ def main() -> int:
         # SRC-8 use the MySQL fixture; the column gate, the CDC refusal and
         # Sheets need no fixture but the API and Dagster, and ride with `sql`,
         # whose job has the shorter matrix (the `other` job carries the
-        # link-local half and the Kafka wait). The MongoDB template check
-        # reads no fixture either and names the type of the `other` half.
+        # link-local half and the Kafka wait). (The MongoDB template check
+        # that used to ride with `other` went with the `debezium-properties`
+        # route, `SRC-4` slice 2, decision S2-h.)
         if _group_runs("sql"):
             step_failed_run_updates_connector_health()
             step_source_schema_changes()
@@ -2347,7 +2304,6 @@ def main() -> int:
             step_cdc_reports_unsupported_not_a_launch()
             step_sheets_reports_unsupported()
         if _group_runs("other"):
-            step_cdc_mongo_debezium_properties()
             # SRC-16: needs the files fixture's bucket, which this half seeds.
             if _active("g6-files"):
                 step_files_pause_after_the_load()

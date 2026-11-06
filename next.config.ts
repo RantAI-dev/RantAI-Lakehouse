@@ -45,7 +45,18 @@ const nextConfig: NextConfig = {
   // Next.js only serves the UI while the Rust axum service owns the API.
   async rewrites() {
     const target = process.env.RUST_API_URL ?? "http://localhost:8080";
-    return [{ source: "/api/:path*", destination: `${target}/api/:path*` }];
+    return [
+      // The API's health route lives at `/health`, NOT under `/api/`, so
+      // the console could not reach it through the rewrite below (it
+      // would ask the API for `/api/health`, which is not a route). This
+      // one exposes it as `/api/health`, and it comes FIRST: the rewrites
+      // are matched top to bottom, so the general `/api/:path*` below
+      // never sees this path. The console's own `/health` PAGE (the
+      // platform dashboard) is a filesystem route, and filesystem routes
+      // are served before any rewrite, so the two cannot collide.
+      { source: "/api/health", destination: `${target}/health` },
+      { source: "/api/:path*", destination: `${target}/api/:path*` },
+    ];
   },
 };
 

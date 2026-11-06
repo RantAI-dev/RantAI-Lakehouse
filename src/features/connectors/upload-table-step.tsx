@@ -64,7 +64,7 @@ export function UploadTableStep({
       <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 px-3 py-2.5">
         <DatabaseIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
         <div className="min-w-0">
-          <p className="text-xs font-medium text-muted-foreground">Lands in Data Explorer as</p>
+          <p className="text-xs font-medium text-muted-foreground">Lands in the Catalog as</p>
           {valid ? (
             <p className="break-all font-mono text-sm" data-testid="upload-destination">
               {rawTableFullName(tableName)}

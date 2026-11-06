@@ -421,3 +421,104 @@ describe("changing a pipeline's connector on the edit form (BLD-9)", () => {
     expect(save?.body.sourceTable).toBe("orders")
   })
 })
+
+// BLD-10: the form is honest about FBIC, and a pipeline with no transform
+// is a plain copy chosen on purpose rather than a side effect.
+describe("FBIC and the plain copy in the pipeline editor (BLD-10)", () => {
+  const fbicSwitch = () => screen.getByRole("switch", { name: /FBIC enrichment/i })
+  const plainCopySwitch = () => screen.getByRole("switch", { name: /copy the source as is/i })
+
+  /** Fills the source step and steps onto the Transform step. */
+  async function reachTransformStep() {
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly_rollup"), {
+      target: { value: "orders_clean" },
+    })
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), {
+      target: { value: "orders_raw" },
+    })
+    await advance()
+    await waitFor(() => expect(plainCopySwitch()).toBeTruthy())
+  }
+
+  /** Adds the one transform this form can add with nothing but a placeholder. */
+  function addDedupeTransform() {
+    fireEvent.change(screen.getByPlaceholderText("order_id"), { target: { value: "id" } })
+    fireEvent.click(screen.getByRole("button", { name: /add transform/i }))
+  }
+
+  it("offers FBIC as not available, with its switch disabled and off", async () => {
+    render(<PipelineEditor />)
+    await reachTransformStep()
+
+    expect(fbicSwitch().getAttribute("aria-disabled")).toBe("true")
+    expect(fbicSwitch().getAttribute("aria-checked")).toBe("false")
+    expect(screen.getByText("Not available yet: nothing runs it in this version.")).toBeTruthy()
+  })
+
+  it("keeps Next disabled on a pipeline with no transform until the plain copy is switched on", async () => {
+    render(<PipelineEditor />)
+    await reachTransformStep()
+
+    const next = screen.getByRole("button", { name: "Next" }) as HTMLButtonElement
+    expect(next.disabled).toBe(true)
+
+    fireEvent.click(plainCopySwitch())
+    await waitFor(() => expect(next.disabled).toBe(false))
+  })
+
+  it("switches the plain copy off and disables it when a transform is added", async () => {
+    render(<PipelineEditor />)
+    await reachTransformStep()
+
+    fireEvent.click(plainCopySwitch())
+    await waitFor(() => expect(plainCopySwitch().getAttribute("aria-checked")).toBe("true"))
+
+    addDedupeTransform()
+    await waitFor(() => expect(plainCopySwitch().getAttribute("aria-checked")).toBe("false"))
+    expect(plainCopySwitch().getAttribute("aria-disabled")).toBe("true")
+  })
+
+  it("shows a pipeline with no transform as a plain copy on the Review step", async () => {
+    render(<PipelineEditor />)
+    await reachTransformStep()
+
+    fireEvent.click(plainCopySwitch())
+    await advance()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), {
+      target: { value: "orders_clean" },
+    })
+    await advance()
+    await advance()
+
+    expect(screen.getByText("None: a plain copy of the source")).toBeTruthy()
+  })
+
+  it("sends fbicEnabled false on a create, because nothing runs it", async () => {
+    render(<PipelineEditor />)
+    await reachTransformStep()
+
+    fireEvent.click(plainCopySwitch())
+    await advance()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), {
+      target: { value: "orders_clean" },
+    })
+    await advance()
+    await advance()
+
+    fireEvent.click(screen.getByRole("button", { name: /create pipeline/i }))
+    await waitFor(() => expect(sent.some((c) => c.method === "POST")).toBe(true))
+    expect(sent.find((c) => c.method === "POST")?.body.fbicEnabled).toBe(false)
+  })
+
+  it("sends a stored fbicEnabled true back on an edit, unchanged", async () => {
+    const stored = existing({
+      definition: { ...existing().definition!, fbicEnabled: true },
+    })
+    render(<PipelineEditor existing={stored} />)
+
+    await walkToReview()
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }))
+    await waitFor(() => expect(sent.some((c) => c.method === "PUT")).toBe(true))
+    expect(sent.find((c) => c.method === "PUT")?.body.fbicEnabled).toBe(true)
+  })
+})

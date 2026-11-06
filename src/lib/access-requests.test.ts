@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test"
-import { accessGrantState, isOwnAccessRequest, requestableAccessPermissions } from "./access-requests"
+import {
+  accessGrantState,
+  isOwnRequest,
+  requestableAccessPermissions,
+  selfApprovalTooltip,
+} from "./access-requests"
 
 describe("accessGrantState", () => {
   const NOW = Date.parse("2026-09-18T00:00:00Z")
@@ -35,10 +40,10 @@ describe("accessGrantState", () => {
   })
 })
 
-describe("isOwnAccessRequest", () => {
+describe("isOwnRequest", () => {
   it("is true only for a pending kind=access row requested by the given user", () => {
     expect(
-      isOwnAccessRequest(
+      isOwnRequest(
         { kind: "access", status: "pending", requestedByUserId: "u1" },
         "u1"
       )
@@ -47,29 +52,65 @@ describe("isOwnAccessRequest", () => {
 
   it("is false for a different requester", () => {
     expect(
-      isOwnAccessRequest(
+      isOwnRequest(
         { kind: "access", status: "pending", requestedByUserId: "u1" },
         "u2"
       )
     ).toBe(false)
   })
 
-  it("is false for a tool_call approval even if requestedByUserId somehow matched", () => {
+  // SEC-57: the rule changed. It used to be an access-request rule only,
+  // and the API refused a self-approval for `kind = "access"` alone; a
+  // tool call asked for by a person is refused the same way, so the
+  // console's check now covers both kinds.
+  it("is true for a pending tool_call approval requested by the given user", () => {
     expect(
-      isOwnAccessRequest(
+      isOwnRequest(
         { kind: "tool_call", status: "pending", requestedByUserId: "u1" },
         "u1"
+      )
+    ).toBe(true)
+  })
+
+  it("is false for a tool_call approval nobody asked for in person — no requester to match", () => {
+    expect(
+      isOwnRequest(
+        { kind: "tool_call", status: "pending" },
+        "u1"
+      )
+    ).toBe(false)
+  })
+
+  it("is false for a tool_call approval requested by somebody else", () => {
+    expect(
+      isOwnRequest(
+        { kind: "tool_call", status: "pending", requestedByUserId: "u1" },
+        "u2"
       )
     ).toBe(false)
   })
 
   it("is false once the request has already been decided — the self-approval rule only blocks a pending decision", () => {
     expect(
-      isOwnAccessRequest(
+      isOwnRequest(
         { kind: "access", status: "approved", requestedByUserId: "u1" },
         "u1"
       )
     ).toBe(false)
+  })
+})
+
+describe("selfApprovalTooltip", () => {
+  it("says somebody else must decide an access request", () => {
+    expect(selfApprovalTooltip("access")).toBe(
+      "You requested this access; someone else must decide it"
+    )
+  })
+
+  it("says somebody else must approve a tool call", () => {
+    expect(selfApprovalTooltip("tool_call")).toBe(
+      "You asked for this action; someone else must approve it"
+    )
   })
 })
 

@@ -1,0 +1,540 @@
+//! ADM-3: an invite hands out a temporary password, and an admin can reset
+//! one.
+//!
+//! Before this, `POST /api/identity/users` created a directory row with no
+//! credential at all, so a site without an identity provider could give an
+//! account to nobody but the bootstrap admin. ADM-3 D1 gives every invite
+//! a server-generated temporary password, returned exactly once; D2 gives
+//! an admin a way to reset one; D3 stops a reset from being an
+//! escalation path; D5 audits both without ever carrying the password.
+//!
+//! The tests live in a module named `identity` so the plan's
+//! `cargo test -p lakehouse-api identity` filter runs them: an
+//! integration test's name is its function's path inside the test
+//! binary, and a bare function name would never match that filter.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
+
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
+
+mod identity {
+    use super::*;
+
+    /// The email every invited user in this file gets. `.example` is the
+    /// RFC 2606 reserved TLD and can never route to a real mailbox.
+    const INVITED_EMAIL: &str = "rina.guest@meridian.example";
+
+    /// The password the invited user replaces the temporary one with.
+    const CHOSEN_PASSWORD: &str = "a-chosen-password-for-rina-2026";
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    /// POST a JSON body; return the status, the parsed body, and the
+    /// `Set-Cookie` header the response carried (the login route's
+    /// session cookie lives in it).
+    async fn post_json(
+        app: &TestApp,
+        cookie: Option<&str>,
+        uri: &str,
+        body: &Value,
+    ) -> (StatusCode, Value, Option<String>) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(body.to_string()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        let status = response.status();
+        // Read the header BEFORE the body: `axum::body::Body` is not
+        // `Clone`, so the response cannot be read twice.
+        let set_cookie = response
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            set_cookie,
+        )
+    }
+
+    /// GET a resource; return the status and the parsed body.
+    async fn get_json(app: &TestApp, cookie: Option<&str>, uri: &str) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let response = app
+            .router
+            .clone()
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("router never fails a request outright");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// The `Cookie` header value carrying the session a login response
+    /// handed out — the first `name=value` pair of its `Set-Cookie`.
+    fn session_cookie_from(set_cookie: Option<String>) -> String {
+        let header = set_cookie.expect("a successful login carries a session cookie");
+        header
+            .split(';')
+            .next()
+            .expect("the cookie header carries a name=value pair")
+            .trim()
+            .to_owned()
+    }
+
+    /// Invite a user and return the 201 body.
+    async fn invite(app: &TestApp, cookie: &str) -> Value {
+        let (status, body, _) = post_json(
+            app,
+            Some(cookie),
+            "/api/identity/users",
+            &json!({
+                "name": "Rina Guest",
+                "email": INVITED_EMAIL,
+                "roles": ["Analyst"],
+                "tenants": ["Meridian Retail"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body
+    }
+
+    /// The temporary password out of an invite (or a reset) body.
+    fn temporary_password(body: &Value) -> String {
+        body["temporaryPassword"]
+            .as_str()
+            .expect("the response carries a temporary password")
+            .to_owned()
+    }
+
+    // ── the log capture ─────────────────────────────────────────────────
+
+    /// An in-memory `tracing` writer: every line the process logs is kept
+    /// in memory so a test can read it.
+    #[derive(Clone)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The process-wide log buffer, and the install of the `tracing`
+    /// subscriber that fills it.
+    ///
+    /// The global subscriber can only be set once per process, so the
+    /// second caller finds it already installed and simply reuses the same
+    /// buffer. The install has to happen BEFORE the request under test,
+    /// or the lines that request wrote would not be in the buffer.
+    fn log_capture() -> &'static Arc<Mutex<Vec<u8>>> {
+        static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+        LOGS.get_or_init(|| {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(LogCapture(Arc::clone(&buffer)))
+                .try_init();
+            buffer
+        })
+    }
+
+    /// Install the process-wide `tracing` capture.
+    fn install_log_capture() {
+        let _ = log_capture();
+    }
+
+    /// Everything the process has logged so far.
+    fn captured_logs() -> String {
+        let bytes = log_capture().lock().expect("the log buffer lock").clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    // ── the tests ───────────────────────────────────────────────────────
+
+    /// ADM-3 D1 + D4, end to end: the invite returns a password, that
+    /// password signs in, the sign-in is FORCED through the
+    /// change-password screen, and after the change the temporary password
+    /// is dead.
+    #[tokio::test]
+    async fn an_invite_returns_a_password_that_signs_in_and_must_then_change_it() {
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+        let body = invite(&app, &admin_cookie).await;
+        let temporary = temporary_password(&body);
+        assert!(
+            temporary.chars().count() >= 20,
+            "a temporary password is at least 20 characters, got {}",
+            temporary.chars().count()
+        );
+        // The user is flattened next to the password, not nested under it.
+        assert_eq!(body["email"], json!(INVITED_EMAIL));
+        assert_eq!(body["roles"], json!(["Analyst"]));
+        assert_eq!(body["tenants"], json!(["Meridian Retail"]));
+
+        // The temporary password signs in.
+        let (status, login, set_cookie) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({ "email": INVITED_EMAIL, "password": temporary }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{login}");
+        assert_eq!(login["mustChangePassword"], json!(true));
+        let session = session_cookie_from(set_cookie);
+
+        // D4: while the rotation is pending, every route but the three
+        // allowed ones is refused. `GET /api/home/layout` needs no
+        // permission of its own (`Policy::RequiresAuth`), so the refusal
+        // it gets is the ROTATION's, not a missing grant — which is what
+        // makes it the right probe here.
+        let (status, body) = get_json(&app, Some(&session), "/api/home/layout").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("password rotation required"),
+            "the refusal says why: {body}"
+        );
+
+        // The forced rotation itself is reachable, and needs no old
+        // password — the temporary one is treated as "good for logging in
+        // and nothing else".
+        let (status, body, _) = post_json(
+            &app,
+            Some(&session),
+            "/api/auth/change-password",
+            &json!({ "newPassword": CHOSEN_PASSWORD }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        // The chosen password signs in, and no longer asks for a change.
+        let (status, login, _) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({ "email": INVITED_EMAIL, "password": CHOSEN_PASSWORD }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{login}");
+        assert_eq!(login["mustChangePassword"], json!(false));
+
+        // The temporary password is dead.
+        let (status, _, _) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({ "email": INVITED_EMAIL, "password": temporary }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// ADM-3 D1: the temporary password is returned ONCE. The directory
+    /// listing never carries it, the audit rows never carry it, and the
+    /// process never logs it.
+    #[tokio::test]
+    async fn the_temporary_password_is_absent_from_the_list_the_audit_rows_and_the_logs() {
+        install_log_capture();
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+        let body = invite(&app, &admin_cookie).await;
+        let temporary = temporary_password(&body);
+
+        // The directory listing never carries it.
+        let (status, list) = get_json(&app, Some(&admin_cookie), "/api/identity/users").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !list.to_string().contains(&temporary),
+            "the user list must not carry the temporary password"
+        );
+
+        // The audit rows never carry it — not the invite's, and not the
+        // reset's either.
+        let args: Vec<Value> = sqlx::query_scalar(
+            "SELECT args FROM audit_event \
+             WHERE action IN ('identity.user.invite', 'identity.user.password_reset')",
+        )
+        .fetch_all(&app.pool)
+        .await
+        .expect("read the audit rows");
+        assert!(!args.is_empty(), "the invite must be audited at all");
+        for row in &args {
+            assert!(
+                !row.to_string().contains(&temporary),
+                "an audit row must not carry the temporary password: {row}"
+            );
+        }
+
+        // The process never logs it.
+        let logs = captured_logs();
+        assert!(
+            !logs.contains(&temporary),
+            "the temporary password must never reach a log line"
+        );
+    }
+
+    /// ADM-3 D1: the invite is ONE transaction. A role or tenant name
+    /// that cannot be resolved leaves no user and no credential behind —
+    /// the credential can never outlive a failed invite.
+    #[tokio::test]
+    async fn a_failed_role_or_tenant_name_leaves_no_user_and_no_credential_behind() {
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+        for (roles, tenants, label) in [
+            (json!(["No Such Role"]), json!([]), "role"),
+            (json!([]), json!(["No Such Tenant"]), "tenant"),
+        ] {
+            let (status, body, _) = post_json(
+                &app,
+                Some(&admin_cookie),
+                "/api/identity/users",
+                &json!({
+                    "name": "Half Created",
+                    "email": INVITED_EMAIL,
+                    "roles": roles,
+                    "tenants": tenants,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+
+            let users: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user WHERE email = $1")
+                .bind(INVITED_EMAIL)
+                .fetch_one(&app.pool)
+                .await
+                .expect("count the users");
+            assert_eq!(users, 0, "{label}: no user may be left behind");
+
+            let identities: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM auth_identity \
+                 WHERE app_user_id IN (SELECT id FROM app_user WHERE email = $1)",
+            )
+            .bind(INVITED_EMAIL)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count the credentials");
+            assert_eq!(identities, 0, "{label}: no credential may be left behind");
+        }
+    }
+
+    /// ADM-3 D2: a reset hands out a NEW password AND ends the target's
+    /// live sessions. A reset that left the old sessions alive would not
+    /// have locked the target out of anything.
+    #[tokio::test]
+    async fn a_reset_returns_a_new_password_and_ends_the_targets_sessions() {
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+        let invited = invite(&app, &admin_cookie).await;
+        let temporary = temporary_password(&invited);
+        let user_id = invited["id"].as_str().expect("the invite carries an id");
+
+        // The invitee signs in.
+        let (status, _, set_cookie) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({ "email": INVITED_EMAIL, "password": temporary }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let session = session_cookie_from(set_cookie);
+        let (status, _) = get_json(&app, Some(&session), "/api/auth/me").await;
+        assert_eq!(status, StatusCode::OK, "the session works before the reset");
+
+        // The admin resets the password.
+        let (status, body, _) = post_json(
+            &app,
+            Some(&admin_cookie),
+            &format!("/api/identity/users/{user_id}/reset-password"),
+            &json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reset = temporary_password(&body);
+        assert_ne!(reset, temporary, "a reset hands out a NEW password");
+
+        // The target's session is dead.
+        let (status, _) = get_json(&app, Some(&session), "/api/auth/me").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a reset must end the target's sessions"
+        );
+
+        // The new password signs in, and asks for a change of its own.
+        let (status, login, _) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({ "email": INVITED_EMAIL, "password": reset }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{login}");
+        assert_eq!(login["mustChangePassword"], json!(true));
+
+        // The old password no longer works.
+        let (status, _, _) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({ "email": INVITED_EMAIL, "password": temporary }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// ADM-3 D3: only an unrestricted (`*:*`) caller may reset the
+    /// password of a user who holds `*:*`. Everyone else gets the SAME 404
+    /// an unknown user gets, body for body, so a probe learns nothing.
+    #[tokio::test]
+    async fn a_caller_without_the_unrestricted_grant_gets_404_for_an_unrestricted_user() {
+        let app = spin_up().await;
+        let caller = create_principal_with_permissions(&app.pool, "identity:write").await;
+        let caller_cookie = session_cookie_for_user(&app.pool, caller).await;
+        let target = create_principal_with_permissions(&app.pool, "*:*").await;
+
+        let (status, body, _) = post_json(
+            &app,
+            Some(&caller_cookie),
+            &format!("/api/identity/users/{target}/reset-password"),
+            &json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // The same answer as for a user who does not exist at all.
+        let (unknown_status, unknown_body, _) = post_json(
+            &app,
+            Some(&caller_cookie),
+            &format!("/api/identity/users/{}/reset-password", Uuid::new_v4()),
+            &json!({}),
+        )
+        .await;
+        assert_eq!(
+            unknown_status,
+            StatusCode::NOT_FOUND,
+            "unknown user body: {unknown_body}"
+        );
+        assert_eq!(
+            body, unknown_body,
+            "no oracle for which users hold the unrestricted grant"
+        );
+    }
+
+    /// ADM-3 D3, the other side: an unrestricted caller MAY reset an
+    /// unrestricted user. The rule is about the CALLER, not about the
+    /// target.
+    #[tokio::test]
+    async fn an_unrestricted_caller_may_reset_an_unrestricted_user() {
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+        let target = create_principal_with_permissions(&app.pool, "*:*").await;
+
+        let (status, body, _) = post_json(
+            &app,
+            Some(&admin_cookie),
+            &format!("/api/identity/users/{target}/reset-password"),
+            &json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            temporary_password(&body).chars().count() >= 20,
+            "the reset hands out a temporary password"
+        );
+    }
+
+    /// ADM-3 D3: a caller may not reset their OWN password here — that is
+    /// what `POST /api/auth/change-password` is for, and it proves the old
+    /// password instead of replacing it behind the holder's back.
+    #[tokio::test]
+    async fn a_caller_may_not_reset_its_own_password_here() {
+        let app = spin_up().await;
+        let caller = create_principal_with_permissions(&app.pool, "*:*").await;
+        let caller_cookie = session_cookie_for_user(&app.pool, caller).await;
+
+        let (status, body, _) = post_json(
+            &app,
+            Some(&caller_cookie),
+            &format!("/api/identity/users/{caller}/reset-password"),
+            &json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("change-password"),
+            "the refusal points at the route that does belong here: {body}"
+        );
+    }
+}

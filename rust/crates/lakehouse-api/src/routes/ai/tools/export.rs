@@ -2,16 +2,22 @@
 //! `export_dashboard` and `export_chart`.
 //!
 //! Both only *give a link*; neither makes a file. The link is the console's own
-//! download route (`GET /api/dashboard/export/pdf`, `GET
+//! download route (`GET /api/dashboard/export`, `GET
 //! /api/dashboard/chart-export`) with the call's arguments, and the file is
 //! made when the person opens it, in their own browser session, so it carries
 //! their permissions, their masking and their audit record (`dashboard.pdf_export`
-//! / `dashboard.chart_export`). Nothing is generated or stored here, which is
-//! why both are `Read` risk.
+//! / `dashboard.chart_export` / `dashboard.chart_png`). Nothing is generated or
+//! stored here, which is why both are `Read` risk.
+//!
+//! `BI-37` D6/D7 widen what a link may be: a chart as a PNG
+//! (`chart-export?format=png`, the renderer's own path) and a dashboard as the
+//! importable JSON file (`export?format=file`). Both are still links; the
+//! routes keep every check they always had (the download switch, the viewer,
+//! the audit entry).
 //!
 //! A refusal is the console's sentence: downloads switched off for the person's
-//! roles (`BI-1` D7), PDF export not set up on this deployment, a dashboard or
-//! chart that does not exist for the person.
+//! roles (`BI-1` D7), PDF export or images not set up on this deployment, a
+//! dashboard or chart that does not exist for the person.
 
 use lakehouse_auth::Principal;
 use lakehouse_bi::store;
@@ -21,11 +27,31 @@ use super::arg_str;
 use crate::export::{FileFormat, Values};
 use crate::pdf::{Orientation, Paper};
 use crate::routes::dashboard::{file_slug, pdf_supported};
-use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 
 /// What the model is told when the call came without a signed-in person.
 const SIGN_IN: &str = "Sign in to export.";
+
+/// What `export_chart` makes (`BI-37` D6): a data file, or the chart as an
+/// image. The image is the renderer's, not a row stream, so it has no `values`
+/// and its own "not set up" sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartFile {
+    /// Excel or CSV, through `GET /api/dashboard/chart-export`.
+    Data(FileFormat),
+    /// The chart as a PNG, through the same route's `format=png` branch.
+    Png,
+}
+
+impl ChartFile {
+    /// The file name's extension, as the link's `format` and the name use it.
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Data(format) => format.extension(),
+            Self::Png => "png",
+        }
+    }
+}
 
 /// Whether `name` is one of the two export tools (one guard arm in `run_tool`).
 pub(super) fn handles(name: &str) -> bool {
@@ -195,24 +221,35 @@ async fn export_dashboard(
     args: &Map<String, Value>,
 ) -> Value {
     let format = arg_str(args, "format");
-    if !format.is_empty() && format != "pdf" {
-        return json!({ "error": "A dashboard exports as a PDF: format must be pdf." });
-    }
-    let paper = match arg_str(args, "paper").as_str() {
-        "" => Paper::A4,
-        other => match Paper::parse(other) {
-            Some(p) => p,
-            None => return json!({ "error": "paper must be a4 or letter." }),
-        },
+    // BI-37 D7: `file` is one dashboard as the importable JSON file
+    // (`GET /api/dashboard/export?format=file`); anything else is the PDF.
+    let as_file = match format.as_str() {
+        "" | "pdf" => false,
+        "file" => true,
+        _ => return json!({ "error": "format must be pdf or file." }),
     };
-    let orientation = match arg_str(args, "orientation").as_str() {
-        "" => Orientation::Portrait,
-        other => match Orientation::parse(other) {
-            Some(o) => o,
-            None => return json!({ "error": "orientation must be portrait or landscape." }),
-        },
+    // Paper and orientation are the PDF's; a file has neither, so they are
+    // neither read nor judged for it.
+    let (paper, orientation) = if as_file {
+        (Paper::A4, Orientation::Portrait)
+    } else {
+        let paper = match arg_str(args, "paper").as_str() {
+            "" => Paper::A4,
+            other => match Paper::parse(other) {
+                Some(p) => p,
+                None => return json!({ "error": "paper must be a4 or letter." }),
+            },
+        };
+        let orientation = match arg_str(args, "orientation").as_str() {
+            "" => Orientation::Portrait,
+            other => match Orientation::parse(other) {
+                Some(o) => o,
+                None => return json!({ "error": "orientation must be portrait or landscape." }),
+            },
+        };
+        (paper, orientation)
     };
-    if !pdf_supported(&state.config) {
+    if !as_file && !pdf_supported(&state.config) {
         return json!({ "error": crate::routes::pdf_export::PDF_NOT_SET_UP });
     }
     let board_id = arg_str(args, "board");
@@ -220,7 +257,12 @@ async fn export_dashboard(
     if board_id.is_empty() {
         return json!({ "error": "board is required (list_boards gives the ids)." });
     }
-    let board = match store::get_board(&state.clickhouse, board_id, &viewer_of(principal)).await {
+    // BI-19 B1 review R1: the resolved viewer, not the baseline.
+    let viewer = match super::viewer_for(state, Some(principal)).await {
+        Ok(viewer) => viewer,
+        Err(error) => return error,
+    };
+    let board = match store::get_board(&state.clickhouse, board_id, &viewer).await {
         Ok(board) => board,
         Err(err) => {
             return json!({
@@ -234,11 +276,24 @@ async fn export_dashboard(
     }
     let name = board.as_ref().map_or("Main", |b| b.name.as_str());
     let date = crate::routes::settings::report_date(state).await;
+    if as_file {
+        // The file describes the dashboard and the tables its charts read; it
+        // holds no rows, so filters, parameters and grain have no place in it.
+        return json!({
+            "url": link(
+                "/api/dashboard/export",
+                &[("format", "file"), ("board", board_id)],
+            ),
+            "fileName": format!("{}-{date}.json", file_slug(name, "dashboard")),
+            "format": "file",
+            "note": "Give the person this link; the file is made when they open it, with their own permissions, and can be imported as a new dashboard.",
+        });
+    }
     // BI-1 QA fix A1: names the dashboard does not have are refused here.
     if args.contains_key("params") || args.contains_key("filters") {
         let params = parameter_names(state).await;
         let on_board: Vec<store::StoredChartSpec> =
-            match store::list_stored_charts(&state.clickhouse, &viewer_of(principal)).await {
+            match store::list_stored_charts(&state.clickhouse, &viewer).await {
                 Ok(all) => all
                     .into_iter()
                     .filter(|c| {
@@ -273,14 +328,31 @@ async fn export_dashboard(
 }
 
 async fn export_chart(state: &AppState, principal: &Principal, args: &Map<String, Value>) -> Value {
-    let Some(format) = FileFormat::parse(&arg_str(args, "format")) else {
-        return json!({ "error": "format must be xlsx or csv." });
+    // BI-37 D6: `png` is the renderer's image of the chart, the same link the
+    // console's Download > PNG makes. The route's PNG branch has its own
+    // "images not set up" answer, which the tool gives before the link.
+    let file = match arg_str(args, "format").as_str() {
+        "png" => {
+            if !pdf_supported(&state.config) {
+                return json!({ "error": crate::routes::pdf_export::IMAGES_NOT_SET_UP });
+            }
+            ChartFile::Png
+        }
+        other => match FileFormat::parse(other) {
+            Some(format) => ChartFile::Data(format),
+            None => return json!({ "error": "format must be xlsx, csv or png." }),
+        },
     };
-    let values = match arg_str(args, "values").as_str() {
-        "" => Values::Formatted,
-        other => match Values::parse(other) {
-            Some(v) => v,
-            None => return json!({ "error": "values must be formatted or raw." }),
+    // An image has no rows, so `values` is neither read nor judged for it
+    // (`BI-37` D6: the note says so).
+    let values = match file {
+        ChartFile::Png => Values::Formatted,
+        ChartFile::Data(_) => match arg_str(args, "values").as_str() {
+            "" => Values::Formatted,
+            other => match Values::parse(other) {
+                Some(v) => v,
+                None => return json!({ "error": "values must be formatted or raw." }),
+            },
         },
     };
     let chart_id = arg_str(args, "chart");
@@ -288,7 +360,12 @@ async fn export_chart(state: &AppState, principal: &Principal, args: &Map<String
     if chart_id.is_empty() {
         return json!({ "error": "chart is required (list_charts gives the ids)." });
     }
-    let charts = match store::list_stored_charts(&state.clickhouse, &viewer_of(principal)).await {
+    // BI-19 B1 review R1: the resolved viewer, not the baseline.
+    let viewer = match super::viewer_for(state, Some(principal)).await {
+        Ok(viewer) => viewer,
+        Err(error) => return error,
+    };
+    let charts = match store::list_stored_charts(&state.clickhouse, &viewer).await {
         Ok(charts) => charts,
         Err(err) => {
             return json!({
@@ -320,17 +397,23 @@ async fn export_chart(state: &AppState, principal: &Principal, args: &Map<String
         Ok(view) => view,
         Err(sentence) => return json!({ "error": sentence }),
     };
-    let mut pairs = vec![
-        ("chart", chart_id),
-        ("format", format.extension()),
-        ("values", values_word),
-    ];
+    let mut pairs = vec![("chart", chart_id), ("format", file.extension())];
+    if file != ChartFile::Png {
+        // The image has no rows to format, so the link carries no `values`
+        // (`BI-37` D6).
+        pairs.push(("values", values_word));
+    }
     pairs.extend(view.iter().map(|(k, v)| (*k, v.as_str())));
+    let note = if file == ChartFile::Png {
+        "Give the person this link; the image is made when they open it, with their own permissions and the filters, parameters and grain in the link. `values` does not apply to an image."
+    } else {
+        "Give the person this link; the file is made when they open it, with their own permissions and the filters, parameters and grain in the link."
+    };
     json!({
         "url": link("/api/dashboard/chart-export", &pairs),
-        "fileName": format!("{}.{}", file_slug(&chart.spec.title, "table"), format.extension()),
-        "format": format.extension(),
-        "note": "Give the person this link; the file is made when they open it, with their own permissions and the filters, parameters and grain in the link.",
+        "fileName": format!("{}.{}", file_slug(&chart.spec.title, "table"), file.extension()),
+        "format": file.extension(),
+        "note": note,
     })
 }
 

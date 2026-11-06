@@ -42,6 +42,19 @@ describe("Data Explorer columns", () => {
     expect(screen.queryByText(/column|tag|description|approximate/)).toBeNull()
   })
 
+  it("shows an approximate name match as approximate, without naming the name (DATA-32)", () => {
+    render(
+      <>
+        {cellOf("name", {
+          name: "Revenue",
+          matchedOn: { field: "name", value: "", approximate: true },
+        })}
+      </>,
+    )
+    expect(screen.getByText("Revenue")).toBeTruthy()
+    expect(screen.getByText("approximate match")).toBeTruthy()
+  })
+
   it("truncates a long owner and keeps the full value as its title", () => {
     // DATA-11 review SHOULD-FIX 7: the Owner cell may not widen the table.
     const owner = "a-very-long-owner-address@example.invalid"

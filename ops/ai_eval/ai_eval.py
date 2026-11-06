@@ -67,6 +67,10 @@ so the set does not depend on what the stack happens to hold and does not
 leave anything behind. A run that could not finish is a failed case, not a
 crash, and a delete that fails is a problem of that case.
 
+A case that changes something the deletes cannot undo (a certification mark
+on an asset) names the call that undoes it in `cleanup`; those calls run
+after the deletes, on every exit of the run.
+
 Exit code 0 when the set passes, 1 when it fails, 2 when the run could not
 start (no stack, no login, a port already in use).
 
@@ -194,6 +198,50 @@ INDONESIAN_MARKERS = (
 )
 
 RAW_ERROR_PATTERNS = (r"DB::Exception", r"Code: \d+", r"\bstack trace\b", r"SQLSTATE")
+
+def continuation_text(turn_confirms: list[dict[str, Any]], next_step: str) -> str:
+    """The text a continuation is sent as (`AI-15`): the objects the person
+    confirmed and that were saved, then the step the request still has.
+
+    The model reads only the text of the chat, so the saved objects have to
+    be named in it — without them it drafts them again. One item per
+    confirmed step that succeeded, in the order of the confirms. The console
+    builds the same text from its stored steps, so the runner measures the
+    product and not a variant of it.
+    """
+    items = [item for confirm in turn_confirms if (item := saved_item(confirm)) is not None]
+    return f"Confirmed and saved: {'; '.join(items)}. Do not draft these again. Continue: {next_step}"
+
+
+def saved_item(confirm: dict[str, Any]) -> str | None:
+    """The item that names one saved object, or None when the confirm saved
+    nothing: one that did not come back `executed` with HTTP 200.
+
+    The id is `result.id`, or `result.field.id` for a calculated field; the
+    title is `result.title`, else `result.name`, else `result.field.name`.
+    A part the result does not carry is left out, never invented, so the
+    item is the tool name alone when there is neither an id nor a title.
+    """
+    if not confirm_succeeded(confirm):
+        return None
+    result = confirmed_result(confirm)
+    field = result.get("field")
+    if not isinstance(field, dict):
+        field = {}
+    ident = _text_of(result.get("id")) or _text_of(field.get("id"))
+    title = _text_of(result.get("title")) or _text_of(result.get("name")) or _text_of(field.get("name"))
+    tool = str(confirm.get("tool") or "")
+    return tool + (f" {ident}" if ident else "") + (f' "{title}"' if title else "")
+
+
+def _text_of(value: Any) -> str | None:
+    """The text a result carries, or None when it carries none."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+# How many continuation messages may follow one scripted turn. The console
+# has the same cap.
+MAX_CONTINUATIONS = 3
 
 MULTIPLIERS = {
     "million": 1e6,
@@ -526,10 +574,14 @@ DELETE_ROUTES = {
     "source": "/api/dashboard/sources",
     "board": "/api/dashboard/boards",
     "metric": "/api/dashboard/metrics",
+    # BI-37: an alert or digest rule, deleted by id like the others
+    # (`DELETE /api/alerts?id=`).
+    "alert": "/api/alerts",
 }
 # Newest first: a chart may use a field, a field a source, and a board holds
-# charts, so the dependants go before what they depend on.
-CLEANUP_ORDER = ("chart", "metric", "field", "source", "board")
+# charts, so the dependants go before what they depend on. An alert watches a
+# chart, so it goes before the charts.
+CLEANUP_ORDER = ("alert", "chart", "metric", "field", "source", "board")
 
 
 def kind_of_path(path: str) -> str | None:
@@ -587,12 +639,15 @@ def fill_check(check: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
 CREATED_RE = re.compile(r"\{created:(\w+)\}")
 
 
-def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[str, Any]:
-    """Replace `{created:<kind>}` in a `where` value with the id of the first
-    object of that kind this run created (from the trace or a confirm). The
-    assistant makes such an object itself, so its id is not known when the case
-    is written. A kind this run did not create is left as written, so it
-    matches nothing."""
+def fill_created_ids(value: Any, created: list[dict[str, str]]) -> Any:
+    """Replace `{created:<kind>}` with the id of the first object of that
+    kind this run created. A kind this run did not create is left as
+    written, so it matches nothing.
+
+    `BI-41` T1: `set_cache_rule` after a continuation names a chart the
+    assistant made itself, so `expect_tool.args_contains` needs the created
+    id as much as an `expect_state` `where` does. `fill_created` applies this
+    to a `where`; both callers read the same first-id rule."""
     first: dict[str, str] = {}
     for obj in created:
         first.setdefault(obj["kind"], obj["id"])
@@ -604,8 +659,17 @@ def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[s
             return {k: sub(v) for k, v in value.items()}
         return value
 
+    return sub(value)
+
+
+def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[str, Any]:
+    """Replace `{created:<kind>}` in a `where` value with the id of the first
+    object of that kind this run created (from the trace or a confirm). The
+    assistant makes such an object itself, so its id is not known when the case
+    is written. A kind this run did not create is left as written, so it
+    matches nothing."""
     filled = dict(check)
-    filled["where"] = sub(check.get("where", {}))
+    filled["where"] = fill_created_ids(check.get("where", {}), created)
     return filled
 
 
@@ -689,6 +753,42 @@ def send_confirm(
     return body
 
 
+def confirm_pending(
+    cfg: Config,
+    session: requests.Session,
+    body: dict[str, Any],
+    mode: str,
+    confirms: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Confirm every draft of the body that waits for the person.
+
+    The confirms of this turn are returned as well as recorded: the request
+    only goes on when every one of them succeeded, which is what the console
+    does.
+    """
+    made: list[dict[str, Any]] = []
+    for step in body.get("toolTrace", []):
+        result = step.get("result") or {}
+        if isinstance(result, dict) and result.get("needs_confirmation"):
+            response = send_confirm(cfg, session, step, mode, body.get("sessionId"))
+            entry = {"tool": pending_of(step)["tool"], "result": response}
+            made.append(entry)
+            confirms.append(entry)
+    return made
+
+
+def confirm_succeeded(confirm: dict[str, Any]) -> bool:
+    """Whether a confirm came back `executed`, without an error."""
+    reply = confirm.get("result")
+    if not isinstance(reply, dict):
+        return False
+    return (
+        reply.get("_status") == 200
+        and reply.get("outcome") == "executed"
+        and "error" not in reply
+    )
+
+
 def confirm_problems(confirms: list[dict[str, Any]]) -> list[str]:
     """A confirm that did not come back `executed` with HTTP 200 is a problem of
     the case: HTTP 400 and up, an `error` in the reply, or any other `outcome`.
@@ -752,29 +852,33 @@ def collect_created(
     confirms: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
     """Every object this run created: setup calls, trace results marked
-    created with an id, and the calculated fields and boards the tools made."""
+    created with an id, the calculated fields and boards the tools made, and
+    (BI-37) the alert or digest rule `create_alert_rule` saved."""
     found = list(setup_created)
-    for trace in traces:
-        for step in trace:
-            result = step.get("result") or {}
-            if not isinstance(result, dict) or not result.get("id"):
-                continue
-            tool = step.get("tool")
+
+    def note(tool: str | None, result: Any) -> None:
+        """Collect one reply's object, by the shape that tool answers with."""
+        if not isinstance(result, dict):
+            return
+        if result.get("id"):
             if tool == "create_chart" and result.get("created"):
                 found.append({"kind": "chart", "id": str(result["id"])})
             elif tool == "create_board" and result.get("created"):
                 found.append({"kind": "board", "id": str(result["id"])})
             elif tool == "create_calculated_field" and result.get("ok") is True:
                 found.append({"kind": "field", "id": str(result["id"])})
+            return
+        # BI-37: `create_alert_rule` answers `{ok: true, rule: {id, ...}}` — the
+        # object to clean up is the rule, not the reply.
+        rule = result.get("rule")
+        if tool == "create_alert_rule" and isinstance(rule, dict) and rule.get("id"):
+            found.append({"kind": "alert", "id": str(rule["id"])})
+
+    for trace in traces:
+        for step in trace:
+            note(step.get("tool"), step.get("result"))
     for confirm in confirms:
-        tool = confirm.get("tool")
-        result = confirmed_result(confirm)
-        if result.get("id") and result.get("created"):
-            kind = {"create_chart": "chart", "create_board": "board"}.get(tool or "")
-            if kind:
-                found.append({"kind": kind, "id": str(result["id"])})
-        if tool == "create_calculated_field" and result.get("id") and result.get("ok") is True:
-            found.append({"kind": "field", "id": str(result["id"])})
+        note(confirm.get("tool"), confirmed_result(confirm))
     return found
 
 
@@ -799,6 +903,34 @@ def run_cleanup(cfg: Config, session: requests.Session, created: list[dict[str, 
             continue
         if resp.status_code >= 400:
             problems.append(f"cleanup {obj['kind']} {obj['id']}: HTTP {resp.status_code}")
+    return problems
+
+
+def run_teardown(
+    cfg: Config,
+    session: requests.Session,
+    calls: list[dict[str, Any]],
+    names: dict[str, str],
+) -> list[str]:
+    """Undo what the case changed that deleting objects cannot undo: a mark it
+    put on an asset. Each call is made the way a setup call is, so a case
+    names it the same way; a call that fails is a problem of the run, not a
+    crash."""
+    problems: list[str] = []
+    for call in calls:
+        path = call.get("path", "?")
+        try:
+            resp = session.request(
+                call["method"],
+                f"{cfg.api_url}{fill_names(path, names)}",
+                json=fill_value(call.get("body"), names),
+                timeout=60,
+            )
+        except requests.RequestException as err:
+            problems.append(f"teardown {path}: {type(err).__name__}")
+            continue
+        if resp.status_code >= 400:
+            problems.append(f"teardown {path}: HTTP {resp.status_code}")
     return problems
 
 
@@ -943,18 +1075,37 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
             messages.append({"role": "user", "content": fill_names(turn, names)})
             body = ask(cfg, session, mode, messages, context=context)
             bodies.append(body)
-            if case.get("confirm"):
-                for step in body.get("toolTrace", []):
-                    result = step.get("result") or {}
-                    if isinstance(result, dict) and result.get("needs_confirmation"):
-                        response = send_confirm(cfg, session, step, mode, body.get("sessionId"))
-                        confirms.append({"tool": pending_of(step)["tool"], "result": response})
+            turn_confirms = (
+                confirm_pending(cfg, session, body, mode, confirms) if case.get("confirm") else []
+            )
             messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
-        scored = score_case(cfg, session, case, bodies, names)
-        scored["confirms"] = confirms
-        scored["problems"].extend(confirm_problems(confirms))
+            # The request had steps left: the console sends them back once
+            # the draft is confirmed, and the runner measures the product,
+            # so it does the same, with the same cap.
+            continuations = 0
+            while continuations < MAX_CONTINUATIONS and body.get("nextStep"):
+                if not turn_confirms or not all(confirm_succeeded(c) for c in turn_confirms):
+                    break
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": continuation_text(turn_confirms, str(body["nextStep"])),
+                    }
+                )
+                body = ask(cfg, session, mode, messages, context=context)
+                bodies.append(body)
+                turn_confirms = (
+                    confirm_pending(cfg, session, body, mode, confirms)
+                    if case.get("confirm")
+                    else []
+                )
+                messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
+                continuations += 1
         trace = [s for b in bodies for s in b.get("toolTrace", [])]
         created = collect_created(setup_created, [trace], confirms)
+        scored = score_case(cfg, session, case, bodies, names, created)
+        scored["confirms"] = confirms
+        scored["problems"].extend(confirm_problems(confirms))
         own_ids = {c["id"] for c in created}
         for check in case.get("expect_state", []):
             try:
@@ -980,6 +1131,7 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
         # result; a run that raised becomes a failed result with the same problems,
         # so a failed cleanup is never only on stderr.
         cleanup_problems = _cleanup(cfg, session, setup_created, bodies, confirms)
+        cleanup_problems.extend(run_teardown(cfg, session, case.get("cleanup", []), names))
         if scored is None:
             scored = _failed_run(case, _raised_run, cleanup_problems)
         else:
@@ -1047,10 +1199,13 @@ def score_case(
     case: dict[str, Any],
     bodies: list[dict[str, Any]],
     names: dict[str, str] | None = None,
+    created: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Score one case from its response bodies. `names` are the ids the case's
     setup saved, used to fill `{name}` in `expect_tool.args_contains` the way
-    the turns are filled; `--rescore` has no setup and passes none."""
+    the turns are filled; `created` are the objects the run made, used to fill
+    `{created:<kind>}` there (`BI-41` T1). `--rescore` has no setup and no
+    confirms, so it passes neither."""
     final = bodies[-1]
     raw_answer = final.get("answer", "") or ""
     answer = plain_text(raw_answer)
@@ -1080,7 +1235,7 @@ def score_case(
     if expect_tool:
         required += 1
         trace = [t for b in bodies for t in b.get("toolTrace", []) if t.get("tool") == expect_tool["name"]]
-        want = fill_value(expect_tool.get("args_contains", {}), names or {})
+        want = fill_created_ids(fill_value(expect_tool.get("args_contains", {}), names or {}), created or [])
         if any(tool_args_match(t.get("args", {}), want) for t in trace):
             hit += 1
         else:
@@ -1177,6 +1332,11 @@ def main() -> int:
     parser.add_argument("--label", default="run")
     parser.add_argument("--cases", default=str(HERE / "cases.json"))
     parser.add_argument("--only", default="")
+    parser.add_argument(
+        "--exclude",
+        default="",
+        help="case ids to leave out of the run, applied after --only; an id naming no case is a setup error",
+    )
     parser.add_argument("--out", default="")
     parser.add_argument(
         "--rescore",
@@ -1196,10 +1356,20 @@ def main() -> int:
 
     try:
         cfg = Config.from_env()
-        cases = json.loads(Path(args.cases).read_text())
+        cases = all_cases = json.loads(Path(args.cases).read_text())
         if args.only:
             wanted = set(args.only.split(","))
             cases = [c for c in cases if c["id"] in wanted]
+        excluded = args.exclude.split(",") if args.exclude else []
+        # Checked against every case in the file, so a stale or mistyped id
+        # stops the run instead of silently leaving a broken case in the count.
+        known = {c["id"] for c in all_cases}
+        unknown = [i for i in excluded if i not in known]
+        if unknown:
+            raise ValueError(f"--exclude names no case: {', '.join(unknown)}")
+        cases = [c for c in cases if c["id"] not in excluded]
+        if excluded:
+            print(f"excluded: {', '.join(excluded)}")
         baseline = load_baseline(args.baseline) if args.baseline else None
 
         session = requests.Session()
@@ -1253,8 +1423,8 @@ def main() -> int:
     if verdict:
         print(summary_line(verdict))
     out = resolve_out(args.out, args.label)
-    out.write_text(json.dumps(result_document(args.label, results, verdict) | {"summary": summary},
-                              ensure_ascii=False, indent=2))
+    document = result_document(args.label, results, verdict) | {"summary": summary, "excluded": excluded}
+    out.write_text(json.dumps(document, ensure_ascii=False, indent=2))
     print(f"saved {out}")
     return exit_code(setup_error=False, verdict=verdict)
 

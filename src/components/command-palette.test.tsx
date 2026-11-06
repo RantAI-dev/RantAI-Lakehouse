@@ -94,6 +94,14 @@ describe("CommandPalette catalog search", () => {
     expect(await screen.findByText("description · approximate match")).toBeTruthy()
   })
 
+  it("says an approximate name match is approximate, without naming the name (DATA-32)", async () => {
+    stubCatalog({
+      assets: [asset(1, { matchedOn: { field: "name", value: "", approximate: true } })],
+    })
+    await search("revnue")
+    expect(await screen.findByText("approximate match")).toBeTruthy()
+  })
+
   it("lists at most eight assets", async () => {
     stubCatalog({ assets: Array.from({ length: 12 }, (_, i) => asset(i + 1)) })
     await search("table")
@@ -102,11 +110,21 @@ describe("CommandPalette catalog search", () => {
     expect(screen.queryByText("Table 9")).toBeNull()
   })
 
-  it("opens the Data Explorer with the typed words from See all results", async () => {
+  it("asks the server for the eight results it shows (DATA-41 D3)", async () => {
+    // The server ranks every match and returns the first `limit` of them:
+    // the box must not be served a catalog of ten thousand tables to throw
+    // all but eight away.
+    stubCatalog({ assets: [asset(1)] })
+    await search("table")
+    await screen.findByText("Table 1")
+    expect(requested[0]).toContain("limit=8")
+  })
+
+  it("opens the Catalog with the typed words from See all results", async () => {
     stubCatalog({ assets: [asset(1)] })
     await search("customer revenue")
     fireEvent.click(await screen.findByText("See all results"))
-    expect(pushed).toEqual(["/data?search=customer%20revenue"])
+    expect(pushed).toEqual(["/catalog?search=customer%20revenue"])
   })
 
   it("says the catalog search is unavailable when the request fails", async () => {

@@ -1,6 +1,6 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
-import { CertificationBadge } from "./status-badge"
+import { CertificationBadge, OutcomeBadge } from "./status-badge"
 
 afterEach(cleanup)
 
@@ -25,5 +25,24 @@ describe("CertificationBadge", () => {
       </>
     )
     expect(container.textContent).toBe("")
+  })
+})
+
+describe("OutcomeBadge", () => {
+  it("reads Pending for a decision that is still waiting, in the info tone", () => {
+    render(
+      <>
+        <OutcomeBadge outcome="pending" />
+        <OutcomeBadge outcome="denied" />
+      </>
+    )
+    const pending = screen.getByText("Pending")
+    // The `info` tone: a decision still open is neither a warning nor a
+    // success (GOV-5).
+    expect(pending.className).toContain("text-primary")
+    expect(pending.className).not.toContain("amber")
+    expect(pending.className).not.toContain("emerald")
+    // A real refusal keeps the warning tone.
+    expect(screen.getByText("Denied").className).toContain("amber")
   })
 })

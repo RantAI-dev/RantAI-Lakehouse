@@ -179,6 +179,15 @@ pub struct AppState {
     /// `services` tile or `/api/ops/services` read past the window always
     /// re-probes. `None` until the first read.
     pub health_cache: crate::health::HealthCache,
+    /// 2 s cache for `readiness::ready_body` — the PUBLIC
+    /// `GET /health/ready` route reuses one probe for every caller inside
+    /// the window, so a loop of anonymous requests cannot turn into a
+    /// Postgres query, a `ClickHouse` query and a Lakekeeper call each.
+    /// `None` until the first read. See [`crate::readiness`]'s module doc
+    /// comment for why the window is this short.
+    ///
+    /// (REL-2 S1 review SHOULD-FIX 1.)
+    pub readiness_cache: crate::readiness::ReadyCache,
     /// The allowlist [`crate::pipeline_source::build_allowlist`] walked
     /// ONCE at startup from `PIPELINE_SOURCE_DIR` (default
     /// `/opt/pipeline-src/dispar_orchestrate` — `rust/Dockerfile`'s `COPY
@@ -690,13 +699,35 @@ fn login_throttle_policy(config: &Config) -> ThrottlePolicy {
 }
 
 impl AppState {
+    /// A state with no database at all: for the unit tests that run a
+    /// statement against a mock `ClickHouse` and ask the unrestricted
+    /// tenant gate (`SEC-50` slice 2 T1).
+    ///
+    /// The gate that reaches everything without a database is the
+    /// unrestricted one (`routes::query::StatementGate::unrestricted`), so
+    /// a test that is about the runner and not about the gate needs no
+    /// deployment.
+    #[cfg(test)]
+    #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "an empty environment has no failure mode: every setting of \
+                  `Config` has a default, so `from_map` cannot fail here"
+    )]
+    pub(crate) fn without_a_database() -> Self {
+        AppState::new(
+            Config::from_map(&std::collections::HashMap::new()).expect("a config with no pool"),
+        )
+    }
+
     /// Build application state from a resolved [`Config`].
     #[must_use]
     #[allow(
         clippy::too_many_lines,
         reason = "one struct literal naming every shared handle, a line per \
-                  field; `tile_slots` (BI-4 part A), `result_cache` (part B) and `query_limits` (BI-5) are \
-                  the lines that took it from 100 to 102"
+                  field; `tile_slots` (BI-4 part A), `result_cache` (part B), `query_limits` (BI-5) and \
+                  `readiness_cache` (REL-2 S1 review SHOULD-FIX 1) are \
+                  the lines that took it from 100 to 103"
     )]
     pub fn new(config: Config) -> Self {
         let clickhouse = Arc::new(ChClient::new(
@@ -825,6 +856,7 @@ impl AppState {
             catalog_search_cache: Arc::new(SearchSnapshotCache::new()),
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            readiness_cache: Arc::new(tokio::sync::Mutex::new(None)),
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,

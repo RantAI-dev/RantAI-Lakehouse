@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { ChevronDown, Folder, FolderCog, LayoutGrid, Lock, PlusIcon, Rows3, Sigma, Trash2 } from "lucide-react"
+import { ChevronDown, Folder, FolderCog, LayoutGrid, Lock, PlusIcon, Rows3, Sigma, Trash2, Upload } from "lucide-react"
 
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
@@ -65,6 +65,7 @@ import {
 import { FavouriteButton } from "./favourite-button"
 import { PRIVATE_HINT } from "./private-badge"
 import { FolderOptions } from "./folder-options"
+import { ImportDashboardDialog } from "./import-dashboard-dialog"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
@@ -345,6 +346,7 @@ export function DashboardListPage() {
   const [view, setView] = React.useState<ViewMode>("gallery")
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set())
   const [foldersOpen, setFoldersOpen] = React.useState(false)
+  const [importOpen, setImportOpen] = React.useState(false)
   const [moving, setMoving] = React.useState<Board | null>(null)
 
   // Preferensi tampilan dibaca setelah mount supaya markup server dan
@@ -595,6 +597,13 @@ export function DashboardListPage() {
                     Trash
                   </Button>
                 ) : null}
+                {/* BI-19 part D (plan D14): a dashboard file in; the server asks for edit on the folder. */}
+                {canFile ? (
+                  <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
+                    <Upload data-icon="inline-start" />
+                    Import…
+                  </Button>
+                ) : null}
                 {newButton}
               </div>
             }
@@ -710,6 +719,17 @@ export function DashboardListPage() {
         }}
       />
 
+      {canFile ? (
+        <ImportDashboardDialog
+          open={importOpen}
+          onOpenChange={setImportOpen}
+          folders={fileable}
+          onImported={() => {
+            notifyDashboardsChanged()
+            reload()
+          }}
+        />
+      ) : null}
       {canFile ? (
         <ManageFoldersDialog
           open={foldersOpen}
