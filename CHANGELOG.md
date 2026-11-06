@@ -21,6 +21,7 @@ once a first release is tagged.
 - Moving a saved query or a folder needs manage on everything moved. That is the query itself, or the folder and every sub-folder and query under it, trashed ones included. This closes a path where an editor could publish, hide or raise a query through a folder of their own (`QS-3` review of #382). A personal space can no longer be shared, and a rule already stored on one is ignored; share a query or a folder inside it instead.
 - `RUSTSEC-2026-0440` (`astral-tokio-tar`, unmaintained since 2026-11-03, no fixed release) is waived in `cargo deny`: only the `testcontainers` test dependencies reach it, and no shipped binary links it.
 - History and the history API no longer keep the engine's error text (backlog `QS-4`). A run that fails in the engine records a fixed sentence by cause and a `Reference: <id>`, with no `Code:` and no catalog name; the result tab still shows the engine's diagnosis. Migration `0127` replaces the engine text already stored for ClickHouse runs with the default sentence and keeps the reference id. Stored Trino messages are not changed, and a Trino statement error shows the default sentence because the Trino client does not keep the error name.
+- The assistant's draft check of a chart change reads the chart as the person asking, so a draft cannot reveal a chart they cannot see (backlog `AI-3`).
 
 ### Changed
 
@@ -35,6 +36,7 @@ once a first release is tagged.
 - The assistant reads back the chart's definition after a chart draft or save, says when a call was refused, and never ends a turn with an empty answer (backlog `AI-6`).
 - The chat shows `Saved: <title>` (or `Not saved: <error>`) under a reply once its draft is confirmed, as the console's own status line; the model's text is not edited and the line is not sent back to the model (backlog `AI-6`).
 - The assistant's prompt gains five rules: a map by a region name (province, city, country) is a `geomap`, and a point or heat map only for coordinates or when the person asks for one; a field that `describe_mart` does not list is checked with `list_calculated_fields` before the assistant says it is missing; a person who cannot change dashboards gets the refusal before any analysis; "Which queries are running right now?" offers `list_workloads`, and a count of running queries comes only from that tool, with no count when it fails; a question about a timeout is answered from `get_query_limits`, with no SQL against `system.*` tables (backlog `AI-4`, `AI-6`, `AI-15`).
+- Query Studio fixes from the owner's QA of 2026-11-04/05 (backlog `QS-1`, `QS-2`, `QS-4`). A Bronze table inserts and completes as `iceberg.bronze.<table>` on a Trino tab, and a ClickHouse tab says to switch to Trino instead of inserting a broken name. `Ctrl+Shift+[` folds and `Ctrl+Shift+]` unfolds the statement at the cursor. Format writes no space before `;` and puts each statement on its own line. The column statistics say "of the 1 row shown" for one row.
 
 ## [0.2.1] - 2026-11-04
 
