@@ -592,10 +592,14 @@ fn arg_filter_modes(
 /// answer; a call that is not a chart call, or a draft that builds, comes back
 /// as the draft (a create's with a `definition` key, the digest of what it
 /// would save: the card reads `args`, so the key changes nothing the person
-/// sees; an update's draft has no `definition`, because its digest would be
-/// read from the stored chart as the server). The error otherwise, so a draft
-/// on a mart or column that does not exist is refused rather than offered.
-/// Writes nothing.
+/// sees; an update's draft has no `definition`: the saved reply carries the
+/// digest of the merged chart). The error otherwise, so a draft on a mart or
+/// column that does not exist is refused rather than offered. Writes nothing.
+///
+/// An update's draft reads the stored chart as `principal`, through the same
+/// [`scope_for_write`] the save uses, so a chart the caller cannot see answers
+/// what the save answers and nothing of the chart. With nobody attached an
+/// update is refused (fail closed); a create reads no stored chart.
 ///
 /// When the reporting settings cannot be read, this returns the same error
 /// the dispatch arm returns, instead of skipping the check.
@@ -608,6 +612,7 @@ fn arg_filter_modes(
 /// The reply that replaces the draft when the call cannot be built.
 pub(crate) async fn check_draft(
     state: &AppState,
+    principal: Option<&Principal>,
     name: &str,
     args: &Map<String, Value>,
     mut draft: Value,
@@ -615,12 +620,20 @@ pub(crate) async fn check_draft(
     if name != "create_chart" && name != "update_chart" {
         return Ok(draft);
     }
+    // Built before anything else is read, as the dispatcher does, so a caller
+    // the save would refuse is refused here with the same sentence.
+    let viewer = if name == "update_chart" {
+        scope_for_write(state, principal).await?.viewer
+    } else {
+        // A create reads no stored chart; `check_chart_draft` ignores this.
+        Viewer::nothing()
+    };
     let Ok(time) = crate::routes::settings::time_context(state).await else {
         return Err(json!({ "error": "The reporting settings could not be read." }));
     };
     let id = (name == "update_chart").then(|| arg_str(args, "id"));
     if let Some(definition) =
-        dashboards::check_chart_draft(&state.clickhouse, args, id, &time).await?
+        dashboards::check_chart_draft(&state.clickhouse, &viewer, args, id, &time).await?
     {
         draft["definition"] = Value::String(definition);
     }
@@ -675,6 +688,37 @@ mod tests {
         }
         let unknown = run_tool(&state, None, "not_a_real_tool", &Map::new()).await;
         assert_eq!(unknown, json!({ "error": "unknown tool: not_a_real_tool" }));
+    }
+
+    /// The draft check of a chart update reads the stored chart as the
+    /// caller, so with nobody attached there is nobody to read it as: it is
+    /// refused with the sentence the save gives, before any store is asked
+    /// (the state here has no reachable `ClickHouse`).
+    #[tokio::test]
+    async fn the_draft_check_of_an_update_chart_with_nobody_signed_in_is_refused() {
+        let state = dispatch_test_state();
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("c_1"));
+        let draft = json!({ "needs_confirmation": true });
+        let refused = check_draft(&state, None, "update_chart", &args, draft.clone())
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            refused,
+            scope_for_write(&state, None).await.map(|_| ()).unwrap_err(),
+            "the draft and the save give one sentence"
+        );
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("there is none")),
+            "{refused}"
+        );
+        // A call that is not a chart call is not checked at all.
+        assert_eq!(
+            check_draft(&state, None, "list_boards", &args, draft.clone()).await,
+            Ok(draft)
+        );
     }
 
     /// BI-26 slice 2 T4 (D4): the pre-approval hook is a no-op for every tool

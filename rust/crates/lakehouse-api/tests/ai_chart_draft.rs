@@ -21,7 +21,10 @@ use tower::ServiceExt;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up_with_env,
+};
 
 /// The one mart the mock lists in `serving`, its dimension and its measure.
 const MART: &str = "mart_seeded_sales";
@@ -150,29 +153,33 @@ fn env_for(llm: &MockServer, ch: &MockServer) -> std::collections::HashMap<Strin
     env
 }
 
-/// Calls `POST /api/ai/tool` once in build mode and returns the status and
+/// Posts `body` to `uri` as the seeded user `fajar@meridian.example` (an
+/// administrator, who sees every personal space), or, with `permissions`, as
+/// a new person who holds exactly those permissions. Returns the status and
 /// the body.
-async fn tool_call(
+async fn post_as(
     llm: &MockServer,
     ch: &MockServer,
-    tool: &str,
-    args: &str,
+    uri: &str,
+    body: &Value,
+    permissions: Option<&str>,
 ) -> (StatusCode, Value) {
     let TestApp { router, pool } = spin_up_with_env(&env_for(llm, ch)).await;
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
-    let body = json!({
-        "tool": tool,
-        "args": serde_json::from_str::<Value>(args).unwrap(),
-        "mode": "build",
-    });
+    let cookie = match permissions {
+        None => session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await,
+        Some(permissions) => {
+            let user = create_principal_with_permissions(&pool, permissions).await;
+            session_cookie_for_user(&pool, user).await
+        }
+    };
     let resp = router
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/ai/tool")
+                .uri(uri)
                 .header("content-type", "application/json")
                 .header("cookie", &cookie)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
                 .unwrap(),
         )
         .await
@@ -187,34 +194,37 @@ async fn tool_call(
     )
 }
 
-/// Sends one build-mode chat turn and returns the status and the body.
-async fn chat(llm: &MockServer, ch: &MockServer, question: &str) -> (StatusCode, Value) {
-    let TestApp { router, pool } = spin_up_with_env(&env_for(llm, ch)).await;
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
-    let body = json!({
+/// The body of a build-mode `POST /api/ai/tool`.
+fn tool_body(tool: &str, args: &str) -> Value {
+    json!({
+        "tool": tool,
+        "args": serde_json::from_str::<Value>(args).unwrap(),
+        "mode": "build",
+    })
+}
+
+/// The body of a build-mode `POST /api/ai/chat` turn.
+fn chat_body(question: &str) -> Value {
+    json!({
         "mode": "build",
         "messages": [{ "role": "user", "content": question }],
-    });
-    let resp = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/ai/chat")
-                .header("content-type", "application/json")
-                .header("cookie", &cookie)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
+    })
+}
+
+/// Calls `POST /api/ai/tool` once in build mode and returns the status and
+/// the body.
+async fn tool_call(
+    llm: &MockServer,
+    ch: &MockServer,
+    tool: &str,
+    args: &str,
+) -> (StatusCode, Value) {
+    post_as(llm, ch, "/api/ai/tool", &tool_body(tool, args), None).await
+}
+
+/// Sends one build-mode chat turn and returns the status and the body.
+async fn chat(llm: &MockServer, ch: &MockServer, question: &str) -> (StatusCode, Value) {
+    post_as(llm, ch, "/api/ai/chat", &chat_body(question), None).await
 }
 
 fn has_insert(sent: &[String]) -> bool {
@@ -602,4 +612,219 @@ async fn a_last_answer_that_is_not_empty_is_left_as_the_model_wrote_it() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["answer"], "Only a draft.", "{body}");
+}
+
+/// The chart the update tests name, and the board it is filed on.
+const STORED_CHART: &str = "c_stored";
+const STORED_BOARD: &str = "b_stored";
+/// A formatting key the stored chart carries and the mart does not return:
+/// a draft that merged the stored chart would name it in its refusal.
+const STALE_FORMAT: &str = "hidden_revenue";
+
+/// `ClickHouse` for an update of the stored chart `STORED_CHART`, which sits
+/// on a board owned by `owner` (an empty owner is a shared board). With
+/// `stale_format` the stored chart carries a value format that names a
+/// column the mart does not return. The mock cannot filter by viewer: it
+/// answers every read, so only the board's owner and the caller the draft
+/// reads as decide whether the chart is shown.
+async fn mock_clickhouse_with_stored_chart(owner: &str, stale_format: bool) -> MockServer {
+    let ch = MockServer::start().await;
+    let mut def = json!({
+        "title": "Sales by region",
+        "kind": "bar",
+        "mart": MART,
+        "dimension": COLUMN,
+        "measures": [MEASURE],
+        "board": STORED_BOARD,
+    });
+    if stale_format {
+        def["valueFormats"] = json!({ STALE_FORMAT: { "style": "number" } });
+    }
+    let document = json!({
+        "spec": {
+            "id": STORED_CHART,
+            "title": "Sales by region",
+            "kind": "bar",
+            "mart": MART,
+            "sql": "SELECT region_code, sum(sale_total) AS sale_total FROM serving.mart_seeded_sales GROUP BY region_code",
+            "x": COLUMN,
+            "y": MEASURE,
+        },
+        "def": def,
+        "hasYear": false,
+    });
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "SELECT is_deleted, board FROM console.bi_chart",
+        ))
+        .respond_with(rows(&json!([{ "is_deleted": 0, "board": STORED_BOARD }])))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM console.bi_chart FINAL WHERE is_deleted = 0",
+        ))
+        .respond_with(rows(&json!([{
+            "id": STORED_CHART,
+            "spec_json": document.to_string(),
+            "board": STORED_BOARD,
+            "created_by": "ai",
+            "created_at": "2026-10-22 00:00:00",
+        }])))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+        ))
+        .respond_with(rows(&json!([{ "is_deleted": 0, "owner_id": owner }])))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("FROM system.tables"))
+        .respond_with(rows(&json!([{ "n": "1" }])))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("FROM system.columns"))
+        .respond_with(rows(&json!([
+            { "name": COLUMN, "type": "String" },
+            { "name": SECOND_COLUMN, "type": "String" },
+            { "name": MEASURE, "type": "Float64" },
+        ])))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(rows(&json!([])))
+        .mount(&ch)
+        .await;
+    ch
+}
+
+/// A rename of the stored chart that names no data field, so the stored ones
+/// are merged into the draft.
+fn rename_args() -> String {
+    json!({ "id": STORED_CHART, "title": "Sales by area", "kind": "bar" }).to_string()
+}
+
+/// The person who edits dashboards but administers nothing: unlike the seeded
+/// administrator, they see their own personal space and no one else's.
+const WRITER: &str = "dashboard:read, dashboard:write";
+
+/// `POST /api/ai/tool` as the `WRITER`.
+async fn tool_call_as_writer(
+    llm: &MockServer,
+    ch: &MockServer,
+    tool: &str,
+    args: &str,
+) -> (StatusCode, Value) {
+    post_as(
+        llm,
+        ch,
+        "/api/ai/tool",
+        &tool_body(tool, args),
+        Some(WRITER),
+    )
+    .await
+}
+
+/// One build-mode chat turn as the `WRITER`.
+async fn chat_as_writer(llm: &MockServer, ch: &MockServer, question: &str) -> (StatusCode, Value) {
+    post_as(llm, ch, "/api/ai/chat", &chat_body(question), Some(WRITER)).await
+}
+
+/// What a refused update must not carry: nothing of the stored chart.
+fn assert_nothing_of_the_stored_chart(body: &Value) {
+    let text = body.to_string();
+    for hidden in [STALE_FORMAT, STORED_BOARD, MART, COLUMN, MEASURE] {
+        assert!(!text.contains(hidden), "{hidden} leaked: {body}");
+    }
+}
+
+/// Call site of the confirm path (`POST /api/ai/tool`): the draft of an update
+/// is read as the caller, so a chart on somebody else's private board answers
+/// what `update_chart` answers and not a refusal built from the chart.
+#[tokio::test]
+async fn the_confirm_path_draft_of_an_update_of_a_chart_on_a_private_board_says_the_tile_does_not_exist()
+ {
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse_with_stored_chart("someone-else", true).await;
+
+    let (status, body) = tool_call_as_writer(&llm, &ch, "update_chart", &rename_args()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"],
+        json!({ "error": "this tile does not exist" }),
+        "{body}"
+    );
+    assert_eq!(body["outcome"], "failed", "{body}");
+    assert_nothing_of_the_stored_chart(&body["result"]);
+    assert!(!has_insert(&statements(&ch).await), "nothing was written");
+}
+
+/// Call site of the chat loop (`POST /api/ai/chat`): the same refusal.
+#[tokio::test]
+async fn the_chat_loop_draft_of_an_update_of_a_chart_on_a_private_board_says_the_tile_does_not_exist()
+ {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "update_chart", &rename_args())]),
+        model_round(Some("That chart is not there."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse_with_stored_chart("someone-else", true).await;
+
+    let (status, body) = chat_as_writer(&llm, &ch, "Rename the sales chart.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let step = traced_step(&body, "update_chart");
+    assert_eq!(
+        step["result"],
+        json!({ "error": "this tile does not exist" }),
+        "{body}"
+    );
+    assert_eq!(step["ok"], false, "{body}");
+    assert_nothing_of_the_stored_chart(&step["result"]);
+    assert!(!has_insert(&statements(&ch).await), "nothing was written");
+}
+
+/// The control for the two tests above: the same update of a chart on a
+/// shared board is merged with the stored chart and offered as a draft, so
+/// the refusals above come from the caller's reach and not from a draft that
+/// refuses every update. It carries no digest.
+#[tokio::test]
+async fn the_draft_of_an_update_of_a_chart_on_a_shared_board_is_still_offered() {
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse_with_stored_chart("", false).await;
+
+    let (status, body) = tool_call_as_writer(&llm, &ch, "update_chart", &rename_args()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "needs_confirmation", "{body}");
+    assert_eq!(body["result"]["needs_confirmation"], json!(true), "{body}");
+    assert!(body["result"].get("definition").is_none(), "{body}");
+    assert!(
+        !has_insert(&statements(&ch).await),
+        "a draft writes nothing"
+    );
+}
+
+/// The stored chart is read as the caller, so a chart on a shared board whose
+/// formatting no longer fits is refused with the sentence about it: the
+/// merge still happens for a chart the caller sees.
+#[tokio::test]
+async fn the_draft_of_an_update_of_a_visible_chart_is_merged_with_the_stored_chart() {
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse_with_stored_chart("", true).await;
+
+    let (status, body) = tool_call_as_writer(&llm, &ch, "update_chart", &rename_args()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "failed", "{body}");
+    assert!(
+        body["result"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains(STALE_FORMAT)),
+        "{body}"
+    );
 }

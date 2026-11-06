@@ -511,16 +511,21 @@ pub(super) async fn create_chart(
 /// so it writes nothing.
 ///
 /// `id` is `None` for a create and `Some` for an update; an update with no
-/// `id` is refused here, as the tool refuses it. A create draft that builds
-/// returns the digest of the call's own definition. An update draft returns
-/// `None`: the stored chart is read as the server here, so a digest of it
-/// would show a caller fields of a chart the caller may not see.
+/// `id` is refused here, as the tool refuses it. An update reads the stored
+/// chart as `viewer`, which must be the caller's own (`scope_for_write`, as
+/// the tool builds it), and refuses a chart the caller cannot edit with the
+/// sentence the tool gives, so the draft says nothing about a chart the
+/// caller cannot see. A create reads no stored chart and ignores `viewer`.
+/// A create draft that builds returns the digest of the call's own
+/// definition. An update draft returns `None`: the save's reply carries the
+/// digest of the merged chart.
 ///
 /// # Errors
 ///
 /// The error the tool would return when the draft cannot be built.
 pub(super) async fn check_chart_draft(
     ch: &ChClient,
+    viewer: &Viewer,
     args: &Map<String, Value>,
     id: Option<String>,
     time: &lakehouse_bi::grain::TimeContext,
@@ -528,17 +533,17 @@ pub(super) async fn check_chart_draft(
     if id.as_deref().is_some_and(str::is_empty) {
         return Err(json!({ "error": "id is required" }));
     }
-    // The stored chart is read as the server (`Viewer::system()`): this check
-    // has no principal of its own, so it only answers whether the draft
-    // builds. That is why an update draft carries no digest: the merged
-    // definition would come from a chart the caller may not see. The digest
-    // in `update_chart`'s saved reply is read as the caller, after
-    // `require_editable_chart` has refused a chart the caller may not edit.
-    let viewer = Viewer::system();
-    // The same carry-over `update_chart` does, so the card and the save
-    // agree. A chart that is not found, or one in the trash, is checked as it
-    // came.
-    let kept = Box::pin(kept_formatting(ch, &viewer, id.as_deref(), args)).await?;
+    // The gate `update_chart` runs first: a chart that is missing, in the
+    // trash, purged or on a board the caller cannot see answers one sentence,
+    // here and at the save, before any stored field is read.
+    if let Some(id) = id.as_deref() {
+        require_editable_chart(ch, id, viewer)
+            .await
+            .map_err(refused)?;
+    }
+    // The same carry-over `update_chart` does, as the same viewer, so the card
+    // and the save agree.
+    let kept = Box::pin(kept_formatting(ch, viewer, id.as_deref(), args)).await?;
     let input = parse_chart_input(&kept.args).map_err(|e| json!({ "error": e }))?;
     if let Err(sentence) = check_layers_name_a_source(&input) {
         return Err(json!({ "error": sentence }));
@@ -1915,7 +1920,14 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let args = rename_call(json!({}));
         let time = lakehouse_bi::grain::TimeContext::default();
-        let draft = check_chart_draft(&ch, &args, Some("c_1".to_owned()), &time).await;
+        let draft = check_chart_draft(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            &args,
+            Some("c_1".to_owned()),
+            &time,
+        )
+        .await;
         let saved = update_chart(
             &ch,
             &as_viewer(Some(&person(7))),
@@ -2077,6 +2089,7 @@ mod tests {
         args.remove("mart");
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &args,
             Some("c_1".to_owned()),
             &lakehouse_bi::grain::TimeContext::default(),
@@ -2363,15 +2376,16 @@ mod tests {
         assert!(!row.contains("Section A"), "{row}");
     }
 
-    /// The draft check of an update whose chart is not found reads the call
-    /// as the tool does: `null` clears a field of any type, so a `null` list
-    /// or map does not make the draft unreadable.
+    /// The draft check of an update reads the call as the tool does: `null`
+    /// clears a field of any type, so a `null` list or map does not make the
+    /// draft unreadable.
     #[tokio::test]
-    async fn the_draft_check_of_an_update_of_a_missing_chart_reads_null_as_a_cleared_field() {
-        let server = wide_mart_server().await;
+    async fn the_draft_check_of_an_update_reads_null_as_a_cleared_field() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &arguments(json!({
                 "title": "Visitors",
                 "kind": "bar",
@@ -2380,11 +2394,46 @@ mod tests {
                 "measures": ["visitors"],
                 "valueFormats": null,
             })),
-            Some("c_gone".to_owned()),
+            Some("c_1".to_owned()),
             &lakehouse_bi::grain::TimeContext::default(),
         )
         .await;
         assert!(draft.is_ok(), "{draft:?}");
+    }
+
+    /// The draft of an update of a chart that is not there, one in the trash
+    /// and one purged for good all answer the sentence `update_chart` answers,
+    /// so the card is never offered for a save that cannot happen and the
+    /// draft says nothing about a chart the caller cannot edit.
+    #[tokio::test]
+    async fn the_draft_check_of_an_update_of_a_chart_that_cannot_be_edited_answers_that_the_tile_does_not_exist()
+     {
+        let call = arguments(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"],
+        }));
+        let time = lakehouse_bi::grain::TimeContext::default();
+        // No row at all, a chart in the trash (2) and one purged for good (1).
+        for row in [None, Some(2), Some(1)] {
+            let server = wide_mart_server().await;
+            if let Some(state) = row {
+                rows_first(
+                    &server,
+                    "SELECT is_deleted, board FROM console.bi_chart",
+                    vec![json!({ "is_deleted": state, "board": "b_board" })],
+                )
+                .await;
+            }
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let viewer = as_viewer(Some(&person(7)));
+            let draft =
+                check_chart_draft(&ch, &viewer, &call, Some("c_gone".to_owned()), &time).await;
+            assert_eq!(
+                draft,
+                Err(json!({ "error": "this tile does not exist" })),
+                "chart row {row:?}"
+            );
+        }
     }
 
     /// The card and the save agree: the draft check of a rename that names
@@ -2395,6 +2444,7 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &bare_rename_call(json!({})),
             Some("c_1".to_owned()),
             &lakehouse_bi::grain::TimeContext::default(),
@@ -2677,6 +2727,7 @@ mod tests {
         let time = lakehouse_bi::grain::TimeContext::default();
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &bare_rename_call(json!({})),
             Some("c_1".to_owned()),
             &time,
@@ -2704,10 +2755,22 @@ mod tests {
         );
     }
 
-    /// The draft check reads the stored chart as the server, so it must not
-    /// hand any of that chart back for a chart on somebody else's private
-    /// board: the update tool refuses that chart, and the draft says nothing
-    /// about it.
+    /// A stored bar whose formatting names a column the chart no longer
+    /// returns, over a mart no other test uses: the draft of a rename that
+    /// merges it is refused with a sentence that names that column, which is
+    /// how a draft read as the server would show a caller a chart they may not
+    /// see.
+    fn stored_bar_with_stale_format() -> Value {
+        let mut stored = stored_bar_with_data();
+        stored["valueFormats"] = json!({ "hidden_revenue": { "style": "number" } });
+        stored["mart"] = json!("mart_hidden_source");
+        stored
+    }
+
+    /// The draft check reads the stored chart as the caller, so a chart on
+    /// somebody else's private board is refused with the sentence the update
+    /// tool answers, and the answer names nothing of the chart: not its
+    /// columns, its formatting keys or its source.
     #[tokio::test]
     async fn the_draft_of_an_update_of_a_chart_on_somebody_elses_private_board_exposes_no_stored_field()
      {
@@ -2718,11 +2781,12 @@ mod tests {
             vec![json!({ "is_deleted": 0, "owner_id": "someone-else" })],
         )
         .await;
-        let server = stored_chart_server_on(server, stored_bar_with_data()).await;
+        let server = stored_chart_server_on(server, stored_bar_with_stale_format()).await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let time = lakehouse_bi::grain::TimeContext::default();
         let draft = check_chart_draft(
             &ch,
+            &as_viewer(Some(&person(7))),
             &bare_rename_call(json!({})),
             Some("c_1".to_owned()),
             &time,
@@ -2738,7 +2802,39 @@ mod tests {
         .await;
         assert_eq!(saved["error"], json!("this tile does not exist"), "{saved}");
         assert!(saved.get("definition").is_none(), "{saved}");
-        assert_eq!(draft, Ok(None), "{draft:?}");
+        // The draft answers what the save answers, and the answer is the whole
+        // reply: it carries none of the hidden chart.
+        let text = format!("{draft:?}");
+        for hidden in ["hidden_revenue", "mart_hidden_source", "region", "province"] {
+            assert!(!text.contains(hidden), "{hidden} leaked: {text}");
+        }
+        assert_eq!(draft, Err(saved));
+    }
+
+    /// The counterpart for a chart the caller sees: the same stored chart on
+    /// a shared board is merged into the draft as before, so the caller
+    /// gets the refusal about their own chart's formatting. The draft read the
+    /// chart as the caller, not as nobody.
+    #[tokio::test]
+    async fn the_draft_of_an_update_of_a_chart_the_caller_sees_still_merges_the_stored_chart() {
+        let server =
+            stored_chart_server_on(wide_mart_server().await, stored_bar_with_stale_format()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let draft = check_chart_draft(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            &bare_rename_call(json!({})),
+            Some("c_1".to_owned()),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        let error = draft.expect_err("the stale format is refused");
+        assert!(
+            error["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("hidden_revenue")),
+            "{error}"
+        );
     }
 
     /// A create draft carries the digest of the call's own definition: there
@@ -2747,8 +2843,10 @@ mod tests {
     async fn the_draft_of_a_create_carries_the_digest_of_the_call() {
         let server = wide_mart_server().await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        // A create reads no stored chart, so it needs no one to read it as.
         let draft = check_chart_draft(
             &ch,
+            &Viewer::nothing(),
             &arguments(json!({
                 "title": "Visitors", "kind": "bar", "mart": "mart_x",
                 "dimension": "province", "breakdown": "region", "measures": ["visitors"],
