@@ -456,18 +456,23 @@ docker compose -p <project> down -v   # tear down when done
 **`LAKEKEEPER_BASE_URI` gotcha, specific to dlt/pyiceberg (not just
 ClickHouse's DNS quirk above).** pyiceberg's `RestCatalog` honors the
 canonical catalog URI Lakekeeper reports in its own `/v1/config` response
-(driven by `LAKEKEEPER__BASE_URI`) for every subsequent call. The API and
-the Lakekeeper init job default to the in-network name
-(`http://lakekeeper:8181`, `REL-19` review R1), but the `lakekeeper`
-service still advertises the host-facing `http://localhost:8181` unless
-`LAKEKEEPER_BASE_URI` is set. A catalog client running **inside** the
-compose network (the dlt pipeline, in `dagster-code-location`) that
-resolves that host-facing address times out resolving/connecting to it —
-this was reproduced directly during P3 verification. When bringing up the
-`dagster` profile, set `LAKEKEEPER_BASE_URI=http://lakekeeper:8181`
-(matching the compose-internal name), exactly as `.github/workflows/
-ci.yml`'s `g1-rustfs`/`g2-seaweedfs`/`g3a-dagster` jobs already do for
-the same underlying reason.
+(driven by `LAKEKEEPER__BASE_URI`) for every subsequent call, and so does
+the Rust client `iceberg-catalog-rest` the API itself uses. Both defaults
+are therefore the in-network name (`http://lakekeeper:8181`, `REL-19`
+review R1): the clients of this stack all run inside the compose network,
+and a client that is handed `http://localhost:8181` fails there — measured
+on a running stack with only the advertised URI changed:
+`GET /api/lakehouse/namespaces` answers 503 ("lakehouse catalog
+unavailable") and `POST /api/gold/export/{mart}` answers 500 ("The catalog
+request failed"), because the client switched to the advertised
+`localhost:8181` (`error sending request for url
+(http://localhost:8181/catalog/v1/.../namespaces)` in the API log). With the
+in-network value: 200 and 200. A client on
+the HOST (a `pyiceberg` run outside the network, the G1 test in its
+host-side form) needs the host mapping instead: set
+`LAKEKEEPER_BASE_URI=http://localhost:8181` in `.env` before
+`docker compose up`. The same reasoning is why `.github/workflows/
+ci.yml`'s jobs and `.env.staging` name the in-network value explicitly.
 
 ### Pipeline-failure alerts (plan 1e)
 
