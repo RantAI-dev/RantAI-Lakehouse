@@ -646,3 +646,35 @@ lesson is applied: an environment key makes url, model and key all `server`.
 - **Missing: the slice 2 handoff.** The developer's session ended before it was written.
   The fix round must add "Handoff (slice 2)" with the commands and counts, the migration
   numbers (`0129`, `0130`) and the mutation checks done.
+
+- **R6 (BLOCKER, planner, after R4) Compose hands the API four values, so the console can
+  never set them.** `docker-compose.yml` passes `LLM_URL: ${LLM_URL:-https://api.minimax.io/v1}`,
+  `LLM_MODEL: ${LLM_MODEL:-MiniMax-M3}`, `SMTP_PORT: ${SMTP_PORT:-587}` and
+  `SMTP_FROM: ${SMTP_FROM:-rantai-lake@localhost}`. Inside the container each is therefore
+  always set and non-empty, so `llm_url_from_env`, `llm_model_from_env`,
+  `smtp_port_from_env` and `smtp_from_from_env` are always true: on every compose install
+  the console's assistant address and model (ADM-9) and the email port and sender (ADM-7,
+  already merged in #404) are read-only. Tests pass because they build `Config` from a map,
+  not from compose. Fix, behaviour unchanged for an operator:
+  1. `config.rs`: an EMPTY value means unset for these four. `LLM_URL`/`LLM_MODEL` use
+     `truthy(..).unwrap_or_else(default)` instead of `or_default` (an empty `LLM_URL` today
+     builds a client with no address); `SMTP_PORT` empty is 587 with no warning;
+     `SMTP_FROM` empty falls through to `SMTP_USER` / the literal (today an empty one is kept
+     as an empty `From`, which no mail server accepts). Update the doc comments that
+     describe the old `??` behaviour; adjust the existing config tests that pinned
+     "empty `SMTP_FROM` is preserved" (rule 2: say why in the commit — the old behaviour
+     sent mail with an empty sender).
+  2. `docker-compose.yml`: those four become `${X:-}`, with a comment: empty means "not set
+     here", the code's own defaults apply, and the console may set them (`ADM-7`, `ADM-9`).
+     Check every other service block that passes them (grep) and the release compose
+     template if it renders them (`ops/release`).
+  3. Tests: config — empty `LLM_URL` gives the default URL and `llm_url_from_env` false; the
+     same for `LLM_MODEL`, `SMTP_PORT`, `SMTP_FROM`. One route test that builds the config
+     the way compose now does (all four present and empty) and shows the console may set
+     the assistant address and the email port. Mutation check on it.
+  4. Proof (rule 8): `docker compose --profile '*' config` shows the four empty for
+     `lakehouse-api`; a real `up` of the stack from `ops/init-env.sh` with none of the four
+     in `.env`, then `GET /api/settings/assistant` and `GET /api/settings/email` as the
+     bootstrap admin show `url`, `model`, `port` and `from` with source `default`. Tear down
+     with `down -v`.
+  Cite `ADM-9 review R6` (and `ADM-7`) at each site.
