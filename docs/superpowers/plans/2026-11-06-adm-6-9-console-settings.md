@@ -424,6 +424,162 @@ The rule was put back and all three pass again.
 - R3 was accepted by the planner and needed no code; the limit is in the
   feature page's Limits.
 
+### Handoff (slice 2) — developer, 2026-11-07
+
+Branch `feat/adm-8-9-console-settings`, base `7ac42f25` (slice 1 merged on
+`main`). Slice 2: `ADM-8` and `ADM-9`. The previous developer's session
+ended before this handoff was written; this round adds the R4 fix, the
+merge of `main`, and the handoff itself.
+
+**Commits** (one per task, in plan order, plus the fix round; every one
+pushed):
+
+| Commit | Task | What |
+| --- | --- | --- |
+| `09076fb0` | S2-T1 | the two settings tables (`0129_sign_in_settings`, `0130_assistant_settings`) and the two store modules |
+| `afd675af` | S2-T2 | the sign-in and assistant resolvers, the swappable `AppState::llm`, and every reader that now asks the resolver |
+| `48e3b8c4` | S2-T3 | `GET`/`PUT /api/settings/sign-in`, `GET`/`PUT /api/settings/assistant`, `POST …/assistant/test`, the policy rows, `route_auth.rs` |
+| `d3a1631f` | S2-T4 | the console: the Sign-in form, the Assistant tab, `setting-field.tsx` |
+| `ccafe9e9` | S2-T5 | `docs/CONFIGURATION.md`, `docs/OPERATIONS.md`, `CHANGELOG.md` |
+| `1d49afe7` | R4 | the environment's `LLM_URL` and `LLM_MODEL` win on their own (`ADM-9 review R4`) |
+| `754a4532` | — | `git merge --no-ff origin/main` (no rebase) |
+
+**Migration.** `0129_sign_in_settings.sql` and `0130_assistant_settings.sql`,
+as the slice 2 commits named them. `main` did **not** take those numbers:
+its last migration is still `0128_email_settings.sql` (slice 1's), so
+nothing was renumbered. The merged tree carries `0128`, `0129`, `0130` in
+that order.
+
+**The merge of `main`.** `git merge --no-ff origin/main` (no rebase) at
+`754a4532`, `main` at `ce1601b1`. **Nothing conflicted**: git merged every
+file, and the two sides' changes to the files both sides touched are both
+in the merged tree:
+
+- `rust/crates/lakehouse-api/src/routes/ai/semantic.rs` — this branch
+  reads the key and the model from the resolver (`ADM-9`), `main` widened
+  the timeout budget of the flaky timeout test (`REL-21`). Both hunks are
+  in the result.
+- `CHANGELOG.md` — this branch's slice 2 entry and `main`'s two
+  saved-queries security entries and its `QS-1` "Open in Query Studio"
+  entry are all kept.
+- `rust/crates/lakehouse-api/tests/sec11_guard.rs` — `main`'s change only;
+  the slice's guard needs no change there.
+
+`--ours`/`--theirs` was not used on any file.
+
+**R4 — the fix.** `Config` records whether `LLM_URL` and `LLM_MODEL` were
+set and non-empty (`llm_url_from_env`, `llm_model_from_env`), the same
+rule slice 1 uses for `SMTP_PORT` (`smtp_port_from_env`). `resolve_assistant`
+then gives each field to the environment on its own: the environment's
+value is the effective one, its source is `server`, the console's saved
+value of that field is not used, and a save that sends it is the existing
+409. The GET and the PUT both read the sources from the resolver, so both
+follow from the one rule. The key rule stays: an environment key
+(`LLM_KEY` or `MINIMAX_API_KEY`) still makes all three the server's. An
+empty `LLM_URL` is no address, and the console may set one.
+
+The test harness changed with it: it points `LLM_URL` at a dead upstream
+so that a test which reaches for the model fails fast instead of calling a
+real provider, and under R4 that also made the environment own the
+address in every test. `spin_up_without_env_llm_url` (and
+`spin_up_with_state_without_env_llm_url`) leave it out, so the tests that
+must prove the CONSOLE owns the address can still do so. The other
+`spin_up*` functions behave exactly as before.
+
+**Tests added for R4** (the three cases the finding names):
+
+- `the_environments_own_address_is_refused_and_nothing_is_written` — env
+  `LLM_URL` only: a PUT of `url` is 409, nothing is written, and the GET
+  reports the environment's address as `server` while the model stays the
+  console's.
+- `the_environments_own_model_is_refused_and_nothing_is_written` — env
+  `LLM_MODEL` only: a PUT of `model` is 409, nothing is written, and the
+  GET reports the environment's model as `server` while the address stays
+  the console's.
+- `the_console_owns_the_provider_when_the_environment_says_nothing` — env
+  none: the console's address, model and key are used.
+- `the_environments_own_address_wins_on_its_own`,
+  `the_environments_own_model_wins_on_its_own`,
+  `an_empty_environments_address_is_not_the_environments_own`
+  (`runtime_settings.rs`'s own tests) — the rule at the resolver.
+
+**Mutation checks.** Done and restored in this round:
+
+- **R4.** With the `llm_url_from_env` branch dropped from
+  `resolve_assistant`, `the_environments_own_address_is_refused_and_nothing_is_written`
+  fails (the save is accepted, 200 instead of 409, and the console's
+  address is written) and
+  `runtime_settings::tests::the_environments_own_address_wins_on_its_own`
+  fails (the console's address is used). The branch was put back and both
+  pass again.
+- **Slice 2, the internal-address check.** The commit `48e3b8c4` claims
+  this one in its message; a claim in a message is not evidence, so it was
+  run again in this round: with the internal-address check removed from
+  `check_assistant_address`, `an_address_that_is_not_https_or_is_internal_is_refused`
+  fails (the address is accepted, 200 instead of 400). The check was put
+  back and the file passes again (12 passed).
+- **Slice 2, the 409 guard.** Also claimed in `48e3b8c4` and re-run here:
+  with the 409 guard for the environment's own fields removed from
+  `put_assistant`, three tests fail —
+  `the_environments_key_owns_the_whole_provider`,
+  `the_environments_own_address_is_refused_and_nothing_is_written` and
+  `the_environments_own_model_is_refused_and_nothing_is_written` (each a
+  200 instead of a 409). The guard was put back and the file passes again.
+
+**Commands run, with their counts** (foreground, on the branch's head
+`754a4532`, `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target-adm67`,
+`CARGO_BUILD_JOBS=2`):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean (2 m 39 s).
+- `cargo test -p lakehouse-api -p lakehouse-store -p lakehouse-llm` — **5580 passed, 0 failed, 25 ignored** across 156 test binaries (the api lib alone: 3214 passed, 18 ignored).
+- `bun run typecheck` — clean.
+- `bun run lint` — **0 errors**, 10 pre-existing warnings in files this slice does not touch.
+- `bun run test` — **3537 passed, 1 skipped, 0 failed** (350 files).
+- `python3 ops/lint/check_intra_package_imports.py` — OK; `python3 ops/lint/check_bare_iceberg_count.py` — OK.
+- `docker compose --profile '*' config --quiet` — OK, with throwaway values for the four variables SEC-18 requires (`POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY`) and for `CONNECTOR_SECRETS_KEY`; no compose file was changed.
+- `git status` — clean, nothing generated staged.
+
+Scoped commands run while fixing R4, before the merge:
+
+- `cargo clippy -p lakehouse-api --all-targets --all-features -- -D warnings` — clean.
+- `cargo test -p lakehouse-api --lib runtime_settings` — **22 passed** (19 before, 3 new).
+- `cargo test -p lakehouse-api --test assistant_settings_route` — **12 passed** (9 before, 3 new).
+- `cargo test -p lakehouse-api --test settings_resolvers` — **5 passed**.
+- `cargo test -p lakehouse-api --test deployment_settings_route` — **7 passed**.
+- `cargo test -p lakehouse-api --test email_settings_route` — **13 passed**.
+- `cargo test -p lakehouse-api --test route_auth` — **82 passed**.
+- `cargo test -p lakehouse-api --test sec11_guard` — **4 passed**.
+- `bun test src/features/admin` — **86 passed, 0 failed** (14 files).
+
+**What R4 means for a deployment that keeps `.env.example` as it is.**
+`.env.example` sets `LLM_URL` and `LLM_MODEL` (uncommented), so on such a
+deployment the console's Assistant tab shows the address and the model
+read-only ("Set by the server") and only the key is the console's to set.
+That is D1 ("the server file wins", shown read-only) and the finding, read
+literally; `.env.example` was not touched, because which settings the
+deployment keeps in its files is the owner's call. The docs
+(`docs/CONFIGURATION.md`, `docs/OPERATIONS.md`, the CHANGELOG entry and
+the feature page's Limits) now say it.
+
+**Not verified:**
+
+- `cargo test --workspace` (every crate) was NOT run: the block was
+  scoped to the three crates this slice touches (`lakehouse-api`,
+  `lakehouse-store`, `lakehouse-llm`). `cargo clippy --workspace` was run
+  over the whole workspace and is clean; CI runs the whole workspace on
+  the pull request.
+- The Dagster suite (`pytest dispar_orchestrate`) and a real
+  `docker compose up` were not run: this slice changed no Python and no
+  compose file. `docker compose --profile '*' config --quiet` passes.
+- The console's own screens were not looked at in a browser. R4 changed
+  no console behaviour — the console already disables a field the server
+  owns and leaves it out of the save body, one field at a time — so the
+  only console change is a comment. What is new is that the API may
+  report the address `server` while the model is `console`.
+- R5 was accepted by the planner and needed no code; the limit is in the
+  feature page's Limits.
+
 ## 5. Review
 
 ### Review of slice 1 (planner, 2026-11-06, at `b1d022fc`)
