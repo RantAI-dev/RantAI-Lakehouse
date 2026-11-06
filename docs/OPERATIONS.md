@@ -1371,6 +1371,51 @@ certificate? — or the name does not match — is `SMTP_HOST` the name on
 the certificate? "The mail server could not be reached" still means the
 relay could not be dialled at all.
 
+## Setting the mail server from the console (`ADM-7`)
+
+The mail server, its port, the security mode, the account and its password,
+the `From` address and the console's public address can be set in the
+console (**Settings → Email**) by a holder of `settings:write`. The next
+alert, scheduled report or comment mention uses them, with no restart.
+
+**The environment still wins.** A setting that is set in `.env` is used as
+it is, and the console shows it read-only ("Set by the server"); a save
+that sends it is refused with a 409 and nothing is written. So a team that
+keeps its configuration in files keeps control: set the value in `.env` and
+the console will not move it.
+
+**To move a setting from the environment to the console:** remove it from
+`.env` and restart the API. **To move it back:** put it in `.env` (and
+restart), and clear it in the console — the console's value is ignored
+while the environment's is set, so clearing it is optional but keeps the
+two from disagreeing.
+
+**The test email** goes to the administrator's own account address and to
+nobody else: the request carries no address, so the button cannot be used
+to send mail to a third party. At most one test email per person every ten
+seconds; a second one is refused with a `Retry-After`. The answer is one of
+a fixed set of sentences ("Sent to …", "Could not reach the mail server.",
+"The mail server refused the user name or password.", "The secure
+connection to the mail server failed.", "Email is not set up: the mail
+server is missing.") — never the relay's own words.
+
+**The saved password** is sealed with the installation key
+(`CONNECTOR_SECRETS_KEY`) and never comes back: the screen says only
+whether one is set, and the audit row (`settings.email.update`) names the
+fields that changed, never a value.
+
+**Several API processes.** A setting saved in the console reaches the other
+processes within 30 seconds, not at once — each process re-reads the saved
+row at most every 30 seconds. The process that saved sees its own change
+immediately.
+
+**What the console does not cover:** the CA bundle of a private relay
+(`SMTP_CA_FILE`, read at start), the start-up secrets and the encryption
+keys, and single sign-on. **Settings → Deployment** lists which features
+are set up and what is missing for the ones that are not; it reports the
+configuration, never whether the relay really answers — the test email
+answers that.
+
 ## Features unavailable in the local stack
 
 | Feature | Needs | Symptom without it | To enable |
