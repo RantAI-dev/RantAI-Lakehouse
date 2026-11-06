@@ -120,19 +120,18 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| err.to_string())?;",
         "rewrite_sql_for_principal's ApiError: the policy's own non-leaking message, written in this repository",
     ),
-    // D3 (plan 39): `run` records every answered run. Both lines write the
-    // history row for a refused or failed run; each `err` is an `ApiError`
-    // (`rewrite_sql_for_principal_with_headers` and
-    // `execute_query_against_engine` both return `Result<_, ApiError>`), so
-    // its `to_string()` is the same fixed text the adjacent
-    // `return Err(err.into())` hands the response. The row goes to the
-    // caller's own history, not into a response, and the marker test in
-    // `tests/query_history_recording.rs` pins that the engine's raw text
-    // never reaches it.
+    // `run` records every answered run. This line writes the history row for a
+    // run the policy rewrite refused or failed: its `err` is the `ApiError`
+    // `rewrite_sql_for_principal_with_headers` returns, so `to_string()` is
+    // the same fixed text the adjacent `return Err(err.into())` hands the
+    // response. The row goes to the caller's own history, not into a
+    // response. An engine failure no longer passes here: `EngineFailure`
+    // carries the classified sentence the row keeps, never the engine's text
+    // (`tests/query_history.rs` pins that).
     (
         "query.rs",
         "&err.to_string(),",
-        "the history row keeps the classified ApiError text the response itself carries (plan 39 D3)",
+        "the history row keeps the policy rewrite's own fixed ApiError text, the same the response carries",
     ),
     (
         "query.rs",

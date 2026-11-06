@@ -19,10 +19,12 @@ once a first release is tagged.
 - An edit grantee of a saved query or folder could move it into or out of a personal space; a move across a personal space now needs manage.
 - Moving a saved query or a folder needs manage on everything moved. That is the query itself, or the folder and every sub-folder and query under it, trashed ones included. This closes a path where an editor could publish, hide or raise a query through a folder of their own (`QS-3` review of #382). A personal space can no longer be shared, and a rule already stored on one is ignored; share a query or a folder inside it instead.
 - `RUSTSEC-2026-0440` (`astral-tokio-tar`, unmaintained since 2026-11-03, no fixed release) is waived in `cargo deny`: only the `testcontainers` test dependencies reach it, and no shipped binary links it.
+- History and the history API no longer keep the engine's error text (backlog `QS-4`). A run that fails in the engine records a fixed sentence by cause and a `Reference: <id>`, with no `Code:` and no catalog name; the result tab still shows the engine's diagnosis. Migration `0127` replaces the engine text already stored for ClickHouse runs with the default sentence and keeps the reference id. Stored Trino messages are not changed, and a Trino statement error shows the default sentence because the Trino client does not keep the error name.
 
 ### Changed
 
 - A saved query's delete and restore need edit instead of manage, and the trash list shows what the caller may edit.
+- A run ended with Stop shows as Stopped in History (backlog `QS-2`, `QS-4`). The status `stopped` is a filter value in place of `cancelled`, and migration `0127` moves the rows already stored. The History page pages by number: `GET /api/query/history` takes `page` instead of `before` and answers `runs`, `total`, `page` and `pageSize`, 50 runs per page, and the pills read Completed, Failed, Stopped and Refused.
 
 ### Fixed
 

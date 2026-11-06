@@ -66,7 +66,7 @@ chart time out?"). The AI team reviews this part.
 Run by the product owner on a running console. A step not performed is never a pass.
 
 - `BI-5-AC1` Lowering the time limit to 10 s stops a slow tile at 10 s with a message naming the limit.
-- `BI-5-AC2` Stop in Query Studio on a slow query: within 5 seconds the query shows as **cancelled** in Query Studio's history.
+- `BI-5-AC2` Stop in Query Studio on a slow query: within 5 seconds the query shows as **Stopped** in Query Studio's history.
 - `BI-5-AC3` A user without `settings:write` cannot change the limits, and a failure shows a plain sentence.
 - `BI-5-AC4` *(proposed)* A role given 5 minutes runs a 2-minute chart that the install's 60 seconds stops for everyone else.
 - `AI-x-AC1` "What are my query limits?" answers the person's own limits.
