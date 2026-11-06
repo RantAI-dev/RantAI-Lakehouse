@@ -798,6 +798,19 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    It names the deployment's own settings, so it needs the same
     //    permission as the email screen (plan D4). ────────────────────────
     ("GET",    "/api/settings/deployment",    Policy::RequiresPermission("settings:write")),
+    // ── Sign-in limits (`ADM-8`, `routes::settings`): the failed-login
+    //    limit, the window, the lockout, the retention and the longest life
+    //    of a signed embed link. They are the deployment's own, so reading
+    //    them needs the same permission as changing them (plan D4). ──────────
+    ("GET",    "/api/settings/sign-in",      Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/sign-in",      Policy::RequiresPermission("settings:write")),
+    // ── The assistant's provider (`ADM-9`, `routes::settings`): the address,
+    //    the model and the key. A provider address and a key are the
+    //    deployment's own, so reading them needs `settings:write` too
+    //    (plan D4); the test request is the same permission. ────────────────
+    ("GET",    "/api/settings/assistant",    Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/assistant",    Policy::RequiresPermission("settings:write")),
+    ("POST",   "/api/settings/assistant/test", Policy::RequiresPermission("settings:write")),
     // ── Query limits (`BI-5`, `routes::query_limits`): anyone signed in reads
     //    the limits that apply to them; changing them is `settings:write`. ──
     ("GET",    "/api/settings/limits",        Policy::RequiresAuth),

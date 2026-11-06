@@ -660,6 +660,49 @@ async fn a_platform_admin_is_not_refused_the_email_settings_routes() {
     }
 }
 
+/// `ADM-8`/`ADM-9` plan D4: the sign-in limits and the assistant's provider
+/// need `settings:write`, the `GET`s included — they are the deployment's
+/// own settings, not every signed-in person's.
+#[tokio::test]
+async fn the_sign_in_and_assistant_settings_routes_are_refused_without_settings_write() {
+    let TestApp { router, pool } = spin_up().await;
+    // A seeded Analyst holds no `settings:write`.
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    for (method, path) in [
+        ("GET", "/api/settings/sign-in"),
+        ("PUT", "/api/settings/sign-in"),
+        ("GET", "/api/settings/assistant"),
+        ("PUT", "/api/settings/assistant"),
+        ("POST", "/api/settings/assistant/test"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, &analyst).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} must need settings:write, reading included"
+        );
+    }
+}
+
+/// The other half of the same decision: a holder of `settings:write` is
+/// never refused by the gate.
+#[tokio::test]
+async fn a_platform_admin_is_not_refused_the_sign_in_and_assistant_settings_routes() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    for (method, path) in [
+        ("GET", "/api/settings/sign-in"),
+        ("PUT", "/api/settings/sign-in"),
+        ("GET", "/api/settings/assistant"),
+        ("PUT", "/api/settings/assistant"),
+        ("POST", "/api/settings/assistant/test"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, &admin).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
 /// `DATA-12` D1: `PUT /api/catalog/{id}/certification` needs
 /// `governance:write`. A seeded Data Engineer holds `catalog:write` (which
 /// edits the details) but not `governance:write`, so the permission
