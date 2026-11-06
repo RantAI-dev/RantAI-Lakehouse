@@ -109,8 +109,8 @@ estimate (S, M, L), which the base has no field for.
 | `ADM-5` | Feature | Switch modules and connector types off for an installation through `.env` (`LAKEHOUSE_DISABLED_MODULES`, `LAKEHOUSE_DISABLED_CONNECTOR_TYPES`): hidden in the console, the palette, the picker and the assistant, and refused by the API. Spec, feature page and plan on branch `docs/adm-5-hide-modules`; eight decisions wait for the product owner | Administration & Security | P1 | Planned |  | Owner request 2026-11-02 |
 | `ADM-6` | Feature | An administrator sees, in Settings → Deployment, which features are set up (PDF export, email, console address, single sign-on, assistant) and which setting is missing for each one that is off | Administration & Security | P2 | In Acceptance | #404 | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
 | `ADM-7` | Feature | Email (mail server, port, security, user, password, sender, console address) set in Settings → Email and used from the next send without a restart, with a test email to the administrator's own address; a value set in `.env` wins and is shown read-only; the password is sealed and never sent back | Administration & Security | P2 | In Acceptance | #404 | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
-| `ADM-8` | Feature | Sign-in limits (failed logins, window, lockout, how long sign-in records are kept, longest embed link life) set in Settings → Sign-in, used from the next sign-in. | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
-| `ADM-9` | Feature | The assistant's provider address, model and key set in Settings → Assistant with a check button, used from the next message; the address must be `https://` and not internal. | Administration & Security | P2 | Building |  | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-8` | Feature | Sign-in limits (failed logins, window, lockout, how long sign-in records are kept, longest embed link life) set in Settings → Sign-in, used from the next sign-in. | Administration & Security | P2 | In Acceptance | #412 | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
+| `ADM-9` | Feature | The assistant's provider address, model and key set in Settings → Assistant with a check button, used from the next message; the address must be `https://` and not internal. | Administration & Security | P2 | In Acceptance | #412 | Owner request 2026-11-06; `specs/console-settings.md`; `features/console-settings.md`; `superpowers/plans/2026-11-06-adm-6-9-console-settings.md` |
 
 ## Next (P2)
 
@@ -563,8 +563,8 @@ set by the product owner and are left empty until they are.
 | `ADM-5` | 2026-11-02 |  | |
 | `ADM-6` | 2026-11-06 | 2026-11-06 | |
 | `ADM-7` | 2026-11-06 | 2026-11-06 | |
-| `ADM-8` | 2026-11-06 |  | |
-| `ADM-9` | 2026-11-06 |  | |
+| `ADM-8` | 2026-11-06 | 2026-11-07 | |
+| `ADM-9` | 2026-11-06 | 2026-11-07 | |
 | `REL-18` | 2026-11-06 | 2026-11-06 | |
 | `REL-19` | 2026-11-06 | 2026-11-06 | |
 | `REL-20` | 2026-11-06 | 2026-11-06 | |
