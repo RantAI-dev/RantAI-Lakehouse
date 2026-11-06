@@ -375,10 +375,21 @@ jobs:
 
   # ── Rust: tests (Docker/testcontainers required — Postgres) ───────────
   test:
-    name: Rust · test (stable)
+    name: Rust · test ${{ matrix.partition }}/3 (stable)
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      # REL-20 (D4): three partitions. `count:` balances by test count rather
+      # than test name, so the three runners finish at roughly the same time
+      # despite `lakehouse-api`'s unit tests outnumbering every other crate.
+      # `fail-fast: false` keeps all three partitions running to completion
+      # even when one fails, so the `ci-required` sum check always sees three
+      # counts. `needs: test` in `ci-required` fans in on all three, and
+      # `needs.test.result` is the worst of the three (D5).
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     # 60, not 40: the three last green runs of this job on `main` took 39m18s,
     # 30m07s and 36m12s (runs 40627697997, 40628462938, 40667618267), the
     # longest took 39m27s (40387475151), and the job was cancelled at the
@@ -457,11 +468,61 @@ jobs:
         with:
           bun-version: "1.3.12"
 
+      # REL-20 (D3): cargo-nextest, pinned by full commit SHA with the version
+      # in the comment (the `release.yml` convention); `@v2` resolves to
+      # v2.90.1. The tool is left unversioned so CI tracks nextest's latest
+      # release, the same way `dtolnay/rust-toolchain@stable` tracks rustc.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-nextest
+
       # ubuntu-latest ships Docker; lakehouse-test-support's integration
       # tests spin up real Postgres via testcontainers.
-      - name: cargo test --workspace --locked
-        run: cargo test --workspace --locked
+      #
+      # REL-20 (D4): one of three partitions. `--color never` keeps the
+      # summary line parseable (no ANSI); `tee` captures it for the count
+      # step below while `PIPESTATUS` preserves nextest's own exit status.
+      - name: cargo nextest run (partition ${{ matrix.partition }}/3)
+        run: |
+          cargo nextest run --workspace --locked --profile ci --color never \
+            --partition "count:${{ matrix.partition }}/3" 2>&1 | tee nextest.log
+          exit "${PIPESTATUS[0]}"
         working-directory: rust
+
+      # REL-20 (D3): nextest does not run doctests, so `cargo test --doc`
+      # still does. This workspace's doc comments use only non-Rust fences
+      # (text/bash/json/sh/ignore), so it compiles and runs zero doctests
+      # today, but the guarantee is kept. Run once, on partition 1, so the
+      # doctest compile/run is not triplicated across the three partitions.
+      - name: cargo test --workspace --locked --doc (doctests)
+        if: matrix.partition == 1
+        run: cargo test --workspace --locked --doc
+        working-directory: rust
+
+      # REL-20 (D4): record this partition's test count (from nextest's
+      # summary line) for the cross-partition sum check in `ci-required`,
+      # and print it in this partition's job summary.
+      - name: Record nextest partition count (REL-20)
+        if: always()
+        run: |
+          count=$(grep -oE '[0-9]+ tests run' nextest.log | head -1 | awk '{print $1}')
+          if [ -z "$count" ]; then count=0; fi
+          echo "partition ${{ matrix.partition }}: $count tests run"
+          echo "$count" > "$RUNNER_TEMP/partition-${{ matrix.partition }}.txt"
+          echo "## Nextest partition ${{ matrix.partition }}/3: $count tests" >> "$GITHUB_STEP_SUMMARY"
+        working-directory: rust
+
+      # REL-20 (D4): all three partitions upload to the same artifact name
+      # with a unique file per partition; `ci-required` merges them and sums.
+      - name: Upload nextest partition count (REL-20)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-counts
+          path: ${{ runner.temp }}/partition-${{ matrix.partition }}.txt
+          retention-days: 1
+          if-no-files-found: error
 
   # ── Rust: MSRV compile check ─────────────────────────────────────────
   # Adds a fast compile check of the declared minimum (REL-9: it moved to
@@ -3884,3 +3945,40 @@ jobs:
           IMAGES_RESULT: ${{ needs.images.result }}
           IMAGE_SMOKE_RESULT: ${{ needs.image-smoke.result }}
         run: ./scripts/ci/required_gate.sh
+
+      # REL-20 (D4): the three nextest partitions each upload their test
+      # count under one artifact name with a unique file per partition
+      # (`partition-{1,2,3}.txt`). Merge them and sum, failing the job if the
+      # total dropped below `main`'s single-run count (9921 passed, plan §0).
+      # A dropped partition removes roughly a third of ~9900 tests, well
+      # below the floor; the floor is the real measured number, not a guess.
+      # Same scope as the `test` job: only when it actually ran.
+      - name: Download nextest partition counts (REL-20)
+        if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: test-counts
+          merge-multiple: true
+          path: ${{ runner.temp }}/counts
+
+      - name: Check nextest partition sum (REL-20)
+        if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+        run: |
+          set -euo pipefail
+          total=0
+          for p in 1 2 3; do
+            f="$RUNNER_TEMP/counts/partition-$p.txt"
+            if [ ! -f "$f" ]; then
+              echo "::error::missing nextest count for partition $p"
+              exit 1
+            fi
+            n=$(cat "$f")
+            echo "partition $p: $n tests run"
+            total=$((total + n))
+          done
+          echo "nextest total across partitions: $total (main: 9921 passed)"
+          echo "## Nextest partition sum: $total (vs main 9921 passed)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$total" -lt 9921 ]; then
+            echo "::error::nextest total $total is below main's 9921 passed"
+            exit 1
+          fi
