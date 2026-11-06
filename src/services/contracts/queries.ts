@@ -535,10 +535,11 @@ export interface QueryService {
   /** The people and the roles the caller may share with, at most 20 of each. */
   findGrantees(query: string, signal?: AbortSignal): Promise<GranteeList>
   /**
-   * The runs of the first page of the caller's own history, newest first,
-   * 50 at most. The studio and the side panel show this page only. The
-   * filter is optional: without it the endpoint answers the newest page
-   * of the last 14 days (`QS-4`, decision 5).
+   * The runs of the page the filter names (`filter.page`, 1-based), newest
+   * first, 50 at most. Without `page` it is the first page. The studio and
+   * the side panel show this page only. `listHistoryPage` returns the same
+   * runs with the total count. The filter is optional: without it the
+   * endpoint answers the newest page of the last 14 days (`QS-4`, decision 5).
    */
   listHistory(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryItem[]>
   /**

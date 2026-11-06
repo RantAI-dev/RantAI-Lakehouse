@@ -2522,8 +2522,8 @@ pub struct HistoryPage {
     page_size: i64,
 }
 
-/// The statuses `query_history`'s own check allows — the set [`run`]
-/// records, and nothing else.
+/// The statuses [`run`] records, which the filter accepts. The table's check
+/// also allows `cancelled` for older rows, and the filter does not accept it.
 const HISTORY_STATUSES: [&str; 4] = ["completed", "failed", "stopped", "blocked"];
 
 /// The engines [`run`] records.

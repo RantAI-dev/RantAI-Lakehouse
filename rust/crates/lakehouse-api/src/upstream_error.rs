@@ -524,9 +524,9 @@ fn author_message(ctx: &Context, raw: &str) -> (String, String) {
     )
 }
 
-/// [`ch_failure_for_author`] returning the message instead of an
-/// [`ApiError`], for the cost estimate, which answers `200` with the message
-/// in `error`.
+/// The response message of [`ch_failure_for_author`], as text, for the callers
+/// that return the author's message as an `Err(String)`: the statement check
+/// behind `propose_sql` and the cost estimate's `estimate_body`.
 #[must_use]
 pub fn ch_message_for_author(ctx: &Context, err: &ChError) -> String {
     match err {
