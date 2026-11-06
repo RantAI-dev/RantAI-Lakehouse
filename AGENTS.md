@@ -212,6 +212,10 @@ for it on every step.
   just before the handoff, and once more by the reviewer before merge. CI
   runs it again on the PR. That is three full runs per PR, not one per
   commit.
+- **CI's `test` job is `cargo nextest run --workspace`, in three partitions**
+  (`REL-20`): the single `cargo test --workspace` became three parallel
+  nextest partitions plus `cargo test --doc`. Local developers may keep
+  `cargo test`; only the CI command changed.
 - **Batch Rust work.** Plans order tasks so the Rust changes sit together,
   and a migration lands in the same sitting as the code that uses it
   (`sqlx::test` embeds migrations at compile time, so each migration edit
