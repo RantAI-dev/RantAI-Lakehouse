@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::{TestApp, spin_up_with_env, spin_up_with_state};
+use common::{TestApp, spin_up_with_env, spin_up_with_state_without_env_llm_url};
 use lakehouse_store::assistant_settings::AssistantSettings;
 use lakehouse_store::sign_in_settings::SignInSettings;
 use tower::ServiceExt;
@@ -142,6 +142,10 @@ async fn the_environments_limit_wins_over_the_saved_one() {
 /// `ADM-9`: the client is rebuilt when the saved provider changes. The
 /// address here is one the deployment's own operator policy allows
 /// (`CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`), so the rebuild goes through.
+///
+/// The deployment's environment says nothing about the address, so the
+/// console owns it and the saved one is the one the client is rebuilt on
+/// (`ADM-9 review R4`).
 #[tokio::test]
 async fn the_assistant_client_is_rebuilt_when_the_saved_provider_changes() {
     let mut env = HashMap::new();
@@ -149,7 +153,7 @@ async fn the_assistant_client_is_rebuilt_when_the_saved_provider_changes() {
         "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
         "true".to_owned(),
     );
-    let (TestApp { pool, .. }, state) = spin_up_with_state(&env, |_| {}).await;
+    let (TestApp { pool, .. }, state) = spin_up_with_state_without_env_llm_url(&env, |_| {}).await;
 
     // Before the save, the client is the one this process started with: the
     // deployment's own `LLM_URL`.
@@ -189,7 +193,8 @@ async fn the_assistant_client_is_rebuilt_when_the_saved_provider_changes() {
 /// resolve inside the network now.
 #[tokio::test]
 async fn a_rebuild_refuses_a_provider_address_inside_the_network() {
-    let (TestApp { pool, .. }, state) = spin_up_with_state(&HashMap::new(), |_| {}).await;
+    let (TestApp { pool, .. }, state) =
+        spin_up_with_state_without_env_llm_url(&HashMap::new(), |_| {}).await;
     let before_url = state.llm.read().await.settings.url.clone();
 
     lakehouse_store::assistant_settings::upsert(

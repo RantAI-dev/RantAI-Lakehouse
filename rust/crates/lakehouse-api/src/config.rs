@@ -392,8 +392,19 @@ pub struct Config {
     /// LLM chat-completions base URL. Default
     /// `"https://api.minimax.io/v1"` (`llm.ts:7`, `??`).
     pub llm_url: String,
+    /// Whether `LLM_URL` was set and non-empty. `llm_url` is the
+    /// environment's value or the code default, so it alone cannot tell an
+    /// operator who set `LLM_URL` from one who never set it; the
+    /// console-settings resolver (`ADM-9`) needs exactly that to answer a
+    /// field's `source` and refuse a console write over an environment
+    /// value (`ADM-9 review R4`, the same rule as
+    /// [`Config::smtp_port_from_env`]).
+    pub llm_url_from_env: bool,
     /// LLM model name. Default `"MiniMax-M3"` (`llm.ts:8`, `??`).
     pub llm_model: String,
+    /// Whether `LLM_MODEL` was set and non-empty — the model half of
+    /// [`Config::llm_url_from_env`] (`ADM-9 review R4`).
+    pub llm_model_from_env: bool,
     /// LLM API key: `LLM_KEY`, falling back to `MINIMAX_API_KEY`, falling
     /// back to `""` (`llm.ts:10`, `||` — an explicitly *empty* `LLM_KEY`
     /// also falls through to `MINIMAX_API_KEY`, unlike every other field
@@ -1106,7 +1117,9 @@ impl std::fmt::Debug for Config {
             .field("dagster_repo", &self.dagster_repo)
             .field("dagster_location", &self.dagster_location)
             .field("llm_url", &self.llm_url)
+            .field("llm_url_from_env", &self.llm_url_from_env)
             .field("llm_model", &self.llm_model)
+            .field("llm_model_from_env", &self.llm_model_from_env)
             .field("llm_key", &REDACTED)
             .field(
                 "embed_secret",
@@ -1665,6 +1678,14 @@ impl Config {
             .or_else(|| truthy(env, "MINIMAX_API_KEY"))
             .unwrap_or_default();
 
+        // `LLM_URL` and `LLM_MODEL` set and non-empty: the environment owns
+        // that field, so the console shows it read-only and a save that
+        // sends it is refused (`ADM-9 review R4`). The same rule as
+        // `SMTP_PORT`: the value alone cannot tell an operator who set it
+        // from one who never did.
+        let llm_url_from_env = env.get("LLM_URL").is_some_and(|raw| !raw.is_empty());
+        let llm_model_from_env = env.get("LLM_MODEL").is_some_and(|raw| !raw.is_empty());
+
         // SMTP_FROM ?? SMTP_USER ?? "rantai-lake@localhost" — a `??` chain,
         // so an explicitly empty SMTP_FROM is preserved and does NOT fall
         // through to SMTP_USER.
@@ -1694,7 +1715,9 @@ impl Config {
             dagster_repo: or_default(env, "DAGSTER_REPO", "__repository__"),
             dagster_location: or_default(env, "DAGSTER_LOCATION", "dispar_orchestrate.definitions"),
             llm_url: or_default(env, "LLM_URL", DEFAULT_LLM_URL),
+            llm_url_from_env,
             llm_model: or_default(env, "LLM_MODEL", DEFAULT_LLM_MODEL),
+            llm_model_from_env,
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
             render_token_secret: truthy(env, "RENDER_TOKEN_SECRET")

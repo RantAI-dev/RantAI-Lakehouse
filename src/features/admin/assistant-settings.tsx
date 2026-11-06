@@ -18,8 +18,12 @@ import { SettingField } from "./setting-field"
  * The address, the model and the key are one unit: when the server's
  * environment holds a key, all three are the server's and are shown
  * read-only, so a key kept in files is never sent to an address chosen
- * here. The key is write-only — the server never sends it back, so the
- * field only says whether one is set.
+ * here. Without a key, the address and the model answer for themselves:
+ * an environment that sets `LLM_URL` owns the address alone, and one that
+ * sets `LLM_MODEL` owns the model alone (`ADM-9 review R4`), so each
+ * field is read-only on its own when the server owns it. The key is
+ * write-only — the server never sends it back, so the field only says
+ * whether one is set.
  */
 export function AssistantSettings() {
   const { hasPermission } = useAuth()

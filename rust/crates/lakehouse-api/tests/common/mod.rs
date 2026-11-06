@@ -14,6 +14,12 @@
 //! than hanging or reaching a real host — see the module docs on
 //! `tests/route_auth.rs` for why that is exactly the behavior the authz
 //! matrix needs (it only ever asserts "not 401/403", never a 2xx).
+//!
+//! The one exception is [`spin_up_without_env_llm_url`], which leaves the
+//! LLM's URL out of the environment: the tests that must prove the CONSOLE
+//! owns the assistant's provider address need the environment to say
+//! nothing about it, because a set `LLM_URL` makes the environment own
+//! that address (`ADM-9 review R4`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
@@ -49,6 +55,14 @@ pub struct TestApp {
 /// comment for why this, rather than a real mock server, is the right
 /// default for every upstream this crate does not itself own.
 const DEAD_UPSTREAM: &str = "http://127.0.0.1:1";
+
+/// The harness's dead upstream is in the deployment's environment: the
+/// default for every test that does not say otherwise.
+const DEAD_LLM_URL: bool = true;
+
+/// The deployment's environment says nothing about the assistant's
+/// provider address, so the console owns it (`ADM-9 review R4`).
+const NO_ENV_LLM_URL: bool = false;
 
 /// `SRC-12` decision 4: the installation key every test app is given unless
 /// a test overrides `CONNECTOR_SECRETS_KEY`: base64 of 32 bytes of `0x2a`.
@@ -94,7 +108,27 @@ pub async fn spin_up() -> TestApp {
 /// without losing the others' fail-fast behaviour, and can set config-only
 /// keys (e.g. `AGENT_RUN_TOKEN`) that [`spin_up`] never sets at all.
 pub async fn spin_up_with_env(overrides: &HashMap<String, String>) -> TestApp {
-    let (state, pool) = build_state_and_pool(overrides).await;
+    let (state, pool) = build_state_and_pool(overrides, DEAD_LLM_URL).await;
+    let router = lakehouse_api::routes::router(state);
+    TestApp { router, pool }
+}
+
+/// Same as [`spin_up_with_env`], but the harness's dead `LLM_URL` is left
+/// OUT of the deployment's environment, so the environment says nothing
+/// about the assistant's provider address and the console owns it
+/// (`ADM-9 review R4`).
+///
+/// The harness points `LLM_URL` at a dead upstream so a test that reaches
+/// for the model fails fast instead of calling a real provider. A test
+/// that must prove the CONSOLE owns the address needs the opposite: with
+/// `LLM_URL` set, the environment owns the address, the console shows it
+/// read-only, and a save that sends it is refused with a 409.
+///
+/// The address this deployment starts with is the code's own default, so a
+/// test in it must not reach for the model before it has saved a provider
+/// address of its own.
+pub async fn spin_up_without_env_llm_url(overrides: &HashMap<String, String>) -> TestApp {
+    let (state, pool) = build_state_and_pool(overrides, NO_ENV_LLM_URL).await;
     let router = lakehouse_api::routes::router(state);
     TestApp { router, pool }
 }
@@ -103,7 +137,7 @@ pub async fn spin_up_with_env(overrides: &HashMap<String, String>) -> TestApp {
 /// [`spin_up_with_env`], without a router: for a test that calls a
 /// background job (the scheduled-report runner, `RPT-1`) directly.
 pub async fn spin_up_state(overrides: &HashMap<String, String>) -> (AppState, PgPool) {
-    build_state_and_pool(overrides).await
+    build_state_and_pool(overrides, DEAD_LLM_URL).await
 }
 
 /// Same as [`spin_up_with_env`], but the [`AppState`] the router was built
@@ -115,7 +149,21 @@ pub async fn spin_up_with_state(
     overrides: &HashMap<String, String>,
     prepare: impl FnOnce(&mut AppState),
 ) -> (TestApp, AppState) {
-    let (mut state, pool) = build_state_and_pool(overrides).await;
+    let (mut state, pool) = build_state_and_pool(overrides, DEAD_LLM_URL).await;
+    prepare(&mut state);
+    let router = lakehouse_api::routes::router(state.clone());
+    (TestApp { router, pool }, state)
+}
+
+/// Same as [`spin_up_with_state`], but the harness's dead `LLM_URL` is left
+/// out of the deployment's environment, so the environment says nothing
+/// about the assistant's provider address and the console owns it
+/// (`ADM-9 review R4`) — see [`spin_up_without_env_llm_url`].
+pub async fn spin_up_with_state_without_env_llm_url(
+    overrides: &HashMap<String, String>,
+    prepare: impl FnOnce(&mut AppState),
+) -> (TestApp, AppState) {
+    let (mut state, pool) = build_state_and_pool(overrides, NO_ENV_LLM_URL).await;
     prepare(&mut state);
     let router = lakehouse_api::routes::router(state.clone());
     (TestApp { router, pool }, state)
@@ -140,7 +188,7 @@ pub async fn spin_up_with_connector_secret_resolver(
     overrides: &HashMap<String, String>,
     resolver: std::sync::Arc<dyn lakehouse_core::secret::DynSecretResolver>,
 ) -> TestApp {
-    let (mut state, pool) = build_state_and_pool(overrides).await;
+    let (mut state, pool) = build_state_and_pool(overrides, DEAD_LLM_URL).await;
     state.connector_secret_resolver = resolver;
     let router = lakehouse_api::routes::router(state);
     TestApp { router, pool }
@@ -184,7 +232,7 @@ pub async fn spin_up_with_env_counting_acquires(
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
-    let (mut state, harness_pool) = build_state_and_pool(overrides).await;
+    let (mut state, harness_pool) = build_state_and_pool(overrides, DEAD_LLM_URL).await;
     let counter = Arc::new(AtomicUsize::new(0));
     let measured = PgPoolOptions::new()
         .max_connections(1)
@@ -226,7 +274,15 @@ pub async fn spin_up_with_env_counting_acquires(
 /// migrated, isolated database and builds the [`AppState`] over it, but
 /// stops short of building the router — the one step a caller needs to
 /// intercept in order to mutate `AppState` before routes are wired to it.
-async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState, PgPool) {
+///
+/// `dead_llm_url` says whether the harness's dead `LLM_URL` is in the
+/// deployment's environment: with it there, the environment owns the
+/// assistant's provider address (`ADM-9 review R4`), and without it the
+/// console owns it.
+async fn build_state_and_pool(
+    overrides: &HashMap<String, String>,
+    dead_llm_url: bool,
+) -> (AppState, PgPool) {
     let base_url = lakehouse_test_support::database_url();
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
@@ -260,7 +316,9 @@ async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState,
     env.insert("DATABASE_URL".to_owned(), db_url);
     env.insert("CH_URL".to_owned(), DEAD_UPSTREAM.to_owned());
     env.insert("DAGSTER_URL".to_owned(), DEAD_UPSTREAM.to_owned());
-    env.insert("LLM_URL".to_owned(), DEAD_UPSTREAM.to_owned());
+    if dead_llm_url {
+        env.insert("LLM_URL".to_owned(), DEAD_UPSTREAM.to_owned());
+    }
     env.insert(
         "CONNECTOR_SECRETS_KEY".to_owned(),
         test_connector_secrets_key(),

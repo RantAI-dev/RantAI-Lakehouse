@@ -25,7 +25,10 @@
 //! * the assistant's provider — the address, the model and the key: when
 //!   the environment holds a key (`LLM_KEY` or `MINIMAX_API_KEY`), all three
 //!   are the server's, so the environment's key is never sent to an address
-//!   the console chose (`ADM-9`).
+//!   the console chose (`ADM-9`). With no key in the environment the key is
+//!   the console's, and the address and the model are per field: an
+//!   environment that sets `LLM_URL` owns the address alone, and one that
+//!   sets `LLM_MODEL` owns the model alone (`ADM-9 review R4`).
 //!
 //! # The cache
 //!
@@ -806,12 +809,16 @@ pub struct AssistantClient {
 /// environment's key is never sent to an address the console chose. The
 /// console's saved values are not used at all in that case.
 ///
-/// When the environment holds no key, the console owns the unit: the
-/// console's saved address and model are used, and where it has saved none
-/// the deployment's own `LLM_URL`/`LLM_MODEL` are the starting values (the
-/// code's defaults where the environment names none). The source of such a
-/// value is `default`, which means "the console has not set this" — the
-/// console may change it.
+/// With no key in the environment, the key is the console's, but the
+/// address and the model are per field (`ADM-9 review R4`): an environment
+/// that sets `LLM_URL` owns the address alone, and one that sets
+/// `LLM_MODEL` owns the model alone — the same rule slice 1 uses for
+/// `SMTP_PORT` (`smtp_port_from_env`). The console's saved value of that
+/// field is then not used, the GET reports it `server`, and a save that
+/// sends it is the existing 409. Where the environment names neither, the
+/// console's saved value is used, and where it has saved none the code's
+/// default is; the source of such a value is `default`, which means "the
+/// console has not set this" — the console may change it.
 #[must_use]
 pub fn resolve_assistant(
     config: &Config,
@@ -829,13 +836,24 @@ pub fn resolve_assistant(
             key_source: Source::Server,
         };
     }
-    let (url, url_source) = match stored.and_then(|s| s.llm_url.as_deref()) {
-        Some(url) => (url.to_owned(), Source::Console),
-        None => (config.llm_url.clone(), Source::Default),
+    // `ADM-9 review R4`: the environment's own address and model win on
+    // their own, each by itself. The console's saved value of that field is
+    // not used, so the operator's file stays the operator's.
+    let (url, url_source) = if config.llm_url_from_env {
+        (config.llm_url.clone(), Source::Server)
+    } else {
+        match stored.and_then(|s| s.llm_url.as_deref()) {
+            Some(url) => (url.to_owned(), Source::Console),
+            None => (config.llm_url.clone(), Source::Default),
+        }
     };
-    let (model, model_source) = match stored.and_then(|s| s.llm_model.as_deref()) {
-        Some(model) => (model.to_owned(), Source::Console),
-        None => (config.llm_model.clone(), Source::Default),
+    let (model, model_source) = if config.llm_model_from_env {
+        (config.llm_model.clone(), Source::Server)
+    } else {
+        match stored.and_then(|s| s.llm_model.as_deref()) {
+            Some(model) => (model.to_owned(), Source::Console),
+            None => (config.llm_model.clone(), Source::Default),
+        }
     };
     let (key, key_set, key_source) = match open_console_key(stored, keyring) {
         Some(key) => (SecretValue::new(key), true, Source::Console),
@@ -1514,6 +1532,59 @@ mod tests {
         assert!(eff.key_set);
         assert_eq!(eff.key.expose_secret(), "console-key");
         assert_eq!(eff.key_source, Source::Console);
+    }
+
+    /// `ADM-9 review R4`: the environment's own address wins on its own,
+    /// with no key beside it. The console's saved address is NOT used, and
+    /// the address is the server's (`server`), so the console shows it
+    /// read-only and refuses a save that sends it.
+    #[test]
+    fn the_environments_own_address_wins_on_its_own() {
+        let cfg = config(&[("LLM_URL", "https://env.example.com/v1")]);
+        let saved = stored_assistant(|s| {
+            s.llm_url = Some("https://console.example.com/v1".to_owned());
+            s.llm_model = Some("console-model".to_owned());
+        });
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.url, "https://env.example.com/v1");
+        assert_eq!(eff.url_source, Source::Server);
+        // The model is still the console's: the environment named none.
+        assert_eq!(eff.model, "console-model");
+        assert_eq!(eff.model_source, Source::Console);
+        // And the key is still the console's.
+        assert!(!eff.key_set);
+        assert_eq!(eff.key_source, Source::Default);
+    }
+
+    /// The model half of the same rule (`ADM-9 review R4`).
+    #[test]
+    fn the_environments_own_model_wins_on_its_own() {
+        let cfg = config(&[("LLM_MODEL", "env-model")]);
+        let saved = stored_assistant(|s| {
+            s.llm_url = Some("https://console.example.com/v1".to_owned());
+            s.llm_model = Some("console-model".to_owned());
+        });
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.model, "env-model");
+        assert_eq!(eff.model_source, Source::Server);
+        // The address is still the console's.
+        assert_eq!(eff.url, "https://console.example.com/v1");
+        assert_eq!(eff.url_source, Source::Console);
+    }
+
+    /// An empty `LLM_URL` is no address: the console may set one, and the
+    /// code's default is used until it does.
+    #[test]
+    fn an_empty_environments_address_is_not_the_environments_own() {
+        let cfg = config(&[("LLM_URL", "")]);
+        let saved =
+            stored_assistant(|s| s.llm_url = Some("https://console.example.com/v1".to_owned()));
+        let eff = resolve_assistant(&cfg, Some(&saved), Some(&keyring()));
+
+        assert_eq!(eff.url, "https://console.example.com/v1");
+        assert_eq!(eff.url_source, Source::Console);
     }
 
     /// Neither the environment's key nor the console's: the code's default

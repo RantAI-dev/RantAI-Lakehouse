@@ -11,6 +11,10 @@
 //!   of the three fields is refused with a 409 and nothing is written, and
 //!   the environment's key is never sent to an address the console chose
 //!   (the `ADM-7 review R1` lesson, applied to the assistant);
+//! * without a key, the environment's own address and model win on their
+//!   own, each by itself (`ADM-9 review R4`): the field is the server's,
+//!   the console's saved value of it is not used, and a save that sends it
+//!   is refused with a 409;
 //! * the address must be `https://` and must not point inside the
 //!   deployment's network (plan D13);
 //! * every save writes one audit row, naming the fields that changed and
@@ -28,7 +32,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{
     TestApp, create_principal_with_permissions, create_zero_permission_principal,
-    session_cookie_for_user, spin_up_with_env,
+    session_cookie_for_user, spin_up_with_env, spin_up_without_env_llm_url,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -90,9 +94,13 @@ async fn call(
 
 /// A deployment with nothing saved answers with the deployment's own
 /// address and model, and says that no key is set.
+///
+/// The deployment's environment says nothing about the address and the
+/// model (`ADM-9 review R4`), so both are the code's defaults and the
+/// console's to change.
 #[tokio::test]
 async fn a_fresh_deployment_answers_every_field_with_its_source() {
-    let TestApp { router, pool } = spin_up_with_env(&HashMap::new()).await;
+    let TestApp { router, pool } = spin_up_without_env_llm_url(&HashMap::new()).await;
     let admin = create_principal_with_permissions(&pool, "settings:write").await;
     let cookie = session_cookie_for_user(&pool, admin).await;
     let (status, body) = call(&router, "GET", ASSISTANT, &cookie, "").await;
@@ -133,7 +141,7 @@ async fn a_caller_without_settings_write_is_refused_on_all_three_routes() {
 /// the row holds it sealed.
 #[tokio::test]
 async fn the_key_never_comes_back_in_an_answer() {
-    let TestApp { router, pool } = spin_up_with_env(&env_with_internal_hosts()).await;
+    let TestApp { router, pool } = spin_up_without_env_llm_url(&env_with_internal_hosts()).await;
     let admin = create_principal_with_permissions(&pool, "settings:write").await;
     let cookie = session_cookie_for_user(&pool, admin).await;
     let (status, body) = call(
@@ -240,11 +248,163 @@ async fn the_environments_key_owns_the_whole_provider() {
     assert!(!read.to_string().contains("an-environment-key"), "{read}");
 }
 
+/// `ADM-9 review R4`: the environment's own address wins on its own, with
+/// no key beside it. The address is the server's, so a save that sends it
+/// is refused with a 409 and writes nothing, and the answer names the
+/// environment's address — not the console's.
+///
+/// The model is not in this case, so it stays the console's: each field of
+/// the provider answers for itself, and only the key makes all three one
+/// unit.
+#[tokio::test]
+async fn the_environments_own_address_is_refused_and_nothing_is_written() {
+    let mut env = env_with_internal_hosts();
+    env.insert(
+        "LLM_URL".to_owned(),
+        "https://env.example.com/v1".to_owned(),
+    );
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    // A console's own row, saved before the operator put the address in
+    // the environment.
+    lakehouse_store::assistant_settings::upsert(
+        &pool,
+        &lakehouse_store::assistant_settings::AssistantSettings {
+            llm_url: Some(CONSOLE_PROVIDER.to_owned()),
+            llm_model: Some("console-model".to_owned()),
+            llm_key: None,
+        },
+        &admin.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // A save that sends the address is refused, and nothing is written.
+    let (status, got) = call(
+        &router,
+        "PUT",
+        ASSISTANT,
+        &cookie,
+        r#"{"url":"https://localhost:8443/v1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{got}");
+    assert_eq!(got["error"].as_str(), Some(SET_BY_THE_SERVER), "{got}");
+
+    let row = lakehouse_store::assistant_settings::get(&pool)
+        .await
+        .unwrap()
+        .expect("the console's own row");
+    assert_eq!(row.llm_url.as_deref(), Some(CONSOLE_PROVIDER));
+    assert_eq!(row.llm_model.as_deref(), Some("console-model"));
+
+    // The answer names the environment's address, as the server's.
+    let (status, read) = call(&router, "GET", ASSISTANT, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        read["url"],
+        json!({"value": "https://env.example.com/v1", "source": "server"})
+    );
+    // The model is the console's own: the environment named none.
+    assert_eq!(
+        read["model"],
+        json!({"value": "console-model", "source": "console"})
+    );
+}
+
+/// The model half of the same rule (`ADM-9 review R4`).
+#[tokio::test]
+async fn the_environments_own_model_is_refused_and_nothing_is_written() {
+    let mut env = env_with_internal_hosts();
+    env.insert("LLM_MODEL".to_owned(), "env-model".to_owned());
+    // The environment says nothing about the address, so that one is the
+    // console's; only the model is the server's here.
+    let TestApp { router, pool } = spin_up_without_env_llm_url(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    lakehouse_store::assistant_settings::upsert(
+        &pool,
+        &lakehouse_store::assistant_settings::AssistantSettings {
+            llm_url: Some(CONSOLE_PROVIDER.to_owned()),
+            llm_model: Some("console-model".to_owned()),
+            llm_key: None,
+        },
+        &admin.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // A save that sends the model is refused, and nothing is written.
+    let (status, got) = call(
+        &router,
+        "PUT",
+        ASSISTANT,
+        &cookie,
+        r#"{"model":"another-console-model"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{got}");
+    assert_eq!(got["error"].as_str(), Some(SET_BY_THE_SERVER), "{got}");
+
+    let row = lakehouse_store::assistant_settings::get(&pool)
+        .await
+        .unwrap()
+        .expect("the console's own row");
+    assert_eq!(row.llm_url.as_deref(), Some(CONSOLE_PROVIDER));
+    assert_eq!(row.llm_model.as_deref(), Some("console-model"));
+
+    // The answer names the environment's model, as the server's, and the
+    // console's address stays the console's.
+    let (status, read) = call(&router, "GET", ASSISTANT, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        read["model"],
+        json!({"value": "env-model", "source": "server"})
+    );
+    assert_eq!(
+        read["url"],
+        json!({"value": CONSOLE_PROVIDER, "source": "console"})
+    );
+}
+
+/// With no key, no address and no model in the environment, the console owns
+/// all three: its saved values are used, and it may change them.
+#[tokio::test]
+async fn the_console_owns_the_provider_when_the_environment_says_nothing() {
+    let TestApp { router, pool } = spin_up_without_env_llm_url(&env_with_internal_hosts()).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let (status, body) = call(
+        &router,
+        "PUT",
+        ASSISTANT,
+        &cookie,
+        r#"{"url":"https://localhost:8443/v1","model":"console-model","key":"not-a-real-secret"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, read) = call(&router, "GET", ASSISTANT, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        read["url"],
+        json!({"value": CONSOLE_PROVIDER, "source": "console"})
+    );
+    assert_eq!(
+        read["model"],
+        json!({"value": "console-model", "source": "console"})
+    );
+    assert_eq!(read["key"], json!({"set": true, "source": "console"}));
+}
+
 /// Plan D13: the address must be `https://`, and it must not point inside
 /// the deployment's network.
 #[tokio::test]
 async fn an_address_that_is_not_https_or_is_internal_is_refused() {
-    let TestApp { router, pool } = spin_up_with_env(&HashMap::new()).await;
+    let TestApp { router, pool } = spin_up_without_env_llm_url(&HashMap::new()).await;
     let admin = create_principal_with_permissions(&pool, "settings:write").await;
     let cookie = session_cookie_for_user(&pool, admin).await;
     for (body, sentence) in [
@@ -274,7 +434,7 @@ async fn an_address_that_is_not_https_or_is_internal_is_refused() {
 /// the key.
 #[tokio::test]
 async fn a_save_writes_one_audit_row_naming_the_fields_and_never_the_key() {
-    let TestApp { router, pool } = spin_up_with_env(&env_with_internal_hosts()).await;
+    let TestApp { router, pool } = spin_up_without_env_llm_url(&env_with_internal_hosts()).await;
     let admin = create_principal_with_permissions(&pool, "settings:write").await;
     let cookie = session_cookie_for_user(&pool, admin).await;
     let (status, body) = call(
@@ -332,7 +492,7 @@ async fn the_test_answers_one_of_the_fixed_sentences() {
 /// while a key is set, because the key would go to the default provider.
 #[tokio::test]
 async fn a_field_that_is_not_sent_keeps_its_value_and_null_clears_it() {
-    let TestApp { router, pool } = spin_up_with_env(&env_with_internal_hosts()).await;
+    let TestApp { router, pool } = spin_up_without_env_llm_url(&env_with_internal_hosts()).await;
     let admin = create_principal_with_permissions(&pool, "settings:write").await;
     let cookie = session_cookie_for_user(&pool, admin).await;
     let (status, body) = call(

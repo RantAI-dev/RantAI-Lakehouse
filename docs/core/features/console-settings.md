@@ -81,6 +81,9 @@ features are off or why.
   connection (server, port, security, user, password) comes from `.env` and
   is read-only here, so a password kept in files is never sent to a server
   chosen in the console.
+- When the server's `.env` sets the assistant's address or its model, that
+  field comes from `.env` and is read-only here; a key in `.env` makes the
+  whole provider (address, model, key) read-only.
 
 ## Acceptance checklist (owner)
 

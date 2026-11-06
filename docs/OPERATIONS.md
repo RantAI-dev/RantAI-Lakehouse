@@ -1462,6 +1462,12 @@ any of them is refused with a 409 and writes nothing. So a key kept in
 files is never sent to an address chosen in the console. To move the
 provider to the console, remove the key from `.env` and restart the API.
 
+**Without a key, `LLM_URL` and `LLM_MODEL` answer for themselves.** A value
+set in `.env` is used as it is and shown read-only, and a save that sends
+that field is refused with a 409 — the console's saved value of it is
+ignored while the environment's is set. To move the address or the model to
+the console, remove that variable from `.env` and restart the API.
+
 **The address the console sends** must be an `https://` address, and it must
 not point inside the deployment's network: the same check the connector
 dials use (`CONNECTOR_PROBE_ALLOWED_CIDRS`,

@@ -22,8 +22,8 @@ guessed.
 | `DAGSTER_URL` | Dagster GraphQL endpoint | `http://localhost:13030/graphql` | No |
 | `DAGSTER_REPO` | Dagster repository name | `__repository__` | No |
 | `DAGSTER_LOCATION` | Dagster repository location | `dispar_orchestrate.definitions` | No |
-| `LLM_URL` | LLM chat-completions base URL (OpenAI-compatible). Settable in the console (Settings → Assistant) only when the environment holds no key — see "Settings the console owns" below | `https://api.minimax.io/v1` | No |
-| `LLM_MODEL` | LLM model name. Settable in the console (Settings → Assistant) only when the environment holds no key | `MiniMax-M3` | No |
+| `LLM_URL` | LLM chat-completions base URL (OpenAI-compatible). Settable in the console (Settings → Assistant) only when the environment sets neither this variable nor a key — see "Settings the console owns" below | `https://api.minimax.io/v1` | No |
+| `LLM_MODEL` | LLM model name. Settable in the console (Settings → Assistant) only when the environment sets neither this variable nor a key | `MiniMax-M3` | No |
 | `LLM_KEY` | LLM API key. Falls back to `MINIMAX_API_KEY` if unset **or empty** (`||` semantics, not `??`). Settable in the console (Settings → Assistant) only when the environment holds none; the console's own copy is sealed with `CONNECTOR_SECRETS_KEY` | `""` | No (but AI features won't work without it) |
 | `MINIMAX_API_KEY` | Fallback for `LLM_KEY` | — | No |
 | `AI_DEFAULT_REPLY_LANGUAGE` | Language the copilot answers in when a chat message is too short to detect its language: `id` (Indonesian) or `en` (English); any other non-empty value fails startup | — | No |
@@ -284,10 +284,14 @@ environment holds a key — `LLM_KEY` or `MINIMAX_API_KEY`, whatever
 `LLM_URL` and `LLM_MODEL` say — all three are the environment's, the
 console shows them read-only, and a save that sends any of them is refused
 with a 409 and writes nothing. So a key kept in files is never sent to an
-address chosen in the console. When the environment holds no key, the
-console owns the three of them: its saved values are used, and the
-environment's `LLM_URL` and `LLM_MODEL` are the starting values it may
-override.
+address chosen in the console.
+
+**Without a key, the address and the model answer for themselves.** The
+environment owns `LLM_URL` and `LLM_MODEL` one at a time: a value set in
+`.env` is used as it is, shown read-only, and a save that sends that field
+is refused with a 409 — the console's saved value of it is ignored while
+the environment's is set. Where the environment names neither, the console
+owns the field and its saved value is used.
 
 **The address the console sends** must be an `https://` address, and its
 host must pass the same internal-address check the connector dials use
