@@ -1791,15 +1791,22 @@ pub async fn run(
 /// `QS-4` (the history page, decision 3): the one place records a run
 /// that did not complete.
 ///
-/// The read-only guard, the Trino keyword check, the policy rewrite, the
-/// tenant gate and the settings guard record `blocked`; the engine's own
-/// error records `failed`. `message` is the exact text the response
-/// carries — an `ApiError`'s response body is `{"error": err.to_string()}`
-/// (`error.rs`), so the row and the caller's screen can never disagree,
-/// and the engine's own text reaches the row only the way it reached the
-/// response: already fixed and classified. Best-effort, the same posture
-/// as the completed write: a failed write is logged and never turns into
-/// an error response.
+/// The row's `message` is not always the text the response carries.
+///
+/// A refusal before the engine (a guard, the policy rewrite, the settings
+/// guard; see `record_blocked`) stores the response's own text,
+/// `err.to_string()`. A rewrite refusal with a 4xx status is `blocked`; a
+/// rewrite failure with a 5xx status is `failed`.
+///
+/// A statement the engine refused is `failed`. The response shows the author
+/// the engine's diagnosis, but the row keeps the classified sentence with the
+/// same reference id (`EngineFailure::statement` stores `failure.recorded`).
+/// A fixed failure (the time limit, an outage, a row cap) is `failed` and
+/// stores `response.to_string()`, the same text the response carries. A Stop
+/// is `stopped` and stores the stopped sentence.
+///
+/// Best-effort, the same posture as the completed write: a failed write is
+/// logged and never turns into an error response.
 ///
 /// A refusal carries no measured numbers — nothing executed — so its
 /// duration is 0 and nothing was scanned or spent. An engine failure

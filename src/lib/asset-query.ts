@@ -61,45 +61,65 @@ export function assetStandInTable(a: Pick<AssetDetail, "queryTarget" | "tableKey
   return read && a.tableKey && read !== a.tableKey ? read : null
 }
 
+/**
+ * Where Query Studio opens this asset, and what to call it there.
+ *
+ * A Bronze table that Trino reads opens on a Trino tab with
+ * `iceberg.bronze.<table>`, the name the schema browser offers on that tab.
+ * The API's `queryTarget` names the table for the console's own reads (for
+ * a Bronze table, the ClickHouse `DataLakeCatalog` name), so it does not
+ * decide this. A Silver stand-in keeps the API's ClickHouse name: Trino
+ * has no table of its own for it. Anything else follows `assetQueryTarget`.
+ */
+export function assetStudioTarget(a: Target & Pick<AssetDetail, "tableKey">): {
+  engine: QueryEngine
+  table: string
+} {
+  if (isIcebergCandidate(a) && a.tableName && assetStandInTable(a) === null) {
+    return { engine: "trino", table: trinoBronzeName(a.tableName) }
+  }
+  return assetQueryTarget(a)
+}
+
 /** A starter `SELECT` for this asset, with explicit columns when there are few. */
-export function assetStarterSql(a: Target & Pick<AssetDetail, "schema">) {
+export function assetStarterSql(a: Target & Pick<AssetDetail, "schema" | "tableKey">) {
   const cols =
     a.schema.length > 0 && a.schema.length <= SNIPPET_MAX_COLUMNS
       ? a.schema.map((c) => `  ${quoteIdent(c.name)}`).join(",\n")
       : "  *"
-  return `SELECT\n${cols}\nFROM ${assetQueryTarget(a).table}\nLIMIT 100`
+  return `SELECT\n${cols}\nFROM ${assetStudioTarget(a).table}\nLIMIT 100`
 }
 
 /** Query Studio, opened on this asset's starter query and the engine it needs. */
-export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema">) {
+export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema" | "tableKey">) {
   const params = new URLSearchParams({
     sql: assetStarterSql(a),
-    engine: assetQueryTarget(a).engine,
+    engine: assetStudioTarget(a).engine,
   })
   return `/query-studio?${params.toString()}`
 }
 
 /**
- * Query Studio, opened on the starter query pinned to one Iceberg snapshot
- * — the table as it was after that load. `null` when the asset is not
- * read from its Iceberg table (a `silver.*` read has no snapshots to go
- * back to), or when the id is not the plain number Iceberg issues.
+ * Query Studio, opened on a Trino tab with the starter query pinned to one
+ * Iceberg snapshot, the table as it was after that load. `null` when the
+ * asset is not an Iceberg candidate, when its rows do not open on Trino (a
+ * Silver stand-in has no snapshots to go back to), or when the id is not
+ * the plain number Iceberg issues.
  *
- * This link is the ClickHouse one (`pinSnapshot`, the one function that
- * writes the pin): it names the `DataLakeCatalog` table the ClickHouse
- * engine reads. A Trino asset's version is opened in Query Studio's own
- * picker instead — the pin belongs to the table it is written on, and
- * that is the Trino table, not this one (`DATA-21` D5).
+ * `pinSnapshot` writes the pin, so the two callers of it cannot drift. The
+ * pin is on the table's own reference, the one `FOR VERSION AS OF` belongs
+ * to (`DATA-21` D5). Past this link the API reads that clause on Trino
+ * (`DATA-21`), which is why it is no longer withheld as it was while
+ * `DATA-16` F6 refused it.
  */
 export function assetSnapshotQueryHref(
-  a: Target & Pick<AssetDetail, "schema">,
+  a: Target & Pick<AssetDetail, "schema" | "tableKey">,
   snapshotId: string
 ): string | null {
   if (!isIcebergCandidate(a)) return null
-  const target = assetQueryTarget(a)
-  // The `DataLakeCatalog` name, e.g. icecat_api.`bronze.orders`.
-  if (!target.table.includes("`bronze.")) return null
-  const sql = pinSnapshot(assetStarterSql(a), target.engine, snapshotId)
+  const target = assetStudioTarget(a)
+  if (target.engine !== "trino") return null
+  const sql = pinSnapshot(assetStarterSql(a), "trino", snapshotId, target.table)
   if (sql === null) return null
   const params = new URLSearchParams({ sql, engine: target.engine })
   return `/query-studio?${params.toString()}`

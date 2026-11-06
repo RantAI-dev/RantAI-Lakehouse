@@ -15,7 +15,7 @@ import {
 } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { formatRelativeTime } from "@/lib/format"
-import { assetQueryStudioHref, assetQueryTarget, assetStarterSql } from "@/lib/asset-query"
+import { assetQueryStudioHref, assetStarterSql, assetStudioTarget } from "@/lib/asset-query"
 import { isIcebergCandidate, snapshotRelativeTime } from "@/lib/lakehouse-view"
 import { notifyError, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
@@ -264,7 +264,7 @@ export function AssetOverview({
         size="sm"
         title="Use this data"
         description={`A starter query for ${
-          assetQueryTarget(a).engine === "trino" ? "Trino" : "ClickHouse"
+          assetStudioTarget(a).engine === "trino" ? "Trino" : "ClickHouse"
         }. Masking still applies when it runs.`}
         action={
           <div className="flex gap-1.5">
