@@ -460,3 +460,33 @@ fixed sentences match D1–D10.
   says whether something answered. That is needed (on-premises mail relays are usually
   internal), the route needs `settings:write`, and it is limited to one try per 10 s per
   person. Written into the feature page's Limits; no code change.
+
+### Review of slice 2 (planner, 2026-11-06, at `ccafe9e9`)
+
+Checked: `resolve_sign_in` and its readers (`AppState::throttle_policy` → `routes/auth.rs`,
+the cleanup sweep in `lib.rs`, both embed checks in `routes/embed.rs`); `resolve_assistant`,
+`assistant()` (rebuild only on change, the address check before a console address is used)
+and every caller (`routes/ai/mod.rs`, `agents.rs`, `pipelines.rs`, `semantic.rs`,
+`settings.rs`); `check_assistant_address` (https, host, `resolve_checked`); `put_assistant`
+(409 loop, the key sealed, the URL-cleared-while-a-key-is-set refusal). The slice-1 R1
+lesson is applied: an environment key makes url, model and key all `server`.
+
+- **R4 (BLOCKER) The environment's `LLM_URL` and `LLM_MODEL` do not win when it sets no
+  key.** `resolve_assistant` only checks `llm_key`; with `LLM_URL` or `LLM_MODEL` set and no
+  key, the console's value replaces the operator's and the GET calls the environment's value
+  `default`. That breaks D1 ("the server file wins", shown read-only) and the feature page.
+  Fix like slice 1's `smtp_port_from_env`: `Config` records whether `LLM_URL` / `LLM_MODEL`
+  were set and non-empty; each is then `server` on its own (409 on PUT, read-only), and the
+  existing key rule stays (an environment key makes all three `server`). Tests: env
+  `LLM_URL` only → PUT `url` 409, nothing written, GET source `server`; same for
+  `LLM_MODEL`; env none → console values used. Mutation check on the first. Cite
+  `ADM-9 review R4`.
+- **R5 (accepted, documented) The address check is not pinned to the dial.** The console's
+  address is resolved and checked when it is saved and when the client is rebuilt, but the
+  client then resolves the name again when it dials, so a name whose DNS answer changes
+  afterwards (rebinding) is not caught. The route needs `settings:write`, and the assistant
+  client has no pinned-address mode today. Written into the feature page's Limits; a pinned
+  dialer would be its own task.
+- **Missing: the slice 2 handoff.** The developer's session ended before it was written.
+  The fix round must add "Handoff (slice 2)" with the commands and counts, the migration
+  numbers (`0129`, `0130`) and the mutation checks done.
