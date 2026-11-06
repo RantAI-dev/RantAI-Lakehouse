@@ -26,6 +26,7 @@ import { askFromStep } from "./ask-options";
 import { BuildTree } from "./build-tree";
 import { MiniMarkdown } from "./mini-markdown";
 import { PendingActionCard } from "./pending-action-card";
+import { SavedStatusLines } from "./saved-status";
 import { SuggestionButton } from "./suggestion-button";
 import { FinishedToolRow, RunningToolRow, ToolStepCard, asObj, toolLabel } from "./tool-step";
 import { useSmoothText } from "./smooth-text";
@@ -383,6 +384,7 @@ export function ChatMessages({
                         />
                       </div>
                     ) : null}
+                    {m.tools?.length ? <SavedStatusLines tools={m.tools} /> : null}
                     {m.chartCreated ? (
                       <Link
                         href="/dashboards"

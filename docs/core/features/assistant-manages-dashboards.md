@@ -157,6 +157,9 @@ draft those objects again, then "Continue:" with the steps that are left;
 it names what was saved, it does not re-send the tool results. A
 cancelled or failed draft sends nothing, so a refused step stops the
 request there. At most three such continuations follow one typed message.
+Once the person confirms a draft, the chat also shows a `Saved: <title>` line
+under the reply, or `Not saved: <error>` when the save fails. A cancelled
+draft shows no such line, and the assistant's own text is not changed.
 A chart draft carries a short `definition` line with the chart's fields (a
 chart update carries it in the saved result), and the prompt tells the
 assistant to describe only what that line lists.
