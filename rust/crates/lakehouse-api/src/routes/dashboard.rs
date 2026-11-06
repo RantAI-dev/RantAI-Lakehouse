@@ -5080,7 +5080,11 @@ async fn embed_info_body(
         return Ok(None);
     };
     let enabled = board.embed_enabled.unwrap_or(false);
-    let max_lifetime = state.config.embed_token_max_lifetime_seconds;
+    // `ADM-8`: the longest life a token may have comes from the resolver,
+    // so a console's saved limit is what the Share dialog shows.
+    let max_lifetime = crate::runtime_settings::sign_in(state)
+        .await
+        .embed_max_lifetime_secs;
     // SEC-12: what the Share dialog shows beside the sample token. `null`
     // when nothing has been withdrawn, so the dialog does not print "1970".
     let revoked_before = if board.embed_access.revoked_before == 0 {

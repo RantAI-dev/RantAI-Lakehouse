@@ -1048,15 +1048,19 @@ fn spawn_auth_cleanup(state: &AppState) {
         tracing::warn!("no Postgres pool configured; auth-cleanup background task will not run");
         return;
     };
-    let retention = time::Duration::days(i64::from(state.config.auth_retention_days));
-    let throttle_window =
-        time::Duration::seconds(i64::from(state.config.login_failure_window_secs));
+    // `ADM-8`: how long the records are kept and how wide the throttle
+    // window is may come from the console's saved settings, so they are
+    // resolved on every sweep rather than read once at start-up.
+    let state = state.clone();
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let run = || async {
+            let sign_in = crate::runtime_settings::sign_in(&state).await;
+            let retention = time::Duration::days(i64::from(sign_in.retention_days));
+            let throttle_window = time::Duration::seconds(i64::from(sign_in.failure_window_secs));
             match lakehouse_auth::cleanup::purge(&pool, retention, throttle_window).await {
                 Ok(counts) => {
                     tracing::info!(

@@ -72,7 +72,7 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::runtime_settings::{EffectiveEmail, Source};
+use crate::runtime_settings::{EffectiveAssistant, EffectiveEmail, Source};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -1018,7 +1018,11 @@ fn feature(name: &str, on: bool, missing: &[&str], source: &str) -> Value {
 /// variable for a setting only the server owns, the console's own field
 /// name for a setting the console can set. `where` says which of the two
 /// it is — a feature the server owns is read-only in the console.
-fn deployment_features(state: &AppState, email: &EffectiveEmail) -> Vec<Value> {
+fn deployment_features(
+    state: &AppState,
+    email: &EffectiveEmail,
+    assistant: &EffectiveAssistant,
+) -> Vec<Value> {
     let config = &state.config;
     // PDF export needs all three of these (feature decision 6).
     let mut pdf_missing: Vec<&str> = Vec::new();
@@ -1043,13 +1047,16 @@ fn deployment_features(state: &AppState, email: &EffectiveEmail) -> Vec<Value> {
     } else {
         vec!["OIDC_ISSUER", "OIDC_CLIENT_ID"]
     };
-    // The assistant is on when it has a key (`ADM-9` reads the saved one
-    // in slice 2; today the environment owns it).
-    let assistant = !config.llm_key.is_empty();
-    let assistant_missing: Vec<&str> = if assistant {
+    // The assistant is on when it has a key — the environment's or the
+    // console's (`ADM-9` reads the saved one; the environment owns the key
+    // whenever it holds one).
+    let assistant_on = assistant.key_set;
+    let assistant_missing: Vec<&str> = if assistant_on {
         Vec::new()
-    } else {
+    } else if assistant.key_source == Source::Server {
         vec!["LLM_KEY"]
+    } else {
+        vec!["key"]
     };
     vec![
         feature("pdfExport", pdf_missing.is_empty(), &pdf_missing, "server"),
@@ -1087,7 +1094,16 @@ fn deployment_features(state: &AppState, email: &EffectiveEmail) -> Vec<Value> {
             },
         ),
         feature("singleSignOn", single_sign_on, &sso_missing, "server"),
-        feature("assistant", assistant, &assistant_missing, "server"),
+        feature(
+            "assistant",
+            assistant_on,
+            &assistant_missing,
+            if assistant.key_source == Source::Server {
+                "server"
+            } else {
+                "console"
+            },
+        ),
     ]
 }
 
@@ -1107,8 +1123,11 @@ pub async fn get_deployment(State(state): State<AppState>) -> ApiResult<ApiJson<
     let email = crate::runtime_settings::email_or_fail(&state)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let assistant = crate::runtime_settings::assistant_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     Ok(ApiJson(json!({
-        "features": deployment_features(&state, &email),
+        "features": deployment_features(&state, &email, &assistant),
     })))
 }
 

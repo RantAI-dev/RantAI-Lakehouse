@@ -227,7 +227,10 @@ pub(crate) async fn subject_of(
 /// unset one means signed embedding is unavailable, said plainly (nothing is
 /// generated or stored); every other failure is the one fixed message, the
 /// reason going to the log only. Shared by `data` and `values`.
-fn verified_claims(
+///
+/// `ADM-8`: the longest life a token may have comes from the resolver, so a
+/// console's saved limit reaches the next signed embed without a restart.
+async fn verified_claims(
     state: &AppState,
     jwt: &str,
 ) -> Result<lakehouse_embed::EmbedClaims, Box<Response>> {
@@ -240,10 +243,11 @@ fn verified_claims(
                 .into_response(),
         ));
     };
+    let sign_in = crate::runtime_settings::sign_in(state).await;
     lakehouse_embed::verify_embed(
         jwt,
         secret,
-        state.config.embed_token_max_lifetime_seconds,
+        sign_in.embed_max_lifetime_secs,
         lakehouse_embed::unix_now(),
     )
     .map_err(|reason| {
@@ -363,7 +367,7 @@ async fn embed_grant(state: &AppState, jwt: Option<&str>) -> Result<Subject, Box
                 .into_response(),
         ));
     };
-    let claims = verified_claims(state, jwt)?;
+    let claims = verified_claims(state, jwt).await?;
     let (_board, subject) = admit(state, &claims).await?;
     Ok(subject)
 }
@@ -384,7 +388,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
             .into_response();
     };
 
-    let claims = match verified_claims(&state, &jwt) {
+    let claims = match verified_claims(&state, &jwt).await {
         Ok(claims) => claims,
         Err(refusal) => return *refusal,
     };
@@ -520,7 +524,7 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response();
     };
-    let claims = match verified_claims(&state, &jwt) {
+    let claims = match verified_claims(&state, &jwt).await {
         Ok(claims) => claims,
         Err(refusal) => return *refusal,
     };
@@ -760,7 +764,7 @@ async fn board_for_frame(state: &AppState, body: FrameBody) -> Result<Option<Boa
         // BI-26 review fix (SHOULD-FIX) R6: the same checks `data` makes
         // (`verified_claims`, `admit`), not a second copy; a token that would be
         // refused there is given no framing list, whatever the reason.
-        let Ok(claims) = verified_claims(state, &jwt) else {
+        let Ok(claims) = verified_claims(state, &jwt).await else {
             return Ok(None);
         };
         return Ok(admit(state, &claims).await.ok().map(|(board, _)| board));
@@ -872,16 +876,12 @@ pub async fn revoke_token(
         return Err(ApiError::Unavailable(EMBEDDING_NOT_CONFIGURED.to_owned()).into());
     };
     let now = lakehouse_embed::unix_now();
-    let claims = lakehouse_embed::verify_embed(
-        token,
-        secret,
-        state.config.embed_token_max_lifetime_seconds,
-        now,
-    )
-    .map_err(|reason| {
-        tracing::info!(%reason, "embed token to withdraw refused");
-        ApiError::BadRequest(TOKEN_REFUSED.to_owned())
-    })?;
+    let sign_in = crate::runtime_settings::sign_in(&state).await;
+    let claims = lakehouse_embed::verify_embed(token, secret, sign_in.embed_max_lifetime_secs, now)
+        .map_err(|reason| {
+            tracing::info!(%reason, "embed token to withdraw refused");
+            ApiError::BadRequest(TOKEN_REFUSED.to_owned())
+        })?;
     // BI-26 (D1): a chart token is withdrawn through its chart's dashboard.
     let for_board = subject_of(&state.clickhouse, claims.resource.as_ref())
         .await

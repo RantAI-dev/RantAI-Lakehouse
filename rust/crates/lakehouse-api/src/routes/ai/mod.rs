@@ -747,9 +747,13 @@ async fn model_round_once(
     tools: &[Value],
     progress: Progress<'_>,
 ) -> Result<LlmMessage, lakehouse_llm::LlmError> {
+    // `ADM-9`: the client comes from the resolver, which rebuilds it when
+    // the effective provider settings change — so a save in the console
+    // takes effect on this message.
+    let assistant = crate::runtime_settings::assistant(state).await;
     if progress.is_none() {
-        return state
-            .llm
+        return assistant
+            .client
             .chat_with_tools(messages, tools, round_options())
             .await;
     }
@@ -757,8 +761,8 @@ async fn model_round_once(
         ("<minimax:tool_call>", "</minimax:tool_call>"),
         ("<invoke ", "</invoke>"),
     ]);
-    state
-        .llm
+    assistant
+        .client
         .chat_with_tools_streamed(messages, tools, round_options(), |piece| match piece {
             StreamPiece::Text(text) => {
                 let visible = tool_xml.push(text);

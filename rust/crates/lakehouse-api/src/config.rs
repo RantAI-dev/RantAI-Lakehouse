@@ -40,6 +40,19 @@ use uuid::Uuid;
 /// used, so the cost is nil for threads that never recurse deeply.
 pub const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// The provider address the assistant uses when neither the environment's
+/// `LLM_URL` nor the console's saved row names one (`ADM-9`).
+///
+/// The code's own default, kept here so the resolver and the config resolve
+/// to the same address: the console's Assistant tab may set the address, and
+/// the deployment's own files may name one, but the value neither of them
+/// names is this one.
+pub const DEFAULT_LLM_URL: &str = "https://api.minimax.io/v1";
+
+/// The model the assistant uses when neither the environment's `LLM_MODEL`
+/// nor the console's saved row names one (`ADM-9`).
+pub const DEFAULT_LLM_MODEL: &str = "MiniMax-M3";
+
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
 ///
@@ -994,6 +1007,32 @@ pub struct Config {
     /// task deletes them. Zero, negative, or unparseable values fall back
     /// to the default (30).
     pub auth_retention_days: u32,
+    /// Whether the environment names [`Self::login_max_failures`] with a
+    /// whole number of 1 or more (`ADM-8`).
+    ///
+    /// The flag, not the value: the console may not change a setting the
+    /// environment owns (plan D1), and the value alone cannot say whether
+    /// the environment named it or the code default supplied it. An
+    /// unparseable value does not count — the operator's value is invalid,
+    /// the code default is in effect, and the console is free to set a real
+    /// one (the same rule as [`Self::smtp_port_from_env`]).
+    pub login_max_failures_from_env: bool,
+    /// Whether the environment names
+    /// [`Self::login_failure_window_secs`] with a whole number of 1 or more
+    /// (`ADM-8`). See [`Self::login_max_failures_from_env`].
+    pub login_failure_window_secs_from_env: bool,
+    /// Whether the environment names [`Self::login_lockout_secs`] with a
+    /// whole number of 1 or more (`ADM-8`). See
+    /// [`Self::login_max_failures_from_env`].
+    pub login_lockout_secs_from_env: bool,
+    /// Whether the environment names [`Self::auth_retention_days`] with a
+    /// whole number of 1 or more (`ADM-8`). See
+    /// [`Self::login_max_failures_from_env`].
+    pub auth_retention_days_from_env: bool,
+    /// Whether the environment names
+    /// [`Self::embed_token_max_lifetime_seconds`] with a whole number of 1
+    /// or more (`ADM-8`). See [`Self::login_max_failures_from_env`].
+    pub embed_token_max_lifetime_from_env: bool,
     /// Files one user may have being received, and loads one user may have
     /// running, at once: `UPLOAD_MAX_CONCURRENT_PER_USER`, default 4
     /// (`SEC-17`). A value that is not a whole number of 1 or more fails
@@ -1275,9 +1314,29 @@ impl std::fmt::Debug for Config {
             .field("ai_relevant_tables", &self.ai_relevant_tables)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
+            .field(
+                "login_max_failures_from_env",
+                &self.login_max_failures_from_env,
+            )
             .field("login_failure_window_secs", &self.login_failure_window_secs)
+            .field(
+                "login_failure_window_secs_from_env",
+                &self.login_failure_window_secs_from_env,
+            )
             .field("login_lockout_secs", &self.login_lockout_secs)
+            .field(
+                "login_lockout_secs_from_env",
+                &self.login_lockout_secs_from_env,
+            )
             .field("auth_retention_days", &self.auth_retention_days)
+            .field(
+                "auth_retention_days_from_env",
+                &self.auth_retention_days_from_env,
+            )
+            .field(
+                "embed_token_max_lifetime_from_env",
+                &self.embed_token_max_lifetime_from_env,
+            )
             .field(
                 "upload_max_concurrent_per_user",
                 &self.upload_max_concurrent_per_user,
@@ -1347,6 +1406,30 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .filter(|v| *v > 0)
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default)
+}
+
+/// Whether the environment names `key` with a whole number of 1 or more
+/// (`ADM-8`): a setting the environment owns is read-only in the console, and
+/// the value alone cannot say whether the environment named it or the code
+/// default supplied it.
+///
+/// The same rule as [`parse_positive_u32_or_default`]: an unparseable value
+/// does not count, because the operator's value is invalid and the code
+/// default is in effect.
+fn env_sets_positive_u32(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key)
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .is_some_and(|value| u32::try_from(value).is_ok())
+}
+
+/// Whether the environment names `key` with a whole number of 1 or more
+/// (`ADM-8`), for a setting counted in seconds as a `u64`. See
+/// [`env_sets_positive_u32`].
+fn env_sets_positive_u64(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .is_some_and(|value| value > 0)
 }
 
 /// Parses `key` as a whole number of 1 or more, `default` when unset or
@@ -1610,8 +1693,8 @@ impl Config {
             dagster_url: or_default(env, "DAGSTER_URL", "http://localhost:13030/graphql"),
             dagster_repo: or_default(env, "DAGSTER_REPO", "__repository__"),
             dagster_location: or_default(env, "DAGSTER_LOCATION", "dispar_orchestrate.definitions"),
-            llm_url: or_default(env, "LLM_URL", "https://api.minimax.io/v1"),
-            llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
+            llm_url: or_default(env, "LLM_URL", DEFAULT_LLM_URL),
+            llm_model: or_default(env, "LLM_MODEL", DEFAULT_LLM_MODEL),
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
             render_token_secret: truthy(env, "RENDER_TOKEN_SECRET")
@@ -1622,6 +1705,10 @@ impl Config {
                 .map(|url| url.trim_end_matches('/').to_owned())
                 .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
             embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
+            embed_token_max_lifetime_from_env: env_sets_positive_u64(
+                env,
+                "EMBED_TOKEN_MAX_LIFETIME_SECONDS",
+            ),
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
             smtp_port,
@@ -1811,13 +1898,20 @@ impl Config {
             )?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
             login_max_failures: parse_positive_u32_or_default(env, "LOGIN_MAX_FAILURES", 5),
+            login_max_failures_from_env: env_sets_positive_u32(env, "LOGIN_MAX_FAILURES"),
             login_failure_window_secs: parse_positive_u32_or_default(
                 env,
                 "LOGIN_FAILURE_WINDOW_SECS",
                 900,
             ),
+            login_failure_window_secs_from_env: env_sets_positive_u32(
+                env,
+                "LOGIN_FAILURE_WINDOW_SECS",
+            ),
             login_lockout_secs: parse_positive_u32_or_default(env, "LOGIN_LOCKOUT_SECS", 300),
+            login_lockout_secs_from_env: env_sets_positive_u32(env, "LOGIN_LOCKOUT_SECS"),
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
+            auth_retention_days_from_env: env_sets_positive_u32(env, "AUTH_RETENTION_DAYS"),
             upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
             upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
             upload_max_concurrent_large: parse_limit(env, "UPLOAD_MAX_CONCURRENT_LARGE", 2)?,
