@@ -328,3 +328,13 @@ Shows only the in-network container defaults for `DAGSTER_URL` and `LAKEKEEPER_B
 ## 5. Review
 
 **R1 (BLOCKER), planner 2026-11-06.** To keep D1, commit `b0f8de82` moved the old template's host-side addresses into compose's container defaults: `DAGSTER_URL` → `http://localhost:13030/graphql` (lakehouse-api, and dagster-code-location, whose default was the correct `http://dagster-webserver:3000/graphql`) and `LAKEKEEPER_BASE_URI` → `http://localhost:8181` (lakehouse-api and the second service). Inside a container `localhost` is the container itself, so these are broken values: CI (`.github/workflows/ci.yml`, e.g. `:767-768`) and `.env.staging` override both with the service names for exactly this reason. The old template carried a bug; D1 is not a reason to bake it into compose. **D1 is amended:** a removed line whose old value was a host-side `localhost` address that compose services cannot use gets the in-network default instead, listed in the handoff. Fix: every container default becomes `http://dagster-webserver:3000/graphql` and `http://lakekeeper:8181`; the comments say why (in-network service names; `localhost` is the container itself; host-dev processes use `config.rs`'s own defaults and do not read compose). The T1 script's expected diff is now exactly these values; the `.env.staging` and staging-workflow overrides may stay (harmless), but fix their comments if they now say the compose default is localhost.
+
+- **R1 closed (planner, 2026-11-06).** Re-ran the T1 script on the committed branch
+  (`85738c2a`) against `main`'s `.env.example`: the only differences are the two
+  `DAGSTER_URL` and the two `LAKEKEEPER_BASE_URI` container defaults, now the in-network
+  names. Lakekeeper's own advertised `LAKEKEEPER__BASE_URI` stays `http://localhost:8181`,
+  as on `main` (clients on the host need it). The R1 handoff's run was made in a checkout
+  with uncommitted edits to `docker-compose.yml` left by a stopped worker, which is why its
+  diff also shows `LAKEKEEPER__BASE_URI` changing; its result that matters (`GET
+  /api/overview` 200 with no `DAGSTER_URL` in `.env`) depends only on `DAGSTER_URL`, which
+  is identical in the committed file. The PR's CI gates are the remaining proof.
