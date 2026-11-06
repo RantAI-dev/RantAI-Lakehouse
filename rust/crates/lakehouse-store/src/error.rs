@@ -16,7 +16,7 @@
 //! | [`StoreError::Conflict`]   | `Conflict`            | 409    | caller-supplied data collides with a unique constraint         |
 //! | [`StoreError::ForeignKeyViolation`] | `BadRequest`  | 400    | caller referenced a row that doesn't exist                     |
 //! | [`StoreError::NotFound`]   | `NotFound`            | 404    | caller asked for a row that doesn't exist                      |
-//! | [`StoreError::NotAllowed`] | `PermissionDenied`    | 403    | the store's own rule refuses the action on a row that does exist (`QS-3` review finding 1) |
+//! | [`StoreError::NotAllowed`] | `PermissionDenied`    | 403    | the store's own rule refuses the action on a row that does exist (`QS-3` review of #382: a move needs manage) |
 //! | [`StoreError::Unavailable`]| `Unavailable`         | 503    | no pool configured at all (see [`crate::connect_lazy`])         |
 //! | [`StoreError::Validation`] | `BadRequest`          | 400    | this crate's own validator rejected caller input (never a raw `sqlx` error) |
 //! | [`StoreError::Database`]   | `Internal`            | 500    | anything else — connection refused, timeout, syntax error, ...  |
@@ -60,12 +60,12 @@ pub enum StoreError {
     /// be visible to them: the store's own rule refuses the action, not
     /// the row's existence — unlike [`Self::NotFound`], which says the
     /// row is not there at all. The one rule that raises it today is the
-    /// move rule (`QS-3` review finding 1): a move into or out of a
-    /// personal space needs manage. The message is this crate's own
+    /// move rule (`QS-3` review of #382): a query move needs manage on the query.
+    /// The message is this crate's own
     /// fixed sentence — the one the fix ships to callers — never an
     /// upstream error's text, so it is safe to surface the way
     /// [`Self::Validation`]'s is.
-    #[error("Only someone who manages this can move it into or out of a personal space.")]
+    #[error("Only someone who manages this can move it.")]
     NotAllowed,
     /// No Postgres pool is configured/available for this request. See the
     /// boot-behavior note on [`crate::connect_lazy`]: an unreachable
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(api.status(), 403);
         assert_eq!(
             api.to_string(),
-            "permission_denied: Only someone who manages this can move it into or out of a personal space."
+            "permission_denied: Only someone who manages this can move it."
         );
     }
 

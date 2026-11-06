@@ -37,7 +37,7 @@ import type { SavedQuery } from "@/services/contracts/queries"
  * The menu offers what the caller may do with the query, and the level the
  * server sends with the row decides that (`QS-3` C2): a viewer may open,
  * copy and duplicate it and read its history, an editor may also rename
- * it, move it and take it to the trash, and a manager may also share it.
+ * it and take it to the trash, and a manager may also move and share it.
  * The server refuses the rest, so the console does not offer it.
  */
 export type SavedQueryRowActions = {
@@ -200,23 +200,27 @@ export function getSavedQueryColumns(
                   <HistoryIcon className="size-3.5" data-icon="inline-start" />
                   History
                 </DropdownMenuItem>
-                {/* Editing a query needs **edit**: the server refuses the
-                    change below that level (C2). */}
+                {/* Renaming and deleting a query need **edit**: the server
+                    refuses the change below that level (C2). */}
                 {levelAtLeast(query.level, "edit") ? (
-                  <>
-                    <DropdownMenuItem onClick={() => onRename(query)}>
-                      <PencilIcon className="size-3.5" data-icon="inline-start" />
-                      Rename
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => onMove(query)}>
-                      <FolderInputIcon className="size-3.5" data-icon="inline-start" />
-                      Move
-                    </DropdownMenuItem>
-                    <DropdownMenuItem variant="destructive" onClick={() => onDelete(query)}>
-                      <Trash2Icon className="size-3.5" data-icon="inline-start" />
-                      Delete
-                    </DropdownMenuItem>
-                  </>
+                  <DropdownMenuItem onClick={() => onRename(query)}>
+                    <PencilIcon className="size-3.5" data-icon="inline-start" />
+                    Rename
+                  </DropdownMenuItem>
+                ) : null}
+                {/* A move changes who can see the query, so it needs
+                    **manage**, as the server's rule does (`QS-3` review of #382). */}
+                {levelAtLeast(query.level, "manage") ? (
+                  <DropdownMenuItem onClick={() => onMove(query)}>
+                    <FolderInputIcon className="size-3.5" data-icon="inline-start" />
+                    Move
+                  </DropdownMenuItem>
+                ) : null}
+                {levelAtLeast(query.level, "edit") ? (
+                  <DropdownMenuItem variant="destructive" onClick={() => onDelete(query)}>
+                    <Trash2Icon className="size-3.5" data-icon="inline-start" />
+                    Delete
+                  </DropdownMenuItem>
                 ) : null}
                 {/* Sharing needs **manage**: both access routes of a saved
                     query ask for it, so the console offers the panel only

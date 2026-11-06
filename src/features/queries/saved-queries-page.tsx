@@ -98,8 +98,8 @@ export function SavedQueriesPage() {
     queryService.updateSaved(id, { title }, signal),
   )
   // A move writes the folder the query lands in: `null` is the shared
-  // space, an id is that folder. The server refuses a move across a
-  // personal space below manage, and says so in its own sentence.
+  // space, an id is that folder. The server refuses a move below manage,
+  // and says so in its own sentence.
   const moveAct = useServiceAction((signal, id: string, folderId: string | null) =>
     queryService.updateSaved(id, { folderId }, signal),
   )
@@ -135,6 +135,9 @@ export function SavedQueriesPage() {
   )
 
   const rawData = React.useMemo(() => state.data ?? [], [state.data])
+  // A search text or a folder narrows what the server sends, so an empty
+  // answer then means "nothing matches", not "nothing saved".
+  const narrowed = q !== "" || folder !== undefined
 
   const tableUrlState = useTableUrlState()
   // The column filters of the advanced toolbar still filter the rows on
@@ -236,7 +239,10 @@ export function SavedQueriesPage() {
           {state.status === "error" ? (
             <ErrorState error={state.error} onRetry={state.reload} />
           ) : null}
-          {state.status === "success" && rawData.length === 0 ? (
+          {state.status === "success" && rawData.length === 0 && narrowed ? (
+            <EmptyState title="No saved queries match." />
+          ) : null}
+          {state.status === "success" && rawData.length === 0 && !narrowed ? (
             <EmptyState
               title="No saved queries"
               description="Write a query in the Studio and save it to reuse it here."

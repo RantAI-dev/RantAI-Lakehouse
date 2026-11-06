@@ -477,8 +477,8 @@ export interface QueryService {
   saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
   /**
    * Change a saved query. A refusal throws with the server's own
-   * sentence: a move into or out of a personal space needs manage and
-   * is refused with the sentence that says so.
+   * sentence: a move (`folderId`) needs manage on the query and is
+   * refused with the sentence that says so.
    */
   updateSaved(id: string, input: UpdateSavedQueryInput, signal?: AbortSignal): Promise<SavedQuery>
   /** Take a saved query to the trash. The server answers with nothing. */

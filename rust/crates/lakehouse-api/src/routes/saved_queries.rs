@@ -95,13 +95,18 @@ pub(crate) const QUERY_FORBIDDEN: &str = "You do not have permission to change t
 /// The sentence a caller that may not change a folder is told.
 pub(crate) const FOLDER_FORBIDDEN: &str = "You do not have permission to change this folder.";
 
-/// The sentence a move into or out of a personal space at a level below
-/// manage is refused with — the same sentence for a query move and for a
-/// folder move, and the sentence the store's own refusal carries, so the
-/// route's answer and the store's backstop read identically (`QS-3`
-/// review finding 1).
-pub(crate) const MOVE_ACROSS_SPACES_FORBIDDEN: &str =
-    "Only someone who manages this can move it into or out of a personal space.";
+/// The sentence a move at a level below manage is refused with: the same
+/// sentence for a query move and for a folder move, and the sentence the
+/// store's own refusal carries (`StoreError::NotAllowed`, and
+/// `FolderError::MoveNeedsManage` through [`folder_failure`]), so every
+/// refused move reads alike (`QS-3` review of #382: a move needs manage).
+pub(crate) const MOVE_NEEDS_MANAGE: &str = "Only someone who manages this can move it.";
+
+/// The sentence a rule on a personal space itself is refused with: a
+/// personal space is shared through a query or a folder inside it, and the
+/// resolver ignores a rule stored on the space (`QS-3` review of #382).
+pub(crate) const PERSONAL_SPACE_NOT_SHARED: &str =
+    "A personal space is not shared: share a query or a folder inside it.";
 
 /// The sentence a folder that still holds queries is refused with.
 pub(crate) const FOLDER_HOLDS_QUERIES: &str =
@@ -495,9 +500,9 @@ fn level_of(level: &str) -> Level {
 /// folder is not theirs to see.
 ///
 /// [`folder_level`] answers with the level alone; this returns the folder
-/// with it, for the one handler that needs the folder's own place in the
-/// tree — the move rule reads where the folder sits now (`QS-3` review
-/// finding 1) — so that handler asks the database once, not twice.
+/// with it, for the handlers that need the folder itself — where it sits
+/// now, and whether it is a personal space — so they ask the database
+/// once, not twice.
 ///
 /// # Errors
 ///
@@ -554,25 +559,20 @@ fn folder_failure(failure: FolderError) -> ApiError {
         FolderError::TooDeep => ApiError::BadRequest(FOLDER_TOO_DEEP.to_owned()),
         FolderError::Cycle => ApiError::BadRequest(FOLDER_CYCLE.to_owned()),
         FolderError::PersonalSpace => ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()),
+        FolderError::MoveNeedsManage => ApiError::PermissionDenied(MOVE_NEEDS_MANAGE.to_owned()),
         FolderError::Database(store_error) => {
-            // The body stays the fixed sentence; the cause goes to the log
-            // under a reference id (AGENTS.md principle 4; QS-3 review
-            // finding 7, plan 55 D7). store() itself is not used here: its
-            // Own variant carries caller-facing text, and this arm's
-            // answer must stay the fixed one.
-            match store_error {
-                lakehouse_store::StoreError::Database(source) => {
-                    let _logged = upstream_error::report_sqlx(&upstream_error::STORE, &source);
+            // A failure of the database is logged under a reference id and
+            // answers with the fixed message and that id, at 503 when the
+            // database cannot be reached (AGENTS.md principle 4; `QS-3`
+            // review of #382, NOTE 7). The store's own fixed sentences
+            // (a store with no pool, a row that is not there) keep their
+            // own status through `ApiError::from`.
+            match upstream_error::store(&upstream_error::STORE, &store_error) {
+                upstream_error::Reported::Upstream(failure) => {
+                    failure.into_api_error(upstream_error::FailedAs::Internal)
                 }
-                other => {
-                    let _logged = upstream_error::report(
-                        &upstream_error::STORE,
-                        upstream_error::Class::Failed,
-                        &other,
-                    );
-                }
+                upstream_error::Reported::Own(_fixed) => ApiError::from(store_error),
             }
-            ApiError::Internal("database error".to_owned())
         }
     }
 }
@@ -720,6 +720,10 @@ impl AccessItem {
 /// parents; a folder inherits from its parents only, because its own
 /// rules are its own and sit in the list beside them.
 ///
+/// A personal space is left out of the chain: the resolver ignores a rule
+/// stored on one (`resolve_level`, `QS-3` review of #382), so listing it
+/// would show access that grants nothing (`QS-3` review of #382, follow-up).
+///
 /// A chain that cannot be built is corrupt data, and corrupt data
 /// inherits nothing.
 fn chain_of(map: &FolderMap, item: AccessItem) -> Vec<Uuid> {
@@ -735,21 +739,29 @@ fn chain_of(map: &FolderMap, item: AccessItem) -> Vec<Uuid> {
     let Some(chain) = map.chain(folder_id) else {
         return Vec::new();
     };
-    let chain: Vec<Uuid> = chain.iter().map(|folder| folder.id).collect();
-    match item {
-        // The folder's own rules are its own: only its parents are
-        // inherited.
-        AccessItem::Folder { .. } => chain.into_iter().skip(1).collect(),
-        AccessItem::Query { .. } => chain,
-    }
+    // The folder's own rules are its own: only its parents are inherited.
+    // The folder itself is skipped before the personal spaces are filtered,
+    // so the chain's first folder is never mistaken for a parent.
+    let skip = match item {
+        AccessItem::Folder { .. } => 1,
+        AccessItem::Query { .. } => 0,
+    };
+    chain
+        .iter()
+        .skip(skip)
+        .filter(|folder| !folder.is_personal)
+        .map(|folder| folder.id)
+        .collect()
 }
 
 /// The access list of one item: its own rules, the rules it inherits
 /// from the folders above it, and the level the caller holds on it.
 ///
 /// The folders are read with the viewer's own tenant, so the chain is the
-/// chain the resolver used to decide the level: the list cannot name a
-/// folder the level did not come from.
+/// chain the resolver used to decide the level. The list names a folder
+/// only when the resolver reads its rules: a rule stored on a personal
+/// space grants nothing, so it is listed neither as inherited nor as the
+/// space's own (`QS-3` review of #382, follow-up).
 async fn access_list(
     pool: &PgPool,
     viewer: &queries::SavedQueryViewer,
@@ -759,7 +771,17 @@ async fn access_list(
     let folders = saved_query_access::list_folders(pool, viewer.tenant_id).await?;
     let map = FolderMap::new(folders);
     let chain = chain_of(&map, item);
-    let own = saved_query_access::rules_for_item(pool, item.query_id(), item.folder_id()).await?;
+    // The resolver ignores a rule stored on a personal space, so the space
+    // lists none of its own.
+    let own = if item
+        .folder_id()
+        .and_then(|id| map.get(id))
+        .is_some_and(|folder| folder.is_personal)
+    {
+        Vec::new()
+    } else {
+        saved_query_access::rules_for_item(pool, item.query_id(), item.folder_id()).await?
+    };
     let inherited = saved_query_access::rules_for_folders(pool, &chain).await?;
     Ok(AccessListWire {
         item_type: item.item_type().to_owned(),
@@ -907,15 +929,15 @@ pub struct PatchSavedQueryBody {
 
 /// `PATCH /api/query/saved/{id}` — change a saved query.
 ///
-/// The caller must hold **edit** on the query: `edit` changes the SQL,
-/// the title, the tags and the folder, `view` may do neither. A move
-/// that takes the query into or out of a personal space is more than a
-/// change of place — it publishes or hides the query for the whole
-/// organisation — so that one move needs **manage**, and it is asked
-/// before any write: a refused PATCH writes nothing, not the title or
-/// the SQL in the same body (`QS-3` review finding 1). A statement
-/// that is not read-only is refused the same way the save route refuses
-/// it, so nothing that can never run is ever stored.
+/// The caller must hold **edit** on the query: `edit` changes the SQL, the
+/// title and the tags, `view` may change nothing. A move to another folder,
+/// or to the shared root, also needs **manage** on the query and edit on
+/// the target folder: a move changes who sees the query, so edit alone does
+/// not move it. The store asks the manage level before any write, so a
+/// refused PATCH writes nothing, not the title or the SQL in the same body
+/// (`QS-3` review of #382), and the route holds no copy of the rule. A
+/// statement that is not read-only is refused the same way the save route
+/// refuses it, so nothing that can never run is ever stored.
 ///
 /// # Errors
 ///
@@ -923,10 +945,10 @@ pub struct PatchSavedQueryBody {
 /// of [`QUERY_NOT_FOUND`] for a query the caller may not see; 403 with the
 /// fixed sentence of [`QUERY_FORBIDDEN`] for a query the caller may see
 /// but not change, and for a folder the caller may see but not fill; 403
-/// with the fixed sentence of [`MOVE_ACROSS_SPACES_FORBIDDEN`] for a move
-/// into or out of a personal space the caller does not manage; 422
-/// with the fixed sentence of [`NOT_READ_ONLY`] for a statement that is
-/// not read-only; 500 on a database failure.
+/// with the fixed sentence of [`MOVE_NEEDS_MANAGE`] for a move the caller
+/// does not manage the query for; 422 with the fixed sentence of
+/// [`NOT_READ_ONLY`] for a statement that is not read-only; 500 on a
+/// database failure.
 pub async fn patch_saved(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -976,40 +998,10 @@ pub async fn patch_saved(
             Some(FolderMove::Into(folder_id))
         }
     };
-    // A move across a personal-space boundary needs manage on the query,
-    // asked before the store is reached so a refused PATCH writes nothing
-    // (`QS-3` review finding 1). The store re-checks the same rule on the
-    // write and answers with this same sentence, so a caller that slips
-    // past this route is refused just the same. The list is the caller's
-    // own tenant's: the store pins the row to that tenant before it
-    // re-checks, so the two read the same tree — and a folder of another
-    // tenant is not in the list at all, which the store answers as an
-    // unseen folder (404), so the crossing rule is not asked about it.
-    // A caller that reads across tenants holds a wider list than the
-    // store's — the row's own tenant — so the crossing refusal there is
-    // left to the store alone.
-    if let Some(move_to) = folder
-        && let Some(tenant_id) = viewer.tenant_id
-    {
-        let target = match move_to {
-            FolderMove::Into(folder_id) => Some(folder_id),
-            FolderMove::Root => None,
-        };
-        let folders = saved_query_access::list_folders(pool(&state)?, Some(tenant_id)).await?;
-        let target_seen = target.is_none_or(|id| folders.iter().any(|folder| folder.id == id));
-        // `saved.folder_id` carries the store's own uuid as text, so the
-        // parse cannot fail for a row the store wrote.
-        let from = saved
-            .folder_id
-            .as_deref()
-            .and_then(|raw| Uuid::parse_str(raw).ok());
-        if target_seen
-            && saved_query_access::crosses_space(&folders, from, target)
-            && level_of(&saved.level) < Level::Manage
-        {
-            return Err(ApiError::PermissionDenied(MOVE_ACROSS_SPACES_FORBIDDEN.to_owned()).into());
-        }
-    }
+    // A move needs manage on the query, and the store asks that before it
+    // writes anything (`QS-3` review of #382): the route holds no second
+    // copy of the rule, so a refused PATCH writes nothing and the rule has
+    // one owner. The level checks above and on the target folder stay here.
     let patch = SavedQueryPatch {
         title,
         sql,
@@ -1380,20 +1372,28 @@ pub struct PatchFolderBody {
 
 /// `PATCH /api/query/folders/{id}` — rename a folder or move it.
 ///
-/// The caller must hold **edit** on the folder: renaming it and moving it
-/// are changes to the tree the folder sits in. A move that takes the
-/// folder into or out of a personal space publishes or hides it — and
-/// every query inside it — for the whole organisation, so that one move
-/// needs **manage**, and it is asked before the move is written
-/// (`QS-3` review finding 1). A **personal** space may be
-/// neither renamed nor moved — it is one person's own space, and moving
-/// it would move their private queries with it.
+/// The caller must hold **edit** on the folder to rename it or to move it,
+/// and edit on the folder it moves under. A move also needs **manage** on
+/// the folder and on every folder and query inside it, the ones in the
+/// trash included: it changes which rules cover all of them, so the store
+/// asks it before it writes (`QS-3` review of #382) and the route holds no
+/// copy of that rule. A **personal** space may be neither renamed nor
+/// moved — it is one person's own space, and moving it would move their
+/// private queries with it.
 ///
-/// A body that carries both a name and a parent renames the folder first
-/// and moves it second. The two are two writes and there is no
-/// transaction across them, so a rename that is refused leaves the folder
-/// where it was; a move that is refused leaves the renamed folder where it
-/// was. The answer is the folder as it is after both writes.
+/// A body that carries both a name and a parent moves the folder first and
+/// renames it second, after the route has checked the name with the
+/// store's placement rule at the folder's new place. Everything that can
+/// refuse is settled before the first write, so a refused PATCH changes
+/// nothing (`QS-3` review of #382, SHOULD-FIX 2). There is no transaction
+/// across the two writes, so two things between them leave the folder moved
+/// and not renamed: a database failure, and a concurrent request that
+/// creates or renames a sibling to the same name, which makes the rename
+/// answer 409 (`QS-3` review of #382, follow-up). The store judges the move by the
+/// folder's current name, so a body that moves a folder under a sibling of
+/// its current name and renames it to a free one at the same time is
+/// refused as a duplicate; two requests do it. The answer is the folder as
+/// it is after both writes.
 ///
 /// # Errors
 ///
@@ -1402,11 +1402,11 @@ pub struct PatchFolderBody {
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
 /// caller may not see and for a parent that does not exist; 403 with the
 /// fixed sentence of [`FOLDER_FORBIDDEN`] for a folder the caller may see
-/// but not change; 403 with the fixed sentence of
-/// [`MOVE_ACROSS_SPACES_FORBIDDEN`] for a move into or out of a personal
-/// space the caller does not manage; 409 with the fixed sentence of
-/// [`FOLDER_DUPLICATE_NAME`] for a name a sibling already carries; 500 on
-/// a database failure.
+/// but not change; 403 with the fixed sentence of [`MOVE_NEEDS_MANAGE`]
+/// for a move of something the caller does not manage, and of anything
+/// inside it; 409 with the fixed sentence of [`FOLDER_DUPLICATE_NAME`] for
+/// a name a sibling already carries; 500, or 503 when the database cannot
+/// be reached, with a reference id on a database failure.
 pub async fn patch_folder(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1419,9 +1419,9 @@ pub async fn patch_folder(
         return Err(ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()).into());
     };
     let folder_id = folder_id_of(&id)?;
-    // The node is kept, not only the level: the move rule reads where the
-    // folder sits now (`QS-3` review finding 1), and this is the same
-    // read the level check needs anyway.
+    // The node is kept, not only the level: the name check reads where the
+    // folder sits now, and this is the same read the level check needs
+    // anyway.
     let (current, level) = folder_with_level(pool(&state)?, &viewer, folder_id).await?;
     if level < Level::Edit {
         return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
@@ -1431,63 +1431,63 @@ pub async fn patch_folder(
     // holds.
     let body: PatchFolderBody = serde_json::from_slice(&body)
         .map_err(|_err| ApiError::BadRequest("Body must be JSON {name?, parentId?}.".to_owned()))?;
+    // Everything that can refuse is settled before the first write, so a
+    // refused PATCH changes nothing (`QS-3` review of #382, SHOULD-FIX 2).
+    // The parent comes first: it needs edit on the target folder.
+    let moves = !matches!(body.parent_id, FolderField::Absent);
+    let new_parent = if moves {
+        match parse_folder_reference(body.parent_id)? {
+            FolderReference::Absent | FolderReference::SharedSpace => None,
+            FolderReference::Folder(parent_id) => {
+                let level = folder_level(pool(&state)?, &viewer, parent_id).await?;
+                if level < Level::Edit {
+                    return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
+                }
+                Some(parent_id)
+            }
+        }
+    } else {
+        None
+    };
+    if body.name.is_none() && !moves {
+        return Err(ApiError::BadRequest("nothing to change.".to_owned()).into());
+    }
+    // The name is checked with the store's own placement rule, at the place
+    // the folder will be in: the move may be allowed while the name is
+    // refused there, and the folder must not be left moved by then. A
+    // personal space is skipped here: the store refuses it with its own
+    // answer on either write.
+    if let Some(name) = body.name.as_deref()
+        && !current.is_personal
+    {
+        let folders =
+            saved_query_access::list_folders(pool(&state)?, Some(current.tenant_id)).await?;
+        let place = if moves { new_parent } else { current.parent_id };
+        saved_query_access::check_placement(&folders, Some(folder_id), name, place)
+            .map_err(|rule| folder_failure(FolderError::from(rule)))?;
+    }
+    // The move goes first: the store asks manage on the folder and on
+    // everything in it before it writes, and a refusal there leaves the
+    // name as it was. The rename after it was checked above.
     let mut folder = None;
+    if moves {
+        folder = Some(
+            saved_query_access::move_folder_for_viewer(
+                pool(&state)?,
+                &viewer,
+                folder_id,
+                new_parent,
+            )
+            .await
+            .map_err(folder_failure)?,
+        );
+    }
     if let Some(name) = body.name.as_deref() {
         folder = Some(
             saved_query_access::rename_folder(pool(&state)?, folder_id, name)
                 .await
                 .map_err(folder_failure)?,
         );
-    }
-    match body.parent_id {
-        FolderField::Absent => {
-            // The body does not name a parent: the folder stays where it is.
-        }
-        reference => {
-            let parent_id = match parse_folder_reference(reference)? {
-                FolderReference::Absent | FolderReference::SharedSpace => None,
-                FolderReference::Folder(parent_id) => {
-                    let level = folder_level(pool(&state)?, &viewer, parent_id).await?;
-                    if level < Level::Edit {
-                        return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
-                    }
-                    Some(parent_id)
-                }
-            };
-            // A move across a personal-space boundary needs manage on the
-            // folder, asked before the move is written (`QS-3` review
-            // finding 1); the store re-checks the rule on the write. The
-            // list is the folder's own tenant's — the one
-            // `move_folder_for_viewer` re-checks the write against — and
-            // a parent of another tenant is not in it: the store answers
-            // it as an unseen parent (404), so the crossing rule is not
-            // asked about it either. A personal space is not asked about
-            // at all: the store refuses any move of one outright, and
-            // that refusal keeps its own sentence.
-            let folders =
-                saved_query_access::list_folders(pool(&state)?, Some(current.tenant_id)).await?;
-            let parent_seen =
-                parent_id.is_none_or(|parent| folders.iter().any(|folder| folder.id == parent));
-            if parent_seen
-                && !current.is_personal
-                && saved_query_access::crosses_space(&folders, current.parent_id, parent_id)
-                && level < Level::Manage
-            {
-                return Err(
-                    ApiError::PermissionDenied(MOVE_ACROSS_SPACES_FORBIDDEN.to_owned()).into(),
-                );
-            }
-            folder = Some(
-                saved_query_access::move_folder_for_viewer(
-                    pool(&state)?,
-                    &viewer,
-                    folder_id,
-                    parent_id,
-                )
-                .await
-                .map_err(folder_failure)?,
-            );
-        }
     }
     let folder = folder.ok_or_else(|| ApiError::BadRequest("nothing to change.".to_owned()))?;
     let level = folder_level(pool(&state)?, &viewer, folder.id).await?;
@@ -1687,9 +1687,10 @@ pub async fn get_folder_access(
 ///
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
 /// caller may not see; 403 with the fixed sentence of [`FOLDER_FORBIDDEN`]
-/// for a folder the caller may see but not manage; 400 for a body of
-/// another shape, for a rule that names two grantees or none, for a
-/// grantee that is listed twice and for a grantee that is not of the
+/// for a folder the caller may see but not manage; 403 with the fixed
+/// sentence of [`PERSONAL_SPACE_NOT_SHARED`] for a personal space; 400 for
+/// a body of another shape, for a rule that names two grantees or none,
+/// for a grantee that is listed twice and for a grantee that is not of the
 /// caller's organisation; 500 on a database failure.
 pub async fn put_folder_access(
     State(state): State<AppState>,
@@ -1703,9 +1704,15 @@ pub async fn put_folder_access(
         return Err(ApiError::NotFound(FOLDER_NOT_FOUND.to_owned()).into());
     };
     let folder_id = folder_id_of(&id)?;
-    let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
+    let (folder, level) = folder_with_level(pool(&state)?, &viewer, folder_id).await?;
     if level < Level::Manage {
         return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
+    }
+    // A personal space is shared through a query or a folder inside it,
+    // never as a whole (`QS-3` review of #382). Asked after the 404 and the
+    // manage check, so a person who may not see the space learns nothing.
+    if folder.is_personal {
+        return Err(ApiError::PermissionDenied(PERSONAL_SPACE_NOT_SHARED.to_owned()).into());
     }
     // The body is read only now: a folder the caller may not see is a
     // 404 and a folder it may not manage is a 403, whatever the body
@@ -1922,5 +1929,68 @@ mod tests {
             "CONTROL: the shared space is a dependent: {listed:?}"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod folder_failure_tests {
+    //! How a refused folder write is answered: the fixed sentence of the
+    //! move rule, and a database failure that carries a reference id and
+    //! never the failure's own text.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_core::ApiError;
+    use lakehouse_store::StoreError;
+    use lakehouse_store::saved_query_access::FolderError;
+
+    use super::{MOVE_NEEDS_MANAGE, folder_failure};
+
+    /// The one sentence a refused move carries is written twice, here and
+    /// in the store's `NotAllowed`; the two must read the same, so a query
+    /// move and a folder move answer identically.
+    #[test]
+    fn the_move_sentence_is_the_same_for_a_query_and_for_a_folder() {
+        assert_eq!(StoreError::NotAllowed.to_string(), MOVE_NEEDS_MANAGE);
+        let folder = folder_failure(FolderError::MoveNeedsManage);
+        assert_eq!(folder.status(), 403);
+        assert_eq!(
+            folder.to_string(),
+            ApiError::from(StoreError::NotAllowed).to_string()
+        );
+        assert_eq!(
+            folder.to_string(),
+            format!("permission_denied: {MOVE_NEEDS_MANAGE}")
+        );
+    }
+
+    /// A database failure answers with the fixed message and the reference
+    /// the cause was logged under, and nothing of the cause itself.
+    #[test]
+    fn a_database_failure_answers_with_a_reference_and_not_its_text() {
+        let cause = sqlx::Error::Protocol("relation saved_query_folder is broken".to_owned());
+        let answer = folder_failure(FolderError::Database(StoreError::Database(cause)));
+        assert_eq!(answer.status(), 500);
+        let text = answer.to_string();
+        assert!(text.contains("Reference: "), "{text}");
+        assert!(!text.contains("saved_query_folder"), "{text}");
+    }
+
+    /// A pool that cannot be reached answers 503, like every other store
+    /// route does, with a reference to find the log line by.
+    #[test]
+    fn an_unreachable_database_answers_503_with_a_reference() {
+        let answer = folder_failure(FolderError::Database(StoreError::Database(
+            sqlx::Error::PoolTimedOut,
+        )));
+        assert_eq!(answer.status(), 503);
+        assert!(answer.to_string().contains("Reference: "), "{answer}");
+    }
+
+    /// No pool at all is the store's own 503, not a 500.
+    #[test]
+    fn a_store_without_a_pool_answers_503() {
+        let answer = folder_failure(FolderError::Database(StoreError::Unavailable));
+        assert_eq!(answer.status(), 503);
     }
 }

@@ -29,8 +29,8 @@ use lakehouse_store::queries::{
 };
 use lakehouse_store::saved_query_access::{
     FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
-    grants_for_viewer, move_folder, move_folder_for_viewer, rename_folder, replace_grants,
-    rules_for_item, search_grantees,
+    grants_for_viewer, move_folder_for_viewer, rename_folder, replace_grants, rules_for_item,
+    search_grantees,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -1278,6 +1278,18 @@ fn viewer(id: Option<Uuid>, tenant_id: Option<Uuid>) -> SavedQueryViewer {
     }
 }
 
+/// A viewer who holds `"*:*"` in one tenant: it manages everything of the
+/// organisation, so a test that is about the tree's own rules (a cycle, the
+/// depth, another tenant's folder) is not also about the access rule.
+fn manager_of_everything(tenant_id: Uuid) -> SavedQueryViewer {
+    SavedQueryViewer {
+        id: None,
+        role_names: Vec::new(),
+        tenant_id: Some(tenant_id),
+        all: true,
+    }
+}
+
 /// The seeded people, as ids.
 fn person(raw: &str) -> Uuid {
     Uuid::parse_str(raw).expect("a seeded person id")
@@ -1908,10 +1920,15 @@ async fn a_managers_move_across_a_space_succeeds(pool: PgPool) -> sqlx::Result<(
     Ok(())
 }
 
-/// A move inside one space is still an edit: a query of Rina's personal
-/// space moves into a folder of that same space on an edit rule alone.
+/// A move inside one space needs manage too: a query of Rina's personal
+/// space does not move into a folder of that same space on an edit rule.
+/// This test used to expect success: an edit rule let a query move inside one space,
+/// and that was the way to publish, hide or raise a query in two steps
+/// (`QS-3` review of #382, BLOCKER 1).
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_edit_grantees_move_inside_one_space_still_succeeds(pool: PgPool) -> sqlx::Result<()> {
+async fn an_edit_grantees_move_inside_one_space_is_refused_and_changes_nothing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
     let tenant_id = tenant(GROUP_TENANT);
     let rina = viewer(Some(person(RINA)), Some(tenant_id));
     let personal = ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
@@ -1947,24 +1964,266 @@ async fn an_edit_grantees_move_inside_one_space_still_succeeds(pool: PgPool) -> 
     .unwrap();
     let sari = viewer(Some(person(SARI)), Some(tenant_id));
 
-    let moved = update_saved_query(
+    let refused = update_saved_query(
         &pool,
         &sari,
         &saved.id,
         &SavedQueryPatch {
+            title: Some("Hijacked".to_owned()),
             folder: Some(FolderMove::Into(week.id)),
             ..Default::default()
         },
     )
     .await;
     assert!(
-        moved.is_ok(),
-        "a move inside one space is still an edit: {moved:?}"
+        matches!(refused, Err(lakehouse_store::StoreError::NotAllowed)),
+        "a move inside one space needs manage too: {refused:?}"
     );
+    let (title, folder): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT title, folder_id FROM saved_query WHERE id = $1")
+            .bind(query_id)
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(
-        moved.unwrap().folder_id,
-        Some(week.id.to_string()),
-        "the query sits in the folder of the same space"
+        title, "Private",
+        "the title of the same body is not written"
+    );
+    assert_eq!(folder, Some(personal.id), "the query stays where it was");
+    Ok(())
+}
+
+/// An edit holder's query move is refused wherever it goes: the shared
+/// root, a sibling folder of the same space, and a folder of another space.
+/// The row does not change in any of the three (`QS-3` review of #382).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edit_holders_query_move_is_refused_to_the_root_a_sibling_and_another_space(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let weekly = create_folder(&pool, tenant_id, Some(person(RINA)), "Weekly", None)
+        .await
+        .unwrap();
+    let sibling = create_folder(&pool, tenant_id, Some(person(RINA)), "Sibling", None)
+        .await
+        .unwrap();
+    let saris_space = ensure_personal_space(&pool, tenant_id, person(SARI), "Sari")
+        .await
+        .unwrap();
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(weekly.id),
+    )
+    .await
+    .unwrap();
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    replace_grants(
+        &pool,
+        Some(query_id),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Edit,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+
+    for (place, target) in [
+        ("the shared root", FolderMove::Root),
+        (
+            "a sibling folder of the same space",
+            FolderMove::Into(sibling.id),
+        ),
+        (
+            "a folder of another space",
+            FolderMove::Into(saris_space.id),
+        ),
+    ] {
+        let refused = update_saved_query(
+            &pool,
+            &sari,
+            &saved.id,
+            &SavedQueryPatch {
+                folder: Some(target),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(lakehouse_store::StoreError::NotAllowed)),
+            "an edit holder cannot move the query to {place}: {refused:?}"
+        );
+        let folder: Option<Uuid> =
+            sqlx::query_scalar("SELECT folder_id FROM saved_query WHERE id = $1")
+                .bind(query_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            folder,
+            Some(weekly.id),
+            "the row stays after a move to {place}"
+        );
+    }
+    Ok(())
+}
+
+/// A manager's move inside one space succeeds, to a folder and to the
+/// root.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_managers_move_inside_one_space_succeeds(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let weekly = create_folder(&pool, tenant_id, Some(person(RINA)), "Weekly", None)
+        .await
+        .unwrap();
+    let saved = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(weekly.id),
+    )
+    .await
+    .unwrap();
+    replace_grants(
+        &pool,
+        Some(Uuid::parse_str(&saved.id).expect("the saved query id")),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Manage,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let to_root = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            folder: Some(FolderMove::Root),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(to_root.folder_id, None, "the manager moves it to the root");
+    let back = update_saved_query(
+        &pool,
+        &sari,
+        &saved.id,
+        &SavedQueryPatch {
+            folder: Some(FolderMove::Into(weekly.id)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        back.folder_id,
+        Some(weekly.id.to_string()),
+        "the manager moves it into a folder"
+    );
+    Ok(())
+}
+
+/// A PATCH that names the folder the query is already in is not a move: an
+/// edit holder who renames with the folder re-sent still succeeds, for a
+/// query in a folder and for a query at the root.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edit_holders_patch_that_names_the_current_folder_is_not_a_move(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let weekly = create_folder(&pool, tenant_id, Some(person(RINA)), "Weekly", None)
+        .await
+        .unwrap();
+    let in_folder = create_saved_query(
+        &pool,
+        &rina,
+        "In a folder",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(weekly.id),
+    )
+    .await
+    .unwrap();
+    let at_root = create_saved_query_at(
+        &pool,
+        &rina,
+        "At the root",
+        "SELECT 2",
+        "Rina Wijaya",
+        &[],
+        SavedQueryPlacement::SharedSpace,
+    )
+    .await
+    .unwrap();
+    for saved in [&in_folder, &at_root] {
+        replace_grants(
+            &pool,
+            Some(Uuid::parse_str(&saved.id).expect("the saved query id")),
+            None,
+            &[NewGrant {
+                user_id: Some(person(SARI)),
+                role_id: None,
+                level: Level::Edit,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let renamed = update_saved_query(
+        &pool,
+        &sari,
+        &in_folder.id,
+        &SavedQueryPatch {
+            title: Some("Renamed".to_owned()),
+            folder: Some(FolderMove::Into(weekly.id)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        renamed.is_ok(),
+        "the folder the query is in, sent again, is no move: {renamed:?}"
+    );
+    assert_eq!(renamed.unwrap().title, "Renamed");
+
+    let renamed = update_saved_query(
+        &pool,
+        &sari,
+        &at_root.id,
+        &SavedQueryPatch {
+            title: Some("Renamed too".to_owned()),
+            folder: Some(FolderMove::Root),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        renamed.is_ok(),
+        "the root, sent again for a query at the root, is no move: {renamed:?}"
     );
     Ok(())
 }
@@ -2305,7 +2564,8 @@ async fn a_personal_space_is_not_renamed_not_moved_and_not_deleted(
         "a personal space is not renamed"
     );
 
-    let moved = move_folder(&pool, space.id, None).await;
+    let moved =
+        move_folder_for_viewer(&pool, &manager_of_everything(tenant_id), space.id, None).await;
     assert!(
         matches!(moved, Err(FolderError::PersonalSpace)),
         "a personal space is not moved"
@@ -2339,13 +2599,15 @@ async fn a_folder_may_not_move_into_its_own_descendant(pool: PgPool) -> sqlx::Re
         .await
         .unwrap();
 
-    let into_itself = move_folder(&pool, parent.id, Some(parent.id)).await;
+    let everything = manager_of_everything(tenant_id);
+    let into_itself = move_folder_for_viewer(&pool, &everything, parent.id, Some(parent.id)).await;
     assert!(
         matches!(into_itself, Err(FolderError::Cycle)),
         "a folder is not its own parent"
     );
 
-    let into_a_descendant = move_folder(&pool, parent.id, Some(grandchild.id)).await;
+    let into_a_descendant =
+        move_folder_for_viewer(&pool, &everything, parent.id, Some(grandchild.id)).await;
     assert!(
         matches!(into_a_descendant, Err(FolderError::Cycle)),
         "a folder is not moved under its own descendant"
@@ -2386,13 +2648,16 @@ async fn a_move_that_would_make_the_tree_five_deep_is_refused(pool: PgPool) -> s
         .await
         .unwrap();
 
-    let too_deep = move_folder(&pool, branch.id, Some(four.id)).await;
+    let everything = manager_of_everything(tenant_id);
+    let too_deep = move_folder_for_viewer(&pool, &everything, branch.id, Some(four.id)).await;
     assert!(
         matches!(too_deep, Err(FolderError::TooDeep)),
         "the subtree would reach past the limit"
     );
 
-    let allowed = move_folder(&pool, branch.id, Some(two.id)).await.unwrap();
+    let allowed = move_folder_for_viewer(&pool, &everything, branch.id, Some(two.id))
+        .await
+        .unwrap();
     assert_eq!(allowed.parent_id, Some(two.id));
     Ok(())
 }
@@ -2495,7 +2760,13 @@ async fn another_tenants_folder_is_not_reachable(pool: PgPool) -> sqlx::Result<(
     let mine = create_folder(&pool, group, None, "Mine", None)
         .await
         .unwrap();
-    let into_theirs = move_folder(&pool, mine.id, Some(theirs.id)).await;
+    let into_theirs = move_folder_for_viewer(
+        &pool,
+        &manager_of_everything(group),
+        mine.id,
+        Some(theirs.id),
+    )
+    .await;
     assert!(
         matches!(into_theirs, Err(FolderError::NotFound)),
         "another tenant's folder is not a place to move into"
@@ -2532,7 +2803,7 @@ async fn an_edit_grantees_folder_move_across_a_space_is_refused(pool: PgPool) ->
 
     let refused = move_folder_for_viewer(&pool, &sari, week.id, None).await;
     assert!(
-        matches!(refused, Err(FolderError::PersonalSpace)),
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
         "an edit grantee cannot move a folder across a space: {refused:?}"
     );
     let parent: Option<Uuid> =
@@ -2574,11 +2845,11 @@ async fn a_managers_folder_move_across_a_space_succeeds(pool: PgPool) -> sqlx::R
     Ok(())
 }
 
-/// A folder move inside one space needs nothing beyond edit: a folder of
-/// Rina's personal space moves under another folder of that same space on
-/// an edit rule alone.
+/// A folder move inside one space needs manage too: a folder of Rina's
+/// personal space does not move under another folder of that space on an
+/// edit rule. This test used to expect success (`QS-3` review of #382, BLOCKER 1).
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_edit_grantees_folder_move_inside_one_space_still_succeeds(
+async fn an_edit_grantees_folder_move_inside_one_space_is_refused(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let tenant_id = tenant(GROUP_TENANT);
@@ -2606,16 +2877,257 @@ async fn an_edit_grantees_folder_move_inside_one_space_still_succeeds(
     .unwrap();
     let sari = viewer(Some(person(SARI)), Some(tenant_id));
 
-    let moved = move_folder_for_viewer(&pool, &sari, week.id, Some(notes.id)).await;
+    let refused = move_folder_for_viewer(&pool, &sari, week.id, Some(notes.id)).await;
     assert!(
-        moved.is_ok(),
-        "a folder move inside one space is still an edit: {moved:?}"
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "a folder move inside one space needs manage too: {refused:?}"
     );
-    assert_eq!(
-        moved.unwrap().parent_id,
-        Some(notes.id),
-        "the folder sits under the folder of the same space"
+    let parent: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_id FROM saved_query_folder WHERE id = $1")
+            .bind(week.id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(parent, Some(personal.id), "the folder stays where it was");
+    Ok(())
+}
+
+/// A folder whose parent does not change is not moved: an edit holder who
+/// sends the parent again is not refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_move_to_the_parent_it_already_has_is_no_move(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let personal = ensure_personal_space(&pool, tenant_id, person(RINA), "Rina Wijaya")
+        .await
+        .unwrap();
+    let week = create_folder(&pool, tenant_id, None, "Week", Some(personal.id))
+        .await
+        .unwrap();
+    let at_root = create_folder(&pool, tenant_id, None, "At the root", None)
+        .await
+        .unwrap();
+    for folder in [week.id, at_root.id] {
+        replace_grants(
+            &pool,
+            None,
+            Some(folder),
+            &[NewGrant {
+                user_id: Some(person(SARI)),
+                role_id: None,
+                level: Level::Edit,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    let same = move_folder_for_viewer(&pool, &sari, week.id, Some(personal.id)).await;
+    assert!(same.is_ok(), "the same parent is no move: {same:?}");
+    let same = move_folder_for_viewer(&pool, &sari, at_root.id, None).await;
+    assert!(same.is_ok(), "the root, again, is no move: {same:?}");
+    Ok(())
+}
+
+/// A folder tree of the `QS-3` review of #382: Sari wrote `X` at the root, so she
+/// manages it, and `X` holds what Rina wrote.
+struct CarriedTree {
+    x: Uuid,
+    /// A root folder of Sari's the move goes under.
+    target: Uuid,
+}
+
+async fn carried_tree(pool: &PgPool, tenant_id: Uuid, suffix: &str) -> CarriedTree {
+    let x = create_folder(
+        pool,
+        tenant_id,
+        Some(person(SARI)),
+        &format!("X {suffix}"),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = create_folder(
+        pool,
+        tenant_id,
+        Some(person(SARI)),
+        &format!("Target {suffix}"),
+        None,
+    )
+    .await
+    .unwrap();
+    CarriedTree {
+        x: x.id,
+        target: target.id,
+    }
+}
+
+/// The author of a folder does not manage what others put inside it: the
+/// move is refused when the folder holds a query the mover does not
+/// manage, live or in the trash, and the folder stays.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_move_is_refused_when_it_holds_a_query_the_mover_does_not_manage(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+
+    for trashed in [false, true] {
+        let tree = carried_tree(&pool, tenant_id, &format!("trashed {trashed}")).await;
+        let saved = create_saved_query(
+            &pool,
+            &rina,
+            "Rina's",
+            "SELECT 1",
+            "Rina Wijaya",
+            &[],
+            Some(tree.x),
+        )
+        .await
+        .unwrap();
+        if trashed {
+            trash_saved_query(&pool, &rina, &saved.id).await.unwrap();
+        }
+
+        let refused = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+        assert!(
+            matches!(refused, Err(FolderError::MoveNeedsManage)),
+            "a query of somebody else (in the trash: {trashed}) stops the move: {refused:?}"
+        );
+        let parent: Option<Uuid> =
+            sqlx::query_scalar("SELECT parent_id FROM saved_query_folder WHERE id = $1")
+                .bind(tree.x)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            parent, None,
+            "the folder stays at the root (trash: {trashed})"
+        );
+    }
+    Ok(())
+}
+
+/// The rule reaches every depth: a sub-folder of somebody else's, and a
+/// query of somebody else's three levels down, each stop the move even
+/// when the folders in between are the mover's own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_move_is_refused_for_what_is_deep_inside_it(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let tree = carried_tree(&pool, tenant_id, "case").await;
+    // `X` and `Y` are Sari's: a folder of Rina's sits one level lower.
+    let y = create_folder(&pool, tenant_id, Some(person(SARI)), "Y", Some(tree.x))
+        .await
+        .unwrap();
+    let z = create_folder(&pool, tenant_id, Some(person(RINA)), "Z", Some(y.id))
+        .await
+        .unwrap();
+
+    let refused = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+    assert!(
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "a sub-folder of somebody else's, two levels down, stops the move: {refused:?}"
     );
+
+    // Hand `Z` to Sari: what stops the move now is a query of Rina's in it.
+    sqlx::query("UPDATE saved_query_folder SET owner_id = $2 WHERE id = $1")
+        .bind(z.id)
+        .bind(person(SARI))
+        .execute(&pool)
+        .await?;
+    let deep = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's, deep",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        Some(z.id),
+    )
+    .await
+    .unwrap();
+    let refused = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+    assert!(
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "a query of somebody else's, three levels down, stops the move: {refused:?}"
+    );
+
+    // Rina trashes it: it is still carried.
+    trash_saved_query(&pool, &rina, &deep.id).await.unwrap();
+    let refused = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+    assert!(
+        matches!(refused, Err(FolderError::MoveNeedsManage)),
+        "a trashed query of somebody else's still stops the move: {refused:?}"
+    );
+    let parent: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_id FROM saved_query_folder WHERE id = $1")
+            .bind(tree.x)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(parent, None, "nothing moved");
+    Ok(())
+}
+
+/// A folder move succeeds when the mover manages the folder, every
+/// sub-folder and every query under it, the ones in the trash included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_folder_move_succeeds_when_the_mover_manages_everything_in_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id = tenant(GROUP_TENANT);
+    let rina = viewer(Some(person(RINA)), Some(tenant_id));
+    let sari = viewer(Some(person(SARI)), Some(tenant_id));
+    let tree = carried_tree(&pool, tenant_id, "case").await;
+    let y = create_folder(&pool, tenant_id, Some(person(SARI)), "Y", Some(tree.x))
+        .await
+        .unwrap();
+    create_saved_query(&pool, &sari, "Sari's", "SELECT 1", "Sari", &[], Some(y.id))
+        .await
+        .unwrap();
+    let trashed = create_saved_query(
+        &pool,
+        &sari,
+        "Sari's, trashed",
+        "SELECT 2",
+        "Sari",
+        &[],
+        Some(y.id),
+    )
+    .await
+    .unwrap();
+    trash_saved_query(&pool, &sari, &trashed.id).await.unwrap();
+    // A query of Rina's inside, with a rule that gives Sari manage on it:
+    // a rule is as good as authorship.
+    let shared = create_saved_query(
+        &pool,
+        &rina,
+        "Rina's, shared",
+        "SELECT 3",
+        "Rina Wijaya",
+        &[],
+        Some(tree.x),
+    )
+    .await
+    .unwrap();
+    replace_grants(
+        &pool,
+        Some(Uuid::parse_str(&shared.id).expect("the saved query id")),
+        None,
+        &[NewGrant {
+            user_id: Some(person(SARI)),
+            role_id: None,
+            level: Level::Manage,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let moved = move_folder_for_viewer(&pool, &sari, tree.x, Some(tree.target)).await;
+    assert!(moved.is_ok(), "the mover manages all of it: {moved:?}");
+    assert_eq!(moved.unwrap().parent_id, Some(tree.target));
     Ok(())
 }
 

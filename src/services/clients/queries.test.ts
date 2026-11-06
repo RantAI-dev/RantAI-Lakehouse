@@ -804,12 +804,12 @@ describe("the saved-query console client (QS-3)", () => {
     expect(calls[0]!.url).toBe("/api/query/grantees?q=reza")
   })
 
-  it("refuses a move across a personal space with the server's own sentence", async () => {
+  it("refuses a move with the server's own sentence", async () => {
     stubFetch(() =>
       json(
         {
           error:
-            "permission_denied: Only someone who manages this can move it into or out of a personal space.",
+            "permission_denied: Only someone who manages this can move it.",
         },
         403,
       ),
@@ -817,7 +817,7 @@ describe("the saved-query console client (QS-3)", () => {
     const err = await rejection(clickhouseQueryService.updateSaved("q-1", { folderId: "f-2" }))
     expect(err.code).toBe("permission_denied")
     expect(err.message).toBe(
-      "Only someone who manages this can move it into or out of a personal space.",
+      "Only someone who manages this can move it.",
     )
   })
 
