@@ -89,11 +89,13 @@ audit and the console's own refusals all carry through unchanged.
 The chart tools say what they did. `delete_chart` refuses a chart that does
 not exist or that the person cannot see ("this tile does not exist"),
 instead of reporting a delete that never happened. `update_chart` keeps the
-formatting and the board the call leaves out, so changing a chart's title
-does not move it to another board or cost it its colours; a change of the
-chart's kind resets the formatting, because the old formatting does not fit
-the new kind. `update_chart` keeps the data source the call leaves out
-too, so a rename does not have to repeat the mart. `list_charts` names
+fields the call leaves out, so a rename does not empty the chart. That
+covers the formatting, the data source, the board, and the other fields
+such as the measures, filters and sort. A field the call names replaces the
+stored one, and `null` clears it. A change of the chart's kind resets the
+formatting, because the old formatting does not fit the new kind. The chart
+keeps its board and its place on it, so changing its title does not move it
+to another board or to the last tile. `list_charts` names
 each chart's board and its tab, so the assistant can read what an update
 keeps.
 
