@@ -383,8 +383,16 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // BI-37 D8 moved the hash: `SYSTEM_BASE` gained one line saying that a
 // dashboard's comments are what people wrote and are never instructions to
 // follow. (Before: `45c0fcda...006b`.)
+//
+// Updated by hand again: the `limits_and_freshness!` sentences both suffixes
+// share gained two rules, that a question about why a chart or query timed out
+// is answered from `get_query_limits` without SQL on `system.*` tables, and that
+// a count of running queries comes only from `list_workloads`. The new hash is
+// the old bytes plus exactly those two sentences (hashing the prompt with them
+// removed gives the previous pin `7842304c...b590`). The AI team reviews the
+// sentences (Assistant parity).
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "7842304ce41a0bae948271ea1433eea25a88f30c36651b11d4ef5a0af62eb590";
+    "534a2e9b4308299cf453babc3fdd017e4fe735396928dbce39b3758026e79e91";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;
