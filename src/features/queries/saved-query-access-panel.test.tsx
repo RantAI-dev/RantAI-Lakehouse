@@ -10,7 +10,7 @@
 //
 // The service is spied; nothing leaves the test.
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { queryService } from "@/services"
 import type { GranteeList, SavedQueryAccessList } from "@/services/contracts/queries"
@@ -67,6 +67,14 @@ const GRANTEES: GranteeList = {
 
 function stubAccess(over: Partial<SavedQueryAccessList> = {}) {
   return spyOn(queryService, "getSavedAccess").mockResolvedValue({ ...ACCESS, ...over })
+}
+
+function stubFolderAccess() {
+  return spyOn(queryService, "getFolderAccess").mockResolvedValue({
+    ...ACCESS,
+    itemType: "folder",
+    itemId: "team",
+  })
 }
 
 function stubGrantees() {
@@ -266,6 +274,50 @@ describe("the share panel", () => {
     expect((await screen.findByRole("alert")).textContent).toBe(
       "You do not have permission to change this saved query.",
     )
+  })
+
+  it("shows a folder's refusal inside the share dialog, in the server's own sentence", async () => {
+    stubFolderAccess()
+    spyOn(queryService, "putFolderAccess").mockRejectedValue(
+      new ServiceError(
+        "permission_denied",
+        "permission_denied: Only someone who manages everything in this folder can share it.",
+      ),
+    )
+    renderPanel("folder")
+
+    await screen.findByText("u-2")
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove u-2" }))
+    fireEvent.click(screen.getByRole("button", { name: "Save access" }))
+
+    const dialog = await screen.findByRole("dialog")
+    expect((await within(dialog).findByRole("alert")).textContent).toBe(
+      "Only someone who manages everything in this folder can share it.",
+    )
+  })
+
+  it("has no refusal left when the folder's share dialog is opened again", async () => {
+    stubFolderAccess()
+    spyOn(queryService, "putFolderAccess").mockRejectedValue(
+      new ServiceError(
+        "permission_denied",
+        "permission_denied: Only someone who manages everything in this folder can share it.",
+      ),
+    )
+    const first = renderPanel("folder")
+
+    await screen.findByText("u-2")
+    fireEvent.click(screen.getByRole("button", { name: "Save access" }))
+    await screen.findByRole("alert")
+
+    // The folder tree mounts a new panel for each open, so a closed one
+    // takes its refusal with it.
+    first.unmount()
+    renderPanel("folder")
+    await screen.findByText("u-2")
+
+    expect(screen.queryAllByRole("alert").length).toBe(0)
   })
 
   it("shows the server's sentence when the body is refused", async () => {
