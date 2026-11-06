@@ -442,6 +442,55 @@ describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
   });
 });
 
+describe("the status line under a confirmed draft stays out of the chat (AI-6)", () => {
+  const modelText = "The board draft is ready.";
+
+  it("leaves the reply as the model wrote it and out of the next request the person types", async () => {
+    nextStep = null;
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.send("Build me a board.");
+    });
+    await act(async () => {
+      await copilot!.confirmTool(1, 0);
+    });
+
+    // With no step left the console sends nothing by itself, and the stored
+    // reply is the model's text alone.
+    expect(chatRequests.length).toBe(1);
+    expect(copilot!.messages[1].content).toBe(modelText);
+    expect(copilot!.messages[1].tools?.[0]).toMatchObject({ ok: true, confirmed: true });
+
+    await act(async () => {
+      await copilot!.send("Thanks.");
+    });
+
+    const history = sentMessages(1);
+    expect(history.map((m) => m.content)).toEqual(["Build me a board.", modelText, "Thanks."]);
+    expect(history.some((m) => m.content.includes("Saved:"))).toBe(false);
+  });
+
+  it("leaves the reply as the model wrote it and out of the continuation the console sends", async () => {
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.send("Build me a dashboard about events.");
+    });
+    await act(async () => {
+      await copilot!.confirmTool(1, 0);
+    });
+
+    expect(copilot!.messages[1].content).toBe(modelText);
+    const history = sentMessages(1);
+    expect(history[1]).toEqual({ role: "assistant", content: modelText });
+    expect(history.some((m) => m.content.includes("Saved:"))).toBe(false);
+    // The continuation names the object in its own words, not the line the
+    // chat shows.
+    expect(history.at(-1)?.content).toContain("Confirmed and saved:");
+  });
+});
+
 describe("a stopped answer stays in the history (BI-41 D3)", () => {
   it("sends the fixed line between the stopped question and the next one", () => {
     const messages: Msg[] = [

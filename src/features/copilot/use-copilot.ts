@@ -154,8 +154,19 @@ function savedItem(step: ToolStep): string | null {
   if (result.needs_confirmation) return null;
   const field = (result.field ?? {}) as { id?: unknown; name?: unknown };
   const id = textOf(result.id) ?? textOf(field.id);
-  const title = textOf(result.title) ?? textOf(result.name) ?? textOf(field.name);
+  const title = savedTitle(result);
   return `${step.tool}${id ? ` ${id}` : ""}${title ? ` "${title}"` : ""}`;
+}
+
+/**
+ * The title a saved result carries: `title`, else `name`, else
+ * `field.name`, or null when it carries none. Shared by the continuation
+ * text and the status line under a reply.
+ */
+export function savedTitle(result: unknown): string | null {
+  const r = (result ?? {}) as { title?: unknown; name?: unknown; field?: unknown };
+  const field = (r.field ?? {}) as { name?: unknown };
+  return textOf(r.title) ?? textOf(r.name) ?? textOf(field.name);
 }
 
 /** The text a result carries, or null when it carries none. */

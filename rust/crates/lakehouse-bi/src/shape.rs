@@ -1018,7 +1018,8 @@ fn check_bins_against_relation(
         }
         if !number(column) {
             return Err(format!(
-                "'{column}' is not a number column; bins are for numbers (a date has a grain)."
+                "'{column}' is not a number column; bins are for numbers (a date has a grain). {}",
+                number_columns_sentence(check.kinds)
             ));
         }
     }
@@ -1026,6 +1027,36 @@ fn check_bins_against_relation(
         return Err("a chart groups by a grain or by bins, not both.".to_owned());
     }
     Ok(())
+}
+
+/// How many number columns [`number_columns_sentence`] names.
+const MAX_LISTED_NUMBER_COLUMNS: usize = 8;
+
+/// What follows a refused bin: the number columns the source has, so the
+/// caller can ask the person which one to bin instead of guessing one. The
+/// columns are sorted before the cut, because a map has no order and the
+/// same refusal must name the same columns every time.
+fn number_columns_sentence(kinds: &HashMap<String, ColumnKind>) -> String {
+    let mut numbers: Vec<&str> = kinds
+        .iter()
+        .filter(|(_, kind)| **kind == ColumnKind::Number)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    numbers.sort_unstable();
+    if numbers.is_empty() {
+        return "The source has no number column to bin.".to_owned();
+    }
+    let listed = numbers
+        .iter()
+        .take(MAX_LISTED_NUMBER_COLUMNS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = match numbers.len().saturating_sub(MAX_LISTED_NUMBER_COLUMNS) {
+        0 => String::new(),
+        n => format!(", and {n} more"),
+    };
+    format!("The source's number columns are: {listed}{more}. Ask the person which one to bin.")
 }
 
 /// No two measures share a result name, and none takes the name of the
@@ -1656,5 +1687,64 @@ mod tests {
         assert!(
             check_against_relation(&list, &width, &relation_check(&c, &sql, &t, "stay")).is_ok()
         );
+    }
+
+    /// A refused bin names the number columns of the source, so the assistant
+    /// can ask which one to bin (and not turn the text column into a number).
+    #[test]
+    fn a_bin_on_a_text_column_is_refused_and_names_the_sources_number_columns() {
+        let c = cols(&[
+            ("p", ColumnKind::Text),
+            ("stay", ColumnKind::Number),
+            ("w", ColumnKind::Number),
+        ]);
+        let t = time();
+        let mart = Relation::Mart(Ident::new("m").unwrap());
+        let list = measures(r#"["w"]"#);
+        let width = shape_of(r#"{"bin":{"mode":"width","width":500}}"#);
+        let err =
+            check_against_relation(&list, &width, &relation_check(&c, &mart, &t, "p")).unwrap_err();
+        assert!(err.starts_with("'p' is not a number column;"), "{err}");
+        assert!(
+            err.contains("The source's number columns are: stay, w."),
+            "{err}"
+        );
+        assert!(err.contains("Ask the person which one to bin."), "{err}");
+    }
+
+    #[test]
+    fn a_bin_on_a_source_with_no_number_column_says_so() {
+        let c = cols(&[("p", ColumnKind::Text), ("d", ColumnKind::Date)]);
+        let t = time();
+        let mart = Relation::Mart(Ident::new("m").unwrap());
+        let list = measures(r#"["d"]"#);
+        let width = shape_of(r#"{"bin":{"mode":"width","width":500}}"#);
+        let err =
+            check_against_relation(&list, &width, &relation_check(&c, &mart, &t, "p")).unwrap_err();
+        assert!(
+            err.contains("The source has no number column to bin."),
+            "{err}"
+        );
+    }
+
+    /// Eight at most, sorted: a map has no order, so the cut must not depend
+    /// on it.
+    #[test]
+    fn a_refused_bin_lists_eight_number_columns_in_order_and_counts_the_rest() {
+        let mut columns = vec![("p", ColumnKind::Text)];
+        let names: Vec<String> = (1..=10).rev().map(|i| format!("n{i:02}")).collect();
+        columns.extend(names.iter().map(|n| (n.as_str(), ColumnKind::Number)));
+        let c = cols(&columns);
+        let t = time();
+        let mart = Relation::Mart(Ident::new("m").unwrap());
+        let list = measures(r#"["n01"]"#);
+        let width = shape_of(r#"{"bin":{"mode":"width","width":500}}"#);
+        let err =
+            check_against_relation(&list, &width, &relation_check(&c, &mart, &t, "p")).unwrap_err();
+        assert!(
+            err.contains("are: n01, n02, n03, n04, n05, n06, n07, n08, and 2 more."),
+            "{err}"
+        );
+        assert!(!err.contains("n09"), "{err}");
     }
 }

@@ -587,29 +587,44 @@ fn arg_filter_modes(
     )
 }
 
-/// Checks a chart call before the gate offers it as a draft (plan 18). `None`
-/// when the call is not a chart call, or when the draft can be built; the
-/// error otherwise, so a draft on a mart or column that does not exist is
-/// refused rather than offered. Writes nothing.
+/// Checks a chart call before the gate offers it as a draft, and
+/// adds what the draft holds to it. `draft` is the gate's `needs_confirmation`
+/// answer; a call that is not a chart call, or a draft that builds, comes back
+/// as the draft (a create's with a `definition` key, the digest of what it
+/// would save: the card reads `args`, so the key changes nothing the person
+/// sees; an update's draft has no `definition`, because its digest would be
+/// read from the stored chart as the server). The error otherwise, so a draft
+/// on a mart or column that does not exist is refused rather than offered.
+/// Writes nothing.
 ///
 /// When the reporting settings cannot be read, this returns the same error
 /// the dispatch arm returns, instead of skipping the check.
 ///
 /// `confirmed` is dropped during parse because `ChartInput` and its flattened `TableFields` lack
 /// `deny_unknown_fields` (`Compare` has it; adding it here would refuse drafts the Confirm path accepts).
+///
+/// # Errors
+///
+/// The reply that replaces the draft when the call cannot be built.
 pub(crate) async fn check_draft(
     state: &AppState,
     name: &str,
     args: &Map<String, Value>,
-) -> Option<Value> {
+    mut draft: Value,
+) -> Result<Value, Value> {
     if name != "create_chart" && name != "update_chart" {
-        return None;
+        return Ok(draft);
     }
     let Ok(time) = crate::routes::settings::time_context(state).await else {
-        return Some(json!({ "error": "The reporting settings could not be read." }));
+        return Err(json!({ "error": "The reporting settings could not be read." }));
     };
     let id = (name == "update_chart").then(|| arg_str(args, "id"));
-    dashboards::check_chart_draft(&state.clickhouse, args, id, &time).await
+    if let Some(definition) =
+        dashboards::check_chart_draft(&state.clickhouse, args, id, &time).await?
+    {
+        draft["definition"] = Value::String(definition);
+    }
+    Ok(draft)
 }
 
 /// Reads `args[key]` as a string, matching `String(args[key] ?? "")`: a
