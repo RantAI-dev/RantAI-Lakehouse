@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
-use crate::routes::alerts::{ApiSilenceSource, smtp_config};
+use crate::routes::alerts::ApiSilenceSource;
 use crate::routes::authored_pipelines;
 use crate::routes::load_alerts;
 use crate::routes::support::{extract_json_object, upstream_message};
@@ -2674,7 +2674,7 @@ pub async fn run_failed_event(
     }
     // SEC-10: the sender checks every webhook target and never follows a redirect.
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
     let silence_source: Option<Box<dyn SilenceSource>> = state
         .pg
         .as_deref()
@@ -2872,7 +2872,7 @@ pub async fn run_finished_event(
     };
     // SEC-10: the sender checks every webhook target and never follows a redirect.
     let http = state.webhook_sender();
-    let email = EmailSender::new(smtp_config(&state.config));
+    let email = EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
     let silence_source: Option<Box<dyn SilenceSource>> = state
         .pg
         .as_deref()

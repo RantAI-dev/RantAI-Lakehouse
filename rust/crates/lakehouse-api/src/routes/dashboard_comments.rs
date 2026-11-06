@@ -484,7 +484,7 @@ pub async fn post(
         .map_err(|e| store_failure(&e))?
     {
         PostOutcome::Posted { id, email } => {
-            notify(&state, &principal, &target, &email);
+            notify(&state, &principal, &target, &email).await;
             Ok(ApiJson(one_json(&state, &principal, &target, id).await?))
         }
         // BI-38 D3: the store wrote nothing, so there is no comment to return,
@@ -547,7 +547,7 @@ pub async fn edit(
         .await
         .map_err(|e| store_failure(&e))?
         .ok_or_else(|| ApiError::NotFound(COMMENT_NOT_FOUND.to_owned()))?;
-    notify(&state, &principal, &target, &to_email);
+    notify(&state, &principal, &target, &to_email).await;
     Ok(ApiJson(one_json(&state, &principal, &target, id).await?))
 }
 
@@ -759,20 +759,26 @@ fn mention_email(author: &str, board: &str, link: Option<&str>) -> String {
     }
 }
 
-/// Email the people the store chose (when `SMTP_HOST` is set): newly mentioned
-/// and with no other unread mention on this dashboard (`BI-19` E review E-1).
-/// Not the comment's text, not a chart or a value (E3).
+/// Email the people the store chose (when the mail server is set): newly
+/// mentioned and with no other unread mention on this dashboard (`BI-19` E
+/// review E-1). Not the comment's text, not a chart or a value (E3).
 /// Runs in the background and is best effort: a failed send never fails or
 /// delays the comment, and is logged without the address.
-fn notify(state: &AppState, author: &Principal, target: &Target, people: &[Uuid]) {
-    if people.is_empty() || state.config.smtp_host.is_none() {
+///
+/// Whether email is set up is the resolver's answer (`ADM-7` D3), not the
+/// environment's alone: the console may have set the mail server.
+async fn notify(state: &AppState, author: &Principal, target: &Target, people: &[Uuid]) {
+    if people.is_empty() {
         return;
     }
     let Some(pool) = state.pg.clone() else {
         return;
     };
-    let sender =
-        lakehouse_notify::EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
+    let email = crate::runtime_settings::email(state).await;
+    if email.host.is_none() {
+        return;
+    }
+    let sender = lakehouse_notify::EmailSender::new(email.smtp());
     let link = crate::routes::report_runner::dashboard_link(state, &target.key);
     let html = mention_email(&author.display_name, &target.name(), link.as_deref());
     let people = people.to_vec();
