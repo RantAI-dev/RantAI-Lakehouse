@@ -1,4 +1,7 @@
 import type {
+  AssistantSettings,
+  AssistantSettingsInput,
+  AssistantTestResult,
   DeploymentSettings,
   EmailSettings,
   EmailSettingsInput,
@@ -7,6 +10,8 @@ import type {
   QueryLimitsInput,
   ReportingSettings,
   SettingsService,
+  SignInSettings,
+  SignInSettingsInput,
 } from "../contracts/settings"
 import { ServiceError } from "../errors"
 import { apiFetch } from "../http"
@@ -53,6 +58,12 @@ const EMAIL_PATH = "/api/settings/email"
 const EMAIL_TEST_PATH = "/api/settings/email/test"
 /** The deployment's feature list (`ADM-6`). */
 const DEPLOYMENT_PATH = "/api/settings/deployment"
+/** The deployment's sign-in limits (`ADM-8`). */
+const SIGN_IN_PATH = "/api/settings/sign-in"
+/** The assistant's provider (`ADM-9`). */
+const ASSISTANT_PATH = "/api/settings/assistant"
+/** One request to the assistant's provider (`ADM-9`). */
+const ASSISTANT_TEST_PATH = "/api/settings/assistant/test"
 
 export const settingsService: SettingsService = {
   getLimits: (signal) => call<QueryLimits>("GET", undefined, signal, LIMITS_PATH),
@@ -65,4 +76,12 @@ export const settingsService: SettingsService = {
   sendTestEmail: (signal) =>
     call<EmailTestResult>("POST", undefined, signal, EMAIL_TEST_PATH),
   getDeployment: (signal) => call<DeploymentSettings>("GET", undefined, signal, DEPLOYMENT_PATH),
+  getSignIn: (signal) => call<SignInSettings>("GET", undefined, signal, SIGN_IN_PATH),
+  saveSignIn: (input: SignInSettingsInput, signal) =>
+    call<SignInSettings>("PUT", input, signal, SIGN_IN_PATH),
+  getAssistant: (signal) => call<AssistantSettings>("GET", undefined, signal, ASSISTANT_PATH),
+  saveAssistant: (input: AssistantSettingsInput, signal) =>
+    call<AssistantSettings>("PUT", input, signal, ASSISTANT_PATH),
+  testAssistant: (signal) =>
+    call<AssistantTestResult>("POST", undefined, signal, ASSISTANT_TEST_PATH),
 }

@@ -28,7 +28,7 @@ export const FEATURE_LABEL: Record<DeploymentFeature["feature"], string> = {
  * The features the console can fix itself. Everything else is set in the
  * server's environment, so the row points at the guide.
  */
-const FIXED_IN_THE_CONSOLE: DeploymentFeature["feature"][] = ["email"]
+const FIXED_IN_THE_CONSOLE: DeploymentFeature["feature"][] = ["email", "assistant"]
 
 /**
  * Admin > Settings > Deployment (`ADM-6`): which of the deployment's
@@ -38,7 +38,13 @@ const FIXED_IN_THE_CONSOLE: DeploymentFeature["feature"][] = ["email"]
  * settings are in place. Whether the mail server really answers is the
  * Email tab's question, not this page's.
  */
-export function DeploymentSettings({ onOpenEmail }: { onOpenEmail?: () => void }) {
+export function DeploymentSettings({
+  onOpenEmail,
+  onOpenAssistant,
+}: {
+  onOpenEmail?: () => void
+  onOpenAssistant?: () => void
+}) {
   const state = useService((signal) => settingsService.getDeployment(signal), [])
   const loaded = state.status === "success" ? state.data.features : []
   return (
@@ -68,7 +74,11 @@ export function DeploymentSettings({ onOpenEmail }: { onOpenEmail?: () => void }
                 </span>
               ) : null}
               {feature.on || FIXED_IN_THE_CONSOLE.indexOf(feature.feature) < 0 ? null : (
-                <FixLink feature={feature} onOpenEmail={onOpenEmail} />
+                <FixLink
+                  feature={feature}
+                  onOpenEmail={onOpenEmail}
+                  onOpenAssistant={onOpenAssistant}
+                />
               )}
             </li>
           ))}
@@ -79,22 +89,33 @@ export function DeploymentSettings({ onOpenEmail }: { onOpenEmail?: () => void }
 }
 
 /**
- * Where to fix a feature that is not set up: the Email tab when the console
- * owns the setting, the configuration guide when the server does.
+ * Where to fix a feature that is not set up: the tab that owns the setting
+ * when the console owns it, the configuration guide when the server does.
  */
 function FixLink({
   feature,
   onOpenEmail,
+  onOpenAssistant,
 }: {
   feature: DeploymentFeature
   onOpenEmail?: () => void
+  onOpenAssistant?: () => void
 }) {
-  if (feature.where === "console" && onOpenEmail) {
-    return (
-      <Button variant="outline" size="sm" onClick={onOpenEmail}>
-        Set it up in the Email tab
-      </Button>
-    )
+  if (feature.where === "console") {
+    if (feature.feature === "email" && onOpenEmail) {
+      return (
+        <Button variant="outline" size="sm" onClick={onOpenEmail}>
+          Set it up in the Email tab
+        </Button>
+      )
+    }
+    if (feature.feature === "assistant" && onOpenAssistant) {
+      return (
+        <Button variant="outline" size="sm" onClick={onOpenAssistant}>
+          Set it up in the Assistant tab
+        </Button>
+      )
+    }
   }
   return (
     <a

@@ -5,7 +5,6 @@ import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import {
   Select,
   SelectContent,
@@ -16,13 +15,11 @@ import {
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
-import { settingsService, type EmailSettingsInput, type SettingSource } from "@/services"
+import { settingsService, type EmailSettingsInput } from "@/services"
+import { SettingField } from "./setting-field"
 
 /** The two ways the connection to the mail server may be secured. */
 const SECURITY = { tls: "Implicit TLS", starttls: "STARTTLS" } as const
-
-/** What the person is told about a setting the server's environment owns. */
-const SET_BY_SERVER = "Set by the server"
 
 /**
  * Admin > Settings > Email (`ADM-7`): the mail server, the account it
@@ -304,32 +301,6 @@ export function EmailSettingsForm({ canWrite }: { canWrite: boolean }) {
             </div>
           </section>
         </div>
-      ) : null}
-    </div>
-  )
-}
-
-/**
- * One setting of the form: its label, and the reason it cannot be changed
- * when the server's environment owns it (plan D1).
- */
-function SettingField({
-  label,
-  source,
-  id,
-  children,
-}: {
-  label: string
-  source: SettingSource
-  id: string
-  children: React.ReactNode
-}) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <Label htmlFor={id}>{label}</Label>
-      {children}
-      {source === "server" ? (
-        <p className="text-xs text-muted-foreground">{SET_BY_SERVER}</p>
       ) : null}
     </div>
   )

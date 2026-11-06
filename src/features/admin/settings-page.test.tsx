@@ -43,6 +43,20 @@ function stubApi(permissions = ["settings:write", "governance:write"]) {
         from: { value: null, source: "default" },
         consolePublicUrl: { value: null, source: "default" },
       })
+    if (path.includes("/api/settings/sign-in"))
+      return json({
+        maxFailures: { value: 5, source: "default" },
+        failureWindowSecs: { value: 900, source: "default" },
+        lockoutSecs: { value: 300, source: "default" },
+        retentionDays: { value: 30, source: "default" },
+        embedMaxLifetimeSecs: { value: 86400, source: "default" },
+      })
+    if (path.includes("/api/settings/assistant"))
+      return json({
+        url: { value: "https://api.example.com/v1", source: "default" },
+        model: { value: "example-model", source: "default" },
+        key: { set: false, source: "default" },
+      })
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
   return paths
@@ -57,7 +71,7 @@ function renderPage() {
 }
 
 describe("Settings sections (WEB-3 S3-D6)", () => {
-  it("offers the six sections and the two administrator ones, and opens Deployment for an administrator", async () => {
+  it("offers the six sections and the three administrator ones, and opens Deployment for an administrator", async () => {
     stubApi()
     renderPage()
     for (const name of [
@@ -69,6 +83,7 @@ describe("Settings sections (WEB-3 S3-D6)", () => {
       "Maps",
       "Deployment",
       "Email",
+      "Assistant",
     ]) {
       expect(await screen.findByRole("tab", { name })).toBeTruthy()
     }
@@ -87,6 +102,7 @@ describe("Settings sections (WEB-3 S3-D6)", () => {
     }
     await waitFor(() => expect(screen.queryByRole("tab", { name: "Deployment" })).toBeNull())
     expect(screen.queryByRole("tab", { name: "Email" })).toBeNull()
+    expect(screen.queryByRole("tab", { name: "Assistant" })).toBeNull()
   })
 
   it("opens Reporting on the bare address for everybody else", async () => {
