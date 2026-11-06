@@ -655,7 +655,7 @@ const GOLD_EXPORT_SERVICE_IDENTITY_NAME: &str = "gold-export-scheduler";
 /// `routes::agents::check_employee_run_auth` matches against `x-run-token`,
 /// already threaded to both `lakehouse-api` and
 /// `dagster-code-location` in compose, and already documented in
-/// `.env.example` — one env var, one meaning ("the credential Dagster's
+/// `docs/CONFIGURATION.md` — one env var, one meaning ("the credential Dagster's
 /// scheduled agent runs use"), satisfied twice (as the bearer credential
 /// AND as the `x-run-token` header), matching
 /// `routes::agents::check_employee_run_auth`'s own preference for the

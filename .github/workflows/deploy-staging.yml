@@ -72,16 +72,17 @@ jobs:
             sed -i "/^$name=/d" .env
             printf '\n%s=%s\n' "$name" "$value" >> .env
           done
-          # TENANT_WAREHOUSE_S3_* used to fall back to the RustFS credentials in .env.example (the
-          # same value as the RustFS keys, ADR 0002 Addendum 2 "may equal,
-          # must never alias"); keep staging's tenant provisioning working.
+          # TENANT_WAREHOUSE_S3_* are empty in the fresh-install template
+          # (they used to fall back to the RustFS credentials, the same
+          # value as the RustFS keys, ADR 0002 Addendum 2 "may equal, must
+          # never alias"); keep staging's tenant provisioning working.
           sed -i '/^TENANT_WAREHOUSE_S3_ACCESS_KEY=/d;/^TENANT_WAREHOUSE_S3_SECRET_KEY=/d' .env
           printf '\nTENANT_WAREHOUSE_S3_ACCESS_KEY=%s\nTENANT_WAREHOUSE_S3_SECRET_KEY=%s\n' \
             "$STAGING_RUSTFS_ACCESS_KEY" "$STAGING_RUSTFS_SECRET_KEY" >> .env
           # File upload storage (DATA-9, DATA-17): compose defaults
           # RUSTFS_ACCESS_KEY_SECRET_REF / RUSTFS_SECRET_KEY_SECRET_REF to
           # env:UPLOAD_S3_ACCESS_KEY / env:UPLOAD_S3_SECRET_KEY, and since SEC-18
-          # (#83) .env.example ships both empty, so on staging every upload
+          # (#83) the template leaves both empty, so on staging every upload
           # answered "Upload storage is not configured." Same RustFS keys as the
           # tenant warehouse above; a separate upload key may replace them later.
           sed -i '/^UPLOAD_S3_ACCESS_KEY=/d;/^UPLOAD_S3_SECRET_KEY=/d' .env
@@ -89,7 +90,7 @@ jobs:
             "$STAGING_RUSTFS_ACCESS_KEY" "$STAGING_RUSTFS_SECRET_KEY" >> .env
           # Paid provider credential, kept OUT of the repo (this repo is
           # public): inject it as the ONLY LLM_KEY= line in the file.
-          # .env.example ships an empty `LLM_KEY=` too; compose resolves
+          # .env.example leaves `LLM_KEY` commented out; compose resolves
           # a duplicated .env key last-wins, but the line must actually
           # START a line — .env.staging historically ended without a
           # trailing newline, so a naive append glued LLM_KEY= onto its

@@ -2140,9 +2140,10 @@ jobs:
           # it drives a Lakekeeper warehouse create and a set of grants
           # (`routes::identity::provision_tenant`), and the API container
           # of a release install cannot reach Lakekeeper at all — the
-          # install's `.env` names the host-facing
-          # `LAKEKEEPER_BASE_URI=http://localhost:8181` (`.env.example`),
-          # and `localhost` inside the API container is the API itself. The
+          # install's `.env` no longer names `LAKEKEEPER_BASE_URI`, so
+          # compose's host-facing default (`http://localhost:8181`) is what
+          # the API container gets, and `localhost` inside it is the API
+          # itself. The
           # proof needs the tenant ROW, not a warehouse, and a tenant that
           # is not on the provisioning state machine says so
           # (`provisioning_status = 'not_applicable'`, the state the seeded

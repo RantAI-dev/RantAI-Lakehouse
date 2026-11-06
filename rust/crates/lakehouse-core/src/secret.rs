@@ -807,7 +807,7 @@ mod tests {
         ));
         // `env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` — the exact variable
         // that motivated the credential-suffix design (WS3 plan review X1,
-        // `config.rs:569`, `docker-compose.yml:197`, `.env.example:409`):
+        // `config.rs:569`, `docker-compose.yml:197`, `docs/CONFIGURATION.md`):
         // a real, non-credential configuration flag this API already
         // reads, admitted only by a bare `env:CONNECTOR_*` prefix pattern,
         // never by a credential-suffixed one.

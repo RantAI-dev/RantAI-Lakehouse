@@ -358,8 +358,8 @@ services:
       # KNOWN GAP, deliberately not silently patched here: this service's
       # `Config::lakekeeper_base_url` reads the SAME `LAKEKEEPER_BASE_URI`
       # var the `lakekeeper` service block below uses for its own
-      # externally-advertised base URI (`.env.example`'s documented
-      # default, `http://localhost:8181` — the host-facing mapping for
+      # externally-advertised base URI (the default in `config.rs`,
+      # `http://localhost:8181` — the host-facing mapping for
       # local dev). `docs/plans/P5-RESULT.md` §4 measured that same
       # default as wrong for an in-network REST client:
       # `AppState::lakekeeper_admin` (this service's `management/v1/*`
@@ -701,7 +701,8 @@ services:
       # should give them a credential limited to the warehouse bucket, and
       # to its `uploads/` prefix where the store supports per-prefix
       # policies. Whether the pinned RustFS can mint such an identity is
-      # the open question the `CONNECTOR_S3_*` note in .env.example records.
+      # the open question `docs/CONFIGURATION.md` records under
+      # `CONNECTOR_S3_ACCESS_KEY`.
       UPLOAD_S3_ACCESS_KEY: ${UPLOAD_S3_ACCESS_KEY:-}
       UPLOAD_S3_SECRET_KEY: ${UPLOAD_S3_SECRET_KEY:-}
       # ── Tenant identity (see `lakehouse-api/src/tenant.rs`) ──
@@ -1699,7 +1700,7 @@ services:
     environment:
       # These four all resolve from INSIDE the compose network (this
       # container's own perspective), unlike the host-facing defaults in
-      # `.env.example` — see the module doc on `g1_lakekeeper.rs`'s
+      # `config.rs` — see the module doc on `g1_lakekeeper.rs`'s
       # `G1Env` for why the host-facing and container-facing values must
       # not be collapsed into one.
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
@@ -1865,7 +1866,7 @@ services:
         fi
         if [ -z "$$signing_key" ]; then
           signing_key="$$(head -c 32 /dev/urandom | base64)"
-          echo "seaweedfs-iam-init: SEAWEEDFS_STS_SIGNING_KEY not set — generated a random per-deployment key (see .env.example)." >&2
+          echo "seaweedfs-iam-init: SEAWEEDFS_STS_SIGNING_KEY not set — generated a random per-deployment key (see docs/CONFIGURATION.md)." >&2
         fi
         sed \
           -e "s#__SEAWEEDFS_ACCESS_KEY__#$$SEAWEEDFS_ACCESS_KEY#g" \
@@ -2364,7 +2365,7 @@ services:
       # defined for `lakehouse-api` above, defaulting to the same RustFS
       # root key ONLY because this stack has no narrower RustFS identity
       # to hand out (RustFS 1.0.0-rc.4 exposes no non-root S3 principal —
-      # see .env.example's note by these vars). A deployment that can
+      # see docs/CONFIGURATION.md). A deployment that can
       # mint a scoped RustFS/S3 identity should set these two to it
       # without touching `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` at all.
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
