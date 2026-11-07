@@ -42,6 +42,8 @@ test("the water only darkens with depth, down to the page's own background at th
     prevBottom = lum(w.bottom);
   }
   assert.deepEqual(waterAt(-FLOOR_DEPTH), { top: "#020514", bottom: "#020514" });
+  // O39: solid at every depth, never a gradient on screen.
+  for (let d = -FLOOR_DEPTH; d <= -100; d += 5) assert.equal(waterAt(d).top, waterAt(d).bottom, `${d} m`);
   assert.deepEqual(waterAt(-1000), waterAt(-FLOOR_DEPTH));
   assert.deepEqual(waterAt(-20), waterAt(-100));
   assert.equal(WATER_BY_DEPTH[0].depth, -FLOOR_DEPTH);

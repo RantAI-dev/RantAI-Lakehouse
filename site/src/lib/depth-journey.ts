@@ -14,22 +14,28 @@ export type Water = { top: string; bottom: string };
  * The water's colour by depth, top and bottom of the screen, deepest
  * first. WEB-5 O33: it only darkens with depth, and the page only goes
  * deeper, so the background never lightens again.
- * - −100 m (the assistant) is about the colour the 3D water shows where the
- *   scene zone ends (the lake engine's deep fog through its tone mapping,
- *   lake-engine.ts); the backdrop takes over from that exact colour there
- *   (lib/scene-colour.ts) and eases into this ramp.
+ *
+ * WEB-5 O39 (owner: "kurangi dong background background gradient ...
+ * mending warna solid aja"): every stop is one solid colour (top equals
+ * bottom), so at any moment the water behind the page is flat, and the
+ * steps are small, so it only darkens very gently down the page: two
+ * adjacent sections never differ by more than a channel step or two.
+ * - −100 m (the assistant) is #030b2a, the DOM hero's own bottom colour and
+ *   the scene zone's solid fallback (scene-zone.tsx), and about the
+ *   average of what the 3D water shows where the zone ends; over the live
+ *   lake the backdrop takes over from the scene's exact colours there
+ *   (lib/scene-colour.ts) and eases into this.
  * - −400 m (the bottom, at the final call) is the page's own background,
- *   #020514, top and bottom alike, so the footer and the overscroll end on
- *   the same colour.
+ *   #020514, so the footer and the overscroll end on that colour.
  * Shallower than −100 m the backdrop is covered (the canvas or the scene
- * zone's gradient), so the ramp holds its −100 m colour there.
+ * zone's fallback), so the ramp holds its −100 m colour there.
  */
 export const WATER_BY_DEPTH: readonly { depth: number; top: string; bottom: string }[] = [
   { depth: -400, top: "#020514", bottom: "#020514" },
-  { depth: -300, top: "#020720", bottom: "#020619" },
-  { depth: -200, top: "#020a2e", bottom: "#02071f" },
-  { depth: -150, top: "#020c38", bottom: "#020826" },
-  { depth: -100, top: "#020e42", bottom: "#02092c" },
+  { depth: -300, top: "#020619", bottom: "#020619" },
+  { depth: -200, top: "#02081f", bottom: "#02081f" },
+  { depth: -150, top: "#020928", bottom: "#020928" },
+  { depth: -100, top: "#030b2a", bottom: "#030b2a" },
 ];
 
 const hex = (c: string): [number, number, number] => [

@@ -10,9 +10,10 @@ import { WHALE_VIEW, WhaleSvg } from "./whale-svg";
  * whale (O29's character, `whale-svg.tsx`) swims down to greet the visitor
  * there, as the guide, and settles below the call to action. This replaces
  * O24's surfacing over the waves and the D14 S5 rising mark.
- * - A soft bioluminescent glow around the whale and a faint shaft of light
- *   from far above keep the deep readable and warm; both are local, so the
- *   water around them stays as dark as the page's own end colour.
+ * - A soft bioluminescent glow around the whale (its own light) keeps the
+ *   deep readable and warm; it is local, so the water around it stays as
+ *   dark as the page's own end colour. O39 removed the faint shaft from
+ *   above, which read as a gradient band behind the section.
  * - Sparse marine snow drifts down past it.
  * - The whale sits in its own band below the headline and the buttons
  *   (`final-mascot.tsx` places the stage there), and swims in from the
@@ -43,10 +44,12 @@ const SNOW = Array.from({ length: 16 }, (_, i) => ({
 
 const SCENE_CSS = `
 @media (prefers-reduced-motion: no-preference) {
+  .lk-f-glow { animation: lk-f-breathe 6s ease-in-out infinite; }
   .lk-f-snow { animation: lk-f-snow linear infinite; }
   [data-arrived="on"] .lk-f-hello { animation: lk-f-hello 1.4s cubic-bezier(0.3, 0.7, 0.4, 1) both; }
 }
 .lk-f-hello { opacity: 0; }
+@keyframes lk-f-breathe { 0%, 100% { opacity: 0.85; } 50% { opacity: 1; } }
 @keyframes lk-f-snow {
   0% { transform: translate3d(0, -20px, 0); opacity: 0; }
   12% { opacity: 0.55; }
@@ -61,7 +64,6 @@ export function MascotRising({ className }: { className?: string }) {
     <div className={className}>
       <style dangerouslySetInnerHTML={{ __html: SCENE_CSS }} />
       <div className="relative aspect-[760/560] w-full">
-        {/* O39: no shaft of light and no standing halo; the water behind the whale is solid. */}
         {/* Marine snow. */}
         <div aria-hidden="true" className="pointer-events-none absolute inset-0">
           {SNOW.map((s, i) => (
@@ -74,6 +76,11 @@ export function MascotRising({ className }: { className?: string }) {
         </div>
 
         <SwimLayer className="absolute inset-0">
+          {/* The whale's own soft light: bioluminescence around it, breathing. */}
+          <div
+            aria-hidden="true"
+            className="lk-f-glow pointer-events-none absolute top-[6%] left-1/2 aspect-square w-[78%] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.2)_0%,rgba(68,166,250,0.08)_38%,transparent_68%)]"
+          />
           {/* A brief brighter ring as it arrives: its hello. */}
           <div
             aria-hidden="true"

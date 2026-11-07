@@ -9,7 +9,7 @@ import { FinalMascotStage } from "./final-mascot";
  * S8 — the last call, at the bottom of the dive (WEB-5 O33: one descent, so
  * no night sky and no moon here any more). The whale swims down to greet
  * the visitor and settles below the headline (O24, in SVG: lighter than a
- * second canvas; O39: on solid water, with no halo). Its eyes follow a mouse a
+ * second canvas; O39: on solid water; only its own glow stays). Its eyes follow a mouse a
  * little; on touch screens, where there is no pointer to follow, they
  * glance around now and then. With reduced motion it rests.
  *

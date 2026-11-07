@@ -100,5 +100,13 @@ export function DepthBackdrop() {
     };
   }, [reduced]);
 
-  return <div ref={ref} aria-hidden="true" className="lk-water pointer-events-none fixed inset-0 overflow-hidden" />;
+  return (
+    <div
+      ref={ref}
+      aria-hidden="true"
+      className="lk-water pointer-events-none fixed inset-0 overflow-hidden"
+      // O39: solid from the first paint (the stylesheet's default is a gradient).
+      style={{ "--lk-water-top": "#020514", "--lk-water-bottom": "#020514" } as React.CSSProperties}
+    />
+  );
 }
