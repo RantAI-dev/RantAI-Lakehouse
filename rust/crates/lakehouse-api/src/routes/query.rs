@@ -6039,7 +6039,10 @@ mod tests {
                     "sql": "SELECT {{day}} AS d, {{who}} AS w",
                     "engine": "trino",
                     "parameters": { "day": "2024-03-05", "who": "it's \\" },
-                    "definitions": [{ "name": "day", "type": "date" }],
+                    "definitions": [
+                        { "name": "day", "type": "date" },
+                        { "name": "who", "type": "text" },
+                    ],
                 })),
             )
             .await
@@ -6048,32 +6051,30 @@ mod tests {
             assert_eq!(value["engine"], json!("trino"));
             let sent = received(&trino).await;
             assert_eq!(sent.len(), 1, "{sent:?}");
-            // Trino has no backslash escape: the quote is doubled and the
-            // backslash stays one.
+            // The quote is doubled, and the backslash is written as
+            // `chr(92)` so the guards never see one in a Trino literal.
             assert!(
-                sent[0].contains(r"SELECT DATE '2024-03-05' AS d, 'it''s \' AS w"),
+                sent[0].contains("SELECT DATE '2024-03-05' AS d, ('it''s ' || chr(92) || '') AS w"),
                 "{}",
                 sent[0]
             );
         }
 
         #[tokio::test]
-        async fn the_trino_guard_reads_the_filled_statement() {
+        async fn a_trino_value_ending_in_a_backslash_cannot_hide_a_later_statement() {
             let trino = trino_answering_one_row().await;
             let state = state_without_pool("http://unused.invalid", &trino.uri());
 
-            // Raw, the keyword sits inside a string. Filled, a trailing
-            // backslash makes the guard (which reads a backslash as an
-            // escape, as ClickHouse does) see that string end early and
-            // the keyword outside it: the guard refuses what it can no
-            // longer prove is a read.
-            let (status, _message) = refusal(
+            // The guard reads a backslash as an escape. A raw `'\'` would
+            // look unterminated to it and hide the `DROP` from its keyword
+            // scan; the Trino printer writes the backslash as `chr(92)`.
+            let (status, message) = refusal(
                 run(
                     State(state),
                     Some(analyst_principal()),
                     HeaderMap::new(),
                     body(&json!({
-                        "sql": "SELECT {{a}} AS x, ' DROP TABLE t ' AS y",
+                        "sql": "SELECT {{a}} AS x; DROP TABLE t",
                         "engine": "trino",
                         "parameters": { "a": "\\" },
                     })),
@@ -6082,6 +6083,7 @@ mod tests {
             );
 
             assert_eq!(status, 422);
+            assert!(message.starts_with("Only read queries"), "{message}");
             assert_eq!(received(&trino).await, Vec::<String>::new());
         }
 

@@ -22,6 +22,11 @@
 //! quoted run ends, in the scanner and in the printer alike. If the two
 //! disagreed about where a literal ends, a value could leave its literal.
 //!
+//! The guards in [`crate::sql_guard`] read a backslash as an escape on both
+//! engines. A `Trino` literal ending in a backslash would look unterminated
+//! to them, so the `Trino` printer never writes a backslash: see
+//! `trino_text`.
+//!
 //! # What is scanned, and when
 //!
 //! The scanner reads the text the author wrote, once per request, and never
@@ -203,9 +208,10 @@ impl std::error::Error for ParamError {}
 /// value.
 ///
 /// `parameters` maps a name to the value the run gives it. `definitions` are
-/// the saved query's (or the request's); a placeholder with none is read as
-/// text, and a `.start` or `.end` one as a date range. A value for a name
-/// the SQL does not use is ignored.
+/// the saved query's (or the request's). Without any, a placeholder is read
+/// as text, and a `.start` or `.end` one as a date range. With some, a
+/// placeholder none of them names is refused. A value for a name the SQL
+/// does not use is ignored.
 ///
 /// # Errors
 ///
@@ -234,11 +240,13 @@ pub fn substitute(
     // placeholder uses it, then its value.
     let mut resolved: BTreeMap<&str, Checked> = BTreeMap::new();
     for name in &names {
-        let def = definitions
-            .iter()
-            .find(|d| d.name == *name)
-            .cloned()
-            .unwrap_or_else(|| implicit_def(name, &found));
+        // A request that carries definitions is complete: a placeholder
+        // none of them names is a mistake, not text (feature decision 11).
+        let def = match definitions.iter().find(|d| d.name == *name) {
+            Some(def) => def.clone(),
+            None if definitions.is_empty() => implicit_def(name, &found),
+            None => return Err(ParamError::NoDefinition((*name).to_owned())),
+        };
         let list = check_definition(&def)?;
         for f in found.iter().filter(|f| f.name == *name) {
             check_part(&def, f.part)?;
@@ -638,14 +646,31 @@ fn print_value(engine: Engine, value: &ParamValue) -> String {
         }
         ParamValue::Text(t) => match engine {
             Engine::ClickHouse => SqlLiteral::from(t.as_str()).to_string(),
-            // `Trino` has no backslash escape: only the quote is doubled.
-            Engine::Trino => format!("'{}'", t.replace('\'', "''")),
+            Engine::Trino => trino_text(t),
         },
         ParamValue::Date(d) => match engine {
             Engine::ClickHouse => format!("toDate32('{d}')"),
             Engine::Trino => format!("DATE '{d}'"),
         },
     }
+}
+
+/// Text as a `Trino` expression that contains no backslash.
+///
+/// `Trino` has no backslash escape, so `'a\'` is a complete string there.
+/// The guards in [`crate::sql_guard`] read a backslash as an escape, as
+/// `ClickHouse` does, so a literal ending in one would look unterminated to
+/// them and hide the rest of the statement from their keyword scan. A text
+/// with a backslash is therefore written as its pieces between the
+/// backslashes, joined by `chr(92)`: `a\b` becomes `('a' || chr(92) || 'b')`.
+/// A quote inside a piece is doubled, as in any `Trino` literal.
+fn trino_text(text: &str) -> String {
+    let quote = |piece: &str| format!("'{}'", piece.replace('\'', "''"));
+    if !text.contains('\\') {
+        return quote(text);
+    }
+    let pieces: Vec<String> = text.split('\\').map(quote).collect();
+    format!("({})", pieces.join(" || chr(92) || "))
 }
 
 #[cfg(test)]
@@ -708,7 +733,45 @@ mod tests {
         panic!("the literal is not closed: {printed}");
     }
 
-    const NASTY: [&str; 10] = [
+    /// Reads the text expression a text value printed as: one literal, or on
+    /// `Trino` a parenthesised `||` chain of literals and `chr(92)`, which
+    /// it evaluates the way `Trino` does. Returns the text and the bytes used.
+    fn read_text(engine: Engine, printed: &str) -> (String, usize) {
+        if engine != Engine::Trino || !printed.starts_with('(') {
+            return read_literal(engine, printed);
+        }
+        let mut at = 1;
+        let mut text = String::new();
+        loop {
+            let rest = &printed[at..];
+            if let Some(after) = rest.strip_prefix("chr(92)") {
+                text.push('\\');
+                at += rest.len() - after.len();
+            } else {
+                let (piece, used) = read_literal(engine, rest);
+                text.push_str(&piece);
+                at += used;
+            }
+            let rest = &printed[at..];
+            if let Some(next) = rest.strip_prefix(" || ") {
+                at += rest.len() - next.len();
+            } else {
+                assert!(
+                    rest.starts_with(')'),
+                    "unexpected text after a piece: {printed}"
+                );
+                return (text, at + 1);
+            }
+        }
+    }
+
+    const NASTY: [&str; 16] = [
+        "\\",
+        "a\\",
+        "\\a",
+        "a\\\\b",
+        "x\\' OR '1'='1",
+        "'; DROP TABLE x; --\\",
         "it's",
         "a\\b",
         "ends with a backslash\\",
@@ -741,7 +804,7 @@ mod tests {
         for engine in BOTH {
             for value in NASTY {
                 let printed = run_ok(engine, "{{v}}", json!({ "v": value }), json!([]));
-                let (decoded, used) = read_literal(engine, &printed);
+                let (decoded, used) = read_text(engine, &printed);
                 assert_eq!(used, printed.len(), "{engine:?} {value}: {printed}");
                 assert_eq!(decoded, value, "{engine:?}: {printed}");
             }
@@ -765,13 +828,82 @@ mod tests {
     }
 
     #[test]
-    fn a_trino_backslash_stays_one_character_and_a_clickhouse_one_is_doubled() {
+    fn a_clickhouse_backslash_is_doubled_and_a_trino_one_is_written_as_chr_92() {
         let value = json!({"v": "a\\b"});
         assert_eq!(
             run_ok(Engine::ClickHouse, "{{v}}", value.clone(), json!([])),
             "'a\\\\b'"
         );
-        assert_eq!(run_ok(Engine::Trino, "{{v}}", value, json!([])), "'a\\b'");
+        assert_eq!(
+            run_ok(Engine::Trino, "{{v}}", value, json!([])),
+            "('a' || chr(92) || 'b')"
+        );
+    }
+
+    #[test]
+    fn a_trino_text_with_backslashes_prints_as_pieces_joined_by_chr_92() {
+        for (value, printed) in [
+            ("\\", "('' || chr(92) || '')"),
+            ("a\\", "('a' || chr(92) || '')"),
+            ("\\a", "('' || chr(92) || 'a')"),
+            ("a\\\\b", "('a' || chr(92) || '' || chr(92) || 'b')"),
+            ("it's\\", "('it''s' || chr(92) || '')"),
+            ("plain", "'plain'"),
+        ] {
+            assert_eq!(
+                run_ok(Engine::Trino, "{{v}}", json!({ "v": value }), json!([])),
+                printed,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trino_text_value_never_prints_a_backslash() {
+        for value in NASTY {
+            let printed = run_ok(Engine::Trino, "{{v}}", json!({ "v": value }), json!([]));
+            assert!(!printed.contains('\\'), "{value}: {printed}");
+        }
+    }
+
+    #[test]
+    fn a_trino_dropdown_and_multi_select_option_with_a_backslash_prints_without_one() {
+        let d = json!([
+            {"name": "c", "type": "dropdown", "options": [{"value": "a\\b"}, {"value": "c"}]},
+            {"name": "m", "type": "multiSelect", "options": [{"value": "a\\b"}, {"value": "c"}]},
+        ]);
+        let got = run_ok(
+            Engine::Trino,
+            "x = {{c}} AND y IN ({{m}})",
+            json!({"c": "a\\b", "m": ["a\\b", "c"]}),
+            d,
+        );
+        assert_eq!(
+            got,
+            "x = ('a' || chr(92) || 'b') AND y IN (('a' || chr(92) || 'b'), 'c')"
+        );
+    }
+
+    #[test]
+    fn the_read_only_guard_still_sees_the_statement_after_a_value_with_a_backslash() {
+        // A raw `\'` would read as an escaped quote to the guard and hide
+        // the rest of the statement from its keyword scan.
+        for engine in BOTH {
+            for value in NASTY {
+                let sql = run_ok(
+                    engine,
+                    "SELECT {{a}}; DROP TABLE t",
+                    json!({ "a": value }),
+                    json!([]),
+                );
+                let seen = crate::sql_guard::strip_sql_noise(&sql);
+                assert!(
+                    seen.contains("DROP TABLE t"),
+                    "{engine:?} {value}: {sql} -> {seen}"
+                );
+                assert!(!crate::sql_guard::is_read_only(&sql), "{engine:?} {value}");
+            }
+        }
     }
 
     #[test]
@@ -1046,14 +1178,36 @@ mod tests {
     }
 
     #[test]
-    fn a_placeholder_missing_from_the_supplied_definitions_is_read_as_text() {
+    fn a_placeholder_missing_from_the_supplied_definitions_is_refused() {
+        for engine in BOTH {
+            for sql in ["{{a}} {{b}}", "{{b}} {{r.start}} {{r.end}}"] {
+                let err = run(
+                    engine,
+                    sql,
+                    json!({"a": "1", "b": 2, "r": {"start": "2024-01-01", "end": "2024-01-02"}}),
+                    json!([{"name": "b", "type": "number"}]),
+                )
+                .unwrap_err();
+                let missing = if sql.starts_with("{{a}}") { "a" } else { "r" };
+                assert_eq!(
+                    err,
+                    format!("{{{{{missing}}}}} is used in the SQL but has no definition.")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_definitions_a_placeholder_is_text_and_start_end_is_a_range() {
+        let got = run_ok(Engine::ClickHouse, "{{a}}", json!({"a": "1"}), json!([]));
+        assert_eq!(got, "'1'");
         let got = run_ok(
             Engine::ClickHouse,
-            "{{a}} {{b}}",
-            json!({"a": "1", "b": 2}),
-            json!([{"name": "b", "type": "number"}]),
+            "{{r.start}} {{r.end}}",
+            json!({"r": {"start": "2024-01-01", "end": "2024-01-02"}}),
+            json!([]),
         );
-        assert_eq!(got, "'1' 2");
+        assert_eq!(got, "toDate32('2024-01-01') toDate32('2024-01-02')");
     }
 
     #[test]
