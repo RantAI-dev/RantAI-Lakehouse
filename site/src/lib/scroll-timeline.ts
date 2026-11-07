@@ -29,9 +29,9 @@ export type SceneState = {
   position: Vec3;
   look: Vec3;
   /**
-   * The camera path's height before the anti-clipping hop (`avoidSurface`):
-   * continuous through the surface, so the waterline overlay and the
-   * underwater blend follow it without a jump (D14 S1).
+   * The camera path's height. Since WEB-5 O5 it is the camera's own height
+   * (there is no hop across the surface any more); kept as its own field
+   * because the underwater blend is defined on the path.
    */
   pathY: number;
   /** 0 above the surface, 1 well below it. */
@@ -113,16 +113,19 @@ export function focusFromProgress(progress: number): number {
 /**
  * WEB-5 D14 S1, the dive. The owner found the crossing "too sudden": the
  * camera went from 1.15 to 0.05 in 0.42 vh and under by 1.0 vh, so the sky
- * became water in a few dozen pixels of scroll. Now:
+ * became water in a few dozen pixels of scroll. Then (O5) "patah": the
+ * waterline was a flat bar over the picture and the camera hopped across a
+ * band at the surface. Now:
  * - the hero is `DIVE.heroVh` viewports tall while the live lake runs (the
  *   DOM hero keeps 150 vh, see `app/globals.css`);
- * - the camera eases down to the waterline, then slows across it: two keys
- *   0.5 vh apart, 0.16 above and 0.16 below the surface, so it crosses at
- *   about 0.6 units per viewport where it used to cross at about 2.6;
+ * - the camera eases down to the waterline, then crosses it slowly in one
+ *   continuous move: from one lens height above the water (`LENS.half`) to
+ *   one below, over 0.8 vh, so the waterline sweeps the whole screen over
+ *   about 0.8 vh of scroll, centred where the depth gauge leaves 0 m;
  * - after the waterline the camera keeps sinking into the sources section
  *   (the storyboard's −5 m), reaching y -2.4 at 2.7 vh;
- * - the underwater blend (fog, colour, light) follows the camera from y 0.9
- *   down to -1.8, over about two viewports of scroll rather than about 0.3.
+ * - the underwater blend (the creature's gaze, the light) follows the
+ *   camera from y 0.9 down to -1.8, over about two viewports of scroll.
  * All in viewport multiples, so the pace is the same on every screen.
  */
 export const DIVE = {
@@ -130,18 +133,43 @@ export const DIVE = {
   heroVh: 2.2,
   /** Scroll positions of the camera keys, in viewports. */
   approach: 0.6,
-  waterlineAbove: 1.1,
-  waterlineBelow: 1.6,
+  waterlineAbove: 0.95,
+  waterlineBelow: 1.75,
   under: 2.7,
   /** Camera y at each key (the water plane is y 0). */
-  yApproach: 0.45,
-  yAbove: 0.16,
-  yBelow: -0.16,
+  yApproach: 0.5,
+  yAbove: 0.26,
+  yBelow: -0.26,
   yUnder: -2.4,
   /** The underwater blend runs from this camera height down to the next. */
   blendTop: 0.9,
   blendBottom: -1.8,
 } as const;
+
+/**
+ * WEB-5 O5, the lens. The screen is treated as a lens `2 * half` world units
+ * tall, centred on the camera: the water stands on it at the lake's height,
+ * plus a little wave (at most `wave`). The engine and the lens shader both
+ * use these numbers, so the camera's path and the sweep of the waterline
+ * cannot disagree.
+ */
+export const LENS = { half: 0.26, wave: 0.053 } as const;
+
+/**
+ * Where the waterline crosses the screen for a camera at height `y`, as a
+ * screen position (-1 bottom, +1 top), ignoring the waves. Above +1 the
+ * whole screen is under water; below -1 none of it is.
+ */
+export function lensLine(y: number): number {
+  return -y / LENS.half;
+}
+
+/** Which pictures a camera at height `y` needs: the one above the water, the one below, or both. */
+export function lensCoverage(y: number): { above: boolean; below: boolean } {
+  // A small margin for the blur and the bend around the line.
+  const reach = LENS.half * 1.06 + LENS.wave;
+  return { above: y > -reach, below: y < reach };
+}
 
 /** Camera height above the slab it is looking at, and its distance from it. */
 const SLAB_CAM_DY = 5;
@@ -177,23 +205,6 @@ function keysFor(layout: SceneLayout): Key[] {
   return raw;
 }
 
-/**
- * Keeps the camera off the water plane itself. Within the camera's near
- * distance of the surface the plane is clipped away and the view opens onto
- * the submerged half of the scene, so the camera hops across a thin band
- * instead of lingering in it. The hop happens at the moment the picture
- * changes from sky to ceiling anyway.
- *
- * WEB-5 D14 S1: the band is 0.07 (was 0.14), so the hop is 0.14 units, still
- * above the camera's 0.05 near plane but half as far as before; with the
- * slow waterline stretch it is one small step inside a long crossing.
- */
-export function avoidSurface(y: number): number {
-  const band = 0.07;
-  const k = 1 - smoothstep(0, 0.6, Math.abs(y));
-  return y + (y >= 0 ? band : -band) * k;
-}
-
 export function sceneStateAt(scrollY: number, layout: SceneLayout): SceneState {
   const { vh, depthsTop, depthsHeight, viewportH } = layout;
   const keys = keysFor(layout);
@@ -205,7 +216,9 @@ export function sceneStateAt(scrollY: number, layout: SceneLayout): SceneState {
       scrollY,
     );
   const pathY = channel((k) => k.pos[1]);
-  const position: Vec3 = [channel((k) => k.pos[0]), avoidSurface(pathY), channel((k) => k.pos[2])];
+  // One continuous camera (O5): the near-plane clipping at the surface is
+  // handled by the engine, which moves the water plane, never the camera.
+  const position: Vec3 = [channel((k) => k.pos[0]), pathY, channel((k) => k.pos[2])];
   const look: Vec3 = [channel((k) => k.look[0]), channel((k) => k.look[1]), channel((k) => k.look[2])];
 
   const span = Math.max(1, depthsHeight - viewportH);
@@ -215,9 +228,7 @@ export function sceneStateAt(scrollY: number, layout: SceneLayout): SceneState {
     look,
     pathY,
     // Fully "above" well before the surface and fully "under" well after
-    // it, so fog, colour and light change over the whole slow crossing (S1).
-    // From the path's height, not the hopped one, so the blend never jumps
-    // with the anti-clipping hop (S1).
+    // it, so what follows it changes over the whole slow crossing (S1).
     underwater: 1 - smoothstep(DIVE.blendBottom, DIVE.blendTop, pathY),
     dive: clamp01(scrollY / Math.max(1, DIVE.waterlineBelow * vh)),
     depthProgress,

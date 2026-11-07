@@ -23,6 +23,7 @@ import {
 import { PALETTE } from "@/lib/palette";
 import { MOON_DIR } from "./scene-config";
 import { SKY_FRAG, SKY_VERT, STARS_FRAG, STARS_VERT } from "./shaders";
+import type { WaterFogUniforms } from "./underwater";
 
 /**
  * Night sky: a gradient dome with a moon, a field of twinkling stars, and the
@@ -36,9 +37,7 @@ export type SkyUniforms = {
   uMoonDir: IUniform<Vector3>;
   uMoonColor: IUniform<Color>;
   uMoonBoost: IUniform<number>;
-  /** The engine's shared fog colour object; the dome shows it when under water. */
-  uFogColor: IUniform<Color>;
-  /** 0 above the surface, 1 below it. */
+  /** 0 above the surface, 1 below it: the dome then shows the water's fog (WEB-5 O5). */
   uUnder: IUniform<number>;
 };
 
@@ -52,14 +51,14 @@ export function createSkyUniforms(): SkyUniforms {
     uMoonDir: { value: new Vector3(...MOON_DIR) },
     uMoonColor: { value: new Color("#cfe6ff") },
     uMoonBoost: { value: 7 },
-    uFogColor: { value: new Color("#0b2257") },
     uUnder: { value: 0 },
   };
 }
 
-export function createSkyDome(uniforms: SkyUniforms): Mesh {
+export function createSkyDome(uniforms: SkyUniforms, fog: WaterFogUniforms): Mesh {
   const material = new ShaderMaterial({
-    uniforms: uniforms as unknown as Record<string, IUniform>,
+    // The same uniform objects, so the engine's per-pass changes reach the dome.
+    uniforms: { ...uniforms, ...fog } as unknown as Record<string, IUniform>,
     vertexShader: SKY_VERT,
     fragmentShader: SKY_FRAG,
     side: BackSide,
@@ -147,9 +146,10 @@ export function createStars(count: number, pixelRatio: number): Stars {
 export function buildEnvironment(
   renderer: WebGLRenderer,
   skyUniforms: SkyUniforms,
+  fog: WaterFogUniforms,
 ): WebGLRenderTarget {
   const envScene = new Scene();
-  const dome = createSkyDome(skyUniforms);
+  const dome = createSkyDome(skyUniforms, fog);
   envScene.add(dome);
   const panel = (w: number, h: number, pos: [number, number, number], intensity: number, tint: string) => {
     const m = new Mesh(

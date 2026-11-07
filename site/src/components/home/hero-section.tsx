@@ -4,7 +4,7 @@ import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { MascotLogo } from "@/components/shared/mascot-svg";
 import { ProgressSection } from "@/components/shared/progress-section";
-import { BackdropFade, HeroCopyMotion, ScrollCueFade } from "./hero-motion";
+import { BackdropFade, HeroCopyMotion, HeroWashFade, ScrollCueFade } from "./hero-motion";
 
 /**
  * S1 — hero. The DOM hero paints first: a CSS night lake with the logo as
@@ -37,11 +37,11 @@ export function HeroSection({
     <ProgressSection range={["start start", "end start"]} id="hero" className="relative h-[150vh] motion-reduce:h-auto">
       <div className="sticky top-0 isolate flex h-[100svh] flex-col overflow-hidden motion-reduce:relative motion-reduce:min-h-[100svh]">
         <HeroBackdrop />
-        {/* A soft dark wash behind the copy keeps it above 4.5:1 over any frame of the canvas. */}
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.92)_0%,rgba(2,5,20,0.84)_52%,rgba(2,5,20,0.4)_70%,transparent_86%)]"
-        />
+        {/* A soft dark wash behind the copy keeps it above 4.5:1 over any frame of the canvas.
+            WEB-5 O5: it leaves with the copy over the live lake (HeroWashFade). */}
+        <HeroWashFade>
+          <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.92)_0%,rgba(2,5,20,0.84)_52%,rgba(2,5,20,0.4)_70%,transparent_86%)]" />
+        </HeroWashFade>
         <HeroCreature />
         <Container className="relative z-10 flex flex-none flex-col items-center pt-4 pb-32 text-center short:pb-24 md:min-h-[100svh] md:items-start md:justify-center md:pt-24 md:pb-24 md:text-left">
           <HeroCopyMotion>

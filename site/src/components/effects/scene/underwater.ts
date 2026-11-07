@@ -7,19 +7,91 @@ import {
   Color,
   DoubleSide,
   Group,
+  Material,
   Mesh,
   PlaneGeometry,
   Points,
   ShaderMaterial,
   Vector3,
+  type IUniform,
 } from "three";
-import { SHAFT_FRAG, SHAFT_VERT, SNOW_FRAG, SNOW_VERT } from "./shaders";
+import { NOISE_GLSL, SHAFT_FRAG, SHAFT_VERT, SNOW_FRAG, SNOW_VERT, WATER_FOG_GLSL } from "./shaders";
 
 /**
- * What makes the water feel like water once the camera is under it: light
- * shafts falling from the surface and marine snow drifting past. Both are
- * additive and cost a handful of draw calls.
+ * What makes the water feel like water once the camera is under it: the
+ * water's own fog, light shafts falling from the surface and marine snow
+ * drifting past. The shafts and the snow are additive and cost a handful of
+ * draw calls.
  */
+
+/** The uniforms of `WATER_FOG_GLSL`, shared by every material that uses it. */
+export type WaterFogUniforms = {
+  /** 1 while the under-water picture is drawn, 0 for the one above. */
+  uWfOn: IUniform<number>;
+  uWfUp: IUniform<Color>;
+  uWfHorizon: IUniform<Color>;
+  uWfDown: IUniform<Color>;
+  uWfDensity: IUniform<number>;
+  uAirFog: IUniform<Color>;
+  uAirDensity: IUniform<number>;
+  /** The clock, for the caustics on the creature (`applyWaterFog` with `caustics`). */
+  uWfTime: IUniform<number>;
+};
+
+export function createWaterFog(airFog: Color): WaterFogUniforms {
+  return {
+    uWfOn: { value: 0 },
+    uWfUp: { value: new Color("#1b5aa3") },
+    uWfHorizon: { value: new Color("#0b3a74") },
+    uWfDown: { value: new Color("#041640") },
+    uWfDensity: { value: 0.045 },
+    uAirFog: { value: airFog },
+    uAirDensity: { value: 0.003 },
+    uWfTime: { value: 0 },
+  };
+}
+
+/**
+ * Gives one of three's own materials (the creature, the slabs) the water's
+ * fog in place of three's: the same function the sky and the water use, so
+ * a fogged object always fades into exactly the colour behind it.
+ *
+ * With `caustics` (a lit material: the creature's body), under water the
+ * moonlight that the waves focus plays over its upper side, strongest near
+ * the surface (O5; the owner's O8 asks for the body "lit by the underwater
+ * light and caustics").
+ */
+export function applyWaterFog(material: Material, fog: WaterFogUniforms, opts: { caustics?: boolean } = {}): void {
+  const caustics = opts.caustics === true;
+  material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, fog);
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <fog_pars_vertex>", "varying vec3 vWfWorld;")
+      .replace("#include <fog_vertex>", "vWfWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;");
+    let frag = shader.fragmentShader
+      .replace(
+        "#include <fog_pars_fragment>",
+        `varying vec3 vWfWorld;\n${WATER_FOG_GLSL}\n${caustics ? NOISE_GLSL : ""}`,
+      )
+      .replace("#include <fog_fragment>", "gl_FragColor.rgb = waterFog(gl_FragColor.rgb, vWfWorld);");
+    if (caustics) {
+      frag = frag.replace(
+        "#include <emissivemap_fragment>",
+        `#include <emissivemap_fragment>
+        if (uWfOn > 0.5) {
+          vec3 nW = normalize((vec4(normal, 0.0) * viewMatrix).xyz);
+          vec2 cp = vWfWorld.xz * 1.1 + vec2(vWfWorld.y * 0.3, 0.0);
+          float c1 = 1.0 - abs(snoise(cp + vec2(uWfTime * 0.16, uWfTime * 0.11)));
+          float c2 = 1.0 - abs(snoise(cp * 1.7 - vec2(uWfTime * 0.12, -uWfTime * 0.17)));
+          float lit = smoothstep(-0.2, 0.8, nW.y) * exp(min(vWfWorld.y, 0.0) / 3.5);
+          totalEmissiveRadiance += vec3(0.32, 0.62, 1.0) * pow(c1 * c2, 3.0) * 0.55 * lit;
+        }`,
+      );
+    }
+    shader.fragmentShader = frag;
+  };
+  material.customProgramCacheKey = () => (caustics ? "lk-water-fog-caustics" : "lk-water-fog");
+}
 
 export type Shafts = {
   group: Group;
@@ -59,7 +131,7 @@ export function createShafts(count: number): Shafts {
     mesh.frustumCulled = false;
     mesh.renderOrder = 5;
     group.add(mesh);
-    shafts.push({ mesh, tilt: 0.16 + 0.08 * Math.sin(i * 1.7) });
+    shafts.push({ mesh, tilt: 0.1 + 0.06 * Math.sin(i * 1.7) });
   }
   return {
     group,
@@ -71,7 +143,8 @@ export function createShafts(count: number): Shafts {
         const dx = camera.position.x - mesh.position.x;
         const dz = camera.position.z - mesh.position.z;
         mesh.rotation.y = Math.atan2(dx, dz);
-        mesh.rotation.z = tilt;
+        // A slow sway, as the surface they come through moves (O5).
+        mesh.rotation.z = tilt + 0.035 * Math.sin(time * 0.21 + i * 1.9) + 0.015 * Math.sin(time * 0.53 + i);
         const m = materials[i];
         m.uniforms.uTime.value = time;
         m.uniforms.uIntensity.value = intensity * (0.5 + 0.5 * Math.sin(time * 0.17 + i * 2.1));

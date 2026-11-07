@@ -1,7 +1,9 @@
 "use client";
 
 import * as React from "react";
-import { ascentAt, causticAt, depthAt, steppedDepthAt, waterAt, type Anchor } from "@/lib/depth-journey";
+import { ascentAt, causticAt, depthAt, mixColour, steppedDepthAt, waterAt, type Anchor } from "@/lib/depth-journey";
+import { onSceneColours, sceneColours } from "@/lib/scene-colour";
+import { smoothstep } from "@/lib/scroll-timeline";
 import { measureJourney } from "@/lib/measure-journey";
 import { afterPaint } from "@/lib/after-paint";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
@@ -17,6 +19,12 @@ import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
  * - Before the assistant the 3D canvas or the scene zone's own gradient
  *   covers it, and its colour there is already the deep water those end on,
  *   so there is no seam where they stop.
+ * - WEB-5 O5: over the live lake it is exact. The engine publishes the
+ *   colours its water shows at the top and the bottom of the screen
+ *   (lib/scene-colour.ts); until the canvas has faded out at the zone's end
+ *   this layer shows those, and over the next viewport and a half of
+ *   scroll it blends to its own, so the hand-over is never a band or a
+ *   jump in colour.
  * - The colour is written to two CSS variables through a ref, from a
  *   passive scroll listener, once per frame and only when it changes. There
  *   is no React state per scroll event (D5).
@@ -43,11 +51,16 @@ export function DepthBackdrop() {
     let climb = { from: 0, to: 0 };
     let frame = 0;
     let last = "";
+    // Where the canvas is gone: the scroll at which the scene zone's pinned
+    // layer starts to leave the screen.
+    let zoneOut = 0;
 
     // R9: the same measurement as the gauge. No hold through the hero: the
     // water is covered there (see `journeyFromBoxes`).
     const measure = () => {
       ({ anchors, climb } = measureJourney({ holdSurfaceThroughHero: false }));
+      const zone = document.getElementById("scene-zone");
+      zoneOut = zone ? zone.getBoundingClientRect().bottom + window.scrollY - window.innerHeight : 0;
       paint();
     };
     const paint = () => {
@@ -58,7 +71,13 @@ export function DepthBackdrop() {
       const depth = reduced
         ? steppedDepthAt(window.scrollY + window.innerHeight / 2, anchors)
         : depthAt(window.scrollY, anchors);
-      const water = waterAt(depth);
+      const own = waterAt(depth);
+      const scene = reduced ? null : sceneColours();
+      const handOver = scene ? 1 - smoothstep(zoneOut, zoneOut + 1.5 * window.innerHeight, window.scrollY) : 0;
+      const water =
+        scene && handOver > 0
+          ? { top: mixColour(own.top, scene.top, handOver), bottom: mixColour(own.bottom, scene.bottom, handOver) }
+          : own;
       const ascent = reduced ? 0 : ascentAt(window.scrollY, climb.from, climb.to, window.innerHeight * 0.6);
       const caustic = ascent * causticAt(depth);
       const key = `${water.top}${water.bottom}|${ascent.toFixed(2)}|${caustic.toFixed(2)}`;
@@ -74,6 +93,7 @@ export function DepthBackdrop() {
     };
 
     measure();
+    const offScene = onSceneColours(onScroll);
     window.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("resize", measure);
     // Fonts, the live hero's longer height and the dashboards rail all move
@@ -82,6 +102,7 @@ export function DepthBackdrop() {
     ro.observe(document.body);
     return () => {
       if (frame) cancelAnimationFrame(frame);
+      offScene();
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", measure);
       ro.disconnect();

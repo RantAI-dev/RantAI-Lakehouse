@@ -58,6 +58,45 @@ vec3 skyGradient(vec3 d){
 }
 `;
 
+/**
+ * WEB-5 O5: one fog for everything the camera sees, so nothing can show an
+ * edge against anything else. Above the water it is the old night haze (a
+ * single colour, exp2). Below it, light is absorbed per channel with
+ * distance (red first, then green), and the colour the water fades to
+ * depends on the direction you look: lighter towards the surface, the lake's
+ * blue at eye level, darker towards the depths, so the far water is a soft
+ * gradient with no horizon line. The sky dome, the water's underside and
+ * every mesh material (patched in `underwater.ts`) all call `waterFog`.
+ */
+export const WATER_FOG_GLSL = /* glsl */ `
+uniform float uWfOn;
+uniform vec3 uWfUp;
+uniform vec3 uWfHorizon;
+uniform vec3 uWfDown;
+uniform float uWfDensity;
+uniform vec3 uAirFog;
+uniform float uAirDensity;
+uniform float uWfTime;
+vec3 waterFogColor(vec3 d){
+  vec3 c = mix(uWfDown, uWfHorizon, smoothstep(-0.5, 0.06, d.y));
+  return mix(c, uWfUp, smoothstep(0.0, 0.8, d.y));
+}
+vec3 waterFog(vec3 col, vec3 worldPos){
+  vec3 toP = worldPos - cameraPosition;
+  float dist = length(toP);
+  vec3 d = toP / max(dist, 1e-4);
+  if (uWfOn > 0.5) {
+    // A little faster than linear, so the near water stays clear and the
+    // far water is fully fogged well before the lake's plane ends.
+    float k = pow(dist * uWfDensity, 1.35);
+    vec3 T = exp(-k * vec3(1.5, 1.08, 0.85));
+    return col * T + waterFogColor(d) * (1.0 - T);
+  }
+  float f = 1.0 - exp(-pow(dist * uAirDensity, 2.0));
+  return mix(col, uAirFog, clamp(f, 0.0, 1.0));
+}
+`;
+
 export const SKY_VERT = /* glsl */ `
 varying vec3 vDir;
 void main(){
@@ -72,10 +111,10 @@ export const SKY_FRAG = /* glsl */ `
 uniform vec3 uMoonDir;
 uniform vec3 uMoonColor;
 uniform float uMoonBoost;
-uniform vec3 uFogColor;
 uniform float uUnder;
 varying vec3 vDir;
 ${SKY_GRADIENT_GLSL}
+${WATER_FOG_GLSL}
 void main(){
   vec3 d = normalize(vDir);
   vec3 col = skyGradient(d);
@@ -83,10 +122,10 @@ void main(){
   float disc = smoothstep(0.99978, 0.99988, m);
   float halo = pow(max(m, 0.0), 900.0) * 0.5 + pow(max(m, 0.0), 60.0) * 0.12 + pow(max(m, 0.0), 8.0) * 0.03;
   col += uMoonColor * (disc * uMoonBoost + halo);
-  // Under the surface the "sky" is just the water's fog colour. It has to be
-  // drawn here, through the same tone mapping as the water, rather than as the
-  // scene's clear colour, which three does not tone-map and so never matches.
-  col = mix(col, uFogColor, uUnder);
+  // Under the surface the "sky" is the water itself, far away: the same
+  // direction-dependent colour every fogged object fades to (O5), so the
+  // far water is a gradient with no horizon line.
+  col = mix(col, waterFogColor(d), uUnder);
   gl_FragColor = vec4(col, 1.0);
   ${OUTPUT_GLSL}
 }
@@ -136,8 +175,19 @@ void main(){
  * perturbation from three simplex layers plus radial ripples, which is
  * enough at the grazing angles the camera sees and keeps the vertex stage
  * free. Seen from above it reflects the sky and the moon with a fresnel
- * term; seen from below (`gl_FrontFacing` false) it becomes a rippling
- * ceiling with a Snell's-window glow and a caustic web.
+ * term. Seen from below (`gl_FrontFacing` false) it is the surface as a
+ * diver sees it (WEB-5 O5):
+ * - Snell's window: within about 49° of straight up the ray leaves the
+ *   water, and you see the night sky squeezed into a bright disc, with the
+ *   moon near its rim and soft caustic light;
+ * - beyond it, total internal reflection: the surface is a dark, rippled
+ *   mirror of the water below;
+ * - the two meet in a soft rim, never a line;
+ * - far away (where a pixel covers more water than the waves' scale) the
+ *   ripples flatten out, so the grazing ceiling never turns into streaks or
+ *   a band of shimmering noise;
+ * - the above-water part of the creature shows as a soft dark shape in the
+ *   window (`uMascot`), since it blocks the light from the sky.
  */
 export const WATER_FRAG = /* glsl */ `
 #define RIPPLES ${RIPPLES}
@@ -151,9 +201,13 @@ uniform vec3 uLake;
 uniform vec4 uRip[RIPPLES];
 uniform vec3 uMascot;
 uniform float uWaveGain;
+uniform vec3 uBodyC;
+uniform vec3 uBodyR;
+uniform vec3 uBodyTint;
 varying vec3 vWorld;
 ${NOISE_GLSL}
 ${SKY_GRADIENT_GLSL}
+${WATER_FOG_GLSL}
 
 float baseH(vec2 p){
   float t = uTime;
@@ -196,10 +250,10 @@ void main(){
   }
   g = g * uWaveGain + rippleGrad(p);
   float lod = 1.0 / (1.0 + dist * 0.05);
-  vec3 n = normalize(vec3(-g.x * 0.2 * lod, 1.0, -g.y * 0.2 * lod));
 
   vec3 col;
   if (gl_FrontFacing) {
+    vec3 n = normalize(vec3(-g.x * 0.2 * lod, 1.0, -g.y * 0.2 * lod));
     float ndv = clamp(dot(n, V), 0.0, 1.0);
     float fres = 0.03 + 0.97 * pow(1.0 - ndv, 4.5);
     vec3 R = reflect(-V, n);
@@ -218,21 +272,60 @@ void main(){
     col *= 1.0 - 0.6 * shade;
     float rim = exp(-pow((dm - uMascot.z) / 0.14, 2.0));
     col += uLake * rim * 0.4;
+
+    float f = 1.0 - exp(-pow(dist * uFogDensity, 2.0));
+    col = mix(col, uFogColor, clamp(f, 0.0, 1.0));
   } else {
+    // How much water one pixel covers: where it is more than a ripple's
+    // width, the ripples average out to a flat, calm mirror.
+    float fw = length(fwidth(p));
+    // ...and so do they where the ceiling is seen nearly edge-on.
+    float detail = (1.0 - smoothstep(0.03, 0.26, fw)) * smoothstep(0.03, 0.3, -V.y);
+    vec3 n = normalize(vec3(-g.x * 0.2 * lod * detail, 1.0, -g.y * 0.2 * lod * detail));
     vec3 Vd = -V;
-    float up = clamp(Vd.y, 0.0, 1.0);
-    float win = smoothstep(0.5, 0.92, up);
-    vec2 cp = p * 0.55 + g * 0.9;
-    float c1 = 1.0 - abs(snoise(cp + vec2(uTime * 0.12, uTime * 0.09)));
-    float c2 = 1.0 - abs(snoise(cp * 1.7 - vec2(uTime * 0.1, -uTime * 0.14)));
-    float caustic = pow(c1 * c2, 3.0);
-    col = mix(uDeep * 3.0, uLake * 0.55, win);
-    col += vec3(0.45, 0.75, 1.0) * caustic * (0.2 + 0.9 * win);
-    col += uMoonColor * pow(max(dot(Vd, uMoonDir), 0.0), 220.0) * 1.4 * win;
+    float dm = length(p - uMascot.xy);
+    float cosI = clamp(dot(Vd, n), 0.0, 1.0);
+    // The window's edge (the critical angle, cos 0.66), softened on both sides.
+    float win = smoothstep(0.6, 0.76, cosI);
+    vec3 air = refract(Vd, -n, 1.333);
+    if (dot(air, air) < 0.5) air = Vd;
+    float m = max(dot(normalize(air), uMoonDir), 0.0);
+    vec3 sky = skyGradient(air) * 1.8 + uLake * 0.16;
+    sky += uMoonColor * (pow(m, 260.0) * 2.2 + pow(m, 24.0) * 0.12);
+    // Soft caustic light playing over the window.
+    vec2 cp = p * 0.5 + g * 0.6 * detail;
+    float c1 = 1.0 - abs(snoise(cp + vec2(uTime * 0.11, uTime * 0.08)));
+    float c2 = 1.0 - abs(snoise(cp * 1.6 - vec2(uTime * 0.09, -uTime * 0.12)));
+    sky += vec3(0.35, 0.62, 0.95) * pow(c1 * c2, 4.0) * 0.35 * detail;
+    // The creature above the water blocks the sky: a soft shadow in the window.
+    sky *= mix(0.28, 1.0, smoothstep(uMascot.z * 0.75, uMascot.z * 1.25, dm));
+    // Beyond the window the surface mirrors the water below it (always
+    // below: a wave can tilt the mirror, never turn it to face the sky),
+    // and, above the creature, the creature's own submerged body.
+    vec3 R = reflect(Vd, -n);
+    R.y = -abs(R.y);
+    vec3 mirror = waterFogColor(R) * (1.0 + detail * (0.16 * (1.0 - abs(snoise(p * 0.9 + uTime * 0.05))) - 0.08));
+    // The creature's submerged body in the mirror: the reflected ray against
+    // the body's ellipsoid (uBodyC, uBodyR), with a soft edge, so the body
+    // meets its own reflection at the surface instead of ending in a cut.
+    {
+      // Mostly the calm mirror, a little of the waves: the reflection
+      // wavers without breaking into stripes.
+      vec3 Rb = reflect(Vd, normalize(mix(vec3(0.0, -1.0, 0.0), -n, 0.3)));
+      Rb.y = -abs(Rb.y);
+      vec3 o = (vWorld - uBodyC) / uBodyR;
+      vec3 rd = normalize(Rb / uBodyR);
+      float tc = max(-dot(o, rd), 0.0);
+      float miss = length(o + rd * tc);
+      float hit = (1.0 - smoothstep(0.72, 1.08, miss)) * 0.92;
+      vec3 hitW = uBodyC + (o + rd * tc) * uBodyR;
+      mirror = mix(mirror, waterFog(uBodyTint, hitW) , hit);
+    }
+    col = mix(mirror, sky, win);
+    col += uLake * 0.12 * exp(-pow((cosI - 0.68) / 0.05, 2.0));
+    col = waterFog(col, vWorld);
   }
 
-  float f = 1.0 - exp(-pow(dist * uFogDensity, 2.0));
-  col = mix(col, uFogColor, clamp(f, 0.0, 1.0));
   gl_FragColor = vec4(col, 1.0);
   ${OUTPUT_GLSL}
 }
@@ -344,8 +437,10 @@ void main(){
 /** One light shaft: a tall billboard, bright at the surface, fading with depth. */
 export const SHAFT_VERT = /* glsl */ `
 varying vec2 vUv;
+varying float vDepth;
 void main(){
   vUv = uv;
+  vDepth = -(modelMatrix * vec4(position, 1.0)).y;
   gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
 }
 `;
@@ -356,10 +451,14 @@ uniform float uIntensity;
 uniform float uSeed;
 uniform vec3 uColor;
 varying vec2 vUv;
+varying float vDepth;
 ${NOISE_GLSL}
 void main(){
   float across = pow(1.0 - abs(vUv.x * 2.0 - 1.0), 1.7);
-  float along = pow(vUv.y, 3.0);
+  // WEB-5 O5: born just under the surface (soft, so the shaft never shows
+  // the line where its quad meets the water) and fading as the light is
+  // absorbed on the way down.
+  float along = smoothstep(0.0, 1.8, vDepth) * exp(-vDepth / 11.0);
   float flick = 0.6 + 0.4 * snoise(vec2(vUv.x * 2.5 + uSeed * 9.0, uTime * 0.12 + uSeed * 5.0 + vUv.y * 1.5));
   float a = across * along * flick * uIntensity;
   gl_FragColor = vec4(uColor * a, a);
@@ -470,6 +569,109 @@ void main(){
   float d = length(gl_PointCoord - 0.5);
   float a = (1.0 - smoothstep(0.0, 0.5, d)) * vA;
   gl_FragColor = vec4(uColor * a, a);
+  ${OUTPUT_GLSL}
+}
+`;
+
+/**
+ * WEB-5 O5, the lens. Every frame is drawn into an off-screen picture and
+ * this pass puts it on screen, so the crossing can be a camera in the water
+ * rather than an overlay on top of it:
+ * - `tA` is the scene as seen above the water, `tB` as seen below it. While
+ *   the camera is at the surface both are drawn and the screen splits where
+ *   the water stands on the lens: the camera's height, against the lake's
+ *   own waves sampled along the lens (`lensWave`). The line is wavy, moves
+ *   with the water, and sweeps up the screen as the camera sinks.
+ * - At the line: a thin bright meniscus with a soft shadow under it, and
+ *   the picture bends and blurs a little in the water clinging to the lens.
+ * - Below the line, and everywhere once under, the picture wobbles very
+ *   slightly and slowly, as it does through moving water.
+ * - `uMode` 0 draws only `tA`, 1 only `tB` (one scene render), 2 both.
+ * The pass also does the tone mapping and the sRGB conversion, so every
+ * frame is graded the same way whichever side of the surface it shows.
+ */
+export const LENS_VERT = /* glsl */ `
+varying vec2 vUv;
+void main(){
+  vUv = uv;
+  gl_Position = vec4(position.xy, 0.0, 1.0);
+}
+`;
+
+export const LENS_FRAG = /* glsl */ `
+uniform sampler2D tA;
+uniform sampler2D tB;
+uniform float uMode;
+uniform float uTime;
+uniform float uCamY;
+uniform float uLens;
+uniform float uAspect;
+uniform vec2 uCamXZ;
+uniform vec2 uRight;
+uniform vec2 uRes;
+uniform float uWobble;
+uniform vec3 uMeniscus;
+varying vec2 vUv;
+${NOISE_GLSL}
+
+// Height of the water where it touches the lens, at lens position u (-1..1).
+// The swell uses the lake's own wave layers (WATER_FRAG baseH, at the scale
+// its normals use), the last term is the meniscus' own small ripple.
+// x is the lens position in units of the screen's half-height, so a narrow
+// portrait screen shows fewer ripples rather than the same ones squeezed,
+// and on it the ripples are lower too.
+float lensWave(float u){
+  vec2 p = uCamXZ + uRight * (u * uLens * uAspect);
+  float t = uTime;
+  float x = u * uAspect;
+  float h = snoise(p * 0.62 + vec2(-t * 0.06, t * 0.05)) * 0.024;
+  h += snoise(p * 1.5 + vec2(t * 0.1, -t * 0.07)) * 0.014;
+  h += snoise(vec2(x * 1.6 + t * 0.32, t * 0.19)) * 0.011;
+  h += snoise(vec2(x * 4.4 - t * 0.6, 3.1 + t * 0.4)) * 0.0035;
+  return h * mix(0.55, 1.0, clamp(uAspect, 0.0, 1.0));
+}
+
+vec3 tap(sampler2D t, vec2 uv, float r){
+  if (r < 0.35) return texture2D(t, uv).rgb;
+  vec2 px = r / uRes;
+  vec3 c = texture2D(t, uv).rgb * 0.36;
+  c += texture2D(t, uv + vec2(px.x, 0.0)).rgb * 0.16;
+  c += texture2D(t, uv - vec2(px.x, 0.0)).rgb * 0.16;
+  c += texture2D(t, uv + vec2(0.0, px.y)).rgb * 0.16;
+  c += texture2D(t, uv - vec2(0.0, px.y)).rgb * 0.16;
+  return c;
+}
+
+void main(){
+  vec2 uv = vUv;
+  vec2 wob = uWobble * vec2(
+    sin(uv.y * 8.0 + uTime * 0.62) + 0.5 * sin(uv.y * 17.0 - uTime * 0.9),
+    cos(uv.x * 6.0 + uTime * 0.5) + 0.5 * cos(uv.x * 13.0 + uTime * 0.77)
+  ) * 0.0011;
+  vec3 col;
+  if (uMode < 0.5) {
+    col = texture2D(tA, uv).rgb;
+  } else if (uMode < 1.5) {
+    col = texture2D(tB, uv + wob).rgb;
+  } else {
+    float v = uv.y * 2.0 - 1.0;
+    float line = (lensWave(uv.x * 2.0 - 1.0) - uCamY) / uLens;
+    // Pixels above (+) or below (-) the waterline.
+    float s = (v - line) * 0.5 * uRes.y;
+    float span = 0.035 * uRes.y;
+    float near = exp(-abs(s) / span);
+    // Water on the lens bends the picture towards the line and softens it.
+    vec2 bend = vec2(0.0, -sign(s) * near * 0.01);
+    float blur = near * 2.6 * uRes.y / 900.0;
+    vec3 a = tap(tA, uv + bend, blur);
+    vec3 b = tap(tB, uv + bend + wob * (1.0 - near), blur);
+    float px = uRes.y / 900.0;
+    col = mix(b, a, smoothstep(-1.2 * px, 1.2 * px, s));
+    // The meniscus: light caught in the curved water, then its shadow.
+    col += uMeniscus * exp(-pow((s - 0.5 * px) / (1.1 * px), 2.0));
+    col *= 1.0 - 0.22 * exp(-pow((s + 3.0 * px) / (3.0 * px), 2.0));
+  }
+  gl_FragColor = vec4(col, 1.0);
   ${OUTPUT_GLSL}
 }
 `;

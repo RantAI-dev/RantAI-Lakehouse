@@ -13,6 +13,7 @@ import { PALETTE } from "@/lib/palette";
 import { MASCOT_R, RIPPLES } from "./scene-config";
 import type { SkyUniforms } from "./sky";
 import { WATER_FRAG, WATER_VERT } from "./shaders";
+import type { WaterFogUniforms } from "./underwater";
 
 /**
  * The lake: one large plane, one custom program (see `WATER_FRAG`). The
@@ -28,7 +29,7 @@ export type Water = {
   dispose: () => void;
 };
 
-export function createWater(sky: SkyUniforms, lowQuality: boolean): Water {
+export function createWater(sky: SkyUniforms, fog: WaterFogUniforms, lowQuality: boolean): Water {
   const ripples = Array.from({ length: RIPPLES }, () => new Vector4(0, 0, -100, 0));
   const uniforms: Record<string, IUniform> = {
     uTime: { value: 0 },
@@ -46,6 +47,13 @@ export function createWater(sky: SkyUniforms, lowQuality: boolean): Water {
     uRip: { value: ripples },
     uMascot: { value: new Vector3(0, 0, MASCOT_R * 0.99) },
     uWaveGain: { value: 1 },
+    // The creature's submerged body, as an ellipsoid, for its reflection in
+    // the underside of the surface (WEB-5 O5); the engine keeps it in step
+    // with the creature.
+    uBodyC: { value: new Vector3(0, -0.1, 0) },
+    uBodyR: { value: new Vector3(MASCOT_R, MASCOT_R * 0.9, MASCOT_R) },
+    uBodyTint: { value: new Color("#06134a") },
+    ...fog,
   };
   const material = new ShaderMaterial({
     uniforms,

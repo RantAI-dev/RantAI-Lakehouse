@@ -2,8 +2,10 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
   activeLayerIndex,
-  avoidSurface,
   focusFromProgress,
+  lensCoverage,
+  lensLine,
+  LENS,
   pchip,
   sceneStateAt,
   smoothstep,
@@ -130,11 +132,50 @@ test("a layout that is not measured yet still yields a finite state", () => {
   }
 });
 
-test("the camera never rests on the water plane", () => {
-  for (let y = -1; y <= 1; y += 0.01) {
-    // D14 S1 halved the band (0.14 -> 0.07); it still clears the 0.05 near plane.
-    assert.ok(Math.abs(avoidSurface(y)) >= 0.065, `y ${y} maps to ${avoidSurface(y)}`);
+// WEB-5 O5 replaces "the camera never rests on the water plane": the
+// owner found the old hop across the surface "patah". The camera now moves
+// in one continuous path through the surface, and the engine keeps the
+// water plane off its near plane instead.
+test("the camera moves continuously through the surface, with no hop", () => {
+  const step = 0.01 * VH;
+  let prev = sceneStateAt(0, layout).position[1];
+  for (let y = step; y <= DIVE.under * VH; y += step) {
+    const now = sceneStateAt(y, layout).position[1];
+    assert.ok(Math.abs(now - prev) <= 0.035, `moved ${now - prev} at ${y / VH} vh`);
+    prev = now;
   }
-  assert.equal(avoidSurface(5), 5);
-  assert.equal(avoidSurface(-5), -5);
+  let crossing = -1;
+  for (let y = 0; y <= DIVE.under * VH && crossing < 0; y += 1) if (sceneStateAt(y, layout).position[1] < 0) crossing = y;
+  assert.ok(crossing > DIVE.waterlineAbove * VH && crossing < DIVE.waterlineBelow * VH, `crosses at ${crossing / VH} vh`);
+  const s = sceneStateAt(crossing, layout);
+  assert.equal(s.position[1], s.pathY);
+});
+
+test("the waterline sweeps up the whole screen over a long stretch of scroll, never back", () => {
+  let enters = -1;
+  let leaves = -1;
+  let prev = -Infinity;
+  for (let y = 0; y <= DIVE.under * VH; y += 1) {
+    const line = lensLine(sceneStateAt(y, layout).position[1]);
+    assert.ok(line >= prev - 1e-9, `the line moved down at ${y / VH} vh`);
+    // While it is on screen: at most 4 % of the screen's height per 1 % of a
+    // viewport of scroll.
+    if (prev > -Infinity && Math.abs(line) <= 1.1) assert.ok((line - prev) / 2 <= 0.04 / (0.01 * VH), `the line jumped at ${y / VH} vh`);
+    if (enters < 0 && line > -1) enters = y;
+    if (leaves < 0 && line > 1) leaves = y;
+    prev = line;
+  }
+  assert.ok(enters > 0 && leaves > enters, `from ${enters} to ${leaves}`);
+  assert.ok((leaves - enters) / VH >= 0.7, `sweeps in ${(leaves - enters) / VH} vh`);
+});
+
+test("both pictures are drawn only while the waterline can be on screen", () => {
+  assert.deepEqual(lensCoverage(1), { above: true, below: false });
+  assert.deepEqual(lensCoverage(0), { above: true, below: true });
+  assert.deepEqual(lensCoverage(-1), { above: false, below: true });
+  // Wherever the line (with its waves) can touch the screen, both are there.
+  for (let y = -0.5; y <= 0.5; y += 0.005) {
+    const c = lensCoverage(y);
+    if (Math.abs(y) <= LENS.half + LENS.wave) assert.ok(c.above && c.below, `y ${y}`);
+  }
 });

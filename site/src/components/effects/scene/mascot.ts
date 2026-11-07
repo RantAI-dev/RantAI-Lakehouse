@@ -46,6 +46,8 @@ export type Mascot = {
   /** Everything that moves with the creature. Raycast target is `dome`. */
   group: Group;
   dome: Mesh;
+  /** The body's material: the engine gives it the water's fog and caustics. */
+  skin: MeshPhysicalMaterial;
   /** Foam collar and splash, which live in world space at the waterline. */
   extras: Group;
   /** The foam collar alone, hidden when the camera is below the surface. */
@@ -123,31 +125,14 @@ export function createMascot(opts: MascotOptions): Mascot {
   group.add(dome);
   disposables.push(bodyGeo, bodyMat);
 
-  // Seen from below, the part of the creature above the water shows through
-  // the surface as a faint blue shape: the dome's upper half drawn without
-  // depth testing, only while the camera is under water.
-  const ghostBodyGeo = buildBodyGeometry(true);
-  const ghostBodyMat = new MeshBasicMaterial({
-    color: new Color("#2f6fd6"),
-    transparent: true,
-    opacity: 0,
-    depthTest: false,
-    depthWrite: false,
-    toneMapped: false,
-  });
-  const ghostBody = new Mesh(ghostBodyGeo, ghostBodyMat);
-  ghostBody.renderOrder = 6;
-  ghostBody.visible = false;
-  group.add(ghostBody);
-  disposables.push(ghostBodyGeo, ghostBodyMat);
-
   // ---- Eyes --------------------------------------------------------------
   // WEB-5 O3: two eyes, one each side of the front, built alike and sharing
   // their materials, so they glow, blink and fade under water as one.
   const eyeGeo = new SphereGeometry(1, 40, 28);
-  // Pure white, outside tone mapping: the logo's eye is a white cut-out, and
-  // ACES would turn "white" into light grey next to the glow around it.
-  const eyeMat = new MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
+  // The logo's eye is a white cut-out. Since O5 the whole frame is tone
+  // mapped once, in the lens pass, so "white" is set bright enough (6 in
+  // linear light) that ACES maps it to about 0.99, not light grey.
+  const eyeMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(6) });
   const glowGeo = new PlaneGeometry(1, 1);
   const glowMat = new ShaderMaterial({
     uniforms: { uColor: { value: new Color("#bfe0ff") }, uIntensity: { value: 0.5 } },
@@ -157,34 +142,13 @@ export function createMascot(opts: MascotOptions): Mascot {
     depthWrite: false,
     blending: AdditiveBlending,
   });
-  // Seen from below, the creature's eyes still look down at you: a faint copy
-  // of each eye and its halo, drawn without depth testing so the water ceiling
-  // does not hide it. Hidden above the surface.
-  const ghostMat = new MeshBasicMaterial({
-    color: 0xffffff,
-    transparent: true,
-    opacity: 0,
-    depthTest: false,
-    depthWrite: false,
-    toneMapped: false,
-  });
-  const ghostGlowMat = new ShaderMaterial({
-    uniforms: { uColor: { value: new Color("#9fd0ff") }, uIntensity: { value: 0 } },
-    vertexShader: GLOW_VERT,
-    fragmentShader: GLOW_FRAG,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-    blending: AdditiveBlending,
-  });
-  disposables.push(eyeGeo, eyeMat, glowGeo, glowMat, ghostMat, ghostGlowMat);
+  disposables.push(eyeGeo, eyeMat, glowGeo, glowMat);
   /**
    * The halo's size, in eye radii. The single eye's was 6.5 of its width;
    * two halos that wide would merge into one blur between the eyes, so each
    * is smaller and they only just touch.
    */
   const GLOW = 4.2;
-  const GHOST_GLOW = 4.6;
   function buildEye() {
     const eye = new Group();
     const eyeMesh = new Mesh(eyeGeo, eyeMat);
@@ -195,17 +159,8 @@ export function createMascot(opts: MascotOptions): Mascot {
     glow.position.z = 0.12 * MASCOT_R;
     glow.renderOrder = 3;
     eye.add(glow);
-    const ghostEye = new Mesh(eyeGeo, ghostMat);
-    ghostEye.renderOrder = 8;
-    ghostEye.visible = false;
-    eye.add(ghostEye);
-    const ghostGlow = new Mesh(glowGeo, ghostGlowMat);
-    ghostGlow.renderOrder = 7;
-    ghostGlow.visible = false;
-    ghostGlow.position.z = 0.12 * MASCOT_R;
-    eye.add(ghostGlow);
     group.add(eye);
-    return { eye, eyeMesh, glow, ghostEye, ghostGlow };
+    return { eye, eyeMesh, glow };
   }
   /** Left and right, by their side of the front (−phi, +phi). */
   const eyes = [buildEye(), buildEye()] as const;
@@ -217,6 +172,10 @@ export function createMascot(opts: MascotOptions): Mascot {
   // second hot spot to the clearcoat the way a point light would.
   const bounce = new HemisphereLight(0x1b2f7a, new Color(PALETTE.lake), 0.9);
   extras.add(bounce);
+  // Under water the light comes the other way: down from the surface, with
+  // the dark depths below (O5), so the submerged body is lit from above.
+  const BOUNCE_ABOVE = { sky: new Color(0x1b2f7a), ground: new Color(PALETTE.lake) };
+  const BOUNCE_UNDER = { sky: new Color("#3f86d6"), ground: new Color("#04102e") };
 
   // ---- Foam collar -------------------------------------------------------
   const foamSize = MASCOT_R * 2 * 1.75;
@@ -313,21 +272,18 @@ export function createMascot(opts: MascotOptions): Mascot {
   const mascot: Mascot = {
     group,
     dome,
+    skin: bodyMat,
     extras,
     foam,
     still: false,
     setUnderwater(uw) {
-      bodyMat.emissiveIntensity = MathUtils.lerp(0.55, 1.5, uw);
-      bounce.intensity = MathUtils.lerp(0.9, 2.6, uw);
-      const k = MathUtils.smoothstep(uw, 0.1, 0.9);
-      for (const e of eyes) {
-        e.ghostEye.visible = k > 0.01;
-        e.ghostGlow.visible = k > 0.01;
-      }
-      ghostMat.opacity = 0.85 * k;
-      ghostBody.visible = k > 0.01;
-      ghostBodyMat.opacity = 0.22 * k;
-      ghostGlowMat.uniforms.uIntensity.value = 0.75 * k;
+      // Under water the light is scattered from every side; a little more
+      // glow keeps the body readable through the water's fog without
+      // flattening it (O5: the old 1.5 made it a flat disc).
+      bodyMat.emissiveIntensity = MathUtils.lerp(0.55, 0.6, uw);
+      bounce.intensity = MathUtils.lerp(0.9, 2.2, uw);
+      bounce.color.copy(BOUNCE_ABOVE.sky).lerp(BOUNCE_UNDER.sky, uw);
+      bounce.groundColor.copy(BOUNCE_ABOVE.ground).lerp(BOUNCE_UNDER.ground, uw);
     },
     dip(t) {
       if (t - dipStart < 1.6) return;
@@ -374,8 +330,6 @@ export function createMascot(opts: MascotOptions): Mascot {
       const blink = bp >= 0 && bp <= 1 ? 1 - 0.9 * Math.sin(Math.PI * bp) : 1;
       for (const e of eyes) {
         e.eyeMesh.scale.y = EYES_3D.r * blink;
-        e.ghostEye.scale.copy(e.eyeMesh.scale);
-        e.ghostGlow.scale.set(EYES_3D.r * GHOST_GLOW, EYES_3D.r * GHOST_GLOW * (0.35 + 0.65 * blink), 1);
         e.glow.scale.y = EYES_3D.r * GLOW * (0.35 + 0.65 * blink);
       }
       glowMat.uniforms.uIntensity.value = 0.8 + 0.12 * Math.sin(t * 1.3);

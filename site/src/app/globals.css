@@ -162,25 +162,6 @@ html[data-scene="full"] #hero {
   height: 220vh;
 }
 
-/* WEB-5 D14 S1: the waterline the lake engine moves up the screen as the
-   camera crosses the surface (lake-engine.ts sets the two variables). Above
-   the line the scene shows as it is; at the line a pale meniscus; below it
-   the lake-blue tint of the water at the lens. */
-.lk-waterline {
-  --lk-wl-pos: 105%;
-  --lk-wl-a: 0;
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: linear-gradient(
-    to bottom,
-    transparent calc(var(--lk-wl-pos) - 0.6%),
-    rgba(190, 228, 255, calc(var(--lk-wl-a) * 1.2)) var(--lk-wl-pos),
-    rgba(18, 70, 140, var(--lk-wl-a)) calc(var(--lk-wl-pos) + 1.2%),
-    rgba(7, 31, 82, var(--lk-wl-a)) 100%
-  );
-}
-
 /* WEB-5 D14 S2: the page-wide water (components/home/depth-backdrop.tsx).
    Its two colours are written by the page as it scrolls; the defaults are
    the deepest water, where the assistant starts. Once the page has

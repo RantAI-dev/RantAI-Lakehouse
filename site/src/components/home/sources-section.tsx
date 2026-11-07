@@ -23,7 +23,9 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
           content below the 64 px top bar (pt-16) instead of under it, and the
           headline box, the lead's line height and the margins are tighter, so
           at 360x740 neither the headline nor the caption is clipped. */}
-      <div className="sticky top-0 flex h-[100svh] flex-col items-center justify-center overflow-hidden max-md:pt-16 motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
+      {/* WEB-5 O5: the stage's top edge is a soft mask, not a hard cut, so a droplet
+          falling in from above fades in instead of being sliced by a straight line. */}
+      <div className="sticky top-0 flex h-[100svh] flex-col items-center justify-center overflow-hidden [mask-image:linear-gradient(180deg,transparent_0,#000_9%)] max-md:pt-16 motion-reduce:static motion-reduce:h-auto motion-reduce:py-28 motion-reduce:[mask-image:none]">
         <Container className="text-center">
           <SourcesHeadingFade>
             <DisplayHeading>{copy.headline}</DisplayHeading>

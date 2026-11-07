@@ -4,22 +4,25 @@ import {
   AmbientLight,
   Color,
   DirectionalLight,
-  FogExp2,
   Material,
   MathUtils,
+  Mesh,
   PerspectiveCamera,
   Raycaster,
   Scene,
+  ShaderMaterial,
   Vector2,
   Vector3,
   WebGLRenderer,
 } from "three";
-import { sceneStateAt, smoothstep, type SceneLayout, type SceneState } from "@/lib/scroll-timeline";
+import { LENS, lensCoverage, sceneStateAt, smoothstep, type SceneLayout, type SceneState } from "@/lib/scroll-timeline";
+import { displayedHex, publishSceneColours } from "@/lib/scene-colour";
+import { createLens } from "./lens";
 import { createMascot, type Aim } from "./mascot";
 import { CAMERA_FOV, MASCOT_H, MOON_DIR, STILL_TIME } from "./scene-config";
 import { buildEnvironment, createSkyDome, createSkyUniforms, createStars } from "./sky";
 import { createSlabs, SLAB_SIZE } from "./slabs";
-import { createShafts, createSnow } from "./underwater";
+import { applyWaterFog, createShafts, createSnow, createWaterFog } from "./underwater";
 import { createWater } from "./water";
 
 /**
@@ -39,6 +42,15 @@ import { createWater } from "./water";
  * runs only while the page zone is on screen and the tab is visible;
  * particle counts halve below 768 px. If frames run long for a while the
  * pixel ratio steps down by itself.
+ *
+ * WEB-5 O5, the crossing. Every frame goes through the lens pass
+ * (`lens.ts`): the scene is drawn off screen and the lens puts it on screen.
+ * While the waterline is on the lens the scene is drawn twice from the same
+ * camera, once as it looks above the water and once below, and the lens
+ * splits the screen along the water. The camera never hops: to keep its
+ * near plane off the water, the water plane itself steps a few centimetres
+ * away from the camera in each picture (`PLANE_CLEAR`), which no one can
+ * see, since the split hides the plane near the lens.
  */
 
 export type EngineMode = "full" | "still";
@@ -61,61 +73,66 @@ const lerp = MathUtils.lerp;
 const UNDER_NEAR = new Color("#0b3a74");
 const UNDER_MID = new Color("#071f52");
 const UNDER_DEEP = new Color("#020b2a");
+/** The light that comes down through the surface, scattered: the water's colour looking up. */
+const UNDER_LIGHT = new Color("#2a74c4");
+
+/** How far the water plane keeps from the camera in each picture (the near plane is 0.03). */
+const PLANE_CLEAR = 0.055;
+
+/** The moonlight under water: bent towards the vertical by the surface (Snell, n 1.333). */
+const UNDER_MOON = (() => {
+  const [x, y, z] = MOON_DIR;
+  const sinAir = Math.sqrt(1 - y * y);
+  const sinWater = sinAir / 1.333;
+  const k = sinWater / sinAir;
+  return [x * k, Math.sqrt(1 - sinWater * sinWater), z * k] as const;
+})();
 
 export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const { canvas, mode, observe } = opts;
   const host = canvas.parentElement ?? canvas; // the layer div the page sizes
 
-  // WEB-5 D14 S1, the waterline. One water plane cannot be seen from both
-  // sides at once, so as the camera crosses it the picture flips from sky to
-  // ceiling in one frame. Over it, a waterline with an underwater tint below
-  // rises up the screen with the camera's path height, and the flip happens
-  // when three quarters of the screen is already under the tint: the
-  // crossing reads as the water rising past the lens. Two CSS variables per
-  // frame (app/globals.css `.lk-waterline`), no React state.
-  const waterline = document.createElement("div");
-  waterline.className = "lk-waterline";
-  waterline.setAttribute("aria-hidden", "true");
-  if (mode !== "still") host.appendChild(waterline);
-  let lastLine = "";
   const still = mode === "still";
   let phone = window.innerWidth < 768;
 
   const maxDpr = phone ? 1.25 : 1.75;
   let dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
 
+  // The canvas needs no MSAA of its own: the scene is drawn off screen
+  // (into the lens' main picture, which has it on desktop) and the canvas
+  // only receives the lens pass.
   const renderer = new WebGLRenderer({
     canvas,
-    antialias: !phone,
+    antialias: false,
     powerPreference: "high-performance",
   });
   renderer.setPixelRatio(dpr);
+  renderer.setClearColor(0x000000, 1);
   renderer.toneMapping = ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
+  const lens = createLens(renderer, { lensHalf: LENS.half, msaa: !phone });
 
   const scene = new Scene();
-  const camera = new PerspectiveCamera(CAMERA_FOV, 1, 0.05, 600);
+  const camera = new PerspectiveCamera(CAMERA_FOV, 1, 0.03, 600);
 
   // ---- Sky, stars, environment ------------------------------------------
   const skyUniforms = createSkyUniforms();
-  const sky = createSkyDome(skyUniforms);
+  // One air-fog colour object shared by the water's top and every mesh,
+  // so they can never disagree at the horizon; the water's own fog
+  // (O5) is a set of uniforms shared the same way.
+  const airFog = new Color().copy(skyUniforms.uSkyHorizon.value);
+  const fog = createWaterFog(airFog);
+  const sky = createSkyDome(skyUniforms, fog);
   scene.add(sky);
   const stars = createStars(phone ? 300 : 600, dpr);
   scene.add(stars.points);
-  const envTarget = buildEnvironment(renderer, skyUniforms);
+  const envTarget = buildEnvironment(renderer, skyUniforms, fog);
   scene.environment = envTarget.texture;
   scene.environmentIntensity = 0.95;
 
-  // One fog colour object shared by the background, three's fog (for the
-  // mascot) and the water shader, so they can never disagree at the horizon.
-  const fogColor = new Color().copy(skyUniforms.uSkyHorizon.value);
-  scene.background = fogColor;
-  scene.fog = new FogExp2(fogColor, 0.003);
-  skyUniforms.uFogColor.value = fogColor;
-
   // ---- Water -------------------------------------------------------------
-  const water = createWater(skyUniforms, phone);
-  water.uniforms.uFogColor.value = fogColor;
+  const water = createWater(skyUniforms, fog, phone);
+  water.uniforms.uFogColor.value = airFog;
   scene.add(water.mesh);
 
   // ---- Mascot ------------------------------------------------------------
@@ -130,12 +147,23 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   // ---- Underwater --------------------------------------------------------
   const shafts = createShafts(phone ? 5 : 9);
   scene.add(shafts.group);
-  const snow = createSnow(phone ? 700 : 1500);
+  // Marine snow: sparse and small (O5), so it reads as water, not as weather.
+  const snow = createSnow(phone ? 420 : 900);
   scene.add(snow.points);
 
   // ---- Medallion slabs ----------------------------------------------------
   const slabs = createSlabs(phone);
   scene.add(slabs.group);
+
+  // Every one of three's own materials (the creature, the slabs) takes the
+  // water's fog in place of three's (O5, `applyWaterFog`).
+  scene.traverse((o) => {
+    const mesh = o as Partial<Mesh>;
+    const mats = mesh.material ? (Array.isArray(mesh.material) ? mesh.material : [mesh.material]) : [];
+    for (const m of mats)
+      if (!(m as ShaderMaterial).isShaderMaterial && (m as { fog?: boolean }).fog)
+        applyWaterFog(m, fog, { caustics: m === mascot.skin });
+  });
 
   // ---- Lights ------------------------------------------------------------
   // Moonlight from behind the creature rims its dome. There is deliberately no
@@ -145,7 +173,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const moonLight = new DirectionalLight(0xbcd8ff, 3.2);
   moonLight.position.set(...MOON_DIR).multiplyScalar(10);
   scene.add(moonLight);
-  scene.add(new AmbientLight(0x1b2f7a, 0.8));
+  const ambient = new AmbientLight(0x1b2f7a, 0.8);
+  scene.add(ambient);
 
   const clock = { t: still ? STILL_TIME : 0, last: 0 };
 
@@ -216,6 +245,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     height = Math.max(1, host.clientHeight);
     phone = window.innerWidth < 768;
     renderer.setSize(width, height, false);
+    lens.setSize(width, height, dpr);
     const aspect = width / height;
     camera.aspect = aspect;
     // Desktop: the creature sits right of centre so the copy has the left.
@@ -329,19 +359,6 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     if (Math.abs(scrollY - smoothY) < 0.05) smoothY = scrollY;
     state = sceneStateAt(smoothY, layout);
     const uw = state.underwater;
-    if (!still) {
-      // Line position: 100 % (bottom edge) at path y +0.35, 25 % at the surface,
-      // 0 % (top edge) just below it. Tint fades out from y -0.35 to -0.9,
-      // where the 3D underwater view carries the picture on its own.
-      const pos = clamp(25 + (state.pathY / 0.35) * 75, -5, 105);
-      const alpha = 0.5 * smoothstep(-0.9, -0.35, state.pathY);
-      const line = `${pos.toFixed(1)}|${alpha.toFixed(3)}`;
-      if (line !== lastLine) {
-        lastLine = line;
-        waterline.style.setProperty("--lk-wl-pos", `${pos.toFixed(1)}%`);
-        waterline.style.setProperty("--lk-wl-a", alpha.toFixed(3));
-      }
-    }
 
     // Camera: the scroll path, plus a small pointer parallax while above the water.
     const heroPointer = 1 - state.dive;
@@ -389,7 +406,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     aim.x = lerp(rawX + (wanderX - rawX) * w, clamp(camera.position.x * 0.3, -0.5, 0.5), uw);
     aim.y = lerp(rawY + (wanderY - rawY) * w, -0.8, uw);
     mascot.update(dt, t, aim, 1 - uw * 0.5);
-    mascot.foam.visible = uw < 0.95;
+    (water.uniforms.uBodyC.value as Vector3).set(0, mascot.group.position.y, 0);
 
     // WEB-5 D14 S1: one ring spreads from the crossing as the camera goes
     // through the surface (either way), so the moment reads as a dive.
@@ -404,29 +421,29 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       lastBob = bobIndex;
     }
 
-    // Fog, background and the underwater colour ramp by depth.
-    const depthK = clamp((-camera.position.y - 0.5) / 26, 0, 1);
+    // The water's colour by depth (O5): lake-blue near the surface, abyss at
+    // the bottom; lighter looking up, where the light comes from, and darker
+    // looking down. Used only by the picture below the water.
+    const depth = Math.max(0, -camera.position.y);
+    const depthK = clamp((depth - 0.5) / 26, 0, 1);
     if (depthK < 0.35) underColor.copy(UNDER_NEAR).lerp(UNDER_MID, depthK / 0.35);
     else underColor.copy(UNDER_MID).lerp(UNDER_DEEP, (depthK - 0.35) / 0.65);
-    fogColor.copy(skyUniforms.uSkyHorizon.value).lerp(underColor, smoothstep(0, 1, uw));
-    const density = lerp(0.021, 0.036, uw);
-    (scene.fog as FogExp2).density = lerp(0.003, 0.036, uw);
-    (scene.fog as FogExp2).color.copy(fogColor);
-    water.uniforms.uFogDensity.value = density;
-    skyUniforms.uUnder.value = smoothstep(0, 1, uw);
-    mascot.setUnderwater(uw);
-    stars.points.visible = uw < 0.98;
-    stars.uniforms.uAlpha.value = 1 - uw;
+    fog.uWfHorizon.value.copy(underColor);
+    fog.uWfUp.value.copy(underColor).lerp(UNDER_LIGHT, 0.55 * Math.exp(-depth / 12));
+    fog.uWfDown.value.copy(underColor).multiplyScalar(0.42);
+    fog.uWfDensity.value = lerp(0.034, 0.042, depthK);
+    water.uniforms.uFogDensity.value = 0.021;
 
     sky.position.copy(camera.position);
     stars.points.position.copy(camera.position);
     stars.uniforms.uTime.value = t;
     water.uniforms.uTime.value = t;
+    fog.uWfTime.value = t;
 
-    // Light shafts fade out with depth; snow is a constant presence below.
-    const below = Math.max(0, -camera.position.y);
-    shafts.update(t, uw * 0.55 * Math.exp(-below / 14), camera);
-    snow.update(t, uw * 0.85, camera, dpr);
+    // Light shafts fade out with depth (and in their own shader with their
+    // own depth); snow is a constant presence below.
+    shafts.update(t, 0.75 * Math.exp(-depth / 16), camera);
+    snow.update(t, 0.75, camera, dpr);
     slabs.update({ time: t, focus: state.focus, reveal: state.slabsReveal, pixelRatio: dpr });
 
     // WEB-1 review round 1 SHOULD-FIX 2: the canvas layer is sticky only inside
@@ -437,8 +454,77 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     if (!still) canvas.style.opacity = String(1 - smoothstep(0.82, 1, state.depthProgress));
   }
 
+  /** Sets the scene up as it looks above the water, or below it (O5). */
+  function configure(under: boolean): void {
+    const y = camera.position.y;
+    water.mesh.position.y = under ? Math.max(0, y + PLANE_CLEAR) : Math.min(0, y - PLANE_CLEAR);
+    fog.uWfOn.value = under ? 1 : 0;
+    skyUniforms.uUnder.value = under ? 1 : 0;
+    stars.points.visible = !under;
+    shafts.group.visible = under;
+    snow.points.visible = under;
+    slabs.group.visible = under;
+    mascot.foam.visible = !under;
+    mascot.setUnderwater(under ? 1 : 0);
+    if (under) {
+      moonLight.position.set(...UNDER_MOON).multiplyScalar(10);
+      moonLight.intensity = 2.2;
+      ambient.intensity = 1.1;
+    } else {
+      moonLight.position.set(...MOON_DIR).multiplyScalar(10);
+      moonLight.intensity = 3.2;
+      ambient.intensity = 0.8;
+    }
+  }
+
+  // The water's colour at the top and the bottom of the screen, as the lens
+  // puts it on screen, for the page-wide water that takes over where the
+  // zone ends (O5, lib/scene-colour.ts). The far water is the fog alone.
+  const fogAt = (dy: number, out: Color): Color => {
+    out.copy(fog.uWfDown.value).lerp(fog.uWfHorizon.value, smoothstep(-0.5, 0.06, dy));
+    return out.lerp(fog.uWfUp.value, smoothstep(0, 0.8, dy));
+  };
+  const camUp = new Vector3();
+  const camFwd = new Vector3();
+  const edgeColour = new Color();
+  function publishColours(): void {
+    const half = MathUtils.degToRad(CAMERA_FOV / 2);
+    camera.getWorldDirection(camFwd);
+    camUp.setFromMatrixColumn(camera.matrixWorld, 1);
+    const hex = (dy: number) => {
+      fogAt(dy, edgeColour);
+      return displayedHex(edgeColour.r, edgeColour.g, edgeColour.b, renderer.toneMappingExposure);
+    };
+    publishSceneColours({
+      top: hex(camFwd.y * Math.cos(half) + camUp.y * Math.sin(half)),
+      bottom: hex(camFwd.y * Math.cos(half) - camUp.y * Math.sin(half)),
+    });
+  }
+
+  const right = new Vector3();
   function renderFrame(): void {
+    const cover = lensCoverage(camera.position.y);
+    const lensMode = cover.above && cover.below ? 2 : cover.above ? 0 : 1;
+    configure(lensMode === 1);
+    renderer.setRenderTarget(lens.main);
     renderer.render(scene, camera);
+    if (lensMode === 1) publishColours();
+    if (lensMode === 2) {
+      configure(true);
+      renderer.setRenderTarget(lens.second());
+      renderer.render(scene, camera);
+    }
+    right.setFromMatrixColumn(camera.matrixWorld, 0);
+    lens.present(renderer, {
+      mode: lensMode,
+      time: clock.t,
+      camY: camera.position.y,
+      camX: camera.position.x,
+      camZ: camera.position.z,
+      rightX: right.x,
+      rightZ: right.z,
+      wobble: still ? 0 : 1,
+    });
   }
 
   function renderOnceIfStill(): void {
@@ -472,6 +558,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       renderer.setPixelRatio(dpr);
       stars.uniforms.uPx.value = dpr;
       renderer.setSize(width, height, false);
+      lens.setSize(width, height, dpr);
       slow = 0;
       ema = 1 / 60;
     }
@@ -510,9 +597,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   return {
     dispose() {
-      waterline.remove();
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
+      publishSceneColours(null);
       ro.disconnect();
       roZone.disconnect();
       io.disconnect();
@@ -531,6 +618,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       stars.points.geometry.dispose();
       (stars.points.material as Material).dispose();
       envTarget.dispose();
+      lens.dispose();
       renderer.dispose();
       // Release the GPU context now rather than at garbage collection, unless
       // the browser already took it (calling this on a lost context only warns).
