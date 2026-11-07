@@ -1,5 +1,8 @@
 //! `POST /api/query/run` records the statement the user wrote in query
-//! history, not the statement sent to the engine (`SEC-21`, `SEC-33`).
+//! history, not the statement sent to the engine (`SEC-21`, `SEC-33`). A
+//! statement with `{{name}}` parameters is recorded as it ran, with the
+//! checked literals in it and not the placeholders (`QS-5`, D5), so a
+//! download needs no values.
 //!
 //! History is what the console shows back to the user and what
 //! `GET /api/query/run/{id}/download` re-runs. A history row that held the
@@ -269,4 +272,128 @@ async fn a_download_of_a_run_applies_the_policy_once() {
         1,
         "{downloaded}"
     );
+}
+
+// ── QS-5 part 1, D5: a parameterised run ────────────────────────────────
+
+/// What the user types: one text parameter.
+const PARAMETERISED: &str = "SELECT email FROM serving.mart_x WHERE region = {{region}}";
+
+/// Runs a request body as the cookie's user and returns the response.
+async fn post_run(
+    router: &axum::Router,
+    cookie: &str,
+    request: &Value,
+) -> axum::http::Response<Body> {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query/run")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
+async fn run_parameterised(router: &axum::Router, cookie: &str, region: &str) -> String {
+    let resp = post_run(
+        router,
+        cookie,
+        &json!({ "sql": PARAMETERISED, "parameters": { "region": region } }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_body(resp).await["id"]
+        .as_str()
+        .expect("the run response carries its history id")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn history_holds_the_statement_that_ran_with_the_values_printed_in_it() {
+    let ch = MockServer::start().await;
+    mount_columns_csv_and_json(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    seed_mask_and_row_filter_policy(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let id = run_parameterised(&router, &cookie, "EU").await;
+
+    let stored = history_sql(&router, &cookie, &id).await;
+    assert_eq!(
+        stored,
+        "SELECT email FROM serving.mart_x WHERE region = 'EU'"
+    );
+    // The table list is read from the filled statement: the text with its
+    // placeholder does not parse, and would list no table.
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT tables_read FROM query_history WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .expect("the run is in history");
+    assert_eq!(tables, ["serving.mart_x"]);
+    let sent = sent_statements(&ch).await;
+    assert!(sent[0].contains("region = 'EU'"), "{}", sent[0]);
+    assert!(sent[0].contains(MASK_EXPRESSION), "{}", sent[0]);
+    assert!(sent[0].contains(REWRITTEN_FILTER), "{}", sent[0]);
+}
+
+/// Download re-runs the stored statement and never scans it. A text value
+/// that reads `{{x}}` sits in the stored statement as `'{{x}}'`, which the
+/// scanner would refuse as a placeholder inside quotes.
+#[tokio::test]
+async fn a_download_of_a_parameterised_run_needs_no_values_even_for_a_value_that_reads_a_placeholder()
+ {
+    let ch = MockServer::start().await;
+    mount_columns_csv_and_json(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    seed_mask_and_row_filter_policy(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let id = run_parameterised(&router, &cookie, "{{x}}").await;
+    assert_eq!(
+        history_sql(&router, &cookie, &id).await,
+        "SELECT email FROM serving.mart_x WHERE region = '{{x}}'"
+    );
+    assert_eq!(download_csv(&router, &cookie, &id).await, StatusCode::OK);
+
+    let sent = sent_statements(&ch).await;
+    assert_eq!(sent.len(), 2, "the run, then the download: {sent:?}");
+    assert!(sent[1].contains("region = '{{x}}'"), "{}", sent[1]);
+    assert_eq!(sent[1].matches(MASK_EXPRESSION).count(), 1, "{}", sent[1]);
+}
+
+#[tokio::test]
+async fn a_run_refused_while_filling_is_recorded_as_blocked_with_the_text_the_user_wrote() {
+    let ch = MockServer::start().await;
+    mount_columns_csv_and_json(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let resp = post_run(&router, &cookie, &json!({ "sql": PARAMETERISED })).await;
+
+    // 400, never 403: Run all reads a 403 as a refusal of the whole batch.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(resp).await["error"],
+        "Fill in {{region}} to run this query."
+    );
+    let (status, message, sql): (String, Option<String>, String) =
+        sqlx::query_as("SELECT status, message, sql FROM query_history")
+            .fetch_one(&pool)
+            .await
+            .expect("the refusal is in history");
+    assert_eq!(status, "blocked");
+    assert_eq!(
+        message.as_deref(),
+        Some("Fill in {{region}} to run this query.")
+    );
+    assert_eq!(sql, PARAMETERISED);
+    assert_eq!(sent_statements(&ch).await, Vec::<String>::new());
 }

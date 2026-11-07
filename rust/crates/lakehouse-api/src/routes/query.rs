@@ -51,7 +51,27 @@ struct SqlBody {
     /// `ClickHouse`, unaffected.
     #[serde(default)]
     engine: Option<String>,
+    /// `QS-5`: the value each `{{name}}` in `sql` takes, name to value.
+    /// Kept as raw JSON so a value of the wrong shape is refused with
+    /// [`PARAMETERS_SHAPE`], not with serde's rendering of the caller's
+    /// request (AGENTS.md principle 4).
+    #[serde(default)]
+    parameters: Option<Value>,
+    /// `QS-5`: the definitions of those parameters (type, default,
+    /// options), as a saved query keeps them. Raw JSON for the same reason
+    /// as `parameters`.
+    #[serde(default)]
+    definitions: Option<Value>,
 }
+
+/// The fixed sentence for a `parameters` value that is not an object.
+const PARAMETERS_SHAPE: &str =
+    "parameters must be an object that maps a parameter name to its value.";
+
+/// The fixed sentence for a `definitions` value that is not a list of
+/// definitions.
+const DEFINITIONS_SHAPE: &str = "definitions must be a list of parameter definitions, each with a \
+     name, a type, a default and options.";
 
 /// Parse the raw request body as `{"sql": "..."}`.
 ///
@@ -63,6 +83,72 @@ struct SqlBody {
 fn parse_body(body: &Bytes) -> Result<SqlBody, ApiError> {
     serde_json::from_slice(body)
         .map_err(|_err| ApiError::BadRequest("Body must be JSON {sql}".to_owned()))
+}
+
+/// The values and definitions a request carries (`QS-5`): `parameters` as
+/// an object and `definitions` as a list of
+/// [`QueryParamDef`](crate::query_params::QueryParamDef). An absent or
+/// `null` field is empty. A field of the wrong shape is a 400 with a fixed
+/// sentence; serde's text, which would quote the caller's own JSON back,
+/// stays out of the response.
+fn parameter_inputs(
+    parameters: Option<Value>,
+    definitions: Option<Value>,
+) -> Result<(Map<String, Value>, Vec<crate::query_params::QueryParamDef>), ApiError> {
+    let parameters = match parameters {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err(ApiError::BadRequest(PARAMETERS_SHAPE.to_owned())),
+    };
+    let definitions = match definitions {
+        None | Some(Value::Null) => Vec::new(),
+        Some(list) => serde_json::from_value(list)
+            .map_err(|_shape| ApiError::BadRequest(DEFINITIONS_SHAPE.to_owned()))?,
+    };
+    Ok((parameters, definitions))
+}
+
+/// Fill the `{{name}}` placeholders of `sql` with the checked literal of
+/// each value (`QS-5` part 1, D4), for the engine `engine` names.
+///
+/// This is the one place a route turns a parameterised statement into the
+/// statement that runs, and it runs before everything that reads the
+/// statement: the table list, the read-only guard, the `Trino` guard, the
+/// policy rewrite and the settings rule. Each of them then sees the final
+/// statement, and a row filter or mask governs a parameterised query as it
+/// governs any other.
+///
+/// The scanner reads text a person or the model wrote, once per request. Its
+/// output is a statement with literals in it, and a literal may itself read
+/// `'{{x}}'`; scanning that again would refuse a text value that was
+/// `{{x}}`. So the caller scans once here and then hands the result to
+/// [`run_statement`], which never scans.
+///
+/// A statement with no placeholder comes back byte for byte.
+///
+/// # Errors
+///
+/// 400 [`ApiError::BadRequest`] with the sentence of
+/// [`ParamError`](crate::query_params::ParamError): a placeholder inside
+/// quotes, a `{{` that is not a parameter, a missing value, a value that
+/// does not fit its type, or a limit passed. Those sentences name a
+/// parameter and never repeat a value or an upstream error. Never 403: Query
+/// Studio's Run all reads a 403 as a refusal of the whole batch.
+pub(crate) fn substitute_parameters(
+    engine: &str,
+    sql: &str,
+    parameters: &Map<String, Value>,
+    definitions: &[crate::query_params::QueryParamDef],
+) -> Result<String, ApiError> {
+    crate::query_params::substitute(
+        crate::sql_rewrite::Engine::from_name(engine),
+        sql,
+        parameters,
+        definitions,
+    )
+    // `ParamError`'s `Display` is the fixed sentence for the person: it
+    // holds a parameter name (after the name rule) and never a value.
+    .map_err(|refusal| ApiError::BadRequest(refusal.to_string()))
 }
 
 /// WS7 item C2: prefetches obligations for every table `sql` references
@@ -1509,10 +1595,25 @@ const RESULT_BYTE_CAP: usize = 10 * 1024 * 1024;
 /// trail's own refusal path stays what WS7 built it for: enforcement
 /// decisions, not this route's history write.
 ///
+/// `QS-5`: the body may carry `parameters` (name to value) and `definitions`
+/// (type, default, options). The `{{name}}` placeholders are filled by
+/// [`substitute_parameters`] before anything else reads the statement, then
+/// [`run_statement`] runs the result. The history row holds that filled
+/// statement, literals included, so a download or "open in studio" needs no
+/// values; a run refused while filling holds the text with its placeholders.
+///
 /// # Errors
 ///
 /// - 400 [`ApiError::BadRequest`] on an unparseable body or a missing/empty
 ///   `sql`.
+/// - 400 [`ApiError::BadRequest`] when `parameters` is not an object or
+///   `definitions` is not a list of definitions (a fixed sentence each), and
+///   when a `{{name}}` cannot be filled (`QS-5`): no value and no default, a
+///   value that does not fit its type, a placeholder inside quotes, a `{{`
+///   that is not a parameter, or a limit passed. The sentence is
+///   [`crate::query_params::ParamError`]'s and holds no value. It is 400 and
+///   never 403, because Query Studio's Run all reads a 403 as a refusal of
+///   the whole batch. The refusal is recorded as `blocked` like the guards'.
 /// - 401 [`ApiError::Unauthorized`] with no authenticated principal, for
 ///   ANY engine. `query_history.user_name` now records the principal's own
 ///   uuid (previously the fixed placeholder `"anonymous"` — see
@@ -1541,15 +1642,6 @@ const RESULT_BYTE_CAP: usize = 10 * 1024 * 1024;
 ///   Requirement 1), or, on `ClickHouse`, when the statement names a setting
 ///   other than `iceberg_snapshot_id` (`SEC-21`).
 /// - 503 [`ApiError::Unavailable`] when `Trino` is unreachable or times out.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one linear guard order (read-only, principal, Trino keywords, \
-              policy rewrite, settings, engine), each guard now ending in the \
-              same best-effort history record that `record_blocked` and \
-              `record_uncompleted_run` carry; splitting the guards into \
-              helpers would scatter an order whose sequence is the route's \
-              correctness, for a threshold, not a real seam"
-)]
 pub async fn run(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -1561,24 +1653,80 @@ pub async fn run(
         Some(s) if !s.is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
+    let (parameters, definitions) = parameter_inputs(parsed.parameters, parsed.definitions)?;
     // The engine is only a request field, so reading it before the guards
-    // changes nothing about which refusal a request meets. It is needed
-    // here for `tables_read`: the statement's tables are parsed with the
-    // dialect of the engine it names (the same parser the policy step
-    // uses), and the history row records them whether the run completes,
-    // fails or is refused (`QS-4`, decisions 3 and 4).
+    // changes nothing about which refusal a request meets. The scanner needs
+    // it (a backslash ends a quoted run on `ClickHouse` and not on `Trino`),
+    // and so does `tables_read` in [`run_statement`].
     let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
-    let tables_read = referenced_table_names(&statement, is_trino_engine(&engine));
+    let principal = principal.map(|Extension(p)| p);
 
-    if !is_read_only(&statement) {
+    // `QS-5`, D4: the placeholders are filled as soon as the statement is
+    // read, before the table list, every guard and the policy rewrite.
+    let statement = match substitute_parameters(&engine, &statement, &parameters, &definitions) {
+        Ok(filled) => filled,
+        Err(refusal) => {
+            // A refusal is recorded like the guards' (`QS-4`), with the text
+            // the person wrote: nothing was filled in, so no value is in it.
+            // No principal, no row.
+            if let Some(p) = &principal {
+                let tables_read = referenced_table_names(&statement, is_trino_engine(&engine));
+                record_blocked(&state, p, &statement, &engine, &tables_read, &refusal).await;
+            }
+            return Err(refusal.into());
+        }
+    };
+    run_statement(&state, principal.as_ref(), &headers, &statement, &engine).await
+}
+
+/// The run of a statement that is already final: every `{{name}}` in it is
+/// filled (or it never had one), and nothing here scans for placeholders.
+///
+/// [`run`] reaches it after [`substitute_parameters`]. The assistant's
+/// `run_sql` and `run_saved_query` reach it the same way, after their own
+/// guards and their own substitution. It exists so the scanner reads text a
+/// person or the model wrote exactly once per request: a literal printed from
+/// a value may read `'{{x}}'`, and a second scan would refuse it.
+///
+/// `principal` is `None` for a request that carries none, which answers 401.
+/// The order of the guards, the history records and the errors are those of
+/// [`run`].
+///
+/// # Errors
+///
+/// The same as [`run`], less the 400s for the request body and the
+/// parameters.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear guard order (read-only, principal, Trino keywords, \
+              policy rewrite, settings, engine), each guard now ending in the \
+              same best-effort history record that `record_blocked` and \
+              `record_uncompleted_run` carry; splitting the guards into \
+              helpers would scatter an order whose sequence is the route's \
+              correctness, for a threshold, not a real seam"
+)]
+pub(crate) async fn run_statement(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+    statement: &str,
+    engine: &str,
+) -> ApiResult<ApiJson<Value>> {
+    // The statement's tables are parsed with the dialect of the engine it
+    // names (the same parser the policy step uses), and the history row
+    // records them whether the run completes, fails or is refused (`QS-4`,
+    // decisions 3 and 4).
+    let tables_read = referenced_table_names(statement, is_trino_engine(engine));
+
+    if !is_read_only(statement) {
         let refusal = ApiError::Unprocessable(
             "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
         );
         // No principal, no row: nobody to record the refusal against
         // (`QS-4`, decision 3).
-        if let Some(Extension(p)) = &principal {
-            record_blocked(&state, p, &statement, &engine, &tables_read, &refusal).await;
+        if let Some(p) = principal {
+            record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
         }
         return Err(refusal.into());
     }
@@ -1587,7 +1735,7 @@ pub async fn run(
     // record (or, for Trino, to send as `X-Trino-User`) for an
     // unauthenticated caller, so every engine requires a principal now —
     // `"anonymous"` is never written to `query_history` again.
-    let Some(Extension(p)) = principal else {
+    let Some(p) = principal else {
         return Err(ApiError::unauthorized().into());
     };
     let user_id = p.id.uuid().to_string();
@@ -1597,13 +1745,13 @@ pub async fn run(
     let limits = run.limits().await?;
     let row_limit = limits.studio_rows as usize;
 
-    if engine == "trino" && !is_trino_safe(&statement) {
+    if engine == "trino" && !is_trino_safe(statement) {
         let refusal = ApiError::Unprocessable(
             "This statement is not permitted against Trino (write, session, or procedure \
              keyword detected)."
                 .to_owned(),
         );
-        record_blocked(&state, &p, &statement, &engine, &tables_read, &refusal).await;
+        record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
         return Err(refusal.into());
     }
 
@@ -1614,14 +1762,13 @@ pub async fn run(
     // for `policyDecisionP95Ms` covers exactly the rewrite step, nothing
     // else.
     //
-    // `statement` stays what the user wrote: query history records it (and
-    // `download` re-rewrites it for the caller's roles at that time), while
-    // `rewritten` is what the engine runs and the audit event records
-    // (`SEC-21`, `SEC-33`).
+    // `statement` is what the user wrote with its `{{name}}` placeholders
+    // already filled (`QS-5`, D5): query history records it, literals
+    // included, so `download` re-rewrites it for the caller's roles at that
+    // time and needs no values. `rewritten` is what the engine runs and the
+    // audit event records (`SEC-21`, `SEC-33`).
     let rewritten =
-        match rewrite_sql_for_principal_with_headers(&state, &statement, &engine, &p, &headers)
-            .await
-        {
+        match rewrite_sql_for_principal_with_headers(state, statement, engine, p, headers).await {
             Ok(rewritten) => rewritten,
             Err(err) => {
                 // A 4xx from the rewrite is the gate refusing (the policy, the
@@ -1634,10 +1781,10 @@ pub async fn run(
                     "failed"
                 };
                 record_uncompleted_run(
-                    &state,
-                    &p,
-                    &statement,
-                    &engine,
+                    state,
+                    p,
+                    statement,
+                    engine,
                     status,
                     &err.to_string(),
                     &tables_read,
@@ -1649,10 +1796,10 @@ pub async fn run(
         };
     // SEC-21: a statement's own `SETTINGS` would override the cap the run
     // sends with the request. Trino has no such settings in its client.
-    if !is_trino_engine(&engine)
+    if !is_trino_engine(engine)
         && let Err(refusal) = refuse_unlisted_settings(&rewritten)
     {
-        record_blocked(&state, &p, &statement, &engine, &tables_read, &refusal).await;
+        record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
         return Err(refusal.into());
     }
 
@@ -1667,8 +1814,8 @@ pub async fn run(
     // statement the engine refused is recorded as a classified sentence with
     // the reference the response carries (`EngineFailure`).
     let (columns, mut rows, duration_ms, scanned_bytes) = match execute_query_against_engine(
-        &state,
-        &engine,
+        state,
+        engine,
         &rewritten,
         &user_id,
         started,
@@ -1679,10 +1826,10 @@ pub async fn run(
         Ok(result) => result,
         Err(failure) => {
             record_uncompleted_run(
-                &state,
-                &p,
-                &statement,
-                &engine,
+                state,
+                p,
+                statement,
+                engine,
                 failure.status,
                 &failure.message,
                 &tables_read,
@@ -1733,7 +1880,7 @@ pub async fn run(
     // with this run's own `id` is the pairing WS1 T16's `LEFT JOIN`
     // resolves on read (WS5 Phase D preamble).
     if let Some(pool) = state.pg.as_deref() {
-        let event = query_run_audit_event(&p, &id, &rewritten);
+        let event = query_run_audit_event(p, &id, &rewritten);
         if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
             tracing::warn!(%err, "failed to record query.run audit event (query itself succeeded)");
         }
@@ -1757,7 +1904,7 @@ pub async fn run(
         )]
         let input = RecordHistoryInput {
             id: &id,
-            sql: &statement,
+            sql: statement,
             user: &user_id,
             owner_id: Some(p.id.uuid()),
             status: "completed",
@@ -1765,7 +1912,7 @@ pub async fn run(
             scanned_bytes: scanned_bytes as i64,
             cost_units: cost_units as f64,
             workload_class: "hot-analytics",
-            engine: &engine,
+            engine,
             cache_assisted: false,
             tables_read: &tables_read,
             message: None,
@@ -1784,7 +1931,7 @@ pub async fn run(
         duration_ms,
         scanned_bytes,
         cost_units,
-        &engine,
+        engine,
     )))
 }
 
@@ -2184,7 +2331,9 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// # Errors
 ///
 /// Returns 400 [`ApiError::BadRequest`] on an unparseable body or a
-/// missing/blank `sql`, and 422 [`ApiError::Unprocessable`] when `sql` fails
+/// missing/blank `sql`, and with the same sentences as [`run`] when
+/// `parameters` or `definitions` has the wrong shape or a `{{name}}` cannot
+/// be filled (`QS-5`), and 422 [`ApiError::Unprocessable`] when `sql` fails
 /// [`is_read_only`], the rewrite refuses it, or it names a setting other than
 /// `iceberg_snapshot_id` (`SEC-21`), as [`run`] does. An `EXPLAIN
 /// ESTIMATE` failure (e.g. an unknown column) still answers 200 — the
@@ -2203,6 +2352,12 @@ pub async fn estimate(
         Some(s) if !s.trim().is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
+    let (parameters, definitions) = parameter_inputs(parsed.parameters, parsed.definitions)?;
+    // `QS-5`, D4: the estimate explains the statement the run would send, so
+    // it fills the placeholders first, with the run's function and before
+    // every guard below. It always asks `ClickHouse`. A refusal is the run's
+    // 400 sentence; the estimate keeps no history.
+    let sql = substitute_parameters("clickhouse", &sql, &parameters, &definitions)?;
     // SEC-19: the estimate refuses what the run refuses, with the run's
     // status and message, and does so before the rewrite below, whose policy
     // prefetch already queries the engine. `EXPLAIN ESTIMATE` is the only
@@ -3070,8 +3225,11 @@ fn download_response(
 /// named after the caller and the run (`<caller uuid>:<runId>:download`), so
 /// Stop's pattern (`<caller uuid>:<runId>:%`) reaches it on the engine.
 ///
-/// The stored statement is the one the user wrote ([`run`] records it, not
-/// the rewritten form), so today's policy is applied to it once. A row
+/// The stored statement is the one the user wrote, with any `{{name}}`
+/// placeholders already filled in ([`run`] records it, not the rewritten
+/// form), so today's policy is applied to it once and no value is needed
+/// (`QS-5`, D5). This route never scans the stored text for placeholders: a
+/// text value that read `{{x}}` is a quoted literal in it. A row
 /// recorded before that change holds the rewritten form: an old mask or row
 /// filter sits inside it and today's policy applies on top, which only adds
 /// restriction (it fails closed). Those rows are left as they are (`SEC-21`,
@@ -5578,6 +5736,488 @@ mod tests {
                 requests.is_empty(),
                 "a table function must never reach ClickHouse at all: {requests:?}"
             );
+            Ok(())
+        }
+    }
+
+    /// `QS-5` part 1, D4: `{{name}}` parameters on `run` and `estimate`.
+    /// The engine's own recorded requests are the oracle, for `ClickHouse`
+    /// and for `Trino`, as in `enforcement` and `trino_engine` above.
+    mod query_parameters {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use std::collections::HashMap;
+
+        use lakehouse_store::governance::CreatePolicyInput;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        /// Without a Postgres pool (`DATABASE_URL` is unparseable): enough
+        /// for statements that read no table, as `trino_engine`'s
+        /// `test_state_with_trino` does.
+        fn state_without_pool(ch_url: &str, trino_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert("TRINO_URL".to_owned(), trino_url.to_owned());
+            AppState::new(Config::from_map(&env).expect("valid config from a plain map"))
+        }
+
+        /// With the seeded deployment's database, so a policy row governs
+        /// `serving.mart_x`.
+        fn state_with_pool(pool: &PgPool, ch_url: &str, trino_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert("TRINO_URL".to_owned(), trino_url.to_owned());
+            env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+            AppState::new(Config::from_map(&env).expect("valid config from a plain map"))
+        }
+
+        fn body(value: &Value) -> Bytes {
+            Bytes::from(serde_json::to_vec(value).unwrap())
+        }
+
+        /// A `ClickHouse` that answers every statement with one row.
+        async fn clickhouse_answering_one_row() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [{"name": "n", "type": "UInt8"}],
+                    "data": [{"n": 7}],
+                    "rows": 1,
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// A `Trino` that answers every statement with one row.
+        async fn trino_answering_one_row() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [{"name": "n", "type": "bigint"}],
+                    "data": [[1]],
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// What the engine received, without the policy rewrite's own
+        /// `system.*` lookups.
+        async fn received(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .expect("mock server records requests")
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .filter(|b| !b.contains("system."))
+                .collect()
+        }
+
+        /// A refusal's status and the sentence the response carries.
+        fn refusal(result: ApiResult<ApiJson<Value>>) -> (u16, String) {
+            let rejection = result.expect_err("expected a refusal");
+            (rejection.0.status(), rejection.0.to_string())
+        }
+
+        async fn run_on_clickhouse(state: AppState, request: Value) -> ApiResult<ApiJson<Value>> {
+            run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                body(&request),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_text_value_reaches_clickhouse_as_one_literal() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            run_on_clickhouse(
+                state,
+                json!({
+                    "sql": "SELECT {{who}} AS who",
+                    "parameters": { "who": "x'; DROP TABLE t; --" },
+                }),
+            )
+            .await
+            .expect("a parameterised read must run");
+
+            let sent = received(&ch).await;
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                sent[0].contains(r"SELECT 'x\'; DROP TABLE t; --' AS who"),
+                "the value must arrive as one escaped literal: {}",
+                sent[0]
+            );
+            assert!(!sent[0].contains("{{"), "{}", sent[0]);
+        }
+
+        #[tokio::test]
+        async fn a_default_fills_the_value_a_run_does_not_give() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            run_on_clickhouse(
+                state,
+                json!({
+                    "sql": "SELECT {{region}} AS r",
+                    "definitions": [{ "name": "region", "type": "text", "default": "EU" }],
+                }),
+            )
+            .await
+            .expect("the default must fill the placeholder");
+
+            let sent = received(&ch).await;
+            assert!(sent[0].contains("SELECT 'EU' AS r"), "{}", sent[0]);
+        }
+
+        #[tokio::test]
+        async fn a_missing_value_is_refused_with_one_sentence_and_the_engine_is_never_asked() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            let (status, message) =
+                refusal(run_on_clickhouse(state, json!({ "sql": "SELECT {{region}} AS r" })).await);
+
+            // 400, never 403: Query Studio's Run all reads a 403 as "this
+            // user may not run anything" and refuses the other statements.
+            assert_eq!(status, 400);
+            assert_eq!(message, "Fill in {{region}} to run this query.");
+            assert_eq!(received(&ch).await, Vec::<String>::new());
+        }
+
+        /// What the engine receives for a statement with no placeholder is
+        /// what it received before `QS-5`: the policy rewrite's own print of
+        /// the statement. The expected text below was captured from the run
+        /// route before the substitution step existed; a comment holding a
+        /// well-formed `{{as}}` is ignored and does not change it.
+        #[tokio::test]
+        async fn a_statement_without_a_placeholder_reaches_the_engine_unchanged() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            // A value for a name the statement does not use changes nothing.
+            run_on_clickhouse(
+                state,
+                json!({
+                    "sql": "SELECT   1  AS \"n\"  /* kept {{as}} written */",
+                    "parameters": { "other": "unused" },
+                }),
+            )
+            .await
+            .expect("a statement without a placeholder must run");
+
+            assert_eq!(received(&ch).await, ["SELECT 1 AS \"n\"\nFORMAT JSON"]);
+        }
+
+        #[test]
+        fn a_statement_without_a_placeholder_comes_back_byte_for_byte() {
+            let statement = "  SELECT\t'a  b',\n  1 -- {{note}}\n/* {{c}} */ ";
+            assert_eq!(
+                substitute_parameters("clickhouse", statement, &Map::new(), &[]).unwrap(),
+                statement
+            );
+            assert_eq!(
+                substitute_parameters("trino", statement, &Map::new(), &[]).unwrap(),
+                statement
+            );
+        }
+
+        /// The scanner reads what a person wrote, once. A text value that
+        /// itself reads `{{x}}` is printed inside a literal, and the run of
+        /// the filled statement does not scan it again.
+        #[tokio::test]
+        async fn a_text_value_that_reads_a_placeholder_runs_as_text() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            run_on_clickhouse(
+                state,
+                json!({ "sql": "SELECT {{t}} AS v", "parameters": { "t": "{{x}}" } }),
+            )
+            .await
+            .expect("a value that reads {{x}} is only text");
+
+            let sent = received(&ch).await;
+            assert!(sent[0].contains("SELECT '{{x}}' AS v"), "{}", sent[0]);
+        }
+
+        /// What the assistant's tools call after their own substitution:
+        /// the filled statement runs without a second scan, so a literal
+        /// that reads `'{{x}}'` is not refused as a placeholder in quotes.
+        #[tokio::test]
+        async fn run_statement_runs_a_final_statement_without_scanning_it() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+            let principal = analyst_principal().0;
+
+            run_statement(
+                &state,
+                Some(&principal),
+                &HeaderMap::new(),
+                "SELECT '{{x}}' AS v",
+                "clickhouse",
+            )
+            .await
+            .expect("a final statement is not scanned again");
+
+            let sent = received(&ch).await;
+            assert!(sent[0].contains("SELECT '{{x}}' AS v"), "{}", sent[0]);
+        }
+
+        #[tokio::test]
+        async fn a_parameters_value_of_the_wrong_shape_is_a_fixed_400_that_quotes_nothing() {
+            let ch = clickhouse_answering_one_row().await;
+            let cases = [
+                json!({ "sql": "SELECT 1", "parameters": "EU" }),
+                json!({ "sql": "SELECT 1", "parameters": ["EU"] }),
+                json!({ "sql": "SELECT 1", "definitions": "region" }),
+                json!({ "sql": "SELECT 1", "definitions": { "name": "a" } }),
+                // `deny_unknown_fields`: serde would name the field.
+                json!({ "sql": "SELECT 1", "definitions": [
+                    { "name": "a", "type": "text", "leaky_field": 1 }
+                ] }),
+                json!({ "sql": "SELECT 1", "definitions": [{ "name": "a", "type": "blob" }] }),
+            ];
+            for request in cases {
+                let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+                let (status, message) = refusal(run_on_clickhouse(state, request.clone()).await);
+                assert_eq!(status, 400, "{request}");
+                assert!(
+                    message == PARAMETERS_SHAPE || message == DEFINITIONS_SHAPE,
+                    "{request} answered {message:?}"
+                );
+            }
+            assert_eq!(received(&ch).await, Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_value_cannot_turn_a_read_into_a_write_on_clickhouse() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            // The statement does not start with a read keyword once the
+            // placeholder is filled, so the read-only guard refuses it.
+            let (status, message) = refusal(
+                run_on_clickhouse(
+                    state,
+                    json!({
+                        "sql": "{{verb}} TABLE t",
+                        "parameters": { "verb": "DROP" },
+                    }),
+                )
+                .await,
+            );
+
+            assert_eq!(status, 422);
+            assert!(message.starts_with("Only read queries"), "{message}");
+            assert_eq!(received(&ch).await, Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_date_reaches_trino_as_its_own_literal() {
+            let trino = trino_answering_one_row().await;
+            let state = state_without_pool("http://unused.invalid", &trino.uri());
+
+            let ApiJson(value) = run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                body(&json!({
+                    "sql": "SELECT {{day}} AS d, {{who}} AS w",
+                    "engine": "trino",
+                    "parameters": { "day": "2024-03-05", "who": "it's \\" },
+                    "definitions": [{ "name": "day", "type": "date" }],
+                })),
+            )
+            .await
+            .expect("a parameterised read on Trino must run");
+
+            assert_eq!(value["engine"], json!("trino"));
+            let sent = received(&trino).await;
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            // Trino has no backslash escape: the quote is doubled and the
+            // backslash stays one.
+            assert!(
+                sent[0].contains(r"SELECT DATE '2024-03-05' AS d, 'it''s \' AS w"),
+                "{}",
+                sent[0]
+            );
+        }
+
+        #[tokio::test]
+        async fn the_trino_guard_reads_the_filled_statement() {
+            let trino = trino_answering_one_row().await;
+            let state = state_without_pool("http://unused.invalid", &trino.uri());
+
+            // Raw, the keyword sits inside a string. Filled, a trailing
+            // backslash makes the guard (which reads a backslash as an
+            // escape, as ClickHouse does) see that string end early and
+            // the keyword outside it: the guard refuses what it can no
+            // longer prove is a read.
+            let (status, _message) = refusal(
+                run(
+                    State(state),
+                    Some(analyst_principal()),
+                    HeaderMap::new(),
+                    body(&json!({
+                        "sql": "SELECT {{a}} AS x, ' DROP TABLE t ' AS y",
+                        "engine": "trino",
+                        "parameters": { "a": "\\" },
+                    })),
+                )
+                .await,
+            );
+
+            assert_eq!(status, 422);
+            assert_eq!(received(&trino).await, Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn the_estimate_explains_the_filled_statement() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            estimate(
+                State(state),
+                analyst_principal(),
+                HeaderMap::new(),
+                body(&json!({
+                    "sql": "SELECT {{n}} AS n",
+                    "parameters": { "n": 7 },
+                    "definitions": [{ "name": "n", "type": "number" }],
+                })),
+            )
+            .await
+            .expect("the estimate answers 200");
+
+            let sent = received(&ch).await;
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                sent[0].contains("EXPLAIN ESTIMATE SELECT 7 AS n"),
+                "{}",
+                sent[0]
+            );
+        }
+
+        #[tokio::test]
+        async fn the_estimate_refuses_a_missing_value_with_the_runs_sentence() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            let (status, message) = refusal(
+                estimate(
+                    State(state),
+                    analyst_principal(),
+                    HeaderMap::new(),
+                    body(&json!({ "sql": "SELECT {{n}} AS n" })),
+                )
+                .await,
+            );
+
+            assert_eq!(status, 400);
+            assert_eq!(message, "Fill in {{n}} to run this query.");
+            assert_eq!(received(&ch).await, Vec::<String>::new());
+        }
+
+        /// A policy that masks `email` and filters rows, seeded for the
+        /// analyst role.
+        async fn seed_mask_and_row_filter(pool: &PgPool) {
+            lakehouse_store::governance::create_policy(
+                pool,
+                &CreatePolicyInput {
+                    name: "query-parameters-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "serving.mart_x".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"],"rowFilter":"id != 99"}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+        }
+
+        /// The rewrite must see the statement with the value in it: the
+        /// mask and the row filter govern a parameterised query on a
+        /// protected table, and the engine receives all three together.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_row_filter_and_a_mask_govern_a_parameterised_query_on_clickhouse(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            seed_mask_and_row_filter(&pool).await;
+            let ch = MockServer::start().await;
+            mount_governed_table_responses(&ch).await;
+            let state = state_with_pool(&pool, &ch.uri(), "http://unused.invalid");
+
+            run_on_clickhouse(
+                state,
+                json!({
+                    "sql": "SELECT * FROM serving.mart_x WHERE id = {{id}}",
+                    "parameters": { "id": 7 },
+                    "definitions": [{ "name": "id", "type": "number" }],
+                }),
+            )
+            .await
+            .expect("a governed, parameterised read must run");
+
+            let sent = received(&ch).await;
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(sent[0].contains("replaceRegexpOne"), "mask: {}", sent[0]);
+            assert!(sent[0].contains("id <> 99"), "row filter: {}", sent[0]);
+            assert!(sent[0].contains("id = 7"), "the value: {}", sent[0]);
+            assert!(!sent[0].contains("{{"), "{}", sent[0]);
+            Ok(())
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_mask_governs_a_parameterised_query_on_trino(pool: PgPool) -> sqlx::Result<()> {
+            seed_mask_and_row_filter(&pool).await;
+            let ch = MockServer::start().await;
+            mount_governed_table_responses(&ch).await;
+            let trino = trino_answering_one_row().await;
+            let state = state_with_pool(&pool, &ch.uri(), &trino.uri());
+
+            run(
+                State(state),
+                Some(analyst_principal()),
+                HeaderMap::new(),
+                body(&json!({
+                    "sql": "SELECT * FROM serving.mart_x WHERE id = {{id}}",
+                    "engine": "trino",
+                    "parameters": { "id": 7 },
+                    "definitions": [{ "name": "id", "type": "number" }],
+                })),
+            )
+            .await
+            .expect("a governed, parameterised read on Trino must run");
+
+            let sent = received(&trino).await;
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                sent[0].contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END"),
+                "mask: {}",
+                sent[0]
+            );
+            assert!(sent[0].contains("id <> 99"), "row filter: {}", sent[0]);
+            assert!(sent[0].contains("id = 7"), "the value: {}", sent[0]);
             Ok(())
         }
     }
