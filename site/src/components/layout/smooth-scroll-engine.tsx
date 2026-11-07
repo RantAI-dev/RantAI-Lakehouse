@@ -3,6 +3,7 @@
 import * as React from "react";
 import Lenis from "lenis";
 import "lenis/dist/lenis.css";
+import { SCROLL_TOP_EVENT } from "./back-to-top";
 
 /** Keys the browser scrolls with; pressing one hands the page back to native scrolling at once. */
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Spacebar"]);
@@ -63,9 +64,13 @@ export default function SmoothScrollEngine() {
       }
     };
 
+    // The footer's Back to top (O7) asks for a glide through this event.
+    const onTop = () => lenis.scrollTo(0);
     document.addEventListener("click", onClick);
     window.addEventListener("keydown", onKey, { capture: true });
+    window.addEventListener(SCROLL_TOP_EVENT, onTop);
     return () => {
+      window.removeEventListener(SCROLL_TOP_EVENT, onTop);
       document.removeEventListener("click", onClick);
       window.removeEventListener("keydown", onKey, { capture: true });
       lenis.destroy();

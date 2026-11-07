@@ -63,7 +63,7 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
           <GetStartedSection copy={home.getStarted} />
           {/* WEB-5 D21: free and open source, your servers, sources, installing; all of them on /contact/. */}
           <Faq copy={contact.faq} pick={HOME_FAQ} more={{ label: home.faq.all, href: `${contactHref}#faq` }} />
-          <FinalSection copy={home.final} cta={common.cta} contactHref={contactHref} />
+          <FinalSection copy={home.final} />
         </main>
         <SiteFooter locale={locale} copy={common.footer} />
         <JsonLd data={homeStructuredData({ locale, siteUrl: siteUrl(), description: meta.home.description })} />

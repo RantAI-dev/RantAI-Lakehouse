@@ -1,8 +1,7 @@
 import * as React from "react";
-import type { CommonCopy, HomeCopy } from "@/lib/copy";
-import { LINKS } from "@/lib/home-content";
-import { Container, CtaLink, DisplayHeading } from "@/components/shared/primitives";
-import { Reveal, SplitWords } from "@/components/shared/reveal";
+import type { HomeCopy } from "@/lib/copy";
+import { Container, DisplayHeading } from "@/components/shared/primitives";
+import { SplitWords } from "@/components/shared/reveal";
 import { FinalMascotStage } from "./final-mascot";
 
 /**
@@ -31,16 +30,7 @@ const STARS = Array.from({ length: 44 }, (_, i) => {
   };
 });
 
-export function FinalSection({
-  copy,
-  cta,
-  contactHref,
-}: {
-  copy: HomeCopy["final"];
-  cta: CommonCopy["cta"];
-  /** WEB-5 D15: "Talk to us" goes to the contact page, in the page's language. */
-  contactHref: string;
-}) {
+export function FinalSection({ copy }: { copy: HomeCopy["final"] }) {
   return (
     <section
       id="final"
@@ -65,12 +55,8 @@ export function FinalSection({
         <DisplayHeading className="max-w-[14ch]">
           <SplitWords text={copy.headline} />
         </DisplayHeading>
-        <Reveal className="mt-9 flex flex-wrap items-center justify-center gap-3" delay={0.25}>
-          <CtaLink href={LINKS.install}>{cta.install}</CtaLink>
-          <CtaLink href={contactHref} variant="ghost">
-            {cta.talk}
-          </CtaLink>
-        </Reveal>
+        {/* WEB-5 O7: no buttons here. This is the story's end; the footer's card right below is the action,
+            so the page never shows two calls to action in a row. */}
       </Container>
 
       <FinalMascotStage />

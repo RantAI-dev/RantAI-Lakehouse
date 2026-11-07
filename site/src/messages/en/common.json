@@ -37,7 +37,28 @@
     "legal": "© 2026 RantAI. Depok, West Java, Indonesia.",
     "contact": "Contact",
     "follow": "Follow RantAI",
-    "current": "This site"
+    "current": "This site",
+    "cta": {
+      "eyebrow": "Start with one source",
+      "title": "What should your data answer first?",
+      "line": "Tell us in a sentence. Sending opens an email to our team, and we reply by email.",
+      "label": "Describe what you want to do",
+      "send": "Send",
+      "opening": "Opening your email app with this message",
+      "subject": "RantAI Lakehouse · From the website",
+      "examples": [
+        "Install it on our own servers",
+        "Connect our PostgreSQL database",
+        "Bring in our Salesforce data",
+        "A walkthrough for my team"
+      ],
+      "install": "Or install it yourself",
+      "contactTitle": "Everything you need is above.",
+      "contactLine": "The form, the address and the answers to common questions are on this page.",
+      "backToForm": "Back to the form"
+    },
+    "backToTop": "Back to top",
+    "home": "RantAI Lakehouse home"
   },
   "language": {
     "label": "Language",

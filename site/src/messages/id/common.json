@@ -37,7 +37,28 @@
     "legal": "© 2026 RantAI. Depok, Jawa Barat, Indonesia.",
     "contact": "Kontak",
     "follow": "Ikuti RantAI",
-    "current": "Situs ini"
+    "current": "Situs ini",
+    "cta": {
+      "eyebrow": "Mulai dari satu sumber",
+      "title": "Apa yang perlu dijawab data Anda dulu?",
+      "line": "Ceritakan dalam satu kalimat. Tombol kirim membuka email ke tim kami, dan kami membalas lewat email.",
+      "label": "Jelaskan apa yang ingin Anda lakukan",
+      "send": "Kirim",
+      "opening": "Membuka aplikasi email dengan pesan ini",
+      "subject": "RantAI Lakehouse · Dari situs web",
+      "examples": [
+        "Instal di server kami sendiri",
+        "Hubungkan database PostgreSQL kami",
+        "Masukkan data Salesforce kami",
+        "Demo produk untuk tim saya"
+      ],
+      "install": "Atau instal sendiri",
+      "contactTitle": "Semua yang Anda perlukan ada di atas.",
+      "contactLine": "Formulir, alamat email, dan jawaban atas pertanyaan umum ada di halaman ini.",
+      "backToForm": "Kembali ke formulir"
+    },
+    "backToTop": "Kembali ke atas",
+    "home": "Beranda RantAI Lakehouse"
   },
   "language": {
     "label": "Bahasa",
