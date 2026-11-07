@@ -27,11 +27,14 @@ export function SceneZone({ children }: { children: React.ReactNode }) {
     <div id="scene-zone" ref={zoneRef} className="relative">
       {/* Below the hero, with no live canvas behind it, the sections sit on a deep-water gradient.
           WEB-5 O43 (the O33 gradient is back): it ends on the page-wide water's −100 m colour
-          (lib/depth-journey.ts), which only darkens from there, so the page never lightens again. */}
+          (lib/depth-journey.ts), which only darkens from there, so the page never lightens again.
+          Task A (neutral base): it starts on the colour the DOM hero's stage ends on (#030b2a, the
+          hero's bottom band), holds it to where the hero ends, feathers into the neutral near-black
+          by mid zone, and over its last 640 px is transparent into the page-wide neutral. */}
       <div
         aria-hidden="true"
         className={cn(
-          "absolute inset-x-0 top-[100svh] bottom-0 bg-[linear-gradient(180deg,#0a1f55_0%,#081a50_30%,#05134a_65%,#020e42_100%)] transition-opacity duration-400",
+          "absolute inset-x-0 top-[100svh] bottom-0 bg-[linear-gradient(180deg,#030b2a_0,#030b2a_calc(50vh_+_64px),#070d18_22%,#090b0c_55%,#090b0c_calc(100%_-_640px),rgba(9,11,12,0)_100%)] transition-opacity duration-400",
           mode === "full" && sceneReady ? "opacity-0" : "opacity-100",
         )}
       />

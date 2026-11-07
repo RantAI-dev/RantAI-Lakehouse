@@ -41,7 +41,7 @@ export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: Common
         <CodePanel
           copy={copy.code}
           action={
-            <CtaLink href={LINKS.source} variant="ghost" size="sm" target="_blank" className="bg-[#0a1230]">
+            <CtaLink href={LINKS.source} variant="ghost" size="sm" target="_blank" className="bg-[var(--lk-n-surface)]">
               {cta.source}
               <ArrowUpRight aria-hidden="true" className="size-4 transition-transform duration-200 ease-out group-hover:translate-x-0.5 group-hover:-translate-y-0.5 motion-reduce:transition-none" />
             </CtaLink>
@@ -66,7 +66,7 @@ export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: Common
   ];
   return (
     // WEB-5 audit #19: less padding above and below (the gaps to governance and Get started).
-    <section id="open" className="lk-fallback-bg relative scroll-mt-16 bg-[#050A30] pt-16 pb-20 md:pt-20 md:pb-24">
+    <section id="open" className="lk-fallback-bg relative scroll-mt-16 bg-[var(--lk-n-bg)] pt-16 pb-20 md:pt-20 md:pb-24">
       <noscript dangerouslySetInnerHTML={{ __html: `<style>${NO_SCRIPT_CSS}</style>` }} />
       <Container>
         <DisplayHeading>
@@ -94,7 +94,7 @@ export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: Common
                     <h3 className="lk-show-title text-[22px] leading-8 font-medium text-balance text-[#E8F4FF] md:text-[24px]">
                       {item.title}
                     </h3>
-                    <p className="lk-show-line mt-1.5 max-w-[28rem] text-[15px] leading-[1.6] text-pretty text-[#E8F4FF]/75">
+                    <p className="lk-show-line mt-1.5 max-w-[28rem] text-[15px] leading-[1.6] text-pretty text-white/75">
                       {item.body}
                     </p>
                   </a>

@@ -66,6 +66,11 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
           <GetStartedSection copy={home.getStarted} />
           {/* WEB-5 D21: free and open source, your servers, sources, installing; all of them on /contact/. */}
           <Faq copy={contact.faq} pick={HOME_FAQ} more={{ label: home.faq.all, href: `${contactHref}#faq` }} />
+          {/* Task A: the neutral page feathers into the final call's night sea over 480 px, no hard edge. */}
+          <div
+            aria-hidden="true"
+            className="pointer-events-none relative z-[1] -mt-[480px] h-[480px] bg-[linear-gradient(180deg,rgba(2,5,20,0)_0%,rgba(2,5,20,0.12)_30%,rgba(2,5,20,0.55)_68%,#020514_100%)]"
+          />
           <FinalSection copy={home.final} />
         </main>
         <SiteFooter locale={locale} copy={common.footer} />

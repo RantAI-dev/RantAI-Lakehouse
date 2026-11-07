@@ -42,6 +42,11 @@ export function HeroSection({
         <HeroWashFade>
           <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.92)_0%,rgba(2,5,20,0.84)_52%,rgba(2,5,20,0.4)_70%,transparent_86%)]" />
         </HeroWashFade>
+        {/* Task A: the DOM hero's stage ends on one colour across its width (#030b2a, the colour the
+            scene zone's fallback gradient starts on, scene-zone.tsx), so its bottom edge leaves no line. */}
+        <BackdropFade className="pointer-events-none absolute inset-x-0 bottom-0 h-[28%] bg-[linear-gradient(180deg,rgba(3,11,42,0)_0%,rgba(3,11,42,0.7)_55%,#030b2a_100%)]">
+          {null}
+        </BackdropFade>
         <HeroCreature />
         <Container className="relative z-10 flex flex-none flex-col items-center pt-4 pb-32 text-center short:pb-24 md:min-h-[100svh] md:items-start md:justify-center md:pt-24 md:pb-24 md:text-left">
           <HeroCopyMotion>

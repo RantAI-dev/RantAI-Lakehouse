@@ -29,12 +29,17 @@ export type Water = { top: string; bottom: string };
  * Shallower than −100 m the backdrop is covered (the canvas or the scene
  * zone's gradient), so the ramp holds its −100 m colour there.
  */
+/**
+ * Task A (owner, 2026-11-07, "jangan biru semuanya"): below the scene zone the page is the
+ * neutral near-black, oklch(0.148 0.004 228.8) = rantai.dev's dark background. The ramp is flat
+ * on purpose; the hand-over from the 3D water (depth-backdrop.tsx) blends into it over a
+ * viewport and a half, and the final call's night sea is feathered in by its own top band.
+ */
+export const NEUTRAL = "#090b0c";
+
 export const WATER_BY_DEPTH: readonly { depth: number; top: string; bottom: string }[] = [
-  { depth: -400, top: "#020514", bottom: "#020514" },
-  { depth: -300, top: "#020720", bottom: "#020619" },
-  { depth: -200, top: "#020a2e", bottom: "#02071f" },
-  { depth: -150, top: "#020c38", bottom: "#020826" },
-  { depth: -100, top: "#020e42", bottom: "#02092c" },
+  { depth: -400, top: NEUTRAL, bottom: NEUTRAL },
+  { depth: -100, top: NEUTRAL, bottom: NEUTRAL },
 ];
 
 const hex = (c: string): [number, number, number] => [

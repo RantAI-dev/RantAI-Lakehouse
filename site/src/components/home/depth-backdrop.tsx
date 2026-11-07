@@ -5,7 +5,6 @@ import { depthAt, mixColour, steppedDepthAt, waterAt, type Anchor } from "@/lib/
 import { onSceneColours, sceneColours } from "@/lib/scene-colour";
 import { smoothstep } from "@/lib/scroll-timeline";
 import { measureJourney } from "@/lib/measure-journey";
-import { afterPaint } from "@/lib/after-paint";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
@@ -37,7 +36,11 @@ import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
  * O33 removed S5's ascent: the bubbles rising to the surface and the
  * caustics coming back.
  *
- * WEB-5 O43 (owner: "balikin lah kalo gitu permainan gradient dan partikel
+ * Task A (owner, 2026-11-07, "jangan biru semuanya"): the water below the scene zone is
+ * the neutral near-black now (depth-journey.ts), and the marine snow and bubbles of O43 are
+ * gone; only the sea scenes (hero, the scene zone, the final call) keep water effects.
+ *
+ * (history) WEB-5 O43 (owner: "balikin lah kalo gitu permainan gradient dan partikel
  * partikel airnya"): the water's life is back, as water, not as a climb:
  * marine snow in two layers drifting down at different speeds (parallax),
  * and a few bubbles rising gently at the screen's edges. They show in the
@@ -60,9 +63,6 @@ export function DepthBackdrop() {
     // Where the canvas is gone: the scroll at which the scene zone's pinned
     // layer starts to leave the screen.
     let zoneOut = 0;
-    // O43: where the final call's night sea begins (the water's life stops there).
-    let finalTop = Infinity;
-    let lastLife = "";
 
     // R9: the same measurement as the gauge. No hold through the hero: the
     // water is covered there (see `journeyFromBoxes`).
@@ -70,8 +70,6 @@ export function DepthBackdrop() {
       ({ anchors } = measureJourney({ holdSurfaceThroughHero: false }));
       const zone = document.getElementById("scene-zone");
       zoneOut = zone ? zone.getBoundingClientRect().bottom + window.scrollY - window.innerHeight : 0;
-      const final = document.getElementById("final");
-      finalTop = final ? final.getBoundingClientRect().top + window.scrollY : Infinity;
       paint();
     };
     const paint = () => {
@@ -89,16 +87,6 @@ export function DepthBackdrop() {
         scene && handOver > 0
           ? { top: mixColour(own.top, scene.top, handOver), bottom: mixColour(own.bottom, scene.bottom, handOver) }
           : own;
-      const vh = window.innerHeight;
-      const y = window.scrollY;
-      const life = (
-        smoothstep(zoneOut - 0.5 * vh, zoneOut + 0.5 * vh, y) *
-        (1 - smoothstep(finalTop - vh, finalTop - 0.4 * vh, y))
-      ).toFixed(2);
-      if (life !== lastLife) {
-        lastLife = life;
-        el.style.setProperty("--lk-life", life);
-      }
       const key = `${water.top}${water.bottom}`;
       if (key === last) return;
       last = key;
@@ -126,87 +114,11 @@ export function DepthBackdrop() {
     };
   }, [reduced]);
 
-  const [alive, setAlive] = React.useState(false);
-  React.useEffect(() => afterPaint(() => setAlive(true)), []);
-
   return (
     <div
       ref={ref}
       aria-hidden="true"
       className="lk-water pointer-events-none fixed inset-0 overflow-hidden"
-      style={{ "--lk-life": 0 } as React.CSSProperties}
-    >
-      {alive && !reduced && <WaterLife />}
-    </div>
-  );
-}
-
-/** Marine snow in two layers (far: small and slow; near: larger and quicker), and bubbles at the edges. */
-const SNOW = Array.from({ length: 30 }, (_, i) => {
-  const near = i % 3 === 0;
-  return {
-    left: (3 + ((i * 37) % 94)).toFixed(1),
-    top: ((i * 29) % 100).toFixed(1),
-    size: near ? 2.5 : 1.5,
-    alpha: near ? 0.45 : 0.28,
-    dur: near ? 16 + ((i * 7) % 6) : 28 + ((i * 11) % 10),
-    delay: -((i * 3.7) % 30),
-  };
-});
-const BUBBLES = Array.from({ length: 12 }, (_, i) => ({
-  left: i % 2 === 0 ? 2 + ((i * 7) % 11) : 87 + ((i * 5) % 11),
-  size: 3 + ((i * 3) % 6),
-  dur: 11 + ((i * 7) % 8),
-  delay: -((i * 13) % 19),
-}));
-const LIFE_CSS = `
-.lk-life { opacity: var(--lk-life); }
-.lk-life-snow { animation: lk-life-snow linear infinite; }
-.lk-life-bubble { animation: lk-life-bubble linear infinite; }
-@keyframes lk-life-snow {
-  0% { transform: translate3d(0, -6vh, 0); }
-  100% { transform: translate3d(1.5vw, 106vh, 0); }
-}
-@keyframes lk-life-bubble {
-  0% { transform: translate3d(0, 8vh, 0); opacity: 0; }
-  12% { opacity: 0.85; }
-  50% { transform: translate3d(5px, -48vh, 0); }
-  86% { opacity: 0.6; }
-  100% { transform: translate3d(-4px, -104vh, 0); opacity: 0; }
-}
-`;
-
-function WaterLife() {
-  return (
-    <div className="lk-life absolute inset-0">
-      <style dangerouslySetInnerHTML={{ __html: LIFE_CSS }} />
-      {SNOW.map((p, i) => (
-        <span
-          key={`s${i}`}
-          className="lk-life-snow absolute -top-[6vh] rounded-full bg-[#cfe6ff]"
-          style={{
-            left: `${p.left}%`,
-            width: p.size,
-            height: p.size,
-            opacity: p.alpha,
-            animationDuration: `${p.dur}s`,
-            animationDelay: `${p.delay}s`,
-          }}
-        />
-      ))}
-      {BUBBLES.map((b, i) => (
-        <span
-          key={`b${i}`}
-          className="lk-life-bubble absolute bottom-0 rounded-full border border-[#E8F4FF]/45 bg-[#E8F4FF]/10"
-          style={{
-            left: `${b.left}%`,
-            width: b.size,
-            height: b.size,
-            animationDuration: `${b.dur}s`,
-            animationDelay: `${b.delay}s`,
-          }}
-        />
-      ))}
-    </div>
+    />
   );
 }

@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
+  NEUTRAL,
   depthAt,
   FLOOR_DEPTH,
   formatDepth,
@@ -41,9 +42,9 @@ test("the water only darkens with depth, down to the page's own background at th
     prevTop = lum(w.top);
     prevBottom = lum(w.bottom);
   }
-  assert.deepEqual(waterAt(-FLOOR_DEPTH), { top: "#020514", bottom: "#020514" });
-  // O43: a gradient on screen (lighter at the top) until the bottom, where it is the page's own colour.
-  assert.notEqual(waterAt(-150).top, waterAt(-150).bottom);
+  assert.deepEqual(waterAt(-FLOOR_DEPTH), { top: NEUTRAL, bottom: NEUTRAL });
+  // Task A: flat neutral, no gradient.
+  assert.equal(waterAt(-150).top, waterAt(-150).bottom);
   assert.deepEqual(waterAt(-1000), waterAt(-FLOOR_DEPTH));
   assert.deepEqual(waterAt(-20), waterAt(-100));
   assert.equal(WATER_BY_DEPTH[0].depth, -FLOOR_DEPTH);

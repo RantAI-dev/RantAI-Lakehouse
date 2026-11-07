@@ -36,7 +36,7 @@ import { GET_STARTED_OUTPUT } from "./get-started-output";
 export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarted"] }>) {
   const copyText = { copy: copy.copy, copied: copy.copied, failed: copy.copyFailed };
   return (
-    <section id="get-started" aria-labelledby="get-started-heading" className="lk-fallback-bg relative scroll-mt-16 bg-[#050A30] py-24 md:py-32">
+    <section id="get-started" aria-labelledby="get-started-heading" className="lk-fallback-bg relative scroll-mt-16 bg-[var(--lk-n-bg)] py-24 md:py-32">
       <Container className="grid gap-12 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)] md:gap-16">
         {/* O9: centred in the screen while the steps pass (app/globals.css). */}
         <div className="lk-sticky-center-md">
@@ -60,16 +60,16 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
             <Reveal as="li" key={step.title} delay={i * 0.08} y={20} className="relative pb-10 pl-12 last:pb-0">
               <span
                 aria-hidden="true"
-                className="lk-gs-num absolute top-1 left-0 grid size-6 place-items-center rounded-full bg-[#020514] text-[12px] font-medium tabular-nums"
+                className="lk-gs-num absolute top-1 left-0 grid size-6 place-items-center rounded-full bg-[var(--lk-n-bg)] text-[12px] font-medium tabular-nums"
               >
                 {i + 1}
               </span>
               <h3 className="text-[19px] leading-7 font-medium text-[#E8F4FF]">{step.title}</h3>
-              <div data-term="" className="lk-gs-term mt-3 overflow-hidden rounded-2xl bg-[#0a1230]">
-                <p className="border-b border-[#E8F4FF]/8 px-4 py-2 text-[11px] leading-4 font-medium tracking-[0.14em] text-[#E8F4FF]/50 uppercase">
+              <div data-term="" className="lk-gs-term mt-3 overflow-hidden rounded-2xl bg-[var(--lk-n-surface)]">
+                <p className="border-b border-white/8 px-4 py-2 text-[11px] leading-4 font-medium tracking-[0.14em] text-white/50 uppercase">
                   {copy.terminal}
                 </p>
-                <ul className="divide-y divide-[#E8F4FF]/6">
+                <ul className="divide-y divide-white/6">
                   {GET_STARTED_COMMANDS[i].map((cmd, j) => {
                     const id = `get-started-${i}-${j}`;
                     return (
@@ -88,11 +88,11 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                   })}
                 </ul>
                 {/* What the commands print, dimmed as output. */}
-                <div aria-hidden="true" className="lk-gs-out border-t border-[#E8F4FF]/6 px-4 py-3">
+                <div aria-hidden="true" className="lk-gs-out border-t border-white/6 px-4 py-3">
                   {GET_STARTED_OUTPUT[i].map((line) => (
                     <p
                       key={line.text}
-                      className="lk-gs-line flex gap-2 font-mono text-[12px] leading-5 whitespace-pre-wrap text-[#E8F4FF]/55 [overflow-wrap:anywhere]"
+                      className="lk-gs-line flex gap-2 font-mono text-[12px] leading-5 whitespace-pre-wrap text-white/55 [overflow-wrap:anywhere]"
                     >
                       <span className={line.ok ? "text-[#7be0b0]" : "text-transparent"}>✓</span>
                       <span className="min-w-0">{line.text}</span>
@@ -106,7 +106,7 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                   )}
                 </div>
               </div>
-              <p className="mt-3 max-w-[36rem] text-[15px] leading-[1.6] text-pretty text-[#E8F4FF]/75">
+              <p className="mt-3 max-w-[36rem] text-[15px] leading-[1.6] text-pretty text-white/75">
                 <Inline text={step.note} />
               </p>
             </Reveal>
@@ -134,7 +134,7 @@ function Inline({ text }: Readonly<{ text: string }>) {
     <>
       {text.split("`").map((part, i) =>
         i % 2 === 1 ? (
-          <code key={i} className="rounded-md bg-[#E8F4FF]/[0.08] px-1.5 py-0.5 text-[13px] whitespace-nowrap text-[#E8F4FF]">
+          <code key={i} className="rounded-md bg-white/[0.08] px-1.5 py-0.5 text-[13px] whitespace-nowrap text-[#E8F4FF]">
             {part}
           </code>
         ) : (

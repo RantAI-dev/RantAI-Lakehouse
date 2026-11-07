@@ -37,7 +37,7 @@ export function AssistantSection({ copy }: { copy: AssistantCopy }) {
     // a screen of empty water. Without JavaScript its background is opaque, so it keeps its place.
     <section
       id="assistant"
-      className="lk-fallback-bg relative overflow-hidden bg-[#050A30] motion-safe:[html[data-scene]_&]:-mt-[30vh]"
+      className="lk-fallback-bg relative overflow-hidden bg-[var(--lk-n-bg)] motion-safe:[html[data-scene]_&]:-mt-[30vh]"
     >
       <Container className="relative z-10 grid min-h-[100svh] items-center gap-10 py-24 md:grid-cols-[1fr_1.1fr] md:gap-14 md:py-28">
         <div>

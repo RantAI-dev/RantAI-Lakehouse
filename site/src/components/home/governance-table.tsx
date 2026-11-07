@@ -74,7 +74,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
   return (
     <div
       ref={tableRef}
-      className="overflow-hidden rounded-3xl border border-[#E8F4FF]/10 bg-[#070F3A]"
+      className="overflow-hidden rounded-3xl border border-white/10 bg-[var(--lk-n-surface)]"
     >
       {/* O32: no visible "Illustration" label (the owner's decision; the data is plainly fictional and the
           caption for screen readers stays). The policy chip leads; the switch sits at the right. */}
@@ -91,7 +91,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
         <table className="w-full min-w-[640px] table-fixed text-left">
           <caption className="sr-only">{copy.tableCaption}</caption>
           <thead>
-            <tr className="text-[13px] text-[#E8F4FF]/55">
+            <tr className="text-[13px] text-white/55">
               {GOVERNANCE_COLUMNS.map((c) => (
                 <th
                   key={c.key}
@@ -110,7 +110,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
             {GOVERNANCE_ROWS.map((r, i) => (
               <tr
                 key={r.email}
-                className="border-t border-[#E8F4FF]/8 text-[14px] text-[#E8F4FF]/90 transition-colors duration-200 hover:bg-[#E8F4FF]/[0.04]"
+                className="border-t border-white/8 text-[14px] text-white/90 transition-colors duration-200 hover:bg-white/[0.04]"
               >
                 <td className="px-4 py-4 whitespace-nowrap md:px-6">
                   <span className="inline-flex items-center gap-3">
@@ -143,7 +143,7 @@ function PolicyChip({ copy, role }: { copy: GovernanceCopy; role: Role }) {
     <span
       key={role}
       className={cn(
-        "lk-fade-in inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] font-medium ring-1 ring-[#E8F4FF]/12",
+        "lk-fade-in inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] font-medium ring-1 ring-white/12",
         role === "analyst" ? "text-[#8fcbff]" : "text-[#7be0b0]",
       )}
     >
@@ -167,7 +167,7 @@ function PiiTag({ copy }: { copy: GovernanceCopy }) {
       <span
         id={id}
         role="tooltip"
-        className="pointer-events-none absolute top-full left-0 z-10 mt-2 w-max max-w-[15rem] rounded-lg bg-[#020514]/95 px-2.5 py-1.5 text-[12px] leading-4 font-normal text-[#E8F4FF] opacity-0 shadow-[inset_0_0_0_1px_rgba(232,244,255,0.2)] transition-opacity duration-200 group-hover/pii:opacity-100 group-focus-within/pii:opacity-100"
+        className="pointer-events-none absolute top-full left-0 z-10 mt-2 w-max max-w-[15rem] rounded-lg bg-[var(--lk-n-bg)]/95 px-2.5 py-1.5 text-[12px] leading-4 font-normal text-[#E8F4FF] opacity-0 shadow-[inset_0_0_0_1px_rgba(232,244,255,0.2)] transition-opacity duration-200 group-hover/pii:opacity-100 group-focus-within/pii:opacity-100"
       >
         {copy.piiTip}
       </span>
@@ -185,7 +185,7 @@ function Avatar({ name, masked }: { name: string; masked: boolean }) {
       aria-hidden="true"
       className={cn(
         "grid size-8 shrink-0 place-items-center rounded-full text-[11px] font-semibold transition-colors duration-300 ease-out",
-        masked ? "bg-[#E8F4FF]/[0.07] text-[#E8F4FF]/45" : "bg-[#44A6FA]/20 text-[#bfe0ff]",
+        masked ? "bg-white/[0.07] text-white/45" : "bg-[#44A6FA]/20 text-[#bfe0ff]",
       )}
     >
       {masked ? <UserRound className="size-4" /> : initials}
@@ -238,7 +238,7 @@ function Cell({
     return (
       <span
         key="masked"
-        className="group/mask lk-fade-in relative inline-flex items-center gap-1.5 text-[#E8F4FF]/55"
+        className="group/mask lk-fade-in relative inline-flex items-center gap-1.5 text-white/55"
         style={{ animationDelay: `${row * 40}ms` }}
       >
         <Lock aria-hidden="true" className="size-3 shrink-0 text-[#8fcbff]/70" />
@@ -246,7 +246,7 @@ function Cell({
         <span className="sr-only">, {tip}</span>
         <span
           aria-hidden="true"
-          className="pointer-events-none absolute bottom-full left-0 z-10 mb-1.5 w-max rounded-lg bg-[#020514]/95 px-2 py-1 text-[11px] text-[#E8F4FF] opacity-0 shadow-[inset_0_0_0_1px_rgba(232,244,255,0.2)] transition-opacity duration-200 group-hover/mask:opacity-100"
+          className="pointer-events-none absolute bottom-full left-0 z-10 mb-1.5 w-max rounded-lg bg-[var(--lk-n-bg)]/95 px-2 py-1 text-[11px] text-[#E8F4FF] opacity-0 shadow-[inset_0_0_0_1px_rgba(232,244,255,0.2)] transition-opacity duration-200 group-hover/mask:opacity-100"
         >
           {tip}
         </span>
@@ -272,14 +272,14 @@ function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role
   };
   return (
     <div className="flex items-center gap-2.5">
-      <span id="lk-view-as" className="text-[13px] text-[#E8F4FF]/55">
+      <span id="lk-view-as" className="text-[13px] text-white/55">
         {copy.viewAs}
       </span>
       <div
         role="radiogroup"
         aria-labelledby="lk-view-as"
         onKeyDown={onKey}
-        className="relative grid grid-cols-2 rounded-full bg-[#E8F4FF]/[0.06] p-0.5 ring-1 ring-[#E8F4FF]/12"
+        className="relative grid grid-cols-2 rounded-full bg-white/[0.06] p-0.5 ring-1 ring-white/12"
       >
         {/* The thumb slides under the chosen role. */}
         <span
@@ -301,7 +301,7 @@ function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role
             onClick={() => onChange(r)}
             className={cn(
               "relative z-10 rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors duration-200 ease-out active:scale-95 motion-reduce:transition-none",
-              role === r ? "text-white" : "text-[#E8F4FF]/70 hover:text-[#E8F4FF]",
+              role === r ? "text-white" : "text-white/70 hover:text-[#E8F4FF]",
             )}
           >
             {copy.roles[r]}

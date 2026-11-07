@@ -114,6 +114,16 @@
    hover one step lighter at 4.84:1, the press one step deeper at 5.79:1. On
    :root, because the language offer renders outside `.lk-root`. */
 :root {
+  /* Task A neutral base (owner, 2026-11-07: "jangan biru semuanya"): the content
+     sections between the two seas are near-black and grey, as rantai.dev's dark
+     mode (oklch(0.148 0.004 228.8) = #090b0c). Blue stays on the primary button,
+     links, data and small accents. Panels and cards are flat steps of this grey. */
+  --lk-n-bg: #090b0c;
+  --lk-n-surface: #101314;
+  --lk-n-raised: #181b1d;
+  --lk-n-hair: rgba(255, 255, 255, 0.09);
+  --lk-n-text: #f1f3f4;
+  --lk-n-muted: #9aa1a5;
   --lk-primary: #1d6ccf;
   --lk-primary-hover: #2370d4;
   --lk-primary-press: #1a63c4;
@@ -190,8 +200,8 @@ html[data-scene="full"] #hero {
    final call drop their own backgrounds and sit in it. Without
    JavaScript the attribute never appears, and they keep them. */
 .lk-water {
-  --lk-water-top: #020514;
-  --lk-water-bottom: #040a2a;
+  --lk-water-top: #090b0c;
+  --lk-water-bottom: #090b0c;
   background: linear-gradient(180deg, var(--lk-water-top), var(--lk-water-bottom));
 }
 html[data-scene] .lk-fallback-bg {
@@ -242,7 +252,7 @@ html:not([data-scene]) .lk-gauge {
 /* Outlined numerals for the "Yours to keep" cards. */
 .lk-outline-text {
   color: transparent;
-  -webkit-text-stroke: 1px rgba(232, 244, 255, 0.38);
+  -webkit-text-stroke: 1px rgba(255, 255, 255, 0.38);
 }
 
 /* Film grain: a 160px tile of fractal noise, very faint. It breaks up the
@@ -640,7 +650,7 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-map img {
 }
 /* Audit #23: the highlighted island is Java, the busiest. */
 .lk-map-glow {
-  background: radial-gradient(16% 14% at 33% 75%, rgba(232, 244, 255, 0.55), transparent 70%);
+  background: radial-gradient(16% 14% at 33% 75%, rgba(255, 255, 255, 0.55), transparent 70%);
   opacity: 0.6;
 }
 html.motion-ready .lk-tile:not([data-shown]) .lk-map-glow {
@@ -650,7 +660,7 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-map-glow {
   animation: lk-tile-fade 1s ease-out 1.2s backwards;
 }
 .lk-map-sweep {
-  background: linear-gradient(100deg, transparent 35%, rgba(232, 244, 255, 0.7) 50%, transparent 65%) no-repeat;
+  background: linear-gradient(100deg, transparent 35%, rgba(255, 255, 255, 0.7) 50%, transparent 65%) no-repeat;
   background-size: 300% 100%;
   background-position: 120% 0;
 }
@@ -805,8 +815,8 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
   translate: -50% 0;
   white-space: nowrap;
   border-radius: 10px;
-  background: rgba(2, 5, 20, 0.92);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.22);
+  background: rgba(9, 11, 12, 0.94);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
   padding: 4px 9px;
   font-size: 11px;
   line-height: 16px;
@@ -832,7 +842,7 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
   right: 2.5%;
   top: calc((14 + var(--r, 0) * 23) / 190 * 100%);
   height: calc(17 / 190 * 100%);
-  background: rgba(232, 244, 255, 0.05);
+  background: rgba(255, 255, 255, 0.05);
   border-radius: 6px;
 }
 .lk-calhov-col {
@@ -840,7 +850,7 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
   bottom: 3%;
   left: calc((12 + var(--c, 0) * 17) / 360 * 100%);
   width: calc(13 / 360 * 100%);
-  background: rgba(232, 244, 255, 0.05);
+  background: rgba(255, 255, 255, 0.05);
   border-radius: 6px;
 }
 .lk-calhov-cell {
@@ -1017,7 +1027,7 @@ section[data-role="admin"] .lk-gv-closed {
   flex: 1 1 0;
   min-width: 14px;
   height: 1px;
-  background: rgba(232, 244, 255, 0.16);
+  background: rgba(255, 255, 255, 0.16);
   overflow: hidden;
 }
 @media (max-width: 47.99rem) {
@@ -1263,10 +1273,10 @@ section[data-role="admin"] .lk-gv-closed {
   position: relative;
   overflow: hidden;
   border-radius: var(--radius-3xl);
-  border: 1px solid rgba(232, 244, 255, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.09);
   /* O35 follow-up (owner: solid colours, not gradients): one flat surface a
      step lighter than the water, with the depth's colour as a top hairline. */
-  background: #0a1230;
+  background: var(--lk-n-surface);
   box-shadow: inset 0 1px 0 0 color-mix(in srgb, var(--lk-depth-accent) 55%, transparent);
   color: #e8f4ff;
   font-size: 12px;
@@ -1319,8 +1329,8 @@ section[data-role="admin"] .lk-gv-closed {
   z-index: 2;
   padding: 1px 6px;
   border-radius: 5px;
-  background: #0b1a4a;
-  box-shadow: 0 0 0 1px rgba(232, 244, 255, 0.16);
+  background: var(--lk-n-raised);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16);
   color: #e8f4ff;
   font-size: 10.5px;
   line-height: 16px;
@@ -1342,9 +1352,9 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-depth-head {
   height: 28px;
   font-size: 10.5px;
-  color: rgba(232, 244, 255, 0.6);
+  color: rgba(255, 255, 255, 0.6);
   white-space: nowrap;
-  border-bottom: 1px solid rgba(232, 244, 255, 0.06);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   transition: opacity 0.4s ease;
 }
 
@@ -1361,14 +1371,14 @@ section[data-role="admin"] .lk-gv-closed {
     background-color 0.4s ease;
 }
 .lk-depth-row:hover {
-  background-color: rgba(232, 244, 255, 0.05);
+  background-color: rgba(255, 255, 255, 0.05);
 }
 .lk-depth-row + .lk-depth-row::before {
   content: "";
   position: absolute;
   inset-inline: 14px;
   top: 0;
-  border-top: 1px solid rgba(232, 244, 255, 0.05);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 /* Bronze: the mess shows. The second copy of an order is tinted and
@@ -1508,7 +1518,7 @@ section[data-role="admin"] .lk-gv-closed {
   background-color: rgba(242, 193, 78, 0.07);
 }
 .lk-depth-track {
-  background: rgba(232, 244, 255, 0.07);
+  background: rgba(255, 255, 255, 0.07);
 }
 .lk-depth-bar {
   background: #f2c14e;
@@ -1665,12 +1675,12 @@ section[data-role="admin"] .lk-gv-closed {
    O35 (owner: minimal, clean, professional): one flat surface and one
    hairline; every part inside is told apart by a step of fill and by
    spacing (12 / 16 / 24), never by a border, a gradient or a glow. The
-   surface steps: panel #0a1230, fields and bubbles #121c40, the card
-   #111a3c. Type: 14 px body, 13 px meta, 12 px chart labels. */
+   surface steps: panel var(--lk-n-surface), fields and bubbles var(--lk-n-raised), the card
+   var(--lk-n-raised). Type: 14 px body, 13 px meta, 12 px chart labels. */
 .lk-ast {
   --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
-  --lk-ast-surface: #0a1230;
-  --lk-ast-raised: #121c40;
+  --lk-ast-surface: var(--lk-n-surface);
+  --lk-ast-raised: var(--lk-n-raised);
   --lk-ast-ok: #7ee2b0;
   --lk-ast-wait: #f5c46a;
   container: lk-ast / inline-size;
@@ -1680,7 +1690,7 @@ section[data-role="admin"] .lk-gv-closed {
   height: min(560px, 74svh);
   overflow: hidden;
   border-radius: var(--radius-3xl);
-  border: 1px solid rgba(232, 244, 255, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.09);
   background: var(--lk-ast-surface);
 }
 .lk-ast-avatar {
@@ -1736,7 +1746,7 @@ section[data-role="admin"] .lk-gv-closed {
   background: var(--lk-ast-raised);
 }
 .lk-ast-summary {
-  color: rgba(232, 244, 255, 0.55);
+  color: rgba(255, 255, 255, 0.55);
 }
 .lk-ast-summary svg {
   color: var(--lk-ast-ok);
@@ -1744,7 +1754,7 @@ section[data-role="admin"] .lk-gv-closed {
 
 /* The assistant's steps: a small spinner and a breathing label while each runs, a check once done. */
 .lk-ast-step-label {
-  color: rgba(232, 244, 255, 0.8);
+  color: rgba(255, 255, 255, 0.8);
   animation: lk-ast-breathe 1.4s ease-in-out infinite;
 }
 .lk-ast-step-icon {
@@ -1767,7 +1777,7 @@ section[data-role="admin"] .lk-gv-closed {
     color: var(--lk-ast-ok);
   }
   & .lk-ast-step-label {
-    color: rgba(232, 244, 255, 0.55);
+    color: rgba(255, 255, 255, 0.55);
     animation: none;
   }
 }
@@ -1807,7 +1817,7 @@ section[data-role="admin"] .lk-gv-closed {
   position: absolute;
   inset-inline: 0;
   bottom: 24px;
-  border-top: 1px solid rgba(232, 244, 255, 0.14);
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
 }
 .lk-ast-bar-item {
   display: grid;
@@ -1820,7 +1830,7 @@ section[data-role="admin"] .lk-gv-closed {
   text-align: center;
   font-size: 12px;
   line-height: 16px;
-  color: rgba(232, 244, 255, 0.55);
+  color: rgba(255, 255, 255, 0.55);
 }
 .lk-ast-bar-item[data-lead] .lk-ast-bar-label {
   color: #e8f4ff;
@@ -1835,7 +1845,7 @@ section[data-role="admin"] .lk-gv-closed {
   bottom: 0;
   height: calc(var(--v) * 100%);
   border-radius: 4px 4px 0 0;
-  background: rgba(232, 244, 255, 0.14);
+  background: rgba(255, 255, 255, 0.14);
   transform: scaleY(0);
   transform-origin: bottom;
   transition:
@@ -1857,7 +1867,7 @@ section[data-role="admin"] .lk-gv-closed {
   transition: opacity 0.2s ease;
 }
 .lk-ast-bar-value {
-  color: rgba(232, 244, 255, 0.6);
+  color: rgba(255, 255, 255, 0.6);
   opacity: 0;
 }
 .lk-ast-bar-item[data-lead] .lk-ast-bar-value {
@@ -1887,7 +1897,7 @@ section[data-role="admin"] .lk-gv-closed {
   opacity: 0.5;
 }
 .lk-ast-bar-item:not([data-lead]):hover .lk-ast-bar {
-  background: rgba(232, 244, 255, 0.24);
+  background: rgba(255, 255, 255, 0.24);
 }
 .lk-ast-bar-item:hover .lk-ast-bar-value {
   opacity: 0 !important;
@@ -1908,7 +1918,7 @@ section[data-role="admin"] .lk-gv-closed {
     top: 0;
     bottom: 0;
     border-top: 0;
-    border-left: 1px solid rgba(232, 244, 255, 0.14);
+    border-left: 1px solid rgba(255, 255, 255, 0.14);
   }
   .lk-ast-bar-item {
     grid-template-rows: none;
@@ -1952,7 +1962,7 @@ section[data-role="admin"] .lk-gv-closed {
 /* The approval card: one step of fill, no border. Its status is a small
    text pill, amber while it waits and green once an admin approves. */
 .lk-ast-card {
-  background: #111a3c;
+  background: var(--lk-n-raised);
 }
 .lk-ast-card-icon {
   color: var(--lk-ast-wait);
@@ -1996,7 +2006,7 @@ section[data-role="admin"] .lk-gv-closed {
   transform: scale(0.8);
 }
 .lk-ast-admin {
-  background: #3a4fa8;
+  background: #4a5a6a;
 }
 .lk-ast-btn {
   transition:
@@ -2006,10 +2016,10 @@ section[data-role="admin"] .lk-gv-closed {
 }
 .lk-ast-decline {
   color: #e8f4ff;
-  background: rgba(232, 244, 255, 0.08);
+  background: rgba(255, 255, 255, 0.08);
 }
 .lk-ast-decline:hover {
-  background: rgba(232, 244, 255, 0.14);
+  background: rgba(255, 255, 255, 0.14);
 }
 .lk-ast-approve {
   background: var(--lk-primary);
@@ -2085,8 +2095,8 @@ section[data-role="admin"] .lk-gv-closed {
   display: none;
 }
 .lk-ast-send {
-  color: rgba(232, 244, 255, 0.4);
-  background: rgba(232, 244, 255, 0.06);
+  color: rgba(255, 255, 255, 0.4);
+  background: rgba(255, 255, 255, 0.06);
   transition:
     background-color 0.2s ease,
     color 0.2s ease;
@@ -2120,18 +2130,18 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 .lk-ast-mode {
-  color: rgba(232, 244, 255, 0.45);
+  color: rgba(255, 255, 255, 0.45);
   transition: color 0.3s ease;
 }
 .lk-ast-mode[data-mode="ask"],
 .lk-ast[data-s~="6"] .lk-ast-mode[data-mode="build"] {
-  color: rgba(232, 244, 255, 0.9);
+  color: rgba(255, 255, 255, 0.9);
 }
 .lk-ast[data-s~="6"] .lk-ast-mode[data-mode="ask"] {
-  color: rgba(232, 244, 255, 0.45);
+  color: rgba(255, 255, 255, 0.45);
 }
 .lk-ast-mode-thumb {
-  background: rgba(232, 244, 255, 0.07);
+  background: rgba(255, 255, 255, 0.07);
   transition: transform 0.4s var(--lk-ease);
 }
 .lk-ast[data-s~="6"] .lk-ast-mode-thumb {
@@ -2186,8 +2196,8 @@ section[data-role="admin"] .lk-gv-closed {
 }
 @keyframes lk-gs-lit {
   from {
-    color: rgba(232, 244, 255, 0.5);
-    box-shadow: 0 0 0 1px rgba(232, 244, 255, 0.2);
+    color: rgba(255, 255, 255, 0.5);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2);
     scale: 0.88;
   }
 }
@@ -2201,7 +2211,7 @@ section[data-role="admin"] .lk-gv-closed {
 /* O35 follow-up: a flat terminal, one step lighter than the water, with a
    hairline. */
 .lk-gs-term {
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.09);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
 }
 .lk-gs-term[data-term="done"] .lk-gs-line {
   animation: lk-fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) 0.3s backwards;
@@ -2345,7 +2355,7 @@ section[data-role="admin"] .lk-gv-closed {
 }
 .lk-show-item {
   padding-left: 20px;
-  border-left: 2px solid rgba(232, 244, 255, 0.1);
+  border-left: 2px solid rgba(255, 255, 255, 0.1);
 }
 .lk-show-item a {
   pointer-events: none;
@@ -2357,8 +2367,8 @@ section[data-role="admin"] .lk-gv-closed {
   max-width: 40rem;
   overflow: hidden;
   border-radius: var(--radius-3xl);
-  border: 1px solid rgba(232, 244, 255, 0.09);
-  background: #0a1230;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: var(--lk-n-surface);
   margin-bottom: 32px;
 }
 /* From 1024 px, and only where the window is tall enough to hold the list
@@ -2414,7 +2424,7 @@ section[data-role="admin"] .lk-gv-closed {
     align-content: center;
   }
   .lk-show-item {
-    border-left-color: rgba(232, 244, 255, 0.1);
+    border-left-color: rgba(255, 255, 255, 0.1);
     padding-block: 14px;
     transition: border-color 0.3s ease;
   }
@@ -2426,16 +2436,16 @@ section[data-role="admin"] .lk-gv-closed {
     transition: color 0.3s ease;
   }
   .lk-show-item:not([data-on]) .lk-show-title {
-    color: rgba(232, 244, 255, 0.45);
+    color: rgba(255, 255, 255, 0.45);
   }
   .lk-show-item:not([data-on]) .lk-show-line {
-    color: rgba(232, 244, 255, 0.35);
+    color: rgba(255, 255, 255, 0.35);
   }
   .lk-show-item[data-on] {
     border-left-color: #44a6fa;
   }
   .lk-show-item:not([data-on]):hover .lk-show-title {
-    color: rgba(232, 244, 255, 0.8);
+    color: rgba(255, 255, 255, 0.8);
   }
   /* The four pictures share one cell of the stage. */
   .lk-show-visual {
@@ -2522,8 +2532,8 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 .lk-open-fold {
-  color: rgba(232, 244, 255, 0.5);
-  background: rgba(232, 244, 255, 0.06);
+  color: rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.06);
 }
 .lk-con-tab {
   animation: lk-con-tab 16s infinite;
@@ -2580,17 +2590,17 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 .lk-open-table {
-  background: #121c40;
+  background: var(--lk-n-raised);
   box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
 }
 /* Iceberg keeps snapshots: two faint ones stacked behind the table. */
 .lk-open-table-back {
   z-index: -1;
   transform: translate(6px, 6px);
-  background: #0e1738;
+  background: var(--lk-n-surface);
   box-shadow:
     inset 0 0 0 1px rgba(143, 203, 255, 0.2),
-    6px 6px 0 -1px #0c1534,
+    6px 6px 0 -1px var(--lk-n-bg),
     6px 6px 0 0 rgba(143, 203, 255, 0.12);
 }
 .lk-open-tables {
@@ -2599,8 +2609,8 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-open-reader {
   left: var(--x);
   top: var(--y);
-  background: #121c40;
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.16);
+  background: var(--lk-n-raised);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
   transition: box-shadow 0.2s ease;
 }
 .lk-open-reader:hover {
@@ -2619,14 +2629,14 @@ section[data-role="admin"] .lk-gv-closed {
 
 /* Your servers or ours: two radio buttons drive the picture. */
 .lk-open-seg {
-  background: #121c40;
+  background: var(--lk-n-raised);
 }
 .lk-open-seg-thumb {
   background: rgba(68, 166, 250, 0.22);
   transition: transform 0.45s var(--lk-ease);
 }
 .lk-open-seg-opt {
-  color: rgba(232, 244, 255, 0.65);
+  color: rgba(255, 255, 255, 0.65);
   transition: color 0.2s ease;
 }
 .lk-open-seg-opt:hover,
@@ -2640,11 +2650,11 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-open-stage {
   container-type: inline-size;
   min-height: 180px;
-  background: #0d1636;
+  background: var(--lk-n-surface);
 }
 .lk-open-unit {
-  background: rgba(232, 244, 255, 0.06);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 .lk-open-led {
   background: #7ee2b0;
@@ -2665,7 +2675,7 @@ section[data-role="admin"] .lk-gv-closed {
 }
 .lk-open-stack {
   bottom: 110px;
-  background: #121c40;
+  background: var(--lk-n-raised);
   box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
   transition:
     transform 0.7s var(--lk-ease),
@@ -2698,7 +2708,7 @@ section[data-role="admin"] .lk-gv-closed {
 
 /* The console's home: a dark recreation whose placeholder types prompts in turn. */
 .lk-con-box {
-  background: #121c40;
+  background: var(--lk-n-raised);
 }
 .lk-con-prompt {
   opacity: 0;
@@ -2734,7 +2744,7 @@ section[data-role="admin"] .lk-gv-closed {
   animation: lk-twinkle 1s steps(2, jump-none) infinite;
 }
 .lk-con-short {
-  background: #121c40;
+  background: var(--lk-n-raised);
   transition:
     transform 0.25s var(--lk-ease),
     box-shadow 0.25s ease;
@@ -2817,14 +2827,14 @@ section[data-role="admin"] .lk-gv-closed {
   position: absolute;
   inset: 0 0 var(--lk-depths-slab-edge) 0;
   clip-path: polygon(5.5% 0, 94.5% 0, 100% 100%, 0 100%);
-  background: color-mix(in srgb, var(--lk-slab) 24%, #0a1230);
+  background: color-mix(in srgb, var(--lk-slab) 24%, var(--lk-n-surface));
 }
 .lk-depth-slab-front {
   position: absolute;
   inset: auto 0 0 0;
   height: var(--lk-depths-slab-edge);
   border-radius: 0 0 10px 10px;
-  background: color-mix(in srgb, var(--lk-slab) 48%, #0a1230);
+  background: color-mix(in srgb, var(--lk-slab) 48%, var(--lk-n-surface));
   box-shadow: inset 0 1px 0 0 color-mix(in srgb, var(--lk-slab) 80%, #fff 0%);
 }
 @media (prefers-reduced-motion: reduce) {
