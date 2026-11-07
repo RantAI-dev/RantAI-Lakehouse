@@ -1722,7 +1722,7 @@ async fn a_version_is_written_for_a_change_and_skipped_when_nothing_changed(
     Ok(())
 }
 
-/// The two definitions the `QS-5` tests save (`D6`): the store keeps them as
+/// The two definitions the `QS-5` tests save (decision 3): the store keeps them as
 /// the JSON the route validated and never reads inside them.
 fn region_definitions() -> Value {
     json!([{"name": "region", "type": "text", "default": "EU"}])
@@ -1734,7 +1734,7 @@ fn region_definitions_with_default_us() -> Value {
     json!([{"name": "region", "type": "text", "default": "US"}])
 }
 
-/// `QS-5` D6: a saved query keeps its parameters beside its SQL. A change
+/// `query-parameters.md` decision 3: a saved query keeps its parameters beside its SQL. A change
 /// of the parameters alone writes a version, a change that leaves them as
 /// they were writes none, a change of the title alone keeps them, and a
 /// revert brings back the parameters of the version it went back to.

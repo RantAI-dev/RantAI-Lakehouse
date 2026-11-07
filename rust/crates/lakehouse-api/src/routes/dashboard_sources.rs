@@ -775,7 +775,7 @@ mod preview_tests {
         );
     }
 
-    /// `QS-5` D8: a source with a `{{name}}` placeholder is refused with the
+    /// `query-parameters.md` decision 15: a source with a `{{name}}` placeholder is refused with the
     /// page's sentence, and nothing reaches `ClickHouse`, not even the probe.
     #[tokio::test]
     async fn a_source_with_a_placeholder_is_refused_before_anything_reaches_clickhouse() {

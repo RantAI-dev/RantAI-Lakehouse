@@ -23,7 +23,8 @@ pub(in crate::routes) const CATALOG_UNION: &str = "(SELECT slug,title,descriptio
 
 /// WS7 item C3: delegates to the SAME run (`routes::query::run_statement`,
 /// the end of `routes::query::run`) Query Studio and saved queries already
-/// call — closing the divergent-guard gap this task's own name cites (`WS7 plan §0 item 7`): before this change,
+/// call — closing the divergent-guard gap this task's own name cites
+/// (`WS7 plan §0 item 7`): before this change,
 /// `run_sql` called `ch.query` directly, so `sql_rewrite::enforce`'s
 /// masking/row-filter/table-function/sensitive-table/view refusal (WS7
 /// items B3-B6, wired into `routes::query::run` by WS7 item C2) never ran
@@ -44,7 +45,7 @@ pub(super) async fn run_sql(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
-    // `QS-5` D7: the model's `{{name}}` placeholders are filled FIRST, with
+    // `query-parameters.md` decision 7: the model's `{{name}}` placeholders are filled FIRST, with
     // the function the run route uses (`ClickHouse`, this tool's only engine),
     // so every check below, the policy rewrite and the run read the final
     // statement. A refusal is the tool's error: the model reads the sentence
@@ -1198,7 +1199,7 @@ mod run_sql_delegation {
         args
     }
 
-    /// `QS-5` D7: the model's `{{region}}` is filled before the dry run and
+    /// `query-parameters.md` decision 7: the model's `{{region}}` is filled before the dry run and
     /// before the run, so the engine never sees a brace and both calls carry
     /// the one literal.
     #[tokio::test]
@@ -1261,7 +1262,7 @@ mod run_sql_delegation {
         assert!(engine_bodies(&server).await.is_empty(), "nothing is sent");
     }
 
-    /// `QS-5` D7: a number the model passes for a placeholder with no
+    /// `query-parameters.md` decision 7: a number the model passes for a placeholder with no
     /// definition is a number, not text. Negative ones are wrapped.
     #[tokio::test]
     async fn run_sql_reads_a_number_for_an_undefined_placeholder_as_a_number() {

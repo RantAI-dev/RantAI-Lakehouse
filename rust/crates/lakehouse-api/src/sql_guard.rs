@@ -328,7 +328,7 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
     if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
         return Err(SqlSourceRefusal::TooLong);
     }
-    // `QS-5` D8: before anything reads the statement as ClickHouse SQL. The
+    // `query-parameters.md` decision 15: before anything reads the statement as ClickHouse SQL. The
     // scanner is the one that knows comments and quotes, so a `{{` in a
     // comment, or text that is not a well-formed placeholder, changes
     // nothing here.
@@ -464,7 +464,7 @@ mod sql_source_rules {
         );
     }
 
-    /// `QS-5` D8: parameters in a source come later, so a well-formed
+    /// `query-parameters.md` decision 15: parameters in a source come later, so a well-formed
     /// placeholder is refused with the page's sentence instead of reaching
     /// the engine parser, which would answer with a message about `{`.
     #[test]

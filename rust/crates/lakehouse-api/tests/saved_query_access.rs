@@ -4931,7 +4931,7 @@ async fn more_rules_do_not_add_a_round_trip_to_an_access_list() {
     );
 }
 
-// ── Parameters (`QS-5` part 1, D6) ───────────────────────────────────────
+// ── Parameters (`query-parameters.md`, decision 3) ───────────────────────────────────────
 
 /// The sentence a `parameters` value that is not a list of definitions is
 /// refused with. Fixed: it never quotes the caller's JSON back.

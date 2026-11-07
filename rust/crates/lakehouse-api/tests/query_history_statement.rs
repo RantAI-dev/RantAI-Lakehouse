@@ -1,7 +1,7 @@
 //! `POST /api/query/run` records the statement the user wrote in query
 //! history, not the statement sent to the engine (`SEC-21`, `SEC-33`). A
 //! statement with `{{name}}` parameters is recorded as it ran, with the
-//! checked literals in it and not the placeholders (`QS-5`, D5), so a
+//! checked literals in it and not the placeholders (`query-parameters.md`, decision 14), so a
 //! download needs no values.
 //!
 //! History is what the console shows back to the user and what
@@ -274,7 +274,7 @@ async fn a_download_of_a_run_applies_the_policy_once() {
     );
 }
 
-// ── QS-5 part 1, D5: a parameterised run ────────────────────────────────
+// ── query-parameters.md, decision 14: a parameterised run ────────────────────────────────
 
 /// What the user types: one text parameter.
 const PARAMETERISED: &str = "SELECT email FROM serving.mart_x WHERE region = {{region}}";

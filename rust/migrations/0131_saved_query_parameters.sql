@@ -1,6 +1,6 @@
 -- Query Studio: a saved query keeps the definitions of its `{{name}}`
 -- parameters (backlog `QS-5` part 1, feature page
--- `docs/core/features/query-parameters.md`, decision 3 and D6).
+-- `docs/core/features/query-parameters.md`, decisions 3 and 14).
 --
 -- WHY: a statement can now hold `{{region}}`, and the SQL alone cannot say
 -- what type the value has, what it defaults to or which options a dropdown

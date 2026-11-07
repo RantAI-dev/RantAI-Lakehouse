@@ -3251,7 +3251,7 @@ mod tests {
         );
     }
 
-    /// `QS-5` D7: the two tools that run SQL take an optional `parameters`
+    /// `query-parameters.md` decision 7: the two tools that run SQL take an optional `parameters`
     /// object, described in one short line (the build turn's tool list has
     /// about 2,200 characters of room, `tests/ai_build_tool_list.rs`).
     #[test]

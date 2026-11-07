@@ -36,7 +36,7 @@ pub(super) async fn save_query(
     if title.is_empty() || sql.is_empty() {
         return json!({ "error": "title and sql are required" });
     }
-    // `QS-5` D7: this tool stores no definitions, so SQL that holds a
+    // `query-parameters.md` decision 7: this tool stores no definitions, so SQL that holds a
     // `{{name}}` placeholder would be saved with nothing to say what the
     // placeholder is. It gets the refusal the save route gives the same SQL.
     if let Err(refusal) = crate::routes::query::checked_saved_definitions(&sql, None) {
@@ -178,7 +178,7 @@ pub(super) async fn run_saved_query(
     let Some(saved) = saved else {
         return json!({ "error": "saved query tidak ditemukan" });
     };
-    // `QS-5` D7: the saved definitions and the model's values fill the
+    // `query-parameters.md` decision 7: the saved definitions and the model's values fill the
     // placeholders, once, here. A refusal ("Fill in {{name}} to run this
     // query.", a value that does not fit) is the tool's error, so the model
     // asks the person instead of guessing. A saved query with no placeholder
@@ -457,7 +457,7 @@ mod tests {
             args
         }
 
-        /// `QS-5` D7: the tool fills the saved query's `{{region}}` with the
+        /// `query-parameters.md` decision 7: the tool fills the saved query's `{{region}}` with the
         /// model's value, and with the stored default when it gives none.
         #[sqlx::test(migrations = "../../migrations")]
         async fn run_saved_query_fills_the_saved_definitions_with_the_models_values(
@@ -584,7 +584,7 @@ mod tests {
             Ok(())
         }
 
-        /// `QS-5` D7: the `save_query` tool is held to the rule the save route
+        /// `query-parameters.md` decision 7: the `save_query` tool is held to the rule the save route
         /// applies. SQL with a placeholder and no definition is refused with
         /// the route's sentence and stores nothing; plain SQL still saves.
         #[sqlx::test(migrations = "../../migrations")]

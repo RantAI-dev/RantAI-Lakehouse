@@ -1,4 +1,4 @@
-//! `{{name}}` parameters in SQL (`QS-5` part 1, plan decisions D1 to D3): find
+//! `{{name}}` parameters in SQL (`QS-5` part 1, decisions 8 to 12 of `query-parameters.md`): find
 //! the placeholders an author wrote, check the value each one gets, and
 //! print the checked value into the statement as a literal.
 //!
@@ -271,7 +271,7 @@ pub fn substitute(
 /// on `ClickHouse`, whether or not it sits in quotes.
 ///
 /// For a place that takes no parameters and must say so (a dashboard's SQL
-/// source, `QS-5` D8). It reads with [`scan`], so a `{{` in a comment, or one
+/// source, `query-parameters.md` decision 15). It reads with [`scan`], so a `{{` in a comment, or one
 /// that is not a well-formed placeholder, is not one. A statement where the
 /// scanner stops at a stray `{{` before it reaches a placeholder is `false`:
 /// that statement was already failing and keeps failing the way it did.

@@ -7305,7 +7305,7 @@ mod records_pages {
         assert!(rows.contains("max_execution_time = 60"), "{rows}");
     }
 
-    /// `QS-5` D8: a stored source whose SQL holds a placeholder (saved before
+    /// `query-parameters.md` decision 15: a stored source whose SQL holds a placeholder (saved before
     /// the refusal existed) is not run for a record list: the source gate
     /// refuses it like any other source that no longer passes. The
     /// placeholder is in quotes, the one spelling the engine parser accepts,

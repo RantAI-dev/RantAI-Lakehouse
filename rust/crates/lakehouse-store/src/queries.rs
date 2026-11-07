@@ -581,7 +581,7 @@ pub async fn create_saved_query_at(
 }
 
 /// [`create_saved_query_at`] for a query that keeps the definitions of its
-/// `{{name}}` parameters (`QS-5`, D6).
+/// `{{name}}` parameters (`query-parameters.md`, decision 3).
 ///
 /// `parameters` is a JSON array, stored as given: the caller has already
 /// validated it against `sql` (`lakehouse-api` `query_params.rs`), and this
@@ -684,7 +684,7 @@ pub struct SavedQueryPatch {
     pub tags: Option<Vec<String>>,
     /// The folder the query moves to. `None` leaves it where it is.
     pub folder: Option<FolderMove>,
-    /// New parameter definitions, a JSON array (`QS-5`, D6). `None` leaves
+    /// New parameter definitions, a JSON array (`query-parameters.md`, decision 3). `None` leaves
     /// them as they are; the caller has validated them against the SQL the
     /// query will have.
     pub parameters: Option<serde_json::Value>,

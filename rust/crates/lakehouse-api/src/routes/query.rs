@@ -114,7 +114,7 @@ pub(crate) const SAVED_PARAMETERS_SHAPE: &str = "parameters must be a list of pa
      definitions, each with a name, a type, a default and options.";
 
 /// Check the definitions a saved query is written with against the SQL it
-/// will hold, and answer them as the JSON the store keeps (`QS-5`, D6).
+/// will hold, and answer them as the JSON the store keeps (`query-parameters.md`, decision 3).
 ///
 /// `None` and `null` are no definitions. A list of the wrong shape, an
 /// unknown key or an unknown type is [`SAVED_PARAMETERS_SHAPE`]; serde's
@@ -153,7 +153,7 @@ pub(crate) fn checked_saved_definitions(
 }
 
 /// Fill the `{{name}}` placeholders of `sql` with the checked literal of
-/// each value (`QS-5` part 1, D4), for the engine `engine` names.
+/// each value (`query-parameters.md`, decision 13), for the engine `engine` names.
 ///
 /// This is the one place a route turns a parameterised statement into the
 /// statement that runs, and it runs before everything that reads the
@@ -195,7 +195,7 @@ pub(crate) fn substitute_parameters(
     .map_err(|refusal| ApiError::BadRequest(refusal.to_string()))
 }
 
-/// [`substitute_parameters`] for the assistant's two SQL tools (`QS-5`, D7):
+/// [`substitute_parameters`] for the assistant's two SQL tools (`query-parameters.md`, decision 7):
 /// the `parameters` the model passed and, for a saved query, the definitions
 /// the store holds, both as raw JSON, for the engine the tools run on
 /// (`ClickHouse`, as `run` does when a body names none).
@@ -1727,7 +1727,7 @@ pub async fn run(
     let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
     let principal = principal.map(|Extension(p)| p);
 
-    // `QS-5`, D4: the placeholders are filled as soon as the statement is
+    // `query-parameters.md`, decision 13: the placeholders are filled as soon as the statement is
     // read, before the table list, every guard and the policy rewrite.
     let statement = match substitute_parameters(&engine, &statement, &parameters, &definitions) {
         Ok(filled) => filled,
@@ -1829,7 +1829,7 @@ pub(crate) async fn run_statement(
     // else.
     //
     // `statement` is what the user wrote with its `{{name}}` placeholders
-    // already filled (`QS-5`, D5): query history records it, literals
+    // already filled (`query-parameters.md`, decision 14): query history records it, literals
     // included, so `download` re-rewrites it for the caller's roles at that
     // time and needs no values. `rewritten` is what the engine runs and the
     // audit event records (`SEC-21`, `SEC-33`).
@@ -2419,7 +2419,7 @@ pub async fn estimate(
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
     let (parameters, definitions) = parameter_inputs(parsed.parameters, parsed.definitions)?;
-    // `QS-5`, D4: the estimate explains the statement the run would send, so
+    // `query-parameters.md`, decision 13: the estimate explains the statement the run would send, so
     // it fills the placeholders first, with the run's function and before
     // every guard below. It always asks `ClickHouse`. A refusal is the run's
     // 400 sentence; the estimate keeps no history.
@@ -3305,7 +3305,7 @@ fn download_response(
 /// The stored statement is the one the user wrote, with any `{{name}}`
 /// placeholders already filled in ([`run`] records it, not the rewritten
 /// form), so today's policy is applied to it once and no value is needed
-/// (`QS-5`, D5). This route never scans the stored text for placeholders: a
+/// (`query-parameters.md`, decision 14). This route never scans the stored text for placeholders: a
 /// text value that read `{{x}}` is a quoted literal in it. A row
 /// recorded before that change holds the rewritten form: an old mask or row
 /// filter sits inside it and today's policy applies on top, which only adds
@@ -5817,7 +5817,7 @@ mod tests {
         }
     }
 
-    /// `QS-5` part 1, D4: `{{name}}` parameters on `run` and `estimate`.
+    /// `query-parameters.md`, decision 13: `{{name}}` parameters on `run` and `estimate`.
     /// The engine's own recorded requests are the oracle, for `ClickHouse`
     /// and for `Trino`, as in `enforcement` and `trino_engine` above.
     mod query_parameters {
