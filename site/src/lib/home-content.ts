@@ -114,6 +114,33 @@ export const RANTAI_PRODUCTS = [
   { id: "lakehouse", label: "RantAI Lakehouse", href: null, logo: null, ratio: 196 / 167 },
 ] as const;
 
+/**
+ * WEB-5 O20: each source pill's mark, by the index of `home.sources.items`
+ * (the same order in both languages). Real marks where Simple Icons has
+ * them; neutral glyphs elsewhere (components/shared/brand-icons.tsx).
+ */
+export const SOURCE_ICONS = [
+  "postgresql", // PostgreSQL
+  "mysql", // MySQL
+  "database", // SQL Server
+  "mongodb", // MongoDB
+  "rest", // REST APIs
+  "apachekafka", // Kafka
+  "spreadsheet", // CSV and TSV files
+  "spreadsheet", // Excel workbooks
+  "apacheparquet", // Parquet files
+  "app", // Salesforce
+  "app", // ServiceNow
+  "googleanalytics", // Google Analytics 4
+  "hubspot", // HubSpot
+  "zendesk", // Zendesk
+  "confluence", // Confluence
+  "app", // Dynamics 365
+  "folder", // SharePoint
+  "json", // JSON, JSON Lines and Avro
+  "archive", // gzip and zip archives
+] as const;
+
 export type DepthId = "bronze" | "silver" | "gold";
 
 export type DepthLayer = {

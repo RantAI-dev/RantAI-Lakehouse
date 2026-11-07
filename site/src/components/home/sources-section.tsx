@@ -3,7 +3,17 @@ import type { HomeCopy } from "@/lib/copy";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
 import { ProgressSection } from "@/components/shared/progress-section";
 import { Reveal } from "@/components/shared/reveal";
+import { hoverColour, SourceIcon } from "@/components/shared/brand-icons";
+import { SOURCE_ICONS } from "@/lib/home-content";
 import { SourcePills, SourcesHeadingFade } from "./sources-motion";
+
+/**
+ * WEB-5 O20: a pill's mark, in the foam at 85 %, turning its brand colour
+ * (`--lk-brand`, set by the pill) on hover. Kept here, in the server
+ * module that renders the marks.
+ */
+const PILL_MARK_CLASS =
+  "size-3.5 shrink-0 text-[#E8F4FF]/85 transition-colors duration-200 ease-out group-hover/pill:text-[var(--lk-brand)] motion-reduce:transition-none md:size-4";
 
 /**
  * S2 — "Everything flows in": the sources that land in the lakehouse today.
@@ -35,7 +45,12 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
               margins are tighter so the pinned 100svh stage still holds the
               headline, every pill and the caption; desktop is unchanged. */}
           <ul className="relative z-0 mx-auto mt-5 flex max-w-[760px] flex-wrap justify-center gap-1.5 md:mt-12 md:gap-3">
-            <SourcePills items={copy.items} />
+            {/* O20: the marks render here, on the server (see SourcePills). */}
+            <SourcePills
+              items={copy.items}
+              marks={SOURCE_ICONS.map((id, i) => <SourceIcon key={i} id={id} className={PILL_MARK_CLASS} />)}
+              colours={SOURCE_ICONS.map(hoverColour)}
+            />
           </ul>
           <Reveal className="mx-auto mt-4 max-w-[36rem] md:mt-10">
             <p className="text-[11px] leading-4 md:text-[12px] md:leading-5 tracking-wide text-[#E8F4FF]/65">{copy.caption}</p>

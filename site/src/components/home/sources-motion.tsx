@@ -37,14 +37,72 @@ export function SourcesHeadingFade({ children }: { children: React.ReactNode }) 
   );
 }
 
-/** The pills, as the items of the server-rendered list. */
-export function SourcePills({ items }: { items: readonly string[] }) {
+/**
+ * The order the pills land in, from their places in the wrapped list
+ * (WEB-5 owner QA O13): the bottom row first, then each row above it, left
+ * to right. A droplet then only ever falls through slots that are still
+ * empty, so a pill in flight never crosses one that has landed. Read from
+ * layout (`offsetTop`, which transforms do not change), again whenever the
+ * list rewraps; until then, list order.
+ */
+function useLandingOrder(listRef: React.RefObject<HTMLLIElement | null>, count: number): number[] {
+  const [order, setOrder] = React.useState<number[]>(() => Array.from({ length: count }, (_, i) => i));
+  React.useEffect(() => {
+    const list = listRef.current?.parentElement;
+    if (!list) return;
+    const measure = () => {
+      const pills = [...list.querySelectorAll<HTMLLIElement>(":scope > li:not([hidden])")];
+      const rows = [...new Set(pills.map((p) => p.offsetTop))].sort((a, b) => b - a);
+      const ranked = pills
+        .map((p, i) => ({ i, row: rows.indexOf(p.offsetTop), left: p.offsetLeft }))
+        .sort((a, b) => a.row - b.row || a.left - b.left);
+      const next = Array.from({ length: pills.length }, () => 0);
+      ranked.forEach((r, k) => (next[r.i] = k));
+      setOrder((prev) => (prev.length === next.length && prev.every((v, i) => v === next[i]) ? prev : next));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(list);
+    return () => ro.disconnect();
+  }, [listRef, count]);
+  return order;
+}
+
+/**
+ * The pills, as the items of the server-rendered list. WEB-5 O20: each
+ * pill's mark arrives rendered by the server (`marks`, with its hover
+ * colour in `colours`), so the brand paths travel as HTML and stay out of
+ * the first JavaScript (they were 11 KB of it when imported here).
+ */
+export function SourcePills({
+  items,
+  marks,
+  colours,
+}: {
+  items: readonly string[];
+  marks: readonly React.ReactNode[];
+  colours: readonly string[];
+}) {
   const reduced = useReducedMotionSafe();
   const progress = useProgress();
+  // A hidden, empty item, so the order can find the list it sits in (hidden
+  // items are not announced and take no place in the wrap).
+  const markerRef = React.useRef<HTMLLIElement>(null);
+  const order = useLandingOrder(markerRef, items.length);
   return (
     <>
+      <li ref={markerRef} hidden />
       {items.map((item, i) => (
-        <SourcePill key={item} label={item} index={i} count={items.length} progress={progress} animate={!reduced} />
+        <SourcePill
+          key={item}
+          label={item}
+          mark={marks[i]}
+          colour={colours[i] ?? "#8fcbff"}
+          index={order[i] ?? i}
+          count={items.length}
+          progress={progress}
+          animate={!reduced}
+        />
       ))}
     </>
   );
@@ -62,35 +120,63 @@ const settle = (t: number): number => 1 - Math.pow(1 - t, 3);
 /** Gap between two droplets' departures, so the last of `count` arrives by 0.80. */
 export const stagger = (count: number): number => (count > 1 ? Math.min(0.034, 0.4 / (count - 1)) : 0);
 
+/**
+ * WEB-5 O20: the mark sits before the name, in the foam at 85 %, and turns
+ * its brand colour on hover while the pill lifts a little and its border
+ * brightens (200 ms; at once under reduced motion). The lift uses the
+ * `translate` property and the border an important colour, because the
+ * fall drives the pill's `transform` and colours inline.
+ */
 const PILL_CLASS =
-  "rounded-full border px-2.5 py-1 text-[11px] text-[#E8F4FF] md:px-4 md:py-2 md:text-[13px]";
+  "group/pill inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] text-[#E8F4FF] transition-[translate,border-color] duration-200 ease-out hover:-translate-y-0.5 hover:border-[#8fcbff]/70! motion-reduce:transition-none md:gap-2 md:px-4 md:py-2 md:text-[13px]";
+
+function PillContent({ label, mark }: { label: string; mark: React.ReactNode }) {
+  return (
+    <>
+      {mark}
+      {label}
+    </>
+  );
+}
 
 function SourcePill({
   label,
+  mark,
+  colour,
   index,
   count,
   progress,
   animate,
 }: {
   label: string;
+  mark: React.ReactNode;
+  colour: string;
   index: number;
   count: number;
   progress: MotionValue<number>;
   animate: boolean;
 }) {
   if (!animate) {
-    return <li className={`${PILL_CLASS} border-[#44A6FA]/30 bg-[#44A6FA]/10`}>{label}</li>;
+    return (
+      <li className={`${PILL_CLASS} border-[#44A6FA]/30 bg-[#44A6FA]/10`} style={{ "--lk-brand": colour } as React.CSSProperties}>
+        <PillContent label={label} mark={mark} />
+      </li>
+    );
   }
-  return <FallingPill label={label} index={index} count={count} progress={progress} />;
+  return <FallingPill label={label} mark={mark} colour={colour} index={index} count={count} progress={progress} />;
 }
 
 function FallingPill({
   label,
+  mark,
+  colour,
   index,
   count,
   progress,
 }: {
   label: string;
+  mark: React.ReactNode;
+  colour: string;
   index: number;
   count: number;
   progress: MotionValue<number>;
@@ -98,12 +184,17 @@ function FallingPill({
   // Staggered: the first droplet leaves at 0.10, the last arrives by 0.80.
   // WEB-5 T6: the step shrinks when the list grows (19 sources now), so the
   // last droplet still lands inside the pin; nine pills keep the old 0.034.
+  // O13: `index` is the landing order (bottom row first), not list order.
   const start = 0.1 + index * stagger(count);
   const end = start + 0.3;
   const dir = index % 2 === 0 ? -1 : 1;
   const y = useTransform(progress, [start, end], ["-110vh", "0vh"], { ease: settle });
-  const x = useTransform(progress, [start, end], [`${dir * (36 + index * 9)}px`, "0px"], { ease: settle });
-  const rotate = useTransform(progress, [start, end], [((index % 3) - 1) * 16, 0], { ease: settle });
+  // WEB-5 owner QA O13: the drift and the tilt used to reach 198 px and 16°,
+  // so a falling pill swept across its landed neighbours. Now a droplet
+  // sways a little high up and is straight, in its own column, well before
+  // it reaches the row, so it never crosses a pill beside it.
+  const x = useTransform(progress, [start, start + 0.2], [`${dir * (8 + (index % 4) * 4)}px`, "0px"], { ease: settle });
+  const rotate = useTransform(progress, [start, start + 0.2], [((index % 3) - 1) * 6, 0], { ease: settle });
   const opacity = useTransform(progress, [start, start + 0.06, end], [0, 0.55, 1]);
   const filter = useTransform(progress, [start, end - 0.05], ["blur(4px)", "blur(0px)"]);
   // Stretched while falling, compressed for a beat on arrival.
@@ -127,9 +218,20 @@ function FallingPill({
     <m.li
       data-reveal
       className={PILL_CLASS}
-      style={{ y, x, rotate, opacity, filter, scaleY, boxShadow: glow, borderColor: border, backgroundColor: fill }}
+      style={{
+        y,
+        x,
+        rotate,
+        opacity,
+        filter,
+        scaleY,
+        boxShadow: glow,
+        borderColor: border,
+        backgroundColor: fill,
+        ["--lk-brand" as string]: colour,
+      }}
     >
-      {label}
+      <PillContent label={label} mark={mark} />
     </m.li>
   );
 }
