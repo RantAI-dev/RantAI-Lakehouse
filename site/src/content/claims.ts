@@ -121,11 +121,9 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.getStarted.steps.0.note", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart step 1: git clone the public repository" },
   { key: "home.getStarted.steps.1.note", backlog: ["SEC-18 Done", "REL-2 Done"], note: "README step 2: ops/init-env.sh writes .env with generated values (no default credentials, SEC-18); AUTH_BOOTSTRAP_EMAIL / _PASSWORD create the first admin" },
   { key: "home.getStarted.steps.2.note", backlog: ["REL-2 Done"], note: "README step 3: scripts/compose.sh up --build; the console listens on :3000 once the API is healthy (REL-2 slice 1: the console in the stack)" },
-  // The footer's prompt (O7, 2026-11-07): example requests a visitor can send; each names something built.
-  { key: "common.footer.cta.examples.0", backlog: ["WEB-1 In Acceptance", "REL-2 Done"], note: "runs on your own infrastructure (the 'Your servers or ours' card)" },
-  { key: "common.footer.cta.examples.1", backlog: ["WEB-1 In Acceptance"], note: "PostgreSQL is a source on the page (sources section)" },
-  { key: "common.footer.cta.examples.2", backlog: ["SRC-3 Released"], note: "Salesforce connector" },
-  { key: "common.footer.cta.examples.3", backlog: ["WEB-1 In Acceptance"], note: "a walkthrough is one of the contact form's topics (D15); no product claim" },
+  // The footer card (O14, 2026-11-07): its sources are the sources section's
+  // own (WEB-1, SRC-3, DATA-17 above), and Bronze, Silver and Gold are the depths.
+  { key: "common.footer.cta.ready", backlog: ["WEB-1 In Acceptance"], note: "raw to clean to ready: the three depths, as on the home page" },
   // Contact page FAQ (D15, 2026-11-07): every answer is a claim. Most repeat
   // what the home page already says (WEB-1's copy, "limited to what is
   // built", In Acceptance), so they trace to the same rows.

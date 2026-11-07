@@ -5,6 +5,7 @@ import { ArrowRight, Check, Copy } from "lucide-react";
 import type { ContactCopy } from "@/lib/copy";
 import { contactMailto, TOPICS, validateContact, type Topic } from "@/lib/contact-mail";
 import { cn } from "@/lib/utils";
+import { CONTACT_TOPIC_EVENT } from "@/components/layout/source-flow";
 
 /**
  * The contact form (WEB-5 D15, after the RantAI site's `contact-form.tsx`,
@@ -42,6 +43,17 @@ export function ContactForm({ text, to }: Readonly<{ text: ContactCopy["form"]; 
   const [sent, setSent] = React.useState(false);
   const [copied, setCopied] = React.useState<"idle" | "copied" | "failed">("idle");
   const addressRef = React.useRef<HTMLSpanElement>(null);
+
+  // O14: the footer card's "Ask about <source>" on this page presets the topic and the message.
+  React.useEffect(() => {
+    const preset = (e: Event) => {
+      const d = (e as CustomEvent<{ topic: Topic; message: string }>).detail;
+      if (d?.topic && TOPICS.includes(d.topic)) setTopic(d.topic);
+      if (d?.message) setMessage((m) => (m.trim() ? m : d.message));
+    };
+    window.addEventListener(CONTACT_TOPIC_EVENT, preset);
+    return () => window.removeEventListener(CONTACT_TOPIC_EVENT, preset);
+  }, []);
 
   React.useEffect(() => {
     if (copied !== "copied") return;

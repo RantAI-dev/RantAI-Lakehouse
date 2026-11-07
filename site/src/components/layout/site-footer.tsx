@@ -1,22 +1,42 @@
 import * as React from "react";
-import { ArrowUp, ArrowUpRight, Mail } from "lucide-react";
+import { ArrowUpRight, Mail } from "lucide-react";
 import { localizedPath } from "@/i18n/paths";
 import type { Locale } from "@/i18n/routing";
 import type { CommonCopy } from "@/lib/copy";
 import { CONTACT_EMAIL, FOOTER_SECTIONS, LINKS, RANTAI_PRODUCTS, SOCIAL_LINKS } from "@/lib/home-content";
-import { CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
+import { DisplayHeading, Eyebrow } from "@/components/shared/primitives";
 import { MascotMark } from "@/components/shared/mascot-svg";
-import { Reveal as LiftReveal, SplitWords } from "@/components/shared/reveal";
+import { SplitWords } from "@/components/shared/reveal";
 import { SocialIcon } from "@/components/shared/social-icons";
 import { BackToTop, FooterWordmark, Reveal } from "./footer-motion";
-import { FooterPrompt } from "./footer-prompt";
+import { SourceFlow } from "./source-flow";
+import { SourceIcon, type SourceIconId } from "@/components/shared/brand-icons";
+
+/**
+ * WEB-5 O14: the sources the footer card offers, ten of the sources the
+ * product connects to today (the sources section's own, claimed there),
+ * with their marks (`components/shared/brand-icons.tsx`).
+ */
+const FLOW_SOURCES: readonly { name: string; icon: SourceIconId }[] = [
+  { name: "PostgreSQL", icon: "postgresql" },
+  { name: "MySQL", icon: "mysql" },
+  { name: "SQL Server", icon: "database" },
+  { name: "MongoDB", icon: "mongodb" },
+  { name: "Salesforce", icon: "app" },
+  { name: "HubSpot", icon: "hubspot" },
+  { name: "Excel", icon: "spreadsheet" },
+  { name: "CSV", icon: "spreadsheet" },
+  { name: "Kafka", icon: "apachekafka" },
+  { name: "REST API", icon: "rest" },
+];
 
 /**
  * S9 — the footer, on rantai-page's footer structure in the lake's look
  * (WEB-5 owner QA O7, `components/layout/footer.tsx`, `footer-motion.tsx`
  * and `footer-prompt.tsx`), so every product site has the same footer:
- * 1. a rounded call-to-action card with a typewriter prompt that opens an
- *    e-mail (on the contact page, a pointer back to the form);
+ * 1. a rounded call-to-action card, Lakehouse's own (O14): pick a source and
+ *    watch it flow through Bronze, Silver and Gold into a dashboard, then
+ *    start with it (an e-mail; on the contact page, the form);
  * 2. the links: the mark, tagline and "Follow RantAI" (D17), then Product,
  *    Connect, and the RantAI products with their official marks, this one
  *    marked as the current site;
@@ -117,31 +137,22 @@ export function SiteFooter({
         className="relative isolate overflow-hidden rounded-[28px] bg-[linear-gradient(180deg,#050A30_0%,#0A1F55_62%,#0b2a66_100%)] ring-1 ring-[#E8F4FF]/10"
       >
         <FooterWater />
-        <div className="mx-auto flex max-w-3xl flex-col items-center px-6 py-16 text-center max-sm:items-start max-sm:px-6 max-sm:py-14 max-sm:text-left sm:py-28">
+        {/* O14: Lakehouse's own call to action. Little text: an eyebrow and a headline, then the picker. */}
+        <div className="mx-auto flex max-w-5xl flex-col items-center px-5 py-16 text-center sm:px-8 sm:py-24">
           <Eyebrow>{cta.eyebrow}</Eyebrow>
-          <DisplayHeading id="footer-cta-heading" size="md" className="mt-5 max-w-[18ch]">
-            <SplitWords text={page === "home" ? cta.title : cta.contactTitle} />
+          <DisplayHeading id="footer-cta-heading" size="md" className="mt-5 max-w-[20ch]">
+            <SplitWords text={cta.title} />
           </DisplayHeading>
-          <LeadText className="mt-5 max-w-xl max-sm:text-[16px]">{page === "home" ? cta.line : cta.contactLine}</LeadText>
-          {page === "home" ? (
-            <>
-              <LiftReveal className="mt-10 w-full max-sm:mt-8" delay={0.15} y={16}>
-                <FooterPrompt text={cta} to={CONTACT_EMAIL} />
-              </LiftReveal>
-              <a
-                href="#get-started"
-                className="group mt-8 inline-flex min-h-10 items-center gap-1.5 text-[15px] text-[#E8F4FF]/70 transition-colors duration-200 ease-out hover:text-[#E8F4FF]"
-              >
-                {cta.install}
-                <ArrowUp aria-hidden="true" className="size-4 transition-transform duration-200 ease-out group-hover:-translate-y-0.5 motion-reduce:transition-none" />
-              </a>
-            </>
-          ) : (
-            <CtaLink href="#contact-heading" variant="ghost" className="mt-8">
-              <ArrowUp aria-hidden="true" className="size-4 transition-transform duration-200 ease-out group-hover:-translate-y-0.5 motion-reduce:transition-none" />
-              {cta.backToForm}
-            </CtaLink>
-          )}
+          <div className="mt-10 w-full">
+            <SourceFlow
+              names={FLOW_SOURCES.map((s) => s.name)}
+              marks={FLOW_SOURCES.map((s) => <SourceIcon key={s.name} id={s.icon} />)}
+              text={cta}
+              to={CONTACT_EMAIL}
+              page={page}
+              installHref={page === "home" ? "#get-started" : `${home}#get-started`}
+            />
+          </div>
         </div>
       </section>
 
