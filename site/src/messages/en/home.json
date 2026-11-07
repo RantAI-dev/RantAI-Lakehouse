@@ -186,7 +186,7 @@
   },
   "governance": {
     "headline": "Guarded by default.",
-    "sub": "Roles decide who sees what. Sensitive columns are classified and masked for everyone who should not see them, and column-level lineage shows where every column comes from.",
+    "sub": "Roles decide who sees what, down to the column.",
     "illustration": "Illustration · fictional people",
     "viewAs": "View as",
     "roles": {
@@ -200,28 +200,63 @@
       "amount": "Amount"
     },
     "tableCaption": "Five fictional customers. As an analyst the name and email columns are masked; as an admin they are shown in full.",
-    "facts": [
-      {
-        "label": "Proof",
-        "text": "Masking proven end to end in an acceptance gate"
+    "status": {
+      "analyst": "Showing as Analyst: names and emails masked",
+      "admin": "Showing as Admin: every column in full"
+    },
+    "policy": {
+      "analyst": "PII masked for Analyst",
+      "admin": "Admin · full access"
+    },
+    "pii": "PII",
+    "piiTip": "Personal data, masked for roles without access",
+    "masked": "masked",
+    "bento": {
+      "lineage": {
+        "title": "Column-level lineage",
+        "line": "See where every column comes from, raw to curated.",
+        "nodes": [
+          "orders.amount",
+          "clean.amount",
+          "revenue_by_city"
+        ]
       },
-      {
-        "label": "Audit",
-        "text": "Assistant actions logged; risky ones wait for approval"
+      "proof": {
+        "title": "Masking, tested",
+        "line": "An automated acceptance test checks it end to end.",
+        "badge": "Tested end to end"
       },
-      {
-        "label": "Lineage",
-        "text": "Column-level lineage, from raw table to curated table"
+      "audit": {
+        "title": "Every action, logged",
+        "line": "Risky assistant actions wait for a person.",
+        "rows": [
+          "Built chart “Visits by region”",
+          "Refreshed revenue_by_city",
+          "Pause pipeline sales_nightly"
+        ],
+        "awaiting": "Awaiting approval",
+        "approved": "Approved"
       },
-      {
-        "label": "Catalog",
-        "text": "Catalog search with certified and deprecated marks and governed tags"
+      "catalog": {
+        "title": "A catalog you can trust",
+        "line": "Search, then see what is certified or deprecated.",
+        "query": "revenue",
+        "certified": "Certified",
+        "deprecated": "Deprecated",
+        "tag": "finance"
       },
-      {
-        "label": "Access",
-        "text": "Permissions per dashboard and per folder"
+      "access": {
+        "title": "Access per folder",
+        "line": "Permissions per dashboard and per folder.",
+        "folders": [
+          "Sales",
+          "Finance"
+        ],
+        "dashboard": "Revenue",
+        "open": "Open to Admin",
+        "closed": "Closed to Analyst"
       }
-    ]
+    }
   },
   "open": {
     "headline": "Yours to keep.",

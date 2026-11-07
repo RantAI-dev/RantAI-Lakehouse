@@ -85,14 +85,17 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.dashboards.features.8", backlog: ["BI-19 In Acceptance", "SEC-12 In Acceptance"], note: "public links with an expiry and a password (BI-19 A)" },
   { key: "home.dashboards.features.9", backlog: ["BI-26 In Acceptance", "SEC-12 In Acceptance"], note: "embeds" },
   // Governance
-  { key: "home.governance.sub", backlog: ["DATA-13 Released"], note: "column-level lineage" },
-  { key: "home.governance.facts.2.text", backlog: ["DATA-13 Released"], note: "column-level lineage" },
-  { key: "home.governance.facts.3.text", backlog: ["DATA-11 Released", "DATA-12 Released"], note: "catalog search; certified and deprecated marks; governed tags" },
-  { key: "home.governance.facts.4.text", backlog: ["BI-19 In Acceptance"], note: "permissions per dashboard and folder" },
   // The hero's reassurance line (D21, 2026-11-07): each part is a claim.
   { key: "home.hero.reassurance.0", backlog: ["WEB-1 In Acceptance"], note: "free and open source: the repository is public under the AGPL-3.0, with no price (the open-source card; JSON-LD isAccessibleForFree)" },
   { key: "home.hero.reassurance.1", backlog: ["WEB-1 In Acceptance"], note: "the repository's LICENSE is the GNU AGPL v3" },
   { key: "home.hero.reassurance.2", backlog: ["WEB-1 In Acceptance", "REL-2 Done"], note: "the 'Your servers or ours' card; the stack runs from docker-compose.yml (REL-2)" },
+  // Governance (O16 + O17, 2026-11-07): the one-line lead and the bento's lines.
+  { key: "home.governance.sub", backlog: ["WEB-1 In Acceptance"], note: "roles decide who sees what; columns are classified and masked (WEB-1's claim, the table shows it)" },
+  { key: "home.governance.bento.lineage.line", backlog: ["DATA-13 Released"], note: "column-level lineage" },
+  { key: "home.governance.bento.proof.line", backlog: ["WEB-1 In Acceptance"], note: "masking proven end to end in an acceptance gate (WEB-1's governance fact, kept; the gate is ops/g*)" },
+  { key: "home.governance.bento.audit.line", backlog: ["AI-18 In Acceptance", "SEC-57 Done"], note: "assistant actions logged; risky ones wait for a person's approval" },
+  { key: "home.governance.bento.catalog.line", backlog: ["DATA-11 Released", "DATA-12 Released"], note: "catalog search; certified and deprecated marks; governed tags (the tag chip)" },
+  { key: "home.governance.bento.access.line", backlog: ["BI-19 In Acceptance"], note: "permissions per dashboard and per folder" },
   // The real console (D19, 2026-11-07): a crop of rantai-page's
   // public/products/lake-home.webp; the strings are the console's own
   // (src/lib/home-prompts.ts, src/features/home/home-shortcuts.ts).

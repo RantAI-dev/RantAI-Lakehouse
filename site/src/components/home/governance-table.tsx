@@ -2,29 +2,43 @@
 
 import * as React from "react";
 import { useInView } from "framer-motion";
-import { Lock } from "lucide-react";
+import { Lock, LockOpen, MapPin } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";
 import { GOVERNANCE_COLUMNS, GOVERNANCE_ROWS } from "@/lib/home-content";
-import { maskEmail, maskName, scrambleFrame } from "@/lib/scramble";
+import { scrambleFrame } from "@/lib/scramble";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
- * The governance section's illustration: the masked table, its "View as"
- * toggle, the one automatic flip to Analyst when it scrolls into view, and
- * the scrambling cells. The client leaf of `governance-section.tsx` (WEB-5
- * review fix R5); the headline, lead and facts render on the server there.
+ * The governance section's table (WEB-5 owner QA O17, the client leaf of
+ * `governance-section.tsx`): a product-grade data table of five fictional
+ * customers, and the "View as" switch that shows the masking policy act.
+ *
+ * - The switch is a radio group with a sliding thumb (220 ms); the arrow
+ *   keys move it. A policy chip beside it says what the role sees, and a
+ *   live region announces it.
+ * - Sensitive columns carry a "PII" tag with a tooltip on hover and focus.
+ * - For Admin the cells hold the real values and they decode into place,
+ *   row by row, 40 ms apart (`lib/scramble`). For Analyst only the masked
+ *   form exists in the DOM: a soft redaction bar with a faint shimmer, and
+ *   the avatar turns to a blurred silhouette. Reduced motion swaps at once.
+ * - The role is also written on the section (`data-role`), so the bento's
+ *   access tile below opens or closes its lock in CSS, with no more script.
+ * - It starts as Admin and, once, flips to Analyst when it scrolls into
+ *   view, unless the visitor has already chosen.
+ * - Phones: the table scrolls inside its own frame, with a fade at the edge.
  */
 
 type Role = "analyst" | "admin";
 type GovernanceCopy = HomeCopy["governance"];
+const ROLES: Role[] = ["analyst", "admin"];
 
 export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
   const tableRef = React.useRef<HTMLDivElement>(null);
   const reduced = useReducedMotionSafe();
   const [role, setRole] = React.useState<Role>("admin");
   const touched = React.useRef(false);
-  const inView = useInView(tableRef, { once: true, amount: 0.7 });
+  const inView = useInView(tableRef, { once: true, amount: 0.6 });
 
   // The one automatic flip, unless the visitor has already chosen for themselves.
   React.useEffect(() => {
@@ -35,6 +49,11 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
     return () => window.clearTimeout(id);
   }, [inView]);
 
+  // The bento's access tile follows the role (governance-section.tsx).
+  React.useEffect(() => {
+    tableRef.current?.closest("section")?.setAttribute("data-role", role);
+  }, [role]);
+
   const choose = (next: Role) => {
     touched.current = true;
     setRole(next);
@@ -43,45 +62,60 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
   return (
     <div
       ref={tableRef}
-      className="overflow-hidden rounded-3xl border border-[#E8F4FF]/12 bg-[#020514]/55 shadow-[0_40px_120px_-50px_rgba(68,166,250,0.45)] backdrop-blur-md"
+      className="overflow-hidden rounded-3xl border border-[#E8F4FF]/12 bg-[#020514]/60 shadow-[0_40px_120px_-50px_rgba(68,166,250,0.45),inset_0_1px_0_rgba(232,244,255,0.06)] backdrop-blur-md"
     >
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E8F4FF]/10 px-4 py-3 md:px-6">
-        <p className="text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">
-          {copy.illustration}
-        </p>
-        <RoleToggle copy={copy} role={role} onChange={choose} />
+        <p className="text-[13px] text-[#E8F4FF]/55">{copy.illustration}</p>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <PolicyChip copy={copy} role={role} />
+          <RoleToggle copy={copy} role={role} onChange={choose} />
+        </div>
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[620px] text-left">
+      <p aria-live="polite" className="sr-only">
+        {copy.status[role]}
+      </p>
+      {/* Phones: the table scrolls inside its frame; the right edge fades to say there is more. */}
+      <div className="overflow-x-auto max-md:[mask-image:linear-gradient(90deg,#000_82%,transparent)]">
+        <table className="w-full min-w-[640px] text-left">
           <caption className="sr-only">{copy.tableCaption}</caption>
           <thead>
-            <tr className="text-[11px] tracking-[0.16em] text-[#E8F4FF]/60 uppercase">
+            <tr className="text-[13px] text-[#E8F4FF]/55">
               {GOVERNANCE_COLUMNS.map((c) => (
-                <th key={c.key} scope="col" className="px-4 py-3 font-medium md:px-6">
-                  <span className="inline-flex items-center gap-1.5">
+                <th
+                  key={c.key}
+                  scope="col"
+                  className={cn("px-4 py-3 font-medium md:px-6", c.key === "amount" && "text-right")}
+                >
+                  <span className="inline-flex items-center gap-2">
                     {copy.columns[c.key]}
-                    {role === "analyst" && c.masked && (
-                      <Lock aria-hidden="true" className="size-3 text-[#44A6FA]" />
-                    )}
+                    {c.masked && <PiiTag copy={copy} />}
                   </span>
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {GOVERNANCE_ROWS.map((r) => (
+            {GOVERNANCE_ROWS.map((r, i) => (
               <tr
                 key={r.email}
-                className="border-t border-[#E8F4FF]/8 text-[14px] transition-colors hover:bg-[#E8F4FF]/[0.04]"
+                className="border-t border-[#E8F4FF]/8 text-[14px] text-[#E8F4FF]/90 transition-colors duration-200 hover:bg-[#E8F4FF]/[0.04]"
               >
-                <td className="px-4 py-3.5 whitespace-nowrap md:px-6">
-                  <Masked value={r.name} masked={maskName(r.name)} role={role} animate={!reduced} />
+                <td className="px-4 py-4 whitespace-nowrap md:px-6">
+                  <span className="inline-flex items-center gap-3">
+                    <Avatar name={r.name} masked={role === "analyst"} />
+                    <Cell value={r.name} role={role} row={i} animate={!reduced} label={copy.masked} />
+                  </span>
                 </td>
-                <td className="px-4 py-3.5 whitespace-nowrap md:px-6">
-                  <Masked value={r.email} masked={maskEmail(r.email)} role={role} animate={!reduced} />
+                <td className="px-4 py-4 whitespace-nowrap md:px-6">
+                  <Cell value={r.email} role={role} row={i} animate={!reduced} label={copy.masked} />
                 </td>
-                <td className="px-4 py-3.5 whitespace-nowrap md:px-6">{r.city}</td>
-                <td className="px-4 py-3.5 whitespace-nowrap tabular-nums md:px-6">{r.amount}</td>
+                <td className="px-4 py-4 whitespace-nowrap md:px-6">
+                  <span className="inline-flex items-center gap-1.5">
+                    <MapPin aria-hidden="true" className="size-3.5 text-[#44A6FA]/70" />
+                    {r.city}
+                  </span>
+                </td>
+                <td className="px-4 py-4 text-right whitespace-nowrap tabular-nums md:px-6">€{r.amount}</td>
               </tr>
             ))}
           </tbody>
@@ -91,86 +125,154 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
   );
 }
 
-function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role; onChange: (r: Role) => void }) {
-  const options: { id: Role; label: string }[] = [
-    { id: "analyst", label: copy.roles.analyst },
-    { id: "admin", label: copy.roles.admin },
-  ];
+function PolicyChip({ copy, role }: { copy: GovernanceCopy; role: Role }) {
+  const Icon = role === "analyst" ? Lock : LockOpen;
   return (
-    <div className="flex items-center gap-3">
-      <span id="lk-view-as" className="text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">
+    <span
+      key={role}
+      className={cn(
+        "lk-fade-in inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] font-medium ring-1",
+        role === "analyst" ? "bg-[#44A6FA]/10 text-[#8fcbff] ring-[#44A6FA]/30" : "bg-[#7be0b0]/10 text-[#7be0b0] ring-[#7be0b0]/30",
+      )}
+    >
+      <Icon aria-hidden="true" className="size-3.5" />
+      {copy.policy[role]}
+    </span>
+  );
+}
+
+function PiiTag({ copy }: { copy: GovernanceCopy }) {
+  const id = React.useId();
+  return (
+    <span className="group/pii relative inline-flex">
+      <span
+        tabIndex={0}
+        aria-describedby={id}
+        className="rounded-md bg-[#44A6FA]/12 px-1.5 py-px text-[10px] font-semibold tracking-[0.06em] text-[#8fcbff] ring-1 ring-[#44A6FA]/30 outline-none focus-visible:ring-2 focus-visible:ring-[#44A6FA]"
+      >
+        {copy.pii}
+      </span>
+      <span
+        id={id}
+        role="tooltip"
+        className="pointer-events-none absolute top-full left-0 z-10 mt-2 w-max max-w-[15rem] rounded-lg bg-[#020514]/95 px-2.5 py-1.5 text-[12px] leading-4 font-normal text-[#E8F4FF] opacity-0 shadow-[inset_0_0_0_1px_rgba(232,244,255,0.2)] transition-opacity duration-200 group-hover/pii:opacity-100 group-focus-within/pii:opacity-100"
+      >
+        {copy.piiTip}
+      </span>
+    </span>
+  );
+}
+
+function Avatar({ name, masked }: { name: string; masked: boolean }) {
+  const initials = name
+    .split(" ")
+    .map((w) => w[0])
+    .join("");
+  return (
+    <span
+      aria-hidden="true"
+      className={cn(
+        "grid size-8 shrink-0 place-items-center rounded-full text-[11px] font-semibold transition-[filter,background-color,color] duration-300 ease-out",
+        masked ? "bg-[#E8F4FF]/10 text-transparent blur-[2px]" : "bg-[#44A6FA]/20 text-[#bfe0ff]",
+      )}
+    >
+      {masked ? <span className="block size-3 rounded-full bg-[#E8F4FF]/35" /> : initials}
+    </span>
+  );
+}
+
+/**
+ * One sensitive cell. As Admin it holds the value, decoding into place
+ * (random glyphs settle left to right in 420 ms, starting 40 ms after the
+ * row above). As Analyst it holds only a redaction bar as long as the value,
+ * with a faint shimmer, and the word "masked" for screen readers.
+ */
+function Cell({ value, role, row, animate, label }: { value: string; role: Role; row: number; animate: boolean; label: string }) {
+  const [shown, setShown] = React.useState(value);
+  const previous = React.useRef(role);
+
+  // Decode only on the way back to Admin; the frames are set from the
+  // animation callback, never in the effect itself.
+  React.useEffect(() => {
+    const was = previous.current;
+    previous.current = role;
+    if (role !== "admin" || was === "admin" || !animate) return;
+    let raf = 0;
+    const t0 = performance.now() + row * 40;
+    const from = value.replace(/[^@.\s]/g, "•");
+    const step = (now: number) => {
+      const p = Math.max(0, Math.min(1, (now - t0) / 420));
+      setShown(scrambleFrame(from, value, p, Math.random));
+      if (p < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [role, value, row, animate]);
+
+  if (role === "analyst") {
+    return (
+      <span
+        className="lk-redact relative inline-block h-[0.95em] rounded-full align-middle"
+        style={{ width: `${Math.min(14, value.length * 0.55)}em`, animationDelay: `${row * 40}ms` }}
+      >
+        <span className="sr-only">{label}</span>
+      </span>
+    );
+  }
+  return (
+    <span>
+      <span aria-hidden="true">{animate ? shown : value}</span>
+      <span className="sr-only">{value}</span>
+    </span>
+  );
+}
+
+function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role; onChange: (r: Role) => void }) {
+  const refs = React.useRef<(HTMLButtonElement | null)[]>([]);
+  const onKey = (e: React.KeyboardEvent) => {
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+    e.preventDefault();
+    const next = ROLES[(ROLES.indexOf(role) + 1) % ROLES.length];
+    onChange(next);
+    refs.current[ROLES.indexOf(next)]?.focus();
+  };
+  return (
+    <div className="flex items-center gap-2.5">
+      <span id="lk-view-as" className="text-[13px] text-[#E8F4FF]/55">
         {copy.viewAs}
       </span>
       <div
         role="radiogroup"
         aria-labelledby="lk-view-as"
-        className="relative flex rounded-full border border-[#E8F4FF]/15 bg-[#E8F4FF]/[0.05] p-0.5"
+        onKeyDown={onKey}
+        className="relative grid grid-cols-2 rounded-full bg-[#E8F4FF]/[0.06] p-0.5 ring-1 ring-[#E8F4FF]/12"
       >
-        {options.map((o) => (
+        {/* The thumb slides under the chosen role. */}
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-[var(--lk-primary)] shadow-[0_6px_20px_-6px_rgba(68,166,250,0.7)] transition-transform duration-[220ms] ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none"
+          style={{ transform: role === "admin" ? "translateX(100%)" : "translateX(0)" }}
+        />
+        {ROLES.map((r, i) => (
           <button
-            key={o.id}
+            key={r}
+            ref={(el) => {
+              refs.current[i] = el;
+            }}
             type="button"
             role="radio"
-            aria-checked={role === o.id}
-            onClick={() => onChange(o.id)}
+            aria-checked={role === r}
+            tabIndex={role === r ? 0 : -1}
+            onClick={() => onChange(r)}
             className={cn(
-              // Micro pass (DESIGN.md §3): 200 ms, a hover wash and a press on the idle side.
-              "relative rounded-full px-4 py-1.5 text-[13px] font-medium transition-[background-color,color,transform] duration-200 ease-out active:scale-95 motion-reduce:transition-none",
-              role === o.id ? "bg-[#44A6FA] text-[#020514]" : "text-[#E8F4FF]/75 hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF]",
+              "relative z-10 rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors duration-200 ease-out active:scale-95 motion-reduce:transition-none",
+              role === r ? "text-white" : "text-[#E8F4FF]/70 hover:text-[#E8F4FF]",
             )}
           >
-            {o.label}
+            {copy.roles[r]}
           </button>
         ))}
       </div>
     </div>
-  );
-}
-
-/**
- * One cell that cycles random glyphs for 400 ms when its role changes, then
- * rests on the masked or the full value. Screen readers get the final value
- * only; the in-between frames are `aria-hidden`.
- */
-function Masked({
-  value,
-  masked,
-  role,
-  animate,
-}: {
-  value: string;
-  masked: string;
-  role: Role;
-  animate: boolean;
-}) {
-  const target = role === "admin" ? value : masked;
-  const [shown, setShown] = React.useState(target);
-  const previous = React.useRef(target);
-
-  React.useEffect(() => {
-    if (!animate || previous.current === target) {
-      previous.current = target;
-      return;
-    }
-    const from = previous.current;
-    previous.current = target;
-    const t0 = performance.now();
-    let raf = 0;
-    const step = (now: number) => {
-      const p = Math.min(1, (now - t0) / 400);
-      setShown(scrambleFrame(from, target, p, Math.random));
-      if (p < 1) raf = requestAnimationFrame(step);
-    };
-    raf = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(raf);
-  }, [target, animate]);
-
-  // Without animation the cell simply shows the target; with it, the frame.
-  const text = animate ? shown : target;
-  return (
-    <span className={cn("text-[13px]", role === "analyst" && "text-[#E8F4FF]/90")}>
-      <span aria-hidden="true">{text}</span>
-      <span className="sr-only">{target}</span>
-    </span>
   );
 }

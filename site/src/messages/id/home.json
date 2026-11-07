@@ -186,7 +186,7 @@
   },
   "governance": {
     "headline": "Aman sejak awal.",
-    "sub": "Peran menentukan siapa melihat apa. Kolom sensitif diklasifikasikan dan disamarkan bagi siapa pun yang tak berhak melihatnya, dan lineage tingkat kolom menunjukkan asal setiap kolom.",
+    "sub": "Peran menentukan siapa melihat apa, sampai ke tiap kolom.",
     "illustration": "Ilustrasi · orang fiktif",
     "viewAs": "Lihat sebagai",
     "roles": {
@@ -200,28 +200,63 @@
       "amount": "Jumlah"
     },
     "tableCaption": "Lima pelanggan fiktif. Sebagai analis, kolom nama dan email disamarkan; sebagai admin, keduanya tampil utuh.",
-    "facts": [
-      {
-        "label": "Bukti",
-        "text": "Masking terbukti end to end di acceptance gate"
+    "status": {
+      "analyst": "Tampilan Analyst: nama dan email disamarkan",
+      "admin": "Tampilan Admin: semua kolom terlihat"
+    },
+    "policy": {
+      "analyst": "PII disamarkan untuk Analyst",
+      "admin": "Admin · akses penuh"
+    },
+    "pii": "PII",
+    "piiTip": "Data pribadi, disamarkan untuk peran tanpa akses",
+    "masked": "disamarkan",
+    "bento": {
+      "lineage": {
+        "title": "Lineage per kolom",
+        "line": "Lihat asal setiap kolom, dari mentah sampai terkurasi.",
+        "nodes": [
+          "orders.amount",
+          "clean.amount",
+          "revenue_by_city"
+        ]
       },
-      {
-        "label": "Audit",
-        "text": "Aksi asisten tercatat; yang berisiko menunggu persetujuan"
+      "proof": {
+        "title": "Masking teruji",
+        "line": "Uji penerimaan otomatis memeriksanya dari awal sampai akhir.",
+        "badge": "Teruji menyeluruh"
       },
-      {
-        "label": "Lineage",
-        "text": "Lineage tingkat kolom, dari tabel mentah ke tabel terkurasi"
+      "audit": {
+        "title": "Setiap aksi tercatat",
+        "line": "Aksi asisten yang berisiko menunggu persetujuan orang.",
+        "rows": [
+          "Membuat chart “Kunjungan per wilayah”",
+          "Memperbarui revenue_by_city",
+          "Jeda pipeline sales_nightly"
+        ],
+        "awaiting": "Menunggu persetujuan",
+        "approved": "Disetujui"
       },
-      {
-        "label": "Katalog",
-        "text": "Pencarian katalog dengan tanda certified dan deprecated serta tag terkelola"
+      "catalog": {
+        "title": "Katalog tepercaya",
+        "line": "Cari, lalu lihat mana yang certified atau deprecated.",
+        "query": "revenue",
+        "certified": "Certified",
+        "deprecated": "Deprecated",
+        "tag": "finance"
       },
-      {
-        "label": "Akses",
-        "text": "Izin per dashboard dan per folder"
+      "access": {
+        "title": "Akses per folder",
+        "line": "Izin per dashboard dan per folder.",
+        "folders": [
+          "Sales",
+          "Finance"
+        ],
+        "dashboard": "Revenue",
+        "open": "Terbuka untuk Admin",
+        "closed": "Tertutup untuk Analyst"
       }
-    ]
+    }
   },
   "open": {
     "headline": "Milik Anda.",
