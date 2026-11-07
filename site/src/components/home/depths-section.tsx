@@ -4,6 +4,18 @@ import { DEPTH_LAYERS } from "@/lib/home-content";
 import { Container, DisplayHeading, Eyebrow } from "@/components/shared/primitives";
 import { ProgressSection } from "@/components/shared/progress-section";
 import { DepthsStage } from "./depths-stage";
+import { DepthDataCard } from "./depth-data-card";
+import { DepthKey } from "./depth-key";
+
+/**
+ * WEB-5 O21: without JavaScript the pinned stage cannot follow the scroll,
+ * so it would show Bronze for the whole section. The page then reads as with
+ * reduced motion instead: no pin, and every depth with its final card. A
+ * `<noscript>` style, because it is the one switch that exists before any
+ * script runs and costs nothing for everyone else.
+ */
+const NO_SCRIPT_CSS =
+  ".lk-depth-pin{height:auto!important}.lk-depth-stage{display:none!important}.lk-depth-list{display:block!important}";
 
 /**
  * S3 — "Three depths": the medallion layers, Bronze to Gold.
@@ -13,38 +25,46 @@ import { DepthsStage } from "./depths-stage";
  * gauge; both read the same progress as the engine (`scroll-timeline.ts`),
  * so the lit slab, the copy and the gauge marker always agree. Without the
  * canvas the same stage shows a CSS stack in its place. With reduced motion
- * there is no pin at all: the three depths are a plain list of cards.
+ * (and, since O21, without JavaScript) there is no pin at all: the three
+ * depths are a plain list, each with its data card at rest.
  *
  * WEB-5 review fix R5: a server component. The pinned stage is the client
  * leaf in `depths-stage.tsx`; the reduced-motion list renders here.
  */
 export function DepthsSection({ copy }: { copy: HomeCopy["depths"] }) {
   return (
-    <ProgressSection range={["start start", "end end"]} id="depths" className="relative h-[300vh] motion-reduce:h-auto">
+    <ProgressSection
+      range={["start start", "end end"]}
+      id="depths"
+      className="lk-depth-pin relative h-[300vh] motion-reduce:h-auto"
+    >
       <h2 className="sr-only">{copy.eyebrow}</h2>
+      <noscript dangerouslySetInnerHTML={{ __html: `<style>${NO_SCRIPT_CSS}</style>` }} />
 
       {/* Pinned, scroll-driven stage. */}
       <DepthsStage copy={copy} />
 
-      {/* Reduced motion: no pin, no canvas, all three depths on the page. */}
-      <div className="hidden py-28 motion-reduce:block">
+      {/* Reduced motion (and no JavaScript): no pin, no canvas, all three depths on the page, each with its card at rest. */}
+      <div className="lk-depth-list hidden py-28 motion-reduce:block">
         <Container>
           <Eyebrow aria-hidden="true">{copy.eyebrow}</Eyebrow>
           <DisplayHeading className="mt-4" aria-hidden="true">
             {copy.headline}
           </DisplayHeading>
-          <ol className="mt-12 grid gap-5 md:grid-cols-3">
-            {DEPTH_LAYERS.map((l) => (
+          <DepthKey active={2} words={copy.key} className="mt-6" />
+          <ol className="mt-10 grid gap-5 lg:grid-cols-3">
+            {DEPTH_LAYERS.map((l, i) => (
               <li
                 key={l.id}
-                className="rounded-3xl border border-[#E8F4FF]/10 bg-[#E8F4FF]/[0.04] p-7"
+                className="flex flex-col rounded-3xl border border-[#E8F4FF]/10 bg-[#E8F4FF]/[0.04] p-5 md:p-6"
                 style={{ boxShadow: `inset 0 1px 0 0 ${l.accent}66` }}
               >
                 <p className="text-[12px] tracking-[0.2em] uppercase" style={{ color: l.accent }}>
                   {l.label} · {l.meters}
                 </p>
                 <h3 className="lk-display mt-3 text-[34px] leading-[1.05] text-[#E8F4FF]">{copy.layers[l.id].title}</h3>
-                <p className="mt-3 text-[16px] leading-[1.6] text-[#E8F4FF]/85">{copy.layers[l.id].body}</p>
+                <p className="mt-3 text-[15px] leading-[1.55] text-[#E8F4FF]/85">{copy.layers[l.id].body}</p>
+                <DepthDataCard stage={i as 0 | 1 | 2} copy={copy.card} animate={false} className="mt-auto pt-5" />
               </li>
             ))}
           </ol>

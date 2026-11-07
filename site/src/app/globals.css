@@ -961,3 +961,425 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
     animation: none;
   }
 }
+
+/* ---- WEB-5 O21: the depths' data card (components/home/depth-data-card.tsx) ----
+   One table that changes with the depth: `data-stage` on the card says
+   which, and every move below is a transition between two of its states,
+   so scrolling back up plays them in reverse. The accent is a registered
+   property so it eases from bronze to silver to gold with the rows. */
+@property --lk-depth-accent {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #c8834a;
+}
+.lk-depth-card {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --lk-depth-row: 32px;
+  --lk-depth-group: 44px;
+  --lk-depth-ok: #7ee2b0;
+  --lk-depth-bad: #ff9b8e;
+  container: lk-depth / inline-size;
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius-3xl);
+  border: 1px solid rgba(232, 244, 255, 0.12);
+  background:
+    radial-gradient(120% 60% at 0% 0%, color-mix(in srgb, var(--lk-depth-accent) 10%, transparent), transparent 60%),
+    linear-gradient(180deg, rgba(11, 26, 74, 0.62), rgba(2, 5, 20, 0.82));
+  box-shadow:
+    inset 0 1px 0 0 color-mix(in srgb, var(--lk-depth-accent) 50%, transparent),
+    0 28px 70px -30px rgba(0, 0, 0, 0.7),
+    0 0 50px -20px color-mix(in srgb, var(--lk-depth-accent) 35%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: #e8f4ff;
+  font-size: 12px;
+  line-height: 16px;
+  transition: --lk-depth-accent 0.7s ease;
+}
+.lk-depth-dot {
+  background: var(--lk-depth-accent);
+  box-shadow: 0 0 10px 1px color-mix(in srgb, var(--lk-depth-accent) 70%, transparent);
+  animation: lk-depth-breathe 3.2s ease-in-out infinite;
+}
+@keyframes lk-depth-breathe {
+  50% {
+    opacity: 0.55;
+  }
+}
+.lk-depth-body {
+  height: calc(28px + 5 * var(--lk-depth-row) + 6px);
+}
+
+/* Columns: the source's name and the order number only where they fit. */
+.lk-depth-grid {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) 70px 58px;
+  column-gap: 8px;
+  align-items: center;
+  padding: 0 14px;
+}
+.lk-depth-ord,
+.lk-depth-src-label {
+  display: none;
+}
+@container lk-depth (min-width: 330px) {
+  .lk-depth-grid {
+    grid-template-columns: 14px 50px minmax(0, 1fr) 72px 60px;
+  }
+  .lk-depth-ord {
+    display: block;
+  }
+}
+@container lk-depth (min-width: 400px) {
+  .lk-depth-grid {
+    grid-template-columns: 84px 52px minmax(0, 1fr) 72px 60px;
+  }
+  .lk-depth-src-label {
+    display: inline;
+  }
+}
+.lk-depth-grid-gold {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 52px minmax(0, 1.3fr);
+  column-gap: 14px;
+  align-items: center;
+  padding: 0 14px;
+}
+.lk-depth-head {
+  height: 28px;
+  font-size: 10.5px;
+  color: rgba(232, 244, 255, 0.6);
+  white-space: nowrap;
+  border-bottom: 1px solid rgba(232, 244, 255, 0.06);
+  transition: opacity 0.4s ease;
+}
+
+.lk-depth-row {
+  position: absolute;
+  inset-inline: 0;
+  top: 28px;
+  height: var(--lk-depth-row);
+  border-radius: 8px;
+  transform: translateY(calc(var(--slot) * var(--lk-depth-row)));
+  transition:
+    transform 0.75s var(--lk-ease) calc(0.12s + var(--i) * 45ms),
+    opacity 0.45s ease calc(var(--i) * 45ms),
+    background-color 0.4s ease;
+}
+.lk-depth-row:hover {
+  background-color: rgba(232, 244, 255, 0.05);
+}
+.lk-depth-row + .lk-depth-row::before {
+  content: "";
+  position: absolute;
+  inset-inline: 14px;
+  top: 0;
+  border-top: 1px solid rgba(232, 244, 255, 0.05);
+}
+
+/* Bronze: the mess shows. The second copy of an order is tinted and
+   marked, the spellings Silver will change are underlined, a trailing
+   space is drawn, and the missing amount is a dashed gap. */
+.lk-depth-twice {
+  display: none;
+  background: rgba(200, 131, 74, 0.22);
+  color: #f3c49c;
+}
+[data-stage="bronze"] .lk-depth-row[data-dup] {
+  background-color: rgba(200, 131, 74, 0.1);
+}
+[data-stage="bronze"] .lk-depth-twice {
+  display: inline;
+}
+[data-stage="bronze"] .lk-depth-word[data-fix] [data-word] {
+  text-decoration: underline wavy rgba(226, 158, 102, 0.85);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.lk-depth-space {
+  display: none;
+  margin-left: 1px;
+  color: #e29e66;
+}
+[data-stage="bronze"] .lk-depth-space {
+  display: inline;
+}
+.lk-depth-empty {
+  border: 1px dashed rgba(226, 158, 102, 0.7);
+  color: #f3c49c;
+  transition:
+    background-color 0.4s ease,
+    border-color 0.4s ease,
+    color 0.4s ease;
+}
+.lk-depth-empty-x {
+  display: none;
+}
+
+/* Silver: the duplicate slides out, the rows under it close the gap, each
+   rewritten value flashes once, and the checks mark their columns. */
+[data-stage="silver"] .lk-depth-row[data-dup],
+[data-stage="gold"] .lk-depth-row[data-dup] {
+  opacity: 0;
+  transform: translate(28px, calc(var(--slot) * var(--lk-depth-row)));
+  transition-delay: 0s;
+}
+[data-stage="silver"] .lk-depth-src-label {
+  opacity: 0.6;
+}
+[data-stage="silver"] .lk-depth-word[data-fix] {
+  animation: lk-depth-fix 1.1s ease-out 0.2s;
+  border-radius: 5px;
+}
+@keyframes lk-depth-fix {
+  0%,
+  35% {
+    background-color: rgba(185, 198, 211, 0.24);
+    box-shadow: 0 0 0 3px rgba(185, 198, 211, 0.24);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+[data-stage="silver"] .lk-depth-empty {
+  border-style: solid;
+  border-color: rgba(255, 155, 142, 0.45);
+  background-color: rgba(255, 110, 95, 0.12);
+  color: var(--lk-depth-bad);
+}
+[data-stage="silver"] .lk-depth-empty-x {
+  display: block;
+}
+.lk-depth-mark {
+  opacity: 0;
+  transform: scale(0.4);
+  color: var(--lk-depth-ok);
+  background: rgba(126, 226, 176, 0.14);
+  transition:
+    opacity 0.3s ease,
+    transform 0.45s var(--lk-ease);
+}
+.lk-depth-mark:not([data-ok]) {
+  color: var(--lk-depth-bad);
+  background: rgba(255, 110, 95, 0.16);
+}
+[data-stage="silver"] .lk-depth-mark {
+  opacity: 1;
+  transform: none;
+  transition-delay: 0.6s;
+}
+.lk-depth-badge {
+  color: var(--lk-depth-ok);
+  background: rgba(126, 226, 176, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(126, 226, 176, 0.25);
+}
+.lk-depth-badge:not([data-ok]) {
+  color: var(--lk-depth-bad);
+  background: rgba(255, 110, 95, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(255, 155, 142, 0.3);
+}
+
+/* Gold: every row travels to its city's group and fades into it while
+   the group's bar grows and the revenue counts up. */
+[data-stage="gold"] .lk-depth-row {
+  opacity: 0;
+  transform: translateY(calc(var(--slot) * var(--lk-depth-group))) scaleY(0.7);
+}
+[data-stage="gold"] .lk-depth-body > .lk-depth-head {
+  opacity: 0;
+}
+.lk-depth-gold {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.35s ease;
+}
+[data-stage="gold"] .lk-depth-gold {
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity 0.5s ease 0.3s;
+}
+.lk-depth-group {
+  position: absolute;
+  inset-inline: 0;
+  top: 28px;
+  height: var(--lk-depth-group);
+  border-radius: 8px;
+  transform: translateY(calc(var(--slot) * var(--lk-depth-group) + 8px));
+  transition:
+    transform 0.7s var(--lk-ease) 0.3s,
+    background-color 0.3s ease;
+}
+[data-stage="gold"] .lk-depth-group {
+  transform: translateY(calc(var(--slot) * var(--lk-depth-group)));
+}
+.lk-depth-group:hover {
+  background-color: rgba(242, 193, 78, 0.07);
+}
+.lk-depth-track {
+  background: rgba(232, 244, 255, 0.07);
+}
+.lk-depth-bar {
+  background: linear-gradient(90deg, rgba(242, 193, 78, 0.55), #f2c14e);
+  box-shadow: 0 0 10px rgba(242, 193, 78, 0.45);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.5s var(--lk-ease);
+}
+[data-stage="gold"] .lk-depth-bar {
+  transform: none;
+  transition: transform 1s var(--lk-ease) calc(0.45s + var(--i) * 0.14s);
+}
+.lk-depth-group:hover .lk-depth-bar {
+  filter: brightness(1.15);
+}
+.lk-depth-kpi {
+  color: #f2c14e;
+}
+.lk-depth-lag {
+  color: #f6d27f;
+  background: rgba(242, 193, 78, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(242, 193, 78, 0.28);
+}
+[data-stage="gold"] .lk-depth-spin {
+  animation: lk-depth-spin 6s linear infinite;
+}
+@keyframes lk-depth-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+[data-stage="gold"] .lk-depth-hint {
+  animation: lk-depth-hint 2.4s ease-in-out infinite;
+}
+@keyframes lk-depth-hint {
+  50% {
+    transform: translate(2px, 2px);
+  }
+}
+
+/* The header's table name and the footer's line: one per depth, crossfaded. */
+.lk-depth-swap {
+  opacity: 0;
+  transform: translateY(5px);
+  pointer-events: none;
+  transition:
+    opacity 0.3s ease,
+    transform 0.45s var(--lk-ease);
+}
+[data-stage="bronze"] .lk-depth-swap[data-for="bronze"],
+[data-stage="silver"] .lk-depth-swap[data-for="silver"],
+[data-stage="gold"] .lk-depth-swap[data-for="gold"] {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  transition-delay: 0.2s;
+}
+[data-stage="silver"] .lk-depth-swap[data-for="silver"] .lk-depth-badge {
+  animation: lk-fade-in 0.4s var(--lk-ease) backwards;
+}
+[data-stage="silver"] .lk-depth-swap[data-for="silver"] .lk-depth-badge:nth-child(2) {
+  animation-delay: 0.12s;
+}
+[data-stage="silver"] .lk-depth-swap[data-for="silver"] .lk-depth-badge:nth-child(3) {
+  animation-delay: 0.24s;
+}
+
+/* The three-step key above the chapters: Bronze → Silver → Gold. */
+.lk-depth-key-step {
+  transition:
+    color 0.4s ease,
+    background-color 0.4s ease,
+    box-shadow 0.4s ease;
+}
+.lk-depth-key-link {
+  background: rgba(232, 244, 255, 0.16);
+}
+.lk-depth-key-link > span {
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.6s var(--lk-ease);
+}
+.lk-depth-key-link[data-done] > span {
+  transform: none;
+}
+
+/* Still: the reduced-motion list and the no-JS page show each depth's
+   final card without a transition or a loop. */
+.lk-depth-still,
+.lk-depth-still * {
+  transition: none !important;
+  animation: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-depth-card,
+  .lk-depth-card *,
+  .lk-depth-key-step,
+  .lk-depth-key-link > span {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+/* O21: without a canvas, the CSS slabs stand in only where the cell beside
+   the chapter has room for them (a short phone gives it to the card). */
+.lk-depth-stack-cell {
+  container-type: size;
+}
+@container (max-height: 200px) {
+  .lk-depth-stack-cell > * {
+    display: none;
+  }
+}
+/* O21: a narrow card (phones, the reduced-motion list) keeps every badge and
+   the table's name whole: smaller badges, no row count, and the Gold hint
+   on two short lines. */
+@container lk-depth (max-width: 329px) {
+  .lk-depth-count {
+    display: none;
+  }
+  .lk-depth-badge {
+    gap: 3px;
+    padding-inline: 6px;
+    font-size: 10px;
+  }
+  .lk-depth-badge svg {
+    width: 10px;
+    height: 10px;
+  }
+  .lk-depth-feeds {
+    font-size: 10.5px;
+    line-height: 13px;
+  }
+}
+.lk-depth-word {
+  line-height: 20px;
+}
+.lk-depth-sources {
+  display: none;
+}
+@container lk-depth (max-width: 329px) {
+  .lk-depth-chip {
+    display: none;
+  }
+  .lk-depth-sources {
+    display: inline;
+  }
+  .lk-depth-checks {
+    gap: 4px;
+    padding-inline: 8px;
+  }
+}
+.lk-depth-foot {
+  height: 40px;
+}
+@container lk-depth (max-width: 329px) {
+  .lk-depth-foot {
+    height: 54px;
+  }
+  .lk-depth-checks {
+    flex-wrap: wrap;
+    align-content: center;
+    row-gap: 4px;
+  }
+}

@@ -39,18 +39,54 @@
   "depths": {
     "eyebrow": "Three depths",
     "headline": "Three depths.",
+    "key": {
+      "bronze": "raw",
+      "silver": "clean",
+      "gold": "ready"
+    },
     "layers": {
       "bronze": {
-        "title": "Raw, kept as it came.",
-        "body": "Every source lands untouched in open Apache Iceberg tables, so nothing is lost and nothing is locked in."
+        "title": "As it came.",
+        "body": "Every source lands untouched in open Apache Iceberg tables. Nothing is changed, nothing is lost."
       },
       "silver": {
-        "title": "Cleaned and joined.",
-        "body": "Pipelines with schedules, dependencies, retries and version history clean the raw data into tables you can trust, and quality checks with anomaly detection watch them."
+        "title": "Cleaned and checked.",
+        "body": "Pipelines drop duplicates, fix spellings and join the sources. Quality checks flag what is still wrong."
       },
       "gold": {
         "title": "Ready for answers.",
-        "body": "Curated tables built for the questions your business asks. They refresh themselves within the lag you set, and publish as open tables when you switch it on."
+        "body": "Tables built for your questions, refreshed within the lag you set. Dashboards and the assistant read from here."
+      }
+    },
+    "card": {
+      "illustration": "Illustration",
+      "numberLocale": "en-US",
+      "rows": "rows",
+      "cities": "cities",
+      "sources": "2 sources",
+      "columns": {
+        "source": "Source",
+        "order": "Order",
+        "city": "City",
+        "date": "Date",
+        "amount": "Amount",
+        "orders": "Orders",
+        "revenue": "Revenue"
+      },
+      "empty": "empty",
+      "bronzeNote": "Stored as sent, every row kept",
+      "checks": {
+        "duplicates": "No duplicates",
+        "city": "City valid",
+        "amount": "1 empty amount"
+      },
+      "total": "Total revenue",
+      "lag": "Within target lag",
+      "feeds": "Feeds dashboards and the assistant",
+      "sr": {
+        "bronze": "Illustration: five order rows from an orders file and a CRM export, stored as they came. One order arrives twice, Jakarta is spelt three ways, the dates use three formats and one amount is missing.",
+        "silver": "Illustration: the same rows in one Silver table. The duplicate is gone, every city reads Jakarta or Bandung, every date has one format, and a quality check flags the one empty amount.",
+        "gold": "Illustration: a Gold table of revenue by city built from those rows, Jakarta first, then Bandung, within its target lag, ready for dashboards and the assistant."
       }
     }
   },

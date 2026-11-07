@@ -39,18 +39,54 @@
   "depths": {
     "eyebrow": "Tiga kedalaman",
     "headline": "Tiga kedalaman.",
+    "key": {
+      "bronze": "mentah",
+      "silver": "bersih",
+      "gold": "siap"
+    },
     "layers": {
       "bronze": {
-        "title": "Mentah dan utuh.",
-        "body": "Setiap sumber masuk tanpa diubah ke tabel Apache Iceberg yang terbuka, jadi tak ada yang hilang dan tak ada yang terkunci."
+        "title": "Apa adanya.",
+        "body": "Setiap sumber masuk tanpa diubah ke tabel Apache Iceberg yang terbuka. Tak ada yang diubah, tak ada yang hilang."
       },
       "silver": {
-        "title": "Bersih, terpadu.",
-        "body": "Pipeline dengan jadwal, dependensi, retry, dan riwayat versi membersihkan data mentah menjadi tabel tepercaya, diawasi pemeriksaan kualitas dengan deteksi anomali."
+        "title": "Bersih dan teruji.",
+        "body": "Pipeline membuang duplikat, merapikan ejaan, dan menyatukan sumber. Pemeriksaan kualitas menandai yang masih salah."
       },
       "gold": {
         "title": "Siap menjawab.",
-        "body": "Tabel terkurasi untuk pertanyaan bisnis Anda. Tabel ini diperbarui sendiri dalam lag yang Anda tetapkan, dan terbit sebagai tabel terbuka bila Anda aktifkan."
+        "body": "Tabel untuk pertanyaan bisnis Anda, diperbarui dalam lag yang Anda tetapkan. Dashboard dan asisten membaca dari sini."
+      }
+    },
+    "card": {
+      "illustration": "Ilustrasi",
+      "numberLocale": "id-ID",
+      "rows": "baris",
+      "cities": "kota",
+      "sources": "2 sumber",
+      "columns": {
+        "source": "Sumber",
+        "order": "Pesanan",
+        "city": "Kota",
+        "date": "Tanggal",
+        "amount": "Jumlah",
+        "orders": "Pesanan",
+        "revenue": "Pendapatan"
+      },
+      "empty": "kosong",
+      "bronzeNote": "Disimpan apa adanya, semua baris utuh",
+      "checks": {
+        "duplicates": "Tanpa duplikat",
+        "city": "Kota valid",
+        "amount": "1 jumlah kosong"
+      },
+      "total": "Total pendapatan",
+      "lag": "Dalam target lag",
+      "feeds": "Dipakai dashboard dan asisten",
+      "sr": {
+        "bronze": "Ilustrasi: lima baris pesanan dari file pesanan dan ekspor CRM, disimpan apa adanya. Satu pesanan masuk dua kali, Jakarta ditulis dengan tiga cara, tanggalnya memakai tiga format, dan satu jumlah kosong.",
+        "silver": "Ilustrasi: baris yang sama dalam satu tabel Silver. Duplikatnya hilang, semua kota tertulis Jakarta atau Bandung, semua tanggal satu format, dan pemeriksaan kualitas menandai satu jumlah yang kosong.",
+        "gold": "Ilustrasi: tabel Gold berisi pendapatan per kota dari baris-baris tadi, Jakarta lebih dulu lalu Bandung, dalam target lag-nya, siap untuk dashboard dan asisten."
       }
     }
   },

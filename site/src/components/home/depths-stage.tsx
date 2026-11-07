@@ -6,15 +6,22 @@ import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";
 import { DEPTH_LAYERS, type DepthLayer } from "@/lib/home-content";
 import { useLandingMode } from "@/components/effects/scene-mode";
-import { Container, Eyebrow } from "@/components/shared/primitives";
+import { Container } from "@/components/shared/primitives";
 import { useProgress } from "@/components/shared/progress-section";
 import { activeLayerIndex } from "@/lib/scroll-timeline";
+import { DepthDataCard } from "./depth-data-card";
+import { DepthKey } from "./depth-key";
 
 /**
  * The depths section's pinned, scroll-driven stage: the depth gauge, the
  * panel that swaps to the lit depth, and the CSS stack when there is no
  * canvas. The client leaf of `depths-section.tsx` (WEB-5 review fix R5);
  * the reduced-motion list of all three depths renders on the server there.
+ *
+ * WEB-5 O21: the panel shows what each depth does, not only says it: the
+ * three-step key, a short title and line, and the data card, whose rows
+ * change as the lit depth changes. The card follows the same `active` as
+ * the copy and the gauge, so all three turn at the same scroll position.
  */
 export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
   const { mode } = useLandingMode();
@@ -34,21 +41,26 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
   const text = copy.layers[layer.id];
 
   return (
-    <div className="sticky top-0 h-[100svh] overflow-hidden motion-reduce:hidden">
+    <div className="lk-depth-stage sticky top-0 h-[100svh] overflow-hidden motion-reduce:hidden">
       {/* The gauge hugs the screen's left edge, outside the 1120 px column. */}
       <DepthGauge progress={progress} active={active} />
       <Container className="relative h-full">
-        <div className="grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:pl-6 md:grid-cols-[minmax(0,420px)_1fr] md:pl-36">
+        <div className="grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:gap-3 max-md:pl-6 md:grid-cols-[minmax(0,420px)_1fr] md:pl-36">
+          {/* WEB-5 O21: the chapter shows what the depth does to the data.
+              The key says the whole idea at once, the text is a title and
+              one line, and the card below is the same few rows at this
+              depth (depth-data-card.tsx). It sits in the text column, so
+              the 3D slabs behind the other cell stay in view. */}
           <div className="rounded-3xl max-md:bg-[#020514]/55 max-md:p-4 max-md:backdrop-blur-md">
-            <Eyebrow aria-hidden="true">{copy.eyebrow}</Eyebrow>
+            <DepthKey active={active} words={copy.key} />
             <AnimatePresence mode="wait" initial={false}>
               <m.div
                 key={layer.id}
-                initial={{ opacity: 0, y: 26, filter: "blur(6px)" }}
+                initial={{ opacity: 0, y: 18, filter: "blur(6px)" }}
                 animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                exit={{ opacity: 0, y: -20, filter: "blur(6px)" }}
-                transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
-                className="mt-5"
+                exit={{ opacity: 0, y: -14, filter: "blur(6px)" }}
+                transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                className="mt-4 md:mt-6"
                 aria-live="polite"
               >
                 <p
@@ -57,15 +69,18 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
                 >
                   {layer.label} · {layer.meters}
                 </p>
-                <h3 className="lk-display mt-3 text-[clamp(2.5rem,5.2vw,4.25rem)] leading-[1.02] text-[#E8F4FF]">
+                <h3 className="lk-display mt-2 text-[clamp(2rem,9vw,2.5rem)] leading-[1.04] text-balance text-[#E8F4FF] md:mt-3 md:text-[clamp(2.5rem,3.9vw,3.4rem)]">
                   {text.title}
                 </h3>
-                <p className="mt-4 max-w-[28rem] text-[17px] leading-[1.6] text-[#E8F4FF]/85">{text.body}</p>
+                <p className="mt-2 max-w-[26rem] text-[15px] leading-[1.5] text-pretty text-[#E8F4FF]/85 md:mt-3 md:text-[16px]">
+                  {text.body}
+                </p>
               </m.div>
             </AnimatePresence>
+            <DepthDataCard stage={active} copy={copy.card} className="mt-4 md:mt-6" />
           </div>
           {/* The 3D stack renders on the canvas behind this cell; without one, a CSS stack stands in. */}
-          <div className="relative h-full min-h-[280px]">
+          <div className="lk-depth-stack-cell relative h-full min-h-0 md:min-h-[280px]">
             {mode !== "full" && <CssStack active={active} />}
           </div>
         </div>
