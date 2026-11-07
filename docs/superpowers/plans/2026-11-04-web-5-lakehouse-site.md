@@ -989,6 +989,106 @@ section top in px):
   - :3400, :3402, :3403 and :9557 were not touched;
   - `git status` is clean.
 
+### Handoff 9: developer (Opus), 2026-11-07, review 8 (R12)
+
+**Commit:** `3ff3eee5`, R12 (BLOCKER). It is cited at the fix sites:
+- `hero-section.tsx` (`HeroCreature`)
+- `lake-engine.ts` (`fitHeroToRoom`)
+- `app/globals.css` (the `short` variant)
+
+**The choice.** The copy is laid out below the creature, and the creature
+scales into the room the copy leaves.
+- **Layout.** Below `md` the hero stage is a column:
+  - The creature moved out of the backdrop into its own slot
+    (`data-hero-room`), which takes the free height above the copy.
+  - The copy sits under it with a 16 px gap: the 12 px asked for, plus the
+    bob's 0.6° tilt, which widens the drawing's box by about 1 px.
+- **No change where it fits.** The gap above the creature (14 svh, at
+  least 4.5 rem) and the creature shrink only when that height runs out.
+  - The creature keeps its old place and size where there was room.
+  - It stays under the copy's wash (`-z-[5]`).
+  - From `md` up it is placed on the right as before.
+- **The `short` variant.** It covers screens below `md` that are at most
+  832 px tall: 360×800 and 375×812 are short, 390×844 is not.
+  - The copy is set tighter: h1 3.25 rem, smaller gaps and lead, `pb-24`
+    and a shorter scroll cue.
+  - So the creature keeps a readable size, and both buttons stay on the
+    first screen.
+- **The 3D creature.** On a phone, if the 3D creature (waterline to the
+  top of the dome) would end below the room, the camera is pulled back and
+  the view shifted, so it fills the DOM creature's box. Otherwise the
+  framing is unchanged.
+
+**Measured** (`r12probe.ts`, CDP, built export, scene "none"). The
+creature's box includes the drawing's bob, sampled over one 4 s cycle.
+
+| Screen | EN gap | ID gap | Buttons end (both) |
+| --- | --- | --- | --- |
+| 360×640 | 14 px | 15 px | 544 of 640 |
+| 360×740 | 84 px | 62 px | 644 of 740 |
+| 375×667 | 14 px | 15 px | 571 of 667 |
+| 390×844 | 45 px | 17 px | 716 of 844 |
+| 412×915 | 96 px | 68 px | 787 of 915 |
+
+Extra screens, all on the first screen and clear by at least 14 px:
+
+| Screen | EN gap | ID gap |
+| --- | --- | --- |
+| 320×568 | 15 px | 15 px |
+| 360×800 | 135 px | 113 px |
+| 375×812 | 139 px | 117 px |
+| 393×852 | 51 px | 23 px |
+| 414×736 | 55 px | 55 px |
+
+On the build before the fix (`63f09a87`), 360×800, 360×900 and 375×812
+also overlapped in EN, and the overlap was not limited to the listed sizes.
+
+**Nothing changes at 390×844 and up.** `herodiff.ts` compares lossless
+PNGs with animations off, against `63f09a87`'s build. It finds 0
+differing pixels at:
+- 390×844, 412×915, 430×932, 768×1024, 1024×768 and 1440×900, in EN and ID;
+- 390×844 and 1440×900 with reduced motion.
+
+The first try differed by about 700 anti-aliased edge pixels at 390×844.
+The creature's box is now positioned exactly as before (`left-1/2`,
+`-translate-x-1/2`), which brought that to 0.
+
+**The live 3D hero** (`next dev`, dev-only override, SwiftShader Chrome):
+- Checked by screenshot at 360×740 (EN, ID), 375×667 (EN, ID), 360×640
+  and 320×568.
+- At 320×568 the new framing takes over, and the dome fits the DOM
+  creature's box.
+- The DOM boxes measure the same as in the export.
+- The 3D dome's edge itself is checked by eye, *not measured* in pixels.
+
+**Evidence** in `docs/plans/web-5-screens/`:
+- `r12-hero-short-dom.jpg`: 4 before, then 4 after, at 360×740 and
+  375×667, EN and ID;
+- `r12-hero-short-live.jpg`: the live hero.
+
+**Checks** on `3ff3eee5`, from a clean `.next`/`out`:
+- `bun run lint` 0
+- `bun run typecheck` 0
+- `bun run test`: 65 pass, 0 fail
+- build 0
+- `bun run size` 0: 181.5 KB of 200 KB
+- Lighthouse not run, as asked.
+
+**Not verified, and limits:**
+- **Not tried on real phones,** nor in Safari or Firefox. The probe uses
+  Chrome mobile emulation.
+- **Small creature on the smallest screens.** On 320×568 the DOM creature
+  is 72 px, because the room left above a two-line headline is small.
+- **Process:**
+  - The worktree was recreated by the planner, so I ran
+    `bun install --frozen-lockfile` with bun 1.3.12 in `site/`; the
+    lockfile is unchanged.
+  - `next dev` wrote `site/AGENTS.md`; I removed it, and it was never
+    committed.
+  - My servers on :3460, :3461, :3462, :9555 and :9556 are stopped.
+  - :3400 and :9557 were not touched.
+  - `git status` is clean.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
