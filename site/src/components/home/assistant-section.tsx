@@ -1,4 +1,5 @@
 import * as React from "react";
+import { BarChart3, SquareTerminal, Workflow } from "lucide-react";
 import type { HomeCopy } from "@/lib/copy";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
 import { SplitWords } from "@/components/shared/reveal";
@@ -22,6 +23,9 @@ import { AssistantChat } from "./assistant-chat";
 
 type AssistantCopy = HomeCopy["assistant"];
 
+/** One icon per chip, in `assistant.features` order: charts, pipelines, Query Studio. */
+const FEATURE_ICONS = [BarChart3, Workflow, SquareTerminal] as const;
+
 export function AssistantSection({ copy }: { copy: AssistantCopy }) {
   return (
     <section id="assistant" className="lk-fallback-bg relative overflow-hidden bg-[#050A30]">
@@ -31,7 +35,22 @@ export function AssistantSection({ copy }: { copy: AssistantCopy }) {
           <DisplayHeading size="lg" className="max-md:text-[clamp(2.6rem,12vw,3.4rem)]">
             <SplitWords text={copy.headline} />
           </DisplayHeading>
-          <LeadText className="mt-3 max-w-[32rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">{copy.sub}</LeadText>
+          <LeadText className="mt-3 max-w-[30rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">{copy.sub}</LeadText>
+          {/* O19 follow-up, "lots of visuals, little text": what else it does, as chips, each one a claim. */}
+          <ul className="mt-5 flex max-w-[32rem] flex-wrap gap-1.5 md:mt-6 md:gap-2">
+            {copy.features.map((f, i) => {
+              const Icon = FEATURE_ICONS[i] ?? BarChart3;
+              return (
+                <li
+                  key={f}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] px-3 py-1 text-[12px] leading-5 text-[#E8F4FF]/80 transition-colors duration-200 hover:border-[#44A6FA]/45 hover:text-[#E8F4FF] md:text-[13px]"
+                >
+                  <Icon aria-hidden="true" className="size-3.5 shrink-0 text-[#8fcbff]" strokeWidth={2} />
+                  {f}
+                </li>
+              );
+            })}
+          </ul>
         </div>
         <AssistantChat copy={copy} />
       </Container>

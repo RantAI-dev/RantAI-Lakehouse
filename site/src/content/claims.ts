@@ -66,7 +66,11 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.depths.card.lag", backlog: ["BLD-2 In Acceptance"], note: "a table refreshing within its target lag" },
   { key: "home.depths.card.feeds", backlog: ["WEB-1 In Acceptance", "AI-18 In Acceptance"], note: "dashboards and the assistant read Gold" },
   // Assistant section (Query Studio, D7)
-  { key: "home.assistant.sub", backlog: ["QS-1 In Acceptance", "QS-4 In Acceptance"], note: "autocomplete, tabs, query history" },
+  // O19 follow-up (2026-11-07): the lead became one line and three chips.
+  { key: "home.assistant.sub", backlog: ["AI-18 In Acceptance"], note: "ask in plain language; risky actions wait for a person's approval (WriteHigh tools go to Approvals)" },
+  { key: "home.assistant.features.0", backlog: ["AI-18 In Acceptance"], note: "builds charts and dashboards with the console's own tools (create_chart, create_board, suggest_dashboard)" },
+  { key: "home.assistant.features.1", backlog: ["AI-18 In Acceptance"], note: "runs pipelines (the Pipeline Builder tools: trigger_pipeline, retry_pipeline_run, ...)" },
+  { key: "home.assistant.features.2", backlog: ["QS-1 In Acceptance", "QS-4 In Acceptance"], note: "autocomplete, tabs, query history" },
   // O19 (2026-11-07): the assistant panel is an illustration, but every
   // behaviour it plays is the console's own.
   { key: "home.assistant.placeholder", backlog: ["AI-18 In Acceptance"], note: "the console composer's own placeholder (src/features/copilot/chat-composer.tsx)" },

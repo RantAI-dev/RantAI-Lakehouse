@@ -92,7 +92,12 @@
   },
   "assistant": {
     "headline": "Ask, don't dig.",
-    "sub": "The assistant works with the same tools as the console. It answers questions, builds charts and dashboards, and runs pipelines. Anything risky waits for a person to approve it. Prefer SQL? Query Studio has autocomplete, tabs and a query history.",
+    "sub": "Ask in plain words. Anything risky waits for a person.",
+    "features": [
+      "Charts and dashboards",
+      "Runs pipelines",
+      "Query Studio: autocomplete, tabs, history"
+    ],
     "caption": "Illustration",
     "name": "Assistant",
     "status": {

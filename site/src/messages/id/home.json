@@ -92,7 +92,12 @@
   },
   "assistant": {
     "headline": "Cukup tanya.",
-    "sub": "Asisten memakai tool yang sama dengan konsol. Ia menjawab pertanyaan, membuat chart dan dashboard, serta menjalankan pipeline. Apa pun yang berisiko menunggu persetujuan manusia. Lebih suka SQL? Query Studio punya autocomplete, tab, dan riwayat query.",
+    "sub": "Tanya dengan bahasa biasa. Yang berisiko menunggu persetujuan manusia.",
+    "features": [
+      "Chart dan dashboard",
+      "Menjalankan pipeline",
+      "Query Studio: autocomplete, tab, riwayat"
+    ],
     "caption": "Ilustrasi",
     "name": "Asisten",
     "status": {
