@@ -71,6 +71,10 @@ recorded the same way; the chat's `run_sql` is not recorded, as today.
 - History is per user, not per tenant: a user who changes tenant still sees their own earlier runs from the
   other tenant.
 
+A run of a statement with `{{name}}` parameters (`QS-5`, `docs/core/features/query-parameters.md`)
+is recorded as the statement that ran, with the parameter values printed in it as literals, not as the text with
+`{{name}}`. Clicking the run or downloading it works without the values.
+
 ## Acceptance checklist
 
 Run on a running console by the product owner. A step not performed is never a pass.

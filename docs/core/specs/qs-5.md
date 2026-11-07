@@ -7,7 +7,7 @@
 | Also involves | Dashboards |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Blocked by | `BI-18` (the dashboard date filter) |
+| Blocked by | `BI-18` (the dashboard date filter), for part 2 only: dashboard filters and the query-filled dropdown. Part 1 (parameters in Query Studio, saved queries and the assistant) is not blocked |
 
 ## Why
 
@@ -23,7 +23,7 @@ SQL that becomes dashboard content directly.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Parameters | None | Named parameters: text, number, date, date range, dropdown, multi-select, dropdown filled from a query (Databricks' widgets), always bound, never spliced into SQL |
+| Parameters | None | Named parameters: text, number, date, date range, dropdown, multi-select, dropdown filled from a query (Databricks' widgets), checked by type and re-printed as a literal, never spliced as text |
 | On dashboards | n/a | A parameter maps to a dashboard filter (Metabase field filters) |
 | Snippets | None | Shared snippets inserted by name, with folders and permissions |
 | Chart from a result | Through 'save as SQL source' only | Pick any chart type from the result and add it to a dashboard in two clicks |
