@@ -125,7 +125,12 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
       <div className="lk-gauge-line fixed inset-x-0 top-16 z-40 h-4 min-[1360px]:hidden">
         <span className="absolute inset-x-0 top-0 h-px bg-[#E8F4FF]/10" />
         <span className="lk-gauge-fill absolute top-0 left-0 h-px w-full origin-left bg-[#44A6FA]/80" />
-        <span ref={phoneReadingRef} className="absolute top-1 right-4 text-[10px] font-medium tracking-[0.12em] text-[#E8F4FF]/70 tabular-nums">
+        {/* WEB-5 audit #8: no reading on phones (it sat on the copy and the cards); from 768 px it sits
+            on its own dark chip, so it never merges with a card corner passing under it. */}
+        <span
+          ref={phoneReadingRef}
+          className="absolute top-1.5 right-4 hidden rounded-full bg-[#020514]/85 px-2 py-0.5 text-[10px] font-medium tracking-[0.12em] text-[#E8F4FF]/75 tabular-nums backdrop-blur-sm md:inline"
+        >
           0 m
         </span>
       </div>

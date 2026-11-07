@@ -93,9 +93,22 @@ export function WhaleSvg({
   className,
   idPrefix = "final",
   surface = false,
+  spout = true,
+  water = false,
+  viewBox,
 }: {
+  /**
+   * Surface mode only: a little water of its own under the waterline (a soft
+   * pool, two thin ripples and the head's broken reflection, in the water's
+   * own blues), for the DOM hero, where nothing else is in front of it.
+   */
+  water?: boolean;
+  /** Surface mode only: the little spout every few seconds (the DOM hero leaves it out). */
+  spout?: boolean;
   className?: string;
   idPrefix?: string;
+  /** A crop of the 600 x 480 drawing (the DOM hero frames the head alone). */
+  viewBox?: string;
   /**
    * O42: floating at the surface, as in the hero. Only what is above the
    * water is drawn (the dome, the eyes and, every few seconds, a little
@@ -105,7 +118,7 @@ export function WhaleSvg({
 }) {
   const id = (n: string) => `lk-w-${n}-${idPrefix}`;
   return (
-    <svg viewBox={`0 0 ${WHALE_VIEW.w} ${WHALE_VIEW.h}`} className={className} aria-hidden="true" focusable="false">
+    <svg viewBox={viewBox ?? `0 0 ${WHALE_VIEW.w} ${WHALE_VIEW.h}`} className={className} aria-hidden="true" focusable="false">
       {/* Raw text: React would escape the quotes in the selectors, and a style element's text is not decoded. */}
       <style dangerouslySetInnerHTML={{ __html: MOTION_CSS }} />
       <defs>
@@ -134,6 +147,14 @@ export function WhaleSvg({
           <stop offset="0%" stopColor="#131f6e" />
           <stop offset="100%" stopColor="#070d3a" />
         </linearGradient>
+        {/* Surface mode: nothing below the waterline is drawn (the water is there). */}
+        <clipPath id={id("above")}>
+          <rect x="0" y="0" width={WHALE_VIEW.w} height={WHALE_WATERLINE} />
+        </clipPath>
+        <radialGradient id={id("pool")} cx="50%" cy="20%" r="60%">
+          <stop offset="0%" stopColor="#0b2a66" stopOpacity="0.9" />
+          <stop offset="100%" stopColor="#0b2a66" stopOpacity="0" />
+        </radialGradient>
         <clipPath id={id("clip")}>
           <path d={BODY_PATH} />
         </clipPath>
@@ -151,8 +172,17 @@ export function WhaleSvg({
       </g>
       )}
 
+      {surface && water && (
+        <g aria-hidden="true">
+          <ellipse cx="300" cy="332" rx="250" ry="40" fill={`url(#${id("pool")})`} />
+          <path d="M120 322 Q 210 316 300 321 T 480 322" fill="none" stroke="#3d6aa8" strokeOpacity="0.45" strokeWidth="2" strokeLinecap="round" />
+          <path d="M170 338 Q 240 333 300 337 T 430 338" fill="none" stroke="#2c548f" strokeOpacity="0.4" strokeWidth="1.5" strokeLinecap="round" />
+          <path d="M248 350 H 352 M262 362 H 338 M276 374 H 324" stroke="#16237a" strokeOpacity="0.55" strokeWidth="4" strokeLinecap="round" />
+        </g>
+      )}
+
       {/* The body: one round, chubby shape, with a soft plastic sheen. */}
-      <path d={BODY_PATH} fill={`url(#${id("body")})`} />
+      <path d={BODY_PATH} fill={`url(#${id("body")})`} clipPath={surface ? `url(#${id("above")})` : undefined} />
       {!surface && (
       <g clipPath={`url(#${id("clip")})`}>
         {/* The belly, rising a little towards the middle, with its grooves. */}
@@ -191,7 +221,7 @@ export function WhaleSvg({
       ))}
 
       {/* O42: a little spout every few seconds while it floats at the surface. */}
-      {surface && (
+      {surface && spout && (
         <>
           <g className="lk-w-spout">
             <path d="M300 86 C 296 56, 274 36, 248 34 C 262 42, 282 56, 292 86 Z" fill="#a9d4ff" fillOpacity="0.85" />

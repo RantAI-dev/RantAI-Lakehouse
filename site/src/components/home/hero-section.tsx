@@ -2,7 +2,7 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
-import { MascotLogo } from "@/components/shared/mascot-svg";
+import { WhaleSvg } from "@/components/shared/whale-svg";
 import { ProgressSection } from "@/components/shared/progress-section";
 import { BackdropFade, HeroCopyMotion, HeroWashFade, ScrollCueFade } from "./hero-motion";
 
@@ -98,7 +98,23 @@ function HeroBackdrop() {
       {/* Moon glow and its reflection streak on the water. */}
       <div className="absolute top-[8%] left-[62%] size-[46vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.22)_0%,rgba(68,166,250,0.10)_38%,transparent_70%)]" />
       <div className="absolute top-[62%] left-[62%] h-[34vh] w-[14vw] -translate-x-1/2 bg-[radial-gradient(ellipse_at_top,rgba(68,166,250,0.35)_0%,transparent_70%)] blur-xl" />
-      <div className="absolute inset-x-0 top-[61.2%] h-px bg-[#44A6FA]/40" />
+      {/* WEB-5 audit #11: the waterline is wavy and feathered, and kept out of the text column
+          (only under the creature on the right; none on phones, where the copy spans the width). */}
+      <svg
+        viewBox="0 0 1200 12"
+        preserveAspectRatio="none"
+        className="absolute inset-x-0 top-[calc(61.2%-6px)] h-3 w-full max-md:hidden [mask-image:linear-gradient(90deg,transparent_0%,transparent_50%,#000_64%,#000_90%,transparent_100%)]"
+        aria-hidden="true"
+      >
+        <path
+          d="M0 6 Q 75 3 150 6 T 300 6 T 450 6 T 600 6 T 750 6 T 900 6 T 1050 6 T 1200 6"
+          fill="none"
+          stroke="#44A6FA"
+          strokeOpacity="0.35"
+          strokeWidth="1"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
       <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-[#020514] via-[#020514]/55 to-transparent md:hidden" />
     </BackdropFade>
   );
@@ -140,7 +156,13 @@ function HeroCreature() {
         data-hero-creature=""
         className="relative left-1/2 aspect-[196/167] h-[min(46vw,230px)] min-h-0 -translate-x-1/2 self-start md:static md:h-auto md:w-full md:translate-x-0"
       >
-        <MascotLogo className="lk-bob size-full drop-shadow-[0_0_60px_rgba(68,166,250,0.25)]" />
+        {/* WEB-5 audit #27: the same character as the live lake (the O29 head at its waterline,
+            plain white eyes, no glow), not the logo's dome and bowl, with a little water of its own.
+            Phones: the head is in the room above the copy, so its own water is under it (waterline
+            at 72 % of the box). From md: the waterline is at 96 % of the box, just below the
+            backdrop's horizon, so the head sits in the lake rather than above it. */}
+        <WhaleSvg surface water spout={false} idPrefix="hero-m" viewBox="104 78 392 334" className="lk-bob size-full md:hidden" />
+        <WhaleSvg surface water spout={false} idPrefix="hero-d" viewBox="104 -3 392 334" className="lk-bob size-full max-md:hidden" />
       </div>
     </BackdropFade>
   );
