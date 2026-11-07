@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/dialog"
 import { readableErrorMessage } from "@/lib/notify-message"
 import type { QueryFolder } from "@/services/contracts/queries"
+import { FolderSharingNote } from "./folder-sharing-note"
 import {
   PERSONAL_SPACE_LABEL,
   SHARED_SPACE_LABEL,
@@ -72,6 +73,7 @@ export function SavedQueryMoveDialog({
   onMove,
   busy,
   error,
+  viewerId,
 }: {
   /** The folders the caller may see, as the server sent them. */
   readonly folders: QueryFolder[]
@@ -89,6 +91,8 @@ export function SavedQueryMoveDialog({
   readonly busy?: boolean
   /** The refusal, in the server's own words. */
   readonly error?: string | null
+  /** The signed-in person, who is left out of "Shared with"; `undefined` leaves nobody out. */
+  readonly viewerId: string | undefined
 }) {
   const targets = React.useMemo(
     () => moveTargets(folders, excludeId),
@@ -96,6 +100,13 @@ export function SavedQueryMoveDialog({
   )
   const [target, setTarget] = React.useState(currentFolderId ?? "")
   const pickerId = React.useId()
+  // The shared space (value "") and the caller's own space hold no rule, so
+  // the dialog neither asks nor says anything for them. A folder inside the
+  // own space is a real folder and can be shared.
+  const personalRootId = folders.find(
+    (folder) => folder.isPersonal && folder.parentId === null,
+  )?.id
+  const sharedFolderId = target === "" || target === personalRootId ? null : target
 
   return (
     <Dialog
@@ -140,6 +151,7 @@ export function SavedQueryMoveDialog({
               ))}
             </optgroup>
           </select>
+          <FolderSharingNote folderId={sharedFolderId} viewerId={viewerId} />
         </div>
         {error ? (
           <p role="alert" className="text-sm text-destructive">

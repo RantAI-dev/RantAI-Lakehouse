@@ -48,6 +48,7 @@ export function SavedQueryFolderTree({
   selected,
   onSelect,
   onChanged,
+  viewerId,
 }: {
   /** The folders the caller may see, as the server sent them. */
   readonly folders: QueryFolder[]
@@ -56,6 +57,8 @@ export function SavedQueryFolderTree({
   readonly onSelect: (folder: string | undefined) => void
   /** Called after a change, so the folders and the list are read again. */
   readonly onChanged: () => void
+  /** The signed-in person, for the move dialog's "Shared with" line. */
+  readonly viewerId: string | undefined
 }) {
   const tree = React.useMemo(() => buildSavedQueryTree(folders), [folders])
   const createAct = useServiceAction((signal, name: string, parentId: string | null) =>
@@ -241,6 +244,7 @@ export function SavedQueryFolderTree({
           onMove={(target) => void move(target)}
           busy={moveAct.status === "pending"}
           error={moveAct.error?.message ?? null}
+          viewerId={viewerId}
         />
       ) : null}
 

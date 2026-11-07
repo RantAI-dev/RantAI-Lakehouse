@@ -483,13 +483,23 @@ describe("the saved-query console client (QS-3)", () => {
         id: "rule-1",
         userId: "u-2",
         roleId: null,
+        granteeName: "Dewi Lestari",
+        granteeEmail: "dewi@example.com",
         level: "edit",
         grantedBy: "u-1",
         grantedAt: "2026-11-04T10:00:00Z",
       },
     ],
     inherited: [
-      { folderId: "f-1", folderName: "Reports", userId: null, roleId: "r-1", level: "view" },
+      {
+        folderId: "f-1",
+        folderName: "Reports",
+        userId: null,
+        roleId: "r-1",
+        granteeName: "Finance",
+        granteeEmail: null,
+        level: "view",
+      },
     ],
   }
 

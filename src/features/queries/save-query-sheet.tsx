@@ -9,6 +9,7 @@ import { useService } from "@/hooks/use-service"
 import { sqlSummary } from "@/lib/sql-text"
 import { queryService } from "@/services"
 import type { QueryFolder, SaveQueryInput, SavedQuery } from "@/services/contracts/queries"
+import { FolderSharingNote } from "./folder-sharing-note"
 import {
   PERSONAL_SPACE_LABEL,
   SHARED_SPACE_LABEL,
@@ -45,6 +46,7 @@ export function SaveQuerySheet({
   onSave,
   mode = "create",
   savedId = null,
+  viewerId,
 }: {
   readonly open: boolean
   readonly onOpenChange: (open: boolean) => void
@@ -56,6 +58,8 @@ export function SaveQuerySheet({
   readonly mode?: "create" | "update"
   /** The saved query the tab came from, when it came from one. */
   readonly savedId?: string | null
+  /** The signed-in person, who is left out of "Shared with"; `undefined` leaves nobody out. */
+  readonly viewerId: string | undefined
 }) {
   const [title, setTitle] = React.useState("")
   const [tags, setTags] = React.useState("")
@@ -196,6 +200,12 @@ export function SaveQuerySheet({
               ))}
             </optgroup>
           </select>
+          {/* Only a real folder can hold rules: the shared space and the
+              caller's own space send `null` and `undefined`. */}
+          <FolderSharingNote
+            folderId={typeof folderId === "string" ? folderId : null}
+            viewerId={viewerId}
+          />
         </div>
       ) : null}
     </CreateSheet>
