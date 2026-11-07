@@ -21,7 +21,10 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use common::{TestApp, session_cookie_for_seeded_user, session_cookie_for_user, spin_up};
+use common::{
+    TestApp, session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
+    spin_up_with_env_counting_acquires,
+};
 
 /// Meridian Group, the tenant the seeded Analyst and the seeded Data
 /// Scientist both act for.
@@ -1729,8 +1732,11 @@ async fn a_folder_carries_its_own_rule_and_inherits_its_parents() {
     assert_eq!(inherited[0]["userId"], reza_id.to_string());
 }
 
-/// The access list needs manage, for reading it as well as for changing
-/// it: a person who may only see a query may not see who else has it.
+/// The access list of a query needs manage, for reading it as well as for
+/// changing it: a person who may only see a query may not see who else has
+/// it. The list of a folder is read from edit up and changed with manage, so
+/// a person who may only see a folder is refused both (QS-3, folder sharing
+/// warning: the case below has view only on the folder).
 #[tokio::test]
 async fn the_access_list_needs_manage_to_be_read_or_changed() {
     let TestApp { router, pool } = spin_up().await;
@@ -3225,10 +3231,12 @@ async fn a_view_grantee_neither_deletes_nor_restores_a_personal_query() {
 }
 
 /// Review finding 3: decision 6 lifts only a query's delete and restore
-/// to edit. Reading and writing the access list of a query, reading and
-/// writing the access list of a folder, and deleting a folder, all
-/// still need manage — an edit grantee is refused all five, and the
-/// refused writes change nothing.
+/// to edit. Reading and writing the access list of a query, writing the
+/// access list of a folder, and deleting a folder still need manage — an
+/// edit grantee is refused all four, and the refused writes change nothing.
+/// Reading the access list of a folder is the one exception, from edit up
+/// (QS-3, folder sharing warning): the save and move dialogs name who a
+/// folder is shared with before the user confirms.
 #[tokio::test]
 async fn an_edit_grantee_is_refused_the_access_lists_and_a_folder_delete() {
     let TestApp { router, pool } = spin_up().await;
@@ -3238,8 +3246,8 @@ async fn an_edit_grantee_is_refused_the_access_lists_and_a_folder_delete() {
     let (id, _) = rinas_private_query_opened_to_reza(&router, &pool, "edit").await;
     let folder_id = a_shared_folder_opened_to_reza(&pool, "edit").await;
 
-    // All five, each refused with its item's own sentence: the sharing
-    // surface keeps manage even after decision 6.
+    // All four, each refused with its item's own sentence: changing the
+    // rules, and reading a query's list, keep manage even after decision 6.
     for (method, path, body, sentence) in [
         (
             "GET",
@@ -3252,12 +3260,6 @@ async fn an_edit_grantee_is_refused_the_access_lists_and_a_folder_delete() {
             format!("/api/query/saved/{id}/access"),
             Some(json!({"rules": []})),
             QUERY_FORBIDDEN,
-        ),
-        (
-            "GET",
-            format!("/api/query/folders/{folder_id}/access"),
-            None,
-            FOLDER_FORBIDDEN,
         ),
         (
             "PUT",
@@ -3280,6 +3282,24 @@ async fn an_edit_grantee_is_refused_the_access_lists_and_a_folder_delete() {
             "{method} {path}"
         );
     }
+
+    // QS-3, folder sharing warning: the one list an edit grantee may read
+    // is the folder's. It carries the folder's own rule (Reza's) and the
+    // level he reads it at.
+    let (status, list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{folder_id}/access"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["yourLevel"], "edit", "{list}");
+    let rules = list["rules"].as_array().expect("the rules are an array");
+    assert_eq!(rules.len(), 1, "the folder's own rule: {list}");
+    assert_eq!(rules[0]["userId"], reza_id.to_string());
+    assert_eq!(rules[0]["level"], "edit");
 
     // The refused writes changed nothing: the query's rule is still
     // Rina's edit grant, and the folder still stands.
@@ -4556,5 +4576,357 @@ async fn the_earlier_refusals_of_a_folder_share_win_over_the_contents_rule() {
     assert_eq!(
         error(&body),
         format!("permission_denied: {PERSONAL_SPACE_NOT_SHARED}")
+    );
+}
+
+// ── A folder says who it is shared with, to edit and up (`QS-3`, folder sharing warning) ──
+
+/// The rule of `list` (`rules` or `inherited`) that names the person or the
+/// role `grantee`, under the key `key` (`"userId"` or `"roleId"`).
+fn rule_naming<'a>(list: &'a Value, which: &str, key: &str, grantee: &str) -> &'a Value {
+    list[which]
+        .as_array()
+        .unwrap_or_else(|| panic!("{which} is an array: {list}"))
+        .iter()
+        .find(|rule| rule[key] == grantee)
+        .unwrap_or_else(|| panic!("{which} holds a rule for {key} {grantee}: {list}"))
+}
+
+/// The Analyst role of the seed.
+const ANALYST_ROLE: &str = "22222222-2222-4222-8222-000000000001";
+/// The Approver role of the seed.
+const APPROVER_ROLE: &str = "22222222-2222-4222-8222-000000000002";
+
+/// Who may read the access list of a folder: edit and up. The list is the
+/// folder's own rules and the rules it inherits, with the level the reader
+/// holds, and `grantedBy`, `grantedAt` and the inherited rule's `folderName`
+/// are there as a manager sees them. The rules are still changed with
+/// manage only.
+#[tokio::test]
+async fn an_edit_holder_reads_a_folders_own_and_inherited_rules() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let rina_id = user_id(&pool, "rina@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await;
+    let yoga_id = user_id(&pool, "yoga@meridian.example").await;
+    let reports = folder_created(&router, &rina, "Reports", None).await;
+    let weekly = folder_created(&router, &rina, "Weekly", Some(&reports)).await;
+    let (status, body) = put_folder_rules(
+        &router,
+        &rina,
+        &reports,
+        json!([{"userId": reza_id.to_string(), "level": "edit"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = put_folder_rules(
+        &router,
+        &rina,
+        &weekly,
+        json!([{"userId": yoga_id.to_string(), "level": "view"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Reza holds edit on `Weekly` through `Reports`: the list is his to read.
+    let (status, list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{weekly}/access"),
+        &reza,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["yourLevel"], "edit", "{list}");
+    let own = rule_naming(&list, "rules", "userId", &yoga_id.to_string());
+    assert_eq!(own["level"], "view", "{list}");
+    assert_eq!(own["grantedBy"], rina_id.to_string(), "{list}");
+    assert!(own["grantedAt"].is_string(), "{list}");
+    let inherited = rule_naming(&list, "inherited", "userId", &reza_id.to_string());
+    assert_eq!(inherited["level"], "edit", "{list}");
+    assert_eq!(inherited["folderId"], reports, "{list}");
+    assert_eq!(inherited["folderName"], "Reports", "{list}");
+
+    // Reading is all that edit gives: the rules stay manage's to change.
+    let (status, answer) = put_folder_rules(&router, &reza, &weekly, json!([])).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    assert_eq!(
+        error(&answer),
+        format!("permission_denied: {FOLDER_FORBIDDEN}")
+    );
+}
+
+/// A person who may only view a folder is told no: the sentence is the
+/// folder's fixed one, and the list stays closed below edit.
+#[tokio::test]
+async fn a_view_holder_is_refused_a_folders_access_list() {
+    let TestApp { router, pool } = spin_up().await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let folder_id = a_shared_folder_opened_to_reza(&pool, "view").await;
+
+    let (status, answer) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{folder_id}/access"),
+        &reza,
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    assert_eq!(
+        error(&answer),
+        format!("permission_denied: {FOLDER_FORBIDDEN}")
+    );
+}
+
+/// A folder the caller may not see stays a 404 at the lower edit bar: the
+/// personal space of another person.
+#[tokio::test]
+async fn a_folder_the_caller_may_not_see_is_still_not_found_for_its_access_list() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza = session_cookie_for_seeded_user(&pool, "reza@meridian.example").await;
+    let (_, space) = query_saved(&router, &rina, "Private", None).await;
+
+    let (status, answer) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{space}/access"),
+        &reza,
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_eq!(error(&answer), FOLDER_NOT_FOUND);
+}
+
+/// Every access list names its grantees, so the console shows who a rule is
+/// for and not an id: a person by name and email, a role by name with no
+/// email. The names are on the own and on the inherited rules of a query and
+/// of a folder, and on the answer of a `PUT` as on a `GET`.
+#[tokio::test]
+async fn the_access_lists_name_their_people_and_roles() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let reza_id = user_id(&pool, "reza@meridian.example").await.to_string();
+    let yoga_id = user_id(&pool, "yoga@meridian.example").await.to_string();
+    let citra_id = user_id(&pool, "citra@meridian.example").await.to_string();
+    let reports = folder_created(&router, &rina, "Reports", None).await;
+    let weekly = folder_created(&router, &rina, "Weekly", Some(&reports)).await;
+    let (query, _) = query_saved(&router, &rina, "Numbers", Some(&weekly)).await;
+    let (status, body) = put_folder_rules(
+        &router,
+        &rina,
+        &reports,
+        json!([
+            {"userId": reza_id, "level": "edit"},
+            {"roleId": ANALYST_ROLE, "level": "view"},
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, put_answer) = put_folder_rules(
+        &router,
+        &rina,
+        &weekly,
+        json!([{"userId": citra_id, "level": "view"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{put_answer}");
+    let (status, body) = call(
+        &router,
+        "PUT",
+        &format!("/api/query/saved/{query}/access"),
+        &rina,
+        Some(json!({"rules": [{"userId": yoga_id, "level": "view"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, folder_list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{weekly}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{folder_list}");
+    let (status, query_list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{query}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{query_list}");
+
+    // The folder's list, read and as written: its own rule, and the two it
+    // inherits from `Reports`.
+    for list in [&folder_list, &put_answer] {
+        let citra = rule_naming(list, "rules", "userId", &citra_id);
+        assert_eq!(citra["granteeName"], "Citra Amelia", "{list}");
+        assert_eq!(citra["granteeEmail"], "citra@meridian.example", "{list}");
+        let reza = rule_naming(list, "inherited", "userId", &reza_id);
+        assert_eq!(reza["granteeName"], "Reza Hakim", "{list}");
+        assert_eq!(reza["granteeEmail"], "reza@meridian.example", "{list}");
+        let analyst = rule_naming(list, "inherited", "roleId", ANALYST_ROLE);
+        assert_eq!(analyst["granteeName"], "Analyst", "{list}");
+        assert_eq!(
+            analyst.get("granteeEmail"),
+            Some(&Value::Null),
+            "a role has no email, and the key is there: {list}"
+        );
+    }
+
+    // The query's list: its own rule, and both folders above it.
+    let yoga = rule_naming(&query_list, "rules", "userId", &yoga_id);
+    assert_eq!(yoga["granteeName"], "Yoga Prasetya", "{query_list}");
+    assert_eq!(yoga["granteeEmail"], "yoga@meridian.example");
+    let citra = rule_naming(&query_list, "inherited", "userId", &citra_id);
+    assert_eq!(citra["granteeName"], "Citra Amelia", "{query_list}");
+    let analyst = rule_naming(&query_list, "inherited", "roleId", ANALYST_ROLE);
+    assert_eq!(analyst["granteeName"], "Analyst", "{query_list}");
+    assert_eq!(analyst.get("granteeEmail"), Some(&Value::Null));
+}
+
+/// A rule whose person is not in the caller's organisation names nobody:
+/// the list carries the id and `null` for the name and the email, never the
+/// name of another organisation's person. A person who is no longer active
+/// is still named, because the rule that names them still applies.
+#[tokio::test]
+async fn a_person_outside_the_tenant_is_not_named_and_an_inactive_one_is() {
+    let TestApp { router, pool } = spin_up().await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    // Sari belongs to the Retail tenant only; Yoga to the Group's, and is
+    // deactivated here.
+    let sari_id = user_id(&pool, "sari@meridian.example").await;
+    let yoga_id = user_id(&pool, "yoga@meridian.example").await;
+    sqlx::query("UPDATE app_user SET status = 'inactive' WHERE id = $1")
+        .bind(yoga_id)
+        .execute(&pool)
+        .await
+        .expect("deactivate the person");
+    let reports = folder_created(&router, &rina, "Reports", None).await;
+    let (query, _) = query_saved(&router, &rina, "Numbers", Some(&reports)).await;
+    // The route refuses a grantee outside the tenant, so a rule that
+    // outlived one is written by hand.
+    for grantee in [sari_id, yoga_id] {
+        sqlx::query(
+            "INSERT INTO saved_query_access_rule (folder_id, user_id, level, granted_by) \
+             VALUES ($1, $2, 'view', $3)",
+        )
+        .bind(Uuid::parse_str(&reports).expect("the folder id"))
+        .bind(grantee)
+        .bind(user_id(&pool, "rina@meridian.example").await)
+        .execute(&pool)
+        .await
+        .expect("write the rule");
+    }
+
+    // The folder lists the rules as its own, the query as inherited.
+    let (status, folder_list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/folders/{reports}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{folder_list}");
+    let (status, query_list) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{query}/access"),
+        &rina,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{query_list}");
+
+    for (list, which) in [(&folder_list, "rules"), (&query_list, "inherited")] {
+        let sari = rule_naming(list, which, "userId", &sari_id.to_string());
+        assert_eq!(sari.get("granteeName"), Some(&Value::Null), "{list}");
+        assert_eq!(sari.get("granteeEmail"), Some(&Value::Null), "{list}");
+        let yoga = rule_naming(list, which, "userId", &yoga_id.to_string());
+        assert_eq!(yoga["granteeName"], "Yoga Prasetya", "{list}");
+        assert_eq!(yoga["granteeEmail"], "yoga@meridian.example", "{list}");
+    }
+}
+
+/// The names cost two queries at most, whatever the number of rules: one
+/// list holds a person and a role, the other five people and four roles, and
+/// both cost the same number of pool checkouts.
+#[tokio::test]
+async fn more_rules_do_not_add_a_round_trip_to_an_access_list() {
+    let (app, checkouts) =
+        spin_up_with_env_counting_acquires(&std::collections::HashMap::new()).await;
+    let TestApp { router, pool } = app;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let small = folder_created(&router, &rina, "Small", None).await;
+    let large = folder_created(&router, &rina, "Large", None).await;
+    let mut people = Vec::new();
+    for email in [
+        "reza@meridian.example",
+        "bayu@meridian.example",
+        "dewi@meridian.example",
+        "citra@meridian.example",
+        "yoga@meridian.example",
+    ] {
+        people.push(user_id(&pool, email).await.to_string());
+    }
+    let (status, body) = put_folder_rules(
+        &router,
+        &rina,
+        &small,
+        json!([
+            {"userId": people[0], "level": "view"},
+            {"roleId": ANALYST_ROLE, "level": "view"},
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut many: Vec<Value> = people
+        .iter()
+        .map(|id| json!({"userId": id, "level": "view"}))
+        .collect();
+    for role in [
+        ANALYST_ROLE,
+        APPROVER_ROLE,
+        "22222222-2222-4222-8222-000000000003",
+        "22222222-2222-4222-8222-000000000004",
+    ] {
+        many.push(json!({"roleId": role, "level": "view"}));
+    }
+    let (status, body) = put_folder_rules(&router, &rina, &large, Value::Array(many)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Warm-up: the first request of a fresh harness opens what later ones
+    // reuse, so it is not part of the measurement.
+    let path = |folder: &String| format!("/api/query/folders/{folder}/access");
+    let (status, _) = call(&router, "GET", &path(&small), &rina, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let before = checkouts.load(std::sync::atomic::Ordering::SeqCst);
+    let (status, list) = call(&router, "GET", &path(&small), &rina, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let small_cost = checkouts.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert_eq!(list["rules"].as_array().map(Vec::len), Some(2), "{list}");
+
+    let before = checkouts.load(std::sync::atomic::Ordering::SeqCst);
+    let (status, list) = call(&router, "GET", &path(&large), &rina, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let large_cost = checkouts.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert_eq!(list["rules"].as_array().map(Vec::len), Some(9), "{list}");
+
+    assert!(small_cost > 0, "the counter counts: {small_cost}");
+    assert_eq!(
+        large_cost, small_cost,
+        "nine rules cost as many checkouts as two"
     );
 }
