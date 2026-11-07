@@ -1,11 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useSyncExternalStore } from "react";
+import { useEffect, useRef } from "react";
 import { m } from "framer-motion";
 import { ArrowUp } from "lucide-react";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 import { cn } from "@/lib/utils";
-import { DESKTOP_MOTION } from "./smooth-scroll";
 
 /**
  * WEB-5 owner QA O15: a 1:1 copy of rantai-page's
@@ -13,14 +12,15 @@ import { DESKTOP_MOTION } from "./smooth-scroll";
  * `BackToTop`), so the family's footers move the same way. Only these
  * change:
  * - the colours, to the lake by role (rantai's `foreground` is the foam);
+ * - no overscroll pull on the wordmark (O26, see below);
  * - `m.*` instead of `motion.*`, because this site loads motion's features
  *   lazily (`motion-features.tsx`), and `data-reveal`, so every piece is
  *   visible without JavaScript (D5);
  * - Back to top reaches Lenis through a window event (`SCROLL_TOP_EVENT`),
  *   so Lenis stays out of the first JavaScript (D16);
- * - the wordmark's letters show once a tenth of it is in view, not three
- *   tenths: the page's end crops it, and less than that was ever on screen
- *   here, so they never rose (measured in O7).
+ * - the wordmark's letters rise as soon as any of it is in view, not at
+ *   three tenths: the page's end crops it, and the reveal must never wait
+ *   on more of it than the page can show (O26).
  */
 
 const ease = [0.22, 1, 0.36, 1] as const;
@@ -61,20 +61,9 @@ export function Reveal({
 
 const letterClass = "inline-block bg-linear-to-b bg-clip-text text-transparent";
 
-function subscribeDesktop(onChange: () => void): () => void {
-  const mq = window.matchMedia(DESKTOP_MOTION);
-  mq.addEventListener("change", onChange);
-  return () => mq.removeEventListener("change", onChange);
-}
-
-function useDesktopMotion(): boolean {
-  return useSyncExternalStore(subscribeDesktop, () => window.matchMedia(DESKTOP_MOTION).matches, () => false);
-}
-
 export function FooterWordmark({ text, className }: Readonly<{ text: string; className?: string }>) {
   const ref = useRef<HTMLDivElement>(null);
   const reduce = useReducedMotionSafe();
-  const desktopMotion = useDesktopMotion();
   const letters = Array.from(text);
 
   useEffect(() => {
@@ -125,99 +114,25 @@ export function FooterWordmark({ text, className }: Readonly<{ text: string; cla
     };
   }, [reduce]);
 
-  // Overscroll reveal: the wordmark is cropped by the panel's bottom edge.
-  // If the visitor keeps scrolling down once the page has ended, the panel
-  // stretches (with growing resistance) to show the whole word, and the
-  // footer lifts by the same amount so the new space stays in view. When
-  // they stop, it settles back.
-  useEffect(() => {
-    const root = ref.current;
-    const panel = root?.parentElement;
-    const footer = root?.closest("footer");
-    // Never intercept touch scrolling, even while the footer is offscreen.
-    // Safari must be free to handle momentum and its own rubber band.
-    if (!root || !panel || !footer || !desktopMotion) return;
-
-    let pull = 0; // raw input since the pull started
-    let shown = 0; // pixels currently revealed
-    let room = 0; // pixels needed to show the whole word
-    let frame = 0;
-    let release: ReturnType<typeof setTimeout> | undefined;
-
-    const atBottom = () => window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - shown - 4;
-
-    const measure = () => {
-      const word = root.firstElementChild?.getBoundingClientRect();
-      const edge = panel.getBoundingClientRect().bottom;
-      room = word ? Math.max(0, word.bottom - edge) + 40 : 0;
-    };
-
-    const apply = () => {
-      root.style.marginBottom = shown ? `calc(-0.2em + ${shown}px)` : "";
-      // How far through the reveal we are, 0 to 1; brightens the "reward" layer.
-      // The rubber band only creeps toward its end, so reach full solid
-      // colour by about three quarters of the way instead.
-      const progress = room ? shown / room : 0;
-      const solid = Math.min(1, Math.max(0, (progress - 0.1) / 0.65));
-      root.style.setProperty("--pull", String(solid));
-      footer.style.transform = shown ? `translateY(${-shown}px)` : "";
-    };
-
-    const tick = () => {
-      // Rubber band: easy at first, then harder the further it goes.
-      const goal = room * (1 - Math.exp(-pull / (room * 1.4)));
-      shown += (goal - shown) * 0.18;
-      if (Math.abs(goal - shown) < 0.4) shown = goal;
-      apply();
-      frame = shown !== goal ? requestAnimationFrame(tick) : 0;
-    };
-    const kick = () => {
-      if (!frame) frame = requestAnimationFrame(tick);
-    };
-
-    /** Returns true when this input was used for the pull. */
-    const take = (delta: number) => {
-      if (pull === 0) {
-        if (delta <= 0 || !atBottom()) return false;
-        measure();
-        if (!room) return false;
-      }
-      pull = Math.max(0, pull + delta);
-      clearTimeout(release);
-      release = setTimeout(() => {
-        pull = 0;
-        kick();
-      }, 180);
-      kick();
-      return true;
-    };
-
-    // Capture phase, so the smooth scroller never sees a wheel we used.
-    const onWheel = (e: WheelEvent) => {
-      if (take(e.deltaY)) {
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    };
-    window.addEventListener("wheel", onWheel, { capture: true, passive: false });
-    return () => {
-      cancelAnimationFrame(frame);
-      clearTimeout(release);
-      window.removeEventListener("wheel", onWheel, { capture: true });
-      root.style.marginBottom = "";
-      root.style.removeProperty("--pull");
-      footer.style.transform = "";
-    };
-  }, [desktopMotion]);
+  // WEB-5 owner QA O26: rantai-page's overscroll pull (scrolling on past the
+  // end stretches the panel to show the whole word in solid colour, and lifts
+  // the footer) is left out here. On this page it moved the end of the page,
+  // so the page-wide water re-coloured to the abyss and the bottom turned
+  // black, and a solid grey word appeared under the bar. The browser's own
+  // rubber band shows the footer's colour instead (app/globals.css).
 
   return (
     <div ref={ref} aria-hidden="true" className={cn("relative select-none", className)}>
+      {/* WEB-5 owner QA O26: this site's base styles give every <p> 16 px / 24 px
+          (app/globals.css, the console's type rules), which rantai-page does not
+          have, so the wordmark rendered 24 px tall below the page's end. It
+          inherits the wrapper's clamp and leading instead. */}
       <m.p
         data-reveal
-        className="flex justify-center"
+        className="flex justify-center [font-size:inherit] [line-height:inherit]"
         initial={reduce ? false : "hidden"}
         whileInView="shown"
-        viewport={{ once: true, amount: 0.1 }}
+        viewport={{ once: true, amount: "some" }}
         transition={{ staggerChildren: 0.06 }}
       >
         {letters.map((char, i) => (
@@ -232,11 +147,6 @@ export function FooterWordmark({ text, className }: Readonly<{ text: string; cla
           >
             <span data-wave className="relative inline-block">
               <span className={cn(letterClass, "from-[#E8F4FF]/[0.08] to-transparent")}>{char}</span>
-              {/* Solid copy that takes over as the visitor pulls past the
-                  end; fully pulled, the word reads as one flat colour */}
-              <span className="absolute inset-0 inline-block text-[#E8F4FF]" style={{ opacity: "var(--pull, 0)" }}>
-                {char}
-              </span>
               {/* Brighter copy, faded in as the cursor comes near */}
               <span
                 data-wave-ink

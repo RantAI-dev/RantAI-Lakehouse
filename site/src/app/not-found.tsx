@@ -29,7 +29,7 @@ export default async function NotFound() {
   const id = await getTranslations({ locale: "id", namespace: "common.notFound" });
   return (
     <SiteDocument locale={routing.defaultLocale}>
-      <div className="lk-root relative isolate flex min-h-[100svh] flex-col items-center justify-center overflow-hidden px-4 py-20 text-center">
+      <div className="lk-root lk-404 relative isolate flex min-h-[100svh] flex-col items-center justify-center overflow-hidden px-4 py-20 text-center">
         <div
           aria-hidden="true"
           className="absolute inset-0 -z-10 bg-[linear-gradient(180deg,#020514_0%,#050A30_42%,#0A1F55_70%,#061440_100%)]"

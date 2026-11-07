@@ -119,6 +119,24 @@
   --lk-primary-press: #1a63c4;
 }
 
+/* WEB-5 owner QA O26: the rubber band past either end of the page (macOS
+   and iOS) shows the root's canvas. It is split at the middle of the
+   screen, so the top bounce shows the hero's night sky and the bottom bounce
+   the colour the page ends on: the page-wide water's deep lake blue on the
+   home page (`.lk-water`, #0b2a66 at its bottom), the 404's lake, and the
+   footer's abyss elsewhere. `fixed`, so the split stays with the screen.
+   The body keeps the abyss behind the content. The bounce itself is left
+   alone. */
+:root:has(.lk-root) {
+  background: linear-gradient(180deg, #020514 0 50%, #020514 50% 100%) fixed;
+}
+:root:has(.lk-water) {
+  background: linear-gradient(180deg, #020514 0 50%, #0b2a66 50% 100%) fixed;
+}
+:root:has(.lk-404) {
+  background: linear-gradient(180deg, #020514 0 50%, #061440 50% 100%) fixed;
+}
+
 .lk-root {
   --lk-abyss: #020514;
   --lk-navy: #050a30;

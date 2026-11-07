@@ -74,6 +74,44 @@ export function calendarSvg(): string {
   return `${open}${shapes.join("")}</svg>\n`;
 }
 
+/**
+ * WEB-5 O18: the map's hover regions, a 4 × 3 grid over the tile, each with
+ * an illustrative value; only regions that hold dots are hoverable. Derived
+ * from the same generator as the drawing, so they agree with the dots.
+ */
+export function mapZones(): { col: number; row: number; value: number }[] {
+  const cols = 34;
+  const rows = 15;
+  const counts = new Map<string, number>();
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const nx = (c / (cols - 1)) * 2 - 1;
+      const ny = (r / (rows - 1)) * 2 - 1;
+      const lobe = Math.min((nx + 0.42) ** 2 / 0.32 + (ny + 0.05) ** 2 / 0.62, (nx - 0.4) ** 2 / 0.3 + (ny - 0.12) ** 2 / 0.5);
+      const edge = (hash(c, r) - 0.5) * 0.35;
+      if (lobe + edge >= 1) continue;
+      const x = 14 + c * 10.1;
+      const y = 16 + r * 11.5;
+      const key = `${Math.min(3, Math.floor(x / 90))},${Math.min(2, Math.floor(y / (TILE_SIZE.height / 3)))}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .filter(([, n]) => n >= 6)
+    .map(([key]) => {
+      const [col, row] = key.split(",").map(Number);
+      return { col, row, value: Math.round((2 + hash(col * 3 + row, 7) * 9) * 10) / 10 };
+    })
+    .sort((a, b) => a.row - b.row || a.col - b.col);
+}
+
+/** WEB-5 O18: the calendar's cell value (0..1) at a column and row, the same as the drawing's. */
+export function calendarLevel(c: number, r: number): number {
+  const v = hash(c + 1, r + 11);
+  const quiet = r >= 5 ? 0.45 : 1;
+  return Math.min(1, v * quiet * (0.55 + 0.6 * hash(c, 2)));
+}
+
 /** Where each file is served from and written to (`public/` + path). */
 export const TILE_FILES = {
   map: { path: "/tiles/dot-map.svg", render: dotMapSvg },
