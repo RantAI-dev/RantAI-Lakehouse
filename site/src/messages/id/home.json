@@ -136,18 +136,6 @@
   "dashboards": {
     "headline": "Jawaban jadi dashboard.",
     "sub": "Sekitar dua lusin jenis chart, termasuk peta dengan batas wilayah Anda.",
-    "features": [
-      "Calculated field",
-      "Parameter",
-      "Metrik bersama",
-      "Hasil diingat dan diperbarui",
-      "Komentar dengan @mention",
-      "Alert di chart",
-      "PNG, PDF, dan Excel",
-      "Laporan terjadwal",
-      "Tautan publik berbatas waktu dan bersandi",
-      "Embed"
-    ],
     "tiles": {
       "line": {
         "title": "Kunjungan dari waktu ke waktu",

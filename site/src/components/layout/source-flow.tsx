@@ -55,6 +55,7 @@ const DEPTHS = [
 
 const CHIP =
   "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition-[background-color,border-color,color] duration-200 ease-out motion-reduce:transition-none";
+/** Audit #12: the site's one selected style (also the contact topics and the governance role toggle). */
 const CHIP_ON = "border-[#8fcbff]/60 bg-[#44A6FA]/15 text-white";
 const CHIP_OFF = "border-[#E8F4FF]/12 text-[#E8F4FF]/70 hover:border-[#E8F4FF]/30 hover:text-[#E8F4FF]";
 

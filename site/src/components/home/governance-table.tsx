@@ -284,7 +284,8 @@ function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role
         {/* The thumb slides under the chosen role. */}
         <span
           aria-hidden="true"
-          className="absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-[var(--lk-primary)] shadow-[0_6px_20px_-6px_rgba(68,166,250,0.7)] transition-transform duration-[220ms] ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none"
+          // Audit #12: the site's one selected style (lake tint, light hairline), not a glowing primary button.
+          className="absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-[#44A6FA]/15 ring-1 ring-[#8fcbff]/60 ring-inset transition-transform duration-[220ms] ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none"
           style={{ transform: role === "admin" ? "translateX(100%)" : "translateX(0)" }}
         />
         {ROLES.map((r, i) => (

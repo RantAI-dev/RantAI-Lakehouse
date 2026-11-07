@@ -172,8 +172,9 @@ export function ContactForm({ text, to }: Readonly<{ text: ContactCopy["form"]; 
                   key={k}
                   className={cn(
                     "relative inline-flex min-h-11 cursor-pointer items-center justify-center rounded-full px-4 py-2 text-center text-[14px] leading-5 ring-1 transition-[background-color,color,box-shadow,transform] duration-200 ease-out active:scale-[0.98] has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-[#44A6FA] motion-reduce:transition-none sm:min-h-10",
+                    // Audit #12: the site's one selected style, a lake tint with a light hairline.
                     on
-                      ? "bg-[#E8F4FF] text-[#020514] ring-[#E8F4FF]"
+                      ? "bg-[#44A6FA]/15 text-white ring-[#8fcbff]/60"
                       : "bg-transparent text-[#E8F4FF]/80 ring-[#E8F4FF]/20 hover:text-[#E8F4FF] hover:ring-[#E8F4FF]/45",
                   )}
                 >

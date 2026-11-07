@@ -89,16 +89,6 @@ export const CLAIMS: readonly Claim[] = [
     backlog: ["WEB-1 In Acceptance", "BI-16 Building (part C2 merged in #246/#265): your own map boundaries, not every chart type"],
     note: "about two dozen chart types (WEB-1's claim); maps on your own boundaries (BI-16 C2)",
   },
-  { key: "home.dashboards.features.0", backlog: ["BI-8 In Acceptance"], note: "calculated fields" },
-  { key: "home.dashboards.features.1", backlog: ["BI-11 In Acceptance"], note: "parameters" },
-  { key: "home.dashboards.features.2", backlog: ["BI-2 In Acceptance"], note: "reusable metrics" },
-  { key: "home.dashboards.features.3", backlog: ["BI-4 In Acceptance"], note: "results remembered and refreshed" },
-  { key: "home.dashboards.features.4", backlog: ["BI-19 In Acceptance"], note: "comments with @mentions" },
-  { key: "home.dashboards.features.5", backlog: ["BI-19 In Acceptance"], note: "alerts on a chart" },
-  { key: "home.dashboards.features.6", backlog: ["BI-19 In Acceptance", "BI-1 In Acceptance"], note: "PNG export (BI-19); PDF and Excel (BI-1)" },
-  { key: "home.dashboards.features.7", backlog: ["RPT-1 In Acceptance"], note: "scheduled reports" },
-  { key: "home.dashboards.features.8", backlog: ["BI-19 In Acceptance", "SEC-12 In Acceptance"], note: "public links with an expiry and a password (BI-19 A)" },
-  { key: "home.dashboards.features.9", backlog: ["BI-26 In Acceptance", "SEC-12 In Acceptance"], note: "embeds" },
   // Governance
   // The hero's reassurance line (D21, 2026-11-07): each part is a claim.
   // O50 (audit #7): the three parts are one line now; the licence joined the first part.

@@ -50,18 +50,9 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
             <LeadText className="mt-4 max-w-[38rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
               {copy.sub}
             </LeadText>
-            {/* WEB-5 O10, "lots of visuals, little text": the features as chips, each one a claim. */}
-            <ul className="mt-5 flex max-w-[52rem] flex-wrap gap-1.5 max-md:max-h-[4.6rem] max-md:overflow-hidden md:mt-6 md:gap-2">
-              {copy.features.map((f) => (
-                <li
-                  key={f}
-                  // O18: the site's chip states, a lighter border and a small lift.
-                  className="rounded-full border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] px-3 py-1 text-[12px] leading-5 whitespace-nowrap text-[#E8F4FF]/80 transition-[border-color,background-color,color,translate] duration-200 ease-out hover:-translate-y-0.5 hover:border-[#E8F4FF]/35 hover:bg-[#E8F4FF]/[0.09] hover:text-[#E8F4FF] active:translate-y-0 motion-reduce:transition-none motion-reduce:hover:translate-y-0 md:text-[13px]"
-                >
-                  {f}
-                </li>
-              ))}
-            </ul>
+            {/* Audit #2 + #12: no feature pills here. The tiles already show the features, and the
+                page has enough chip walls (sources, assistant, the footer card); on phones the pills'
+                third row was also cut by the pinned track. */}
           </Container>
         </>
       }

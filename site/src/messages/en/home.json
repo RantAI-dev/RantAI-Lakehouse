@@ -136,18 +136,6 @@
   "dashboards": {
     "headline": "Answers become dashboards.",
     "sub": "About two dozen chart types, maps on your own boundaries included.",
-    "features": [
-      "Calculated fields",
-      "Parameters",
-      "Reusable metrics",
-      "Results remembered and refreshed",
-      "Comments with @mentions",
-      "Alerts on a chart",
-      "PNG, PDF and Excel",
-      "Scheduled reports",
-      "Public links with expiry and password",
-      "Embeds"
-    ],
     "tiles": {
       "line": {
         "title": "Visits over time",
