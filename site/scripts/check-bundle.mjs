@@ -3,8 +3,8 @@
 // "JS loaded before the 3D scene (all initial chunks, gzip) ≤ 200 KB").
 //
 // "Initial" means every script a page's HTML loads by itself: the
-// `<script src>` tags and the script preloads in `out/index.html` and
-// `out/id/index.html`. A `<script noModule>` is not counted: it is Next's
+// `<script src>` tags and the script preloads in each page's HTML (the
+// home page and, since WEB-5 D15, the contact page, in both languages). A `<script noModule>` is not counted: it is Next's
 // legacy polyfill bundle, which every browser that runs modules (all the
 // spec's targets, and Lighthouse's emulated Chrome) skips without
 // downloading; it is listed so the number stays visible. The scene's
@@ -25,7 +25,7 @@ import { gzipSync } from "node:zlib";
 
 const OUT = new URL("../out/", import.meta.url).pathname;
 const BUDGET = 200_000;
-const PAGES = ["index.html", "id/index.html"];
+const PAGES = ["index.html", "id/index.html", "contact/index.html", "id/contact/index.html"];
 // Strings three.js keeps after minification, and one of the scene's own
 // shader uniforms, so both the library chunk and the engine chunk are found.
 const SCENE_MARKERS = ["WebGLRenderer", "uSkyHorizon"];

@@ -5,7 +5,8 @@
     "product": "Product",
     "howItWorks": "How it works",
     "governance": "Governance",
-    "openSource": "Open source"
+    "openSource": "Open source",
+    "contact": "Contact"
   },
   "cta": {
     "install": "Install it",
@@ -28,7 +29,8 @@
       "open": "Yours to keep"
     },
     "userGuide": "User guide",
-    "legal": "© 2026 RantAI. Depok, West Java, Indonesia."
+    "legal": "© 2026 RantAI. Depok, West Java, Indonesia.",
+    "contact": "Contact"
   },
   "language": {
     "label": "Language",

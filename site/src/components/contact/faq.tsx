@@ -1,0 +1,45 @@
+import { Plus } from "lucide-react";
+import type { ContactCopy } from "@/lib/copy";
+import { Container, DisplayHeading, Eyebrow } from "@/components/shared/primitives";
+
+/**
+ * The product's common questions (WEB-5 D15, after the RantAI site's
+ * `components/shared/faq.tsx`). A disclosure list of `<details>`, so it
+ * opens and closes by keyboard and works without JavaScript; the shared
+ * `name` lets a browser that supports it keep one answer open at a time.
+ * Every answer is a claim, traced to the backlog in `content/claims.ts`.
+ */
+export function Faq({ copy }: Readonly<{ copy: ContactCopy["faq"] }>) {
+  return (
+    <section id="faq" aria-labelledby="faq-heading" className="relative scroll-mt-16 py-20 md:py-28">
+      <Container className="grid grid-cols-[minmax(0,1fr)] gap-10 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:gap-16">
+        <div className="lg:sticky lg:top-28 lg:self-start">
+          <Eyebrow>{copy.eyebrow}</Eyebrow>
+          <DisplayHeading id="faq-heading" size="md" className="mt-5 whitespace-pre-line">
+            {copy.title}
+          </DisplayHeading>
+        </div>
+        <ul className="border-t border-[#E8F4FF]/12">
+          {copy.items.map((item, i) => (
+            <li key={item.q} className="border-b border-[#E8F4FF]/12">
+              <details name="lakehouse-faq" open={i === 0} className="group">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-6 rounded-lg py-5 text-left text-[17px] leading-snug font-medium text-[#E8F4FF] marker:hidden focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[#44A6FA] sm:py-6 sm:text-[19px] [&::-webkit-details-marker]:hidden">
+                  {item.q}
+                  <span
+                    aria-hidden="true"
+                    className="grid size-8 shrink-0 place-items-center rounded-full bg-[#E8F4FF]/[0.08] text-[#E8F4FF]/80 transition-[background-color,color,rotate] duration-300 group-open:rotate-45 group-open:bg-[#E8F4FF] group-open:text-[#020514] motion-reduce:transition-none"
+                  >
+                    <Plus className="size-4" />
+                  </span>
+                </summary>
+                <p className="max-w-2xl pr-12 pb-6 text-[15px] leading-relaxed text-pretty text-[#E8F4FF]/75 sm:text-[16px]">
+                  {item.a}
+                </p>
+              </details>
+            </li>
+          ))}
+        </ul>
+      </Container>
+    </section>
+  );
+}

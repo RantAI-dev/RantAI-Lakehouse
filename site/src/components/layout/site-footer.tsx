@@ -1,4 +1,6 @@
 import * as React from "react";
+import { localizedPath } from "@/i18n/paths";
+import type { Locale } from "@/i18n/routing";
 import type { CommonCopy } from "@/lib/copy";
 import { CONTACT_EMAIL, FAMILY_LINKS, FOOTER_SECTIONS, LINKS } from "@/lib/home-content";
 import { Container } from "@/components/shared/primitives";
@@ -7,17 +9,35 @@ import { Reveal } from "@/components/shared/reveal";
 
 type Column = { title: string; links: readonly { label: string; href: string }[] };
 
-/** S9 — footer: the family links and the legal line. */
-export function SiteFooter({ copy }: { copy: CommonCopy["footer"] }) {
+/**
+ * S9 — footer: the family links and the legal line. Shared by the home page
+ * and the contact page (WEB-5 D15); on the contact page the section links
+ * lead back to the home page's sections.
+ */
+export function SiteFooter({
+  locale,
+  page = "home",
+  copy,
+}: {
+  locale: Locale;
+  page?: "home" | "contact";
+  copy: CommonCopy["footer"];
+}) {
+  const home = localizedPath(locale, "/");
   const columns: Column[] = [
     {
       title: copy.columns.product,
-      links: FOOTER_SECTIONS.map((s) => ({ label: copy.sections[s.key], href: s.href })),
+      links: FOOTER_SECTIONS.map((s) => ({
+        label: copy.sections[s.key],
+        href: page === "home" ? s.href : `${home}${s.href}`,
+      })),
     },
     { title: copy.columns.rantai, links: FAMILY_LINKS },
     {
       title: copy.columns.connect,
       links: [
+        // D15: the contact page, in the visitor's language; the address stays as plain mail.
+        { label: copy.contact, href: localizedPath(locale, "/contact") },
         { label: copy.userGuide, href: LINKS.guide },
         { label: "GitHub", href: LINKS.source },
         { label: CONTACT_EMAIL, href: LINKS.email },

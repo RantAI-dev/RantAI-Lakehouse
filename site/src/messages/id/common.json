@@ -5,7 +5,8 @@
     "product": "Produk",
     "howItWorks": "Cara kerja",
     "governance": "Tata kelola",
-    "openSource": "Open source"
+    "openSource": "Open source",
+    "contact": "Kontak"
   },
   "cta": {
     "install": "Instal",
@@ -28,7 +29,8 @@
       "open": "Milik Anda"
     },
     "userGuide": "Panduan pengguna",
-    "legal": "© 2026 RantAI. Depok, Jawa Barat, Indonesia."
+    "legal": "© 2026 RantAI. Depok, Jawa Barat, Indonesia.",
+    "contact": "Kontak"
   },
   "language": {
     "label": "Bahasa",

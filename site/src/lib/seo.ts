@@ -24,9 +24,13 @@ export type PageText = { title: string; description: string };
 /** The preview card each language's route handler writes (`app/…/og.png`). */
 export const OG_IMAGE = { width: 1200, height: 630, type: "image/png" } as const;
 
-export function ogImagePath(locale: Locale): string {
-  return `${localizedPath(locale, "/")}og.png`;
+/** The page's own preview card: `og.png` next to its `index.html` (`/og.png`, `/id/contact/og.png`). */
+export function ogImagePath(locale: Locale, path = "/"): string {
+  return `${localizedPath(locale, path)}og.png`;
 }
+
+/** The pages with their own title and description in `metadata.json`. */
+export type MetadataPage = "home" | "contact";
 
 /** The pure part, so it is unit-tested without a Next build. */
 export function buildPageMetadata({
@@ -41,8 +45,8 @@ export function buildPageMetadata({
 }): Metadata {
   const url = localizedPath(locale, path);
   return {
-    // The home page's title already names the product, so the layout's
-    // "%s — RantAI Lakehouse" template is not applied to it.
+    // Every page's title already names the product ("… — RantAI
+    // Lakehouse"), so the layout's template is not applied on top.
     title: { absolute: text.title },
     description: text.description,
     alternates: { canonical: url, languages: languageAlternates(path) },
@@ -54,13 +58,13 @@ export function buildPageMetadata({
       alternateLocale: routing.locales.filter((l) => l !== locale).map((l) => OG_LOCALE[l]),
       title: text.title,
       description: text.description,
-      images: [{ url: ogImagePath(locale), ...OG_IMAGE, alt: SITE_NAME }],
+      images: [{ url: ogImagePath(locale, path), ...OG_IMAGE, alt: SITE_NAME }],
     },
     twitter: {
       card: "summary_large_image",
       title: text.title,
       description: text.description,
-      images: [ogImagePath(locale)],
+      images: [ogImagePath(locale, path)],
     },
   };
 }
@@ -73,7 +77,7 @@ export async function pageMetadata({
 }: {
   locale: Locale;
   path: string;
-  page?: "home";
+  page?: MetadataPage;
 }): Promise<Metadata> {
   const t = await getTranslations({ locale, namespace: "metadata" });
   return buildPageMetadata({

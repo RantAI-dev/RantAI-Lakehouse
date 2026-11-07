@@ -1567,3 +1567,133 @@ change how it moves between sections. The sections, copy structure, palette and 
    - A miss is written with its number, not lowered.
 
 The owner reviews the result in QA, which can send any of S1–S5 back.
+
+## 10. Addendum: production ready, as one RantAI family (owner, 2026-11-07)
+
+The owner asked for the Lakehouse site to be "fully built and ready to deploy, with every best
+practice and the same features as rantai-page" by **2026-11-08 12:00 WIB (05:00 UTC)**. RantAI is
+the company; Agents, Claw, LLMOps and Lakehouse are its products, so their landing pages must read
+as one family and be polished to the same standard. Lakehouse is the first of the four. The
+cross-site baseline is in `~/mtharreq/notes/rantai-product-site-standard.md`.
+
+Owner answers, 2026-11-07:
+- Hosting is still undecided: **D2 stands**. No host config files, no domain, no deploy workflow.
+- From rantai-page, bring: **the contact page with its FAQ**, **smooth scroll (Lenis)** and the
+  **social links**. Not brought: Vercel Analytics and Speed Insights (D1 stands: no analytics),
+  the light/dark theme (decision 2 stands: the site is dark).
+- The work stays in **PR #379**.
+
+### D15. The contact page, `/contact/` and `/id/contact/`
+
+- Port rantai-page's `/contact` (`src/app/[locale]/contact/`, `contact-form.tsx`,
+  `components/shared/faq.tsx`, `lib/faq-json-ld.ts`, `messages/*/contact.json`) to the site's
+  design: dark, the lake palette, sans only (monospace for code only, owner QA note 1).
+- **The form sends nothing to a server.** It opens a ready-made e-mail to `contact@rantai.dev`,
+  with a subject of `RantAI Lakehouse · <topic> · <name>`, the same way rantai-page does. There is
+  a fallback line with the address and a copy button. The site stays static, with no API and no
+  cookie (D1).
+- **Topics,** written for Lakehouse: installing it on your servers, a walkthrough of the product,
+  connectors and data sources, and something else. The developer may adjust the wording. Pricing,
+  plans and trials are not offered: there are none.
+- **Direct contacts:** the e-mail address, the public repository, and "Follow RantAI"
+  (D17).
+- **The FAQ** has 6–8 questions a Lakehouse visitor asks:
+  - what it is;
+  - whether it is open source (AGPL-3.0);
+  - whether it runs on your own servers;
+  - what it connects to;
+  - what Bronze, Silver and Gold mean;
+  - whether the assistant can change data without a person approving it;
+  - where the data is kept (Apache Iceberg);
+  - how to install it.
+
+  **Every answer is a claim:** add each one to `site/src/content/claims.ts` with its backlog
+  trace, under D7's rule (Released, Done or In Acceptance only). A question that has no answer the
+  build can back is left out.
+- The FAQ is an accessible disclosure list that works without JavaScript (`<details>` or the
+  equivalent). It has `FAQPage` JSON-LD on `/contact/` only.
+- **Links that move to the page:** "Talk to us" in the hero, the final call and the footer's
+  contact link now go to `/contact/` (in the visitor's language), as on rantai-page. The plain
+  `mailto:` stays in the footer as the address.
+- **SEO:** the page gets its own title, description, canonical address, hreflang links and
+  preview card (`/contact/og.png`, in both languages), and an entry in the sitemap with its
+  Indonesian alternate.
+- **The top bar and the story:** the top bar gets a "Contact" link. The home page's D14 journey
+  is unchanged. The contact page is a page at the surface: the same top bar, footer and
+  background family, and no depth gauge.
+- **Budgets:** the spec's targets apply to `/contact/` as well (Lighthouse mobile: LCP, CLS, TBT,
+  SEO 100, Accessibility ≥ 95). Initial JS on both pages stays ≤ 200 KB, checked by
+  `bun run size` (extend it to the new page).
+
+### D16. Smooth scroll
+
+- Lenis, as rantai-page's `components/layout/smooth-scroll.tsx`:
+  - only on desktops with a fine pointer;
+  - never under `prefers-reduced-motion: reduce`;
+  - in-page anchors keep their offset under the top bar;
+  - phones keep native scrolling.
+- **Must verify:**
+  - the D14 journey, the depth gauge and every scroll-driven section read the same scroll
+    position with and without Lenis: no lag, jump or jitter at the chapter marks;
+  - keyboard scrolling (Space, Page Down, Home, End) and the skip link still work;
+  - Lenis is not in the initial-JS count, or it fits inside the 200 KB budget.
+  - If Lenis fights the scroll timeline and cannot be made to agree, stop and report. Do not
+    ship a half-working version.
+
+### D17. Social links and the family footer
+
+- **The footer:**
+  - "Follow RantAI" links to LinkedIn, GitHub, Instagram and YouTube, at the same URLs as
+    rantai-page's `siteConfig.links`, with the same icons and accessible names;
+  - a "RantAI products" column lists Agents, Claw, LLMOps and Lakehouse (the current page
+    marked as such) and rantai.dev. Today Claw is missing.
+- **Short links** (`/github`, `/linkedin`…) are host redirects on rantai-page. A static export
+  cannot redirect without a host, so they wait for D2. Do not fake them with refresh pages.
+
+### D18. Ready for any static host
+
+- **Security headers** that work without a host: a `<meta http-equiv="Content-Security-Policy">`
+  built from rantai-page's policy, cut to what this site loads, plus `<meta name="referrer">`.
+  - The site loads nothing from other origins, so `script-src` is `'self' 'unsafe-inline'`,
+    `connect-src` is `'self'`, `img-src` is `'self' data: blob:`, and there are no third-party
+    hosts.
+  - Check that the WebGL scene, its worker or blob URLs (if any) and the OG routes still work
+    under it.
+- **The headers a meta tag cannot set** go in `site/README.md`, ready to paste per host
+  (Vercel `vercel.json`, Cloudflare Pages / Netlify `_headers`, nginx):
+  - Strict-Transport-Security, X-Content-Type-Options, frame-ancestors / X-Frame-Options,
+    Permissions-Policy;
+  - long-lived caching for `/_next/static/*`, and short caching for HTML.
+  - No file is added until a host is chosen (D2).
+- **Production polish,** each checked by the developer and again by the reviewer:
+  - no console error or hydration warning on any page;
+  - a 404 for a missing path in each language;
+  - the icons and `theme-color` are right;
+  - `site.webmanifest` names the site;
+  - every external link has `rel="noopener noreferrer"`;
+  - the form is fully usable by keyboard and labelled;
+  - no horizontal scroll at 320–1920 px;
+  - the text is right in both languages (the owner reviews the Indonesian).
+
+### Tasks P1–P5 (one commit each, in order; local commits, pushed only after the owner's QA)
+
+1. **P1 Contact page and FAQ** (D15).
+   - *Accept:* screenshots at 1440, 390 and 360, EN and ID;
+   - the form opens the right `mailto:` (subject and body checked in a test);
+   - the claims test passes for the FAQ;
+   - the sitemap and preview card are correct.
+2. **P2 Smooth scroll** (D16).
+   - *Accept:* the gauge and chapter readings match with Lenis on and off, measured by the
+     scroll probe at the chapter marks;
+   - the reduced-motion and phone runs show no Lenis.
+3. **P3 The family footer and the social links** (D17).
+   - *Accept:* screenshots of the footer at 1440 and 390, EN and ID.
+4. **P4 CSP meta, README headers and the polish sweep** (D18).
+   - *Accept:* every page loads under the CSP with no violation in the console;
+   - the polish list is written in the handoff with Pass or Fail for each item.
+5. **P5 Measure.**
+   - `bun run lint`, `typecheck`, `test`, `build` and `size`.
+   - Lighthouse, three interleaved rounds, on `/`, `/id/`, `/contact/` and `/id/contact/`.
+   - Record the results in RESULT as a dated update. A miss is written with its number.
+   - Update the feature page (`docs/core/features/landing-page.md`): what the user can do,
+     decisions, and checklist rows for the contact page, smooth scroll and footer.

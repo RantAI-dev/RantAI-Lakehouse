@@ -22,7 +22,6 @@ export const LINKS = {
    * heading, the section that installs the stack (confirmed in README.md).
    */
   install: `${REPO}#quickstart`,
-  talk: "mailto:contact@rantai.dev?subject=RantAI%20Lakehouse",
   email: "mailto:contact@rantai.dev",
   source: REPO,
   /**
@@ -36,6 +35,24 @@ export const LINKS = {
 } as const;
 
 export const CONTACT_EMAIL = "contact@rantai.dev";
+
+/**
+ * WEB-5 D17: RantAI's social profiles, at the same URLs as the RantAI site's
+ * `siteConfig.links` (rantai-page `src/lib/config.ts`), so the family links
+ * to one set. Brand names, not translated. The short links that site keeps
+ * (`/github`, `/linkedin`…) are host redirects; a static export cannot
+ * redirect, so they wait for a host (D2) and are not faked here.
+ */
+export const SOCIAL_LINKS = [
+  { id: "linkedin", label: "LinkedIn", href: "https://www.linkedin.com/company/rantai-dev/home/" },
+  { id: "github", label: "GitHub", href: "https://github.com/RantAI-dev" },
+  { id: "instagram", label: "Instagram", href: "https://www.instagram.com/rantaidev" },
+  { id: "youtube", label: "YouTube", href: "https://www.youtube.com/@RantAI-dev" },
+] as const;
+export type SocialId = (typeof SOCIAL_LINKS)[number]["id"];
+
+/** The repository as shown in text, without the scheme. */
+export const SOURCE_LABEL = REPO.replace(/^https:\/\//, "");
 
 /** Section anchors of the top bar, in order; labels are `common.nav.<key>`. */
 export const NAV_ANCHORS = [

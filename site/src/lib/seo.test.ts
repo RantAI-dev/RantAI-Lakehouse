@@ -29,6 +29,18 @@ test("ogImagePath points each language at its own png", () => {
   assert.equal(ogImagePath("id"), "/id/og.png");
 });
 
+test("the contact page has its own canonical, hreflang links and preview card (D15)", () => {
+  const en = buildPageMetadata({ locale: "en", path: "/contact", text });
+  assert.equal(en.alternates?.canonical, "/contact/");
+  assert.deepEqual(en.alternates?.languages, { en: "/contact/", id: "/id/contact/", "x-default": "/contact/" });
+  assert.equal((en.openGraph as Record<string, unknown>).url, "/contact/");
+  const id = buildPageMetadata({ locale: "id", path: "/contact", text });
+  assert.equal(id.alternates?.canonical, "/id/contact/");
+  assert.deepEqual((id.openGraph as { images: { url: string }[] }).images[0].url, "/id/contact/og.png");
+  assert.deepEqual((id.twitter as { images: string[] }).images, ["/id/contact/og.png"]);
+  assert.equal(ogImagePath("en", "/contact"), "/contact/og.png");
+});
+
 test("buildPageMetadata asks for the large preview card and never sets robots", () => {
   const m = buildPageMetadata({ locale: "en", path: "/", text });
   assert.equal((m.twitter as Record<string, unknown>).card, "summary_large_image");

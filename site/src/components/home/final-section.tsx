@@ -31,7 +31,16 @@ const STARS = Array.from({ length: 44 }, (_, i) => {
   };
 });
 
-export function FinalSection({ copy, cta }: { copy: HomeCopy["final"]; cta: CommonCopy["cta"] }) {
+export function FinalSection({
+  copy,
+  cta,
+  contactHref,
+}: {
+  copy: HomeCopy["final"];
+  cta: CommonCopy["cta"];
+  /** WEB-5 D15: "Talk to us" goes to the contact page, in the page's language. */
+  contactHref: string;
+}) {
   return (
     <section
       id="final"
@@ -58,7 +67,7 @@ export function FinalSection({ copy, cta }: { copy: HomeCopy["final"]; cta: Comm
         </DisplayHeading>
         <Reveal className="mt-9 flex flex-wrap items-center justify-center gap-3" delay={0.25}>
           <CtaLink href={LINKS.install}>{cta.install}</CtaLink>
-          <CtaLink href={LINKS.talk} variant="ghost">
+          <CtaLink href={contactHref} variant="ghost">
             {cta.talk}
           </CtaLink>
         </Reveal>

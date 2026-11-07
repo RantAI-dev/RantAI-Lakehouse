@@ -281,6 +281,9 @@ jobs:
           set -euo pipefail
           grep -Eq '<html[^>]* lang="en"' out/index.html
           grep -Eq '<html[^>]* lang="id"' out/id/index.html
+          # D15: the contact page, in both languages.
+          grep -Eq '<html[^>]* lang="en"' out/contact/index.html
+          grep -Eq '<html[^>]* lang="id"' out/id/contact/index.html
           if [ -e out/en ]; then
             echo "out/en must not exist: English lives at the root (WEB-5 D3)" >&2
             exit 1

@@ -1,0 +1,81 @@
+{
+  "hero": {
+    "eyebrow": "Kontak",
+    "title": "Ceritakan\ndata Anda.",
+    "description": "Instalasi di server Anda, demo produk, atau sumber yang ingin dihubungkan: beberapa kalimat sudah cukup, dan kami membalas lewat email."
+  },
+  "direct": {
+    "title": "Atau hubungi langsung",
+    "email": "Email",
+    "source": "Repository publik",
+    "follow": "Ikuti RantAI"
+  },
+  "form": {
+    "label": "Formulir kontak",
+    "name": "Nama",
+    "namePlaceholder": "Nama Anda",
+    "email": "Email kantor",
+    "emailPlaceholder": "anda@perusahaan.com",
+    "company": "Perusahaan",
+    "optional": "Opsional",
+    "topic": "Tentang apa?",
+    "topics": {
+      "install": "Instalasi di server Anda",
+      "walkthrough": "Demo produk",
+      "connectors": "Konektor dan sumber data",
+      "other": "Lainnya"
+    },
+    "message": "Pesan",
+    "messagePlaceholder": "Sumber data, data Anda, atau pertanyaan yang Anda pikirkan",
+    "send": "Kirim pesan",
+    "note": "Tombol kirim membuka aplikasi email Anda dengan pesan yang sudah siap. Halaman ini tidak mengirim apa pun.",
+    "opening": "Membuka aplikasi email…",
+    "fallback": "Tidak terbuka? Kirim ke {email}.",
+    "copy": "Salin alamat",
+    "copied": "Tersalin",
+    "required": "Mohon diisi",
+    "invalidEmail": "Masukkan alamat email yang valid",
+    "subject": "RantAI Lakehouse · {topic} · {name}",
+    "bodyName": "Nama",
+    "bodyEmail": "Email",
+    "bodyCompany": "Perusahaan"
+  },
+  "faq": {
+    "eyebrow": "FAQ",
+    "title": "Yang sering\nditanyakan.",
+    "items": [
+      {
+        "q": "Apa itu RantAI Lakehouse?",
+        "a": "Satu lakehouse dengan dashboard bawaan. Database, file, stream, dan aplikasi bisnis Anda masuk ke satu tempat, datanya disimpan dalam tabel Apache Iceberg yang terbuka, dan Anda bisa meminta jawaban dengan bahasa sehari-hari atau menulis SQL di Query Studio."
+      },
+      {
+        "q": "Apakah ini open source?",
+        "a": "Ya. Kodenya terbuka di GitHub dengan lisensi AGPL-3.0, jadi Anda bisa membaca setiap barisnya dan menjalankannya sendiri."
+      },
+      {
+        "q": "Bisa berjalan di server kami sendiri?",
+        "a": "Bisa. Lakehouse berjalan di infrastruktur Anda sendiri dengan Docker Compose, termasuk object storage dan katalog tabelnya, jadi data tetap di server Anda. Kalau Anda ingin kami yang menjalankannya, hubungi kami."
+      },
+      {
+        "q": "Bisa terhubung ke apa saja?",
+        "a": "Database (PostgreSQL, MySQL, SQL Server, dan MongoDB), stream Kafka, REST API, file yang diunggah (CSV, TSV, Excel, Parquet, JSON, JSON Lines, Avro, serta arsip gzip atau zip), dan delapan aplikasi bisnis: Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, dan SharePoint. PostgreSQL juga punya change capture langsung."
+      },
+      {
+        "q": "Apa arti Bronze, Silver, dan Gold?",
+        "a": "Itulah tiga kedalaman yang dilalui data Anda. Bronze menyimpan data setiap sumber apa adanya, dalam tabel Apache Iceberg. Silver adalah data itu setelah dibersihkan dan digabungkan oleh pipeline, lalu diawasi pemeriksaan kualitas. Gold berisi tabel terkurasi untuk pertanyaan bisnis Anda, yang diperbarui sendiri dalam lag yang Anda tetapkan."
+      },
+      {
+        "q": "Bisakah asisten mengubah data tanpa persetujuan orang?",
+        "a": "Tidak untuk hal yang berisiko. Asisten memakai tool yang sama dengan konsol: menjawab pertanyaan, membuat chart dan dashboard, serta menjalankan pipeline. Apa pun yang berisiko, misalnya menjeda pipeline, menunggu persetujuan orang, dan orang yang meminta tidak bisa menyetujui permintaannya sendiri."
+      },
+      {
+        "q": "Di mana data kami disimpan?",
+        "a": "Di server tempat Anda menginstalnya. Data mentah masuk ke tabel Apache Iceberg, format terbuka yang bisa dibaca engine apa pun yang mendukung Iceberg, dan tabel Gold juga bisa diterbitkan sebagai tabel terbuka."
+      },
+      {
+        "q": "Bagaimana cara menginstalnya?",
+        "a": "Dari repository publik, dengan Docker Compose: clone repository-nya, buat file pengaturan, lalu jalankan stack-nya. Langkahnya ada di bagian Quickstart pada README, yang ditautkan dari tombol “Instal” di bagian atas setiap halaman."
+      }
+    ]
+  }
+}

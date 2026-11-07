@@ -1,4 +1,5 @@
 import type common from "@/messages/en/common.json";
+import type contact from "@/messages/en/contact.json";
 import type home from "@/messages/en/home.json";
 
 /**
@@ -10,3 +11,4 @@ import type home from "@/messages/en/home.json";
  */
 export type CommonCopy = typeof common;
 export type HomeCopy = typeof home;
+export type ContactCopy = typeof contact;

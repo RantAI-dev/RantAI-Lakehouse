@@ -6,8 +6,12 @@ import { siteUrl } from "@/lib/site-url";
 // A static export writes this once, as out/sitemap.xml.
 export const dynamic = "force-static";
 
-/** The pages, by their English path. */
-const PAGES = ["/"] as const;
+/** The pages, by their English path, with their sitemap priority. */
+const PAGES = [
+  { path: "/", priority: 1 },
+  // WEB-5 D15.
+  { path: "/contact", priority: 0.6 },
+] as const;
 
 /**
  * Each page once, at its English URL, with every language as an hreflang
@@ -15,7 +19,7 @@ const PAGES = ["/"] as const;
  */
 export default function sitemap(): MetadataRoute.Sitemap {
   const base = siteUrl();
-  return PAGES.map((path) => ({
+  return PAGES.map(({ path, priority }) => ({
     url: `${base}${localizedPath(routing.defaultLocale, path)}`,
     alternates: {
       languages: Object.fromEntries(
@@ -23,6 +27,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
       ),
     },
     changeFrequency: "monthly" as const,
-    priority: 1,
+    priority,
   }));
 }

@@ -3,6 +3,11 @@
     "title": "RantAI Lakehouse — rumah bagi data Anda",
     "description": "Satu lakehouse dengan dashboard bawaan. Satukan semua sumber, simpan dalam tabel terbuka, dan tanyakan jawabannya dengan bahasa sehari-hari."
   },
+  "contact": {
+    "title": "Kontak — RantAI Lakehouse",
+    "description": "Tanyakan soal instalasi RantAI Lakehouse di server Anda, demo produk, atau cara menghubungkan sumber data Anda. Jawaban atas pertanyaan umum ada di sini.",
+    "ogHeadline": "Ceritakan data Anda."
+  },
   "og": {
     "headline": "Rumah bagi data Anda."
   }

@@ -47,6 +47,45 @@ test("every claim names at least one backlog row and no key is listed twice", ()
   assert.equal(new Set(CLAIMS.map((c) => c.key)).size, CLAIMS.length);
 });
 
+test("every FAQ answer is a claim with a backlog trace (D15)", () => {
+  for (const locale of routing.locales) {
+    const items = resolve(load(locale), "contact.faq.items") as { q: string; a: string }[];
+    assert.ok(Array.isArray(items) && items.length >= 6 && items.length <= 8, `${locale}: 6 to 8 questions`);
+    items.forEach((_, i) => {
+      const key = `contact.faq.items.${i}.a`;
+      assert.ok(CLAIMS.some((c) => c.key === key), `${key} has no entry in claims.ts`);
+    });
+  }
+});
+
+test("a claim's backlog rows are ones the page may claim: Released, Done or In Acceptance (D7)", () => {
+  for (const c of CLAIMS) {
+    // BI-16 is Building; its merged part C2 alone is claimed, and the row says so.
+    for (const b of c.backlog.filter((x) => !x.startsWith("BI-16 "))) {
+      assert.match(b, /^[A-Z]+-\d+ (Released|Done|In Acceptance)\b/, `${c.key}: ${b}`);
+    }
+  }
+});
+
+test("every claimed backlog row still has a status the page may claim in docs/core/BACKLOG.md", () => {
+  // The repository's backlog is the source (D7). Read straight from it, so a
+  // row that is reopened or killed later fails here instead of staying claimed.
+  const backlog = readFileSync(join(import.meta.dir, "../../../docs/core/BACKLOG.md"), "utf8");
+  const status = new Map<string, string>();
+  for (const line of backlog.split("\n")) {
+    const cells = line.split("|").map((c) => c.trim());
+    const id = /^`([A-Z]+-\d+)`$/.exec(cells[1] ?? "")?.[1];
+    // The item table's rows: ID, kind, item, module, priority, status, PR, source.
+    if (id && cells.length >= 9 && /^(Feature|Task|Decision)$/.test(cells[2]) && !status.has(id)) status.set(id, cells[6]);
+  }
+  for (const c of CLAIMS) {
+    for (const b of c.backlog.filter((x) => !x.startsWith("BI-16 "))) {
+      const id = b.split(" ")[0];
+      assert.match(status.get(id) ?? "missing", /^(Released|Done|In Acceptance)$/, `${c.key}: ${id} in BACKLOG.md`);
+    }
+  }
+});
+
 test("no message in any language makes a claim from the do-not-add list", () => {
   for (const locale of routing.locales) {
     for (const s of strings(load(locale))) {

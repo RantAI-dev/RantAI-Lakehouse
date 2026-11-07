@@ -23,7 +23,16 @@ import { BackdropFade, HeroCopyMotion, ScrollCueFade } from "./hero-motion";
  * and the cue render on the server; `hero-motion.tsx` holds the three
  * client leaves that move them.
  */
-export function HeroSection({ copy, cta }: { copy: HomeCopy["hero"]; cta: CommonCopy["cta"] }) {
+export function HeroSection({
+  copy,
+  cta,
+  contactHref,
+}: {
+  copy: HomeCopy["hero"];
+  cta: CommonCopy["cta"];
+  /** WEB-5 D15: "Talk to us" goes to the contact page, in the page's language. */
+  contactHref: string;
+}) {
   return (
     <ProgressSection range={["start start", "end start"]} id="hero" className="relative h-[150vh] motion-reduce:h-auto">
       <div className="sticky top-0 isolate flex h-[100svh] flex-col overflow-hidden motion-reduce:relative motion-reduce:min-h-[100svh]">
@@ -47,7 +56,7 @@ export function HeroSection({ copy, cta }: { copy: HomeCopy["hero"]; cta: Common
             <LeadText className="mx-auto mt-6 max-w-[34rem] short:mt-4 short:text-[15px] short:leading-[1.5] md:mx-0">{copy.sub}</LeadText>
             <div className="mt-9 short:mt-6 flex flex-wrap items-center justify-center gap-3 md:justify-start">
               <CtaLink href={LINKS.install}>{cta.install}</CtaLink>
-              <CtaLink href={LINKS.talk} variant="ghost">
+              <CtaLink href={contactHref} variant="ghost">
                 {cta.talk}
               </CtaLink>
             </div>
