@@ -3,7 +3,7 @@
 import * as React from "react";
 import Lenis from "lenis";
 import "lenis/dist/lenis.css";
-import { SCROLL_TOP_EVENT } from "./back-to-top";
+import { SCROLL_TOP_EVENT } from "./footer-motion";
 
 /** Keys the browser scrolls with; pressing one hands the page back to native scrolling at once. */
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Spacebar"]);

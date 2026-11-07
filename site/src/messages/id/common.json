@@ -34,9 +34,7 @@
       "open": "Milik Anda"
     },
     "userGuide": "Panduan pengguna",
-    "legal": "© 2026 RantAI. Depok, Jawa Barat, Indonesia.",
     "contact": "Kontak",
-    "follow": "Ikuti RantAI",
     "current": "Situs ini",
     "cta": {
       "eyebrow": "Mulai dari satu sumber",
@@ -58,7 +56,10 @@
       "backToForm": "Kembali ke formulir"
     },
     "backToTop": "Kembali ke atas",
-    "home": "Beranda RantAI Lakehouse"
+    "home": "Beranda RantAI Lakehouse",
+    "rights": "Hak cipta dilindungi",
+    "email": "Email {email}",
+    "nav": "Footer"
   },
   "language": {
     "label": "Bahasa",

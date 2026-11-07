@@ -34,9 +34,7 @@
       "open": "Yours to keep"
     },
     "userGuide": "User guide",
-    "legal": "© 2026 RantAI. Depok, West Java, Indonesia.",
     "contact": "Contact",
-    "follow": "Follow RantAI",
     "current": "This site",
     "cta": {
       "eyebrow": "Start with one source",
@@ -58,7 +56,10 @@
       "backToForm": "Back to the form"
     },
     "backToTop": "Back to top",
-    "home": "RantAI Lakehouse home"
+    "home": "RantAI Lakehouse home",
+    "rights": "All rights reserved",
+    "email": "Email {email}",
+    "nav": "Footer"
   },
   "language": {
     "label": "Language",

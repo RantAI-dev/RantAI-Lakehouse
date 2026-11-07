@@ -41,7 +41,7 @@ export function LanguageSwitcher({
   return (
     <nav
       aria-label={text.label}
-      className={cn("flex items-center rounded-full bg-[#E8F4FF]/[0.07] p-0.5", className)}
+      className={cn("flex items-center rounded-full bg-[#E8F4FF]/[0.06] p-0.5", className)}
     >
       {routing.locales.map((l) => {
         const current = l === locale;
@@ -66,7 +66,8 @@ export function LanguageSwitcher({
             className={cn(
               "rounded-full font-medium transition-[background-color,color,transform] duration-200 ease-out active:scale-95 motion-reduce:transition-none",
               // O6: the phone menu shows the switch larger, as rantai-page's sheet does.
-              size === "lg" ? "px-4 py-2 text-[14px]" : "px-2 py-1 text-[12px] md:px-2.5",
+              // O15: rantai-page language-switcher.tsx's two sizes, 1:1.
+              size === "lg" ? "px-5 py-2.5 text-sm" : "px-2.5 py-1 text-xs",
               current ? "bg-[#E8F4FF] text-[#020514]" : "text-[#E8F4FF]/70 hover:text-[#E8F4FF]",
             )}
           >

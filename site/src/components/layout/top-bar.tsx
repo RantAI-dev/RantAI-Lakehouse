@@ -38,7 +38,7 @@ export type TopBarPage = "home" | "contact";
 const pill =
   "inline-block rounded-full px-3.5 py-2 text-[14px] text-[#E8F4FF]/70 transition-[background-color,color,transform] duration-200 ease-out hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] active:scale-[0.97] active:bg-[#E8F4FF]/[0.14] aria-[current]:bg-[#E8F4FF]/[0.12] aria-[current]:text-[#E8F4FF] motion-reduce:transition-none";
 const sheetLink =
-  "flex min-h-14 items-center justify-between border-b border-[#E8F4FF]/10 text-[18px] font-medium text-[#E8F4FF]/65 transition-colors duration-200 ease-out hover:text-[#E8F4FF] active:text-[#8fcbff] aria-[current]:text-[#E8F4FF]";
+  "flex min-h-14 items-center justify-between border-b border-[#E8F4FF]/10 text-lg font-medium text-[#E8F4FF]/60 transition-colors duration-200 ease-out hover:text-[#E8F4FF] active:text-[#8fcbff] aria-[current]:text-[#E8F4FF]";
 
 export function TopBar({
   locale,
@@ -184,16 +184,18 @@ export function TopBar({
       ref={headerRef}
       className="fixed inset-x-0 top-0 z-50 border-b border-transparent bg-transparent backdrop-blur-0 transition-[background-color,backdrop-filter,border-color] duration-500 data-[scrolled]:border-[#E8F4FF]/10 data-[scrolled]:bg-[#020514]/55 data-[scrolled]:backdrop-blur-xl"
     >
-      <div className="mx-auto flex h-16 w-full max-w-[1440px] items-center justify-between gap-4 px-4 sm:px-8">
+      {/* O15: rantai-page navbar.tsx's container, logo and wordmark sizes, gaps and pills, 1:1. */}
+      <div className="mx-auto flex h-16 w-full max-w-[1440px] items-center justify-between gap-6 px-5 sm:px-8">
         <div className="flex min-w-0 items-center gap-10">
           <a
             href={anchor("#hero")}
-            className="flex shrink-0 items-center gap-2.5 rounded-lg text-[15px] font-medium tracking-tight text-[#E8F4FF] transition-opacity duration-200 ease-out hover:opacity-80"
+            className="flex shrink-0 items-center gap-2.5 rounded-lg text-[#E8F4FF] transition-opacity hover:opacity-75"
           >
-            {/* O2: the official mark at its own ratio, sized by height. */}
-            <MascotMark className="h-5 w-auto" />
-            {/* Never wraps: beside the button a 360 px phone has room for one line. */}
-            <span className="whitespace-nowrap">RantAI Lakehouse</span>
+            {/* O2: the official mark at its own ratio, sized by height (rantai-page: size-7). */}
+            <MascotMark className="h-7 w-auto max-[339px]:h-6" />
+            {/* rantai-page's 19 px semibold. "RantAI Lakehouse" is longer than "RantAI", so on the
+                narrowest phones it steps down to stay on one line beside the button and the menu. */}
+            <span className="text-[19px] font-semibold tracking-[-0.03em] whitespace-nowrap max-[399px]:text-[16px] max-[339px]:text-[14px]">RantAI Lakehouse</span>
           </a>
           <nav aria-label={nav.label} className="hidden lg:block">
             <ul className="flex items-center gap-1">
@@ -215,7 +217,8 @@ export function TopBar({
         <div className="flex items-center gap-2">
           <LanguageSwitcher locale={locale} text={language} className="hidden lg:flex" />
           {/* WEB-5 D20: to the page's own "Get started", which links on to the README. */}
-          <CtaLink href={anchor("#get-started")} size="sm" className="h-10 px-4 lg:h-9">
+          {/* rantai-page's PillLink in the bar: h-10 px-4, h-9 from lg, text-sm. */}
+          <CtaLink href={anchor("#get-started")} size="sm" className="h-10 px-4 text-sm lg:h-9">
             {cta.install}
           </CtaLink>
           <button
@@ -240,27 +243,27 @@ export function TopBar({
         aria-describedby={`${sheetId}-desc`}
         // Wheel and touch over the sheet stay with the sheet, not Lenis (D16).
         data-lenis-prevent=""
-        className="lk-sheet fixed inset-y-0 right-0 left-auto m-0 h-[100dvh] max-h-none w-[min(calc(100vw-3rem),24rem)] max-w-none flex-col overflow-y-auto bg-[#050A30] p-0 text-[#E8F4FF] shadow-[-30px_0_80px_-30px_rgba(2,5,20,0.9)] ring-1 ring-[#E8F4FF]/10 backdrop:bg-[#020514]/60 backdrop:backdrop-blur-sm"
+        // rantai-page's SheetContent (right): w-3/4, max sm, a hairline on its open edge.
+        className="lk-sheet fixed inset-y-0 right-0 left-auto m-0 h-[100dvh] max-h-none w-3/4 max-w-none flex-col gap-4 overflow-y-auto border-l border-[#E8F4FF]/10 bg-[#050A30] p-0 text-sm text-[#E8F4FF] shadow-lg backdrop:bg-[#020514]/50 backdrop:backdrop-blur-xs sm:max-w-sm"
       >
-        <div className="flex items-start justify-between gap-4 px-5 pt-5 pb-4">
-          <div>
-            <p id={`${sheetId}-title`} className="text-[17px] leading-6 font-medium">
-              {nav.sheetTitle}
-            </p>
-            <p id={`${sheetId}-desc`} className="mt-1 text-[14px] leading-5 text-[#E8F4FF]/65">
-              {nav.sheetDescription}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={closeSheet}
-            aria-label={nav.close}
-            className="-mt-1 -mr-2 grid size-10 shrink-0 place-items-center rounded-full text-[#E8F4FF]/75 transition-[background-color,color,transform] duration-200 ease-out hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] active:scale-90 motion-reduce:transition-none"
-          >
-            <X className="size-5" aria-hidden="true" />
-          </button>
+        {/* rantai-page's SheetHeader (p-4, gap-0.5, pr-14 beside the close button), SheetTitle and SheetDescription. */}
+        <div className="flex flex-col gap-0.5 p-4 pr-14">
+          <p id={`${sheetId}-title`} className="text-base font-medium text-[#E8F4FF]">
+            {nav.sheetTitle}
+          </p>
+          <p id={`${sheetId}-desc`} className="text-sm text-[#E8F4FF]/65">
+            {nav.sheetDescription}
+          </p>
         </div>
-        <nav aria-label={nav.label} className="flex flex-1 flex-col px-5 pb-8">
+        <button
+          type="button"
+          onClick={closeSheet}
+          aria-label={nav.close}
+          className="absolute top-2 right-2 grid size-10 place-items-center rounded-full text-[#E8F4FF]/75 transition-[background-color,color,transform] duration-200 ease-out hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] active:scale-90 motion-reduce:transition-none"
+        >
+          <X className="size-4" aria-hidden="true" />
+        </button>
+        <nav aria-label={nav.label} className="flex flex-1 flex-col px-4 pb-8">
           <ul>
             {/* The mark is the way home in the bar; the sheet names it too. */}
             {[{ href: anchor("#hero"), label: nav.home } as NavLink, ...links].map((l) => (

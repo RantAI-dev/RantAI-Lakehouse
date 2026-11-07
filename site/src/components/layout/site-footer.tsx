@@ -1,15 +1,14 @@
 import * as React from "react";
-import { ArrowUp, ArrowUpRight } from "lucide-react";
+import { ArrowUp, ArrowUpRight, Mail } from "lucide-react";
 import { localizedPath } from "@/i18n/paths";
 import type { Locale } from "@/i18n/routing";
 import type { CommonCopy } from "@/lib/copy";
 import { CONTACT_EMAIL, FOOTER_SECTIONS, LINKS, RANTAI_PRODUCTS, SOCIAL_LINKS } from "@/lib/home-content";
 import { CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { MascotMark } from "@/components/shared/mascot-svg";
-import { Reveal, SplitWords } from "@/components/shared/reveal";
+import { Reveal as LiftReveal, SplitWords } from "@/components/shared/reveal";
 import { SocialIcon } from "@/components/shared/social-icons";
-import { cn } from "@/lib/utils";
-import { BackToTop } from "./back-to-top";
+import { BackToTop, FooterWordmark, Reveal } from "./footer-motion";
 import { FooterPrompt } from "./footer-prompt";
 
 /**
@@ -32,9 +31,9 @@ import { FooterPrompt } from "./footer-prompt";
 
 type FooterLink = { label: string; href: string; external?: boolean; logo?: React.ReactNode; current?: boolean };
 
-/** Hover: the text brightens and a hairline grows under it from the left (rantai-page's link underline). */
-const linkClass =
-  "group inline-flex min-h-10 items-center gap-2 text-[15px] leading-6 text-[#E8F4FF]/80 transition-[color,background-size] duration-200 ease-out hover:text-[#E8F4FF] active:text-[#44A6FA] md:min-h-0 bg-[linear-gradient(currentColor,currentColor)] bg-[length:0%_1px] bg-[position:0_100%] bg-no-repeat hover:bg-[length:100%_1px] motion-reduce:transition-none";
+// rantai-page footer.tsx: underline that grows from the left on hover.
+const linkUnderline =
+  "bg-[linear-gradient(currentColor,currentColor)] bg-[length:0%_1px] bg-[position:0_100%] bg-no-repeat pb-0.5 transition-[background-size,color] duration-300 hover:bg-[length:100%_1px] motion-reduce:transition-none";
 
 export function SiteFooter({
   locale,
@@ -57,7 +56,7 @@ export function SiteFooter({
     {
       title: copy.columns.connect,
       links: [
-        // D15: the contact page, in the visitor's language; the address itself is in the legal line.
+        // D15: the contact page, in the visitor's language; the address itself is in the bottom bar.
         { label: copy.contact, href: localizedPath(locale, "/contact") },
         { label: copy.userGuide, href: LINKS.guide, external: true },
         { label: "GitHub", href: LINKS.source, external: true },
@@ -72,19 +71,37 @@ export function SiteFooter({
                 label: p.label,
                 href: p.href,
                 external: true,
-                // Decorative: the product's name is the link text.
+                // rantai-page's ProductLogo, Dark variant (decorative: the name is the link text).
                 // eslint-disable-next-line @next/next/no-img-element -- a static SVG mark; the export has no image optimizer
-                logo: <img src={p.logo} alt="" width={Math.round(14 * p.ratio)} height={14} loading="lazy" decoding="async" className="h-3.5 w-auto shrink-0" />,
+                logo: <img src={p.logo} alt="" width={Math.round(14 * p.ratio)} height={14} loading="lazy" decoding="async" className="mr-1 h-3.5 w-auto shrink-0" />,
               }
             : {
                 label: p.label,
                 href: page === "home" ? "#hero" : home,
                 current: true,
-                logo: <MascotMark className="h-3.5 w-auto shrink-0" />,
+                logo: <MascotMark className="mr-1 h-3.5 w-auto shrink-0" />,
               },
         ),
-        { label: "rantai.dev", href: LINKS.rantai, external: true },
+        {
+          label: "rantai.dev",
+          href: LINKS.rantai,
+          external: true,
+          // O15: the RantAI mark too (rantai-page public/rant-ai.png at 2x), made white
+          // the way rantai-page shows it on dark (navbar `overDark`: brightness-0 invert).
+          // eslint-disable-next-line @next/next/no-img-element -- a static mark; the export has no image optimizer
+          logo: <img src="/logo/rantai.png" alt="" width={14} height={14} loading="lazy" decoding="async" className="mr-1 h-3.5 w-auto shrink-0 brightness-0 invert" />,
+        },
       ],
+    },
+  ];
+  // rantai-page's footerSocials: the four networks, then the address as a fifth icon.
+  const socials = [
+    ...SOCIAL_LINKS.map((s) => ({ label: s.label, href: s.href, icon: <SocialIcon id={s.id} size={16} />, external: true })),
+    {
+      label: copy.email.replace("{email}", CONTACT_EMAIL),
+      href: LINKS.email,
+      icon: <Mail aria-hidden="true" className="size-[17px]" />,
+      external: false,
     },
   ];
 
@@ -108,9 +125,9 @@ export function SiteFooter({
           <LeadText className="mt-5 max-w-xl max-sm:text-[16px]">{page === "home" ? cta.line : cta.contactLine}</LeadText>
           {page === "home" ? (
             <>
-              <Reveal className="mt-10 w-full max-sm:mt-8" delay={0.15} y={16}>
+              <LiftReveal className="mt-10 w-full max-sm:mt-8" delay={0.15} y={16}>
                 <FooterPrompt text={cta} to={CONTACT_EMAIL} />
-              </Reveal>
+              </LiftReveal>
               <a
                 href="#get-started"
                 className="group mt-8 inline-flex min-h-10 items-center gap-1.5 text-[15px] text-[#E8F4FF]/70 transition-colors duration-200 ease-out hover:text-[#E8F4FF]"
@@ -128,97 +145,100 @@ export function SiteFooter({
         </div>
       </section>
 
-      {/* 2. The links: the mark, tagline and socials at left; three columns at right. */}
-      <div className="relative overflow-hidden px-3 pt-14 sm:px-8 lg:px-14 lg:pt-20">
-        <div className="mx-auto grid max-w-[1312px] gap-12 xl:grid-cols-[minmax(0,1fr)_auto] xl:gap-20">
-          <div className="max-w-sm">
+      {/* WEB-5 owner QA O15: from here down, a 1:1 copy of rantai-page's
+          footer.tsx ("Links sit straight on the page…"): the same markup,
+          classes, spacing and type, with the lake's colours by role
+          (foreground → foam, muted-foreground → foam at 65 %) and this
+          site's content. */}
+      {/* Links sit straight on the page, with a faded wordmark below */}
+      <div className="relative overflow-hidden px-6 pt-14 sm:px-10 lg:px-16 lg:pt-20">
+        <div className="grid gap-12 xl:grid-cols-[minmax(0,1fr)_auto] xl:gap-20">
+          <Reveal className="max-w-sm">
             <a
               href={page === "home" ? "#hero" : home}
               aria-label={copy.home}
-              className="inline-flex items-center gap-2.5 rounded-lg text-[17px] font-medium tracking-tight text-[#E8F4FF] transition-opacity duration-200 ease-out hover:opacity-80"
+              className="inline-flex items-center gap-2.5 text-[#E8F4FF] transition-opacity hover:opacity-75"
             >
-              <MascotMark className="h-6 w-auto" />
-              RantAI Lakehouse
+              <MascotMark className="h-7 w-auto" />
+              <span className="text-[19px] font-semibold tracking-[-0.03em]">RantAI Lakehouse</span>
             </a>
-            <p className="mt-4 text-[15px] leading-6 text-pretty text-[#E8F4FF]/70">{copy.tagline}</p>
-            <p className="mt-6 text-[12px] font-medium tracking-[0.04em] text-[#E8F4FF]/60">{copy.follow}</p>
-            <ul className="mt-2 -ml-2.5 flex items-center gap-1">
-              {SOCIAL_LINKS.map((s) => (
-                <li key={s.id}>
+            <p className="mt-4 text-sm leading-relaxed text-[#E8F4FF]/65">{copy.tagline}</p>
+            <ul className="mt-5 -ml-2 flex items-center gap-1">
+              {socials.map((social) => (
+                <li key={social.label}>
                   <a
-                    href={s.href}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    aria-label={s.label}
-                    className="grid size-10 place-items-center rounded-full text-[#E8F4FF]/65 transition-[color,background-color,transform] duration-200 ease-out hover:-translate-y-0.5 hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] active:translate-y-0 active:scale-95 motion-reduce:transition-none motion-reduce:hover:translate-y-0"
+                    href={social.href}
+                    aria-label={social.label}
+                    {...(social.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
+                    className="grid size-9 place-items-center rounded-full text-[#E8F4FF]/55 transition-colors hover:bg-[#E8F4FF]/5 hover:text-[#E8F4FF]"
                   >
-                    <SocialIcon id={s.id} />
+                    {social.icon}
                   </a>
                 </li>
               ))}
             </ul>
-          </div>
-          {/* Phones: Product and Connect side by side, the products across. */}
-          <div className="grid grid-cols-2 gap-x-6 gap-y-10 sm:grid-cols-3 sm:gap-x-10 lg:gap-x-16">
-            {columns.map((col) => (
-              <nav
-                key={col.title}
-                aria-label={col.title}
-                className={cn(col.title === copy.columns.products && "max-sm:col-span-2")}
-              >
-                <h2 className="text-[11px] leading-4 font-medium tracking-[0.2em] text-[#E8F4FF]/60 uppercase">{col.title}</h2>
-                <ul className="mt-3 sm:mt-4 sm:space-y-2.5">
-                  {col.links.map((l) => (
-                    <li key={l.href + l.label}>
+          </Reveal>
+
+          <nav aria-label={copy.nav} className="grid gap-y-9 sm:grid-cols-3 sm:gap-x-10 sm:gap-y-10 lg:gap-x-16">
+            {columns.map((column, i) => (
+              <Reveal key={column.title} index={i + 1}>
+                <p className="text-sm font-medium text-[#E8F4FF]">{column.title}</p>
+                <ul className="mt-2 sm:mt-4 sm:space-y-3">
+                  {column.links.map((link) => (
+                    <li key={link.label}>
                       <a
-                        href={l.href}
-                        className={cn(linkClass, l.current && "text-[#E8F4FF]")}
-                        aria-current={l.current && page === "home" ? "page" : undefined}
-                        {...(l.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
+                        href={link.href}
+                        aria-current={link.current && page === "home" ? "page" : undefined}
+                        {...(link.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
+                        className={`group inline-flex items-center gap-1 text-sm text-[#E8F4FF]/65 transition-colors hover:text-[#E8F4FF] max-sm:min-h-10 max-sm:bg-none max-sm:text-[15px] ${linkUnderline}`}
                       >
-                        {l.logo}
-                        {l.label}
-                        {l.current && (
-                          <span className="rounded-full bg-[#44A6FA]/15 px-2 py-0.5 text-[11px] leading-4 font-medium text-[#8fcbff]">
+                        {link.logo}
+                        {link.label}
+                        {/* The site's own content: this product is the current site. */}
+                        {link.current && (
+                          <span className="ml-1 rounded-full bg-[#44A6FA]/15 px-2 py-0.5 text-[11px] leading-4 font-medium text-[#8fcbff]">
                             {copy.current}
                           </span>
                         )}
-                        {l.external && (
+                        {link.external && (
                           <ArrowUpRight
                             aria-hidden="true"
-                            className="size-3.5 shrink-0 opacity-45 transition-[translate,opacity] duration-200 ease-out group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:opacity-100 motion-reduce:transition-none"
+                            className="size-3.5 opacity-50 transition-[translate,opacity] duration-300 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:opacity-100 motion-reduce:transition-none"
                           />
                         )}
                       </a>
                     </li>
                   ))}
                 </ul>
-              </nav>
+              </Reveal>
             ))}
-          </div>
+          </nav>
         </div>
 
-        {/* 3. The bottom bar: the legal line; the address and Back to top. */}
-        <div className="mx-auto mt-12 flex max-w-[1312px] flex-col gap-2 border-t border-[#E8F4FF]/10 pt-6 sm:mt-16 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-          <p className="text-[13px] text-[#E8F4FF]/60">{copy.legal}</p>
+        <div className="mt-12 flex flex-col gap-2 border-t border-[#E8F4FF]/10 pt-6 text-sm text-[#E8F4FF]/65 sm:mt-16 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+          {/* The year is the build's: the export is static. */}
+          <p>
+            © {new Date().getFullYear()} RantAI
+            <span className="mx-1.5 opacity-50">·</span>
+            {copy.rights}
+          </p>
           <div className="flex items-center justify-between gap-x-6 sm:justify-start">
-            <a href={LINKS.email} className={cn(linkClass, "text-[13px] text-[#E8F4FF]/70")}>
+            <a
+              href={LINKS.email}
+              className={`hover:text-[#E8F4FF] max-sm:inline-flex max-sm:min-h-10 max-sm:items-center max-sm:bg-none ${linkUnderline}`}
+            >
               {CONTACT_EMAIL}
             </a>
             <BackToTop label={copy.backToTop} />
           </div>
         </div>
 
-        {/* 4. The giant faded wordmark along the bottom edge (rantai-page's FooterWordmark). */}
-        {/* Static: cropped by the page's end, too little of it is ever in view for a reveal to fire. */}
-        <div className="pointer-events-none mt-4 -mb-[0.22em] select-none">
-          <p
-            aria-hidden="true"
-            className="bg-[linear-gradient(180deg,rgba(232,244,255,0.1),rgba(232,244,255,0))] bg-clip-text text-center text-[clamp(3.5rem,15.5vw,15.5rem)] leading-[0.85] font-semibold tracking-[-0.06em] whitespace-nowrap text-transparent"
-          >
-            Lakehouse
-          </p>
-        </div>
+        {/* rantai-page's clamp is for six letters ("RantAI"); "Lakehouse" has nine, so
+            each bound is scaled by 6/9, or the word runs off the page (measured in O7). */}
+        <FooterWordmark
+          text="Lakehouse"
+          className="mt-4 mb-[-0.2em] text-[clamp(4rem,16vw,14.5rem)] leading-[0.85] font-semibold tracking-[-0.06em]"
+        />
       </div>
     </footer>
   );
