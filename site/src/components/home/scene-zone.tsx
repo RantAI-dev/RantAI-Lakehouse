@@ -25,14 +25,13 @@ export function SceneZone({ children }: { children: React.ReactNode }) {
 
   return (
     <div id="scene-zone" ref={zoneRef} className="relative">
-      {/* Below the hero, with no live canvas behind it, the sections sit on deep water.
-          WEB-5 O39 (owner: "mending warna solid aja"): one solid colour, the DOM hero's own
-          bottom colour, which is also where the page-wide water starts (its −100 m colour,
-          lib/depth-journey.ts) and only darkens from, so there is no seam on either side. */}
+      {/* Below the hero, with no live canvas behind it, the sections sit on a deep-water gradient.
+          WEB-5 O43 (the O33 gradient is back): it ends on the page-wide water's −100 m colour
+          (lib/depth-journey.ts), which only darkens from there, so the page never lightens again. */}
       <div
         aria-hidden="true"
         className={cn(
-          "absolute inset-x-0 top-[100svh] bottom-0 bg-[#030b2a] transition-opacity duration-700",
+          "absolute inset-x-0 top-[100svh] bottom-0 bg-[linear-gradient(180deg,#0a1f55_0%,#081a50_30%,#05134a_65%,#020e42_100%)] transition-opacity duration-700",
           mode === "full" && sceneReady ? "opacity-0" : "opacity-100",
         )}
       />
