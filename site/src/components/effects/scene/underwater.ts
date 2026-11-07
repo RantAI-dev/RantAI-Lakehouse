@@ -15,7 +15,7 @@ import {
   Vector3,
   type IUniform,
 } from "three";
-import { NOISE_GLSL, SHAFT_FRAG, SHAFT_VERT, SNOW_FRAG, SNOW_VERT, WATER_FOG_GLSL } from "./shaders";
+import { CONTACT_GLSL, NOISE_GLSL, SHAFT_FRAG, SHAFT_VERT, SNOW_FRAG, SNOW_VERT, WATER_FOG_GLSL } from "./shaders";
 
 /**
  * What makes the water feel like water once the camera is under it: the
@@ -71,9 +71,16 @@ export function applyWaterFog(material: Material, fog: WaterFogUniforms, opts: {
     let frag = shader.fragmentShader
       .replace(
         "#include <fog_pars_fragment>",
-        `varying vec3 vWfWorld;\n${WATER_FOG_GLSL}\n${caustics ? NOISE_GLSL : ""}`,
+        `varying vec3 vWfWorld;\n${WATER_FOG_GLSL}\n${caustics ? NOISE_GLSL + CONTACT_GLSL : ""}`,
       )
-      .replace("#include <fog_fragment>", "gl_FragColor.rgb = waterFog(gl_FragColor.rgb, vWfWorld);");
+      .replace(
+        "#include <fog_fragment>",
+        caustics
+          ? // The creature's contact with the surface, seen from below (O8, CONTACT_GLSL).
+            `if (uWfOn > 0.5) gl_FragColor.rgb = mix(gl_FragColor.rgb, surfaceMirror(vWfWorld), surfaceContact(vWfWorld));
+             gl_FragColor.rgb = waterFog(gl_FragColor.rgb, vWfWorld);`
+          : "gl_FragColor.rgb = waterFog(gl_FragColor.rgb, vWfWorld);",
+      );
     if (caustics) {
       frag = frag.replace(
         "#include <emissivemap_fragment>",

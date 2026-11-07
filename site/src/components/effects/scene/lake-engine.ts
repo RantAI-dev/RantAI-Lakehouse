@@ -246,6 +246,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     phone = window.innerWidth < 768;
     renderer.setSize(width, height, false);
     lens.setSize(width, height, dpr);
+    mascot.setViewport(height * dpr, dpr);
     const aspect = width / height;
     camera.aspect = aspect;
     // Desktop: the creature sits right of centre so the copy has the left.
@@ -559,6 +560,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       stars.uniforms.uPx.value = dpr;
       renderer.setSize(width, height, false);
       lens.setSize(width, height, dpr);
+      mascot.setViewport(height * dpr, dpr);
       slow = 0;
       ema = 1 / 60;
     }

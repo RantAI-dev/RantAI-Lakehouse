@@ -97,6 +97,27 @@ vec3 waterFog(vec3 col, vec3 worldPos){
 }
 `;
 
+/**
+ * WEB-5 O8 (planner's SHOULD-FIX on O5): where the creature meets the
+ * surface, seen from below. The water plane is flat, so the line where it
+ * cuts the creature was perfectly straight. Under water, the creature fades
+ * into the surface's own mirror colour over a band just under the surface
+ * whose top moves with the waves, and its reflection in the surface (in
+ * WATER_FRAG) fades the same way, so the two meet in a soft, moving
+ * meniscus instead of an edge. Needs NOISE_GLSL and WATER_FOG_GLSL.
+ */
+export const CONTACT_GLSL = /* glsl */ `
+float surfaceContact(vec3 wp){
+  float w = snoise(wp.xz * 1.4 + vec2(uWfTime * 0.33, -uWfTime * 0.26)) * 0.07
+          + snoise(wp.xz * 3.1 - vec2(uWfTime * 0.5, uWfTime * 0.41)) * 0.025;
+  return smoothstep(-0.42, -0.04, wp.y + w);
+}
+vec3 surfaceMirror(vec3 wp){
+  vec3 d = normalize(wp - cameraPosition);
+  return waterFogColor(normalize(vec3(d.x, -0.06, d.z)));
+}
+`;
+
 export const SKY_VERT = /* glsl */ `
 varying vec3 vDir;
 void main(){
@@ -208,6 +229,7 @@ varying vec3 vWorld;
 ${NOISE_GLSL}
 ${SKY_GRADIENT_GLSL}
 ${WATER_FOG_GLSL}
+${CONTACT_GLSL}
 
 float baseH(vec2 p){
   float t = uTime;
@@ -319,7 +341,8 @@ void main(){
       float miss = length(o + rd * tc);
       float hit = (1.0 - smoothstep(0.72, 1.08, miss)) * 0.92;
       vec3 hitW = uBodyC + (o + rd * tc) * uBodyR;
-      mirror = mix(mirror, waterFog(uBodyTint, hitW) , hit);
+      vec3 body = mix(uBodyTint, surfaceMirror(hitW), surfaceContact(hitW));
+      mirror = mix(mirror, waterFog(body, hitW), hit);
     }
     col = mix(mirror, sky, win);
     col += uLake * 0.12 * exp(-pow((cosI - 0.68) / 0.05, 2.0));
@@ -672,6 +695,41 @@ void main(){
     col *= 1.0 - 0.22 * exp(-pow((s + 3.0 * px) / (3.0 * px), 2.0));
   }
   gl_FragColor = vec4(col, 1.0);
+  ${OUTPUT_GLSL}
+}
+`;
+
+/**
+ * WEB-5 O8, the blowhole's spout: droplets and mist as points, each sized
+ * in world units and drawn at its true size on screen (with a floor, so it
+ * still reads on a phone). `aSoft` 0 is a droplet (a small round bead), 1 a
+ * puff of mist (a wide, very soft disc).
+ */
+export const SPOUT_VERT = /* glsl */ `
+attribute float aSize;
+attribute float aAlpha;
+attribute float aSoft;
+uniform float uHalfH;
+uniform float uMinPx;
+varying float vAlpha;
+varying float vSoft;
+void main(){
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  gl_Position = projectionMatrix * mv;
+  vAlpha = aAlpha;
+  vSoft = aSoft;
+  gl_PointSize = max(uMinPx, aSize * projectionMatrix[1][1] * uHalfH / max(-mv.z, 0.1));
+}
+`;
+
+export const SPOUT_FRAG = /* glsl */ `
+uniform vec3 uColor;
+varying float vAlpha;
+varying float vSoft;
+void main(){
+  float d = length(gl_PointCoord - 0.5);
+  float a = mix(1.0 - smoothstep(0.22, 0.5, d), exp(-d * d * 14.0), vSoft) * vAlpha;
+  gl_FragColor = vec4(uColor * a, a);
   ${OUTPUT_GLSL}
 }
 `;

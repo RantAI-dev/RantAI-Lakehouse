@@ -30,22 +30,38 @@ export const DOME_SPHERE = (() => {
 export const MASCOT_H = DOME_SPHERE.cy + DOME_SPHERE.r;
 
 /**
- * WEB-5 owner decision O3: the 3D creature has two eyes, mirrored about its
- * front, so it reads as a face when it looks at the camera. The mark keeps
- * one eye, since the mark is the creature seen from the side.
- * - Size and height start from the mark's (r 19.5 of 98; the centre 39.5
- *   above the base, 0.32 of the dome's height). Seen from the hero camera,
- *   which looks down a little, two eyes that size sat low and read as
- *   goggles, so each is 0.82 of the mark's eye and sits at 0.42 of the
- *   height (checked in the live hero at 1440 and 390, SwiftShader).
- * - `phi` is each eye's angle from the front, around the vertical axis.
- *   Taken literally, the mark's side view puts the eye about 70° round,
- *   where from the front it shows edge-on at the silhouette, which does not
- *   read as a face. 0.42 rad (24°) each way spaces them like a face at
- *   phone size and in the 1440 hero; the single eye they replace sat at
- *   0.35 rad.
+ * WEB-5 owner decision O8 (2026-11-07): the creature is a whale. Above the
+ * water you see only its head, which is the mark's dome, so the logo and
+ * the mascot stay one character; below it, the whole whale.
+ *
+ * The head is the dome stretched front to back by `HEAD_LONG` (seen from
+ * the hero camera, which looks along its length, the silhouette is still
+ * the mark's).
  */
-export const EYES_3D = { r: 0.82 * (19.5 / LOGO_R) * DOME_SPHERE.r, rho: 0.42, phi: 0.42 } as const;
+export const HEAD_LONG = 1.2;
+
+/**
+ * The eyes (O3: two, mirrored about the front; O8: a whale's).
+ * - Low on the sides of the head, near the waterline, as on a real whale:
+ *   `rho` 0.26 of the dome's height (the mark's own eye sits at 0.32),
+ *   `phi` 0.52 rad (30°) either side of the front, so from the hero camera
+ *   both still face it enough to read as round.
+ * - Small: 0.74 of the mark's eye. Each is a bead, not a flat disc, so it
+ *   stays round seen at an angle.
+ * - `socket` is how far each eye can move in its socket towards the
+ *   pointer (radians round, and fraction of the height up and down); the
+ *   head itself turns only a little (`HEAD_TURN`), so both eyes stay on
+ *   the face. Before O8 the eyes slid up to 0.6 rad and the dome turned
+ *   0.15, which put one eye mid-face and the other on the silhouette.
+ */
+export const EYES_3D = {
+  r: 0.74 * (19.5 / LOGO_R) * DOME_SPHERE.r,
+  rho: 0.26,
+  phi: 0.52,
+  socket: { phi: 0.13, rho: 0.07 },
+} as const;
+/** How far the head turns towards the pointer: radians round (yaw) and up or down (pitch). */
+export const HEAD_TURN = { yaw: 0.06, pitch: 0.03 } as const;
 
 /** Direction the moonlight comes from (towards the moon), unit length. */
 export const MOON_DIR: readonly [number, number, number] = (() => {

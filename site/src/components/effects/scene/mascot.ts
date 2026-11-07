@@ -20,18 +20,24 @@ import {
   Vector3,
 } from "three";
 import { PALETTE } from "@/lib/palette";
-import { DOME_SPHERE, EYES_3D, MASCOT_H, MASCOT_R } from "./scene-config";
-import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT } from "./shaders";
+import { DOME_SPHERE, EYES_3D, HEAD_LONG, HEAD_TURN, MASCOT_H, MASCOT_R } from "./scene-config";
+import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, SPOUT_VERT } from "./shaders";
 
 /**
  * The 3D mascot, built from primitives on the official mark's shapes
  * (`components/shared/mascot-svg.tsx`, WEB-5 O2): a navy dome, the mark's
  * sphere cap revolved, with two white eyes (O3: the mark is the creature
- * seen from the side, with one eye; facing the camera it has two). Half of
- * it is below the waterline; the water plane hides that half until the
- * camera dives. The eyes slide together over the dome's surface towards
- * where the visitor is looking, inside a cone that keeps them on the face,
- * and blink together.
+ * seen from the side, with one eye; facing the camera it has two).
+ *
+ * WEB-5 O8: it is a whale, and the dome is its head breaking the surface:
+ * - stretched front to back (`HEAD_LONG`), the eyes low on its sides near
+ *   the waterline, small beads that stay round at an angle;
+ * - the eyes follow the pointer in their sockets, and the head turns only
+ *   a little, so both eyes stay on the face from the hero camera;
+ * - every 5 to 9 seconds it breathes out through its blowhole: a short,
+ *   soft spout of droplets and mist from the top of the head.
+ * The water plane hides everything below the waterline until the camera
+ * dives.
  */
 
 export type Aim = { x: number; y: number };
@@ -54,8 +60,10 @@ export type Mascot = {
   foam: Mesh;
   update: (dt: number, t: number, aim: Aim, look: number) => void;
   dip: (t: number) => void;
-  /** 0 above the surface, 1 below: lifts the body's glow and fades in the eye seen through the water. */
+  /** 0 for the picture above the surface, 1 for the one below (lighting, the spout). */
   setUnderwater: (uw: number) => void;
+  /** The drawing buffer's height in pixels, so the spout's droplets keep their true size. */
+  setViewport: (heightPx: number, pixelRatio: number) => void;
   /** Freeze the idle motion (reduced motion). */
   still: boolean;
   dispose: () => void;
@@ -87,7 +95,11 @@ function buildBodyGeometry(upperOnly = false): LatheGeometry {
     const p = profile(i / 72);
     pts.push(new Vector2(p.r, p.y));
   }
-  return new LatheGeometry(pts, upperOnly ? 64 : 112);
+  const geo = new LatheGeometry(pts, upperOnly ? 64 : 112);
+  // O8: a whale's head is longer than it is wide; the front (+z) still
+  // faces the camera, so the mark's silhouette is unchanged from there.
+  geo.scale(1, 1, HEAD_LONG);
+  return geo;
 }
 
 /** Point and outward normal on the dome for azimuth `phi` and height fraction `rho` of the dome. */
@@ -97,9 +109,16 @@ function surface(phi: number, rho: number, out: { pos: Vector3; normal: Vector3 
   const sinT = (y - SPHERE_CY) / SPHERE_R;
   const cosT = Math.sqrt(Math.max(0, 1 - sinT * sinT));
   const r = SPHERE_R * cosT;
-  out.pos.set(r * Math.sin(phi), y, r * Math.cos(phi));
-  out.normal.set(cosT * Math.sin(phi), sinT, cosT * Math.cos(phi)).normalize();
+  // The head is the sphere stretched along z: positions stretch with it,
+  // normals by the inverse.
+  out.pos.set(r * Math.sin(phi), y, r * Math.cos(phi) * HEAD_LONG);
+  out.normal.set(cosT * Math.sin(phi), sinT, (cosT * Math.cos(phi)) / HEAD_LONG).normalize();
 }
+
+/** The blowhole, on top of the head a little behind its crown (group space). */
+const BLOWHOLE = new Vector3(0, MASCOT_H - 0.03, -0.32);
+const SPOUT_DROPS = 46;
+const SPOUT_MIST = 34;
 
 const SPLASH_COUNT = 56;
 
@@ -152,7 +171,10 @@ export function createMascot(opts: MascotOptions): Mascot {
   function buildEye() {
     const eye = new Group();
     const eyeMesh = new Mesh(eyeGeo, eyeMat);
-    eyeMesh.scale.set(EYES_3D.r, EYES_3D.r, 0.065 * MASCOT_R);
+    // A bead (O8): an ellipsoid sunk into the head, so its visible part is
+    // round from any side rather than a disc that turns to an oval.
+    eyeMesh.scale.set(EYES_3D.r, EYES_3D.r, 0.9 * EYES_3D.r);
+    eyeMesh.position.z = -0.62 * EYES_3D.r;
     eye.add(eyeMesh);
     const glow = new Mesh(glowGeo, glowMat);
     glow.scale.set(EYES_3D.r * GLOW, EYES_3D.r * GLOW, 1);
@@ -196,6 +218,7 @@ export function createMascot(opts: MascotOptions): Mascot {
   });
   const foam = new Mesh(foamGeo, foamMat);
   foam.position.y = 0.02;
+  foam.scale.z = HEAD_LONG;
   foam.renderOrder = 1;
   extras.add(foam);
   disposables.push(foamGeo, foamMat);
@@ -228,13 +251,133 @@ export function createMascot(opts: MascotOptions): Mascot {
       const r = MASCOT_R * (0.85 + Math.random() * 0.25);
       splashPos[i * 3] = Math.cos(a) * r;
       splashPos[i * 3 + 1] = 0.05;
-      splashPos[i * 3 + 2] = Math.sin(a) * r;
+      splashPos[i * 3 + 2] = Math.sin(a) * r * HEAD_LONG;
       const up = 2.6 + Math.random() * 3.2;
       const out = 0.5 + Math.random() * 1.1;
       splashVel[i * 3] = Math.cos(a) * out;
       splashVel[i * 3 + 1] = up;
       splashVel[i * 3 + 2] = Math.sin(a) * out;
       splashAlpha[i] = 1;
+    }
+  }
+
+  // ---- Spout (O8) ------------------------------------------------------------
+  // Droplets first, then the mist; each particle has its own birth delay,
+  // so one breath is a short burst that rises, hangs and drifts, not a
+  // single pop. World space, so the bob does not drag it about.
+  const SPOUT_N = SPOUT_DROPS + SPOUT_MIST;
+  const spoutPos = new Float32Array(SPOUT_N * 3);
+  const spoutVel = new Float32Array(SPOUT_N * 3);
+  const spoutAge = new Float32Array(SPOUT_N).fill(-1);
+  const spoutLife = new Float32Array(SPOUT_N);
+  const spoutBase = new Float32Array(SPOUT_N);
+  const spoutSize = new Float32Array(SPOUT_N);
+  const spoutAlpha = new Float32Array(SPOUT_N);
+  const spoutSoft = new Float32Array(SPOUT_N);
+  for (let i = SPOUT_DROPS; i < SPOUT_N; i++) spoutSoft[i] = 1;
+  const spoutGeo = new BufferGeometry();
+  spoutGeo.setAttribute("position", new BufferAttribute(spoutPos, 3));
+  spoutGeo.setAttribute("aSize", new BufferAttribute(spoutSize, 1));
+  spoutGeo.setAttribute("aAlpha", new BufferAttribute(spoutAlpha, 1));
+  spoutGeo.setAttribute("aSoft", new BufferAttribute(spoutSoft, 1));
+  const spoutMat = new ShaderMaterial({
+    uniforms: {
+      uColor: { value: new Color("#d8ecff") },
+      uHalfH: { value: 450 },
+      uMinPx: { value: 1.6 * opts.pixelRatio },
+    },
+    vertexShader: SPOUT_VERT,
+    fragmentShader: SPOUT_FRAG,
+    transparent: true,
+    depthWrite: false,
+    blending: AdditiveBlending,
+  });
+  const spout = new Points(spoutGeo, spoutMat);
+  spout.frustumCulled = false;
+  spout.renderOrder = 4;
+  spout.visible = false;
+  extras.add(spout);
+  disposables.push(spoutGeo, spoutMat);
+  const holeWorld = new Vector3();
+  let spoutAlive = false;
+  let nextSpout = 2.8;
+  let aboveWater = true;
+
+  function breathe(): void {
+    group.updateMatrixWorld();
+    holeWorld.copy(BLOWHOLE).applyMatrix4(group.matrixWorld);
+    // A little variety per breath: a stronger or softer one, leaning a bit.
+    const power = 0.85 + Math.random() * 0.3;
+    const lean = (Math.random() - 0.5) * 0.3;
+    for (let i = 0; i < SPOUT_N; i++) {
+      const mist = i >= SPOUT_DROPS;
+      const j = i * 3;
+      spoutPos[j] = holeWorld.x + (Math.random() - 0.5) * 0.08;
+      spoutPos[j + 1] = holeWorld.y;
+      spoutPos[j + 2] = holeWorld.z + (Math.random() - 0.5) * 0.08;
+      // A whale's breath opens into a bushy plume: the mist leaves fast and
+      // fans out, then hangs; the droplets are fine and fall back.
+      const spread = mist ? 0.9 : 0.6;
+      spoutVel[j] = (Math.random() - 0.5) * spread + lean;
+      spoutVel[j + 1] = (mist ? 2.5 + Math.random() * 1.3 : 2.4 + Math.random() * 1.3) * power;
+      spoutVel[j + 2] = (Math.random() - 0.5) * spread * 0.6 - 0.12;
+      // Negative age is the birth delay: the breath lasts about 0.45 s.
+      spoutAge[i] = -(mist ? Math.random() * 0.45 : Math.random() * 0.3);
+      spoutLife[i] = mist ? 1.6 + Math.random() * 0.9 : 0.8 + Math.random() * 0.45;
+      spoutBase[i] = mist ? 0.18 + Math.random() * 0.16 : 0.018 + Math.random() * 0.022;
+    }
+    spoutAlive = true;
+  }
+
+  function updateSpout(dt: number): void {
+    let alive = false;
+    for (let i = 0; i < SPOUT_N; i++) {
+      if (spoutAge[i] === -1 && spoutLife[i] === 0) continue;
+      const age = (spoutAge[i] += dt);
+      const life = spoutLife[i];
+      if (age > life) {
+        spoutAlpha[i] = 0;
+        continue;
+      }
+      alive = true;
+      if (age < 0) {
+        spoutAlpha[i] = 0;
+        continue;
+      }
+      const j = i * 3;
+      const mist = i >= SPOUT_DROPS;
+      const p = age / life;
+      if (mist) {
+        // Mist hangs: drag slows it, the air lifts it a little, it widens.
+        const drag = Math.exp(-dt * 1.9);
+        spoutVel[j] *= drag;
+        spoutVel[j + 1] = spoutVel[j + 1] * drag + 0.05 * dt;
+        spoutVel[j + 2] *= drag;
+        spoutSize[i] = spoutBase[i] * (1 + 3.2 * Math.sqrt(p));
+        spoutAlpha[i] = 0.3 * Math.min(1, age / 0.12) * Math.pow(1 - p, 1.6);
+      } else {
+        spoutVel[j + 1] -= 5.2 * dt;
+        spoutSize[i] = spoutBase[i];
+        spoutAlpha[i] = Math.min(1, age / 0.06) * Math.pow(1 - p, 1.4) * 0.75;
+      }
+      // A light breeze from the left.
+      spoutVel[j] += 0.12 * dt;
+      spoutPos[j] += spoutVel[j] * dt;
+      spoutPos[j + 1] += spoutVel[j + 1] * dt;
+      spoutPos[j + 2] += spoutVel[j + 2] * dt;
+      // Droplets that fall back into the lake are gone.
+      if (spoutPos[j + 1] < 0) spoutAlpha[i] = 0;
+    }
+    if (!alive) {
+      spoutLife.fill(0);
+      spoutAge.fill(-1);
+    }
+    spoutAlive = alive;
+    spout.visible = alive && aboveWater;
+    if (alive) {
+      spoutGeo.attributes.position.needsUpdate = true;
+      spoutGeo.attributes.aSize.needsUpdate = true;
+      spoutGeo.attributes.aAlpha.needsUpdate = true;
     }
   }
 
@@ -276,7 +419,14 @@ export function createMascot(opts: MascotOptions): Mascot {
     extras,
     foam,
     still: false,
+    setViewport(heightPx, pixelRatio) {
+      spoutMat.uniforms.uHalfH.value = heightPx / 2;
+      spoutMat.uniforms.uMinPx.value = 1.6 * pixelRatio;
+    },
     setUnderwater(uw) {
+      // The spout is above the water: only the picture above shows it.
+      aboveWater = uw < 0.5;
+      spout.visible = spoutAlive && aboveWater;
       // Under water the light is scattered from every side; a little more
       // glow keeps the body readable through the water's fog without
       // flattening it (O5: the old 1.5 made it a flat disc).
@@ -305,14 +455,14 @@ export function createMascot(opts: MascotOptions): Mascot {
       const dipY = mascot.still ? 0 : dipOffset(t);
       group.position.y = -0.05 + 0.06 * bob + dipY;
       group.rotation.z = 0.02 * Math.sin((t * TAU) / 4 + 0.7);
-      group.rotation.y = lookAim.x * 0.15 * look;
-      group.rotation.x = -lookAim.y * 0.06 * look + 0.012 * Math.sin((t * TAU) / 8);
+      // O8: the head turns only a little; the eyes do most of the looking.
+      group.rotation.y = lookAim.x * HEAD_TURN.yaw * look;
+      group.rotation.x = -lookAim.y * HEAD_TURN.pitch * look + 0.012 * Math.sin((t * TAU) / 8);
 
-      // Eyes: both slide by the same turn over the dome, inside a cone that
-      // keeps them on the face (the outer one reaches 1.02 rad from the
-      // front, the single eye's old limit).
-      const turn = MathUtils.clamp(eyeAim.x * 0.78, -0.6, 0.6);
-      const rho = MathUtils.clamp(rho0 + eyeAim.y * 0.24, 0.22, 0.62);
+      // Eyes: both move by the same amount in their sockets.
+      const sock = EYES_3D.socket;
+      const turn = MathUtils.clamp(eyeAim.x * sock.phi, -sock.phi, sock.phi);
+      const rho = MathUtils.clamp(rho0 + eyeAim.y * sock.rho, rho0 - sock.rho, rho0 + sock.rho);
       for (let i = 0; i < eyes.length; i++) {
         surface(EYE_SIDE[i] * EYES_3D.phi + turn, rho, scratch);
         eyes[i].eye.position.copy(scratch.pos).addScaledVector(scratch.normal, 0.012 * MASCOT_R);
@@ -339,6 +489,13 @@ export function createMascot(opts: MascotOptions): Mascot {
       const submerged = MathUtils.clamp(-dipY / DIP_DEPTH, 0, 1);
       foamMat.uniforms.uAmount.value = (0.42 + 0.14 * bob) * (1 - 0.7 * submerged);
       foam.scale.setScalar(1 + 0.035 * bob);
+
+      // A breath every 5 to 9 s, never while it is diving after a click.
+      if (!mascot.still && t >= nextSpout) {
+        if (t - dipStart > 1.8) breathe();
+        nextSpout = t + 5 + Math.random() * 4;
+      }
+      if (spoutAlive) updateSpout(dt);
 
       if (!mascot.still && poppedAt > 0 && t >= poppedAt && t - dt < poppedAt) {
         opts.onRipple(1);
