@@ -75,12 +75,6 @@ export type Mascot = {
   update: (dt: number, t: number, aim: Aim, look: number) => void;
   /** 0..1: how much it is swimming (the camera under water) rather than resting at the surface. */
   swim: number;
-  /**
-   * O51: the mouse's place across the screen (-1 left, +1 right), or 0 when
-   * there is none to look at (touch, idle, out of the window, reduced
-   * motion). Near the edges the head turns to it; otherwise it rests.
-   */
-  pointerX: number;
   /** Paints the belly and its grooves in the skin's shader; the engine applies it with the fog. */
   paintSkin: (shader: WebGLProgramParametersWithUniforms) => void;
   dip: (t: number) => void;
@@ -424,7 +418,6 @@ export function createMascot(opts: MascotOptions): Mascot {
   let dipStart = -10;
   let poppedAt = -10;
   const DIP_DEPTH = MASCOT_H + 0.25;
-  let headYaw: number = HEAD_TURN.rest;
   let swimPhase = 0;
 
   function dipOffset(t: number): number {
@@ -450,7 +443,6 @@ export function createMascot(opts: MascotOptions): Mascot {
     foam,
     still: false,
     swim: 0,
-    pointerX: 0,
     paintSkin(shader) {
       Object.assign(shader.uniforms, skinUniforms);
       shader.vertexShader = shader.vertexShader
@@ -539,13 +531,8 @@ export function createMascot(opts: MascotOptions): Mascot {
       swimPhase += dt;
       group.position.x = swim * 0.14 * Math.sin(swimPhase * 0.42);
       group.rotation.z = 0.02 * Math.sin((t * TAU) / 4 + 0.7) + swim * 0.05 * Math.sin(swimPhase * 0.8);
-      // O51: turned to the right at rest (one eye, like the mark); a mouse
-      // near either edge turns it to look (both eyes), and it eases back.
-      const p = mascot.still ? 0 : MathUtils.clamp(mascot.pointerX, -1, 1);
-      const engage = MathUtils.smoothstep(Math.abs(p), 0.35, 0.85);
-      const targetYaw = MathUtils.lerp(HEAD_TURN.rest, p < 0 ? HEAD_TURN.left : HEAD_TURN.right, engage);
-      headYaw += (targetYaw - headYaw) * k(2.2);
-      group.rotation.y = headYaw + swim * 0.08 * Math.sin(swimPhase * 0.55 + 0.4);
+      // The head turns only a little; the pupils do most of the looking.
+      group.rotation.y = lookAim.x * HEAD_TURN.yaw * look + swim * 0.08 * Math.sin(swimPhase * 0.55 + 0.4);
       group.rotation.x = -lookAim.y * HEAD_TURN.pitch * look + 0.012 * Math.sin((t * TAU) / 8);
       parts.update(t, swim, mascot.still);
 
