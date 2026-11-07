@@ -288,18 +288,37 @@
       },
       {
         "title": "Tabel terbuka.",
-        "body": "Data mentah dalam Apache Iceberg. Engine apa pun yang membaca Iceberg bisa membacanya."
+        "body": "Di bawahnya Apache Iceberg, jadi engine apa pun yang membaca Iceberg bisa membacanya."
       },
       {
         "title": "Server Anda atau kami.",
-        "body": "Pasang di infrastruktur Anda sendiri, atau bicarakan dengan kami agar kami yang menjalankannya untuk Anda."
+        "body": "Pasang di infrastruktur Anda sendiri, atau bicarakan dengan kami agar kami yang menjalankannya."
       }
     ],
+    "code": {
+      "license": "AGPL-3.0",
+      "sr": "Beberapa baris kode sumber Lakehouse sendiri: fungsi yang menahan aksi asisten yang berisiko sampai disetujui seseorang, dan menolaknya bila tak ada tempat menyimpan persetujuan itu."
+    },
+    "tables": {
+      "table": "orders",
+      "format": "Apache Iceberg",
+      "builtIn": "bawaan",
+      "engine": "Query engine Anda",
+      "notebook": "Notebook Anda",
+      "sr": "Sebuah tabel Apache Iceberg di tengah, dibaca oleh ClickHouse yang dijalankan Lakehouse, dan oleh engine atau notebook lain yang membaca Iceberg."
+    },
+    "hosting": {
+      "label": "Tempat berjalan",
+      "yours": "Server Anda",
+      "ours": "Kami jalankan",
+      "yoursNote": "Di infrastruktur Anda sendiri",
+      "oursNote": "Bicarakan dengan kami"
+    },
     "console": {
       "window": "Beranda",
-      "label": "Konsolnya, seperti yang akan Anda jalankan",
-      "caption": "Halaman utamanya: ajukan pertanyaan dengan bahasa sehari-hari, atau mulai dari pintasan untuk menghubungkan sumber, membuat pipeline, atau membuat dashboard.",
-      "alt": "Halaman utama konsol RantAI Lakehouse: kotak untuk bertanya ke asisten, dengan Ask, Build, dan Tools, serta tiga pintasan: Connect a source, Create a pipeline, dan Build a dashboard."
+      "label": "Beranda konsol, dibuat ulang",
+      "caption": "Bertanya dengan bahasa biasa, atau mulai dari pintasan.",
+      "alt": "Beranda konsol RantAI Lakehouse, dibuat ulang: kotak untuk bertanya ke asisten, dengan Ask, Build, dan Tools, serta tiga pintasan: Connect a source, Create a pipeline, dan Build a dashboard."
     }
   },
   "getStarted": {

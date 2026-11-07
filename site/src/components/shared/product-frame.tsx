@@ -1,3 +1,4 @@
+import type * as React from "react";
 import { MascotMark } from "./mascot-svg";
 
 /**
@@ -12,6 +13,10 @@ import { MascotMark } from "./mascot-svg";
  * `decoding="async"`, and has its width and height, so it shifts nothing
  * when it arrives (CLS 0). The source is a crop at the screenshot's own
  * pixels, so there is one file and no 2x (the handoff says why).
+ *
+ * WEB-5 O22: it can also frame live HTML (`children`) instead of a picture,
+ * for a recreation of the console that is crisp at any size; the caller
+ * then labels it as recreated and describes it for assistive tech.
  */
 export function ProductFrame({
   src,
@@ -21,17 +26,20 @@ export function ProductFrame({
   windowTitle,
   narrow,
   className,
+  children,
 }: Readonly<{
-  src: string;
-  width: number;
-  height: number;
+  /** A screenshot to frame; or pass `children` to frame live HTML instead. */
+  src?: string;
+  width?: number;
+  height?: number;
+  children?: React.ReactNode;
   /**
    * A narrower crop of the same screenshot for phones, where the full one
    * would show its text at half size. Its cut edge fades out, so it reads
    * as the window going on, not as a cut.
    */
   narrow?: { src: string; width: number; height: number };
-  alt: string;
+  alt?: string;
   /** What the window shows, in the title strip ("Home"). */
   windowTitle: string;
   className?: string;
@@ -49,6 +57,7 @@ export function ProductFrame({
             <span className="text-[12px] leading-4 font-medium text-[#E8F4FF]/75">{windowTitle}</span>
           </div>
           <div className="p-2 sm:p-3">
+            {children ?? (
             <picture>
               {narrow && (
                 <source media="(max-width: 47.99rem)" srcSet={narrow.src} width={narrow.width} height={narrow.height} />
@@ -68,6 +77,7 @@ export function ProductFrame({
                 }
               />
             </picture>
+            )}
           </div>
         </div>
       </div>
