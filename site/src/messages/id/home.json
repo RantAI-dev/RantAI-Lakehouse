@@ -1,0 +1,163 @@
+{
+  "hero": {
+    "eyebrow": "RANTAI LAKEHOUSE",
+    "headline": "Rumah bagi data Anda.",
+    "sub": "Satu lakehouse dengan dashboard bawaan. Satukan semua sumber, simpan dalam tabel terbuka, dan tanyakan jawabannya dengan bahasa sehari-hari.",
+    "scrollCue": "Gulir untuk menyelam"
+  },
+  "sources": {
+    "headline": "Semua mengalir masuk.",
+    "sub": "Database, file, stream, API, dan aplikasi bisnis masuk ke satu tempat, terjadwal atau setiap kali datanya berubah.",
+    "items": [
+      "PostgreSQL",
+      "MySQL",
+      "SQL Server",
+      "MongoDB",
+      "REST API",
+      "Kafka",
+      "File CSV dan TSV",
+      "Workbook Excel",
+      "File Parquet",
+      "Salesforce",
+      "ServiceNow",
+      "Google Analytics 4",
+      "HubSpot",
+      "Zendesk",
+      "Confluence",
+      "Dynamics 365",
+      "SharePoint",
+      "JSON, JSON Lines, Avro",
+      "Arsip gzip dan zip"
+    ],
+    "caption": "Change capture langsung untuk PostgreSQL. Dedupe atau simpan riwayat saat load, temukan tabel di semua sumber, dan unggah 10 file sekaligus ke folder."
+  },
+  "depths": {
+    "eyebrow": "Tiga kedalaman",
+    "headline": "Tiga kedalaman.",
+    "layers": {
+      "bronze": {
+        "title": "Mentah dan utuh.",
+        "body": "Setiap sumber masuk tanpa diubah ke tabel Apache Iceberg yang terbuka, jadi tak ada yang hilang dan tak ada yang terkunci."
+      },
+      "silver": {
+        "title": "Bersih, terpadu.",
+        "body": "Pipeline dengan jadwal, dependensi, retry, dan riwayat versi membersihkan data mentah menjadi tabel tepercaya, diawasi pemeriksaan kualitas dengan deteksi anomali."
+      },
+      "gold": {
+        "title": "Siap menjawab.",
+        "body": "Tabel terkurasi untuk pertanyaan bisnis Anda. Tabel ini diperbarui sendiri dalam lag yang Anda tetapkan, dan terbit sebagai tabel terbuka bila Anda aktifkan."
+      }
+    }
+  },
+  "assistant": {
+    "headline": "Cukup tanya.",
+    "sub": "Asisten memakai tool yang sama dengan konsol. Ia menjawab pertanyaan, membuat chart dan dashboard, serta menjalankan pipeline. Apa pun yang berisiko menunggu persetujuan manusia. Lebih suka SQL? Query Studio punya autocomplete, tab, dan riwayat query.",
+    "caption": "Ilustrasi",
+    "userOne": "Wilayah mana yang paling banyak pengunjungnya kuartal lalu?",
+    "answerOne": "Wilayah Utara paling banyak pengunjungnya kuartal lalu.",
+    "userTwo": "Jeda pipeline penjualan malam.",
+    "approvalLabel": "Menunggu persetujuan",
+    "approvalAction": "Jeda pipeline",
+    "approve": "Setujui",
+    "decline": "Tolak",
+    "regions": {
+      "north": "Utara",
+      "south": "Selatan",
+      "east": "Timur",
+      "west": "Barat"
+    },
+    "srDescription": "Ilustrasi asisten. Seseorang bertanya wilayah mana yang paling banyak pengunjungnya kuartal lalu, dan asisten menjawab dengan bar chart kecil. Lalu ia meminta pipeline penjualan malam dijeda, dan asisten menampilkan kartu yang menunggu seseorang menyetujui atau menolak perubahan itu. Nama wilayah dan angkanya hanya ilustrasi."
+  },
+  "dashboards": {
+    "headline": "Jawabannya naik jadi dashboard.",
+    "sub": "Sekitar dua lusin jenis chart, termasuk peta dengan batas wilayah Anda, plus calculated field, parameter, metrik bersama, dan hasil yang diingat lalu diperbarui. Komentar dengan @mention, alert di chart, ekspor PNG, PDF, atau Excel, laporan terjadwal, dan berbagi lewat tautan publik berbatas waktu dan bersandi, atau embed.",
+    "caption": "Ilustrasi, bukan data pelanggan.",
+    "tiles": {
+      "line": {
+        "title": "Kunjungan dari waktu ke waktu",
+        "kind": "Line chart",
+        "aria": "Ilustrasi line chart"
+      },
+      "map": {
+        "title": "Kunjungan per wilayah",
+        "kind": "Peta",
+        "aria": "Ilustrasi peta titik"
+      },
+      "sankey": {
+        "title": "Asal kunjungan",
+        "kind": "Sankey",
+        "aria": "Ilustrasi diagram Sankey"
+      },
+      "kpi": {
+        "title": "Kunjungan minggu ini",
+        "kind": "KPI",
+        "aria": "Ilustrasi tile KPI",
+        "delta": "+8,4% vs minggu lalu"
+      },
+      "calendar": {
+        "title": "Hari tersibuk",
+        "kind": "Calendar heatmap",
+        "aria": "Ilustrasi calendar heatmap"
+      }
+    }
+  },
+  "governance": {
+    "headline": "Aman sejak awal.",
+    "sub": "Peran menentukan siapa melihat apa. Kolom sensitif diklasifikasikan dan disamarkan bagi siapa pun yang tak berhak melihatnya, dan lineage tingkat kolom menunjukkan asal setiap kolom.",
+    "illustration": "Ilustrasi · orang fiktif",
+    "viewAs": "Lihat sebagai",
+    "roles": {
+      "analyst": "Analis",
+      "admin": "Admin"
+    },
+    "columns": {
+      "name": "Nama",
+      "email": "Email",
+      "city": "Kota",
+      "amount": "Jumlah"
+    },
+    "tableCaption": "Lima pelanggan fiktif. Sebagai analis, kolom nama dan email disamarkan; sebagai admin, keduanya tampil utuh.",
+    "facts": [
+      {
+        "label": "Bukti",
+        "text": "Masking terbukti end to end di acceptance gate"
+      },
+      {
+        "label": "Audit",
+        "text": "Aksi asisten tercatat; yang berisiko menunggu persetujuan"
+      },
+      {
+        "label": "Lineage",
+        "text": "Lineage tingkat kolom, dari tabel mentah ke tabel terkurasi"
+      },
+      {
+        "label": "Katalog",
+        "text": "Pencarian katalog dengan tanda certified dan deprecated serta tag terkelola"
+      },
+      {
+        "label": "Akses",
+        "text": "Izin per dashboard dan per folder"
+      }
+    ]
+  },
+  "open": {
+    "headline": "Milik Anda.",
+    "cards": [
+      {
+        "title": "Open source.",
+        "body": "AGPL-3.0. Baca setiap baris kodenya, jalankan sendiri."
+      },
+      {
+        "title": "Tabel terbuka.",
+        "body": "Data mentah dalam Apache Iceberg. Engine apa pun yang membaca Iceberg bisa membacanya."
+      },
+      {
+        "title": "Server Anda atau kami.",
+        "body": "Pasang di infrastruktur Anda sendiri, atau bicarakan dengan kami agar kami yang menjalankannya untuk Anda."
+      }
+    ]
+  },
+  "final": {
+    "headline": "Masuklah. Datanya aman."
+  }
+}

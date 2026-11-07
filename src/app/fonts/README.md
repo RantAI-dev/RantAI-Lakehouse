@@ -2,8 +2,7 @@
 
 These are the fonts the console loads through `next/font/local` (OPS-16,
 decisions D1 and D5), so they need no network at build or at runtime:
-`src/app/fonts.ts` loads the dashboard faces, `src/features/landing/landing-fonts.ts`
-the landing page's display face, and `design-system/fonts/fonts.ts` the root
+`src/app/fonts.ts` loads the dashboard faces and `design-system/fonts/fonts.ts` the root
 layout's Geist and Geist Mono. The ids, weights and CSS variables are the ones
 `next/font`'s Google loader produced before, so
 `lakehouse_bi::formatting::SHIPPED_FONTS` and `lib/dashboard-look.ts` need no
@@ -71,7 +70,7 @@ the license requires.
 | IBM Plex Sans | `ibm-plex-sans/IBMPlexSans-latin-wght.woff2` | <https://fonts.gstatic.com/s/ibmplexsans/v23/zYXzKVElMYYaJe8bpLHnCwDKr932-G7dytD-Dmu1syxeKYY.woff2> | `v23` | variable, `wght` 100–700 |
 | Source Serif 4 | `source-serif-4/SourceSerif4-latin-opsz-wght.woff2` | <https://fonts.gstatic.com/s/sourceserif4/v15/vEFI2_tTDB4M7-auWDN0ahZJW1gb8tc.woff2> | `v15` | variable, `opsz` 8–60, `wght` 200–900 |
 | JetBrains Mono | `jetbrains-mono/JetBrainsMono-latin-wght.woff2` | <https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbV2o-flEEny0FZhsfKu5WU4xD7OwE.woff2> | `v24` | variable, `wght` 100–800 |
-| Instrument Serif | `instrument-serif/InstrumentSerif-Italic-latin.woff2` | <https://fonts.gstatic.com/s/instrumentserif/v5/jizHRFtNs2ka5fXjeivQ4LroWlx-6zAjjH7M.woff2> | `v5` | static, italic 400 |
+| Instrument Serif (moved to `site/src/fonts/instrument-serif/` by WEB-5; the console no longer loads it) | `instrument-serif/InstrumentSerif-Italic-latin.woff2` | <https://fonts.gstatic.com/s/instrumentserif/v5/jizHRFtNs2ka5fXjeivQ4LroWlx-6zAjjH7M.woff2> | `v5` | static, italic 400 |
 
 The CSS requests that produced these `latin` blocks:
 
@@ -97,8 +96,8 @@ code did not use.
   `font-optical-sizing: auto` chooses the optical size, exactly as it did with
   the Google-served file.
 - **JetBrains Mono**: `wght` 100–800, as before.
-- **Instrument Serif**: the landing page uses italic 400 only, and that is a
-  static face.
+- **Instrument Serif**: the landing page (since WEB-5 the Lakehouse site,
+  `site/`) uses italic 400 only, and that is a static face.
 - **Geist** and **Geist Mono**: `wght` 100–900, the axis the release's variable
   files carry; the old Google loader requested the same 100–900 range.
 
@@ -107,5 +106,6 @@ code did not use.
 For the five Google-served families, `OFL.txt` in each directory is the
 upstream license file from Google Fonts' copy of the family
 (<https://github.com/google/fonts/tree/main/ofl>): `inter`, `ibmplexsans`,
-`sourceserif4`, `jetbrainsmono`, `instrumentserif`. The Geist and Geist Mono
+`sourceserif4`, `jetbrainsmono`, `instrumentserif` (its directory, with its
+`OFL.txt`, is now `site/src/fonts/instrument-serif/`). The Geist and Geist Mono
 directories carry the `OFL.txt` from the geist-font release, described above.

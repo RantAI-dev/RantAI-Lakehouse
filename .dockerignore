@@ -10,7 +10,7 @@
 #
 # What the frontend build MUST see, and therefore what this file must
 # not exclude: `package.json`, `bun.lock`, `bunfig.toml`, `src/` (apart
-# from the landing page's two folders, below), `public/`,
+# from the Lakehouse site, below), `public/`,
 # `design-system/` (the `@rantai/design-system` path alias in
 # `tsconfig.json`), `design-kit/`, `GTM/`, `next.config.ts`,
 # `tsconfig.json`, `postcss.config.mjs`, `eslint.config.mjs`,
@@ -52,12 +52,12 @@ docs
 ops
 scripts
 
-# The landing page (WEB-1) is not served by an installed Lakehouse: the
-# product owner decided on 2026-11-02 that it is a separate product page
-# and that an install must not offer it. Both folders are excluded, so no
-# console image — the release's, the staging deploy's, compose's — carries
-# the route or the bundles it pulls in, and `/landing` answers with the
-# console's page-not-found. The source stays in the repository and is
-# served by the dev server (`bun run dev`) only.
-src/app/landing
-src/features/landing
+# The Lakehouse site (WEB-5, `site/`), the product page that was the
+# console's `/landing` (WEB-1), is not served by an installed Lakehouse:
+# the product owner decided on 2026-11-02 that it is a separate product
+# page and that an install must not offer it (WEB-2). It is its own
+# package, built as a static export and hosted on its own, so no console
+# image needs it, and keeping it out of the build context means no
+# console image can carry it. `/landing` answers with the console's
+# page-not-found.
+site/
