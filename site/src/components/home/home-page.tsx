@@ -15,6 +15,7 @@ import { DepthBackdrop } from "./depth-backdrop";
 import { DepthGauge } from "./depth-gauge";
 import { DepthsSection } from "./depths-section";
 import { FinalSection } from "./final-section";
+import { GetStartedSection } from "./get-started-section";
 import { GovernanceSection } from "./governance-section";
 import { HeroSection } from "./hero-section";
 import { OpenSection } from "./open-section";
@@ -56,6 +57,7 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
           <DashboardsSection copy={home.dashboards} />
           <GovernanceSection copy={home.governance} />
           <OpenSection copy={home.open} cta={common.cta} />
+          <GetStartedSection copy={home.getStarted} />
           <FinalSection copy={home.final} cta={common.cta} contactHref={contactHref} />
         </main>
         <SiteFooter locale={locale} copy={common.footer} />

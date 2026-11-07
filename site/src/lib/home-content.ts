@@ -35,6 +35,18 @@ export const LINKS = {
 export const CONTACT_EMAIL = "contact@rantai.dev";
 
 /**
+ * WEB-5 D20: the three steps of `#get-started`, word for word from the
+ * README's Quickstart (README.md, "## Quickstart"): commands are not
+ * translated. Each step's words are `home.getStarted.steps.<i>`, and each
+ * step is a claim in `content/claims.ts`.
+ */
+export const GET_STARTED_COMMANDS = [
+  ["git clone https://github.com/RantAI-dev/RantAI-Lakehouse.git", "cd RantAI-Lakehouse"],
+  ["sh ops/init-env.sh"],
+  ["scripts/compose.sh up --build"],
+] as const;
+
+/**
  * WEB-5 D17: RantAI's social profiles, at the same URLs as the RantAI site's
  * `siteConfig.links` (rantai-page `src/lib/config.ts`), so the family links
  * to one set. Brand names, not translated. The short links that site keeps

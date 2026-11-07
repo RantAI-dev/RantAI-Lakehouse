@@ -163,6 +163,30 @@
       "alt": "Halaman utama konsol RantAI Lakehouse: kotak untuk bertanya ke asisten, dengan Ask, Build, dan Tools, serta tiga pintasan: Connect a source, Create a pipeline, dan Build a dashboard."
     }
   },
+  "getStarted": {
+    "eyebrow": "Mulai",
+    "headline": "Jalan dalam tiga langkah.",
+    "sub": "Cukup Docker.",
+    "steps": [
+      {
+        "title": "Clone repository-nya",
+        "note": "Repository publik, lengkap dengan semua yang dibutuhkan stack-nya."
+      },
+      {
+        "title": "Atur konfigurasinya",
+        "note": "Perintah ini menulis `.env` dengan secret yang dibuat otomatis. Lalu isi `AUTH_BOOTSTRAP_EMAIL` dan `AUTH_BOOTSTRAP_PASSWORD` di dalamnya: itulah akun pertama Anda."
+      },
+      {
+        "title": "Jalankan",
+        "note": "Lalu buka `http://localhost:3000` dan masuk dengan akun itu."
+      }
+    ],
+    "terminal": "Terminal",
+    "copy": "Salin",
+    "copied": "Tersalin",
+    "copyFailed": "Terpilih: tekan Ctrl+C atau ⌘C",
+    "more": "Quickstart lengkap, konfigurasi, dan troubleshooting"
+  },
   "final": {
     "headline": "Masuklah. Datanya aman."
   }

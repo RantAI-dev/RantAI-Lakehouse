@@ -4,7 +4,7 @@ import * as React from "react";
 import { localizedPath } from "@/i18n/paths";
 import type { Locale } from "@/i18n/routing";
 import type { CommonCopy } from "@/lib/copy";
-import { LINKS, NAV_ANCHORS } from "@/lib/home-content";
+import { NAV_ANCHORS } from "@/lib/home-content";
 import { LanguageSwitcher } from "./language-switcher";
 import { CtaLink } from "@/components/shared/primitives";
 import { MascotMark } from "@/components/shared/mascot-svg";
@@ -91,7 +91,8 @@ export function TopBar({
         </nav>
         <div className="flex items-center gap-1.5 md:gap-3">
           <LanguageSwitcher locale={locale} text={language} />
-          <CtaLink href={LINKS.install} size="sm">
+          {/* WEB-5 D20: to the page's own "Get started", which links on to the README. */}
+          <CtaLink href={anchor("#get-started")} size="sm">
             {cta.install}
           </CtaLink>
         </div>

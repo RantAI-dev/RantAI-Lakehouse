@@ -53,7 +53,7 @@ export function ProductFrame({
               {narrow && (
                 <source media="(max-width: 47.99rem)" srcSet={narrow.src} width={narrow.width} height={narrow.height} />
               )}
-              {/* eslint-disable-next-line @next/next/no-img-element -- a static export has no image optimizer; the file is already WebP at its own size */}
+              {/* A plain <img> in a <picture>: a static export has no image optimizer, and the files are WebP at their own size. */}
               <img
                 src={src}
                 width={width}

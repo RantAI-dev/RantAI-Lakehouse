@@ -163,6 +163,30 @@
       "alt": "The RantAI Lakehouse console's home: a box to ask the assistant, with Ask, Build and Tools, and three shortcuts: Connect a source, Create a pipeline and Build a dashboard."
     }
   },
+  "getStarted": {
+    "eyebrow": "Get started",
+    "headline": "Up and running in three steps.",
+    "sub": "All it needs is Docker.",
+    "steps": [
+      {
+        "title": "Clone it",
+        "note": "The public repository, with everything the stack needs."
+      },
+      {
+        "title": "Configure it",
+        "note": "This writes `.env` with generated secrets. Then set `AUTH_BOOTSTRAP_EMAIL` and `AUTH_BOOTSTRAP_PASSWORD` in it: that is your first account."
+      },
+      {
+        "title": "Start it",
+        "note": "Then open `http://localhost:3000` and sign in with that account."
+      }
+    ],
+    "terminal": "Terminal",
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyFailed": "Selected: press Ctrl+C or ⌘C",
+    "more": "Full Quickstart, configuration and troubleshooting"
+  },
   "final": {
     "headline": "Come on in. The data's fine."
   }

@@ -75,6 +75,11 @@ export const CLAIMS: readonly Claim[] = [
     backlog: ["AI-18 In Acceptance"],
     note: "ask in plain language on the console's home (Copilot Chat); the three shortcuts are the home page's own",
   },
+  // Get started (D20, 2026-11-07): the README's Quickstart, step by step.
+  { key: "home.getStarted.sub", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart: \"Assumes you have Docker installed and nothing else\"" },
+  { key: "home.getStarted.steps.0.note", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart step 1: git clone the public repository" },
+  { key: "home.getStarted.steps.1.note", backlog: ["SEC-18 Done", "REL-2 Done"], note: "README step 2: ops/init-env.sh writes .env with generated values (no default credentials, SEC-18); AUTH_BOOTSTRAP_EMAIL / _PASSWORD create the first admin" },
+  { key: "home.getStarted.steps.2.note", backlog: ["REL-2 Done"], note: "README step 3: scripts/compose.sh up --build; the console listens on :3000 once the API is healthy (REL-2 slice 1: the console in the stack)" },
   // Contact page FAQ (D15, 2026-11-07): every answer is a claim. Most repeat
   // what the home page already says (WEB-1's copy, "limited to what is
   // built", In Acceptance), so they trace to the same rows.

@@ -1,6 +1,5 @@
 import * as React from "react";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
-import { LINKS } from "@/lib/home-content";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { MascotLogo } from "@/components/shared/mascot-svg";
 import { ProgressSection } from "@/components/shared/progress-section";
@@ -55,7 +54,8 @@ export function HeroSection({
             </DisplayHeading>
             <LeadText className="mx-auto mt-6 max-w-[34rem] short:mt-4 short:text-[15px] short:leading-[1.5] md:mx-0">{copy.sub}</LeadText>
             <div className="mt-9 short:mt-6 flex flex-wrap items-center justify-center gap-3 md:justify-start">
-              <CtaLink href={LINKS.install}>{cta.install}</CtaLink>
+              {/* WEB-5 D20: the install path is on the page now; it links on to the README. */}
+              <CtaLink href="#get-started">{cta.install}</CtaLink>
               <CtaLink href={contactHref} variant="ghost">
                 {cta.talk}
               </CtaLink>
