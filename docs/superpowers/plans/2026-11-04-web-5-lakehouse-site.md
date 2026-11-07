@@ -1089,6 +1089,152 @@ The creature's box is now positioned exactly as before (`left-1/2`,
   - :3400 and :9557 were not touched.
   - `git status` is clean.
 
+### Handoff 10: developer (Opus), 2026-11-07, §10 production ready (P1–P5), owner QA O1–O10, P6–P8
+
+**Commits** (local on `feat/web-5-landing-refresh`, not pushed; author `mtharreqq`), in order:
+
+| Commit | Item | What |
+| --- | --- | --- |
+| `a47da239` | P1 (D15) | `/contact/` and `/id/contact/`: form that opens a `mailto:`, direct contacts, Follow RantAI, 8-question FAQ with `FAQPage` JSON-LD, SEO and preview cards, sitemap entry, "Talk to us" and the Contact links moved there. The plan's §10 addendum is in this commit as the planner wrote it. |
+| `ab6d8ae1` | O1 | The language offer in the lake's look (was rantai-page's white card). |
+| `3723b7f7` | P2 (D16) | Lenis 1.3.27, desktop fine pointer only, deferred chunk. |
+| `21567afc` | O2, O3 | The official Lakehouse mark everywhere (and every raster from its SVG); the 3D dome on the mark's sphere cap; two eyes on the 3D creature. |
+| `171d997e` | P3 (D17) | Follow RantAI, the RantAI products column with official marks, Claw added. |
+| `aa5a7d71` | P4 (D18) | CSP meta (first in `<head>`, post-build), referrer meta, README host headers and caching for Vercel, `_headers` and nginx, the polish sweep, bilingual 404. Done before the owner parked P4's technical half. |
+| `6f3ec277` | P6 (D19) | The real console, cropped and framed. |
+| `a75ee680` | P7 (D20) | `#get-started` with copy buttons; "Install it" lands there. |
+| `cf8d7832` | P8 (D21), O4 | Reassurance line, home FAQ, "Email". |
+| `6dd1da4d` | O6 | rantai-page's navbar layout, phone sheet, scroll spy. |
+| `ccc39f97` | O7 | rantai-page's footer structure: CTA card with a typewriter prompt, links, bottom bar, giant wordmark; the final section's buttons dropped. |
+| `d4e0ef44` | O9 | Sticky side columns centred in the screen. |
+| `02e9b757` | O10 | Living dashboard tiles; the feature list as chips. |
+| `c12a6e73` | micro pass | DESIGN.md §3 over every visible control. |
+
+**Checks at `c12a6e73`** (site, run in the foreground on a fresh `rm -rf .next out` build):
+- `bun run lint`: exit 0, 0 warnings. `bun run typecheck`: exit 0. `bun run test`: 80 pass, 0 fail.
+- `NEXT_PUBLIC_SITE_URL=https://example.invalid bun run build`: exit 0; `csp-meta: the policy is first in <head> in 7 pages`.
+- `bun run size`: exit 0. Initial JS: `/` and `/id/` 185.6 KB, `/contact/` and `/id/contact/` 165.4 KB, of 200 KB. Deferred, not counted: the scene 147.3 KB, Lenis 5.9 KB.
+- Lockfile: `lenis` was added with bun 1.3.12 (CI's version); `bun install --frozen-lockfile` with 1.3.12 passes.
+- Lighthouse: **not run.** The owner parked measurement until the UI sign-off; the planner runs it (coordinator, 2026-11-07).
+
+**P1, contact page.**
+- Probe (keyboard only, `/contact/`): Tab order reaches the form after the bar. An empty send focuses Name, with `aria-invalid` and the error "Please fill this in" as its description. Arrow keys move the topic. Send opens `mailto:contact@rantai.dev?subject=RantAI%20Lakehouse%20%C2%B7%20Product%20walkthrough%20%C2%B7%20Mira%20Okafor&body=…` (`Page.frameRequestedNavigation`), the live region says "Opening your email app…", and the fallback line with Copy appears.
+- Tests: `lib/contact-mail.test.ts` (subject and body in both languages, `%20` not `+`, validation), `lib/faq-json-ld.test.ts`, `seo.test.ts` (canonical, hreflang, OG image of `/contact/` and `/id/contact/`).
+- Claims: every FAQ answer is in `claims.ts`. New tests: every FAQ answer has an entry; every claimed row is Released, Done or In Acceptance; and the rows are read from `docs/core/BACKLOG.md` itself, so a row that is reopened later fails the test.
+- Sitemap: `/contact/` with its `id` and `x-default` alternates, priority 0.6. Both `contact/og.png` files are 1200×630.
+- Evidence: `p1-contact-{en,id}-{1440,390,360}.jpg`.
+
+**P2, Lenis** (CDP on a Chrome that reports a mouse: `--blink-settings` pointer and hover; headless reports `pointer: none`, so Lenis correctly stays off there).
+- Eight chapter marks, Lenis wheel against native `scrollTo` at the same y: the gauge text is the same at all eight. The fill variable differs by at most 0.0006 (0.06 m, under 1 px) at four marks, because the gauge repaints only when the fill moves by 0.001 (an existing rounding), so its last value depends on the path taken.
+- Through a 7,100 px glide: 381 frames, 0 frames where y went back, and 381 of 381 gauge readings equal the native reading at that frame's y.
+- Keyboard with Lenis: PageDown 0→787, Space →1574, ArrowDown →1614, End →12815 (max), PageUp →12028, Home →0. A PageDown during a wheel glide wins, and nothing pulls back.
+- Skip link: the first Tab is "Skip to content"; Enter moves focus to `#main`. `#governance`, `#open` and `#sources` land at the same y with and without Lenis (10268, 11436, 1350), with focus on the section.
+- Phone 390 with touch, desktop with reduced motion, and tablet 768 with touch: no `html.lenis`, and the chunk is never fetched.
+
+**O2/O3, the mark and the eyes.**
+- R12 gap probe after O2: 360×640 15/15 px, 375×667 15/15, 390×844 45/18; buttons on the first screen.
+- 3D, under SwiftShader with the dev-only override in `next dev`: eyes at ±0.42 rad, at 0.42 of the dome's height, 0.82 of the mark's eye size.
+- Evidence: `o2-logo-{topbar,footer,hero-fallback}-{desk,phone}.jpg`, `o2-logo-strip.jpg`, `o3-two-eyes-{desk,phone,turned}.jpg`.
+- After the ownership change, nothing under `effects/**`, `scroll-timeline.ts`, `hero-motion.tsx`, `depth-backdrop.tsx` or `scene-zone.tsx` was touched (O2/O3 came before it).
+
+**P3, footer.** Evidence: `p3-footer-{en,id}-{desk,phone}.jpg`, superseded in layout by O7.
+
+**P4: the D18 polish list.**
+
+| Item | Result | How checked |
+| --- | --- | --- |
+| No console error or hydration warning on any page | Pass | `csp-probe`: `/`, `/id/` (scene forced on by a test-only GPU spoof over CDP, Lenis on), `/contact/`, `/id/contact/`, at 1440 and 390, each scrolled through: 0 errors. The only log line is the 404 status of the missing-page runs themselves. |
+| Every page loads under the CSP with no violation | Pass | the same runs, with a `securitypolicyviolation` listener: 0. The WebGL scene ran, the canvas was present, and Lenis loaded. |
+| A 404 for a missing path in each language | Pass | One `404.html`, English and then Indonesian (`lang="id"`), each with a way home. Some hosts serve only the root 404, hence one file. `p4-404-{desk,phone}.jpg`. |
+| Icons and `theme-color` | Pass | O2 rendered every icon from the official SVG; `theme-color` and the manifest are both `#020514` (the manifest was `#050A30`). |
+| `site.webmanifest` names the site | Pass | name and short_name "RantAI Lakehouse", plus id, start_url, scope, lang and description. |
+| Every external link has `rel="noopener noreferrer"` | Pass | scan of the built HTML; the install button lacked it, and `CtaLink` now adds it to any http(s) href. |
+| The form is usable by keyboard and labelled | Pass | the P1 probe above. |
+| No horizontal scroll from 320 to 1920 px | Pass | 5 pages × 7 widths, scrolled through: 0 px. Re-checked for the footer after O7, and for the bar at 320–1280 after O6. |
+| The text is right in both languages | Not verified | The owner reviews the Indonesian. Every new heading is checked: none wraps to more lines than its English. |
+
+**Micro-detail list** (DESIGN.md §3, `c12a6e73`; CDP with forced `:hover` and `:focus-visible` on 128 interactive elements on `/` and `/contact/`):
+
+| Item | Result | Note |
+| --- | --- | --- |
+| Visible focus state on every control | Pass | 128 of 128 |
+| Transitions 150–250 ms, eased | Pass | none over 250 ms. The bar's background (500 ms) and the depth labels are ambient, not controls. |
+| Hover on every control | Pass | The exceptions are deliberate: the current language, the selected topic and the open question are already lit, and the skip link exists only while focused. |
+| Press state on buttons, pills, chips and calls to action | Pass | scale or wash |
+| Feedback for every action | Pass | Send says it is opening the e-mail app. Copy says "Copied", or without a clipboard selects the text and says "Selected: press Ctrl+C or ⌘C"; both paths were probed in the form and in Get started. The prompt confirms a send. Back to top glides there and moves focus to `<main>`. |
+| Smooth FAQ disclosure with a turning chevron | Pass where supported | `::details-content` + `interpolate-size` (Chrome). Elsewhere it opens at once; Safari not verified. |
+| No widow words in headings | Pass | `text-balance` on display headings, `text-pretty` on questions and captions |
+| Empty, error and success states designed | Pass | form errors, the opening note, the fallback line, the copy states, the quiet and lit send buttons |
+| Not every section uses the same fade-up | Pass | the new pieces use a draw, a wave, a ripple, a roll, a slide-in sheet, the steps' beads, the waterline |
+| Still under reduced motion | Pass | `rm` run of the tiles; the sheet, FAQ, rings and bob are off in the reduced-motion block |
+
+**P6, the real console: the screenshot audit.**
+- `lake-dashboard.webp`: **dropped.** Its charts show what look like real tourism statistics (foreign visitors by country and entry point, "GCI indicators", "DTW"), the kind of data the repo's `dispar` pipeline handles. No crop saves it.
+- `lake-home.webp`: **cropped** to the composer and its three shortcuts, at its own pixels: 676×156, plus a 420×156 crop for phones whose cut edge fades out. Left out:
+  - the internal staging account and its e-mail;
+  - "450 alerts open" in red, from a staging stack;
+  - the sidebar (the old "Rantai Lake" name, "Intelligence SOON", and a Monitoring group WEB-3 is reshaping);
+  - a source name in a suggested question;
+  - the dashboard cards' titles.
+- The composer's strings are the console's own (`src/lib/home-prompts.ts`, `src/features/home/home-shortcuts.ts`). Nothing is painted over.
+- There is no 2x file, because the source has no more pixels.
+- Follow-up for the owner: fresh screenshots from a demo dataset would allow the dashboard placement D19 suggests.
+- Evidence: `p6-console-{desk,phone}.jpg`.
+
+**P7.**
+- `p7-probe` (Lenis on and off): "Install it" in the bar and in the hero lands `#get-started` at 64 px, the hash is written, and focus moves to the section with Lenis. From `/id/contact/` it goes to `/id/#get-started`.
+- Copy with a clipboard: all three commands land in the clipboard, and the button says "Copied", then "Copy" after 2 s.
+- Copy without a clipboard (`navigator.clipboard` removed): the command is selected, and the button says "Selected: press Ctrl+C or ⌘C" for 4 s.
+- Evidence: `p7-get-started-{desk,phone}.jpg`.
+
+**P8.**
+- R12 gap probe with the new line: 360×640 15/16 px (EN/ID), 375×667 15/15, 390×844 15/15. Buttons end at 476/640, 503/667 and 640/844. No overflow.
+- The creature is smaller on the shortest phones: 98 px tall at 360×640 EN and 76 px in ID.
+- Evidence: `p8-hero-{desk,phone}.jpg`, `p8-faq-{desk,phone}.jpg` (EN | ID).
+
+**O6, navbar** (`o6` probe).
+- The scroll spy lights Product → How it works (depths, assistant, dashboards) → Governance → Open source (open, get-started), and nothing over the hero, the FAQ or the final.
+- On `/contact/`, Contact is `aria-current="page"`.
+- The sheet: opens with `aria-expanded="true"` and `html` overflow hidden; focus moves to Close; the page is inert; 12 Tabs stay inside; Esc closes, focus returns to the menu button, and the scroll unlocks; a link closes it and lands the section at 64 px.
+- The bar fits at 320, 360, 768, 1023, 1024 and 1280 px in EN, ID and contact.
+- Evidence: `o6-navbar-{desk,phone,sheet}.jpg`.
+
+**O7, footer.**
+- Back to top: y 0 with Lenis (desktop) and without (phone); focus moves to `#main`.
+- The wordmark fits from 320 to 1920 px.
+- Evidence: `o7-footer-{desk,phone}.jpg`.
+
+**O9, sticky columns** (`o9` probe).
+- Get started and the home FAQ at 1440×900: the list is shorter than the screen, so the column is centred against it, also when an answer opens.
+- `/contact/` FAQ at 1440×640: centred at y 352 (the screen's mid 352) while the list passes, then it leaves with the list.
+- Taller than the screen (1024×420), it falls back to the top.
+- No frame-to-frame jump in a 20 px sweep.
+- Evidence: `o9-sticky-{start,middle,end}-desk.jpg`, `o9-faq-{home,contact}-desk.jpg`.
+
+**O10, tiles.** Evidence: `o10-tiles-{entrance,idle}-desk.jpg`, `o10-tiles-phone.jpg`. Reduced motion was checked by eye: the final pictures, still.
+
+**Decisions the plan did not settle:**
+- **The contact address.** It stays `contact@rantai.dev`, as the plan says. But rantai.dev switched to **`contacts@rantai.dev`** on 2026-11-01 (rantai-page `fcf05a2`, "fix: send contact emails to contacts@rantai.dev"). The owner should confirm which mailbox exists. It is one constant: `CONTACT_EMAIL` in `site/src/lib/home-content.ts`.
+- **Eye placement (O3).** Taken literally, the mark's side view puts each eye about 70° round from the front, where it shows edge-on at the silhouette. I used ±24° so the face reads from the hero camera. Needs the owner's check on a GPU phone.
+- **The CSP is written after the build, not by React.** React placed the meta after Next's script tags. The CSP has `form-action 'none'`, so a no-JS submit goes nowhere instead of to the host.
+- **The 404 is one bilingual file**, rather than one per language.
+- **Order.** O7 was finished before O9 and O10: it was almost done when "O10 before O7" arrived.
+- **Removed.** The final section's buttons are gone (O7: no two calls to action in a row). The phone bar's language switch moved into the sheet (as on rantai-page).
+
+**Disagreement with the plan:** none. One note: AGENTS.md says the developer is "a non-Opus agent", and plan §0 records the owner's PR #368 exception. This session followed the plan.
+
+**Not verified, and why:**
+- Lighthouse on all four pages: parked by the owner.
+- Real phones, Safari and Firefox: the VM has Chrome only. In particular, the sheet's slide-out (`display` and `overlay` transitions), the FAQ ease and the copy fallback on iOS are not verified.
+- The 3D scene on a GPU: SwiftShader only. The O3 eyes and the O2 dome were seen in `next dev` with the dev-only override. Under the CSP, the scene was exercised with a CDP GPU spoof.
+- The Indonesian copy: the owner reviews it.
+- The P5 docs (RESULT dated update, feature page rows): parked by the owner. Not done.
+
+**Process:**
+- My servers and browsers on :3401, :3402, :9571, :9572 and :9573 are stopped at the end of this session. :3000, :3200 and :3400 were not touched.
+- `next dev` wrote `site/AGENTS.md`; I removed it, and it was never committed.
+- The planner's uncommitted plan addendum (§10 continued) and `docs/core/specs/web-5-brief.md` are left as they were; only this handoff's lines are committed.
+
 ## 8. Review (planner appends)
 
 ### Review 1: planner, 2026-11-04, at `e78fa90b`
