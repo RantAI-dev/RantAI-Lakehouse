@@ -19,7 +19,7 @@ import { LENS, lensCoverage, sceneStateAt, smoothstep, type SceneLayout, type Sc
 import { displayedHex, publishSceneColours } from "@/lib/scene-colour";
 import { createLens } from "./lens";
 import { createMascot, type Aim } from "./mascot";
-import { CAMERA_FOV, MASCOT_H, MOON_DIR, STILL_TIME } from "./scene-config";
+import { CAMERA_FOV, MASCOT_H, MOON_DIR, SLAB_Y, STILL_TIME } from "./scene-config";
 import { buildEnvironment, createSkyDome, createSkyUniforms, createStars } from "./sky";
 import { createSlabs, SLAB_SIZE } from "./slabs";
 import { applyWaterFog, createShafts, createSnow, createWaterFog } from "./underwater";
@@ -231,6 +231,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     depthsHeight: window.innerHeight * 3,
   };
   const measure = () => {
+    if (width > 1) fitSlabsToCard();
     layout.vh = host.clientHeight || window.innerHeight;
     layout.viewportH = window.innerHeight;
     const depths = document.getElementById("depths");
@@ -274,6 +275,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     distScaleDepths = wide ? 1.25 : 1;
     // On wide screens also cap it below 1 so the stack stays clear of the copy.
     slabs.setFootprint(Math.min(wide ? 0.86 : 1, (0.7 * 8.06 * aspect * distScaleDepths) / SLAB_SIZE.w));
+    fitSlabsToCard();
     if (phone) fitHeroToRoom();
     viewKey = "";
     measure();
@@ -291,6 +293,89 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   // already fits (390×844 and taller) nothing changes.
   const fitCam = new PerspectiveCamera(CAMERA_FOV, 1, 0.05, 600);
   const fitPoint = new Vector3();
+
+  /**
+   * WEB-5 O34: the slabs ran under the depths card on narrower desktops (a
+   * third developer measured about 118 px of clearance at 1440, 40 at 1280,
+   * and the slab under the card's right edge at 1024): their framing was a
+   * fixed `anchorDepths.x` of 0.42. Now the card is measured
+   * (`[data-depths-card]`, or else the first cell of the depths grid) and
+   * the slab is fitted into the room to its right: the slab, at its
+   * focused pose, is projected to the screen; its centre goes where 0.42
+   * put it if that keeps 48 px from the card and 24 px from the screen's
+   * edge, or else into the middle of that room; and if the room is
+   * narrower than the slab, its footprint shrinks to fit. Where the layout
+   * stacks the card above the slab (narrow screens), the slab is moved down
+   * until its top clears the card's bottom.
+   */
+  const slabCorner = new Vector3();
+  const slabSpan = (footprint: number): { half: number; top: number } => {
+    // The focused pose for the middle slab (all three are framed alike).
+    const y = SLAB_Y[1];
+    const k = distScaleDepths;
+    fitCam.aspect = width / height;
+    fitCam.position.set(0, y - 0.3 + (5 + 0.3) * k, 9.2 * k);
+    fitCam.clearViewOffset();
+    fitCam.lookAt(0, y - 0.3, 0);
+    fitCam.updateProjectionMatrix();
+    fitCam.updateMatrixWorld();
+    let half = 0;
+    let top = Infinity;
+    for (const sx of [-1, 1])
+      for (const sy of [-1, 1])
+        for (const sz of [-1, 1]) {
+          slabCorner
+            .set((sx * SLAB_SIZE.w * footprint) / 2, y + (sy * SLAB_SIZE.h) / 2, (sz * SLAB_SIZE.d * footprint) / 2)
+            .project(fitCam);
+          half = Math.max(half, (Math.abs(slabCorner.x) * width) / 2);
+          top = Math.min(top, ((1 - slabCorner.y) * height) / 2);
+        }
+    return { half, top };
+  };
+  const fitSlabsToCard = () => {
+    const depthsEl = document.getElementById("depths");
+    const card =
+      depthsEl?.querySelector("[data-depths-card]") ?? depthsEl?.querySelector(".grid")?.firstElementChild ?? null;
+    if (!card) return;
+    const r = card.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
+    const hostLeft = host.getBoundingClientRect().left;
+    const minLeft = r.right - hostLeft + 48;
+    const maxRight = width - 24;
+    const room = maxRight - minLeft;
+    const wanted = slabs.footprint();
+    const half1 = slabSpan(1).half;
+    const fitted = room > 0 ? Math.min(wanted, room / (2 * half1)) : 0;
+    // Beside the card when the room there keeps the slab at least 45 % of
+    // its size; otherwise (a stacked layout, or a portrait tablet with a
+    // narrow second column) under the card, full size and centred.
+    const stacked = r.width > width * 0.6 || fitted < wanted * 0.45;
+    if (!stacked) {
+      const footprint = fitted;
+      slabs.setFootprint(footprint);
+      const half = half1 * footprint;
+      const preferred = width / 2 + (anchorDepths.x * width) / 2;
+      const centre = Math.min(maxRight - half, Math.max(minLeft + half, preferred));
+      anchorDepths.x = ((centre - width / 2) * 2) / width;
+      // Dev only (removed from the export): the measured clearance, for review probes.
+      if (process.env.NODE_ENV === "development") {
+        host.dataset.lkSlabClearance = String(Math.round(centre - half - (r.right - hostLeft)));
+        host.dataset.lkSlabFootprint = footprint.toFixed(3);
+      }
+      return;
+    }
+    // Under the card: centred, and its top kept under the card's bottom,
+    // measured in the depths' pinned stage (which fills the screen while
+    // the slabs show), not where the page happens to be scrolled now.
+    anchorDepths.x = 0;
+    const stage = card.closest(".sticky") ?? depthsEl;
+    const cardBottom = r.bottom - (stage ? stage.getBoundingClientRect().top : 0) + 12;
+    const top = slabSpan(slabs.footprint()).top - (anchorDepths.y * height) / 2;
+    if (top < cardBottom) anchorDepths.y -= ((cardBottom - top) * 2) / height;
+    if (process.env.NODE_ENV === "development") {
+      host.dataset.lkSlabStack = `${Math.round(top)}|${Math.round(cardBottom)}|${anchorDepths.y.toFixed(3)}|${slabs.footprint().toFixed(3)}`;
+    }
+  };
   const heroCreatureSpan = (dist: number, ay: number): { top: number; bottom: number } => {
     const hero = sceneStateAt(0, layout);
     fitCam.aspect = width / height;

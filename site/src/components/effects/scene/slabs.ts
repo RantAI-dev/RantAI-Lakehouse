@@ -48,6 +48,8 @@ export type Slabs = {
   update: (args: { time: number; focus: number; reveal: number; pixelRatio: number }) => void;
   /** Narrow screens shrink the slabs sideways (x and z) so the stack fits the width. */
   setFootprint: (scale: number) => void;
+  /** The footprint last set (1 = full size). */
+  footprint: () => number;
   /** The light that makes the glass catch something; follows the focus. */
   light: PointLight;
   dispose: () => void;
@@ -185,6 +187,7 @@ export function createSlabs(lowQuality: boolean): Slabs {
       footprint = scale;
       for (const s of slabs) s.root.scale.set(scale, 1, scale);
     },
+    footprint: () => footprint,
     update({ time, focus, reveal, pixelRatio }) {
       group.visible = reveal > 0.003;
       if (!group.visible) return;
