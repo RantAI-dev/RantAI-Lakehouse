@@ -28,6 +28,7 @@ once a first release is tagged.
 ### Changed
 
 - A saved query's delete and restore need edit instead of manage, and the trash list shows what the caller may edit.
+- Anyone with edit on a folder reads who it has been shared with: `GET /api/query/folders/{id}/access` answers at edit, and every rule in an access list now carries `granteeName` and `granteeEmail` (`null` outside the caller's organisation). The save sheet and the move dialog name who a chosen folder is shared with before the user confirms, and the share panel shows names instead of ids (backlog `QS-3`).
 - A run ended with Stop shows as Stopped in History (backlog `QS-2`, `QS-4`). The status `stopped` is a filter value in place of `cancelled`, and migration `0127` moves the rows already stored. The History page pages by number: `GET /api/query/history` takes `page` instead of `before` and answers `runs`, `total`, `page` and `pageSize`, 50 runs per page, and the pills read Completed, Failed, Stopped and Refused.
 
 ### Fixed

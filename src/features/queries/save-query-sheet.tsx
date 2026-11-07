@@ -5,10 +5,12 @@ import * as React from "react"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { levelAtLeast } from "@/features/dashboards/access-level"
 import { useService } from "@/hooks/use-service"
 import { sqlSummary } from "@/lib/sql-text"
 import { queryService } from "@/services"
 import type { QueryFolder, SaveQueryInput, SavedQuery } from "@/services/contracts/queries"
+import { FolderSharingNote } from "./folder-sharing-note"
 import {
   PERSONAL_SPACE_LABEL,
   SHARED_SPACE_LABEL,
@@ -45,6 +47,7 @@ export function SaveQuerySheet({
   onSave,
   mode = "create",
   savedId = null,
+  viewerId,
 }: {
   readonly open: boolean
   readonly onOpenChange: (open: boolean) => void
@@ -56,6 +59,8 @@ export function SaveQuerySheet({
   readonly mode?: "create" | "update"
   /** The saved query the tab came from, when it came from one. */
   readonly savedId?: string | null
+  /** The signed-in person, who is left out of "Shared with"; `undefined` leaves nobody out. */
+  readonly viewerId: string | undefined
 }) {
   const [title, setTitle] = React.useState("")
   const [tags, setTags] = React.useState("")
@@ -121,6 +126,12 @@ export function SaveQuerySheet({
     if (folder === PERSONAL_SPACE) return undefined
     return folder
   }, [mode, folder])
+
+  const noteFolderId =
+    typeof folderId === "string" &&
+    levelAtLeast(folders.data?.find((candidate) => candidate.id === folderId)?.level, "edit")
+      ? folderId
+      : null
 
   return (
     <CreateSheet
@@ -196,6 +207,17 @@ export function SaveQuerySheet({
               ))}
             </optgroup>
           </select>
+          {/* Only a real folder can hold rules: the shared space and the
+              caller's own space send `null` and `undefined`. The server
+              refuses the access list to a caller below edit on the folder,
+              so such a folder is not asked (QS-3 review). The key drops the
+              previous folder's names at once; the hook keeps them until its
+              effect resets (QS-3 review). */}
+          <FolderSharingNote
+            key={noteFolderId ?? ""}
+            folderId={noteFolderId}
+            viewerId={viewerId}
+          />
         </div>
       ) : null}
     </CreateSheet>

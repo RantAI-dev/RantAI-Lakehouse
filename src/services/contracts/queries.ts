@@ -121,6 +121,10 @@ export type SavedQueryAccessRule = {
   userId: string | null
   /** The role the rule names; `null` when the rule names a person. */
   roleId: string | null
+  /** The grantee's name; `null` when the server cannot find it in the organisation. */
+  granteeName: string | null
+  /** The person's email; `null` for a role and for a person the server cannot find. */
+  granteeEmail: string | null
   /** What the rule gives. */
   level: SavedQueryLevel | string
   /** Who wrote the rule; `null` when nobody is recorded. */
@@ -139,6 +143,10 @@ export type InheritedAccessRule = {
   userId: string | null
   /** The role the rule names; `null` when the rule names a person. */
   roleId: string | null
+  /** The grantee's name; `null` when the server cannot find it in the organisation. */
+  granteeName: string | null
+  /** The person's email; `null` for a role and for a person the server cannot find. */
+  granteeEmail: string | null
   /** What the rule gives. */
   level: SavedQueryLevel | string
 }

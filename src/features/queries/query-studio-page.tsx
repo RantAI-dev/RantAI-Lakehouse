@@ -30,7 +30,7 @@ export function QueryStudioPage() {
   const [saveOpen, setSaveOpen] = React.useState(false)
   const [sourceOpen, setSourceOpen] = React.useState(false)
   const [schemaOpen, setSchemaOpen] = React.useState(false)
-  const { hasPermission } = useAuth()
+  const { hasPermission, user } = useAuth()
   const canAuthorSources = hasPermission("dashboard:sql")
 
   // Page-aware Copilot (plan §6): the SQL being written and the first rows
@@ -207,6 +207,7 @@ export function QueryStudioPage() {
         onSave={studio.save}
         mode={studio.saveTarget.mode}
         savedId={studio.saveTarget.savedId}
+        viewerId={user?.id}
       />
       {canAuthorSources ? (
         <SaveSqlSourceSheet

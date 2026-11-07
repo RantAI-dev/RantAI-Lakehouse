@@ -30,8 +30,8 @@ use lakehouse_store::queries::{
 };
 use lakehouse_store::saved_query_access::{
     FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
-    grants_for_viewer, manages_folder_and_contents, move_folder_for_viewer, rename_folder,
-    replace_grants, rules_for_item, search_grantees,
+    grantee_labels, grants_for_viewer, manages_folder_and_contents, move_folder_for_viewer,
+    rename_folder, replace_grants, rules_for_item, search_grantees,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -3618,5 +3618,113 @@ async fn the_grantee_search_answers_with_the_tenants_people_only(pool: PgPool) -
 
     let none = search_grantees(&pool, Some(group), "", 0).await.unwrap();
     assert!(none.people.is_empty(), "a limit of zero asks for no rows");
+    Ok(())
+}
+
+/// A rule's grantee is named the way the share panel shows it: a person of
+/// the viewer's tenant by name and email, a role by name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_name_a_person_of_the_tenant_and_a_role(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let labels = grantee_labels(&pool, Some(group), &[person(RINA)], &[person(ANALYST_ROLE)])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 1, "{labels:?}");
+    assert_eq!(labels.people[0].id, person(RINA));
+    assert_eq!(labels.people[0].name, "Rina Wijaya");
+    assert_eq!(labels.people[0].email, "rina@meridian.example");
+    assert_eq!(labels.roles.len(), 1, "{labels:?}");
+    assert_eq!(labels.roles[0].id, person(ANALYST_ROLE));
+    assert_eq!(labels.roles[0].name, "Analyst");
+    Ok(())
+}
+
+/// A person who is not a member of the viewer's tenant gets no label: the
+/// name and email of another organisation's person never reach the list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_leave_out_a_person_of_another_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let labels = grantee_labels(&pool, Some(group), &[person(RINA), person(SARI)], &[])
+        .await
+        .unwrap();
+
+    assert!(
+        labels.people.iter().any(|found| found.id == person(RINA)),
+        "CONTROL: the member of the tenant is named"
+    );
+    assert!(
+        !labels.people.iter().any(|found| found.id == person(SARI)),
+        "Sari belongs to the Retail tenant only: {labels:?}"
+    );
+    Ok(())
+}
+
+/// A rule still applies to a person who has been deactivated, so the list
+/// keeps naming them, unlike the grantee search.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_keep_the_name_of_an_inactive_person(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let inactive = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Sleepy Person', $2, 'inactive')",
+    )
+    .bind(inactive)
+    .bind("sleepy@meridian.example")
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(inactive)
+        .bind(group)
+        .execute(&pool)
+        .await?;
+
+    let labels = grantee_labels(&pool, Some(group), &[inactive], &[])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 1, "{labels:?}");
+    assert_eq!(labels.people[0].name, "Sleepy Person");
+    assert_eq!(labels.people[0].email, "sleepy@meridian.example");
+    Ok(())
+}
+
+/// An id the database does not hold is absent from the answer, and an
+/// empty input is an empty answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_leave_out_an_unknown_id_and_answer_nothing_for_no_ids(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let unknown = grantee_labels(
+        &pool,
+        Some(group),
+        &[Uuid::new_v4(), person(RINA)],
+        &[Uuid::new_v4()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(unknown.people.len(), 1, "{unknown:?}");
+    assert_eq!(unknown.people[0].id, person(RINA));
+    assert!(unknown.roles.is_empty(), "{unknown:?}");
+
+    let none = grantee_labels(&pool, Some(group), &[], &[]).await.unwrap();
+    assert!(none.people.is_empty() && none.roles.is_empty(), "{none:?}");
+    Ok(())
+}
+
+/// With no tenant every person of the deployment is named, the same
+/// reading of "no tenant" as the grantee search and the tenant check.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_with_no_tenant_name_every_person(pool: PgPool) -> sqlx::Result<()> {
+    let labels = grantee_labels(&pool, None, &[person(RINA), person(SARI)], &[])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 2, "{labels:?}");
+    assert!(labels.people.iter().any(|found| found.id == person(SARI)));
     Ok(())
 }
