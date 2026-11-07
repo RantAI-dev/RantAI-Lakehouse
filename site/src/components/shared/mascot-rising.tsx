@@ -17,7 +17,8 @@ import { WHALE_VIEW, WHALE_WATERLINE, WhaleSvg } from "./whale-svg";
  *   small dashes that twinkle;
  * - the whale's broken reflection, shimmering;
  * - a gentle ring at the waterline, and a splash ring as it settles
- *   (`data-arrived`, set by `final-mascot.tsx`).
+ *   (`data-arrived`, set by `final-mascot.tsx`), in the water's own blues
+ *   (O48: nothing that reads as a glowing ring).
  * The whale is small (a third of the stage), so the scene reads as calm.
  *
  * A server component: SVG and CSS only. The loops use the page's keyframes
@@ -109,7 +110,8 @@ export function MascotRising({ className }: { className?: string }) {
             className="lk-bob absolute"
             style={{ left: pct(WHALE_BOX.left), top: pct(WHALE_BOX.top), width: pct(WHALE_BOX.width), height: pct(WHALE_BOX.height) }}
           >
-            <WhaleSvg surface className="size-full drop-shadow-[0_0_40px_rgba(68,166,250,0.22)]" />
+            {/* O48: no glow around it; the night's own light is enough. */}
+            <WhaleSvg surface className="size-full" />
           </div>
         </SwimLayer>
 
@@ -176,11 +178,11 @@ export function MascotRising({ className }: { className?: string }) {
         <div aria-hidden="true" className="pointer-events-none absolute top-[66.4%] left-1/2 h-0 w-[44%] -translate-x-1/2">
           {/* Centred in its base style too (the keyframes centre it while they run); still frames have no ring. */}
           <span
-            className="lk-ring absolute top-0 left-1/2 block aspect-[5/1] w-full rounded-[50%] border border-[#7fb8f5]/30 motion-reduce:hidden"
+            className="lk-ring absolute top-0 left-1/2 block aspect-[5/1] w-full rounded-[50%] border border-[#3d6aa8]/30 motion-reduce:hidden"
             style={{ transform: "translate(-50%, -50%)" }}
           />
-          <span className="lk-r-splash absolute top-0 left-1/2 block aspect-[5/1] w-[82%] rounded-[50%] border-2 border-[#cfe6ff]/60" />
-          <span className="lk-r-splash lk-r-splash-b absolute top-0 left-1/2 block aspect-[5/1] w-[82%] rounded-[50%] border border-[#9fd0ff]/45" />
+          <span className="lk-r-splash absolute top-0 left-1/2 block aspect-[5/1] w-[82%] rounded-[50%] border border-[#7fa3d6]/40" />
+          <span className="lk-r-splash lk-r-splash-b absolute top-0 left-1/2 block aspect-[5/1] w-[82%] rounded-[50%] border border-[#5f86c0]/30" />
         </div>
       </div>
     </div>

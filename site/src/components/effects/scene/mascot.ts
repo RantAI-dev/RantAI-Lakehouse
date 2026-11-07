@@ -23,7 +23,7 @@ import {
 import { PALETTE } from "@/lib/palette";
 import { BELLY_SQUASH, BODY_LONG, DOME_SPHERE, EYES_3D, HEAD_TURN, MASCOT_H, MASCOT_R } from "./scene-config";
 import { createToyParts } from "./whale";
-import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, SPOUT_VERT } from "./shaders";
+import { FOAM_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, SPOUT_VERT } from "./shaders";
 
 /**
  * The 3D mascot, built from primitives on the official mark's shapes
@@ -38,7 +38,7 @@ import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, 
  *   skin's own shader (`paintSkin`), so it costs no geometry. The belly is
  *   below the waterline.
  * - O29 (owner: "gausah ada matanya dan blushnya gitu, keep it simple kek
- *   desain awal"): two plain, glowing white eyes in the logo's style (O3:
+ *   desain awal"): two plain white eyes in the logo's style (O3:
  *   two, the mark keeps one), no pupils, no highlights, no blush. They
  *   blink and shift a little in their sockets towards the pointer.
  * - A short tail curling up to a small fluke, and two small flippers
@@ -180,28 +180,18 @@ export function createMascot(opts: MascotOptions): Mascot {
   };
 
   // ---- Eyes --------------------------------------------------------------
-  // WEB-5 O29: the logo's eyes, as O3/O8 drew them: a plain white bead with
-  // a soft glow, two of them, sharing their materials so they glow, blink
-  // and fade under water as one. No pupil, no highlight. Placed where O11
-  // put them (the front-sides), so from the hero camera they read as a face.
-  // The lens pass tone-maps the frame once (O5): the white is 3.5 in linear
-  // light, about 0.97 on screen; brighter would saturate the MSAA edge
-  // pixels into jaggies.
+  // WEB-5 O29: the logo's eyes, as O3/O8 drew them: a plain white bead, two
+  // of them, sharing their material so they blink and fade under water as
+  // one. No pupil, no highlight. Placed where O11 put them (the
+  // front-sides), so from the hero camera they read as a face.
+  // WEB-5 O48 (owner: "coba buat mata pausnya ga bercahaya dong"): no glow,
+  // halo or spill around them any more. They are a flat, unlit white (so
+  // they read white at night without being a light source), at 1.6 in
+  // linear light, about 0.94 on screen once the lens pass tone-maps it.
   const eyeGeo = new SphereGeometry(1, 40, 28);
-  const eyeMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(3.5) });
-  const glowGeo = new PlaneGeometry(1, 1);
-  const glowMat = new ShaderMaterial({
-    uniforms: { uColor: { value: new Color("#bfe0ff") }, uIntensity: { value: 0.5 } },
-    vertexShader: GLOW_VERT,
-    fragmentShader: GLOW_FRAG,
-    transparent: true,
-    depthWrite: false,
-    blending: AdditiveBlending,
-  });
-  disposables.push(eyeGeo, eyeMat, glowGeo, glowMat);
+  const eyeMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(1.6) });
+  disposables.push(eyeGeo, eyeMat);
   const R_EYE = EYES_3D.r;
-  /** The halo's size, in eye radii (O3: two halos that only just touch). */
-  const GLOW = 4.2;
   function buildEye() {
     const eye = new Group();
     const lid = new Group();
@@ -211,13 +201,8 @@ export function createMascot(opts: MascotOptions): Mascot {
     bead.scale.set(R_EYE, R_EYE, 0.9 * R_EYE);
     bead.position.z = -0.62 * R_EYE;
     lid.add(bead);
-    const glow = new Mesh(glowGeo, glowMat);
-    glow.scale.set(R_EYE * GLOW, R_EYE * GLOW, 1);
-    glow.position.z = 0.12 * MASCOT_R;
-    glow.renderOrder = 3;
-    eye.add(glow);
     group.add(eye);
-    return { eye, lid, glow };
+    return { eye, lid };
   }
   /** Left and right, by their side of the front (−phi, +phi). */
   const eyes = [buildEye(), buildEye()] as const;
@@ -232,11 +217,13 @@ export function createMascot(opts: MascotOptions): Mascot {
   // Water bounce from below-front, so the lower dome is not a black cut-out.
   // A hemisphere light is diffuse only, so it tints the dome without adding a
   // second hot spot to the clearcoat the way a point light would.
-  const bounce = new HemisphereLight(0x1b2f7a, new Color(PALETTE.lake), 0.9);
+  // O48: the ground colour is a deep lake blue, not the bright one: lit
+  // from the water in the bright one, the dome's base read as a glowing ring.
+  const bounce = new HemisphereLight(0x1b2f7a, new Color("#163a7a"), 0.9);
   extras.add(bounce);
   // Under water the light comes the other way: down from the surface, with
   // the dark depths below (O5), so the submerged body is lit from above.
-  const BOUNCE_ABOVE = { sky: new Color(0x1b2f7a), ground: new Color(PALETTE.lake) };
+  const BOUNCE_ABOVE = { sky: new Color(0x1b2f7a), ground: new Color("#163a7a") };
   const BOUNCE_UNDER = { sky: new Color("#3f86d6"), ground: new Color("#04102e") };
 
   // ---- Foam collar -------------------------------------------------------
@@ -247,7 +234,8 @@ export function createMascot(opts: MascotOptions): Mascot {
     uniforms: {
       uTime: { value: 0 },
       uAmount: { value: 0.45 },
-      uColor: { value: new Color("#7fb8f5") },
+      // O48: a thin foam line in the water's own colour, not a light-blue glow.
+      uColor: { value: new Color("#2a4a80") },
       uInner: { value: 1 / 1.75 },
     },
     vertexShader: GLOW_VERT,
@@ -570,14 +558,12 @@ export function createMascot(opts: MascotOptions): Mascot {
       const blink = bp >= 0 && bp <= 1 ? 1 - 0.9 * Math.sin(Math.PI * bp) : 1;
       for (const e of eyes) {
         e.lid.scale.y = blink;
-        e.glow.scale.y = R_EYE * GLOW * (0.35 + 0.65 * blink);
       }
-      glowMat.uniforms.uIntensity.value = 0.8 + 0.12 * Math.sin(t * 1.3);
 
       // Foam breathes with the bob and thins out while the creature is under.
       foamMat.uniforms.uTime.value = t;
       const submerged = MathUtils.clamp(-dipY / DIP_DEPTH, 0, 1);
-      foamMat.uniforms.uAmount.value = (0.42 + 0.14 * bob) * (1 - 0.7 * submerged);
+      foamMat.uniforms.uAmount.value = (0.22 + 0.06 * bob) * (1 - 0.7 * submerged);
       foam.scale.setScalar(1 + 0.035 * bob);
 
       // A breath every 5 to 9 s, never while it is diving after a click.

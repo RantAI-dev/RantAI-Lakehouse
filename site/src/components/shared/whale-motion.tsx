@@ -23,17 +23,16 @@ const FinalWhaleContext = React.createContext<FinalWhaleMotion | null>(null);
 export const FinalWhaleProvider = FinalWhaleContext.Provider;
 
 /**
- * One of the whale's eyes (O29: a plain glowing white, the logo's eye),
- * shifted a little towards the stage's gaze. Without a stage it rests,
- * looking up.
+ * One of the whale's eyes (O29: a plain white, the logo's eye; O48: flat,
+ * with no glow around it), shifted a little towards the stage's gaze.
+ * Without a stage it rests, looking up.
  */
-export function WhaleEye({ cx, cy, r, glow }: { cx: number; cy: number; r: number; glow: string }) {
+export function WhaleEye({ cx, cy, r }: { cx: number; cy: number; r: number }) {
   const ctx = React.useContext(FinalWhaleContext);
   const restX = useMotionValue(-1);
   const restY = useMotionValue(-3);
   return (
     <m.g style={{ x: ctx?.eyeX ?? restX, y: ctx?.eyeY ?? restY }}>
-      <circle cx={cx} cy={cy} r={r * 2.3} fill={glow} />
       <circle cx={cx} cy={cy} r={r} fill="#ffffff" />
     </m.g>
   );

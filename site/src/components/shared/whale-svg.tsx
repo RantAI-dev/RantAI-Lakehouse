@@ -5,8 +5,8 @@ import { WhaleEye } from "./whale-motion";
  * WEB-5 O24/O33: the whale in 2D, the same character as the 3D mascot
  * (O11's round body, O29's face and skin, `components/effects/scene/
  * mascot.ts`): one chubby round body in the mark's deep navy, lit like the
- * logo's dome (the same gradient, a lake-blue rim), two plain glowing white
- * eyes, a foam-white belly with soft lake-blue grooves, small flippers and
+ * logo's dome (the same gradient, a lake-blue rim), two plain white
+ * eyes (O48: flat, with no glow), a foam-white belly with soft lake-blue grooves, small flippers and
  * a little tail fluke curling up behind. It is drawn whole, as it is seen
  * deep under water at the final call.
  *
@@ -117,13 +117,11 @@ export function WhaleSvg({
         </radialGradient>
         <linearGradient id={id("rim")} x1="0" y1="0" x2="1" y2="0.3">
           <stop offset="0%" stopColor="#44a6fa" stopOpacity="0" />
-          <stop offset="60%" stopColor="#44a6fa" stopOpacity="0.25" />
-          <stop offset="100%" stopColor="#9fd0ff" stopOpacity="0.95" />
+          {/* O48: softer, and faded before the base, so the edge is defined but does not glow there. */}
+          <stop offset="55%" stopColor="#44a6fa" stopOpacity="0.2" />
+          <stop offset="85%" stopColor="#9fd0ff" stopOpacity="0.55" />
+          <stop offset="100%" stopColor="#9fd0ff" stopOpacity="0.15" />
         </linearGradient>
-        <radialGradient id={id("eye")} cx="50%" cy="50%" r="50%">
-          <stop offset="0%" stopColor="#ffffff" stopOpacity="0.6" />
-          <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
-        </radialGradient>
         <linearGradient id={id("belly")} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor="#ffffff" />
           <stop offset="100%" stopColor="#d3e7fb" />
@@ -185,10 +183,10 @@ export function WhaleSvg({
         </>
       )}
 
-      {/* Eyes (O29): two plain glowing whites that blink and shift a little towards the pointer. */}
+      {/* Eyes (O29): two plain whites that blink and shift a little towards the pointer (O48: no glow). */}
       {EYES.map((e, i) => (
         <g key={i} className={i === 0 ? "lk-w-lid" : "lk-w-lid lk-w-lid-b"}>
-          <WhaleEye cx={e.cx} cy={e.cy} r={EYE_R} glow={`url(#${id("eye")})`} />
+          <WhaleEye cx={e.cx} cy={e.cy} r={EYE_R} />
         </g>
       ))}
 

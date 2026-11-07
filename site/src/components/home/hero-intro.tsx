@@ -24,6 +24,9 @@ import * as React from "react";
  * - First visit per session only (`sessionStorage`, in a try). Not on a
  *   back or forward navigation, not under reduced motion, and without
  *   JavaScript the page is static as before.
+ * - WEB-5 O49, for QA: `?intro` or `#intro` in the URL plays the full intro
+ *   again on any page that has it, whatever the session says (reduced
+ *   motion still wins).
  * - Any wheel, touch, key or click ends it at once (`lk-intro-end` stops
  *   every animation, so everything is in its final place).
  * - `/id/` (and the contact page, `variant="lite"`): only a light reveal
@@ -35,12 +38,14 @@ import * as React from "react";
 const BOOT = (variant: "home" | "lite") => `(function(){try{
 var d=document.documentElement;
 if(window.matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches)return;
+var force=/(^|[?&])intro(=|&|$)/.test(location.search.slice(1))||location.hash==="#intro";
+if(!force){
 var n=performance.getEntriesByType?performance.getEntriesByType("navigation")[0]:null;
 if(n&&n.type==="back_forward")return;
 var k="lk-intro-seen:"+location.pathname;
 if(sessionStorage.getItem(k))return;
-sessionStorage.setItem(k,"1");
-var lite=${variant === "lite" ? "true" : 'location.pathname.indexOf("/id")===0'};
+sessionStorage.setItem(k,"1");}
+var lite=!force&&${variant === "lite" ? "true" : 'location.pathname.indexOf("/id")===0'};
 var c=lite?"lk-intro-lite":"lk-intro";
 d.classList.add(c);
 var ev=["wheel","touchstart","keydown","pointerdown"],done=false;

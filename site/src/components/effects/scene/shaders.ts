@@ -297,7 +297,9 @@ void main(){
     col *= 1.0 - 0.6 * shade;
     float rimX = (dm - uMascot.z) / 0.14;
     float rim = exp(-rimX * rimX);
-    col += uLake * rim * 0.4;
+    // O48: no light-blue rim on the water any more (it read as a glowing
+    // ring); just the contact shade and the faintest line of foam.
+    col += vec3(0.02, 0.035, 0.06) * rim;
 
     float f = 1.0 - exp(-pow(dist * uFogDensity, 2.0));
     col = mix(col, uFogColor, clamp(f, 0.0, 1.0));
