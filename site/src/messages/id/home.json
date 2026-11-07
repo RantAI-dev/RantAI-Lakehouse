@@ -95,10 +95,6 @@
       "Query Studio: autocomplete, tab, riwayat"
     ],
     "name": "Asisten",
-    "status": {
-      "ready": "Siap",
-      "working": "Bekerja"
-    },
     "placeholder": "Tanyakan apa saja tentang lakehouse Anda…",
     "modes": {
       "ask": "Ask",

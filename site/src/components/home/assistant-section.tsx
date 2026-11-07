@@ -19,6 +19,10 @@ import { AssistantChat } from "./assistant-chat";
  * conversation is shown at once.
  *
  * A server component: the only client code is the panel's player.
+ *
+ * O35 (owner: no gradients, "mending warna solid aja"): the two drifting
+ * radial lights behind the stage are gone; the section sits on the
+ * page-wide water, with its solid colour as the no-JS fallback.
  */
 
 type AssistantCopy = HomeCopy["assistant"];
@@ -29,7 +33,6 @@ const FEATURE_ICONS = [BarChart3, Workflow, SquareTerminal] as const;
 export function AssistantSection({ copy }: { copy: AssistantCopy }) {
   return (
     <section id="assistant" className="lk-fallback-bg relative overflow-hidden bg-[#050A30]">
-      <Caustics />
       <Container className="relative z-10 grid min-h-[100svh] items-center gap-10 py-24 md:grid-cols-[1fr_1.1fr] md:gap-14 md:py-28">
         <div>
           <DisplayHeading size="lg" className="max-md:text-[clamp(2.6rem,12vw,3.4rem)]">
@@ -55,28 +58,5 @@ export function AssistantSection({ copy }: { copy: AssistantCopy }) {
         <AssistantChat copy={copy} />
       </Container>
     </section>
-  );
-}
-
-/** Two slow radial lights, like the pattern the sun throws on a pool floor. Off under reduced motion. */
-function Caustics() {
-  return (
-    <div
-      aria-hidden="true"
-      // WEB-5 D14 S2: the glow fades in over the stage's first quarter and out
-      // over its last, so it starts and ends softly on the page-wide water
-      // instead of at the stage's edges.
-      className="absolute inset-0 overflow-hidden [mask-image:linear-gradient(to_bottom,transparent,#000_25%,#000_75%,transparent)]"
-    >
-      <div className="lk-fallback-bg absolute inset-0 bg-[radial-gradient(ellipse_at_50%_0%,#0B1A4A_0%,#050A30_55%,#030824_100%)]" />
-
-      <div className="lk-caustic-a absolute -top-1/4 -left-1/4 size-[80%] rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.20)_0%,transparent_62%)] blur-2xl" />
-      <div className="lk-caustic-b absolute -right-1/4 -bottom-1/3 size-[90%] rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.14)_0%,transparent_60%)] blur-3xl" />
-      {/* WEB-1 review round 1 SHOULD-FIX 2: meets the abyss the canvas fades to at
-          the end of S3 with no seam. Last, so the glow blobs above cannot show a
-          clipped edge at the top of the stage. */}
-      {/* WEB-5 D14 S2: with the page-wide water this join is no longer needed, so it is part of the no-JS fallback only. */}
-      <div className="lk-fallback-bg absolute inset-x-0 top-0 h-[50%] bg-gradient-to-b from-[#020514] via-[#020514]/60 to-transparent" />
-    </div>
   );
 }

@@ -1660,48 +1660,36 @@ section[data-role="admin"] .lk-gv-closed {
    the steps reached (assistant-steps.ts). The server renders every step,
    which is the finished chat; the deferred script adds them one by one.
    `.lk-ast-still` (no JavaScript, reduced motion, already on screen)
-   shows any state without a transition. */
+   shows any state without a transition.
+   O35 (owner: minimal, clean, professional): one flat surface and one
+   hairline; every part inside is told apart by a step of fill and by
+   spacing (12 / 16 / 24), never by a border, a gradient or a glow. The
+   surface steps: panel #0a1230, fields and bubbles #121c40, the card
+   #111a3c. Type: 14 px body, 13 px meta, 12 px chart labels. */
 .lk-ast {
   --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
-  --lk-primary: #1d6ccf;
-  --lk-primary-hover: #2370d4;
-  --lk-primary-press: #1a63c4;
+  --lk-ast-surface: #0a1230;
+  --lk-ast-raised: #121c40;
   --lk-ast-ok: #7ee2b0;
   --lk-ast-wait: #f5c46a;
   container: lk-ast / inline-size;
   display: flex;
   flex-direction: column;
-  height: 684px;
   overflow: hidden;
   border-radius: var(--radius-3xl);
-  border: 1px solid rgba(232, 244, 255, 0.12);
-  background: linear-gradient(180deg, rgba(11, 26, 74, 0.6), rgba(2, 5, 20, 0.86));
-  box-shadow:
-    inset 0 1px 0 0 rgba(232, 244, 255, 0.1),
-    0 40px 120px -40px rgba(68, 166, 250, 0.38);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-}
-@media (min-width: 48rem) {
-  .lk-ast {
-    height: 700px;
-  }
+  border: 1px solid rgba(232, 244, 255, 0.09);
+  background: var(--lk-ast-surface);
 }
 .lk-ast-avatar {
   background: rgba(68, 166, 250, 0.14);
-  box-shadow: inset 0 0 0 1px rgba(68, 166, 250, 0.35);
-}
-.lk-ast-log {
-  overflow: hidden;
-  mask-image: linear-gradient(to bottom, transparent, #000 20px);
 }
 
-/* A message opens its height from zero, so the log slides up under it. */
+/* A message opens its height from zero, so the panel grows under it. */
 .lk-ast-grow {
   display: grid;
   grid-template-rows: 0fr;
   opacity: 0;
-  transform: translateY(10px);
+  transform: translateY(8px);
   transition:
     grid-template-rows 0.5s var(--lk-ease),
     opacity 0.35s ease,
@@ -1711,7 +1699,7 @@ section[data-role="admin"] .lk-gv-closed {
   overflow: hidden;
 }
 .lk-ast-log > .lk-ast-grow > div > * {
-  margin-top: 12px;
+  margin-top: 16px;
 }
 .lk-ast[data-s~="2"] .lk-ast-grow[data-from="2"],
 .lk-ast[data-s~="3"] .lk-ast-grow[data-from="3"],
@@ -1731,45 +1719,19 @@ section[data-role="admin"] .lk-gv-closed {
   transform: none;
 }
 
-/* Header state: Ready, or Working while the assistant runs its steps. */
-.lk-ast-state-dot {
-  background: var(--lk-ast-ok);
-  box-shadow: 0 0 8px rgba(126, 226, 176, 0.6);
-}
-.lk-ast-state-working {
-  display: none;
-}
-.lk-ast:is([data-s~="3"]:not([data-s~="5"]), [data-s~="9"]:not([data-s~="10"])) .lk-ast-state-working {
-  display: inline;
-}
-.lk-ast:is([data-s~="3"]:not([data-s~="5"]), [data-s~="9"]:not([data-s~="10"])) .lk-ast-state-ready {
-  display: none;
-}
-.lk-ast:is([data-s~="3"]:not([data-s~="5"]), [data-s~="9"]:not([data-s~="10"])) .lk-ast-state-dot {
-  background: #44a6fa;
-  box-shadow: 0 0 8px rgba(68, 166, 250, 0.7);
-  animation: lk-twinkle 1.2s ease-in-out infinite;
-}
-
 .lk-ast-user {
-  background: rgba(68, 166, 250, 0.2);
-  box-shadow: inset 0 0 0 1px rgba(68, 166, 250, 0.3);
-}
-.lk-ast-answer {
-  background: rgba(232, 244, 255, 0.05);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.08);
+  background: var(--lk-ast-raised);
 }
 .lk-ast-summary {
-  color: rgba(232, 244, 255, 0.72);
-  background: rgba(232, 244, 255, 0.06);
+  color: rgba(232, 244, 255, 0.55);
 }
 .lk-ast-summary svg {
   color: var(--lk-ast-ok);
 }
 
-/* The assistant's steps: a spinner and a breathing label while each runs, a check once done. */
+/* The assistant's steps: a small spinner and a breathing label while each runs, a check once done. */
 .lk-ast-step-label {
-  color: rgba(232, 244, 255, 0.85);
+  color: rgba(232, 244, 255, 0.8);
   animation: lk-ast-breathe 1.4s ease-in-out infinite;
 }
 .lk-ast-step-icon {
@@ -1785,7 +1747,6 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-ast[data-s~="10"] .lk-ast-step[data-done-at="10"] {
   & .lk-ast-step-icon {
     border-color: transparent;
-    background: rgba(126, 226, 176, 0.16);
     animation: none;
   }
   & .lk-ast-step-check {
@@ -1793,7 +1754,7 @@ section[data-role="admin"] .lk-gv-closed {
     color: var(--lk-ast-ok);
   }
   & .lk-ast-step-label {
-    color: rgba(232, 244, 255, 0.7);
+    color: rgba(232, 244, 255, 0.55);
     animation: none;
   }
 }
@@ -1819,38 +1780,37 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 
-/* The chart: vertical bars on a baseline where the panel is wide,
-   horizontal ones on a phone. The leader is lit, the rest muted. */
+/* The chart: flat bars on a thin baseline, vertical where the panel is
+   wide and horizontal on a phone. The leader is the solid accent. */
 .lk-ast-bars {
   position: relative;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  column-gap: 10px;
-  padding-top: 22px;
+  column-gap: 12px;
+  padding-top: 20px;
 }
 .lk-ast-bars::after {
   content: "";
   position: absolute;
   inset-inline: 0;
-  bottom: 22px;
-  border-top: 1px solid rgba(232, 244, 255, 0.22);
+  bottom: 24px;
+  border-top: 1px solid rgba(232, 244, 255, 0.14);
 }
 .lk-ast-bar-item {
   display: grid;
-  grid-template-rows: 76px 22px;
+  grid-template-rows: 76px 24px;
   transition: opacity 0.2s ease;
 }
 .lk-ast-bar-item .lk-ast-bar-label {
   grid-row: 2;
   align-self: end;
   text-align: center;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 16px;
-  color: rgba(232, 244, 255, 0.65);
+  color: rgba(232, 244, 255, 0.55);
 }
 .lk-ast-bar-item[data-lead] .lk-ast-bar-label {
   color: #e8f4ff;
-  font-weight: 500;
 }
 .lk-ast-bar-track {
   grid-row: 1;
@@ -1861,20 +1821,16 @@ section[data-role="admin"] .lk-gv-closed {
   inset-inline: 0;
   bottom: 0;
   height: calc(var(--v) * 100%);
-  border-radius: 6px 6px 2px 2px;
-  background: linear-gradient(to top, rgba(232, 244, 255, 0.1), rgba(232, 244, 255, 0.2));
-  box-shadow: inset 0 1px 0 0 rgba(232, 244, 255, 0.18);
+  border-radius: 4px 4px 0 0;
+  background: rgba(232, 244, 255, 0.14);
   transform: scaleY(0);
   transform-origin: bottom;
   transition:
     transform 0.4s var(--lk-ease),
-    filter 0.2s ease;
+    background-color 0.2s ease;
 }
 .lk-ast-bar-item[data-lead] .lk-ast-bar {
-  background: linear-gradient(to top, #2a7fe0, #6bb8ff);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.4),
-    0 0 22px -2px rgba(68, 166, 250, 0.6);
+  background: #44a6fa;
 }
 .lk-ast-bar-value,
 .lk-ast-tip {
@@ -1883,26 +1839,23 @@ section[data-role="admin"] .lk-gv-closed {
   bottom: calc(var(--v) * 100% + 4px);
   translate: -50% 0;
   white-space: nowrap;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 16px;
   transition: opacity 0.2s ease;
 }
 .lk-ast-bar-value {
-  color: rgba(232, 244, 255, 0.7);
+  color: rgba(232, 244, 255, 0.6);
   opacity: 0;
 }
 .lk-ast-bar-item[data-lead] .lk-ast-bar-value {
   color: #e8f4ff;
-  font-weight: 600;
+  font-weight: 500;
 }
 .lk-ast-tip {
   z-index: 1;
   padding: 2px 8px;
   border-radius: 6px;
-  background: #0b1a4a;
-  box-shadow:
-    0 0 0 1px rgba(232, 244, 255, 0.16),
-    0 6px 18px -6px rgba(0, 0, 0, 0.6);
+  background: var(--lk-ast-raised);
   color: #e8f4ff;
   opacity: 0;
   pointer-events: none;
@@ -1911,7 +1864,7 @@ section[data-role="admin"] .lk-gv-closed {
   transform: none;
   transition:
     transform 0.8s var(--lk-ease) calc(0.45s + var(--i) * 0.14s),
-    filter 0.2s ease;
+    background-color 0.2s ease;
 }
 .lk-ast[data-s~="5"] .lk-ast-bar-value {
   opacity: 1;
@@ -1920,8 +1873,8 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-ast-bars:hover .lk-ast-bar-item:not(:hover) {
   opacity: 0.5;
 }
-.lk-ast-bar-item:hover .lk-ast-bar {
-  filter: brightness(1.3);
+.lk-ast-bar-item:not([data-lead]):hover .lk-ast-bar {
+  background: rgba(232, 244, 255, 0.24);
 }
 .lk-ast-bar-item:hover .lk-ast-bar-value {
   opacity: 0 !important;
@@ -1933,7 +1886,7 @@ section[data-role="admin"] .lk-gv-closed {
 @container lk-ast (max-width: 419px) {
   .lk-ast-bars {
     grid-template-columns: none;
-    row-gap: 5px;
+    row-gap: 6px;
     padding-top: 0;
   }
   .lk-ast-bars::after {
@@ -1942,7 +1895,7 @@ section[data-role="admin"] .lk-gv-closed {
     top: 0;
     bottom: 0;
     border-top: 0;
-    border-left: 1px solid rgba(232, 244, 255, 0.22);
+    border-left: 1px solid rgba(232, 244, 255, 0.14);
   }
   .lk-ast-bar-item {
     grid-template-rows: none;
@@ -1958,7 +1911,7 @@ section[data-role="admin"] .lk-gv-closed {
   }
   .lk-ast-bar-track {
     grid-column: 2;
-    height: 17px;
+    height: 16px;
   }
   .lk-ast-bar {
     inset-inline: auto;
@@ -1966,54 +1919,41 @@ section[data-role="admin"] .lk-gv-closed {
     left: 0;
     height: auto;
     width: calc(var(--v) * (100% - 48px));
-    border-radius: 2px 6px 6px 2px;
+    border-radius: 0 4px 4px 0;
     transform: scaleX(0);
     transform-origin: left;
   }
   .lk-ast-bar-value {
     left: calc(var(--v) * (100% - 48px) + 6px);
-    bottom: 1px;
+    bottom: 0;
     translate: none;
   }
   .lk-ast-tip {
     left: auto;
     right: 0;
-    bottom: -1px;
+    bottom: -2px;
     translate: none;
   }
 }
 
-/* The approval card: amber while it waits, green once an admin approves. */
+/* The approval card: one step of fill, no border. Its status is a small
+   text pill, amber while it waits and green once an admin approves. */
 .lk-ast-card {
-  border: 1px solid rgba(245, 196, 106, 0.38);
-  background: linear-gradient(180deg, rgba(245, 185, 74, 0.09), rgba(5, 10, 48, 0.5));
-  box-shadow: 0 18px 40px -24px rgba(245, 185, 74, 0.45);
-  transition:
-    border-color 0.5s ease,
-    box-shadow 0.5s ease,
-    background-color 0.5s ease;
+  background: #111a3c;
 }
 .lk-ast-card-icon {
   color: var(--lk-ast-wait);
-  background: rgba(245, 185, 74, 0.14);
-  box-shadow: inset 0 0 0 1px rgba(245, 196, 106, 0.3);
+  background: rgba(245, 185, 74, 0.12);
   transition:
     color 0.5s ease,
-    background-color 0.5s ease,
-    box-shadow 0.5s ease;
-}
-.lk-ast-chip {
-  background: rgba(232, 244, 255, 0.08);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.12);
+    background-color 0.5s ease;
 }
 .lk-ast-pill {
   color: var(--lk-ast-wait);
-  background: #1d1a2a;
-  box-shadow: inset 0 0 0 1px rgba(245, 196, 106, 0.4);
+  background: rgba(245, 185, 74, 0.12);
   transition:
     color 0.4s ease,
-    background-color 0.4s ease,
-    box-shadow 0.4s ease;
+    background-color 0.4s ease;
 }
 .lk-ast-pill-dot {
   background: var(--lk-ast-wait);
@@ -2035,12 +1975,15 @@ section[data-role="admin"] .lk-gv-closed {
     opacity 0.3s ease,
     transform 0.45s var(--lk-ease);
 }
+/* The pill is as wide as the state it shows: the hidden one is taken out of the flow. */
 .lk-ast-pill-ok {
+  position: absolute;
+  inset: 0;
   opacity: 0;
   transform: scale(0.8);
 }
 .lk-ast-admin {
-  background: linear-gradient(135deg, #3a5bd9, #7a4fd1);
+  background: #3a4fa8;
 }
 .lk-ast-btn {
   transition:
@@ -2050,15 +1993,13 @@ section[data-role="admin"] .lk-gv-closed {
 }
 .lk-ast-decline {
   color: #e8f4ff;
-  background: rgba(232, 244, 255, 0.05);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.4);
+  background: rgba(232, 244, 255, 0.08);
 }
 .lk-ast-decline:hover {
-  background: rgba(232, 244, 255, 0.12);
+  background: rgba(232, 244, 255, 0.14);
 }
 .lk-ast-approve {
   background: var(--lk-primary);
-  box-shadow: 0 8px 20px -8px rgba(29, 108, 207, 0.9);
 }
 .lk-ast-approve:hover {
   background: var(--lk-primary-hover);
@@ -2066,7 +2007,7 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-ast[data-s~="11"]:not([data-s~="12"]) .lk-ast-approve {
   background: var(--lk-primary-press);
   transform: scale(0.95);
-  box-shadow: 0 0 0 4px rgba(68, 166, 250, 0.35);
+  box-shadow: 0 0 0 3px rgba(68, 166, 250, 0.3);
 }
 .lk-ast-done {
   color: #c6f5dc;
@@ -2074,24 +2015,17 @@ section[data-role="admin"] .lk-gv-closed {
   transform: translateY(6px);
   pointer-events: none;
 }
-.lk-ast-done-icon {
+.lk-ast-done svg {
   color: var(--lk-ast-ok);
-  background: rgba(126, 226, 176, 0.16);
 }
 .lk-ast[data-s~="12"] {
-  & .lk-ast-card {
-    border-color: rgba(126, 226, 176, 0.4);
-    box-shadow: 0 18px 40px -24px rgba(126, 226, 176, 0.4);
-  }
   & .lk-ast-card-icon {
     color: var(--lk-ast-ok);
-    background: rgba(126, 226, 176, 0.14);
-    box-shadow: inset 0 0 0 1px rgba(126, 226, 176, 0.3);
+    background: rgba(126, 226, 176, 0.12);
   }
   & .lk-ast-pill {
     color: var(--lk-ast-ok);
-    background: #0d2433;
-    box-shadow: inset 0 0 0 1px rgba(126, 226, 176, 0.4);
+    background: rgba(126, 226, 176, 0.12);
   }
   & .lk-ast-pill-wait,
   & .lk-ast-decide {
@@ -2100,8 +2034,14 @@ section[data-role="admin"] .lk-gv-closed {
     pointer-events: none;
   }
   & .lk-ast-pill-ok {
+    position: static;
     opacity: 1;
     transform: none;
+  }
+  & .lk-ast-pill-wait {
+    position: absolute;
+    inset: 0;
+    padding-inline: 10px;
   }
   & .lk-ast-done {
     opacity: 1;
@@ -2109,30 +2049,36 @@ section[data-role="admin"] .lk-gv-closed {
     transition-delay: 0.15s;
   }
 }
+.lk-ast-reviewer-short {
+  display: none;
+}
+@container lk-ast (max-width: 419px) {
+  .lk-ast-reviewer {
+    display: none;
+  }
+  .lk-ast-reviewer-short {
+    display: inline;
+  }
+}
 
-/* The composer: focused and typing during steps 1 and 7, with the send
-   button lit while there is text and pressed when the message goes. */
+/* The composer: a flat field one step lighter than the panel. It shows
+   typing during steps 1 and 7; the send button is muted when empty, the
+   primary blue with a white arrow while there is text, and presses when
+   the message goes. */
 .lk-ast-composer {
-  background: rgba(232, 244, 255, 0.05);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.12);
-  transition: box-shadow 0.25s ease;
+  background: var(--lk-ast-raised);
 }
 .lk-ast-caret {
   display: none;
 }
 .lk-ast-send {
-  color: rgba(232, 244, 255, 0.55);
-  background: rgba(232, 244, 255, 0.1);
+  color: rgba(232, 244, 255, 0.4);
+  background: rgba(232, 244, 255, 0.06);
   transition:
     background-color 0.2s ease,
     color 0.2s ease;
 }
 .lk-ast:is([data-s~="1"]:not([data-s~="2"]), [data-s~="7"]:not([data-s~="8"])) {
-  & .lk-ast-composer {
-    box-shadow:
-      inset 0 0 0 1px rgba(68, 166, 250, 0.6),
-      0 0 0 4px rgba(68, 166, 250, 0.12);
-  }
   & .lk-ast-placeholder {
     opacity: 0;
   }
@@ -2161,19 +2107,18 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 .lk-ast-mode {
-  color: rgba(232, 244, 255, 0.6);
+  color: rgba(232, 244, 255, 0.45);
   transition: color 0.3s ease;
 }
 .lk-ast-mode[data-mode="ask"],
 .lk-ast[data-s~="6"] .lk-ast-mode[data-mode="build"] {
-  color: #e8f4ff;
+  color: rgba(232, 244, 255, 0.9);
 }
 .lk-ast[data-s~="6"] .lk-ast-mode[data-mode="ask"] {
-  color: rgba(232, 244, 255, 0.6);
+  color: rgba(232, 244, 255, 0.45);
 }
 .lk-ast-mode-thumb {
-  background: rgba(232, 244, 255, 0.14);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  background: rgba(232, 244, 255, 0.07);
   transition: transform 0.4s var(--lk-ease);
 }
 .lk-ast[data-s~="6"] .lk-ast-mode-thumb {
@@ -2191,27 +2136,6 @@ section[data-role="admin"] .lk-gv-closed {
     transition: none !important;
     animation: none !important;
   }
-}
-.lk-ast-reviewer-short {
-  display: none;
-}
-@container lk-ast (max-width: 419px) {
-  .lk-ast-reviewer {
-    display: none;
-  }
-  .lk-ast-reviewer-short {
-    display: inline;
-  }
-}
-.lk-ast-empty {
-  opacity: 0;
-  transition: opacity 0.5s ease;
-}
-.lk-ast:not([data-s~="2"]) .lk-ast-empty {
-  opacity: 0.1;
-}
-.lk-ast:not([data-s~="2"]) .lk-ast-empty svg {
-  animation: lk-bob 4s ease-in-out infinite;
 }
 
 /* ---- WEB-5 O23: "Get started" comes alive (components/home/get-started-*.tsx) ----

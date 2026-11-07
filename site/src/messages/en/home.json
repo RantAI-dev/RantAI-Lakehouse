@@ -95,10 +95,6 @@
       "Query Studio: autocomplete, tabs, history"
     ],
     "name": "Assistant",
-    "status": {
-      "ready": "Ready",
-      "working": "Working"
-    },
     "placeholder": "Ask anything about your lakehouse…",
     "modes": {
       "ask": "Ask",
