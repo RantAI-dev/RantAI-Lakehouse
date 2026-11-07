@@ -1284,6 +1284,44 @@ This changes D6 for one thing: type.
 
 **No open finding.** Next: the owner's QA on this build (served on :3400), then CI green, Dependency review included, then the PR marked ready.
 
+### Review 8: planner, 2026-11-07, at `390a482f` (owner's question: is it safe on phones?)
+
+**What the reviewer ran:**
+- **Screenshots** of fifteen points down the page, in EN and ID, at 390×844 and 360×740. These are the reviewer's own, not committed.
+- **A horizontal-overflow check** at every half screen of scroll, at 360×740, 375×667, 390×844 and 412×915, in EN and ID.
+- **Mode:** the DOM hero (`scene: none`), which is what a phone without fast WebGL gets.
+
+**What holds:**
+- No page scrolls sideways at any of the four sizes, in either language.
+- Every section reads at 360 and at 390.
+- The assistant stage fits.
+- The gauge hairline and its reading sit under the bar.
+
+**R12: BLOCKER, on short phone screens the hero's creature sits under the eyebrow and the headline.**
+
+| Screen | Language | Creature's bottom edge | Eyebrow's top edge | Headline's top edge |
+| --- | --- | --- | --- | --- |
+| 360×740 | EN | y 267 | y 139 | y 175 |
+| 360×740 | ID | y 267 | y 212 | y 248 |
+| 375×667 | EN | y 264 | y 93 | y 129 |
+| 375×667 | ID | y 264 | y 139 | y 175 |
+| 390×844 | EN | y 295 | y 344 | — |
+| 412×915 | EN | y 315 | y 415 | — |
+
+- On the short screens the text overlaps the creature by 55–171 px. It is clear at 390×844 and at 412×915.
+- **Cause:** the hero copy is centred in the 100 svh stage, while the creature has a fixed place and size. On a short screen, the centred copy rises into it.
+- **Why it matters:** the first screen a phone visitor sees is the hero. 360×740 is a common Android size, and 375×667 is the iPhone SE.
+- **Fix:** on short screens the creature and the copy share the stage without overlapping. For example, the creature scales with the stage's height, or the copy is laid out below the creature instead of centred. The headline may still wrap. No new library, and no change at 390×844 and up.
+- **Acceptance:**
+  - at 360×640, 360×740, 375×667, 390×844 and 412×915, in EN and ID, the creature's box ends at least 12 px above the eyebrow;
+  - both buttons stay on the first screen;
+  - screenshots at 360×740 and 375×667, in EN and ID;
+  - the live 3D hero is checked with the dev-only override at 360×740.
+
+**Not measured on a phone:** the live 3D lake. This VM has no GPU. A phone whose WebGL2 passes `hasFastWebGL` runs the scene. That scene chunk (147 KB gzip) loads only after the page is usable, and no Lighthouse number here includes it.
+
+**Open: R12 (BLOCKER).**
+
 ## 9. Addendum: the story, top to bottom (owner, 2026-11-04)
 
 The owner's QA asked:
