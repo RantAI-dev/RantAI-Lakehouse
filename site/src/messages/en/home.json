@@ -155,7 +155,13 @@
         "title": "Your servers or ours.",
         "body": "Install it on your own infrastructure, or talk to us about running it for you."
       }
-    ]
+    ],
+    "console": {
+      "window": "Home",
+      "label": "The console, as you will run it",
+      "caption": "Its home: ask a question in plain words, or start from a shortcut to connect a source, create a pipeline or build a dashboard.",
+      "alt": "The RantAI Lakehouse console's home: a box to ask the assistant, with Ask, Build and Tools, and three shortcuts: Connect a source, Create a pipeline and Build a dashboard."
+    }
   },
   "final": {
     "headline": "Come on in. The data's fine."

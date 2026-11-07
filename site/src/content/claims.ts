@@ -67,6 +67,14 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.governance.facts.2.text", backlog: ["DATA-13 Released"], note: "column-level lineage" },
   { key: "home.governance.facts.3.text", backlog: ["DATA-11 Released", "DATA-12 Released"], note: "catalog search; certified and deprecated marks; governed tags" },
   { key: "home.governance.facts.4.text", backlog: ["BI-19 In Acceptance"], note: "permissions per dashboard and folder" },
+  // The real console (D19, 2026-11-07): a crop of rantai-page's
+  // public/products/lake-home.webp; the strings are the console's own
+  // (src/lib/home-prompts.ts, src/features/home/home-shortcuts.ts).
+  {
+    key: "home.open.console.caption",
+    backlog: ["AI-18 In Acceptance"],
+    note: "ask in plain language on the console's home (Copilot Chat); the three shortcuts are the home page's own",
+  },
   // Contact page FAQ (D15, 2026-11-07): every answer is a claim. Most repeat
   // what the home page already says (WEB-1's copy, "limited to what is
   // built", In Acceptance), so they trace to the same rows.

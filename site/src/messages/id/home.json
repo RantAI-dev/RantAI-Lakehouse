@@ -155,7 +155,13 @@
         "title": "Server Anda atau kami.",
         "body": "Pasang di infrastruktur Anda sendiri, atau bicarakan dengan kami agar kami yang menjalankannya untuk Anda."
       }
-    ]
+    ],
+    "console": {
+      "window": "Beranda",
+      "label": "Konsolnya, seperti yang akan Anda jalankan",
+      "caption": "Halaman utamanya: ajukan pertanyaan dengan bahasa sehari-hari, atau mulai dari pintasan untuk menghubungkan sumber, membuat pipeline, atau membuat dashboard.",
+      "alt": "Halaman utama konsol RantAI Lakehouse: kotak untuk bertanya ke asisten, dengan Ask, Build, dan Tools, serta tiga pintasan: Connect a source, Create a pipeline, dan Build a dashboard."
+    }
   },
   "final": {
     "headline": "Masuklah. Datanya aman."
