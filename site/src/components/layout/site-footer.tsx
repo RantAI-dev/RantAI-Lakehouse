@@ -127,7 +127,10 @@ export function SiteFooter({
 
   const cta = copy.cta;
   return (
-    <footer className="flex flex-col gap-3 bg-[#020514] px-3 pb-3 sm:gap-4 sm:px-4 sm:pb-4">
+    // No background of its own (O28): at rest the page-wide water (or, on the contact page, the
+    // abyss) shows here anyway, and once the pull lifts the footer with a transform it would
+    // paint its own dark fill over the water.
+    <footer className="flex flex-col gap-3 px-3 pb-3 sm:gap-4 sm:px-4 sm:pb-4">
       {/* 1. The call to action, as a card (rantai-page's FooterCtaCard). On
           the home page it is the action after the story's end (the final
           section); on the contact page it points back up to the form
@@ -162,7 +165,9 @@ export function SiteFooter({
           (foreground → foam, muted-foreground → foam at 65 %) and this
           site's content. */}
       {/* Links sit straight on the page, with a faded wordmark below */}
-      <div className="relative overflow-hidden px-6 pt-14 sm:px-10 lg:px-16 lg:pt-20">
+      {/* overflow-clip (rantai: overflow-hidden): the same crop, but its paint edge can widen
+          during the wordmark's pull without changing layout (O28, footer-motion.tsx). */}
+      <div className="relative overflow-clip px-6 pt-14 sm:px-10 lg:px-16 lg:pt-20">
         <div className="grid gap-12 xl:grid-cols-[minmax(0,1fr)_auto] xl:gap-20">
           <Reveal className="max-w-sm">
             <a
