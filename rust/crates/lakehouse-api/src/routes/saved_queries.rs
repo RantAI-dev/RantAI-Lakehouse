@@ -30,9 +30,12 @@
 //! # The access lists
 //!
 //! The last surface here is the sharing one: who has what on a saved query
-//! or on a folder (`QS-3`). The list is read with **manage**, because
-//! managing an item includes sharing it: a person who may only see a query
-//! has no business seeing who else sees it. The list answers with the
+//! or on a folder (`QS-3`). A query's list is read with **manage**,
+//! because managing a query includes sharing it: a person who may only see
+//! a query has no business seeing who else sees it. A folder's list is
+//! read with **edit**, so a person who may save or move a query into a
+//! folder sees who the folder is shared with before they do. Changing
+//! either list needs **manage**. A list answers with the
 //! item's own rules and the rules it inherits from the folders above it,
 //! and the grantee search answers with the people and the roles of the
 //! caller's organisation — the two halves of one question, "who may I
@@ -1740,11 +1743,16 @@ pub async fn put_query_access(
 /// # Errors
 ///
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
-/// caller may not see; 403 with the fixed sentence of [`FOLDER_FORBIDDEN`]
-/// for a folder the caller may see but only view; 503 when no database
-/// pool is configured, and 500 with the fixed sentence `database error` on
-/// a database failure, both through `From<StoreError> for ApiError` (this
-/// route does not use `folder_failure`, which only the writes use).
+/// caller may not see, for an id that is not a UUID and for a caller that
+/// acts for no organisation; 404 for an `X-Tenant` header that names a
+/// tenant the caller does not belong to; 403 with the fixed sentence of
+/// [`FOLDER_FORBIDDEN`] for a folder the caller may see but only view; 503
+/// when no database pool is configured, which `pool` raises before any
+/// store call, or when the tenant scope cannot verify the deployment's
+/// tenant count; 500 with the fixed sentence `database error` on a
+/// database failure inside a store call, through
+/// `From<StoreError> for ApiError`. This route does not use
+/// `folder_failure`, which only the writes use.
 pub async fn get_folder_access(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
