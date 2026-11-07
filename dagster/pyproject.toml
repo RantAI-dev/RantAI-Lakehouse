@@ -101,7 +101,7 @@ dependencies = [
     # wheel and an sdist -- pure Python, no native transport to link
     # against, so no system package is needed for Kafka at all).
     "kafka-python==3.0.11",
-    "paramiko==3.5.0",
+    "paramiko==5.0.0",
 ]
 
 [build-system]
