@@ -43,7 +43,8 @@ const LandingModeContext = React.createContext<LandingModeValue>({
  * The WebGL answer, as a tiny external store: "unknown" until the page is
  * usable, then the probe's result. Probing creates a context, so it runs
  * once and the answer is kept; the scene's chunk is only requested once the
- * answer is "yes", so the `three` download starts after the first paint too.
+ * answer is "yes", so the `three` download starts after the first paint too
+ * (except on the intro's 3D path, below).
  */
 let webglAnswer: "unknown" | "yes" | "no" = "unknown";
 const webglListeners = new Set<() => void>();
@@ -52,10 +53,20 @@ function subscribeWebgl(onChange: () => void): () => void {
   webglListeners.add(onChange);
   if (!webglScheduled) {
     webglScheduled = true;
-    afterPaint(() => {
+    const answer = () => {
       webglAnswer = hasFastWebGL() ? "yes" : "no";
       for (const l of webglListeners) l();
-    });
+    };
+    // WEB-5 O52: on the first-load intro's 3D path (hero-intro.tsx has
+    // probed already and holds the page until the scene's first frame), the
+    // answer is given at hydration and the scene's chunk is requested at
+    // once, so the hold stays short. Everywhere else, after the first paint.
+    if (document.documentElement.classList.contains("lk-intro-3d")) {
+      void import("./scene/lake-scene");
+      queueMicrotask(answer);
+    } else {
+      afterPaint(answer);
+    }
   }
   return () => {
     webglListeners.delete(onChange);

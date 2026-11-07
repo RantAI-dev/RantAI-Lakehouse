@@ -31,7 +31,7 @@ export function SceneZone({ children }: { children: React.ReactNode }) {
       <div
         aria-hidden="true"
         className={cn(
-          "absolute inset-x-0 top-[100svh] bottom-0 bg-[linear-gradient(180deg,#0a1f55_0%,#081a50_30%,#05134a_65%,#020e42_100%)] transition-opacity duration-700",
+          "absolute inset-x-0 top-[100svh] bottom-0 bg-[linear-gradient(180deg,#0a1f55_0%,#081a50_30%,#05134a_65%,#020e42_100%)] transition-opacity duration-400",
           mode === "full" && sceneReady ? "opacity-0" : "opacity-100",
         )}
       />
@@ -39,7 +39,7 @@ export function SceneZone({ children }: { children: React.ReactNode }) {
         <div
           aria-hidden="true"
           className={cn(
-            "pointer-events-none z-0 transition-opacity duration-700",
+            "pointer-events-none z-0 transition-opacity duration-400",
             // Full: pinned behind the hero, sources and depths for as long as
             // the zone lasts (the negative margin gives its flow height back).
             // Still: one frame, in the hero only.

@@ -662,6 +662,34 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     renderFrame();
   }
 
+  // WEB-5 O52: the first-load intro, played in this scene when the page
+  // chose it for this device (hero-intro.tsx puts `lk-intro-3d` on <html>
+  // before the first paint, and holds the DOM hero hidden). The whale waits
+  // under the surface; on this scene's first frame the page is told to start
+  // (the open sea shows as the canvas fades in, the text follows from 1.6 s);
+  // 0.9 s in, the whale rises. If the intro is skipped or ends, or the page
+  // fell back to the DOM intro before this scene was ready, it is put at
+  // the surface at once.
+  const root = document.documentElement;
+  let intro3d = !still && root.classList.contains("lk-intro-3d");
+  let introStart = -1;
+  if (intro3d) mascot.submerge();
+  const tickIntro = () => {
+    if (!intro3d) return;
+    if (introStart < 0) {
+      introStart = clock.t;
+      if (root.classList.contains("lk-intro-3d")) {
+        (window as unknown as { __lkIntroGo?: () => void }).__lkIntroGo?.();
+      }
+    }
+    if (!root.classList.contains("lk-intro-3d")) {
+      mascot.surface();
+      intro3d = false;
+    } else if (clock.t - introStart >= 0.9) {
+      mascot.rise(clock.t);
+    }
+  };
+
   let raf = 0;
   let onScreen = true;
   const running = () => !still && onScreen && !document.hidden;
@@ -675,6 +703,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     clock.t += dt;
     update(dt);
     renderFrame();
+    tickIntro();
 
     // Adaptive quality: after about 1.5 s of frames slower than 25 fps, drop
     // the pixel ratio one step (never below 1).

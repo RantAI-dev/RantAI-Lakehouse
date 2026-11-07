@@ -132,7 +132,7 @@ export function BackdropFade({
   return (
     <div
       aria-hidden="true"
-      className={cn(className, "transition-opacity duration-700", sceneReady && "opacity-0")}
+      className={cn(className, "transition-opacity duration-400", sceneReady && "opacity-0")}
       data-intro-backdrop={isPicture ? "" : undefined}
       {...rest}
     >

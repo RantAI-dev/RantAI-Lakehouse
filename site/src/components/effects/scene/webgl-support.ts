@@ -24,6 +24,10 @@ export function hasFastWebGL(): boolean {
   if (process.env.NODE_ENV === "development" && process.env.NEXT_PUBLIC_WEB5_FORCE_WEBGL === "1") {
     return (cached = true);
   }
+  // WEB-5 O52: the first-load intro (home/hero-intro.tsx) may have run the
+  // same test inline before the first paint.
+  const early = (window as unknown as { __lkFastGL?: unknown }).__lkFastGL;
+  if (typeof early === "boolean") return (cached = early);
   try {
     const canvas = document.createElement("canvas");
     const gl = canvas.getContext("webgl2", { failIfMajorPerformanceCaveat: true });

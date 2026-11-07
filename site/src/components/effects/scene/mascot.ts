@@ -82,6 +82,15 @@ export type Mascot = {
   setUnderwater: (uw: number) => void;
   /** The drawing buffer's height in pixels, so the spout's droplets keep their true size. */
   setViewport: (heightPx: number, pixelRatio: number) => void;
+  /**
+   * WEB-5 O52, the intro in the live scene: `submerge` holds it under the
+   * surface, `rise(t)` brings it up (it breaks the water with a splash ring,
+   * settles in its rest pose and breathes out once), `surface()` puts it
+   * there at once (the intro skipped or over).
+   */
+  submerge: () => void;
+  rise: (t: number) => void;
+  surface: () => void;
   /** Freeze the idle motion (reduced motion). */
   still: boolean;
   dispose: () => void;
@@ -417,6 +426,12 @@ export function createMascot(opts: MascotOptions): Mascot {
   let blinkStart = -10;
   let dipStart = -10;
   let poppedAt = -10;
+  // O52: the intro's rise. `introHold` keeps it under until `riseStart`.
+  let introHold = false;
+  let clockNow = 0;
+  let riseStart = -1;
+  let riseSplashed = false;
+  let riseBreathed = false;
   const DIP_DEPTH = MASCOT_H + 0.25;
   let swimPhase = 0;
 
@@ -503,6 +518,21 @@ export function createMascot(opts: MascotOptions): Mascot {
       bounce.color.copy(BOUNCE_ABOVE.sky).lerp(BOUNCE_UNDER.sky, uw);
       bounce.groundColor.copy(BOUNCE_ABOVE.ground).lerp(BOUNCE_UNDER.ground, uw);
     },
+    submerge() {
+      introHold = true;
+      riseStart = -1;
+      riseSplashed = false;
+      riseBreathed = false;
+      nextSpout = Infinity;
+    },
+    rise(t) {
+      if (introHold && riseStart < 0) riseStart = t;
+    },
+    surface() {
+      if (!introHold) return;
+      introHold = false;
+      nextSpout = clockNow + 4 + Math.random() * 3;
+    },
     dip(t) {
       if (t - dipStart < 1.6) return;
       dipStart = t;
@@ -510,6 +540,7 @@ export function createMascot(opts: MascotOptions): Mascot {
       opts.onRipple(0.8);
     },
     update(dt, t, aim, look) {
+      clockNow = t;
       const k = (rate: number) => 1 - Math.exp(-dt * rate);
       // A non-finite aim would stick in the smoothing for good, so it counts as "straight ahead".
       const ax = Number.isFinite(aim.x) ? aim.x : 0;
@@ -520,7 +551,26 @@ export function createMascot(opts: MascotOptions): Mascot {
       lookAim.y += (ay - lookAim.y) * k(2.6);
 
       const bob = mascot.still ? 0 : Math.sin((t * TAU) / 4);
-      const dipY = mascot.still ? 0 : dipOffset(t);
+      let dipY = mascot.still ? 0 : dipOffset(t);
+      if (introHold) {
+        // Under until the rise, then up with the pop's overshoot ease.
+        const p = riseStart < 0 ? 0 : Math.min(1, (t - riseStart) / 0.8);
+        const c1 = 1.6;
+        const c3 = c1 + 1;
+        const back = p <= 0 ? 0 : 1 + c3 * Math.pow(p - 1, 3) + c1 * Math.pow(p - 1, 2);
+        dipY = -DIP_DEPTH * (1 - back);
+        if (riseStart >= 0 && !riseSplashed && p > 0.45) {
+          riseSplashed = true;
+          opts.onRipple(1);
+          burst();
+        }
+        if (riseStart >= 0 && !riseBreathed && t - riseStart > 1.1) {
+          riseBreathed = true;
+          breathe();
+          nextSpout = t + 6 + Math.random() * 3;
+        }
+        if (riseBreathed && p >= 1) introHold = false;
+      }
       // WEB-5 O30 (owner: "gausah ikut tenggelam, karena jadi ngehalangin
       // tulisan"): it stays at the surface. The diving camera glimpses its
       // underside from just below, then sinks away from it.
