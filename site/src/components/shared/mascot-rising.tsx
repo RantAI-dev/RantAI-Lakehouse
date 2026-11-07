@@ -1,6 +1,6 @@
 import * as React from "react";
 import { SwimLayer } from "./whale-motion";
-import { WHALE_VIEW, WHALE_WATERLINE, WhaleSvg } from "./whale-svg";
+import { WHALE_DOME_TOP, WHALE_VIEW, WHALE_WATERLINE, WhaleSvg } from "./whale-svg";
 
 /**
  * The final call: a night sea, like the hero, so the page closes where it
@@ -89,7 +89,14 @@ export function MascotRising({ className }: { className?: string }) {
   return (
     <div className={className}>
       <style dangerouslySetInnerHTML={{ __html: SCENE_CSS }} />
-      <div className="relative aspect-[760/560] w-full">
+      {/* WEB-5 O53: the live lake frames its 3D whale from this stage (lake-engine.ts, `fitFinal`):
+          the waterline and the 2D head's height, as fractions of the stage's height. */}
+      <div
+        data-final-stage=""
+        data-waterline={(372 / 560).toFixed(4)}
+        data-head={(((WHALE_WATERLINE - WHALE_DOME_TOP) * SCALE) / 560).toFixed(4)}
+        className="relative aspect-[760/560] w-full"
+      >
         {/* The far water, behind the whale: a band that drifts slowly. */}
         <div aria-hidden="true" className="absolute top-[64.6%] left-1/2 h-[10%] w-screen -translate-x-1/2 overflow-hidden">
           <svg viewBox="0 0 1520 40" preserveAspectRatio="none" className="lk-wave-slow absolute top-0 left-0 h-full w-[200%]" style={{ animationDuration: "34s" }}>

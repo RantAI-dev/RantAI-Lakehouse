@@ -96,7 +96,15 @@ const UNDER_MOON = (() => {
 
 export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const { canvas, mode, observe } = opts;
-  const host = canvas.parentElement ?? canvas; // the layer div the page sizes
+  // The layer div the page sizes. WEB-5 O53: the canvas moves between the
+  // hero zone's layer and the final call's (`setView`), so this follows it.
+  const heroHost = canvas.parentElement ?? canvas;
+  let host: HTMLElement = heroHost;
+  // WEB-5 O53: the final call (`#final`, home/final-section.tsx) shows the
+  // same lake again, at the surface: one renderer, one context, one chunk.
+  const finalSection = document.getElementById("final");
+  const finalHost = finalSection?.querySelector<HTMLElement>("[data-final-scene]") ?? null;
+  let view: "hero" | "final" = "hero";
 
   const still = mode === "still";
   let phone = window.innerWidth < 768;
@@ -201,8 +209,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     el instanceof Element && el.closest("a,button,input,select,textarea,summary,[role='button']") !== null;
   const onPointerDown = (e: PointerEvent) => {
     setPointer(e);
-    // Only the hero's own screen area counts as "the dome".
-    if (still || window.scrollY > layout.vh * 0.5 || isInteractive(e.target)) return;
+    // Only the hero's own screen area (or the final call) counts as "the dome".
+    if (still || (view === "hero" && window.scrollY > layout.vh * 0.5) || isInteractive(e.target)) return;
     ndc.set(pointer.x, pointer.y);
     raycaster.setFromCamera(ndc, camera);
     if (raycaster.intersectObject(mascot.dome, false).length > 0) mascot.dip(clock.t);
@@ -232,7 +240,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   };
   const measure = () => {
     if (width > 1) fitSlabsToCard();
-    layout.vh = host.clientHeight || window.innerHeight;
+    layout.vh = heroHost.clientHeight || window.innerHeight;
     layout.viewportH = window.innerHeight;
     const depths = document.getElementById("depths");
     if (depths) {
@@ -280,7 +288,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // height) ease towards it in `update`.
     anchorDepths.x = depthsTarget.x;
     anchorDepths.y = depthsTarget.y;
-    if (phone) fitHeroToRoom();
+    if (phone && view === "hero") fitHeroToRoom();
+    if (view === "final") fitFinal();
     viewKey = "";
     measure();
     camera.updateProjectionMatrix();
@@ -435,8 +444,78 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     anchorHero.y = (2 * ((span.top + span.bottom) / 2 - (target.top + target.height / 2))) / height;
   };
 
+  /**
+   * WEB-5 O53: in the final call the whale takes the place of the 2D one,
+   * framed like the hero (the same camera pose, so the sky, the moon and its
+   * path on the water read the same), sized and placed from the 2D stage
+   * (`data-final-stage`, shared/mascot-rising.tsx): its waterline on the
+   * stage's, its centre on the stage's, its dome `FINAL_SCALE` times as tall
+   * as the 2D head. The stage is below the headline, so the whale never
+   * reaches the text.
+   */
+  const FINAL_SCALE = 1.5;
+  const moonDir = skyUniforms.uMoonDir.value; // shared by the sky and the water
+  const moonFinal = new Vector3(...MOON_DIR);
+  const moonProbe = new Vector3();
+  const anchorFinal = { x: 0, y: 0 };
+  let distScaleFinal = 1;
+  const fitFinal = () => {
+    const stage = finalSection?.querySelector<HTMLElement>("[data-final-stage]");
+    if (!stage || !finalHost) return;
+    const hostR = finalHost.getBoundingClientRect();
+    const r = stage.getBoundingClientRect();
+    const waterline = Number(stage.dataset.waterline);
+    const head = Number(stage.dataset.head) * FINAL_SCALE;
+    if (!(r.height > 0) || !Number.isFinite(waterline) || !Number.isFinite(head)) return;
+    const waterY = r.top - hostR.top + waterline * r.height;
+    const topY = Math.max(r.top - hostR.top, waterY - head * r.height);
+    const want = waterY - topY;
+    let dist = distScaleHero;
+    for (let i = 0; i < 4; i++) {
+      const span = heroCreatureSpan(dist, 0);
+      dist *= (span.bottom - span.top) / want;
+    }
+    const span = heroCreatureSpan(dist, 0);
+    distScaleFinal = dist;
+    anchorFinal.y = (2 * ((span.top + span.bottom) / 2 - (topY + waterY) / 2)) / height;
+    anchorFinal.x = (2 * (r.left - hostR.left + r.width / 2 - width / 2)) / width;
+
+    // The moon, clear of the headline: beside it where there is room (wide
+    // screens, at its left), else low on the right, between the headline
+    // and the horizon. Its light and its path on the water follow it.
+    const heading = finalSection?.querySelector("h2, h1");
+    const hr = heading?.getBoundingClientRect();
+    if (!hr) return;
+    const hero = sceneStateAt(0, layout);
+    fitPoint.set(hero.look[0], hero.look[1], hero.look[2]);
+    fitCam.aspect = width / height;
+    fitCam.position
+      .set(hero.position[0] - hero.look[0], hero.position[1] - hero.look[1], hero.position[2] - hero.look[2])
+      .multiplyScalar(dist)
+      .add(fitPoint);
+    fitCam.lookAt(fitPoint);
+    fitCam.setViewOffset(width, height, (-anchorFinal.x * width) / 2, (anchorFinal.y * height) / 2, width, height);
+    fitCam.updateProjectionMatrix();
+    fitCam.updateMatrixWorld();
+    const pxY = (p: Vector3) => ((1 - p.project(fitCam).y) / 2) * height;
+    const horizonY = pxY(moonProbe.set(fitCam.position.x, 0, fitCam.position.z - 400));
+    const left = hr.left - hostR.left;
+    const headBottom = hr.bottom - hostR.top;
+    const beside = left > width * 0.22;
+    const sx = beside ? left * 0.5 : width * 0.8;
+    const sy = beside ? hr.bottom - hostR.top - hr.height * 0.3 : headBottom + 0.45 * (horizonY - headBottom);
+    moonFinal
+      .set((sx / width) * 2 - 1, 1 - (sy / height) * 2, 0.5)
+      .unproject(fitCam)
+      .sub(fitCam.position)
+      .normalize();
+    if (moonFinal.y < 0.05) moonFinal.setY(0.05).normalize();
+    if (view === "final") moonDir.copy(moonFinal);
+  };
+
   const ro = new ResizeObserver(resize);
   ro.observe(host);
+  if (finalHost) ro.observe(finalHost);
   // The room changes with the copy's height (fonts, language).
   const heroRoom = document.querySelector("[data-hero-room]");
   if (heroRoom) ro.observe(heroRoom);
@@ -459,8 +538,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   function applyView(wHero: number, wDepths: number): void {
     const wUnder = Math.max(0, 1 - wHero - wDepths);
-    const ax = wHero * anchorHero.x + wDepths * anchorDepths.x + wUnder * anchorUnder.x;
-    const ay = wHero * anchorHero.y + wDepths * anchorDepths.y + wUnder * anchorUnder.y;
+    const fin = view === "final";
+    const ax = fin ? anchorFinal.x : wHero * anchorHero.x + wDepths * anchorDepths.x + wUnder * anchorUnder.x;
+    const ay = fin ? anchorFinal.y : wHero * anchorHero.y + wDepths * anchorDepths.y + wUnder * anchorUnder.y;
     // Only rebuild the projection when the offset really moved.
     const key = `${Math.round(ax * 1000)}:${Math.round(ay * 1000)}`;
     if (key === viewKey) return;
@@ -476,7 +556,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // Critically damped follow: wheel notches glide instead of stepping.
     smoothY += (scrollY - smoothY) * (1 - Math.exp(-dt * 7));
     if (Math.abs(scrollY - smoothY) < 0.05) smoothY = scrollY;
-    state = sceneStateAt(smoothY, layout);
+    // O53: the final call is the hero's pose, whatever the scroll.
+    state = sceneStateAt(view === "final" ? 0 : smoothY, layout);
     const uw = state.underwater;
 
     // Camera: the scroll path, plus a small pointer parallax while above the water.
@@ -491,7 +572,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     );
     // On a narrow screen the camera stays pulled back so the creature, and later
     // the slabs, fit the width.
-    camera.position.sub(look).multiplyScalar(lerp(distScaleHero, distScaleDepths, state.depthsWeight)).add(look);
+    const dist = view === "final" ? distScaleFinal : lerp(distScaleHero, distScaleDepths, state.depthsWeight);
+    camera.position.sub(look).multiplyScalar(dist).add(look);
     camera.lookAt(look);
     applyView(state.heroWeight, state.depthsWeight);
 
@@ -578,7 +660,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // across the Gold slab. Fade it to the page's abyss over the last part of
     // the pinned range so it is gone before that edge arrives. (On the canvas
     // itself, not its layer: the layer has its own opacity transition.)
-    if (!still) canvas.style.opacity = String(1 - smoothstep(0.82, 1, state.depthProgress));
+    if (!still) canvas.style.opacity = view === "final" ? "1" : String(1 - smoothstep(0.82, 1, state.depthProgress));
   }
 
   /** Sets the scene up as it looks above the water, or below it (O5). */
@@ -598,7 +680,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       moonLight.intensity = 2.2;
       ambient.intensity = 1.1;
     } else {
-      moonLight.position.set(...MOON_DIR).multiplyScalar(10);
+      moonLight.position.copy(moonDir).multiplyScalar(10);
       moonLight.intensity = 3.2;
       ambient.intensity = 0.8;
     }
@@ -629,7 +711,13 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   }
 
   const right = new Vector3();
+  let shown = false;
   function renderFrame(): void {
+    // O53: once a frame exists, the final call shows the lake in place of its 2D scene.
+    if (!shown && finalSection && finalHost) {
+      shown = true;
+      finalSection.dataset.scene3d = "on";
+    }
     const cover = lensCoverage(camera.position.y);
     const lensMode = cover.above && cover.below ? 2 : cover.above ? 0 : 1;
     configure(lensMode === 1);
@@ -728,14 +816,56 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     raf = requestAnimationFrame(loop);
   };
 
+  // O53: the loop runs while the hero zone or the final call is on screen,
+  // and sleeps in between (no frame is requested at all).
+  let heroOn = true;
+  let finalOn = false;
   const io = new IntersectionObserver(
     (entries) => {
-      onScreen = entries.some((e) => e.isIntersecting);
+      for (const e of entries) {
+        if (e.target === observe) heroOn = e.isIntersecting;
+        else finalOn = e.isIntersecting;
+      }
+      onScreen = heroOn || finalOn;
       if (onScreen) start();
     },
     { rootMargin: "0px" },
   );
   io.observe(observe);
+  if (finalSection && finalHost) io.observe(finalSection);
+
+  // O53: the canvas goes to whichever of the two is near, a quarter of a
+  // screen before it shows, so it is in place when it scrolls in. They are
+  // many screens apart, so both are never near at once.
+  const setView = (next: "hero" | "final") => {
+    if (next === view) return;
+    const target = next === "final" ? finalHost : heroHost;
+    if (!target) return;
+    view = next;
+    host = target;
+    target.appendChild(canvas);
+    if (next === "hero") moonDir.set(...MOON_DIR);
+    // Coming back from the final call, the camera does not glide down the whole dive.
+    smoothY = window.scrollY;
+    resize();
+  };
+  let nearHero = true;
+  let nearFinal = false;
+  const ioNear = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (e.target === observe) nearHero = e.isIntersecting;
+        else nearFinal = e.isIntersecting;
+      }
+      if (nearFinal && !nearHero) setView("final");
+      else if (nearHero) setView("hero");
+    },
+    { rootMargin: "25% 0px" },
+  );
+  if (finalSection && finalHost) {
+    ioNear.observe(observe);
+    ioNear.observe(finalSection);
+  }
   const onVisibility = () => {
     if (!document.hidden) start();
   };
@@ -761,6 +891,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       roZone.disconnect();
       roCard.disconnect();
       io.disconnect();
+      ioNear.disconnect();
+      if (finalSection) delete finalSection.dataset.scene3d;
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pointermove", setPointer);
       window.removeEventListener("pointerdown", onPointerDown);

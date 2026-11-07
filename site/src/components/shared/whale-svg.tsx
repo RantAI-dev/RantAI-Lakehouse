@@ -41,6 +41,8 @@ export const WHALE_WATERLINE = 318;
  * the bottom.
  */
 const BODY_PATH = "M108 266 A192 184 0 0 1 492 266 A192 156 0 0 1 108 266 Z";
+/** The top of the dome in `BODY_PATH` (266 − 184), for framing the 3D whale like this one (O53). */
+export const WHALE_DOME_TOP = 82;
 const EYES = [
   { cx: 219, cy: 230 },
   { cx: 381, cy: 230 },

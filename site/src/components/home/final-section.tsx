@@ -11,7 +11,10 @@ import { FinalMascotStage } from "./final-mascot";
  * night sea like the hero): the page closes where it began, on the night
  * lake. A sky with stars and the moon at the upper left, the moonlit water
  * below, and the whale's head floating at the waterline under the headline
- * (`shared/mascot-rising.tsx`, in SVG: lighter than a second canvas). The
+ * (`shared/mascot-rising.tsx`, in SVG). WEB-5 O53 (owner: "bagian footer ini
+ * kenapa jadi 2d gini"): where the live lake runs, the hero's own canvas is
+ * moved in here and draws the same night sea and 3D whale (lake-engine.ts,
+ * `setView`); the SVG scene stays for no fast WebGL and no JavaScript. The
  * sky starts on the page's own deepest colour (#020514), so the descent
  * runs into it without a seam; the depth gauge has faded out by here.
  *
@@ -48,9 +51,25 @@ export function FinalSection({ copy }: { copy: HomeCopy["final"] }) {
       // O42: the night sky is the scene, so it shows with and without JavaScript (no
       // `lk-fallback-bg`): the page's deepest colour at the top, the hero's night blue
       // towards the horizon, where the stage's water begins.
-      className="relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[linear-gradient(180deg,#020514_0%,#050a30_55%,#0a1f55_100%)] pt-28 max-md:min-h-0 max-md:gap-8 max-md:pb-6 md:pt-32"
+      className="group/final relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[linear-gradient(180deg,#020514_0%,#050a30_55%,#0a1f55_100%)] pt-28 max-md:min-h-0 max-md:gap-8 max-md:pb-6 md:pt-32"
     >
-      <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10">
+      {/* WEB-5 O53: where the live lake runs, the engine moves its canvas in here when the section
+          is near, and marks the section `data-scene3d="on"` once it has drawn; the 2D sky, moon and
+          sea below then fade out. The top and the bottom fade to the page's #020514, so the descent
+          above and the footer below meet it without a seam. */}
+      <div aria-hidden="true" data-final-scene="" className="pointer-events-none absolute inset-0 -z-10" />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[24%] bg-[linear-gradient(180deg,#020514_0%,rgba(2,5,20,0.6)_45%,rgba(2,5,20,0)_100%)] opacity-0 transition-opacity duration-400 group-data-[scene3d=on]/final:opacity-100"
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 bottom-0 -z-10 h-[12%] bg-[linear-gradient(0deg,#020514_0%,rgba(2,5,20,0)_100%)] opacity-0 transition-opacity duration-400 group-data-[scene3d=on]/final:opacity-100"
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 -z-20 transition-[opacity,visibility] duration-400 group-data-[scene3d=on]/final:invisible group-data-[scene3d=on]/final:opacity-0"
+      >
         {STARS.map((s, i) => (
           <span
             key={i}
@@ -74,7 +93,7 @@ export function FinalSection({ copy }: { copy: HomeCopy["final"] }) {
       </Container>
 
       <FinalMascotStage>
-        <MascotRising className="w-full" />
+        <MascotRising className="w-full transition-[opacity,visibility] duration-400 group-data-[scene3d=on]/final:invisible group-data-[scene3d=on]/final:opacity-0" />
       </FinalMascotStage>
     </section>
   );
