@@ -14,11 +14,11 @@
     "source": "Lihat source code"
   },
   "footer": {
-    "tagline": "RantAI Lakehouse. Satu lakehouse dengan dashboard bawaan.",
+    "tagline": "Satu lakehouse dengan dashboard bawaan.",
     "columns": {
       "product": "Produk",
-      "rantai": "RantAI",
-      "connect": "Kontak"
+      "products": "Produk RantAI",
+      "connect": "Terhubung"
     },
     "sections": {
       "sources": "Semua mengalir masuk",
@@ -30,7 +30,9 @@
     },
     "userGuide": "Panduan pengguna",
     "legal": "© 2026 RantAI. Depok, Jawa Barat, Indonesia.",
-    "contact": "Kontak"
+    "contact": "Kontak",
+    "follow": "Ikuti RantAI",
+    "current": "Situs ini"
   },
   "language": {
     "label": "Bahasa",

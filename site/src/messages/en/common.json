@@ -14,10 +14,10 @@
     "source": "Read the source"
   },
   "footer": {
-    "tagline": "RantAI Lakehouse. One lakehouse with dashboards built in.",
+    "tagline": "One lakehouse with dashboards built in.",
     "columns": {
       "product": "Product",
-      "rantai": "RantAI",
+      "products": "RantAI products",
       "connect": "Connect"
     },
     "sections": {
@@ -30,7 +30,9 @@
     },
     "userGuide": "User guide",
     "legal": "© 2026 RantAI. Depok, West Java, Indonesia.",
-    "contact": "Contact"
+    "contact": "Contact",
+    "follow": "Follow RantAI",
+    "current": "This site"
   },
   "language": {
     "label": "Language",

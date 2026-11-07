@@ -53,8 +53,8 @@ export async function renderOgImage({ headline }: { headline: string }) {
         <span style={{ fontSize: 30, letterSpacing: "0.22em", color: "#44A6FA" }}>RANTAI LAKEHOUSE</span>
         <span style={{ marginTop: 36, fontSize: 88, lineHeight: 1.04, letterSpacing: "-0.02em" }}>{headline}</span>
       </div>
-      {/* eslint-disable-next-line @next/next/no-img-element -- rendered to PNG, not the DOM */}
       {/* O2: the official mark at its own ratio (196 x 167), never a square. */}
+      {/* eslint-disable-next-line @next/next/no-img-element -- rendered to PNG, not the DOM */}
       <img src={src} width={330} height={281} alt="" />
     </div>,
     ogSize,

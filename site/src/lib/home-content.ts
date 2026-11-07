@@ -30,8 +30,6 @@ export const LINKS = {
    */
   guide: `${REPO}/blob/main/docs/core/reference/user-guide.md`,
   rantai: "https://rantai.dev",
-  agents: "https://agents.rantai.dev",
-  llmops: "https://llmops.rantai.dev",
 } as const;
 
 export const CONTACT_EMAIL = "contact@rantai.dev";
@@ -72,11 +70,18 @@ export const FOOTER_SECTIONS = [
   { key: "open", href: "#open" },
 ] as const;
 
-/** The other RantAI sites: brand names, not translated. */
-export const FAMILY_LINKS = [
-  { label: "rantai.dev", href: LINKS.rantai },
-  { label: "RantAI Agents", href: LINKS.agents },
-  { label: "RantAI LLMOps", href: LINKS.llmops },
+/**
+ * WEB-5 D17: the RantAI family, as rantai-page's footer lists it, at the
+ * same URLs. Brand names, not translated. Each product shows its official
+ * mark (rantai-page `public/logo/*Dark.svg`, copied to `public/logo/`),
+ * sized by height at its own ratio; Lakehouse is this site, drawn inline
+ * (`MascotMark`) and linked to its own home page.
+ */
+export const RANTAI_PRODUCTS = [
+  { id: "agents", label: "RantAI Agents", href: "https://agents.rantai.dev/", logo: "/logo/agents-dark.svg", ratio: 130 / 100 },
+  { id: "claw", label: "RantAI Claw", href: "https://claw.rantai.dev/", logo: "/logo/claw-dark.svg", ratio: 106 / 100 },
+  { id: "llmops", label: "RantAI LLMOps", href: "https://llmops.rantai.dev/", logo: "/logo/llmops-dark.svg", ratio: 1 },
+  { id: "lakehouse", label: "RantAI Lakehouse", href: null, logo: null, ratio: 196 / 167 },
 ] as const;
 
 export type DepthId = "bronze" | "silver" | "gold";
