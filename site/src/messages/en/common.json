@@ -74,7 +74,8 @@
     "label": "Language choice",
     "text": "Available in English",
     "view": "View",
-    "dismiss": "Close, stay in Indonesian"
+    "dismiss": "Close, stay in Indonesian",
+    "reopen": "Show the Indonesian language offer"
   },
   "notFound": {
     "meta": "Page not found",

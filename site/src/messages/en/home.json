@@ -1,12 +1,12 @@
 {
   "hero": {
-    "eyebrow": "RANTAI LAKEHOUSE",
+    "eyebrow": "For data teams who run their own stack",
     "headline": "Your data has a home now.",
     "sub": "One lakehouse with dashboards built in. Bring every source in, keep it in open tables, and ask for answers in plain language.",
     "reassurance": [
-      "Free and open source",
-      "AGPL-3.0",
-      "Runs on your servers"
+      "Free & open source (AGPL-3.0)",
+      "Runs on your servers",
+      "Open Iceberg tables"
     ],
     "scrollCue": "Scroll to dive"
   },

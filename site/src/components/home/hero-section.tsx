@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check } from "lucide-react";
+import { cn } from "@/lib/utils";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { MascotLogo } from "@/components/shared/mascot-svg";
@@ -47,7 +47,8 @@ export function HeroSection({
           <HeroCopyMotion>
             {/* WEB-1 review round 1 SHOULD-FIX 4: on a phone the eyebrow sits on the moon's
                 reflection, so it is lighter and carries a dark halo there. */}
-            <Eyebrow className="max-md:text-[#a9d6ff] max-md:[text-shadow:0_0_10px_rgba(2,5,20,0.95),0_1px_2px_rgba(2,5,20,0.9)]">
+            {/* O50 (audit #7): who it is for, not the product name the top bar already shows. */}
+            <Eyebrow className="text-balance max-md:text-[#a9d6ff] max-md:[text-shadow:0_0_10px_rgba(2,5,20,0.95),0_1px_2px_rgba(2,5,20,0.9)]">
               {copy.eyebrow}
             </Eyebrow>
             <DisplayHeading as="h1" size="xl" className="mt-5 short:mt-3 short:text-[3.25rem]">
@@ -61,12 +62,20 @@ export function HeroSection({
                 {cta.talk}
               </CtaLink>
             </div>
-            {/* WEB-5 D21: the doubts answered where people decide, in one quiet line; each part is a claim. */}
-            {/* A check before each part, not a dot between them: a wrapped line never starts with a separator. */}
-            <ul className="mt-6 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-[13px] leading-5 text-[#E8F4FF]/70 short:mt-4 short:text-[12px] md:justify-start">
-              {copy.reassurance.map((part) => (
-                <li key={part} className="flex items-center gap-1.5 whitespace-nowrap">
-                  <Check aria-hidden="true" className="size-3.5 shrink-0 text-[#44A6FA]" />
+            {/* WEB-5 D21 + O50 (audit #7): the doubts answered where people decide, in one quiet line
+                with a dot between the parts; each part is a claim. On a phone the first part takes the
+                first line and the other two share the second, so no part is ever left alone. */}
+            <ul className="mt-6 flex flex-wrap items-center justify-center gap-y-1 text-[13px] leading-5 text-[#E8F4FF]/70 short:mt-4 short:text-[12px] md:justify-start">
+              {copy.reassurance.map((part, i) => (
+                <li
+                  key={part}
+                  className={cn(
+                    "whitespace-nowrap",
+                    i > 0 && "before:mx-2 before:text-[#44A6FA] before:content-['·']",
+                    i === 0 && "max-sm:basis-full max-sm:text-center",
+                    i === 1 && "max-sm:before:hidden",
+                  )}
+                >
                   {part}
                 </li>
               ))}

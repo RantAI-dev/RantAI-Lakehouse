@@ -7,7 +7,7 @@ import { usePathname } from "@/i18n/navigation";
 import { localizedPath } from "@/i18n/paths";
 import { LOCALE_CHOICE_KEY } from "./language-switcher";
 
-export type SuggestionText = { label: string; text: string; view: string; dismiss: string };
+export type SuggestionText = { label: string; text: string; view: string; dismiss: string; reopen: string };
 
 /**
  * Offers the Indonesian page to a visitor whose browser prefers Indonesian,
@@ -26,11 +26,20 @@ export type SuggestionText = { label: string; text: string; view: string; dismis
  * who sees it: the layout passes the `id` locale's `common.suggestion`
  * strings as `text`. Shown once; picking a language or closing it is
  * remembered.
+ *
+ * WEB-5 audit #6: it must not sit over the content. After the hero (or
+ * 8 s, whichever comes first) it folds into a small "ID" pill in the same
+ * corner, which opens it again; while the footer is in view it is hidden.
  */
+const FOLD_MS = 8000;
+
 export default function LanguageSuggestion({ text }: Readonly<{ text: SuggestionText }>) {
   const pathname = usePathname();
   const reduce = useReducedMotion();
-  const [open, setOpen] = React.useState(false);
+  const [state, setState] = React.useState<"off" | "open" | "pill">("off");
+  const [footerInView, setFooterInView] = React.useState(false);
+  const first = React.useRef(true);
+  const held = React.useRef(false);
 
   React.useEffect(() => {
     let chosen: string | null = null;
@@ -44,9 +53,45 @@ export default function LanguageSuggestion({ text }: Readonly<{ text: Suggestion
       .slice(0, 3)
       .some((l) => /^(id|in)\b/i.test(l));
     if (!prefersIndonesian) return;
-    const t = window.setTimeout(() => setOpen(true), 1500);
+    const t = window.setTimeout(() => setState("open"), 1500);
     return () => window.clearTimeout(t);
   }, []);
+
+  // Open: fold into the pill after 8 s, or (the first time) once the hero has scrolled away.
+  React.useEffect(() => {
+    if (state !== "open") return;
+    let timer = 0;
+    const fold = () => {
+      if (held.current) {
+        timer = window.setTimeout(fold, 2000);
+        return;
+      }
+      setState("pill");
+    };
+    timer = window.setTimeout(fold, FOLD_MS);
+    const hero = first.current ? document.getElementById("hero") : null;
+    first.current = false;
+    const io = hero
+      ? new IntersectionObserver(([e]) => {
+          if (!e.isIntersecting) fold();
+        })
+      : null;
+    if (hero) io?.observe(hero);
+    return () => {
+      window.clearTimeout(timer);
+      io?.disconnect();
+    };
+  }, [state]);
+
+  // Hidden while the footer is in view, in either form.
+  React.useEffect(() => {
+    if (state === "off") return;
+    const footer = document.querySelector("footer");
+    if (!footer) return;
+    const io = new IntersectionObserver(([e]) => setFooterInView(e.isIntersecting));
+    io.observe(footer);
+    return () => io.disconnect();
+  }, [state]);
 
   const remember = (choice: string) => {
     try {
@@ -54,19 +99,31 @@ export default function LanguageSuggestion({ text }: Readonly<{ text: Suggestion
     } catch {
       // No storage: it shows again next visit, which is harmless.
     }
-    setOpen(false);
+    setState("off");
+  };
+
+  const motion = {
+    initial: reduce ? false : { opacity: 0, y: 12 },
+    animate: { opacity: 1, y: 0 },
+    exit: { opacity: 0, y: 8 },
+    transition: { duration: 0.3, ease: [0.22, 1, 0.36, 1] as const },
+  };
+  const hold = {
+    onPointerEnter: () => (held.current = true),
+    onPointerLeave: () => (held.current = false),
+    onFocus: () => (held.current = true),
+    onBlur: () => (held.current = false),
   };
 
   return (
-    <AnimatePresence>
-      {open && (
+    <AnimatePresence mode="wait">
+      {state === "open" && !footerInView && (
         <m.aside
+          key="open"
           lang="id"
           aria-label={text.label}
-          initial={reduce ? false : { opacity: 0, y: 16 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: 12 }}
-          transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+          {...motion}
+          {...hold}
           className="fixed inset-x-3 bottom-3 z-[90] flex items-center gap-1.5 rounded-2xl bg-[#020514]/85 py-2 pr-1 pl-3.5 font-sans text-[#E8F4FF] shadow-[0_18px_40px_-16px_rgba(0,0,0,0.8)] ring-1 ring-[#E8F4FF]/15 backdrop-blur-xl sm:right-auto sm:bottom-6 sm:left-6 sm:max-w-[calc(100vw-2rem)] sm:gap-3 sm:py-2.5 sm:pr-2 sm:pl-3.5"
         >
           <Languages className="size-4 shrink-0 text-[#44A6FA] max-sm:hidden" aria-hidden />
@@ -89,6 +146,20 @@ export default function LanguageSuggestion({ text }: Readonly<{ text: Suggestion
             <X className="size-4" />
           </button>
         </m.aside>
+      )}
+      {state === "pill" && !footerInView && (
+        <m.button
+          key="pill"
+          type="button"
+          lang="id"
+          aria-label={text.reopen}
+          onClick={() => setState("open")}
+          {...motion}
+          className="fixed bottom-3 left-3 z-[90] inline-flex h-10 items-center gap-1.5 rounded-full bg-[#020514]/85 px-3.5 font-sans text-[13px] font-semibold tracking-[0.04em] text-[#E8F4FF] shadow-[0_18px_40px_-16px_rgba(0,0,0,0.8)] ring-1 ring-[#E8F4FF]/15 backdrop-blur-xl transition-[background-color,box-shadow] duration-200 ease-out hover:bg-[#050A30]/90 hover:ring-[#8fcbff]/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#44A6FA] sm:bottom-6 sm:left-6"
+        >
+          <Languages className="size-4 text-[#44A6FA]" aria-hidden />
+          ID
+        </m.button>
       )}
     </AnimatePresence>
   );

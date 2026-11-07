@@ -101,9 +101,12 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.dashboards.features.9", backlog: ["BI-26 In Acceptance", "SEC-12 In Acceptance"], note: "embeds" },
   // Governance
   // The hero's reassurance line (D21, 2026-11-07): each part is a claim.
-  { key: "home.hero.reassurance.0", backlog: ["WEB-1 In Acceptance"], note: "free and open source: the repository is public under the AGPL-3.0, with no price (the open-source card; JSON-LD isAccessibleForFree)" },
-  { key: "home.hero.reassurance.1", backlog: ["WEB-1 In Acceptance"], note: "the repository's LICENSE is the GNU AGPL v3" },
-  { key: "home.hero.reassurance.2", backlog: ["WEB-1 In Acceptance", "REL-2 Done"], note: "the 'Your servers or ours' card; the stack runs from docker-compose.yml (REL-2)" },
+  // O50 (audit #7): the three parts are one line now; the licence joined the first part.
+  { key: "home.hero.reassurance.0", backlog: ["WEB-1 In Acceptance"], note: "free and open source: the repository is public under the AGPL-3.0 (its LICENSE is the GNU AGPL v3), with no price (the open-source card; JSON-LD isAccessibleForFree)" },
+  { key: "home.hero.reassurance.1", backlog: ["WEB-1 In Acceptance", "REL-2 Done"], note: "the 'Your servers or ours' card; the stack runs from docker-compose.yml (REL-2)" },
+  { key: "home.hero.reassurance.2", backlog: ["WEB-1 In Acceptance", "BLD-3 Done"], note: "the data is kept in open Iceberg tables (BLD-3: Bronze is Iceberg; WEB-1's open-tables card)" },
+  // O50 (audit #7): the hero's audience line, in place of the product name the top bar already shows.
+  { key: "home.hero.eyebrow", backlog: ["REL-2 Done", "WEB-1 In Acceptance"], note: "who runs their own stack: the Lakehouse is self-hosted from docker-compose.yml on the team's own servers (REL-2; the 'Your servers or ours' card)" },
   // Governance (O16 + O17, 2026-11-07): the one-line lead and the bento's lines.
   { key: "home.governance.sub", backlog: ["WEB-1 In Acceptance"], note: "roles decide who sees what; columns are classified and masked (WEB-1's claim, the table shows it)" },
   { key: "home.governance.bento.lineage.line", backlog: ["DATA-13 Released"], note: "column-level lineage" },

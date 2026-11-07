@@ -74,7 +74,8 @@
     "label": "Pilihan bahasa",
     "text": "Tersedia dalam Bahasa Indonesia",
     "view": "Lihat",
-    "dismiss": "Tutup, tetap dalam bahasa Inggris"
+    "dismiss": "Tutup, tetap dalam bahasa Inggris",
+    "reopen": "Tampilkan pilihan Bahasa Indonesia"
   },
   "notFound": {
     "meta": "Halaman tidak ditemukan",
