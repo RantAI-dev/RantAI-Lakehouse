@@ -212,7 +212,7 @@ export function ContactForm({ text, to }: Readonly<{ text: ContactCopy["form"]; 
         </p>
         <button
           type="submit"
-          className="group inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-[#44A6FA] px-7 text-[15px] font-medium text-[#020514] transition-[transform,background-color,box-shadow] duration-200 ease-out hover:-translate-y-0.5 hover:bg-[#6bbaff] hover:shadow-[0_10px_40px_-8px_rgba(68,166,250,0.7)] active:translate-y-0 active:scale-[0.98] active:duration-100 motion-reduce:transition-none motion-reduce:hover:translate-y-0"
+          className="group inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-[var(--lk-primary)] px-7 text-[15px] font-medium text-white transition-[transform,background-color,box-shadow] duration-200 ease-out hover:-translate-y-0.5 hover:bg-[var(--lk-primary-hover)] active:bg-[var(--lk-primary-press)] hover:shadow-[0_10px_40px_-8px_rgba(68,166,250,0.7)] active:translate-y-0 active:scale-[0.98] active:duration-100 motion-reduce:transition-none motion-reduce:hover:translate-y-0"
         >
           {text.send}
           <ArrowRight className="size-4 transition-transform duration-200 ease-out group-hover:translate-x-0.5 motion-reduce:transition-none" aria-hidden="true" />

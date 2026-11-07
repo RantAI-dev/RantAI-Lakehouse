@@ -108,6 +108,17 @@
 
 /* ---- The landing ------------------------------------------------------ */
 
+/* WEB-5 owner QA O25: the primary (filled) button's colours, one token for
+   every filled call to action. White text needs a deeper lake blue than the
+   accent (#44A6FA is 2.6:1 with white): the fill is 5.12:1 with white, the
+   hover one step lighter at 4.84:1, the press one step deeper at 5.79:1. On
+   :root, because the language offer renders outside `.lk-root`. */
+:root {
+  --lk-primary: #1d6ccf;
+  --lk-primary-hover: #2370d4;
+  --lk-primary-press: #1a63c4;
+}
+
 .lk-root {
   --lk-abyss: #020514;
   --lk-navy: #050a30;

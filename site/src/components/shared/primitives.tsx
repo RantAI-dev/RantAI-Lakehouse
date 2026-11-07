@@ -58,7 +58,7 @@ export function CtaLink({ variant = "solid", size = "md", className, children, r
         // "sm" is only the top bar's button: rantai-page's PillLink there is text-sm.
         size === "md" ? "h-12 px-7 text-[15px]" : "h-9 px-4 text-sm",
         variant === "solid"
-          ? "bg-[#44A6FA] text-[#020514] shadow-[0_0_0_0_rgba(68,166,250,0)] hover:-translate-y-0.5 hover:bg-[#6bbaff] hover:shadow-[0_10px_40px_-8px_rgba(68,166,250,0.7)]"
+          ? "bg-[var(--lk-primary)] text-white shadow-[0_0_0_0_rgba(68,166,250,0)] hover:-translate-y-0.5 hover:bg-[var(--lk-primary-hover)] active:bg-[var(--lk-primary-press)] hover:shadow-[0_10px_40px_-8px_rgba(68,166,250,0.7)]"
           : "border border-[#E8F4FF]/35 text-[#E8F4FF] hover:-translate-y-0.5 hover:border-[#E8F4FF]/70 hover:bg-[#E8F4FF]/10",
         className,
       )}

@@ -134,7 +134,7 @@ export function FooterPrompt({ text, to }: Readonly<{ text: FooterPromptText; to
               className={cn(
                 "inline-flex h-10 shrink-0 items-center gap-2 rounded-full pr-1.5 pl-4 text-[14px] font-medium transition-[background-color,color,transform] duration-200 ease-out active:scale-[0.97] motion-reduce:transition-none",
                 value.trim()
-                  ? "bg-[#44A6FA] text-[#020514] hover:bg-[#6bbaff]"
+                  ? "bg-[var(--lk-primary)] text-white hover:bg-[var(--lk-primary-hover)] active:bg-[var(--lk-primary-press)]"
                   : "bg-[#E8F4FF]/12 text-[#E8F4FF] hover:bg-[#E8F4FF]/20",
               )}
             >

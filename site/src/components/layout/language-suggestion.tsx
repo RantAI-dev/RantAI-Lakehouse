@@ -76,7 +76,7 @@ export default function LanguageSuggestion({ text }: Readonly<{ text: Suggestion
             href={localizedPath("id", pathname)}
             hrefLang="id"
             onClick={() => remember("id")}
-            className="inline-flex h-10 shrink-0 items-center rounded-full bg-[#44A6FA] px-3.5 text-[13px] font-medium text-[#020514] transition-[background-color,transform] duration-200 ease-out hover:bg-[#6bbaff] active:scale-[0.97] focus-visible:outline-2 focus-visible:outline-offset-3 focus-visible:outline-[#44A6FA] sm:h-auto sm:px-3.5 sm:py-1.5"
+            className="inline-flex h-10 shrink-0 items-center rounded-full bg-[var(--lk-primary)] px-3.5 text-[13px] font-medium text-white transition-[background-color,transform] duration-200 ease-out hover:bg-[var(--lk-primary-hover)] active:bg-[var(--lk-primary-press)] active:scale-[0.97] focus-visible:outline-2 focus-visible:outline-offset-3 focus-visible:outline-[#44A6FA] sm:h-auto sm:px-3.5 sm:py-1.5"
           >
             {text.view}
           </a>
