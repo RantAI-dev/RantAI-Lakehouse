@@ -32,7 +32,13 @@ const FEATURE_ICONS = [BarChart3, Workflow, SquareTerminal] as const;
 
 export function AssistantSection({ copy }: { copy: AssistantCopy }) {
   return (
-    <section id="assistant" className="lk-fallback-bg relative overflow-hidden bg-[#050A30]">
+    // WEB-5 audit #19: with JavaScript and motion, it comes up 30 vh under the depths' leaving stage
+    // (its own top is padding, and the stage's card is gone above by then), so the hand-over is not
+    // a screen of empty water. Without JavaScript its background is opaque, so it keeps its place.
+    <section
+      id="assistant"
+      className="lk-fallback-bg relative overflow-hidden bg-[#050A30] motion-safe:[html[data-scene]_&]:-mt-[30vh]"
+    >
       <Container className="relative z-10 grid min-h-[100svh] items-center gap-10 py-24 md:grid-cols-[1fr_1.1fr] md:gap-14 md:py-28">
         <div>
           <DisplayHeading size="lg" className="max-md:text-[clamp(2.6rem,12vw,3.4rem)]">

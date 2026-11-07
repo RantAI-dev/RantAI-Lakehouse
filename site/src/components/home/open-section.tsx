@@ -65,7 +65,8 @@ export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: Common
     },
   ];
   return (
-    <section id="open" className="lk-fallback-bg relative scroll-mt-16 bg-[#050A30] py-28 md:py-36">
+    // WEB-5 audit #19: less padding above and below (the gaps to governance and Get started).
+    <section id="open" className="lk-fallback-bg relative scroll-mt-16 bg-[#050A30] pt-16 pb-20 md:pt-20 md:pb-24">
       <noscript dangerouslySetInnerHTML={{ __html: `<style>${NO_SCRIPT_CSS}</style>` }} />
       <Container>
         <DisplayHeading>

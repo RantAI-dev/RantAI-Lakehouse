@@ -35,7 +35,10 @@ export function DepthsSection({ copy }: { copy: HomeCopy["depths"] }) {
     <ProgressSection
       range={["start start", "end end"]}
       id="depths"
-      className="lk-depth-pin relative h-[300vh] motion-reduce:h-auto"
+      // WEB-5 audit #19: with JavaScript and motion, the pinned stage starts a quarter screen before the
+      // sources' stage has left (their content never meets: the sources' copy is above its middle by
+      // then), so the hand-over is not a screen of empty water.
+      className="lk-depth-pin relative h-[300vh] motion-reduce:h-auto motion-safe:[html[data-scene]_&]:-mt-[25vh]"
     >
       <h2 className="sr-only">{copy.eyebrow}</h2>
       <noscript dangerouslySetInnerHTML={{ __html: `<style>${NO_SCRIPT_CSS}</style>` }} />
