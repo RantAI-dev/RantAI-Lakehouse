@@ -74,7 +74,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
   return (
     <div
       ref={tableRef}
-      className="overflow-hidden rounded-3xl border border-[#E8F4FF]/10 bg-[#020514]/70"
+      className="overflow-hidden rounded-3xl border border-[#E8F4FF]/10 bg-[#070F3A]"
     >
       {/* O32: no visible "Illustration" label (the owner's decision; the data is plainly fictional and the
           caption for screen readers stays). The policy chip leads; the switch sits at the right. */}

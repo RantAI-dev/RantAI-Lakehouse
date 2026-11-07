@@ -26,7 +26,7 @@ type Bento = HomeCopy["governance"]["bento"];
  * and space. No lift, no tilt.
  */
 const tile =
-  "lk-mb-tile relative flex flex-col overflow-hidden rounded-3xl border border-[#E8F4FF]/10 bg-[#050A30]/80 p-5 outline-none transition-[border-color] duration-200 ease-out focus-visible:border-[#44A6FA]/70 md:p-6";
+  "lk-mb-tile relative flex flex-col overflow-hidden rounded-3xl border border-[#E8F4FF]/10 bg-[#070F3A] p-5 outline-none transition-[border-color] duration-200 ease-out focus-visible:border-[#44A6FA]/70 md:p-6";
 
 function Words({ title, line }: { title: string; line: string }) {
   return (

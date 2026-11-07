@@ -134,9 +134,8 @@ function DirectLink({
 function Waterline() {
   return (
     <div aria-hidden="true" className="pointer-events-none relative mt-10 h-28 md:mt-16 md:h-36">
-      <div className="absolute inset-x-0 top-1/2 h-px bg-gradient-to-r from-transparent via-[#44A6FA]/60 to-transparent" />
-      <div className="absolute inset-x-0 top-1/2 h-24 bg-gradient-to-b from-[#44A6FA]/[0.08] to-transparent" />
-      <div className="absolute top-1/2 left-1/2 h-16 w-[min(60vw,520px)] -translate-x-1/2 -translate-y-1/2 rounded-[50%] bg-[radial-gradient(ellipse,rgba(68,166,250,0.18)_0%,transparent_70%)]" />
+      {/* O39: a solid hairline, with no glow on it. */}
+      <div className="absolute inset-x-0 top-1/2 h-px bg-[#44A6FA]/40" />
       <Container className="relative h-full">
         <MascotLogo className="lk-bob absolute right-4 bottom-1/2 h-auto w-14 translate-y-[3px] drop-shadow-[0_0_24px_rgba(68,166,250,0.35)] md:right-6 md:w-20" />
       </Container>
@@ -145,16 +144,15 @@ function Waterline() {
 }
 
 /**
- * The page's water: lake blue at the top, darkening down into the abyss
- * the FAQ and the footer sit on (O33: one descent, as on the home page),
- * with a moon's glow at the upper right. Decorative and static.
+ * The page's water: one solid dark colour, the abyss the FAQ and the footer
+ * sit on (O39: backgrounds are solid; no gradient, no moon glow).
+ * Decorative and static.
  */
 function SurfaceBackdrop() {
   return (
     <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[70rem] overflow-hidden">
-      {/* O33: darker down the page, like the home page's one descent, ending on the page's abyss. */}
-      <div className="absolute inset-0 bg-[linear-gradient(180deg,#0a1f55_0%,#020e42_40%,#020514_100%)]" />
-      <div className="absolute top-[3rem] right-[8%] size-[min(46vmin,28rem)] rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.16)_0%,rgba(68,166,250,0.08)_38%,transparent_70%)]" />
+      {/* O39: one solid dark colour, with no gradient and no moon glow. */}
+      <div className="absolute inset-0 bg-[#020514]" />
     </div>
   );
 }

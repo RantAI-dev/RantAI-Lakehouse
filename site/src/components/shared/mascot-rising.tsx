@@ -43,12 +43,10 @@ const SNOW = Array.from({ length: 16 }, (_, i) => ({
 
 const SCENE_CSS = `
 @media (prefers-reduced-motion: no-preference) {
-  .lk-f-glow { animation: lk-f-breathe 6s ease-in-out infinite; }
   .lk-f-snow { animation: lk-f-snow linear infinite; }
   [data-arrived="on"] .lk-f-hello { animation: lk-f-hello 1.4s cubic-bezier(0.3, 0.7, 0.4, 1) both; }
 }
 .lk-f-hello { opacity: 0; }
-@keyframes lk-f-breathe { 0%, 100% { opacity: 0.85; } 50% { opacity: 1; } }
 @keyframes lk-f-snow {
   0% { transform: translate3d(0, -20px, 0); opacity: 0; }
   12% { opacity: 0.55; }
@@ -63,12 +61,7 @@ export function MascotRising({ className }: { className?: string }) {
     <div className={className}>
       <style dangerouslySetInnerHTML={{ __html: SCENE_CSS }} />
       <div className="relative aspect-[760/560] w-full">
-        {/* A faint shaft of light from far above, narrowing as it falls. */}
-        <div
-          aria-hidden="true"
-          // Faded on all four sides (a vertical fade, masked across), so it has no edge.
-          className="pointer-events-none absolute -top-[40%] left-1/2 h-[120%] w-[56%] -translate-x-1/2 bg-[linear-gradient(180deg,transparent_0%,rgba(68,166,250,0.09)_35%,rgba(68,166,250,0.04)_70%,transparent_100%)] [mask-image:linear-gradient(90deg,transparent_0%,#000_50%,transparent_100%)]"
-        />
+        {/* O39: no shaft of light and no standing halo; the water behind the whale is solid. */}
         {/* Marine snow. */}
         <div aria-hidden="true" className="pointer-events-none absolute inset-0">
           {SNOW.map((s, i) => (
@@ -81,11 +74,6 @@ export function MascotRising({ className }: { className?: string }) {
         </div>
 
         <SwimLayer className="absolute inset-0">
-          {/* The whale's own soft light: bioluminescence around it, breathing. */}
-          <div
-            aria-hidden="true"
-            className="lk-f-glow pointer-events-none absolute top-[6%] left-1/2 aspect-square w-[78%] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.2)_0%,rgba(68,166,250,0.08)_38%,transparent_68%)]"
-          />
           {/* A brief brighter ring as it arrives: its hello. */}
           <div
             aria-hidden="true"

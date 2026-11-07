@@ -33,7 +33,7 @@ export default async function NotFound() {
       <div className="lk-root relative isolate flex min-h-[100svh] flex-col items-center justify-center overflow-hidden px-4 py-20 text-center">
         <div
           aria-hidden="true"
-          className="absolute inset-0 -z-10 bg-[linear-gradient(180deg,#0a1f55_0%,#020e42_40%,#020514_100%)]"
+          className="absolute inset-0 -z-10 bg-[#020514]"
         />
         <main className="flex max-w-[36rem] flex-col items-center">
           <MascotLogo className="lk-bob h-24 w-auto drop-shadow-[0_0_40px_rgba(68,166,250,0.3)] md:h-28" />

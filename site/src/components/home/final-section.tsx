@@ -8,8 +8,8 @@ import { FinalMascotStage } from "./final-mascot";
 /**
  * S8 — the last call, at the bottom of the dive (WEB-5 O33: one descent, so
  * no night sky and no moon here any more). The whale swims down to greet
- * the visitor and settles below the headline, in its own soft light
- * (O24, in SVG: lighter than a second canvas). Its eyes follow a mouse a
+ * the visitor and settles below the headline (O24, in SVG: lighter than a
+ * second canvas; O39: on solid water, with no halo). Its eyes follow a mouse a
  * little; on touch screens, where there is no pointer to follow, they
  * glance around now and then. With reduced motion it rests.
  *
@@ -43,7 +43,7 @@ export function FinalSection({ copy }: { copy: HomeCopy["final"] }) {
       // O7 + O33: without the buttons, a full-screen section left a phone a screen of empty
       // water between the headline and the whale (the stage sits at the bottom, `mt-auto`).
       // On phones the section is as tall as its content, so the whale follows the headline.
-      className="lk-fallback-bg lk-grain relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[linear-gradient(180deg,#020720_0%,#020514_100%)] pt-28 max-md:min-h-0 max-md:gap-8 max-md:pb-6 md:pt-32"
+      className="lk-fallback-bg relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[#020514] pt-28 max-md:min-h-0 max-md:gap-8 max-md:pb-6 md:pt-32"
     >
       <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10">
         {STARS.map((s, i) => (

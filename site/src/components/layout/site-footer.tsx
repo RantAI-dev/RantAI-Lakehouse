@@ -137,7 +137,7 @@ export function SiteFooter({
           instead of repeating it. */}
       <section
         aria-labelledby="footer-cta-heading"
-        className="relative isolate overflow-hidden rounded-[28px] bg-[linear-gradient(180deg,#050A30_0%,#0A1F55_62%,#0b2a66_100%)] ring-1 ring-[#E8F4FF]/10"
+        className="relative isolate overflow-hidden rounded-[28px] bg-[#050A30] ring-1 ring-[#E8F4FF]/10"
       >
         <FooterWater />
         {/* O14: Lakehouse's own call to action. Little text: an eyebrow and a headline, then the picker. */}
@@ -263,16 +263,15 @@ export function SiteFooter({
 
 /**
  * The card's water, the lake's version of rantai-page's ASCII wave: a
- * waterline across the lower third with the moon's glow on it and two rings
- * spreading slowly from where the creature would surface. Decorative; the
+ * waterline across the lower third and two rings spreading slowly from
+ * where the creature would surface (O39: on a solid card, with no glow). Decorative; the
  * rings stop under reduced motion (`.lk-ring`).
  */
 function FooterWater() {
   return (
     <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10">
-      <div className="absolute top-[8%] left-1/2 size-[50vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.12)_0%,rgba(68,166,250,0.06)_40%,transparent_70%)]" />
-      <div className="absolute inset-x-0 bottom-[22%] h-px bg-gradient-to-r from-transparent via-[#44A6FA]/50 to-transparent" />
-      <div className="absolute inset-x-0 bottom-0 h-[22%] bg-[linear-gradient(180deg,rgba(68,166,250,0.10),transparent)]" />
+      {/* O39: the card is solid; the waterline is a solid hairline, with no moon glow and no glow under it. */}
+      <div className="absolute inset-x-0 bottom-[22%] h-px bg-[#44A6FA]/35" />
       <div className="absolute bottom-[22%] left-1/2 w-[min(70%,760px)] -translate-x-1/2 translate-y-1/2">
         <span className="lk-ring absolute top-0 left-0 block aspect-[6/1] w-full -translate-y-1/2 rounded-[50%] border border-[#44A6FA]/35" />
         <span
