@@ -25,7 +25,8 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
   return (
     <section id="get-started" aria-labelledby="get-started-heading" className="lk-fallback-bg relative scroll-mt-16 bg-[#050A30] py-24 md:py-32">
       <Container className="grid gap-12 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)] md:gap-16">
-        <div className="md:sticky md:top-28 md:self-start">
+        {/* O9: centred in the screen while the steps pass (app/globals.css). */}
+        <div className="lk-sticky-center-md">
           <Eyebrow>{copy.eyebrow}</Eyebrow>
           <DisplayHeading id="get-started-heading" size="md" className="mt-5">
             {copy.headline}

@@ -497,6 +497,41 @@ html:not([data-scene]) .lk-gauge {
   }
 }
 
+/* WEB-5 owner QA O9: a side column that stays with a longer list beside it
+   sits at the vertical centre of the screen below the top bar, not pinned
+   under it. The column is a wrapper as tall as the visible area (or as its
+   grid row, if that is shorter) with its content centred in it, so:
+   - beside a short list it is simply centred against the list;
+   - beside a long one it rises into the centre as the section arrives,
+     stays there, and leaves with the last item, inside its own section;
+   - when its content is taller than the screen, `safe` falls back to the
+     top instead of cutting it.
+   The percentage height resolves against the grid area. Applied from the
+   breakpoint where the layout has two columns (`lk-sticky-center-md` /
+   `-lg`); on phones nothing is sticky. */
+@media (min-width: 48rem) {
+  .lk-sticky-center-md {
+    position: sticky;
+    top: 4rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: safe center;
+    align-self: start;
+    height: min(100%, calc(100svh - 4rem));
+  }
+}
+@media (min-width: 64rem) {
+  .lk-sticky-center-lg {
+    position: sticky;
+    top: 4rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: safe center;
+    align-self: start;
+    height: min(100%, calc(100svh - 4rem));
+  }
+}
+
 /* ---- Reduced motion --------------------------------------------------- */
 
 @media (prefers-reduced-motion: reduce) {

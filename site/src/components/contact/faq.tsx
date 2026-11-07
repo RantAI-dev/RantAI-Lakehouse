@@ -31,7 +31,8 @@ export function Faq({
   return (
     <section id="faq" aria-labelledby="faq-heading" className="relative scroll-mt-16 py-20 md:py-28">
       <Container className="grid grid-cols-[minmax(0,1fr)] gap-10 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:gap-16">
-        <div className="lg:sticky lg:top-28 lg:self-start">
+        {/* O9: centred against a short list, centred in the screen beside a long one (app/globals.css). */}
+        <div className="lk-sticky-center-lg">
           <Eyebrow>{copy.eyebrow}</Eyebrow>
           <DisplayHeading id="faq-heading" size="md" className="mt-5 whitespace-pre-line">
             {copy.title}
