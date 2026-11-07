@@ -1,0 +1,220 @@
+/* Lab 1, "Waterline" (a WEB-5 hero exploration; delete with its folder). */
+.l1 {
+  --l1-line: 45%;
+}
+@media (max-width: 47.99rem) {
+  .l1 {
+    --l1-line: 40%;
+  }
+}
+.l1-star {
+  opacity: 0.35;
+  animation: l1-twinkle 6s ease-in-out infinite;
+}
+@keyframes l1-twinkle {
+  50% {
+    opacity: 0.8;
+  }
+}
+.l1-moon {
+  right: 9%;
+  top: 22%;
+  width: clamp(48px, 6vw, 84px);
+  aspect-ratio: 1;
+  box-shadow: inset -10px -6px 0 rgba(170, 196, 230, 0.35);
+}
+@media (max-width: 47.99rem) {
+  .l1-moon {
+    top: 30%;
+    right: 8%;
+  }
+}
+.l1-reflection {
+  right: calc(9% - 2vw);
+  top: calc(var(--l1-line) + 18px);
+  width: calc(clamp(48px, 6vw, 84px) + 4vw);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+}
+.l1-reflection span {
+  height: 2px;
+  border-radius: 2px;
+  background: rgba(232, 244, 255, 0.35);
+  animation: l1-shimmer 3.2s ease-in-out infinite;
+}
+@keyframes l1-shimmer {
+  50% {
+    transform: translateX(6px) scaleX(0.8);
+    opacity: 0.5;
+  }
+}
+.l1-whale {
+  width: clamp(150px, 17vw, 250px);
+  aspect-ratio: 600 / 480;
+  transform-origin: 50% 66.25%;
+  will-change: transform;
+}
+.l1-whale-top,
+.l1-whale-bottom {
+  position: absolute;
+  inset: 0;
+}
+/* Above the water: the dome and the eyes, as drawn. */
+.l1-whale-top {
+  clip-path: inset(0 0 33.75% 0);
+}
+/* Below it: the belly and the flippers, bent, dimmer and a touch wider. */
+.l1-whale-bottom {
+  clip-path: inset(66.25% 0 0 0);
+  filter: url(#l1-refract);
+  opacity: 0.85;
+  transform: translateX(4px) scale(1.04, 1.06);
+  transform-origin: 50% 66.25%;
+}
+
+/* The deep: everything below the line, sized in its own container units. */
+.l1-deep {
+  top: var(--l1-line);
+  z-index: 12;
+  container-type: size;
+}
+.l1-reflection {
+  z-index: 12;
+}
+.l1-stratum {
+  height: 22cqh;
+  border-top: 1px solid color-mix(in srgb, var(--l1-c) 32%, transparent);
+  background: color-mix(in srgb, var(--l1-c) 4%, transparent);
+}
+.l1-stratum-label {
+  position: absolute;
+  left: max(1.25rem, calc((100% - 80rem) / 2 + 2rem));
+  top: 10px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: color-mix(in srgb, var(--l1-c) 75%, #e8f4ff);
+  opacity: 0.8;
+}
+.l1-stratum-label b {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+}
+@media (max-width: 47.99rem) {
+  .l1-stratum {
+    background: none;
+  }
+  .l1-drop:nth-of-type(n + 6) {
+    display: none;
+  }
+}
+.l1-drop {
+  position: absolute;
+  left: calc(var(--x) * 1%);
+  top: 0;
+  width: 34px;
+  height: 34px;
+  margin-left: -17px;
+  display: grid;
+  place-items: center;
+  border-radius: 9999px;
+  color: #cfe6ff;
+  background: rgba(143, 203, 255, 0.08);
+  box-shadow:
+    inset 0 0 0 1px rgba(143, 203, 255, 0.4),
+    0 0 16px rgba(68, 166, 250, 0.22);
+  opacity: 0;
+  animation: l1-sink 10s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+  animation-delay: var(--d);
+}
+/* Down through the strata, slowing in each, drifting to the answer. */
+@keyframes l1-sink {
+  0% {
+    opacity: 0;
+    transform: translate(0, -8px) scale(0.5);
+  }
+  8% {
+    opacity: 1;
+    transform: translate(0, 6cqh) scale(1);
+  }
+  30% {
+    transform: translate(calc((50 - var(--x)) * 0.25cqw), 28cqh) scale(1);
+    box-shadow:
+      inset 0 0 0 1px rgba(185, 129, 87, 0.8),
+      0 0 16px rgba(185, 129, 87, 0.3);
+    color: #e8c2a2;
+  }
+  52% {
+    transform: translate(calc((50 - var(--x)) * 0.55cqw), 50cqh) scale(0.9);
+    box-shadow:
+      inset 0 0 0 1px rgba(170, 182, 194, 0.85),
+      0 0 16px rgba(170, 182, 194, 0.3);
+    color: #e3ebf2;
+  }
+  74% {
+    transform: translate(calc((50 - var(--x)) * 0.85cqw), 72cqh) scale(0.8);
+    box-shadow:
+      inset 0 0 0 1px rgba(217, 180, 90, 0.9),
+      0 0 18px rgba(217, 180, 90, 0.35);
+    color: #f3dc9e;
+  }
+  90% {
+    opacity: 1;
+    transform: translate(calc((50 - var(--x)) * 1cqw), 88cqh) scale(0.45);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(calc((50 - var(--x)) * 1cqw), 90cqh) scale(0.2);
+  }
+}
+.l1-answer {
+  position: absolute;
+  left: 50%;
+  top: 90cqh;
+  transform: translate(-50%, -50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px 6px 8px;
+  border-radius: 9999px;
+  font-size: 12px;
+  color: #f3e4b8;
+  background: #0b1236;
+  box-shadow:
+    inset 0 0 0 1px rgba(217, 180, 90, 0.45),
+    0 0 28px rgba(217, 180, 90, 0.18);
+  animation: l1-answer 1.25s ease-in-out infinite;
+}
+.l1-answer-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+}
+.l1-answer-bars i {
+  width: 3px;
+  border-radius: 1px;
+  background: #d9b45a;
+}
+@keyframes l1-answer {
+  50% {
+    box-shadow:
+      inset 0 0 0 1px rgba(217, 180, 90, 0.7),
+      0 0 36px rgba(217, 180, 90, 0.28);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .l1-star,
+  .l1-reflection span,
+  .l1-answer {
+    animation: none;
+  }
+  /* The droplets rest, one per stratum and two at the answer. */
+  .l1-drop {
+    animation: none;
+    opacity: 1;
+    transform: translate(0, var(--r));
+  }
+}

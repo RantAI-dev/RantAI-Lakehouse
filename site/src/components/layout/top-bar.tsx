@@ -33,7 +33,8 @@ import { MascotMark } from "@/components/shared/mascot-svg";
  * scroll is locked while it is open, and it slides in and out with CSS
  * (`.lk-sheet`, app/globals.css), still under reduced motion.
  */
-export type TopBarPage = "home" | "contact";
+/** `lab`: the WEB-5 hero explorations (`app/(en)/lab/`); links lead to the home page, nothing is current. */
+export type TopBarPage = "home" | "contact" | "lab";
 
 const pill =
   "inline-block rounded-full px-3.5 py-2 text-[14px] text-[#E8F4FF]/70 transition-[background-color,color,transform] duration-200 ease-out hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] active:scale-[0.97] active:bg-[#E8F4FF]/[0.14] aria-[current]:bg-[#E8F4FF]/[0.12] aria-[current]:text-[#E8F4FF] motion-reduce:transition-none";
