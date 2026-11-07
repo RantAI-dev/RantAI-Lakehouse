@@ -2179,3 +2179,157 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-ast:not([data-s~="2"]) .lk-ast-empty svg {
   animation: lk-bob 4s ease-in-out infinite;
 }
+
+/* ---- WEB-5 O23: "Get started" comes alive (components/home/get-started-*.tsx) ----
+   The line fills and the numbers light as the steps pass the middle of the
+   screen, on CSS scroll timelines; without them the line is full and the
+   numbers lit, which is also the reduced-motion picture. The terminals
+   type through `data-term` (idle → typing → done), set by the deferred
+   typing script; the server's `data-term=""` is the finished terminal. */
+.lk-gs-num {
+  color: #8fcbff;
+  box-shadow:
+    0 0 0 1px rgba(68, 166, 250, 0.6),
+    0 0 14px 2px rgba(68, 166, 250, 0.35);
+}
+.lk-gs-fill {
+  transform-origin: top;
+}
+@supports (animation-timeline: view()) {
+  .lk-gs-steps {
+    view-timeline: --lk-gs block;
+  }
+  .lk-gs-fill {
+    animation: lk-gs-fill linear both;
+    animation-timeline: --lk-gs;
+    animation-range: cover 50vh cover calc(100% - 50vh);
+  }
+  .lk-gs-num {
+    animation: lk-gs-lit linear both;
+    animation-timeline: view();
+    animation-range: cover calc(50vh - 48px) cover 50vh;
+  }
+}
+@keyframes lk-gs-fill {
+  from {
+    transform: scaleY(0);
+  }
+}
+@keyframes lk-gs-lit {
+  from {
+    color: rgba(232, 244, 255, 0.5);
+    box-shadow:
+      0 0 0 1px rgba(232, 244, 255, 0.2),
+      0 0 0 0 rgba(68, 166, 250, 0);
+    scale: 0.88;
+  }
+}
+
+/* Typing: the real command is transparent until its line has typed; the
+   overlay shows the typed part, with a block caret. */
+.lk-gs-term:is([data-term="idle"], [data-term="typing"]) [data-cmd]:not([data-typed]) .lk-gs-real {
+  color: transparent;
+}
+.lk-gs-typed {
+  color: #e8f4ff;
+}
+.lk-gs-rest {
+  color: transparent;
+}
+[data-cmd][data-typing] .lk-gs-typed::after {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 1.05em;
+  margin-left: 1px;
+  margin-right: -0.55em;
+  vertical-align: -0.18em;
+  background: #8fcbff;
+  animation: lk-twinkle 0.9s steps(2, jump-none) infinite;
+}
+.lk-gs-term:is([data-term="idle"], [data-term="typing"]) :is(.lk-gs-line, .lk-gs-ready) {
+  opacity: 0;
+}
+.lk-gs-term {
+  transition: box-shadow 0.3s ease;
+}
+.lk-gs-term[data-term="typing"] {
+  box-shadow:
+    0 0 0 1px rgba(68, 166, 250, 0.4),
+    0 24px 60px -30px rgba(2, 5, 20, 0.9);
+}
+.lk-gs-term[data-term="done"] .lk-gs-line {
+  animation: lk-fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+.lk-gs-term[data-term="done"] .lk-gs-line:nth-child(2) {
+  animation-delay: 0.35s;
+}
+.lk-gs-term[data-term="done"] .lk-gs-ready {
+  animation: lk-fade-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) 0.8s backwards;
+}
+.lk-gs-ready-dot {
+  animation: lk-gs-ready 2.2s ease-out infinite;
+}
+@keyframes lk-gs-ready {
+  0% {
+    box-shadow: 0 0 0 0 rgba(123, 224, 176, 0.55);
+  }
+  100% {
+    box-shadow: 0 0 0 7px rgba(123, 224, 176, 0);
+  }
+}
+
+/* The copy button: the icon morphs between copy, check and select, and a
+   ring answers a successful copy. */
+.lk-copy {
+  position: relative;
+}
+.lk-copy-icon {
+  position: relative;
+  width: 14px;
+  height: 14px;
+}
+.lk-copy-icon > svg {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transform: scale(0.5) rotate(-30deg);
+  transition:
+    opacity 0.18s ease,
+    transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.lk-copy[data-state="idle"] .lk-copy-idle,
+.lk-copy[data-state="copied"] .lk-copy-copied,
+.lk-copy[data-state="failed"] .lk-copy-failed {
+  opacity: 1;
+  transform: none;
+}
+.lk-copy[data-state="copied"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  animation: lk-copy-ring 0.6s ease-out;
+}
+@keyframes lk-copy-ring {
+  from {
+    box-shadow: 0 0 0 0 rgba(123, 224, 176, 0.5);
+  }
+  to {
+    box-shadow: 0 0 0 8px rgba(123, 224, 176, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lk-gs-fill,
+  .lk-gs-num,
+  .lk-gs-ready-dot,
+  .lk-gs-term *,
+  .lk-copy,
+  .lk-copy::after,
+  .lk-copy-icon > svg {
+    animation: none !important;
+    transition: none !important;
+  }
+}

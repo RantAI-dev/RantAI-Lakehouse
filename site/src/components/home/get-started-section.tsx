@@ -5,6 +5,8 @@ import { GET_STARTED_COMMANDS, LINKS } from "@/lib/home-content";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { CopyButton } from "@/components/shared/copy-button";
 import { Reveal } from "@/components/shared/reveal";
+import { GetStartedPlay } from "./get-started-play";
+import { GET_STARTED_OUTPUT } from "./get-started-output";
 
 /**
  * S7b — "Get started" (WEB-5 D20): the install path on the page itself,
@@ -19,6 +21,17 @@ import { Reveal } from "@/components/shared/reveal";
  * numbered list. A server section; only the copy buttons are client code.
  * The commands wrap on a phone (no sideways scroll), and the `$` prompt is
  * not selectable, so selecting a line by hand copies only the command.
+ *
+ * WEB-5 O23 (owner: "udah bagus cuma kek kurang animasi"): the same layout,
+ * alive. The line fills as the steps pass the middle of the screen and
+ * each step's number lights there (CSS scroll timelines; where a browser
+ * has none, the line is full and the numbers lit). Each terminal types its
+ * commands when it comes into view, then shows what they print, dimmed,
+ * with a green check on the line that says it worked
+ * (`get-started-output.ts`), and the last one ends ready on
+ * localhost:3000. The server renders every terminal finished, so the
+ * section is complete without JavaScript and under reduced motion; the
+ * typing is a deferred chunk (`get-started-play.tsx`).
  */
 export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarted"] }>) {
   const copyText = { copy: copy.copy, copied: copy.copied, failed: copy.copyFailed };
@@ -38,19 +51,21 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
           </CtaLink>
         </div>
 
-        <ol className="relative">
-          {/* The line the steps hang from, fading out at the bottom toward the surface. */}
-          <span aria-hidden="true" className="absolute top-3 bottom-8 left-[11px] w-px bg-gradient-to-b from-[#44A6FA]/60 via-[#44A6FA]/25 to-transparent" />
+        <GetStartedPlay>
+        <ol className="lk-gs-steps relative">
+          {/* The line the steps hang from, fading out at the bottom toward the surface: a dim track, and the fill that follows the scroll. */}
+          <span aria-hidden="true" className="absolute top-3 bottom-8 left-[11px] w-px bg-gradient-to-b from-[#44A6FA]/25 via-[#44A6FA]/12 to-transparent" />
+          <span aria-hidden="true" className="lk-gs-fill absolute top-3 bottom-8 left-[11px] w-px bg-gradient-to-b from-[#8fcbff] via-[#44A6FA]/70 to-transparent" />
           {copy.steps.map((step, i) => (
             <Reveal as="li" key={step.title} delay={i * 0.08} y={20} className="relative pb-10 pl-12 last:pb-0">
               <span
                 aria-hidden="true"
-                className="absolute top-1 left-0 grid size-6 place-items-center rounded-full bg-[#020514] text-[12px] font-medium text-[#8fcbff] tabular-nums ring-1 ring-[#44A6FA]/60 shadow-[0_0_14px_2px_rgba(68,166,250,0.35)]"
+                className="lk-gs-num absolute top-1 left-0 grid size-6 place-items-center rounded-full bg-[#020514] text-[12px] font-medium tabular-nums"
               >
                 {i + 1}
               </span>
               <h3 className="text-[19px] leading-7 font-medium text-[#E8F4FF]">{step.title}</h3>
-              <div className="mt-3 overflow-hidden rounded-2xl bg-[#020514]/80 ring-1 ring-[#E8F4FF]/12 shadow-[0_24px_60px_-30px_rgba(2,5,20,0.9)]">
+              <div data-term="" className="lk-gs-term mt-3 overflow-hidden rounded-2xl bg-[#020514]/80 ring-1 ring-[#E8F4FF]/12 shadow-[0_24px_60px_-30px_rgba(2,5,20,0.9)]">
                 <p className="border-b border-[#E8F4FF]/8 px-4 py-2 text-[11px] leading-4 font-medium tracking-[0.14em] text-[#E8F4FF]/50 uppercase">
                   {copy.terminal}
                 </p>
@@ -58,18 +73,39 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                   {GET_STARTED_COMMANDS[i].map((cmd, j) => {
                     const id = `get-started-${i}-${j}`;
                     return (
-                      <li key={cmd} className="flex items-start gap-3 px-4 py-3">
+                      <li key={cmd} data-cmd className="flex items-start gap-3 px-4 py-3">
                         <code className="min-w-0 flex-1 pt-1.5 text-[13px] leading-5 break-all whitespace-pre-wrap text-[#E8F4FF] sm:text-[14px]">
                           <span aria-hidden="true" className="mr-2 text-[#44A6FA] select-none">
                             $
                           </span>
-                          <span id={id}>{cmd}</span>
+                          {/* While it "types", the command keeps all its text (the rest transparent), so it wraps as it will and Copy copies all of it. */}
+                          <span id={id} data-real className="lk-gs-real">
+                            {cmd}
+                          </span>
                         </code>
                         <CopyButton targetId={id} text={copyText} />
                       </li>
                     );
                   })}
                 </ul>
+                {/* What the commands print, dimmed as output. */}
+                <div aria-hidden="true" className="lk-gs-out border-t border-[#E8F4FF]/6 px-4 py-3">
+                  {GET_STARTED_OUTPUT[i].map((line) => (
+                    <p
+                      key={line.text}
+                      className="lk-gs-line flex gap-2 font-mono text-[12px] leading-5 whitespace-pre-wrap text-[#E8F4FF]/55 [overflow-wrap:anywhere]"
+                    >
+                      <span className={line.ok ? "text-[#7be0b0]" : "text-transparent"}>✓</span>
+                      <span className="min-w-0">{line.text}</span>
+                    </p>
+                  ))}
+                  {i === copy.steps.length - 1 && (
+                    <p className="lk-gs-ready mt-3 inline-flex items-center gap-2 rounded-full bg-[#7be0b0]/10 px-3 py-1 text-[12px] leading-5 font-medium text-[#7be0b0] ring-1 ring-[#7be0b0]/30">
+                      <span className="lk-gs-ready-dot size-1.5 rounded-full bg-[#7be0b0]" />
+                      {copy.ready}
+                    </p>
+                  )}
+                </div>
               </div>
               <p className="mt-3 max-w-[36rem] text-[15px] leading-[1.6] text-pretty text-[#E8F4FF]/75">
                 <Inline text={step.note} />
@@ -77,6 +113,7 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
             </Reveal>
           ))}
         </ol>
+        </GetStartedPlay>
 
         <CtaLink
           href={LINKS.install}

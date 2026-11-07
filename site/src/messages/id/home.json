@@ -326,6 +326,7 @@
     "copy": "Salin",
     "copied": "Tersalin",
     "copyFailed": "Terpilih: tekan Ctrl+C atau ⌘C",
+    "ready": "Siap di localhost:3000",
     "more": "Quickstart lengkap, konfigurasi, dan troubleshooting"
   },
   "faq": {

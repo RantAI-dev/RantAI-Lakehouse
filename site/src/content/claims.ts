@@ -120,6 +120,7 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.getStarted.sub", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart: \"Assumes you have Docker installed and nothing else\"" },
   { key: "home.getStarted.steps.0.note", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart step 1: git clone the public repository" },
   { key: "home.getStarted.steps.1.note", backlog: ["SEC-18 Done", "REL-2 Done"], note: "README step 2: ops/init-env.sh writes .env with generated values (no default credentials, SEC-18); AUTH_BOOTSTRAP_EMAIL / _PASSWORD create the first admin" },
+  { key: "home.getStarted.ready", backlog: ["REL-2 Done"], note: "README Quickstart: the console listens on :3000 once the API reports healthy. The terminals' output lines are in components/home/get-started-output.ts, each traced to the script or README line that prints or states it" },
   { key: "home.getStarted.steps.2.note", backlog: ["REL-2 Done"], note: "README step 3: scripts/compose.sh up --build; the console listens on :3000 once the API is healthy (REL-2 slice 1: the console in the stack)" },
   // The footer card (O14, 2026-11-07): its sources are the sources section's
   // own (WEB-1, SRC-3, DATA-17 above), and Bronze, Silver and Gold are the depths.

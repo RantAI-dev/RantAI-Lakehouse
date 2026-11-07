@@ -326,6 +326,7 @@
     "copy": "Copy",
     "copied": "Copied",
     "copyFailed": "Selected: press Ctrl+C or ⌘C",
+    "ready": "Ready on localhost:3000",
     "more": "Full Quickstart, configuration and troubleshooting"
   },
   "faq": {
