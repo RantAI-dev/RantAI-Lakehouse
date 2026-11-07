@@ -1,6 +1,9 @@
 import * as React from "react";
-import { TILE_FILES, TILE_SIZE } from "@/lib/tile-svg";
-import type { TileText } from "./dashboard-tiles";
+import type { HomeCopy } from "@/lib/copy";
+import { mapZones, TILE_FILES, TILE_SIZE } from "@/lib/tile-svg";
+import { CalendarHoverHost } from "./calendar-hover-host";
+
+type Tiles = HomeCopy["dashboards"]["tiles"];
 
 /**
  * The two dashboard tiles that do not animate, the dot map and the calendar
@@ -28,25 +31,58 @@ function TileImage({ src, alt }: { src: string; alt: string }) {
  * (app/globals.css, "the living tiles").
  */
 
-/** A dot-matrix map: a landmass-like blob of dots whose size and brightness stand for a value per region. */
-export function DotMapTile({ tile }: { tile: TileText }) {
+/** Region letters, in reading order of the 4 × 3 grid. */
+const REGION_NAMES = "ABCDEFGHIJKL";
+
+/**
+ * A dot-matrix map: a landmass-like blob of dots whose size and brightness
+ * stand for a value per region. WEB-5 O18: a 4 × 3 grid of hover regions
+ * over the picture (only those that hold dots, `mapZones`); the region
+ * under the pointer shows its dots lit, the rest dim, and a tooltip names
+ * it with its value. CSS only (".lk-zone" in app/globals.css).
+ */
+export function DotMapTile({ tile }: { tile: Tiles["map"] }) {
   return (
     <div className="lk-map relative">
       <TileImage src={TILE_FILES.map.path} alt={tile.aria} />
       {/* The highlighted region (the right lobe) settling, then a light sweep now and then. */}
       <span aria-hidden="true" className="lk-map-glow absolute inset-0" />
       <span aria-hidden="true" className="lk-map-sweep absolute inset-0" />
+      {mapZones().map((z) => (
+        <span
+          key={`${z.col}${z.row}`}
+          aria-hidden="true"
+          className="lk-zone absolute"
+          style={{
+            left: `${z.col * 25}%`,
+            top: `${(z.row * 100) / 3}%`,
+            width: "25%",
+            height: `${100 / 3}%`,
+            backgroundPosition: `${(z.col * 100) / 3}% ${z.row * 50}%`,
+          }}
+        >
+          <span className="lk-tip">
+            {tile.region} {REGION_NAMES[z.row * 4 + z.col]} · {z.value.toFixed(1)}k
+          </span>
+        </span>
+      ))}
     </div>
   );
 }
 
-/** Twenty weeks of days; weekends are quieter, and a few busy weeks stand out. */
-export function CalendarTile({ tile }: { tile: TileText }) {
+/**
+ * Twenty weeks of days; weekends are quieter, and a few busy weeks stand
+ * out. WEB-5 O18: its 140 cells take their hover from a small handler that
+ * loads on the first pointer over the tile (`calendar-hover-host.tsx`), so
+ * neither 140 hover elements nor the handler weigh on the first load.
+ */
+export function CalendarTile({ tile }: { tile: Tiles["calendar"] }) {
   return (
     <div className="lk-cal relative">
       <TileImage src={TILE_FILES.calendar.path} alt={tile.aria} />
       {/* Now and then one day glows, as if it just filled up. */}
       <span aria-hidden="true" className="lk-cal-glow absolute inset-0" />
+      <CalendarHoverHost days={tile.days} week={tile.week} unit={tile.unit} />
     </div>
   );
 }

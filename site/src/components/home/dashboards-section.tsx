@@ -21,13 +21,21 @@ import { TiltCard } from "@/components/shared/tilt-card";
  * stage is not pinned and the row is an ordinary, keyboard-scrollable strip.
  */
 
-const TILE_VISUALS = {
-  line: LineChartTile,
-  map: DotMapTile,
-  sankey: SankeyTile,
-  kpi: KpiTile,
-  calendar: CalendarTile,
-} as const;
+/** Each tile's drawing, with its own words (O18: tooltips need each tile's labels). */
+function TileVisual({ id, tiles }: { id: (typeof TILE_IDS)[number]; tiles: HomeCopy["dashboards"]["tiles"] }) {
+  switch (id) {
+    case "line":
+      return <LineChartTile tile={tiles.line} />;
+    case "map":
+      return <DotMapTile tile={tiles.map} />;
+    case "sankey":
+      return <SankeyTile tile={tiles.sankey} />;
+    case "kpi":
+      return <KpiTile tile={tiles.kpi} />;
+    case "calendar":
+      return <CalendarTile tile={tiles.calendar} />;
+  }
+}
 
 export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
   return (
@@ -47,7 +55,8 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
               {copy.features.map((f) => (
                 <li
                   key={f}
-                  className="rounded-full border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] px-3 py-1 text-[12px] leading-5 whitespace-nowrap text-[#E8F4FF]/80 md:text-[13px]"
+                  // O18: the site's chip states, a lighter border and a small lift.
+                  className="rounded-full border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] px-3 py-1 text-[12px] leading-5 whitespace-nowrap text-[#E8F4FF]/80 transition-[border-color,background-color,color,translate] duration-200 ease-out hover:-translate-y-0.5 hover:border-[#E8F4FF]/35 hover:bg-[#E8F4FF]/[0.09] hover:text-[#E8F4FF] active:translate-y-0 motion-reduce:transition-none motion-reduce:hover:translate-y-0 md:text-[13px]"
                 >
                   {f}
                 </li>
@@ -63,19 +72,21 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
       }
     >
       {TILE_IDS.map((id) => {
-        const Visual = TILE_VISUALS[id];
         const tile = copy.tiles[id];
         return (
           <LiveTile
             key={id}
             label={`${tile.kind}: ${tile.title}`}
-            className="w-[78vw] shrink-0 rounded-3xl transition-transform duration-200 ease-out outline-none hover:-translate-y-1 focus-visible:-translate-y-1 motion-reduce:transition-none motion-reduce:hover:translate-y-0 sm:w-[380px] md:w-[420px]"
+            // O18: a clear lift (6 px) with a deeper shadow on hover, focus or a tap; still under reduced motion.
+            className="w-[78vw] shrink-0 rounded-3xl transition-transform duration-200 ease-out outline-none hover:-translate-y-1.5 focus-visible:-translate-y-1.5 active:-translate-y-1 motion-reduce:transition-none motion-reduce:hover:translate-y-0 motion-reduce:focus-visible:translate-y-0 sm:w-[380px] md:w-[420px]"
           >
-            <TiltCard className="rounded-3xl border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] backdrop-blur-md transition-[border-color,box-shadow] duration-200 ease-out group-hover/tile:border-[#44A6FA]/45 group-hover/tile:shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9),0_0_40px_-8px_rgba(68,166,250,0.45)] group-focus-visible/tile:border-[#44A6FA]/70 group-focus-visible/tile:shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9),0_0_40px_-8px_rgba(68,166,250,0.55)] md:p-6">
+            <TiltCard className="rounded-3xl border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] backdrop-blur-md transition-[border-color,box-shadow] duration-200 ease-out group-hover/tile:border-[#44A6FA]/60 group-hover/tile:shadow-[0_40px_90px_-36px_rgba(2,5,20,0.95),0_0_44px_-6px_rgba(68,166,250,0.55)] group-focus-visible/tile:border-[#44A6FA]/75 group-focus-visible/tile:shadow-[0_40px_90px_-36px_rgba(2,5,20,0.95),0_0_44px_-6px_rgba(68,166,250,0.6)] group-active/tile:border-[#44A6FA]/60 md:p-6">
               <p className="text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{tile.kind}</p>
-              <p className="mt-1.5 text-[15px] text-[#E8F4FF]">{tile.title}</p>
+              <p className="mt-1.5 text-[15px] text-[#E8F4FF]/85 transition-colors duration-200 ease-out group-hover/tile:text-white group-focus-visible/tile:text-white">
+                {tile.title}
+              </p>
               <div className="mt-4">
-                <Visual tile={tile} />
+                <TileVisual id={id} tiles={copy.tiles} />
               </div>
             </TiltCard>
           </LiveTile>

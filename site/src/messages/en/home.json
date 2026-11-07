@@ -93,17 +93,36 @@
       "line": {
         "title": "Visits over time",
         "kind": "Line chart",
-        "aria": "Illustrative line chart"
+        "aria": "Illustrative line chart",
+        "points": [
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "May"
+        ]
       },
       "map": {
         "title": "Visits by region",
         "kind": "Map",
-        "aria": "Illustrative map of dots"
+        "aria": "Illustrative map of dots",
+        "region": "Region"
       },
       "sankey": {
         "title": "Where visits come from",
         "kind": "Sankey",
-        "aria": "Illustrative Sankey diagram"
+        "aria": "Illustrative Sankey diagram",
+        "from": [
+          "Search",
+          "Social",
+          "Direct"
+        ],
+        "to": [
+          "Home",
+          "Docs",
+          "Blog"
+        ],
+        "total": "total"
       },
       "kpi": {
         "title": "Visits this week",
@@ -114,7 +133,18 @@
       "calendar": {
         "title": "Busy days",
         "kind": "Calendar heatmap",
-        "aria": "Illustrative calendar heatmap"
+        "aria": "Illustrative calendar heatmap",
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri",
+          "Sat",
+          "Sun"
+        ],
+        "week": "Week",
+        "unit": "visits"
       }
     }
   },

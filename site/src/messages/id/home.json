@@ -93,17 +93,36 @@
       "line": {
         "title": "Kunjungan dari waktu ke waktu",
         "kind": "Line chart",
-        "aria": "Ilustrasi line chart"
+        "aria": "Ilustrasi line chart",
+        "points": [
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "Mei"
+        ]
       },
       "map": {
         "title": "Kunjungan per wilayah",
         "kind": "Peta",
-        "aria": "Ilustrasi peta titik"
+        "aria": "Ilustrasi peta titik",
+        "region": "Wilayah"
       },
       "sankey": {
         "title": "Asal kunjungan",
         "kind": "Sankey",
-        "aria": "Ilustrasi diagram Sankey"
+        "aria": "Ilustrasi diagram Sankey",
+        "from": [
+          "Pencarian",
+          "Media sosial",
+          "Langsung"
+        ],
+        "to": [
+          "Beranda",
+          "Dokumentasi",
+          "Blog"
+        ],
+        "total": "total"
       },
       "kpi": {
         "title": "Kunjungan minggu ini",
@@ -114,7 +133,18 @@
       "calendar": {
         "title": "Hari tersibuk",
         "kind": "Calendar heatmap",
-        "aria": "Ilustrasi calendar heatmap"
+        "aria": "Ilustrasi calendar heatmap",
+        "days": [
+          "Sen",
+          "Sel",
+          "Rab",
+          "Kam",
+          "Jum",
+          "Sab",
+          "Min"
+        ],
+        "week": "Minggu ke",
+        "unit": "kunjungan"
       }
     }
   },

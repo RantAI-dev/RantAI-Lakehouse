@@ -769,19 +769,160 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
   animation-play-state: paused;
 }
 
-/* Hover or focus on the line chart: the value at the nearest point. */
-.lk-point-label {
+
+/* ---- Tile hover (WEB-5 owner QA O18) ------------------------------------
+   Every tile answers the pointer. Hover zones and their layers are in the
+   tiles' markup; these rules show them. Tooltips appear under reduced
+   motion too, only without the easing (the block at the end). */
+.lk-hov-show,
+.lk-hov-tip,
+.lk-flowtip,
+.lk-nodetip {
+  opacity: 0;
+  transition: opacity 180ms ease-out;
+  pointer-events: none;
+}
+.lk-hov-zone:hover .lk-hov-show,
+.lk-tile:focus-visible .lk-hov-zone[data-last] .lk-hov-show {
+  opacity: 1;
+}
+.lk-hov-show .lk-hov-tip,
+.lk-flowtip .lk-hov-tip,
+.lk-nodetip .lk-hov-tip {
+  /* Shown and hidden by their parent group. */
+  opacity: 1;
+}
+.lk-hov-grow {
+  transform-box: fill-box;
+  transform-origin: center;
+  scale: 0.5;
+  transition: scale 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.lk-hov-zone:hover .lk-hov-grow,
+.lk-tile:focus-visible .lk-hov-zone[data-last] .lk-hov-grow {
+  scale: 1;
+}
+/* The KPI follows the hovered day: the idle tick stops, the digits roll there. */
+.lk-tile .lk-kpi .lk-roll {
+  transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.lk-kpi:has(.lk-kz:hover) .lk-roll {
+  animation: none;
+}
+/* Sankey: the hovered band, or a node's bands, stay lit; the rest dim. */
+.lk-sankey .lk-flowgrp {
+  transition: opacity 200ms ease-out;
+}
+.lk-sankey:has(.lk-flowgrp:hover) .lk-flowgrp:not(:hover) {
+  opacity: 0.18;
+}
+/* Map: the region under the pointer shows its dots lit, the rest dim. */
+.lk-zone::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: url(/tiles/dot-map.svg) no-repeat;
+  background-size: 400% 300%;
+  background-position: inherit;
+  filter: brightness(1.8) drop-shadow(0 0 6px rgba(68, 166, 250, 0.6));
+}
+.lk-zone::before,
+.lk-zone .lk-tip {
   opacity: 0;
   transition: opacity 180ms ease-out;
 }
-.lk-point:hover .lk-point-label,
-.lk-tile:focus-visible .lk-point[data-last] .lk-point-label {
+.lk-zone:hover::before,
+.lk-zone:hover .lk-tip {
   opacity: 1;
+}
+.lk-map img {
+  transition: opacity 200ms ease-out;
+}
+.lk-map:has(.lk-zone:hover) img {
+  opacity: 0.35;
+}
+/* The HTML tooltips (map, calendar): the site's glass, tabular. */
+.lk-tip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  translate: -50% 0;
+  white-space: nowrap;
+  border-radius: 10px;
+  background: rgba(2, 5, 20, 0.92);
+  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.22);
+  padding: 4px 9px;
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: #e8f4ff;
+  pointer-events: none;
+  filter: none;
+}
+/* Calendar (calendar-hover.tsx writes --c, --r and data-on). The grid is
+   the drawing's: columns of 17 and rows of 23 from (12, 14), cells 13 x 17,
+   in a 360 x 190 tile. */
+.lk-calhov > span {
+  position: absolute;
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+.lk-calhov[data-on] > span {
+  opacity: 1;
+}
+.lk-calhov-row {
+  left: 2.5%;
+  right: 2.5%;
+  top: calc((14 + var(--r, 0) * 23) / 190 * 100%);
+  height: calc(17 / 190 * 100%);
+  background: rgba(232, 244, 255, 0.05);
+  border-radius: 6px;
+}
+.lk-calhov-col {
+  top: 5%;
+  bottom: 3%;
+  left: calc((12 + var(--c, 0) * 17) / 360 * 100%);
+  width: calc(13 / 360 * 100%);
+  background: rgba(232, 244, 255, 0.05);
+  border-radius: 6px;
+}
+.lk-calhov-cell {
+  left: calc((12 + var(--c, 0) * 17) / 360 * 100%);
+  top: calc((14 + var(--r, 0) * 23) / 190 * 100%);
+  width: calc(13 / 360 * 100%);
+  height: calc(17 / 190 * 100%);
+  border-radius: 4px;
+  box-shadow: 0 0 0 2px #e8f4ff, 0 0 14px 2px rgba(68, 166, 250, 0.6);
+  scale: 1.35;
+  transition:
+    left 120ms ease-out,
+    top 120ms ease-out,
+    opacity 150ms ease-out;
+}
+.lk-calhov .lk-calhov-tip {
+  left: calc((18.5 + var(--c, 0) * 17) / 360 * 100%);
+  top: calc((14 + var(--r, 0) * 23) / 190 * 100% - 30px);
+  bottom: auto;
+}
+.lk-calhov .lk-calhov-tip[data-flip] {
+  translate: -100% 0;
 }
 
 /* ---- Reduced motion --------------------------------------------------- */
 
 @media (prefers-reduced-motion: reduce) {
+  /* O18: tooltips and highlights still appear, at once. */
+  .lk-hov-show,
+  .lk-hov-grow,
+  .lk-flowtip,
+  .lk-nodetip,
+  .lk-zone::before,
+  .lk-zone .lk-tip,
+  .lk-calhov > span,
+  .lk-sankey .lk-flowgrp {
+    transition: none !important;
+  }
   /* O10: the tiles are their final pictures, with no entrance and no loop. */
   .lk-tile *,
   .lk-tile *::before,
