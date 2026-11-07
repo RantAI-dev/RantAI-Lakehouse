@@ -21,9 +21,9 @@ use crate::state::AppState;
 pub(in crate::routes) const CATALOG_UNION: &str = "(SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
      UNION ALL SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta_sec.dataset_catalog`)";
 
-/// WS7 item C3: delegates to the SAME `routes::query::run` Query Studio
-/// and saved queries already call — closing the divergent-guard gap this
-/// task's own name cites (`WS7 plan §0 item 7`): before this change,
+/// WS7 item C3: delegates to the SAME run (`routes::query::run_statement`,
+/// the end of `routes::query::run`) Query Studio and saved queries already
+/// call — closing the divergent-guard gap this task's own name cites (`WS7 plan §0 item 7`): before this change,
 /// `run_sql` called `ch.query` directly, so `sql_rewrite::enforce`'s
 /// masking/row-filter/table-function/sensitive-table/view refusal (WS7
 /// items B3-B6, wired into `routes::query::run` by WS7 item C2) never ran
@@ -44,7 +44,20 @@ pub(super) async fn run_sql(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
-    let sql = arg_str(args, "sql");
+    // `QS-5` D7: the model's `{{name}}` placeholders are filled FIRST, with
+    // the function the run route uses (`ClickHouse`, this tool's only engine),
+    // so every check below, the policy rewrite and the run read the final
+    // statement. A refusal is the tool's error: the model reads the sentence
+    // and asks the person. This is the one scan of what the model wrote; the
+    // run at the end is of the final statement and never scans again.
+    let sql = match crate::routes::query::fill_tool_parameters(
+        &arg_str(args, "sql"),
+        args.get("parameters").cloned(),
+        None,
+    ) {
+        Ok(filled) => filled,
+        Err(refusal) => return json!({ "error": refusal.to_string() }),
+    };
     if !is_read_only_sql(&sql) {
         return json!({ "error": "Only a read-only SELECT is allowed." });
     }
@@ -93,9 +106,9 @@ pub(super) async fn run_sql(
     // the dry run then asks the engine about the statement the run will really
     // send (rewritten for the caller's current roles, with the run route's own
     // function), and a statement the rewrite refuses is refused here with the
-    // run's status and fixed message and never sent. `routes::query::run`
-    // rewrites once more from the original text, so the two never rewrite an
-    // already-rewritten statement.
+    // run's status and fixed message and never sent. `run_statement`
+    // rewrites once more from the final, unrewritten statement, so the two
+    // never rewrite an already-rewritten statement.
     let rewritten =
         match crate::routes::query::rewrite_sql_for_principal(state, &sql, "clickhouse", principal)
             .await
@@ -112,14 +125,15 @@ pub(super) async fn run_sql(
     if dry_run.get("error").is_some() {
         return dry_run;
     }
-    let body = axum::body::Bytes::from(json!({ "sql": sql }).to_string());
-    let extension = Some(axum::Extension(principal.clone()));
+    // The final statement, so `run_statement` and not `run`: `run` would scan
+    // it again and refuse a text value that reads `'{{x}}'`.
     let result = api_result_to_value(
-        crate::routes::query::run(
-            axum::extract::State(state.clone()),
-            extension,
-            axum::http::HeaderMap::new(),
-            body,
+        crate::routes::query::run_statement(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            &sql,
+            "clickhouse",
         )
         .await,
     )
@@ -1163,6 +1177,266 @@ mod run_sql_delegation {
         );
         assert!(bodies[0].contains("EXPLAIN AST"), "{bodies:?}");
         assert!(!bodies[1].contains("EXPLAIN AST"), "{bodies:?}");
+        Ok(())
+    }
+
+    /// Every body the mock engine received, in order.
+    async fn engine_bodies(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    fn args_with(sql: &str, parameters: Value) -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!(sql));
+        args.insert("parameters".to_owned(), parameters);
+        args
+    }
+
+    /// `QS-5` D7: the model's `{{region}}` is filled before the dry run and
+    /// before the run, so the engine never sees a brace and both calls carry
+    /// the one literal.
+    #[tokio::test]
+    async fn run_sql_fills_a_placeholder_before_the_engine_sees_the_statement() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let args = args_with("SELECT {{region}} AS region", json!({ "region": "EU" }));
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        let bodies = engine_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "dry run then execution: {bodies:?}");
+        for body in &bodies {
+            assert!(body.contains("SELECT 'EU' AS region"), "{body}");
+            assert!(!body.contains("{{"), "{body}");
+        }
+    }
+
+    /// A text value is one string literal: a quote inside it is escaped and
+    /// cannot close it, on the dry run and on the run.
+    #[tokio::test]
+    async fn run_sql_prints_a_hostile_text_value_as_one_literal() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let args = args_with("SELECT {{v}} AS v", json!({ "v": "x' OR '1'='1" }));
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        let bodies = engine_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        for body in &bodies {
+            assert!(
+                body.contains(r"SELECT 'x\' OR \'1\'=\'1' AS v"),
+                "the value must stay in one escaped literal: {body}"
+            );
+        }
+    }
+
+    /// A value that spells a write cannot make the tool write: the tool's own
+    /// read-only filter reads the final statement, and it refuses the word
+    /// `drop` even inside a literal (as it does for any statement). The
+    /// engine receives nothing.
+    #[tokio::test]
+    async fn run_sql_does_not_let_a_value_make_it_write() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let args = args_with("SELECT {{v}} AS v", json!({ "v": "'; DROP TABLE x; --" }));
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert_eq!(
+            result,
+            json!({ "error": "Only a read-only SELECT is allowed." })
+        );
+        assert!(engine_bodies(&server).await.is_empty(), "nothing is sent");
+    }
+
+    /// `QS-5` D7: a number the model passes for a placeholder with no
+    /// definition is a number, not text. Negative ones are wrapped.
+    #[tokio::test]
+    async fn run_sql_reads_a_number_for_an_undefined_placeholder_as_a_number() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+
+        for (value, printed) in [
+            (json!(7), "SELECT 7 AS id"),
+            (json!(-7), "SELECT (-7) AS id"),
+        ] {
+            let args = args_with("SELECT {{id}} AS id", json!({ "id": value }));
+            let result = run_sql(&state, Some(&principal), &args).await;
+            assert!(result.get("error").is_none(), "{result}");
+            let bodies = engine_bodies(&server).await;
+            let last = bodies.last().expect("the run reached the engine");
+            assert!(last.contains(printed), "{last}");
+        }
+        // A list has no definition to say what it is.
+        let args = args_with("SELECT {{id}} AS id", json!({ "id": [1, 2] }));
+        let before = engine_bodies(&server).await.len();
+        let result = run_sql(&state, Some(&principal), &args).await;
+        assert_eq!(
+            result,
+            json!({ "error": "parameter 'id' is a list: a multi-select needs a saved query's definition." })
+        );
+        assert_eq!(
+            engine_bodies(&server).await.len(),
+            before,
+            "nothing is sent"
+        );
+    }
+
+    /// The scanner reads what the model wrote once: a value that itself reads
+    /// `{{x}}` is printed in its literal and is not read as a placeholder
+    /// when the final statement is run.
+    #[tokio::test]
+    async fn run_sql_does_not_scan_a_value_that_reads_like_a_placeholder() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let args = args_with("SELECT {{v}} AS v", json!({ "v": "{{x}}" }));
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        let bodies = engine_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        for body in &bodies {
+            assert!(body.contains("SELECT '{{x}}' AS v"), "{body}");
+        }
+    }
+
+    /// A refusal is the tool's error, in the sentence the person would read,
+    /// and the engine receives nothing, not even the dry run.
+    #[tokio::test]
+    async fn run_sql_returns_a_refusal_as_its_error_and_sends_nothing() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+
+        for (args, sentence) in [
+            (
+                // No value and no default.
+                args_with("SELECT {{region}} AS region", json!({})),
+                "Fill in {{region}} to run this query.",
+            ),
+            (
+                // Inside quotes.
+                args_with("SELECT '{{region}}' AS region", json!({ "region": "EU" })),
+                "{{region}} is inside quotes: write it without them, for example = {{region}}.",
+            ),
+            (
+                // A shape that is not an object.
+                args_with("SELECT {{region}} AS region", json!("EU")),
+                "parameters must be an object that maps a parameter name to its value.",
+            ),
+        ] {
+            let result = run_sql(&state, Some(&principal), &args).await;
+            assert_eq!(result, json!({ "error": sentence }), "{args:?}");
+        }
+        assert!(
+            engine_bodies(&server).await.is_empty(),
+            "the engine received a request for a refused statement"
+        );
+    }
+
+    /// Without a placeholder and without `parameters` the tool behaves as it
+    /// did: the statement reaches the engine byte for byte, and History holds
+    /// it as written. With a placeholder, History holds the statement that ran.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_sql_records_the_statement_that_ran_in_history(pool: PgPool) -> sqlx::Result<()> {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, database_url_for(&pool));
+        let principal = analyst_principal();
+
+        let mut plain = Map::new();
+        plain.insert("sql".to_owned(), json!("SELECT 1 AS one"));
+        let result = run_sql(&state, Some(&principal), &plain).await;
+        assert!(result.get("error").is_none(), "{result}");
+        let result = run_sql(
+            &state,
+            Some(&principal),
+            &args_with("SELECT {{region}} AS region", json!({ "region": "EU" })),
+        )
+        .await;
+        assert!(result.get("error").is_none(), "{result}");
+
+        let history = lakehouse_store::queries::list_history(
+            &pool,
+            Uuid::nil(),
+            &lakehouse_store::queries::HistoryFilter::default(),
+        )
+        .await
+        .expect("query_history is readable");
+        let ran: std::collections::BTreeSet<&str> =
+            history.iter().map(|h| h.sql.as_str()).collect();
+        assert_eq!(
+            ran,
+            ["SELECT 'EU' AS region", "SELECT 1 AS one"]
+                .into_iter()
+                .collect()
+        );
+        Ok(())
+    }
+
+    /// The role's row filter and mask govern a parameterised statement: the
+    /// rewrite reads the filled statement (a literal in `WHERE email = '…'`), finds
+    /// the governed table and masks it. A rewrite over the unfilled text would
+    /// not parse, and a rewrite after the fill order would have missed it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_sql_masks_a_parameterised_statement_over_a_governed_table(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        lakehouse_store::governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "run-sql-parameter-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+        let server = MockServer::start().await;
+        mount_governed_table_responses(&server).await;
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), server.uri());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+        let principal = analyst_principal();
+        let args = args_with(
+            "SELECT * FROM serving.mart_x WHERE email = {{who}}",
+            json!({ "who": "ana@example.test" }),
+        );
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        let bodies = engine_bodies(&server).await;
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.contains("replaceRegexpOne") && b.contains("'ana@example.test'")),
+            "the query the engine ran must be the masked form of the filled statement: {bodies:?}"
+        );
+        assert!(bodies.iter().all(|b| !b.contains("{{")), "{bodies:?}");
         Ok(())
     }
 

@@ -209,7 +209,8 @@ impl std::error::Error for ParamError {}
 ///
 /// `parameters` maps a name to the value the run gives it. `definitions` are
 /// the saved query's (or the request's). Without any, a placeholder is read
-/// as text, and a `.start` or `.end` one as a date range. With some, a
+/// as a number when its value is a JSON number, as text otherwise, and a
+/// `.start` or `.end` one as a date range (`implicit_def`). With some, a
 /// placeholder none of them names is refused. A value for a name the SQL
 /// does not use is ignored.
 ///
@@ -244,7 +245,7 @@ pub fn substitute(
         // none of them names is a mistake, not text (feature decision 11).
         let def = match definitions.iter().find(|d| d.name == *name) {
             Some(def) => def.clone(),
-            None if definitions.is_empty() => implicit_def(name, &found),
+            None if definitions.is_empty() => implicit_def(name, &found, parameters.get(*name))?,
             None => return Err(ParamError::NoDefinition((*name).to_owned())),
         };
         let list = check_definition(&def)?;
@@ -264,6 +265,23 @@ pub fn substitute(
     }
     out.push_str(&sql[at..]);
     Ok(out)
+}
+
+/// Whether `sql` holds a well-formed `{{name}}` placeholder outside comments,
+/// on `ClickHouse`, whether or not it sits in quotes.
+///
+/// For a place that takes no parameters and must say so (a dashboard's SQL
+/// source, `QS-5` D8). It reads with [`scan`], so a `{{` in a comment, or one
+/// that is not a well-formed placeholder, is not one. A statement where the
+/// scanner stops at a stray `{{` before it reaches a placeholder is `false`:
+/// that statement was already failing and keeps failing the way it did.
+#[must_use]
+pub fn holds_placeholder(sql: &str) -> bool {
+    match scan(Engine::ClickHouse, sql) {
+        Ok(found) => !found.is_empty(),
+        Err(ParamError::InsideQuotes(_)) => true,
+        Err(_) => false,
+    }
 }
 
 /// Check a query's definitions against its SQL before it is saved.
@@ -454,22 +472,44 @@ enum Checked {
     Many(Vec<ParamValue>),
 }
 
-/// The definition a placeholder without one gets: text, or a date range
-/// when it is written `.start` or `.end`.
-fn implicit_def(name: &str, found: &[Found]) -> QueryParamDef {
+/// The definition a placeholder without one gets, read from the value the
+/// request gave it: a date range when it is written `.start` or `.end`, a
+/// number when the value is a JSON number, text otherwise.
+///
+/// A number is checked and printed as a defined number is (finite, below
+/// `BI-11`'s bound, a negative one in parentheses), so `run_sql` can be given
+/// `{"id": 7}` without a saved definition. A string stays text. A list has
+/// nothing to say which entries are allowed, so it is refused: a multi-select
+/// needs a saved query's definition. The sentence holds the name and no
+/// value.
+fn implicit_def(
+    name: &str,
+    found: &[Found],
+    value: Option<&Value>,
+) -> Result<QueryParamDef, ParamError> {
     let ranged = found
         .iter()
         .any(|f| f.name == name && f.part != Part::Whole);
-    QueryParamDef {
+    let ty = if ranged {
+        QueryParamType::DateRange
+    } else {
+        match value {
+            Some(Value::Number(_)) => QueryParamType::Number,
+            Some(Value::Array(_)) => {
+                return Err(ParamError::Invalid(format!(
+                    "parameter '{name}' is a list: a multi-select needs a saved query's \
+                     definition."
+                )));
+            }
+            _ => QueryParamType::Text,
+        }
+    };
+    Ok(QueryParamDef {
         name: name.to_owned(),
-        ty: if ranged {
-            QueryParamType::DateRange
-        } else {
-            QueryParamType::Text
-        },
+        ty,
         default: Value::Null,
         options: Vec::new(),
-    }
+    })
 }
 
 /// `BI-11`'s definition for a plain text, number or date check.
@@ -928,10 +968,94 @@ mod tests {
         }
     }
 
+    /// With no definition, a JSON number is read as a number definition: it
+    /// is checked and printed like `BI-11`'s number, a negative one in
+    /// parentheses, on both engines.
     #[test]
-    fn a_number_for_a_parameter_without_a_definition_is_refused_as_text() {
-        let err = run(Engine::ClickHouse, "{{n}}", json!({"n": 42}), json!([])).unwrap_err();
+    fn a_number_for_a_parameter_without_a_definition_is_a_number() {
+        for engine in BOTH {
+            for (value, printed) in [
+                (json!(7), "7"),
+                (json!(-7), "(-7)"),
+                (json!(1.5), "1.5"),
+                (json!(0), "0"),
+            ] {
+                assert_eq!(
+                    run_ok(engine, "{{n}}", json!({"n": value}), json!([])),
+                    printed
+                );
+            }
+            // A negative number cannot start a comment in any position.
+            assert_eq!(
+                run_ok(engine, "SELECT 1 -{{n}}", json!({"n": -5}), json!([])),
+                "SELECT 1 -(-5)"
+            );
+            // A string stays text, even when it looks like a number.
+            assert_eq!(run_ok(engine, "{{n}}", json!({"n": "7"}), json!([])), "'7'");
+        }
+    }
+
+    /// A request that carries definitions is complete: the rule for a number
+    /// given to a text definition is unchanged.
+    #[test]
+    fn a_number_for_a_text_definition_is_still_refused() {
+        let err = run(
+            Engine::ClickHouse,
+            "{{n}}",
+            json!({"n": 42}),
+            json!([{"name": "n", "type": "text"}]),
+        )
+        .unwrap_err();
         assert_eq!(err, "parameter 'n' must be text.");
+    }
+
+    /// With no definition, a bool, a list and an out-of-bound number are
+    /// refused in a fixed sentence that holds the name and no value; a
+    /// `null` is a value that was not given.
+    #[test]
+    fn a_value_without_a_definition_that_is_not_text_or_a_number_is_refused() {
+        for engine in BOTH {
+            for (value, sentence) in [
+                (json!(true), "parameter 'v' must be text."),
+                (
+                    json!(["a", "b"]),
+                    "parameter 'v' is a list: a multi-select needs a saved query's definition.",
+                ),
+                (json!(1e15), "parameter 'v' must be a number."),
+                (json!(-2e300), "parameter 'v' must be a number."),
+                (json!(null), "Fill in {{v}} to run this query."),
+            ] {
+                let err = run(engine, "{{v}}", json!({"v": value}), json!([])).unwrap_err();
+                assert_eq!(err, sentence, "{value}");
+            }
+        }
+        // The bound is below 1e15, as `BI-11`'s.
+        assert_eq!(
+            run_ok(
+                Engine::ClickHouse,
+                "{{v}}",
+                json!({"v": 999_999_999_999_999_i64}),
+                json!([])
+            ),
+            "999999999999999"
+        );
+    }
+
+    /// A date range stays a date range with no definition, and a number is
+    /// not one.
+    #[test]
+    fn a_number_for_a_range_without_a_definition_is_refused() {
+        let err = run(
+            Engine::ClickHouse,
+            "{{d.start}}",
+            json!({"d": 5}),
+            json!([]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "parameter 'd' must be a date range with a start and an end."
+        );
     }
 
     #[test]

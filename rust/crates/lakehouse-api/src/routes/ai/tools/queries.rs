@@ -1,17 +1,14 @@
 //! Saved-query tools (T1.4 of the copilot-operations-handover plan):
 //! `save_query`, `list_saved_queries`, `run_saved_query`.
 //!
-//! `run_saved_query` calls `routes::query::run` directly — the exact
-//! `POST /api/query/run` handler, read-only guard (`is_read_only`,
-//! `routes/query.rs:61-133`) and query-history recording included — rather
-//! than duplicating any part of it. This is why no visibility bump of
-//! `is_read_only` was needed: calling the whole route function already
-//! applies the guard internally, which is a stronger form of reuse than
-//! exposing the guard alone and re-calling `ClickHouse` a second way here.
+//! `run_saved_query` fills the query's `{{name}}` parameters and then calls
+//! `routes::query::run_statement`, the run `POST /api/query/run` ends in —
+//! read-only guard (`is_read_only`) and query-history recording included —
+//! rather than duplicating any part of it. This is why no visibility bump of
+//! `is_read_only` was needed: calling the whole function already applies the
+//! guard internally, which is a stronger form of reuse than exposing the
+//! guard alone and re-calling `ClickHouse` a second way here.
 
-use axum::Extension;
-use axum::body::Bytes;
-use axum::extract::State;
 use lakehouse_auth::Principal;
 use lakehouse_store::PgPool;
 use lakehouse_store::queries;
@@ -38,6 +35,12 @@ pub(super) async fn save_query(
     let sql = arg_str(args, "sql");
     if title.is_empty() || sql.is_empty() {
         return json!({ "error": "title and sql are required" });
+    }
+    // `QS-5` D7: this tool stores no definitions, so SQL that holds a
+    // `{{name}}` placeholder would be saved with nothing to say what the
+    // placeholder is. It gets the refusal the save route gives the same SQL.
+    if let Err(refusal) = crate::routes::query::checked_saved_definitions(&sql, None) {
+        return json!({ "error": refusal.to_string() });
     }
     let owner = {
         let o = arg_str(args, "owner");
@@ -175,26 +178,39 @@ pub(super) async fn run_saved_query(
     let Some(saved) = saved else {
         return json!({ "error": "saved query tidak ditemukan" });
     };
-    let body = Bytes::from(json!({ "sql": saved.sql }).to_string());
+    // `QS-5` D7: the saved definitions and the model's values fill the
+    // placeholders, once, here. A refusal ("Fill in {{name}} to run this
+    // query.", a value that does not fit) is the tool's error, so the model
+    // asks the person instead of guessing. A saved query with no placeholder
+    // and no `parameters` comes back byte for byte.
+    let statement = match crate::routes::query::fill_tool_parameters(
+        &saved.sql,
+        args.get("parameters").cloned(),
+        Some(saved.parameters.clone()),
+    ) {
+        Ok(filled) => filled,
+        Err(refusal) => return json!({ "error": refusal.to_string() }),
+    };
     // This internal call never goes through axum's auth middleware, so it
-    // must forward the caller's own `Principal` itself rather than relying
-    // on `Extension` extraction: the copilot dispatcher
+    // forwards the caller's own `Principal` itself: the copilot dispatcher
     // (`routes::ai::tools::run_tool`) is handed the SAME principal axum
-    // extracted for `POST /api/ai/chat` / `POST /api/ai/tool`, and this is
-    // where it is re-wrapped for `query::run`. That principal is required
-    // now — `query::run` 401s with none, for every engine — so a
-    // copilot-run saved query is recorded under the real user in
-    // `query_history`, exactly like a console-run query.
-    let extension = Some(Extension(principal.clone()));
+    // extracted for `POST /api/ai/chat` / `POST /api/ai/tool`.
+    // `run_statement` 401s with none, for every engine, so a copilot-run
+    // saved query is recorded under the real user in `query_history`,
+    // exactly like a console-run query, with the statement that ran.
+    //
+    // The final statement goes to `run_statement`, not `run`: `run` would
+    // scan it a second time and refuse a text value that reads `'{{x}}'`.
     // The chat sends no `X-Tenant` header, so the tenant is the caller's
     // first one — the same answer `tenant_scope::resolve` gives every
     // caller without headers.
     api_result_to_value(
-        crate::routes::query::run(
-            State(state.clone()),
-            extension,
-            axum::http::HeaderMap::new(),
-            body,
+        crate::routes::query::run_statement(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            &statement,
+            "clickhouse",
         )
         .await,
     )
@@ -364,6 +380,246 @@ mod tests {
                 "query_history.user_name must be the calling principal's uuid, not a \
                  placeholder or a 401 short-circuit"
             );
+            Ok(())
+        }
+
+        /// A saved query in the shared space with the definitions given, in
+        /// the catalog tenant the test principal belongs to.
+        async fn saved_with(pool: &PgPool, sql: &str, definitions: &Value) -> String {
+            let viewer = crate::routes::query::saved_query_viewer(
+                &alice(),
+                Some(uuid::uuid!("11111111-1111-4111-8111-000000000001")),
+            );
+            queries::create_saved_query_with_parameters(
+                pool,
+                &viewer,
+                "regional visitors",
+                sql,
+                definitions,
+                "alice",
+                &[],
+                queries::SavedQueryPlacement::SharedSpace,
+            )
+            .await
+            .expect("the saved query is stored")
+            .id
+        }
+
+        /// A mock engine that answers every statement with one row and keeps
+        /// the bodies it received.
+        async fn engine() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [{"name": "region", "type": "String"}],
+                    "data": [{"region": "EU"}],
+                    "rows": 1,
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn state_with(server: &MockServer, pool: &PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+            AppState::new(Config::from_map(&env).expect("valid config from a map"))
+        }
+
+        async fn bodies(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .expect("recorded")
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .collect()
+        }
+
+        fn region_dropdown() -> Value {
+            json!([{
+                "name": "region", "type": "dropdown", "default": "US",
+                "options": [
+                    { "value": "EU", "label": "Europe" },
+                    { "value": "US", "label": "United States" },
+                ],
+            }])
+        }
+
+        fn run_args(id: &str, parameters: Option<Value>) -> Map<String, Value> {
+            let mut args = Map::new();
+            args.insert("id".to_owned(), json!(id));
+            if let Some(parameters) = parameters {
+                args.insert("parameters".to_owned(), parameters);
+            }
+            args
+        }
+
+        /// `QS-5` D7: the tool fills the saved query's `{{region}}` with the
+        /// model's value, and with the stored default when it gives none.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_saved_query_fills_the_saved_definitions_with_the_models_values(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let id = saved_with(&pool, "SELECT {{region}} AS region", &region_dropdown()).await;
+            let server = engine().await;
+            let state = state_with(&server, &pool);
+            let principal = alice();
+
+            let given = run_saved_query(
+                &state,
+                Some(&principal),
+                &run_args(&id, Some(json!({ "region": "EU" }))),
+            )
+            .await;
+            let defaulted = run_saved_query(&state, Some(&principal), &run_args(&id, None)).await;
+
+            assert!(given.get("error").is_none(), "{given}");
+            assert!(defaulted.get("error").is_none(), "{defaulted}");
+            let sent = bodies(&server).await;
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert!(
+                sent[0].contains("SELECT 'EU' AS region"),
+                "the model's value: {sent:?}"
+            );
+            assert!(
+                sent[1].contains("SELECT 'US' AS region"),
+                "the stored default: {sent:?}"
+            );
+            Ok(())
+        }
+
+        /// The stored definitions are forwarded: a dropdown refuses a value
+        /// that is not one of its options. Run as text it would have passed.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_saved_query_forwards_the_stored_definitions(pool: PgPool) -> sqlx::Result<()> {
+            let id = saved_with(&pool, "SELECT {{region}} AS region", &region_dropdown()).await;
+            let server = engine().await;
+            let state = state_with(&server, &pool);
+
+            let result = run_saved_query(
+                &state,
+                Some(&alice()),
+                &run_args(&id, Some(json!({ "region": "Mars" }))),
+            )
+            .await;
+
+            let error = result["error"].as_str().expect("a refusal");
+            assert!(error.contains("region"), "{error}");
+            assert!(
+                !error.contains("Mars"),
+                "a refusal never repeats a value: {error}"
+            );
+            assert!(bodies(&server).await.is_empty(), "nothing is sent");
+            Ok(())
+        }
+
+        /// A value that is missing with no default is the tool's error, so the
+        /// model asks the person instead of guessing.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_saved_query_returns_a_missing_value_as_its_error(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let id = saved_with(
+                &pool,
+                "SELECT {{region}} AS region",
+                &json!([{ "name": "region", "type": "text" }]),
+            )
+            .await;
+            let server = engine().await;
+            let state = state_with(&server, &pool);
+
+            let result = run_saved_query(&state, Some(&alice()), &run_args(&id, None)).await;
+
+            assert_eq!(
+                result,
+                json!({ "error": "Fill in {{region}} to run this query." })
+            );
+            assert!(bodies(&server).await.is_empty(), "nothing is sent");
+
+            let bad_shape =
+                run_saved_query(&state, Some(&alice()), &run_args(&id, Some(json!(["EU"])))).await;
+            assert_eq!(
+                bad_shape,
+                json!({ "error": "parameters must be an object that maps a parameter name to its value." })
+            );
+            assert!(bodies(&server).await.is_empty(), "nothing is sent");
+            Ok(())
+        }
+
+        /// One scan per request: a text value that reads `{{x}}` is printed in
+        /// its literal and the final statement is not scanned again. History
+        /// holds the statement that ran.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_saved_query_does_not_scan_the_printed_value_again(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let id = saved_with(
+                &pool,
+                "SELECT {{region}} AS region",
+                &json!([{ "name": "region", "type": "text" }]),
+            )
+            .await;
+            let server = engine().await;
+            let state = state_with(&server, &pool);
+
+            let result = run_saved_query(
+                &state,
+                Some(&alice()),
+                &run_args(&id, Some(json!({ "region": "{{x}}" }))),
+            )
+            .await;
+
+            assert!(result.get("error").is_none(), "{result}");
+            let sent = bodies(&server).await;
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(sent[0].contains("SELECT '{{x}}' AS region"), "{sent:?}");
+            let history =
+                queries::list_history(&pool, Uuid::nil(), &queries::HistoryFilter::default())
+                    .await
+                    .expect("query_history is readable");
+            assert_eq!(history[0].sql, "SELECT '{{x}}' AS region");
+            Ok(())
+        }
+
+        /// `QS-5` D7: the `save_query` tool is held to the rule the save route
+        /// applies. SQL with a placeholder and no definition is refused with
+        /// the route's sentence and stores nothing; plain SQL still saves.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn save_query_refuses_a_placeholder_it_cannot_define(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let server = engine().await;
+            let state = state_with(&server, &pool);
+            let principal = alice();
+            let mut args = Map::new();
+            args.insert("title".to_owned(), json!("by region"));
+            args.insert("sql".to_owned(), json!("SELECT {{region}} AS region"));
+
+            let refused = save_query(&state, Some(&principal), &args).await;
+
+            assert_eq!(
+                refused,
+                json!({ "error": "{{region}} is used in the SQL but has no definition." })
+            );
+            let stored = queries::list_saved(
+                &pool,
+                queries::SavedQueryScope::All {
+                    viewer: crate::routes::query::saved_query_viewer(&principal, None),
+                },
+            )
+            .await
+            .expect("saved queries are readable");
+            assert!(
+                stored.iter().all(|q| q.title != "by region"),
+                "nothing is stored"
+            );
+
+            args.insert("sql".to_owned(), json!("SELECT 'a' AS region"));
+            let saved = save_query(&state, Some(&principal), &args).await;
+            assert_eq!(saved["ok"], json!(true), "{saved}");
             Ok(())
         }
 

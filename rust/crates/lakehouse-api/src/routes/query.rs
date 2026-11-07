@@ -195,6 +195,28 @@ pub(crate) fn substitute_parameters(
     .map_err(|refusal| ApiError::BadRequest(refusal.to_string()))
 }
 
+/// [`substitute_parameters`] for the assistant's two SQL tools (`QS-5`, D7):
+/// the `parameters` the model passed and, for a saved query, the definitions
+/// the store holds, both as raw JSON, for the engine the tools run on
+/// (`ClickHouse`, as `run` does when a body names none).
+///
+/// The tool calls this once, on the text the model or the author wrote, and
+/// hands the result to [`run_statement`], so the scanner never reads a printed
+/// literal.
+///
+/// # Errors
+///
+/// The 400 [`ApiError::BadRequest`] of [`substitute_parameters`], or the fixed
+/// sentence for a `parameters` or `definitions` value of the wrong shape.
+pub(crate) fn fill_tool_parameters(
+    sql: &str,
+    parameters: Option<Value>,
+    definitions: Option<Value>,
+) -> Result<String, ApiError> {
+    let (parameters, definitions) = parameter_inputs(parameters, definitions)?;
+    substitute_parameters("clickhouse", sql, &parameters, &definitions)
+}
+
 /// WS7 item C2: prefetches obligations for every table `sql` references
 /// (WS7 item C1's `PolicyEngineObligations`) and rewrites `sql` through
 /// [`crate::sql_rewrite::enforce`] — masking/row-filtering every governed

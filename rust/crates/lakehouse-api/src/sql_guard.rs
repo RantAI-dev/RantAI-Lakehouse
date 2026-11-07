@@ -276,6 +276,10 @@ pub(crate) enum SqlSourceRefusal {
     /// It reads a table outside `serving` (including `console.*` and
     /// `system.*`), or a bare table name.
     OutsideServing,
+    /// A well-formed `{{name}}` placeholder (`QS-5`). A dashboard source cannot
+    /// take parameters until part 2, and the engine would answer with a
+    /// message about `{`.
+    ParametersLater,
 }
 
 impl SqlSourceRefusal {
@@ -293,6 +297,10 @@ impl SqlSourceRefusal {
             Self::Unparseable => "the SQL could not be parsed, so the tables it reads are unknown.",
             Self::OutsideServing => {
                 "a SQL source may only read Gold tables, written as serving.<table>."
+            }
+            Self::ParametersLater => {
+                "Parameters in a dashboard's SQL source come later: give the value in the SQL \
+                 for now."
             }
         }
     }
@@ -319,6 +327,13 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
     }
     if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
         return Err(SqlSourceRefusal::TooLong);
+    }
+    // `QS-5` D8: before anything reads the statement as ClickHouse SQL. The
+    // scanner is the one that knows comments and quotes, so a `{{` in a
+    // comment, or text that is not a well-formed placeholder, changes
+    // nothing here.
+    if crate::query_params::holds_placeholder(trimmed) {
+        return Err(SqlSourceRefusal::ParametersLater);
     }
     let code = strip_sql_noise(trimmed);
     let lower = code.trim_start().to_ascii_lowercase();
@@ -445,6 +460,61 @@ mod sql_source_rules {
     fn unparseable_sql_is_refused_not_passed_through() {
         assert_eq!(
             check_sql_source("SELECT * FROM serving.a WHERE ((("),
+            Err(SqlSourceRefusal::Unparseable)
+        );
+    }
+
+    /// `QS-5` D8: parameters in a source come later, so a well-formed
+    /// placeholder is refused with the page's sentence instead of reaching
+    /// the engine parser, which would answer with a message about `{`.
+    #[test]
+    fn a_placeholder_in_a_source_is_refused_with_the_part_two_sentence() {
+        for sql in [
+            "SELECT * FROM serving.a WHERE region = {{region}}",
+            "SELECT * FROM serving.a WHERE region = {{ region }}",
+            "SELECT * FROM serving.a WHERE day >= {{days.start}} AND day <= {{days.end}}",
+            "SELECT * FROM serving.a WHERE region IN ({{regions}})",
+            // The same words in a string are a placeholder the person meant.
+            "SELECT * FROM serving.a WHERE region = '{{region}}'",
+        ] {
+            let refusal = check_sql_source(sql).unwrap_err();
+            assert_eq!(refusal, SqlSourceRefusal::ParametersLater, "{sql}");
+            assert_eq!(
+                refusal.message(),
+                "Parameters in a dashboard's SQL source come later: give the value in the \
+                 SQL for now.",
+                "{sql}"
+            );
+        }
+    }
+
+    /// The refusal comes before the engine parse: a source that holds a
+    /// placeholder and would also fail the parse says the placeholder first.
+    #[test]
+    fn the_placeholder_refusal_comes_before_the_engine_parse() {
+        assert_eq!(
+            check_sql_source("SELECT * FROM serving.a WHERE x = {{x}} AND ((("),
+            Err(SqlSourceRefusal::ParametersLater)
+        );
+    }
+
+    /// A `{{` that is not a well-formed placeholder, or that sits in a
+    /// comment, changes nothing: the source is judged as it was before.
+    #[test]
+    fn braces_that_are_not_a_placeholder_leave_the_verdict_as_it_was() {
+        for sql in [
+            "SELECT * FROM serving.a -- {{region}}",
+            "SELECT * FROM serving.a /* {{region}} */",
+            "SELECT '{{ not closed' AS note FROM serving.a",
+            "SELECT '{{9x}}' AS note FROM serving.a",
+        ] {
+            assert!(check_sql_source(sql).is_ok(), "{sql}");
+        }
+        // A stray `{{` outside quotes and comments is not a well-formed
+        // placeholder either: it keeps failing the way it did (a parse
+        // failure), not with the part-two sentence.
+        assert_eq!(
+            check_sql_source("SELECT * FROM serving.a WHERE x = {{"),
             Err(SqlSourceRefusal::Unparseable)
         );
     }

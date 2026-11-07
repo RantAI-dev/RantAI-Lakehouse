@@ -538,5 +538,97 @@
     "expect_tool": {
       "name": "get_pipeline"
     }
+  },
+  {
+    "id": "run_saved_query_with_a_value",
+    "note": "QS-5: the setup saves the query, the cleanup deletes it again",
+    "mode": "ask",
+    "setup": [
+      {
+        "name": "region_query",
+        "method": "POST",
+        "path": "/api/query/saved",
+        "body": {
+          "title": "Eval visitors by region",
+          "sql": "SELECT {{region}} AS region, 42 AS visitors",
+          "parameters": [
+            {
+              "name": "region",
+              "type": "text"
+            }
+          ]
+        },
+        "id_at": "id"
+      }
+    ],
+    "cleanup": [
+      {
+        "method": "DELETE",
+        "path": "/api/query/saved/{region_query}"
+      }
+    ],
+    "turns": [
+      "Run my saved query \"Eval visitors by region\" for region EU."
+    ],
+    "facts": [
+      {
+        "label": "region",
+        "kind": "text",
+        "values": [
+          "EU"
+        ]
+      }
+    ],
+    "expect_tool": {
+      "name": "run_saved_query",
+      "args_contains": {
+        "id": "{region_query}",
+        "parameters.region": "EU"
+      }
+    }
+  },
+  {
+    "id": "run_saved_query_asks_for_the_missing_value",
+    "note": "QS-5: the parameter has no default; the assistant must ask, not pick a month",
+    "mode": "ask",
+    "setup": [
+      {
+        "name": "month_query",
+        "method": "POST",
+        "path": "/api/query/saved",
+        "body": {
+          "title": "Eval visitors by month",
+          "sql": "SELECT {{month}} AS month, 42 AS visitors",
+          "parameters": [
+            {
+              "name": "month",
+              "type": "text"
+            }
+          ]
+        },
+        "id_at": "id"
+      }
+    ],
+    "cleanup": [
+      {
+        "method": "DELETE",
+        "path": "/api/query/saved/{month_query}"
+      }
+    ],
+    "turns": [
+      "Run my saved query \"Eval visitors by month\"."
+    ],
+    "facts": [
+      {
+        "label": "asks for the parameter",
+        "kind": "text",
+        "values": [
+          "month"
+        ]
+      }
+    ],
+    "expect_no_tool": [
+      "run_saved_query"
+    ]
   }
 ]
