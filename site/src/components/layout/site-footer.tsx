@@ -18,15 +18,16 @@ import { SourceIcon, type SourceIconId } from "@/components/shared/brand-icons";
  * with their marks (`components/shared/brand-icons.tsx`).
  */
 const FLOW_SOURCES: readonly { name: string; icon: SourceIconId }[] = [
+  // O46: the first five get a chip; the rest are behind the "+N" select.
   { name: "PostgreSQL", icon: "postgresql" },
   { name: "MySQL", icon: "mysql" },
-  { name: "SQL Server", icon: "database" },
   { name: "MongoDB", icon: "mongodb" },
   { name: "Salesforce", icon: "app" },
-  { name: "HubSpot", icon: "hubspot" },
   { name: "Excel", icon: "spreadsheet" },
-  { name: "CSV", icon: "spreadsheet" },
   { name: "Kafka", icon: "apachekafka" },
+  { name: "SQL Server", icon: "database" },
+  { name: "HubSpot", icon: "hubspot" },
+  { name: "CSV", icon: "spreadsheet" },
   { name: "REST API", icon: "rest" },
 ];
 
@@ -135,27 +136,26 @@ export function SiteFooter({
           the home page it is the action after the story's end (the final
           section); on the contact page it points back up to the form
           instead of repeating it. */}
-      <section
-        aria-labelledby="footer-cta-heading"
-        className="relative isolate overflow-hidden rounded-[28px] bg-[#050A30] ring-1 ring-[#E8F4FF]/10"
-      >
-        <FooterWater />
-        {/* O14: Lakehouse's own call to action. Little text: an eyebrow and a headline, then the picker. */}
-        <div className="mx-auto flex max-w-5xl flex-col items-center px-5 py-16 text-center sm:px-8 sm:py-24">
-          <Eyebrow>{cta.eyebrow}</Eyebrow>
-          <DisplayHeading id="footer-cta-heading" size="md" className="mt-5 max-w-[20ch]">
-            <SplitWords text={cta.title} />
-          </DisplayHeading>
-          <div className="mt-10 w-full">
-            <SourceFlow
-              names={FLOW_SOURCES.map((s) => s.name)}
-              marks={FLOW_SOURCES.map((s) => <SourceIcon key={s.name} id={s.icon} />)}
-              text={cta}
-              to={CONTACT_EMAIL}
-              page={page}
-              installHref={page === "home" ? "#get-started" : `${home}#get-started`}
-            />
-          </div>
+      {/* O46: compact, two columns, a flat solid panel with a hairline (no water, no rings). */}
+      <section aria-labelledby="footer-cta-heading" className="relative isolate rounded-[28px] bg-[#070F3A] ring-1 ring-[#E8F4FF]/10">
+        <div className="mx-auto max-w-6xl">
+          <SourceFlow
+            names={FLOW_SOURCES.map((s) => s.name)}
+            marks={FLOW_SOURCES.map((s) => <SourceIcon key={s.name} id={s.icon} />)}
+            text={cta}
+            to={CONTACT_EMAIL}
+            page={page}
+            installHref={page === "home" ? "#get-started" : `${home}#get-started`}
+            intro={
+              <>
+                <Eyebrow>{cta.eyebrow}</Eyebrow>
+                <DisplayHeading id="footer-cta-heading" size="sm" className="mt-4 max-w-[16ch]">
+                  <SplitWords text={cta.title} />
+                </DisplayHeading>
+                <p className="mt-3 max-w-[40ch] text-[15px] leading-6 text-[#E8F4FF]/70">{cta.line}</p>
+              </>
+            }
+          />
         </div>
       </section>
 
@@ -258,27 +258,5 @@ export function SiteFooter({
         />
       </div>
     </footer>
-  );
-}
-
-/**
- * The card's water, the lake's version of rantai-page's ASCII wave: a
- * waterline across the lower third and two rings spreading slowly from
- * where the creature would surface (O39: on a solid card, with no glow). Decorative; the
- * rings stop under reduced motion (`.lk-ring`).
- */
-function FooterWater() {
-  return (
-    <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10">
-      {/* O39: the card is solid; the waterline is a solid hairline, with no moon glow and no glow under it. */}
-      <div className="absolute inset-x-0 bottom-[22%] h-px bg-[#44A6FA]/35" />
-      <div className="absolute bottom-[22%] left-1/2 w-[min(70%,760px)] -translate-x-1/2 translate-y-1/2">
-        <span className="lk-ring absolute top-0 left-0 block aspect-[6/1] w-full -translate-y-1/2 rounded-[50%] border border-[#44A6FA]/35" />
-        <span
-          className="lk-ring absolute top-0 left-0 block aspect-[6/1] w-full -translate-y-1/2 rounded-[50%] border border-[#44A6FA]/25"
-          style={{ animationDelay: "2s" }}
-        />
-      </div>
-    </div>
   );
 }

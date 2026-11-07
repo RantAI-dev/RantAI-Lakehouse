@@ -1,19 +1,24 @@
 "use client";
 
 import * as React from "react";
-import { ArrowRight, Check } from "lucide-react";
+import { ArrowRight, Check, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /**
- * The footer card's "Pick a source, watch it flow" (WEB-5 owner QA O14):
+ * The footer card's "Pick a source, watch it flow" (WEB-5 owner QA O14,
+ * made compact in O46: two columns, the words and the actions on the left,
+ * the picker and the flow on the right; stacked on phones):
  * Lakehouse's own call to action, in place of rantai.dev's typewriter
  * prompt. A visitor picks a source; a light runs from it through Bronze,
  * Silver and Gold into a small dashboard that draws itself. Then "Start with
  * <source>" opens a ready-made e-mail (on the contact page it scrolls to
  * the form with the topic set to connectors).
  *
- * - The sources are a radio group: one is picked by default, the arrow keys
- *   move the choice, and the picked chip is lit and pressed.
+ * - The first sources are one row of chips, a radio group: one is picked
+ *   by default, the arrow keys move the choice. The rest sit behind a
+ *   "+N" chip, a native select, so the row never wraps.
+ * - The flow is one thin line from the source through three small dots
+ *   (Bronze, Silver, Gold) into a small dashboard chip; a light travels it.
  * - The marks arrive rendered by the server (`marks`), so their paths stay
  *   out of this chunk; the motion is CSS (".lk-sf-" in app/globals.css),
  *   restarted by keying the flow on the source; it runs only on screen (the
@@ -35,16 +40,23 @@ export type SourceFlowText = {
   opening: string;
   fallback: string;
   contactStart: string;
+  more: string;
 };
 
 /** The contact form listens for this to preset its topic (contact-form.tsx). */
 export const CONTACT_TOPIC_EVENT = "lk:contact-topic";
 
+/** Muted medal colours (O46): small dots, no glow. */
 const DEPTHS = [
-  { name: "Bronze", colour: "#C8834A" },
-  { name: "Silver", colour: "#B9C6D3" },
-  { name: "Gold", colour: "#F2C14E" },
+  { name: "Bronze", colour: "#b98157" },
+  { name: "Silver", colour: "#aab6c2" },
+  { name: "Gold", colour: "#d9b45a" },
 ] as const;
+
+const CHIP =
+  "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition-[background-color,border-color,color] duration-200 ease-out motion-reduce:transition-none";
+const CHIP_ON = "border-[#8fcbff]/60 bg-[#44A6FA]/15 text-white";
+const CHIP_OFF = "border-[#E8F4FF]/12 text-[#E8F4FF]/70 hover:border-[#E8F4FF]/30 hover:text-[#E8F4FF]";
 
 /** A deterministic little series per source, so each one draws its own line. */
 function series(seed: number): string {
@@ -64,6 +76,8 @@ export function SourceFlow({
   to,
   page,
   installHref,
+  intro,
+  shown = 5,
 }: Readonly<{
   names: readonly string[];
   marks: readonly React.ReactNode[];
@@ -71,12 +85,17 @@ export function SourceFlow({
   to: string;
   page: "home" | "contact";
   installHref: string;
+  /** The card's words (eyebrow, headline, line), rendered by the server. */
+  intro: React.ReactNode;
+  /** How many sources get a chip; the rest are in the "+N" select. */
+  shown?: number;
 }>) {
   const [picked, setPicked] = React.useState(0);
   const [sent, setSent] = React.useState(false);
   const rootRef = React.useRef<HTMLDivElement>(null);
   const refs = React.useRef<(HTMLButtonElement | null)[]>([]);
   const source = names[picked];
+  const extra = picked >= shown;
 
   React.useEffect(() => {
     const el = rootRef.current;
@@ -90,7 +109,8 @@ export function SourceFlow({
     const step = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
     if (!step) return;
     e.preventDefault();
-    const next = (picked + step + names.length) % names.length;
+    const from = extra ? (step > 0 ? -1 : 0) : picked;
+    const next = (from + step + shown) % shown;
     setPicked(next);
     refs.current[next]?.focus();
   };
@@ -110,84 +130,108 @@ export function SourceFlow({
   };
 
   return (
-    <div ref={rootRef} className="lk-sf w-full">
-      <div role="radiogroup" aria-label={text.sources} onKeyDown={onKey} className="flex flex-wrap justify-center gap-2">
-        {names.map((n, i) => (
+    <div
+      ref={rootRef}
+      className="lk-sf grid items-center gap-8 px-6 py-9 sm:px-8 lg:grid-cols-[minmax(0,4.5fr)_minmax(0,7.5fr)] lg:gap-10 lg:px-10 lg:py-10"
+    >
+      <div>
+        {intro}
+        <div className="mt-6 flex flex-wrap items-center gap-3">
           <button
-            key={n}
-            ref={(el) => {
-              refs.current[i] = el;
-            }}
             type="button"
-            role="radio"
-            aria-checked={picked === i}
-            tabIndex={picked === i ? 0 : -1}
-            onClick={() => setPicked(i)}
-            className={cn(
-              "inline-flex h-10 items-center gap-2 rounded-full border px-3.5 text-[13px] transition-[background-color,border-color,color,box-shadow,transform] duration-200 ease-out active:scale-[0.97] motion-reduce:transition-none",
-              picked === i
-                ? "border-[#8fcbff]/70 bg-[#44A6FA]/20 text-white shadow-[inset_0_1px_0_rgba(232,244,255,0.15),0_0_24px_-6px_rgba(68,166,250,0.7)]"
-                : "border-[#E8F4FF]/15 bg-[#E8F4FF]/[0.04] text-[#E8F4FF]/75 hover:border-[#E8F4FF]/35 hover:text-[#E8F4FF]",
-            )}
+            onClick={start}
+            className="group inline-flex h-11 items-center gap-2 rounded-full bg-[var(--lk-primary)] px-5 text-[14px] font-medium text-white transition-[background-color,transform] duration-200 ease-out hover:bg-[var(--lk-primary-hover)] active:scale-[0.98] active:bg-[var(--lk-primary-press)] motion-reduce:transition-none"
           >
-            <span className={cn("[&>svg]:size-4", picked === i ? "text-white" : "text-[#E8F4FF]/70")}>{marks[i]}</span>
-            {n}
+            {(page === "contact" ? text.contactStart : text.start).replace("{source}", source)}
+            <ArrowRight aria-hidden="true" className="size-4 transition-transform duration-200 ease-out group-hover:translate-x-0.5 motion-reduce:transition-none" />
           </button>
-        ))}
+          <a
+            href={installHref}
+            className="inline-flex h-11 items-center rounded-full border border-[#E8F4FF]/25 px-5 text-[14px] font-medium text-[#E8F4FF] transition-[background-color,border-color,transform] duration-200 ease-out hover:border-[#E8F4FF]/50 hover:bg-[#E8F4FF]/[0.06] active:scale-[0.98] motion-reduce:transition-none"
+          >
+            {text.install}
+          </a>
+        </div>
+        <p aria-live="polite" className="mt-3 min-h-5 text-[13px] text-[#E8F4FF]/70">
+          {sent && (
+            <span className="lk-fade-in inline-flex items-center gap-1.5">
+              <Check aria-hidden="true" className="size-3.5 text-[#7be0b0]" />
+              {text.opening} {text.fallback.replace("{email}", to)}
+            </span>
+          )}
+        </p>
       </div>
 
-      {/* The flow, keyed on the source so its light and its chart start again on every pick. */}
-      <div key={source} aria-hidden="true" className="lk-sf-flow mt-10 flex flex-col items-center gap-0 md:flex-row md:justify-center">
-        <div className="lk-sf-node flex h-12 min-w-[9rem] items-center justify-center gap-2 rounded-2xl bg-[#020514]/70 px-4 text-[13px] text-[#E8F4FF] ring-1 ring-[#8fcbff]/40">
-          <span className="[&>svg]:size-4">{marks[picked]}</span>
-          {source}
+      <div className="min-w-0 rounded-2xl bg-[#020514]/50 p-4 ring-1 ring-[#E8F4FF]/[0.07] sm:p-5">
+        {/* One row, never wrapped: it scrolls sideways on a narrow screen instead. */}
+        <div className="-mx-1 flex items-center gap-1.5 overflow-x-auto px-1 py-1 [scrollbar-width:none] max-sm:[mask-image:linear-gradient(90deg,#000_80%,transparent)]">
+          <div role="radiogroup" aria-label={text.sources} onKeyDown={onKey} className="flex gap-1.5">
+            {names.slice(0, shown).map((n, i) => (
+              <button
+                key={n}
+                ref={(el) => {
+                  refs.current[i] = el;
+                }}
+                type="button"
+                role="radio"
+                aria-checked={picked === i}
+                tabIndex={picked === i || (extra && i === 0) ? 0 : -1}
+                onClick={() => setPicked(i)}
+                className={cn(CHIP, picked === i ? CHIP_ON : CHIP_OFF)}
+              >
+                <span className="[&>svg]:size-3.5">{marks[i]}</span>
+                {n}
+              </button>
+            ))}
+          </div>
+          {names.length > shown && (
+            <label className={cn(CHIP, extra ? CHIP_ON : CHIP_OFF, "relative cursor-pointer has-[select:focus-visible]:outline-2 has-[select:focus-visible]:outline-offset-2 has-[select:focus-visible]:outline-[#8fcbff]")}>
+              <span aria-hidden="true">+{names.length - shown}</span>
+              <ChevronDown aria-hidden="true" className="size-3" />
+              <select
+                aria-label={text.more}
+                value={extra ? String(picked) : ""}
+                onChange={(e) => e.target.value && setPicked(Number(e.target.value))}
+                className="absolute inset-0 cursor-pointer opacity-0 [color-scheme:dark]"
+              >
+                <option value="" disabled>
+                  {text.more}
+                </option>
+                {names.slice(shown).map((n, j) => (
+                  <option key={n} value={shown + j}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
         </div>
-        {DEPTHS.map((d, i) => (
-          <React.Fragment key={d.name}>
-            <span className="lk-sf-line" style={{ animationDelay: `${i * 0.35}s` }} />
-            <div className="lk-sf-node flex flex-col items-center" style={{ animationDelay: `${0.35 + i * 0.35}s` }}>
-              <span className="grid size-12 place-items-center rounded-full text-[11px] font-semibold text-[#020514]" style={{ background: d.colour, boxShadow: `0 0 24px -4px ${d.colour}` }}>
-                {d.name.slice(0, 1)}
-              </span>
-              <span className="mt-1.5 text-[11px] text-[#E8F4FF]/70">
-                {d.name} · {[text.raw, text.clean, text.ready][i]}
-              </span>
-            </div>
-          </React.Fragment>
-        ))}
-        <span className="lk-sf-line" style={{ animationDelay: "1.05s" }} />
-        <div className="lk-sf-node lk-tile w-[11rem] rounded-2xl bg-[#E8F4FF]/[0.06] p-3 ring-1 ring-[#E8F4FF]/15" data-shown="" style={{ animationDelay: "1.4s" }}>
-          <p className="text-[11px] text-[#E8F4FF]/70">{text.tile}</p>
-          <svg viewBox="0 0 120 52" className="mt-1.5 h-auto w-full">
-            <path className="lk-draw" style={{ animationDelay: "1.5s" }} pathLength={1} d={series(picked)} fill="none" stroke="#44A6FA" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </div>
-      </div>
 
-      <div className="mt-10 flex flex-wrap items-center justify-center gap-3">
-        <button
-          type="button"
-          onClick={start}
-          className="group inline-flex h-12 items-center gap-2 rounded-full bg-[var(--lk-primary)] px-6 text-[15px] font-medium text-white transition-[transform,background-color,box-shadow] duration-200 ease-out hover:-translate-y-0.5 hover:bg-[var(--lk-primary-hover)] hover:shadow-[0_10px_40px_-8px_rgba(68,166,250,0.7)] active:translate-y-0 active:scale-[0.98] active:bg-[var(--lk-primary-press)] motion-reduce:transition-none motion-reduce:hover:translate-y-0"
-        >
-          {(page === "contact" ? text.contactStart : text.start).replace("{source}", source)}
-          <ArrowRight aria-hidden="true" className="size-4 transition-transform duration-200 ease-out group-hover:translate-x-0.5 motion-reduce:transition-none" />
-        </button>
-        <a
-          href={installHref}
-          className="inline-flex h-12 items-center rounded-full border border-[#E8F4FF]/35 px-6 text-[15px] font-medium text-[#E8F4FF] transition-[transform,background-color,border-color] duration-200 ease-out hover:-translate-y-0.5 hover:border-[#E8F4FF]/70 hover:bg-[#E8F4FF]/10 active:translate-y-0 active:scale-[0.98] motion-reduce:transition-none motion-reduce:hover:translate-y-0"
-        >
-          {text.install}
-        </a>
+        {/* The flow, keyed on the source so its light and its chart start again on every pick. */}
+        <div key={source} aria-hidden="true" className="lk-sf-flow mt-6 flex items-center max-md:flex-col max-md:items-start md:pb-7">
+          <div className="lk-sf-node inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full bg-[#020514]/70 px-3 text-[12px] text-[#E8F4FF] ring-1 ring-[#E8F4FF]/15">
+            <span className="[&>svg]:size-3.5">{marks[picked]}</span>
+            {source}
+          </div>
+          {DEPTHS.map((d, i) => (
+            <React.Fragment key={d.name}>
+              <span className="lk-sf-line" style={{ "--lk-sf-d": `${i * 0.45}s` } as React.CSSProperties} />
+              <span className="lk-sf-node relative size-2.5 shrink-0 rounded-full max-md:ml-[13.5px]" style={{ background: d.colour, animationDelay: `${0.1 + i * 0.1}s` }}>
+                <span className="absolute text-[11px] whitespace-nowrap text-[#E8F4FF]/65 max-md:top-1/2 max-md:left-full max-md:ml-3 max-md:-translate-y-1/2 md:top-full md:left-1/2 md:mt-2.5 md:-translate-x-1/2">
+                  {d.name} · {[text.raw, text.clean, text.ready][i]}
+                </span>
+              </span>
+            </React.Fragment>
+          ))}
+          <span className="lk-sf-line" style={{ "--lk-sf-d": "1.35s" } as React.CSSProperties} />
+          <div className="lk-sf-node lk-tile shrink-0 rounded-xl bg-[#E8F4FF]/[0.05] px-2.5 py-1.5 ring-1 ring-[#E8F4FF]/12" data-shown="" style={{ animationDelay: "0.4s" }}>
+            <p className="text-[10px] leading-3 whitespace-nowrap text-[#E8F4FF]/65">{text.tile}</p>
+            <svg viewBox="0 0 120 52" className="mt-1 h-5 w-[4.5rem]">
+              <path className="lk-draw" style={{ animationDelay: "0.5s" }} pathLength={1} d={series(picked)} fill="none" stroke="#44A6FA" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </div>
+        </div>
       </div>
-      <p aria-live="polite" className="mt-4 min-h-5 text-center text-[13px] text-[#E8F4FF]/70">
-        {sent && (
-          <span className="lk-fade-in inline-flex items-center gap-1.5">
-            <Check aria-hidden="true" className="size-3.5 text-[#7be0b0]" />
-            {text.opening} {text.fallback.replace("{email}", to)}
-          </span>
-        )}
-      </p>
     </div>
   );
 }

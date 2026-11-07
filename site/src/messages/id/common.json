@@ -50,7 +50,9 @@
       "body": "Kami ingin mulai dengan {source}.",
       "opening": "Membuka aplikasi email…",
       "fallback": "Tidak terbuka? Kirim ke {email}.",
-      "contactStart": "Tanya soal {source}"
+      "contactStart": "Tanya soal {source}",
+      "line": "Mentah di Bronze, bersih di Silver, siap di Gold.",
+      "more": "Sumber lain"
     },
     "backToTop": "Kembali ke atas",
     "home": "Beranda RantAI Lakehouse",

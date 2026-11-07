@@ -50,7 +50,9 @@
       "body": "We would like to start with {source}.",
       "opening": "Opening your email app…",
       "fallback": "Nothing opened? Write to {email}.",
-      "contactStart": "Ask about {source}"
+      "contactStart": "Ask about {source}",
+      "line": "Raw in Bronze, clean in Silver, ready in Gold.",
+      "more": "More sources"
     },
     "backToTop": "Back to top",
     "home": "RantAI Lakehouse home",

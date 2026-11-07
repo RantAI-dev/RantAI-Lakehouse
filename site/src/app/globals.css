@@ -1005,23 +1005,27 @@ section[data-role="admin"] .lk-gv-closed {
   animation-play-state: paused;
 }
 
-/* ---- The footer card's flow (WEB-5 owner QA O14) -------------------------
-   Keyed on the picked source, so every pick replays it: the nodes arrive
-   left to right, the lines between them light, and a soft light keeps
-   travelling along them while the card is on screen (`data-live`). */
+/* ---- The footer card's flow (WEB-5 owner QA O14, compact in O46) --------
+   Keyed on the picked source, so every pick replays it: the nodes fade in
+   and one light travels the thin line, segment after segment (each
+   segment's delay is `--lk-sf-d`), while the card is on screen
+   (`data-live`). Across on wider screens, down on phones. */
 .lk-sf-line {
   position: relative;
   display: block;
-  width: 2px;
-  height: 28px;
-  background: rgba(232, 244, 255, 0.18);
+  flex: 1 1 0;
+  min-width: 14px;
+  height: 1px;
+  background: rgba(232, 244, 255, 0.16);
   overflow: hidden;
 }
-@media (min-width: 48rem) {
+@media (max-width: 47.99rem) {
   .lk-sf-line {
-    width: 44px;
-    height: 2px;
-    margin-bottom: 22px;
+    flex: none;
+    width: 1px;
+    min-width: 0;
+    height: 18px;
+    margin-left: 18px;
   }
 }
 .lk-sf-line::after {
@@ -1029,35 +1033,46 @@ section[data-role="admin"] .lk-gv-closed {
   position: absolute;
   inset: 0;
   background: linear-gradient(90deg, transparent, #8fcbff, transparent);
-  background-size: 200% 100%;
+  transform: translateX(-100%);
   animation: lk-sf-run 1.8s linear infinite;
+  animation-delay: var(--lk-sf-d, 0s);
   animation-play-state: paused;
 }
 @media (max-width: 47.99rem) {
   .lk-sf-line::after {
     background: linear-gradient(180deg, transparent, #8fcbff, transparent);
-    background-size: 100% 200%;
+    animation-name: lk-sf-run-down;
   }
 }
 .lk-sf[data-live] .lk-sf-line::after {
   animation-play-state: running;
 }
+/* A quarter of the cycle crossing its segment, then dark while the light
+   crosses the next ones (four segments, 0.45 s apart). */
 @keyframes lk-sf-run {
-  from {
-    background-position: 100% 100%;
+  0% {
+    transform: translateX(-100%);
   }
-  to {
-    background-position: -100% -100%;
+  25%,
+  100% {
+    transform: translateX(100%);
   }
 }
-.lk-sf-node,
-.lk-sf-line {
-  animation: lk-sf-in 420ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+@keyframes lk-sf-run-down {
+  0% {
+    transform: translateY(-100%);
+  }
+  25%,
+  100% {
+    transform: translateY(100%);
+  }
+}
+.lk-sf-node {
+  animation: lk-sf-in 360ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
 }
 @keyframes lk-sf-in {
   from {
     opacity: 0;
-    transform: scale(0.92);
   }
 }
 
@@ -1164,7 +1179,7 @@ section[data-role="admin"] .lk-gv-closed {
     animation: none !important;
   }
   .lk-sf-line {
-    background: rgba(143, 203, 255, 0.6);
+    background: rgba(143, 203, 255, 0.4);
   }
   /* O16/O17: still. */
   .lk-gv-open,

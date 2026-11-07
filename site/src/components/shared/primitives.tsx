@@ -81,6 +81,7 @@ const HEADING_SIZE = {
   xl: "text-[clamp(4.5rem,9vw,7.5rem)] leading-[1.02]",
   lg: "text-[clamp(3rem,7vw,5.75rem)] leading-[1.02]",
   md: "text-[clamp(2.5rem,5vw,4rem)] leading-[1.04]",
+  sm: "text-[clamp(2rem,3.4vw,2.75rem)] leading-[1.06]",
 } as const;
 
 export function DisplayHeading({
