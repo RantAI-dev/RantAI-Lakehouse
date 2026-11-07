@@ -1,15 +1,22 @@
 import { parseTimestamp } from "@/lib/format"
 
 /**
+ * Text with each unverified-number marker (`lib/citation-markers.ts`) reduced
+ * to the number it wraps. For places that show text verbatim, where the tag
+ * would otherwise print as literal markup.
+ */
+export function stripUnverifiedMarkers(text: string): string {
+  return text.replace(/<span data-unverified="true">([^<]*)<\/span>/g, "$1")
+}
+
+/**
  * A chat message's markdown as one plain line, for a list preview: code
  * blocks, emphasis, headings, list markers and link targets stripped.
  */
 export function plainPreview(markdown: string, max = 160): string {
-  const text = markdown
-    .replace(/```[\s\S]*?```/g, " ")
-    // Citation markers (`lib/citation-markers.ts`) wrap an unbacked number
-    // in a span; a preview keeps the number and drops the tag.
-    .replace(/<span data-unverified="true">([^<]*)<\/span>/g, "$1")
+  // Citation markers wrap an unbacked number in a span; a preview keeps the
+  // number and drops the tag.
+  const text = stripUnverifiedMarkers(markdown.replace(/```[\s\S]*?```/g, " "))
     .replace(/`([^`]*)`/g, "$1")
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/^\s{0,3}(#{1,6}|>|[-*+]|\d+\.)\s+/gm, "")
