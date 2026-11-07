@@ -11,7 +11,7 @@ import { SplitWords } from "@/components/shared/reveal";
 import { TiltCard } from "@/components/shared/tilt-card";
 
 /**
- * S5 — "Dashboards live on the shore": answers come back up as dashboards.
+ * S5 — "Dashboards live on the shore": answers become dashboards (O33: one descent, so not "come back up").
  *
  * A pinned stage whose row of five tiles slides sideways as the page scrolls
  * down: vertical scroll drives `x` one for one, so the section is exactly as

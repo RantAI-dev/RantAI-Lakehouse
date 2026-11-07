@@ -133,7 +133,7 @@
     "srDescription": "An illustration of the assistant. A person asks which region had the most visitors last quarter; the assistant reads a Gold table, groups it by region and answers with a bar chart where North leads. The person then asks to pause the nightly sales pipeline. The assistant does not do it on its own: it shows a request that waits for approval, and an admin approves it. The region names and numbers are illustrative."
   },
   "dashboards": {
-    "headline": "Answers come back up as dashboards.",
+    "headline": "Answers become dashboards.",
     "sub": "About two dozen chart types, maps on your own boundaries included.",
     "features": [
       "Calculated fields",

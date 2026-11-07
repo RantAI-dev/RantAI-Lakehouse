@@ -12,8 +12,9 @@ import { routing } from "@/i18n/routing";
  * D18: a 404 in each language. One file answers both `/x/` and `/id/x/`
  * on every host (some hosts only ever serve the root one), so it says it
  * in English first and then in Indonesian (`lang="id"`), each with a way
- * home in its own language. The creature waits at the surface; it bobs
- * like the hero's and rests under reduced motion. Next marks the page
+ * home in its own language. The creature waits in water that darkens down
+ * to the abyss (O33); it bobs like the hero's and rests under reduced
+ * motion. Next marks the page
  * `noindex`, which is right for a missing page.
  */
 export async function generateMetadata(): Promise<Metadata> {
@@ -29,10 +30,10 @@ export default async function NotFound() {
   const id = await getTranslations({ locale: "id", namespace: "common.notFound" });
   return (
     <SiteDocument locale={routing.defaultLocale}>
-      <div className="lk-root lk-404 relative isolate flex min-h-[100svh] flex-col items-center justify-center overflow-hidden px-4 py-20 text-center">
+      <div className="lk-root relative isolate flex min-h-[100svh] flex-col items-center justify-center overflow-hidden px-4 py-20 text-center">
         <div
           aria-hidden="true"
-          className="absolute inset-0 -z-10 bg-[linear-gradient(180deg,#020514_0%,#050A30_42%,#0A1F55_70%,#061440_100%)]"
+          className="absolute inset-0 -z-10 bg-[linear-gradient(180deg,#0a1f55_0%,#020e42_40%,#020514_100%)]"
         />
         <main className="flex max-w-[36rem] flex-col items-center">
           <MascotLogo className="lk-bob h-24 w-auto drop-shadow-[0_0_40px_rgba(68,166,250,0.3)] md:h-28" />

@@ -119,22 +119,14 @@
   --lk-primary-press: #1a63c4;
 }
 
-/* WEB-5 owner QA O26: the rubber band past either end of the page (macOS
-   and iOS) shows the root's canvas. It is split at the middle of the
-   screen, so the top bounce shows the hero's night sky and the bottom bounce
-   the colour the page ends on: the page-wide water's deep lake blue on the
-   home page (`.lk-water`, #0b2a66 at its bottom), the 404's lake, and the
-   footer's abyss elsewhere. `fixed`, so the split stays with the screen.
-   The body keeps the abyss behind the content. The bounce itself is left
-   alone. */
+/* WEB-5 owner QA O26, O33: the rubber band past either end of the page
+   (macOS and iOS) shows the root's canvas. Since O33 every page ends on the
+   abyss, #020514 (the home page's water, the contact page and the 404 all
+   darken down to it), which is also the hero's night at the top, so the
+   canvas is that one colour above and below. The body keeps the abyss
+   behind the content. The bounce itself is left alone. */
 :root:has(.lk-root) {
-  background: linear-gradient(180deg, #020514 0 50%, #020514 50% 100%) fixed;
-}
-:root:has(.lk-water) {
-  background: linear-gradient(180deg, #020514 0 50%, #0b2a66 50% 100%) fixed;
-}
-:root:has(.lk-404) {
-  background: linear-gradient(180deg, #020514 0 50%, #061440 50% 100%) fixed;
+  background: #020514;
 }
 
 .lk-root {
@@ -205,46 +197,9 @@ html[data-scene="full"] #hero {
 html[data-scene] .lk-fallback-bg {
   background: none;
 }
-/* S5, the ascent: caustics and bubbles, scaled by the page (0 outside the climb). */
-.lk-water {
-  --lk-ascent: 0;
-  --lk-caustic: 0;
-}
-.lk-water-caustics {
-  opacity: calc(var(--lk-caustic) * 0.9);
-}
-.lk-bubbles {
-  opacity: var(--lk-ascent);
-}
-.lk-bubble {
-  animation-name: lk-bubble;
-  animation-timing-function: linear;
-  animation-iteration-count: infinite;
-}
-@keyframes lk-bubble {
-  0% {
-    transform: translate3d(0, 10vh, 0);
-    opacity: 0;
-  }
-  10% {
-    opacity: 0.9;
-  }
-  50% {
-    transform: translate3d(6px, -50vh, 0);
-  }
-  85% {
-    opacity: 0.7;
-  }
-  100% {
-    transform: translate3d(-4px, -105vh, 0);
-    opacity: 0;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .lk-bubbles {
-    display: none;
-  }
-}
+/* WEB-5 O33: the ascent's caustics and bubbles (`.lk-water-caustics`,
+   `.lk-bubbles`, `.lk-bubble`, `--lk-ascent`, `--lk-caustic`) are gone with
+   the ascent: the page is one descent now. */
 
 /* WEB-5 D14 S3: the depth gauge (components/home/depth-gauge.tsx). The page
    writes --lk-gauge-f, the depth as a fraction of the deepest point. The

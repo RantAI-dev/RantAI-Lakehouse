@@ -133,7 +133,7 @@
     "srDescription": "Ilustrasi asisten. Seseorang bertanya wilayah mana yang paling banyak pengunjungnya kuartal lalu; asisten membaca tabel Gold, mengelompokkannya per wilayah, dan menjawab dengan bar chart yang dipimpin Utara. Lalu ia meminta pipeline penjualan malam dijeda. Asisten tidak menjalankannya sendiri: ia menampilkan permintaan yang menunggu persetujuan, dan seorang admin menyetujuinya. Nama wilayah dan angkanya hanya ilustrasi."
   },
   "dashboards": {
-    "headline": "Jawabannya naik jadi dashboard.",
+    "headline": "Jawaban jadi dashboard.",
     "sub": "Sekitar dua lusin jenis chart, termasuk peta dengan batas wilayah Anda.",
     "features": [
       "Calculated field",

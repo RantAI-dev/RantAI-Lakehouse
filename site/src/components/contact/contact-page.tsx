@@ -145,14 +145,15 @@ function Waterline() {
 }
 
 /**
- * The night sky of the hero, without the lake: the page sits at the
- * surface. A moon's glow at the upper right and a soft fall into the abyss
- * colour the FAQ and the footer sit on. Decorative and static.
+ * The page's water: lake blue at the top, darkening down into the abyss
+ * the FAQ and the footer sit on (O33: one descent, as on the home page),
+ * with a moon's glow at the upper right. Decorative and static.
  */
 function SurfaceBackdrop() {
   return (
     <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[70rem] overflow-hidden">
-      <div className="absolute inset-0 bg-[linear-gradient(180deg,#020514_0%,#050A30_32%,#0A1F55_58%,#020514_100%)]" />
+      {/* O33: darker down the page, like the home page's one descent, ending on the page's abyss. */}
+      <div className="absolute inset-0 bg-[linear-gradient(180deg,#0a1f55_0%,#020e42_40%,#020514_100%)]" />
       <div className="absolute top-[3rem] right-[8%] size-[min(46vmin,28rem)] rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.16)_0%,rgba(68,166,250,0.08)_38%,transparent_70%)]" />
     </div>
   );
