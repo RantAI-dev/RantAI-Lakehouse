@@ -2191,48 +2191,25 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 
-/* Typing: the real command is transparent until its line has typed; the
-   overlay shows the typed part, with a block caret. */
-.lk-gs-term:is([data-term="idle"], [data-term="typing"]) [data-cmd]:not([data-typed]) .lk-gs-real {
-  color: transparent;
-}
-.lk-gs-typed {
-  color: #e8f4ff;
-}
-.lk-gs-rest {
-  color: transparent;
-}
-[data-cmd][data-typing] .lk-gs-typed::after {
-  content: "";
-  display: inline-block;
-  width: 0.55em;
-  height: 1.05em;
-  margin-left: 1px;
-  margin-right: -0.55em;
-  vertical-align: -0.18em;
-  background: #8fcbff;
-  animation: lk-twinkle 0.9s steps(2, jump-none) infinite;
-}
-.lk-gs-term:is([data-term="idle"], [data-term="typing"]) :is(.lk-gs-line, .lk-gs-ready) {
+/* O45 rollback (and audit #5): every command shows at once, so no step
+   sits blank while another types; only what the commands print waits for
+   its terminal to come into view, then appears line by line. */
+.lk-gs-term[data-term="idle"] :is(.lk-gs-line, .lk-gs-ready) {
   opacity: 0;
 }
 /* O35 follow-up: a flat terminal, one step lighter than the water, with a
-   hairline that turns lake blue while it types. */
+   hairline. */
 .lk-gs-term {
   box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.09);
-  transition: box-shadow 0.3s ease;
-}
-.lk-gs-term[data-term="typing"] {
-  box-shadow: inset 0 0 0 1px rgba(68, 166, 250, 0.45);
 }
 .lk-gs-term[data-term="done"] .lk-gs-line {
-  animation: lk-fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation: lk-fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) 0.3s backwards;
 }
 .lk-gs-term[data-term="done"] .lk-gs-line:nth-child(2) {
-  animation-delay: 0.35s;
+  animation-delay: 0.7s;
 }
 .lk-gs-term[data-term="done"] .lk-gs-ready {
-  animation: lk-fade-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) 0.8s backwards;
+  animation: lk-fade-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) 1.1s backwards;
 }
 .lk-gs-ready-dot {
   animation: lk-gs-ready 2.2s ease-out infinite;

@@ -25,13 +25,13 @@ import { GET_STARTED_OUTPUT } from "./get-started-output";
  * WEB-5 O23 (owner: "udah bagus cuma kek kurang animasi"): the same layout,
  * alive. The line fills as the steps pass the middle of the screen and
  * each step's number lights there (CSS scroll timelines; where a browser
- * has none, the line is full and the numbers lit). Each terminal types its
- * commands when it comes into view, then shows what they print, dimmed,
- * with a green check on the line that says it worked
- * (`get-started-output.ts`), and the last one ends ready on
- * localhost:3000. The server renders every terminal finished, so the
- * section is complete without JavaScript and under reduced motion; the
- * typing is a deferred chunk (`get-started-play.tsx`).
+ * has none, the line is full and the numbers lit). When a terminal comes
+ * into view, what its commands print appears, dimmed, line by line, with a
+ * green check on the line that says it worked (`get-started-output.ts`),
+ * and the last one ends ready on localhost:3000. The commands themselves
+ * show at once (O45 rollback, audit #5: typed one terminal at a time,
+ * steps 2 and 3 sat blank). The server renders every terminal finished, so
+ * the section is complete without JavaScript and under reduced motion.
  */
 export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarted"] }>) {
   const copyText = { copy: copy.copy, copied: copy.copied, failed: copy.copyFailed };
@@ -57,12 +57,7 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
           <span aria-hidden="true" className="absolute top-3 bottom-8 left-[11px] w-px bg-[#44A6FA]/20" />
           <span aria-hidden="true" className="lk-gs-fill absolute top-3 bottom-8 left-[11px] w-px bg-[#8fcbff]/80" />
           {copy.steps.map((step, i) => (
-            // WEB-5 O45 (owner: "buat ini sticky lah, sampe 3 terminal selesai"):
-            // from md each step takes most of a screen, so the left column
-            // visibly stays put while the steps pass, and the last one is
-            // taller still, so step 3 has typed and shown its output well
-            // before the column lets go at the section's end.
-            <Reveal as="li" key={step.title} delay={i * 0.08} y={20} className="relative pb-10 pl-12 last:pb-0 md:min-h-[60svh] md:last:min-h-[92svh]">
+            <Reveal as="li" key={step.title} delay={i * 0.08} y={20} className="relative pb-10 pl-12 last:pb-0">
               <span
                 aria-hidden="true"
                 className="lk-gs-num absolute top-1 left-0 grid size-6 place-items-center rounded-full bg-[#020514] text-[12px] font-medium tabular-nums"
@@ -83,7 +78,6 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                           <span aria-hidden="true" className="mr-2 text-[#44A6FA] select-none">
                             $
                           </span>
-                          {/* While it "types", the command keeps all its text (the rest transparent), so it wraps as it will and Copy copies all of it. */}
                           <span id={id} data-real className="lk-gs-real">
                             {cmd}
                           </span>

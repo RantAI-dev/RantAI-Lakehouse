@@ -3,16 +3,21 @@
 import * as React from "react";
 
 /**
- * WEB-5 O23: brings the Quickstart's terminals to life, and is the only
- * client code the section adds to the initial bundle (the typing is
- * `get-started-type.ts`, loaded on first sight). The server renders every
- * terminal finished: commands, output and the "ready" state, so the
- * section reads complete without JavaScript and under reduced motion.
+ * WEB-5 O23: brings the Quickstart's terminals to life, the only client
+ * code of the section. The server renders every terminal finished:
+ * commands, output and the "ready" state, so the section reads complete
+ * without JavaScript and under reduced motion.
  *
- * After hydration each terminal that is still off screen is set to `idle`
- * (its command blank, its output hidden: CSS on `data-term`); when one
- * comes into view its commands type themselves and its output appears.
- * A terminal already on screen stays finished.
+ * After hydration each terminal still off screen is set to `idle`, which
+ * hides only what its commands print (CSS on `data-term`); when it comes
+ * into view it is `done` and its output appears, line by line. A terminal
+ * already on screen stays finished.
+ *
+ * O45 rollback (owner: "kembalikan kayak yang dulu"), and audit #5: the
+ * commands no longer type themselves. Typed one terminal at a time, steps 2
+ * and 3 sat blank for seconds while step 1 typed; now every command shows
+ * at once and only the output is animated, so the deferred typing chunk is
+ * gone too.
  */
 export function GetStartedPlay({ children }: { children: React.ReactNode }) {
   const ref = React.useRef<HTMLDivElement>(null);
@@ -25,29 +30,21 @@ export function GetStartedPlay({ children }: { children: React.ReactNode }) {
     });
     if (terms.length === 0) return;
     for (const t of terms) t.dataset.term = "idle";
-    const stops: (() => void)[] = [];
-    let gone = false;
     const io = new IntersectionObserver(
       (entries) => {
         for (const e of entries) {
           if (!e.isIntersecting) continue;
           const t = e.target as HTMLElement;
           io.unobserve(t);
-          void import("./get-started-type").then(({ typeTerminal }) => {
-            if (!gone) stops.push(typeTerminal(t));
-          });
+          t.dataset.term = "done";
         }
       },
-      // O45: start typing as a terminal comes in from below, not once it is
-      // mostly on screen, so the last one has finished before the sticky
-      // column beside it releases.
-      { threshold: 0.35 },
+      { threshold: 0.6 },
     );
     for (const t of terms) io.observe(t);
     return () => {
-      gone = true;
       io.disconnect();
-      for (const stop of stops) stop();
+      for (const t of terms) t.dataset.term = "done";
     };
   }, []);
   return <div ref={ref}>{children}</div>;

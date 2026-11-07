@@ -13,9 +13,10 @@
  * through the page and fails (exit 1) when:
  * - "Yours to keep": two showcase list items ever overlap (O44: at the
  *   release all four were pushed into one spot), or more than one picture
- *   is shown at once;
- * - "Get started": from 1024 px wide and 600 px tall, the left column is
- *   not pinned for at least half a screen of scroll (O45).
+ *   is shown at once.
+ * It also prints how long "Get started"'s left column stays pinned, for
+ * information only: since the O45 rollback the steps keep their compact
+ * spacing and the column pins only as long as they naturally take.
  */
 
 export {};
@@ -100,7 +101,6 @@ for (const [w, h] of SIZES) {
   const errors: string[] = [];
   if (r.overlap > 0) errors.push(`showcase items overlap by ${r.overlap}px`);
   if (r.shown > 1) errors.push(`${r.shown} showcase pictures shown at once`);
-  if (w >= 1024 && h >= 600 && r.pinned < h / 2) errors.push(`Get started column pinned for only ${r.pinned}px`);
   console.log(`${w}x${h}`, errors.length ? `FAIL: ${errors.join("; ")}` : `ok (Get started pinned ${r.pinned}px)`);
   if (errors.length) failed++;
 }
