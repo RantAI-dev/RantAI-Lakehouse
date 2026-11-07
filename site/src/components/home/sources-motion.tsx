@@ -23,10 +23,11 @@ export function SourcesHeadingFade({ children }: { children: React.ReactNode }) 
       // WEB-5 D5: scroll fades it in from opacity 0, which the server
       // HTML carries; `data-reveal` shows it in full without JavaScript.
       data-reveal
-      // WEB-1 review round 1 SHOULD-FIX 5: on a phone the copy sits over the
-      // glow of the mascot's eye seen through the water, so it gets a dark
-      // backing there (body text stays above 4.5:1 on it).
-      className="relative z-10 max-md:rounded-3xl max-md:bg-[#020b2a]/70 max-md:p-3"
+      // Audit #4: no dark plate behind the copy on phones any more (it showed
+      // as a box while the chips flew in behind it). The whale's eyes have no
+      // glow since O48, so the text keeps its contrast on the water, and the
+      // chips are only drawn inside the list's own area (sources-section.tsx).
+      className="relative z-10"
       // Keyed on `reduced`: before motion's features load an `m` element keeps
       // the style it first rendered (review fix R1), so a switch must remount it.
       key={reduced ? "reduced" : "motion"}

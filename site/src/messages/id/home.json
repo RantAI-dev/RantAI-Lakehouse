@@ -11,7 +11,7 @@
     "scrollCue": "Gulir untuk menyelam"
   },
   "sources": {
-    "headline": "Semua mengalir masuk.",
+    "headline": "Semua mengalir.",
     "sub": "Database, file, stream, API, dan aplikasi bisnis masuk ke satu tempat, terjadwal atau setiap kali datanya berubah.",
     "items": [
       "PostgreSQL",

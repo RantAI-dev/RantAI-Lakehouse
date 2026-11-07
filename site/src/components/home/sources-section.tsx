@@ -44,7 +44,11 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
           {/* WEB-5 T6: 19 sources instead of 9. On phones the pills, gaps and
               margins are tighter so the pinned 100svh stage still holds the
               headline, every pill and the caption; desktop is unchanged. */}
-          <ul className="relative z-0 mx-auto mt-5 flex max-w-[760px] flex-wrap justify-center gap-1.5 md:mt-12 md:gap-3">
+          {/* Audit #4: on phones a droplet is only drawn once it is inside the
+              list's own area, fading in over a 24 px band above the first row
+              (padding, so the settled pills are never faded), so none crosses
+              the heading: a mask, not a backing plate. */}
+          <ul className="relative z-0 mx-auto mt-5 flex max-w-[760px] flex-wrap justify-center gap-1.5 max-md:mt-0 max-md:pt-6 max-md:[mask-image:linear-gradient(180deg,transparent_0,#000_20px)] md:mt-12 md:gap-3">
             {/* O20: the marks render here, on the server (see SourcePills). */}
             <SourcePills
               items={copy.items}
@@ -52,8 +56,9 @@ export function SourcesSection({ copy }: { copy: HomeCopy["sources"] }) {
               colours={SOURCE_ICONS.map(hoverColour)}
             />
           </ul>
-          <Reveal className="mx-auto mt-4 max-w-[36rem] md:mt-10">
-            <p className="text-[11px] leading-4 md:text-[12px] md:leading-5 tracking-wide text-[#E8F4FF]/65">{copy.caption}</p>
+          {/* Audit #26: the footnote is readable (14 px, ~8:1 on the water) and wraps without a widow. */}
+          <Reveal className="mx-auto mt-4 max-w-[34rem] md:mt-10">
+            <p className="text-[14px] leading-[1.5] text-pretty text-[#E8F4FF]/75">{copy.caption}</p>
           </Reveal>
         </Container>
       </div>
