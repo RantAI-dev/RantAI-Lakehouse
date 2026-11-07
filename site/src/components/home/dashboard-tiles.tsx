@@ -31,14 +31,9 @@ type Tiles = HomeCopy["dashboards"]["tiles"];
 /** The words a tile draws itself: its accessible name, and the KPI line. */
 export type TileText = { aria: string; delta?: string };
 
-// Task B: the tiles sit on white cards in the light dashboards panel. LAKE is the deeper
-// primary blue (#1d6ccf is 5.1:1 on white), INK the near-black of the text, and the
-// tooltips stay dark glass with light text, as in Linear and Vercel analytics.
-const LAKE = "#1d6ccf";
-const INK = "#0f1419";
-const GREY = "#6b7680";
-const TIP = "#E8F4FF";
-const GLASS = "#0b0d0e";
+const LAKE = "#44A6FA";
+const FOAM = "#E8F4FF";
+const GLASS = "#020514";
 
 const svgProps = {
   viewBox: "0 0 360 190",
@@ -61,11 +56,11 @@ function SvgTip({ x, y, top, bottom, width = 68 }: { x: number; y: number; top: 
   const ty = Math.max(4, Math.min(190 - 40, y - 46));
   return (
     <g className="lk-hov-tip">
-      <rect x={left} y={ty} width={width} height="36" rx="10" fill={GLASS} fillOpacity="0.96" />
-      <text x={left + 10} y={ty + 16} fill={TIP} fontSize="12" fontWeight="600" fontFamily="var(--font-sans), sans-serif" style={{ fontVariantNumeric: "tabular-nums" }}>
+      <rect x={left} y={ty} width={width} height="36" rx="10" fill={GLASS} fillOpacity="0.92" stroke={FOAM} strokeOpacity="0.22" />
+      <text x={left + 10} y={ty + 16} fill={FOAM} fontSize="12" fontWeight="600" fontFamily="var(--font-sans), sans-serif" style={{ fontVariantNumeric: "tabular-nums" }}>
         {top}
       </text>
-      <text x={left + 10} y={ty + 29} fill={TIP} fillOpacity="0.65" fontSize="10" fontFamily="var(--font-sans), sans-serif">
+      <text x={left + 10} y={ty + 29} fill={FOAM} fillOpacity="0.65" fontSize="10" fontFamily="var(--font-sans), sans-serif">
         {bottom}
       </text>
     </g>
@@ -84,11 +79,11 @@ export function LineChartTile({ tile }: { tile: Tiles["line"] }) {
         </linearGradient>
       </defs>
       {[40, 80, 120, 160].map((y) => (
-        <line key={y} x1="10" x2="350" y1={y} y2={y} stroke={INK} strokeOpacity="0.08" />
+        <line key={y} x1="10" x2="350" y1={y} y2={y} stroke={FOAM} strokeOpacity="0.08" />
       ))}
       <path className="lk-fade" style={{ animationDelay: "0.5s" }} d={`${a} L350 180 L10 180 Z`} fill="url(#lk-area)" />
       <path className="lk-draw" pathLength={1} d={a} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" />
-      <path className="lk-fade" style={{ animationDelay: "0.3s" }} d={b} fill="none" stroke={GREY} strokeOpacity="0.8" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="1 5" />
+      <path className="lk-fade" style={{ animationDelay: "0.3s" }} d={b} fill="none" stroke={FOAM} strokeOpacity="0.55" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="1 5" />
       {/* The newest point: it lands when the line arrives, breathes, and now and then nudges up as if data came in. */}
       <g className="lk-nudge">
         <circle className="lk-breathe" cx="350" cy="24" r="9" fill={LAKE} fillOpacity="0.25" />
@@ -102,8 +97,8 @@ export function LineChartTile({ tile }: { tile: Tiles["line"] }) {
           <g key={p.x} className="lk-hov-zone" data-last={i === LINE_POINTS.length - 1 ? "" : undefined}>
             <rect x={x0} y="0" width={x1 - x0} height="190" fill="transparent" />
             <g className="lk-hov-show">
-              <line x1={p.x} x2={p.x} y1="8" y2="182" stroke={INK} strokeOpacity="0.28" strokeWidth="1" />
-              <circle className="lk-hov-grow" cx={p.x} cy={p.y} r="5.5" fill="#ffffff" stroke={LAKE} strokeWidth="2" />
+              <line x1={p.x} x2={p.x} y1="8" y2="182" stroke={FOAM} strokeOpacity="0.35" strokeWidth="1" />
+              <circle className="lk-hov-grow" cx={p.x} cy={p.y} r="5.5" fill={FOAM} stroke={LAKE} strokeWidth="2" />
               <SvgTip x={p.x} y={p.y} top={p.v} bottom={tile.points[i]} />
             </g>
           </g>
@@ -171,8 +166,8 @@ export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
             pathLength={1}
             d={p.d}
             fill="none"
-            stroke={i % 2 ? GREY : LAKE}
-            strokeOpacity={i % 2 ? 0.32 : 0.55}
+            stroke={i % 2 ? FOAM : LAKE}
+            strokeOpacity={i % 2 ? 0.3 : 0.5}
             strokeWidth={p.sw}
           />
         </g>
@@ -186,8 +181,8 @@ export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
           pathLength={1}
           d={p.d}
           fill="none"
-          stroke="#ffffff"
-          strokeOpacity="0.6"
+          stroke={FOAM}
+          strokeOpacity="0.3"
           strokeWidth="2"
           strokeLinecap="round"
           pointerEvents="none"
@@ -200,19 +195,19 @@ export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
         <rect key={`r${i}`} className="lk-node" data-r={i} x={SK_R - 4} y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
       ))}
       {left.map((n, i) => (
-        <rect key={`lv${i}`} x={SK_L} y={n.y} width="8" height={n.h} rx="3" fill={INK} fillOpacity="0.85" pointerEvents="none" />
+        <rect key={`lv${i}`} x={SK_L} y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" pointerEvents="none" />
       ))}
       {right.map((n, i) => (
-        <rect key={`rv${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x={SK_R} y={n.y} width="8" height={n.h} rx="3" fill={INK} fillOpacity="0.85" pointerEvents="none" />
+        <rect key={`rv${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x={SK_R} y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" pointerEvents="none" />
       ))}
       {/* Audit #23: every node is named, sources on the left, pages on the right. */}
       {left.map((n, i) => (
-        <text key={`ln${i}`} x={SK_L - 8} y={n.y + n.h / 2} textAnchor="end" dominantBaseline="central" fontSize="11" fill={INK} fillOpacity="0.78" pointerEvents="none">
+        <text key={`ln${i}`} x={SK_L - 8} y={n.y + n.h / 2} textAnchor="end" dominantBaseline="central" fontSize="11" fill={FOAM} fillOpacity="0.72" pointerEvents="none">
           {tile.from[i]}
         </text>
       ))}
       {right.map((n, i) => (
-        <text key={`rn${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x={SK_R + 16} y={n.y + n.h / 2} dominantBaseline="central" fontSize="11" fill={INK} fillOpacity="0.78" pointerEvents="none">
+        <text key={`rn${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x={SK_R + 16} y={n.y + n.h / 2} dominantBaseline="central" fontSize="11" fill={FOAM} fillOpacity="0.72" pointerEvents="none">
           {tile.to[i]}
         </text>
       ))}
@@ -284,8 +279,8 @@ export function KpiTile({ tile }: { tile: Tiles["kpi"] }) {
           <g key={i} className="lk-hov-zone lk-kz" data-i={i}>
             <rect x={i === 0 ? 0 : x(i) - 14} y="60" width={i === 0 ? x(0) + 14 : 28} height="130" fill="transparent" />
             <g className="lk-hov-show">
-              <line x1={x(i)} x2={x(i)} y1="64" y2="182" stroke={INK} strokeOpacity="0.28" />
-              <circle className="lk-hov-grow" cx={x(i)} cy={y(v)} r="5" fill="#ffffff" stroke={LAKE} strokeWidth="2" />
+              <line x1={x(i)} x2={x(i)} y1="64" y2="182" stroke={FOAM} strokeOpacity="0.35" />
+              <circle className="lk-hov-grow" cx={x(i)} cy={y(v)} r="5" fill={FOAM} stroke={LAKE} strokeWidth="2" />
             </g>
           </g>
         ))}
@@ -293,7 +288,7 @@ export function KpiTile({ tile }: { tile: Tiles["kpi"] }) {
       {/* The number, as HTML over the drawing so its digits can roll (the old SVG text, same place and size: 54 of 360). */}
       <p
         aria-hidden="true"
-        className="pointer-events-none absolute top-[9.5%] left-[5.5%] flex text-[15cqw] leading-none font-medium tracking-[-0.04em] text-[#0f1419] tabular-nums"
+        className="pointer-events-none absolute top-[9.5%] left-[5.5%] flex text-[15cqw] leading-none font-medium tracking-[-0.04em] text-[#E8F4FF] tabular-nums"
       >
         <Digit d={2} slot="a" />
         <Digit d={4} slot="b" />

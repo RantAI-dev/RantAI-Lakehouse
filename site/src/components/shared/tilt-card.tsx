@@ -15,13 +15,10 @@ export function TiltCard({
   className,
   children,
   max = 8,
-  tone = "dark",
 }: {
   className?: string;
   children: React.ReactNode;
   max?: number;
-  /** "light": the gloss for a white card (a faint blue wash instead of a bright sheen). */
-  tone?: "dark" | "light";
 }) {
   const reduced = useReducedMotionSafe();
   const rx = useSpring(0, { stiffness: 220, damping: 22, mass: 0.6 });
@@ -29,9 +26,7 @@ export function TiltCard({
   const mx = useMotionValue(50);
   const my = useMotionValue(50);
   const sheen = useSpring(0, { stiffness: 160, damping: 24 });
-  const wash = tone === "light" ? "rgba(29,108,207,0.07)" : "rgba(232,244,255,0.20)";
-  const edge = tone === "light" ? "rgba(29,108,207,0.02)" : "rgba(68,166,250,0.06)";
-  const gloss = useMotionTemplate`radial-gradient(260px circle at ${mx}% ${my}%, ${wash}, ${edge} 45%, transparent 70%)`;
+  const gloss = useMotionTemplate`radial-gradient(260px circle at ${mx}% ${my}%, rgba(232,244,255,0.20), rgba(68,166,250,0.06) 45%, transparent 70%)`;
 
   const onMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (reduced || e.pointerType === "touch") return;

@@ -11,9 +11,8 @@
  * numbers and attributes are the ones the inline tiles rendered (D6).
  */
 
-// Task B: the tiles are drawn for the light panel: strong cells in the primary blue, quiet ones in grey.
-const QUIET = "#6b7680";
-const STRONG = "#1d6ccf";
+const LAKE = "#44A6FA";
+const FOAM = "#E8F4FF";
 
 /**
  * Stable pseudo-random in 0..1 from two integers. Integer maths only, so the
@@ -119,7 +118,7 @@ function mapDots(): { x: number; y: number; island: number }[] {
 export function dotMapSvg(): string {
   const shapes = mapDots().map(({ x, y, island }) => {
     const v = ISLANDS[island].value / MAX_VALUE;
-    return `<circle cx="${x}" cy="${y}" r="${(1.15 + v * 1.25).toFixed(2)}" fill="${v > 0.6 ? STRONG : QUIET}" fill-opacity="${(0.35 + v * 0.6).toFixed(2)}"/>`;
+    return `<circle cx="${x}" cy="${y}" r="${(1.15 + v * 1.25).toFixed(2)}" fill="${v > 0.6 ? FOAM : LAKE}" fill-opacity="${(0.35 + v * 0.6).toFixed(2)}"/>`;
   });
   return `${open}${shapes.join("")}</svg>\n`;
 }
@@ -134,7 +133,7 @@ export function calendarSvg(): string {
       const quiet = r >= 5 ? 0.45 : 1;
       const level = Math.min(1, v * quiet * (0.55 + 0.6 * hash(c, 2)));
       shapes.push(
-        `<rect x="${12 + c * 17}" y="${14 + r * 23}" width="13" height="17" rx="3.5" fill="${level > 0.55 ? STRONG : QUIET}" fill-opacity="${0.16 + level * 0.8}"/>`,
+        `<rect x="${12 + c * 17}" y="${14 + r * 23}" width="13" height="17" rx="3.5" fill="${level > 0.55 ? FOAM : LAKE}" fill-opacity="${0.12 + level * 0.8}"/>`,
       );
     }
   }
