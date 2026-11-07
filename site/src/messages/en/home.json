@@ -71,6 +71,11 @@
         "revenue": "Revenue"
       },
       "empty": "empty",
+      "legend": {
+        "spelling": "Spelling varies",
+        "twice": "Arrived twice",
+        "empty": "Missing"
+      },
       "checks": {
         "duplicates": "No duplicates",
         "city": "City valid",

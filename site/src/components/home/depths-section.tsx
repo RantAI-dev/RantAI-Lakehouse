@@ -5,7 +5,6 @@ import { Container, DisplayHeading, Eyebrow } from "@/components/shared/primitiv
 import { ProgressSection } from "@/components/shared/progress-section";
 import { DepthsStage } from "./depths-stage";
 import { DepthDataCard } from "./depth-data-card";
-import { DepthKey } from "./depth-key";
 
 /**
  * WEB-5 O21: without JavaScript the pinned stage cannot follow the scroll,
@@ -51,7 +50,6 @@ export function DepthsSection({ copy }: { copy: HomeCopy["depths"] }) {
           <DisplayHeading className="mt-4" aria-hidden="true">
             {copy.headline}
           </DisplayHeading>
-          <DepthKey active={2} words={copy.key} className="mt-6" />
           <ol className="mt-10 grid gap-5 lg:grid-cols-3">
             {DEPTH_LAYERS.map((l, i) => (
               <li

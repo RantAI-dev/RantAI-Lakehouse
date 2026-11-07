@@ -71,6 +71,11 @@
         "revenue": "Pendapatan"
       },
       "empty": "kosong",
+      "legend": {
+        "spelling": "Ejaan beda",
+        "twice": "Masuk dua kali",
+        "empty": "Kosong"
+      },
       "checks": {
         "duplicates": "Tanpa duplikat",
         "city": "Kota valid",

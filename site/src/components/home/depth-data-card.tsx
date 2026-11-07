@@ -241,11 +241,21 @@ export function DepthDataCard({
 
         {/* Footer: what this depth promises, one line each. */}
         <div className="lk-depth-foot relative border-t border-[#E8F4FF]/10">
-          {/* Bronze: the two sources the rows came from, as the row glyphs show them. */}
-          <div className="lk-depth-swap absolute inset-0 flex items-center gap-1.5 px-3" data-for="bronze">
-            {(["orders", "crm"] as const).map((src) => (
-              <SourceChip key={src} source={src} />
-            ))}
+          {/* Bronze, O40: a key to the mess the rows show (the row glyphs already
+              name the sources, so their chips are gone). */}
+          <div className="lk-depth-swap lk-depth-legend absolute inset-0 flex items-center gap-3.5 px-3.5 text-[11px] whitespace-nowrap text-[#E8F4FF]/65" data-for="bronze">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="lk-depth-legend-wavy text-[#E8F4FF]/85">abc</span>
+              {copy.legend.spelling}
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="lk-depth-twice rounded px-1 text-[10px] leading-4">×2</span>
+              {copy.legend.twice}
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="lk-depth-legend-empty inline-block h-3 w-5 rounded" />
+              {copy.legend.empty}
+            </span>
           </div>
           <div className="lk-depth-swap lk-depth-checks absolute inset-0 flex items-center gap-1.5 px-3" data-for="silver">
             <Badge ok>{copy.checks.duplicates}</Badge>
@@ -281,16 +291,6 @@ function Word({ raw, clean, value, twice }: { raw: string; clean: string; value:
       {trailing && <span className="lk-depth-space">␣</span>}
       {/* The second copy of an order, marked where every width shows it. */}
       {twice && <span className="lk-depth-twice ml-1.5 rounded px-1 text-[10px] leading-4">×2</span>}
-    </span>
-  );
-}
-
-function SourceChip({ source }: { source: SourceId }) {
-  const Icon = SOURCE_ICON[source];
-  return (
-    <span className="inline-flex min-w-0 items-center gap-1 rounded-md bg-[#E8F4FF]/[0.06] px-1.5 py-0.5 ring-1 ring-[#E8F4FF]/10">
-      <Icon className="size-3 shrink-0 text-[#E8F4FF]/60" strokeWidth={2} />
-      <code className="truncate !text-[11px] !leading-4 text-[#E8F4FF]/85">{SOURCE_FILES[source]}</code>
     </span>
   );
 }

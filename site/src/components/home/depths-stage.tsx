@@ -4,13 +4,12 @@ import * as React from "react";
 import { AnimatePresence, m, useMotionValueEvent, useTransform, type MotionValue } from "framer-motion";
 import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";
-import { DEPTH_LAYERS, type DepthLayer } from "@/lib/home-content";
+import { DEPTH_LAYERS } from "@/lib/home-content";
 import { useLandingMode } from "@/components/effects/scene-mode";
 import { Container } from "@/components/shared/primitives";
 import { useProgress } from "@/components/shared/progress-section";
 import { activeLayerIndex } from "@/lib/scroll-timeline";
 import { DepthDataCard } from "./depth-data-card";
-import { DepthKey } from "./depth-key";
 
 /**
  * The depths section's pinned, scroll-driven stage: the depth gauge, the
@@ -45,46 +44,40 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
       {/* The gauge hugs the screen's left edge, outside the 1120 px column. */}
       <DepthGauge progress={progress} active={active} />
       <Container className="relative h-full">
-        <div className="lk-depth-grid-stage grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:gap-3 max-md:pl-6 md:grid-cols-[minmax(0,400px)_1fr]">
+        <div className="lk-depth-grid-stage grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:gap-5 max-md:pl-6 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] md:gap-12">
           {/* WEB-5 O21: the chapter shows what the depth does to the data.
-              The key says the whole idea at once, the text is a title and
-              one line, and the card below is the same few rows at this
-              depth (depth-data-card.tsx). It sits in the text column, so
-              the 3D slabs behind the other cell stay in view.
-              O31 (owner: "penuh banget"): one indicator, the key (the
-              "BRONZE · −10 M" eyebrow is gone: the gauge and the key say
-              it), one short line, and the card as the focal point. The
-              column starts right after the gauge, so the card stays clear
-              of the slabs on the right (app/globals.css). */}
-          <div className="rounded-3xl max-md:bg-[#020514]/55 max-md:p-4 max-md:backdrop-blur-md">
-            <DepthKey active={active} words={copy.key} />
-            <AnimatePresence mode="wait" initial={false}>
-              <m.div
-                key={layer.id}
-                initial={{ opacity: 0, y: 18, filter: "blur(6px)" }}
-                animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                exit={{ opacity: 0, y: -14, filter: "blur(6px)" }}
-                transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                className="mt-4 md:mt-7"
-                aria-live="polite"
-              >
-                <h3 className="lk-display text-[clamp(2rem,9vw,2.5rem)] leading-[1.04] text-balance text-[#E8F4FF] md:text-[clamp(2.4rem,3.5vw,3.1rem)]">
-                  {/* The depth's name for assistive tech; on screen the key above says it. */}
-                  <span className="sr-only">
-                    {layer.label} {layer.meters}:{" "}
-                  </span>
-                  {text.title}
-                </h3>
-                <p className="mt-2 max-w-[24rem] text-[15px] leading-[1.5] text-pretty text-[#E8F4FF]/75 md:mt-3 md:text-[16px]">
-                  {text.body}
-                </p>
-              </m.div>
-            </AnimatePresence>
-            <DepthDataCard stage={active} copy={copy.card} className="mt-5 md:mt-8" />
-          </div>
-          {/* The 3D stack renders on the canvas behind this cell; without one, a CSS stack stands in. */}
-          <div className="lk-depth-stack-cell relative h-full min-h-0 md:min-h-[280px]">
-            {mode !== "full" && <CssStack active={active} />}
+              O40 (owner: "masih kerasa rame sekali ... tablenya di sebelah
+              kanan aja dan di gabung dengan tampilan balok"): the left column
+              is the words only, a title and one line (the key stepper is
+              gone: the page's depth gauge names the layer); the right column
+              is one focal pair, the data card resting on its layer's slab. */}
+          <AnimatePresence mode="wait" initial={false}>
+            <m.div
+              key={layer.id}
+              initial={{ opacity: 0, y: 18, filter: "blur(6px)" }}
+              animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+              exit={{ opacity: 0, y: -14, filter: "blur(6px)" }}
+              transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+              aria-live="polite"
+            >
+              <h3 className="lk-display text-[clamp(2.25rem,10vw,2.75rem)] leading-[1.04] text-balance text-[#E8F4FF] md:text-[clamp(2.6rem,3.8vw,3.4rem)]">
+                {/* The depth's name for assistive tech; on screen the gauge says it. */}
+                <span className="sr-only">
+                  {layer.label} {layer.meters}:{" "}
+                </span>
+                {text.title}
+              </h3>
+              <p className="mt-3 max-w-[24rem] text-[16px] leading-[1.55] text-pretty text-[#E8F4FF]/75 md:mt-4 md:text-[17px]">
+                {text.body}
+              </p>
+            </m.div>
+          </AnimatePresence>
+          {/* The card on its slab. With the canvas the 3D slab is drawn under
+              the card's box (`data-depths-card`, lake-engine.ts); without one,
+              the CSS slab below stands in, in the same place. */}
+          <div className="lk-depth-pair relative mx-auto w-full max-w-[460px] md:mr-0">
+            <DepthDataCard stage={active} copy={copy.card} className="lk-depth-on-slab relative z-10" />
+            {mode !== "full" && <CssSlab active={active} />}
           </div>
         </div>
       </Container>
@@ -144,39 +137,17 @@ function DepthGauge({ progress, active }: { progress: MotionValue<number>; activ
 }
 
 /**
- * Stand-in for the 3D stack when there is no canvas: three tilted glass
- * plates in CSS, the active one lit and the others drawn apart. Same story,
- * flatter.
+ * Stand-in for the 3D slab when there is no canvas (WEB-5 O40): one slab of
+ * the current depth, in perspective, that the card rests on. Its top face
+ * shows in the strip the card leaves free below it (`--lk-depths-card-lift`
+ * in app/globals.css) and its front edge under that. Solid tints only.
  */
-function CssStack({ active }: { active: 0 | 1 | 2 }) {
+function CssSlab({ active }: { active: 0 | 1 | 2 }) {
+  const accent = DEPTH_LAYERS[active].accent;
   return (
-    <div className="absolute inset-0 flex items-center justify-center [perspective:1200px]" aria-hidden="true">
-      <div className="relative h-[300px] w-[min(86%,440px)] [transform-style:preserve-3d] [transform:rotateX(58deg)_rotateZ(-16deg)]">
-        {DEPTH_LAYERS.map((l, i) => (
-          <Plate key={l.id} layer={l} index={i} active={active} />
-        ))}
-      </div>
+    <div aria-hidden="true" className="lk-depth-slab" style={{ "--lk-slab": accent } as React.CSSProperties}>
+      <span className="lk-depth-slab-top" />
+      <span className="lk-depth-slab-front" />
     </div>
-  );
-}
-
-function Plate({ layer, index, active }: { layer: DepthLayer; index: number; active: 0 | 1 | 2 }) {
-  const isActive = index === active;
-  const lift = (index - active) * 70 + (index - 1) * 6;
-  return (
-    <m.div
-      className="absolute inset-x-0 top-1/2 h-[190px] -translate-y-1/2 rounded-[22px] border"
-      initial={false}
-      animate={{
-        translateZ: -lift,
-        opacity: isActive ? 1 : 0.7,
-      }}
-      transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
-      style={{
-        borderColor: `${layer.accent}${isActive ? "cc" : "55"}`,
-        // O35 follow-up: a solid tint, no gradient and no glow (owner: "mending warna solid aja").
-        background: `${layer.accent}${isActive ? "2e" : "14"}`,
-      }}
-    />
   );
 }

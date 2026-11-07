@@ -1574,23 +1574,17 @@ section[data-role="admin"] .lk-gv-closed {
   animation-delay: 0.24s;
 }
 
-/* The three-step key above the chapters: Bronze → Silver → Gold. */
-.lk-depth-key-step {
-  transition:
-    color 0.4s ease,
-    background-color 0.4s ease,
-    box-shadow 0.4s ease;
+/* O40: the Bronze footer's key to the mess the rows show. */
+.lk-depth-legend-wavy {
+  text-decoration: underline wavy rgba(226, 158, 102, 0.85);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
 }
-.lk-depth-key-link {
-  background: rgba(232, 244, 255, 0.16);
+.lk-depth-legend-empty {
+  border: 1px dashed rgba(226, 158, 102, 0.7);
 }
-.lk-depth-key-link > span {
-  transform: scaleX(0);
-  transform-origin: left;
-  transition: transform 0.6s var(--lk-ease);
-}
-.lk-depth-key-link[data-done] > span {
-  transform: none;
+[data-stage="bronze"] .lk-depth-swap[data-for="bronze"] .lk-depth-twice {
+  display: inline;
 }
 
 /* Still: the reduced-motion list and the no-JS page show each depth's
@@ -1603,10 +1597,8 @@ section[data-role="admin"] .lk-gv-closed {
 @media (prefers-reduced-motion: reduce) {
   .lk-depth-card,
   .lk-depth-card *,
-  .lk-depth-key-step,
-  .lk-depth-key-link > span {
+  .lk-depth-slab-top {
     transition: none !important;
-    animation: none !important;
   }
 }
 /* O21: without a canvas, the CSS slabs stand in only where the cell beside
@@ -2798,5 +2790,63 @@ section[data-role="admin"] .lk-gv-closed {
   }
   .lk-con-tab {
     animation: none !important;
+  }
+}
+
+/* ---- WEB-5 O40: the depths card rests on its layer's slab ----
+   The card sits in the right column; below it a strip of
+   `--lk-depths-card-lift` is left free, where the slab's top face shows,
+   then the slab's front edge. With the canvas the 3D slab is drawn under the
+   card's box (`[data-depths-card]`, lake-engine.ts), so the 3D side reads
+   the same lift; without one, `.lk-depth-slab` below is the slab. A soft
+   contact shadow under the card makes it rest rather than float. */
+@property --lk-slab {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #c8834a;
+}
+.lk-depth-pair {
+  --lk-depths-card-lift: 36px;
+  --lk-depths-slab-edge: 14px;
+  padding-bottom: calc(var(--lk-depths-card-lift) + var(--lk-depths-slab-edge));
+}
+.lk-depth-on-slab .lk-depth-card {
+  box-shadow:
+    inset 0 1px 0 0 color-mix(in srgb, var(--lk-depth-accent) 55%, transparent),
+    0 18px 22px -14px rgba(0, 0, 0, 0.75);
+}
+.lk-depth-slab {
+  position: absolute;
+  left: -6%;
+  right: -6%;
+  bottom: 0;
+  height: calc(var(--lk-depths-card-lift) + var(--lk-depths-slab-edge) + 48px);
+  transition: --lk-slab 0.7s ease;
+}
+.lk-depth-slab-top {
+  position: absolute;
+  inset: 0 0 var(--lk-depths-slab-edge) 0;
+  clip-path: polygon(5.5% 0, 94.5% 0, 100% 100%, 0 100%);
+  background: color-mix(in srgb, var(--lk-slab) 24%, #0a1230);
+}
+.lk-depth-slab-front {
+  position: absolute;
+  inset: auto 0 0 0;
+  height: var(--lk-depths-slab-edge);
+  border-radius: 0 0 10px 10px;
+  background: color-mix(in srgb, var(--lk-slab) 48%, #0a1230);
+  box-shadow: inset 0 1px 0 0 color-mix(in srgb, var(--lk-slab) 80%, #fff 0%);
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-depth-slab {
+    transition: none;
+  }
+}
+/* O40: on a narrow card the mess key stays on one line. */
+@container lk-depth (max-width: 329px) {
+  .lk-depth-legend {
+    gap: 8px;
+    padding-inline: 10px;
+    font-size: 10px;
   }
 }
