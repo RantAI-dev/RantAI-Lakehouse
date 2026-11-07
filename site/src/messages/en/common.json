@@ -6,7 +6,12 @@
     "howItWorks": "How it works",
     "governance": "Governance",
     "openSource": "Open source",
-    "contact": "Contact"
+    "contact": "Contact",
+    "home": "Home",
+    "open": "Open menu",
+    "close": "Close menu",
+    "sheetTitle": "Menu",
+    "sheetDescription": "Jump to a part of the page, or get in touch."
   },
   "cta": {
     "install": "Install it",

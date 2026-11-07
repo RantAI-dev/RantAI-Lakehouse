@@ -6,7 +6,12 @@
     "howItWorks": "Cara kerja",
     "governance": "Tata kelola",
     "openSource": "Open source",
-    "contact": "Kontak"
+    "contact": "Kontak",
+    "home": "Beranda",
+    "open": "Buka menu",
+    "close": "Tutup menu",
+    "sheetTitle": "Menu",
+    "sheetDescription": "Langsung ke bagian halaman, atau hubungi kami."
   },
   "cta": {
     "install": "Instal",

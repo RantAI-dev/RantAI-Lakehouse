@@ -34,7 +34,8 @@ export function LanguageSwitcher({
   locale,
   text,
   className,
-}: Readonly<{ locale: Locale; text: CommonCopy["language"]; className?: string }>) {
+  size = "sm",
+}: Readonly<{ locale: Locale; text: CommonCopy["language"]; className?: string; size?: "sm" | "lg" }>) {
   const pathname = usePathname();
 
   return (
@@ -63,7 +64,9 @@ export function LanguageSwitcher({
               }
             }}
             className={cn(
-              "rounded-full px-2 py-1 text-[12px] font-medium transition-colors md:px-2.5",
+              "rounded-full font-medium transition-colors duration-200 ease-out",
+              // O6: the phone menu shows the switch larger, as rantai-page's sheet does.
+              size === "lg" ? "px-4 py-2 text-[14px]" : "px-2 py-1 text-[12px] md:px-2.5",
               current ? "bg-[#E8F4FF] text-[#020514]" : "text-[#E8F4FF]/70 hover:text-[#E8F4FF]",
             )}
           >

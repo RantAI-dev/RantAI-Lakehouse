@@ -71,12 +71,18 @@ export type SocialId = (typeof SOCIAL_LINKS)[number]["id"];
 /** The repository as shown in text, without the scheme. */
 export const SOURCE_LABEL = REPO.replace(/^https:\/\//, "");
 
-/** Section anchors of the top bar, in order; labels are `common.nav.<key>`. */
+/**
+ * Section anchors of the top bar, in order; labels are `common.nav.<key>`.
+ * WEB-5 O6: `spy` lists the sections during which the item is the current
+ * one (the scroll spy in `top-bar.tsx`), so every part of the page lights
+ * one item: the dive's chapters belong to "How it works", "Get started" to
+ * "Open source".
+ */
 export const NAV_ANCHORS = [
-  { key: "product", href: "#sources" },
-  { key: "howItWorks", href: "#depths" },
-  { key: "governance", href: "#governance" },
-  { key: "openSource", href: "#open" },
+  { key: "product", href: "#sources", spy: ["sources"] },
+  { key: "howItWorks", href: "#depths", spy: ["depths", "assistant", "dashboards"] },
+  { key: "governance", href: "#governance", spy: ["governance"] },
+  { key: "openSource", href: "#open", spy: ["open", "get-started"] },
 ] as const;
 
 /** The footer's links to the page's own sections; labels are `common.footer.sections.<key>`. */
