@@ -187,7 +187,7 @@ export function TablesDiagram({ copy }: { copy: OpenCopy["tables"] }) {
  */
 export function HostingSwitch({ copy }: { copy: OpenCopy["hosting"] }) {
   return (
-    <div className="lk-open-host flex h-full flex-col gap-3">
+    <div className="lk-open-host flex h-full flex-col gap-3 p-4">
       <fieldset className="lk-open-seg relative inline-grid w-full grid-cols-2 rounded-xl p-1 text-[13px] leading-5 font-medium">
         <legend className="sr-only">{copy.label}</legend>
         <span aria-hidden="true" className="lk-open-seg-thumb absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-lg" />
@@ -202,7 +202,7 @@ export function HostingSwitch({ copy }: { copy: OpenCopy["hosting"] }) {
       </fieldset>
       <div aria-hidden="true" className="lk-open-stage relative min-h-[150px] flex-1 overflow-hidden rounded-2xl">
         {/* Your servers: a rack whose lights blink. */}
-        <span className="lk-open-rack absolute bottom-7 left-4 flex w-[42%] flex-col gap-1.5">
+        <span className="lk-open-rack absolute bottom-7 left-4 flex w-[42%] max-w-[220px] flex-col gap-1.5">
           {[0, 1, 2].map((i) => (
             <span key={i} className="lk-open-unit flex h-5 items-center gap-1.5 rounded-md px-2">
               <span className="lk-open-led size-1 rounded-full" style={{ animationDelay: `${i * 0.7}s` }} />
@@ -212,11 +212,11 @@ export function HostingSwitch({ copy }: { copy: OpenCopy["hosting"] }) {
           ))}
         </span>
         {/* Ours: a cloud drifting. */}
-        <span className="lk-open-cloud absolute top-4 right-3 grid w-[44%] place-items-center">
+        <span className="lk-open-cloud absolute top-4 right-3 grid w-[44%] max-w-[170px] place-items-center">
           <Cloud className="h-auto w-full text-[#8fcbff]" strokeWidth={1} />
         </span>
         {/* The stack itself: the same Lakehouse in either home. */}
-        <span className="lk-open-stack absolute left-4 flex w-[42%] flex-col items-center gap-1 rounded-xl px-2 py-2">
+        <span className="lk-open-stack absolute left-4 flex w-[42%] max-w-[220px] flex-col items-center gap-1 rounded-xl px-2 py-2">
           <MascotMark className="h-4 w-auto" />
           <span className="flex w-full flex-col gap-0.5">
             <span className="h-1 rounded-full bg-[#C8834A]" />
@@ -248,7 +248,8 @@ export function HostingSwitch({ copy }: { copy: OpenCopy["hosting"] }) {
  *
  * In the console's dark theme rather than the light one of the old crop: the
  * console ships both, and the dark one sits on this page without a bright
- * slab, which is what the owner disliked in the crop.
+ * slab, which is what the owner disliked in the crop. O38: the showcase
+ * panel is its window, with the title strip drawn here.
  */
 const PROMPTS = [
   "Which tables changed in the last day?",
@@ -262,9 +263,15 @@ const SHORTCUTS = [
   { title: "Build a dashboard", icon: BarChart3 },
 ] as const;
 
-export function ConsoleHome() {
+export function ConsoleHome({ windowTitle }: { windowTitle: string }) {
   return (
-    <div className="lk-con p-1 sm:p-3">
+    <div className="lk-con flex h-full flex-col">
+      {/* The window's title strip: the mark and what it shows. No traffic lights, no address bar. */}
+      <div className="flex items-center gap-2 px-5 pt-4 pb-1">
+        <MascotMark className="h-3 w-auto" />
+        <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/75">{windowTitle}</span>
+      </div>
+      <div className="flex flex-1 flex-col justify-center p-4 sm:p-6">
       <div className="lk-con-box rounded-2xl px-4 pt-3.5 pb-2.5">
         <p className="relative h-6 text-[15px] leading-6">
           <span className="lk-con-caret absolute top-0.5 left-0 h-5 w-px bg-[#8fcbff]" />
@@ -306,6 +313,7 @@ export function ConsoleHome() {
             </span>
           );
         })}
+      </div>
       </div>
     </div>
   );

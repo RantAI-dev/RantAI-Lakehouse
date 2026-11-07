@@ -2296,41 +2296,151 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 
-/* ---- WEB-5 O22: "Yours to keep" as a bento (components/home/open-*.tsx) ----
-   Each tile is glass on the water with a picture of its promise; every loop
-   here is CSS and stops under reduced motion (the end of this block). */
-.lk-open-tile {
+/* ---- WEB-5 O22 / O38: "Yours to keep" as a sticky showcase (components/home/open-*.tsx) ----
+   O38 (owner: one bento on the page is enough; governance keeps it): a
+   list of the four promises on the left and one large panel on the right,
+   held at the middle of the screen, that swaps between their pictures as
+   the list scrolls by. `data-active` on `.lk-show` (set by
+   open-showcase.tsx) says which. Flat and solid (O35): one surface a step
+   lighter than the water, one hairline, no gradient, no glow.
+   On phones, without JavaScript and under reduced motion, nothing is
+   sticky or hidden where it matters: phones read title, line, picture,
+   four times; no JS reads the same (a <noscript> style); reduced motion
+   swaps without a fade. Every loop pauses while its picture is hidden. */
+.lk-show {
   --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
-  border: 1px solid rgba(232, 244, 255, 0.1);
-  background: linear-gradient(160deg, rgba(232, 244, 255, 0.06), rgba(232, 244, 255, 0.015));
-  box-shadow:
-    inset 0 1px 0 0 rgba(232, 244, 255, 0.08),
-    0 30px 80px -40px rgba(2, 5, 20, 0.9);
-  transition:
-    border-color 0.25s ease,
-    transform 0.35s var(--lk-ease),
-    box-shadow 0.35s var(--lk-ease);
+  --lk-show-slot: 112px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  row-gap: 16px;
 }
-.lk-open-tile:hover {
-  border-color: rgba(68, 166, 250, 0.35);
-  transform: translateY(-3px);
-  box-shadow:
-    inset 0 1px 0 0 rgba(232, 244, 255, 0.12),
-    0 36px 90px -40px rgba(68, 166, 250, 0.35);
+.lk-show-mark {
+  display: none;
 }
-.lk-open-visual {
-  min-height: 220px;
+.lk-show-item {
+  padding-left: 20px;
+  border-left: 2px solid rgba(232, 244, 255, 0.1);
+}
+.lk-show-item a {
+  pointer-events: none;
+}
+.lk-show-visual {
+  position: relative;
+  /* Phones: as tall as the picture needs; from 1024 px one fixed panel. */
+  min-height: 260px;
+  max-width: 40rem;
+  overflow: hidden;
+  border-radius: var(--radius-3xl);
+  border: 1px solid rgba(232, 244, 255, 0.09);
+  background: #0a1230;
+  margin-bottom: 32px;
+}
+@media (min-width: 64rem) {
+  /* Four invisible markers, one screen of scroll each, drive the showcase;
+     the list and the panel both stay at the middle of the screen. */
+  .lk-show {
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    grid-template-rows: repeat(4, auto);
+    column-gap: 64px;
+    row-gap: 0;
+  }
+  .lk-show-mark {
+    display: block;
+    grid-column: 1;
+    height: 75vh;
+    scroll-margin-top: 12.5vh;
+  }
+  .lk-show-mark[data-i="0"] {
+    grid-row: 1;
+  }
+  .lk-show-mark[data-i="1"] {
+    grid-row: 2;
+  }
+  .lk-show-mark[data-i="2"] {
+    grid-row: 3;
+  }
+  .lk-show-mark[data-i="3"] {
+    grid-row: 4;
+  }
+  /* The items share the column's whole height and stick one slot apart, so
+     together they read as one list held at the middle of the screen. */
+  .lk-show-item {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    align-self: start;
+    position: sticky;
+    top: calc(50vh - 2 * var(--lk-show-slot) + var(--i) * var(--lk-show-slot) + 2rem);
+    margin-top: calc(var(--i) * var(--lk-show-slot));
+    height: var(--lk-show-slot);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    border-left-color: rgba(232, 244, 255, 0.1);
+    transition: border-color 0.3s ease;
+  }
+  .lk-show-item a {
+    pointer-events: auto;
+  }
+  .lk-show-item .lk-show-title,
+  .lk-show-item .lk-show-line {
+    transition: color 0.3s ease;
+  }
+  .lk-show-item:not([data-on]) .lk-show-title {
+    color: rgba(232, 244, 255, 0.45);
+  }
+  .lk-show-item:not([data-on]) .lk-show-line {
+    color: rgba(232, 244, 255, 0.35);
+  }
+  .lk-show-item[data-on] {
+    border-left-color: #44a6fa;
+  }
+  .lk-show-item:not([data-on]):hover .lk-show-title {
+    color: rgba(232, 244, 255, 0.8);
+  }
+  /* The four pictures share one place at the middle of the screen. */
+  .lk-show-visual {
+    grid-column: 2;
+    grid-row: 1 / -1;
+    position: sticky;
+    top: calc(50vh - 220px + 2rem);
+    align-self: start;
+    height: 440px;
+    max-width: none;
+    margin: 0;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(12px);
+    transition:
+      opacity 0.45s ease,
+      transform 0.6s var(--lk-ease),
+      visibility 0s linear 0.45s;
+  }
+  .lk-show-visual[data-on] {
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+    transition:
+      opacity 0.45s ease,
+      transform 0.6s var(--lk-ease),
+      visibility 0s;
+  }
+  .lk-show-visual:not([data-on]) *,
+  .lk-show-visual:not([data-on]) *::after {
+    animation-play-state: paused !important;
+  }
+}
+@media (min-width: 64rem) and (prefers-reduced-motion: reduce) {
+  .lk-show-visual,
+  .lk-show-visual[data-on] {
+    transition: none;
+    transform: none;
+  }
 }
 
 /* Open source: the code, highlighted, with a band walking down it. */
-.lk-open-code {
-  background: rgba(2, 5, 20, 0.72);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.08);
-}
 .lk-open-pre {
-  mask-image: linear-gradient(90deg, #000 82%, transparent), linear-gradient(#000 70%, transparent);
-  mask-composite: intersect;
-  max-height: 236px;
+  /* The long string line fades out at the panel's edge instead of being cut. */
+  mask-image: linear-gradient(90deg, #000 86%, transparent);
 }
 .lk-tok-kw {
   color: #8fcbff;
@@ -2350,7 +2460,7 @@ section[data-role="admin"] .lk-gv-closed {
   box-shadow: inset 0 0 0 1px rgba(126, 226, 176, 0.3);
 }
 .lk-open-band {
-  background: linear-gradient(90deg, rgba(68, 166, 250, 0.16), rgba(68, 166, 250, 0.04));
+  background: rgba(68, 166, 250, 0.1);
   box-shadow: inset 2px 0 0 #44a6fa;
   animation: lk-open-band 9s steps(1, end) infinite;
 }
@@ -2395,12 +2505,6 @@ section[data-role="admin"] .lk-gv-closed {
 }
 
 /* Open tables: data flows out of the table along each reader's wire. */
-.lk-open-tables {
-  background:
-    radial-gradient(60% 70% at 50% 50%, rgba(68, 166, 250, 0.12), transparent 70%),
-    rgba(2, 5, 20, 0.6);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.08);
-}
 .lk-open-wires-narrow {
   display: none;
 }
@@ -2440,19 +2544,17 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 .lk-open-table {
-  background: #0b1a4a;
-  box-shadow:
-    inset 0 0 0 1px rgba(143, 203, 255, 0.45),
-    0 0 30px -6px rgba(68, 166, 250, 0.55);
+  background: #121c40;
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
 }
 /* Iceberg keeps snapshots: two faint ones stacked behind the table. */
 .lk-open-table-back {
   z-index: -1;
   transform: translate(6px, 6px);
-  background: rgba(11, 26, 74, 0.7);
+  background: #0e1738;
   box-shadow:
     inset 0 0 0 1px rgba(143, 203, 255, 0.2),
-    6px 6px 0 -1px rgba(11, 26, 74, 0.5),
+    6px 6px 0 -1px #0c1534,
     6px 6px 0 0 rgba(143, 203, 255, 0.12);
 }
 .lk-open-tables {
@@ -2461,7 +2563,7 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-open-reader {
   left: var(--x);
   top: var(--y);
-  background: #08123a;
+  background: #121c40;
   box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.16);
   transition: box-shadow 0.2s ease;
 }
@@ -2481,12 +2583,10 @@ section[data-role="admin"] .lk-gv-closed {
 
 /* Your servers or ours: two radio buttons drive the picture. */
 .lk-open-seg {
-  background: rgba(2, 5, 20, 0.6);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.1);
+  background: #121c40;
 }
 .lk-open-seg-thumb {
-  background: rgba(68, 166, 250, 0.2);
-  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
+  background: rgba(68, 166, 250, 0.22);
   transition: transform 0.45s var(--lk-ease);
 }
 .lk-open-seg-opt {
@@ -2504,10 +2604,7 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-open-stage {
   container-type: inline-size;
   min-height: 180px;
-  background:
-    radial-gradient(80% 70% at 50% 100%, rgba(68, 166, 250, 0.1), transparent 70%),
-    rgba(2, 5, 20, 0.6);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.08);
+  background: #0d1636;
 }
 .lk-open-unit {
   background: rgba(232, 244, 255, 0.06);
@@ -2532,10 +2629,8 @@ section[data-role="admin"] .lk-gv-closed {
 }
 .lk-open-stack {
   bottom: 110px;
-  background: #0b1a4a;
-  box-shadow:
-    inset 0 0 0 1px rgba(143, 203, 255, 0.45),
-    0 10px 24px -10px rgba(68, 166, 250, 0.7);
+  background: #121c40;
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
   transition:
     transform 0.7s var(--lk-ease),
     bottom 0.7s var(--lk-ease);
@@ -2566,17 +2661,8 @@ section[data-role="admin"] .lk-gv-closed {
 }
 
 /* The console's home: a dark recreation whose placeholder types prompts in turn. */
-.lk-open-frame {
-  display: flex;
-  flex-direction: column;
-}
-.lk-open-frame > div,
-.lk-open-frame > div > div:last-child {
-  flex: 1;
-}
 .lk-con-box {
-  background: rgba(2, 5, 20, 0.7);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.12);
+  background: #121c40;
 }
 .lk-con-prompt {
   opacity: 0;
@@ -2612,24 +2698,20 @@ section[data-role="admin"] .lk-gv-closed {
   animation: lk-twinkle 1s steps(2, jump-none) infinite;
 }
 .lk-con-short {
-  background: rgba(2, 5, 20, 0.6);
-  box-shadow: inset 0 0 0 1px rgba(232, 244, 255, 0.12);
+  background: #121c40;
   transition:
     transform 0.25s var(--lk-ease),
     box-shadow 0.25s ease;
 }
 .lk-con-short:hover {
   transform: translateY(-2px);
-  box-shadow:
-    inset 0 0 0 1px rgba(143, 203, 255, 0.5),
-    0 10px 24px -14px rgba(68, 166, 250, 0.7);
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
 }
 .lk-con-short:hover .lk-con-short-icon {
   color: #8fcbff;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .lk-open-tile,
   .lk-open-band,
   .lk-open-wire-flow,
   .lk-open-led,
@@ -2641,7 +2723,6 @@ section[data-role="admin"] .lk-gv-closed {
     animation: none !important;
     transition: none !important;
   }
-  .lk-open-tile:hover,
   .lk-con-short:hover {
     transform: none;
   }
@@ -2663,5 +2744,11 @@ section[data-role="admin"] .lk-gv-closed {
   }
   .lk-con-tab {
     animation: none !important;
+  }
+}
+/* O38: in the large showcase panel the table and its readers grow a little, so the diagram fills it. */
+@media (min-width: 64rem) {
+  .lk-show-visual .lk-open-tables > [aria-hidden="true"] {
+    transform: scale(1.18);
   }
 }
