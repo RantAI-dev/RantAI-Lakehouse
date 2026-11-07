@@ -3,6 +3,7 @@ import { routing, type Locale } from "@/i18n/routing";
 import { MotionFeatures } from "@/components/shared/motion-features";
 import { fontVariables } from "@/lib/fonts";
 import { DeferredLanguageSuggestion } from "./deferred-language-suggestion";
+import { SmoothScroll } from "./smooth-scroll";
 import type { SuggestionText } from "./language-suggestion";
 
 /**
@@ -35,6 +36,8 @@ export async function SiteDocument({
         <MotionFeatures>
           {children}
           {suggestion && <DeferredLanguageSuggestion text={suggestion} />}
+          {/* WEB-5 D16: desktop wheel only, loaded after the page is usable. */}
+          <SmoothScroll />
         </MotionFeatures>
       </body>
     </html>

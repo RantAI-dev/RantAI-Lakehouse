@@ -93,6 +93,25 @@ if (scene.length === 0) {
   for (const f of scene) console.log(`  ${f} ${kb(gz(f))}`);
 }
 
+// WEB-5 D16: Lenis (smooth wheel scrolling) is fetched after the page is
+// usable and only on a desktop with a fine pointer, so it must not be an
+// initial chunk; its own size is reported. `lenisVersion` is the global
+// the library writes, kept by the minifier.
+const lenis = readdirSync(chunkDir, { recursive: true })
+  .filter((f) => String(f).endsWith(".js"))
+  .map((f) => join("_next/static/chunks", String(f)))
+  .filter((f) => readFileSync(join(OUT, f), "utf8").includes("lenisVersion"));
+const lenisInitial = lenis.filter((f) => allInitial.has(f));
+if (lenisInitial.length) {
+  console.error(`Lenis is loaded by the HTML (${lenisInitial.join(", ")}): it must stay deferred (D16).`);
+  failed = true;
+} else if (lenis.length === 0) {
+  console.error("No Lenis chunk found: the marker no longer matches the build, so its size is unknown.");
+  failed = true;
+} else {
+  console.log(`lenis (deferred, desktop only, not counted): ${kb(lenis.reduce((sum, f) => sum + gz(f), 0))} gzip in ${lenis.length} files`);
+}
+
 // WEB-5 D14 S1: the test-only WebGL override must never reach the export.
 const leaked = readdirSync(OUT, { recursive: true })
   .map(String)
