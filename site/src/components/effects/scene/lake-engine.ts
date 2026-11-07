@@ -265,8 +265,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     const wide = aspect > 1.1;
     anchorHero.x = wide ? 0.42 : 0;
     anchorHero.y = wide ? 0 : 0.42;
-    anchorDepths.x = wide ? 0.42 : 0;
-    anchorDepths.y = wide ? -0.1 : -0.5;
+    anchorDepths.x = depthsTarget.x = wide ? 0.42 : 0;
+    anchorDepths.y = depthsTarget.y = depthsDefaultY = wide ? -0.1 : -0.5;
     const tanV = Math.tan(MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
     distScaleHero = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
@@ -276,6 +276,10 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // On wide screens also cap it below 1 so the stack stays clear of the copy.
     slabs.setFootprint(Math.min(wide ? 0.86 : 1, (0.7 * 8.06 * aspect * distScaleDepths) / SLAB_SIZE.w));
     fitSlabsToCard();
+    // A resize places the slab at once; later refits (fonts, the card's
+    // height) ease towards it in `update`.
+    anchorDepths.x = depthsTarget.x;
+    anchorDepths.y = depthsTarget.y;
     if (phone) fitHeroToRoom();
     viewKey = "";
     measure();
@@ -295,21 +299,30 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const fitPoint = new Vector3();
 
   /**
-   * WEB-5 O34: the slabs ran under the depths card on narrower desktops (a
-   * third developer measured about 118 px of clearance at 1440, 40 at 1280,
-   * and the slab under the card's right edge at 1024): their framing was a
-   * fixed `anchorDepths.x` of 0.42. Now the card is measured
-   * (`[data-depths-card]`, or else the first cell of the depths grid) and
-   * the slab is fitted into the room to its right: the slab, at its
-   * focused pose, is projected to the screen; its centre goes where 0.42
-   * put it if that keeps 48 px from the card and 24 px from the screen's
-   * edge, or else into the middle of that room; and if the room is
-   * narrower than the slab, its footprint shrinks to fit. Where the layout
-   * stacks the card above the slab (narrow screens), the slab is moved down
-   * until its top clears the card's bottom.
+   * WEB-5 O40 (owner: "tablenya di sebelah kanan aja dan di gabung dengan
+   * tampilan balok ... biar lebih clean"): the focused slab is the depths
+   * card's pedestal. It replaces O34's rule (keep 48 px clear of the card).
+   * - The card is `[data-depths-card]` (or else the first cell of the depths
+   *   grid), measured in the depths' pinned stage, where it sits while the
+   *   slabs show.
+   * - The slab, at its focused pose (all three are framed alike), is
+   *   projected to the screen: its footprint makes it `PEDESTAL.width` of
+   *   the card's width, its centre is the card's centre, and the front edge
+   *   of its top face is `PEDESTAL.gap` below the card's bottom, so the card
+   *   rests on it (the card's layout leaves about 28 to 40 px there).
+   * - Below 1024 px, or where the card spans the screen, the slab is full
+   *   width, centred, its top under the card's bottom (O34's stacked case).
+   * - The framing eases to its target (`depthsTarget`), so a card that
+   *   changes height from one chapter to the next never makes it jump.
+   * Bronze, Silver and Gold take the pedestal in turn: the leaving slab
+   * sinks and fades as the next rises into place (slabs.ts, `pedestalY`).
    */
+  const PEDESTAL = { width: 1.08, gap: 32 } as const;
+  const depthsTarget = { x: 0, y: 0 };
+  let depthsDefaultY = 0;
+  let watchedCard: Element | null = null;
   const slabCorner = new Vector3();
-  const slabSpan = (footprint: number): { half: number; top: number } => {
+  const slabSpan = (footprint: number): { half: number; top: number; frontTop: number } => {
     // The focused pose for the middle slab (all three are framed alike).
     const y = SLAB_Y[1];
     const k = distScaleDepths;
@@ -321,61 +334,70 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     fitCam.updateMatrixWorld();
     let half = 0;
     let top = Infinity;
+    let frontTop = -Infinity;
     for (const sx of [-1, 1])
       for (const sy of [-1, 1])
         for (const sz of [-1, 1]) {
           slabCorner
             .set((sx * SLAB_SIZE.w * footprint) / 2, y + (sy * SLAB_SIZE.h) / 2, (sz * SLAB_SIZE.d * footprint) / 2)
             .project(fitCam);
+          const py = ((1 - slabCorner.y) * height) / 2;
           half = Math.max(half, (Math.abs(slabCorner.x) * width) / 2);
-          top = Math.min(top, ((1 - slabCorner.y) * height) / 2);
+          top = Math.min(top, py);
+          // The top face's front edge: the lowest of its corners on screen.
+          if (sy > 0) frontTop = Math.max(frontTop, py);
         }
-    return { half, top };
+    return { half, top, frontTop };
   };
   const fitSlabsToCard = () => {
     const depthsEl = document.getElementById("depths");
     const card =
       depthsEl?.querySelector("[data-depths-card]") ?? depthsEl?.querySelector(".grid")?.firstElementChild ?? null;
     if (!card) return;
+    if (card !== watchedCard) {
+      // The card's height changes with the chapter: refit when it does.
+      if (watchedCard) roCard.unobserve(watchedCard);
+      roCard.observe(card);
+      watchedCard = card;
+    }
     const r = card.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
     const hostLeft = host.getBoundingClientRect().left;
-    const minLeft = r.right - hostLeft + 48;
-    const maxRight = width - 24;
-    const room = maxRight - minLeft;
-    const wanted = slabs.footprint();
-    const half1 = slabSpan(1).half;
-    const fitted = room > 0 ? Math.min(wanted, room / (2 * half1)) : 0;
-    // Beside the card when the room there keeps the slab at least 45 % of
-    // its size; otherwise (a stacked layout, or a portrait tablet with a
-    // narrow second column) under the card, full size and centred.
-    const stacked = r.width > width * 0.6 || fitted < wanted * 0.45;
+    const stage = card.closest(".sticky") ?? depthsEl;
+    const cardBottom = r.bottom - (stage ? stage.getBoundingClientRect().top : 0);
+    const cardCentre = r.left - hostLeft + r.width / 2;
+    const stacked = window.innerWidth < 1024 || r.width > width * 0.6;
     if (!stacked) {
-      const footprint = fitted;
+      // The projected width is not linear in the footprint (the near corners
+      // grow faster), so two proportional steps settle it on the target.
+      const wantHalf = (PEDESTAL.width * r.width) / 2;
+      let footprint = wantHalf / slabSpan(1).half;
+      for (let i = 0; i < 2; i++) footprint *= wantHalf / slabSpan(footprint).half;
+      footprint = Math.min(1.4, footprint);
       slabs.setFootprint(footprint);
-      const half = half1 * footprint;
-      const preferred = width / 2 + (anchorDepths.x * width) / 2;
-      const centre = Math.min(maxRight - half, Math.max(minLeft + half, preferred));
-      anchorDepths.x = ((centre - width / 2) * 2) / width;
-      // Dev only (removed from the export): the measured clearance, for review probes.
+      const span = slabSpan(footprint);
+      depthsTarget.x = ((cardCentre - width / 2) * 2) / width;
+      depthsTarget.y = (2 * (span.frontTop - (cardBottom + PEDESTAL.gap))) / height;
+      // Dev only (removed from the export): the fit, for review probes.
       if (process.env.NODE_ENV === "development") {
-        host.dataset.lkSlabClearance = String(Math.round(centre - half - (r.right - hostLeft)));
-        host.dataset.lkSlabFootprint = footprint.toFixed(3);
+        host.dataset.lkSlabFit = JSON.stringify({
+          card: [Math.round(r.left - hostLeft), Math.round(r.right - hostLeft), Math.round(cardBottom)],
+          slab: [Math.round(cardCentre - span.half), Math.round(cardCentre + span.half), Math.round(cardBottom + PEDESTAL.gap)],
+          footprint: Number(footprint.toFixed(3)),
+        });
       }
       return;
     }
-    // Under the card: centred, and its top kept under the card's bottom,
-    // measured in the depths' pinned stage (which fills the screen while
-    // the slabs show), not where the page happens to be scrolled now.
-    anchorDepths.x = 0;
-    const stage = card.closest(".sticky") ?? depthsEl;
-    const cardBottom = r.bottom - (stage ? stage.getBoundingClientRect().top : 0) + 12;
-    const top = slabSpan(slabs.footprint()).top - (anchorDepths.y * height) / 2;
-    if (top < cardBottom) anchorDepths.y -= ((cardBottom - top) * 2) / height;
+    // Stacked: full width (the footprint resize set), centred, its top
+    // under the card's bottom.
+    depthsTarget.x = 0;
+    const top0 = slabSpan(slabs.footprint()).top;
+    depthsTarget.y = Math.min(depthsDefaultY, (2 * (top0 - (cardBottom + 12))) / height);
     if (process.env.NODE_ENV === "development") {
-      host.dataset.lkSlabStack = `${Math.round(top)}|${Math.round(cardBottom)}|${anchorDepths.y.toFixed(3)}|${slabs.footprint().toFixed(3)}`;
+      host.dataset.lkSlabFit = JSON.stringify({ stacked: true, cardBottom: Math.round(cardBottom), y: depthsTarget.y });
     }
   };
+  const roCard = new ResizeObserver(() => fitSlabsToCard());
   const heroCreatureSpan = (dist: number, ay: number): { top: number; bottom: number } => {
     const hero = sceneStateAt(0, layout);
     fitCam.aspect = width / height;
@@ -542,7 +564,14 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // own depth); snow is a constant presence below.
     shafts.update(t, 0.75 * Math.exp(-depth / 16), camera);
     snow.update(t, 0.75, camera, dpr);
-    slabs.update({ time: t, focus: state.focus, reveal: state.slabsReveal, pixelRatio: dpr });
+    // O40: the framing eases to the card's pedestal; the focused slab takes
+    // the pedestal, which the camera's look point carries (all slab keys
+    // frame it alike), clamped to the stack so the approach does not drag it.
+    const ease = 1 - Math.exp(-dt * 5);
+    anchorDepths.x += (depthsTarget.x - anchorDepths.x) * ease;
+    anchorDepths.y += (depthsTarget.y - anchorDepths.y) * ease;
+    const pedestalY = clamp(state.look[1] + 0.3, SLAB_Y[2], SLAB_Y[0]);
+    slabs.update({ time: t, focus: state.focus, reveal: state.slabsReveal, pixelRatio: dpr, pedestalY });
 
     // WEB-1 review round 1 SHOULD-FIX 2: the canvas layer is sticky only inside
     // the zone, so where S3 ends it used to be cut by a hard horizontal edge
@@ -701,6 +730,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       publishSceneColours(null);
       ro.disconnect();
       roZone.disconnect();
+      roCard.disconnect();
       io.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pointermove", setPointer);

@@ -25,13 +25,20 @@ import { SLAB_Y } from "./scene-config";
  * Each slab is a rounded glass box with a data surface on top and a soft
  * halo underneath. Between them, particles ("rows") fall from the slab above
  * into the next one: noisy and many at Bronze, aligned in rows at Silver, few
- * and bright at Gold. The slab the visitor is at lights up and the others
- * draw apart from it a little. All of it is driven by one number, the
- * continuous `focus` (0 Bronze, 1 Silver, 2 Gold) from `scroll-timeline.ts`.
+ * and bright at Gold. The slab the visitor is at lights up. All of it is
+ * driven by one number, the continuous `focus` (0 Bronze, 1 Silver, 2 Gold)
+ * from `scroll-timeline.ts`. WEB-5 O40: only the focused slab shows, as the
+ * depths card's pedestal; the others are below it, out of sight, and take
+ * its place in turn (the one leaving sinks and fades as the next rises).
  */
 
 export const SLAB_SIZE = { w: 7, h: 0.46, d: 4.7 } as const;
-const SEPARATION = 0.75;
+/** O40: how far a slab sinks below the pedestal as it leaves or before it arrives. */
+const SINK = 2.2;
+const smooth01 = (x: number): number => {
+  const t = Math.min(1, Math.max(0, x));
+  return t * t * (3 - 2 * t);
+};
 
 type StreamSpec = { count: number; order: number; size: number; speed: number; cols: number; rows: number };
 const STREAMS: StreamSpec[] = [
@@ -45,7 +52,11 @@ const STREAMS: StreamSpec[] = [
 
 export type Slabs = {
   group: Group;
-  update: (args: { time: number; focus: number; reveal: number; pixelRatio: number }) => void;
+  /**
+   * `pedestalY` (WEB-5 O40): the world height where the focused slab stands,
+   * under the depths card; the engine passes the camera's look point there.
+   */
+  update: (args: { time: number; focus: number; reveal: number; pixelRatio: number; pedestalY: number }) => void;
   /** Narrow screens shrink the slabs sideways (x and z) so the stack fits the width. */
   setFootprint: (scale: number) => void;
   /** The footprint last set (1 = full size). */
@@ -188,7 +199,7 @@ export function createSlabs(lowQuality: boolean): Slabs {
       for (const s of slabs) s.root.scale.set(scale, 1, scale);
     },
     footprint: () => footprint,
-    update({ time, focus, reveal, pixelRatio }) {
+    update({ time, focus, reveal, pixelRatio, pedestalY }) {
       group.visible = reveal > 0.003;
       if (!group.visible) return;
       const ys: number[] = [];
@@ -197,17 +208,21 @@ export function createSlabs(lowQuality: boolean): Slabs {
         const d = i - focus;
         // 1 at the focused slab, falling to 0 a full slab away.
         const w = clamp01(1 - Math.abs(d) * 1.25);
-        const lift = -Math.max(-1, Math.min(1, d)) * SEPARATION;
-        s.root.position.y = SLAB_Y[i] + lift;
+        // WEB-5 O40: the focused slab stands on the pedestal under the depths
+        // card; the one leaving sinks and fades as the next rises into place,
+        // so only one slab is ever under the card.
+        const there = 1 - smooth01(Math.abs(d) / 0.85);
+        s.root.position.y = pedestalY - SINK * Math.min(1, Math.abs(d));
         ys.push(s.root.position.y);
         const grow = 1 + 0.035 * w;
         s.root.scale.set(footprint * grow, 1, footprint * grow);
-        s.bodyMat.opacity = (0.3 + 0.2 * w) * reveal;
+        s.root.visible = there > 0.002;
+        s.bodyMat.opacity = (0.3 + 0.2 * w) * reveal * there;
         s.bodyMat.emissiveIntensity = 0.04 + 0.4 * w;
         s.surfaceMat.uniforms.uTime.value = time;
         s.surfaceMat.uniforms.uGlow.value = w;
-        s.surfaceMat.uniforms.uReveal.value = reveal;
-        s.haloMat.uniforms.uIntensity.value = (0.1 + 0.55 * w) * reveal;
+        s.surfaceMat.uniforms.uReveal.value = reveal * there;
+        s.haloMat.uniforms.uIntensity.value = (0.1 + 0.55 * w) * reveal * there;
       }
       for (let i = 0; i < streams.length; i++) {
         const m = streams[i].material;
@@ -222,7 +237,9 @@ export function createSlabs(lowQuality: boolean): Slabs {
         m.uniforms.uHalfW.value = (SLAB_SIZE.w / 2 - 0.7) * footprint;
         m.uniforms.uHalfD.value = (SLAB_SIZE.d / 2 - 0.7) * footprint;
         const w = clamp01(1 - Math.abs(i - focus) * 1.1);
-        m.uniforms.uAlpha.value = (0.22 + 0.78 * w) * reveal;
+        // O40: a stream shows only with the slab it feeds on the pedestal.
+        const there = 1 - smooth01(Math.abs(i - focus) / 0.85);
+        m.uniforms.uAlpha.value = (0.22 + 0.78 * w) * reveal * there;
       }
       light.intensity = 26 * reveal;
       light.position.set(2.5, ys[Math.round(Math.max(0, Math.min(2, focus)))] + 3.4, 4.5);

@@ -42,7 +42,7 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
   return (
     <div className="lk-depth-stage sticky top-0 h-[100svh] overflow-hidden motion-reduce:hidden">
       {/* The gauge hugs the screen's left edge, outside the 1120 px column. */}
-      <DepthGauge progress={progress} active={active} />
+      <DepthGauge progress={progress} active={active} words={copy.key} />
       <Container className="relative h-full">
         <div className="lk-depth-grid-stage grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:gap-5 max-md:pl-6 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] md:gap-12">
           {/* WEB-5 O21: the chapter shows what the depth does to the data.
@@ -93,7 +93,16 @@ const TICKS = [14, 50, 86] as const;
  * scroll. On phones the labels drop away (the panel's own eyebrow says the
  * same thing) and only the line and the marker remain.
  */
-function DepthGauge({ progress, active }: { progress: MotionValue<number>; active: 0 | 1 | 2 }) {
+function DepthGauge({
+  progress,
+  active,
+  words,
+}: {
+  progress: MotionValue<number>;
+  active: 0 | 1 | 2;
+  /** WEB-5 O40: each depth's word ("raw", "clean", "ready"), now that the key above the card is gone. */
+  words: Record<"bronze" | "silver" | "gold", string>;
+}) {
   // The marker rides the same eased path as the camera: it rests on each tick
   // at the middle of that depth's third.
   const top = useTransform(progress, [0, 1 / 6, 1 / 2, 5 / 6, 1], ["6%", "14%", "50%", "86%", "94%"]);
@@ -120,7 +129,7 @@ function DepthGauge({ progress, active }: { progress: MotionValue<number>; activ
             )}
             style={{ color: active === i ? l.accent : "rgba(232,244,255,0.5)" }}
           >
-            {l.meters} {l.label}
+            {l.meters} {l.label} · {words[l.id]}
           </span>
         </div>
       ))}
