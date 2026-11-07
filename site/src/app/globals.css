@@ -2746,9 +2746,48 @@ section[data-role="admin"] .lk-gv-closed {
     animation: none !important;
   }
 }
-/* O38: in the large showcase panel the table and its readers grow a little, so the diagram fills it. */
-@media (min-width: 64rem) {
-  .lk-show-visual .lk-open-tables > [aria-hidden="true"] {
-    transform: scale(1.18);
+/* O38 review fix: a desktop window too short for the held list (4 x 112 px)
+   and panel (440 px) under the top bar, below about 544 px, gets the plain
+   sequence instead of the sticky showcase, as phones and no-JS do. */
+@media (min-width: 64rem) and (max-height: 33.99rem) {
+  .lk-show {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 16px;
+  }
+  .lk-show-mark {
+    display: none;
+  }
+  .lk-show-item,
+  .lk-show-visual {
+    grid-column: auto;
+    grid-row: auto;
+    position: relative;
+    top: auto;
+    margin-top: 0;
+    height: auto;
+  }
+  .lk-show-item {
+    border-left-color: rgba(232, 244, 255, 0.1);
+  }
+  .lk-show-item a {
+    pointer-events: none;
+  }
+  .lk-show-item:not([data-on]) .lk-show-title,
+  .lk-show-item:not([data-on]) .lk-show-line {
+    color: inherit;
+  }
+  .lk-show-visual,
+  .lk-show-visual[data-on] {
+    max-width: 40rem;
+    min-height: 260px;
+    margin-bottom: 32px;
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+    transition: none;
+  }
+  .lk-show-visual:not([data-on]) *,
+  .lk-show-visual:not([data-on]) *::after {
+    animation-play-state: running !important;
   }
 }

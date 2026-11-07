@@ -29,7 +29,7 @@ import { OpenShowcase } from "./open-showcase";
  */
 
 const NO_SCRIPT_CSS =
-  "@media (min-width:64rem){.lk-show{grid-template-columns:minmax(0,1fr)!important;row-gap:16px!important}.lk-show-mark{display:none!important}.lk-show-item,.lk-show-visual{grid-column:auto!important;grid-row:auto!important;position:relative!important;top:auto!important;margin-top:0!important;height:auto!important}.lk-show-visual{opacity:1!important;visibility:visible!important;transform:none!important;margin-bottom:32px!important;max-width:40rem!important}.lk-show-item .lk-show-title,.lk-show-item .lk-show-line{color:inherit!important}.lk-show-visual .lk-open-tables>[aria-hidden]{transform:none!important}}";
+  "@media (min-width:64rem){.lk-show{grid-template-columns:minmax(0,1fr)!important;row-gap:16px!important}.lk-show-mark{display:none!important}.lk-show-item,.lk-show-visual{grid-column:auto!important;grid-row:auto!important;position:relative!important;top:auto!important;margin-top:0!important;height:auto!important}.lk-show-visual{opacity:1!important;visibility:visible!important;transform:none!important;margin-bottom:32px!important;max-width:40rem!important}.lk-show-item .lk-show-title,.lk-show-item .lk-show-line{color:inherit!important}}";
 
 export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: CommonCopy["cta"] }) {
   const [source, tables, servers] = copy.cards;

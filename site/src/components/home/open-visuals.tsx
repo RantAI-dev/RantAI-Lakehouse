@@ -115,9 +115,9 @@ export function CodePanel({ copy, action }: { copy: OpenCopy["code"]; action?: R
  * site for any of them (DESIGN.md: a neutral icon, never a fake logo).
  */
 const READERS = [
-  { id: "clickhouse", x: 17, y: 24, nx: 50, ny: 14, icon: Database },
-  { id: "engine", x: 17, y: 76, nx: 27, ny: 86, icon: SquareTerminal },
-  { id: "notebook", x: 84, y: 50, nx: 73, ny: 86, icon: NotebookPen },
+  { id: "clickhouse", x: 23, y: 22, nx: 50, ny: 14, icon: Database },
+  { id: "engine", x: 23, y: 78, nx: 27, ny: 86, icon: SquareTerminal },
+  { id: "notebook", x: 79, y: 50, nx: 73, ny: 86, icon: NotebookPen },
 ] as const;
 
 /** The wires, in the wide layout (readers left and right) or the narrow one (one above, two below). */
@@ -143,7 +143,10 @@ export function TablesDiagram({ copy }: { copy: OpenCopy["tables"] }) {
   return (
     <div className="lk-open-tables relative h-full min-h-[200px] overflow-hidden rounded-2xl">
       <p className="sr-only">{copy.sr}</p>
-      <div aria-hidden="true" className="absolute inset-0">
+      {/* O38 review fix: the diagram lives in a centred box 24 px inside the
+          panel and at most 560 px wide, so no reader chip ever reaches an
+          edge, however large the panel. */}
+      <div aria-hidden="true" className="absolute inset-6 mx-auto max-w-[560px]">
         <Wires />
         <Wires narrow />
         {/* The table in the middle: one Iceberg table, its snapshots stacked behind it. */}
@@ -265,7 +268,7 @@ const SHORTCUTS = [
 
 export function ConsoleHome({ windowTitle }: { windowTitle: string }) {
   return (
-    <div className="lk-con flex h-full flex-col">
+    <div className="lk-con @container flex h-full flex-col">
       {/* The window's title strip: the mark and what it shows. No traffic lights, no address bar. */}
       <div className="flex items-center gap-2 px-5 pt-4 pb-1">
         <MascotMark className="h-3 w-auto" />
@@ -301,7 +304,8 @@ export function ConsoleHome({ windowTitle }: { windowTitle: string }) {
           </span>
         </div>
       </div>
-      <div className="mt-2.5 grid gap-2 sm:grid-cols-3">
+      {/* Three across only where the panel itself has room (a container query), so no shortcut is cut. */}
+      <div className="mt-2.5 grid gap-2 @xl:grid-cols-3">
         {SHORTCUTS.map((s) => {
           const Icon = s.icon;
           return (
