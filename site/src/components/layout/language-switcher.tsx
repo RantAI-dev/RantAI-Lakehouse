@@ -64,7 +64,7 @@ export function LanguageSwitcher({
               }
             }}
             className={cn(
-              "rounded-full font-medium transition-colors duration-200 ease-out",
+              "rounded-full font-medium transition-[background-color,color,transform] duration-200 ease-out active:scale-95 motion-reduce:transition-none",
               // O6: the phone menu shows the switch larger, as rantai-page's sheet does.
               size === "lg" ? "px-4 py-2 text-[14px]" : "px-2 py-1 text-[12px] md:px-2.5",
               current ? "bg-[#E8F4FF] text-[#020514]" : "text-[#E8F4FF]/70 hover:text-[#E8F4FF]",

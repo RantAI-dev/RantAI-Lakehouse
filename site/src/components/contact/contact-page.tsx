@@ -74,7 +74,7 @@ export async function ContactPage({ locale }: Readonly<{ locale: Locale }>) {
                         target="_blank"
                         rel="noopener noreferrer"
                         aria-label={s.label}
-                        className="grid size-11 place-items-center rounded-full text-[#E8F4FF]/70 transition-colors hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF]"
+                        className="grid size-11 place-items-center rounded-full text-[#E8F4FF]/70 transition-[color,background-color,transform] duration-200 ease-out hover:-translate-y-0.5 hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] active:translate-y-0 active:scale-95 motion-reduce:transition-none motion-reduce:hover:translate-y-0"
                       >
                         <SocialIcon id={s.id} />
                       </a>
@@ -106,9 +106,9 @@ function DirectLink({
       <a
         href={href}
         {...(external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
-        className="group flex items-center gap-4 py-4"
+        className="group flex items-center gap-4 rounded-xl py-4 transition-opacity duration-200 ease-out active:opacity-80"
       >
-        <span className="grid size-10 shrink-0 place-items-center rounded-full bg-[#E8F4FF]/[0.08] text-[#E8F4FF]/85 transition-colors group-hover:bg-[#44A6FA] group-hover:text-[#020514]">
+        <span className="grid size-10 shrink-0 place-items-center rounded-full bg-[#E8F4FF]/[0.08] text-[#E8F4FF]/85 transition-colors duration-200 ease-out group-hover:bg-[#44A6FA] group-hover:text-[#020514]">
           {icon}
         </span>
         <span className="min-w-0 flex-1">
@@ -116,7 +116,7 @@ function DirectLink({
           <span className="block truncate text-[14px] text-[#E8F4FF]/70">{value}</span>
         </span>
         <ArrowUpRight
-          className="size-4 shrink-0 text-[#E8F4FF]/40 transition-colors group-hover:text-[#E8F4FF]"
+          className="size-4 shrink-0 text-[#E8F4FF]/40 transition-[color,translate] duration-200 ease-out group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:text-[#E8F4FF] motion-reduce:transition-none"
           aria-hidden="true"
         />
       </a>

@@ -114,8 +114,9 @@ function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role
             aria-checked={role === o.id}
             onClick={() => onChange(o.id)}
             className={cn(
-              "relative rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors duration-300",
-              role === o.id ? "bg-[#44A6FA] text-[#020514]" : "text-[#E8F4FF]/75 hover:text-[#E8F4FF]",
+              // Micro pass (DESIGN.md §3): 200 ms, a hover wash and a press on the idle side.
+              "relative rounded-full px-4 py-1.5 text-[13px] font-medium transition-[background-color,color,transform] duration-200 ease-out active:scale-95 motion-reduce:transition-none",
+              role === o.id ? "bg-[#44A6FA] text-[#020514]" : "text-[#E8F4FF]/75 hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF]",
             )}
           >
             {o.label}

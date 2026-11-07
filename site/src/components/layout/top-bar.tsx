@@ -36,9 +36,9 @@ import { MascotMark } from "@/components/shared/mascot-svg";
 export type TopBarPage = "home" | "contact";
 
 const pill =
-  "rounded-full px-3.5 py-2 text-[14px] text-[#E8F4FF]/70 transition-[background-color,color] duration-200 ease-out hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] aria-[current]:bg-[#E8F4FF]/[0.12] aria-[current]:text-[#E8F4FF] motion-reduce:transition-none";
+  "inline-block rounded-full px-3.5 py-2 text-[14px] text-[#E8F4FF]/70 transition-[background-color,color,transform] duration-200 ease-out hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] active:scale-[0.97] active:bg-[#E8F4FF]/[0.14] aria-[current]:bg-[#E8F4FF]/[0.12] aria-[current]:text-[#E8F4FF] motion-reduce:transition-none";
 const sheetLink =
-  "flex min-h-14 items-center justify-between border-b border-[#E8F4FF]/10 text-[18px] font-medium text-[#E8F4FF]/65 transition-colors duration-200 ease-out hover:text-[#E8F4FF] aria-[current]:text-[#E8F4FF]";
+  "flex min-h-14 items-center justify-between border-b border-[#E8F4FF]/10 text-[18px] font-medium text-[#E8F4FF]/65 transition-colors duration-200 ease-out hover:text-[#E8F4FF] active:text-[#8fcbff] aria-[current]:text-[#E8F4FF]";
 
 export function TopBar({
   locale,

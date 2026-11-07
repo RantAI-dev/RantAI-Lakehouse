@@ -94,7 +94,7 @@ export function FooterPrompt({ text, to }: Readonly<{ text: FooterPromptText; to
     <>
       <div
         ref={boxRef}
-        className="relative w-full rounded-[20px] bg-[linear-gradient(180deg,rgba(232,244,255,0.4),rgba(232,244,255,0.08)_45%,rgba(68,166,250,0.35))] p-px shadow-[0_0_0_6px_rgba(232,244,255,0.03),0_30px_90px_-24px_rgba(68,166,250,0.35)] transition-shadow duration-300 ease-out focus-within:shadow-[0_0_0_6px_rgba(68,166,250,0.12),0_30px_90px_-24px_rgba(68,166,250,0.5)]"
+        className="relative w-full rounded-[20px] bg-[linear-gradient(180deg,rgba(232,244,255,0.4),rgba(232,244,255,0.08)_45%,rgba(68,166,250,0.35))] p-px shadow-[0_0_0_6px_rgba(232,244,255,0.03),0_30px_90px_-24px_rgba(68,166,250,0.35)] transition-shadow duration-250 ease-out hover:shadow-[0_0_0_6px_rgba(232,244,255,0.06),0_30px_90px_-24px_rgba(68,166,250,0.45)] focus-within:shadow-[0_0_0_6px_rgba(68,166,250,0.12),0_30px_90px_-24px_rgba(68,166,250,0.5)]"
       >
         <form onSubmit={send} className="relative w-full rounded-[19px] bg-[linear-gradient(180deg,#0B1A4A,#050A30)] p-3 text-left">
           <label htmlFor={`${id}-field`} className="sr-only">
