@@ -236,9 +236,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   const anchorHero = { x: 0, y: 0 };
   const anchorDepths = { x: 0, y: 0 };
-  // WEB-5 O8/O11: between the hero and the depths (the sources, where the
-  // whole whale shows), a portrait screen frames the toy whale low, under
-  // the sources' copy and pills, which fill the top of a phone's screen.
+  // WEB-5 O8/O11 framed the whale here, between the hero and the depths;
+  // since O30 it stays at the surface and the sources are framed centred.
   const anchorUnder = { x: 0, y: 0 };
   let distScaleHero = 1;
   let distScaleDepths = 1;
@@ -261,8 +260,6 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     anchorHero.y = wide ? 0 : 0.42;
     anchorDepths.x = wide ? 0.42 : 0;
     anchorDepths.y = wide ? -0.1 : -0.5;
-    anchorUnder.x = 0;
-    anchorUnder.y = wide ? 0 : -0.45;
     const tanV = Math.tan(MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
     distScaleHero = Math.max(1, 2.35 / (tanV * aspect) / 7.2);

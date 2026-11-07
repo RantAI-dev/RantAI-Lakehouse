@@ -21,7 +21,7 @@ import {
   type WebGLProgramParametersWithUniforms,
 } from "three";
 import { PALETTE } from "@/lib/palette";
-import { BELLY_SQUASH, BLUSH, BODY_LONG, DOME_SPHERE, EYES_3D, HEAD_TURN, MASCOT_H, MASCOT_R } from "./scene-config";
+import { BELLY_SQUASH, BODY_LONG, DOME_SPHERE, EYES_3D, HEAD_TURN, MASCOT_H, MASCOT_R } from "./scene-config";
 import { createToyParts } from "./whale";
 import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, SPOUT_VERT } from "./shaders";
 
@@ -34,15 +34,19 @@ import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, 
  * - One round body: the mark's dome on top, so above the water the
  *   silhouette is exactly the logo's, rounding off below the waterline into
  *   a soft egg, longer front to back (`BODY_LONG`) and wider than tall.
- * - A white belly with soft curved grooves in lake blue, and a light coral
- *   blush under each eye, painted in the skin's own shader (`paintSkin`),
- *   so they cost no geometry. The belly is below the waterline.
- * - Two round eyes (O3: two, the mark keeps one): a bright white, a navy
- *   pupil that follows the pointer, and two small highlights. They blink.
+ * - A white belly with soft curved grooves in lake blue, painted in the
+ *   skin's own shader (`paintSkin`), so it costs no geometry. The belly is
+ *   below the waterline.
+ * - O29 (owner: "gausah ada matanya dan blushnya gitu, keep it simple kek
+ *   desain awal"): two plain, glowing white eyes in the logo's style (O3:
+ *   two, the mark keeps one), no pupils, no highlights, no blush. They
+ *   blink and shift a little in their sockets towards the pointer.
  * - A short tail curling up to a small fluke, and two small flippers
  *   (whale.ts), seen under water only.
- * - Smooth, soft-plastic skin: satin rather than glossy, a friendlier navy.
- * - A gentle bob; under water a slow, happy swim (`swim`).
+ * - O29: the original deep navy skin, glossy, with the lake-blue rim the
+ *   moonlight draws (the O11 brighter blue read "terlalu biru").
+ * - A gentle bob; seen from under water, a slow, happy paddle (`swim`):
+ *   it sways, wags its tail and paddles, staying at the surface (O30).
  * - Every 5 to 9 s a small, soft fountain from the blowhole.
  * The water plane hides everything below the waterline until the camera
  * dives.
@@ -71,7 +75,7 @@ export type Mascot = {
   update: (dt: number, t: number, aim: Aim, look: number) => void;
   /** 0..1: how much it is swimming (the camera under water) rather than resting at the surface. */
   swim: number;
-  /** Paints the belly, its grooves and the blush in the skin's shader; the engine applies it with the fog. */
+  /** Paints the belly and its grooves in the skin's shader; the engine applies it with the fog. */
   paintSkin: (shader: WebGLProgramParametersWithUniforms) => void;
   dip: (t: number) => void;
   /** 0 for the picture above the surface, 1 for the one below (lighting, the spout). */
@@ -146,18 +150,18 @@ export function createMascot(opts: MascotOptions): Mascot {
 
   // ---- Body --------------------------------------------------------------
   const bodyGeo = buildBodyGeometry();
-  // O11: soft plastic. Satin, a thin soft clearcoat, and a navy a step
-  // towards the lake's blue, friendlier and still readable through water.
+  // WEB-5 O29: the original skin (before O11), the mark's deep navy with a
+  // clearcoat that catches the moon's rim light.
   const bodyMat = new MeshPhysicalMaterial({
-    color: new Color("#2152b8"),
-    roughness: 0.5,
+    color: new Color(PALETTE.navy),
+    roughness: 0.42,
     metalness: 0.0,
-    clearcoat: 0.45,
-    clearcoatRoughness: 0.38,
-    // A little emission keeps the shadow side blue rather than black.
-    emissive: new Color("#12307f"),
-    emissiveIntensity: 0.5,
-    envMapIntensity: 1.1,
+    clearcoat: 1,
+    clearcoatRoughness: 0.2,
+    // A little emission keeps the shadow side navy rather than black.
+    emissive: new Color("#0a1450"),
+    emissiveIntensity: 0.55,
+    envMapIntensity: 1.35,
   });
   const dome = new Mesh(bodyGeo, bodyMat);
   group.add(dome);
@@ -169,83 +173,60 @@ export function createMascot(opts: MascotOptions): Mascot {
   group.add(parts.group);
   disposables.push(parts);
 
-  // Where the blush sits, in the body's own space.
-  const blushAt = [-1, 1].map((side) => {
-    const at = { pos: new Vector3(), normal: new Vector3() };
-    surface(side * BLUSH.phi, BLUSH.rho, at);
-    return at.pos;
-  });
   const skinUniforms = {
     uBelly: { value: new Color(PALETTE.foam) },
     uGroove: { value: new Color(PALETTE.lake) },
-    uBlush: { value: new Color("#ff8f96") },
-    uBlushL: { value: blushAt[0] },
-    uBlushR: { value: blushAt[1] },
-    uBlushSize: { value: BLUSH.r },
-    uBlushA: { value: BLUSH.alpha },
     uLongZ: { value: SPHERE_R * BODY_LONG },
   };
 
   // ---- Eyes --------------------------------------------------------------
-  // WEB-5 O11: toy eyes, built alike and sharing their materials. Each is a
-  // socket on the dome (fixed), a white that blinks, a navy pupil that
-  // follows the pointer over the white, and two small highlights that ride
-  // on the pupil. The lens pass tone-maps the frame once (O5), so the
-  // whites are set above 1 in linear light: 2.5 maps to about 0.96 on
-  // screen. Not higher: MSAA averages an edge before tone mapping, and a
-  // much brighter white would saturate its edge pixels into jaggies.
-  const ballGeo = new SphereGeometry(1, 32, 22);
-  const whiteMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(2.5) });
-  const pupilMat = new MeshBasicMaterial({ color: new Color("#081038") });
-  const glintMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(3) });
+  // WEB-5 O29: the logo's eyes, as O3/O8 drew them: a plain white bead with
+  // a soft glow, two of them, sharing their materials so they glow, blink
+  // and fade under water as one. No pupil, no highlight. Placed where O11
+  // put them (the front-sides), so from the hero camera they read as a face.
+  // The lens pass tone-maps the frame once (O5): the white is 3.5 in linear
+  // light, about 0.97 on screen; brighter would saturate the MSAA edge
+  // pixels into jaggies.
+  const eyeGeo = new SphereGeometry(1, 40, 28);
+  const eyeMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(3.5) });
   const glowGeo = new PlaneGeometry(1, 1);
   const glowMat = new ShaderMaterial({
-    uniforms: { uColor: { value: new Color("#bfe0ff") }, uIntensity: { value: 0.3 } },
+    uniforms: { uColor: { value: new Color("#bfe0ff") }, uIntensity: { value: 0.5 } },
     vertexShader: GLOW_VERT,
     fragmentShader: GLOW_FRAG,
     transparent: true,
     depthWrite: false,
     blending: AdditiveBlending,
   });
-  disposables.push(ballGeo, whiteMat, pupilMat, glintMat, glowGeo, glowMat);
+  disposables.push(eyeGeo, eyeMat, glowGeo, glowMat);
   const R_EYE = EYES_3D.r;
-  /** The white is an ellipsoid sunk into the dome: its depth and how far its centre sits inside. */
-  const WHITE_DEPTH = 0.6 * R_EYE;
-  const WHITE_SINK = -0.3 * R_EYE;
-  const GLOW = 3.2;
-  function buildEye(side: number) {
+  /** The halo's size, in eye radii (O3: two halos that only just touch). */
+  const GLOW = 4.2;
+  function buildEye() {
     const eye = new Group();
     const lid = new Group();
     eye.add(lid);
-    const white = new Mesh(ballGeo, whiteMat);
-    white.scale.set(R_EYE, R_EYE, WHITE_DEPTH);
-    white.position.z = WHITE_SINK;
-    lid.add(white);
-    const pupil = new Mesh(ballGeo, pupilMat);
-    pupil.scale.set(0.58 * R_EYE, 0.6 * R_EYE, 0.3 * R_EYE);
-    lid.add(pupil);
-    const glint = new Mesh(ballGeo, glintMat);
-    glint.scale.setScalar(0.19 * R_EYE);
-    lid.add(glint);
-    const glintSmall = new Mesh(ballGeo, glintMat);
-    glintSmall.scale.setScalar(0.085 * R_EYE);
-    lid.add(glintSmall);
+    // A bead (O8): an ellipsoid sunk into the dome, round from any side.
+    const bead = new Mesh(eyeGeo, eyeMat);
+    bead.scale.set(R_EYE, R_EYE, 0.9 * R_EYE);
+    bead.position.z = -0.62 * R_EYE;
+    lid.add(bead);
     const glow = new Mesh(glowGeo, glowMat);
     glow.scale.set(R_EYE * GLOW, R_EYE * GLOW, 1);
-    glow.position.z = -0.05 * R_EYE;
+    glow.position.z = 0.12 * MASCOT_R;
     glow.renderOrder = 3;
     eye.add(glow);
-    // The socket: on the dome's surface, facing out along its normal.
-    const at = { pos: new Vector3(), normal: new Vector3() };
-    surface(side * EYES_3D.phi, EYES_3D.rho, at);
-    eye.position.copy(at.pos);
-    const m = new Matrix4().lookAt(new Vector3(), at.normal.clone().negate(), new Vector3(0, 1, 0));
-    eye.quaternion.setFromRotationMatrix(m);
     group.add(eye);
-    return { eye, lid, pupil, glint, glintSmall, glow };
+    return { eye, lid, glow };
   }
   /** Left and right, by their side of the front (−phi, +phi). */
-  const eyes = [buildEye(-1), buildEye(1)] as const;
+  const eyes = [buildEye(), buildEye()] as const;
+  const EYE_SIDE = [-1, 1] as const;
+  const socket = { pos: new Vector3(), normal: new Vector3() };
+  const socketM = new Matrix4();
+  const socketO = new Vector3();
+  const socketN = new Vector3();
+  const socketUp = new Vector3(0, 1, 0);
 
   // ---- Lights that belong to the creature --------------------------------
   // Water bounce from below-front, so the lower dome is not a black cut-out.
@@ -449,8 +430,6 @@ export function createMascot(opts: MascotOptions): Mascot {
   let dipStart = -10;
   let poppedAt = -10;
   const DIP_DEPTH = MASCOT_H + 0.25;
-  /** How deep it swims once the camera is under (O11): about the camera's own depth at −5 m. */
-  const SWIM_DEPTH = 2.3;
   let swimPhase = 0;
 
   function dipOffset(t: number): number {
@@ -486,8 +465,7 @@ export function createMascot(opts: MascotOptions): Mascot {
           "#include <common>",
           `#include <common>
           varying vec3 vSkin;
-          uniform vec3 uBelly; uniform vec3 uGroove; uniform vec3 uBlush;
-          uniform vec3 uBlushL; uniform vec3 uBlushR; uniform float uBlushSize; uniform float uBlushA;
+          uniform vec3 uBelly; uniform vec3 uGroove;
           uniform float uLongZ;`,
         )
         .replace(
@@ -509,13 +487,7 @@ export function createMascot(opts: MascotOptions): Mascot {
               * smoothstep(-0.05, 0.45, cos(phi));
             vec3 c = mix(diffuseColor.rgb, uBelly, belly);
             c = mix(c, uGroove, groove * belly * 0.7);
-            vec3 dl = q - uBlushL;
-            vec3 dr = q - uBlushR;
-            float s2 = uBlushSize * uBlushSize;
-            float blush = max(exp(-dot(dl, dl) / s2), exp(-dot(dr, dr) / s2)) * uBlushA;
-            diffuseColor.rgb = mix(c, uBlush, blush * (1.0 - belly));
-            // A touch of its own light, so the blush still reads by moonlight.
-            totalEmissiveRadiance += uBlush * blush * 0.1;
+            diffuseColor.rgb = c;
             // The belly keeps a little light of its own, so it reads white, not grey, in shade.
             totalEmissiveRadiance += uBelly * belly * 0.16;
           }`,
@@ -533,12 +505,12 @@ export function createMascot(opts: MascotOptions): Mascot {
       // Under water the light is scattered from every side; a little more
       // glow keeps the body readable through the water's fog without
       // flattening it (O5: the old 1.5 made it a flat disc).
-      bodyMat.emissiveIntensity = MathUtils.lerp(0.5, 0.55, uw);
+      bodyMat.emissiveIntensity = MathUtils.lerp(0.55, 0.6, uw);
       // The environment is the night sky; under water there is no sky to
       // reflect, only the window overhead, so the gloss mostly goes (O8: it
       // made the throat glow white).
-      bodyMat.envMapIntensity = MathUtils.lerp(1.1, 0.25, uw);
-      bodyMat.clearcoat = MathUtils.lerp(0.45, 0.2, uw);
+      bodyMat.envMapIntensity = MathUtils.lerp(1.35, 0.22, uw);
+      bodyMat.clearcoat = MathUtils.lerp(1, 0.35, uw);
       bounce.intensity = MathUtils.lerp(0.9, 2.2, uw);
       bounce.color.copy(BOUNCE_ABOVE.sky).lerp(BOUNCE_UNDER.sky, uw);
       bounce.groundColor.copy(BOUNCE_ABOVE.ground).lerp(BOUNCE_UNDER.ground, uw);
@@ -561,34 +533,32 @@ export function createMascot(opts: MascotOptions): Mascot {
 
       const bob = mascot.still ? 0 : Math.sin((t * TAU) / 4);
       const dipY = mascot.still ? 0 : dipOffset(t);
-      // O11: it dives with the visitor. At the surface only the dome shows;
-      // as the camera goes under, the whale sinks to about the camera's
-      // depth, so under water the whole of it is in view, beside you.
+      // WEB-5 O30 (owner: "gausah ikut tenggelam, karena jadi ngehalangin
+      // tulisan"): it stays at the surface. The diving camera glimpses its
+      // underside from just below, then sinks away from it.
       const swim = mascot.still ? 0 : MathUtils.clamp(mascot.swim, 0, 1);
-      const sink = SWIM_DEPTH * MathUtils.smoothstep(swim, 0.15, 1);
-      group.position.y = -0.05 + 0.06 * bob + dipY - sink;
+      group.position.y = -0.05 + 0.06 * bob + dipY;
       // O11: under water it swims, slowly and happily: the whole body
       // sways and drifts a little, the tail wags, the flippers paddle.
       swimPhase += dt;
       group.position.x = swim * 0.14 * Math.sin(swimPhase * 0.42);
       group.rotation.z = 0.02 * Math.sin((t * TAU) / 4 + 0.7) + swim * 0.05 * Math.sin(swimPhase * 0.8);
       // The head turns only a little; the pupils do most of the looking.
-      // Swimming, it turns nearly side-on to the camera, so its tail shows.
-      const turnToSwim = 0.9 * MathUtils.smoothstep(swim, 0.3, 1);
-      group.rotation.y =
-        lookAim.x * HEAD_TURN.yaw * look + turnToSwim + swim * 0.08 * Math.sin(swimPhase * 0.55 + 0.4);
+      group.rotation.y = lookAim.x * HEAD_TURN.yaw * look + swim * 0.08 * Math.sin(swimPhase * 0.55 + 0.4);
       group.rotation.x = -lookAim.y * HEAD_TURN.pitch * look + 0.012 * Math.sin((t * TAU) / 8);
       parts.update(t, swim, mascot.still);
 
-      // Pupils: over the white towards the pointer, on the white's curve.
-      const px = MathUtils.clamp(eyeAim.x, -1, 1) * EYES_3D.pupil * R_EYE;
-      const py = MathUtils.clamp(eyeAim.y, -1, 1) * EYES_3D.pupil * R_EYE * 0.85;
-      const d2 = Math.min(0.95, (px * px + py * py) / (R_EYE * R_EYE));
-      const pz = WHITE_SINK + WHITE_DEPTH * Math.sqrt(1 - d2) - 0.17 * R_EYE;
-      for (const e of eyes) {
-        e.pupil.position.set(px, py, pz);
-        e.glint.position.set(px - 0.22 * R_EYE, py + 0.24 * R_EYE, pz + 0.24 * R_EYE);
-        e.glintSmall.position.set(px + 0.2 * R_EYE, py - 0.15 * R_EYE, pz + 0.25 * R_EYE);
+      // Eyes: a small shift in their sockets towards the pointer (O29: there
+      // is no pupil to move).
+      const sock = EYES_3D.socket;
+      const turn = MathUtils.clamp(eyeAim.x, -1, 1) * sock.phi;
+      const rho = EYES_3D.rho + MathUtils.clamp(eyeAim.y, -1, 1) * sock.rho;
+      for (let i = 0; i < eyes.length; i++) {
+        surface(EYE_SIDE[i] * EYES_3D.phi + turn, rho, socket);
+        eyes[i].eye.position.copy(socket.pos).addScaledVector(socket.normal, 0.012 * MASCOT_R);
+        socketN.copy(socket.normal).negate();
+        socketM.lookAt(socketO, socketN, socketUp);
+        eyes[i].eye.quaternion.setFromRotationMatrix(socketM);
       }
 
       // Blink: scale-Y to 0.1 and back in 140 ms, every 4 to 7 s.
@@ -602,17 +572,17 @@ export function createMascot(opts: MascotOptions): Mascot {
         e.lid.scale.y = blink;
         e.glow.scale.y = R_EYE * GLOW * (0.35 + 0.65 * blink);
       }
-      glowMat.uniforms.uIntensity.value = 0.3 + 0.05 * Math.sin(t * 1.3);
+      glowMat.uniforms.uIntensity.value = 0.8 + 0.12 * Math.sin(t * 1.3);
 
       // Foam breathes with the bob and thins out while the creature is under.
       foamMat.uniforms.uTime.value = t;
-      const submerged = MathUtils.clamp((-dipY + sink) / DIP_DEPTH, 0, 1);
+      const submerged = MathUtils.clamp(-dipY / DIP_DEPTH, 0, 1);
       foamMat.uniforms.uAmount.value = (0.42 + 0.14 * bob) * (1 - 0.7 * submerged);
       foam.scale.setScalar(1 + 0.035 * bob);
 
       // A breath every 5 to 9 s, never while it is diving after a click.
       if (!mascot.still && t >= nextSpout) {
-        if (t - dipStart > 1.8 && sink < 0.2) breathe();
+        if (t - dipStart > 1.8) breathe();
         nextSpout = t + 5 + Math.random() * 4;
       }
       if (spoutAlive) updateSpout(dt);

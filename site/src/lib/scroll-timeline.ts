@@ -141,8 +141,13 @@ export const DIVE = {
   yAbove: 0.26,
   yBelow: -0.26,
   yUnder: -2.4,
-  /** Camera x at the `under` key: to the whale's right (O8). */
-  xUnder: 3.6,
+  /**
+   * O30: where the camera has tipped down far enough that the whale, which
+   * stays at the surface, is above the top of the frame, before the
+   * sources' copy has risen into the middle of the screen.
+   */
+  tipDown: 1.95,
+  yTipDown: -0.8,
   /** The underwater blend runs from this camera height down to the next. */
   blendTop: 0.9,
   blendBottom: -1.8,
@@ -192,11 +197,14 @@ function keysFor(layout: SceneLayout): Key[] {
     { at: DIVE.approach * vh, pos: [0, DIVE.yApproach, 6.9], look: [0, 0.6, 0] },
     // The waterline: a slow, half-above, half-below stretch (D14 S1).
     { at: DIVE.waterlineAbove * vh, pos: [0, DIVE.yAbove, 6.7], look: [0, 0.4, 0] },
-    { at: DIVE.waterlineBelow * vh, pos: [0, DIVE.yBelow, 6.6], look: [0, 0.1, 0] },
-    // WEB-5 O8/O11: under the surface the camera drifts to the right and
-    // looks back at the toy whale, which has dived with it (mascot.ts), from
-    // front-right, so the whole of it (face, belly, flipper, tail) is in view.
-    { at: DIVE.under * vh, pos: [DIVE.xUnder, DIVE.yUnder, 10.4], look: [-0.5, -1.3, -0.6] },
+    // O30: already tipping down a little here, so the whale rises up the frame and away.
+    { at: DIVE.waterlineBelow * vh, pos: [0, DIVE.yBelow, 6.6], look: [0, -0.45, 0] },
+    // WEB-5 O30: the whale stays at the surface. Just under it the camera
+    // still looks up at its belly, flippers and fluke; then it tips down as
+    // it sinks, so the whale slides out of the top of the frame before the
+    // sources' copy and pills arrive, and nothing of it sits behind them.
+    { at: DIVE.tipDown * vh, pos: [0, DIVE.yTipDown, 6.5], look: [0, -4.2, -0.8] },
+    { at: DIVE.under * vh, pos: [0, DIVE.yUnder, 6.4], look: [0, -6.2, -1.2] },
     { at: depthsTop, pos: [0, SLAB_Y[0] + 6.4, 10.2], look: [0, SLAB_Y[0] + 1, 0] },
     slabKey(0, depthsTop + span / 6),
     slabKey(1, depthsTop + span / 2),

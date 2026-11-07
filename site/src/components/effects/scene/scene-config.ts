@@ -43,21 +43,19 @@ export const BODY_LONG = 1.22;
 export const BELLY_SQUASH = 0.8;
 
 /**
- * The toy's eyes (O3: two, mirrored about the front; O11: friendly, round
- * and bright, with a dark pupil and a small highlight).
- * - On the front-sides of the dome, `phi` 0.44 rad either side of the
- *   front and `rho` 0.36 of the dome's height, so from the hero camera both
- *   read as a cute face, as in the owner's reference.
- * - `r` is the white's radius: 0.2, about a seventh of the body's width,
- *   so the eyes read at phone size.
- * - The eyes sit in fixed sockets; the pupils follow the pointer (`pupil`,
- *   as a fraction of `r`), and the head turns only a little (`HEAD_TURN`).
+ * The eyes (O3: two, mirrored about the front; the mark keeps one).
+ * - O11 placed them on the front-sides of the dome, `phi` 0.44 rad either
+ *   side of the front and `rho` 0.36 of the dome's height, so from the hero
+ *   camera both read as a face; `r` 0.2, about a seventh of the body's
+ *   width, so they read at phone size.
+ * - O29 (owner): plain glowing white beads in the logo's style, no pupil,
+ *   no highlight, no blush. They follow the pointer by a small shift in
+ *   their sockets (`socket`: radians round, fraction of the height), and the
+ *   head turns only a little (`HEAD_TURN`).
  */
-export const EYES_3D = { r: 0.2, rho: 0.36, phi: 0.44, pupil: 0.34 } as const;
+export const EYES_3D = { r: 0.2, rho: 0.36, phi: 0.44, socket: { phi: 0.08, rho: 0.04 } } as const;
 /** How far the head turns towards the pointer: radians round (yaw) and up or down (pitch). */
 export const HEAD_TURN = { yaw: 0.06, pitch: 0.03 } as const;
-/** The blush under each eye: where (azimuth and height fraction, as the eyes), how big, how strong. */
-export const BLUSH = { phi: 0.6, rho: 0.25, r: 0.19, alpha: 0.6 } as const;
 
 /** Direction the moonlight comes from (towards the moon), unit length. */
 export const MOON_DIR: readonly [number, number, number] = (() => {
