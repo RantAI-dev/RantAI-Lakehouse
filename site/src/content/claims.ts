@@ -111,8 +111,8 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.governance.bento.audit.line", backlog: ["AI-18 In Acceptance", "SEC-57 Done"], note: "assistant actions logged; risky ones wait for a person's approval" },
   { key: "home.governance.bento.catalog.line", backlog: ["DATA-11 Released", "DATA-12 Released"], note: "catalog search; certified and deprecated marks; governed tags (the tag chip)" },
   { key: "home.governance.bento.access.line", backlog: ["BI-19 In Acceptance"], note: "permissions per dashboard and per folder" },
-  // The real console (D19, 2026-11-07): a crop of rantai-page's
-  // public/products/lake-home.webp; the strings are the console's own
+  // The real console (D19, 2026-11-07): since O22 an HTML recreation of its
+  // home (open-visuals.tsx), with the console's own strings
   // (src/lib/home-prompts.ts, src/features/home/home-shortcuts.ts).
   {
     key: "home.open.console.caption",

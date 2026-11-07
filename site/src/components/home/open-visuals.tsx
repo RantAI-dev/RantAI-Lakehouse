@@ -9,7 +9,6 @@ import {
   NotebookPen,
   Plug,
   SlidersHorizontal,
-  Sparkles,
   SquareTerminal,
   Table2,
 } from "lucide-react";
@@ -241,8 +240,11 @@ export function HostingSwitch({ copy }: { copy: OpenCopy["hosting"] }) {
  * they are not translated): the examples its Home placeholder cycles
  * through (src/lib/home-prompts.ts, Ask mode), the Ask / Build / Tools
  * controls and the "Tab" hint (src/features/copilot/chat-composer.tsx), and
- * the three default shortcuts (src/features/home/home-shortcuts.ts), each
- * with the button that hands it to the assistant.
+ * the three default shortcuts (src/features/home/home-shortcuts.ts). The
+ * console puts a sparkle button beside each shortcut that hands it to the
+ * assistant; the recreation leaves it out (O22 follow-up: DESIGN.md lists
+ * sparkles among the signs of "AI slop", and the page may simplify the
+ * console), and keeps each shortcut's hover.
  *
  * In the console's dark theme rather than the light one of the old crop: the
  * console ships both, and the dark one sits on this page without a bright
@@ -300,9 +302,6 @@ export function ConsoleHome() {
               <span className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5 text-[13px] leading-5 font-medium text-[#E8F4FF]/90">
                 <Icon className="lk-con-short-icon size-4 shrink-0 text-[#E8F4FF]/60" strokeWidth={2} />
                 <span className="truncate">{s.title}</span>
-              </span>
-              <span className="lk-con-ai grid w-10 shrink-0 place-items-center border-l border-[#E8F4FF]/10 text-[#8fcbff]/70">
-                <Sparkles className="size-3.5" strokeWidth={2} />
               </span>
             </span>
           );

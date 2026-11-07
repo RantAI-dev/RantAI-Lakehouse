@@ -2685,15 +2685,6 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-con-short:hover .lk-con-short-icon {
   color: #8fcbff;
 }
-.lk-con-ai {
-  transition:
-    background-color 0.2s ease,
-    color 0.2s ease;
-}
-.lk-con-ai:hover {
-  color: #e8f4ff;
-  background: rgba(68, 166, 250, 0.18);
-}
 
 @media (prefers-reduced-motion: reduce) {
   .lk-open-tile,
