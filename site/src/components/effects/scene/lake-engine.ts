@@ -186,7 +186,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   const clock = { t: still ? STILL_TIME : 0, last: 0 };
 
   // ---- Input -------------------------------------------------------------
-  const pointer = { x: 0, y: 0, seen: false, lastInput: -100 };
+  const pointer = { x: 0, y: 0, seen: false, lastInput: -100, mouse: false, inside: false };
   const tilt = { x: 0, y: 0, active: false };
   const raycaster = new Raycaster();
   const ndc = new Vector2();
@@ -196,6 +196,12 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     pointer.y = -((e.clientY / window.innerHeight) * 2 - 1);
     pointer.seen = true;
     pointer.lastInput = clock.t;
+    // O51: only a mouse or a pen turns the head; touch keeps the rest pose.
+    pointer.mouse = e.pointerType !== "touch";
+    pointer.inside = true;
+  };
+  const onPointerOut = (e: PointerEvent) => {
+    if (!e.relatedTarget) pointer.inside = false;
   };
   const isInteractive = (el: EventTarget | null) =>
     el instanceof Element && el.closest("a,button,input,select,textarea,summary,[role='button']") !== null;
@@ -216,6 +222,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   };
   if (!still) {
     window.addEventListener("pointermove", setPointer, { passive: true });
+    document.addEventListener("pointerout", onPointerOut, { passive: true });
     window.addEventListener("pointerdown", onPointerDown, { passive: true });
     // Phones: the eye follows tilt when the browser already delivers it
     // (Android, or iOS after a permission granted earlier). Without events
@@ -525,6 +532,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     aim.x = lerp(rawX + (wanderX - rawX) * w, clamp(camera.position.x * 0.3, -0.5, 0.5), uw);
     aim.y = lerp(rawY + (wanderY - rawY) * w, -0.8, uw);
     mascot.swim = uw;
+    // O51: the head turns to a mouse near the screen's edges while it is in
+    // the window and active (3 s of stillness counts as gone).
+    mascot.pointerX = pointer.seen && pointer.mouse && pointer.inside && idle < 1 ? pointer.x * (1 - idle) : 0;
     mascot.update(dt, t, aim, 1 - uw * 0.5);
     (water.uniforms.uBodyC.value as Vector3).set(mascot.group.position.x, mascot.group.position.y, 0);
 
@@ -734,6 +744,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       io.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pointermove", setPointer);
+      document.removeEventListener("pointerout", onPointerOut);
       window.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("deviceorientation", onTilt);
       canvas.removeEventListener("webglcontextlost", onLost);

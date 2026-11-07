@@ -46,6 +46,13 @@ const EYES = [
   { cx: 381, cy: 230 },
 ] as const;
 const EYE_R = 27;
+/**
+ * WEB-5 O51: at the surface the head rests turned to the right, as the 3D
+ * head does (`HEAD_TURN.rest`, 1.3 rad): one eye shows, on the right of
+ * the dome (the face's left eye, at 0.86 rad round: 0.76 of the half-width
+ * right of the middle), the other is behind the silhouette, as on the mark.
+ */
+const SIDE_EYE = { cx: 300 + 192 * Math.sin(0.86), cy: 230 } as const;
 /** The belly line: a quadratic arc from the left side over the front to the right side. */
 const BELLY = { x0: 96, x1: 504, ySide: 362, yCtrl: 300 } as const;
 const bellyY = (x: number) => {
@@ -214,7 +221,7 @@ export function WhaleSvg({
       )}
 
       {/* Eyes (O29): two plain whites that blink and shift a little towards the pointer (O48: no glow). */}
-      {EYES.map((e, i) => (
+      {(surface ? [SIDE_EYE] : EYES).map((e, i) => (
         <g key={i} className={i === 0 ? "lk-w-lid" : "lk-w-lid lk-w-lid-b"}>
           <WhaleEye cx={e.cx} cy={e.cy} r={EYE_R} />
         </g>

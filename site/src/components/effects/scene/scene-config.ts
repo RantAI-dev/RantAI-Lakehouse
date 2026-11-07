@@ -54,8 +54,21 @@ export const BELLY_SQUASH = 0.8;
  *   head turns only a little (`HEAD_TURN`).
  */
 export const EYES_3D = { r: 0.2, rho: 0.36, phi: 0.44, socket: { phi: 0.08, rho: 0.04 } } as const;
-/** How far the head turns towards the pointer: radians round (yaw) and up or down (pitch). */
-export const HEAD_TURN = { yaw: 0.06, pitch: 0.03 } as const;
+/**
+ * How the head turns (radians).
+ * WEB-5 O51 (owner: "buat pausnya lebih mereng ke arah kanan aja, jadi biar
+ * tetap keliatan kalo ini matanya satu, cuma kalo user ngearahin kursornya
+ * terlalu kiri/atau kanan tetap keliatan kalo dia tu matanya tetap dua"):
+ * - `rest`: at rest it is turned to the right, as the mark is seen from the
+ *   side, so one eye shows on the right of the dome and the other is just
+ *   behind its silhouette from the hero camera (its eyes sit 0.44 either
+ *   side of the front, 0.14 wide; the silhouette from 7 units is at about
+ *   1.38; at 1.15 a sliver of the far eye still showed, so 1.3).
+ * - `left` / `right`: with a mouse near the screen's left or right edge it
+ *   turns to look at it, far enough that both eyes show.
+ * - `pitch`: a small nod with the pointer's height.
+ */
+export const HEAD_TURN = { rest: 1.3, left: -0.3, right: 0.3, pitch: 0.03 } as const;
 
 /** Direction the moonlight comes from (towards the moon), unit length. */
 export const MOON_DIR: readonly [number, number, number] = (() => {
