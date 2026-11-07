@@ -3,9 +3,12 @@
 //! `run_chat` enforces it, not the prompt: an accepted `ask_user` ends the
 //! turn with its question as the answer and runs nothing after it, and an
 //! `ask_user` that comes after a tool that ran in the same turn is refused
-//! with a result the model reads. The mocked model here answers each round
-//! with plain JSON, so the non-streamed `/api/ai/chat` path drives the same
-//! loop the streamed path does.
+//! with a result the model reads. The one exception is an `ask_user` right
+//! after another tool's call failed, because a refusal just said the call
+//! cannot be built as asked and the person is the only one who can choose.
+//! The mocked model here answers each round with plain JSON, so the
+//! non-streamed `/api/ai/chat` path drives the same loop the streamed path
+//! does.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -60,6 +63,10 @@ const ASK_ONE: &str =
     r#"{"term":"sales","question":"Which table do you mean by sales?","options":["orders"]}"#;
 /// A `run_sql` call whose real query `ClickHouse` answers with `{"n": 5}`.
 const RUN_SQL: &str = r#"{"sql":"SELECT count() AS n FROM serving.sample_rows"}"#;
+/// A `create_chart` call. The turn is in Ask mode, so the gate refuses it
+/// (a result with an `error` key), which stands for any refused or failed
+/// call without mocking a tool's own refusal text.
+const REFUSED_CALL: &str = "{}";
 
 /// The refusal a late `ask_user` gets. Its wording is part of the contract
 /// the model reads, so the tests pin it.
@@ -267,4 +274,120 @@ async fn an_ask_the_tool_rejects_does_not_end_the_turn() {
         "the rejected ask is the one step: {trace:?}"
     );
     assert_eq!(trace[0]["ok"], false);
+}
+
+#[tokio::test]
+async fn an_ask_right_after_a_refused_call_is_accepted_even_after_a_query() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "run_sql", RUN_SQL)]),
+        model_round(None, &[("call_2", "create_chart", REFUSED_CALL)]),
+        model_round(None, &[("call_3", "ask_user", ASK_TWO)]),
+    ])
+    .await;
+    let ch = mock_clickhouse().await;
+
+    let body = chat(&llm, &ch, "berapa sales?").await;
+
+    assert_eq!(
+        body["answer"], "Which table do you mean by sales?",
+        "the ask after the refused call ends the turn with the question: {body}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 3, "query, refused call, ask: {trace:?}");
+    assert_eq!(trace[0]["ok"], true);
+    assert_eq!(trace[1]["tool"], "create_chart");
+    assert_eq!(trace[1]["ok"], false);
+    assert_eq!(trace[2]["tool"], "ask_user");
+    assert_eq!(trace[2]["ok"], true);
+    assert_eq!(trace[2]["result"]["asked"], true);
+}
+
+#[tokio::test]
+async fn an_ask_after_two_queries_is_still_refused() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "run_sql", RUN_SQL)]),
+        model_round(None, &[("call_2", "run_sql", RUN_SQL)]),
+        model_round(None, &[("call_3", "ask_user", ASK_TWO)]),
+        model_round(Some("Ada 5 baris."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse().await;
+
+    let body = chat(&llm, &ch, "berapa sales?").await;
+
+    assert_eq!(
+        body["answer"], "Ada 5 baris.",
+        "the refused ask left the turn open: {body}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(
+        trace.len(),
+        3,
+        "two queries then the refused ask: {trace:?}"
+    );
+    assert_eq!(trace[2]["tool"], "ask_user");
+    assert_eq!(trace[2]["ok"], false);
+    assert_eq!(trace[2]["result"]["error"], LATE_ASK_REFUSAL);
+}
+
+#[tokio::test]
+async fn only_the_latest_step_counts_so_an_ask_after_a_success_that_follows_a_refusal_is_refused() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "create_chart", REFUSED_CALL)]),
+        model_round(None, &[("call_2", "run_sql", RUN_SQL)]),
+        model_round(None, &[("call_3", "ask_user", ASK_TWO)]),
+        model_round(Some("Ada 5 baris."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse().await;
+
+    let body = chat(&llm, &ch, "berapa sales?").await;
+
+    assert_eq!(
+        body["answer"], "Ada 5 baris.",
+        "the refused ask left the turn open: {body}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(
+        trace.len(),
+        3,
+        "refused call, query, refused ask: {trace:?}"
+    );
+    assert_eq!(trace[0]["ok"], false);
+    assert_eq!(trace[1]["ok"], true);
+    assert_eq!(trace[2]["tool"], "ask_user");
+    assert_eq!(trace[2]["result"]["error"], LATE_ASK_REFUSAL);
+}
+
+#[tokio::test]
+async fn a_rejected_ask_does_not_open_the_way_for_a_second_ask_after_a_query() {
+    // The rejected ask (one option) is itself a failed step. If it counted as
+    // "the previous call failed", the second ask would pass although the turn
+    // has run a query and no other tool failed since.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "run_sql", RUN_SQL)]),
+        model_round(None, &[("call_2", "create_chart", REFUSED_CALL)]),
+        model_round(None, &[("call_3", "ask_user", ASK_ONE)]),
+        model_round(None, &[("call_4", "ask_user", ASK_TWO)]),
+        model_round(Some("Ada 5 baris."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse().await;
+
+    let body = chat(&llm, &ch, "berapa sales?").await;
+
+    assert_eq!(
+        body["answer"], "Ada 5 baris.",
+        "the second ask did not end the turn: {body}"
+    );
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 4, "query, refused call, two asks: {trace:?}");
+    assert_eq!(trace[2]["tool"], "ask_user");
+    assert_eq!(trace[2]["ok"], false);
+    assert_ne!(
+        trace[2]["result"]["error"], LATE_ASK_REFUSAL,
+        "the first ask follows a failed call, so the tool itself rejects it: {trace:?}"
+    );
+    assert_eq!(trace[3]["tool"], "ask_user");
+    assert_eq!(trace[3]["result"]["error"], LATE_ASK_REFUSAL);
 }

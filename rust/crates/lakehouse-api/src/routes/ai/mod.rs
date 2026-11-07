@@ -122,6 +122,24 @@ you used, and say in one sentence which reading it is. Do not end with a \
 question: if another reading is possible, name it as a statement. Reply in \
 the language of the user's question.";
 
+/// Whether an `ask_user` made now is a late ask: the turn has run a tool that
+/// succeeded, and the step just before this call is not a failed call to
+/// another tool. A refusal or tool error says the call cannot be built as
+/// asked, so asking the person is the honest next step (for example which
+/// column to bin), even after a query. Only another tool's failure opens the
+/// way: a failed `ask_user` (a rejected ask) is not one; otherwise a rejected ask
+/// would let a second ask through after a query. The late-ask rule itself
+/// (#125, #208) stays for every other case.
+fn ask_is_late(tool_trace: &[Value]) -> bool {
+    let previous_call_failed = tool_trace.last().is_some_and(|step| {
+        step["tool"].as_str() != Some(registry::ASK_USER) && step["ok"].as_bool() == Some(false)
+    });
+    !previous_call_failed
+        && tool_trace.iter().any(|step| {
+            step["tool"].as_str() != Some(registry::ASK_USER) && step["ok"].as_bool() == Some(true)
+        })
+}
+
 /// What a call gets back when the console's allowlist did not offer the tool
 /// (plan 17). The model reads it on its next round, so it is told to answer
 /// without the tool.
@@ -919,13 +937,11 @@ async fn run_chat(
                     .unwrap_or_default(),
             );
             // plan 14: an ask after any tool that ran in this turn is refused
-            // before the gate. The prompt asks the model to ask first; this
-            // is the check that holds when it does not.
-            let late_ask = call.function.name == registry::ASK_USER
-                && tool_trace.iter().any(|step| {
-                    step["tool"].as_str() != Some(registry::ASK_USER)
-                        && step["ok"].as_bool() == Some(true)
-                });
+            // before the gate, unless the step just before it was another
+            // tool's failed call (see `ask_is_late`). The prompt asks the
+            // model to ask first; this is the check that holds when it does
+            // not.
+            let late_ask = call.function.name == registry::ASK_USER && ask_is_late(&tool_trace);
             // D3: `ask` mode filters non-Read tools, and permission
             // filters tools the principal lacks, out of the schema
             // ADVERTISED to the model (above, building `tools`), but that
