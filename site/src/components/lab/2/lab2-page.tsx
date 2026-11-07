@@ -68,7 +68,7 @@ export async function Lab2Page() {
   const common = messages.common as CommonCopy;
   return (
     <div className="lk-root relative min-h-screen overflow-x-clip">
-      <TopBar locale={locale} page="contact" nav={common.nav} cta={common.cta} language={common.language} />
+      <TopBar locale={locale} page="lab" nav={common.nav} cta={common.cta} language={common.language} />
       <Lab2Interact>
         <main className={s.hero} data-lab2>
           {/* The ripple filters: a slow base swell, and a stronger one where the pointer is. */}

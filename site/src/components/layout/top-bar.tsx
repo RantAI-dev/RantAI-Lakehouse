@@ -216,7 +216,7 @@ export function TopBar({
           </nav>
         </div>
         <div className="flex items-center gap-2">
-          <LanguageSwitcher locale={locale} text={language} className="hidden lg:flex" />
+          <LanguageSwitcher locale={locale} text={language} otherPath={page === "lab" ? "/" : undefined} className="hidden lg:flex" />
           {/* WEB-5 D20: to the page's own "Get started", which links on to the README. */}
           {/* rantai-page's PillLink in the bar: h-10 px-4, h-9 from lg, text-sm. */}
           <CtaLink href={anchor("#get-started")} size="sm" className="h-10 px-4 text-sm lg:h-9">
@@ -285,7 +285,7 @@ export function TopBar({
               </li>
             ))}
           </ul>
-          <LanguageSwitcher locale={locale} text={language} size="lg" className="mt-8 self-start" />
+          <LanguageSwitcher locale={locale} text={language} otherPath={page === "lab" ? "/" : undefined} size="lg" className="mt-8 self-start" />
         </nav>
       </dialog>
     </header>

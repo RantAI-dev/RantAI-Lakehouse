@@ -17,12 +17,8 @@ export function LakeConsole({ whale }: Readonly<{ whale: React.ReactNode }>) {
     <div className="l3-stage relative z-10 w-full min-w-0 max-w-[600px] justify-self-end max-lg:justify-self-center" data-pick="0" data-stage="5">
       <div className="l3-panel relative z-10">
         <div className="flex items-center justify-between px-4 pt-3.5 pb-2 sm:px-5">
-          <span className="flex items-center gap-2 text-[13px] font-medium">
-            <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5 text-[#8fcbff]">
-              <path d="M8 1.5c.4 3.3 1.9 5 5.5 6.5-3.6 1.5-5.1 3.2-5.5 6.5-.4-3.3-1.9-5-5.5-6.5C6.1 6.5 7.6 4.8 8 1.5Z" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-            </svg>
-            Assistant
-          </span>
+          {/* No icon (O35, and DESIGN.md bans sparkles): the whale at the panel's corner is the assistant's face. */}
+          <span className="text-[13px] font-medium">Assistant</span>
           <span className="text-[11px] text-[#E8F4FF]/45">Illustrative data</span>
         </div>
 
