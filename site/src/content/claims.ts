@@ -46,22 +46,22 @@ export const CLAIMS: readonly Claim[] = [
   // Assistant section (Query Studio, D7)
   { key: "home.assistant.sub", backlog: ["QS-1 In Acceptance", "QS-4 In Acceptance"], note: "autocomplete, tabs, query history" },
   // Dashboards
+  // O10 (2026-11-07): the dashboards' feature list became one line and a row of chips; each chip is its own claim.
   {
     key: "home.dashboards.sub",
-    backlog: [
-      "BI-16 Building (part C2 merged in #246/#265): your own map boundaries, not every chart type",
-      "BI-8 In Acceptance",
-      "BI-11 In Acceptance",
-      "BI-2 In Acceptance",
-      "BI-4 In Acceptance",
-      "BI-19 In Acceptance",
-      "BI-1 In Acceptance",
-      "RPT-1 In Acceptance",
-      "BI-26 In Acceptance",
-      "SEC-12 In Acceptance",
-    ],
-    note: "boundaries (BI-16 C2); calculated fields, parameters, metrics (BI-8, BI-11, BI-2); results remembered and refreshed (BI-4); comments with @mentions, alerts on a chart, PNG export, public links with expiry and password (BI-19); PDF and Excel (BI-1); scheduled reports (RPT-1); embeds (BI-26, SEC-12)",
+    backlog: ["WEB-1 In Acceptance", "BI-16 Building (part C2 merged in #246/#265): your own map boundaries, not every chart type"],
+    note: "about two dozen chart types (WEB-1's claim); maps on your own boundaries (BI-16 C2)",
   },
+  { key: "home.dashboards.features.0", backlog: ["BI-8 In Acceptance"], note: "calculated fields" },
+  { key: "home.dashboards.features.1", backlog: ["BI-11 In Acceptance"], note: "parameters" },
+  { key: "home.dashboards.features.2", backlog: ["BI-2 In Acceptance"], note: "reusable metrics" },
+  { key: "home.dashboards.features.3", backlog: ["BI-4 In Acceptance"], note: "results remembered and refreshed" },
+  { key: "home.dashboards.features.4", backlog: ["BI-19 In Acceptance"], note: "comments with @mentions" },
+  { key: "home.dashboards.features.5", backlog: ["BI-19 In Acceptance"], note: "alerts on a chart" },
+  { key: "home.dashboards.features.6", backlog: ["BI-19 In Acceptance", "BI-1 In Acceptance"], note: "PNG export (BI-19); PDF and Excel (BI-1)" },
+  { key: "home.dashboards.features.7", backlog: ["RPT-1 In Acceptance"], note: "scheduled reports" },
+  { key: "home.dashboards.features.8", backlog: ["BI-19 In Acceptance", "SEC-12 In Acceptance"], note: "public links with an expiry and a password (BI-19 A)" },
+  { key: "home.dashboards.features.9", backlog: ["BI-26 In Acceptance", "SEC-12 In Acceptance"], note: "embeds" },
   // Governance
   { key: "home.governance.sub", backlog: ["DATA-13 Released"], note: "column-level lineage" },
   { key: "home.governance.facts.2.text", backlog: ["DATA-13 Released"], note: "column-level lineage" },

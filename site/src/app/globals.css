@@ -532,9 +532,262 @@ html:not([data-scene]) .lk-gauge {
   }
 }
 
+/* ---- The living tiles (WEB-5 owner QA O10) ------------------------------
+   The dashboards' tiles move like a live dashboard, in CSS only.
+   `components/home/live-tile.tsx` sets `data-shown` once a tile comes into
+   view (the entrance) and `data-live` while it is on screen (the idle loop,
+   paused off screen). Without JavaScript neither is set and every tile is
+   its final picture; the hidden start states apply only once motion is
+   ready (`html.motion-ready`). Under reduced motion none of it runs (the
+   block at the end of this file). */
+.lk-tile {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+.lk-tile .lk-draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 0;
+}
+html.motion-ready .lk-tile:not([data-shown]) .lk-draw {
+  stroke-dashoffset: 1;
+}
+html.motion-ready .lk-tile:not([data-shown]) :is(.lk-fade, .lk-land, .lk-flow) {
+  opacity: 0;
+}
+.lk-tile[data-shown] .lk-draw {
+  animation: lk-draw 1.4s var(--lk-ease) backwards;
+}
+.lk-tile[data-shown] .lk-fade {
+  animation: lk-tile-fade 0.9s ease-out backwards;
+}
+.lk-tile .lk-land,
+.lk-tile .lk-breathe,
+.lk-tile .lk-nudge,
+.lk-tile .lk-tick {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.lk-tile[data-shown] .lk-land {
+  animation: lk-land 0.5s var(--lk-ease) 1.25s backwards;
+}
+@keyframes lk-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+}
+@keyframes lk-tile-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes lk-land {
+  from {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.4);
+  }
+}
+
+/* Idle loops: defined once shown, running only while on screen (the pause
+   rules follow at the end of this block, after the shorthands they adjust). */
+.lk-tile[data-shown] .lk-breathe {
+  animation: lk-breathe 3.2s ease-in-out 1.8s infinite;
+}
+@keyframes lk-breathe {
+  50% {
+    transform: scale(1.45);
+    opacity: 0.35;
+  }
+}
+/* The newest point nudges up every few seconds, as if a value came in. */
+.lk-tile[data-shown] .lk-nudge {
+  animation: lk-nudge 6s ease-in-out 3s infinite;
+}
+@keyframes lk-nudge {
+  0%,
+  78%,
+  100% {
+    transform: translateY(0);
+  }
+  86% {
+    transform: translateY(-5px);
+  }
+}
+/* Sankey: a short light travels along each band. */
+.lk-tile .lk-flow {
+  stroke-dasharray: 0.08 0.92;
+  stroke-dashoffset: 1;
+}
+.lk-tile[data-shown] .lk-flow {
+  animation: lk-flow 7.5s linear infinite;
+}
+@keyframes lk-flow {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+/* KPI: the digits roll up into place, then the last one ticks now and then. */
+.lk-tile .lk-roll {
+  transform: translateY(calc(var(--lk-d) * -1em));
+}
+.lk-tile[data-shown] .lk-roll {
+  animation: lk-roll 1.2s var(--lk-ease) 0.15s backwards;
+}
+.lk-tile[data-shown] .lk-roll.lk-tick {
+  animation:
+    lk-roll 1.2s var(--lk-ease) 0.15s backwards,
+    lk-tick 9s var(--lk-ease) 4s infinite;
+}
+@keyframes lk-roll {
+  from {
+    transform: translateY(0);
+  }
+}
+@keyframes lk-tick {
+  0%,
+  70%,
+  100% {
+    transform: translateY(calc(var(--lk-d) * -1em));
+  }
+  76%,
+  94% {
+    transform: translateY(calc((var(--lk-d) + 1) * -1em));
+  }
+}
+/* The map: the dots light up in a wave across the shape. */
+.lk-tile[data-shown] .lk-map img {
+  mask-image: linear-gradient(90deg, #000 0 40%, transparent 60% 100%);
+  mask-size: 250% 100%;
+  mask-position: 0% 0;
+  animation: lk-wave 1.6s var(--lk-ease) backwards;
+}
+html.motion-ready .lk-tile:not([data-shown]) .lk-map img {
+  opacity: 0.15;
+}
+@keyframes lk-wave {
+  from {
+    mask-position: 100% 0;
+  }
+}
+/* The highlighted region settles, and a light sweeps over the dots now and then. */
+.lk-map-glow,
+.lk-map-sweep {
+  mask: url(/tiles/dot-map.svg) center / 100% 100% no-repeat;
+  pointer-events: none;
+}
+.lk-map-glow {
+  background: radial-gradient(22% 30% at 68.6% 56%, rgba(232, 244, 255, 0.55), transparent 70%);
+  opacity: 0.6;
+}
+html.motion-ready .lk-tile:not([data-shown]) .lk-map-glow {
+  opacity: 0;
+}
+.lk-tile[data-shown] .lk-map-glow {
+  animation: lk-tile-fade 1s ease-out 1.2s backwards;
+}
+.lk-map-sweep {
+  background: linear-gradient(100deg, transparent 35%, rgba(232, 244, 255, 0.7) 50%, transparent 65%) no-repeat;
+  background-size: 300% 100%;
+  background-position: 120% 0;
+}
+.lk-tile[data-shown] .lk-map-sweep {
+  animation: lk-sweep 8s ease-in-out 3s infinite;
+}
+@keyframes lk-sweep {
+  0% {
+    background-position: 120% 0;
+  }
+  35%,
+  100% {
+    background-position: -20% 0;
+  }
+}
+/* The calendar: the cells fill in a diagonal ripple; one day glows now and then. */
+.lk-tile[data-shown] .lk-cal img {
+  mask-image: linear-gradient(135deg, #000 0 40%, transparent 60% 100%);
+  mask-size: 250% 250%;
+  mask-position: 0% 0%;
+  animation: lk-ripple 1.8s var(--lk-ease) backwards;
+}
+html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
+  opacity: 0.15;
+}
+@keyframes lk-ripple {
+  from {
+    mask-position: 100% 100%;
+  }
+}
+.lk-cal-glow {
+  mask: url(/tiles/calendar-heatmap.svg) center / 100% 100% no-repeat;
+  pointer-events: none;
+}
+.lk-cal-glow::before,
+.lk-cal-glow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+}
+.lk-cal-glow::before {
+  background: radial-gradient(4.5% 9% at 33.5% 36%, #e8f4ff, transparent 100%);
+}
+.lk-cal-glow::after {
+  background: radial-gradient(4.5% 9% at 76% 60%, #e8f4ff, transparent 100%);
+}
+.lk-tile[data-shown] .lk-cal-glow::before {
+  animation: lk-cell 7s ease-in-out 2.5s infinite;
+}
+.lk-tile[data-shown] .lk-cal-glow::after {
+  animation: lk-cell 7s ease-in-out 6s infinite;
+}
+@keyframes lk-cell {
+  0%,
+  60%,
+  100% {
+    opacity: 0;
+  }
+  70%,
+  80% {
+    opacity: 0.9;
+  }
+}
+/* Paused off screen. After every `animation` shorthand above, which would
+   otherwise set the state back to running. The entrance on .lk-roll.lk-tick
+   is a finished, one-off animation, so pausing both is harmless. */
+.lk-tile:not([data-live]) :is(.lk-breathe, .lk-nudge, .lk-flow, .lk-tick, .lk-map-sweep),
+.lk-tile:not([data-live]) .lk-cal-glow::before,
+.lk-tile:not([data-live]) .lk-cal-glow::after,
+.lk-tile:not([data-live]) .lk-roll.lk-tick {
+  animation-play-state: paused;
+}
+
+/* Hover or focus on the line chart: the value at the nearest point. */
+.lk-point-label {
+  opacity: 0;
+  transition: opacity 180ms ease-out;
+}
+.lk-point:hover .lk-point-label,
+.lk-tile:focus-visible .lk-point[data-last] .lk-point-label {
+  opacity: 1;
+}
+
 /* ---- Reduced motion --------------------------------------------------- */
 
 @media (prefers-reduced-motion: reduce) {
+  /* O10: the tiles are their final pictures, with no entrance and no loop. */
+  .lk-tile *,
+  .lk-tile *::before,
+  .lk-tile *::after {
+    animation: none !important;
+  }
+  html.motion-ready .lk-tile:not([data-shown]) :is(.lk-fade, .lk-land, .lk-map-glow),
+  html.motion-ready .lk-tile:not([data-shown]) :is(.lk-map, .lk-cal) img {
+    opacity: 1;
+  }
+  html.motion-ready .lk-tile:not([data-shown]) .lk-draw {
+    stroke-dashoffset: 0;
+  }
+  .lk-tile .lk-flow {
+    opacity: 0;
+  }
   .lk-faq details::details-content,
   .lk-sheet,
   .lk-sheet::backdrop {

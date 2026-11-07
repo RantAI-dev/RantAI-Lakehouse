@@ -4,6 +4,7 @@ import { TILE_IDS } from "@/lib/home-content";
 import { KpiTile, LineChartTile, SankeyTile } from "./dashboard-tiles";
 import { CalendarTile, DotMapTile } from "./dashboard-tiles-static";
 import { DashboardsScroller } from "./dashboards-scroller";
+import { LiveTile } from "./live-tile";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
 import { MascotLogo } from "@/components/shared/mascot-svg";
 import { SplitWords } from "@/components/shared/reveal";
@@ -41,6 +42,17 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
             <LeadText className="mt-4 max-w-[38rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
               {copy.sub}
             </LeadText>
+            {/* WEB-5 O10, "lots of visuals, little text": the features as chips, each one a claim. */}
+            <ul className="mt-5 flex max-w-[52rem] flex-wrap gap-1.5 max-md:max-h-[4.6rem] max-md:overflow-hidden md:mt-6 md:gap-2">
+              {copy.features.map((f) => (
+                <li
+                  key={f}
+                  className="rounded-full border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] px-3 py-1 text-[12px] leading-5 whitespace-nowrap text-[#E8F4FF]/80 md:text-[13px]"
+                >
+                  {f}
+                </li>
+              ))}
+            </ul>
           </Container>
         </>
       }
@@ -54,15 +66,19 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
         const Visual = TILE_VISUALS[id];
         const tile = copy.tiles[id];
         return (
-          <li key={id} className="w-[78vw] shrink-0 sm:w-[380px] md:w-[420px]">
-            <TiltCard className="rounded-3xl border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] backdrop-blur-md md:p-6">
+          <LiveTile
+            key={id}
+            label={`${tile.kind}: ${tile.title}`}
+            className="w-[78vw] shrink-0 rounded-3xl transition-transform duration-200 ease-out outline-none hover:-translate-y-1 focus-visible:-translate-y-1 motion-reduce:transition-none motion-reduce:hover:translate-y-0 sm:w-[380px] md:w-[420px]"
+          >
+            <TiltCard className="rounded-3xl border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] backdrop-blur-md transition-[border-color,box-shadow] duration-200 ease-out group-hover/tile:border-[#44A6FA]/45 group-hover/tile:shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9),0_0_40px_-8px_rgba(68,166,250,0.45)] group-focus-visible/tile:border-[#44A6FA]/70 group-focus-visible/tile:shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9),0_0_40px_-8px_rgba(68,166,250,0.55)] md:p-6">
               <p className="text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{tile.kind}</p>
               <p className="mt-1.5 text-[15px] text-[#E8F4FF]">{tile.title}</p>
               <div className="mt-4">
                 <Visual tile={tile} />
               </div>
             </TiltCard>
-          </li>
+          </LiveTile>
         );
       })}
     </DashboardsScroller>

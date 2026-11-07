@@ -1,16 +1,16 @@
-"use client";
-
 import * as React from "react";
-import { m } from "framer-motion";
-import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
- * The three animated illustrative dashboard tiles of S5 (the dot map and
- * the calendar, which do not animate, are server components in
- * `dashboard-tiles-static.tsx`, WEB-5 review fix R5), drawn as SVG (no screenshots,
- * plan §4 S5). Every number is deterministic and made up: the section carries
- * the caption "Illustrations, not customer data." Colours stay within the
- * page palette: lake blue and foam on glass.
+ * The three drawn dashboard tiles of S5 (the dot map and the calendar are
+ * `dashboard-tiles-static.tsx`, WEB-5 review fix R6), as SVG with made-up,
+ * deterministic numbers; the section says "Illustrations, not customer
+ * data." Colours stay in the page palette: lake blue and foam on glass.
+ *
+ * WEB-5 owner QA O10: they move like a live dashboard, all in CSS (the
+ * classes below are styled in app/globals.css, "the living tiles"), started
+ * and paused by `live-tile.tsx`. Server components now: nothing here runs
+ * in the browser. Every animated path has `pathLength="1"`, so one dash
+ * rule draws any of them.
  */
 
 /** The words a tile draws itself: its accessible name, and the KPI line. */
@@ -19,24 +19,21 @@ export type TileText = { aria: string; delta?: string };
 const LAKE = "#44A6FA";
 const FOAM = "#E8F4FF";
 
-function useDraw() {
-  const reduced = useReducedMotionSafe();
-  return {
-    initial: { pathLength: reduced ? 1 : 0, opacity: reduced ? 1 : 0 },
-    whileInView: { pathLength: 1, opacity: 1 },
-    viewport: { once: true, amount: 0.6 },
-    transition: { duration: reduced ? 0 : 1.4, ease: [0.16, 1, 0.3, 1] as const },
-  };
-}
-
 const svgProps = {
   viewBox: "0 0 360 190",
-  className: "h-auto w-full",
+  className: "h-auto w-full overflow-visible",
   role: "img" as const,
 };
 
+/** The line's points, for the hover labels: [x, y, value]. */
+const LINE_POINTS = [
+  [95, 100, "12.1k"],
+  [185, 95, "13.4k"],
+  [285, 62, "17.8k"],
+  [350, 24, "21.3k"],
+] as const;
+
 export function LineChartTile({ tile }: { tile: TileText }) {
-  const draw = useDraw();
   const a = "M10 150 C45 140 60 90 95 100 S150 140 185 95 S250 40 285 62 S335 30 350 24";
   const b = "M10 160 C50 150 70 135 105 138 S160 150 195 122 S255 100 290 106 S335 84 350 80";
   return (
@@ -50,17 +47,32 @@ export function LineChartTile({ tile }: { tile: TileText }) {
       {[40, 80, 120, 160].map((y) => (
         <line key={y} x1="10" x2="350" y1={y} y2={y} stroke={FOAM} strokeOpacity="0.08" />
       ))}
-      <m.path d={`${a} L350 180 L10 180 Z`} fill="url(#lk-area)" initial={{ opacity: 0 }} whileInView={{ opacity: 1 }} viewport={{ once: true, amount: 0.6 }} transition={{ duration: 1.2, delay: 0.5 }} />
-      <m.path d={a} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" {...draw} />
-      <m.path d={b} fill="none" stroke={FOAM} strokeOpacity="0.55" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="1 5" {...draw} />
-      <circle cx="350" cy="24" r="4" fill={LAKE} />
-      <circle cx="350" cy="24" r="9" fill={LAKE} fillOpacity="0.25" />
+      <path className="lk-fade" style={{ animationDelay: "0.5s" }} d={`${a} L350 180 L10 180 Z`} fill="url(#lk-area)" />
+      <path className="lk-draw" pathLength={1} d={a} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" />
+      <path className="lk-fade" style={{ animationDelay: "0.3s" }} d={b} fill="none" stroke={FOAM} strokeOpacity="0.55" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="1 5" />
+      {/* The newest point: it lands when the line arrives, breathes, and now and then nudges up as if data came in. */}
+      <g className="lk-nudge">
+        <circle className="lk-breathe" cx="350" cy="24" r="9" fill={LAKE} fillOpacity="0.25" />
+        <circle className="lk-land" cx="350" cy="24" r="4" fill={LAKE} />
+      </g>
+      {/* Hover or focus: the value at each point. Pointer-sized zones over the chart, one label each. */}
+      {LINE_POINTS.map(([x, y, v], i) => (
+        <g key={x} className="lk-point" data-last={i === LINE_POINTS.length - 1 ? "" : undefined}>
+          <rect x={x - 45} y="0" width="90" height="190" fill="transparent" />
+          <g className="lk-point-label">
+            <circle cx={x} cy={y} r="3.5" fill={FOAM} />
+            <rect x={x - 26} y={y - 34} width="52" height="22" rx="11" fill="#020514" fillOpacity="0.9" stroke={FOAM} strokeOpacity="0.25" />
+            <text x={x} y={y - 19} textAnchor="middle" fill={FOAM} fontSize="12" fontWeight="500" fontFamily="var(--font-sans), sans-serif" style={{ fontVariantNumeric: "tabular-nums" }}>
+              {v}
+            </text>
+          </g>
+        </g>
+      ))}
     </svg>
   );
 }
 
 export function SankeyTile({ tile }: { tile: TileText }) {
-  const draw = useDraw();
   const left = [
     { y: 28, h: 50 },
     { y: 92, h: 38 },
@@ -81,49 +93,95 @@ export function SankeyTile({ tile }: { tile: TileText }) {
   ];
   const usedL = [0, 0, 0];
   const usedR = [0, 0, 0];
+  const paths = flows.map((f) => {
+    const y0 = left[f.from].y + usedL[f.from] + f.w / 2;
+    const y1 = right[f.to].y + usedR[f.to] + f.w / 2;
+    usedL[f.from] += f.w * 0.9;
+    usedR[f.to] += f.w * 0.9;
+    return { d: `M44 ${y0} C170 ${y0} 190 ${y1} 316 ${y1}`, w: f.w * 0.9 };
+  });
   return (
     <svg {...svgProps} aria-label={tile.aria}>
-      {flows.map((f, i) => {
-        const y0 = left[f.from].y + usedL[f.from] + f.w / 2;
-        const y1 = right[f.to].y + usedR[f.to] + f.w / 2;
-        usedL[f.from] += f.w * 0.9;
-        usedR[f.to] += f.w * 0.9;
-        return (
-          <m.path
-            key={i}
-            d={`M44 ${y0} C170 ${y0} 190 ${y1} 316 ${y1}`}
-            fill="none"
-            stroke={i % 2 ? FOAM : LAKE}
-            strokeOpacity={i % 2 ? 0.3 : 0.5}
-            strokeWidth={f.w * 0.9}
-            {...draw}
-          />
-        );
-      })}
+      {paths.map((p, i) => (
+        <path
+          key={i}
+          className="lk-draw"
+          style={{ animationDelay: `${i * 0.08}s` }}
+          pathLength={1}
+          d={p.d}
+          fill="none"
+          stroke={i % 2 ? FOAM : LAKE}
+          strokeOpacity={i % 2 ? 0.3 : 0.5}
+          strokeWidth={p.w}
+        />
+      ))}
+      {/* Idle: slow light travelling along the bands, left to right. */}
+      {paths.map((p, i) => (
+        <path
+          key={`f${i}`}
+          className="lk-flow"
+          style={{ animationDelay: `${-i * 1.3}s` }}
+          pathLength={1}
+          d={p.d}
+          fill="none"
+          stroke={FOAM}
+          strokeOpacity="0.3"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+      ))}
       {left.map((n, i) => (
         <rect key={`l${i}`} x="36" y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" />
       ))}
       {right.map((n, i) => (
-        <rect key={`r${i}`} x="316" y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" />
+        <rect key={`r${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x="316" y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" />
       ))}
     </svg>
   );
 }
 
+/** One rolling digit: a column of 0 to 9, shown at `d`; it rolls up from 0 on entrance. */
+function Digit({ d, idle }: { d: number; idle?: boolean }) {
+  return (
+    <span className="lk-digit inline-block h-[1em] overflow-hidden align-top">
+      <span className={idle ? "lk-roll lk-tick block" : "lk-roll block"} style={{ "--lk-d": d } as React.CSSProperties}>
+        {Array.from({ length: 10 }, (_, i) => (
+          <span key={i} className="block h-[1em] leading-none">
+            {i}
+          </span>
+        ))}
+      </span>
+    </span>
+  );
+}
+
 export function KpiTile({ tile }: { tile: TileText }) {
-  const draw = useDraw();
   const pts = [22, 30, 26, 38, 34, 46, 42, 58, 52, 66, 62, 78];
   const d = pts.map((v, i) => `${i === 0 ? "M" : "L"}${20 + i * 28} ${150 - v}`).join(" ");
   return (
-    <svg {...svgProps} aria-label={tile.aria}>
-      <text x="20" y="62" fill={FOAM} fontSize="54" fontWeight="500" letterSpacing="-2" fontFamily="var(--font-sans), sans-serif">
-        24.6k
-      </text>
-      <text x="22" y="86" fill={LAKE} fontSize="14" fontFamily="var(--font-sans), sans-serif">
-        {tile.delta}
-      </text>
-      <m.path d={d} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" {...draw} />
-      <circle cx={20 + 11 * 28} cy={150 - 78} r="4" fill={LAKE} />
-    </svg>
+    <div className="relative [container-type:inline-size]">
+      <svg {...svgProps} aria-label={tile.aria}>
+        <g className="lk-fade" style={{ animationDelay: "0.9s" }}>
+          {/* The trend arrow appears once the number has rolled up. */}
+          <path d="M22 81 L29 74 M24 74 H29 V79" fill="none" stroke={LAKE} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          <text x="36" y="86" fill={LAKE} fontSize="14" fontFamily="var(--font-sans), sans-serif">
+            {tile.delta}
+          </text>
+        </g>
+        <path className="lk-draw" style={{ animationDelay: "0.2s" }} pathLength={1} d={d} fill="none" stroke={LAKE} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+        <circle className="lk-land" style={{ animationDelay: "1.2s" }} cx={20 + 11 * 28} cy={150 - 78} r="4" fill={LAKE} />
+      </svg>
+      {/* The number, as HTML over the drawing so its digits can roll (the old SVG text, same place and size: 54 of 360). */}
+      <p
+        aria-hidden="true"
+        className="pointer-events-none absolute top-[9.5%] left-[5.5%] flex text-[15cqw] leading-none font-medium tracking-[-0.04em] text-[#E8F4FF] tabular-nums"
+      >
+        <Digit d={2} />
+        <Digit d={4} />
+        <span>.</span>
+        <Digit d={6} idle />
+        <span>k</span>
+      </p>
+    </div>
   );
 }

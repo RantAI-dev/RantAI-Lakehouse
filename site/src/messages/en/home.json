@@ -75,7 +75,19 @@
   },
   "dashboards": {
     "headline": "Answers come back up as dashboards.",
-    "sub": "About two dozen chart types, maps on your own boundaries included, with calculated fields, parameters, reusable metrics and results that are remembered and refreshed. Comment with @mentions, set alerts on a chart, export PNG, PDF or Excel, schedule reports, and share by a public link with an expiry and a password, or as an embed.",
+    "sub": "About two dozen chart types, maps on your own boundaries included.",
+    "features": [
+      "Calculated fields",
+      "Parameters",
+      "Reusable metrics",
+      "Results remembered and refreshed",
+      "Comments with @mentions",
+      "Alerts on a chart",
+      "PNG, PDF and Excel",
+      "Scheduled reports",
+      "Public links with expiry and password",
+      "Embeds"
+    ],
     "caption": "Illustrations, not customer data.",
     "tiles": {
       "line": {
