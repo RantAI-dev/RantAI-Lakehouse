@@ -58,15 +58,11 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
                 out.push(' ');
             }
             '/' if next == Some('*') => {
-                i += 2;
-                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-                    i += 1;
-                }
-                i = (i + 2).min(chars.len());
+                i = skip_block_comment(&chars, i);
                 out.push(' ');
             }
             '\'' | '"' | '`' => {
-                i = skip_quoted(&chars, i, c);
+                i = skip_quoted(&chars, i, c, true);
                 out.push(' ');
             }
             _ => {
@@ -78,8 +74,10 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
     out
 }
 
-/// Index just past the end of the line starting at `from`.
-fn skip_to_line_end(chars: &[char], from: usize) -> usize {
+/// Index of the newline that ends the line starting at `from` (the end of
+/// the text when the last line has none), so the caller resumes on the
+/// newline itself.
+pub(crate) fn skip_to_line_end(chars: &[char], from: usize) -> usize {
     let mut i = from;
     while i < chars.len() && chars[i] != '\n' {
         i += 1;
@@ -87,13 +85,33 @@ fn skip_to_line_end(chars: &[char], from: usize) -> usize {
     i
 }
 
+/// Index just past the `/* … */` comment that opens at `from`. An
+/// unterminated comment consumes the rest of the statement.
+pub(crate) fn skip_block_comment(chars: &[char], from: usize) -> usize {
+    let mut i = from + 2;
+    while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+        i += 1;
+    }
+    (i + 2).min(chars.len())
+}
+
 /// Index just past the quoted run that opens at `from` with `quote`.
 /// An unterminated quote consumes the rest of the statement, which is the
 /// safe reading: the guard sees less, not more.
-fn skip_quoted(chars: &[char], from: usize, quote: char) -> usize {
+///
+/// `backslash_escapes` says whether a backslash escapes the next character.
+/// `ClickHouse` does, so the guards here always pass `true`. `Trino` does
+/// not: `'a\'` is a complete string there, so `query_params` passes `false`
+/// when it scans `Trino` SQL.
+pub(crate) fn skip_quoted(
+    chars: &[char],
+    from: usize,
+    quote: char,
+    backslash_escapes: bool,
+) -> usize {
     let mut i = from + 1;
     while i < chars.len() {
-        if chars[i] == '\\' {
+        if backslash_escapes && chars[i] == '\\' {
             i += 2;
             continue;
         }
