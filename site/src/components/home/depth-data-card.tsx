@@ -123,7 +123,9 @@ export function DepthDataCard({
   const rowCount = stage === 0 ? RAW_RECORDS.length : stage === 1 ? kept : GOLD_ROWS.length;
 
   return (
-    <div className={className}>
+    // `data-depths-card`: the 3D scene measures this box to keep its slabs
+    // 48 px clear of the card (WEB-5 O34, lake-engine.ts).
+    <div className={className} data-depths-card>
       <p className="sr-only">{copy.sr[id]}</p>
       <div
         ref={root}

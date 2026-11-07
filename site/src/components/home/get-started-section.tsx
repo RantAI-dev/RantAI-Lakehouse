@@ -53,9 +53,9 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
 
         <GetStartedPlay>
         <ol className="lk-gs-steps relative">
-          {/* The line the steps hang from, fading out at the bottom toward the surface: a dim track, and the fill that follows the scroll. */}
-          <span aria-hidden="true" className="absolute top-3 bottom-8 left-[11px] w-px bg-gradient-to-b from-[#44A6FA]/25 via-[#44A6FA]/12 to-transparent" />
-          <span aria-hidden="true" className="lk-gs-fill absolute top-3 bottom-8 left-[11px] w-px bg-gradient-to-b from-[#8fcbff] via-[#44A6FA]/70 to-transparent" />
+          {/* The line the steps hang from: a dim track, and the fill that follows the scroll. Solid, no gradient (owner, O35 follow-up). */}
+          <span aria-hidden="true" className="absolute top-3 bottom-8 left-[11px] w-px bg-[#44A6FA]/20" />
+          <span aria-hidden="true" className="lk-gs-fill absolute top-3 bottom-8 left-[11px] w-px bg-[#8fcbff]/80" />
           {copy.steps.map((step, i) => (
             <Reveal as="li" key={step.title} delay={i * 0.08} y={20} className="relative pb-10 pl-12 last:pb-0">
               <span
@@ -65,7 +65,7 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                 {i + 1}
               </span>
               <h3 className="text-[19px] leading-7 font-medium text-[#E8F4FF]">{step.title}</h3>
-              <div data-term="" className="lk-gs-term mt-3 overflow-hidden rounded-2xl bg-[#020514]/80 ring-1 ring-[#E8F4FF]/12 shadow-[0_24px_60px_-30px_rgba(2,5,20,0.9)]">
+              <div data-term="" className="lk-gs-term mt-3 overflow-hidden rounded-2xl bg-[#0a1230]">
                 <p className="border-b border-[#E8F4FF]/8 px-4 py-2 text-[11px] leading-4 font-medium tracking-[0.14em] text-[#E8F4FF]/50 uppercase">
                   {copy.terminal}
                 </p>

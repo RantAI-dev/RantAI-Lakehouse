@@ -110,7 +110,7 @@ function DepthGauge({ progress, active }: { progress: MotionValue<number>; activ
       aria-hidden="true"
       className="pointer-events-none absolute top-[18%] bottom-[14%] left-3 z-10 w-16 md:left-8 md:w-36"
     >
-      <span className="absolute top-0 left-[7px] h-full w-px bg-gradient-to-b from-transparent via-[#E8F4FF]/30 to-transparent" />
+      <span className="absolute top-0 left-[7px] h-full w-px bg-[#E8F4FF]/20" />
       {DEPTH_LAYERS.map((l, i) => (
         <div
           key={l.id}
@@ -165,17 +165,17 @@ function Plate({ layer, index, active }: { layer: DepthLayer; index: number; act
   const lift = (index - active) * 70 + (index - 1) * 6;
   return (
     <m.div
-      className="absolute inset-x-0 top-1/2 h-[190px] -translate-y-1/2 rounded-[22px] border backdrop-blur-sm"
+      className="absolute inset-x-0 top-1/2 h-[190px] -translate-y-1/2 rounded-[22px] border"
       initial={false}
       animate={{
         translateZ: -lift,
         opacity: isActive ? 1 : 0.7,
-        boxShadow: isActive ? `0 0 60px 6px ${layer.accent}55` : `0 0 0px 0px ${layer.accent}00`,
       }}
       transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
       style={{
         borderColor: `${layer.accent}${isActive ? "cc" : "55"}`,
-        background: `linear-gradient(135deg, ${layer.accent}${isActive ? "40" : "22"}, rgba(5,10,48,0.55))`,
+        // O35 follow-up: a solid tint, no gradient and no glow (owner: "mending warna solid aja").
+        background: `${layer.accent}${isActive ? "2e" : "14"}`,
       }}
     />
   );
