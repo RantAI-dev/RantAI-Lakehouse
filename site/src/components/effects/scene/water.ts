@@ -10,7 +10,7 @@ import {
   type IUniform,
 } from "three";
 import { PALETTE } from "@/lib/palette";
-import { MASCOT_R, RIPPLES } from "./scene-config";
+import { BELLY_SQUASH, BODY_LONG, MASCOT_R, RIPPLES } from "./scene-config";
 import type { SkyUniforms } from "./sky";
 import { WATER_FRAG, WATER_VERT } from "./shaders";
 import type { WaterFogUniforms } from "./underwater";
@@ -51,7 +51,9 @@ export function createWater(sky: SkyUniforms, fog: WaterFogUniforms, lowQuality:
     // the underside of the surface (WEB-5 O5); the engine keeps it in step
     // with the creature.
     uBodyC: { value: new Vector3(0, -0.1, 0) },
-    uBodyR: { value: new Vector3(MASCOT_R, MASCOT_R * 0.9, MASCOT_R) },
+    uBodyR: { value: new Vector3(MASCOT_R * 1.03, MASCOT_R * 0.76 * BELLY_SQUASH, MASCOT_R * 1.03 * BODY_LONG) },
+    // The body's waterline is an ellipse, `uLong` times longer front to back (O11).
+    uLong: { value: BODY_LONG },
     uBodyTint: { value: new Color("#06134a") },
     ...fog,
   };

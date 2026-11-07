@@ -14,6 +14,7 @@ import {
   ShaderMaterial,
   Vector3,
   type IUniform,
+  type WebGLProgramParametersWithUniforms,
 } from "three";
 import { CONTACT_GLSL, NOISE_GLSL, SHAFT_FRAG, SHAFT_VERT, SNOW_FRAG, SNOW_VERT, WATER_FOG_GLSL } from "./shaders";
 
@@ -61,7 +62,11 @@ export function createWaterFog(airFog: Color): WaterFogUniforms {
  * the surface (O5; the owner's O8 asks for the body "lit by the underwater
  * light and caustics").
  */
-export function applyWaterFog(material: Material, fog: WaterFogUniforms, opts: { caustics?: boolean } = {}): void {
+export function applyWaterFog(
+  material: Material,
+  fog: WaterFogUniforms,
+  opts: { caustics?: boolean; extra?: (shader: WebGLProgramParametersWithUniforms) => void } = {},
+): void {
   const caustics = opts.caustics === true;
   material.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, fog);
@@ -87,15 +92,17 @@ export function applyWaterFog(material: Material, fog: WaterFogUniforms, opts: {
         `#include <emissivemap_fragment>
         if (uWfOn > 0.5) {
           vec3 nW = normalize((vec4(normal, 0.0) * viewMatrix).xyz);
-          vec2 cp = vWfWorld.xz * 1.1 + vec2(vWfWorld.y * 0.3, 0.0);
-          float c1 = 1.0 - abs(snoise(cp + vec2(uWfTime * 0.16, uWfTime * 0.11)));
-          float c2 = 1.0 - abs(snoise(cp * 1.7 - vec2(uWfTime * 0.12, -uWfTime * 0.17)));
+          // O11: soft and broad, light playing on a toy, not veins on skin.
+          vec2 cp = vWfWorld.xz * 0.55 + vec2(vWfWorld.y * 0.2, 0.0);
+          float c1 = 1.0 - abs(snoise(cp + vec2(uWfTime * 0.12, uWfTime * 0.08)));
+          float c2 = 1.0 - abs(snoise(cp * 1.4 - vec2(uWfTime * 0.09, -uWfTime * 0.13)));
           float lit = smoothstep(-0.2, 0.8, nW.y) * exp(min(vWfWorld.y, 0.0) / 3.5);
-          totalEmissiveRadiance += vec3(0.32, 0.62, 1.0) * pow(max(c1 * c2, 0.0), 3.0) * 0.55 * lit;
+          totalEmissiveRadiance += vec3(0.32, 0.62, 1.0) * smoothstep(0.35, 0.85, c1 * c2) * 0.2 * lit;
         }`,
       );
     }
     shader.fragmentShader = frag;
+    opts.extra?.(shader);
   };
   material.customProgramCacheKey = () => (caustics ? "lk-water-fog-caustics" : "lk-water-fog");
 }

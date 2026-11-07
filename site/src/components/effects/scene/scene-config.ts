@@ -30,38 +30,34 @@ export const DOME_SPHERE = (() => {
 export const MASCOT_H = DOME_SPHERE.cy + DOME_SPHERE.r;
 
 /**
- * WEB-5 owner decision O8 (2026-11-07): the creature is a whale. Above the
- * water you see only its head, which is the mark's dome, so the logo and
- * the mascot stay one character; below it, the whole whale.
- *
- * The head is the dome stretched front to back by `HEAD_LONG` (seen from
- * the hero camera, which looks along its length, the silhouette is still
- * the mark's).
+ * WEB-5 O11 (owner, 2026-11-07, replacing O8's realistic whale): the
+ * creature is a simple, chubby toy whale. Its body is one round shape: the
+ * mark's dome is its top, so above the water the silhouette is exactly the
+ * logo's, and below the waterline it rounds off into a soft egg, a little
+ * squashed, so the whole body is wider than tall. `BODY_LONG` stretches it
+ * front to back, like a bean (the hero camera looks along it, so the dome
+ * still reads as the mark).
  */
-export const HEAD_LONG = 1.2;
+export const BODY_LONG = 1.22;
+/** Below the waterline the round body is squashed this much at its belly (1 = a sphere). */
+export const BELLY_SQUASH = 0.8;
 
 /**
- * The eyes (O3: two, mirrored about the front; O8: a whale's).
- * - Low on the sides of the head, near the waterline, as on a real whale:
- *   `rho` 0.26 of the dome's height (the mark's own eye sits at 0.32),
- *   `phi` 0.52 rad (30°) either side of the front, so from the hero camera
- *   both still face it enough to read as round.
- * - Small: 0.74 of the mark's eye. Each is a bead, not a flat disc, so it
- *   stays round seen at an angle.
- * - `socket` is how far each eye can move in its socket towards the
- *   pointer (radians round, and fraction of the height up and down); the
- *   head itself turns only a little (`HEAD_TURN`), so both eyes stay on
- *   the face. Before O8 the eyes slid up to 0.6 rad and the dome turned
- *   0.15, which put one eye mid-face and the other on the silhouette.
+ * The toy's eyes (O3: two, mirrored about the front; O11: friendly, round
+ * and bright, with a dark pupil and a small highlight).
+ * - On the front-sides of the dome, `phi` 0.44 rad either side of the
+ *   front and `rho` 0.36 of the dome's height, so from the hero camera both
+ *   read as a cute face, as in the owner's reference.
+ * - `r` is the white's radius: 0.2, about a seventh of the body's width,
+ *   so the eyes read at phone size.
+ * - The eyes sit in fixed sockets; the pupils follow the pointer (`pupil`,
+ *   as a fraction of `r`), and the head turns only a little (`HEAD_TURN`).
  */
-export const EYES_3D = {
-  r: 0.74 * (19.5 / LOGO_R) * DOME_SPHERE.r,
-  rho: 0.26,
-  phi: 0.52,
-  socket: { phi: 0.13, rho: 0.07 },
-} as const;
+export const EYES_3D = { r: 0.2, rho: 0.36, phi: 0.44, pupil: 0.34 } as const;
 /** How far the head turns towards the pointer: radians round (yaw) and up or down (pitch). */
 export const HEAD_TURN = { yaw: 0.06, pitch: 0.03 } as const;
+/** The blush under each eye: where (azimuth and height fraction, as the eyes), how big, how strong. */
+export const BLUSH = { phi: 0.6, rho: 0.25, r: 0.19, alpha: 0.6 } as const;
 
 /** Direction the moonlight comes from (towards the moon), unit length. */
 export const MOON_DIR: readonly [number, number, number] = (() => {

@@ -1,215 +1,152 @@
 // WEB-5 D5: named imports, so the scene chunk carries only what it uses.
-import {
-  BufferAttribute,
-  BufferGeometry,
-  Group,
-  Mesh,
-  SphereGeometry,
-  Vector3,
-  type Material,
-} from "three";
-import { MASCOT_R } from "./scene-config";
+import { BufferAttribute, BufferGeometry, Group, Mesh, SphereGeometry, Vector3, type Material } from "three";
+import { BODY_LONG, MASCOT_R } from "./scene-config";
 
 /**
- * WEB-5 O8: the whale under the head. Above the water the visitor only ever
- * sees the head (the mark's dome); when the camera dives, this is the body
- * the head belongs to: the "oh, it's a whale" moment of the D14 dive, and
- * the guide the assistant section names.
- *
- * Procedural and low-poly, in the head's own space (the waterline is y 0,
- * the face looks along +z):
- * - the body is a tube of rings along a spine that leaves the throat
- *   straight back, then curls to the left within its first 40 % (a whale
- *   turning towards you), so the camera, which dives in front of the head,
- *   sees the whole body side-on running across the screen towards the
- *   middle (on desktop the creature sits right of centre);
- *   it is a little wider than tall, round at the throat, full at the chest,
- *   tapering to a slim tail stock;
- * - the spine undulates slowly, more towards the tail (a whale swims by
- *   beating its fluke up and down), and the fluke follows the tail's slope;
- * - two pectoral flippers and the two lobes of the fluke are flattened
- *   ellipsoids, rocking gently;
- * - the whole body stays below the surface: behind the head its back is
- *   under the waterline (0.06 at the shoulder, 0.3 at the chest), so above
- *   the water you still see only the head; the scene also draws it only
- *   in the picture below the water.
- * The rings are rebuilt on the CPU (about 1,000 vertices) only for frames
- * that draw the picture below the water.
+ * WEB-5 O11: the toy whale's tail and flippers. The owner rejected O8's long
+ * realistic body ("ini lebih kek dugong") and asked for a simple, chubby,
+ * toy-like whale. The body itself is the mascot's one round shape (the
+ * mark's dome on top, mascot.ts); this module adds what makes it a whale:
+ * - a short tail stalk that leaves the back of the body and curls up to a
+ *   small two-lobed fluke, which wags slowly;
+ * - two small rounded flippers low on the sides, which paddle.
+ * Everything is built once and animated by transforms only: no geometry is
+ * rebuilt per frame. The scene draws these parts only in the picture below
+ * the water, so above it the visitor still sees only the dome; by the time
+ * the camera is under, the whale has dived with it (mascot.ts), so the tail
+ * can curl up above its back.
  */
 
-export type Whale = {
+export type ToyParts = {
   group: Group;
-  /** Rebuild the pose for time `t`. Cheap enough per frame; skipped while nothing under water is drawn. */
-  update: (t: number, still: boolean) => void;
+  /** `swim` 0..1 is how much the whale is swimming (under water) rather than resting. */
+  update: (t: number, swim: number, still: boolean) => void;
   dispose: () => void;
 };
 
 const TAU = Math.PI * 2;
-/** Body length along its spine, in world units (the head's waterline radius is 1.35). */
-const LENGTH = 8.6;
-/** One fluke beat, in seconds: slow and calm. */
-const BEAT = 4.6;
+/** One wag of the tail, in seconds: slow and happy. */
+const WAG = 2.8;
 
-const smooth = (a: number, b: number, x: number): number => {
-  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
-  return t * t * (3 - 2 * t);
+/** The tail stalk's centre line: from inside the back of the body, down a little, then curling up. */
+const TAIL = {
+  root: new Vector3(0, -0.38, -1.15 * BODY_LONG),
+  bend: new Vector3(0, -0.62, -2.15 * BODY_LONG),
+  tip: new Vector3(0, 0.3, -2.3 * BODY_LONG),
 };
 
-/** Body radius along the spine (0 the throat, 1 the tail stock). */
-function radius(s: number): number {
-  const nose = Math.sqrt(Math.min(1, s / 0.07));
-  const chest = 0.95 + 0.15 * smooth(0, 0.18, s);
-  const taper = Math.pow(1 - smooth(0.2, 0.97, s), 0.9);
-  return MASCOT_R * (nose * (chest * taper + 0.1 * (1 - taper)) * (s < 0.995 ? 1 : 0.2));
+function bezier(a: Vector3, b: Vector3, c: Vector3, t: number, out: Vector3): Vector3 {
+  const u = 1 - t;
+  return out
+    .copy(a)
+    .multiplyScalar(u * u)
+    .addScaledVector(b, 2 * u * t)
+    .addScaledVector(c, t * t);
 }
 
-export function createWhale(skin: Material, lowQuality: boolean): Whale {
-  const group = new Group();
-  const RINGS = lowQuality ? 30 : 44;
-  const SIDES = lowQuality ? 18 : 26;
-  const count = RINGS * (SIDES + 1);
-  const pos = new Float32Array(count * 3);
-  const nrm = new Float32Array(count * 3);
+/** A tapered tube along the tail's curve, with smooth normals, built once. */
+function buildStalk(lowQuality: boolean): BufferGeometry {
+  const rings = lowQuality ? 12 : 18;
+  const sides = lowQuality ? 14 : 20;
+  const pos: number[] = [];
+  const nrm: number[] = [];
   const index: number[] = [];
-  for (let i = 0; i < RINGS - 1; i++) {
-    for (let j = 0; j < SIDES; j++) {
-      const a = i * (SIDES + 1) + j;
-      const b = a + SIDES + 1;
+  const c = new Vector3();
+  const next = new Vector3();
+  const T = new Vector3();
+  const side = new Vector3();
+  const vert = new Vector3();
+  const n = new Vector3();
+  const x = new Vector3(1, 0, 0);
+  for (let i = 0; i < rings; i++) {
+    const t = i / (rings - 1);
+    bezier(TAIL.root, TAIL.bend, TAIL.tip, t, c);
+    // The curve's derivative: 2(1-t)(bend-root) + 2t(tip-bend).
+    T.subVectors(TAIL.bend, TAIL.root)
+      .multiplyScalar(2 * (1 - t))
+      .addScaledVector(next.subVectors(TAIL.tip, TAIL.bend), 2 * t)
+      .normalize();
+    // The curve lies in the y-z plane, so x is always across it.
+    side.copy(x);
+    vert.crossVectors(T, side).normalize();
+    // Chunky at the root, slim at the fluke, rounded off at the very tip.
+    const r = MASCOT_R * (0.36 * (1 - t) + 0.085 * t) * (t > 0.97 ? 0.6 : 1);
+    for (let j = 0; j <= sides; j++) {
+      const a = (j / sides) * TAU;
+      n.copy(side).multiplyScalar(Math.cos(a)).addScaledVector(vert, Math.sin(a));
+      pos.push(c.x + n.x * r, c.y + n.y * r * 0.9, c.z + n.z * r);
+      nrm.push(n.x, n.y, n.z);
+    }
+  }
+  for (let i = 0; i < rings - 1; i++) {
+    for (let j = 0; j < sides; j++) {
+      const a = i * (sides + 1) + j;
+      const b = a + sides + 1;
       index.push(a, a + 1, b, b, a + 1, b + 1);
     }
   }
-  const geometry = new BufferGeometry();
-  geometry.setAttribute("position", new BufferAttribute(pos, 3));
-  geometry.setAttribute("normal", new BufferAttribute(nrm, 3));
-  geometry.setIndex(index);
-  const body = new Mesh(geometry, skin);
-  // The pose moves every frame; a fixed bound would cull it wrongly.
-  body.frustumCulled = false;
-  group.add(body);
+  const g = new BufferGeometry();
+  g.setAttribute("position", new BufferAttribute(new Float32Array(pos), 3));
+  g.setAttribute("normal", new BufferAttribute(new Float32Array(nrm), 3));
+  g.setIndex(index);
+  // Pivot at the root, so the whole tail wags from where it leaves the body.
+  g.translate(-TAIL.root.x, -TAIL.root.y, -TAIL.root.z);
+  return g;
+}
 
-  // Flippers and flukes: one squashed sphere, scaled per part.
-  const partGeo = new SphereGeometry(1, lowQuality ? 14 : 20, lowQuality ? 10 : 14);
-  const part = (sx: number, sy: number, sz: number) => {
+export function createToyParts(skin: Material, lowQuality: boolean): ToyParts {
+  const group = new Group();
+  const stalkGeo = buildStalk(lowQuality);
+  const blobGeo = new SphereGeometry(1, lowQuality ? 18 : 26, lowQuality ? 12 : 18);
+
+  // ---- Tail -----------------------------------------------------------------
+  const tail = new Group();
+  tail.position.copy(TAIL.root);
+  tail.add(new Mesh(stalkGeo, skin));
+  const fluke = new Group();
+  fluke.position.subVectors(TAIL.tip, TAIL.root);
+  tail.add(fluke);
+  // Two plump lobes in a V, turned up at their tips like a toy's.
+  for (const dir of [-1, 1]) {
     const holder = new Group();
-    const mesh = new Mesh(partGeo, skin);
-    mesh.scale.set(sx, sy, sz);
-    // Pivot at the root: the part extends along its own +z from the holder,
-    // which `lookAt` below turns to face back along the body.
-    mesh.position.z = sz * 0.92;
-    holder.add(mesh);
-    group.add(holder);
-    return holder;
-  };
-  const flippers = [part(0.3, 0.075, 0.85), part(0.3, 0.075, 0.85)];
-  const flukes = [part(0.5, 0.075, 1.15), part(0.5, 0.075, 1.15)];
-
-  // ---- The spine -----------------------------------------------------------
-  const spine = Array.from({ length: RINGS }, () => new Vector3());
-  const tangent = Array.from({ length: RINGS }, () => new Vector3());
-  const up = new Vector3(0, 1, 0);
-  const side = new Vector3();
-  const vert = new Vector3();
-  const tmp = new Vector3();
-
-  function pose(t: number, still: boolean): void {
-    const phase = still ? 0.9 : (t * TAU) / BEAT;
-    const ds = LENGTH / (RINGS - 1);
-    // Integrate the heading: straight back from the throat, then a slow
-    // turn to the left; the height sinks gently towards the tail.
-    let x = 0;
-    // The throat starts under the front of the head, like a lower jaw.
-    let z = 1.05;
-    for (let i = 0; i < RINGS; i++) {
-      const s = i / (RINGS - 1);
-      const heading = 1.3 * smooth(0, 0.42, s) + 0.12 * s;
-      if (i > 0) {
-        x -= Math.sin(heading) * ds;
-        z -= Math.cos(heading) * ds;
-      }
-      const amp = 0.03 + 0.32 * Math.pow(s, 2.1);
-      // Sinks quickly behind the throat, so the back stays under the surface.
-      const y = -1.15 - 0.95 * smooth(0, 0.35, s) - 0.35 * s + amp * Math.sin(phase - TAU * 0.85 * s);
-      spine[i].set(x, y, z);
-    }
-    for (let i = 0; i < RINGS; i++) {
-      const a = spine[Math.max(0, i - 1)];
-      const b = spine[Math.min(RINGS - 1, i + 1)];
-      tangent[i].subVectors(b, a).normalize();
-    }
-
-    // Rings: a little wider than tall, and flatter underneath.
-    let k = 0;
-    for (let i = 0; i < RINGS; i++) {
-      const s = i / (RINGS - 1);
-      const r = radius(s);
-      const dr = (radius(Math.min(1, s + 0.01)) - radius(Math.max(0, s - 0.01))) / (0.02 * LENGTH);
-      const T = tangent[i];
-      side.crossVectors(up, T).normalize();
-      vert.crossVectors(T, side).normalize();
-      const rx = r * 1.1;
-      for (let j = 0; j <= SIDES; j++) {
-        const a = (j / SIDES) * TAU;
-        const c = Math.cos(a);
-        const sn = Math.sin(a);
-        const ry = r * (sn < 0 ? 0.82 : 0.95);
-        const o = k * 3;
-        pos[o] = spine[i].x + side.x * c * rx + vert.x * sn * ry;
-        pos[o + 1] = spine[i].y + side.y * c * rx + vert.y * sn * ry;
-        pos[o + 2] = spine[i].z + side.z * c * rx + vert.z * sn * ry;
-        tmp
-          .copy(side)
-          .multiplyScalar(c / Math.max(rx, 1e-3))
-          .addScaledVector(vert, sn / Math.max(ry, 1e-3))
-          .normalize()
-          .addScaledVector(T, -dr)
-          .normalize();
-        nrm[o] = tmp.x;
-        nrm[o + 1] = tmp.y;
-        nrm[o + 2] = tmp.z;
-        k++;
-      }
-    }
-    geometry.attributes.position.needsUpdate = true;
-    geometry.attributes.normal.needsUpdate = true;
-
-    // Flippers: from the chest's sides, swept back and down, rocking.
-    const fi = Math.round(0.2 * (RINGS - 1));
-    const fr = radius(0.2);
-    const T = tangent[fi];
-    side.crossVectors(up, T).normalize();
-    for (let n = 0; n < 2; n++) {
-      const dir = n === 0 ? 1 : -1;
-      const f = flippers[n];
-      f.position.copy(spine[fi]).addScaledVector(side, dir * fr * 0.92).addScaledVector(up, -fr * 0.42);
-      f.rotation.set(0, 0, 0);
-      f.lookAt(tmp.copy(f.position).sub(T));
-      f.rotateY(dir * -0.7);
-      f.rotateZ(dir * (0.95 + 0.12 * Math.sin(phase + 0.6)));
-      f.rotateX(0.25);
-    }
-
-    // Flukes: at the tail's end, level with the body, pitched by its slope
-    // plus a little more, so the beat reads at the very tip.
-    const last = spine[RINGS - 1];
-    const TL = tangent[RINGS - 1];
-    const beat = 0.35 * Math.cos(phase - TAU * 0.85);
-    for (let n = 0; n < 2; n++) {
-      const dir = n === 0 ? 1 : -1;
-      const f = flukes[n];
-      f.position.copy(last);
-      f.rotation.set(0, 0, 0);
-      f.lookAt(tmp.copy(last).sub(TL));
-      f.rotateX(beat);
-      f.rotateY(dir * 1.0);
-    }
+    const lobe = new Mesh(blobGeo, skin);
+    lobe.scale.set(0.46, 0.075, 0.27);
+    lobe.position.set(dir * 0.38, 0, -0.08);
+    holder.add(lobe);
+    holder.rotation.set(-0.15, dir * 0.42, dir * -0.22);
+    fluke.add(holder);
   }
+  group.add(tail);
+
+  // ---- Flippers -------------------------------------------------------------
+  // Low on the sides, a little forward of the middle, pointing down and back.
+  const flippers = [-1, 1].map((dir) => {
+    const holder = new Group();
+    holder.position.set(dir * MASCOT_R * 0.9, -0.5, 0.35 * BODY_LONG);
+    const fin = new Mesh(blobGeo, skin);
+    fin.scale.set(0.34, 0.075, 0.2);
+    fin.position.set(dir * 0.27, 0, -0.05);
+    holder.add(fin);
+    group.add(holder);
+    return { holder, dir };
+  });
 
   return {
     group,
-    update: pose,
+    update(t, swim, still) {
+      const s = still ? 0 : swim;
+      const p = (t * TAU) / WAG;
+      // At rest the tail only sways a little; swimming, it wags.
+      tail.rotation.y = (0.05 + 0.17 * s) * Math.sin(p);
+      tail.rotation.x = (0.03 + 0.07 * s) * Math.sin(p + 1.1);
+      fluke.rotation.x = (0.06 + 0.16 * s) * Math.sin(p - 0.9);
+      for (const f of flippers) {
+        f.holder.rotation.set(0, f.dir * -0.75, f.dir * (-0.6 - (0.08 + 0.2 * s) * Math.sin(p + 0.5)));
+      }
+    },
     dispose() {
-      geometry.dispose();
-      partGeo.dispose();
+      stalkGeo.dispose();
+      blobGeo.dispose();
     },
   };
 }

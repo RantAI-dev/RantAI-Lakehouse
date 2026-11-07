@@ -163,7 +163,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     const mats = mesh.material ? (Array.isArray(mesh.material) ? mesh.material : [mesh.material]) : [];
     for (const m of mats)
       if (!(m as ShaderMaterial).isShaderMaterial && (m as { fog?: boolean }).fog)
-        applyWaterFog(m, fog, { caustics: m === mascot.skin });
+        applyWaterFog(m, fog, m === mascot.skin ? { caustics: true, extra: mascot.paintSkin } : {});
   });
 
   // ---- Lights ------------------------------------------------------------
@@ -236,9 +236,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   const anchorHero = { x: 0, y: 0 };
   const anchorDepths = { x: 0, y: 0 };
-  // WEB-5 O8: between the hero and the depths (the sources, where the whale
-  // shows), a portrait screen frames the head on the right so the body has
-  // the width of the screen to sweep across. Wide screens keep the centre.
+  // WEB-5 O8/O11: between the hero and the depths (the sources, where the
+  // whole whale shows), a portrait screen frames the toy whale low, under
+  // the sources' copy and pills, which fill the top of a phone's screen.
   const anchorUnder = { x: 0, y: 0 };
   let distScaleHero = 1;
   let distScaleDepths = 1;
@@ -261,8 +261,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     anchorHero.y = wide ? 0 : 0.42;
     anchorDepths.x = wide ? 0.42 : 0;
     anchorDepths.y = wide ? -0.1 : -0.5;
-    anchorUnder.x = wide ? 0 : 0.62;
-    anchorUnder.y = wide ? 0 : 0.05;
+    anchorUnder.x = 0;
+    anchorUnder.y = wide ? 0 : -0.45;
     const tanV = Math.tan(MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
     distScaleHero = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
@@ -414,8 +414,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // Under the surface the eye looks down at the visitor sinking past it.
     aim.x = lerp(rawX + (wanderX - rawX) * w, clamp(camera.position.x * 0.3, -0.5, 0.5), uw);
     aim.y = lerp(rawY + (wanderY - rawY) * w, -0.8, uw);
+    mascot.swim = uw;
     mascot.update(dt, t, aim, 1 - uw * 0.5);
-    (water.uniforms.uBodyC.value as Vector3).set(0, mascot.group.position.y, 0);
+    (water.uniforms.uBodyC.value as Vector3).set(mascot.group.position.x, mascot.group.position.y, 0);
 
     // WEB-5 D14 S1: one ring spreads from the crossing as the camera goes
     // through the surface (either way), so the moment reads as a dive.

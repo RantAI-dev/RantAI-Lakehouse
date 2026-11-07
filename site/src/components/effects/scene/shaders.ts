@@ -224,6 +224,7 @@ uniform vec3 uMascot;
 uniform float uWaveGain;
 uniform vec3 uBodyC;
 uniform vec3 uBodyR;
+uniform float uLong;
 uniform vec3 uBodyTint;
 varying vec3 vWorld;
 ${NOISE_GLSL}
@@ -288,8 +289,10 @@ void main(){
     col = mix(body, sky, fres);
     col += uMoonColor * (spec + glint) * (0.25 + fres);
 
-    // Contact with the mascot: darker water around it and a thin lit rim.
-    float dm = length(p - uMascot.xy);
+    // Contact with the mascot: darker water around it and a thin lit rim,
+    // around its waterline, an ellipse uLong times longer front to back.
+    vec2 dmv = p - uMascot.xy;
+    float dm = length(vec2(dmv.x, dmv.y / uLong));
     float shade = 1.0 - smoothstep(uMascot.z, uMascot.z + 1.5, dm);
     col *= 1.0 - 0.6 * shade;
     float rimX = (dm - uMascot.z) / 0.14;
@@ -306,7 +309,8 @@ void main(){
     float detail = (1.0 - smoothstep(0.03, 0.26, fw)) * smoothstep(0.03, 0.3, -V.y);
     vec3 n = normalize(vec3(-g.x * 0.2 * lod * detail, 1.0, -g.y * 0.2 * lod * detail));
     vec3 Vd = -V;
-    float dm = length(p - uMascot.xy);
+    vec2 dmv = p - uMascot.xy;
+    float dm = length(vec2(dmv.x, dmv.y / uLong));
     float cosI = clamp(dot(Vd, n), 0.0, 1.0);
     // The window's edge (the critical angle, cos 0.66), softened on both sides.
     float win = smoothstep(0.6, 0.76, cosI);

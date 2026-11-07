@@ -18,25 +18,32 @@ import {
   SphereGeometry,
   Vector2,
   Vector3,
+  type WebGLProgramParametersWithUniforms,
 } from "three";
 import { PALETTE } from "@/lib/palette";
-import { DOME_SPHERE, EYES_3D, HEAD_LONG, HEAD_TURN, MASCOT_H, MASCOT_R } from "./scene-config";
-import { createWhale } from "./whale";
+import { BELLY_SQUASH, BLUSH, BODY_LONG, DOME_SPHERE, EYES_3D, HEAD_TURN, MASCOT_H, MASCOT_R } from "./scene-config";
+import { createToyParts } from "./whale";
 import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, SPOUT_VERT } from "./shaders";
 
 /**
  * The 3D mascot, built from primitives on the official mark's shapes
- * (`components/shared/mascot-svg.tsx`, WEB-5 O2): a navy dome, the mark's
- * sphere cap revolved, with two white eyes (O3: the mark is the creature
- * seen from the side, with one eye; facing the camera it has two).
+ * (`components/shared/mascot-svg.tsx`, WEB-5 O2).
  *
- * WEB-5 O8: it is a whale, and the dome is its head breaking the surface:
- * - stretched front to back (`HEAD_LONG`), the eyes low on its sides near
- *   the waterline, small beads that stay round at an angle;
- * - the eyes follow the pointer in their sockets, and the head turns only
- *   a little, so both eyes stay on the face from the hero camera;
- * - every 5 to 9 seconds it breathes out through its blowhole: a short,
- *   soft spout of droplets and mist from the top of the head.
+ * WEB-5 O11 (owner, replacing O8's realistic whale, "ini lebih kek
+ * dugong"): a simple, chubby toy whale.
+ * - One round body: the mark's dome on top, so above the water the
+ *   silhouette is exactly the logo's, rounding off below the waterline into
+ *   a soft egg, longer front to back (`BODY_LONG`) and wider than tall.
+ * - A white belly with soft curved grooves in lake blue, and a light coral
+ *   blush under each eye, painted in the skin's own shader (`paintSkin`),
+ *   so they cost no geometry. The belly is below the waterline.
+ * - Two round eyes (O3: two, the mark keeps one): a bright white, a navy
+ *   pupil that follows the pointer, and two small highlights. They blink.
+ * - A short tail curling up to a small fluke, and two small flippers
+ *   (whale.ts), seen under water only.
+ * - Smooth, soft-plastic skin: satin rather than glossy, a friendlier navy.
+ * - A gentle bob; under water a slow, happy swim (`swim`).
+ * - Every 5 to 9 s a small, soft fountain from the blowhole.
  * The water plane hides everything below the waterline until the camera
  * dives.
  */
@@ -62,6 +69,10 @@ export type Mascot = {
   /** The foam collar alone, hidden when the camera is below the surface. */
   foam: Mesh;
   update: (dt: number, t: number, aim: Aim, look: number) => void;
+  /** 0..1: how much it is swimming (the camera under water) rather than resting at the surface. */
+  swim: number;
+  /** Paints the belly, its grooves and the blush in the skin's shader; the engine applies it with the fog. */
+  paintSkin: (shader: WebGLProgramParametersWithUniforms) => void;
   dip: (t: number) => void;
   /** 0 for the picture above the surface, 1 for the one below (lighting, the spout). */
   setUnderwater: (uw: number) => void;
@@ -83,27 +94,28 @@ function profile(u: number): { r: number; y: number } {
   return { r: SPHERE_R * Math.cos(t), y: SPHERE_CY + SPHERE_R * Math.sin(t) };
 }
 
-function buildBodyGeometry(upperOnly = false): LatheGeometry {
+function buildBodyGeometry(): LatheGeometry {
   const pts: Vector2[] = [];
-  // Submerged half: a deep half-ellipsoid that sinks into the whale's
-  // throat (O8, whale.ts), so seen from below the head swells straight into
-  // the body with no neck and no edge.
-  const below = 1.45 * MASCOT_R;
-  if (upperOnly) pts.push(new Vector2(0, 0), new Vector2(MASCOT_R, 0));
-  else
-    for (let i = 0; i <= 24; i++) {
-      const s = (i / 24) * (Math.PI / 2);
-      pts.push(new Vector2(MASCOT_R * Math.sin(s), -below * Math.cos(s)));
-    }
+  // Below the waterline the mark's sphere carries on round to the bottom,
+  // squashed towards the belly (smoothly, so the curve has no crease at
+  // the waterline): the toy's chubby, slightly flat-bottomed body (O11).
+  const below = 40;
+  for (let i = 0; i <= below; i++) {
+    const t = -Math.PI / 2 + (i / below) * (BASE_T + Math.PI / 2);
+    const r = SPHERE_R * Math.cos(t);
+    const y = SPHERE_CY + SPHERE_R * Math.sin(t);
+    const squash = 1 - (1 - BELLY_SQUASH) * MathUtils.smoothstep(-y, 0, 0.6);
+    pts.push(new Vector2(Math.max(r, i === 0 ? 0 : 1e-3), y * squash));
+  }
   // Visible dome: the sphere cap, evenly spaced along its arc.
   for (let i = 1; i <= 72; i++) {
     const p = profile(i / 72);
     pts.push(new Vector2(p.r, p.y));
   }
-  const geo = new LatheGeometry(pts, upperOnly ? 64 : 112);
-  // O8: a whale's head is longer than it is wide; the front (+z) still
-  // faces the camera, so the mark's silhouette is unchanged from there.
-  geo.scale(1, 1, HEAD_LONG);
+  const geo = new LatheGeometry(pts, 112);
+  // Longer front to back, like a bean; the front (+z) faces the camera,
+  // so the mark's silhouette is unchanged from there.
+  geo.scale(1, 1, BODY_LONG);
   return geo;
 }
 
@@ -114,16 +126,16 @@ function surface(phi: number, rho: number, out: { pos: Vector3; normal: Vector3 
   const sinT = (y - SPHERE_CY) / SPHERE_R;
   const cosT = Math.sqrt(Math.max(0, 1 - sinT * sinT));
   const r = SPHERE_R * cosT;
-  // The head is the sphere stretched along z: positions stretch with it,
+  // The body is the sphere stretched along z: positions stretch with it,
   // normals by the inverse.
-  out.pos.set(r * Math.sin(phi), y, r * Math.cos(phi) * HEAD_LONG);
-  out.normal.set(cosT * Math.sin(phi), sinT, (cosT * Math.cos(phi)) / HEAD_LONG).normalize();
+  out.pos.set(r * Math.sin(phi), y, r * Math.cos(phi) * BODY_LONG);
+  out.normal.set(cosT * Math.sin(phi), sinT, (cosT * Math.cos(phi)) / BODY_LONG).normalize();
 }
 
 /** The blowhole, on top of the head a little behind its crown (group space). */
 const BLOWHOLE = new Vector3(0, MASCOT_H - 0.03, -0.32);
-const SPOUT_DROPS = 46;
-const SPOUT_MIST = 34;
+const SPOUT_DROPS = 44;
+const SPOUT_MIST = 22;
 
 const SPLASH_COUNT = 56;
 
@@ -134,72 +146,106 @@ export function createMascot(opts: MascotOptions): Mascot {
 
   // ---- Body --------------------------------------------------------------
   const bodyGeo = buildBodyGeometry();
+  // O11: soft plastic. Satin, a thin soft clearcoat, and a navy a step
+  // towards the lake's blue, friendlier and still readable through water.
   const bodyMat = new MeshPhysicalMaterial({
-    color: new Color(PALETTE.navy),
-    roughness: 0.42,
+    color: new Color("#2152b8"),
+    roughness: 0.5,
     metalness: 0.0,
-    clearcoat: 1,
-    clearcoatRoughness: 0.2,
-    // A little emission keeps the shadow side navy rather than black.
-    emissive: new Color("#0a1450"),
-    emissiveIntensity: 0.55,
-    envMapIntensity: 1.35,
+    clearcoat: 0.45,
+    clearcoatRoughness: 0.38,
+    // A little emission keeps the shadow side blue rather than black.
+    emissive: new Color("#12307f"),
+    emissiveIntensity: 0.5,
+    envMapIntensity: 1.1,
   });
   const dome = new Mesh(bodyGeo, bodyMat);
   group.add(dome);
   disposables.push(bodyGeo, bodyMat);
 
-  // O8: the whale's body, in the same navy skin, seen only under water.
-  const whale = createWhale(bodyMat, opts.lowQuality);
-  whale.group.visible = false;
-  group.add(whale.group);
-  disposables.push(whale);
-  let clockT = 0;
-  let posedAt = -1;
+  // O11: the tail and the flippers, in the same skin, seen only under water.
+  const parts = createToyParts(bodyMat, opts.lowQuality);
+  parts.group.visible = false;
+  group.add(parts.group);
+  disposables.push(parts);
+
+  // Where the blush sits, in the body's own space.
+  const blushAt = [-1, 1].map((side) => {
+    const at = { pos: new Vector3(), normal: new Vector3() };
+    surface(side * BLUSH.phi, BLUSH.rho, at);
+    return at.pos;
+  });
+  const skinUniforms = {
+    uBelly: { value: new Color(PALETTE.foam) },
+    uGroove: { value: new Color(PALETTE.lake) },
+    uBlush: { value: new Color("#ff8f96") },
+    uBlushL: { value: blushAt[0] },
+    uBlushR: { value: blushAt[1] },
+    uBlushSize: { value: BLUSH.r },
+    uBlushA: { value: BLUSH.alpha },
+    uLongZ: { value: SPHERE_R * BODY_LONG },
+  };
 
   // ---- Eyes --------------------------------------------------------------
-  // WEB-5 O3: two eyes, one each side of the front, built alike and sharing
-  // their materials, so they glow, blink and fade under water as one.
-  const eyeGeo = new SphereGeometry(1, 40, 28);
-  // The logo's eye is a white cut-out. Since O5 the whole frame is tone
-  // mapped once, in the lens pass, so "white" is set bright enough (6 in
-  // linear light) that ACES maps it to about 0.99, not light grey.
-  const eyeMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(6) });
+  // WEB-5 O11: toy eyes, built alike and sharing their materials. Each is a
+  // socket on the dome (fixed), a white that blinks, a navy pupil that
+  // follows the pointer over the white, and two small highlights that ride
+  // on the pupil. The lens pass tone-maps the frame once (O5), so the
+  // whites are set above 1 in linear light: 2.5 maps to about 0.96 on
+  // screen. Not higher: MSAA averages an edge before tone mapping, and a
+  // much brighter white would saturate its edge pixels into jaggies.
+  const ballGeo = new SphereGeometry(1, 32, 22);
+  const whiteMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(2.5) });
+  const pupilMat = new MeshBasicMaterial({ color: new Color("#081038") });
+  const glintMat = new MeshBasicMaterial({ color: new Color(1, 1, 1).multiplyScalar(3) });
   const glowGeo = new PlaneGeometry(1, 1);
   const glowMat = new ShaderMaterial({
-    uniforms: { uColor: { value: new Color("#bfe0ff") }, uIntensity: { value: 0.5 } },
+    uniforms: { uColor: { value: new Color("#bfe0ff") }, uIntensity: { value: 0.3 } },
     vertexShader: GLOW_VERT,
     fragmentShader: GLOW_FRAG,
     transparent: true,
     depthWrite: false,
     blending: AdditiveBlending,
   });
-  disposables.push(eyeGeo, eyeMat, glowGeo, glowMat);
-  /**
-   * The halo's size, in eye radii. The single eye's was 6.5 of its width;
-   * two halos that wide would merge into one blur between the eyes, so each
-   * is smaller and they only just touch.
-   */
-  const GLOW = 4.2;
-  function buildEye() {
+  disposables.push(ballGeo, whiteMat, pupilMat, glintMat, glowGeo, glowMat);
+  const R_EYE = EYES_3D.r;
+  /** The white is an ellipsoid sunk into the dome: its depth and how far its centre sits inside. */
+  const WHITE_DEPTH = 0.6 * R_EYE;
+  const WHITE_SINK = -0.3 * R_EYE;
+  const GLOW = 3.2;
+  function buildEye(side: number) {
     const eye = new Group();
-    const eyeMesh = new Mesh(eyeGeo, eyeMat);
-    // A bead (O8): an ellipsoid sunk into the head, so its visible part is
-    // round from any side rather than a disc that turns to an oval.
-    eyeMesh.scale.set(EYES_3D.r, EYES_3D.r, 0.9 * EYES_3D.r);
-    eyeMesh.position.z = -0.62 * EYES_3D.r;
-    eye.add(eyeMesh);
+    const lid = new Group();
+    eye.add(lid);
+    const white = new Mesh(ballGeo, whiteMat);
+    white.scale.set(R_EYE, R_EYE, WHITE_DEPTH);
+    white.position.z = WHITE_SINK;
+    lid.add(white);
+    const pupil = new Mesh(ballGeo, pupilMat);
+    pupil.scale.set(0.58 * R_EYE, 0.6 * R_EYE, 0.3 * R_EYE);
+    lid.add(pupil);
+    const glint = new Mesh(ballGeo, glintMat);
+    glint.scale.setScalar(0.19 * R_EYE);
+    lid.add(glint);
+    const glintSmall = new Mesh(ballGeo, glintMat);
+    glintSmall.scale.setScalar(0.085 * R_EYE);
+    lid.add(glintSmall);
     const glow = new Mesh(glowGeo, glowMat);
-    glow.scale.set(EYES_3D.r * GLOW, EYES_3D.r * GLOW, 1);
-    glow.position.z = 0.12 * MASCOT_R;
+    glow.scale.set(R_EYE * GLOW, R_EYE * GLOW, 1);
+    glow.position.z = -0.05 * R_EYE;
     glow.renderOrder = 3;
     eye.add(glow);
+    // The socket: on the dome's surface, facing out along its normal.
+    const at = { pos: new Vector3(), normal: new Vector3() };
+    surface(side * EYES_3D.phi, EYES_3D.rho, at);
+    eye.position.copy(at.pos);
+    const m = new Matrix4().lookAt(new Vector3(), at.normal.clone().negate(), new Vector3(0, 1, 0));
+    eye.quaternion.setFromRotationMatrix(m);
     group.add(eye);
-    return { eye, eyeMesh, glow };
+    return { eye, lid, pupil, glint, glintSmall, glow };
   }
   /** Left and right, by their side of the front (−phi, +phi). */
-  const eyes = [buildEye(), buildEye()] as const;
-  const EYE_SIDE = [-1, 1] as const;
+  const eyes = [buildEye(-1), buildEye(1)] as const;
 
   // ---- Lights that belong to the creature --------------------------------
   // Water bounce from below-front, so the lower dome is not a black cut-out.
@@ -231,7 +277,7 @@ export function createMascot(opts: MascotOptions): Mascot {
   });
   const foam = new Mesh(foamGeo, foamMat);
   foam.position.y = 0.02;
-  foam.scale.z = HEAD_LONG;
+  foam.scale.z = BODY_LONG;
   foam.renderOrder = 1;
   extras.add(foam);
   disposables.push(foamGeo, foamMat);
@@ -264,7 +310,7 @@ export function createMascot(opts: MascotOptions): Mascot {
       const r = MASCOT_R * (0.85 + Math.random() * 0.25);
       splashPos[i * 3] = Math.cos(a) * r;
       splashPos[i * 3 + 1] = 0.05;
-      splashPos[i * 3 + 2] = Math.sin(a) * r * HEAD_LONG;
+      splashPos[i * 3 + 2] = Math.sin(a) * r * BODY_LONG;
       const up = 2.6 + Math.random() * 3.2;
       const out = 0.5 + Math.random() * 1.1;
       splashVel[i * 3] = Math.cos(a) * out;
@@ -321,23 +367,24 @@ export function createMascot(opts: MascotOptions): Mascot {
     holeWorld.copy(BLOWHOLE).applyMatrix4(group.matrixWorld);
     // A little variety per breath: a stronger or softer one, leaning a bit.
     const power = 0.85 + Math.random() * 0.3;
-    const lean = (Math.random() - 0.5) * 0.3;
+    const lean = (Math.random() - 0.5) * 0.12;
     for (let i = 0; i < SPOUT_N; i++) {
       const mist = i >= SPOUT_DROPS;
       const j = i * 3;
       spoutPos[j] = holeWorld.x + (Math.random() - 0.5) * 0.08;
       spoutPos[j + 1] = holeWorld.y;
       spoutPos[j + 2] = holeWorld.z + (Math.random() - 0.5) * 0.08;
-      // A whale's breath opens into a bushy plume: the mist leaves fast and
-      // fans out, then hangs; the droplets are fine and fall back.
-      const spread = mist ? 0.9 : 0.6;
-      spoutVel[j] = (Math.random() - 0.5) * spread + lean;
-      spoutVel[j + 1] = (mist ? 2.5 + Math.random() * 1.3 : 2.4 + Math.random() * 1.3) * power;
-      spoutVel[j + 2] = (Math.random() - 0.5) * spread * 0.6 - 0.12;
+      // O11: a toy's little fountain. The breath splits into two soft
+      // arcs, left and right, that rise, curl over and fall back, with a
+      // puff of mist hanging between them.
+      const side = i % 2 === 0 ? -1 : 1;
+      spoutVel[j] = side * (mist ? 0.25 + Math.random() * 0.35 : 0.5 + Math.random() * 0.3) + lean;
+      spoutVel[j + 1] = (mist ? 1.7 + Math.random() * 0.7 : 2.05 + Math.random() * 0.6) * power;
+      spoutVel[j + 2] = (Math.random() - 0.5) * 0.18 - 0.06;
       // Negative age is the birth delay: the breath lasts about 0.45 s.
       spoutAge[i] = -(mist ? Math.random() * 0.45 : Math.random() * 0.3);
       spoutLife[i] = mist ? 1.6 + Math.random() * 0.9 : 0.8 + Math.random() * 0.45;
-      spoutBase[i] = mist ? 0.18 + Math.random() * 0.16 : 0.018 + Math.random() * 0.022;
+      spoutBase[i] = mist ? 0.15 + Math.random() * 0.12 : 0.028 + Math.random() * 0.022;
     }
     spoutAlive = true;
   }
@@ -367,14 +414,14 @@ export function createMascot(opts: MascotOptions): Mascot {
         spoutVel[j + 1] = spoutVel[j + 1] * drag + 0.05 * dt;
         spoutVel[j + 2] *= drag;
         spoutSize[i] = spoutBase[i] * (1 + 3.2 * Math.sqrt(p));
-        spoutAlpha[i] = 0.3 * Math.min(1, age / 0.12) * Math.pow(1 - p, 1.6);
+        spoutAlpha[i] = 0.24 * Math.min(1, age / 0.12) * Math.pow(1 - p, 1.6);
       } else {
         spoutVel[j + 1] -= 5.2 * dt;
         spoutSize[i] = spoutBase[i];
         spoutAlpha[i] = Math.min(1, age / 0.06) * Math.pow(1 - p, 1.4) * 0.75;
       }
-      // A light breeze from the left.
-      spoutVel[j] += 0.12 * dt;
+      // The faintest breeze from the left.
+      spoutVel[j] += 0.04 * dt;
       spoutPos[j] += spoutVel[j] * dt;
       spoutPos[j + 1] += spoutVel[j + 1] * dt;
       spoutPos[j + 2] += spoutVel[j + 2] * dt;
@@ -395,11 +442,6 @@ export function createMascot(opts: MascotOptions): Mascot {
   }
 
   // ---- Animation state ---------------------------------------------------
-  const scratch = { pos: new Vector3(), normal: new Vector3() };
-  const m4 = new Matrix4();
-  const origin = new Vector3();
-  const negNormal = new Vector3();
-  const up = new Vector3(0, 1, 0);
   const eyeAim = { x: 0, y: 0 };
   const lookAim = { x: 0, y: 0 };
   let nextBlink = 2.2;
@@ -407,8 +449,9 @@ export function createMascot(opts: MascotOptions): Mascot {
   let dipStart = -10;
   let poppedAt = -10;
   const DIP_DEPTH = MASCOT_H + 0.25;
-
-  const rho0 = EYES_3D.rho;
+  /** How deep it swims once the camera is under (O11): about the camera's own depth at −5 m. */
+  const SWIM_DEPTH = 2.3;
+  let swimPhase = 0;
 
   function dipOffset(t: number): number {
     const age = t - dipStart;
@@ -432,6 +475,52 @@ export function createMascot(opts: MascotOptions): Mascot {
     extras,
     foam,
     still: false,
+    swim: 0,
+    paintSkin(shader) {
+      Object.assign(shader.uniforms, skinUniforms);
+      shader.vertexShader = shader.vertexShader
+        .replace("#include <common>", "#include <common>\nvarying vec3 vSkin;")
+        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvSkin = position;");
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          "#include <common>",
+          `#include <common>
+          varying vec3 vSkin;
+          uniform vec3 uBelly; uniform vec3 uGroove; uniform vec3 uBlush;
+          uniform vec3 uBlushL; uniform vec3 uBlushR; uniform float uBlushSize; uniform float uBlushA;
+          uniform float uLongZ;`,
+        )
+        .replace(
+          "#include <color_fragment>",
+          `#include <color_fragment>
+          {
+            vec3 q = vSkin;
+            // The belly line rises towards the front, as on a toy whale.
+            float zf = clamp(q.z / uLongZ, -1.0, 1.0);
+            float edge = -0.36 + 0.24 * zf;
+            float belly = smoothstep(edge + 0.035, edge - 0.035, q.y);
+            // Soft grooves, curving back as they run under the belly, on its front half.
+            float phi = atan(q.x, q.z / ${BODY_LONG.toFixed(3)});
+            float gp = phi + 0.32 * q.y;
+            float cell = abs(fract(gp / 0.27 + 0.5) - 0.5) * 0.27 * 1.3;
+            float groove = (1.0 - smoothstep(0.02, 0.045, cell))
+              * smoothstep(edge - 0.07, edge - 0.2, q.y)
+              * smoothstep(-0.78, -0.5, q.y)
+              * smoothstep(-0.05, 0.45, cos(phi));
+            vec3 c = mix(diffuseColor.rgb, uBelly, belly);
+            c = mix(c, uGroove, groove * belly * 0.7);
+            vec3 dl = q - uBlushL;
+            vec3 dr = q - uBlushR;
+            float s2 = uBlushSize * uBlushSize;
+            float blush = max(exp(-dot(dl, dl) / s2), exp(-dot(dr, dr) / s2)) * uBlushA;
+            diffuseColor.rgb = mix(c, uBlush, blush * (1.0 - belly));
+            // A touch of its own light, so the blush still reads by moonlight.
+            totalEmissiveRadiance += uBlush * blush * 0.1;
+            // The belly keeps a little light of its own, so it reads white, not grey, in shade.
+            totalEmissiveRadiance += uBelly * belly * 0.16;
+          }`,
+        );
+    },
     setViewport(heightPx, pixelRatio) {
       spoutMat.uniforms.uHalfH.value = heightPx / 2;
       spoutMat.uniforms.uMinPx.value = 1.6 * pixelRatio;
@@ -440,20 +529,16 @@ export function createMascot(opts: MascotOptions): Mascot {
       // The spout is above the water: only the picture above shows it.
       aboveWater = uw < 0.5;
       spout.visible = spoutAlive && aboveWater;
-      whale.group.visible = !aboveWater;
-      if (!aboveWater && posedAt !== clockT) {
-        whale.update(clockT, mascot.still);
-        posedAt = clockT;
-      }
+      parts.group.visible = !aboveWater;
       // Under water the light is scattered from every side; a little more
       // glow keeps the body readable through the water's fog without
       // flattening it (O5: the old 1.5 made it a flat disc).
-      bodyMat.emissiveIntensity = MathUtils.lerp(0.55, 0.6, uw);
+      bodyMat.emissiveIntensity = MathUtils.lerp(0.5, 0.55, uw);
       // The environment is the night sky; under water there is no sky to
       // reflect, only the window overhead, so the gloss mostly goes (O8: it
       // made the throat glow white).
-      bodyMat.envMapIntensity = MathUtils.lerp(1.35, 0.22, uw);
-      bodyMat.clearcoat = MathUtils.lerp(1, 0.35, uw);
+      bodyMat.envMapIntensity = MathUtils.lerp(1.1, 0.25, uw);
+      bodyMat.clearcoat = MathUtils.lerp(0.45, 0.2, uw);
       bounce.intensity = MathUtils.lerp(0.9, 2.2, uw);
       bounce.color.copy(BOUNCE_ABOVE.sky).lerp(BOUNCE_UNDER.sky, uw);
       bounce.groundColor.copy(BOUNCE_ABOVE.ground).lerp(BOUNCE_UNDER.ground, uw);
@@ -465,7 +550,6 @@ export function createMascot(opts: MascotOptions): Mascot {
       opts.onRipple(0.8);
     },
     update(dt, t, aim, look) {
-      clockT = t;
       const k = (rate: number) => 1 - Math.exp(-dt * rate);
       // A non-finite aim would stick in the smoothing for good, so it counts as "straight ahead".
       const ax = Number.isFinite(aim.x) ? aim.x : 0;
@@ -477,22 +561,34 @@ export function createMascot(opts: MascotOptions): Mascot {
 
       const bob = mascot.still ? 0 : Math.sin((t * TAU) / 4);
       const dipY = mascot.still ? 0 : dipOffset(t);
-      group.position.y = -0.05 + 0.06 * bob + dipY;
-      group.rotation.z = 0.02 * Math.sin((t * TAU) / 4 + 0.7);
-      // O8: the head turns only a little; the eyes do most of the looking.
-      group.rotation.y = lookAim.x * HEAD_TURN.yaw * look;
+      // O11: it dives with the visitor. At the surface only the dome shows;
+      // as the camera goes under, the whale sinks to about the camera's
+      // depth, so under water the whole of it is in view, beside you.
+      const swim = mascot.still ? 0 : MathUtils.clamp(mascot.swim, 0, 1);
+      const sink = SWIM_DEPTH * MathUtils.smoothstep(swim, 0.15, 1);
+      group.position.y = -0.05 + 0.06 * bob + dipY - sink;
+      // O11: under water it swims, slowly and happily: the whole body
+      // sways and drifts a little, the tail wags, the flippers paddle.
+      swimPhase += dt;
+      group.position.x = swim * 0.14 * Math.sin(swimPhase * 0.42);
+      group.rotation.z = 0.02 * Math.sin((t * TAU) / 4 + 0.7) + swim * 0.05 * Math.sin(swimPhase * 0.8);
+      // The head turns only a little; the pupils do most of the looking.
+      // Swimming, it turns nearly side-on to the camera, so its tail shows.
+      const turnToSwim = 0.9 * MathUtils.smoothstep(swim, 0.3, 1);
+      group.rotation.y =
+        lookAim.x * HEAD_TURN.yaw * look + turnToSwim + swim * 0.08 * Math.sin(swimPhase * 0.55 + 0.4);
       group.rotation.x = -lookAim.y * HEAD_TURN.pitch * look + 0.012 * Math.sin((t * TAU) / 8);
+      parts.update(t, swim, mascot.still);
 
-      // Eyes: both move by the same amount in their sockets.
-      const sock = EYES_3D.socket;
-      const turn = MathUtils.clamp(eyeAim.x * sock.phi, -sock.phi, sock.phi);
-      const rho = MathUtils.clamp(rho0 + eyeAim.y * sock.rho, rho0 - sock.rho, rho0 + sock.rho);
-      for (let i = 0; i < eyes.length; i++) {
-        surface(EYE_SIDE[i] * EYES_3D.phi + turn, rho, scratch);
-        eyes[i].eye.position.copy(scratch.pos).addScaledVector(scratch.normal, 0.012 * MASCOT_R);
-        negNormal.copy(scratch.normal).negate();
-        m4.lookAt(origin, negNormal, up);
-        eyes[i].eye.quaternion.setFromRotationMatrix(m4);
+      // Pupils: over the white towards the pointer, on the white's curve.
+      const px = MathUtils.clamp(eyeAim.x, -1, 1) * EYES_3D.pupil * R_EYE;
+      const py = MathUtils.clamp(eyeAim.y, -1, 1) * EYES_3D.pupil * R_EYE * 0.85;
+      const d2 = Math.min(0.95, (px * px + py * py) / (R_EYE * R_EYE));
+      const pz = WHITE_SINK + WHITE_DEPTH * Math.sqrt(1 - d2) - 0.17 * R_EYE;
+      for (const e of eyes) {
+        e.pupil.position.set(px, py, pz);
+        e.glint.position.set(px - 0.22 * R_EYE, py + 0.24 * R_EYE, pz + 0.24 * R_EYE);
+        e.glintSmall.position.set(px + 0.2 * R_EYE, py - 0.15 * R_EYE, pz + 0.25 * R_EYE);
       }
 
       // Blink: scale-Y to 0.1 and back in 140 ms, every 4 to 7 s.
@@ -503,20 +599,20 @@ export function createMascot(opts: MascotOptions): Mascot {
       const bp = (t - blinkStart) / 0.14;
       const blink = bp >= 0 && bp <= 1 ? 1 - 0.9 * Math.sin(Math.PI * bp) : 1;
       for (const e of eyes) {
-        e.eyeMesh.scale.y = EYES_3D.r * blink;
-        e.glow.scale.y = EYES_3D.r * GLOW * (0.35 + 0.65 * blink);
+        e.lid.scale.y = blink;
+        e.glow.scale.y = R_EYE * GLOW * (0.35 + 0.65 * blink);
       }
-      glowMat.uniforms.uIntensity.value = 0.8 + 0.12 * Math.sin(t * 1.3);
+      glowMat.uniforms.uIntensity.value = 0.3 + 0.05 * Math.sin(t * 1.3);
 
       // Foam breathes with the bob and thins out while the creature is under.
       foamMat.uniforms.uTime.value = t;
-      const submerged = MathUtils.clamp(-dipY / DIP_DEPTH, 0, 1);
+      const submerged = MathUtils.clamp((-dipY + sink) / DIP_DEPTH, 0, 1);
       foamMat.uniforms.uAmount.value = (0.42 + 0.14 * bob) * (1 - 0.7 * submerged);
       foam.scale.setScalar(1 + 0.035 * bob);
 
       // A breath every 5 to 9 s, never while it is diving after a click.
       if (!mascot.still && t >= nextSpout) {
-        if (t - dipStart > 1.8) breathe();
+        if (t - dipStart > 1.8 && sink < 0.2) breathe();
         nextSpout = t + 5 + Math.random() * 4;
       }
       if (spoutAlive) updateSpout(dt);

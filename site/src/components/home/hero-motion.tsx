@@ -52,13 +52,50 @@ export function HeroCopyMotion({ children }: { children: React.ReactNode }) {
  * scrolled away its bottom edge crossed the underwater view as a hard
  * horizontal band (the owner's −2 m to −5 m frames). It is gone at 0.46 of
  * the hero, before the stage starts to move (0.55). The DOM hero keeps it.
+ *
+ * WEB-5 O11: on a phone the wash rises from the bottom over most of the
+ * stage, and the 3D whale's eyes, in the room above the copy, read grey
+ * through it. Over the live lake on a phone the wash now fades out above
+ * the copy: it is clear from 48 px above the bottom of the creature's room
+ * (`data-hero-room`, which R12 keeps at least 16 px above the eyebrow) and
+ * full at that bottom, so the copy keeps all of its contrast.
  */
 export function HeroWashFade({ children }: { children: React.ReactNode }) {
   const { mode } = useLandingMode();
   const live = mode === "full";
+  const ref = React.useRef<HTMLDivElement>(null);
   const washOpacity = useTransform(useProgress(), [0.28, 0.46], live ? [1, 0] : [1, 1]);
+
+  React.useEffect(() => {
+    const el = ref.current;
+    const room = el?.parentElement?.querySelector<HTMLElement>("[data-hero-room]");
+    if (!live || !el || !room) return;
+    const place = () => {
+      if (window.innerWidth >= 768) {
+        el.style.removeProperty("mask-image");
+        el.style.removeProperty("-webkit-mask-image");
+        return;
+      }
+      const bottom = room.getBoundingClientRect().bottom - el.getBoundingClientRect().top;
+      const mask = `linear-gradient(180deg, transparent ${Math.max(0, bottom - 48).toFixed(0)}px, #000 ${bottom.toFixed(0)}px)`;
+      el.style.setProperty("mask-image", mask);
+      el.style.setProperty("-webkit-mask-image", mask);
+    };
+    place();
+    const ro = new ResizeObserver(place);
+    ro.observe(room);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [live]);
+
   return (
-    <m.div aria-hidden="true" className="pointer-events-none absolute inset-0" style={live ? { opacity: washOpacity } : undefined} key={live ? "live" : "still"}>
+    <m.div
+      ref={ref}
+      aria-hidden="true"
+      className="pointer-events-none absolute inset-0"
+      style={live ? { opacity: washOpacity } : undefined}
+      key={live ? "live" : "still"}
+    >
       {children}
     </m.div>
   );
