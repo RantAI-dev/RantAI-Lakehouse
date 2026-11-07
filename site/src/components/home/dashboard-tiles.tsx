@@ -4,8 +4,9 @@ import type { HomeCopy } from "@/lib/copy";
 /**
  * The three drawn dashboard tiles of S5 (the dot map and the calendar are
  * `dashboard-tiles-static.tsx`, WEB-5 review fix R6), as SVG with made-up,
- * deterministic numbers; the section says "Illustrations, not customer
- * data." Colours stay in the page palette: lake blue and foam on glass.
+ * deterministic numbers; each tile's accessible name says it is
+ * illustrative (O32 removed the visible caption). Colours stay in the page
+ * palette: lake blue and foam on glass.
  *
  * WEB-5 owner QA O10: they move like a live dashboard, all in CSS ("the
  * living tiles" in app/globals.css), started and paused by `live-tile.tsx`.

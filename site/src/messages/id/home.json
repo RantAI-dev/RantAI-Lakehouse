@@ -147,7 +147,6 @@
       "Tautan publik berbatas waktu dan bersandi",
       "Embed"
     ],
-    "caption": "Ilustrasi, bukan data pelanggan.",
     "tiles": {
       "line": {
         "title": "Kunjungan dari waktu ke waktu",
@@ -210,7 +209,6 @@
   "governance": {
     "headline": "Aman sejak awal.",
     "sub": "Peran menentukan siapa melihat apa, sampai ke tiap kolom.",
-    "illustration": "Ilustrasi · orang fiktif",
     "viewAs": "Lihat sebagai",
     "roles": {
       "analyst": "Analis",

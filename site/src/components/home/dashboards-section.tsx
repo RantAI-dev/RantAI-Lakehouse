@@ -65,11 +65,9 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
           </Container>
         </>
       }
-      after={
-        <Container className="relative z-10 mt-5">
-          <p className="text-[12px] text-[#E8F4FF]/65">{copy.caption}</p>
-        </Container>
-      }
+      // O32: no visible "Illustrations, not customer data." line (the owner's decision); each
+      // tile's accessible name still says it is illustrative.
+      after={null}
     >
       {TILE_IDS.map((id) => {
         const tile = copy.tiles[id];

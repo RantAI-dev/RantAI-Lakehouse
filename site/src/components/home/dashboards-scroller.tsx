@@ -18,7 +18,7 @@ export function DashboardsScroller({
 }: {
   /** Inside the stage, before the rail: the shore and the heading block. */
   before: React.ReactNode;
-  /** Inside the stage, after the rail: the caption. */
+  /** Inside the stage, after the rail (none since O32 removed the caption). */
   after: React.ReactNode;
   /** The rail's `<li>` items. */
   children: React.ReactNode;

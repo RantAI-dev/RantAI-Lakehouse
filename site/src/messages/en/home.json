@@ -147,7 +147,6 @@
       "Public links with expiry and password",
       "Embeds"
     ],
-    "caption": "Illustrations, not customer data.",
     "tiles": {
       "line": {
         "title": "Visits over time",
@@ -210,7 +209,6 @@
   "governance": {
     "headline": "Guarded by default.",
     "sub": "Roles decide who sees what, down to the column.",
-    "illustration": "Illustration · fictional people",
     "viewAs": "View as",
     "roles": {
       "analyst": "Analyst",

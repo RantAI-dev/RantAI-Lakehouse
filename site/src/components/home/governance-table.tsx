@@ -64,12 +64,11 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
       ref={tableRef}
       className="overflow-hidden rounded-3xl border border-[#E8F4FF]/12 bg-[#020514]/60 shadow-[0_40px_120px_-50px_rgba(68,166,250,0.45),inset_0_1px_0_rgba(232,244,255,0.06)] backdrop-blur-md"
     >
+      {/* O32: no visible "Illustration" label (the owner's decision; the data is plainly fictional and the
+          caption for screen readers stays). The policy chip leads; the switch sits at the right. */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E8F4FF]/10 px-4 py-3 md:px-6">
-        <p className="text-[13px] text-[#E8F4FF]/55">{copy.illustration}</p>
-        <div className="flex flex-wrap items-center gap-2.5">
-          <PolicyChip copy={copy} role={role} />
-          <RoleToggle copy={copy} role={role} onChange={choose} />
-        </div>
+        <PolicyChip copy={copy} role={role} />
+        <RoleToggle copy={copy} role={role} onChange={choose} />
       </div>
       <p aria-live="polite" className="sr-only">
         {copy.status[role]}
