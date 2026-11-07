@@ -22,7 +22,7 @@ export const LINKS = {
    * heading, the section that installs the stack (confirmed in README.md).
    */
   install: `${REPO}#quickstart`,
-  email: "mailto:contact@rantai.dev",
+  email: "mailto:contacts@rantai.dev",
   source: REPO,
   /**
    * DOC-2: the step-by-step user guide. It lives in the public repository, so
@@ -32,7 +32,12 @@ export const LINKS = {
   rantai: "https://rantai.dev",
 } as const;
 
-export const CONTACT_EMAIL = "contact@rantai.dev";
+/**
+ * The address every contact path writes to: the same mailbox as rantai.dev
+ * (rantai-page `src/lib/config.ts`, changed there in `fcf05a2`). Owner
+ * decision 2026-11-07: `contacts@`, with an s.
+ */
+export const CONTACT_EMAIL = "contacts@rantai.dev";
 
 /**
  * WEB-5 D21: the four questions the home page answers before the final

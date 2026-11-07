@@ -31,8 +31,8 @@ test("the body is the message, then who sent it", () => {
 });
 
 test("the mailto URL goes to the given address with an encoded subject and body", () => {
-  const url = contactMailto("contact@rantai.dev", fields, en.form);
-  assert.ok(url.startsWith("mailto:contact@rantai.dev?subject="), url);
+  const url = contactMailto("contacts@rantai.dev", fields, en.form);
+  assert.ok(url.startsWith("mailto:contacts@rantai.dev?subject="), url);
   const q = new URL(url).search.slice(1);
   const [s, b] = q.split("&");
   assert.equal(decodeURIComponent(s.replace(/^subject=/, "")), "RantAI Lakehouse · Product walkthrough · Mira Okafor");
