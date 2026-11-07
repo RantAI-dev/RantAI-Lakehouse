@@ -163,7 +163,8 @@ export type Journey = { anchors: Anchor[]; depths: DepthsRange | null };
  *   zone's own gradient, and only its colour where that cover ends shows.
  * - The depths pin starts on Bronze (−10 m) and ends on Gold (−90 m).
  * - O33: there is no climb and no surface at the end any more; the last
- *   chapter (the final call) is the deepest point.
+ *   chapter (the final call) is the deepest point, reached as its top comes
+ *   onto the screen (O42), where the gauge then fades out.
  */
 export function journeyFromBoxes(
   chapters: readonly { id: string; depth: number }[],
@@ -176,7 +177,9 @@ export function journeyFromBoxes(
   for (const c of chapters) {
     const box = boxes[c.id];
     if (!box) continue;
-    anchors.push({ at: box.top - half, depth: c.depth });
+    // O42: the bottom is reached as the final call comes onto the screen
+    // (its top at the screen's bottom), before its night sea is in view.
+    anchors.push({ at: c.id === "final" ? box.top - viewportH : box.top - half, depth: c.depth });
     if (c.id === "hero" && opts.holdSurfaceThroughHero) {
       anchors.push({ at: box.top + box.height - viewportH, depth: c.depth });
     }

@@ -12,7 +12,9 @@ const TICKS = [...new Set([0, ...JOURNEY.map((c) => c.depth), ...SLAB_DEPTHS])].
 /**
  * WEB-5 D14 S3: where the visitor is in the dive, the whole way down
  * (O33: one descent, from the surface to the bottom at −400 m, on a
- * square-root scale, `gaugeFraction`).
+ * square-root scale, `gaugeFraction`). O42: it reaches the bottom as the
+ * final call comes on screen and fades out over the next 60 % of a screen,
+ * as the final's night sea scrolls in.
  * - Wide screens (1360 px and up): a thin scale on the left edge, 0 m at the top and the deepest
  *   point at the bottom, with a tick for each chapter, a marker and the
  *   reading in metres. Inside the depths section it hides, because that
@@ -46,6 +48,8 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
     if (!root) return;
     let anchors: Anchor[] = [];
     let depths: DepthsRange | null = null;
+    // O42: where the final call's night sea begins; the gauge fades out as it comes in.
+    let finalTop = Infinity;
     let frame = 0;
     let last = "";
 
@@ -53,6 +57,8 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
       // R9: the same measurement as the water, holding 0 m through the
       // hero's pin because this reading is on screen over the hero.
       ({ anchors, depths } = measureJourney({ holdSurfaceThroughHero: true }));
+      const final = document.getElementById("final");
+      finalTop = final ? final.getBoundingClientRect().top + window.scrollY : Infinity;
       paint();
     };
     const paint = () => {
@@ -62,9 +68,15 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
       const inDepths = depths !== null && y >= depths.top - window.innerHeight * 0.25 && y <= depths.top + depths.span;
       const f = gaugeFraction(depth);
       const text = formatDepth(depth);
-      const key = `${f.toFixed(3)}|${text}|${inDepths}`;
+      // O42: the reading has reached the bottom as the final call comes on
+      // screen; it fades out while the night sea scrolls in (no climb to 0 m).
+      const vh = window.innerHeight;
+      const fade = Math.min(1, Math.max(0, (y - (finalTop - vh)) / (0.6 * vh)));
+      const opacity = (1 - fade).toFixed(2);
+      const key = `${f.toFixed(3)}|${text}|${inDepths}|${opacity}`;
       if (key === last) return;
       last = key;
+      root.style.opacity = opacity;
       root.style.setProperty("--lk-gauge-f", f.toFixed(4));
       root.toggleAttribute("data-in-depths", inDepths);
       if (readingRef.current) readingRef.current.textContent = text;

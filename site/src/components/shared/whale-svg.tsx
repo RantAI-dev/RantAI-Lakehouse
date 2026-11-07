@@ -22,6 +22,13 @@ import { WhaleEye } from "./whale-motion";
  */
 
 export const WHALE_VIEW = { w: 600, h: 480 } as const;
+/**
+ * WEB-5 O42: where the water meets the whale when it floats at the
+ * surface, in its own units: just above the belly line's highest point
+ * (y 331), so above the water only the dome and the eyes show, as in the
+ * hero.
+ */
+export const WHALE_WATERLINE = 318;
 
 /*
  * Proportions from the 3D whale (O11), at 137 units per world unit, so the
@@ -56,11 +63,25 @@ const GROOVES = [-3, -2, -1, 0, 1, 2, 3].map((k) => {
 /** The scoped motion: blink, paddle, wag, spout. Unique names, so nothing else on the page can collide. */
 const MOTION_CSS = `
 @media (prefers-reduced-motion: no-preference) {
+  .lk-w-spout { animation: lk-w-spout 9.5s cubic-bezier(0.2, 0.7, 0.3, 1) 2.2s infinite both; }
+  .lk-w-drop { animation: lk-w-drop 9.5s cubic-bezier(0.3, 0.6, 0.5, 1) 2.2s infinite both; }
   .lk-w-lid { transform-box: fill-box; transform-origin: 50% 50%; animation: lk-w-blink 5.6s ease-in-out infinite; }
   .lk-w-lid-b { animation-delay: 0.04s; }
   .lk-w-fin-l { transform-box: fill-box; transform-origin: 90% 20%; animation: lk-w-paddle 3.2s ease-in-out infinite; }
   .lk-w-fin-r { transform-box: fill-box; transform-origin: 10% 20%; animation: lk-w-paddle-r 3.2s ease-in-out infinite; }
   .lk-w-tail { transform-box: fill-box; transform-origin: 0% 100%; animation: lk-w-wag 2.8s ease-in-out infinite; }
+}
+.lk-w-spout, .lk-w-drop { opacity: 0; transform-box: fill-box; transform-origin: 50% 100%; }
+@keyframes lk-w-spout {
+  0% { opacity: 0; transform: translateY(18px) scale(0.35, 0.2); }
+  5% { opacity: 1; transform: translateY(0) scale(1, 1.05); }
+  14% { opacity: 0.9; transform: translateY(-4px) scale(1.05, 1); }
+  24%, 100% { opacity: 0; transform: translateY(-10px) scale(1.12, 0.95); }
+}
+@keyframes lk-w-drop {
+  0%, 4% { opacity: 0; transform: translateY(10px); }
+  8% { opacity: 1; }
+  24%, 100% { opacity: 0; transform: translateY(46px); }
 }
 @keyframes lk-w-blink { 0%, 94%, 100% { transform: scaleY(1); } 96.5% { transform: scaleY(0.1); } }
 @keyframes lk-w-paddle { 0%, 100% { transform: rotate(-4deg); } 50% { transform: rotate(9deg); } }
@@ -68,7 +89,20 @@ const MOTION_CSS = `
 @keyframes lk-w-wag { 0%, 100% { transform: rotate(-5deg); } 50% { transform: rotate(6deg); } }
 `;
 
-export function WhaleSvg({ className, idPrefix = "final" }: { className?: string; idPrefix?: string }) {
+export function WhaleSvg({
+  className,
+  idPrefix = "final",
+  surface = false,
+}: {
+  className?: string;
+  idPrefix?: string;
+  /**
+   * O42: floating at the surface, as in the hero. Only what is above the
+   * water is drawn (the dome, the eyes and, every few seconds, a little
+   * spout); the belly, the flippers and the tail are left out.
+   */
+  surface?: boolean;
+}) {
   const id = (n: string) => `lk-w-${n}-${idPrefix}`;
   return (
     <svg viewBox={`0 0 ${WHALE_VIEW.w} ${WHALE_VIEW.h}`} className={className} aria-hidden="true" focusable="false">
@@ -109,6 +143,7 @@ export function WhaleSvg({ className, idPrefix = "final" }: { className?: string
 
       {/* The tail, as on the 3D whale: a short stalk from behind, dipping and
           curling up to a small two-lobed fluke whose tips turn up. */}
+      {!surface && (
       <g className="lk-w-tail">
         <path d="M424 330 C 480 344, 520 318, 528 250" fill="none" stroke={`url(#${id("fin")})`} strokeWidth="30" strokeLinecap="round" />
         <path
@@ -116,9 +151,11 @@ export function WhaleSvg({ className, idPrefix = "final" }: { className?: string
           fill={`url(#${id("fin")})`}
         />
       </g>
+      )}
 
       {/* The body: one round, chubby shape, with a soft plastic sheen. */}
       <path d={BODY_PATH} fill={`url(#${id("body")})`} />
+      {!surface && (
       <g clipPath={`url(#${id("clip")})`}>
         {/* The belly, rising a little towards the middle, with its grooves. */}
         <path d={`M${BELLY.x0} ${BELLY.ySide} Q 300 ${BELLY.yCtrl} ${BELLY.x1} ${BELLY.ySide} L ${BELLY.x1} 440 L ${BELLY.x0} 440 Z`} fill={`url(#${id("belly")})`} />
@@ -128,6 +165,7 @@ export function WhaleSvg({ className, idPrefix = "final" }: { className?: string
         {/* A soft shade along the bottom, so the round body has weight. */}
         <ellipse cx="300" cy="420" rx="192" ry="60" fill="#0b2a66" fillOpacity="0.16" />
       </g>
+      )}
       <ellipse cx="222" cy="152" rx="96" ry="50" fill={`url(#${id("sheen")})`} transform="rotate(-20 222 152)" />
       {/* The lake-blue rim along the upper right, as the moonlight draws it on the 3D dome. */}
       <path
@@ -140,8 +178,12 @@ export function WhaleSvg({ className, idPrefix = "final" }: { className?: string
       />
 
       {/* Flippers, low on the sides, paddling. */}
-      <path className="lk-w-fin-l" d="M124 300 C 92 310, 66 334, 60 362 C 88 358, 120 342, 142 318 Z" fill={`url(#${id("fin")})`} />
-      <path className="lk-w-fin-r" d="M476 300 C 508 310, 534 334, 540 362 C 512 358, 480 342, 458 318 Z" fill={`url(#${id("fin")})`} />
+      {!surface && (
+        <>
+          <path className="lk-w-fin-l" d="M124 300 C 92 310, 66 334, 60 362 C 88 358, 120 342, 142 318 Z" fill={`url(#${id("fin")})`} />
+          <path className="lk-w-fin-r" d="M476 300 C 508 310, 534 334, 540 362 C 512 358, 480 342, 458 318 Z" fill={`url(#${id("fin")})`} />
+        </>
+      )}
 
       {/* Eyes (O29): two plain glowing whites that blink and shift a little towards the pointer. */}
       {EYES.map((e, i) => (
@@ -150,6 +192,22 @@ export function WhaleSvg({ className, idPrefix = "final" }: { className?: string
         </g>
       ))}
 
+      {/* O42: a little spout every few seconds while it floats at the surface. */}
+      {surface && (
+        <>
+          <g className="lk-w-spout">
+            <path d="M300 86 C 296 56, 274 36, 248 34 C 262 42, 282 56, 292 86 Z" fill="#a9d4ff" fillOpacity="0.85" />
+            <path d="M300 86 C 304 56, 326 36, 352 34 C 338 42, 318 56, 308 86 Z" fill="#a9d4ff" fillOpacity="0.85" />
+            <ellipse cx="300" cy="40" rx="20" ry="12" fill="#d6ebff" fillOpacity="0.7" />
+          </g>
+          <g className="lk-w-drop" fill="#cfe6ff">
+            <circle cx="246" cy="44" r="4" />
+            <circle cx="356" cy="46" r="3.5" />
+            <circle cx="266" cy="30" r="2.5" />
+            <circle cx="334" cy="28" r="3" />
+          </g>
+        </>
+      )}
     </svg>
   );
 }

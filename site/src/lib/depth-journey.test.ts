@@ -120,7 +120,7 @@ test("journeyFromBoxes puts each chapter's depth where its top reaches the middl
     { at: 6200, depth: -90 },
     { at: 6700, depth: -100 },
     { at: 7700, depth: -150 },
-    { at: 8700, depth: -400 },
+    { at: 8200, depth: -400 },
   ]);
   assert.deepEqual(j.depths, { top: 3200, span: 3000 });
 });

@@ -6,23 +6,25 @@ import { MascotRising } from "@/components/shared/mascot-rising";
 import { FinalMascotStage } from "./final-mascot";
 
 /**
- * S8 — the last call, at the bottom of the dive (WEB-5 O33: one descent, so
- * no night sky and no moon here any more). The whale swims down to greet
- * the visitor and settles below the headline (O24, in SVG: lighter than a
- * second canvas; O39: on solid water; only its own glow stays). Its eyes follow a mouse a
- * little; on touch screens, where there is no pointer to follow, they
- * glance around now and then. With reduced motion it rests.
+ * S8 — the last call. WEB-5 O42 (owner, on O33's whale in the abyss: "aku
+ * lebih suka yang lama, kek beneran pemandangan laut"; the owner chose a
+ * night sea like the hero): the page closes where it began, on the night
+ * lake. A sky with stars and the moon at the upper left, the moonlit water
+ * below, and the whale's head floating at the waterline under the headline
+ * (`shared/mascot-rising.tsx`, in SVG: lighter than a second canvas). The
+ * sky starts on the page's own deepest colour (#020514), so the descent
+ * runs into it without a seam; the depth gauge has faded out by here.
  *
- * WEB-5 review fix R5: a server component; the creature and its eye are
+ * Its eyes follow a mouse a little; on touch screens they glance around now
+ * and then. With reduced motion it rests; without JavaScript the scene is
+ * static.
+ *
+ * WEB-5 review fix R5: a server component; the creature and its eyes are
  * the client leaf in `final-mascot.tsx`.
  */
 
-/**
- * Sparse marine snow over the section, very dim (O33: specks in the deep,
- * not stars). Deterministic (integer maths: the server and the browser must
- * agree).
- */
-const STARS = Array.from({ length: 22 }, (_, i) => {
+/** Deterministic star field (integer maths: the server and the browser must agree). */
+const STARS = Array.from({ length: 40 }, (_, i) => {
   const h = (n: number) => {
     let x = Math.imul(i + 1, 374761393) ^ Math.imul(n, 668265263);
     x = Math.imul(x ^ (x >>> 13), 1274126177);
@@ -43,16 +45,24 @@ export function FinalSection({ copy }: { copy: HomeCopy["final"] }) {
       // O7 + O33: without the buttons, a full-screen section left a phone a screen of empty
       // water between the headline and the whale (the stage sits at the bottom, `mt-auto`).
       // On phones the section is as tall as its content, so the whale follows the headline.
-      className="lk-fallback-bg relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[#020514] pt-28 max-md:min-h-0 max-md:gap-8 max-md:pb-6 md:pt-32"
+      // O42: the night sky is the scene, so it shows with and without JavaScript (no
+      // `lk-fallback-bg`): the page's deepest colour at the top, the hero's night blue
+      // towards the horizon, where the stage's water begins.
+      className="relative isolate flex min-h-[100svh] flex-col items-center overflow-hidden bg-[linear-gradient(180deg,#020514_0%,#050a30_55%,#0a1f55_100%)] pt-28 max-md:min-h-0 max-md:gap-8 max-md:pb-6 md:pt-32"
     >
       <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10">
         {STARS.map((s, i) => (
           <span
             key={i}
-            className="absolute rounded-full bg-[#9fc4ee]/25"
-            style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size - 0.5, height: s.size - 0.5 }}
+            className="lk-twinkle absolute rounded-full bg-[#E8F4FF]"
+            style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, animationDelay: `${s.delay}s` }}
           />
         ))}
+        {/* A small moon at the upper left, centred in its own glow, as in the hero. */}
+        <div className="absolute top-[13%] left-[13%]">
+          <div className="absolute top-1/2 left-1/2 size-[34vmin] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.18)_0%,rgba(68,166,250,0.07)_36%,transparent_68%)]" />
+          <div className="absolute top-1/2 left-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#E8F4FF] shadow-[0_0_26px_7px_rgba(232,244,255,0.4)]" />
+        </div>
       </div>
 
       <Container className="relative z-10 flex flex-col items-center text-center">
