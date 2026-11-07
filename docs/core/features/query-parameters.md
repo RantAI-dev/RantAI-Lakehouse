@@ -63,13 +63,17 @@ Linking a query's parameter to a global one is part 2.
 
 ## Asking the assistant
 
-Yes, and it is part of this feature. `run_sql` and `run_saved_query` take a
-`parameters` object that maps a parameter name to its value. A value is a
-string, a number, `{ "start", "end" }` for a date range, or a list for a
-multi-select. The assistant may also write `{{name}}` in the editor. When the
-server refuses a run, the refusal sentence comes back to the assistant as the
-tool's error, and it asks the person for the value instead of guessing. The
-AI team reviews this part.
+Yes, and it is part of this feature. `run_sql` takes a `parameters` object
+that maps a parameter name to its value: a string, a number, or
+`{ "start", "end" }` for a date range. A multi-select (a list) needs a saved
+query, so it goes through `run_saved_query`, which uses the query's stored
+definitions plus the values the model gives. When `run_saved_query` misses a
+required value, it returns "Fill in {{name}} to run this query." as the
+tool's error, and the assistant asks the person for the value instead of
+guessing. A refusal inside a tool is not written to History; the HTTP run
+records it as blocked. `save_query` refuses SQL that holds a `{{name}}`
+placeholder, because the tool cannot give definitions. The person saves such
+a query in Query Studio. The AI team reviews this part.
 
 ## Decisions
 
@@ -85,7 +89,7 @@ AI team reviews this part.
 | 8 | `{{name}}` marks a single value. A date range is written `{{name.start}}` and `{{name.end}}`. Spaces inside the braces are allowed, so `{{ region }}` works. A name follows the rule for `BI-11` parameter names: 1 to 64 letters, digits or `_`, not starting with a digit. A placeholder inside a comment (`--`, `#` or `/* */`) is ignored | none | Planner's choice, 2026-11-07 |
 | 9 | A placeholder inside a quoted string or quoted identifier refuses the run with "{{name}} is inside quotes: write it without them, for example = {{name}}." A `{{` outside quotes and comments that is not a well-formed placeholder refuses it with "This query has a {{ that is not a parameter." A bare `{{name}}` for a date range is refused the second way | none | Planner's choice, 2026-11-07 |
 | 10 | A definition is a name, a type, a default and, for a dropdown or multi-select, a list of options with a value and a label. Values are checked by type as in `BI-11`: text of at most 200 characters with no control character such as a newline, a date written `YYYY-MM-DD` between the years 1900 and 2299, a finite number, and for a dropdown or multi-select only a value from the definition's own list, which the server prints from its stored copy, not from the request's text | none | Planner's choice, 2026-11-07 |
-| 11 | On saving a query, a definition whose name is not in the SQL, or a placeholder with no definition, is refused with a fixed sentence. On a run, a placeholder with no definition is read as text, so an unsaved statement can run with values only. A run whose request carries definitions uses those and applies no such fallback. Such a placeholder is refused with "{{name}} is used in the SQL but has no definition." | none | Planner's choice, 2026-11-07 |
+| 11 | On saving a query, a definition whose name is not in the SQL, or a placeholder with no definition, is refused with a fixed sentence. On a run whose request carries no definitions, a placeholder is read from its value alone, so an unsaved statement can run with values only: a string is text, a JSON number is a number, and `{start,end}` used as `.start` and `.end` is a date range. A list is refused with "parameter 'name' is a list: a multi-select needs a saved query's definition.", with the parameter's name in place of `name`. A boolean is refused as before, and null counts as not given. When the request carries definitions, a placeholder none of them names is refused with "{{name}} is used in the SQL but has no definition." | none | Planner's choice, 2026-11-07 |
 | 12 | Printing: a number as `BI-11` prints it, a negative number in parentheses so that `-{{n}}` cannot become a `--` comment. Text as a string literal; on Trino a text that holds a backslash is written as pieces joined by `chr(92)`, for example `('a' || chr(92) || 'b')`, because the SQL guards read a backslash as an escape and Trino does not. A date as a date literal (`toDate32('YYYY-MM-DD')` on ClickHouse, `DATE 'YYYY-MM-DD'` on Trino). A date range as two dates. A multi-select as a comma-separated list of literals for `IN ({{name}})`; an empty selection is refused with "Pick at least one value for {{name}}." A dropdown prints its value as text, unless every option is a number | none | Planner's choice, 2026-11-07 |
 | 13 | The run and the estimate routes take the values and, optionally, the definitions. The server fills the placeholders as soon as it reads the statement, so the read-only check, the Trino check, the table list, the role's row filters and masks, and the settings check all see the final statement. A statement with no placeholder and no values behaves exactly as before | none | Planner's choice, 2026-11-07 |
 | 14 | History records the statement that ran, with the values printed in it, not the text with `{{name}}`. Download and "open in studio" then work without the values. Changing a saved query's parameters alone writes a version, like a change to its SQL, and edit level is enough to change them. Revert and duplicate carry the parameters | none | Planner's choice, 2026-11-07 |
@@ -106,7 +110,14 @@ AI team reviews this part.
   filled from another query. Both are part 2.
 - A string literal that contains a well-formed `{{name}}` written by hand, for
   example `'{{region}}'`, is now refused. Before, it ran as plain text.
-- A dashboard's SQL source with a placeholder is refused.
+- A dashboard's SQL source with a placeholder is refused on save and on
+  preview. A chart saved before whose SQL no longer passes shows the generic
+  "no longer passes the SQL check" message.
+- Through the HTTP run, a text value that holds a word the read-only check
+  blocks, such as `drop`, is fine because the value is one literal. Through
+  `run_sql`, the assistant's own read-only filter also reads the literal's
+  text, so a value that contains a word such as `drop` or `delete` is refused
+  there.
 - A text value may not contain a control character such as a newline, as in
   `BI-11`.
 - A query takes at most 20 parameters, a text value 200 characters, a
