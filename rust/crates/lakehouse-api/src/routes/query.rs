@@ -108,6 +108,50 @@ fn parameter_inputs(
     Ok((parameters, definitions))
 }
 
+/// The fixed sentence for a saved query's `parameters` that is not a list
+/// of definitions.
+pub(crate) const SAVED_PARAMETERS_SHAPE: &str = "parameters must be a list of parameter \
+     definitions, each with a name, a type, a default and options.";
+
+/// Check the definitions a saved query is written with against the SQL it
+/// will hold, and answer them as the JSON the store keeps (`QS-5`, D6).
+///
+/// `None` and `null` are no definitions. A list of the wrong shape, an
+/// unknown key or an unknown type is [`SAVED_PARAMETERS_SHAPE`]; serde's
+/// text would quote the caller's own JSON back (AGENTS.md principle 4).
+/// Everything else is [`crate::query_params::validate_definitions`]: a
+/// definition the SQL does not use, a placeholder with no definition, a
+/// placeholder in quotes, a stray `{{` and the limits.
+///
+/// A saved query does not record an engine; a run chooses one. The scanner
+/// reads quotes the way the run route does when it is given no engine, which
+/// is `ClickHouse` (`Engine::from_name`).
+///
+/// # Errors
+///
+/// 400 [`ApiError::BadRequest`] with a fixed sentence that names a
+/// parameter and never repeats a value.
+pub(crate) fn checked_saved_definitions(
+    sql: &str,
+    definitions: Option<Value>,
+) -> Result<Value, ApiError> {
+    let definitions: Vec<crate::query_params::QueryParamDef> = match definitions {
+        None | Some(Value::Null) => Vec::new(),
+        Some(list) => serde_json::from_value(list)
+            .map_err(|_shape| ApiError::BadRequest(SAVED_PARAMETERS_SHAPE.to_owned()))?,
+    };
+    crate::query_params::validate_definitions(
+        crate::sql_rewrite::Engine::ClickHouse,
+        sql,
+        &definitions,
+    )
+    .map_err(|refusal| ApiError::BadRequest(refusal.to_string()))?;
+    // The normal form: no `null` default and no empty options, so a list
+    // sent again in another spelling is the list that is stored.
+    serde_json::to_value(&definitions)
+        .map_err(|_shape| ApiError::BadRequest(SAVED_PARAMETERS_SHAPE.to_owned()))
+}
+
 /// Fill the `{{name}}` placeholders of `sql` with the checked literal of
 /// each value (`QS-5` part 1, D4), for the engine `engine` names.
 ///
@@ -2820,6 +2864,11 @@ pub struct CreateSavedQueryBody {
     /// or absent for the caller's own personal space.
     #[serde(default)]
     folder_id: FolderField,
+    /// `QS-5`: the definitions of the `{{name}}` parameters in `sql`. Raw
+    /// JSON so a list of the wrong shape is refused with
+    /// [`SAVED_PARAMETERS_SHAPE`], not with serde's text.
+    #[serde(default)]
+    parameters: Option<Value>,
 }
 
 /// `POST /api/query/saved` — save the SQL in the editor under a name.
@@ -2835,8 +2884,11 @@ pub struct CreateSavedQueryBody {
 ///
 /// # Errors
 ///
-/// 400 on a malformed body, a blank title/SQL or a folder that is neither
-/// an id nor the root; 401 when nobody is signed in; 404 for an
+/// 400 on a malformed body, a blank title/SQL, a folder that is neither
+/// an id nor the root, or `parameters` that do not fit the SQL (`QS-5`:
+/// the sentence of [`crate::query_params::ParamError`], or
+/// [`SAVED_PARAMETERS_SHAPE`] for a list of the wrong shape); 401 when
+/// nobody is signed in; 404 for an
 /// `X-Tenant` header the caller does not belong to, and for a folder the
 /// caller may not see; 403 for a folder the caller may see but not fill;
 /// 422 when the SQL is not read-only — a saved query is run through the
@@ -2858,6 +2910,8 @@ pub async fn create_saved(
     if !is_read_only(&sql) {
         return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
+    // `QS-5`: the definitions must fit the SQL they are saved with.
+    let parameters = checked_saved_definitions(&sql, body.parameters)?;
     let principal = principal
         .as_ref()
         .map(|Extension(p)| p)
@@ -2879,11 +2933,12 @@ pub async fn create_saved(
         parse_folder_reference(body.folder_id)?,
     )
     .await?;
-    let saved = queries::create_saved_query_at(
+    let saved = queries::create_saved_query_with_parameters(
         pool(&state)?,
         &viewer,
         &title,
         &sql,
+        &parameters,
         &owner,
         &body.tags,
         placement,
