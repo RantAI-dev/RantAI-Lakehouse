@@ -130,10 +130,11 @@ export function createShafts(count: number): Shafts {
     });
     materials.push(material);
     const mesh = new Mesh(geometry, material);
-    const width = 2.6 + ((i * 7) % 5) * 0.9;
+    const width = 3.2 + ((i * 7) % 5) * 1.1;
     mesh.scale.set(width, 40, 1);
     // Spread across and behind the scene; the centre stays clearer.
-    mesh.position.set((u - 0.5) * 30 + Math.sin(i * 2.3) * 2, -19, -8 + ((i * 5) % 7) * 1.4);
+    // Behind the creature (O8: a shaft in front of the whale read as a stripe on its body).
+    mesh.position.set((u - 0.5) * 34 + Math.sin(i * 2.3) * 2, -19, -16 + ((i * 5) % 7) * 1.2);
     mesh.rotation.order = "YXZ";
     mesh.frustumCulled = false;
     mesh.renderOrder = 5;

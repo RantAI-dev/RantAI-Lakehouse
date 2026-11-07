@@ -137,6 +137,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   // ---- Mascot ------------------------------------------------------------
   const mascot = createMascot({
+    lowQuality: phone,
     pixelRatio: dpr,
     onRipple: (amp) => water.spawnRipple(clock.t, amp),
   });
@@ -235,6 +236,10 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   const anchorHero = { x: 0, y: 0 };
   const anchorDepths = { x: 0, y: 0 };
+  // WEB-5 O8: between the hero and the depths (the sources, where the whale
+  // shows), a portrait screen frames the head on the right so the body has
+  // the width of the screen to sweep across. Wide screens keep the centre.
+  const anchorUnder = { x: 0, y: 0 };
   let distScaleHero = 1;
   let distScaleDepths = 1;
   let viewKey = "";
@@ -256,6 +261,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     anchorHero.y = wide ? 0 : 0.42;
     anchorDepths.x = wide ? 0.42 : 0;
     anchorDepths.y = wide ? -0.1 : -0.5;
+    anchorUnder.x = wide ? 0 : 0.62;
+    anchorUnder.y = wide ? 0 : 0.05;
     const tanV = Math.tan(MathUtils.degToRad(CAMERA_FOV / 2));
     // Pull the camera back until the dome fits the width of a narrow screen.
     distScaleHero = Math.max(1, 2.35 / (tanV * aspect) / 7.2);
@@ -341,8 +348,9 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   let state: SceneState = sceneStateAt(0, layout);
 
   function applyView(wHero: number, wDepths: number): void {
-    const ax = wHero * anchorHero.x + wDepths * anchorDepths.x;
-    const ay = wHero * anchorHero.y + wDepths * anchorDepths.y;
+    const wUnder = Math.max(0, 1 - wHero - wDepths);
+    const ax = wHero * anchorHero.x + wDepths * anchorDepths.x + wUnder * anchorUnder.x;
+    const ay = wHero * anchorHero.y + wDepths * anchorDepths.y + wUnder * anchorUnder.y;
     // Only rebuild the projection when the offset really moved.
     const key = `${Math.round(ax * 1000)}:${Math.round(ay * 1000)}`;
     if (key === viewKey) return;

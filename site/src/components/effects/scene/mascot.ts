@@ -21,6 +21,7 @@ import {
 } from "three";
 import { PALETTE } from "@/lib/palette";
 import { DOME_SPHERE, EYES_3D, HEAD_LONG, HEAD_TURN, MASCOT_H, MASCOT_R } from "./scene-config";
+import { createWhale } from "./whale";
 import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, SPOUT_VERT } from "./shaders";
 
 /**
@@ -43,6 +44,8 @@ import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT, SPOUT_FRAG, 
 export type Aim = { x: number; y: number };
 
 type MascotOptions = {
+  /** Phones: a lighter whale body. */
+  lowQuality: boolean;
   /** Called when the mascot disturbs the water; `amp` is 0.3 (bob) to 1 (pop). */
   onRipple: (amp: number) => void;
   pixelRatio: number;
@@ -82,8 +85,10 @@ function profile(u: number): { r: number; y: number } {
 
 function buildBodyGeometry(upperOnly = false): LatheGeometry {
   const pts: Vector2[] = [];
-  // Submerged half: a plain ellipse, reached only when the camera is below.
-  const below = 0.9 * MASCOT_R;
+  // Submerged half: a deep half-ellipsoid that sinks into the whale's
+  // throat (O8, whale.ts), so seen from below the head swells straight into
+  // the body with no neck and no edge.
+  const below = 1.45 * MASCOT_R;
   if (upperOnly) pts.push(new Vector2(0, 0), new Vector2(MASCOT_R, 0));
   else
     for (let i = 0; i <= 24; i++) {
@@ -143,6 +148,14 @@ export function createMascot(opts: MascotOptions): Mascot {
   const dome = new Mesh(bodyGeo, bodyMat);
   group.add(dome);
   disposables.push(bodyGeo, bodyMat);
+
+  // O8: the whale's body, in the same navy skin, seen only under water.
+  const whale = createWhale(bodyMat, opts.lowQuality);
+  whale.group.visible = false;
+  group.add(whale.group);
+  disposables.push(whale);
+  let clockT = 0;
+  let posedAt = -1;
 
   // ---- Eyes --------------------------------------------------------------
   // WEB-5 O3: two eyes, one each side of the front, built alike and sharing
@@ -427,10 +440,20 @@ export function createMascot(opts: MascotOptions): Mascot {
       // The spout is above the water: only the picture above shows it.
       aboveWater = uw < 0.5;
       spout.visible = spoutAlive && aboveWater;
+      whale.group.visible = !aboveWater;
+      if (!aboveWater && posedAt !== clockT) {
+        whale.update(clockT, mascot.still);
+        posedAt = clockT;
+      }
       // Under water the light is scattered from every side; a little more
       // glow keeps the body readable through the water's fog without
       // flattening it (O5: the old 1.5 made it a flat disc).
       bodyMat.emissiveIntensity = MathUtils.lerp(0.55, 0.6, uw);
+      // The environment is the night sky; under water there is no sky to
+      // reflect, only the window overhead, so the gloss mostly goes (O8: it
+      // made the throat glow white).
+      bodyMat.envMapIntensity = MathUtils.lerp(1.35, 0.22, uw);
+      bodyMat.clearcoat = MathUtils.lerp(1, 0.35, uw);
       bounce.intensity = MathUtils.lerp(0.9, 2.2, uw);
       bounce.color.copy(BOUNCE_ABOVE.sky).lerp(BOUNCE_UNDER.sky, uw);
       bounce.groundColor.copy(BOUNCE_ABOVE.ground).lerp(BOUNCE_UNDER.ground, uw);
@@ -442,6 +465,7 @@ export function createMascot(opts: MascotOptions): Mascot {
       opts.onRipple(0.8);
     },
     update(dt, t, aim, look) {
+      clockT = t;
       const k = (rate: number) => 1 - Math.exp(-dt * rate);
       // A non-finite aim would stick in the smoothing for good, so it counts as "straight ahead".
       const ax = Number.isFinite(aim.x) ? aim.x : 0;

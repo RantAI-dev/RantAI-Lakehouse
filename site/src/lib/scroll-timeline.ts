@@ -141,6 +141,8 @@ export const DIVE = {
   yAbove: 0.26,
   yBelow: -0.26,
   yUnder: -2.4,
+  /** Camera x at the `under` key: to the whale's right (O8). */
+  xUnder: 1.2,
   /** The underwater blend runs from this camera height down to the next. */
   blendTop: 0.9,
   blendBottom: -1.8,
@@ -191,7 +193,9 @@ function keysFor(layout: SceneLayout): Key[] {
     // The waterline: a slow, half-above, half-below stretch (D14 S1).
     { at: DIVE.waterlineAbove * vh, pos: [0, DIVE.yAbove, 6.7], look: [0, 0.4, 0] },
     { at: DIVE.waterlineBelow * vh, pos: [0, DIVE.yBelow, 6.6], look: [0, 0.1, 0] },
-    { at: DIVE.under * vh, pos: [0, DIVE.yUnder, 6.4], look: [0, -0.6, 0] },
+    // WEB-5 O8: under the surface the camera drifts a little to the right
+    // and looks across to the left, along the whale's body (whale.ts).
+    { at: DIVE.under * vh, pos: [DIVE.xUnder, DIVE.yUnder, 8.4], look: [-2.4, -1.7, -1.4] },
     { at: depthsTop, pos: [0, SLAB_Y[0] + 6.4, 10.2], look: [0, SLAB_Y[0] + 1, 0] },
     slabKey(0, depthsTop + span / 6),
     slabKey(1, depthsTop + span / 2),
