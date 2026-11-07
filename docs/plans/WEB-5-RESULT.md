@@ -349,3 +349,26 @@ Measured on `85187993` (D14 S1–S5), interleaved against the R7 commit
   - The final build's TBT medians are 13 ms (EN) and 28 ms (ID) above R7. Both differences are smaller than the spread of R7's own runs, which is 95–187 ms.
   - One final ID run reached 200.3 ms. The median is 136.6 ms.
   - So this is no regression that can be measured on this VM. It is no gain either.
+
+### Reviewer's run 4: `89e049e2` (R12) against `390a482f`, interleaved
+
+- **Conditions:**
+  - both builds come from a clean `git archive`, are served side by side, and are run in turn, three rounds;
+  - the Lighthouse command is the same as before;
+  - the load average was 3.8 to 7.1;
+  - there is no GPU, so these runs measure the DOM hero only.
+
+| Build | EN TBT runs | EN median | ID TBT runs | ID median |
+| --- | --- | --- | --- | --- |
+| `390a482f` (before R12) | 111.5, 96.0, 164.6 ms | **111.5 ms** | 87.2, 194.7, 132.8 ms | **132.8 ms** |
+| `89e049e2` (R12) | 105.2, 295.5, 99.3 ms | **105.2 ms** | 148.0, 162.8, 155.5 ms | **155.5 ms** |
+
+- **Every other metric held in all twelve runs:**
+  - LCP 1.06–1.13 s;
+  - CLS 0;
+  - accessibility, SEO and best practices 100;
+  - performance 93–100.
+- **Initial JS:** 181.5 KB.
+- **Reading:** every target is met.
+  - EN run 2 of R12, at 295.5 ms, was taken at the highest load of the session (7.1). The other two EN runs of R12 are below the earlier build's median.
+  - The ID median is 23 ms higher. That is within the spread of the earlier build's own runs, 87–195 ms.

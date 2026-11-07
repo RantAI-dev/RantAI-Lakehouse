@@ -1422,6 +1422,32 @@ This changes D6 for one thing: type.
 
 **Open: R12 (BLOCKER).**
 
+### Review 9: planner, 2026-11-07, at `89e049e2` (R12)
+
+**What the reviewer re-ran** (clean `git archive`, fresh install):
+- lint 0, typecheck 0;
+- tests: 65 pass, 0 fail;
+- the build exits 0;
+- `bun run size` exits 0: initial JS is 181.5 KB, and the override is not in the export.
+
+**R12: closed.**
+- **The reviewer's probe** (built export, DOM hero, the creature's box `[data-hero-creature]` against the eyebrow), EN / ID:
+
+  | Screen | Gap, EN / ID | Buttons end |
+  | --- | --- | --- |
+  | 360×640 | 16 / 16 px | y 544 of 640 |
+  | 360×740 | 85 / 63 px | y 644 of 740 |
+  | 375×667 | 16 / 16 px | y 571 of 667 |
+  | 390×844 | 46 / 19 px | y 716 of 844 |
+  | 412×915 | 97 / 70 px | y 787 of 915 |
+
+- **No horizontal overflow** at any of these sizes.
+- **Before and after** (`r12-hero-short-dom.jpg`): the creature sits above the copy on the short screens.
+- **The live 3D framing.** It changes only where the 3D creature would reach the copy. It was checked by eye by the developer under SwiftShader, not by the reviewer. A phone with a GPU is still not verified.
+- **Lighthouse:** "Reviewer's run 4" in `WEB-5-RESULT.md`. TBT medians are EN 105.2 ms and ID 155.5 ms, LCP is about 1.07 s and CLS 0. Every target is met.
+
+**No open finding.** Next: the owner's QA on this build (:3400), then CI on `89e049e2` or later, then the PR marked ready.
+
 ## 9. Addendum: the story, top to bottom (owner, 2026-11-04)
 
 The owner's QA asked:
