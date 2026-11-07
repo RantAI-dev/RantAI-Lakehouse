@@ -429,12 +429,49 @@ html:not([data-scene]) .lk-gauge {
   animation: lk-shimmer 1.6s linear infinite;
 }
 
+/* WEB-5 P4 micro-details (DESIGN.md §3). A state that appears (the form's
+   "Nothing opened?" line, a copy button's feedback) eases in instead of
+   popping. */
+@keyframes lk-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+.lk-fade-in {
+  animation: lk-fade-in 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* The FAQ's answers open and close smoothly where the browser can animate
+   a <details> (`::details-content` with `interpolate-size`); elsewhere they
+   open at once, which is the same disclosure without the ease. */
+.lk-faq {
+  interpolate-size: allow-keywords;
+}
+.lk-faq details::details-content {
+  block-size: 0;
+  overflow: clip;
+  opacity: 0;
+  transition:
+    block-size 260ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 200ms ease-out,
+    content-visibility 260ms allow-discrete;
+}
+.lk-faq details[open]::details-content {
+  block-size: auto;
+  opacity: 1;
+}
+
 /* ---- Reduced motion --------------------------------------------------- */
 
 @media (prefers-reduced-motion: reduce) {
+  .lk-faq details::details-content {
+    transition: none;
+  }
   html:has(.lk-root) {
     scroll-behavior: auto;
   }
+  .lk-root .lk-fade-in,
   .lk-root .lk-bob,
   .lk-root .lk-drop,
   .lk-root .lk-caustic-a,

@@ -13,6 +13,11 @@ import type { SuggestionText } from "./language-suggestion";
  * middleware, so each language is its own set of files and `lang` is fixed
  * per file (D10).
  *
+ * The Content Security Policy is not rendered here: React places a `<meta>`
+ * after Next's own script tags, where it would not cover them, so
+ * `scripts/csp-meta.ts` writes it into every exported page straight after
+ * `<meta charset>` (WEB-5 D18).
+ *
  * No messages reach the browser as a whole: every text is read on the
  * server and handed to the client leaves as props, and there is no
  * `NextIntlClientProvider`, so neither the message files nor next-intl's

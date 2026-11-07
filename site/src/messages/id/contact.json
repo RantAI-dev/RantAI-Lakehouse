@@ -33,6 +33,7 @@
     "fallback": "Tidak terbuka? Kirim ke {email}.",
     "copy": "Salin alamat",
     "copied": "Tersalin",
+    "copyFailed": "Terpilih: tekan Ctrl+C atau ⌘C",
     "required": "Mohon diisi",
     "invalidEmail": "Masukkan alamat email yang valid",
     "subject": "RantAI Lakehouse · {topic} · {name}",

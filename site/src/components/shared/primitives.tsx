@@ -42,12 +42,19 @@ type CtaProps = React.AnchorHTMLAttributes<HTMLAnchorElement> & {
   size?: "md" | "sm";
 };
 
-/** A real `<a>` (plan §2.8): works without JavaScript and with a keyboard. */
-export function CtaLink({ variant = "solid", size = "md", className, children, ...rest }: CtaProps) {
+/**
+ * A real `<a>` (plan §2.8): works without JavaScript and with a keyboard.
+ * WEB-5 D18: a link to another site always carries `rel="noopener
+ * noreferrer"`, whatever the caller passes. Pressing it settles it back
+ * down (DESIGN.md §3: no button stays still when clicked).
+ */
+export function CtaLink({ variant = "solid", size = "md", className, children, rel, ...rest }: CtaProps) {
+  const external = typeof rest.href === "string" && /^https?:\/\//.test(rest.href);
   return (
     <a
+      rel={external ? "noopener noreferrer" : rel}
       className={cn(
-        "group relative inline-flex items-center justify-center gap-2 rounded-full font-medium whitespace-nowrap transition-[transform,background-color,box-shadow,border-color] duration-300 ease-out",
+        "group relative inline-flex items-center justify-center gap-2 rounded-full font-medium whitespace-nowrap transition-[transform,background-color,box-shadow,border-color] duration-300 ease-out active:translate-y-0 active:scale-[0.98] active:duration-100 motion-reduce:transition-none motion-reduce:hover:translate-y-0",
         size === "md" ? "h-12 px-7 text-[15px]" : "h-9 px-4 text-[13px]",
         variant === "solid"
           ? "bg-[#44A6FA] text-[#020514] shadow-[0_0_0_0_rgba(68,166,250,0)] hover:-translate-y-0.5 hover:bg-[#6bbaff] hover:shadow-[0_10px_40px_-8px_rgba(68,166,250,0.7)]"

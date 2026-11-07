@@ -51,6 +51,7 @@
     "dismiss": "Tutup, tetap dalam bahasa Inggris"
   },
   "notFound": {
+    "meta": "Halaman tidak ditemukan",
     "title": "Halaman ini tidak ada.",
     "body": "Tautannya mungkin usang, atau halamannya sudah pindah.",
     "home": "Kembali ke beranda"

@@ -15,7 +15,7 @@
   },
   "scripts": {
     "dev": "bun --bun next dev -p 3400",
-    "build": "next build",
+    "build": "next build && bun scripts/csp-meta.ts",
     "lint": "bun --bun eslint",
     "typecheck": "bun --bun tsc --noEmit",
     "test": "bun test src",

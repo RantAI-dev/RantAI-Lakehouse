@@ -33,6 +33,7 @@
     "fallback": "Nothing opened? Write to {email}.",
     "copy": "Copy address",
     "copied": "Copied",
+    "copyFailed": "Selected: press Ctrl+C or ⌘C",
     "required": "Please fill this in",
     "invalidEmail": "Enter a valid email address",
     "subject": "RantAI Lakehouse · {topic} · {name}",

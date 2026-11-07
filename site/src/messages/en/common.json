@@ -51,6 +51,7 @@
     "dismiss": "Close, stay in Indonesian"
   },
   "notFound": {
+    "meta": "Page not found",
     "title": "This page is not here.",
     "body": "The link may be old, or the page has moved.",
     "home": "Back to the home page"

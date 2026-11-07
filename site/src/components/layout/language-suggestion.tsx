@@ -76,7 +76,7 @@ export default function LanguageSuggestion({ text }: Readonly<{ text: Suggestion
             href={localizedPath("id", pathname)}
             hrefLang="id"
             onClick={() => remember("id")}
-            className="inline-flex h-10 shrink-0 items-center rounded-full bg-[#44A6FA] px-3.5 text-[13px] font-medium text-[#020514] transition-colors hover:bg-[#6bbaff] focus-visible:outline-2 focus-visible:outline-offset-3 focus-visible:outline-[#44A6FA] sm:h-auto sm:px-3.5 sm:py-1.5"
+            className="inline-flex h-10 shrink-0 items-center rounded-full bg-[#44A6FA] px-3.5 text-[13px] font-medium text-[#020514] transition-[background-color,transform] duration-200 ease-out hover:bg-[#6bbaff] active:scale-[0.97] focus-visible:outline-2 focus-visible:outline-offset-3 focus-visible:outline-[#44A6FA] sm:h-auto sm:px-3.5 sm:py-1.5"
           >
             {text.view}
           </a>
@@ -84,7 +84,7 @@ export default function LanguageSuggestion({ text }: Readonly<{ text: Suggestion
             type="button"
             onClick={() => remember("en")}
             aria-label={text.dismiss}
-            className="grid size-10 shrink-0 place-items-center rounded-full text-[#E8F4FF]/70 transition-colors hover:bg-[#E8F4FF]/10 hover:text-[#E8F4FF] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#44A6FA] sm:size-8"
+            className="grid size-10 shrink-0 place-items-center rounded-full text-[#E8F4FF]/70 transition-[background-color,color,transform] duration-200 ease-out hover:bg-[#E8F4FF]/10 hover:text-[#E8F4FF] active:scale-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#44A6FA] sm:size-8"
           >
             <X className="size-4" />
           </button>

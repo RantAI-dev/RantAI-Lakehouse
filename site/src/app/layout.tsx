@@ -27,6 +27,9 @@ export const metadata: Metadata = {
     apple: "/apple-touch-icon.png",
   },
   manifest: "/site.webmanifest",
+  // WEB-5 D18: the host header cannot be relied on before a host is chosen
+  // (D2), so the meta tag says it: other sites see the origin, not the path.
+  referrer: "strict-origin-when-cross-origin",
   appleWebApp: { title: SITE_NAME },
 };
 
