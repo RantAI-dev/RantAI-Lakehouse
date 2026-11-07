@@ -94,20 +94,43 @@
     "headline": "Cukup tanya.",
     "sub": "Asisten memakai tool yang sama dengan konsol. Ia menjawab pertanyaan, membuat chart dan dashboard, serta menjalankan pipeline. Apa pun yang berisiko menunggu persetujuan manusia. Lebih suka SQL? Query Studio punya autocomplete, tab, dan riwayat query.",
     "caption": "Ilustrasi",
+    "name": "Asisten",
+    "status": {
+      "ready": "Siap",
+      "working": "Bekerja"
+    },
+    "placeholder": "Tanyakan apa saja tentang lakehouse Anda…",
+    "modes": {
+      "ask": "Ask",
+      "build": "Build"
+    },
+    "send": "Kirim",
     "userOne": "Wilayah mana yang paling banyak pengunjungnya kuartal lalu?",
+    "steps": {
+      "read": "Membaca",
+      "group": "Mengelompokkan per wilayah",
+      "check": "Memeriksa pipeline",
+      "done": "2 langkah"
+    },
     "answerOne": "Wilayah Utara paling banyak pengunjungnya kuartal lalu.",
-    "userTwo": "Jeda pipeline penjualan malam.",
-    "approvalLabel": "Menunggu persetujuan",
-    "approvalAction": "Jeda pipeline",
-    "approve": "Setujui",
-    "decline": "Tolak",
     "regions": {
       "north": "Utara",
       "south": "Selatan",
       "east": "Timur",
       "west": "Barat"
     },
-    "srDescription": "Ilustrasi asisten. Seseorang bertanya wilayah mana yang paling banyak pengunjungnya kuartal lalu, dan asisten menjawab dengan bar chart kecil. Lalu ia meminta pipeline penjualan malam dijeda, dan asisten menampilkan kartu yang menunggu seseorang menyetujui atau menolak perubahan itu. Nama wilayah dan angkanya hanya ilustrasi."
+    "unit": "kunjungan",
+    "numberLocale": "id-ID",
+    "userTwo": "Jeda pipeline penjualan malam.",
+    "approvalAction": "Jeda pipeline",
+    "impact": "Jadwal 02.00 malam ini berhenti",
+    "approvalLabel": "Menunggu persetujuan",
+    "reviewer": "Ditinjau Admin",
+    "approve": "Setujui",
+    "decline": "Tolak",
+    "approvedLabel": "Disetujui",
+    "approvedBy": "Disetujui Admin · baru saja",
+    "srDescription": "Ilustrasi asisten. Seseorang bertanya wilayah mana yang paling banyak pengunjungnya kuartal lalu; asisten membaca tabel Gold, mengelompokkannya per wilayah, dan menjawab dengan bar chart yang dipimpin Utara. Lalu ia meminta pipeline penjualan malam dijeda. Asisten tidak menjalankannya sendiri: ia menampilkan permintaan yang menunggu persetujuan, dan seorang admin menyetujuinya. Nama wilayah dan angkanya hanya ilustrasi."
   },
   "dashboards": {
     "headline": "Jawabannya naik jadi dashboard.",

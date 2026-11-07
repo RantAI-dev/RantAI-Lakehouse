@@ -67,6 +67,18 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.depths.card.feeds", backlog: ["WEB-1 In Acceptance", "AI-18 In Acceptance"], note: "dashboards and the assistant read Gold" },
   // Assistant section (Query Studio, D7)
   { key: "home.assistant.sub", backlog: ["QS-1 In Acceptance", "QS-4 In Acceptance"], note: "autocomplete, tabs, query history" },
+  // O19 (2026-11-07): the assistant panel is an illustration, but every
+  // behaviour it plays is the console's own.
+  { key: "home.assistant.placeholder", backlog: ["AI-18 In Acceptance"], note: "the console composer's own placeholder (src/features/copilot/chat-composer.tsx)" },
+  { key: "home.assistant.modes.build", backlog: ["AI-18 In Acceptance"], note: "the composer's Ask/Build switch; Build can change things, asking first" },
+  { key: "home.assistant.steps.read", backlog: ["AI-18 In Acceptance", "AI-24 Done"], note: "a turn shows its tool steps as they run and keeps them (tool-step.tsx; AI-24)" },
+  {
+    key: "home.assistant.approvalLabel",
+    backlog: ["AI-18 In Acceptance"],
+    note: "pause_pipeline is a WriteHigh tool: \"Needs human approval before it runs\" (registry.rs); it waits in Approvals and nothing executes until a person approves (gate.rs)",
+  },
+  { key: "home.assistant.impact", backlog: ["AI-18 In Acceptance"], note: "pause_pipeline pauses the pipeline's schedule; the 02:00 run is the illustration's" },
+  { key: "home.assistant.approvedBy", backlog: ["AI-18 In Acceptance", "SEC-57 Done"], note: "another person approves: the one who asked cannot approve their own request (SEC-57)" },
   // Dashboards
   // O10 (2026-11-07): the dashboards' feature list became one line and a row of chips; each chip is its own claim.
   {

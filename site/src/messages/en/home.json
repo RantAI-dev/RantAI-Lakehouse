@@ -94,20 +94,43 @@
     "headline": "Ask, don't dig.",
     "sub": "The assistant works with the same tools as the console. It answers questions, builds charts and dashboards, and runs pipelines. Anything risky waits for a person to approve it. Prefer SQL? Query Studio has autocomplete, tabs and a query history.",
     "caption": "Illustration",
+    "name": "Assistant",
+    "status": {
+      "ready": "Ready",
+      "working": "Working"
+    },
+    "placeholder": "Ask anything about your lakehouse…",
+    "modes": {
+      "ask": "Ask",
+      "build": "Build"
+    },
+    "send": "Send",
     "userOne": "Which region had the most visitors last quarter?",
+    "steps": {
+      "read": "Reading",
+      "group": "Grouping by region",
+      "check": "Checking pipeline",
+      "done": "2 steps"
+    },
     "answerOne": "Region North had the most visitors last quarter.",
-    "userTwo": "Pause the nightly sales pipeline.",
-    "approvalLabel": "Waiting for approval",
-    "approvalAction": "Pause pipeline",
-    "approve": "Approve",
-    "decline": "Decline",
     "regions": {
       "north": "North",
       "south": "South",
       "east": "East",
       "west": "West"
     },
-    "srDescription": "An illustration of the assistant. A person asks which region had the most visitors last quarter and the assistant answers with a small bar chart. The person then asks to pause the nightly sales pipeline, and the assistant shows a card that waits for a person to approve or decline the change. The region names and numbers are illustrative."
+    "unit": "visits",
+    "numberLocale": "en-US",
+    "userTwo": "Pause the nightly sales pipeline.",
+    "approvalAction": "Pause pipeline",
+    "impact": "Stops tonight's 02:00 run",
+    "approvalLabel": "Waiting for approval",
+    "reviewer": "Admin reviews",
+    "approve": "Approve",
+    "decline": "Decline",
+    "approvedLabel": "Approved",
+    "approvedBy": "Approved by Admin · just now",
+    "srDescription": "An illustration of the assistant. A person asks which region had the most visitors last quarter; the assistant reads a Gold table, groups it by region and answers with a bar chart where North leads. The person then asks to pause the nightly sales pipeline. The assistant does not do it on its own: it shows a request that waits for approval, and an admin approves it. The region names and numbers are illustrative."
   },
   "dashboards": {
     "headline": "Answers come back up as dashboards.",

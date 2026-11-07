@@ -1,49 +1,41 @@
 import * as React from "react";
 import type { HomeCopy } from "@/lib/copy";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
-import { ProgressSection } from "@/components/shared/progress-section";
 import { SplitWords } from "@/components/shared/reveal";
 import { AssistantChat } from "./assistant-chat";
 
 /**
- * S4 — "Ask, don't dig": the assistant, with a scripted chat that scrolling
- * plays and un-plays.
+ * S4 — "Ask, don't dig": the assistant, with a chat that plays once when it
+ * comes into view.
  *
- * The chat is DOM, not a screenshot, and every step is a pure function of
- * scroll progress, so scrolling back rewinds it: the typing, the thinking
- * shimmer, the answer with its bar chart, the second question, and the
- * approval card. Nothing here talks to an API. The mock is decorative
- * (`aria-hidden`); a visually hidden sentence describes it, and it is
- * labelled "Illustration" on screen. With reduced motion the finished
+ * WEB-5 O19: the chat no longer follows the scroll. It was a 260 vh pinned
+ * stage that typed and un-typed with every scroll step; now the section is
+ * one screen tall and the panel tells its own story in time
+ * (`assistant-chat.tsx`), then rests. The chat is DOM, not a screenshot, and
+ * nothing in it talks to an API. The mock is decorative (`aria-hidden`); a
+ * visually hidden sentence describes it, and it is labelled "Illustration"
+ * on screen. Without JavaScript and with reduced motion the finished
  * conversation is shown at once.
  *
- * WEB-5 review fix R5: a server component; the chat is the client leaf in
- * `assistant-chat.tsx`.
+ * A server component: the only client code is the panel's player.
  */
 
 type AssistantCopy = HomeCopy["assistant"];
 
 export function AssistantSection({ copy }: { copy: AssistantCopy }) {
   return (
-    <ProgressSection range={["start start", "end end"]} id="assistant" className="lk-fallback-bg relative h-[260vh] bg-[#050A30] motion-reduce:h-auto">
-      <div className="sticky top-0 flex h-[100svh] items-center overflow-hidden motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
-        <Caustics />
-        {/* WEB-5 D14 S4: tighter phone spacing (gap-4, the lead at mt-3, and the
-            chat's own spacing in assistant-chat.tsx) so the pinned stage fits a
-            360x740 screen, where it overflowed by up to 45 px; desktop is unchanged. */}
-        <Container className="relative z-10 grid items-center gap-4 pt-16 md:grid-cols-[1fr_1.1fr] md:gap-14 md:pt-0">
-          <div>
-            <DisplayHeading size="lg" className="max-md:text-[clamp(2.6rem,12vw,3.4rem)]">
-              <SplitWords text={copy.headline} />
-            </DisplayHeading>
-            <LeadText className="mt-3 max-w-[32rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
-              {copy.sub}
-            </LeadText>
-          </div>
-          <AssistantChat copy={copy} />
-        </Container>
-      </div>
-    </ProgressSection>
+    <section id="assistant" className="lk-fallback-bg relative overflow-hidden bg-[#050A30]">
+      <Caustics />
+      <Container className="relative z-10 grid min-h-[100svh] items-center gap-10 py-24 md:grid-cols-[1fr_1.1fr] md:gap-14 md:py-28">
+        <div>
+          <DisplayHeading size="lg" className="max-md:text-[clamp(2.6rem,12vw,3.4rem)]">
+            <SplitWords text={copy.headline} />
+          </DisplayHeading>
+          <LeadText className="mt-3 max-w-[32rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">{copy.sub}</LeadText>
+        </div>
+        <AssistantChat copy={copy} />
+      </Container>
+    </section>
   );
 }
 

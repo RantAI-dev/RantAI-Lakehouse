@@ -1,270 +1,317 @@
-"use client";
-
 import * as React from "react";
-import { m, useMotionValueEvent, useTransform, type MotionValue } from "framer-motion";
+import { ArrowUp, Check, Clock, GitBranch, Pause } from "lucide-react";
+import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";
 import { APPROVAL_TARGET, REGIONS } from "@/lib/home-content";
-import { useProgress } from "@/components/shared/progress-section";
 import { MascotMark } from "@/components/shared/mascot-svg";
-import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
+import { AssistantPlay } from "./assistant-play";
+import { ALL_STEPS, S } from "./assistant-steps";
 
 /**
- * The assistant section's scripted chat: the client leaf of
- * `assistant-section.tsx` (WEB-5 review fix R5). The heading, the lead and
- * the caustic lights render on the server there.
+ * WEB-5 O19: the assistant panel of "Ask, don't dig" (owner, 2026-11-07:
+ * "ui ini juga jelek banget, coba perbaiki"). A product-grade chat that
+ * tells its story by moving, once, when it comes into view, then rests:
+ *
+ * 1. the first question types into the composer and is sent;
+ * 2. the assistant works through two steps (reading a Gold table, grouping
+ *    it by region), which fold into a "2 steps" summary;
+ * 3. the answer streams in word by word, and the bars grow one after
+ *    another, the leader in the lake accent; a bar shows its value on hover;
+ * 4. the composer switches from Ask to Build (the console's own modes) and
+ *    the second request is sent;
+ * 5. the approval card, the hero moment: the assistant does not pause the
+ *    pipeline itself, the request waits for approval, and an admin approves
+ *    it ("Approved by Admin · just now"). That is the claim: a person
+ *    approves risky actions (AI-18), and not the person who asked (SEC-57).
+ *
+ * WEB-5 D5 and the initial-JS budget: this is a server component, and every
+ * state of the conversation is CSS keyed on one attribute, `data-s`, the
+ * list of steps reached (`assistant-steps.ts`). The server renders the last
+ * step, so without JavaScript, under reduced motion, and when the panel is
+ * already on screen at hydration the finished conversation shows, still.
+ * `AssistantPlay` (a few lines of client code) rewinds it only when it will
+ * be seen playing, and loads the timed script (`assistant-script.ts`) as a
+ * separate chunk when the panel comes into view. Nothing follows the scroll.
+ *
+ * The mock is decorative (`aria-hidden`), described by a visually hidden
+ * sentence, and labelled "Illustration" on screen (D7).
  */
 
 type AssistantCopy = HomeCopy["assistant"];
 
-/** Beats of the script, as fractions of the pinned scroll. */
-const T = {
-  type1: [0.05, 0.25],
-  think1: [0.25, 0.34],
-  answer: [0.34, 0.42],
-  bars: [0.4, 0.58],
-  type2: [0.6, 0.72],
-  think2: [0.72, 0.78],
-  approval: [0.78, 0.9],
-} as const;
+/** The Gold table the illustrative answer reads: generic, not a client's. */
+const SOURCE_TABLE = "gold.visits_by_region";
 
-const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
-const span = (p: number, [a, b]: readonly [number, number]) => clamp01((p - a) / (b - a));
-
-/** The chat, driven by the enclosing section's scroll progress. */
 export function AssistantChat({ copy }: { copy: AssistantCopy }) {
-  const reduced = useReducedMotionSafe();
-  const progress = useProgress();
-  return <ChatWindow copy={copy} progress={progress} reduced={reduced} />;
-}
-
-// Every `m` element below whose style switches on `reduced` is keyed on it:
-// before motion's features load an `m` element keeps the style it first
-// rendered (WEB-5 review fix R1), and `reduced` is only known after
-// hydration, so a switch of style must remount the element. Each key also
-// names its element: siblings must not share a key (R1 follow-up).
-function ChatWindow({ copy, progress, reduced }: { copy: AssistantCopy; progress: MotionValue<number>; reduced: boolean }) {
-  // Opacity and travel of each beat, from the same progress.
-  const frame = useTransform(progress, [0, 0.05], [0, 1]);
-  const think1 = useTransform(progress, [T.think1[0], T.think1[0] + 0.02, T.think1[1] - 0.02, T.think1[1]], [0, 1, 1, 0]);
-  const answerO = useTransform(progress, [T.answer[0], T.answer[1]], [0, 1]);
-  const answerY = useTransform(progress, [T.answer[0], T.answer[1]], [18, 0]);
-  const think2 = useTransform(progress, [T.think2[0], T.think2[0] + 0.02, T.think2[1] - 0.02, T.think2[1]], [0, 1, 1, 0]);
-  const approvalO = useTransform(progress, [T.approval[0], T.approval[1]], [0, 1]);
-  const approvalY = useTransform(progress, [T.approval[0], T.approval[1]], [34, 0]);
-  const approvalS = useTransform(progress, [T.approval[0], T.approval[1]], [0.96, 1]);
-
+  const fmt = new Intl.NumberFormat(copy.numberLocale, { notation: "compact", maximumFractionDigits: 1 });
+  const full = new Intl.NumberFormat(copy.numberLocale);
+  const leader = copy.regions.north;
   const max = REGIONS[0].value;
+
   return (
     <div>
       <p className="sr-only">{copy.srDescription}</p>
-      {/* `data-reveal`: without JavaScript the finished conversation shows, as with reduced motion (D5). */}
-      <m.div
-        data-reveal
-        aria-hidden="true"
-        className="overflow-hidden rounded-3xl border border-[#E8F4FF]/12 bg-[#020514]/70 shadow-[0_30px_120px_-30px_rgba(68,166,250,0.35)] backdrop-blur-xl"
-        key={reduced ? "frame-reduced" : "frame-motion"}
-        style={reduced ? { opacity: 1 } : { opacity: frame }}
-      >
-        <div className="flex items-center justify-between border-b border-[#E8F4FF]/10 px-4 py-2 md:py-3">
-          <div className="flex items-center gap-1.5">
-            <span className="size-2.5 rounded-full bg-[#E8F4FF]/20" />
-            <span className="size-2.5 rounded-full bg-[#E8F4FF]/20" />
-            <span className="size-2.5 rounded-full bg-[#E8F4FF]/20" />
-          </div>
-          <p className="text-[11px] tracking-[0.2em] text-[#E8F4FF]/60 uppercase">{copy.caption}</p>
-        </div>
-
-        <div className="space-y-2 px-4 py-3 md:space-y-4 md:px-5 md:py-5">
-          {/* Question one */}
-          <TypedQuestion text={copy.userOne} beat={T.type1} progress={progress} reduced={reduced} />
-
-          {/* Answer one: thinking, then the answer with its chart. Heights are reserved so nothing jumps. */}
-          <div className="relative min-h-[120px] pl-7 md:min-h-[158px] md:pl-9">
-            <GuideMark />
-            <m.div
-              className="absolute top-0 left-7 flex h-9 md:left-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
-              key={reduced ? "think1-reduced" : "think1-motion"}
-              style={reduced ? { opacity: 0 } : { opacity: think1 }}
-            >
-              <Dots />
-            </m.div>
-            <m.div
-              data-reveal
-              className="rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-3.5 py-3 md:max-w-[92%] md:px-4"
-              key={reduced ? "answer-reduced" : "answer-motion"}
-              style={reduced ? { opacity: 1, y: 0 } : { opacity: answerO, y: answerY }}
-            >
-              <p className="text-[13px] leading-5 text-[#E8F4FF] md:text-[15px] md:leading-6">{copy.answerOne}</p>
-              <div className="mt-3 flex h-[52px] items-end gap-2.5 md:h-[68px] md:gap-3">
-                {REGIONS.map((r, i) => (
-                  <Bar key={r.key} progress={progress} index={i} height={r.value / max} reduced={reduced} label={copy.regions[r.key]} value={r.value} />
-                ))}
-              </div>
-            </m.div>
+      <AssistantPlay>
+        <div aria-hidden="true" className="lk-ast lk-ast-still" data-s={ALL_STEPS}>
+          {/* Header: the guide's mark (WEB-5 D14 S4), its name and state, and the illustration tag. */}
+          <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-[#E8F4FF]/10 px-4">
+            <span className="lk-ast-avatar grid size-7 place-items-center rounded-full">
+              <MascotMark className="h-[14px] w-auto" />
+            </span>
+            <span className="text-[14px] leading-5 font-medium text-[#E8F4FF]">{copy.name}</span>
+            <span className="lk-ast-state inline-flex items-center gap-1.5 text-[12px] leading-4 text-[#E8F4FF]/70">
+              <span className="lk-ast-state-dot size-1.5 rounded-full" />
+              <span className="lk-ast-state-ready">{copy.status.ready}</span>
+              <span className="lk-ast-state-working">{copy.status.working}</span>
+            </span>
+            <span className="ml-auto rounded-full border border-[#E8F4FF]/15 px-2 py-0.5 text-[11px] leading-4 text-[#E8F4FF]/70">
+              {copy.caption}
+            </span>
           </div>
 
-          {/* Question two */}
-          <TypedQuestion text={copy.userTwo} beat={T.type2} progress={progress} reduced={reduced} />
+          {/* The conversation, anchored to the composer like a real chat: new messages push the older ones up. */}
+          <div className="lk-ast-log relative flex min-h-0 flex-1 flex-col justify-end px-4 pt-4 pb-3">
+            {/* The empty chat before the first question: the guide, waiting. */}
+            <span className="lk-ast-empty pointer-events-none absolute inset-0 grid place-items-center">
+              <MascotMark className="h-12 w-auto" />
+            </span>
+            <Grow from={S.ask1}>
+              <UserBubble text={copy.userOne} />
+            </Grow>
 
-          {/* Answer two: thinking, then the approval card. */}
-          <div className="relative min-h-[92px] pl-7 md:min-h-[104px] md:pl-9">
-            <GuideMark />
-            <m.div
-              className="absolute top-0 left-7 flex h-9 md:left-9 items-center gap-1.5 rounded-2xl rounded-bl-md bg-[#E8F4FF]/[0.06] px-4"
-              key={reduced ? "think2-reduced" : "think2-motion"}
-              style={reduced ? { opacity: 0 } : { opacity: think2 }}
-            >
-              <Dots />
-            </m.div>
-            <m.div
-              data-reveal
-              className="rounded-2xl border border-[#44A6FA]/45 bg-[#44A6FA]/[0.08] p-3.5 md:p-4"
-              key={reduced ? "approval-reduced" : "approval-motion"}
-              style={reduced ? { opacity: 1, y: 0, scale: 1 } : { opacity: approvalO, y: approvalY, scale: approvalS }}
-            >
-              <div className="flex items-center gap-2">
-                <span className="lk-pulse size-2 rounded-full bg-[#44A6FA]" />
-                <p className="text-[11px] tracking-[0.16em] text-[#44A6FA] uppercase">
-                  {copy.approvalLabel}
-                </p>
+            <Grow from={S.think1a}>
+              <div className="flex gap-2.5">
+                <GuideMark />
+                <div className="min-w-0 flex-1">
+                  {/* The work, while it runs; then folded into one line. */}
+                  <Grow from={S.think1a} until={S.answer}>
+                    <ol className="space-y-1.5 pt-1 pb-2">
+                      <WorkStep doneAt={S.think1b} label={copy.steps.read} code={SOURCE_TABLE} />
+                      <Grow from={S.think1b}>
+                        <WorkStep doneAt={S.answer} label={copy.steps.group} />
+                      </Grow>
+                    </ol>
+                  </Grow>
+                  <Grow from={S.answer}>
+                    <span className="lk-ast-summary inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] leading-4">
+                      <Check className="size-3" strokeWidth={2.75} />
+                      {copy.steps.done}
+                      <span className="text-[#E8F4FF]/40">·</span>
+                      <code className="!text-[11px] !leading-4">{SOURCE_TABLE}</code>
+                    </span>
+                    <div className="lk-ast-answer mt-2 rounded-2xl rounded-tl-md px-3.5 py-3">
+                      <p className="text-[14px] leading-[21px] text-[#E8F4FF]">
+                        {copy.answerOne.split(" ").map((w, i) => (
+                          <span
+                            key={i}
+                            className={cn("lk-ast-word", w.replace(/[.,]/g, "") === leader && "font-semibold text-[#8FCBFF]")}
+                            style={{ animationDelay: `${i * 55}ms` }}
+                          >
+                            {w}{" "}
+                          </span>
+                        ))}
+                      </p>
+                      <Chart copy={copy} fmt={fmt} full={full} max={max} />
+                    </div>
+                  </Grow>
+                </div>
               </div>
-              <p className="mt-2 text-[13px] leading-5 text-[#E8F4FF] md:text-[15px]">
-                {copy.approvalAction} <code className="text-[#E8F4FF]">{APPROVAL_TARGET}</code>
+            </Grow>
+
+            <Grow from={S.ask2}>
+              <UserBubble text={copy.userTwo} />
+            </Grow>
+
+            <Grow from={S.think2}>
+              <div className="flex gap-2.5">
+                <GuideMark />
+                <div className="min-w-0 flex-1">
+                  <Grow from={S.think2} until={S.card}>
+                    <ol className="pt-1 pb-2">
+                      <WorkStep doneAt={S.card} label={copy.steps.check} code={APPROVAL_TARGET} />
+                    </ol>
+                  </Grow>
+                  <Grow from={S.card}>
+                    <ApprovalCard copy={copy} />
+                  </Grow>
+                </div>
+              </div>
+            </Grow>
+          </div>
+
+          {/* The composer: the console's placeholder and its Ask / Build modes. */}
+          <div className="shrink-0 px-3 pb-3">
+            <div className="lk-ast-composer rounded-2xl px-3.5 pt-3 pb-2.5">
+              {/* One line: while a question types, the line keeps its end in view, like a real input. */}
+              <p className="relative flex h-5 justify-end overflow-hidden text-[14px] leading-5 text-[#E8F4FF]">
+                <span className="lk-ast-placeholder absolute inset-0 truncate text-[#E8F4FF]/50">{copy.placeholder}</span>
+                <span className="mr-auto shrink-0 whitespace-pre">
+                  <span data-typed />
+                  <span className="lk-ast-caret ml-px inline-block h-[1.05em] w-px translate-y-[3px] bg-[#8FCBFF]" />
+                </span>
               </p>
-              <div className="mt-3 flex gap-2">
-                <span className="rounded-full bg-[#44A6FA] px-4 py-1.5 text-[12px] font-medium text-[#020514]">
-                  {copy.approve}
+              <div className="mt-1.5 flex items-center justify-between">
+                <span className="lk-ast-modes relative inline-flex rounded-lg bg-[#E8F4FF]/[0.06] p-0.5 text-[12px] leading-4 font-medium">
+                  <span className="lk-ast-mode-thumb absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-md" />
+                  <span className="lk-ast-mode relative min-w-12 px-2.5 py-1 text-center" data-mode="ask">
+                    {copy.modes.ask}
+                  </span>
+                  <span className="lk-ast-mode relative min-w-12 px-2.5 py-1 text-center" data-mode="build">
+                    {copy.modes.build}
+                  </span>
                 </span>
-                <span className="rounded-full border border-[#E8F4FF]/30 px-4 py-1.5 text-[12px] text-[#E8F4FF]">
-                  {copy.decline}
+                <span className="lk-ast-send grid size-8 place-items-center rounded-full text-white" title={copy.send}>
+                  <ArrowUp className="size-4" strokeWidth={2.5} />
                 </span>
               </div>
-            </m.div>
+            </div>
           </div>
         </div>
-      </m.div>
+      </AssistantPlay>
     </div>
   );
 }
 
-function Bar({
-  progress,
-  index,
-  height,
-  reduced,
-  label,
-  value,
-}: {
-  progress: MotionValue<number>;
-  index: number;
-  height: number;
-  reduced: boolean;
-  label: string;
-  value: number;
-}) {
-  const a = T.bars[0] + index * 0.025;
-  const scaleY = useTransform(progress, [a, a + 0.08], [0, 1]);
+/** Opens its content's height from zero, so a new message pushes the log up instead of jumping it. */
+function Grow({ from, until, children }: { from: number; until?: number; children: React.ReactNode }) {
   return (
-    <div className="flex h-full flex-1 flex-col justify-end gap-1">
-      <m.div
-        data-reveal
-        className="w-full origin-bottom rounded-t-md bg-gradient-to-t from-[#44A6FA]/60 to-[#44A6FA]"
-        key={reduced ? "reduced" : "motion"}
-        style={{ height: `${Math.round(height * 100)}%`, scaleY: reduced ? 1 : scaleY }}
-      />
-      <span className="text-center text-[9px] leading-3 text-[#E8F4FF]/60 md:text-[10px]">
-        {label} {Math.round(value / 100) / 10}k
-      </span>
+    <div className="lk-ast-grow" data-from={from} data-until={until}>
+      <div className="min-h-0">{children}</div>
     </div>
   );
 }
 
-/**
- * WEB-5 D14 S4, the guide: the assistant's side of the chat carries the
- * creature's mark, the same character the visitor met at the surface and
- * will see rise again at the end. Decorative, like the whole mock, which is
- * `aria-hidden` and described in words for assistive tech.
- */
+function UserBubble({ text }: { text: string }) {
+  return (
+    <div className="flex justify-end">
+      <p className="lk-ast-user max-w-[85%] rounded-2xl rounded-br-md px-3.5 py-2 text-[14px] leading-5 text-[#E8F4FF]" data-q>
+        {text}
+      </p>
+    </div>
+  );
+}
+
+/** WEB-5 D14 S4, the guide: the assistant's side carries the creature's mark the visitor met at the surface. */
 function GuideMark() {
   return (
-    // Phones: a 20 px mark and a 28 px indent, with the answer at full width,
-    // so the text has the width it had before the mark (the pinned stage still
-    // fits 360x740).
-    <span className="absolute top-1 left-0 grid size-5 place-items-center rounded-full bg-[#44A6FA]/15 ring-1 ring-[#44A6FA]/35 md:size-7">
-      <MascotMark className="h-3 w-auto md:h-[15px]" />
+    <span className="lk-ast-avatar mt-0.5 grid size-7 shrink-0 place-items-center rounded-full">
+      <MascotMark className="h-[14px] w-auto" />
     </span>
   );
 }
 
-function Dots() {
+function WorkStep({ doneAt, label, code }: { doneAt: number; label: string; code?: string }) {
   return (
-    <>
-      {[0, 1, 2].map((i) => (
-        <span
-          key={i}
-          className="lk-twinkle size-1.5 rounded-full bg-[#E8F4FF]/70"
-          style={{ animationDelay: `${i * 0.25}s` }}
-        />
-      ))}
-    </>
+    <li className="lk-ast-step flex items-center gap-2 text-[12px] leading-5" data-done-at={doneAt}>
+      <span className="lk-ast-step-icon grid size-4 shrink-0 place-items-center rounded-full">
+        <Check className="lk-ast-step-check size-2.5" strokeWidth={3} />
+      </span>
+      <span className="lk-ast-step-label min-w-0 truncate">
+        {label}
+        {code && (
+          <>
+            {" "}
+            <code className="!text-[11.5px] !leading-5 text-[#E8F4FF]/85">{code}</code>
+          </>
+        )}
+      </span>
+    </li>
   );
 }
 
 /**
- * A question that types itself as the section scrolls, and un-types when it
- * scrolls back. WEB-5 D5: the typed text, the bubble's visibility and the
- * caret are written straight to the DOM through refs, and only when the
- * character count changes, so scrolling never re-renders the chat (it used
- * to be React state updated from every scroll event). The server HTML holds
- * the whole question, so it reads without JavaScript; the first effect sets
- * it to the current scroll position.
+ * The answer's chart: a baseline, a value on each bar and the leader in the
+ * accent, the others muted. Vertical bars where the panel is wide, and
+ * horizontal ones on a phone (a container query), both from one list.
  */
-function TypedQuestion({
-  text,
-  beat,
-  progress,
-  reduced,
+function Chart({
+  copy,
+  fmt,
+  full,
+  max,
 }: {
-  text: string;
-  beat: readonly [number, number];
-  progress: MotionValue<number>;
-  reduced: boolean;
+  copy: AssistantCopy;
+  fmt: Intl.NumberFormat;
+  full: Intl.NumberFormat;
+  max: number;
 }) {
-  const bubbleRef = React.useRef<HTMLParagraphElement>(null);
-  const textRef = React.useRef<HTMLSpanElement>(null);
-  const caretRef = React.useRef<HTMLSpanElement>(null);
-  const shown = React.useRef(-1);
-
-  const apply = React.useCallback(
-    (p: number) => {
-      const n = reduced ? text.length : Math.round(span(p, beat) * text.length);
-      if (n === shown.current) return;
-      shown.current = n;
-      if (textRef.current) textRef.current.textContent = text.slice(0, n);
-      bubbleRef.current?.classList.toggle("invisible", n === 0);
-      if (caretRef.current) caretRef.current.hidden = !(n > 0 && n < text.length);
-    },
-    [text, beat, reduced],
-  );
-  React.useEffect(() => {
-    shown.current = -1;
-    apply(progress.get());
-  }, [apply, progress]);
-  useMotionValueEvent(progress, "change", apply);
-
   return (
-    <div className="flex min-h-9 justify-end">
-      <p
-        ref={bubbleRef}
-        className="max-w-[88%] rounded-2xl rounded-br-md bg-[#44A6FA]/20 px-3.5 py-2 text-[13px] leading-5 text-[#E8F4FF] md:text-[15px] md:leading-6"
-      >
-        <span ref={textRef}>{text}</span>
-        <span
-          ref={caretRef}
-          hidden
-          className="lk-twinkle ml-0.5 inline-block h-[1em] w-px translate-y-[2px] bg-[#E8F4FF]"
-        />
+    <div className="lk-ast-chart mt-3">
+      <ol className="lk-ast-bars">
+        {REGIONS.map((r, i) => (
+          <li
+            key={r.key}
+            className="lk-ast-bar-item"
+            data-lead={i === 0 || undefined}
+            style={{ "--v": r.value / max, "--i": i } as React.CSSProperties}
+          >
+            <span className="lk-ast-bar-label">{copy.regions[r.key]}</span>
+            <span className="lk-ast-bar-track">
+              <span className="lk-ast-bar" />
+              <span className="lk-ast-bar-value tabular-nums">{fmt.format(r.value)}</span>
+              <span className="lk-ast-tip tabular-nums">
+                {copy.regions[r.key]} · {full.format(r.value)} {copy.unit}
+              </span>
+            </span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function ApprovalCard({ copy }: { copy: AssistantCopy }) {
+  return (
+    // The status sits on the card's top edge, like a tag, so the title keeps the full width on a phone.
+    <div className="lk-ast-card relative mt-3 rounded-2xl p-3.5 md:p-4">
+      <span className="lk-ast-pill absolute -top-3 right-3 inline-flex h-6 items-center rounded-full px-2.5 text-[12px] leading-4 font-medium whitespace-nowrap">
+        <span className="lk-ast-pill-wait inline-flex items-center gap-1.5">
+          <span className="lk-ast-pill-dot size-1.5 rounded-full" />
+          {copy.approvalLabel}
+        </span>
+        <span className="lk-ast-pill-ok absolute inset-0 inline-flex items-center justify-center gap-1">
+          <Check className="size-3.5" strokeWidth={3} />
+          {copy.approvedLabel}
+        </span>
+      </span>
+      <div className="flex min-w-0 items-center gap-2.5">
+        <span className="lk-ast-card-icon grid size-9 shrink-0 place-items-center rounded-xl">
+          <Pause className="size-4" strokeWidth={2.5} fill="currentColor" />
+        </span>
+        <div className="min-w-0">
+          <p className="truncate text-[15px] leading-5 font-semibold text-[#E8F4FF]">{copy.approvalAction}</p>
+          <p className="mt-1 flex items-center gap-1.5">
+            <GitBranch className="size-3 text-[#E8F4FF]/60" strokeWidth={2.25} />
+            <code className="lk-ast-chip rounded-md px-1.5 !text-[12px] !leading-[18px] text-[#E8F4FF]">{APPROVAL_TARGET}</code>
+          </p>
+        </div>
+      </div>
+      <p className="mt-3 flex items-center gap-1.5 text-[13px] leading-5 text-[#E8F4FF]/80">
+        <Clock className="size-3.5 shrink-0 text-[#E8F4FF]/60" strokeWidth={2.25} />
+        {copy.impact}
       </p>
+      <div className="relative mt-3 h-9 border-t border-[#E8F4FF]/10 pt-3 [box-sizing:content-box]">
+        <div className="lk-ast-decide absolute inset-x-0 bottom-0 flex h-9 items-center justify-between gap-2">
+          <span className="flex min-w-0 items-center gap-2 text-[12px] leading-4 text-[#E8F4FF]/70">
+            <span className="lk-ast-admin grid size-6 shrink-0 place-items-center rounded-full text-[11px] font-semibold text-[#E8F4FF]">A</span>
+            {/* "Admin" is the console's role name, the same in both languages; a phone shows only it. */}
+            <span className="lk-ast-reviewer truncate">{copy.reviewer}</span>
+            <span className="lk-ast-reviewer-short">Admin</span>
+          </span>
+          <span className="flex shrink-0 gap-2">
+            <span className="lk-ast-btn lk-ast-decline inline-flex h-9 items-center rounded-full px-4 text-[13px] font-medium">{copy.decline}</span>
+            <span className="lk-ast-btn lk-ast-approve inline-flex h-9 items-center rounded-full px-4 text-[13px] font-semibold text-white">
+              {copy.approve}
+            </span>
+          </span>
+        </div>
+        <p className="lk-ast-done absolute inset-x-0 bottom-0 flex h-9 items-center gap-2 text-[13px] leading-5 font-medium">
+          <span className="lk-ast-done-icon grid size-6 place-items-center rounded-full">
+            <Check className="size-3.5" strokeWidth={3} />
+          </span>
+          {copy.approvedBy}
+        </p>
+      </div>
     </div>
   );
 }
