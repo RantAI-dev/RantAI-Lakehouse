@@ -35,19 +35,7 @@ export function LanguageSwitcher({
   text,
   className,
   size = "sm",
-  otherPath,
-}: Readonly<{
-  locale: Locale;
-  text: CommonCopy["language"];
-  className?: string;
-  size?: "sm" | "lg";
-  /**
-   * Where the other languages' links go, when this page has no
-   * translation: the English-only labs send ID to the Indonesian home page,
-   * not to an /id/lab/ that does not exist.
-   */
-  otherPath?: string;
-}>) {
+}: Readonly<{ locale: Locale; text: CommonCopy["language"]; className?: string; size?: "sm" | "lg" }>) {
   const pathname = usePathname();
 
   return (
@@ -60,7 +48,7 @@ export function LanguageSwitcher({
         return (
           <a
             key={l}
-            href={localizedPath(l, current ? pathname : (otherPath ?? pathname))}
+            href={localizedPath(l, pathname)}
             hrefLang={l}
             lang={l}
             aria-current={current ? "true" : undefined}

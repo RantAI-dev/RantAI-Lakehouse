@@ -33,8 +33,7 @@ import { MascotMark } from "@/components/shared/mascot-svg";
  * scroll is locked while it is open, and it slides in and out with CSS
  * (`.lk-sheet`, app/globals.css), still under reduced motion.
  */
-/** `lab`: the WEB-5 hero explorations (`app/(en)/lab/`); links lead to the home page, nothing is current. */
-export type TopBarPage = "home" | "contact" | "lab";
+export type TopBarPage = "home" | "contact";
 
 const pill =
   "inline-block rounded-full px-3.5 py-2 text-[14px] text-[#E8F4FF]/70 transition-[background-color,color,transform] duration-200 ease-out hover:bg-[#E8F4FF]/[0.08] hover:text-[#E8F4FF] active:scale-[0.97] active:bg-[#E8F4FF]/[0.14] aria-[current]:bg-[#E8F4FF]/[0.12] aria-[current]:text-[#E8F4FF] motion-reduce:transition-none";
@@ -216,7 +215,7 @@ export function TopBar({
           </nav>
         </div>
         <div className="flex items-center gap-2">
-          <LanguageSwitcher locale={locale} text={language} otherPath={page === "lab" ? "/" : undefined} className="hidden lg:flex" />
+          <LanguageSwitcher locale={locale} text={language} className="hidden lg:flex" />
           {/* WEB-5 D20: to the page's own "Get started", which links on to the README. */}
           {/* rantai-page's PillLink in the bar: h-10 px-4, h-9 from lg, text-sm. */}
           <CtaLink href={anchor("#get-started")} size="sm" className="h-10 px-4 text-sm lg:h-9">
@@ -285,7 +284,7 @@ export function TopBar({
               </li>
             ))}
           </ul>
-          <LanguageSwitcher locale={locale} text={language} otherPath={page === "lab" ? "/" : undefined} size="lg" className="mt-8 self-start" />
+          <LanguageSwitcher locale={locale} text={language} size="lg" className="mt-8 self-start" />
         </nav>
       </dialog>
     </header>
