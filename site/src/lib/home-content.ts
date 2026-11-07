@@ -35,6 +35,13 @@ export const LINKS = {
 export const CONTACT_EMAIL = "contact@rantai.dev";
 
 /**
+ * WEB-5 D21: the four questions the home page answers before the final
+ * call, as indexes into `contact.faq.items`: is it open source (free), can
+ * it run on our servers, what can it connect to, how do we install it.
+ */
+export const HOME_FAQ = [1, 2, 3, 7] as const;
+
+/**
  * WEB-5 D20: the three steps of `#get-started`, word for word from the
  * README's Quickstart (README.md, "## Quickstart"): commands are not
  * translated. Each step's words are `home.getStarted.steps.<i>`, and each

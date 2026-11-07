@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { routing } from "../i18n/routing";
+import { HOME_FAQ } from "../lib/home-content";
 import { CLAIMS, FORBIDDEN } from "./claims";
 
 /** WEB-5 D7: every claim resolves in every language, and no forbidden claim is made. */
@@ -55,6 +56,17 @@ test("every FAQ answer is a claim with a backlog trace (D15)", () => {
       const key = `contact.faq.items.${i}.a`;
       assert.ok(CLAIMS.some((c) => c.key === key), `${key} has no entry in claims.ts`);
     });
+  }
+});
+
+test("the home page's four questions are contact FAQ items, so they carry the same claims (D21)", () => {
+  assert.equal(HOME_FAQ.length, 4);
+  for (const locale of routing.locales) {
+    const items = resolve(load(locale), "contact.faq.items") as { q: string; a: string }[];
+    for (const i of HOME_FAQ) {
+      assert.ok(items[i]?.q && items[i]?.a, `${locale}: contact.faq.items.${i}`);
+      assert.ok(CLAIMS.some((c) => c.key === `contact.faq.items.${i}.a`), `contact.faq.items.${i}.a is a claim`);
+    }
   }
 });
 

@@ -3,6 +3,11 @@
     "eyebrow": "RANTAI LAKEHOUSE",
     "headline": "Your data has a home now.",
     "sub": "One lakehouse with dashboards built in. Bring every source in, keep it in open tables, and ask for answers in plain language.",
+    "reassurance": [
+      "Free and open source",
+      "AGPL-3.0",
+      "Runs on your servers"
+    ],
     "scrollCue": "Scroll to dive"
   },
   "sources": {
@@ -186,6 +191,9 @@
     "copied": "Copied",
     "copyFailed": "Selected: press Ctrl+C or ⌘C",
     "more": "Full Quickstart, configuration and troubleshooting"
+  },
+  "faq": {
+    "all": "All questions"
   },
   "final": {
     "headline": "Come on in. The data's fine."

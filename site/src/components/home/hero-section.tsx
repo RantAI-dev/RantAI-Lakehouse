@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Check } from "lucide-react";
 import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { MascotLogo } from "@/components/shared/mascot-svg";
@@ -60,6 +61,16 @@ export function HeroSection({
                 {cta.talk}
               </CtaLink>
             </div>
+            {/* WEB-5 D21: the doubts answered where people decide, in one quiet line; each part is a claim. */}
+            {/* A check before each part, not a dot between them: a wrapped line never starts with a separator. */}
+            <ul className="mt-6 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-[13px] leading-5 text-[#E8F4FF]/70 short:mt-4 short:text-[12px] md:justify-start">
+              {copy.reassurance.map((part) => (
+                <li key={part} className="flex items-center gap-1.5 whitespace-nowrap">
+                  <Check aria-hidden="true" className="size-3.5 shrink-0 text-[#44A6FA]" />
+                  {part}
+                </li>
+              ))}
+            </ul>
           </HeroCopyMotion>
         </Container>
         <ScrollCueFade>

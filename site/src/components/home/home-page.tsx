@@ -6,9 +6,11 @@ import { TopBar } from "@/components/layout/top-bar";
 import { localizedPath } from "@/i18n/paths";
 import type { Locale } from "@/i18n/routing";
 import { JsonLd } from "@/components/shared/json-ld";
-import type { CommonCopy, HomeCopy } from "@/lib/copy";
+import { HOME_FAQ } from "@/lib/home-content";
+import type { CommonCopy, ContactCopy, HomeCopy } from "@/lib/copy";
 import { siteUrl } from "@/lib/site-url";
 import { homeStructuredData } from "@/lib/structured-data";
+import { Faq } from "@/components/contact/faq";
 import { AssistantSection } from "./assistant-section";
 import { DashboardsSection } from "./dashboards-section";
 import { DepthBackdrop } from "./depth-backdrop";
@@ -37,6 +39,7 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
   const common = messages.common as CommonCopy;
   const meta = messages.metadata as { home: { description: string } };
   const contactHref = localizedPath(locale, "/contact");
+  const contact = messages.contact as ContactCopy;
 
   return (
     <LandingModeProvider>
@@ -58,6 +61,8 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
           <GovernanceSection copy={home.governance} />
           <OpenSection copy={home.open} cta={common.cta} />
           <GetStartedSection copy={home.getStarted} />
+          {/* WEB-5 D21: free and open source, your servers, sources, installing; all of them on /contact/. */}
+          <Faq copy={contact.faq} pick={HOME_FAQ} more={{ label: home.faq.all, href: `${contactHref}#faq` }} />
           <FinalSection copy={home.final} cta={common.cta} contactHref={contactHref} />
         </main>
         <SiteFooter locale={locale} copy={common.footer} />

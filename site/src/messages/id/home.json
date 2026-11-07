@@ -3,6 +3,11 @@
     "eyebrow": "RANTAI LAKEHOUSE",
     "headline": "Rumah bagi data Anda.",
     "sub": "Satu lakehouse dengan dashboard bawaan. Satukan semua sumber, simpan dalam tabel terbuka, dan tanyakan jawabannya dengan bahasa sehari-hari.",
+    "reassurance": [
+      "Gratis dan open source",
+      "AGPL-3.0",
+      "Jalan di server Anda"
+    ],
     "scrollCue": "Gulir untuk menyelam"
   },
   "sources": {
@@ -186,6 +191,9 @@
     "copied": "Tersalin",
     "copyFailed": "Terpilih: tekan Ctrl+C atau ⌘C",
     "more": "Quickstart lengkap, konfigurasi, dan troubleshooting"
+  },
+  "faq": {
+    "all": "Semua pertanyaan"
   },
   "final": {
     "headline": "Masuklah. Datanya aman."
