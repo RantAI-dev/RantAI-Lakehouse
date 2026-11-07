@@ -83,7 +83,7 @@ function Lineage({ nodes }: { nodes: string[] }) {
       ))}
       {nodes.map((n, i) => (
         <g key={n} className="lk-gv-node" style={{ animationDelay: `${i * 0.3}s` }}>
-          <rect x={xs[i]} y="36" width="156" height="48" rx="14" fill="#090b0c" fillOpacity="0.7" stroke={colours[i]} strokeOpacity="0.55" />
+          <rect x={xs[i]} y="36" width="156" height="48" rx="14" fill="#061224" fillOpacity="0.7" stroke={colours[i]} strokeOpacity="0.55" />
           <circle cx={xs[i] + 18} cy="60" r="4" fill={colours[i]} />
           {/* A column name is code: monospace (DESIGN.md §4). */}
           <text x={xs[i] + 30} y="64.5" fill="#E8F4FF" fontSize="13" fontFamily="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
@@ -182,8 +182,8 @@ function Access({ text }: { text: Bento["access"] }) {
           {f}
           {i === 1 && (
             <div className="ml-auto flex -space-x-1.5">
-              <span className="grid size-6 place-items-center rounded-full bg-[#44A6FA]/25 text-[10px] font-semibold text-[#bfe0ff] ring-2 ring-[#101314]">A</span>
-              <span className="grid size-6 place-items-center rounded-full bg-white/12 text-[10px] font-semibold text-white/80 ring-2 ring-[#101314]">An</span>
+              <span className="grid size-6 place-items-center rounded-full bg-[#44A6FA]/25 text-[10px] font-semibold text-[#bfe0ff] ring-2 ring-[#0b1a2d]">A</span>
+              <span className="grid size-6 place-items-center rounded-full bg-white/12 text-[10px] font-semibold text-white/80 ring-2 ring-[#0b1a2d]">An</span>
             </div>
           )}
         </div>

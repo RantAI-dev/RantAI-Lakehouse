@@ -116,14 +116,14 @@
 :root {
   /* Task A neutral base (owner, 2026-11-07: "jangan biru semuanya"): the content
      sections between the two seas are near-black and grey, as rantai.dev's dark
-     mode (oklch(0.148 0.004 228.8) = #090b0c). Blue stays on the primary button,
+     mode, now (Task C) a dark muted deep-sea blue, not black. Bright blue stays on the primary button,
      links, data and small accents. Panels and cards are flat steps of this grey. */
-  --lk-n-bg: #090b0c;
-  --lk-n-surface: #101314;
-  --lk-n-raised: #181b1d;
-  --lk-n-hair: rgba(255, 255, 255, 0.09);
+  --lk-n-bg: #061224;
+  --lk-n-surface: #0b1a2d;
+  --lk-n-raised: #112238;
+  --lk-n-hair: rgba(170, 200, 235, 0.12);
   --lk-n-text: #f1f3f4;
-  --lk-n-muted: #9aa1a5;
+  --lk-n-muted: #9fb0c4;
   --lk-primary: #1d6ccf;
   --lk-primary-hover: #2370d4;
   --lk-primary-press: #1a63c4;
@@ -200,8 +200,8 @@ html[data-scene="full"] #hero {
    final call drop their own backgrounds and sit in it. Without
    JavaScript the attribute never appears, and they keep them. */
 .lk-water {
-  --lk-water-top: #090b0c;
-  --lk-water-bottom: #090b0c;
+  --lk-water-top: #081a2e;
+  --lk-water-bottom: #071626;
   background: linear-gradient(180deg, var(--lk-water-top), var(--lk-water-bottom));
 }
 html[data-scene] .lk-fallback-bg {
@@ -815,7 +815,7 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
   translate: -50% 0;
   white-space: nowrap;
   border-radius: 10px;
-  background: rgba(9, 11, 12, 0.94);
+  background: rgba(4, 12, 24, 0.94);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
   padding: 4px 9px;
   font-size: 11px;

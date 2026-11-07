@@ -6,6 +6,7 @@ import { onSceneColours, sceneColours } from "@/lib/scene-colour";
 import { smoothstep } from "@/lib/scroll-timeline";
 import { measureJourney } from "@/lib/measure-journey";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
+import { WaterLife } from "./water-life";
 
 /**
  * WEB-5 D14 S2: one water behind the second half of the page. From the
@@ -36,9 +37,8 @@ import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
  * O33 removed S5's ascent: the bubbles rising to the surface and the
  * caustics coming back.
  *
- * Task A (owner, 2026-11-07, "jangan biru semuanya"): the water below the scene zone is
- * the neutral near-black now (depth-journey.ts), and the marine snow and bubbles of O43 are
- * gone; only the sea scenes (hero, the scene zone, the final call) keep water effects.
+ * Task C (owner: "biru gelap perairan, jangan full hitam"): the water below the scene zone is
+ * a dark muted deep-sea blue (depth-journey.ts) with a little life in it (water-life.tsx).
  *
  * (history) WEB-5 O43 (owner: "balikin lah kalo gitu permainan gradient dan partikel
  * partikel airnya"): the water's life is back, as water, not as a climb:
@@ -63,6 +63,10 @@ export function DepthBackdrop() {
     // Where the canvas is gone: the scroll at which the scene zone's pinned
     // layer starts to leave the screen.
     let zoneOut = 0;
+    // Task C: where the final call's night sea begins (the water's life stops there).
+    let finalTop = Infinity;
+    let lastLife = "";
+    let lastShaft = "";
 
     // R9: the same measurement as the gauge. No hold through the hero: the
     // water is covered there (see `journeyFromBoxes`).
@@ -70,6 +74,8 @@ export function DepthBackdrop() {
       ({ anchors } = measureJourney({ holdSurfaceThroughHero: false }));
       const zone = document.getElementById("scene-zone");
       zoneOut = zone ? zone.getBoundingClientRect().bottom + window.scrollY - window.innerHeight : 0;
+      const final = document.getElementById("final");
+      finalTop = final ? final.getBoundingClientRect().top + window.scrollY : Infinity;
       paint();
     };
     const paint = () => {
@@ -87,6 +93,24 @@ export function DepthBackdrop() {
         scene && handOver > 0
           ? { top: mixColour(own.top, scene.top, handOver), bottom: mixColour(own.bottom, scene.bottom, handOver) }
           : own;
+      // Task C: the ambience (water-life.tsx) fades in over a screen after the scene zone's
+      // canvas is gone and out before the final sea; its light shafts fade with depth.
+      const vh = window.innerHeight;
+      const y = window.scrollY;
+      const life = (
+        smoothstep(zoneOut - 0.5 * vh, zoneOut + 0.5 * vh, y) *
+        (1 - smoothstep(finalTop - vh, finalTop - 0.4 * vh, y))
+      ).toFixed(2);
+      if (life !== lastLife) {
+        lastLife = life;
+        el.style.setProperty("--lk-life", life);
+        el.dataset.run = Number(life) > 0 && !document.hidden ? "1" : "0";
+      }
+      const shaft = (Math.min(1, Math.max(0, (depth + 260) / 150)) * Number(life)).toFixed(2);
+      if (shaft !== lastShaft) {
+        lastShaft = shaft;
+        el.style.setProperty("--lk-shaft", shaft);
+      }
       const key = `${water.top}${water.bottom}`;
       if (key === last) return;
       last = key;
@@ -101,6 +125,10 @@ export function DepthBackdrop() {
     const offScene = onSceneColours(onScroll);
     window.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("resize", measure);
+    const onVisibility = () => {
+      el.dataset.run = Number(lastLife) > 0 && !document.hidden ? "1" : "0";
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     // Fonts, the live hero's longer height and the dashboards rail all move
     // the chapters after load.
     const ro = new ResizeObserver(measure);
@@ -110,6 +138,7 @@ export function DepthBackdrop() {
       offScene();
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", measure);
+      document.removeEventListener("visibilitychange", onVisibility);
       ro.disconnect();
     };
   }, [reduced]);
@@ -119,6 +148,10 @@ export function DepthBackdrop() {
       ref={ref}
       aria-hidden="true"
       className="lk-water pointer-events-none fixed inset-0 overflow-hidden"
-    />
+      data-run="0"
+      style={{ "--lk-life": 0, "--lk-shaft": 0 } as React.CSSProperties}
+    >
+      <WaterLife />
+    </div>
   );
 }

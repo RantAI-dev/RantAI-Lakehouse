@@ -62,7 +62,7 @@ export function DashboardsScroller({
       className="relative h-[240vh] motion-reduce:h-auto!"
       style={{ height: "calc(100vh + 0px)" }}
     >
-      <div className="lk-fallback-bg sticky top-0 flex h-[100svh] flex-col justify-center overflow-hidden bg-[#07123a] motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
+      <div className="lk-fallback-bg sticky top-0 flex h-[100svh] flex-col justify-center overflow-hidden bg-[var(--lk-n-bg)] motion-reduce:static motion-reduce:h-auto motion-reduce:py-28">
         {before}
 
         {/* The rail. Pinned: transformed by scroll. Reduced motion: a native horizontal scroller. */}

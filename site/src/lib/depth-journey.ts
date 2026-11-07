@@ -30,16 +30,20 @@ export type Water = { top: string; bottom: string };
  * zone's gradient), so the ramp holds its −100 m colour there.
  */
 /**
- * Task A (owner, 2026-11-07, "jangan biru semuanya"): below the scene zone the page is the
- * neutral near-black, oklch(0.148 0.004 228.8) = rantai.dev's dark background. The ramp is flat
- * on purpose; the hand-over from the 3D water (depth-backdrop.tsx) blends into it over a
- * viewport and a half, and the final call's night sea is feathered in by its own top band.
+ * Task C (owner, 2026-11-07: "biru gelap perairan, jangan full hitam"): below the scene zone the
+ * page is a dark, muted deep-sea blue (low chroma, unlike the old navy #050a30) that only
+ * darkens with depth, down to the deepest blue, which the final call's top band (home-page.tsx) takes to its night sea, #020514.
+ * The hand-over from the 3D water (depth-backdrop.tsx) blends into the -100 m colour over a
+ * viewport and a half. A very gentle gradient from the top of the screen to the bottom.
  */
-export const NEUTRAL = "#090b0c";
+export const NEUTRAL = "#061224";
 
 export const WATER_BY_DEPTH: readonly { depth: number; top: string; bottom: string }[] = [
-  { depth: -400, top: NEUTRAL, bottom: NEUTRAL },
-  { depth: -100, top: NEUTRAL, bottom: NEUTRAL },
+  { depth: -400, top: "#04101c", bottom: "#030d18" },
+  { depth: -300, top: "#05101e", bottom: "#040e1a" },
+  { depth: -200, top: "#061425", bottom: "#05111f" },
+  { depth: -150, top: "#07172a", bottom: "#061422" },
+  { depth: -100, top: "#081a2e", bottom: "#071626" },
 ];
 
 const hex = (c: string): [number, number, number] => [

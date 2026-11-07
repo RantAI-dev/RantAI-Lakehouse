@@ -34,7 +34,7 @@ export function SceneZone({ children }: { children: React.ReactNode }) {
       <div
         aria-hidden="true"
         className={cn(
-          "absolute inset-x-0 top-[100svh] bottom-0 bg-[linear-gradient(180deg,#030b2a_0,#030b2a_calc(50vh_+_64px),#070d18_22%,#090b0c_55%,#090b0c_calc(100%_-_640px),rgba(9,11,12,0)_100%)] transition-opacity duration-400",
+          "absolute inset-x-0 top-[100svh] bottom-0 bg-[linear-gradient(180deg,#030b2a_0,#030b2a_calc(50vh_+_64px),#051328_22%,#081a2e_55%,#081a2e_calc(100%_-_640px),rgba(8,26,46,0)_100%)] transition-opacity duration-400",
           mode === "full" && sceneReady ? "opacity-0" : "opacity-100",
         )}
       />
