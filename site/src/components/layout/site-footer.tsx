@@ -93,13 +93,13 @@ export function SiteFooter({
                 external: true,
                 // rantai-page's ProductLogo, Dark variant (decorative: the name is the link text).
                 // eslint-disable-next-line @next/next/no-img-element -- a static SVG mark; the export has no image optimizer
-                logo: <img src={p.logo} alt="" width={Math.round(14 * p.ratio)} height={14} loading="lazy" decoding="async" className="mr-1 h-3.5 w-auto shrink-0" />,
+                logo: <img src={p.logo} alt="" width={Math.round(14 * p.ratio)} height={14} loading="lazy" decoding="async" className="h-3.5 w-auto max-w-5 shrink-0" />,
               }
             : {
                 label: p.label,
                 href: page === "home" ? "#hero" : home,
                 current: true,
-                logo: <MascotMark className="mr-1 h-3.5 w-auto shrink-0" />,
+                logo: <MascotMark className="h-3.5 w-auto max-w-5 shrink-0" />,
               },
         ),
         {
@@ -109,7 +109,7 @@ export function SiteFooter({
           // O15: the RantAI mark too (rantai-page public/rant-ai.png at 2x), made white
           // the way rantai-page shows it on dark (navbar `overDark`: brightness-0 invert).
           // eslint-disable-next-line @next/next/no-img-element -- a static mark; the export has no image optimizer
-          logo: <img src="/logo/rantai.png" alt="" width={14} height={14} loading="lazy" decoding="async" className="mr-1 h-3.5 w-auto shrink-0 brightness-0 invert" />,
+          logo: <img src="/logo/rantai.png" alt="" width={14} height={14} loading="lazy" decoding="async" className="h-3.5 w-auto max-w-5 shrink-0 brightness-0 invert" />,
         },
       ],
     },
@@ -203,7 +203,8 @@ export function SiteFooter({
                         {...(link.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
                         className={`group inline-flex items-center gap-1 text-sm text-[#E8F4FF]/65 transition-colors hover:text-[#E8F4FF] max-sm:min-h-10 max-sm:bg-none max-sm:text-[15px] ${linkUnderline}`}
                       >
-                        {link.logo}
+                        {/* O27: every mark sits in the same centred 20 px slot, so all the labels start at one x. */}
+                        {link.logo && <span className="mr-1 inline-flex w-5 shrink-0 justify-center">{link.logo}</span>}
                         {link.label}
                         {/* The site's own content: this product is the current site. */}
                         {link.current && (
