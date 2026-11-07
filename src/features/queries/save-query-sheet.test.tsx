@@ -4,7 +4,7 @@
 // The sheet asks the server for the folders and for the query the tab came
 // from; both are stubbed here, so nothing leaves the test.
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { queryService } from "@/services"
 import type {
@@ -258,6 +258,18 @@ describe("the save sheet", () => {
     /** The line under the picker, once it has loaded. */
     const sharedLine = () => screen.queryAllByText(/^Shared with /)
 
+    /**
+     * Wait until the stubbed list has been asked for, resolved and rendered.
+     * An absence is only worth asserting after this: before it, "no line"
+     * is also what a note that has not loaded yet looks like (QS-3 review).
+     */
+    async function loaded(spy: { mock: { results: { value: unknown }[] } }) {
+      await waitFor(() => expect(spy.mock.results.length).toBeGreaterThan(0))
+      await act(async () => {
+        await Promise.allSettled(spy.mock.results.map((result) => result.value))
+      })
+    }
+
     it("names the people and roles the folder is shared with, without the caller and once each", async () => {
       spyOn(queryService, "listFolders").mockResolvedValue(FOLDERS)
       const access = spyOn(queryService, "getFolderAccess").mockResolvedValue(TEAM_ACCESS)
@@ -294,8 +306,9 @@ describe("the save sheet", () => {
 
       fireEvent.change(await picker(), { target: { value: "team" } })
 
-      await waitFor(() => expect(access).toHaveBeenCalledTimes(1))
-      await waitFor(() => expect(sharedLine().length).toBe(0))
+      await loaded(access)
+      expect(access).toHaveBeenCalledTimes(1)
+      expect(sharedLine().length).toBe(0)
     })
 
     it("shows nothing when the folder has no rule at all", async () => {
@@ -305,7 +318,8 @@ describe("the save sheet", () => {
 
       fireEvent.change(await picker(), { target: { value: "team" } })
 
-      await waitFor(() => expect(access).toHaveBeenCalledTimes(1))
+      await loaded(access)
+      expect(access).toHaveBeenCalledTimes(1)
       expect(sharedLine().length).toBe(0)
     })
 
@@ -371,17 +385,74 @@ describe("the save sheet", () => {
     it("shows the server's sentence when the list cannot be read, and still saves", async () => {
       spyOn(queryService, "listFolders").mockResolvedValue(FOLDERS)
       spyOn(queryService, "getFolderAccess").mockRejectedValue(
-        new ServiceError("permission_denied", "permission_denied: You cannot see who this folder is shared with."),
+        new ServiceError("unavailable", "unavailable: The folder list could not be read."),
       )
       const { onSave } = renderSheet()
 
       fireEvent.change(await picker(), { target: { value: "team" } })
 
-      expect(await screen.findByText("You cannot see who this folder is shared with.")).toBeDefined()
+      expect(await screen.findByText("The folder list could not be read.")).toBeDefined()
       expect(sharedLine().length).toBe(0)
       fireEvent.click(screen.getByRole("button", { name: "Save as new" }))
       await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
       expect((onSave.mock.calls[0]?.[0] as SaveQueryInput).folderId).toBe("team")
+    })
+
+    it("neither asks nor shows anything for a folder the caller may only view", async () => {
+      // The server refuses the access list of a folder the caller holds at
+      // view only, so asking would print a refusal for a folder that is
+      // simply not the caller's to change (QS-3 review).
+      spyOn(queryService, "listFolders").mockResolvedValue([
+        ...FOLDERS,
+        {
+          id: "read-only",
+          parentId: null,
+          name: "Read only",
+          isPersonal: false,
+          ownerId: "u2",
+          level: "view",
+        },
+      ])
+      const access = spyOn(queryService, "getFolderAccess").mockRejectedValue(
+        new ServiceError("permission_denied", "permission_denied: You do not have permission to change this folder."),
+      )
+      renderSheet()
+
+      const select = await picker()
+      await waitFor(() => expect(select.options.length).toBe(5))
+      fireEvent.change(select, { target: { value: "read-only" } })
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      })
+
+      expect(access).not.toHaveBeenCalled()
+      expect(sharedLine().length).toBe(0)
+      expect(screen.queryAllByText(/permission/i).length).toBe(0)
+    })
+
+    it("does not show the first folder's names for the second while the second loads", async () => {
+      spyOn(queryService, "listFolders").mockResolvedValue(FOLDERS)
+      // What the line says at the moment the second request goes out: the
+      // effect that starts it runs right after the commit of the new
+      // target, before the hook resets its own state, so a note that kept
+      // its instance still shows the first folder's names here (QS-3 review).
+      const asked: { lines: number | null } = { lines: null }
+      spyOn(queryService, "getFolderAccess").mockImplementation(async (id) => {
+        if (id === "team") return TEAM_ACCESS
+        asked.lines = sharedLine().length
+        return new Promise<SavedQueryAccessList>(() => {})
+      })
+      renderSheet()
+
+      const select = await picker()
+      fireEvent.change(select, { target: { value: "team" } })
+      expect(await screen.findByText("Shared with 2 people or roles: Dewi Lestari, Finance.")).toBeDefined()
+
+      fireEvent.change(select, { target: { value: "reports" } })
+
+      await waitFor(() => expect(asked.lines).not.toBeNull())
+      expect(asked.lines).toBe(0)
+      expect(sharedLine().length).toBe(0)
     })
 
     it("neither asks nor shows anything when a query is being changed", async () => {

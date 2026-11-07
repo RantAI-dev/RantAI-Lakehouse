@@ -11,6 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { levelAtLeast } from "@/features/dashboards/access-level"
 import { readableErrorMessage } from "@/lib/notify-message"
 import type { QueryFolder } from "@/services/contracts/queries"
 import { FolderSharingNote } from "./folder-sharing-note"
@@ -106,7 +107,14 @@ export function SavedQueryMoveDialog({
   const personalRootId = folders.find(
     (folder) => folder.isPersonal && folder.parentId === null,
   )?.id
-  const sharedFolderId = target === "" || target === personalRootId ? null : target
+  // The server refuses the access list to a caller below edit on the folder,
+  // and the picker offers every folder, so such a folder is not asked
+  // (QS-3 review).
+  const targetLevel = folders.find((folder) => folder.id === target)?.level
+  const sharedFolderId =
+    target === "" || target === personalRootId || !levelAtLeast(targetLevel, "edit")
+      ? null
+      : target
 
   return (
     <Dialog
@@ -151,7 +159,13 @@ export function SavedQueryMoveDialog({
               ))}
             </optgroup>
           </select>
-          <FolderSharingNote folderId={sharedFolderId} viewerId={viewerId} />
+          {/* The key drops the previous folder's names at once; the hook
+              keeps them until its effect resets (QS-3 review). */}
+          <FolderSharingNote
+            key={sharedFolderId ?? ""}
+            folderId={sharedFolderId}
+            viewerId={viewerId}
+          />
         </div>
         {error ? (
           <p role="alert" className="text-sm text-destructive">

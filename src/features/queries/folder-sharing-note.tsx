@@ -40,7 +40,8 @@ function sharedWith(
  * tells them before they confirm (`QS-3`). `folderId` is `null` where there
  * is nothing to say and nothing to ask: the shared space (everyone in the
  * organisation sees it at view) and the caller's own space (it holds no
- * rule).
+ * rule), and for a folder the caller holds below edit: the server refuses
+ * that folder's access list, so the callers do not ask (QS-3 review).
  *
  * The note never blocks the save or the move: while the list loads it shows
  * nothing, and a failed load shows the server's sentence on its own line.
