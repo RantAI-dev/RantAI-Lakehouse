@@ -231,7 +231,6 @@
     },
     "pii": "PII",
     "piiTip": "Data pribadi, disamarkan untuk peran tanpa akses",
-    "masked": "disamarkan",
     "bento": {
       "lineage": {
         "title": "Lineage per kolom",
@@ -277,7 +276,8 @@
         "open": "Terbuka untuk Admin",
         "closed": "Tertutup untuk Analyst"
       }
-    }
+    },
+    "maskedTip": "Disamarkan oleh kebijakan untuk Analyst"
   },
   "open": {
     "headline": "Milik Anda.",

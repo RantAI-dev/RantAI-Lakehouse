@@ -2,11 +2,18 @@
 
 import * as React from "react";
 import { useInView } from "framer-motion";
-import { Lock, LockOpen, MapPin } from "lucide-react";
+import { Lock, LockOpen, MapPin, UserRound } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";
 import { GOVERNANCE_COLUMNS, GOVERNANCE_ROWS } from "@/lib/home-content";
-import { scrambleFrame } from "@/lib/scramble";
+
+const COL_WIDTH: Record<(typeof GOVERNANCE_COLUMNS)[number]["key"], string> = {
+  name: "w-[30%]",
+  email: "w-[34%]",
+  city: "w-[20%]",
+  amount: "w-[16%]",
+};
+import { maskEmail, maskName, scrambleFrame } from "@/lib/scramble";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
@@ -18,10 +25,15 @@ import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
  *   keys move it. A policy chip beside it says what the role sees, and a
  *   live region announces it.
  * - Sensitive columns carry a "PII" tag with a tooltip on hover and focus.
- * - For Admin the cells hold the real values and they decode into place,
- *   row by row, 40 ms apart (`lib/scramble`). For Analyst only the masked
- *   form exists in the DOM: a soft redaction bar with a faint shimmer, and
- *   the avatar turns to a blurred silhouette. Reduced motion swaps at once.
+ * - For Admin the cells hold the real values; switching to Admin, the
+ *   masked dots decode into letters row by row, 40 ms apart
+ *   (`lib/scramble`). For Analyst only the masked form exists in the DOM,
+ *   as muted text that keeps the data's shape (`M••• O•••`,
+ *   `m•••@•••.com`) behind a small lock with a "Masked by policy" tooltip,
+ *   and the avatar is a neutral circle with a person glyph (O36: the blurred
+ *   bars and blobs read as loading skeletons). Reduced motion swaps at once.
+ * - O36, clean and minimal: a flat dark card with no glow, no header
+ *   divider (spacing carries it), muted text tags, a hairline policy chip.
  * - The role is also written on the section (`data-role`), so the bento's
  *   access tile below opens or closes its lock in CSS, with no more script.
  * - It starts as Admin and, once, flips to Analyst when it scrolls into
@@ -62,11 +74,11 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
   return (
     <div
       ref={tableRef}
-      className="overflow-hidden rounded-3xl border border-[#E8F4FF]/12 bg-[#020514]/60 shadow-[0_40px_120px_-50px_rgba(68,166,250,0.45),inset_0_1px_0_rgba(232,244,255,0.06)] backdrop-blur-md"
+      className="overflow-hidden rounded-3xl border border-[#E8F4FF]/10 bg-[#020514]/70"
     >
       {/* O32: no visible "Illustration" label (the owner's decision; the data is plainly fictional and the
           caption for screen readers stays). The policy chip leads; the switch sits at the right. */}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E8F4FF]/10 px-4 py-3 md:px-6">
+      <div className="flex flex-wrap items-center justify-between gap-3 px-4 pt-4 pb-2 md:px-6 md:pt-5">
         <PolicyChip copy={copy} role={role} />
         <RoleToggle copy={copy} role={role} onChange={choose} />
       </div>
@@ -75,7 +87,8 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
       </p>
       {/* Phones: the table scrolls inside its frame; the right edge fades to say there is more. */}
       <div className="overflow-x-auto max-md:[mask-image:linear-gradient(90deg,#000_82%,transparent)]">
-        <table className="w-full min-w-[640px] text-left">
+        {/* Fixed column widths: the columns stay put when the role switches and the values change length. */}
+        <table className="w-full min-w-[640px] table-fixed text-left">
           <caption className="sr-only">{copy.tableCaption}</caption>
           <thead>
             <tr className="text-[13px] text-[#E8F4FF]/55">
@@ -83,7 +96,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
                 <th
                   key={c.key}
                   scope="col"
-                  className={cn("px-4 py-3 font-medium md:px-6", c.key === "amount" && "text-right")}
+                  className={cn("px-4 py-3 font-medium md:px-6", COL_WIDTH[c.key], c.key === "amount" && "text-right")}
                 >
                   <span className="inline-flex items-center gap-2">
                     {copy.columns[c.key]}
@@ -102,11 +115,11 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
                 <td className="px-4 py-4 whitespace-nowrap md:px-6">
                   <span className="inline-flex items-center gap-3">
                     <Avatar name={r.name} masked={role === "analyst"} />
-                    <Cell value={r.name} role={role} row={i} animate={!reduced} label={copy.masked} />
+                    <Cell value={r.name} masked={maskName(r.name)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
                   </span>
                 </td>
                 <td className="px-4 py-4 whitespace-nowrap md:px-6">
-                  <Cell value={r.email} role={role} row={i} animate={!reduced} label={copy.masked} />
+                  <Cell value={r.email} masked={maskEmail(r.email)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
                 </td>
                 <td className="px-4 py-4 whitespace-nowrap md:px-6">
                   <span className="inline-flex items-center gap-1.5">
@@ -130,8 +143,8 @@ function PolicyChip({ copy, role }: { copy: GovernanceCopy; role: Role }) {
     <span
       key={role}
       className={cn(
-        "lk-fade-in inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] font-medium ring-1",
-        role === "analyst" ? "bg-[#44A6FA]/10 text-[#8fcbff] ring-[#44A6FA]/30" : "bg-[#7be0b0]/10 text-[#7be0b0] ring-[#7be0b0]/30",
+        "lk-fade-in inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] font-medium ring-1 ring-[#E8F4FF]/12",
+        role === "analyst" ? "text-[#8fcbff]" : "text-[#7be0b0]",
       )}
     >
       <Icon aria-hidden="true" className="size-3.5" />
@@ -147,7 +160,7 @@ function PiiTag({ copy }: { copy: GovernanceCopy }) {
       <span
         tabIndex={0}
         aria-describedby={id}
-        className="rounded-md bg-[#44A6FA]/12 px-1.5 py-px text-[10px] font-semibold tracking-[0.06em] text-[#8fcbff] ring-1 ring-[#44A6FA]/30 outline-none focus-visible:ring-2 focus-visible:ring-[#44A6FA]"
+        className="rounded-sm text-[10px] font-semibold tracking-[0.08em] text-[#8fcbff]/70 outline-none focus-visible:ring-2 focus-visible:ring-[#44A6FA]"
       >
         {copy.pii}
       </span>
@@ -171,22 +184,36 @@ function Avatar({ name, masked }: { name: string; masked: boolean }) {
     <span
       aria-hidden="true"
       className={cn(
-        "grid size-8 shrink-0 place-items-center rounded-full text-[11px] font-semibold transition-[filter,background-color,color] duration-300 ease-out",
-        masked ? "bg-[#E8F4FF]/10 text-transparent blur-[2px]" : "bg-[#44A6FA]/20 text-[#bfe0ff]",
+        "grid size-8 shrink-0 place-items-center rounded-full text-[11px] font-semibold transition-colors duration-300 ease-out",
+        masked ? "bg-[#E8F4FF]/[0.07] text-[#E8F4FF]/45" : "bg-[#44A6FA]/20 text-[#bfe0ff]",
       )}
     >
-      {masked ? <span className="block size-3 rounded-full bg-[#E8F4FF]/35" /> : initials}
+      {masked ? <UserRound className="size-4" /> : initials}
     </span>
   );
 }
 
 /**
- * One sensitive cell. As Admin it holds the value, decoding into place
- * (random glyphs settle left to right in 420 ms, starting 40 ms after the
- * row above). As Analyst it holds only a redaction bar as long as the value,
- * with a faint shimmer, and the word "masked" for screen readers.
+ * One sensitive cell. As Admin it holds the value; switching to Admin, the
+ * masked dots decode into letters (420 ms, starting 40 ms after the row
+ * above). As Analyst it holds only the masked form, muted, after a small
+ * lock whose tooltip says why, and fades in row by row.
  */
-function Cell({ value, role, row, animate, label }: { value: string; role: Role; row: number; animate: boolean; label: string }) {
+function Cell({
+  value,
+  masked,
+  role,
+  row,
+  animate,
+  tip,
+}: {
+  value: string;
+  masked: string;
+  role: Role;
+  row: number;
+  animate: boolean;
+  tip: string;
+}) {
   const [shown, setShown] = React.useState(value);
   const previous = React.useRef(role);
 
@@ -198,23 +225,31 @@ function Cell({ value, role, row, animate, label }: { value: string; role: Role;
     if (role !== "admin" || was === "admin" || !animate) return;
     let raf = 0;
     const t0 = performance.now() + row * 40;
-    const from = value.replace(/[^@.\s]/g, "•");
     const step = (now: number) => {
       const p = Math.max(0, Math.min(1, (now - t0) / 420));
-      setShown(scrambleFrame(from, value, p, Math.random));
+      setShown(scrambleFrame(masked, value, p, Math.random));
       if (p < 1) raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-  }, [role, value, row, animate]);
+  }, [role, value, masked, row, animate]);
 
   if (role === "analyst") {
     return (
       <span
-        className="lk-redact relative inline-block h-[0.95em] rounded-full align-middle"
-        style={{ width: `${Math.min(14, value.length * 0.55)}em`, animationDelay: `${row * 40}ms` }}
+        key="masked"
+        className="group/mask lk-fade-in relative inline-flex items-center gap-1.5 text-[#E8F4FF]/55"
+        style={{ animationDelay: `${row * 40}ms` }}
       >
-        <span className="sr-only">{label}</span>
+        <Lock aria-hidden="true" className="size-3 shrink-0 text-[#8fcbff]/70" />
+        <span className="tabular-nums">{masked}</span>
+        <span className="sr-only">, {tip}</span>
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute bottom-full left-0 z-10 mb-1.5 w-max rounded-lg bg-[#020514]/95 px-2 py-1 text-[11px] text-[#E8F4FF] opacity-0 shadow-[inset_0_0_0_1px_rgba(232,244,255,0.2)] transition-opacity duration-200 group-hover/mask:opacity-100"
+        >
+          {tip}
+        </span>
       </span>
     );
   }

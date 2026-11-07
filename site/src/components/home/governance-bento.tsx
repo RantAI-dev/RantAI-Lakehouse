@@ -1,6 +1,7 @@
 import * as React from "react";
 import { BadgeCheck, Check, Folder, LayoutDashboard, Lock, LockOpen, Search } from "lucide-react";
 import type { HomeCopy } from "@/lib/copy";
+import { BentoFxHost } from "./bento-fx-host";
 import { LiveTile } from "./live-tile";
 
 /**
@@ -19,8 +20,13 @@ import { LiveTile } from "./live-tile";
 
 type Bento = HomeCopy["governance"]["bento"];
 
+/**
+ * O37 (the clean rule of O35): a flat dark surface, one hairline border (the
+ * one that glows at the pointer, `.lk-mb-tile`), content set apart by fill
+ * and space. No lift, no tilt.
+ */
 const tile =
-  "flex flex-col rounded-3xl border border-[#E8F4FF]/12 bg-[#E8F4FF]/[0.04] p-5 transition-[translate,border-color,box-shadow] duration-200 ease-out outline-none hover:-translate-y-1 hover:border-[#44A6FA]/45 hover:shadow-[0_0_40px_-10px_rgba(68,166,250,0.5)] focus-visible:-translate-y-1 focus-visible:border-[#44A6FA]/70 motion-reduce:transition-none motion-reduce:hover:translate-y-0 md:p-6";
+  "lk-mb-tile relative flex flex-col overflow-hidden rounded-3xl border border-[#E8F4FF]/10 bg-[#050A30]/80 p-5 outline-none transition-[border-color] duration-200 ease-out focus-visible:border-[#44A6FA]/70 md:p-6";
 
 function Words({ title, line }: { title: string; line: string }) {
   return (
@@ -33,7 +39,11 @@ function Words({ title, line }: { title: string; line: string }) {
 
 export function GovernanceBento({ copy }: { copy: Bento }) {
   return (
-    <ul className="mt-6 grid gap-4 md:grid-cols-3 md:gap-5">
+    <div className="lk-mb relative mt-6">
+      {/* O37: the spotlight over the whole grid, moved by the deferred controller. */}
+      <span aria-hidden="true" className="lk-mb-spot pointer-events-none absolute -inset-10 z-10" />
+      <BentoFxHost />
+    <ul className="grid gap-4 md:grid-cols-3 md:gap-5">
       <LiveTile label={copy.lineage.title} className={`${tile} md:col-span-2`}>
         <Lineage nodes={copy.lineage.nodes} />
         <Words title={copy.lineage.title} line={copy.lineage.line} />
@@ -55,6 +65,7 @@ export function GovernanceBento({ copy }: { copy: Bento }) {
         <Words title={copy.access.title} line={copy.access.line} />
       </LiveTile>
     </ul>
+    </div>
   );
 }
 
@@ -90,10 +101,10 @@ function Proof({ badge }: { badge: string }) {
     <div aria-hidden="true" className="flex flex-col items-start gap-4">
       <div className="relative h-10 w-full max-w-[16rem] overflow-hidden rounded-xl bg-[#020514]/70 px-3 ring-1 ring-[#E8F4FF]/10">
         <span className="lk-gv-plain absolute inset-y-0 left-3 flex items-center text-[14px] text-[#E8F4FF]">mira.okafor@example.com</span>
-        <span className="lk-gv-mask absolute inset-y-0 left-3 flex items-center gap-1.5">
-          <span className="lk-redact inline-block h-3.5 w-16 rounded-full" />
-          <span className="text-[13px] text-[#E8F4FF]/50">@</span>
-          <span className="lk-redact inline-block h-3.5 w-20 rounded-full" />
+        {/* O36: masking shown as masked text that keeps the shape, never a grey bar. */}
+        <span className="lk-gv-mask absolute inset-y-0 left-3 flex items-center gap-1.5 text-[14px] text-[#E8F4FF]/55">
+          <Lock className="size-3 text-[#8fcbff]/70" />
+          m•••@•••.com
         </span>
       </div>
       <span className="lk-gv-badge inline-flex items-center gap-1.5 rounded-full bg-[#7be0b0]/10 px-2.5 py-1 text-[12px] font-medium text-[#7be0b0] ring-1 ring-[#7be0b0]/30">

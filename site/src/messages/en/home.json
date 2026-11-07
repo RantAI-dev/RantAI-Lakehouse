@@ -231,7 +231,6 @@
     },
     "pii": "PII",
     "piiTip": "Personal data, masked for roles without access",
-    "masked": "masked",
     "bento": {
       "lineage": {
         "title": "Column-level lineage",
@@ -277,7 +276,8 @@
         "open": "Open to Admin",
         "closed": "Closed to Analyst"
       }
-    }
+    },
+    "maskedTip": "Masked by policy for Analyst"
   },
   "open": {
     "headline": "Yours to keep.",

@@ -864,25 +864,8 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-cal img {
   translate: -100% 0;
 }
 
-/* ---- Governance (WEB-5 owner QA O16 + O17) -------------------------------
-   A redaction bar: a soft pill with a faint shimmer, never bullet
-   characters. It slides in, row by row, when the table switches to
-   Analyst (the delay is set per row). */
-.lk-redact {
-  background: linear-gradient(90deg, rgba(232, 244, 255, 0.14), rgba(232, 244, 255, 0.28), rgba(232, 244, 255, 0.14));
-  background-size: 200% 100%;
-  animation:
-    lk-redact-in 360ms cubic-bezier(0.16, 1, 0.3, 1) backwards,
-    lk-shimmer 2.4s linear infinite;
-  transform-origin: left center;
-}
-@keyframes lk-redact-in {
-  from {
-    opacity: 0;
-    transform: scaleX(0.3);
-    filter: blur(3px);
-  }
-}
+/* ---- Governance (WEB-5 owner QA O16 + O17; O36: masking is masked text
+   that keeps its shape, with a lock, never a grey bar or a blur) ---------- */
 /* The bento's illustrations: hidden start states only once motion is ready. */
 html.motion-ready .lk-tile:not([data-shown]) :is(.lk-gv-node, .lk-gv-row, .lk-gv-result, .lk-gv-badge) {
   opacity: 0;
@@ -919,27 +902,27 @@ html.motion-ready .lk-tile:not([data-shown]) :is(.lk-gv-node, .lk-gv-row, .lk-gv
 .lk-tile[data-shown] .lk-gv-mask {
   animation: lk-gv-mask 6s ease-in-out 1.2s infinite;
 }
+/* O36: one gives way before the other comes, so the two never overlap. */
 @keyframes lk-gv-plain {
   0%,
   35%,
   100% {
     opacity: 1;
-    filter: blur(0);
   }
-  45%,
-  85% {
+  41%,
+  92% {
     opacity: 0;
-    filter: blur(4px);
   }
 }
 @keyframes lk-gv-mask {
   0%,
-  35%,
+  43%,
+  90%,
   100% {
     opacity: 0;
   }
-  45%,
-  85% {
+  48%,
+  84% {
     opacity: 1;
   }
 }
@@ -1078,6 +1061,99 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 
+/* ---- Governance bento pointer effects (WEB-5 owner QA O37) --------------
+   Written here, not taken from a library. `bento-fx.tsx` writes the pointer
+   into `--mx`/`--my` on the grid and `--x`/`--y` on every tile, once a frame.
+   - The spotlight: one soft light over the whole grid.
+   - The border glow: each tile's hairline lights up near the pointer, a
+     radial light masked to the 1px ring; it fades with distance, so a
+     neighbour catches a little of it.
+   - Foam dots drift inside the hovered tile; a ring spreads from a press.
+   Pointer effects only while `data-fx` is set (a mouse is over the grid). */
+.lk-mb-spot {
+  opacity: 0;
+  background: radial-gradient(260px circle at calc(var(--mx, -999px) + 40px) calc(var(--my, -999px) + 40px), rgba(68, 166, 250, 0.09), transparent 70%);
+  transition: opacity 300ms ease-out;
+}
+.lk-mb-tile::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  padding: 1px;
+  pointer-events: none;
+  background: radial-gradient(320px circle at var(--x, -999px) var(--y, -999px), rgba(143, 203, 255, 0.75), rgba(68, 166, 250, 0.25) 40%, transparent 70%);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box exclude,
+    linear-gradient(#000 0 0);
+  opacity: 0;
+  transition: opacity 300ms ease-out;
+}
+.lk-mb[data-fx] .lk-mb-spot,
+.lk-mb[data-fx] .lk-mb-tile::before {
+  opacity: 1;
+}
+.lk-mb-dots {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+.lk-mb-dot {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 9999px;
+  background: rgba(190, 225, 255, 0.7);
+  box-shadow: 0 0 6px rgba(143, 203, 255, 0.6);
+  opacity: 0;
+  animation: lk-mb-dot 2.4s ease-in-out infinite;
+}
+@keyframes lk-mb-dot {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  30% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--dx), var(--dy));
+  }
+}
+.lk-mb-ripple {
+  position: absolute;
+  z-index: 2;
+  width: 24px;
+  height: 24px;
+  margin: -12px 0 0 -12px;
+  border-radius: 9999px;
+  border: 1px solid rgba(143, 203, 255, 0.7);
+  background: rgba(68, 166, 250, 0.12);
+  pointer-events: none;
+  animation: lk-mb-ripple 650ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+@keyframes lk-mb-ripple {
+  to {
+    opacity: 0;
+    transform: scale(14);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-mb-spot,
+  .lk-mb-tile::before,
+  .lk-mb-dots,
+  .lk-mb-ripple {
+    display: none;
+  }
+}
+
 /* ---- Reduced motion --------------------------------------------------- */
 
 @media (prefers-reduced-motion: reduce) {
@@ -1090,10 +1166,7 @@ section[data-role="admin"] .lk-gv-closed {
   .lk-sf-line {
     background: rgba(143, 203, 255, 0.6);
   }
-  /* O16/O17: still; the redaction bars are plain. */
-  .lk-redact {
-    animation: none;
-  }
+  /* O16/O17: still. */
   .lk-gv-open,
   .lk-gv-closed {
     transition: none;
