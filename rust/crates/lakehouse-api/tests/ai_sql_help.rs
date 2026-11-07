@@ -391,8 +391,14 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // the old bytes plus exactly those two sentences (hashing the prompt with them
 // removed gives the previous pin `7842304c...b590`). The AI team reviews the
 // sentences (Assistant parity).
+//
+// Updated by hand again (PR #395 review): the two timeout sentences in
+// `limits_and_freshness!` became one. The first clause no longer repeats the
+// timeout question ("or \"why did this chart time out?\"" is gone), and the
+// second one, which answers it from `get_query_limits` without SQL on
+// `system.*` tables, stays. (Before: `534a2e9b...1e91`.)
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "534a2e9b4308299cf453babc3fdd017e4fe735396928dbce39b3758026e79e91";
+    "a383686693eae1ecc15195d708140e34934f637763f92fdb3dc6494b71ec2a09";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;

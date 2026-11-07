@@ -369,7 +369,7 @@ pub(super) fn reply_language(text: &str) -> Option<&'static str> {
 /// literals; [`SYSTEM_BASE`] stays the measured prompt it was.
 macro_rules! limits_and_freshness {
     () => {
-        " Charts and Query Studio run under time and row limits an administrator sets: for \"what are my query limits?\" or \"why did this chart time out?\" call get_query_limits and say the limit and where it comes from; a question about why a chart or query timed out or was cut is answered from get_query_limits (and the chart's own result when it names one), and you do not run SQL against system.* tables for it; you cannot change limits, an administrator does in Admin > Settings > Query limits. To \"stop the running query\", call stop_query (it ends only the person's own running queries); a count of running queries comes only from list_workloads, and if that tool fails, say it failed and give no count. Dashboards remember the results of their charts; each tile result carries computedAt (when the data was computed) and remembered (true when it came from memory), so for \"how fresh is this dashboard?\" read them from the data and say the time."
+        " Charts and Query Studio run under time and row limits an administrator sets: for \"what are my query limits?\" call get_query_limits and say the limit and where it comes from; a question about why a chart or query timed out or was cut is answered from get_query_limits (and the chart's own result when it names one), and you do not run SQL against system.* tables for it; you cannot change limits, an administrator does in Admin > Settings > Query limits. To \"stop the running query\", call stop_query (it ends only the person's own running queries); a count of running queries comes only from list_workloads, and if that tool fails, say it failed and give no count. Dashboards remember the results of their charts; each tile result carries computedAt (when the data was computed) and remembered (true when it came from memory), so for \"how fresh is this dashboard?\" read them from the data and say the time."
     };
 }
 
@@ -388,18 +388,49 @@ pub(super) fn dashboard_permission_note(
     perms: Option<&lakehouse_auth::PermissionSet>,
 ) -> Option<&'static str> {
     // Nobody signed in has no account to speak of: the prompt is unchanged.
-    if perms.is_none_or(|p| p.has("dashboard:write")) {
+    let perms = perms?;
+    if perms.has("dashboard:write") {
         return None;
     }
-    Some(
-        "[Permissions: the signed-in person's account does not have the dashboard:write \
+    // A metric needs `metric:write`, a separate permission (PR #395 review):
+    // a person who holds it can still change a metric without
+    // `dashboard:write`, so the note must not list metrics among the refusals.
+    // A view-filter change needs only `dashboard:read` and is offered in both
+    // modes. `create_report_subscription` needs only `dashboard:read` too but
+    // is offered in Build mode only, and the note does not know the mode, so
+    // it says the note does not refuse it.
+    macro_rules! note {
+        ($changes:literal, $metrics:literal) => {
+            concat!(
+                "[Permissions: the signed-in person's account does not have the dashboard:write \
 permission, so the tools that create or change charts, tabs and dashboards are withheld \
 from you because of that permission, not because they are unavailable or not set up. \
-When asked to change anything (a chart, a tab, a dashboard, a calculated field or a \
-metric), your first sentence, before any analysis or other tool call, is: \"Your account \
-cannot change dashboards; ask an editor or an administrator.\" Reading dashboards and \
-charts still works.]",
-    )
+When asked to change ",
+                $changes,
+                ", your first sentence, before any analysis or other tool call, is: \"Your account \
+cannot change dashboards; ask an editor or an administrator.\" ",
+                $metrics,
+                "Reading dashboards and charts still works, and changing this person's own view \
+filters with set_board_view_filters still works, so do not refuse a view-filter request. \
+This note does not refuse subscribing to a report either: create_report_subscription \
+(when that tool is offered) is not blocked by the missing dashboard:write permission, so \
+subscribing to a report is not refused in words.]"
+            )
+        };
+    }
+    Some(if perms.has("metric:write") {
+        note!(
+            "a chart, a tab, a dashboard or a calculated field",
+            "Metrics can be handled: the person has the metric:write permission, so, when the \
+metric tools are offered, metrics can still be created and changed, and you do not refuse \
+that. "
+        )
+    } else {
+        note!(
+            "a chart, a tab, a dashboard, a calculated field or a metric",
+            ""
+        )
+    })
 }
 
 /// The system prompt with [`dashboard_permission_note`] before its closing
@@ -737,6 +768,12 @@ const DOMAINS: &[Domain] = &[
             "time out",
             "timeout",
             "too long",
+            // Phrases, never the bare word "cut": it matches "shortcut".
+            "cut off",
+            "was cut",
+            "got cut",
+            "terpotong",
+            "dipotong",
             "stop the",
             "stop query",
             "stop my",
@@ -1682,5 +1719,111 @@ mod tests {
     fn a_message_without_a_workloads_word_does_not_offer_list_workloads() {
         let tools = select_tools(&["How many foreign tourists came in 2024?"], false);
         assert!(!tools.contains("list_workloads"), "{tools:?}");
+    }
+
+    /// PR #395 review: a person without `metric:write` cannot change a metric,
+    /// a person with it can, and the note must not tell the second one no.
+    #[test]
+    fn the_permission_note_names_metrics_as_unchangeable_only_without_metric_write() {
+        use lakehouse_auth::PermissionSet;
+        const REFUSAL: &str =
+            "\"Your account cannot change dashboards; ask an editor or an administrator.\"";
+        // What the refusal applies to: the text between these two markers.
+        let refused = |note: &'static str| -> &'static str {
+            let from = note.find("When asked to change ").unwrap_or_default() + 21;
+            let to = note.find(", your first sentence").unwrap_or(note.len());
+            note.get(from..to).unwrap_or_default()
+        };
+        let without = PermissionSet::parse("dashboard:read");
+        let note = dashboard_permission_note(Some(&without)).unwrap_or_default();
+        assert!(refused(note).contains("a calculated field"), "{note}");
+        assert!(refused(note).contains("metric"), "{note}");
+        assert!(
+            !note.contains("metrics can still be created and changed"),
+            "{note}"
+        );
+        assert!(note.contains(REFUSAL), "{note}");
+
+        let with = PermissionSet::parse("dashboard:read, metric:write");
+        let note = dashboard_permission_note(Some(&with)).unwrap_or_default();
+        assert!(
+            note.contains("metrics can still be created and changed"),
+            "{note}"
+        );
+        assert!(refused(note).contains("a calculated field"), "{note}");
+        assert!(!refused(note).contains("metric"), "{note}");
+        assert!(note.contains(REFUSAL), "{note}");
+    }
+
+    /// PR #395 review: changing the person's own view filters needs only
+    /// `dashboard:read`, and a report subscription is not refused by the note.
+    /// The subscription tool is offered in Build mode only, so the wording
+    /// must hold in Ask mode too.
+    #[test]
+    fn the_permission_note_leaves_view_filters_and_report_subscriptions_unrefused() {
+        use lakehouse_auth::PermissionSet;
+        for perms in ["dashboard:read", "dashboard:read, metric:write"] {
+            let set = PermissionSet::parse(perms);
+            let note = dashboard_permission_note(Some(&set)).unwrap_or_default();
+            assert!(
+                note.contains("changing this person's own view filters with set_board_view_filters still works"),
+                "{perms}: {note}"
+            );
+            assert!(
+                note.contains("subscribing to a report is not refused"),
+                "{perms}: {note}"
+            );
+            assert!(
+                note.contains("create_report_subscription (when that tool is offered)"),
+                "{perms}: {note}"
+            );
+            assert!(
+                note.contains("is not blocked by the missing dashboard:write permission"),
+                "{perms}: {note}"
+            );
+        }
+    }
+
+    /// PR #395 review: "cut" alone would match "shortcut", so the limits
+    /// domain holds phrases.
+    #[test]
+    fn a_question_about_a_cut_off_chart_offers_get_query_limits() {
+        for question in [
+            "Why was this chart cut off?",
+            "My query was cut at 1000 rows, why?",
+            "The result got cut, why?",
+            "Kenapa grafik ini terpotong?",
+            "Kenapa hasilnya dipotong?",
+        ] {
+            let tools = select_tools(&[question], false);
+            assert!(
+                tools.contains("get_query_limits"),
+                "`{question}` should offer get_query_limits: {tools:?}"
+            );
+        }
+    }
+
+    /// Guards the word list: the bare word "cut" must not be a limits word,
+    /// because "shortcut" contains it.
+    #[test]
+    fn a_shortcut_request_does_not_offer_get_query_limits() {
+        let tools = select_tools(&["Add a shortcut to the dashboard"], false);
+        assert!(!tools.contains("get_query_limits"), "{tools:?}");
+    }
+
+    /// The timeout rule is stated once per prompt, not twice.
+    #[test]
+    fn both_mode_suffixes_state_the_timeout_rule_once() {
+        for (mode, suffix) in [("ask", SYSTEM_ASK_SUFFIX), ("build", SYSTEM_BUILD_SUFFIX)] {
+            let found = suffix.matches("timed out or was cut").count();
+            assert_eq!(
+                found, 1,
+                "{mode}: the timeout rule must be stated exactly once, found {found}"
+            );
+            assert!(
+                !suffix.contains("why did this chart time out"),
+                "{mode}: the first clause repeats the timeout question"
+            );
+        }
     }
 }
