@@ -1675,6 +1675,8 @@ section[data-role="admin"] .lk-gv-closed {
   container: lk-ast / inline-size;
   display: flex;
   flex-direction: column;
+  /* O41: a fixed height, like a real chat window. */
+  height: min(560px, 74svh);
   overflow: hidden;
   border-radius: var(--radius-3xl);
   border: 1px solid rgba(232, 244, 255, 0.09);
@@ -1682,6 +1684,16 @@ section[data-role="admin"] .lk-gv-closed {
 }
 .lk-ast-avatar {
   background: rgba(68, 166, 250, 0.14);
+}
+@media (min-width: 48rem) {
+  .lk-ast {
+    height: min(640px, 78svh);
+  }
+}
+/* The oldest messages fade out under the header as newer ones push them up. */
+.lk-ast-log {
+  mask-image: linear-gradient(to bottom, transparent, #000 20px);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 20px);
 }
 
 /* A message opens its height from zero, so the panel grows under it. */

@@ -41,9 +41,13 @@ import { ALL_STEPS, S } from "./assistant-steps";
  * aja gausah gradient. Gausah ada tulisan ready dan dot hijau. kurang
  * border"): one flat dark surface with a single hairline; no status, no
  * dividers, no nested cards; the parts are told apart by fill and spacing.
- * The panel is as tall as its conversation and grows with it, upward from
- * the composer, as a chat does. A hidden copy of the finished panel (`ghost`) holds the
- * final height in the layout, so the growth moves nothing around it (CLS 0).
+ * O41 (owner: "buat heightnya langsung fix aja, jangan ngikutin isi
+ * content. biar kesannya jadi kek chat asli"): the panel has a fixed
+ * height, like a chat window. The header stays at the top, the composer at
+ * the bottom, and the messages stack from the bottom up between them; each
+ * new one pushes the earlier ones up, and the oldest slide out of the top
+ * under a short fade. The finished conversation shows the approval card and
+ * the last reply whole; the first question may be faded at the top.
  */
 
 type AssistantCopy = HomeCopy["assistant"];
@@ -55,18 +59,9 @@ export function AssistantChat({ copy }: { copy: AssistantCopy }) {
   return (
     <div>
       <p className="sr-only">{copy.srDescription}</p>
-      {/* The ghost and the live panel share one grid cell: the ghost (finished, invisible) sets the height. */}
-      <div className="grid">
-        <div className="invisible [grid-area:1/1]" aria-hidden="true">
-          <Panel copy={copy} />
-        </div>
-        {/* Anchored at the bottom: the composer stays put and the conversation grows upward, as a chat does. */}
-        <div className="self-end [grid-area:1/1]">
-          <AssistantPlay>
-            <Panel copy={copy} />
-          </AssistantPlay>
-        </div>
-      </div>
+      <AssistantPlay>
+        <Panel copy={copy} />
+      </AssistantPlay>
     </div>
   );
 }
@@ -84,7 +79,10 @@ function Panel({ copy }: { copy: AssistantCopy }) {
         <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/80">{copy.name}</span>
       </div>
 
-      <div className="lk-ast-log flex flex-col px-5 pt-1 pb-4">
+      {/* O41: the conversation is its own viewport between the header and the
+          composer, stacked from the bottom; older messages slide out of the
+          top under a short fade. */}
+      <div className="lk-ast-log flex min-h-0 flex-1 flex-col justify-end overflow-hidden px-5 pt-1 pb-4">
         <Grow from={S.ask1}>
           <UserBubble text={copy.userOne} />
         </Grow>
