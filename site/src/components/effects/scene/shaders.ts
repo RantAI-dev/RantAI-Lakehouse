@@ -292,7 +292,8 @@ void main(){
     float dm = length(p - uMascot.xy);
     float shade = 1.0 - smoothstep(uMascot.z, uMascot.z + 1.5, dm);
     col *= 1.0 - 0.6 * shade;
-    float rim = exp(-pow((dm - uMascot.z) / 0.14, 2.0));
+    float rimX = (dm - uMascot.z) / 0.14;
+    float rim = exp(-rimX * rimX);
     col += uLake * rim * 0.4;
 
     float f = 1.0 - exp(-pow(dist * uFogDensity, 2.0));
@@ -318,7 +319,7 @@ void main(){
     vec2 cp = p * 0.5 + g * 0.6 * detail;
     float c1 = 1.0 - abs(snoise(cp + vec2(uTime * 0.11, uTime * 0.08)));
     float c2 = 1.0 - abs(snoise(cp * 1.6 - vec2(uTime * 0.09, -uTime * 0.12)));
-    sky += vec3(0.35, 0.62, 0.95) * pow(c1 * c2, 4.0) * 0.35 * detail;
+    sky += vec3(0.35, 0.62, 0.95) * pow(max(c1 * c2, 0.0), 4.0) * 0.35 * detail;
     // The creature above the water blocks the sky: a soft shadow in the window.
     sky *= mix(0.28, 1.0, smoothstep(uMascot.z * 0.75, uMascot.z * 1.25, dm));
     // Beyond the window the surface mirrors the water below it (always
@@ -345,7 +346,8 @@ void main(){
       mirror = mix(mirror, waterFog(body, hitW), hit);
     }
     col = mix(mirror, sky, win);
-    col += uLake * 0.12 * exp(-pow((cosI - 0.68) / 0.05, 2.0));
+    float rimW = (cosI - 0.68) / 0.05;
+    col += uLake * 0.12 * exp(-rimW * rimW);
     col = waterFog(col, vWorld);
   }
 
@@ -388,8 +390,10 @@ void main(){
   float r = length(c) * 2.0;
   float ang = atan(c.y, c.x);
   r += snoise(vec2(ang * 3.0, uTime * 0.5)) * 0.012;
-  float core = exp(-pow((r - uInner) / 0.035, 2.0));
-  float soft = exp(-pow((r - uInner - 0.03) / 0.14, 2.0)) * 0.3;
+  float dc = (r - uInner) / 0.035;
+  float ds = (r - uInner - 0.03) / 0.14;
+  float core = exp(-dc * dc);
+  float soft = exp(-ds * ds) * 0.3;
   float edge = 1.0 - smoothstep(0.82, 1.0, r);
   float a = (core * 0.85 + soft) * edge * uAmount;
   gl_FragColor = vec4(uColor * a, a);
@@ -477,7 +481,10 @@ varying vec2 vUv;
 varying float vDepth;
 ${NOISE_GLSL}
 void main(){
-  float across = pow(1.0 - abs(vUv.x * 2.0 - 1.0), 1.7);
+  // WEB-5 O12: clamped. With MSAA a pixel just outside the quad is shaded
+  // with vUv a little past 0..1; pow() of the negative base is NaN on
+  // Apple GPUs, and NaN resolved to black dashes along every shaft's edge.
+  float across = pow(max(1.0 - abs(vUv.x * 2.0 - 1.0), 0.0), 1.7);
   // WEB-5 O5: born just under the surface (soft, so the shaft never shows
   // the line where its quad meets the water) and fading as the light is
   // absorbed on the way down.
@@ -691,8 +698,10 @@ void main(){
     float px = uRes.y / 900.0;
     col = mix(b, a, smoothstep(-1.2 * px, 1.2 * px, s));
     // The meniscus: light caught in the curved water, then its shadow.
-    col += uMeniscus * exp(-pow((s - 0.5 * px) / (1.1 * px), 2.0));
-    col *= 1.0 - 0.22 * exp(-pow((s + 3.0 * px) / (3.0 * px), 2.0));
+    float mg = (s - 0.5 * px) / (1.1 * px);
+    float ms = (s + 3.0 * px) / (3.0 * px);
+    col += uMeniscus * exp(-mg * mg);
+    col *= 1.0 - 0.22 * exp(-ms * ms);
   }
   gl_FragColor = vec4(col, 1.0);
   ${OUTPUT_GLSL}

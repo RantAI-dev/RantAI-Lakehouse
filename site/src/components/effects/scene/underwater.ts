@@ -91,7 +91,7 @@ export function applyWaterFog(material: Material, fog: WaterFogUniforms, opts: {
           float c1 = 1.0 - abs(snoise(cp + vec2(uWfTime * 0.16, uWfTime * 0.11)));
           float c2 = 1.0 - abs(snoise(cp * 1.7 - vec2(uWfTime * 0.12, -uWfTime * 0.17)));
           float lit = smoothstep(-0.2, 0.8, nW.y) * exp(min(vWfWorld.y, 0.0) / 3.5);
-          totalEmissiveRadiance += vec3(0.32, 0.62, 1.0) * pow(c1 * c2, 3.0) * 0.55 * lit;
+          totalEmissiveRadiance += vec3(0.32, 0.62, 1.0) * pow(max(c1 * c2, 0.0), 3.0) * 0.55 * lit;
         }`,
       );
     }
