@@ -35,6 +35,8 @@ const ACCESS: SavedQueryAccessList = {
       id: "rule-a",
       userId: "u-2",
       roleId: null,
+      granteeName: "Dewi Lestari",
+      granteeEmail: "dewi@example.com",
       level: "edit",
       grantedBy: "u-1",
       grantedAt: "2026-11-01T09:00:00.000Z",
@@ -43,6 +45,8 @@ const ACCESS: SavedQueryAccessList = {
       id: "rule-b",
       userId: null,
       roleId: "role-1",
+      granteeName: "Finance",
+      granteeEmail: null,
       level: "view",
       grantedBy: null,
       grantedAt: "2026-11-02T09:00:00.000Z",
@@ -54,6 +58,8 @@ const ACCESS: SavedQueryAccessList = {
       folderName: "Team",
       userId: "u-3",
       roleId: null,
+      granteeName: "Bagus Santoso",
+      granteeEmail: "bagus@example.com",
       level: "view",
     },
   ],
@@ -97,11 +103,11 @@ describe("the share panel", () => {
     stubAccess()
     renderPanel()
 
-    await screen.findByText("u-2")
+    await screen.findByText("Dewi Lestari")
 
     const own = screen.getByRole("list", { name: "People and roles with access" })
-    expect(own.textContent).toContain("u-2")
-    expect(own.textContent).toContain("role-1 (role)")
+    expect(own.textContent).toContain("Dewi Lestari")
+    expect(own.textContent).toContain("Finance")
     expect(own.textContent).toContain("Can edit")
     expect(own.textContent).toContain("Can view")
   })
@@ -110,14 +116,95 @@ describe("the share panel", () => {
     stubAccess()
     renderPanel()
 
-    await screen.findByText("u-2")
+    await screen.findByText("Dewi Lestari")
 
     const inherited = screen.getByRole("list", { name: "Inherited access" })
-    expect(inherited.textContent).toContain("u-3")
+    expect(inherited.textContent).toContain("Bagus Santoso")
     expect(inherited.textContent).toContain("Team")
     // An inherited rule is not one of the item's own rules.
     const own = screen.getByRole("list", { name: "People and roles with access" })
-    expect(own.textContent).not.toContain("u-3")
+    expect(own.textContent).not.toContain("Bagus Santoso")
+  })
+
+  it("names a person with the email under it and a role with (role) after it", async () => {
+    stubAccess()
+    renderPanel()
+
+    const person = (await screen.findByText("Dewi Lestari")).closest("li")
+    expect(person?.textContent).toContain("dewi@example.com")
+    // The id is the server's business; the panel shows who the rule names.
+    expect(person?.textContent).not.toContain("u-2")
+
+    const role = screen.getByText("Finance").closest("li")
+    expect(role?.textContent).toContain("Finance")
+    expect(role?.textContent).toContain("(role)")
+    expect(role?.textContent).not.toContain("role-1")
+  })
+
+  it("labels the level picker and the remove button with the grantee's name", async () => {
+    stubAccess()
+    renderPanel()
+
+    await screen.findByText("Dewi Lestari")
+
+    expect(screen.getByLabelText("Level of Dewi Lestari")).toBeDefined()
+    expect(screen.getByRole("button", { name: "Remove Dewi Lestari" })).toBeDefined()
+    expect(screen.getByRole("button", { name: "Remove Finance (role)" })).toBeDefined()
+  })
+
+  it("says Unknown person or Unknown role, with the id, when the server found no name", async () => {
+    stubAccess({
+      rules: [
+        {
+          id: "rule-x",
+          userId: "u-77",
+          roleId: null,
+          granteeName: null,
+          granteeEmail: null,
+          level: "view",
+          grantedBy: null,
+          grantedAt: "2026-11-02T09:00:00.000Z",
+        },
+        {
+          id: "rule-y",
+          userId: null,
+          roleId: "role-77",
+          granteeName: null,
+          granteeEmail: null,
+          level: "view",
+          grantedBy: null,
+          grantedAt: "2026-11-02T09:00:00.000Z",
+        },
+      ],
+      inherited: [],
+    })
+    renderPanel()
+
+    await screen.findByText("Unknown person")
+    const own = screen.getByRole("list", { name: "People and roles with access" })
+    expect(own.textContent).toContain("Unknown person")
+    expect(own.textContent).toContain("u-77")
+    expect(own.textContent).toContain("Unknown role")
+    expect(own.textContent).toContain("role-77")
+    // The two unknowns stay apart for a screen reader.
+    expect(screen.getByRole("button", { name: "Remove Unknown person (u-77)" })).toBeDefined()
+    expect(screen.getByRole("button", { name: "Remove Unknown role (role-77)" })).toBeDefined()
+  })
+
+  it("keeps the name of a grantee picked from the search until the list is saved", async () => {
+    stubAccess()
+    stubGrantees()
+    renderPanel()
+
+    fireEvent.change(await screen.findByLabelText("Add a person or role"), {
+      target: { value: "re" },
+    })
+    fireEvent.click(await screen.findByRole("button", { name: /Reza Hakim/ }))
+
+    const own = screen.getByRole("list", { name: "People and roles with access" })
+    expect(own.textContent).toContain("Reza Hakim")
+    expect(own.textContent).toContain("reza@example.com")
+    expect(own.textContent).not.toContain("u-9")
   })
 
   it("says in one line what the shared space means", async () => {
@@ -211,10 +298,10 @@ describe("the share panel", () => {
     const put = spyOn(queryService, "putSavedAccess").mockResolvedValue(ACCESS)
     renderPanel()
 
-    await screen.findByText("u-2")
+    await screen.findByText("Dewi Lestari")
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove u-2" }))
-    fireEvent.change(screen.getByLabelText("Level of role-1 (role)"), {
+    fireEvent.click(screen.getByRole("button", { name: "Remove Dewi Lestari" }))
+    fireEvent.change(screen.getByLabelText("Level of Finance (role)"), {
       target: { value: "manage" },
     })
     fireEvent.click(screen.getByRole("button", { name: "Save access" }))
@@ -238,6 +325,8 @@ describe("the share panel", () => {
           id: "rule-c",
           userId: "u-9",
           roleId: null,
+          granteeName: "Reza Hakim",
+          granteeEmail: "reza@example.com",
           level: "manage",
           grantedBy: "u-1",
           grantedAt: "2026-11-03T09:00:00.000Z",
@@ -246,14 +335,14 @@ describe("the share panel", () => {
     })
     renderPanel()
 
-    await screen.findByText("u-2")
+    await screen.findByText("Dewi Lestari")
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove u-2" }))
+    fireEvent.click(screen.getByRole("button", { name: "Remove Dewi Lestari" }))
     fireEvent.click(screen.getByRole("button", { name: "Save access" }))
 
     // The panel draws the answer of the write, not the list it held.
-    expect(await screen.findByText("u-9")).toBeDefined()
-    expect(screen.queryAllByText("u-2").length).toBe(0)
+    expect(await screen.findByText("Reza Hakim")).toBeDefined()
+    expect(screen.queryAllByText("Dewi Lestari").length).toBe(0)
   })
 
   it("shows the server's sentence when the write is refused", async () => {
@@ -266,9 +355,9 @@ describe("the share panel", () => {
     )
     renderPanel()
 
-    await screen.findByText("u-2")
+    await screen.findByText("Dewi Lestari")
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove u-2" }))
+    fireEvent.click(screen.getByRole("button", { name: "Remove Dewi Lestari" }))
     fireEvent.click(screen.getByRole("button", { name: "Save access" }))
 
     expect((await screen.findByRole("alert")).textContent).toBe(
@@ -286,9 +375,9 @@ describe("the share panel", () => {
     )
     renderPanel("folder")
 
-    await screen.findByText("u-2")
+    await screen.findByText("Dewi Lestari")
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove u-2" }))
+    fireEvent.click(screen.getByRole("button", { name: "Remove Dewi Lestari" }))
     fireEvent.click(screen.getByRole("button", { name: "Save access" }))
 
     const dialog = await screen.findByRole("dialog")
@@ -307,9 +396,9 @@ describe("the share panel", () => {
     )
     renderPanel()
 
-    await screen.findByText("u-2")
+    await screen.findByText("Dewi Lestari")
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove u-2" }))
+    fireEvent.click(screen.getByRole("button", { name: "Remove Dewi Lestari" }))
     fireEvent.click(screen.getByRole("button", { name: "Save access" }))
 
     expect((await screen.findByRole("alert")).textContent).toBe(
@@ -341,10 +430,10 @@ describe("the share panel", () => {
     })
     renderPanel("folder")
 
-    await screen.findByText("u-2")
+    await screen.findByText("Dewi Lestari")
     expect(get.mock.calls.at(-1)?.[0]).toBe("team")
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove u-2" }))
+    fireEvent.click(screen.getByRole("button", { name: "Remove Dewi Lestari" }))
     fireEvent.click(screen.getByRole("button", { name: "Save access" }))
 
     await waitFor(() => {

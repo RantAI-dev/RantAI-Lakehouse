@@ -54,9 +54,19 @@ type WorkingRule = {
   readonly userId: string | null
   /** The role the rule names; `null` when it names a person. */
   readonly roleId: string | null
+  /** The grantee's name, as the server sent it; `null` when it found none. */
+  readonly granteeName: string | null
+  /** The person's email; `null` for a role and when the server found none. */
+  readonly granteeEmail: string | null
   /** What the rule gives. */
   readonly level: string
 }
+
+/** The grantee a rule names: the ids a write needs and the words a reader needs. */
+type Grantee = Pick<
+  WorkingRule,
+  "userId" | "roleId" | "granteeName" | "granteeEmail"
+>
 
 /**
  * The key of a rule.
@@ -68,14 +78,45 @@ function ruleKey(rule: { userId: string | null; roleId: string | null }): string
   return rule.roleId ? `role:${rule.roleId}` : `user:${rule.userId ?? ""}`
 }
 
+/** What the panel calls a grantee the server found no name for. */
+function unknownName(rule: { roleId: string | null }): string {
+  return rule.roleId ? "Unknown role" : "Unknown person"
+}
+
+/** The id of the grantee a rule names. */
+function granteeId(rule: { userId: string | null; roleId: string | null }): string {
+  return rule.roleId ?? rule.userId ?? ""
+}
+
 /**
- * What the panel shows for a rule: the grantee it names.
+ * What the panel calls a rule in a sentence or a label: the grantee's name,
+ * with "(role)" after a role's name.
  *
- * The server sends the grantee's id and not its name, so the panel shows
- * the id; it never makes a name up.
+ * The server sends the name; when it found none the panel says so and adds
+ * the id, so two unknown grantees stay apart. It never makes a name up.
  */
-function ruleLabel(rule: { userId: string | null; roleId: string | null }): string {
-  return rule.roleId ? `${rule.roleId} (role)` : (rule.userId ?? "")
+function ruleLabel(rule: Grantee): string {
+  const name = rule.granteeName
+  if (name === null) return `${unknownName(rule)} (${granteeId(rule)})`
+  return rule.roleId ? `${name} (role)` : name
+}
+
+/** A rule's grantee in a row: the name, and under it the email or the id. */
+function GranteeText({ rule }: { readonly rule: Grantee }) {
+  const name = rule.granteeName
+  return (
+    <span className="min-w-0 flex-1 truncate">
+      <span>{name ?? unknownName(rule)}</span>
+      {name !== null && rule.roleId ? (
+        <span className="text-muted-foreground"> (role)</span>
+      ) : null}
+      {name === null ? (
+        <span className="block text-xs text-muted-foreground">{granteeId(rule)}</span>
+      ) : rule.granteeEmail ? (
+        <span className="block text-xs text-muted-foreground">{rule.granteeEmail}</span>
+      ) : null}
+    </span>
+  )
 }
 
 /** The rules of an access list, as the panel edits them. */
@@ -83,6 +124,8 @@ function workingRules(rules: SavedQueryAccessList["rules"]): WorkingRule[] {
   return rules.map((rule) => ({
     userId: rule.userId,
     roleId: rule.roleId,
+    granteeName: rule.granteeName,
+    granteeEmail: rule.granteeEmail,
     level: rule.level,
   }))
 }
@@ -144,8 +187,9 @@ export function SavedQueryAccessPanel({
   readonly title: string
   readonly onClose: () => void
 }) {
-  // Both access lists are manage-level on the server, so the caller that
-  // opens the panel is the one who may change it.
+  // The panel opens only where the caller holds manage and may change the
+  // rules. The folder's list is also readable at edit (so the save and move
+  // dialogs can say who a folder is shared with), but editing stays here.
   const access = useService(
     (signal) =>
       kind === "query"
@@ -215,7 +259,7 @@ export function SavedQueryAccessPanel({
   const yourLevel = list?.yourLevel ?? ""
   const refusal = save.error ?? access.error ?? searchError
 
-  function add(grantee: { userId: string | null; roleId: string | null }) {
+  function add(grantee: Grantee) {
     setRows((current) =>
       current.some((rule) => ruleKey(rule) === ruleKey(grantee))
         ? current
@@ -290,7 +334,7 @@ export function SavedQueryAccessPanel({
             ) : null}
             {rows.map((row) => (
               <li key={ruleKey(row)} className="flex items-center gap-2 text-sm">
-                <span className="min-w-0 flex-1 truncate">{ruleLabel(row)}</span>
+                <GranteeText rule={row} />
                 <select
                   aria-label={`Level of ${ruleLabel(row)}`}
                   value={row.level}
@@ -369,7 +413,14 @@ export function SavedQueryAccessPanel({
                   <button
                     type="button"
                     className="w-full px-2 py-1 text-left hover:bg-muted"
-                    onClick={() => add({ userId: person.id, roleId: null })}
+                    onClick={() =>
+                      add({
+                        userId: person.id,
+                        roleId: null,
+                        granteeName: person.name,
+                        granteeEmail: person.email,
+                      })
+                    }
                   >
                     {person.name}{" "}
                     <span className="text-muted-foreground">{person.email}</span>
@@ -381,7 +432,14 @@ export function SavedQueryAccessPanel({
                   <button
                     type="button"
                     className="w-full px-2 py-1 text-left hover:bg-muted"
-                    onClick={() => add({ userId: null, roleId: role.id })}
+                    onClick={() =>
+                      add({
+                        userId: null,
+                        roleId: role.id,
+                        granteeName: role.name,
+                        granteeEmail: null,
+                      })
+                    }
                   >
                     {role.name} <span className="text-muted-foreground">(role)</span>
                   </button>

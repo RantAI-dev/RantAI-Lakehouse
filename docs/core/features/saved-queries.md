@@ -12,7 +12,7 @@
 | Acceptor | Held in the base. |
 | Started | 2026-10-30; also in `BACKLOG.md` Dates |
 | Shipped | Not yet |
-| Evidence | API in #361 (2026-11-03) and its review fixes in #382 (2026-11-05); console in #389 (2026-11-05), with moving a folder needing manage on everything in it in #393 (2026-11-06) and sharing a folder needing the same in #409: the folder tree with the personal and the shared space, server-side search, the level-gated row and folder actions, the move dialog, the trash with restore at edit, version history with revert behind a confirmation, the share panel for queries and folders at manage, and the studio saving back into the query it came from; TypeScript suite 3449 pass / 1 skip / 0 fail on #389's head; every refusal surfaces the server's own sentence through the standard renderer, and the console writes none of its own. |
+| Evidence | API in #361 (2026-11-03) and its review fixes in #382 (2026-11-05); console in #389 (2026-11-05), with moving a folder needing manage on everything in it in #393 (2026-11-06) and sharing a folder needing the same in #409, and a folder naming who it is shared with before a save or a move in #416: the folder tree with the personal and the shared space, server-side search, the level-gated row and folder actions, the move dialog, the trash with restore at edit, version history with revert behind a confirmation, the share panel for queries and folders at manage, with the grantees' names, and the studio saving back into the query it came from; TypeScript suite 3449 pass / 1 skip / 0 fail on #389's head; every refusal surfaces the server's own sentence through the standard renderer, and the console writes none of its own. |
 | Plan | Plan files are not kept in the repository. |
 
 ## Problem
@@ -53,7 +53,7 @@ saves into the person's personal space. No new tool: organising and sharing are 
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Three levels, the same as dashboards (`BI-19`): view (see and run), edit (change SQL, title and tags; rename a folder), manage (also move, share, and delete a folder). The spec's separate "run" level is dropped: anyone who can see a query's SQL can copy it and run it under their own `query:read`, so view-but-not-run would protect nothing. Sharing or moving a folder needs manage on everything in it | 3 levels | Owner, 2026-11-05; changed: Owner, 2026-11-06 |
+| 1 | Three levels, the same as dashboards (`BI-19`): view (see and run), edit (change SQL, title and tags; rename a folder), manage (also move, share, and delete a folder). The spec's separate "run" level is dropped: anyone who can see a query's SQL can copy it and run it under their own `query:read`, so view-but-not-run would protect nothing. Sharing or moving a folder needs manage on everything in it. Anyone with edit on a folder sees who it is shared with: the access list answers at edit, every rule in it carries the grantee's name and email, the save sheet and the move dialog name who a chosen folder is shared with, and the share panel shows names instead of ids | 3 levels | Owner, 2026-11-05; changed: Owner, 2026-11-06; changed: Owner, 2026-11-07 |
 | 2 | A level is granted to a person or a role of the same organisation, on a query or a folder. A folder's grant covers what is inside it | none | Owner, 2026-10-30 |
 | 3 | A new saved query goes to the author's personal space unless they pick a folder. Only the author sees the personal space. The **shared space** is the root of the tree, a query that sits in no folder. Every holder of `query:read` in the organisation sees what is in it, at **view**. The **personal space** is one folder per person, and only its owner sees it | personal | Owner, 2026-10-30 |
 | 4 | Every query saved before this release moves to the organisation's shared space with view for everyone in the organisation and manage for its author, so nobody loses a query they see today. A query with no author (seeded, or saved by the assistant before this release) gets manage for administrators only. A grant adds a person or a role to an item in either space. In the shared space it raises the level; in a personal space it is the only way anybody else sees the item. So the acceptance check `QS-3-AC1` (share at view with a second user) is a personal query shared with them | none | Owner, 2026-10-30 |
@@ -68,8 +68,13 @@ saves into the person's personal space. No new tool: organising and sharing are 
 ## Limits to tell a customer
 
 - A shared query shows its SQL to everyone it is shared with; sharing at view level does not hide the SQL.
-- A query saved into a folder that is already shared is shared with the same people, because a folder's grant covers what is inside it. Choosing that folder when saving is the saver's choice.
+- A query saved into a folder that is already shared is shared with the same people, because a folder's grant covers what is inside it. The save sheet and the move dialog name who the chosen folder is shared with before the user confirms, so the choice is an informed one.
 - Sharing a folder needs manage on the folder and on every sub-folder and query under it, trashed ones included. Otherwise the share is refused with 403 and "Only someone who manages everything in this folder can share it."
+- A `PUT` that only removes rules is refused too when the folder holds a query the caller does not manage, so the
+  author of such a folder cannot revoke its rules. The query's manager can move the query out, or an administrator
+  changes the rules.
+- A rule set on an empty folder applies to what is saved or moved into it later. The save sheet and the move dialog
+  name who that is, for anyone with edit on the folder.
 - Queries saved before this release start in the shared space, visible to the whole organisation, as they were.
 - After 30 days in the trash, a query is gone.
 - A folder is deleted only when it holds nothing live and nothing in the trash. Otherwise the delete is refused with
@@ -100,6 +105,7 @@ Run on a running console by the product owner. A step not performed is never a p
 | `QS-3-AC5` | Share a folder with a role; as a user of that role, open a query inside it | Visible at the folder's level | Not run |
 | `QS-3-AC6` | In the chat, as the second user, ask for the saved queries | The private query is not listed | Not run |
 | `QS-3-AC7` | A user without `query:read` opens the saved queries, and an edit fails on the database | Refused; the failure shows a fixed message (principles 2 and 4) | Not run |
+| `QS-3-AC8` | As a user with edit on a shared folder, pick that folder in the save sheet, then in the move dialog | Both name who the folder is shared with, without you, before you confirm | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

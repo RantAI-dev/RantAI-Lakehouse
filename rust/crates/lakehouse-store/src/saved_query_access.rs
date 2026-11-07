@@ -1480,6 +1480,62 @@ pub async fn search_grantees(
     Ok(GranteeMatches { people, roles })
 }
 
+/// The name (and, for a person, the email) of the grantees a list of rules
+/// names, so the console can say who a rule is for instead of showing an
+/// id.
+///
+/// This is the one lookup behind every access list: at most two queries
+/// whatever the number of rules, and none when both slices are empty.
+///
+/// The tenant boundary is the one of [`search_grantees`] and
+/// [`tenant_user_ids`]: a person is named only when they are a member of
+/// `tenant_id` (through `app_user_tenant`), and with no tenant every person
+/// of the deployment is. A person outside the tenant is left out of the
+/// answer, so the caller shows no name for them: the list never carries
+/// the name or email of another organisation's person, and never makes one
+/// up (`AGENTS.md` principle 2). Unlike the search, an inactive person is
+/// named, because the rule that names them still applies.
+///
+/// A role belongs to the deployment rather than to a tenant — the `role`
+/// table has no tenant column — so every role that exists is named.
+///
+/// An id the database does not hold is absent from the answer.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn grantee_labels(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+    user_ids: &[Uuid],
+    role_ids: &[Uuid],
+) -> Result<GranteeMatches, StoreError> {
+    let people: Vec<GranteePerson> = if user_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT u.id, u.name, u.email FROM app_user u \
+             WHERE u.id = ANY($1::uuid[]) \
+               AND ($2::uuid IS NULL OR EXISTS ( \
+                    SELECT 1 FROM app_user_tenant t \
+                     WHERE t.user_id = u.id AND t.tenant_id = $2))",
+        )
+        .bind(user_ids.to_vec())
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await?
+    };
+    let roles: Vec<GranteeRole> = if role_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as("SELECT id, name FROM role WHERE id = ANY($1::uuid[])")
+            .bind(role_ids.to_vec())
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(GranteeMatches { people, roles })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

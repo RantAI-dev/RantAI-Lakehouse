@@ -30,9 +30,12 @@
 //! # The access lists
 //!
 //! The last surface here is the sharing one: who has what on a saved query
-//! or on a folder (`QS-3`). The list is read with **manage**, because
-//! managing an item includes sharing it: a person who may only see a query
-//! has no business seeing who else sees it. The list answers with the
+//! or on a folder (`QS-3`). A query's list is read with **manage**,
+//! because managing a query includes sharing it: a person who may only see
+//! a query has no business seeing who else sees it. A folder's list is
+//! read with **edit**, so a person who may save or move a query into a
+//! folder sees who the folder is shared with before they do. Changing
+//! either list needs **manage**. A list answers with the
 //! item's own rules and the rules it inherits from the folders above it,
 //! and the grantee search answers with the people and the roles of the
 //! caller's organisation — the two halves of one question, "who may I
@@ -40,7 +43,7 @@
 //! is refused before anything is written, so a refused change leaves the
 //! old rules exactly as they were.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -325,6 +328,12 @@ pub struct AccessRuleWire {
     pub user_id: Option<String>,
     /// The role the rule names; `None` when the rule names a person.
     pub role_id: Option<String>,
+    /// The name of the person or the role the rule names; `None` (sent as
+    /// `null`) when the grantee is not found in the caller's organisation.
+    pub grantee_name: Option<String>,
+    /// The email of the person the rule names; `None` (sent as `null`) for
+    /// a role, and for a person not found in the caller's organisation.
+    pub grantee_email: Option<String>,
     /// What the rule gives: "view", "edit" or "manage".
     pub level: String,
     /// Who wrote the rule; `None` when nobody is recorded.
@@ -334,12 +343,15 @@ pub struct AccessRuleWire {
 }
 
 impl AccessRuleWire {
-    /// The wire shape of a stored rule.
-    fn of(rule: &ItemRule) -> Self {
+    /// The wire shape of a stored rule, with its grantee named from `names`.
+    fn of(rule: &ItemRule, names: &GranteeNames) -> Self {
+        let (grantee_name, grantee_email) = names.of(rule);
         Self {
             id: rule.id.to_string(),
             user_id: rule.user_id.map(|id| id.to_string()),
             role_id: rule.role_id.map(|id| id.to_string()),
+            grantee_name,
+            grantee_email,
             level: rule.level.as_str().to_owned(),
             granted_by: rule.granted_by.map(|id| id.to_string()),
             granted_at: granted_at_of(rule.granted_at),
@@ -359,16 +371,24 @@ pub struct InheritedRuleWire {
     pub user_id: Option<String>,
     /// The role the rule names; `None` when the rule names a person.
     pub role_id: Option<String>,
+    /// The name of the person or the role the rule names; `None` (sent as
+    /// `null`) when the grantee is not found in the caller's organisation.
+    pub grantee_name: Option<String>,
+    /// The email of the person the rule names; `None` (sent as `null`) for
+    /// a role, and for a person not found in the caller's organisation.
+    pub grantee_email: Option<String>,
     /// What the rule gives: "view", "edit" or "manage".
     pub level: String,
 }
 
 impl InheritedRuleWire {
-    /// The wire shape of a rule inherited from the folder `folder_id`.
+    /// The wire shape of a rule inherited from the folder `folder_id`, with
+    /// its grantee named from `names`.
     ///
     /// The folder's name is read from the same map the chain came from,
     /// so the list names the folder the way the tree does.
-    fn of(rule: &ItemRule, folder_id: Uuid, map: &FolderMap) -> Self {
+    fn of(rule: &ItemRule, folder_id: Uuid, map: &FolderMap, names: &GranteeNames) -> Self {
+        let (grantee_name, grantee_email) = names.of(rule);
         Self {
             folder_id: folder_id.to_string(),
             folder_name: map
@@ -376,8 +396,36 @@ impl InheritedRuleWire {
                 .map_or_else(String::new, |folder| folder.name.clone()),
             user_id: rule.user_id.map(|id| id.to_string()),
             role_id: rule.role_id.map(|id| id.to_string()),
+            grantee_name,
+            grantee_email,
             level: rule.level.as_str().to_owned(),
         }
+    }
+}
+
+/// The names of the people and roles an access list's rules name, read in
+/// one lookup for the whole list ([`saved_query_access::grantee_labels`]).
+///
+/// A grantee the lookup did not find is not here, so its rule is sent with
+/// `null` for the name and the email: the list never makes a name up.
+struct GranteeNames {
+    /// The people found in the caller's tenant, by id.
+    people: HashMap<Uuid, GranteePerson>,
+    /// The roles found, by id.
+    roles: HashMap<Uuid, GranteeRole>,
+}
+
+impl GranteeNames {
+    /// The name and the email of the grantee `rule` names: both for a person
+    /// found, the name alone for a role found, neither otherwise.
+    fn of(&self, rule: &ItemRule) -> (Option<String>, Option<String>) {
+        if let Some(person) = rule.user_id.and_then(|id| self.people.get(&id)) {
+            return (Some(person.name.clone()), Some(person.email.clone()));
+        }
+        if let Some(role) = rule.role_id.and_then(|id| self.roles.get(&id)) {
+            return (Some(role.name.clone()), None);
+        }
+        (None, None)
     }
 }
 
@@ -790,16 +838,49 @@ async fn access_list(
         saved_query_access::rules_for_item(pool, item.query_id(), item.folder_id()).await?
     };
     let inherited = saved_query_access::rules_for_folders(pool, &chain).await?;
+    // One lookup names the grantees of the own and the inherited rules
+    // together, whatever their number: a list is never a query per rule.
+    let mut user_ids: Vec<Uuid> = own
+        .iter()
+        .chain(&inherited)
+        .filter_map(|rule| rule.user_id)
+        .collect();
+    let mut role_ids: Vec<Uuid> = own
+        .iter()
+        .chain(&inherited)
+        .filter_map(|rule| rule.role_id)
+        .collect();
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    role_ids.sort_unstable();
+    role_ids.dedup();
+    let labels =
+        saved_query_access::grantee_labels(pool, viewer.tenant_id, &user_ids, &role_ids).await?;
+    let names = GranteeNames {
+        people: labels
+            .people
+            .into_iter()
+            .map(|person| (person.id, person))
+            .collect(),
+        roles: labels
+            .roles
+            .into_iter()
+            .map(|role| (role.id, role))
+            .collect(),
+    };
     Ok(AccessListWire {
         item_type: item.item_type().to_owned(),
         item_id: item.id().to_string(),
         your_level: your_level.as_str().to_owned(),
-        rules: own.iter().map(AccessRuleWire::of).collect(),
+        rules: own
+            .iter()
+            .map(|rule| AccessRuleWire::of(rule, &names))
+            .collect(),
         inherited: inherited
             .iter()
             .filter_map(|rule| {
                 rule.folder_id
-                    .map(|folder_id| InheritedRuleWire::of(rule, folder_id, &map))
+                    .map(|folder_id| InheritedRuleWire::of(rule, folder_id, &map, &names))
             })
             .collect(),
     })
@@ -1654,12 +1735,24 @@ pub async fn put_query_access(
 /// A rule on a folder covers everything inside it, so the list of a
 /// folder is the list of the space it holds.
 ///
+/// The list is read from edit up and changed with manage
+/// ([`put_folder_access`]): a person who may save or move a query into a
+/// folder is told who that folder is shared with before they do (`QS-3`,
+/// folder sharing warning).
+///
 /// # Errors
 ///
 /// 404 with the fixed sentence of [`FOLDER_NOT_FOUND`] for a folder the
-/// caller may not see; 403 with the fixed sentence of [`FOLDER_FORBIDDEN`]
-/// for a folder the caller may see but not manage; 500 on a database
-/// failure.
+/// caller may not see, for an id that is not a UUID and for a caller that
+/// acts for no organisation; 404 for an `X-Tenant` header that names a
+/// tenant the caller does not belong to; 403 with the fixed sentence of
+/// [`FOLDER_FORBIDDEN`] for a folder the caller may see but only view; 503
+/// when no database pool is configured, which `pool` raises before any
+/// store call, or when the tenant scope cannot verify the deployment's
+/// tenant count; 500 with the fixed sentence `database error` on a
+/// database failure inside a store call, through
+/// `From<StoreError> for ApiError`. This route does not use
+/// `folder_failure`, which only the writes use.
 pub async fn get_folder_access(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1673,7 +1766,10 @@ pub async fn get_folder_access(
     };
     let folder_id = folder_id_of(&id)?;
     let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
-    if level < Level::Manage {
+    // Edit reads the list, manage changes it (`QS-3`, folder sharing
+    // warning): a person who may save or move a query into a folder is
+    // told who that folder is shared with before they do.
+    if level < Level::Edit {
         return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
     }
     let item = AccessItem::Folder { id: folder_id };
@@ -1700,7 +1796,9 @@ pub async fn get_folder_access(
 /// whose sub-folders or queries the caller does not all manage; 400 for
 /// a body of another shape, for a rule that names two grantees or none,
 /// for a grantee that is listed twice and for a grantee that is not of the
-/// caller's organisation; 500 on a database failure.
+/// caller's organisation; 503 with a reference id when the database cannot
+/// be reached, which `folder_failure` answers for the check of what the
+/// caller manages in the folder; 500 on any other database failure.
 pub async fn put_folder_access(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
