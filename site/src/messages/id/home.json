@@ -47,25 +47,22 @@
     "layers": {
       "bronze": {
         "title": "Apa adanya.",
-        "body": "Setiap sumber masuk tanpa diubah ke tabel Apache Iceberg yang terbuka. Tak ada yang diubah, tak ada yang hilang."
+        "body": "Disimpan apa adanya, di tabel Apache Iceberg terbuka."
       },
       "silver": {
         "title": "Bersih dan teruji.",
-        "body": "Pipeline membuang duplikat, merapikan ejaan, dan menyatukan sumber. Pemeriksaan kualitas menandai yang masih salah."
+        "body": "Pipeline merapikan, pemeriksaan kualitas menandai."
       },
       "gold": {
         "title": "Siap menjawab.",
-        "body": "Tabel untuk pertanyaan bisnis Anda, diperbarui dalam lag yang Anda tetapkan. Dashboard dan asisten membaca dari sini."
+        "body": "Diperbarui sendiri dalam lag yang Anda tetapkan."
       }
     },
     "card": {
-      "illustration": "Ilustrasi",
       "numberLocale": "id-ID",
       "rows": "baris",
       "cities": "kota",
-      "sources": "2 sumber",
       "columns": {
-        "source": "Sumber",
         "order": "Pesanan",
         "city": "Kota",
         "date": "Tanggal",
@@ -74,7 +71,6 @@
         "revenue": "Pendapatan"
       },
       "empty": "kosong",
-      "bronzeNote": "Disimpan apa adanya, semua baris utuh",
       "checks": {
         "duplicates": "Tanpa duplikat",
         "city": "Kota valid",
@@ -84,9 +80,9 @@
       "lag": "Dalam target lag",
       "feeds": "Dipakai dashboard dan asisten",
       "sr": {
-        "bronze": "Ilustrasi: lima baris pesanan dari file pesanan dan ekspor CRM, disimpan apa adanya. Satu pesanan masuk dua kali, Jakarta ditulis dengan tiga cara, tanggalnya memakai tiga format, dan satu jumlah kosong.",
-        "silver": "Ilustrasi: baris yang sama dalam satu tabel Silver. Duplikatnya hilang, semua kota tertulis Jakarta atau Bandung, semua tanggal satu format, dan pemeriksaan kualitas menandai satu jumlah yang kosong.",
-        "gold": "Ilustrasi: tabel Gold berisi pendapatan per kota dari baris-baris tadi, Jakarta lebih dulu lalu Bandung, dalam target lag-nya, siap untuk dashboard dan asisten."
+        "bronze": "Lima contoh baris pesanan dari file pesanan dan ekspor CRM, disimpan apa adanya. Satu pesanan masuk dua kali, Jakarta ditulis dengan tiga cara, tanggalnya memakai tiga format, dan satu jumlah kosong.",
+        "silver": "Baris yang sama dalam satu tabel Silver. Duplikatnya hilang, semua kota tertulis Jakarta atau Bandung, semua tanggal satu format, dan pemeriksaan kualitas menandai satu jumlah yang kosong.",
+        "gold": "Tabel Gold berisi pendapatan per kota dari baris-baris tadi, Jakarta lebih dulu lalu Bandung, dalam target lag-nya, siap untuk dashboard dan asisten."
       }
     }
   },
@@ -98,7 +94,6 @@
       "Menjalankan pipeline",
       "Query Studio: autocomplete, tab, riwayat"
     ],
-    "caption": "Ilustrasi",
     "name": "Asisten",
     "status": {
       "ready": "Siap",

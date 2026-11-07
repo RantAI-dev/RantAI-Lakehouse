@@ -47,25 +47,22 @@
     "layers": {
       "bronze": {
         "title": "As it came.",
-        "body": "Every source lands untouched in open Apache Iceberg tables. Nothing is changed, nothing is lost."
+        "body": "Kept as sent, in open Apache Iceberg tables."
       },
       "silver": {
         "title": "Cleaned and checked.",
-        "body": "Pipelines drop duplicates, fix spellings and join the sources. Quality checks flag what is still wrong."
+        "body": "Pipelines fix it. Quality checks flag the rest."
       },
       "gold": {
         "title": "Ready for answers.",
-        "body": "Tables built for your questions, refreshed within the lag you set. Dashboards and the assistant read from here."
+        "body": "Refreshes itself within the lag you set."
       }
     },
     "card": {
-      "illustration": "Illustration",
       "numberLocale": "en-US",
       "rows": "rows",
       "cities": "cities",
-      "sources": "2 sources",
       "columns": {
-        "source": "Source",
         "order": "Order",
         "city": "City",
         "date": "Date",
@@ -74,7 +71,6 @@
         "revenue": "Revenue"
       },
       "empty": "empty",
-      "bronzeNote": "Stored as sent, every row kept",
       "checks": {
         "duplicates": "No duplicates",
         "city": "City valid",
@@ -84,9 +80,9 @@
       "lag": "Within target lag",
       "feeds": "Feeds dashboards and the assistant",
       "sr": {
-        "bronze": "Illustration: five order rows from an orders file and a CRM export, stored as they came. One order arrives twice, Jakarta is spelt three ways, the dates use three formats and one amount is missing.",
-        "silver": "Illustration: the same rows in one Silver table. The duplicate is gone, every city reads Jakarta or Bandung, every date has one format, and a quality check flags the one empty amount.",
-        "gold": "Illustration: a Gold table of revenue by city built from those rows, Jakarta first, then Bandung, within its target lag, ready for dashboards and the assistant."
+        "bronze": "Five example order rows from an orders file and a CRM export, stored as they came. One order arrives twice, Jakarta is spelt three ways, the dates use three formats and one amount is missing.",
+        "silver": "The same rows in one Silver table. The duplicate is gone, every city reads Jakarta or Bandung, every date has one format, and a quality check flags the one empty amount.",
+        "gold": "A Gold table of revenue by city built from those rows, Jakarta first, then Bandung, within its target lag, ready for dashboards and the assistant."
       }
     }
   },
@@ -98,7 +94,6 @@
       "Runs pipelines",
       "Query Studio: autocomplete, tabs, history"
     ],
-    "caption": "Illustration",
     "name": "Assistant",
     "status": {
       "ready": "Ready",

@@ -14,8 +14,8 @@ import { AssistantChat } from "./assistant-chat";
  * one screen tall and the panel tells its own story in time
  * (`assistant-chat.tsx`), then rests. The chat is DOM, not a screenshot, and
  * nothing in it talks to an API. The mock is decorative (`aria-hidden`); a
- * visually hidden sentence describes it, and it is labelled "Illustration"
- * on screen. Without JavaScript and with reduced motion the finished
+ * visually hidden sentence describes it (O32: no visible "Illustration"
+ * tag). Without JavaScript and with reduced motion the finished
  * conversation is shown at once.
  *
  * A server component: the only client code is the panel's player.

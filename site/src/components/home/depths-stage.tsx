@@ -45,12 +45,17 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
       {/* The gauge hugs the screen's left edge, outside the 1120 px column. */}
       <DepthGauge progress={progress} active={active} />
       <Container className="relative h-full">
-        <div className="grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:gap-3 max-md:pl-6 md:grid-cols-[minmax(0,420px)_1fr] md:pl-36">
+        <div className="lk-depth-grid-stage grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:gap-3 max-md:pl-6 md:grid-cols-[minmax(0,400px)_1fr]">
           {/* WEB-5 O21: the chapter shows what the depth does to the data.
               The key says the whole idea at once, the text is a title and
               one line, and the card below is the same few rows at this
               depth (depth-data-card.tsx). It sits in the text column, so
-              the 3D slabs behind the other cell stay in view. */}
+              the 3D slabs behind the other cell stay in view.
+              O31 (owner: "penuh banget"): one indicator, the key (the
+              "BRONZE · −10 M" eyebrow is gone: the gauge and the key say
+              it), one short line, and the card as the focal point. The
+              column starts right after the gauge, so the card stays clear
+              of the slabs on the right (app/globals.css). */}
           <div className="rounded-3xl max-md:bg-[#020514]/55 max-md:p-4 max-md:backdrop-blur-md">
             <DepthKey active={active} words={copy.key} />
             <AnimatePresence mode="wait" initial={false}>
@@ -60,24 +65,22 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
                 animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
                 exit={{ opacity: 0, y: -14, filter: "blur(6px)" }}
                 transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                className="mt-4 md:mt-6"
+                className="mt-4 md:mt-7"
                 aria-live="polite"
               >
-                <p
-                  className="text-[12px] font-medium tracking-[0.22em] uppercase"
-                  style={{ color: layer.accent }}
-                >
-                  {layer.label} · {layer.meters}
-                </p>
-                <h3 className="lk-display mt-2 text-[clamp(2rem,9vw,2.5rem)] leading-[1.04] text-balance text-[#E8F4FF] md:mt-3 md:text-[clamp(2.5rem,3.9vw,3.4rem)]">
+                <h3 className="lk-display text-[clamp(2rem,9vw,2.5rem)] leading-[1.04] text-balance text-[#E8F4FF] md:text-[clamp(2.4rem,3.5vw,3.1rem)]">
+                  {/* The depth's name for assistive tech; on screen the key above says it. */}
+                  <span className="sr-only">
+                    {layer.label} {layer.meters}:{" "}
+                  </span>
                   {text.title}
                 </h3>
-                <p className="mt-2 max-w-[26rem] text-[15px] leading-[1.5] text-pretty text-[#E8F4FF]/85 md:mt-3 md:text-[16px]">
+                <p className="mt-2 max-w-[24rem] text-[15px] leading-[1.5] text-pretty text-[#E8F4FF]/75 md:mt-3 md:text-[16px]">
                   {text.body}
                 </p>
               </m.div>
             </AnimatePresence>
-            <DepthDataCard stage={active} copy={copy.card} className="mt-4 md:mt-6" />
+            <DepthDataCard stage={active} copy={copy.card} className="mt-5 md:mt-8" />
           </div>
           {/* The 3D stack renders on the canvas behind this cell; without one, a CSS stack stands in. */}
           <div className="lk-depth-stack-cell relative h-full min-h-0 md:min-h-[280px]">

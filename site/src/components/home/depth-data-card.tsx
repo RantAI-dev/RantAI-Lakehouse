@@ -39,8 +39,9 @@ import {
  * list, and the no-JS page) is the same card, still, at its depth.
  *
  * The card is decorative (`aria-hidden`); a visually hidden sentence per
- * depth says what it shows, and it carries the on-screen "Illustration"
- * label (D7). The records are fictional (`depth-records.ts`).
+ * depth says what it shows. The records are fictional (`depth-records.ts`);
+ * O32 (owner, 2026-11-07) dropped the visible "Illustration" pill, as
+ * visitors can tell they are not real data.
  */
 
 type DepthsCopy = HomeCopy["depths"];
@@ -131,17 +132,11 @@ export function DepthDataCard({
         className={`lk-depth-card${animate ? "" : " lk-depth-still"}`}
         style={{ "--lk-depth-accent": accent } as React.CSSProperties}
       >
-        {/* Header: the table the rows live in. Bronze is two sources; Silver and Gold are one table each. */}
+        {/* Header: the table the rows live in, one per depth, and how many rows it holds. */}
         <div className="flex h-10 items-center gap-2 border-b border-[#E8F4FF]/10 px-3.5">
           <span className="lk-depth-dot size-1.5 shrink-0 rounded-full" />
           <span className="relative h-5 min-w-0 flex-1">
-            <span className="lk-depth-swap absolute inset-0 flex items-center gap-1.5" data-for="bronze">
-              {(["orders", "crm"] as const).map((s) => (
-                <SourceChip key={s} source={s} />
-              ))}
-              <span className="lk-depth-sources text-[12px] text-[#E8F4FF]/85">{copy.sources}</span>
-            </span>
-            {(["silver", "gold"] as const).map((d) => (
+            {(["bronze", "silver", "gold"] as const).map((d) => (
               <span key={d} className="lk-depth-swap absolute inset-0 flex items-center" data-for={d}>
                 <code className="truncate !text-[12px] !leading-5 text-[#E8F4FF]/90">{DEPTH_TABLES[d]}</code>
               </span>
@@ -150,17 +145,12 @@ export function DepthDataCard({
           <span className="lk-depth-count shrink-0 text-[11px] text-[#E8F4FF]/60 tabular-nums">
             {rowCount} {stage === 2 ? copy.cities : copy.rows}
           </span>
-          <span className="shrink-0 rounded-full border border-[#E8F4FF]/15 px-2 py-0.5 text-[10px] leading-4 text-[#E8F4FF]/70">
-            {copy.illustration}
-          </span>
         </div>
 
         {/* Body: the rows, and over them the Gold groups. Fixed height, so a change of depth moves nothing around the card. */}
         <div className="lk-depth-body relative">
           <div className="lk-depth-grid lk-depth-head" data-cols>
-            <span className="lk-depth-src">
-              <span className="lk-depth-src-label">{copy.columns.source}</span>
-            </span>
+            <span className="lk-depth-src" />
             <span className="lk-depth-ord">
               {copy.columns.order}
               <CheckMark ok />
@@ -189,9 +179,10 @@ export function DepthDataCard({
                 data-dup={dup || undefined}
                 style={{ "--slot": slotOf(raw.id, stage), "--i": RAW_RECORDS.indexOf(raw) } as React.CSSProperties}
               >
-                <span className="lk-depth-src flex min-w-0 items-center gap-1.5 text-[#E8F4FF]/60">
-                  <Icon className="size-3 shrink-0" strokeWidth={2} />
-                  <code className="lk-depth-src-label truncate !text-[11px] !leading-4">{SOURCE_FILES[raw.source]}</code>
+                {/* O31: the source as its glyph only; its name is in the Bronze footer and on hover. */}
+                <span className="lk-depth-src relative flex items-center text-[#E8F4FF]/60">
+                  <Icon className="size-3.5 shrink-0" strokeWidth={2} />
+                  <span className="lk-depth-tip">{SOURCE_FILES[raw.source]}</span>
                 </span>
                 <span className="lk-depth-ord text-[#E8F4FF]/70 tabular-nums">
                   {raw.order}
@@ -248,9 +239,11 @@ export function DepthDataCard({
 
         {/* Footer: what this depth promises, one line each. */}
         <div className="lk-depth-foot relative border-t border-[#E8F4FF]/10">
-          <div className="lk-depth-swap absolute inset-0 flex items-center gap-2 px-3.5 text-[11px] text-[#E8F4FF]/70" data-for="bronze">
-            <span className="lk-depth-dot size-1.5 rounded-full" />
-            {copy.bronzeNote}
+          {/* Bronze: the two sources the rows came from, as the row glyphs show them. */}
+          <div className="lk-depth-swap absolute inset-0 flex items-center gap-1.5 px-3" data-for="bronze">
+            {(["orders", "crm"] as const).map((src) => (
+              <SourceChip key={src} source={src} />
+            ))}
           </div>
           <div className="lk-depth-swap lk-depth-checks absolute inset-0 flex items-center gap-1.5 px-3" data-for="silver">
             <Badge ok>{copy.checks.duplicates}</Badge>
@@ -293,7 +286,7 @@ function Word({ raw, clean, value, twice }: { raw: string; clean: string; value:
 function SourceChip({ source }: { source: SourceId }) {
   const Icon = SOURCE_ICON[source];
   return (
-    <span className="lk-depth-chip inline-flex min-w-0 items-center gap-1 rounded-md bg-[#E8F4FF]/[0.06] px-1.5 py-0.5 ring-1 ring-[#E8F4FF]/10">
+    <span className="inline-flex min-w-0 items-center gap-1 rounded-md bg-[#E8F4FF]/[0.06] px-1.5 py-0.5 ring-1 ring-[#E8F4FF]/10">
       <Icon className="size-3 shrink-0 text-[#E8F4FF]/60" strokeWidth={2} />
       <code className="truncate !text-[11px] !leading-4 text-[#E8F4FF]/85">{SOURCE_FILES[source]}</code>
     </span>

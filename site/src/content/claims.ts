@@ -44,12 +44,11 @@ export const CLAIMS: readonly Claim[] = [
   // O21 (2026-11-07): each depth shows what it does to the data, on a card of
   // fictional rows labelled "Illustration" (components/home/depth-records.ts).
   // The words of each line and of each card label are claims.
-  { key: "home.depths.layers.bronze.body", backlog: ["WEB-1 In Acceptance", "BLD-3 Done"], note: "every source lands untouched in open Iceberg tables (WEB-1's copy; BLD-3: Bronze is Iceberg)" },
-  { key: "home.depths.card.bronzeNote", backlog: ["WEB-1 In Acceptance", "BLD-3 Done"], note: "Bronze stores what the source sent; nothing is changed or dropped" },
+  { key: "home.depths.layers.bronze.body", backlog: ["WEB-1 In Acceptance", "BLD-3 Done"], note: "kept as the source sent it, in open Iceberg tables (WEB-1's copy; BLD-3: Bronze is Iceberg)" },
   {
     key: "home.depths.layers.silver.body",
     backlog: ["WEB-1 In Acceptance", "SRC-10 Released", "DATA-14 Released"],
-    note: "pipelines clean and join the raw data (WEB-1's copy); dropping duplicates is also a load mode (SRC-10); quality checks flag what fails (DATA-14)",
+    note: "pipelines clean and join the raw data (WEB-1's copy; the card's dropped duplicate is also a load mode, SRC-10); quality checks flag what fails (DATA-14)",
   },
   {
     key: "home.depths.card.checks.duplicates",
@@ -62,7 +61,7 @@ export const CLAIMS: readonly Claim[] = [
     backlog: ["DATA-14 Released"],
     note: "null count is one of DATA-14's ready checks; a failing check is flagged and never blocks the load (decision 4), so the row stays",
   },
-  { key: "home.depths.layers.gold.body", backlog: ["BLD-2 In Acceptance", "AI-18 In Acceptance", "WEB-1 In Acceptance"], note: "tables that refresh themselves within a target lag (BLD-2); dashboards and the assistant read Gold (WEB-1's copy; the assistant's describe_mart tool, AI-18)" },
+  { key: "home.depths.layers.gold.body", backlog: ["BLD-2 In Acceptance"], note: "tables that refresh themselves within a target lag set per pipeline (BLD-2); that dashboards and the assistant read Gold is the card's footer (home.depths.card.feeds)" },
   { key: "home.depths.card.lag", backlog: ["BLD-2 In Acceptance"], note: "a table refreshing within its target lag" },
   { key: "home.depths.card.feeds", backlog: ["WEB-1 In Acceptance", "AI-18 In Acceptance"], note: "dashboards and the assistant read Gold" },
   // Assistant section (Query Studio, D7)

@@ -3,8 +3,9 @@
  * Bronze, Silver and Gold, so a visitor watches one dataset change instead
  * of reading three sentences (owner, 2026-11-07: "ini 3 layer ini tu apa?").
  *
- * The records are fictional and the page labels them as an illustration
- * (D7). Silver and Gold are *computed* from the Bronze rows here, not typed
+ * The records are fictional, and plainly so (O32: the owner dropped the
+ * visible "Illustration" label; the screen-reader text still describes
+ * them as example rows). Silver and Gold are *computed* from the Bronze rows here, not typed
  * in, so the three cards can never disagree with each other: the duplicate
  * that leaves, the spellings that settle, the empty amount the quality
  * check flags, and the totals Gold shows all follow from the five rows

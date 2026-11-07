@@ -33,8 +33,9 @@ import { ALL_STEPS, S } from "./assistant-steps";
  * be seen playing, and loads the timed script (`assistant-script.ts`) as a
  * separate chunk when the panel comes into view. Nothing follows the scroll.
  *
- * The mock is decorative (`aria-hidden`), described by a visually hidden
- * sentence, and labelled "Illustration" on screen (D7).
+ * The mock is decorative (`aria-hidden`) and described by a visually hidden
+ * sentence. O32 (owner, 2026-11-07): no visible "Illustration" tag, as
+ * visitors can tell it is not real data.
  */
 
 type AssistantCopy = HomeCopy["assistant"];
@@ -53,7 +54,7 @@ export function AssistantChat({ copy }: { copy: AssistantCopy }) {
       <p className="sr-only">{copy.srDescription}</p>
       <AssistantPlay>
         <div aria-hidden="true" className="lk-ast lk-ast-still" data-s={ALL_STEPS}>
-          {/* Header: the guide's mark (WEB-5 D14 S4), its name and state, and the illustration tag. */}
+          {/* Header: the guide's mark (WEB-5 D14 S4), its name and state. O32: no visible "Illustration" tag (owner); the sr-only description stays. */}
           <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-[#E8F4FF]/10 px-4">
             <span className="lk-ast-avatar grid size-7 place-items-center rounded-full">
               <MascotMark className="h-[14px] w-auto" />
@@ -63,9 +64,6 @@ export function AssistantChat({ copy }: { copy: AssistantCopy }) {
               <span className="lk-ast-state-dot size-1.5 rounded-full" />
               <span className="lk-ast-state-ready">{copy.status.ready}</span>
               <span className="lk-ast-state-working">{copy.status.working}</span>
-            </span>
-            <span className="ml-auto rounded-full border border-[#E8F4FF]/15 px-2 py-0.5 text-[11px] leading-4 text-[#E8F4FF]/70">
-              {copy.caption}
             </span>
           </div>
 
