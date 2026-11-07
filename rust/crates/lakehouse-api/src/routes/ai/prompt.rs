@@ -408,7 +408,9 @@ from you because of that permission, not because they are unavailable or not set
 When asked to change ",
                 $changes,
                 ", your first sentence, before any analysis or other tool call, is: \"Your account \
-cannot change dashboards; ask an editor or an administrator.\" ",
+cannot change dashboards; ask an editor or an administrator.\" After that sentence, call \
+no tool for the change you refused; call a reading tool only when the person also asked a \
+question that needs it. ",
                 $metrics,
                 "Reading dashboards and charts still works, and changing this person's own view \
 filters with set_board_view_filters still works, so do not refuse a view-filter request. \
@@ -481,7 +483,8 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, call no other tool that needs the drafted object (a chart, a board or a tab that does not exist yet, a calculated field): reply with ONE short sentence that names the draft the result is for (a chart, a board, a tab or a calculated field). Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab): for example a chart on the board being drafted, the charts moved to the tab being drafted, or the cache rule of the chart just drafted; never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.
-- A chart draft, and a created or updated chart, has `definition`: describe the chart only by what it lists, because a top N, a bin or a filter it does not list was not made. When a tool refused a call, say so in your first sentence, in plain words, and never present a workaround as what the person asked for. When a refusal says bins are for numbers and names the number columns, call ask_user with those columns as the options; when it says the source has no number column to bin, say that and ask nothing. \"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N.");
+- A chart draft, and a created or updated chart, has `definition`: describe the chart only by what it lists, because a top N, a bin or a filter it does not list was not made. When a tool refused a call, say so in your first sentence, in plain words, and never present a workaround as what the person asked for. When a refusal says bins are for numbers and names the number columns, call ask_user with those columns as the options; when it says the source has no number column to bin, say that and ask nothing. \"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N.
+- A chart's `limit` counts values of its dimension only and never cuts a breakdown; with a time grain on the dimension and the chart ordered by that date, it keeps the latest periods; ordered by a measure, it keeps the top periods. For \"top N of Y over time\" choose one and tell the person which: (a) a chart with dimension Y, sort descending and limit N, with no time axis; (b) a time chart with a filter on the N values of Y found first with a query, saying the list is fixed at today's top N. Never answer \"top N\" for a chart whose `definition` does not show that limit on that column. Never state a number of bins, rows, series or categories that no tool result gave; describe a bin by its width or count as `definition` states it. When update_chart changes the grain, a measure, its aggregation or a filter, send in the same call a `title` and `subtitle` that match the new content, or `subtitle: null` when no subtitle fits. To explain a calculated field, call list_calculated_fields, which explains the formula in plain words, and run no SQL for it.");
 
 /// Tools offered on every turn: the data tools, and the read-only listings
 /// a general question about the platform needs.
@@ -1339,6 +1342,68 @@ mod tests {
             SYSTEM_BUILD_SUFFIX.contains("reply with ONE short sentence that names the draft"),
             "the plain-draft rule is gone"
         );
+    }
+
+    /// The QA of 2026-11-07: a limit counts a dimension's values, never a
+    /// breakdown, so "top N of Y over time" has two honest shapes and the
+    /// model says which it made; it states no count a tool did not give; it
+    /// renames a chart when its content changes; it explains a calculated
+    /// field with `list_calculated_fields`. Build mode only: the Ask prompt
+    /// is pinned by hash and has no chart to describe.
+    #[test]
+    fn the_build_prompt_says_what_a_limit_counts_and_four_rules_for_what_the_model_states() {
+        for clause in [
+            // A limit counts dimension values; a grain makes it the latest periods.
+            "A chart's `limit` counts values of its dimension only and never cuts a breakdown; with a time grain on the dimension and the chart ordered by that date, it keeps the latest periods; ordered by a measure, it keeps the top periods.",
+            // The two shapes of "top N of Y over time", and that the person is told.
+            "For \"top N of Y over time\" choose one and tell the person which: (a) a chart with dimension Y, sort descending and limit N, with no time axis; (b) a time chart with a filter on the N values of Y found first with a query, saying the list is fixed at today's top N.",
+            "Never answer \"top N\" for a chart whose `definition` does not show that limit on that column.",
+            // No count the tools did not give.
+            "Never state a number of bins, rows, series or categories that no tool result gave; describe a bin by its width or count as `definition` states it.",
+            // A title follows the content.
+            "When update_chart changes the grain, a measure, its aggregation or a filter, send in the same call a `title` and `subtitle` that match the new content, or `subtitle: null` when no subtitle fits.",
+            // A formula is explained, not queried.
+            "To explain a calculated field, call list_calculated_fields, which explains the formula in plain words, and run no SQL for it.",
+        ] {
+            assert!(
+                SYSTEM_BUILD_SUFFIX.contains(clause),
+                "the build suffix must say: {clause}"
+            );
+            assert!(
+                !SYSTEM_ASK_SUFFIX.contains(clause),
+                "the Ask prompt is pinned and must not carry: {clause}"
+            );
+        }
+        // The top-N sentence keeps its wording; the new rules follow it.
+        let top_n = "\"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N.";
+        let at = SYSTEM_BUILD_SUFFIX.find(top_n);
+        let limit_rule = SYSTEM_BUILD_SUFFIX.find("A chart's `limit` counts values");
+        assert!(
+            at.is_some() && limit_rule > at,
+            "the limit rule follows the top-N sentence"
+        );
+    }
+
+    /// `AI-4-03`: after the refusal sentence the model ran six `run_sql`
+    /// calls for the change it had refused. Both note variants carry the rule,
+    /// the one with `metric:write` and the one without.
+    #[test]
+    fn the_permission_note_says_to_call_no_tool_for_the_refused_change_in_both_variants() {
+        use lakehouse_auth::PermissionSet;
+        for perms in ["dashboard:read", "dashboard:read, metric:write"] {
+            let set = PermissionSet::parse(perms);
+            let note = dashboard_permission_note(Some(&set)).unwrap_or_default();
+            assert!(
+                note.contains(
+                    "After that sentence, call no tool for the change you refused; call a reading tool only when the person also asked a question that needs it."
+                ),
+                "{perms}: {note}"
+            );
+            assert!(
+                note.find("After that sentence") > note.find("cannot change dashboards"),
+                "{perms}: the rule follows the refusal sentence: {note}"
+            );
+        }
     }
 
     /// `BI-41` D2: "this chart" is a chart. The build suffix says to give the
