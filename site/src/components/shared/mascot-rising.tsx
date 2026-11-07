@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { m, type MotionValue } from "framer-motion";
-import { DOME_ARC, DOME_PATH, EYE } from "./mascot-svg";
+import { DOME, DOME_ARC, DOME_BASE_Y, EYE, MARK_WIDTH } from "./mascot-svg";
 
 /**
  * The final call's creature: the dome half sunk in a night lake, its eye
@@ -11,9 +11,25 @@ import { DOME_ARC, DOME_PATH, EYE } from "./mascot-svg";
  * The stage is 760 x 560 units; the waterline is at y = 372, so the water is
  * the bottom 33.6% of the stage. The dome bobs in HTML while the water, which
  * is full-bleed (as wide as the screen, not as the stage), sits in front of
- * its foot and its waves slide across. The dome's foot is 70 units below the
- * waterline, so the bob never shows it.
+ * its foot and its waves slide across. The dome's foot is below the
+ * waterline (`DOME_Y`), so the bob never shows it.
+ *
+ * WEB-5 O2: drawn from the official mark (`mascot-svg.tsx`), scaled so its
+ * dome is 500 units wide, as the old trace's was. The eye is placed in the
+ * stage's own units, outside that scale, so the pointer offsets
+ * (`final-mascot.tsx`) keep their size. One eye: this is the mark, drawn
+ * large (O3 gives two eyes to the 3D creature only).
  */
+const SCALE = 500 / MARK_WIDTH;
+const DOME_X = (760 - 500) / 2;
+/**
+ * The dome's base 34 units under the waterline at y 372, so its eye stands
+ * about as high above the water as the old, taller trace's did. The bob
+ * lifts it at most 12 units (2.2 % of 560) and tilts its edge about 3, so
+ * the foot still never shows.
+ */
+const DOME_Y = 372 + 34 - DOME_BASE_Y * SCALE;
+const EYE_STAGE = { cx: DOME_X + EYE.cx * SCALE, cy: DOME_Y + EYE.cy * SCALE, r: EYE.r * SCALE };
 export function MascotRising({
   className,
   eyeX,
@@ -29,8 +45,6 @@ export function MascotRising({
   const glow = `lk-rglow-${uid}`;
   const refl = `lk-rrefl-${uid}`;
   const clip = `lk-rclip-${uid}`;
-  const dx = (760 - 512) / 2;
-  const dy = 372 - 382 + 70;
   return (
     <div className={className}>
       <div className="relative aspect-[760/560] w-full">
@@ -46,7 +60,7 @@ export function MascotRising({
           <svg viewBox="0 0 760 560" className="absolute inset-0 size-full" aria-hidden="true" focusable="false">
             <defs>
               <clipPath id={clip}>
-                <path d={DOME_PATH} />
+                <path d={DOME} />
               </clipPath>
               <radialGradient id={body} cx="34%" cy="22%" r="85%">
                 <stop offset="0%" stopColor="#1a2a8c" />
@@ -63,14 +77,15 @@ export function MascotRising({
                 <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
               </radialGradient>
             </defs>
-            <g transform={`translate(${dx} ${dy})`}>
-              <path d={DOME_PATH} fill={`url(#${body})`} />
-              <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth="9" clipPath={`url(#${clip})`} />
-              <m.g style={{ x: eyeX, y: eyeY }}>
-                <ellipse cx={EYE.cx} cy={EYE.cy} rx={EYE.rx * 2.3} ry={EYE.ry * 2.3} fill={`url(#${glow})`} />
-                <ellipse {...EYE} fill="#ffffff" />
-              </m.g>
+            <g transform={`translate(${DOME_X} ${DOME_Y}) scale(${SCALE})`}>
+              <path d={DOME} fill={`url(#${body})`} />
+              {/* 9 stage units wide, as before. */}
+              <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth={9 / SCALE} clipPath={`url(#${clip})`} />
             </g>
+            <m.g style={{ x: eyeX, y: eyeY }}>
+              <circle cx={EYE_STAGE.cx} cy={EYE_STAGE.cy} r={EYE_STAGE.r * 2.3} fill={`url(#${glow})`} />
+              <circle {...EYE_STAGE} fill="#ffffff" />
+            </m.g>
           </svg>
         </div>
 

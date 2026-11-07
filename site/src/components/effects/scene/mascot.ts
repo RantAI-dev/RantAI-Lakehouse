@@ -20,15 +20,18 @@ import {
   Vector3,
 } from "three";
 import { PALETTE } from "@/lib/palette";
-import { DOME_EXPONENT, EYE_LOGO, MASCOT_H, MASCOT_R } from "./scene-config";
+import { DOME_SPHERE, EYES_3D, MASCOT_H, MASCOT_R } from "./scene-config";
 import { FOAM_FRAG, GLOW_FRAG, GLOW_VERT, SPLASH_FRAG, SPLASH_VERT } from "./shaders";
 
 /**
- * The 3D mascot, built from primitives so it matches `public/logo-light.png`:
- * a navy dome (a superellipse profile, revolved) with one white eye on its
- * right. Half of it is below the waterline; the water plane hides that half
- * until the camera dives. The eye slides over the dome's surface towards where
- * the visitor is looking, inside a cone that keeps it on the face.
+ * The 3D mascot, built from primitives on the official mark's shapes
+ * (`components/shared/mascot-svg.tsx`, WEB-5 O2): a navy dome, the mark's
+ * sphere cap revolved, with two white eyes (O3: the mark is the creature
+ * seen from the side, with one eye; facing the camera it has two). Half of
+ * it is below the waterline; the water plane hides that half until the
+ * camera dives. The eyes slide together over the dome's surface towards
+ * where the visitor is looking, inside a cone that keeps them on the face,
+ * and blink together.
  */
 
 export type Aim = { x: number; y: number };
@@ -57,11 +60,14 @@ export type Mascot = {
 };
 
 const TAU = Math.PI * 2;
-const EXP = 2 / DOME_EXPONENT;
+const { r: SPHERE_R, cy: SPHERE_CY } = DOME_SPHERE;
+/** The angle, seen from the sphere's centre, of the dome's flat base (the waterline): below the equator. */
+const BASE_T = -Math.asin(SPHERE_CY / SPHERE_R);
 
-/** Upper dome profile at parameter t in [0, PI/2]. */
-function profile(t: number): { r: number; y: number } {
-  return { r: MASCOT_R * Math.pow(Math.cos(t), EXP), y: MASCOT_H * Math.pow(Math.sin(t), EXP) };
+/** Upper dome profile at parameter u in [0, 1]: from the waterline (r = MASCOT_R) to the top. */
+function profile(u: number): { r: number; y: number } {
+  const t = BASE_T + u * (Math.PI / 2 - BASE_T);
+  return { r: SPHERE_R * Math.cos(t), y: SPHERE_CY + SPHERE_R * Math.sin(t) };
 }
 
 function buildBodyGeometry(upperOnly = false): LatheGeometry {
@@ -74,10 +80,9 @@ function buildBodyGeometry(upperOnly = false): LatheGeometry {
       const s = (i / 24) * (Math.PI / 2);
       pts.push(new Vector2(MASCOT_R * Math.sin(s), -below * Math.cos(s)));
     }
-  // Visible dome: dense near the base where the sides turn.
+  // Visible dome: the sphere cap, evenly spaced along its arc.
   for (let i = 1; i <= 72; i++) {
-    const t = Math.pow(i / 72, 0.8) * (Math.PI / 2);
-    const p = profile(t);
+    const p = profile(i / 72);
     pts.push(new Vector2(p.r, p.y));
   }
   return new LatheGeometry(pts, upperOnly ? 64 : 112);
@@ -85,18 +90,13 @@ function buildBodyGeometry(upperOnly = false): LatheGeometry {
 
 /** Point and outward normal on the dome for azimuth `phi` and height fraction `rho` of the dome. */
 function surface(phi: number, rho: number, out: { pos: Vector3; normal: Vector3 }): void {
-  const sinT = Math.pow(MathUtils.clamp(rho, 0.02, 0.98), DOME_EXPONENT / 2);
-  const t = Math.asin(sinT);
-  const cosT = Math.cos(t);
-  const r = MASCOT_R * Math.pow(cosT, EXP);
-  const y = MASCOT_H * rho;
-  const dr = -MASCOT_R * EXP * Math.pow(cosT, EXP - 1) * sinT;
-  const dy = MASCOT_H * EXP * Math.pow(sinT, EXP - 1) * cosT;
-  const len = Math.hypot(dr, dy) || 1;
-  const nr = dy / len;
-  const ny = -dr / len;
+  // On a sphere the outward normal is the direction from its centre.
+  const y = MASCOT_H * MathUtils.clamp(rho, 0.02, 0.98);
+  const sinT = (y - SPHERE_CY) / SPHERE_R;
+  const cosT = Math.sqrt(Math.max(0, 1 - sinT * sinT));
+  const r = SPHERE_R * cosT;
   out.pos.set(r * Math.sin(phi), y, r * Math.cos(phi));
-  out.normal.set(nr * Math.sin(phi), ny, nr * Math.cos(phi)).normalize();
+  out.normal.set(cosT * Math.sin(phi), sinT, cosT * Math.cos(phi)).normalize();
 }
 
 const SPLASH_COUNT = 56;
@@ -141,15 +141,13 @@ export function createMascot(opts: MascotOptions): Mascot {
   group.add(ghostBody);
   disposables.push(ghostBodyGeo, ghostBodyMat);
 
-  // ---- Eye ---------------------------------------------------------------
-  const eye = new Group();
+  // ---- Eyes --------------------------------------------------------------
+  // WEB-5 O3: two eyes, one each side of the front, built alike and sharing
+  // their materials, so they glow, blink and fade under water as one.
   const eyeGeo = new SphereGeometry(1, 40, 28);
   // Pure white, outside tone mapping: the logo's eye is a white cut-out, and
   // ACES would turn "white" into light grey next to the glow around it.
   const eyeMat = new MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
-  const eyeMesh = new Mesh(eyeGeo, eyeMat);
-  eyeMesh.scale.set(EYE_LOGO.rx * MASCOT_R, EYE_LOGO.ry * MASCOT_R, 0.065 * MASCOT_R);
-  eye.add(eyeMesh);
   const glowGeo = new PlaneGeometry(1, 1);
   const glowMat = new ShaderMaterial({
     uniforms: { uColor: { value: new Color("#bfe0ff") }, uIntensity: { value: 0.5 } },
@@ -159,13 +157,8 @@ export function createMascot(opts: MascotOptions): Mascot {
     depthWrite: false,
     blending: AdditiveBlending,
   });
-  const glow = new Mesh(glowGeo, glowMat);
-  glow.scale.set(EYE_LOGO.rx * MASCOT_R * 6.5, EYE_LOGO.ry * MASCOT_R * 6.5, 1);
-  glow.position.z = 0.12 * MASCOT_R;
-  glow.renderOrder = 3;
-  eye.add(glow);
-  // Seen from below, the creature's eye still looks down at you: a faint copy
-  // of the eye and its halo, drawn without depth testing so the water ceiling
+  // Seen from below, the creature's eyes still look down at you: a faint copy
+  // of each eye and its halo, drawn without depth testing so the water ceiling
   // does not hide it. Hidden above the surface.
   const ghostMat = new MeshBasicMaterial({
     color: 0xffffff,
@@ -175,10 +168,6 @@ export function createMascot(opts: MascotOptions): Mascot {
     depthWrite: false,
     toneMapped: false,
   });
-  const ghostEye = new Mesh(eyeGeo, ghostMat);
-  ghostEye.renderOrder = 8;
-  ghostEye.visible = false;
-  eye.add(ghostEye);
   const ghostGlowMat = new ShaderMaterial({
     uniforms: { uColor: { value: new Color("#9fd0ff") }, uIntensity: { value: 0 } },
     vertexShader: GLOW_VERT,
@@ -188,13 +177,39 @@ export function createMascot(opts: MascotOptions): Mascot {
     depthWrite: false,
     blending: AdditiveBlending,
   });
-  const ghostGlow = new Mesh(glowGeo, ghostGlowMat);
-  ghostGlow.renderOrder = 7;
-  ghostGlow.visible = false;
-  ghostGlow.position.z = 0.12 * MASCOT_R;
-  eye.add(ghostGlow);
-  group.add(eye);
   disposables.push(eyeGeo, eyeMat, glowGeo, glowMat, ghostMat, ghostGlowMat);
+  /**
+   * The halo's size, in eye radii. The single eye's was 6.5 of its width;
+   * two halos that wide would merge into one blur between the eyes, so each
+   * is smaller and they only just touch.
+   */
+  const GLOW = 4.2;
+  const GHOST_GLOW = 4.6;
+  function buildEye() {
+    const eye = new Group();
+    const eyeMesh = new Mesh(eyeGeo, eyeMat);
+    eyeMesh.scale.set(EYES_3D.r, EYES_3D.r, 0.065 * MASCOT_R);
+    eye.add(eyeMesh);
+    const glow = new Mesh(glowGeo, glowMat);
+    glow.scale.set(EYES_3D.r * GLOW, EYES_3D.r * GLOW, 1);
+    glow.position.z = 0.12 * MASCOT_R;
+    glow.renderOrder = 3;
+    eye.add(glow);
+    const ghostEye = new Mesh(eyeGeo, ghostMat);
+    ghostEye.renderOrder = 8;
+    ghostEye.visible = false;
+    eye.add(ghostEye);
+    const ghostGlow = new Mesh(glowGeo, ghostGlowMat);
+    ghostGlow.renderOrder = 7;
+    ghostGlow.visible = false;
+    ghostGlow.position.z = 0.12 * MASCOT_R;
+    eye.add(ghostGlow);
+    group.add(eye);
+    return { eye, eyeMesh, glow, ghostEye, ghostGlow };
+  }
+  /** Left and right, by their side of the front (−phi, +phi). */
+  const eyes = [buildEye(), buildEye()] as const;
+  const EYE_SIDE = [-1, 1] as const;
 
   // ---- Lights that belong to the creature --------------------------------
   // Water bounce from below-front, so the lower dome is not a black cut-out.
@@ -278,8 +293,7 @@ export function createMascot(opts: MascotOptions): Mascot {
   let poppedAt = -10;
   const DIP_DEPTH = MASCOT_H + 0.25;
 
-  const phi0 = Math.asin(EYE_LOGO.x / 0.98);
-  const rho0 = EYE_LOGO.y;
+  const rho0 = EYES_3D.rho;
 
   function dipOffset(t: number): number {
     const age = t - dipStart;
@@ -306,10 +320,12 @@ export function createMascot(opts: MascotOptions): Mascot {
       bodyMat.emissiveIntensity = MathUtils.lerp(0.55, 1.5, uw);
       bounce.intensity = MathUtils.lerp(0.9, 2.6, uw);
       const k = MathUtils.smoothstep(uw, 0.1, 0.9);
-      ghostEye.visible = k > 0.01;
-      ghostGlow.visible = ghostEye.visible;
+      for (const e of eyes) {
+        e.ghostEye.visible = k > 0.01;
+        e.ghostGlow.visible = k > 0.01;
+      }
       ghostMat.opacity = 0.85 * k;
-      ghostBody.visible = ghostEye.visible;
+      ghostBody.visible = k > 0.01;
       ghostBodyMat.opacity = 0.22 * k;
       ghostGlowMat.uniforms.uIntensity.value = 0.75 * k;
     },
@@ -336,14 +352,18 @@ export function createMascot(opts: MascotOptions): Mascot {
       group.rotation.y = lookAim.x * 0.15 * look;
       group.rotation.x = -lookAim.y * 0.06 * look + 0.012 * Math.sin((t * TAU) / 8);
 
-      // Eye: slide over the dome inside a cone that keeps it on the face.
-      const phi = MathUtils.clamp(phi0 + eyeAim.x * 0.78, -0.62, 1.02);
+      // Eyes: both slide by the same turn over the dome, inside a cone that
+      // keeps them on the face (the outer one reaches 1.02 rad from the
+      // front, the single eye's old limit).
+      const turn = MathUtils.clamp(eyeAim.x * 0.78, -0.6, 0.6);
       const rho = MathUtils.clamp(rho0 + eyeAim.y * 0.24, 0.22, 0.62);
-      surface(phi, rho, scratch);
-      eye.position.copy(scratch.pos).addScaledVector(scratch.normal, 0.012 * MASCOT_R);
-      negNormal.copy(scratch.normal).negate();
-      m4.lookAt(origin, negNormal, up);
-      eye.quaternion.setFromRotationMatrix(m4);
+      for (let i = 0; i < eyes.length; i++) {
+        surface(EYE_SIDE[i] * EYES_3D.phi + turn, rho, scratch);
+        eyes[i].eye.position.copy(scratch.pos).addScaledVector(scratch.normal, 0.012 * MASCOT_R);
+        negNormal.copy(scratch.normal).negate();
+        m4.lookAt(origin, negNormal, up);
+        eyes[i].eye.quaternion.setFromRotationMatrix(m4);
+      }
 
       // Blink: scale-Y to 0.1 and back in 140 ms, every 4 to 7 s.
       if (!mascot.still && t >= nextBlink) {
@@ -352,10 +372,12 @@ export function createMascot(opts: MascotOptions): Mascot {
       }
       const bp = (t - blinkStart) / 0.14;
       const blink = bp >= 0 && bp <= 1 ? 1 - 0.9 * Math.sin(Math.PI * bp) : 1;
-      eyeMesh.scale.y = EYE_LOGO.ry * MASCOT_R * blink;
-      ghostEye.scale.copy(eyeMesh.scale);
-      ghostGlow.scale.set(EYE_LOGO.rx * MASCOT_R * 7, EYE_LOGO.ry * MASCOT_R * 7 * (0.35 + 0.65 * blink), 1);
-      glow.scale.y = EYE_LOGO.ry * MASCOT_R * 6.5 * (0.35 + 0.65 * blink);
+      for (const e of eyes) {
+        e.eyeMesh.scale.y = EYES_3D.r * blink;
+        e.ghostEye.scale.copy(e.eyeMesh.scale);
+        e.ghostGlow.scale.set(EYES_3D.r * GHOST_GLOW, EYES_3D.r * GHOST_GLOW * (0.35 + 0.65 * blink), 1);
+        e.glow.scale.y = EYES_3D.r * GLOW * (0.35 + 0.65 * blink);
+      }
       glowMat.uniforms.uIntensity.value = 0.8 + 0.12 * Math.sin(t * 1.3);
 
       // Foam breathes with the bob and thins out while the creature is under.

@@ -26,7 +26,8 @@ export const ogContentType = "image/png";
 
 let logo: Promise<string> | null = null;
 function logoDataUri(): Promise<string> {
-  // The white-dome logo, made for dark backgrounds.
+  // The official mark's Dark variant (white dome, the eye cut out), rendered
+  // from rantai-page's SVG at 392 x 334 (WEB-5 O2).
   logo ??= readFile(join(process.cwd(), "public/logo-dark.png")).then(
     (b) => `data:image/png;base64,${b.toString("base64")}`,
   );
@@ -53,7 +54,8 @@ export async function renderOgImage({ headline }: { headline: string }) {
         <span style={{ marginTop: 36, fontSize: 88, lineHeight: 1.04, letterSpacing: "-0.02em" }}>{headline}</span>
       </div>
       {/* eslint-disable-next-line @next/next/no-img-element -- rendered to PNG, not the DOM */}
-      <img src={src} width={330} height={330} alt="" />
+      {/* O2: the official mark at its own ratio (196 x 167), never a square. */}
+      <img src={src} width={330} height={281} alt="" />
     </div>,
     ogSize,
   );

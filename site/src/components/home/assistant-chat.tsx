@@ -191,7 +191,7 @@ function GuideMark() {
     // so the text has the width it had before the mark (the pinned stage still
     // fits 360x740).
     <span className="absolute top-1 left-0 grid size-5 place-items-center rounded-full bg-[#44A6FA]/15 ring-1 ring-[#44A6FA]/35 md:size-7">
-      <MascotMark className="size-3.5 md:size-[18px]" />
+      <MascotMark className="h-3 w-auto md:h-[15px]" />
     </span>
   );
 }

@@ -110,12 +110,15 @@ function HeroCreature() {
   return (
     <BackdropFade
       data-hero-room=""
-      className="relative -z-[5] flex min-h-0 flex-1 flex-col md:absolute md:top-[18%] md:right-[9%] md:block md:w-[min(38vw,460px)]"
+      // O2: the official mark is 196 x 167, so a box as wide as before is
+      // 0.117 of its width less tall; the extra top offset keeps the horizon
+      // gap where it was against the backdrop's waterline.
+      className="relative -z-[5] flex min-h-0 flex-1 flex-col md:absolute md:top-[calc(18%+min(4.45vw,54px))] md:right-[9%] md:block md:w-[min(38vw,460px)]"
     >
       <div className="h-[14svh] min-h-[4.5rem] md:hidden" />
       <div
         data-hero-creature=""
-        className="relative left-1/2 aspect-square h-[min(46vw,230px)] min-h-0 -translate-x-1/2 self-start md:static md:h-auto md:w-full md:translate-x-0"
+        className="relative left-1/2 aspect-[196/167] h-[min(46vw,230px)] min-h-0 -translate-x-1/2 self-start md:static md:h-auto md:w-full md:translate-x-0"
       >
         <MascotLogo className="lk-bob size-full drop-shadow-[0_0_60px_rgba(68,166,250,0.25)]" />
       </div>

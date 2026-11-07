@@ -1,56 +1,75 @@
 import * as React from "react";
 
 /**
- * The RantAI Lakehouse creature as inline SVG.
+ * The RantAI Lakehouse mark as inline SVG.
  *
- * Geometry is traced from `public/logo-light.png` (512 x 512): a navy dome
- * with one white eye on its right side, a gap for the horizon, and the blue
- * bowl of water below. The same shapes are the 3D mascot's profile
- * (`scene/mascot.ts`), so the WebGL scene, the no-WebGL fallback and the
- * footer all show one character. Used where a canvas would be heavier than
- * the picture it draws: the top bar, the hero fallback, the horizon on the
- * dashboards section, the final call and the footer.
+ * WEB-5 owner QA finding O2: the geometry is the official mark's, copied
+ * from rantai-page `public/logo/RantAI Lakehouse Dark.svg` and
+ * `Light.svg` (viewBox 196 x 167). It replaces a hand trace from a PNG
+ * that forced the mark into a 512 square, with a tall bullet dome and an
+ * oval eye, so the mark looked squashed. The official one is wider than
+ * tall (1.17): the dome is a circle of r 98 centred at (98, 98) and cut
+ * flat at y = 124, the eye a round hole of r 19.5 at (131.5, 84.5), and
+ * the bowl of water runs from y 138 to 166.5. Never fit it into a square:
+ * size it by one side and let the other follow (`h-6 w-auto`), as
+ * rantai-page's `ProductLogo` does.
+ *
+ * Used where a canvas would be heavier than the picture it draws: the top
+ * bar, the hero fallback, the horizon on the dashboards section, the final
+ * call and the footer. The 3D creature (`scene/mascot.ts`) is built on the
+ * same round dome (WEB-5 O3 gives it two eyes; the mark keeps one, since
+ * the mark is the creature seen from the side).
  *
  * WEB-5 review fix R5: a server module. The mark and the logo are static
  * SVG, so they are not hydrated; the final call's moving creature is
  * `mascot-rising.tsx`, the one client piece.
  */
 
-/** Dome silhouette; flat base at y = 382, apex at y = 0. */
-export const DOME_PATH = "M6 382 C6 145 101 0 256 0 C411 0 506 145 506 382 Z";
+export const MARK_WIDTH = 196;
+export const MARK_HEIGHT = 167;
+export const MARK_VIEWBOX = `0 0 ${MARK_WIDTH} ${MARK_HEIGHT}`;
+
+/** The dome alone: the circle (98, 98) r 98, cut flat at y = 124. */
+export const DOME =
+  "M192.514 124C194.786 115.72 196 107.002 196 98C196 43.8761 152.124 0 98 0C43.8761 0 0 43.8761 0 98C0 107.002 1.21368 115.72 3.4863 124H192.514Z";
+/** The official dome path with its eye cut out (`fill-rule="evenodd"`), so the background shows through. */
+export const DOME_WITH_EYE = `${DOME}M151 84.5C151 95.2695 142.27 104 131.5 104C120.73 104 112 95.2695 112 84.5C112 73.7305 120.73 65 131.5 65C142.27 65 151 73.7305 151 84.5Z`;
 /**
- * The dome's curved edge without its base line. WEB-1 review round 1
- * SHOULD-FIX 3: the rim light used to be the whole dome path stroked 5 units
- * wide, so half of it fell outside the dome (a bright arc beside the edge on
- * the right) and a stray line ran along the base. It is now this open arc,
- * clipped to the dome so it only ever lights the inside of the edge.
+ * The dome's curved edge without its base line, for the rim light. WEB-1
+ * review round 1 SHOULD-FIX 3: a stroke of the closed dome put half its
+ * width outside the edge and drew a stray line along the base, so the rim
+ * is this open arc, clipped to the dome.
  */
-export const DOME_ARC = "M6 382 C6 145 101 0 256 0 C411 0 506 145 506 382";
-/** Bowl of lake water below the horizon gap. */
-export const BOWL_PATH =
-  "M22 424 H490 C470 482 438 512 378 512 H134 C74 512 42 482 22 424 Z";
-export const EYE = { cx: 343, cy: 260, rx: 51, ry: 60 } as const;
+export const DOME_ARC =
+  "M3.4863 124C1.21368 115.72 0 107.002 0 98C0 43.8761 43.8761 0 98 0C152.124 0 196 43.8761 196 98C196 107.002 194.786 115.72 192.514 124";
+/** The bowl of lake water below the horizon gap. */
+export const BOWL =
+  "M48.9602 166.5C35.5025 166.5 22.0694 161.401 14.9187 150C12.5163 146.17 10.3714 142.162 8.5083 138H187.492C185.629 142.162 183.484 146.17 181.081 150C173.931 161.401 160.498 166.5 147.04 166.5H48.9602Z";
+export const EYE = { cx: 131.5, cy: 84.5, r: 19.5 } as const;
+/** The dome's flat base (the waterline) and the top of the bowl, in mark units. */
+export const DOME_BASE_Y = 124;
+export const BOWL_TOP_Y = 138;
 
 type MarkProps = { className?: string; title?: string };
 
 /**
- * The mark for dark backgrounds: foam dome, abyss eye, lake bowl. The navy
- * dome of the colour logo would vanish on the abyss, so this swaps it for
- * foam, as `public/logo-dark.png` does.
+ * The mark for dark backgrounds, in the official Dark colours: a white
+ * dome with the eye cut out, and the lake-blue bowl.
  */
 export function MascotMark({ className, title }: MarkProps) {
   return (
     <svg
-      viewBox="0 0 512 512"
+      viewBox={MARK_VIEWBOX}
+      width={MARK_WIDTH}
+      height={MARK_HEIGHT}
       className={className}
       role={title ? "img" : undefined}
       aria-label={title}
       aria-hidden={title ? undefined : true}
       focusable="false"
     >
-      <path d={DOME_PATH} fill="#E8F4FF" />
-      <ellipse {...EYE} fill="#020514" />
-      <path d={BOWL_PATH} fill="#44A6FA" />
+      <path d={BOWL} fill="#44A6FA" fillRule="evenodd" clipRule="evenodd" />
+      <path d={DOME_WITH_EYE} fill="white" fillRule="evenodd" clipRule="evenodd" />
     </svg>
   );
 }
@@ -60,8 +79,9 @@ type LogoProps = {
 };
 
 /**
- * The logo as a lit character on a dark lake: navy dome with a lake-blue rim
- * light on its upper right, so the dark body still reads against the night.
+ * The mark as a lit character on a dark lake, on the official shapes: a
+ * navy dome with a lake-blue rim light on its upper right, so the dark body
+ * still reads against the night, and a glowing white eye.
  */
 export function MascotLogo({ className }: LogoProps) {
   const uid = React.useId().replace(/:/g, "");
@@ -71,10 +91,17 @@ export function MascotLogo({ className }: LogoProps) {
   const glow = `lk-glow-${uid}`;
   const clip = `lk-clip-${uid}`;
   return (
-    <svg viewBox="0 0 512 512" className={className} aria-hidden="true" focusable="false">
+    <svg
+      viewBox={MARK_VIEWBOX}
+      width={MARK_WIDTH}
+      height={MARK_HEIGHT}
+      className={className}
+      aria-hidden="true"
+      focusable="false"
+    >
       <defs>
         <clipPath id={clip}>
-          <path d={DOME_PATH} />
+          <path d={DOME} />
         </clipPath>
         <radialGradient id={body} cx="34%" cy="22%" r="85%">
           <stop offset="0%" stopColor="#16237a" />
@@ -95,14 +122,14 @@ export function MascotLogo({ className }: LogoProps) {
           <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
         </radialGradient>
       </defs>
-      <path d={DOME_PATH} fill={`url(#${body})`} />
-      <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth="9" clipPath={`url(#${clip})`} />
+      <path d={DOME} fill={`url(#${body})`} />
+      {/* 3.5 units: the old rim's 9 of 512, at this mark's scale. */}
+      <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth="3.5" clipPath={`url(#${clip})`} />
       <g>
-        <ellipse cx={EYE.cx} cy={EYE.cy} rx={EYE.rx * 2.1} ry={EYE.ry * 2.1} fill={`url(#${glow})`} />
-        <ellipse {...EYE} fill="#ffffff" />
+        <circle cx={EYE.cx} cy={EYE.cy} r={EYE.r * 2.1} fill={`url(#${glow})`} />
+        <circle {...EYE} fill="#ffffff" />
       </g>
-      <path d={BOWL_PATH} fill={`url(#${water})`} />
+      <path d={BOWL} fill={`url(#${water})`} />
     </svg>
   );
 }
-

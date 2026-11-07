@@ -49,7 +49,7 @@ export function SiteFooter({
     <footer className="relative border-t border-[#E8F4FF]/10 bg-[#020514] py-16">
       <Container className="grid gap-12 md:grid-cols-[1.4fr_repeat(3,1fr)]">
         <div>
-          <MascotMark className="size-8" />
+          <MascotMark className="h-7 w-auto" />
           <p className="mt-4 max-w-[18rem] text-[15px] leading-6 text-[#E8F4FF]/75">{copy.tagline}</p>
         </div>
         {columns.map((col) => (

@@ -64,7 +64,8 @@ export function TopBar({
     >
       <div className="mx-auto flex h-16 w-full max-w-[1280px] items-center justify-between gap-2 px-4 md:gap-4 md:px-6">
         <a href={anchor("#hero")} className="flex items-center gap-2 text-[15px] md:gap-2.5 font-medium tracking-tight text-[#E8F4FF]">
-          <MascotMark className="size-6" />
+          {/* O2: the official mark at its own ratio, sized by height. */}
+          <MascotMark className="h-5 w-auto" />
           {/* Never wraps: beside the language switch a 360 px phone has room for one line. */}
           <span className="whitespace-nowrap">RantAI Lakehouse</span>
         </a>
