@@ -22,6 +22,10 @@
  * every `hover:` in `@media (hover: hover)`.
  */
 @custom-variant hover (&:hover);
+/* WEB-5 review fix R12: a phone screen too short for the hero's creature
+   and its full-size copy: up to 832 px tall, so 360×800 and 375×812 are,
+   and 390×844, where nothing may change, is not. */
+@custom-variant short (@media (max-width: 47.99rem) and (max-height: 52rem));
 
 /*
  * WEB-5 D6 (the design stays): the landing was drawn inside the console, so

@@ -233,13 +233,65 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     distScaleDepths = wide ? 1.25 : 1;
     // On wide screens also cap it below 1 so the stack stays clear of the copy.
     slabs.setFootprint(Math.min(wide ? 0.86 : 1, (0.7 * 8.06 * aspect * distScaleDepths) / SLAB_SIZE.w));
+    if (phone) fitHeroToRoom();
     viewKey = "";
     measure();
     camera.updateProjectionMatrix();
     renderOnceIfStill();
   };
+  // WEB-5 review fix R12 (BLOCKER): on a short phone the creature framed
+  // above (centred, as wide as the screen allows) reached down into the hero
+  // copy, as the DOM creature did. The DOM hero now leaves the creature a
+  // room above the copy (`data-hero-room`, whose bottom is 16 px above the
+  // eyebrow) and sizes its own creature in it (`data-hero-creature`,
+  // hero-section.tsx). When the 3D creature, from the waterline to the top
+  // of its dome, would end below that room, the camera is pulled back and
+  // the view shifted so it fills the DOM creature's box instead. Where it
+  // already fits (390×844 and taller) nothing changes.
+  const fitCam = new PerspectiveCamera(CAMERA_FOV, 1, 0.05, 600);
+  const fitPoint = new Vector3();
+  const heroCreatureSpan = (dist: number, ay: number): { top: number; bottom: number } => {
+    const hero = sceneStateAt(0, layout);
+    fitCam.aspect = width / height;
+    fitCam.position
+      .set(hero.position[0] - hero.look[0], hero.position[1] - hero.look[1], hero.position[2] - hero.look[2])
+      .multiplyScalar(dist)
+      .add(fitPoint.set(hero.look[0], hero.look[1], hero.look[2]));
+    fitCam.lookAt(fitPoint);
+    fitCam.setViewOffset(width, height, 0, (ay * height) / 2, width, height);
+    fitCam.updateProjectionMatrix();
+    fitCam.updateMatrixWorld();
+    const y = (v: number) => ((1 - fitPoint.set(0, v, 0).project(fitCam).y) / 2) * height;
+    return { top: y(MASCOT_H), bottom: y(0) };
+  };
+  const fitHeroToRoom = () => {
+    const room = document.querySelector("[data-hero-room]");
+    const box = room?.querySelector("[data-hero-creature]");
+    const stage = room?.parentElement;
+    if (!room || !box || !stage) return;
+    const top0 = stage.getBoundingClientRect().top;
+    const roomBottom = room.getBoundingClientRect().bottom - top0;
+    const r = box.getBoundingClientRect();
+    const target = { top: r.top - top0, height: r.height };
+    if (heroCreatureSpan(distScaleHero, anchorHero.y).bottom <= roomBottom || target.height <= 0) return;
+    // The creature's height on screen goes as 1 / distance, so a few
+    // proportional steps settle it; the view offset then moves its centre,
+    // since an offset shifts every point by the same number of pixels.
+    let dist = distScaleHero;
+    for (let i = 0; i < 4; i++) {
+      const span = heroCreatureSpan(dist, 0);
+      dist *= (span.bottom - span.top) / target.height;
+    }
+    const span = heroCreatureSpan(dist, 0);
+    distScaleHero = dist;
+    anchorHero.y = (2 * ((span.top + span.bottom) / 2 - (target.top + target.height / 2))) / height;
+  };
+
   const ro = new ResizeObserver(resize);
   ro.observe(host);
+  // The room changes with the copy's height (fonts, language).
+  const heroRoom = document.querySelector("[data-hero-room]");
+  if (heroRoom) ro.observe(heroRoom);
   // The zone's own height changes when fonts load or sections reflow.
   const roZone = new ResizeObserver(measure);
   roZone.observe(observe);

@@ -45,13 +45,25 @@ export function ScrollCueFade({ children }: { children: React.ReactNode }) {
   return <m.div style={{ opacity: cueOpacity }}>{children}</m.div>;
 }
 
-/** The DOM hero fades out once the lake's first frame is on screen. */
-export function BackdropFade({ children }: { children: React.ReactNode }) {
+/**
+ * The DOM hero fades out once the lake's first frame is on screen. `className`
+ * places the faded layer: the whole stage by default, or the creature's own
+ * slot (WEB-5 review fix R12, hero-section.tsx).
+ */
+export function BackdropFade({
+  className = "absolute inset-0 -z-10",
+  children,
+  ...rest
+}: {
+  className?: string;
+  children: React.ReactNode;
+} & React.HTMLAttributes<HTMLDivElement>) {
   const { sceneReady } = useLandingMode();
   return (
     <div
       aria-hidden="true"
-      className={cn("absolute inset-0 -z-10 transition-opacity duration-700", sceneReady && "opacity-0")}
+      className={cn(className, "transition-opacity duration-700", sceneReady && "opacity-0")}
+      {...rest}
     >
       {children}
     </div>
