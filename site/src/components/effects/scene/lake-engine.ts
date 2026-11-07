@@ -69,10 +69,16 @@ export type LakeEngine = { dispose: () => void };
 const clamp = MathUtils.clamp;
 const lerp = MathUtils.lerp;
 
-/** Fog and background by depth: lake-blue near the surface, abyss at the bottom. */
+/**
+ * Fog and background by depth: lake-blue near the surface, deep blue at the
+ * bottom of the slabs. WEB-5 O33: the page keeps darkening for eight more
+ * viewports below this zone, down to the abyss, so the 3D water must still
+ * be a deep blue at Gold (about #000d46 on screen), not black: the old
+ * deep #020b2a tone-mapped to #000115, darker than the page's own end.
+ */
 const UNDER_NEAR = new Color("#0b3a74");
-const UNDER_MID = new Color("#071f52");
-const UNDER_DEEP = new Color("#020b2a");
+const UNDER_MID = new Color("#0a2a72");
+const UNDER_DEEP = new Color("#071f52");
 /** The light that comes down through the surface, scattered: the water's colour looking up. */
 const UNDER_LIGHT = new Color("#2a74c4");
 

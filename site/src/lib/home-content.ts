@@ -192,23 +192,25 @@ export const GOVERNANCE_COLUMNS = [
 
 /**
  * WEB-5 D14, the journey: the depth (in metres, 0 at the surface) at the
- * start of each chapter, by section id, in page order. The page dives from
- * the surface to the deepest point at the assistant, then comes back up to
- * the surface at the final call. The depth gauge reads these, and the
- * page-wide water colour follows them (`lib/depth-journey.ts`). The depths
- * section's own markers stay the three slabs' readings (`DEPTH_LAYERS`).
+ * start of each chapter, by section id, in page order. The depth gauge
+ * reads these, and the page-wide water colour follows them
+ * (`lib/depth-journey.ts`). The depths section's own markers stay the three
+ * slabs' readings (`DEPTH_LAYERS`).
+ *
+ * WEB-5 O33 (owner: "aku kebayangnya makin bawah makin gelap aja, gausah
+ * kek tiba tiba terang lagi trus gelap lagi"): one descent, no ascent. The
+ * reading only ever goes down, from the surface through the slabs (−10,
+ * −40, −90) and the assistant (−100), deeper through the dashboards,
+ * governance and open source, to the bottom at the final call (−400).
  */
 export const JOURNEY = [
   { id: "hero", depth: 0 },
   { id: "sources", depth: -5 },
   { id: "depths", depth: -10 },
   { id: "assistant", depth: -100 },
-  { id: "dashboards", depth: -100 },
-  { id: "governance", depth: -50 },
-  { id: "open", depth: -15 },
-  { id: "final", depth: -3 },
+  { id: "dashboards", depth: -150 },
+  { id: "governance", depth: -200 },
+  { id: "open", depth: -300 },
+  { id: "final", depth: -400 },
 ] as const;
-
-/** Where the depth reaches 0 again: this far into the final section, as a fraction of its height. */
-export const SURFACE_AT_FINAL = 0.5;
 

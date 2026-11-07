@@ -2,18 +2,17 @@
 
 import * as React from "react";
 import { JOURNEY } from "@/lib/home-content";
-import { formatDepth, gaugeDepthAt, SLAB_DEPTHS, type Anchor, type DepthsRange } from "@/lib/depth-journey";
+import { formatDepth, gaugeDepthAt, gaugeFraction, SLAB_DEPTHS, type Anchor, type DepthsRange } from "@/lib/depth-journey";
 import { measureJourney } from "@/lib/measure-journey";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /** Every depth a chapter starts at, plus the three slabs: one tick each. */
 const TICKS = [...new Set([0, ...JOURNEY.map((c) => c.depth), ...SLAB_DEPTHS])].sort((a, b) => b - a);
-/** The scale's full depth: the deepest point. */
-const FLOOR = 100;
 
 /**
- * WEB-5 D14 S3: where the visitor is in the dive, the whole way down and
- * back up.
+ * WEB-5 D14 S3: where the visitor is in the dive, the whole way down
+ * (O33: one descent, from the surface to the bottom at −400 m, on a
+ * square-root scale, `gaugeFraction`).
  * - Wide screens (1360 px and up): a thin scale on the left edge, 0 m at the top and the deepest
  *   point at the bottom, with a tick for each chapter, a marker and the
  *   reading in metres. Inside the depths section it hides, because that
@@ -61,7 +60,7 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
       const y = window.scrollY;
       const depth = gaugeDepthAt(y, anchors, depths, reduced);
       const inDepths = depths !== null && y >= depths.top - window.innerHeight * 0.25 && y <= depths.top + depths.span;
-      const f = Math.min(1, Math.max(0, -depth / FLOOR));
+      const f = gaugeFraction(depth);
       const text = formatDepth(depth);
       const key = `${f.toFixed(3)}|${text}|${inDepths}`;
       if (key === last) return;
@@ -97,7 +96,7 @@ export function DepthGauge({ surfaceLabel }: { surfaceLabel: string }) {
           <span
             key={d}
             className="absolute left-[3px] block h-px w-[9px] bg-[#E8F4FF]/40"
-            style={{ top: `${(-d / FLOOR) * 100}%` }}
+            style={{ top: `${gaugeFraction(d) * 100}%` }}
           />
         ))}
         <span className="absolute -top-6 left-0 text-[10px] font-medium tracking-[0.18em] text-[#E8F4FF]/55 uppercase">

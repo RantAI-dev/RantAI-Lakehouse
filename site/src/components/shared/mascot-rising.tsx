@@ -1,135 +1,104 @@
-"use client";
-
 import * as React from "react";
-import { m, type MotionValue } from "framer-motion";
-import { DOME, DOME_ARC, DOME_BASE_Y, EYE, MARK_WIDTH } from "./mascot-svg";
+import { SwimLayer } from "./whale-motion";
+import { WHALE_VIEW, WhaleSvg } from "./whale-svg";
 
 /**
- * The final call's creature: the dome half sunk in a night lake, its eye
- * turned up to the headline and following the pointer a little.
+ * The final call's creature, at the bottom of the D14 journey.
  *
- * The stage is 760 x 560 units; the waterline is at y = 372, so the water is
- * the bottom 33.6% of the stage. The dome bobs in HTML while the water, which
- * is full-bleed (as wide as the screen, not as the stage), sits in front of
- * its foot and its waves slide across. The dome's foot is below the
- * waterline (`DOME_Y`), so the bob never shows it.
+ * WEB-5 O33 (owner: "makin bawah makin gelap aja"): the page is one descent,
+ * and the final call is its deepest point, not a return to the surface. The
+ * whale (O29's character, `whale-svg.tsx`) swims down to greet the visitor
+ * there, as the guide, and settles below the call to action. This replaces
+ * O24's surfacing over the waves and the D14 S5 rising mark.
+ * - A soft bioluminescent glow around the whale and a faint shaft of light
+ *   from far above keep the deep readable and warm; both are local, so the
+ *   water around them stays as dark as the page's own end colour.
+ * - Sparse marine snow drifts down past it.
+ * - The whale sits in its own band below the headline and the buttons
+ *   (`final-mascot.tsx` places the stage there), and swims in from the
+ *   right inside that band (`SwimLayer`), so it never passes over the text.
  *
- * WEB-5 O2: drawn from the official mark (`mascot-svg.tsx`), scaled so its
- * dome is 500 units wide, as the old trace's was. The eye is placed in the
- * stage's own units, outside that scale, so the pointer offsets
- * (`final-mascot.tsx`) keep their size. One eye: this is the mark, drawn
- * large (O3 gives two eyes to the 3D creature only).
+ * A server component: the art is static SVG and CSS. The glow's breathing
+ * and the snow are scoped keyframes, off under reduced motion, which leaves
+ * the still final frame.
  */
-const SCALE = 500 / MARK_WIDTH;
-const DOME_X = (760 - 500) / 2;
-/**
- * The dome's base 34 units under the waterline at y 372, so its eye stands
- * about as high above the water as the old, taller trace's did. The bob
- * lifts it at most 12 units (2.2 % of 560) and tilts its edge about 3, so
- * the foot still never shows.
- */
-const DOME_Y = 372 + 34 - DOME_BASE_Y * SCALE;
-const EYE_STAGE = { cx: DOME_X + EYE.cx * SCALE, cy: DOME_Y + EYE.cy * SCALE, r: EYE.r * SCALE };
-export function MascotRising({
-  className,
-  eyeX,
-  eyeY,
-}: {
-  className?: string;
-  eyeX: MotionValue<number>;
-  eyeY: MotionValue<number>;
-}) {
-  const uid = React.useId().replace(/:/g, "");
-  const body = `lk-rbody-${uid}`;
-  const rim = `lk-rrim-${uid}`;
-  const glow = `lk-rglow-${uid}`;
-  const refl = `lk-rrefl-${uid}`;
-  const clip = `lk-rclip-${uid}`;
+
+const SCALE = 0.92;
+const WHALE_BOX = {
+  left: (380 - (WHALE_VIEW.w * SCALE) / 2) / 760,
+  top: 0.02,
+  width: (WHALE_VIEW.w * SCALE) / 760,
+  height: (WHALE_VIEW.h * SCALE) / 560,
+};
+const pct = (x: number) => `${(x * 100).toFixed(3)}%`;
+
+/** Marine snow: deterministic specks (the server and the browser must agree). */
+const SNOW = Array.from({ length: 16 }, (_, i) => ({
+  left: (7 + ((i * 37) % 86)).toFixed(1),
+  top: ((i * 23) % 80).toFixed(1),
+  size: i % 5 === 0 ? 3 : 2,
+  dur: (14 + ((i * 7) % 9)).toFixed(1),
+  delay: (-((i * 5.3) % 18)).toFixed(1),
+}));
+
+const SCENE_CSS = `
+@media (prefers-reduced-motion: no-preference) {
+  .lk-f-glow { animation: lk-f-breathe 6s ease-in-out infinite; }
+  .lk-f-snow { animation: lk-f-snow linear infinite; }
+  [data-arrived="on"] .lk-f-hello { animation: lk-f-hello 1.4s cubic-bezier(0.3, 0.7, 0.4, 1) both; }
+}
+.lk-f-hello { opacity: 0; }
+@keyframes lk-f-breathe { 0%, 100% { opacity: 0.85; } 50% { opacity: 1; } }
+@keyframes lk-f-snow {
+  0% { transform: translate3d(0, -20px, 0); opacity: 0; }
+  12% { opacity: 0.55; }
+  88% { opacity: 0.55; }
+  100% { transform: translate3d(10px, 120px, 0); opacity: 0; }
+}
+@keyframes lk-f-hello { 0% { opacity: 0; } 35% { opacity: 1; } 100% { opacity: 0; } }
+`;
+
+export function MascotRising({ className }: { className?: string }) {
   return (
     <div className={className}>
+      <style dangerouslySetInnerHTML={{ __html: SCENE_CSS }} />
       <div className="relative aspect-[760/560] w-full">
-        {/* Soft ring ripples from the waterline. */}
-        <div aria-hidden="true" className="absolute top-[66.4%] left-1/2 w-[72%]">
-          <span className="lk-ring absolute top-0 left-0 block aspect-[5/1] w-full rounded-[50%] border border-[#44A6FA]/60" />
-          <span
-            className="lk-ring absolute top-0 left-0 block aspect-[5/1] w-full rounded-[50%] border border-[#44A6FA]/40"
-            style={{ animationDelay: "2s" }}
-          />
-        </div>
-        <div className="lk-bob absolute inset-0">
-          <svg viewBox="0 0 760 560" className="absolute inset-0 size-full" aria-hidden="true" focusable="false">
-            <defs>
-              <clipPath id={clip}>
-                <path d={DOME} />
-              </clipPath>
-              <radialGradient id={body} cx="34%" cy="22%" r="85%">
-                <stop offset="0%" stopColor="#1a2a8c" />
-                <stop offset="45%" stopColor="#0a1250" />
-                <stop offset="100%" stopColor="#050a30" />
-              </radialGradient>
-              <linearGradient id={rim} x1="0" y1="0" x2="1" y2="0.3">
-                <stop offset="0%" stopColor="#44a6fa" stopOpacity="0" />
-                <stop offset="60%" stopColor="#44a6fa" stopOpacity="0.2" />
-                <stop offset="100%" stopColor="#9fd0ff" stopOpacity="1" />
-              </linearGradient>
-              <radialGradient id={glow} cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stopColor="#ffffff" stopOpacity="0.6" />
-                <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
-              </radialGradient>
-            </defs>
-            <g transform={`translate(${DOME_X} ${DOME_Y}) scale(${SCALE})`}>
-              <path d={DOME} fill={`url(#${body})`} />
-              {/* 9 stage units wide, as before. */}
-              <path d={DOME_ARC} fill="none" stroke={`url(#${rim})`} strokeWidth={9 / SCALE} clipPath={`url(#${clip})`} />
-            </g>
-            <m.g style={{ x: eyeX, y: eyeY }}>
-              <circle cx={EYE_STAGE.cx} cy={EYE_STAGE.cy} r={EYE_STAGE.r * 2.3} fill={`url(#${glow})`} />
-              <circle {...EYE_STAGE} fill="#ffffff" />
-            </m.g>
-          </svg>
-        </div>
-
-        {/* The water: full-bleed, in front of the dome's foot. */}
+        {/* A faint shaft of light from far above, narrowing as it falls. */}
         <div
           aria-hidden="true"
-          className="absolute bottom-0 left-1/2 h-[33.6%] w-screen -translate-x-1/2 bg-[linear-gradient(180deg,#0b2a66_0%,#06143f_55%,#030b2a_100%)]"
-        >
-          <div className="absolute -top-[14%] left-0 h-[22%] w-full overflow-hidden">
-            <svg viewBox="0 0 1520 40" preserveAspectRatio="none" className="lk-wave-slow absolute top-0 left-0 h-full w-[200%]">
-              <path d={WAVE_SLOW} fill="#0b2a66" />
-              <path d={WAVE_SLOW_LINE} fill="none" stroke="#44a6fa" strokeOpacity="0.6" strokeWidth="1.5" />
-            </svg>
-            <svg viewBox="0 0 1520 40" preserveAspectRatio="none" className="lk-wave-fast absolute top-[30%] left-0 h-full w-[200%]">
-              <path d={WAVE_FAST} fill="#071a4d" fillOpacity="0.92" />
-              <path d={WAVE_FAST_LINE} fill="none" stroke="#9fd0ff" strokeOpacity="0.4" strokeWidth="1" />
-            </svg>
-          </div>
-          <svg viewBox="0 0 760 188" preserveAspectRatio="none" className="absolute top-0 left-1/2 h-full w-[min(100%,760px)] -translate-x-1/2" focusable="false">
-            <defs>
-              <linearGradient id={refl} x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#44a6fa" stopOpacity="0.3" />
-                <stop offset="100%" stopColor="#44a6fa" stopOpacity="0" />
-              </linearGradient>
-            </defs>
-            <ellipse cx="380" cy="34" rx="190" ry="30" fill={`url(#${refl})`} />
-          </svg>
+          // Faded on all four sides (a vertical fade, masked across), so it has no edge.
+          className="pointer-events-none absolute -top-[40%] left-1/2 h-[120%] w-[56%] -translate-x-1/2 bg-[linear-gradient(180deg,transparent_0%,rgba(68,166,250,0.09)_35%,rgba(68,166,250,0.04)_70%,transparent_100%)] [mask-image:linear-gradient(90deg,transparent_0%,#000_50%,transparent_100%)]"
+        />
+        {/* Marine snow. */}
+        <div aria-hidden="true" className="pointer-events-none absolute inset-0">
+          {SNOW.map((s, i) => (
+            <span
+              key={i}
+              className="lk-f-snow absolute rounded-full bg-[#cfe6ff]/50"
+              style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, animationDuration: `${s.dur}s`, animationDelay: `${s.delay}s` }}
+            />
+          ))}
         </div>
+
+        <SwimLayer className="absolute inset-0">
+          {/* The whale's own soft light: bioluminescence around it, breathing. */}
+          <div
+            aria-hidden="true"
+            className="lk-f-glow pointer-events-none absolute top-[6%] left-1/2 aspect-square w-[78%] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(68,166,250,0.2)_0%,rgba(68,166,250,0.08)_38%,transparent_68%)]"
+          />
+          {/* A brief brighter ring as it arrives: its hello. */}
+          <div
+            aria-hidden="true"
+            className="lk-f-hello pointer-events-none absolute top-[10%] left-1/2 aspect-square w-[64%] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,transparent_52%,rgba(159,208,255,0.22)_62%,transparent_72%)]"
+          />
+          <div
+            className="lk-bob absolute"
+            style={{ left: pct(WHALE_BOX.left), top: pct(WHALE_BOX.top), width: pct(WHALE_BOX.width), height: pct(WHALE_BOX.height) }}
+          >
+            <WhaleSvg className="size-full drop-shadow-[0_0_40px_rgba(68,166,250,0.28)]" />
+          </div>
+        </SwimLayer>
       </div>
     </div>
   );
 }
-
-/** A wave line that tiles seamlessly across 1520 units: `count` full periods. */
-function waveLine(count: number, amp: number): string {
-  const period = 1520 / count;
-  let d = `M0 22`;
-  for (let i = 0; i < count; i++) {
-    const x0 = i * period;
-    d += ` Q${x0 + period / 4} ${22 - amp} ${x0 + period / 2} 22 T${x0 + period} 22`;
-  }
-  return d;
-}
-const WAVE_SLOW_LINE = waveLine(8, 14);
-const WAVE_SLOW = `${WAVE_SLOW_LINE} V40 H0 Z`;
-const WAVE_FAST_LINE = waveLine(16, 8);
-const WAVE_FAST = `${WAVE_FAST_LINE} V40 H0 Z`;

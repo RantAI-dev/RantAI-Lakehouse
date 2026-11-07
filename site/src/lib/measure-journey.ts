@@ -1,4 +1,4 @@
-import { JOURNEY, SURFACE_AT_FINAL } from "@/lib/home-content";
+import { JOURNEY } from "@/lib/home-content";
 import { journeyFromBoxes, type Journey, type SectionBox } from "@/lib/depth-journey";
 
 /**
@@ -9,13 +9,13 @@ import { journeyFromBoxes, type Journey, type SectionBox } from "@/lib/depth-jou
  */
 export function measureJourney(opts: { holdSurfaceThroughHero: boolean }): Journey {
   const boxes: Record<string, SectionBox> = {};
-  // The chapters include every section the journey reads (the depths pin,
-  // the dashboards where the climb starts, the final).
+  // The chapters include every section the journey reads (the depths pin
+  // among them).
   for (const { id } of JOURNEY) {
     const node = document.getElementById(id);
     if (!node) continue;
     const r = node.getBoundingClientRect();
     boxes[id] = { top: r.top + window.scrollY, height: r.height };
   }
-  return journeyFromBoxes(JOURNEY, boxes, window.innerHeight, { ...opts, surfaceAtFinal: SURFACE_AT_FINAL });
+  return journeyFromBoxes(JOURNEY, boxes, window.innerHeight, opts);
 }

@@ -1,11 +1,11 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
-  ascentAt,
-  causticAt,
   depthAt,
+  FLOOR_DEPTH,
   formatDepth,
   gaugeDepthAt,
+  gaugeFraction,
   journeyFromBoxes,
   mixColour,
   steppedDepthAt,
@@ -27,40 +27,44 @@ test("depthAt is linear between anchors and holds the ends", () => {
   assert.equal(depthAt(9999, anchors), 0);
 });
 
-test("the journey goes down to the deepest point and back up to the surface", () => {
-  const ys = Array.from({ length: 31 }, (_, i) => depthAt(i * 100, anchors));
-  const deepest = Math.min(...ys);
-  assert.equal(deepest, -100);
-  assert.equal(ys[ys.length - 1], 0);
-});
-
-test("waterAt is darkest at the deepest point and lands on the final's old night sky at the surface", () => {
-  assert.deepEqual(waterAt(-120), { top: "#020514", bottom: "#040a2a" });
-  assert.deepEqual(waterAt(0), { top: "#020514", bottom: "#0b2a66" });
-});
-
-test("the water lightens on the way up until just below the surface", () => {
-  const lum = (c: string) => parseInt(c.slice(1, 3), 16) + parseInt(c.slice(3, 5), 16) + parseInt(c.slice(5, 7), 16);
-  let prev = -1;
-  for (let d = -100; d <= -3; d += 1) {
-    const l = lum(waterAt(d).bottom);
-    assert.ok(l >= prev, `darker at ${d} m`);
-    prev = l;
+// WEB-5 O33: one descent. The reading and the water's colour only ever go
+// one way down the page.
+test("the water only darkens with depth, down to the page's own background at the bottom", () => {
+  // Relative luminance (Rec. 709 weights, on the sRGB values: monotone is all this needs).
+  const lum = (c: string) =>
+    0.2126 * parseInt(c.slice(1, 3), 16) + 0.7152 * parseInt(c.slice(3, 5), 16) + 0.0722 * parseInt(c.slice(5, 7), 16);
+  let prevTop = Infinity;
+  let prevBottom = Infinity;
+  for (let d = -100; d >= -FLOOR_DEPTH; d -= 1) {
+    const w = waterAt(d);
+    assert.ok(lum(w.top) <= prevTop && lum(w.bottom) <= prevBottom, `lighter at ${d} m`);
+    prevTop = lum(w.top);
+    prevBottom = lum(w.bottom);
   }
+  assert.deepEqual(waterAt(-FLOOR_DEPTH), { top: "#020514", bottom: "#020514" });
+  assert.deepEqual(waterAt(-1000), waterAt(-FLOOR_DEPTH));
+  assert.deepEqual(waterAt(-20), waterAt(-100));
+  assert.equal(WATER_BY_DEPTH[0].depth, -FLOOR_DEPTH);
 });
 
-// Below -3 m the water changes slowly with depth. The last 3 m are the
-// surfacing (light water to the night sky), which the page spreads over half
-// the final section's height, so it is checked per scroll, not per metre.
-test("waterAt is continuous below the surface: one metre never changes a channel by more than 5", () => {
-  for (let d = -100; d < -3; d += 1) {
-    const a = waterAt(d).top;
-    const b = waterAt(d + 1).top;
-    for (let i = 1; i < 7; i += 2) {
-      assert.ok(Math.abs(parseInt(a.slice(i, i + 2), 16) - parseInt(b.slice(i, i + 2), 16)) <= 5, `${a} -> ${b} at ${d} m`);
+test("waterAt is continuous: one metre never changes a channel by more than 2", () => {
+  for (let d = -FLOOR_DEPTH; d < -100; d += 1) {
+    for (const k of ["top", "bottom"] as const) {
+      const a = waterAt(d)[k];
+      const b = waterAt(d + 1)[k];
+      for (let i = 1; i < 7; i += 2) {
+        assert.ok(Math.abs(parseInt(a.slice(i, i + 2), 16) - parseInt(b.slice(i, i + 2), 16)) <= 2, `${a} -> ${b} at ${d} m`);
+      }
     }
   }
-  assert.equal(WATER_BY_DEPTH[0].depth, -100);
+});
+
+test("the gauge's scale is a square root of the depth: the surface at the top, the bottom at the end", () => {
+  assert.equal(gaugeFraction(0), 0);
+  assert.equal(gaugeFraction(-FLOOR_DEPTH), 1);
+  assert.equal(gaugeFraction(-100), 0.5);
+  assert.equal(gaugeFraction(-9999), 1);
+  assert.ok(gaugeFraction(-10) > 0.15, "the first metres have room");
 });
 
 test("mixColour blends, and the stepped reading holds the last anchor reached", () => {
@@ -83,29 +87,16 @@ test("formatDepth writes whole metres with a real minus sign", () => {
   assert.equal(formatDepth(-0.2), "0 m");
 });
 
-test("the ascent look is on only between the climb's start and the surface, fading in and out", () => {
-  assert.equal(ascentAt(900, 1000, 5000, 200), 0);
-  assert.equal(ascentAt(1100, 1000, 5000, 200), 0.5);
-  assert.equal(ascentAt(3000, 1000, 5000, 200), 1);
-  assert.equal(ascentAt(4900, 1000, 5000, 200), 0.5);
-  assert.equal(ascentAt(5100, 1000, 5000, 200), 0);
-});
-
-test("caustic light grows as the water gets shallower", () => {
-  assert.equal(causticAt(-100), 0);
-  assert.ok(causticAt(-50) < causticAt(-15));
-  assert.equal(causticAt(-3), 1);
-});
-
 // WEB-5 review fix R9: the pure part of the one measurement both the gauge
-// and the water use. A 1000 px screen and boxes laid out like the page.
+// and the water use. A 1000 px screen and boxes laid out like the page,
+// with O33's one-descent depths.
 const chapters = [
   { id: "hero", depth: 0 },
   { id: "sources", depth: -5 },
   { id: "depths", depth: -10 },
   { id: "assistant", depth: -100 },
-  { id: "dashboards", depth: -100 },
-  { id: "final", depth: -3 },
+  { id: "dashboards", depth: -150 },
+  { id: "final", depth: -400 },
 ];
 const boxes = {
   hero: { top: 0, height: 2200 },
@@ -117,52 +108,59 @@ const boxes = {
 };
 const vh = 1000;
 
-test("journeyFromBoxes puts each chapter's depth where its top reaches the middle of the screen, plus the Gold pin end and the surface", () => {
-  const j = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: false, surfaceAtFinal: 0.5 });
+test("journeyFromBoxes puts each chapter's depth where its top reaches the middle of the screen, plus the Gold pin end", () => {
+  const j = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: false });
   assert.deepEqual(j.anchors, [
     { at: -500, depth: 0 },
     { at: 1700, depth: -5 },
     { at: 2700, depth: -10 },
+    { at: 3200, depth: -10 },
     { at: 6200, depth: -90 },
     { at: 6700, depth: -100 },
-    { at: 7700, depth: -100 },
-    { at: 8700, depth: -3 },
-    { at: 9100, depth: 0 },
+    { at: 7700, depth: -150 },
+    { at: 8700, depth: -400 },
   ]);
   assert.deepEqual(j.depths, { top: 3200, span: 3000 });
-  assert.deepEqual(j.climb, { from: 7200, to: 9100 });
+});
+
+test("O33: the reading only ever goes down the page, and ends at the bottom", () => {
+  const j = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: true });
+  let prev = Infinity;
+  for (let y = -1000; y <= 11000; y += 10) {
+    const d = gaugeDepthAt(y, j.anchors, j.depths);
+    assert.ok(d <= prev + 1e-9, `rose at ${y}`);
+    prev = d;
+  }
+  assert.equal(prev, -400);
 });
 
 test("holding the surface through the hero adds one anchor at the end of the hero's pin and changes nothing else", () => {
-  const free = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: false, surfaceAtFinal: 0.5 });
-  const held = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: true, surfaceAtFinal: 0.5 });
+  const free = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: false });
+  const held = journeyFromBoxes(chapters, boxes, vh, { holdSurfaceThroughHero: true });
   assert.deepEqual(held.anchors, [...free.anchors.slice(0, 1), { at: 1200, depth: 0 }, ...free.anchors.slice(1)]);
   assert.deepEqual(held.depths, free.depths);
-  assert.deepEqual(held.climb, free.climb);
   // Held: still 0 m just before the pin ends; free: already on its way down.
   assert.equal(depthAt(1199, held.anchors), 0);
   assert.ok(depthAt(1199, free.anchors) < 0);
 });
 
 test("journeyFromBoxes skips sections that are not on the page and keeps the anchors in scroll order", () => {
-  const j = journeyFromBoxes(chapters, { hero: boxes.hero, final: boxes.final }, vh, {
-    holdSurfaceThroughHero: true,
-    surfaceAtFinal: 0.5,
-  });
+  const j = journeyFromBoxes(chapters, { hero: boxes.hero, final: boxes.final }, vh, { holdSurfaceThroughHero: true });
   assert.equal(j.depths, null);
-  assert.deepEqual(j.climb, { from: 0, to: 9100 });
   assert.deepEqual(
     j.anchors.map((a) => a.depth),
-    [0, 0, -3, 0],
+    [0, 0, -400],
   );
-  const empty = journeyFromBoxes(chapters, {}, vh, { holdSurfaceThroughHero: false, surfaceAtFinal: 0.5 });
-  assert.deepEqual(empty, { anchors: [], depths: null, climb: { from: 0, to: 0 } });
+  const empty = journeyFromBoxes(chapters, {}, vh, { holdSurfaceThroughHero: false });
+  assert.deepEqual(empty, { anchors: [], depths: null });
 });
 
 test("a depths section no taller than the screen still gets a one-pixel pin", () => {
-  const j = journeyFromBoxes(chapters, { depths: { top: 100, height: 800 } }, vh, {
-    holdSurfaceThroughHero: false,
-    surfaceAtFinal: 0.5,
-  });
+  const j = journeyFromBoxes(chapters, { depths: { top: 100, height: 800 } }, vh, { holdSurfaceThroughHero: false });
   assert.deepEqual(j.depths, { top: 100, span: 1 });
+  assert.deepEqual(j.anchors, [
+    { at: -400, depth: -10 },
+    { at: 100, depth: -10 },
+    { at: 101, depth: -90 },
+  ]);
 });

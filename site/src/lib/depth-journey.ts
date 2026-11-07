@@ -1,6 +1,6 @@
 /**
- * WEB-5 D14, the journey down and back up, as pure functions of the scroll
- * position, so they are tested without a browser. The page measures each
+ * WEB-5 D14, the journey down (O33: one descent, no way back up), as pure
+ * functions of the scroll position, so they are tested without a browser. The page measures each
  * chapter's top (`JOURNEY` ids) and hands them in; these turn a scroll
  * position into the depth the gauge shows (S3) and the colour of the water
  * behind the second half of the page (S2).
@@ -11,19 +11,25 @@ export type Anchor = { at: number; depth: number };
 export type Water = { top: string; bottom: string };
 
 /**
- * The water's colour by depth, top and bottom of the screen: from the
- * abyss at the deepest point, lighter on the way up, to the night sky over
- * the lake at the surface. The surface stop is the final scene's old
- * background (#020514 sky over #0b2a66 water), so the return lands on the
- * picture the page always ended on.
+ * The water's colour by depth, top and bottom of the screen, deepest
+ * first. WEB-5 O33: it only darkens with depth, and the page only goes
+ * deeper, so the background never lightens again.
+ * - −100 m (the assistant) is about the colour the 3D water shows where the
+ *   scene zone ends (the lake engine's deep fog through its tone mapping,
+ *   lake-engine.ts); the backdrop takes over from that exact colour there
+ *   (lib/scene-colour.ts) and eases into this ramp.
+ * - −400 m (the bottom, at the final call) is the page's own background,
+ *   #020514, top and bottom alike, so the footer and the overscroll end on
+ *   the same colour.
+ * Shallower than −100 m the backdrop is covered (the canvas or the scene
+ * zone's gradient), so the ramp holds its −100 m colour there.
  */
 export const WATER_BY_DEPTH: readonly { depth: number; top: string; bottom: string }[] = [
-  { depth: -100, top: "#020514", bottom: "#040a2a" },
-  { depth: -75, top: "#050a30", bottom: "#0b1a4a" },
-  { depth: -50, top: "#0b1a4a", bottom: "#10286a" },
-  { depth: -15, top: "#0d2462", bottom: "#163f8c" },
-  { depth: -3, top: "#10306f", bottom: "#1c4c9c" },
-  { depth: 0, top: "#020514", bottom: "#0b2a66" },
+  { depth: -400, top: "#020514", bottom: "#020514" },
+  { depth: -300, top: "#020720", bottom: "#020619" },
+  { depth: -200, top: "#020a2e", bottom: "#02071f" },
+  { depth: -150, top: "#020c38", bottom: "#020826" },
+  { depth: -100, top: "#020e42", bottom: "#02092c" },
 ];
 
 const hex = (c: string): [number, number, number] => [
@@ -56,11 +62,7 @@ export function depthAt(scrollY: number, anchors: readonly Anchor[]): number {
   return anchors[anchors.length - 1].depth;
 }
 
-/**
- * The water's colours at a depth. Past the deepest point the depth goes
- * back up, but the colour depends only on how deep it is, so the ascent
- * lightens as the descent darkened.
- */
+/** The water's colours at a depth: darker the deeper, held past the ramp's ends. */
 export function waterAt(depth: number): Water {
   const stops = WATER_BY_DEPTH;
   if (depth <= stops[0].depth) return { top: stops[0].top, bottom: stops[0].bottom };
@@ -114,37 +116,29 @@ export function gaugeDepthAt(
   return (stepped ? steppedDepthAt : depthAt)(scrollY, anchors);
 }
 
+/** The bottom of the journey, where the gauge's scale ends (O33). */
+export const FLOOR_DEPTH = 400;
+
+/**
+ * Where a depth sits on the gauge's scale, 0 (surface) to 1 (the bottom).
+ * O33: on a square-root scale, so the first metres (0, −5, −10) and the
+ * last hundreds (−300, −400) both have room on one bar.
+ */
+export function gaugeFraction(depth: number): number {
+  return Math.sqrt(Math.min(1, Math.max(0, -depth / FLOOR_DEPTH)));
+}
+
 /** "−40 m": a U+2212 minus, whole metres; the surface reads "0 m". */
 export function formatDepth(depth: number): string {
   const m = Math.round(Math.abs(depth));
   return m === 0 ? "0 m" : `\u2212${m} m`;
 }
 
-/**
- * WEB-5 D14 S5, the ascent: how much of the way-up look to show, 0..1. It is
- * 1 from where the climb starts (`from`, the dashboards) to just before the
- * surface (`to`, halfway into the final), with `fade` of scroll to come in
- * and to go out, and 0 elsewhere (the dive, the deepest point, the night
- * sky). Bubbles and caustics are scaled by it.
- */
-export function ascentAt(scrollY: number, from: number, to: number, fade: number): number {
-  if (!(to > from) || fade <= 0) return 0;
-  const rise = Math.min(1, Math.max(0, (scrollY - from) / fade));
-  const fall = Math.min(1, Math.max(0, (to - scrollY) / fade));
-  return Math.min(rise, fall);
-}
-
-/** Caustic light by depth: none at the deepest point, strongest just under the surface. */
-export function causticAt(depth: number): number {
-  return Math.min(1, Math.max(0, (depth + 100) / 97));
-}
-
-
 /** A section's box in page coordinates (its top plus the scroll position, and its height). */
 export type SectionBox = { top: number; height: number };
 
-/** What the page's sections turn into: the depth anchors, the depths pin, and the climb (S5). */
-export type Journey = { anchors: Anchor[]; depths: DepthsRange | null; climb: { from: number; to: number } };
+/** What the page's sections turn into: the depth anchors and the depths pin. */
+export type Journey = { anchors: Anchor[]; depths: DepthsRange | null };
 
 /**
  * WEB-5 review fix R9 (SHOULD-FIX): the one place that turns the chapters'
@@ -161,15 +155,15 @@ export type Journey = { anchors: Anchor[]; depths: DepthsRange | null; climb: { 
  *   0 m while the visitor is still above the water. The water does not:
  *   behind the hero and the scene zone it is covered by the canvas or the
  *   zone's own gradient, and only its colour where that cover ends shows.
- * - The depths pin ends on Gold (−90 m), so that is the depth after it.
- * - The surface (0 m) is reached `surfaceAtFinal` of the way into the final.
- * - The climb runs from a screen before the dashboards to the surface.
+ * - The depths pin starts on Bronze (−10 m) and ends on Gold (−90 m).
+ * - O33: there is no climb and no surface at the end any more; the last
+ *   chapter (the final call) is the deepest point.
  */
 export function journeyFromBoxes(
   chapters: readonly { id: string; depth: number }[],
   boxes: Readonly<Record<string, SectionBox | undefined>>,
   viewportH: number,
-  opts: { holdSurfaceThroughHero: boolean; surfaceAtFinal: number },
+  opts: { holdSurfaceThroughHero: boolean },
 ): Journey {
   const half = viewportH / 2;
   const anchors: Anchor[] = [];
@@ -185,16 +179,12 @@ export function journeyFromBoxes(
   const d = boxes.depths;
   if (d) {
     depths = { top: d.top, span: Math.max(1, d.height - viewportH) };
+    // O33: hold Bronze until the pin starts, where the gauge switches to the
+    // slabs' own readings; it used to sink on towards Gold first and then
+    // jump back up to −10 m there.
+    anchors.push({ at: depths.top, depth: SLAB_DEPTHS[0] });
     anchors.push({ at: depths.top + depths.span, depth: SLAB_DEPTHS[2] });
   }
-  const final = boxes.final;
-  if (final) anchors.push({ at: final.top + final.height * opts.surfaceAtFinal - half, depth: 0 });
   anchors.sort((a, b) => a.at - b.at);
-  const dash = boxes.dashboards;
-  const surface = anchors[anchors.length - 1];
-  return {
-    anchors,
-    depths,
-    climb: { from: dash ? dash.top - viewportH : 0, to: surface ? surface.at : 0 },
-  };
+  return { anchors, depths };
 }

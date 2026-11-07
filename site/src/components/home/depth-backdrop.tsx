@@ -1,20 +1,20 @@
 "use client";
 
 import * as React from "react";
-import { ascentAt, causticAt, depthAt, mixColour, steppedDepthAt, waterAt, type Anchor } from "@/lib/depth-journey";
+import { depthAt, mixColour, steppedDepthAt, waterAt, type Anchor } from "@/lib/depth-journey";
 import { onSceneColours, sceneColours } from "@/lib/scene-colour";
 import { smoothstep } from "@/lib/scroll-timeline";
 import { measureJourney } from "@/lib/measure-journey";
-import { afterPaint } from "@/lib/after-paint";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 
 /**
  * WEB-5 D14 S2: one water behind the second half of the page. From the
- * assistant (the deepest point) to the final call (the surface), the
- * sections have no background of their own; this fixed layer is the water
- * they sit in, and its colour follows the depth as the page scrolls. The
- * colour lightens on the way up and turns into the night sky at the
- * surface, and section edges no longer show as bands.
+ * assistant to the final call the sections have no background of their
+ * own; this fixed layer is the water they sit in, and its colour follows
+ * the depth as the page scrolls, so section edges never show as bands.
+ * WEB-5 O33: the page is one descent, so the water only ever darkens, down
+ * to the abyss at the final call (the page's own background), where the
+ * footer and the overscroll end on the same colour.
  *
  * - Before the assistant the 3D canvas or the scene zone's own gradient
  *   covers it, and its colour there is already the deep water those end on,
@@ -33,12 +33,8 @@ import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
  * - Without JavaScript the sections keep their own backgrounds
  *   (`.lk-fallback-bg` in app/globals.css), so the page reads as before.
  *
- * S5, the ascent: from the dashboards up to the surface, moonlight caustics
- * come back into the water, stronger the shallower it is, and bubbles rise
- * at the screen's edges. Both are scaled by two more CSS variables from the
- * same listener (`--lk-ascent`, `--lk-caustic`). The bubbles are mounted
- * only once the page is usable (`afterPaint`), and neither shows under
- * reduced motion or without JavaScript.
+ * O33 removed S5's ascent: the bubbles rising to the surface and the
+ * caustics coming back.
  */
 export function DepthBackdrop() {
   const ref = React.useRef<HTMLDivElement>(null);
@@ -48,7 +44,6 @@ export function DepthBackdrop() {
     const el = ref.current;
     if (!el) return;
     let anchors: Anchor[] = [];
-    let climb = { from: 0, to: 0 };
     let frame = 0;
     let last = "";
     // Where the canvas is gone: the scroll at which the scene zone's pinned
@@ -58,7 +53,7 @@ export function DepthBackdrop() {
     // R9: the same measurement as the gauge. No hold through the hero: the
     // water is covered there (see `journeyFromBoxes`).
     const measure = () => {
-      ({ anchors, climb } = measureJourney({ holdSurfaceThroughHero: false }));
+      ({ anchors } = measureJourney({ holdSurfaceThroughHero: false }));
       const zone = document.getElementById("scene-zone");
       zoneOut = zone ? zone.getBoundingClientRect().bottom + window.scrollY - window.innerHeight : 0;
       paint();
@@ -78,15 +73,11 @@ export function DepthBackdrop() {
         scene && handOver > 0
           ? { top: mixColour(own.top, scene.top, handOver), bottom: mixColour(own.bottom, scene.bottom, handOver) }
           : own;
-      const ascent = reduced ? 0 : ascentAt(window.scrollY, climb.from, climb.to, window.innerHeight * 0.6);
-      const caustic = ascent * causticAt(depth);
-      const key = `${water.top}${water.bottom}|${ascent.toFixed(2)}|${caustic.toFixed(2)}`;
+      const key = `${water.top}${water.bottom}`;
       if (key === last) return;
       last = key;
       el.style.setProperty("--lk-water-top", water.top);
       el.style.setProperty("--lk-water-bottom", water.bottom);
-      el.style.setProperty("--lk-ascent", ascent.toFixed(2));
-      el.style.setProperty("--lk-caustic", caustic.toFixed(2));
     };
     const onScroll = () => {
       if (!frame) frame = requestAnimationFrame(paint);
@@ -109,69 +100,5 @@ export function DepthBackdrop() {
     };
   }, [reduced]);
 
-  const showBubbles = useAfterPaint() && !reduced;
-
-  return (
-    <div ref={ref} aria-hidden="true" className="lk-water pointer-events-none fixed inset-0 overflow-hidden">
-      {/* Moonlight from above, stronger as the water gets shallower (S5). */}
-      <div className="lk-water-caustics absolute inset-0">
-        <div className="lk-caustic-a absolute -top-1/3 left-[10%] size-[70%] rounded-full bg-[radial-gradient(circle,rgba(120,190,255,0.22)_0%,transparent_60%)] blur-2xl" />
-        <div className="lk-caustic-b absolute -top-1/4 right-[5%] size-[60%] rounded-full bg-[radial-gradient(circle,rgba(150,205,255,0.18)_0%,transparent_60%)] blur-3xl" />
-      </div>
-      {showBubbles && <Bubbles />}
-    </div>
-  );
-}
-
-/**
- * A dozen bubbles rising at the edges of the screen, a CSS animation each
- * (transform and opacity only). Positions, sizes and timings are fixed
- * numbers, not random, so every visit looks the same.
- */
-const BUBBLES = Array.from({ length: 12 }, (_, i) => ({
-  left: i % 2 === 0 ? 2 + ((i * 7) % 11) : 88 + ((i * 5) % 10),
-  size: 3 + ((i * 3) % 6),
-  duration: 9 + ((i * 7) % 8),
-  delay: -((i * 13) % 17),
-}));
-
-function Bubbles() {
-  return (
-    <div className="lk-bubbles absolute inset-0">
-      {BUBBLES.map((b, i) => (
-        <span
-          key={i}
-          className="lk-bubble absolute bottom-0 rounded-full border border-[#E8F4FF]/45 bg-[#E8F4FF]/10"
-          style={{
-            left: `${b.left}%`,
-            width: b.size,
-            height: b.size,
-            animationDuration: `${b.duration}s`,
-            animationDelay: `${b.delay}s`,
-          }}
-        />
-      ))}
-    </div>
-  );
-}
-
-/** True once the page is usable (`afterPaint`); false on the server and in the first render. */
-let painted = false;
-let paintScheduled = false;
-const paintListeners = new Set<() => void>();
-function subscribePainted(onChange: () => void): () => void {
-  paintListeners.add(onChange);
-  if (!paintScheduled) {
-    paintScheduled = true;
-    afterPaint(() => {
-      painted = true;
-      for (const l of paintListeners) l();
-    });
-  }
-  return () => {
-    paintListeners.delete(onChange);
-  };
-}
-function useAfterPaint(): boolean {
-  return React.useSyncExternalStore(subscribePainted, () => painted, () => false);
+  return <div ref={ref} aria-hidden="true" className="lk-water pointer-events-none fixed inset-0 overflow-hidden" />;
 }
