@@ -2324,13 +2324,42 @@ section[data-role="admin"] .lk-gv-closed {
    swaps without a fade. Every loop pauses while its picture is hidden. */
 .lk-show {
   --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
-  --lk-show-slot: 112px;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   row-gap: 16px;
 }
+/* Phones, no JS and short windows: the two boxes dissolve into the grid and
+   items and pictures interleave by order. */
 .lk-show-mark {
   display: none;
+}
+.lk-show-list,
+.lk-show-stage {
+  display: contents;
+}
+.lk-show-item[data-i="0"] {
+  order: 0;
+}
+.lk-show-visual[data-i="0"] {
+  order: 1;
+}
+.lk-show-item[data-i="1"] {
+  order: 2;
+}
+.lk-show-visual[data-i="1"] {
+  order: 3;
+}
+.lk-show-item[data-i="2"] {
+  order: 4;
+}
+.lk-show-visual[data-i="2"] {
+  order: 5;
+}
+.lk-show-item[data-i="3"] {
+  order: 6;
+}
+.lk-show-visual[data-i="3"] {
+  order: 7;
 }
 .lk-show-item {
   padding-left: 20px;
@@ -2350,9 +2379,13 @@ section[data-role="admin"] .lk-gv-closed {
   background: #0a1230;
   margin-bottom: 32px;
 }
-@media (min-width: 64rem) {
-  /* Four invisible markers, one screen of scroll each, drive the showcase;
-     the list and the panel both stay at the middle of the screen. */
+/* From 1024 px, and only where the window is tall enough to hold the list
+   and the panel under the top bar: four invisible markers, one screen of
+   scroll each, drive the showcase. The list is one sticky box held at the
+   middle of the screen, its items one under another; the pictures are one
+   sticky box, stacked, one shown. Both release together after the last
+   marker. */
+@media (min-width: 64rem) and (min-height: 34rem) {
   .lk-show {
     grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
     grid-template-rows: repeat(4, auto);
@@ -2377,20 +2410,30 @@ section[data-role="admin"] .lk-gv-closed {
   .lk-show-mark[data-i="3"] {
     grid-row: 4;
   }
-  /* The items share the column's whole height and stick one slot apart, so
-     together they read as one list held at the middle of the screen. */
-  .lk-show-item {
-    grid-column: 1;
+  .lk-show-list,
+  .lk-show-stage {
     grid-row: 1 / -1;
     align-self: start;
+    position: -webkit-sticky;
     position: sticky;
-    top: calc(50vh - 2 * var(--lk-show-slot) + var(--i) * var(--lk-show-slot) + 2rem);
-    margin-top: calc(var(--i) * var(--lk-show-slot));
-    height: var(--lk-show-slot);
+    top: 4rem;
+    height: calc(100svh - 4rem);
     display: flex;
     flex-direction: column;
     justify-content: center;
+  }
+  .lk-show-list {
+    grid-column: 1;
+    gap: 12px;
+  }
+  .lk-show-stage {
+    grid-column: 2;
+    display: grid;
+    align-content: center;
+  }
+  .lk-show-item {
     border-left-color: rgba(232, 244, 255, 0.1);
+    padding-block: 14px;
     transition: border-color 0.3s ease;
   }
   .lk-show-item a {
@@ -2412,14 +2455,10 @@ section[data-role="admin"] .lk-gv-closed {
   .lk-show-item:not([data-on]):hover .lk-show-title {
     color: rgba(232, 244, 255, 0.8);
   }
-  /* The four pictures share one place at the middle of the screen. */
+  /* The four pictures share one cell of the stage. */
   .lk-show-visual {
-    grid-column: 2;
-    grid-row: 1 / -1;
-    position: sticky;
-    top: calc(50vh - 220px + 2rem);
-    align-self: start;
-    height: 440px;
+    grid-area: 1 / 1;
+    height: min(440px, calc(100svh - 7rem));
     max-width: none;
     margin: 0;
     opacity: 0;
@@ -2444,7 +2483,7 @@ section[data-role="admin"] .lk-gv-closed {
     animation-play-state: paused !important;
   }
 }
-@media (min-width: 64rem) and (prefers-reduced-motion: reduce) {
+@media (min-width: 64rem) and (min-height: 34rem) and (prefers-reduced-motion: reduce) {
   .lk-show-visual,
   .lk-show-visual[data-on] {
     transition: none;
@@ -2759,50 +2798,5 @@ section[data-role="admin"] .lk-gv-closed {
   }
   .lk-con-tab {
     animation: none !important;
-  }
-}
-/* O38 review fix: a desktop window too short for the held list (4 x 112 px)
-   and panel (440 px) under the top bar, below about 544 px, gets the plain
-   sequence instead of the sticky showcase, as phones and no-JS do. */
-@media (min-width: 64rem) and (max-height: 33.99rem) {
-  .lk-show {
-    grid-template-columns: minmax(0, 1fr);
-    row-gap: 16px;
-  }
-  .lk-show-mark {
-    display: none;
-  }
-  .lk-show-item,
-  .lk-show-visual {
-    grid-column: auto;
-    grid-row: auto;
-    position: relative;
-    top: auto;
-    margin-top: 0;
-    height: auto;
-  }
-  .lk-show-item {
-    border-left-color: rgba(232, 244, 255, 0.1);
-  }
-  .lk-show-item a {
-    pointer-events: none;
-  }
-  .lk-show-item:not([data-on]) .lk-show-title,
-  .lk-show-item:not([data-on]) .lk-show-line {
-    color: inherit;
-  }
-  .lk-show-visual,
-  .lk-show-visual[data-on] {
-    max-width: 40rem;
-    min-height: 260px;
-    margin-bottom: 32px;
-    opacity: 1;
-    visibility: visible;
-    transform: none;
-    transition: none;
-  }
-  .lk-show-visual:not([data-on]) *,
-  .lk-show-visual:not([data-on]) *::after {
-    animation-play-state: running !important;
   }
 }

@@ -57,7 +57,12 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
           <span aria-hidden="true" className="absolute top-3 bottom-8 left-[11px] w-px bg-[#44A6FA]/20" />
           <span aria-hidden="true" className="lk-gs-fill absolute top-3 bottom-8 left-[11px] w-px bg-[#8fcbff]/80" />
           {copy.steps.map((step, i) => (
-            <Reveal as="li" key={step.title} delay={i * 0.08} y={20} className="relative pb-10 pl-12 last:pb-0">
+            // WEB-5 O45 (owner: "buat ini sticky lah, sampe 3 terminal selesai"):
+            // from md each step takes most of a screen, so the left column
+            // visibly stays put while the steps pass, and the last one is
+            // taller still, so step 3 has typed and shown its output well
+            // before the column lets go at the section's end.
+            <Reveal as="li" key={step.title} delay={i * 0.08} y={20} className="relative pb-10 pl-12 last:pb-0 md:min-h-[60svh] md:last:min-h-[92svh]">
               <span
                 aria-hidden="true"
                 className="lk-gs-num absolute top-1 left-0 grid size-6 place-items-center rounded-full bg-[#020514] text-[12px] font-medium tabular-nums"

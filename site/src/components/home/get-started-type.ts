@@ -10,8 +10,10 @@
  * terminal is `done` and CSS brings in its output. Each call returns a stop
  * function that leaves its terminal finished.
  */
-const CHAR_MS = 24;
-const BETWEEN_MS = 260;
+// O45: brisk, so all three terminals have typed while the column beside
+// them is still pinned (a long URL at 24 ms a character took ~3 s alone).
+const CHAR_MS = 14;
+const BETWEEN_MS = 180;
 
 let queue: Promise<void> = Promise.resolve();
 
@@ -55,7 +57,7 @@ export function typeTerminal(term: HTMLElement): () => void {
       if (n < text.length) {
         // A natural pace: a beat longer after a space or a slash.
         const c = text[n - 1];
-        timer = window.setTimeout(step, CHAR_MS + (c === " " || c === "/" ? 60 : Math.random() * 20));
+        timer = window.setTimeout(step, CHAR_MS + (c === " " || c === "/" ? 40 : Math.random() * 12));
         return;
       }
       delete line.dataset.typing;
@@ -64,7 +66,7 @@ export function typeTerminal(term: HTMLElement): () => void {
       delete real.dataset.full;
       timer = window.setTimeout(() => typeLine(i + 1), BETWEEN_MS);
     };
-    timer = window.setTimeout(step, 200);
+    timer = window.setTimeout(step, 120);
   };
 
   queue = queue.then(

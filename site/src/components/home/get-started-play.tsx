@@ -38,7 +38,10 @@ export function GetStartedPlay({ children }: { children: React.ReactNode }) {
           });
         }
       },
-      { threshold: 0.6 },
+      // O45: start typing as a terminal comes in from below, not once it is
+      // mostly on screen, so the last one has finished before the sticky
+      // column beside it releases.
+      { threshold: 0.35 },
     );
     for (const t of terms) io.observe(t);
     return () => {

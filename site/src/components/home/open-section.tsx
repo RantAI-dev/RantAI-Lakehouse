@@ -29,7 +29,7 @@ import { OpenShowcase } from "./open-showcase";
  */
 
 const NO_SCRIPT_CSS =
-  "@media (min-width:64rem){.lk-show{grid-template-columns:minmax(0,1fr)!important;row-gap:16px!important}.lk-show-mark{display:none!important}.lk-show-item,.lk-show-visual{grid-column:auto!important;grid-row:auto!important;position:relative!important;top:auto!important;margin-top:0!important;height:auto!important}.lk-show-visual{opacity:1!important;visibility:visible!important;transform:none!important;margin-bottom:32px!important;max-width:40rem!important}.lk-show-item .lk-show-title,.lk-show-item .lk-show-line{color:inherit!important}}";
+  "@media (min-width:64rem){.lk-show{grid-template-columns:minmax(0,1fr)!important;grid-template-rows:none!important;row-gap:16px!important}.lk-show-mark{display:none!important}.lk-show-list,.lk-show-stage{display:contents!important}.lk-show-visual{opacity:1!important;visibility:visible!important;transform:none!important;height:auto!important;min-height:260px!important;max-width:40rem!important;margin-bottom:32px!important;grid-area:auto!important}.lk-show-item .lk-show-title,.lk-show-item .lk-show-line{color:inherit!important}.lk-show-item{border-left-color:rgba(232,244,255,.1)!important}}";
 
 export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: CommonCopy["cta"] }) {
   const [source, tables, servers] = copy.cards;
@@ -72,17 +72,23 @@ export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: Common
           <SplitWords text={copy.headline} />
         </DisplayHeading>
         <OpenShowcase>
+          {/* WEB-5 O44 (owner: the four titles drawn on top of each other): the
+              list is ONE sticky box whose items flow one under another, and
+              the pictures are ONE sticky box whose pictures stack. Both are
+              held for the four scroll markers and released together. Before,
+              each item was sticky on its own in the same grid area, and at
+              the release the area's end pushed all four into one spot. On
+              phones (and without JS, and in a short window) both boxes are
+              `display: contents`, so items and pictures interleave by
+              `order`: title, line, picture, four times. */}
           <div className="lk-show mt-12 md:mt-16" data-active="0">
             {items.map((item, i) => (
-              <React.Fragment key={item.title}>
-                {/* The scroll marker for this promise: one screen tall, from 1024 px only. */}
-                <div id={`open-${i + 1}`} className="lk-show-mark" data-i={i} aria-hidden="true" />
-                <div
-                  className="lk-show-item"
-                  data-i={i}
-                  data-on={i === 0 ? "" : undefined}
-                  style={{ "--i": i } as React.CSSProperties}
-                >
+              // The scroll marker for each promise: one screen tall, from 1024 px only.
+              <div key={item.title} id={`open-${i + 1}`} className="lk-show-mark" data-i={i} aria-hidden="true" />
+            ))}
+            <ol className="lk-show-list">
+              {items.map((item, i) => (
+                <li key={item.title} className="lk-show-item" data-i={i} data-on={i === 0 ? "" : undefined}>
                   <a href={`#open-${i + 1}`} data-show={i} className="group block rounded-md focus-visible:outline-offset-4">
                     <h3 className="lk-show-title text-[22px] leading-8 font-medium text-balance text-[#E8F4FF] md:text-[24px]">
                       {item.title}
@@ -91,12 +97,16 @@ export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: Common
                       {item.body}
                     </p>
                   </a>
-                </div>
-                <div className="lk-show-visual" data-i={i} data-on={i === 0 ? "" : undefined}>
+                </li>
+              ))}
+            </ol>
+            <div className="lk-show-stage">
+              {items.map((item, i) => (
+                <div key={item.title} className="lk-show-visual" data-i={i} data-on={i === 0 ? "" : undefined}>
                   {item.visual}
                 </div>
-              </React.Fragment>
-            ))}
+              ))}
+            </div>
           </div>
         </OpenShowcase>
       </Container>
