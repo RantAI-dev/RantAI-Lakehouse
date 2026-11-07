@@ -5,7 +5,7 @@ import { KpiTile, LineChartTile, SankeyTile } from "./dashboard-tiles";
 import { CalendarTile, DotMapTile } from "./dashboard-tiles-static";
 import { DashboardsScroller } from "./dashboards-scroller";
 import { LiveTile } from "./live-tile";
-import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
+import { Container, DisplayHeading } from "@/components/shared/primitives";
 import { MascotLogo } from "@/components/shared/mascot-svg";
 import { SplitWords } from "@/components/shared/reveal";
 import { TiltCard } from "@/components/shared/tilt-card";
@@ -47,9 +47,9 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
             <DisplayHeading size="lg" className="max-w-[16ch] max-md:text-[clamp(2.4rem,11vw,3.2rem)]">
               <SplitWords text={copy.headline} />
             </DisplayHeading>
-            <LeadText className="mt-4 max-w-[38rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
+            <p className="lk-l-muted mt-4 max-w-[38rem] text-pretty text-[15px] leading-[1.5] md:mt-5 md:text-[19px] md:leading-[1.6]">
               {copy.sub}
-            </LeadText>
+            </p>
             {/* Audit #2 + #12: no feature pills here. The tiles already show the features, and the
                 page has enough chip walls (sources, assistant, the footer card); on phones the pills'
                 third row was also cut by the pinned track. */}
@@ -69,9 +69,12 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
             // O18: a clear lift (6 px) with a deeper shadow on hover, focus or a tap; still under reduced motion.
             className="w-[78vw] shrink-0 rounded-3xl transition-transform duration-200 ease-out outline-none hover:-translate-y-1.5 focus-visible:-translate-y-1.5 active:-translate-y-1 motion-reduce:transition-none motion-reduce:hover:translate-y-0 motion-reduce:focus-visible:translate-y-0 sm:w-[380px] md:w-[420px]"
           >
-            <TiltCard className="rounded-3xl border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] p-5 shadow-[0_30px_80px_-40px_rgba(2,5,20,0.9)] backdrop-blur-md transition-[border-color,box-shadow] duration-200 ease-out group-hover/tile:border-[#44A6FA]/60 group-hover/tile:shadow-[0_40px_90px_-36px_rgba(2,5,20,0.95),0_0_44px_-6px_rgba(68,166,250,0.55)] group-focus-visible/tile:border-[#44A6FA]/75 group-focus-visible/tile:shadow-[0_40px_90px_-36px_rgba(2,5,20,0.95),0_0_44px_-6px_rgba(68,166,250,0.6)] group-active/tile:border-[#44A6FA]/60 md:p-6">
-              <p className="text-[11px] tracking-[0.2em] text-[#44A6FA] uppercase">{tile.kind}</p>
-              <p className="mt-1.5 text-[15px] text-[#E8F4FF]/85 transition-colors duration-200 ease-out group-hover/tile:text-white group-focus-visible/tile:text-white">
+            <TiltCard
+              tone="light"
+              className="lk-l-card rounded-3xl border border-[#0f1419]/10 bg-white p-5 shadow-[0_1px_2px_rgba(15,20,25,0.04),0_14px_34px_-20px_rgba(15,20,25,0.2)] transition-[border-color,box-shadow] duration-200 ease-out group-hover/tile:border-[#1d6ccf]/45 group-hover/tile:shadow-[0_1px_2px_rgba(15,20,25,0.05),0_26px_50px_-22px_rgba(15,20,25,0.32)] group-focus-visible/tile:border-[#1d6ccf]/70 group-focus-visible/tile:shadow-[0_0_0_3px_rgba(29,108,207,0.18),0_26px_50px_-22px_rgba(15,20,25,0.3)] group-active/tile:border-[#1d6ccf]/45 md:p-6"
+            >
+              <p className="text-[11px] font-medium tracking-[0.2em] text-[#1d6ccf] uppercase">{tile.kind}</p>
+              <p className="lk-l-muted mt-1.5 text-[15px] transition-colors duration-200 ease-out group-hover/tile:text-[#0b0d0e] group-focus-visible/tile:text-[#0b0d0e]">
                 {tile.title}
               </p>
               <div className="mt-4">
@@ -93,7 +96,7 @@ function Shore() {
   return (
     <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 h-[22%]">
       {/* O39: a solid hairline, with no glow above or below it. */}
-      <div className="absolute inset-x-0 bottom-[34%] h-px bg-[#44A6FA]/45" />
+      <div className="absolute inset-x-0 bottom-[34%] h-px bg-[#0f1419]/14" />
       <MascotLogo className="absolute right-[5%] bottom-[34%] h-auto w-9 translate-y-[2px] opacity-90 md:w-12" />
     </div>
   );
