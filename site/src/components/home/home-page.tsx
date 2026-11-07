@@ -19,6 +19,7 @@ import { DepthsSection } from "./depths-section";
 import { FinalSection } from "./final-section";
 import { GetStartedSection } from "./get-started-section";
 import { GovernanceSection } from "./governance-section";
+import { HeroIntro } from "./hero-intro";
 import { HeroSection } from "./hero-section";
 import { OpenSection } from "./open-section";
 import { SceneZone } from "./scene-zone";
@@ -44,6 +45,8 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
   return (
     <LandingModeProvider>
       <div className="lk-root relative min-h-screen overflow-x-clip">
+        {/* WEB-5 O47: first, so its class is on <html> before anything paints. */}
+        <HeroIntro />
         <SkipLink label={common.skipToContent} />
         {/* WEB-5 D14 S2: the water the second half of the page sits in. First, so every section paints over it. */}
         <DepthBackdrop />

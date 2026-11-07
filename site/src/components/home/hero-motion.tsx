@@ -32,6 +32,8 @@ export function HeroCopyMotion({ children }: { children: React.ReactNode }) {
   const copyBlur = useTransform(scrollYProgress, [0.16, 0.38], live ? ["blur(0px)", "blur(3px)"] : ["blur(0px)", "blur(0px)"]);
   return (
     <m.div
+      // WEB-5 O47: the first-load intro reveals the copy through this hook (hero-intro.tsx).
+      data-intro-copy=""
       className="max-w-[660px] origin-[50%_40%] md:origin-[0%_50%]"
       // WEB-5 D5: the h1 inside is the page's largest paint, so it gets
       // no opacity, travel or filter until the live lake runs; the
@@ -104,7 +106,11 @@ export function HeroWashFade({ children }: { children: React.ReactNode }) {
 /** The scroll cue fades over the first few percent of the section. */
 export function ScrollCueFade({ children }: { children: React.ReactNode }) {
   const cueOpacity = useTransform(useProgress(), [0, 0.05], [1, 0]);
-  return <m.div style={{ opacity: cueOpacity }}>{children}</m.div>;
+  return (
+    <m.div data-intro-scroll-cue="" style={{ opacity: cueOpacity }}>
+      {children}
+    </m.div>
+  );
 }
 
 /**
@@ -121,10 +127,13 @@ export function BackdropFade({
   children: React.ReactNode;
 } & React.HTMLAttributes<HTMLDivElement>) {
   const { sceneReady } = useLandingMode();
+  // WEB-5 O47: the night-lake picture (not the creature's room) is where the intro's sky fades up.
+  const isPicture = !("data-hero-room" in rest);
   return (
     <div
       aria-hidden="true"
       className={cn(className, "transition-opacity duration-700", sceneReady && "opacity-0")}
+      data-intro-backdrop={isPicture ? "" : undefined}
       {...rest}
     >
       {children}
