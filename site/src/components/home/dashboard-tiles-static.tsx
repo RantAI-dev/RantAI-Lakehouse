@@ -32,7 +32,6 @@ function TileImage({ src, alt }: { src: string; alt: string }) {
  */
 
 /** Region letters, in reading order of the 4 × 3 grid. */
-const REGION_NAMES = "ABCDEFGHIJKL";
 
 /**
  * A dot-matrix map: a landmass-like blob of dots whose size and brightness
@@ -62,7 +61,7 @@ export function DotMapTile({ tile }: { tile: Tiles["map"] }) {
           }}
         >
           <span className="lk-tip">
-            {tile.region} {REGION_NAMES[z.row * 4 + z.col]} · {z.value.toFixed(1)}k
+            {tile.islands[z.island]} · {z.value.toFixed(1)}k
           </span>
         </span>
       ))}

@@ -638,8 +638,9 @@ html.motion-ready .lk-tile:not([data-shown]) .lk-map img {
   mask: url(/tiles/dot-map.svg) center / 100% 100% no-repeat;
   pointer-events: none;
 }
+/* Audit #23: the highlighted island is Java, the busiest. */
 .lk-map-glow {
-  background: radial-gradient(22% 30% at 68.6% 56%, rgba(232, 244, 255, 0.55), transparent 70%);
+  background: radial-gradient(16% 14% at 33% 75%, rgba(232, 244, 255, 0.55), transparent 70%);
   opacity: 0.6;
 }
 html.motion-ready .lk-tile:not([data-shown]) .lk-map-glow {

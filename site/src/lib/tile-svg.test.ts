@@ -12,8 +12,9 @@ test("the committed tile files are exactly what the drawing code produces (run `
   }
 });
 
-test("the tiles carry the same number of shapes as the inline tiles did (280 dots, 140 days)", () => {
-  assert.equal(dotMapSvg().match(/<circle /g)?.length, 280);
+test("the tiles carry their shapes (the Indonesia dot map, audit #23; 140 days)", () => {
+  const dots = dotMapSvg().match(/<circle /g)?.length ?? 0;
+  assert.ok(dots > 250 && dots < 700, `dots: ${dots}`);
   assert.equal(calendarSvg().match(/<rect /g)?.length, 140);
 });
 

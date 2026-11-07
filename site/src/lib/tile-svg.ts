@@ -30,30 +30,96 @@ export const TILE_SIZE = { width: 360, height: 190 } as const;
 
 const open = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${TILE_SIZE.width} ${TILE_SIZE.height}" width="${TILE_SIZE.width}" height="${TILE_SIZE.height}">`;
 
-/** A dot-matrix map: a landmass-like blob of dots whose size and brightness stand for a value per region. */
-export function dotMapSvg(): string {
-  const shapes: string[] = [];
-  const cols = 34;
-  const rows = 15;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const nx = (c / (cols - 1)) * 2 - 1;
-      const ny = (r / (rows - 1)) * 2 - 1;
-      // Two overlapping lobes, a gap between them, and a ragged edge.
-      const lobe = Math.min(
-        (nx + 0.42) ** 2 / 0.32 + (ny + 0.05) ** 2 / 0.62,
-        (nx - 0.4) ** 2 / 0.3 + (ny - 0.12) ** 2 / 0.5,
-      );
-      const edge = (hash(c, r) - 0.5) * 0.35;
-      if (lobe + edge < 1) {
-        const region = Math.floor(((nx + 1) / 2) * 4) + Math.floor(((ny + 1) / 2) * 3) * 4;
-        const v = 0.25 + hash(region, 3) * 0.75;
-        shapes.push(
-          `<circle cx="${14 + c * 10.1}" cy="${16 + r * 11.5}" r="${1.6 + v * 2.2}" fill="${v > 0.7 ? FOAM : LAKE}" fill-opacity="${0.25 + v * 0.7}"/>`,
-        );
-      }
+/**
+ * Audit #23: the dot map is Indonesia, so it reads as a map. The outline is
+ * this project's own drawing, not traced from any map file: each island is a
+ * rough polygon in longitude and latitude (about a degree of detail),
+ * projected onto the tile (95°E to 141°E, 6°N to 11°S). Each island has an
+ * illustrative value (visits, in thousands); its dots' size and brightness
+ * follow it.
+ */
+type Island = { name: string; value: number; shape: readonly (readonly [number, number])[][] };
+const ISLANDS: readonly Island[] = [
+  {
+    name: "Sumatra",
+    value: 6.4,
+    shape: [[[95.3, 5.6], [97.5, 5.2], [100.3, 2.5], [103.8, 1.0], [104.6, -1.5], [106.0, -3.2], [105.8, -5.8], [104.5, -5.9], [102.3, -4.0], [100.4, -1.2], [98.7, 1.7], [96.2, 3.7]]],
+  },
+  {
+    name: "Java",
+    value: 9.8,
+    shape: [[[105.2, -6.8], [106.4, -5.9], [108.3, -6.2], [110.4, -6.9], [112.6, -6.9], [114.4, -7.7], [114.4, -8.6], [111.5, -8.3], [108.5, -7.8], [106.4, -7.4]]],
+  },
+  {
+    name: "Kalimantan",
+    value: 3.1,
+    shape: [[[108.8, 1.5], [109.6, 2.0], [111.5, 1.0], [113.0, 1.4], [114.5, 1.5], [115.5, 3.0], [116.0, 4.1], [117.7, 4.2], [118.0, 2.0], [117.5, 0.5], [117.0, -1.0], [116.5, -2.5], [116.2, -4.0], [114.5, -3.6], [113.0, -3.2], [111.5, -3.0], [110.2, -2.9], [109.6, -1.0], [109.0, 0.5]]],
+  },
+  {
+    name: "Sulawesi",
+    value: 4.2,
+    shape: [[[120.0, 0.8], [121.5, 1.2], [123.0, 0.9], [124.9, 1.6], [125.2, 1.4], [123.3, 0.3], [121.5, 0.5], [120.6, -0.3], [121.5, -1.2], [123.4, -0.9], [122.8, -1.6], [121.4, -1.9], [122.9, -4.6], [122.0, -5.4], [121.0, -4.0], [120.6, -2.8], [120.3, -5.6], [119.4, -5.4], [119.6, -3.5], [118.8, -2.7], [119.5, -0.8]]],
+  },
+  {
+    name: "Bali & Nusa Tenggara",
+    value: 2.6,
+    shape: [
+      [[114.5, -8.0], [115.7, -8.3], [115.2, -8.9], [114.5, -8.5]],
+      [[116.0, -8.2], [119.0, -8.1], [119.0, -8.9], [116.1, -9.0]],
+      [[119.8, -8.3], [122.9, -8.1], [122.8, -8.8], [119.9, -9.0]],
+      [[119.0, -9.4], [120.8, -9.5], [120.5, -10.3], [119.0, -9.9]],
+      [[123.5, -10.2], [125.2, -9.0], [127.0, -8.4], [125.0, -9.7], [123.8, -10.5]],
+    ],
+  },
+  {
+    name: "Maluku",
+    value: 1.4,
+    shape: [
+      [[127.4, 1.9], [128.4, 1.5], [128.0, 0.5], [128.7, -0.4], [127.9, -0.8], [127.4, 0.3]],
+      [[128.0, -2.9], [130.8, -2.9], [130.6, -3.7], [128.2, -3.7]],
+      [[125.9, -3.1], [127.2, -3.1], [127.0, -3.9], [126.0, -3.8]],
+    ],
+  },
+  {
+    name: "Papua",
+    value: 1.9,
+    shape: [[[131.0, -1.0], [132.5, -0.4], [134.2, -0.9], [135.2, -3.3], [137.5, -1.5], [140.0, -2.3], [141.0, -2.6], [141.0, -9.1], [139.8, -8.1], [138.2, -8.4], [137.8, -7.3], [138.8, -6.9], [138.0, -5.3], [135.2, -4.4], [133.5, -4.0], [132.8, -3.0], [131.6, -2.6], [132.0, -2.0]]],
+  },
+];
+const MAX_VALUE = Math.max(...ISLANDS.map((i) => i.value));
+const project = ([lon, lat]: readonly [number, number]) => [10 + ((lon - 95) / 46) * 340, 10 + ((6 - lat) / 17) * 170] as const;
+const PROJECTED = ISLANDS.map((i) => i.shape.map((ring) => ring.map(project)));
+
+function inside(x: number, y: number, ring: readonly (readonly [number, number])[]): boolean {
+  let hit = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) hit = !hit;
+  }
+  return hit;
+}
+
+/** Every dot of the map: its place, and the island it belongs to. */
+function mapDots(): { x: number; y: number; island: number }[] {
+  const dots: { x: number; y: number; island: number }[] = [];
+  for (let r = 0; r < 30; r++) {
+    for (let c = 0; c < 58; c++) {
+      const x = 8 + c * 6;
+      const y = 8 + r * 6;
+      const island = PROJECTED.findIndex((rings) => rings.some((ring) => inside(x, y, ring)));
+      if (island >= 0) dots.push({ x, y, island });
     }
   }
+  return dots;
+}
+
+/** A dot-matrix map of Indonesia: each island's dots sized and lit by its value. */
+export function dotMapSvg(): string {
+  const shapes = mapDots().map(({ x, y, island }) => {
+    const v = ISLANDS[island].value / MAX_VALUE;
+    return `<circle cx="${x}" cy="${y}" r="${(1.15 + v * 1.25).toFixed(2)}" fill="${v > 0.6 ? FOAM : LAKE}" fill-opacity="${(0.35 + v * 0.6).toFixed(2)}"/>`;
+  });
   return `${open}${shapes.join("")}</svg>\n`;
 }
 
@@ -75,32 +141,25 @@ export function calendarSvg(): string {
 }
 
 /**
- * WEB-5 O18: the map's hover regions, a 4 × 3 grid over the tile, each with
- * an illustrative value; only regions that hold dots are hoverable. Derived
- * from the same generator as the drawing, so they agree with the dots.
+ * WEB-5 O18: the map's hover regions, a 4 × 3 grid over the tile; only
+ * cells that hold dots are hoverable. Audit #23: each cell is named after
+ * the island most of its dots belong to (its index in `ISLANDS`, whose
+ * names the messages hold as `tiles.map.islands`), with that island's value.
  */
-export function mapZones(): { col: number; row: number; value: number }[] {
-  const cols = 34;
-  const rows = 15;
-  const counts = new Map<string, number>();
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const nx = (c / (cols - 1)) * 2 - 1;
-      const ny = (r / (rows - 1)) * 2 - 1;
-      const lobe = Math.min((nx + 0.42) ** 2 / 0.32 + (ny + 0.05) ** 2 / 0.62, (nx - 0.4) ** 2 / 0.3 + (ny - 0.12) ** 2 / 0.5);
-      const edge = (hash(c, r) - 0.5) * 0.35;
-      if (lobe + edge >= 1) continue;
-      const x = 14 + c * 10.1;
-      const y = 16 + r * 11.5;
-      const key = `${Math.min(3, Math.floor(x / 90))},${Math.min(2, Math.floor(y / (TILE_SIZE.height / 3)))}`;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
+export function mapZones(): { col: number; row: number; island: number; value: number }[] {
+  const cells = new Map<string, number[]>();
+  for (const d of mapDots()) {
+    const key = `${Math.min(3, Math.floor(d.x / 90))},${Math.min(2, Math.floor(d.y / (TILE_SIZE.height / 3)))}`;
+    const counts = cells.get(key) ?? ISLANDS.map(() => 0);
+    counts[d.island] += 1;
+    cells.set(key, counts);
   }
-  return [...counts.entries()]
-    .filter(([, n]) => n >= 6)
-    .map(([key]) => {
+  return [...cells.entries()]
+    .filter(([, counts]) => Math.max(...counts) >= 6)
+    .map(([key, counts]) => {
       const [col, row] = key.split(",").map(Number);
-      return { col, row, value: Math.round((2 + hash(col * 3 + row, 7) * 9) * 10) / 10 };
+      const island = counts.indexOf(Math.max(...counts));
+      return { col, row, island, value: ISLANDS[island].value };
     })
     .sort((a, b) => a.row - b.row || a.col - b.col);
 }

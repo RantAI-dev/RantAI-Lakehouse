@@ -152,8 +152,16 @@
       "map": {
         "title": "Kunjungan per wilayah",
         "kind": "Peta",
-        "aria": "Ilustrasi peta titik",
-        "region": "Wilayah"
+        "aria": "Ilustrasi peta titik Indonesia",
+        "islands": [
+          "Sumatra",
+          "Jawa",
+          "Kalimantan",
+          "Sulawesi",
+          "Bali & Nusa Tenggara",
+          "Maluku",
+          "Papua"
+        ]
       },
       "sankey": {
         "title": "Asal kunjungan",

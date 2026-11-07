@@ -108,6 +108,10 @@ export function LineChartTile({ tile }: { tile: Tiles["line"] }) {
   );
 }
 
+/** Audit #23: the nodes sit inward, so each side has room for its labels. */
+const SK_L = 76;
+const SK_R = 276;
+
 export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
   const left = [
     { y: 28, h: 50 },
@@ -134,7 +138,7 @@ export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
     const y1 = right[f.to].y + usedR[f.to] + f.w / 2;
     usedL[f.from] += f.w * 0.9;
     usedR[f.to] += f.w * 0.9;
-    return { ...f, y0, y1, d: `M44 ${y0} C170 ${y0} 190 ${y1} 316 ${y1}`, sw: f.w * 0.9 };
+    return { ...f, y0, y1, d: `M${SK_L + 8} ${y0} C${SK_L + 110} ${y0} ${SK_R - 110} ${y1} ${SK_R} ${y1}`, sw: f.w * 0.9 };
   });
   /** Illustrative counts: a band's width in tenths of thousands. */
   const count = (w: number) => `${(w / 10).toFixed(1)}k`;
@@ -185,31 +189,42 @@ export function SankeyTile({ tile }: { tile: Tiles["sankey"] }) {
         />
       ))}
       {left.map((n, i) => (
-        <rect key={`l${i}`} className="lk-node" data-l={i} x="32" y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
+        <rect key={`l${i}`} className="lk-node" data-l={i} x={SK_L - 4} y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
       ))}
       {right.map((n, i) => (
-        <rect key={`r${i}`} className="lk-node" data-r={i} x="312" y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
+        <rect key={`r${i}`} className="lk-node" data-r={i} x={SK_R - 4} y={n.y} width="16" height={n.h} rx="3" fill="transparent" />
       ))}
       {left.map((n, i) => (
-        <rect key={`lv${i}`} x="36" y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" pointerEvents="none" />
+        <rect key={`lv${i}`} x={SK_L} y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" pointerEvents="none" />
       ))}
       {right.map((n, i) => (
-        <rect key={`rv${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x="316" y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" pointerEvents="none" />
+        <rect key={`rv${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x={SK_R} y={n.y} width="8" height={n.h} rx="3" fill={FOAM} fillOpacity="0.85" pointerEvents="none" />
+      ))}
+      {/* Audit #23: every node is named, sources on the left, pages on the right. */}
+      {left.map((n, i) => (
+        <text key={`ln${i}`} x={SK_L - 8} y={n.y + n.h / 2} textAnchor="end" dominantBaseline="central" fontSize="11" fill={FOAM} fillOpacity="0.72" pointerEvents="none">
+          {tile.from[i]}
+        </text>
+      ))}
+      {right.map((n, i) => (
+        <text key={`rn${i}`} className="lk-fade" style={{ animationDelay: "0.7s" }} x={SK_R + 16} y={n.y + n.h / 2} dominantBaseline="central" fontSize="11" fill={FOAM} fillOpacity="0.72" pointerEvents="none">
+          {tile.to[i]}
+        </text>
       ))}
       {/* Tooltips last, so they sit above every band; shown by the hovered band or node. */}
       {paths.map((p, i) => (
         <g key={`t${i}`} className="lk-flowtip" data-i={i}>
-          <SvgTip x={150} y={(p.y0 + p.y1) / 2} top={`${tile.from[p.from]} → ${tile.to[p.to]}`} bottom={count(p.w)} width={128} />
+          <SvgTip x={(SK_L + SK_R) / 2} y={(p.y0 + p.y1) / 2} top={`${tile.from[p.from]} → ${tile.to[p.to]}`} bottom={count(p.w)} width={128} />
         </g>
       ))}
       {left.map((n, i) => (
         <g key={`tl${i}`} className="lk-nodetip" data-l={i}>
-          <SvgTip x={52} y={n.y + n.h / 2 + 20} top={tile.from[i]} bottom={`${count(totalL[i])} ${tile.total}`} width={96} />
+          <SvgTip x={SK_L + 16} y={n.y + n.h / 2 + 20} top={tile.from[i]} bottom={`${count(totalL[i])} ${tile.total}`} width={96} />
         </g>
       ))}
       {right.map((n, i) => (
         <g key={`tr${i}`} className="lk-nodetip" data-r={i}>
-          <SvgTip x={308} y={n.y + n.h / 2 + 20} top={tile.to[i]} bottom={`${count(totalR[i])} ${tile.total}`} width={96} />
+          <SvgTip x={SK_R - 8} y={n.y + n.h / 2 + 20} top={tile.to[i]} bottom={`${count(totalR[i])} ${tile.total}`} width={96} />
         </g>
       ))}
     </svg>

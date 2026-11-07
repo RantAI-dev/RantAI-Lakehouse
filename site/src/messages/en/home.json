@@ -152,8 +152,16 @@
       "map": {
         "title": "Visits by region",
         "kind": "Map",
-        "aria": "Illustrative map of dots",
-        "region": "Region"
+        "aria": "Illustrative dot map of Indonesia",
+        "islands": [
+          "Sumatra",
+          "Java",
+          "Kalimantan",
+          "Sulawesi",
+          "Bali & Nusa Tenggara",
+          "Maluku",
+          "Papua"
+        ]
       },
       "sankey": {
         "title": "Where visits come from",
