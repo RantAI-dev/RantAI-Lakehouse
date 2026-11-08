@@ -3478,6 +3478,34 @@ html[data-tod="day"] footer code:not(.lk-term code) {
   background-color: rgb(8 24 58 / 0.07);
   color: var(--lk-ink);
 }
+/* The clone-command block: a light surface by day. The scroll edge-fade is a transparency
+   mask, so it fades to this surface by itself. */
+html[data-tod="day"] footer .lk-term {
+  background-color: #e9eef5;
+  box-shadow: inset 0 0 0 1px rgb(8 24 58 / 0.08);
+}
+html[data-tod="day"] footer .lk-term > span[aria-hidden] {
+  color: #546782;
+}
+html[data-tod="day"] footer .lk-term code {
+  color: #0b1a33;
+}
+html[data-tod="day"] footer .lk-term button {
+  background-color: rgb(8 24 58 / 0.08);
+  color: #0b1a33;
+}
+html[data-tod="day"] footer .lk-term button:hover {
+  background-color: rgb(8 24 58 / 0.15);
+  color: #0b1a33;
+}
+html[data-tod="day"] footer .lk-term button[data-state="copied"] {
+  background-color: rgb(14 128 76 / 0.16);
+  color: #0a5e37;
+}
+html[data-tod="day"] footer .lk-term button[data-state="failed"] {
+  background-color: rgb(179 38 30 / 0.12);
+  color: #a3211a;
+}
 /* Logos: the mark's white becomes ink; the product logos (light on dark) are inverted. */
 html[data-tod="day"] footer svg path[fill="white"] {
   fill: #0a1250;
