@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { parseDraft, parseTabs } from "./query-draft"
+import { parseDraft, parseTabs, readTabs, writeTabs } from "./query-draft"
+import type { QueryTabs } from "./query-draft"
 
 test("parseDraft mengembalikan null untuk isi yang tidak terpakai", () => {
   assert.equal(parseDraft(null), null)
@@ -34,8 +35,8 @@ test("parseTabs memulihkan tab yang tersimpan dalam bentuk baru", () => {
   )
   assert.deepEqual(tabs, {
     tabs: [
-      { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse" },
-      { id: "b", name: "Users", sql: "SELECT 2", engine: "trino" },
+      { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse", parameters: [], values: {} },
+      { id: "b", name: "Users", sql: "SELECT 2", engine: "trino", parameters: [], values: {} },
     ],
     activeId: "b",
     question: "berapa?",
@@ -67,6 +68,8 @@ test("parseTabs memulihkan tab yang menyimpan id kueri tersimpan dan levelnya", 
       engine: "clickhouse",
       savedId: "q1",
       level: "edit",
+      parameters: [],
+      values: {},
     },
   ])
 })
@@ -79,7 +82,7 @@ test("parseTabs membaca tab yang tidak menyimpan id kueri tersimpan", () => {
     })
   )
   assert.deepEqual(tabs?.tabs, [
-    { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse" },
+    { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse", parameters: [], values: {} },
   ])
   assert.equal("savedId" in (tabs?.tabs[0] ?? {}), false)
 })
@@ -101,7 +104,7 @@ test("parseTabs mengabaikan medan yang tidak dikenal", () => {
     })
   )
   assert.deepEqual(tabs?.tabs, [
-    { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse" },
+    { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse", parameters: [], values: {} },
   ])
 })
 
@@ -120,7 +123,7 @@ test("parseTabs membuang entri yang tidak bisa dipakai", () => {
     })
   )
   assert.deepEqual(tabs?.tabs, [
-    { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse" },
+    { id: "a", name: "Orders", sql: "SELECT 1", engine: "clickhouse", parameters: [], values: {} },
   ])
   assert.equal(tabs?.activeId, "a")
 })
@@ -168,7 +171,16 @@ test("parseTabs memakai tab pertama ketika activeId tidak ada di dalam daftar", 
 test("parseTabs memindahkan draf lama menjadi satu tab", () => {
   const tabs = parseTabs(JSON.stringify({ sql: "SELECT 1", question: "berapa?", tab: "sql" }))
   assert.deepEqual(tabs, {
-    tabs: [{ id: "tab-1", name: "Query 1", sql: "SELECT 1", engine: "clickhouse" }],
+    tabs: [
+      {
+        id: "tab-1",
+        name: "Query 1",
+        sql: "SELECT 1",
+        engine: "clickhouse",
+        parameters: [],
+        values: {},
+      },
+    ],
     activeId: "tab-1",
     question: "berapa?",
     tab: "sql",
@@ -181,4 +193,79 @@ test("parseTabs mengembalikan null untuk isi yang bukan salah satu bentuk", () =
   assert.equal(parseTabs(JSON.stringify({ sql: "   ", question: "" })), null)
   assert.equal(parseTabs(JSON.stringify({})), null)
   assert.equal(parseTabs(JSON.stringify({ tabs: [] })), null)
+})
+
+const PARAMETER_TAB = {
+  id: "a",
+  name: "Orders",
+  sql: "SELECT * FROM t WHERE region = {{region}} AND day = {{day}}",
+  engine: "clickhouse",
+  parameters: [
+    {
+      name: "region",
+      type: "dropdown",
+      default: "eu",
+      options: [
+        { value: "eu", label: "Europe" },
+        { value: "us", label: "United States" },
+      ],
+    },
+    { name: "day", type: "date" },
+  ],
+  values: { region: "us", day: "2026-11-07" },
+}
+
+test("parseTabs restores the definitions and the values a tab kept", () => {
+  const tabs = parseTabs(JSON.stringify({ tabs: [PARAMETER_TAB], activeId: "a" }))
+  assert.deepEqual(tabs?.tabs, [PARAMETER_TAB])
+})
+
+test("parseTabs drops a malformed definition and a malformed value, never the tab", () => {
+  const tabs = parseTabs(
+    JSON.stringify({
+      tabs: [
+        {
+          ...PARAMETER_TAB,
+          parameters: [
+            ...PARAMETER_TAB.parameters,
+            { name: "", type: "text" },
+            { name: "kind", type: "list" },
+            "not a definition",
+          ],
+          values: { ...PARAMETER_TAB.values, day: 20261107, junk: null },
+        },
+      ],
+      activeId: "a",
+    })
+  )
+  assert.equal(tabs?.tabs.length, 1)
+  assert.deepEqual(tabs?.tabs[0].parameters, PARAMETER_TAB.parameters)
+  assert.deepEqual(tabs?.tabs[0].values, { region: "us" })
+})
+
+test("parseTabs gives a tab stored with fields of the wrong kind no definitions and no values", () => {
+  const tabs = parseTabs(
+    JSON.stringify({
+      tabs: [{ ...PARAMETER_TAB, parameters: "region", values: ["us"] }],
+      activeId: "a",
+    })
+  )
+  assert.deepEqual(tabs?.tabs[0].parameters, [])
+  assert.deepEqual(tabs?.tabs[0].values, {})
+})
+
+test("writeTabs stores the definitions and the values, and readTabs gets them back", () => {
+  window.localStorage.clear()
+  try {
+    const tabs = {
+      tabs: [PARAMETER_TAB],
+      activeId: "a",
+      question: "",
+      tab: "sql",
+    } as QueryTabs
+    writeTabs(tabs)
+    assert.deepEqual(readTabs(), tabs)
+  } finally {
+    window.localStorage.clear()
+  }
 })

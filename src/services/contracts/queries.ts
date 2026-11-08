@@ -19,6 +19,71 @@ export type QueryEngine = "clickhouse" | "trino"
 export type SavedQueryLevel = "view" | "edit" | "manage"
 
 /**
+ * The type of a query parameter (`QS-5`, `{{name}}` in SQL). The server
+ * reads exactly these six words and refuses any other, so the type is not
+ * widened with `| string`: the console cannot show a control for a type it
+ * does not know.
+ */
+export type QueryParamType =
+  | "text"
+  | "number"
+  | "date"
+  | "dateRange"
+  | "dropdown"
+  | "multiSelect"
+
+/**
+ * One choice of a dropdown or multi-select. The server accepts a text or a
+ * number as the value (all options of one list are one or the other) and
+ * keeps the label the control shows.
+ */
+export type QueryParamOption = {
+  value: string | number
+  label: string
+}
+
+/** A date range as the server reads it: exactly these two keys, each `YYYY-MM-DD`. */
+export type QueryDateRange = { start: string; end: string }
+
+/**
+ * A parameter's value, as a run or a default carries it. Text is a string,
+ * a number is a finite JSON number, a date is `YYYY-MM-DD`, a date range is
+ * a {@link QueryDateRange}, a dropdown is one option's value and a
+ * multi-select is a non-empty list of option values. Absent or `null` means
+ * "not given", and the default applies.
+ */
+export type QueryParamValue =
+  | string
+  | number
+  | QueryDateRange
+  | (string | number)[]
+
+/**
+ * One parameter's definition, as a saved query keeps it and as a run may
+ * carry it (`QS-5`). The server omits `default` and `options` when there
+ * are none, so both are optional here; a multi-select default of `[]` is
+ * refused, so leave the default out instead.
+ */
+export type QueryParamDef = {
+  name: string
+  type: QueryParamType
+  default?: QueryParamValue
+  options?: QueryParamOption[]
+}
+
+/**
+ * What a run or an estimate may carry for the `{{name}}` placeholders in its
+ * SQL. Both are optional: a request that carries neither is the request
+ * sent before parameters existed.
+ */
+export type QueryParamInputs = {
+  /** The value of each parameter, by name. */
+  parameters?: Record<string, QueryParamValue>
+  /** The definitions those values are checked against. */
+  definitions?: QueryParamDef[]
+}
+
+/**
  * One saved query, as the server sends it (`QS-3`).
  *
  * The nine fields are the server's own: `folderId` says where the query
@@ -39,6 +104,8 @@ export type SavedQuery = {
   ownerId: string | null
   /** The level the caller holds on it. */
   level: SavedQueryLevel | string
+  /** The query's parameter definitions; the server always sends the list, empty when there are none. */
+  parameters: QueryParamDef[]
 }
 
 /**
@@ -89,6 +156,8 @@ export type SavedQueryVersion = {
   label: string
   /** When it was written, ISO 8601. */
   createdAt: string
+  /** The parameter definitions this version held; the server always sends the list. */
+  parameters: QueryParamDef[]
 }
 
 /**
@@ -387,6 +456,8 @@ export type SaveQueryInput = {
    * absent for the caller's own personal space.
    */
   folderId?: string | null
+  /** The definitions of the `{{name}}` parameters in `sql`; absent when it has none. */
+  parameters?: QueryParamDef[]
 }
 
 /**
@@ -406,6 +477,8 @@ export type UpdateSavedQueryInput = {
   tags?: string[]
   /** The folder the query moves to: an id, `null` for the shared space, absent to leave it where it is. */
   folderId?: string | null
+  /** New definitions; absent leaves them as they are and an empty list clears them. */
+  parameters?: QueryParamDef[]
 }
 
 /**
@@ -555,12 +628,21 @@ export interface QueryService {
    * History page's page numbers. `filter.page` is 1-based.
    */
   listHistoryPage(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryPage>
-  estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
+  /**
+   * `options` carries the `{{name}}` values and definitions (`QS-5`); with
+   * none, the request is the one sent before parameters existed. The
+   * estimate always asks ClickHouse.
+   */
+  estimate(sql: string, options?: QueryParamInputs, signal?: AbortSignal): Promise<QueryEstimate>
   /**
    * `runId` (`BI-5` plan D5) goes out as `X-Run-Id`, so a Stop can name the
    * run; absent, the server makes one and the run cannot be stopped by id.
    */
-  run(sql: string, options: { engine: QueryEngine; runId?: string }, signal?: AbortSignal): Promise<QueryResult>
+  run(
+    sql: string,
+    options: { engine: QueryEngine; runId?: string } & QueryParamInputs,
+    signal?: AbortSignal
+  ): Promise<QueryResult>
   /**
    * `POST /api/query/cancel { runId }` (`BI-5` plan D5): ends the caller's own
    * queries of that run on the engine and answers how many it found running.

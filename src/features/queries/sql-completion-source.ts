@@ -14,7 +14,7 @@ import {
  *
  * The editor's language extension already offers the SQL keywords. This
  * adds what only the catalog knows: the tables, and the columns of the
- * table behind an alias.
+ * table behind an alias; and, after `{{`, the names of the tab's parameters.
  *
  * The source is synchronous over the column cache. A keystroke never waits
  * for the network: the cache says whether the columns are there yet, and
@@ -65,10 +65,10 @@ function toCompletion(option: CompletionOption): Completion {
   }
   return {
     label: option.label,
-    type: option.kind === "column" ? "property" : "class",
+    type: option.kind === "column" ? "property" : option.kind === "parameter" ? "variable" : "class",
     detail: option.detail,
     apply: option.apply,
-    boost: option.kind === "column" ? COLUMN_BOOST : TABLE_BOOST,
+    boost: option.kind === "table" ? TABLE_BOOST : COLUMN_BOOST,
   }
 }
 
@@ -81,11 +81,14 @@ function toCompletion(option: CompletionOption): Completion {
 export function createSqlCompletionSource({
   tables,
   columns,
+  parameters,
 }: {
   /** The tables the catalog shows. */
   tables: CompletionTable[]
   /** The columns fetched so far, keyed by the catalog id of the table. */
   columns: () => Record<string, ColumnState>
+  /** The names of the open tab's parameter definitions, read when `{{` is completed. */
+  parameters: () => readonly string[]
 }): CompletionSource {
   return (context: CompletionContext): CompletionResult => {
     const sql = context.state.doc.toString()
@@ -94,6 +97,7 @@ export function createSqlCompletionSource({
       cursor: context.pos,
       tables,
       columns: columns(),
+      parameters: parameters(),
     })
     return {
       from: answer.from,

@@ -8,7 +8,7 @@ import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { type ServiceState } from "@/hooks/use-service"
 import { formatDateTime, formatDuration, formatRelativeTime } from "@/lib/format"
-import type { QueryHistoryItem, SavedQuery } from "@/services/contracts/queries"
+import type { QueryHistoryItem, QueryParamDef, SavedQuery } from "@/services/contracts/queries"
 
 /** How many entries each rail list shows before "Show more". */
 const PAGE_SIZE = 6
@@ -16,13 +16,16 @@ const PAGE_SIZE = 6
 type SavedListState = ServiceState<SavedQuery[]> & { reload: () => void }
 type HistoryListState = ServiceState<QueryHistoryItem[]> & { reload: () => void }
 
-/** Compact "Saved" quick list. Clicking an item loads its SQL in the editor. */
+/**
+ * Compact "Saved" quick list. Clicking an item loads its SQL in the editor,
+ * with its parameter definitions (`QS-5`): each field starts at its default.
+ */
 export function SavedQuickList({
   state,
   onLoadSql,
 }: {
   state: SavedListState
-  onLoadSql: (sql: string) => void
+  onLoadSql: (sql: string, definitions?: QueryParamDef[]) => void
 }) {
   return (
     <SectionCard
@@ -51,7 +54,7 @@ export function SavedQuickList({
               <li key={q.id}>
                 <button
                   type="button"
-                  onClick={() => onLoadSql(q.sql)}
+                  onClick={() => onLoadSql(q.sql, q.parameters)}
                   className="-mx-2 flex w-full items-baseline justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted/40"
                   title={q.sql}
                 >

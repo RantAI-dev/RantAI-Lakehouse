@@ -340,3 +340,89 @@ describe("QueryStudioPage schema browser", () => {
     expect(toggle.getAttribute("aria-pressed")).toBe("false")
   })
 })
+
+describe("QueryStudioPage parameters", () => {
+  it("shows no field for SQL without a placeholder", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+    await screen.findByRole("button", { name: "Run query" })
+    expect(screen.queryByRole("group", { name: "Query parameters" })).toBeNull()
+  })
+
+  it("shows a field for each placeholder, above the toolbar, and a field for a name typed later", async () => {
+    stubNetwork()
+    seedDraft("SELECT {{region}}")
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    const runButton = screen.getByRole("button", { name: "Run query" })
+    expect(within(fields).getByLabelText("region")).toBeTruthy()
+    // The row sits between the editor and the toolbar.
+    expect(fields.compareDocumentPosition(runButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it("restores the fields of a reload at the values the tab held", async () => {
+    stubNetwork()
+    window.localStorage.setItem(
+      QUERY_DRAFT_KEY,
+      JSON.stringify({
+        tabs: [
+          {
+            id: "tab-1",
+            name: "Query 1",
+            sql: "SELECT {{region}}",
+            engine: "clickhouse",
+            parameters: [{ name: "region", type: "text", default: "EU" }],
+            values: { region: "US" },
+          },
+        ],
+        activeId: "tab-1",
+        question: "",
+        tab: "sql",
+      })
+    )
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    expect((within(fields).getByLabelText("region") as HTMLInputElement).value).toBe("US")
+  })
+
+  it("shows the server's sentence under the editor and marks the field it names", async () => {
+    stubNetwork()
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "Fill in {{region}} to run this query.")
+    )
+    seedDraft("SELECT {{region}}, {{city}}")
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    const runButton = screen.getByRole("button", { name: "Run query" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+
+    fireEvent.click(runButton)
+
+    // The error card adds a hint after the server's sentence.
+    expect(await screen.findByText(/^Fill in \{\{region\}\} to run this query\./)).toBeTruthy()
+    expect(within(fields).getByLabelText("region").getAttribute("aria-invalid")).toBe("true")
+    expect(within(fields).getByLabelText("city").getAttribute("aria-invalid")).toBeNull()
+
+    // Typing a value takes the mark off that field.
+    fireEvent.change(within(fields).getByLabelText("region"), { target: { value: "EU" } })
+    expect(within(fields).getByLabelText("region").getAttribute("aria-invalid")).toBeNull()
+  })
+
+  it("runs with the values typed into the fields", async () => {
+    stubNetwork()
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT)
+    seedDraft("SELECT {{region}}")
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    fireEvent.change(within(fields).getByLabelText("region"), { target: { value: "EU" } })
+
+    fireEvent.click(screen.getByRole("button", { name: "Run query" }))
+
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    expect(run.mock.calls[0]?.[1]).toMatchObject({
+      parameters: { region: "EU" },
+      definitions: [{ name: "region", type: "text" }],
+    })
+  })
+})
