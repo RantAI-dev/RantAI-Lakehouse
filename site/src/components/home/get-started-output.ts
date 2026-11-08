@@ -14,11 +14,18 @@
  *   listens on :8080 once postgres and clickhouse report healthy … and the
  *   console listens on :3000 once the API reports healthy" (REL-2).
  * `ok` marks the line that says the step worked; it gets the green check.
+ * `comment` is a dim `#` line, not output: step 2's is the README's instruction for the first
+ * account (README step 2: set AUTH_BOOTSTRAP_EMAIL and AUTH_BOOTSTRAP_PASSWORD in the .env it
+ * wrote; SEC-18, REL-2), which used to be a paragraph under the step.
  */
-export type OutputLine = { text: string; ok?: true };
+export type OutputLine = { text: string; ok?: true; comment?: true };
 
 export const GET_STARTED_OUTPUT: readonly (readonly OutputLine[])[] = [
   [{ text: "Cloning into 'RantAI-Lakehouse'..." }, { text: "Resolving deltas: 100%, done.", ok: true }],
-  [{ text: "init-env: wrote .env (mode 600). Filled:" }, { text: "  POSTGRES_PASSWORD  RUSTFS_ACCESS_KEY  …", ok: true }],
+  [
+    { text: "init-env: wrote .env (mode 600). Filled:" },
+    { text: "  POSTGRES_PASSWORD  RUSTFS_ACCESS_KEY  …", ok: true },
+    { text: "# then set AUTH_BOOTSTRAP_EMAIL and AUTH_BOOTSTRAP_PASSWORD in .env", comment: true },
+  ],
   [{ text: "lakehouse-api  healthy" }, { text: "console  on http://localhost:3000", ok: true }],
 ];
