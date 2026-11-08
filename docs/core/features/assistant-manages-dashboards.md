@@ -72,7 +72,8 @@ audit and the console's own refusals all carry through unchanged.
   approval reason names the board and says its charts are deleted too;
   the built-in Main board is refused.
 - `arrange_board` (`dashboard:write`, WriteLow): takes the tiles that
-  change and their boxes; the others keep their boxes; the grid is 12
+  change and their boxes; the others keep their boxes, unless one
+  overlaps a tile the call moved, which then moves down; the grid is 12
   columns wide; a box outside the grid or with `w` or `h` below 1 is
   refused.
 - `move_chart` (`dashboard:write`, WriteLow): moves a chart from one
@@ -172,7 +173,7 @@ assistant to describe only what that line lists.
 | --- | --- | --- | --- |
 | 1 | Six tools, with names that contain `board` or `chart` so the console's capability test covers them unchanged: `rename_board`, `delete_board`, `arrange_board`, `move_chart`, `set_board_view_filters`, `save_board_filters` | Planner default | Owner to confirm at QA |
 | 2 | The tools go through the console's route handlers (`tools/calc_fields.rs` pattern); where a handler is private it is widened to `pub(in crate::routes)`; errors pass through the existing classification (`api_result_to_value`) | Planner default | Owner to confirm at QA |
-| 3 | `arrange_board` takes only the tiles that change (`{chartId: {x, y, w, h}}`); the server reads the current layout, refuses a chart id that is not on that board, refuses a box outside the 12-column grid or with `w` or `h` below 1, merges and saves through the console's `boards_update` with `layout`. The prompt says the grid has 12 columns and that `list_boards` gives the current layout | Planner default | Owner to confirm at QA |
+| 3 | `arrange_board` takes only the tiles that change (`{chartId: {x, y, w, h}}`); the server reads the current layout, refuses a chart id that is not on that board, refuses a box outside the 12-column grid or with `w` or `h` below 1, merges and saves through the console's `boards_update` with `layout`. The prompt says the grid has 12 columns and that `list_boards` gives the current layout. The server settles the layout before it saves it: the tiles the call names keep their boxes, and every other tile that overlaps one of them moves down, just below what it hits; two tiles collide only when they are on the same tab | Planner default | Owner to confirm at QA |
 | 4 | `move_chart` reads the stored chart, changes only its board, saves through the path `specs_update` uses, and removes the chart's tile from the old board's layout | Planner default | Owner to confirm at QA |
 | 5 | `set_board_view_filters` validates filters and writes nothing; returns `{applyViewFilters: true, board, filters}` (the full list that should be active; an empty list clears). Read risk, so it is offered in Ask mode too | Planner default | Owner to confirm at QA |
 | 6 | The dashboard page applies a view-filter result. When a chat reply's trace holds a `set_board_view_filters` step with `ok: true` and its `board` is the board on screen, the page writes the filters into the address with the existing helpers (`encodeFilters` / `filtersToParam`). On any other page or another board the step card shows a link to that board with the filters in the address, built with the same helpers. The hook sits beside the existing way the dock tells the page about a tool result (`use-copilot.ts:301`, `:405`); no new channel | Planner default | Owner to confirm at QA |
