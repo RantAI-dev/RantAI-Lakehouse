@@ -3,7 +3,6 @@ import { ArrowUp, Check, Clock, GitBranch, Pause } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { HomeCopy } from "@/lib/copy";
 import { APPROVAL_TARGET, REGIONS } from "@/lib/home-content";
-import { MascotMark } from "@/components/shared/mascot-svg";
 import { AssistantPlay } from "./assistant-play";
 import { ALL_STEPS, S } from "./assistant-steps";
 
@@ -73,12 +72,8 @@ function Panel({ copy }: { copy: AssistantCopy }) {
   const max = REGIONS[0].value;
   return (
     <div aria-hidden="true" className="lk-ast lk-ast-still" data-s={ALL_STEPS}>
-      {/* Header: the guide's mark (WEB-5 D14 S4) and its name. O35: no status, no divider. */}
-      <div className="flex items-center gap-3 px-5 pt-4">
-        {/* The mark sits in the avatar's own 24px slot, so both marks share one vertical axis. */}
-        <span className="grid size-6 shrink-0 place-items-center">
-          <MascotMark className="h-[11px] w-auto" />
-        </span>
+      {/* Header: the assistant's name, text only (owner: no logos in the chat). O35: no status, no divider. */}
+      <div className="flex items-center px-5 pt-4">
         <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/80">{copy.name}</span>
       </div>
 
@@ -91,10 +86,8 @@ function Panel({ copy }: { copy: AssistantCopy }) {
         </Grow>
 
         <Grow from={S.think1a}>
-          <div className="flex gap-3">
-            {/* The mark once, beside the assistant's first reply. */}
-            <GuideMark />
-            <div className="min-w-0 flex-1">
+          <div>
+            <div className="min-w-0">
               {/* The work, while it runs; then folded into one quiet line. */}
               <Grow from={S.think1a} until={S.answer}>
                 <ol className="space-y-1 pb-2">
@@ -133,10 +126,8 @@ function Panel({ copy }: { copy: AssistantCopy }) {
         </Grow>
 
         <Grow from={S.think2}>
-          <div className="flex gap-3">
-            {/* The second reply lines up with the first, without repeating the mark. */}
-            <span aria-hidden="true" className="w-6 shrink-0" />
-            <div className="min-w-0 flex-1">
+          <div>
+            <div className="min-w-0">
               <Grow from={S.think2} until={S.card}>
                 <ol className="pb-2">
                   <WorkStep doneAt={S.card} label={copy.steps.check} code={APPROVAL_TARGET} />
@@ -197,15 +188,6 @@ function UserBubble({ text }: { text: string }) {
         {text}
       </p>
     </div>
-  );
-}
-
-/** WEB-5 D14 S4, the guide: the assistant's side carries the creature's mark the visitor met at the surface. */
-function GuideMark() {
-  return (
-    <span className="lk-ast-avatar mt-px grid size-6 shrink-0 place-items-center rounded-full">
-      <MascotMark className="h-[11px] w-auto" />
-    </span>
   );
 }
 

@@ -1689,9 +1689,6 @@ section[data-role="admin"] .lk-gv-closed {
   border: 1px solid rgba(255, 255, 255, 0.09);
   background: var(--lk-ast-surface);
 }
-.lk-ast-avatar {
-  background: rgba(68, 166, 250, 0.14);
-}
 @media (min-width: 48rem) {
   .lk-ast {
     height: min(640px, 78svh);
