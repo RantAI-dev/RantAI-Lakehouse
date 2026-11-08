@@ -60,10 +60,13 @@ export function SiteFooter({
   locale,
   page = "home",
   copy,
+  cta: ctaSlot,
 }: {
   locale: Locale;
   page?: "home" | "contact";
   copy: CommonCopy["footer"];
+  /** Lab only (`components/lab/cta`): a variant's card in place of the call-to-action card. */
+  cta?: React.ReactNode;
 }) {
   const home = localizedPath(locale, "/");
   const columns: { title: string; links: FooterLink[] }[] = [
@@ -137,6 +140,7 @@ export function SiteFooter({
           section); on the contact page it points back up to the form
           instead of repeating it. */}
       {/* O46: compact, two columns, a flat solid panel with a hairline (no water, no rings). */}
+      {ctaSlot ?? (
       <section aria-labelledby="footer-cta-heading" className="relative isolate rounded-[28px] bg-[#070F3A] ring-1 ring-[#E8F4FF]/10">
         <div className="mx-auto max-w-6xl">
           <SourceFlow
@@ -158,6 +162,7 @@ export function SiteFooter({
           />
         </div>
       </section>
+      )}
 
       {/* WEB-5 owner QA O15: from here down, a 1:1 copy of rantai-page's
           footer.tsx ("Links sit straight on the page…"): the same markup,
