@@ -403,6 +403,25 @@
     ]
   },
   {
+    "id": "board_move_tile_to_top",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Move To Top Board"}, "id_at": "board.id"},
+      {"method": "PUT", "path": "/api/dashboard/boards", "body": {"id": "{board}", "tabs": [{"id": "t_top", "title": "Top"}]}},
+      {"name": "chart_a", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Top Alpha", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
+      {"name": "chart_b", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Top Beta", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
+      {"name": "chart_c", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Top Gamma", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Move chart {chart_c} to the top left of dashboard {board}."],
+    "expect_tool": {"name": "arrange_board", "args_contains": {"board": "{board}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "layout.{chart_c}.y": 0}, "count": 1},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "layout.{chart_a}.y": 0}, "count": 0},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "layout.{chart_b}.y": 0}, "count": 0}
+    ]
+  },
+  {
     "id": "chart_move",
     "mode": "build",
     "confirm": true,

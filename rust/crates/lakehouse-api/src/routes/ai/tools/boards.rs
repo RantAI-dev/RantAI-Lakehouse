@@ -29,7 +29,7 @@
 //! the `specs_update` handler later would not reach this path, and that
 //! is the one place to look when it changes.
 //!
-//! Two rules are the tool's own (not the handler's), and
+//! Three rules are the tool's own (not the handler's), and
 //! because they are tool-specific they live here:
 //!
 //! - `arrange_board` checks each box is on the 12-column grid and is for
@@ -42,6 +42,13 @@
 //!   which `specs_update` does not do (feature page decision 4).
 //!   Neither `spec_from_input` nor `insert_chart` does it, so the tool
 //!   does it.
+//! - `settle_layout` settles the layout before it is saved: the tiles of
+//!   the call keep their boxes and the tile they land on moves down
+//!   (`AI-1` AC1, 2026-11-08). It mirrors the console's `settleLayout`
+//!   (`src/lib/grid-layout.ts:15-36`), which the console runs at render
+//!   time and the save path does not.
+
+use std::cmp::Ordering;
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -49,6 +56,7 @@ use axum::extract::{Query, State};
 use lakehouse_auth::Principal;
 use lakehouse_bi::access::Viewer;
 use lakehouse_bi::filters::{FilterDef, validate_filters, without_inert};
+use lakehouse_bi::layout::{Tab, tab_of};
 use lakehouse_bi::store::{self, LayoutMap, TileBox};
 use serde_json::{Map, Value, json};
 
@@ -156,21 +164,32 @@ pub(super) async fn delete_board(
     .await
 }
 
-/// Read the current layout for `board` from `state`. Returns an empty
-/// `LayoutMap` for the built-in Main board when it has no row yet
-/// (`store::get_board` returns `Ok(None)` until the first layout save,
-/// per `store.rs:904`); a model arrange on the empty Main board
+/// Read the current layout for `board` from `state`, with the board's tabs.
+/// Returns an empty `LayoutMap` for the built-in Main board when it has no
+/// row yet (`store::get_board` returns `Ok(None)` until the first layout
+/// save, per `store.rs:904`); a model arrange on the empty Main board
 /// therefore becomes a fresh save, the same as the console.
+///
+/// The tabs come with the board: the settle needs them to tell which tiles
+/// are on the same tab. The board row already carries them, so this is no
+/// extra read.
 ///
 /// The `Err` arm carries the *classified* upstream-error JSON, not
 /// the raw `ChError` text, so no host / port / table name ever
 /// reaches the model (feature page decision 2: no upstream text
 /// reaches the model). Callers return the `Value` verbatim; the
 /// caller is the boundary that hands a tool result to the chat loop.
-async fn read_layout(state: &AppState, board: &str, viewer: &Viewer) -> Result<LayoutMap, Value> {
+async fn read_layout(
+    state: &AppState,
+    board: &str,
+    viewer: &Viewer,
+) -> Result<(LayoutMap, Vec<Tab>), Value> {
     match store::get_board(&state.clickhouse, board, viewer).await {
-        Ok(Some(b)) => Ok(b.layout.unwrap_or_default()),
-        Ok(None) => Ok(LayoutMap::new()),
+        Ok(Some(b)) => {
+            let tabs = super::tabs::tabs_of(&b);
+            Ok((b.layout.unwrap_or_default(), tabs))
+        }
+        Ok(None) => Ok((LayoutMap::new(), Vec::new())),
         Err(err) => Err(upstream_error_json(&err)),
     }
 }
@@ -219,7 +238,7 @@ pub(super) async fn arrange_board(
     {
         return refused(gate);
     }
-    let mut layout = match read_layout(state, &board, &viewer).await {
+    let (mut layout, tabs) = match read_layout(state, &board, &viewer).await {
         Ok(l) => l,
         Err(json) => return json,
     };
@@ -252,6 +271,12 @@ pub(super) async fn arrange_board(
         }
     }
 
+    // The tiles of the call, by chart id: they are the ones that keep their
+    // boxes when the layout is settled.
+    let moved: Vec<String> = incoming
+        .iter()
+        .map(|(chart_id, _)| chart_id.clone())
+        .collect();
     for (chart_id, mut box_) in incoming {
         // The tool moves and resizes a tile; it does not change its tab, so a
         // tile already in the layout keeps the tab it names (a tile new to
@@ -260,6 +285,11 @@ pub(super) async fn arrange_board(
         box_.tab = layout.get(&chart_id).and_then(|old| old.tab.clone());
         layout.insert(chart_id, box_);
     }
+
+    // AI-1 AC1, 2026-11-08: the layout is settled before it is saved, so the
+    // tile the assistant moved to the top keeps its box and the tile it landed
+    // on moves down below it.
+    let layout = settle_layout(&tabs, &layout, &moved);
 
     api_result_to_value(
         dashboard::boards_update(
@@ -324,6 +354,91 @@ fn tile_box_from(map: &Map<String, Value>) -> Option<TileBox> {
         h: n("h")?,
         tab: None,
     })
+}
+
+/// The layout the server saves when a call moves tiles: the tiles of the call
+/// keep the boxes the call gave them, and every other tile that overlaps one
+/// of them moves down, just below what it hits, until nothing overlaps.
+///
+/// This mirrors `settleLayout` in the console (`src/lib/grid-layout.ts:15-36`),
+/// with the tiles of the call as the anchor instead of the one tile the person
+/// drags: the console gives the dragged tile priority (`anchorId`,
+/// `src/features/dashboards/dashboard-grid.tsx:185`) and the assistant's move
+/// had none, so a chart the assistant moved to the top stayed below the chart
+/// it landed on (`AI-1` AC1, 2026-11-08).
+///
+/// Two tiles collide only when they are on the same tab, so a tile on another
+/// tab keeps its box. Nothing moves up, so a gap the person left stays.
+///
+/// The key order is the layout's own: only the boxes change. The export
+/// renders the map into YAML by iterating it, and the corpus carries a
+/// specific, non-alphabetical order (`lakehouse-bi/src/store.rs:611-618`).
+fn settle_layout(tabs: &[Tab], layout: &LayoutMap, moved: &[String]) -> LayoutMap {
+    let keys: Vec<&str> = layout.keys().map(String::as_str).collect();
+    let is_moved = |i: usize| moved.iter().any(|m| m == keys[i]);
+    // The order the console settles in: the tiles of the call first, then the
+    // rest top to bottom and left to right. A tie keeps the layout's own key
+    // order, as the stable sort of these indices does.
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by(|&a, &b| match (is_moved(a), is_moved(b)) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => layout[a]
+            .y
+            .cmp(&layout[b].y)
+            .then(layout[a].x.cmp(&layout[b].x)),
+    });
+
+    let mut out = layout.clone();
+    // The tiles placed so far, with the tab each of them is on: a tile only
+    // collides with a tile on the same tab.
+    let mut placed: Vec<(TileBox, Option<&str>)> = Vec::with_capacity(order.len());
+    for i in order {
+        let mut box_ = layout[i].clone();
+        let tab = tab_of(tabs, layout, keys[i]);
+        if !is_moved(i) {
+            // The console's rule: drop just below whatever it hits, and keep
+            // dropping until it hits nothing.
+            while let Some(hit) = placed
+                .iter()
+                .find(|p| p.1 == tab && tiles_overlap(&box_, &p.0))
+            {
+                // `i32` holds no sum of two stored tiles' sides, so the sum
+                // saturates; a saturated sum that does not move the tile down
+                // would loop forever, so the loop stops there.
+                let below = hit.0.y.saturating_add(hit.0.h);
+                if below <= box_.y {
+                    break;
+                }
+                box_.y = below;
+            }
+        }
+        placed.push((box_.clone(), tab));
+        // `insert` on a key the map already has keeps its place, so the layout's
+        // own key order survives.
+        out.insert(keys[i].to_owned(), box_);
+    }
+    out
+}
+
+/// Whether two tiles overlap, the console's rule
+/// (`src/lib/grid-layout.ts:3-5`). The sums are `i64`: a stored tile's
+/// `x + w` can overflow `i32`, the same reason `parse_arrange_tiles` compares
+/// the grid in `i64`.
+fn tiles_overlap(a: &TileBox, b: &TileBox) -> bool {
+    let (a_x, a_y, a_w, a_h) = (
+        i64::from(a.x),
+        i64::from(a.y),
+        i64::from(a.w),
+        i64::from(a.h),
+    );
+    let (b_x, b_y, b_w, b_h) = (
+        i64::from(b.x),
+        i64::from(b.y),
+        i64::from(b.w),
+        i64::from(b.h),
+    );
+    a_x < b_x + b_w && b_x < a_x + a_w && a_y < b_y + b_h && b_y < a_y + a_h
 }
 
 fn layout_to_json(layout: &LayoutMap) -> Map<String, Value> {
@@ -685,6 +800,116 @@ mod tests {
         let err = parse_arrange_tiles(&tiles).expect_err("must refuse");
         assert!(err.contains("12-column grid"), "{err}");
         assert!(err.contains("c-sum-overflow"), "{err}");
+    }
+
+    // ── The settle: the tiles the call moved keep their boxes ──
+    //
+    // `AI-1` AC1, 2026-11-08: a chart the assistant moved to the top stayed
+    // below the chart it landed on, because the server saved the layout as it
+    // was and the console settled it without an anchor.
+
+    /// A tile for the settle tests: `tab` is the tab it names, if any.
+    fn tile_box(x: i32, y: i32, w: i32, h: i32, tab: Option<&str>) -> TileBox {
+        TileBox {
+            x,
+            y,
+            w,
+            h,
+            tab: tab.map(str::to_owned),
+        }
+    }
+
+    /// The tile of the call keeps the box the call gave it, and the tile it
+    /// lands on moves down below it.
+    ///
+    /// The layout is the merged one: `c` is the tile of the call and is at the
+    /// box the call gave it, while `a` still sits where `c` now is.
+    #[test]
+    fn the_moved_tile_keeps_its_box_and_the_tile_it_lands_on_moves_down() {
+        let mut layout = LayoutMap::new();
+        layout.insert("a".to_owned(), tile_box(0, 0, 6, 4, None));
+        layout.insert("b".to_owned(), tile_box(6, 0, 6, 4, None));
+        layout.insert("c".to_owned(), tile_box(0, 0, 6, 4, None));
+        let settled = settle_layout(&[], &layout, &["c".to_owned()]);
+        assert_eq!(settled["c"].x, 0);
+        assert_eq!(settled["c"].y, 0);
+        // `a` sat where `c` now is, so it drops below `c`.
+        assert_eq!(settled["a"].x, 0);
+        assert_eq!(settled["a"].y, 4);
+        // `b` is beside them, not under them, so it stays where it was.
+        assert_eq!(settled["b"].x, 6);
+        assert_eq!(settled["b"].y, 0);
+    }
+
+    /// A tile that is pushed down pushes the tile below it down as well, and
+    /// the tiles end up in rows of their own: no two of them overlap.
+    #[test]
+    fn a_tile_pushed_down_pushes_the_tile_below_it_down_as_well() {
+        let mut layout = LayoutMap::new();
+        layout.insert("a".to_owned(), tile_box(0, 0, 6, 4, None));
+        layout.insert("b".to_owned(), tile_box(0, 4, 6, 4, None));
+        // `c` is the tile of the call: it is at the box the call gave it.
+        layout.insert("c".to_owned(), tile_box(0, 0, 6, 4, None));
+        let settled = settle_layout(&[], &layout, &["c".to_owned()]);
+        // The rows each tile covers: `c` on the top row, `a` below it, `b`
+        // below that. The three bands do not touch, so no two tiles overlap.
+        let bands: Vec<(i32, i32)> = ["c", "a", "b"]
+            .iter()
+            .map(|id| {
+                let tile = &settled[*id];
+                (tile.y, tile.y + tile.h)
+            })
+            .collect();
+        assert_eq!(bands, vec![(0, 4), (4, 8), (8, 12)]);
+    }
+
+    /// Two tiles collide only when they are on the same tab, so a tile on
+    /// another tab keeps its box where the moved tile lands.
+    #[test]
+    fn a_tile_on_another_tab_keeps_its_box_where_the_moved_tile_lands() {
+        let tabs = vec![
+            Tab {
+                id: "t_a".to_owned(),
+                title: "A".to_owned(),
+            },
+            Tab {
+                id: "t_b".to_owned(),
+                title: "B".to_owned(),
+            },
+        ];
+        let mut layout = LayoutMap::new();
+        layout.insert("a".to_owned(), tile_box(0, 0, 6, 4, Some("t_a")));
+        layout.insert("b".to_owned(), tile_box(0, 0, 6, 4, Some("t_b")));
+        // `c` is the tile of the call: it is at the box the call gave it, on
+        // the tab `a` is on.
+        layout.insert("c".to_owned(), tile_box(0, 0, 6, 4, Some("t_a")));
+        let settled = settle_layout(&tabs, &layout, &["c".to_owned()]);
+        assert_eq!(settled["c"].y, 0);
+        // `a` shares the tab with `c`, so it drops below it.
+        assert_eq!(settled["a"].y, 4);
+        // `b` is on `t_b`: the tiles are on different tabs, so it stays.
+        assert_eq!(settled["b"].x, 0);
+        assert_eq!(settled["b"].y, 0);
+    }
+
+    /// A layout with no overlap after the move comes back with every box as it
+    /// was, apart from the moved tile, and in the layout's own key order.
+    #[test]
+    fn a_layout_without_an_overlap_comes_back_unchanged_apart_from_the_moved_tile() {
+        let mut layout = LayoutMap::new();
+        layout.insert("a".to_owned(), tile_box(0, 0, 6, 4, None));
+        layout.insert("b".to_owned(), tile_box(6, 0, 6, 4, None));
+        layout.insert("c".to_owned(), tile_box(0, 4, 6, 4, None));
+        let settled = settle_layout(&[], &layout, &["c".to_owned()]);
+        assert_eq!(settled["a"], layout["a"]);
+        assert_eq!(settled["b"], layout["b"]);
+        assert_eq!(settled["c"], layout["c"]);
+        // The key order is the layout's own: the export renders the map into
+        // YAML by iterating it (`lakehouse-bi/src/store.rs:611-618`).
+        assert_eq!(
+            settled.keys().collect::<Vec<_>>(),
+            layout.keys().collect::<Vec<_>>()
+        );
     }
 
     /// `set_board_view_filters`: an empty list clears the view; the
@@ -1050,6 +1275,35 @@ mod tests {
             "{saved}"
         );
         assert_eq!(version_inserts(&sent, "b1"), 1, "{sent:#?}");
+    }
+
+    /// The saved layout is the settled one: the tile the assistant moved to the
+    /// top keeps its box, and the tile it landed on is saved below it
+    /// (`AI-1` AC1, 2026-11-08). Before the fix both tiles were saved at
+    /// (0, 0) and the console drew the older one on top.
+    #[tokio::test]
+    async fn arrange_board_saves_the_moved_tile_on_top_and_the_tile_it_landed_on_below_it() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        // `c2` (on tab `t_a`) moves onto the box `c1` has on that tab.
+        let reply = run(
+            &state,
+            Some(&person()),
+            "arrange_board",
+            &args_of(&json!({ "board": "b1", "tiles": { "c2": tile(0, 0, 6, 4) } })),
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        let sent = sent(&server).await;
+        let saved = last_with(&sent, "INSERT INTO console.bi_board (");
+        assert!(
+            saved.contains(r#""c2":{"x":0,"y":0,"w":6,"h":4,"tab":"t_a"}"#),
+            "{saved}"
+        );
+        assert!(
+            saved.contains(r#""c1":{"x":0,"y":4,"w":6,"h":4,"tab":"t_a"}"#),
+            "{saved}"
+        );
     }
 
     /// `save_board_filters` runs the console's tab rules: a filter tied to a
