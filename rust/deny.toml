@@ -72,10 +72,13 @@ targets = []
 # `SEC-53` (PR #261) ignored all four ids, because on
 # 2026-10-26 no released version could reach the fix: `iceberg` 0.10.1,
 # the latest release, requires `zstd ^0.13.3`, `parquet ^58` and
-# `apache-avro ^0.21`, and the only fixed releases upstream were `zstd`
-# >= 0.14.3, `zstd-safe` >= 8.2.0 and `zstd-sys` >= 2.1.2, which
+# `apache-avro ^0.21`, and the only fixed releases of `zstd` and
+# `zstd-safe` were `zstd` 0.14.3 and `zstd-safe` 8.2.0, which
 # `iceberg` cannot take (`iceberg` 0.11.0, released 2026-11-03, still
-# requires `zstd ^0.13.3`). On 2026-11-01 `zstd-rs` published the
+# requires `zstd ^0.13.3`). `zstd-sys` 2.1.2 was reachable then and
+# later, but `cargo deny` matches an advisory by version and does not
+# filter it by architecture, so that one wanted the version bump and
+# not an exception. On 2026-11-01 `zstd-rs` published the
 # backports `zstd` 0.13.4 and `zstd-safe` 7.4.0, and RustSec widened the
 # patched ranges to accept them: `zstd` is patched in `^0.13.4` or
 # `>= 0.14.3`, `zstd-safe` in `^7.4.0` or `>= 8.2.0`. `zstd-sys` needed
