@@ -56,7 +56,7 @@ export function HeroSection({
             <Eyebrow className="text-balance max-md:text-[#a9d6ff] max-md:[text-shadow:0_0_10px_rgba(2,5,20,0.95),0_1px_2px_rgba(2,5,20,0.9)]">
               {copy.eyebrow}
             </Eyebrow>
-            <DisplayHeading as="h1" size="xl" className="mt-5 short:mt-3 short:text-[3.25rem]">
+            <DisplayHeading as="h1" size="xl" className="mt-5 short:mt-3 short:text-[2.75rem]">
               {copy.headline}
             </DisplayHeading>
             <LeadText className="mx-auto mt-6 max-w-[34rem] short:mt-4 short:text-[15px] short:leading-[1.5] md:mx-0">{copy.sub}</LeadText>

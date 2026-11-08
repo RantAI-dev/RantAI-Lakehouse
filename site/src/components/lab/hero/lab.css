@@ -74,6 +74,13 @@
   line-height: 0.9;
 }
 
+/* 1: Instrument Serif italic, the site's earlier display face (lab only). */
+.lab-hero[data-font="1"] .lab-h1 {
+  font-family: var(--font-lab-serif), ui-serif, Georgia, serif;
+  font-style: italic;
+  font-weight: 400;
+  letter-spacing: -0.015em;
+}
 /* 2: Fraunces, a soft modern serif, upright. */
 .lab-hero[data-font="2"] {
   --lab-scale: 0.9;
@@ -90,7 +97,7 @@
   --lab-scale: 0.82;
 }
 .lab-hero[data-font="3"] .lab-h1 {
-  font-family: var(--font-lab-inter-tight), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  font-family: var(--font-display), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
   font-style: normal;
   font-weight: 700;
   letter-spacing: -0.05em;
@@ -98,7 +105,7 @@
 }
 .lab-hero[data-font="3"] .lab-eyebrow,
 .lab-hero[data-font="3"] .lab-lead {
-  font-family: var(--font-lab-inter-tight), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  font-family: var(--font-display), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
 }
 /* 4: Bricolage Grotesque, with character. */
 .lab-hero[data-font="4"] {

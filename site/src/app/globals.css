@@ -164,9 +164,10 @@ html:has(.lk-root) {
 }
 
 .lk-display {
-  font-family: var(--font-display), "Instrument Serif", ui-serif, Georgia, serif;
-  font-style: italic;
-  font-weight: 400;
+  font-family: var(--font-display), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: -0.04em;
 }
 
 

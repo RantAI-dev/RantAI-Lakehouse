@@ -6,8 +6,8 @@ import { ImageResponse } from "next/og";
  * The link-preview card, 1200x630, rendered once per language at build time
  * (WEB-5 D4, after the RantAI site's `lib/og-image.tsx`): the creature, the
  * wordmark and the localized headline, in the page's night palette. The
- * headline uses the renderer's built-in sans face: the page's Instrument
- * Serif is committed as woff2 only, which the renderer cannot read.
+ * headline uses the renderer's built-in sans face: the page's Inter
+ * Tight is committed as woff2 only, which the renderer cannot read.
  *
  * Why route handlers (`app/(en)/og.png`, `app/[locale]/og.png`) and not the
  * `opengraph-image` file convention (plan §6, measured in T4): under

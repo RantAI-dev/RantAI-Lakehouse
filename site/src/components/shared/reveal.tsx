@@ -63,6 +63,20 @@ export function Reveal({
  * through variants. For assistive tech the text is just the plain words in
  * reading order.
  */
+/**
+ * Keeps the last two words of a title on one line, so a wrapped title never
+ * leaves a single word alone on its last line (owner rule, DESIGN.md §3).
+ */
+function groupLastTwo(nodes: React.ReactNode[]): React.ReactNode[] {
+  if (nodes.length < 3) return nodes;
+  return [
+    ...nodes.slice(0, -2),
+    <span key="tail" className="whitespace-nowrap">
+      {nodes.slice(-2)}
+    </span>,
+  ];
+}
+
 export function SplitWords({
   text,
   className,
@@ -84,7 +98,7 @@ export function SplitWords({
       whileInView="shown"
       viewport={{ once: true, amount: 0.3 }}
     >
-      {words.map((word, i) => (
+      {groupLastTwo(words.map((word, i) => (
         <React.Fragment key={`${word}-${i}`}>
           <span className="inline-block overflow-hidden pb-[0.14em] align-bottom">
             <m.span
@@ -108,7 +122,7 @@ export function SplitWords({
           </span>
           {i < words.length - 1 ? " " : null}
         </React.Fragment>
-      ))}
+      )))}
     </m.span>
   );
 }

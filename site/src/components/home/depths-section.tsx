@@ -63,7 +63,7 @@ export function DepthsSection({ copy }: { copy: HomeCopy["depths"] }) {
                 <p className="text-[12px] tracking-[0.2em] uppercase" style={{ color: l.accent }}>
                   {l.label} · {l.meters}
                 </p>
-                <h3 className="lk-display mt-3 text-[34px] leading-[1.05] text-[#E8F4FF]">{copy.layers[l.id].title}</h3>
+                <h3 className="lk-display mt-3 text-[30px] leading-[1.08] text-[#E8F4FF]">{copy.layers[l.id].title}</h3>
                 <p className="mt-3 text-[15px] leading-[1.55] text-[#E8F4FF]/85">{copy.layers[l.id].body}</p>
                 <DepthDataCard stage={i as 0 | 1 | 2} copy={copy.card} animate={false} className="mt-auto pt-5" />
               </li>

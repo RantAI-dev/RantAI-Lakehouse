@@ -41,7 +41,7 @@ export function AssistantSection({ copy }: { copy: AssistantCopy }) {
     >
       <Container className="relative z-10 grid min-h-[100svh] items-center gap-10 py-24 md:grid-cols-[1fr_1.1fr] md:gap-14 md:py-28">
         <div>
-          <DisplayHeading size="lg" className="max-md:text-[clamp(2.6rem,12vw,3.4rem)]">
+          <DisplayHeading size="lg" className="max-md:text-[clamp(2.2rem,10vw,2.8rem)]">
             <SplitWords text={copy.headline} />
           </DisplayHeading>
           <LeadText className="mt-3 max-w-[30rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">{copy.sub}</LeadText>

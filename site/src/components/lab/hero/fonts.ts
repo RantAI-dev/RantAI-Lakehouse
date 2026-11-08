@@ -1,5 +1,5 @@
 /**
- * The three extra faces the hero lab (`/lab/hero/`) can try on the headline.
+ * The extra faces (Inter Tight is now the site's own, in `lib/fonts.ts`) the hero lab (`/lab/hero/`) can try on the headline.
  * Files are committed under `src/fonts/lab/` (SIL Open Font License 1.1, the
  * licence text beside each) and loaded through `next/font/local`, like the
  * page's own faces, so the build asks no font service for them. They are
@@ -17,11 +17,11 @@ export const fraunces = localFont({
   preload: false,
 });
 
-export const interTight = localFont({
-  src: "../../../fonts/lab/InterTight-wght-latin.woff2",
-  weight: "100 900",
-  style: "normal",
-  variable: "--font-lab-inter-tight",
+export const instrumentSerif = localFont({
+  src: "../../../fonts/instrument-serif/InstrumentSerif-Italic-latin.woff2",
+  weight: "400",
+  style: "italic",
+  variable: "--font-lab-serif",
   display: "swap",
   preload: false,
 });
@@ -35,4 +35,4 @@ export const bricolage = localFont({
   preload: false,
 });
 
-export const labFontVariables = [fraunces.variable, interTight.variable, bricolage.variable].join(" ");
+export const labFontVariables = [instrumentSerif.variable, fraunces.variable, bricolage.variable].join(" ");

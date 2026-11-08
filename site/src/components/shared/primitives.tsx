@@ -70,7 +70,7 @@ export function CtaLink({ variant = "solid", size = "md", className, children, r
 }
 
 /**
- * Big serif-italic title. Size and line height travel together as one class
+ * Big Inter Tight title (bold, tight-tracked; the tracking lives in `.lk-display`). Size and line height travel together as one class
  * string. In the console, `tailwind-merge` dropped a `leading-*` that
  * preceded a later `text-[size]`, so overriding the size alone reset the
  * line height to the 48 px h1 rule and stacked the lines. The site's `cn`
@@ -78,10 +78,10 @@ export function CtaLink({ variant = "solid", size = "md", className, children, r
  * breakpoint (`max-md:`), which never conflicts with these.
  */
 const HEADING_SIZE = {
-  xl: "text-[clamp(4.5rem,9vw,7.5rem)] leading-[1.02]",
-  lg: "text-[clamp(3rem,7vw,5.75rem)] leading-[1.02]",
-  md: "text-[clamp(2.5rem,5vw,4rem)] leading-[1.04]",
-  sm: "text-[clamp(2rem,3.4vw,2.75rem)] leading-[1.06]",
+  xl: "text-[clamp(3.5rem,7vw,5.75rem)] leading-[1]",
+  lg: "text-[clamp(2.5rem,5.4vw,4.5rem)] leading-[1.02]",
+  md: "text-[clamp(2.1rem,4vw,3.25rem)] leading-[1.04]",
+  sm: "text-[clamp(1.75rem,2.8vw,2.25rem)] leading-[1.06]",
 } as const;
 
 export function DisplayHeading({
@@ -99,7 +99,7 @@ export function DisplayHeading({
   return (
     <Tag
       className={cn(
-        "lk-display text-balance tracking-[-0.015em] text-[#E8F4FF]",
+        "lk-display text-balance text-[#E8F4FF]",
         HEADING_SIZE[size],
         className,
       )}

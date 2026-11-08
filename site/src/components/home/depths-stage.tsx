@@ -98,7 +98,7 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
               transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
               aria-live="polite"
             >
-              <h3 className="lk-display text-[clamp(2.25rem,10vw,2.75rem)] leading-[1.04] text-balance text-[#E8F4FF] md:text-[clamp(2.6rem,3.8vw,3.4rem)]">
+              <h3 className="lk-display text-[clamp(2rem,9vw,2.4rem)] leading-[1.06] text-balance text-[#E8F4FF] md:text-[clamp(2.2rem,3.2vw,2.9rem)]">
                 {/* The depth's name for assistive tech; on screen the gauge says it. */}
                 <span className="sr-only">
                   {layer.label} {layer.meters}:{" "}
@@ -223,7 +223,7 @@ function DepthRail({ active, copy }: { active: 0 | 1 | 2; copy: HomeCopy["depths
               inert={!on}
             >
               <div className="min-h-0 overflow-hidden pl-7">
-                <h3 className="lk-display mt-5 text-[clamp(2.4rem,3.4vw,3.4rem)] leading-[1.04] text-balance text-[#E8F4FF]">
+                <h3 className="lk-display mt-5 text-[clamp(2.1rem,3vw,2.9rem)] leading-[1.06] text-balance text-[#E8F4FF]">
                   <span className="sr-only">
                     {l.label} {l.meters}:{" "}
                   </span>

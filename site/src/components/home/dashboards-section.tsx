@@ -42,7 +42,7 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
       before={
         <>
           <Container className="relative z-10">
-            <DisplayHeading size="lg" className="max-w-[16ch] max-md:text-[clamp(2.4rem,11vw,3.2rem)]">
+            <DisplayHeading size="lg" className="max-w-[16ch] max-md:text-[clamp(2.1rem,9.5vw,2.7rem)]">
               <SplitWords text={copy.headline} />
             </DisplayHeading>
             <LeadText className="mt-4 max-w-[38rem] max-md:text-[15px] max-md:leading-[1.5] md:mt-5">
