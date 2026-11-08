@@ -41,7 +41,7 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
             {copy.headline}
           </DisplayHeading>
           <LeadText className="mt-5">{copy.sub}</LeadText>
-          <CtaLink href={LINKS.install} variant="ghost" target="_blank" className="mt-8 max-md:hidden">
+          <CtaLink href={LINKS.install} variant="ghost" target="_blank" className="mt-8 self-start max-md:hidden">
             {copy.more}
             <ArrowUpRight aria-hidden="true" className="size-4 transition-transform duration-200 ease-out group-hover:translate-x-0.5 group-hover:-translate-y-0.5 motion-reduce:transition-none" />
           </CtaLink>
