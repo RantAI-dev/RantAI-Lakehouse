@@ -320,3 +320,57 @@ describe("QueryParameterFields definition menu", () => {
     )
   })
 })
+
+describe("QueryParameterFields refusals", () => {
+  const OPTIONS = [{ value: "eu", label: "Europe" }]
+
+  function mountInvalid(definitions: QueryParamDef[], invalid: string[]) {
+    render(
+      <QueryParameterFields
+        definitions={definitions}
+        values={{}}
+        invalid={new Set(invalid)}
+        onValueChange={() => {}}
+        onDefinitionChange={() => {}}
+      />
+    )
+  }
+
+  it("marks the field the server named and no other", () => {
+    mountInvalid(
+      [
+        { name: "region", type: "text" },
+        { name: "limit", type: "number" },
+      ],
+      ["region"]
+    )
+    expect(screen.getByLabelText("region").getAttribute("aria-invalid")).toBe("true")
+    expect(screen.getByLabelText("limit").getAttribute("aria-invalid")).toBeNull()
+  })
+
+  it("marks a field of each control", () => {
+    mountInvalid(
+      [
+        { name: "n", type: "number" },
+        { name: "day", type: "date" },
+        { name: "pick", type: "dropdown", options: OPTIONS },
+        { name: "picks", type: "multiSelect", options: OPTIONS },
+      ],
+      ["n", "day", "pick", "picks"]
+    )
+    for (const name of ["n", "day", "pick", "picks"]) {
+      expect(screen.getByLabelText(name).getAttribute("aria-invalid")).toBe("true")
+    }
+  })
+
+  it("marks both ends of a date range", () => {
+    mountInvalid([{ name: "period", type: "dateRange" }], ["period"])
+    expect(screen.getByLabelText("Start").getAttribute("aria-invalid")).toBe("true")
+    expect(screen.getByLabelText("End").getAttribute("aria-invalid")).toBe("true")
+  })
+
+  it("marks nothing when the server named no field", () => {
+    mountOver([{ name: "region", type: "text" }])
+    expect(screen.getByLabelText("region").getAttribute("aria-invalid")).toBeNull()
+  })
+})

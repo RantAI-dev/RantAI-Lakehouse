@@ -1,5 +1,6 @@
 import type {
   QueryParamDef,
+  QueryParamInputs,
   QueryParamType,
   QueryParamValue,
 } from "@/services/contracts/queries"
@@ -149,4 +150,59 @@ export function retypeDefinition(def: QueryParamDef, type: QueryParamType): Quer
   if (def.default !== undefined && valueFitsType(type, def.default)) next.default = def.default
   if ((type === "dropdown" || type === "multiSelect") && def.options) next.options = def.options
   return next
+}
+
+/**
+ * What a run, an estimate or a save sends for `definitions`, the
+ * definitions of the names the SQL uses right now (`activeParameters`).
+ *
+ * With none, nothing: the request is the one sent before `QS-5`. With some,
+ * the definitions go whole (the server needs them to check the types, and
+ * the default lives in the definition) and the values go for the names that
+ * have one. A value whose name is not in `definitions` is left out, because
+ * a name that left the SQL has no business in the request.
+ */
+export function paramInputs(
+  definitions: readonly QueryParamDef[],
+  values: Readonly<Record<string, QueryParamValue>>
+): QueryParamInputs {
+  if (definitions.length === 0) return {}
+  const given: Record<string, QueryParamValue> = {}
+  for (const def of definitions) {
+    if (Object.hasOwn(values, def.name)) given[def.name] = values[def.name]
+  }
+  return { parameters: given, definitions: [...definitions] }
+}
+
+/**
+ * Whether some name in `definitions` has nothing to run with: no value that
+ * fits its type and no default. The server refuses such a run with "Fill in
+ * {{name}} to run this query." An estimate is skipped instead of refused, so
+ * the panel does not show an error for a field the person has not reached.
+ */
+export function missingRequiredValue(
+  definitions: readonly QueryParamDef[],
+  values: Readonly<Record<string, QueryParamValue>>
+): boolean {
+  return definitions.some((def) => {
+    const value = Object.hasOwn(values, def.name) ? values[def.name] : def.default
+    return value === undefined || !valueFitsType(def.type, value)
+  })
+}
+
+/**
+ * The names in `names` (the ones the SQL uses) that `sentence`, the server's refusal, quotes:
+ * as `{{name}}`, `{{name.start}}`, `{{name.end}}` or `parameter 'name'`.
+ * The wire gives a sentence and no field, so this is how the field the
+ * server blames is found. A name is matched whole: `a` is not found in
+ * `{{ab}}`. A sentence about the query as a whole names no field.
+ */
+export function fieldsNamedBy(sentence: string, names: readonly string[]): Set<string> {
+  const named = new Set<string>()
+  for (const name of names) {
+    // A name is letters, digits and `_` (`findParamNames`), so it needs no escaping.
+    const quoted = new RegExp(`\\{\\{\\s*${name}(?:\\.(?:start|end))?\\s*\\}\\}|parameter '${name}'`)
+    if (quoted.test(sentence)) named.add(name)
+  }
+  return named
 }

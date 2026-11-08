@@ -19,6 +19,30 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { readableErrorMessage } from "@/lib/notify-message"
 import { queryService } from "@/services"
+import type { SavedQueryVersion } from "@/services/contracts/queries"
+
+/**
+ * What a version did to the parameters (`QS-5`); nothing when it left them
+ * as the version before it had them. A change of the parameters alone writes
+ * a version, so without this line two versions with one SQL would look equal.
+ * `older` is the next row of the list, which the server sends newest first.
+ */
+function ParametersLine({
+  version,
+  older,
+}: {
+  readonly version: SavedQueryVersion
+  readonly older: SavedQueryVersion | undefined
+}) {
+  if (!older || JSON.stringify(version.parameters) === JSON.stringify(older.parameters)) return null
+  return (
+    <p className="text-xs text-muted-foreground">
+      {version.parameters.length === 0
+        ? "Parameters removed"
+        : `Parameters changed: ${version.parameters.map((def) => def.name).join(", ")}`}
+    </p>
+  )
+}
 
 /**
  * The history of a saved query (`QS-3` C2).
@@ -101,7 +125,7 @@ export function SavedQueryHistoryDialog({
           </p>
         ) : null}
         <ul className="flex max-h-[50vh] flex-col divide-y overflow-y-auto">
-          {versions.map((version) => (
+          {versions.map((version, at) => (
             <li key={version.version} className="flex flex-col gap-1 py-2">
               <div className="flex items-center gap-2 text-sm">
                 <span className="font-medium tabular-nums">v{version.version}</span>
@@ -122,6 +146,7 @@ export function SavedQueryHistoryDialog({
                 ) : null}
               </div>
               <CodeBlock>{version.sql}</CodeBlock>
+              <ParametersLine version={version} older={versions[at + 1]} />
               <p className="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
                 <span>{version.authorName}</span>
                 <span aria-hidden="true">·</span>

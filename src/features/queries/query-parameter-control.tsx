@@ -45,6 +45,7 @@ export function ParameterControl({
   id,
   def,
   value,
+  invalid = false,
   onChange,
 }: {
   /** The id of the control the field's label points at. */
@@ -52,28 +53,47 @@ export function ParameterControl({
   readonly def: QueryParamDef
   /** What the field holds; the caller passes the default when the tab has no value. */
   readonly value: QueryParamValue | undefined
+  /** The server's last refusal blamed this parameter: the control is marked. */
+  readonly invalid?: boolean
   readonly onChange: (value: QueryParamValue | undefined) => void
 }) {
   switch (def.type) {
     case "text":
     case "number":
-      return <TypedInput id={id} type={def.type} value={value} onChange={onChange} />
+      return <TypedInput id={id} type={def.type} value={value} invalid={invalid} onChange={onChange} />
     case "date":
       return (
         <Input
           id={id}
           type="date"
+          aria-invalid={invalid || undefined}
           className="h-8 w-40"
           value={typeof value === "string" ? value : ""}
           onChange={(event) => onChange(event.target.value === "" ? undefined : event.target.value)}
         />
       )
     case "dateRange":
-      return <RangeInputs id={id} value={value} onChange={onChange} />
+      return <RangeInputs id={id} value={value} invalid={invalid} onChange={onChange} />
     case "dropdown":
-      return <DropdownSelect id={id} options={def.options ?? []} value={value} onChange={onChange} />
+      return (
+        <DropdownSelect
+          id={id}
+          options={def.options ?? []}
+          value={value}
+          invalid={invalid}
+          onChange={onChange}
+        />
+      )
     case "multiSelect":
-      return <ListSelect id={id} options={def.options ?? []} value={value} onChange={onChange} />
+      return (
+        <ListSelect
+          id={id}
+          options={def.options ?? []}
+          value={value}
+          invalid={invalid}
+          onChange={onChange}
+        />
+      )
   }
 }
 
@@ -86,11 +106,13 @@ function TypedInput({
   id,
   type,
   value,
+  invalid,
   onChange,
 }: {
   readonly id: string
   readonly type: "text" | "number"
   readonly value: QueryParamValue | undefined
+  readonly invalid: boolean
   readonly onChange: (value: QueryParamValue | undefined) => void
 }) {
   const [draft, setDraft] = React.useState<string | null>(null)
@@ -99,6 +121,7 @@ function TypedInput({
     <Input
       id={id}
       type={type}
+      aria-invalid={invalid || undefined}
       className={type === "number" ? "h-8 w-32" : "h-8 w-44"}
       value={draft ?? stored}
       onChange={(event) => {
@@ -126,10 +149,12 @@ function isRange(value: QueryParamValue | undefined): value is QueryDateRange {
 function RangeInputs({
   id,
   value,
+  invalid,
   onChange,
 }: {
   readonly id: string
   readonly value: QueryParamValue | undefined
+  readonly invalid: boolean
   readonly onChange: (value: QueryParamValue | undefined) => void
 }) {
   const [draft, setDraft] = React.useState<{ start?: string; end?: string }>({})
@@ -148,6 +173,7 @@ function RangeInputs({
       <Input
         id={`${id}-start`}
         type="date"
+        aria-invalid={invalid || undefined}
         className="h-8 w-40"
         value={start}
         onChange={(event) => set("start", event.target.value)}
@@ -158,6 +184,7 @@ function RangeInputs({
       <Input
         id={`${id}-end`}
         type="date"
+        aria-invalid={invalid || undefined}
         className="h-8 w-40"
         value={end}
         onChange={(event) => set("end", event.target.value)}
@@ -175,11 +202,13 @@ function DropdownSelect({
   id,
   options,
   value,
+  invalid,
   onChange,
 }: {
   readonly id: string
   readonly options: readonly QueryParamOption[]
   readonly value: QueryParamValue | undefined
+  readonly invalid: boolean
   readonly onChange: (value: QueryParamValue | undefined) => void
 }) {
   const items = options.map((option) => ({ value: String(option.value), label: option.label }))
@@ -193,7 +222,7 @@ function DropdownSelect({
         onChange(option?.value)
       }}
     >
-      <SelectTrigger id={id} size="sm" className="w-44">
+      <SelectTrigger id={id} size="sm" className="w-44" aria-invalid={invalid || undefined}>
         <SelectValue placeholder="Choose" />
       </SelectTrigger>
       <SelectContent>
@@ -211,11 +240,13 @@ function ListSelect({
   id,
   options,
   value,
+  invalid,
   onChange,
 }: {
   readonly id: string
   readonly options: readonly QueryParamOption[]
   readonly value: QueryParamValue | undefined
+  readonly invalid: boolean
   readonly onChange: (value: QueryParamValue | undefined) => void
 }) {
   // The faceted control speaks text; the wire keeps each option's own kind.
@@ -230,7 +261,13 @@ function ListSelect({
       }}
     >
       <FacetedTrigger asChild>
-        <Button id={id} variant="outline" size="sm" className="w-52 font-normal">
+        <Button
+          id={id}
+          variant="outline"
+          size="sm"
+          className="w-52 font-normal"
+          aria-invalid={invalid || undefined}
+        >
           <FacetedBadgeList
             options={options.map((option) => ({ value: String(option.value), label: option.label }))}
             placeholder="Choose"

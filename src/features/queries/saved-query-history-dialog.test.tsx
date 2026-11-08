@@ -209,4 +209,47 @@ describe("the history of a saved query", () => {
       "You do not have permission to change this saved query.",
     )
   })
+
+  it("shows a change of the parameters as a change, with the names they hold now", async () => {
+    const withParameters = (
+      version: number,
+      parameters: SavedQueryVersion["parameters"],
+    ): SavedQueryVersion => ({ ...VERSIONS[0]!, version, parameters })
+    spyOn(queryService, "listSavedVersions").mockResolvedValue([
+      // Same SQL as v2, other parameters: only the parameters changed.
+      withParameters(3, [{ name: "region", type: "text", default: "US" }, { name: "n", type: "number" }]),
+      withParameters(2, [{ name: "region", type: "text", default: "EU" }, { name: "n", type: "number" }]),
+      withParameters(1, [{ name: "region", type: "text", default: "EU" }, { name: "n", type: "number" }]),
+    ])
+    renderDialog("view")
+
+    await screen.findByText("v3")
+
+    const rows = screen.getAllByRole("listitem")
+    expect(rows[0]?.textContent).toContain("Parameters changed: region, n")
+    // v2 holds what v1 held, and v1 has nothing before it to differ from.
+    expect(rows[1]?.textContent).not.toContain("Parameters")
+    expect(rows[2]?.textContent).not.toContain("Parameters")
+  })
+
+  it("says the parameters were removed when a version has none and the one before it had some", async () => {
+    spyOn(queryService, "listSavedVersions").mockResolvedValue([
+      { ...VERSIONS[0]!, version: 2, parameters: [] },
+      { ...VERSIONS[0]!, version: 1, parameters: [{ name: "region", type: "text" }] },
+    ])
+    renderDialog("view")
+
+    await screen.findByText("v2")
+
+    expect(screen.getAllByRole("listitem")[0]?.textContent).toContain("Parameters removed")
+  })
+
+  it("says nothing about parameters when no version differs in them", async () => {
+    stubVersions()
+    renderDialog("view")
+
+    await screen.findByText("SELECT revenue FROM monthly")
+
+    expect(screen.queryAllByText(/Parameters/).length).toBe(0)
+  })
 })

@@ -19,6 +19,7 @@ import { ParameterMenu } from "./query-parameter-menu"
 export function QueryParameterFields({
   definitions,
   values,
+  invalid,
   onValueChange,
   onDefinitionChange,
 }: {
@@ -26,6 +27,11 @@ export function QueryParameterFields({
   readonly definitions: readonly QueryParamDef[]
   /** The tab's values by name. A name without one is not given. */
   readonly values: Readonly<Record<string, QueryParamValue>>
+  /**
+   * The names the server's last refusal blamed. Their fields are marked
+   * invalid; the sentence itself is shown where the run's error is.
+   */
+  readonly invalid?: ReadonlySet<string>
   /** `undefined` means the field holds no value now. */
   readonly onValueChange: (name: string, value: QueryParamValue | undefined) => void
   readonly onDefinitionChange: (def: QueryParamDef) => void
@@ -40,6 +46,7 @@ export function QueryParameterFields({
           key={`${def.name}:${def.type}`}
           def={def}
           value={Object.hasOwn(values, def.name) ? values[def.name] : def.default}
+          invalid={invalid?.has(def.name) ?? false}
           onValueChange={(value) => onValueChange(def.name, value)}
           onDefinitionChange={onDefinitionChange}
         />
@@ -51,11 +58,13 @@ export function QueryParameterFields({
 function ParameterField({
   def,
   value,
+  invalid,
   onValueChange,
   onDefinitionChange,
 }: {
   readonly def: QueryParamDef
   readonly value: QueryParamValue | undefined
+  readonly invalid: boolean
   readonly onValueChange: (value: QueryParamValue | undefined) => void
   readonly onDefinitionChange: (def: QueryParamDef) => void
 }) {
@@ -72,7 +81,7 @@ function ParameterField({
         )}
         <ParameterMenu id={id} def={def} onChange={onDefinitionChange} />
       </div>
-      <ParameterControl id={id} def={def} value={value} onChange={onValueChange} />
+      <ParameterControl id={id} def={def} value={value} invalid={invalid} onChange={onValueChange} />
     </div>
   )
 }

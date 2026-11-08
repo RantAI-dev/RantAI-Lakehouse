@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { queryService } from "@/services"
 import type {
   QueryFolder,
+  QueryParamDef,
   SaveQueryInput,
   SavedQuery,
   SavedQueryAccessList,
@@ -124,6 +125,7 @@ function renderSheet(over: {
   readonly sql?: string
   readonly viewerId?: string
   readonly noViewer?: boolean
+  readonly parameters?: QueryParamDef[]
 } = {}) {
   const onSave = mock<(input: SaveQueryInput) => Promise<unknown>>(
     async () => ({ id: "q2" }),
@@ -133,6 +135,7 @@ function renderSheet(over: {
       open
       onOpenChange={() => {}}
       sql={over.sql ?? "SELECT 1"}
+      parameters={over.parameters}
       saving={false}
       onSave={onSave}
       mode={over.mode ?? "create"}
@@ -147,6 +150,78 @@ function renderSheet(over: {
 async function picker() {
   return (await screen.findByLabelText("Folder")) as HTMLSelectElement
 }
+
+describe("the save sheet parameters (QS-5)", () => {
+  const DEFINITIONS: QueryParamDef[] = [
+    { name: "region", type: "text", default: "EU" },
+    { name: "n", type: "number" },
+  ]
+
+  it("sends the definitions it is given with a new query", async () => {
+    spyOn(queryService, "listFolders").mockResolvedValue(FOLDERS)
+    const { onSave } = renderSheet({ sql: "SELECT {{region}}, {{n}}", parameters: DEFINITIONS })
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save as new" }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    const input = onSave.mock.calls[0]?.[0] as SaveQueryInput
+    expect(input.parameters).toStrictEqual(DEFINITIONS)
+  })
+
+  it("sends no parameters key for a new query without a placeholder", async () => {
+    spyOn(queryService, "listFolders").mockResolvedValue(FOLDERS)
+    const { onSave } = renderSheet({ parameters: [] })
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save as new" }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect("parameters" in (onSave.mock.calls[0]?.[0] as SaveQueryInput)).toBe(false)
+  })
+
+  it("sends an empty list when a change drops the placeholders the saved query had", async () => {
+    spyOn(queryService, "getSaved").mockResolvedValue({ ...SAVED, level: "edit", parameters: DEFINITIONS })
+    const { onSave } = renderSheet({ mode: "update", savedId: "q1", parameters: [] })
+    await waitFor(() =>
+      expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Orders")
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect((onSave.mock.calls[0]?.[0] as SaveQueryInput).parameters).toStrictEqual([])
+  })
+
+  it("sends no parameters key when a change drops nothing because the saved query had none", async () => {
+    spyOn(queryService, "getSaved").mockResolvedValue({ ...SAVED, level: "edit", parameters: [] })
+    const { onSave } = renderSheet({ mode: "update", savedId: "q1", parameters: [] })
+    await waitFor(() =>
+      expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Orders")
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect("parameters" in (onSave.mock.calls[0]?.[0] as SaveQueryInput)).toBe(false)
+  })
+
+  it("sends the new definitions when a change keeps placeholders", async () => {
+    spyOn(queryService, "getSaved").mockResolvedValue({ ...SAVED, level: "edit", parameters: [] })
+    const { onSave } = renderSheet({
+      mode: "update",
+      savedId: "q1",
+      sql: "SELECT {{region}}",
+      parameters: [DEFINITIONS[0]!],
+    })
+    await waitFor(() =>
+      expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Orders")
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect((onSave.mock.calls[0]?.[0] as SaveQueryInput).parameters).toStrictEqual([DEFINITIONS[0]])
+  })
+})
 
 describe("the save sheet", () => {
   it("lists the folders and starts in the caller's own space", async () => {

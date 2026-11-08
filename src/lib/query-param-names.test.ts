@@ -3,7 +3,10 @@ import { test } from "node:test"
 import type { QueryParamDef } from "@/services/contracts/queries"
 import {
   activeParameters,
+  fieldsNamedBy,
   findParamNames,
+  missingRequiredValue,
+  paramInputs,
   reconcileDefinitions,
   replaceDefinition,
   retypeDefinition,
@@ -171,4 +174,102 @@ test("retypeDefinition drops a default that does not fit and the options of a ty
     type: "multiSelect",
     options: dropdown.options,
   })
+})
+
+const active = (...list: string[]) => list
+
+test("fieldsNamedBy finds the placeholder a refusal quotes, whole or as one end of a range", () => {
+  assert.deepEqual(
+    [...fieldsNamedBy("Fill in {{region}} to run this query.", active("region", "city"))],
+    ["region"]
+  )
+  assert.deepEqual(
+    [...fieldsNamedBy("{{day.start}} is for a date range, and day is not one.", active("day", "x"))],
+    ["day"]
+  )
+  assert.deepEqual([...fieldsNamedBy("Pick at least one value for {{day.end}}.", active("day"))], ["day"])
+})
+
+test("fieldsNamedBy finds the name in the sentences that quote it as parameter 'name'", () => {
+  assert.deepEqual(
+    [...fieldsNamedBy("parameter 'n' must be a number.", active("n", "m"))],
+    ["n"]
+  )
+})
+
+test("fieldsNamedBy does not take a name for another name it is the start of", () => {
+  assert.deepEqual([...fieldsNamedBy("Fill in {{ab}} to run this query.", active("a", "ab"))], ["ab"])
+  assert.deepEqual([...fieldsNamedBy("parameter 'ab' must be text.", active("a"))], [])
+  assert.deepEqual([...fieldsNamedBy("{{ab.start}} is for a date range, and ab is not one.", active("a"))], [])
+  assert.deepEqual([...fieldsNamedBy("Fill in {{a_b}} to run this query.", active("a"))], [])
+})
+
+test("fieldsNamedBy names only the active names and every one the sentence quotes", () => {
+  assert.deepEqual(
+    [...fieldsNamedBy("Two parameters are named {{gone}}.", active("region"))],
+    []
+  )
+  assert.deepEqual(
+    [...fieldsNamedBy("{{a}} is inside quotes: write it without them, for example = {{a}}.", active("a", "b"))],
+    ["a"]
+  )
+  assert.deepEqual(
+    [...fieldsNamedBy("{{a}} and {{b}} are both wrong", active("a", "b", "c"))].sort(),
+    ["a", "b"]
+  )
+})
+
+test("fieldsNamedBy names no field for a sentence about the query as a whole", () => {
+  assert.deepEqual(
+    [...fieldsNamedBy("This query has a {{ that is not a parameter.", active("region"))],
+    []
+  )
+  assert.deepEqual([...fieldsNamedBy("A query takes at most 20 parameters.", active("region"))], [])
+})
+
+test("paramInputs sends nothing for SQL without a placeholder", () => {
+  assert.deepEqual(paramInputs([], { region: "EU" }), {})
+})
+
+test("paramInputs sends the values of the given definitions only, and the definitions with their defaults", () => {
+  const definitions: QueryParamDef[] = [
+    { name: "region", type: "text", default: "EU" },
+    { name: "n", type: "number" },
+    { name: "day", type: "dateRange" },
+  ]
+  const inputs = paramInputs(definitions, {
+    n: 3,
+    gone: "left the SQL",
+    day: { start: "2026-11-01", end: "2026-11-07" },
+  })
+  // `region` has no value: its default stays in the definition and is not copied into the values.
+  assert.deepEqual(inputs.parameters, { n: 3, day: { start: "2026-11-01", end: "2026-11-07" } })
+  assert.deepEqual(inputs.definitions, definitions)
+})
+
+test("paramInputs sends an empty object of values when no definition has one", () => {
+  assert.deepEqual(paramInputs([{ name: "a", type: "text" }], {}), {
+    parameters: {},
+    definitions: [{ name: "a", type: "text" }],
+  })
+})
+
+test("missingRequiredValue is true for a name with no value and no default", () => {
+  assert.equal(missingRequiredValue([{ name: "a", type: "text" }], {}), true)
+  assert.equal(missingRequiredValue([{ name: "a", type: "text" }], { a: "x" }), false)
+  assert.equal(missingRequiredValue([{ name: "a", type: "text", default: "x" }], {}), false)
+  assert.equal(missingRequiredValue([], {}), false)
+})
+
+test("missingRequiredValue counts a date range with one end and a multi-select with no pick as missing", () => {
+  assert.equal(
+    missingRequiredValue([{ name: "d", type: "dateRange" }], { d: { start: "2026-11-01", end: "" } }),
+    true
+  )
+  assert.equal(
+    missingRequiredValue([{ name: "d", type: "dateRange" }], { d: { start: "2026-11-01", end: "2026-11-07" } }),
+    false
+  )
+  assert.equal(missingRequiredValue([{ name: "m", type: "multiSelect" }], { m: [] }), true)
+  assert.equal(missingRequiredValue([{ name: "m", type: "multiSelect" }], { m: ["a"] }), false)
 })

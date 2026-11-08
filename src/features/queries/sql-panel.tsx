@@ -80,6 +80,7 @@ export function SqlPanel({
     parameterValues,
     setParameterValue,
     setParameterDefinition,
+    invalidParameters,
     activeTabId,
     editorExtensions,
     statements,
@@ -137,6 +138,7 @@ export function SqlPanel({
         key={activeTabId}
         definitions={parameters}
         values={parameterValues}
+        invalid={invalidParameters}
         onValueChange={setParameterValue}
         onDefinitionChange={setParameterDefinition}
       />
