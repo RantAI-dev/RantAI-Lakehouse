@@ -78,7 +78,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
     >
       {/* O32: no visible "Illustration" label (the owner's decision; the data is plainly fictional and the
           caption for screen readers stays). The policy chip leads; the switch sits at the right. */}
-      <div className="flex flex-wrap items-center justify-between gap-3 px-4 pt-4 pb-2 md:px-6 md:pt-5">
+      <div className="flex flex-wrap items-center justify-between gap-3 px-4 pt-3 pb-1 md:px-6 md:pt-4">
         <PolicyChip copy={copy} role={role} />
         <RoleToggle copy={copy} role={role} onChange={choose} />
       </div>
@@ -96,7 +96,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
                 <th
                   key={c.key}
                   scope="col"
-                  className={cn("px-4 py-3 font-medium md:px-6", COL_WIDTH[c.key], c.key === "amount" && "text-right")}
+                  className={cn("px-4 py-2 font-medium md:px-6", COL_WIDTH[c.key], c.key === "amount" && "text-right")}
                 >
                   <span className="inline-flex items-center gap-2">
                     {copy.columns[c.key]}
@@ -107,27 +107,27 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
             </tr>
           </thead>
           <tbody>
-            {GOVERNANCE_ROWS.map((r, i) => (
+            {GOVERNANCE_ROWS.slice(0, 4).map((r, i) => (
               <tr
                 key={r.email}
                 className="border-t border-white/8 text-[14px] text-white/90 transition-colors duration-200 hover:bg-white/[0.04]"
               >
-                <td className="px-4 py-4 whitespace-nowrap md:px-6">
+                <td className="px-4 py-2 whitespace-nowrap md:px-6">
                   <span className="inline-flex items-center gap-3">
                     <Avatar name={r.name} masked={role === "analyst"} />
                     <Cell value={r.name} masked={maskName(r.name)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
                   </span>
                 </td>
-                <td className="px-4 py-4 whitespace-nowrap md:px-6">
+                <td className="px-4 py-2 whitespace-nowrap md:px-6">
                   <Cell value={r.email} masked={maskEmail(r.email)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
                 </td>
-                <td className="px-4 py-4 whitespace-nowrap md:px-6">
+                <td className="px-4 py-2 whitespace-nowrap md:px-6">
                   <span className="inline-flex items-center gap-1.5">
                     <MapPin aria-hidden="true" className="size-3.5 text-[#44A6FA]/70" />
                     {r.city}
                   </span>
                 </td>
-                <td className="px-4 py-4 text-right whitespace-nowrap tabular-nums md:px-6">€{r.amount}</td>
+                <td className="px-4 py-2 text-right whitespace-nowrap tabular-nums md:px-6">€{r.amount}</td>
               </tr>
             ))}
           </tbody>
@@ -184,11 +184,11 @@ function Avatar({ name, masked }: { name: string; masked: boolean }) {
     <span
       aria-hidden="true"
       className={cn(
-        "grid size-8 shrink-0 place-items-center rounded-full text-[11px] font-semibold transition-colors duration-300 ease-out",
+        "grid size-7 shrink-0 place-items-center rounded-full text-[10.5px] font-semibold transition-colors duration-300 ease-out",
         masked ? "bg-white/[0.07] text-white/45" : "bg-[#44A6FA]/20 text-[#bfe0ff]",
       )}
     >
-      {masked ? <UserRound className="size-4" /> : initials}
+      {masked ? <UserRound className="size-3.5" /> : initials}
     </span>
   );
 }

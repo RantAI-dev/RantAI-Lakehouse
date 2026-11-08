@@ -38,7 +38,7 @@ export function GovernanceSection({ copy }: { copy: HomeCopy["governance"] }) {
           <LeadText className="mt-5 max-w-[40rem]">{copy.sub}</LeadText>
         </Reveal>
 
-        <Reveal className="mt-12" y={40}>
+        <Reveal className="mt-10" y={40}>
           <GovernanceTable copy={copy} />
         </Reveal>
 

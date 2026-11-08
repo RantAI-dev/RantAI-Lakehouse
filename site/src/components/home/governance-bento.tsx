@@ -26,41 +26,41 @@ type Bento = HomeCopy["governance"]["bento"];
  * and space. No lift, no tilt.
  */
 const tile =
-  "lk-mb-tile relative flex flex-col overflow-hidden rounded-3xl border border-white/10 bg-[var(--lk-n-surface)] p-5 outline-none transition-[border-color] duration-200 ease-out focus-visible:border-[#44A6FA]/70 md:p-6";
+  "lk-mb-tile relative flex flex-col overflow-hidden rounded-3xl border border-white/10 bg-[var(--lk-n-surface)] p-4 outline-none transition-[border-color] duration-200 ease-out focus-visible:border-[#44A6FA]/70 md:px-4 md:py-3.5";
 
 function Words({ title, line }: { title: string; line: string }) {
   return (
-    <div className="mt-auto pt-5">
-      <h3 className="text-[17px] leading-6 font-medium text-balance text-[#E8F4FF]">{title}</h3>
-      <p className="mt-1 text-[14px] leading-[1.55] text-pretty text-white/70">{line}</p>
+    <div className="mt-auto pt-3 md:pt-3">
+      <h3 className="text-[16px] leading-6 font-medium text-balance text-[#E8F4FF]">{title}</h3>
+      <p className="mt-0.5 text-[13.5px] leading-[1.5] text-pretty text-white/70">{line}</p>
     </div>
   );
 }
 
 export function GovernanceBento({ copy }: { copy: Bento }) {
   return (
-    <div className="lk-mb relative mt-6">
+    <div className="lk-mb relative mt-4">
       {/* O37: the spotlight over the whole grid, moved by the deferred controller. */}
       <span aria-hidden="true" className="lk-mb-spot pointer-events-none absolute -inset-10 z-10" />
       <BentoFxHost />
-    <ul className="grid gap-4 md:grid-cols-3 md:gap-5">
-      <LiveTile label={copy.lineage.title} className={`${tile} md:col-span-2`}>
+    <ul className="grid gap-3 md:grid-cols-6 md:gap-4">
+      <LiveTile label={copy.lineage.title} className={`${tile} md:col-span-3`}>
         <Lineage nodes={copy.lineage.nodes} />
         <Words title={copy.lineage.title} line={copy.lineage.line} />
       </LiveTile>
-      <LiveTile label={copy.proof.title} className={tile}>
+      <LiveTile label={copy.proof.title} className={`${tile} md:col-span-3`}>
         <Proof badge={copy.proof.badge} />
         <Words title={copy.proof.title} line={copy.proof.line} />
       </LiveTile>
-      <LiveTile label={copy.audit.title} className={tile}>
+      <LiveTile label={copy.audit.title} className={`${tile} md:col-span-2`}>
         <Audit text={copy.audit} />
         <Words title={copy.audit.title} line={copy.audit.line} />
       </LiveTile>
-      <LiveTile label={copy.catalog.title} className={tile}>
+      <LiveTile label={copy.catalog.title} className={`${tile} md:col-span-2`}>
         <Catalog text={copy.catalog} />
         <Words title={copy.catalog.title} line={copy.catalog.line} />
       </LiveTile>
-      <LiveTile label={copy.access.title} className={tile}>
+      <LiveTile label={copy.access.title} className={`${tile} md:col-span-2`}>
         <Access text={copy.access} />
         <Words title={copy.access.title} line={copy.access.line} />
       </LiveTile>
@@ -74,7 +74,7 @@ function Lineage({ nodes }: { nodes: string[] }) {
   const colours = ["#C8834A", "#B9C6D3", "#F2C14E"];
   const xs = [16, 222, 428];
   return (
-    <svg viewBox="0 0 600 120" className="h-auto w-full overflow-visible" aria-hidden="true">
+    <svg viewBox="0 24 600 72" className="my-2 h-auto w-full overflow-visible" aria-hidden="true">
       {[0, 1].map((i) => (
         <g key={i}>
           <path className="lk-gv-edge lk-draw" style={{ animationDelay: `${0.3 + i * 0.3}s` }} pathLength={1} d={`M${xs[i] + 156} 60 C${xs[i] + 180} 60 ${xs[i + 1] - 24} 60 ${xs[i + 1]} 60`} fill="none" stroke="#E8F4FF" strokeOpacity="0.25" strokeWidth="2" />
@@ -98,7 +98,7 @@ function Lineage({ nodes }: { nodes: string[] }) {
 /** An e-mail cell that masks and unmasks, with the test's check. */
 function Proof({ badge }: { badge: string }) {
   return (
-    <div aria-hidden="true" className="flex flex-col items-start gap-4">
+    <div aria-hidden="true" className="flex flex-col items-start gap-3">
       <div className="relative h-10 w-full max-w-[16rem] overflow-hidden rounded-xl bg-[var(--lk-n-bg)]/70 px-3 ring-1 ring-white/10">
         <span className="lk-gv-plain absolute inset-y-0 left-3 flex items-center text-[14px] text-[#E8F4FF]">mira.okafor@example.com</span>
         {/* O36: masking shown as masked text that keeps the shape, never a grey bar. */}
@@ -118,11 +118,11 @@ function Proof({ badge }: { badge: string }) {
 /** Log rows ticking in; the risky one waits, then is approved, now and then. */
 function Audit({ text }: { text: Bento["audit"] }) {
   return (
-    <ul aria-hidden="true" className="flex flex-col gap-2">
+    <ul aria-hidden="true" className="flex flex-col gap-1.5">
       {text.rows.map((r, i) => (
         <li
           key={r}
-          className="lk-gv-row flex items-center gap-2 rounded-xl bg-[var(--lk-n-bg)]/60 px-3 py-2 text-[12.5px] text-white/85 ring-1 ring-white/8"
+          className="lk-gv-row flex items-center gap-2 rounded-xl bg-[var(--lk-n-bg)]/60 px-3 py-1.5 text-[12.5px] text-white/85 ring-1 ring-white/8"
           style={{ animationDelay: `${0.15 + i * 0.25}s` }}
         >
           <span className="size-1.5 shrink-0 rounded-full bg-[#44A6FA]" />
@@ -150,8 +150,8 @@ function Audit({ text }: { text: Bento["audit"] }) {
 /** A search that types a table name, and its results with their marks. */
 function Catalog({ text }: { text: Bento["catalog"] }) {
   return (
-    <div aria-hidden="true" className="flex flex-col gap-2">
-      <div className="flex h-9 items-center gap-2 rounded-xl bg-[var(--lk-n-bg)]/70 px-3 ring-1 ring-white/10">
+    <div aria-hidden="true" className="flex flex-col gap-1.5">
+      <div className="flex h-8 items-center gap-2 rounded-xl bg-[var(--lk-n-bg)]/70 px-3 ring-1 ring-white/10">
         <Search className="size-3.5 text-white/50" />
         {/* The query is a table name, code: monospace, typed in steps of one character. */}
         <span className="lk-gv-type overflow-hidden font-mono text-[12.5px] whitespace-nowrap text-[#E8F4FF]" style={{ "--lk-n": text.query.length } as React.CSSProperties}>
@@ -159,12 +159,12 @@ function Catalog({ text }: { text: Bento["catalog"] }) {
         </span>
         <span className="lk-gv-caret h-4 w-px bg-[#44A6FA]" />
       </div>
-      <div className="lk-gv-result flex items-center gap-2 rounded-xl px-3 py-2 ring-1 ring-white/8">
+      <div className="lk-gv-result flex items-center gap-2 rounded-xl px-3 py-1 ring-1 ring-white/8">
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[#E8F4FF]">gold.revenue_by_city</span>
         <span className="rounded-full bg-[#7be0b0]/12 px-2 py-0.5 text-[10.5px] font-medium text-[#7be0b0]">{text.certified}</span>
         <span className="rounded-full bg-white/8 px-2 py-0.5 text-[10.5px] text-white/75">#{text.tag}</span>
       </div>
-      <div className="lk-gv-result flex items-center gap-2 rounded-xl px-3 py-2 opacity-70 ring-1 ring-white/6" style={{ animationDelay: "1.6s" }}>
+      <div className="lk-gv-result flex items-center gap-2 rounded-xl px-3 py-1 opacity-70 ring-1 ring-white/6" style={{ animationDelay: "1.6s" }}>
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-white/70 line-through decoration-white/30">silver.revenue_old</span>
         <span className="rounded-full bg-[#F2C14E]/12 px-2 py-0.5 text-[10.5px] font-medium text-[#F2C14E]">{text.deprecated}</span>
       </div>
@@ -175,7 +175,7 @@ function Catalog({ text }: { text: Bento["catalog"] }) {
 /** Folders and a dashboard; its lock opens for Admin and stays shut for Analyst (the table's switch). */
 function Access({ text }: { text: Bento["access"] }) {
   return (
-    <div aria-hidden="true" className="flex flex-col gap-1.5 text-[13px] text-white/85">
+    <div aria-hidden="true" className="flex flex-col gap-1 text-[13px] text-white/85">
       {text.folders.map((f, i) => (
         <div key={f} className="flex items-center gap-2">
           <Folder className="size-4 text-[#44A6FA]/80" />
@@ -188,7 +188,7 @@ function Access({ text }: { text: Bento["access"] }) {
           )}
         </div>
       ))}
-      <div className="ml-6 flex items-center gap-2 rounded-xl bg-[var(--lk-n-bg)]/60 px-3 py-2 ring-1 ring-white/8">
+      <div className="ml-6 flex items-center gap-2 rounded-xl bg-[var(--lk-n-bg)]/60 px-3 py-1.5 ring-1 ring-white/8">
         <LayoutDashboard className="size-4 text-white/70" />
         {text.dashboard}
         <span className="relative ml-auto inline-grid">

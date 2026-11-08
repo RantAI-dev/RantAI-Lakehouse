@@ -948,28 +948,36 @@ html.motion-ready .lk-tile:not([data-shown]) :is(.lk-gv-node, .lk-gv-row, .lk-gv
 .lk-tile[data-shown] .lk-gv-ok {
   animation: lk-gv-ok 7s ease-in-out 1.5s infinite;
 }
+/* One status at a time: the old one is fully gone before the new one starts to show
+   (the two pills have different widths and share one cell). */
 @keyframes lk-gv-wait {
   0%,
-  45%,
-  100% {
+  44% {
     opacity: 1;
   }
-  52%,
-  92% {
+  47%,
+  96% {
     opacity: 0;
+  }
+  100% {
+    opacity: 1;
   }
 }
 @keyframes lk-gv-ok {
   0%,
-  45%,
-  100% {
+  50% {
     opacity: 0;
-    transform: scale(0.9);
+    transform: scale(0.94);
   }
-  52%,
+  53%,
   92% {
     opacity: 1;
     transform: scale(1);
+  }
+  95%,
+  100% {
+    opacity: 0;
+    transform: scale(0.94);
   }
 }
 /* Catalog: the query types itself, one character at a time, with a caret. */

@@ -183,7 +183,36 @@ const SHOW_PROBE = `(async () => {
   }
   return out;
 })()`;
+/**
+ * Owner QA, "Guarded by default": on desktop the table and the whole bento grid fit in one window
+ * together: from the table's top to the grid's bottom is at most the window height minus the top
+ * bar (64 px) and 32 px of air. Also, the audit tile shows one status at a time (never both pills).
+ */
+const GOV_PROBE = `(async () => {
+  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const card = document.querySelector('#governance table').closest('[class*="rounded-3xl"]');
+  scrollTo(0, card.getBoundingClientRect().top + scrollY - 80); await frame(); await new Promise((r) => setTimeout(r, 1200));
+  const t = card.getBoundingClientRect(), u = document.querySelector('#governance .lk-mb ul').getBoundingClientRect();
+  let both = 0;
+  const wait = document.querySelector('.lk-gv-wait'), ok = document.querySelector('.lk-gv-ok');
+  for (let i = 0; i < 140; i++) {
+    const a = +getComputedStyle(wait).opacity, b = +getComputedStyle(ok).opacity;
+    if (a > 0.02 && b > 0.02) both++;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return { span: u.bottom - t.top, budget: innerHeight - 64 - 32, both };
+})()`;
 let failed = 0;
+for (const [w, h] of [[1190, 800], [1280, 800], [1440, 900]]) {
+  const p = await open(w, h);
+  const r = (await p.ev(GOV_PROBE)) as { span: number; budget: number; both: number };
+  p.close();
+  const errors: string[] = [];
+  if (r.span > r.budget) errors.push(`table + bento is ${Math.round(r.span)}px, over the ${r.budget}px that fit`);
+  if (r.both > 0) errors.push(`both audit statuses visible together in ${r.both} samples`);
+  console.log(`governance ${w}x${h}`, errors.length ? `FAIL: ${errors.join("; ")}` : `ok (${Math.round(r.span)}/${r.budget}px)`);
+  if (errors.length) failed++;
+}
 for (const [w, h] of [[1190, 960], [1150, 810], [1440, 900]]) {
   const p = await open(w, h);
   const r = (await p.ev(SHOW_PROBE)) as { pinned: boolean; headTop: number; headBottom: number; gap: number; bottom: number; vh: number };
