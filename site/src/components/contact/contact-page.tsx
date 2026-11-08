@@ -5,7 +5,6 @@ import { SiteFooter } from "@/components/layout/site-footer";
 import { SkipLink } from "@/components/layout/skip-link";
 import { TopBar } from "@/components/layout/top-bar";
 import { JsonLd } from "@/components/shared/json-ld";
-import { MascotLogo } from "@/components/shared/mascot-svg";
 import { Container, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { SocialIcon } from "@/components/shared/social-icons";
 import type { Locale } from "@/i18n/routing";
@@ -88,7 +87,6 @@ export async function ContactPage({ locale }: Readonly<{ locale: Locale }>) {
             </div>
           </Container>
         </section>
-        <Waterline />
         <Faq copy={copy.faq} />
       </main>
       <SiteFooter locale={locale} page="contact" copy={common.footer} />
@@ -124,25 +122,6 @@ function DirectLink({
         />
       </a>
     </li>
-  );
-}
-
-/**
- * The surface between the form and the questions (DESIGN.md §2: a visual
- * anchor of this product, not a text block): the hero's waterline, lit
- * where the creature waits on it, the same small creature that sits on the
- * dashboards' horizon. Above it the night, below it the water the FAQ sits
- * in. It bobs as the hero's does and rests under reduced motion.
- */
-function Waterline() {
-  return (
-    <div aria-hidden="true" className="pointer-events-none relative mt-10 h-28 md:mt-16 md:h-36">
-      {/* O39: a solid hairline, with no glow on it. */}
-      <div className="absolute inset-x-0 top-1/2 h-px bg-[#44A6FA]/40" />
-      <Container className="relative h-full">
-        <MascotLogo className="lk-bob absolute right-4 bottom-1/2 h-auto w-14 translate-y-[3px] drop-shadow-[0_0_24px_rgba(68,166,250,0.35)] md:right-6 md:w-20" />
-      </Container>
-    </div>
   );
 }
 

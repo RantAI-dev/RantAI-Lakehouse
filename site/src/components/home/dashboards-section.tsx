@@ -6,7 +6,6 @@ import { CalendarTile, DotMapTile } from "./dashboard-tiles-static";
 import { DashboardsScroller } from "./dashboards-scroller";
 import { LiveTile } from "./live-tile";
 import { Container, DisplayHeading, LeadText } from "@/components/shared/primitives";
-import { MascotLogo } from "@/components/shared/mascot-svg";
 import { SplitWords } from "@/components/shared/reveal";
 import { TiltCard } from "@/components/shared/tilt-card";
 
@@ -42,7 +41,6 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
     <DashboardsScroller
       before={
         <>
-          <Shore />
           <Container className="relative z-10">
             <DisplayHeading size="lg" className="max-w-[16ch] max-md:text-[clamp(2.4rem,11vw,3.2rem)]">
               <SplitWords text={copy.headline} />
@@ -85,16 +83,3 @@ export function DashboardsSection({ copy }: { copy: HomeCopy["dashboards"] }) {
   );
 }
 
-/**
- * The shore: a thin lake-blue horizon along the bottom, and the creature,
- * tiny, sitting on it at the far right.
- */
-function Shore() {
-  return (
-    <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 h-[22%]">
-      {/* O39: a solid hairline, with no glow above or below it. */}
-      <div className="absolute inset-x-0 bottom-[34%] h-px bg-[#44A6FA]/45" />
-      <MascotLogo className="absolute right-[5%] bottom-[34%] h-auto w-9 translate-y-[2px] opacity-90 md:w-12" />
-    </div>
-  );
-}
