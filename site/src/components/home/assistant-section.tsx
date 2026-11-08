@@ -52,7 +52,7 @@ export function AssistantSection({ copy }: { copy: AssistantCopy }) {
               return (
                 <li
                   key={f}
-                  className="inline-flex items-center gap-1.5 rounded-full border border-[#E8F4FF]/14 bg-[#E8F4FF]/[0.05] px-3 py-1 text-[12px] leading-5 text-[#E8F4FF]/80 transition-colors duration-200 hover:border-[#44A6FA]/45 hover:text-[#E8F4FF] md:text-[13px]"
+                  className="inline-flex items-center gap-1.5 rounded-full bg-[#E8F4FF]/[0.07] px-3 py-1 text-[12px] leading-5 text-[#E8F4FF]/80 transition-colors duration-200 hover:bg-[#E8F4FF]/[0.12] hover:text-[#E8F4FF] md:text-[13px]"
                 >
                   <Icon aria-hidden="true" className="size-3.5 shrink-0 text-[#8fcbff]" strokeWidth={2} />
                   {f}

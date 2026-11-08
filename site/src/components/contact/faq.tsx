@@ -47,11 +47,11 @@ export function Faq({
             </a>
           )}
         </div>
-        <ul className="lk-faq border-t border-[#E8F4FF]/12">
+        <ul className="lk-faq flex flex-col gap-3">
           {items.map((item, i) => (
-            <li key={item.q} className="border-b border-[#E8F4FF]/12">
+            <li key={item.q} className="rounded-3xl bg-[var(--lk-n-surface)]">
               <details name="lakehouse-faq" open={i === 0} className="group">
-                <summary className="flex cursor-pointer list-none items-center justify-between gap-6 rounded-lg py-5 text-left text-[17px] leading-snug font-medium text-pretty text-[#E8F4FF]/90 transition-colors duration-200 ease-out marker:hidden hover:text-[#E8F4FF] focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[#44A6FA] group-open:text-[#E8F4FF] sm:py-6 sm:text-[19px] [&::-webkit-details-marker]:hidden">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-6 rounded-3xl px-6 py-5 text-left text-[17px] leading-snug font-medium text-pretty text-[#E8F4FF]/90 transition-colors duration-200 ease-out marker:hidden hover:text-[#E8F4FF] focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[#44A6FA] group-open:text-[#E8F4FF] sm:px-8 sm:py-6 sm:text-[19px] [&::-webkit-details-marker]:hidden">
                   {item.q}
                   <span
                     aria-hidden="true"
@@ -60,7 +60,7 @@ export function Faq({
                     <ChevronDown className="size-4" />
                   </span>
                 </summary>
-                <p className="max-w-2xl pr-12 pb-6 text-[15px] leading-relaxed text-pretty text-[#E8F4FF]/75 sm:text-[16px]">
+                <p className="max-w-2xl px-6 pr-16 pb-6 text-[15px] leading-relaxed text-pretty text-[#E8F4FF]/75 sm:px-8 sm:pr-20 sm:text-[16px]">
                   {item.a}
                 </p>
               </details>

@@ -1282,11 +1282,12 @@ section[data-role="admin"] .lk-gv-closed {
   position: relative;
   overflow: hidden;
   border-radius: var(--radius-3xl);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  /* O35 follow-up (owner: solid colours, not gradients): one flat surface a
-     step lighter than the water, with the depth's colour as a top hairline. */
+  /* Borderless (owner): one flat surface a step lighter than the water, the depth's colour as a
+     top edge, and a soft shadow so it still stands off the 3D sea. */
   background: var(--lk-n-surface);
-  box-shadow: inset 0 1px 0 0 color-mix(in srgb, var(--lk-depth-accent) 55%, transparent);
+  box-shadow:
+    inset 0 1px 0 0 color-mix(in srgb, var(--lk-depth-accent) 55%, transparent),
+    0 28px 60px -28px rgba(0, 0, 0, 0.7);
   color: #e8f4ff;
   font-size: 12px;
   line-height: 16px;
@@ -1695,8 +1696,8 @@ section[data-role="admin"] .lk-gv-closed {
   height: min(560px, 74svh);
   overflow: hidden;
   border-radius: var(--radius-3xl);
-  border: 1px solid rgba(255, 255, 255, 0.09);
   background: var(--lk-ast-surface);
+  box-shadow: 0 28px 60px -30px rgba(0, 0, 0, 0.6);
 }
 @media (min-width: 48rem) {
   .lk-ast {
@@ -2216,7 +2217,7 @@ section[data-role="admin"] .lk-gv-closed {
 /* O35 follow-up: a flat terminal, one step lighter than the water, with a
    hairline. */
 .lk-gs-term {
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+  box-shadow: none;
 }
 
 /* The copy button: the icon morphs between copy, check and select, and a
@@ -2357,7 +2358,6 @@ section[data-role="admin"] .lk-gv-closed {
   max-width: 40rem;
   overflow: hidden;
   border-radius: var(--radius-3xl);
-  border: 1px solid rgba(255, 255, 255, 0.09);
   background: var(--lk-n-surface);
   margin-bottom: 32px;
 }

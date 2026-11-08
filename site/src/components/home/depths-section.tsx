@@ -57,7 +57,7 @@ export function DepthsSection({ copy }: { copy: HomeCopy["depths"] }) {
             {DEPTH_LAYERS.map((l, i) => (
               <li
                 key={l.id}
-                className="flex flex-col rounded-3xl border border-[#E8F4FF]/10 bg-[#E8F4FF]/[0.04] p-5 md:p-6"
+                className="flex flex-col rounded-3xl bg-[var(--lk-n-surface)] p-5 md:p-6"
                 style={{ boxShadow: `inset 0 1px 0 0 ${l.accent}66` }}
               >
                 <p className="text-[12px] tracking-[0.2em] uppercase" style={{ color: l.accent }}>

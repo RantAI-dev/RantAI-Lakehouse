@@ -97,7 +97,7 @@ export function ContactForm({ text, to }: Readonly<{ text: ContactCopy["form"]; 
       noValidate
       aria-label={text.label}
       onSubmit={submit}
-      className="rounded-[28px] bg-[#0B1A4A]/55 p-5 shadow-[0_30px_80px_-40px_rgba(0,0,0,0.8)] ring-1 ring-[#E8F4FF]/12 backdrop-blur-md max-sm:-mx-1 sm:p-8"
+      className="rounded-[28px] bg-[#0B1A4A]/55 p-5 shadow-[0_30px_80px_-40px_rgba(0,0,0,0.8)] backdrop-blur-md max-sm:-mx-1 sm:p-8"
     >
       <div className="grid gap-5 sm:grid-cols-2">
         <div>
