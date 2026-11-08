@@ -41,6 +41,7 @@ const SAVED = {
   folderId: null,
   ownerId: "u1",
   level: "edit",
+  parameters: [],
 }
 
 /** One row of a result, as the API sends it. */

@@ -207,7 +207,14 @@ export function useQueryStudio() {
   const [tab, setTab] = React.useState<StudioTab>("nl")
   const [question, setQuestion] = React.useState("")
   const [tabs, setTabs] = React.useState<QueryTab[]>(() => [
-    { id: FIRST_TAB_ID, name: "Query 1", sql: STARTER_SQL, engine: "clickhouse" },
+    {
+      id: FIRST_TAB_ID,
+      name: "Query 1",
+      sql: STARTER_SQL,
+      engine: "clickhouse",
+      parameters: [],
+      values: {},
+    },
   ])
   const [activeTabId, setActiveTabId] = React.useState(FIRST_TAB_ID)
   // What every statement of every run did. It belongs to the tab that ran
@@ -290,7 +297,7 @@ export function useQueryStudio() {
     queryService.generateSql(q, signal)
   )
   const estimateAct = useServiceAction((signal, s: string) =>
-    queryService.estimate(s, signal)
+    queryService.estimate(s, undefined, signal)
   )
   const saveAct = useServiceAction((signal: AbortSignal, input: SaveQueryInput) => {
     // A change of a saved query leaves it where it is: the folder is the
@@ -587,6 +594,8 @@ export function useQueryStudio() {
           name: nextTabName(stored.tabs),
           sql: linkedSql,
           engine,
+          parameters: [],
+          values: {},
         }
         setTabs([...stored.tabs, linked])
         setActiveTabId(linked.id)
@@ -604,6 +613,8 @@ export function useQueryStudio() {
         name: "Query 1",
         sql: linkedSql,
         engine,
+        parameters: [],
+        values: {},
       }
       placeholderRef.current = false
       setTabs([linked])
@@ -673,6 +684,8 @@ export function useQueryStudio() {
         name: nextTabName(tabs),
         sql: options?.sql ?? STARTER_SQL,
         engine: options?.engine ?? "clickhouse",
+        parameters: [],
+        values: {},
       }
       setTabs((previous) =>
         previous.length >= MAX_QUERY_TABS ? previous : [...previous, opened]
@@ -1125,6 +1138,8 @@ export function useQueryStudio() {
         name,
         sql: linkedSaved.sql,
         engine: "clickhouse",
+        parameters: [],
+        values: {},
         savedId: linkedSaved.id,
         level: linkedSaved.level,
       }

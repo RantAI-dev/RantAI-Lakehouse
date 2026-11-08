@@ -60,6 +60,7 @@ const SAVED: SavedQuery = {
   folderId: null,
   ownerId: "u1",
   level: "view",
+  parameters: [],
 }
 
 /** The caller of these tests: the person who saves, never named in the line. */

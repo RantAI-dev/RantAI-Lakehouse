@@ -27,6 +27,7 @@ const VERSIONS: SavedQueryVersion[] = [
     authorName: "Rina Wijaya",
     label: "",
     createdAt: "2026-11-01T09:00:00.000Z",
+    parameters: [],
   },
   {
     version: 2,
@@ -36,6 +37,7 @@ const VERSIONS: SavedQueryVersion[] = [
     authorName: "Rina Wijaya",
     label: "",
     createdAt: "2026-10-31T09:00:00.000Z",
+    parameters: [],
   },
   {
     version: 1,
@@ -45,6 +47,7 @@ const VERSIONS: SavedQueryVersion[] = [
     authorName: "Rina Wijaya",
     label: "",
     createdAt: "2026-10-30T09:00:00.000Z",
+    parameters: [],
   },
 ]
 
@@ -62,6 +65,7 @@ const AFTER_REVERT: SavedQueryVersion[] = [
     authorName: "Rina Wijaya",
     label: "Restored version 2",
     createdAt: "2026-11-02T09:00:00.000Z",
+    parameters: [],
   },
   ...VERSIONS,
 ]
@@ -77,6 +81,7 @@ function saved(over: Partial<SavedQuery> = {}): SavedQuery {
     folderId: null,
     ownerId: "u1",
     level: "view",
+    parameters: [],
     ...over,
   }
 }
