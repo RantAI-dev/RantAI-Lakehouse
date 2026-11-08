@@ -41,10 +41,12 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
 
   return (
     <div className="lk-depth-stage sticky top-0 h-[100svh] overflow-hidden motion-reduce:hidden">
-      {/* The gauge hugs the screen's left edge, outside the 1120 px column. */}
-      <DepthGauge progress={progress} active={active} words={copy.key} />
       <Container className="relative h-full">
-        <div className="lk-depth-grid-stage grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:gap-5 max-md:pl-6 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] md:gap-12">
+        {/* Owner QA (1210 px, 3D path): the rail has its own column, sized by its longest label, so
+            the heading always starts a full grid gap (48 px) clear of it, at any width and in either
+            language. On phones it is the thin line at the screen's left edge, out of the flow. */}
+        <div className="lk-depth-grid-stage grid h-full items-center gap-6 pt-20 pb-10 max-md:grid-rows-[auto_1fr] max-md:items-start max-md:gap-5 max-md:pl-6 md:grid-cols-[auto_minmax(0,2fr)_minmax(0,3fr)] md:gap-12">
+          <DepthGauge progress={progress} active={active} words={copy.key} />
           {/* WEB-5 O21: the chapter shows what the depth does to the data.
               O40 (owner: "masih kerasa rame sekali ... tablenya di sebelah
               kanan aja dan di gabung dengan tampilan balok"): the left column
@@ -110,7 +112,7 @@ function DepthGauge({
   return (
     <div
       aria-hidden="true"
-      className="pointer-events-none absolute top-[18%] bottom-[14%] left-3 z-10 w-16 md:left-8 md:w-36"
+      className="lk-depth-rail pointer-events-none absolute top-[18%] bottom-[14%] left-3 z-10 w-16 md:static md:z-auto md:my-[4svh] md:w-[8.5rem] md:self-stretch min-[1200px]:w-[12.5rem]"
     >
       <span className="absolute top-0 left-[7px] h-full w-px bg-[#E8F4FF]/20" />
       {DEPTH_LAYERS.map((l, i) => (
@@ -129,7 +131,8 @@ function DepthGauge({
             )}
             style={{ color: active === i ? l.accent : "rgba(232,244,255,0.5)" }}
           >
-            {l.meters} {l.label} · {words[l.id]}
+            {l.meters} {l.label}
+            <span className="hidden min-[1200px]:inline"> · {words[l.id]}</span>
           </span>
         </div>
       ))}

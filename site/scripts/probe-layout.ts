@@ -33,7 +33,7 @@ const SIZES: [number, number][] = [
 type Cdp = { ev: (expr: string) => Promise<unknown>; close: () => void };
 type Reply = { id?: number; result?: { result?: { value?: unknown } } };
 
-async function open(w: number, h: number): Promise<Cdp> {
+async function open(w: number, h: number, url = base): Promise<Cdp> {
   const t = await (await fetch(`http://127.0.0.1:${PORT}/json/new`, { method: "PUT" })).json();
   const ws = new WebSocket(t.webSocketDebuggerUrl);
   await new Promise((r) => (ws.onopen = r));
@@ -53,9 +53,9 @@ async function open(w: number, h: number): Promise<Cdp> {
       pending.set(i, r);
       ws.send(JSON.stringify({ id: i, method, params }));
     });
-  await send("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 1, mobile: false });
+  await send("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 1, mobile: w < 600 });
   await send("Page.enable");
-  await send("Page.navigate", { url: base });
+  await send("Page.navigate", { url });
   const ev = async (expression: string) =>
     (await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true })).result?.result?.value;
   for (let i = 0; i < 200 && (await ev("document.readyState")) !== "complete"; i++) await Bun.sleep(100);
@@ -93,7 +93,45 @@ const PROBE = `(async () => {
   return out;
 })()`;
 
+/**
+ * Owner QA (the depths rail, 3D path): the rail's labels must never touch the stage's heading or
+ * its line. For each width, language and stage (Bronze, Silver, Gold: the pinned section at 1/6,
+ * 1/2 and 5/6 of its scroll), no rail row (`.lk-depth-rail > div`: tick and label) may come
+ * within GAP px of the heading or the body line. GAP is 32 from md up; on phones the rows are
+ * the bare ticks and must only not intersect.
+ */
+const RAIL_PROBE = (gap: number) => `(async () => {
+  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const sec = document.querySelector('#depths');
+  const top = sec.getBoundingClientRect().top + scrollY;
+  const worst = [];
+  for (const k of [1 / 6, 1 / 2, 5 / 6]) {
+    scrollTo(0, top + k * (sec.offsetHeight - innerHeight)); await frame(); await new Promise((r) => setTimeout(r, 900));
+    const rows = [...document.querySelectorAll('.lk-depth-rail > div')].map((e) => e.getBoundingClientRect());
+    const text = [...document.querySelectorAll('.lk-depth-grid-stage h3, .lk-depth-grid-stage h3 + p')].map((e) => e.getBoundingClientRect());
+    let min = 1e9;
+    for (const a of rows) for (const b of text) {
+      const v = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+      if (v <= 0) continue; // not at the same height: cannot collide
+      min = Math.min(min, b.left - a.right);
+    }
+    worst.push(Math.round(min));
+  }
+  return { min: Math.min(...worst), gap: ${gap} };
+})()`;
+
 let failed = 0;
+for (const w of [390, 1024, 1190, 1280, 1440]) {
+  for (const lang of ["", "id/"]) {
+    const url = new URL(lang, base).href;
+    const p = await open(w, w < 600 ? 844 : 800, url);
+    const r = (await p.ev(RAIL_PROBE(w < 768 ? 1 : 32))) as { min: number; gap: number };
+    p.close();
+    const bad = r.min < r.gap;
+    console.log(`rail ${w} ${lang || "en/"}`, bad ? `FAIL: gap ${r.min}px < ${r.gap}px` : `ok (gap ${r.min > 1e8 ? "n/a" : r.min + "px"})`);
+    if (bad) failed++;
+  }
+}
 for (const [w, h] of SIZES) {
   const p = await open(w, h);
   const r = (await p.ev(PROBE)) as { overlap: number; shown: number; pinned: number };
