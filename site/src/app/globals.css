@@ -2565,83 +2565,6 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 
-/* Open tables: data flows out of the table along each reader's wire. */
-.lk-open-wires-narrow {
-  display: none;
-}
-@container lk-tables (max-width: 459px) {
-  .lk-open-wires-wide {
-    display: none;
-  }
-  .lk-open-wires-narrow {
-    display: block;
-  }
-  .lk-open-tables .lk-open-reader {
-    left: var(--nx);
-    top: var(--ny);
-  }
-}
-.lk-open-wire-base {
-  stroke: rgba(143, 203, 255, 0.18);
-  stroke-width: 1;
-}
-.lk-open-wire-flow {
-  stroke: #8fcbff;
-  stroke-width: 1.5;
-  stroke-linecap: round;
-  stroke-dasharray: 2 10;
-  animation: lk-open-flow 1.6s linear infinite;
-  transition: stroke 0.2s ease;
-}
-.lk-open-wire[data-for="engine"] .lk-open-wire-flow {
-  animation-delay: -0.5s;
-}
-.lk-open-wire[data-for="notebook"] .lk-open-wire-flow {
-  animation-delay: -1s;
-}
-@keyframes lk-open-flow {
-  to {
-    stroke-dashoffset: -24;
-  }
-}
-.lk-open-table {
-  background: var(--lk-n-raised);
-  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
-}
-/* Iceberg keeps snapshots: two faint ones stacked behind the table. */
-.lk-open-table-back {
-  z-index: -1;
-  transform: translate(6px, 6px);
-  background: var(--lk-n-surface);
-  box-shadow:
-    inset 0 0 0 1px rgba(143, 203, 255, 0.2),
-    6px 6px 0 -1px var(--lk-n-bg),
-    6px 6px 0 0 rgba(143, 203, 255, 0.12);
-}
-.lk-open-tables {
-  container: lk-tables / inline-size;
-}
-.lk-open-reader {
-  left: var(--x);
-  top: var(--y);
-  background: var(--lk-n-raised);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
-  transition: box-shadow 0.2s ease;
-}
-.lk-open-reader:hover {
-  box-shadow:
-    inset 0 0 0 1px rgba(143, 203, 255, 0.6),
-    0 0 18px -4px rgba(68, 166, 250, 0.6);
-}
-.lk-open-tables:has(.lk-open-reader:hover) .lk-open-wire-flow {
-  stroke: rgba(143, 203, 255, 0.35);
-}
-.lk-open-tables:has(.lk-open-reader[data-for="clickhouse"]:hover) .lk-open-wire[data-for="clickhouse"] .lk-open-wire-flow,
-.lk-open-tables:has(.lk-open-reader[data-for="engine"]:hover) .lk-open-wire[data-for="engine"] .lk-open-wire-flow,
-.lk-open-tables:has(.lk-open-reader[data-for="notebook"]:hover) .lk-open-wire[data-for="notebook"] .lk-open-wire-flow {
-  stroke: #e8f4ff;
-}
-
 /* Your servers or ours: two radio buttons drive the picture. */
 .lk-open-seg {
   background: var(--lk-n-raised);
@@ -2662,65 +2585,6 @@ section[data-role="admin"] .lk-gv-closed {
   outline: 2px solid #8fcbff;
   outline-offset: 1px;
 }
-.lk-open-stage {
-  container-type: inline-size;
-  min-height: 180px;
-  background: var(--lk-n-surface);
-}
-.lk-open-unit {
-  background: rgba(255, 255, 255, 0.06);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
-}
-.lk-open-led {
-  background: #7ee2b0;
-  animation: lk-twinkle 1.6s ease-in-out infinite;
-}
-.lk-open-rack,
-.lk-open-cloud {
-  transition: opacity 0.4s ease;
-}
-.lk-open-cloud {
-  opacity: 0.3;
-  animation: lk-open-drift 7s ease-in-out infinite;
-}
-@keyframes lk-open-drift {
-  50% {
-    translate: -6px 0;
-  }
-}
-.lk-open-stack {
-  bottom: 110px;
-  background: var(--lk-n-raised);
-  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
-  transition:
-    transform 0.7s var(--lk-ease),
-    bottom 0.7s var(--lk-ease);
-}
-.lk-open-note-ours {
-  display: none;
-}
-.lk-open-host:has(input[value="ours"]:checked) {
-  & .lk-open-seg-thumb {
-    transform: translateX(100%);
-  }
-  & .lk-open-rack {
-    opacity: 0.3;
-  }
-  & .lk-open-cloud {
-    opacity: 1;
-  }
-  & .lk-open-stack {
-    bottom: calc(100% - 6.25rem);
-    transform: translateX(calc(100cqw - 100% - 2rem + 0.25rem));
-  }
-  & .lk-open-note-yours {
-    display: none;
-  }
-  & .lk-open-note-ours {
-    display: inline;
-  }
-}
-
 /* The console's home: a dark recreation whose placeholder types prompts in turn. */
 .lk-con-box {
   background: var(--lk-n-raised);
@@ -2774,11 +2638,6 @@ section[data-role="admin"] .lk-gv-closed {
 
 @media (prefers-reduced-motion: reduce) {
   .lk-open-band,
-  .lk-open-wire-flow,
-  .lk-open-led,
-  .lk-open-cloud,
-  .lk-open-stack,
-  .lk-open-seg-thumb,
   .lk-con-caret,
   .lk-con-short {
     animation: none !important;
@@ -2871,4 +2730,319 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-ast-log {
   -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 40px);
   mask-image: linear-gradient(180deg, transparent 0, #000 40px);
+}
+
+/* ---- Open tables, the anatomy (home/tables-anatomy.tsx) ------------------------------------ */
+.lk-tb {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  background: var(--lk-n-surface);
+}
+.lk-tb-label {
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: rgba(232, 244, 255, 0.5);
+}
+.lk-tb-engine,
+.lk-tb-table,
+.lk-tb-file {
+  position: relative;
+  background: var(--lk-n-raised);
+  border-radius: 12px;
+}
+.lk-tb-engine {
+  padding: 8px 10px 9px;
+  transition: box-shadow 0.2s ease, transform 0.2s var(--lk-ease);
+}
+.lk-tb-table {
+  padding: 12px 14px;
+}
+.lk-tb-file {
+  padding: 6px 10px;
+  border-radius: 8px;
+  color: rgba(232, 244, 255, 0.8);
+  transition: box-shadow 0.2s ease, color 0.2s ease;
+}
+/* A wire from each engine down to the table, and from the table down to the files. */
+.lk-tb-stem {
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 1px;
+  height: 14px;
+  background: rgba(143, 203, 255, 0.28);
+  transition: background-color 0.2s ease;
+}
+.lk-tb-table::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 1px;
+  height: 14px;
+  background: rgba(143, 203, 255, 0.28);
+  transition: background-color 0.2s ease;
+}
+/* The snapshot timeline: a hairline with a dot per snapshot; the tip names its row count. */
+.lk-tb-snaps {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+.lk-tb-snap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 16px;
+  color: rgba(232, 244, 255, 0.7);
+}
+.lk-tb-snap + .lk-tb-snap::before {
+  content: "";
+  position: absolute;
+  right: calc(100% + 2px);
+  width: 14px;
+  height: 1px;
+  background: rgba(143, 203, 255, 0.3);
+}
+.lk-tb-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(143, 203, 255, 0.4);
+  transition: transform 0.2s var(--lk-ease), background-color 0.2s ease;
+}
+.lk-tb-snap[data-current] .lk-tb-dot {
+  background: #8fcbff;
+}
+.lk-tb-snap:hover .lk-tb-dot {
+  transform: scale(1.4);
+  background: #8fcbff;
+}
+.lk-tb-snaptip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  translate: -50% 0;
+  padding: 2px 8px;
+  border-radius: 8px;
+  background: var(--lk-n-bg);
+  color: #e8f4ff;
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+.lk-tb-snap:hover .lk-tb-snaptip {
+  opacity: 1;
+}
+/* An engine lit: its own stem, the table's wire and every file light up (the same files, no copy). */
+.lk-tb-engine:hover {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
+  transform: translateY(-2px);
+}
+.lk-tb-engine:hover .lk-tb-stem {
+  background: #8fcbff;
+}
+.lk-tb:has(.lk-tb-engine:hover) .lk-tb-table::after {
+  background: #8fcbff;
+}
+.lk-tb:has(.lk-tb-engine:hover) .lk-tb-file {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.45);
+  color: #e8f4ff;
+}
+/* Entering: the tiers draw in top-down, then a pulse climbs each stem from the files. */
+.lk-show-visual[data-on] .lk-tb-tier {
+  animation: lk-tb-in 0.55s var(--lk-ease) backwards;
+  animation-delay: var(--d, 0s);
+}
+.lk-show-visual[data-on] .lk-tb-file {
+  animation: lk-tb-in 0.45s var(--lk-ease) backwards;
+  animation-delay: calc(0.5s + var(--i) * 0.08s);
+}
+.lk-tb-stem::after {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: 0;
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: #8fcbff;
+  opacity: 0;
+}
+.lk-show-visual[data-on] .lk-tb-stem::after {
+  animation: lk-tb-pulse 3.2s ease-in-out infinite;
+  animation-delay: calc(1.2s + var(--i) * 0.45s);
+}
+@keyframes lk-tb-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+@keyframes lk-tb-pulse {
+  0%,
+  100% {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  15% {
+    opacity: 1;
+  }
+  45% {
+    opacity: 0;
+    transform: translateY(0);
+  }
+}
+
+/* ---- Your servers or ours, the real stack (home/hosting-stack.tsx) --------------------------- */
+.lk-hs {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  background: var(--lk-n-surface);
+}
+.lk-hs-thumb {
+  background: rgba(68, 166, 250, 0.22);
+  transition: transform 0.22s var(--lk-ease);
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-thumb {
+  transform: translateX(calc(100% + 0px));
+}
+.lk-hs-box {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  transition: box-shadow 0.22s ease;
+}
+.lk-hs-head {
+  color: rgba(232, 244, 255, 0.75);
+  transition: color 0.22s ease;
+}
+.lk-hs-name-ours,
+.lk-hs-sources {
+  opacity: 0;
+}
+.lk-hs-name-yours,
+.lk-hs-name-ours,
+.lk-hs-sources,
+.lk-hs-term,
+.lk-hs-talk {
+  transition: opacity 0.22s ease, transform 0.22s var(--lk-ease);
+}
+.lk-hs-talk {
+  opacity: 0;
+  pointer-events: none;
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-box {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-head {
+  color: #8fcbff;
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-name-yours,
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-term {
+  opacity: 0;
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-name-ours,
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-sources {
+  opacity: 1;
+}
+.lk-hs:has(input[value="ours"]:checked) .lk-hs-talk {
+  opacity: 1;
+  pointer-events: auto;
+}
+.lk-hs-card {
+  border-radius: 10px;
+  padding: 8px 9px;
+  background: var(--lk-n-raised);
+  transition: box-shadow 0.2s ease, transform 0.2s var(--lk-ease);
+}
+.lk-hs-card:hover {
+  transform: translateY(-2px);
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
+}
+/* Hovering a card lights the cards it talks to. */
+.lk-hs:has(.lk-hs-card[data-id="console"]:hover) .lk-hs-card[data-rel~="console"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="api"]:hover) .lk-hs-card[data-rel~="api"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="postgres"]:hover) .lk-hs-card[data-rel~="postgres"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="clickhouse"]:hover) .lk-hs-card[data-rel~="clickhouse"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="lakekeeper"]:hover) .lk-hs-card[data-rel~="lakekeeper"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="rustfs"]:hover) .lk-hs-card[data-rel~="rustfs"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="openfga"]:hover) .lk-hs-card[data-rel~="openfga"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+.lk-hs:has(.lk-hs-card[data-id="dagster"]:hover) .lk-hs-card[data-rel~="dagster"] {
+  box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.3);
+  background: #16293f;
+}
+/* Booting like `compose up`: each card goes from Starting to Started, one after another. */
+.lk-hs-st-a {
+  opacity: 0;
+}
+.lk-show-visual[data-on] .lk-hs-st-a {
+  opacity: 1;
+  animation: lk-hs-out 0.2s ease forwards;
+  animation-delay: calc(0.5s + var(--i) * 0.4s);
+}
+.lk-show-visual[data-on] .lk-hs-st-b {
+  opacity: 0;
+  animation: lk-hs-in 0.2s ease forwards;
+  animation-delay: calc(0.5s + var(--i) * 0.4s);
+}
+.lk-show-visual[data-on] .lk-hs-done {
+  opacity: 0;
+  animation: lk-hs-in 0.25s ease forwards;
+  animation-delay: 3.8s;
+}
+@keyframes lk-hs-out {
+  to {
+    opacity: 0;
+  }
+}
+@keyframes lk-hs-in {
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-tb *,
+  .lk-hs * {
+    animation: none !important;
+  }
+  .lk-tb-stem::after {
+    display: none;
+  }
+  .lk-hs-thumb,
+  .lk-hs-box,
+  .lk-hs-name-yours,
+  .lk-hs-name-ours,
+  .lk-hs-sources,
+  .lk-hs-term,
+  .lk-hs-talk,
+  .lk-hs-card,
+  .lk-tb-engine {
+    transition: none !important;
+  }
 }

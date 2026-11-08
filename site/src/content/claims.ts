@@ -118,7 +118,7 @@ export const CLAIMS: readonly Claim[] = [
   { key: "home.open.cards.1.body", backlog: ["WEB-1 In Acceptance", "BLD-3 Done"], note: "raw data is Iceberg (BLD-3: Bronze is Iceberg), so any Iceberg reader can read it (WEB-1's open-tables card)" },
   { key: "home.open.tables.builtIn", backlog: ["BLD-3 Done"], note: "the Lakehouse reads its Iceberg tables with ClickHouse, through a DataLakeCatalog database (compose: clickhouse-iceberg-init); no other engine is named" },
   { key: "home.open.cards.2.body", backlog: ["WEB-1 In Acceptance", "REL-2 Done"], note: "the stack runs on your servers from docker-compose.yml; running it for you is only \"talk to us\"" },
-  { key: "home.open.hosting.oursNote", backlog: ["WEB-1 In Acceptance"], note: "\"talk to us about running it\": no managed offering is claimed" },
+  { key: "home.open.hosting.talk", backlog: ["WEB-1 In Acceptance"], note: "\"talk to us about running it\": no managed offering is claimed" },
   // Get started (D20, 2026-11-07): the README's Quickstart, step by step.
   { key: "home.getStarted.sub", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart: \"Assumes you have Docker installed and nothing else\"" },
   { key: "home.getStarted.steps.0.note", backlog: ["WEB-1 In Acceptance"], note: "README Quickstart step 1: git clone the public repository" },

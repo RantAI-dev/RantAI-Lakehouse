@@ -2,15 +2,10 @@ import * as React from "react";
 import {
   ArrowUp,
   BarChart3,
-  Cloud,
-  Database,
   FileCode2,
   GitBranch,
-  NotebookPen,
   Plug,
   SlidersHorizontal,
-  SquareTerminal,
-  Table2,
 } from "lucide-react";
 import type { HomeCopy } from "@/lib/copy";
 import { MascotMark } from "@/components/shared/mascot-svg";
@@ -99,138 +94,6 @@ export function CodePanel({ copy, action }: { copy: OpenCopy["code"]; action?: R
         )}
       </pre>
       {action && <div className="absolute right-3 bottom-3">{action}</div>}
-    </div>
-  );
-}
-
-// ---- Open tables: one Iceberg table, several readers ----------------------
-
-/**
- * Readers placed around the table, in percent of the diagram. ClickHouse is
- * the engine the Lakehouse itself reads Iceberg with (BLD-3: Bronze is read
- * through a `DataLakeCatalog` database); the other two are generic, because
- * the claim is "any engine that reads Iceberg" and no other engine is named
- * anywhere the backlog backs. No logos: there is no licensed mark in the
- * site for any of them (DESIGN.md: a neutral icon, never a fake logo).
- */
-const READERS = [
-  { id: "clickhouse", x: 23, y: 22, nx: 50, ny: 14, icon: Database },
-  { id: "engine", x: 23, y: 78, nx: 27, ny: 86, icon: SquareTerminal },
-  { id: "notebook", x: 79, y: 50, nx: 73, ny: 86, icon: NotebookPen },
-] as const;
-
-/** The wires, in the wide layout (readers left and right) or the narrow one (one above, two below). */
-function Wires({ narrow }: { narrow?: boolean }) {
-  return (
-    <svg
-      className={`absolute inset-0 size-full ${narrow ? "lk-open-wires-narrow" : "lk-open-wires-wide"}`}
-      viewBox="0 0 100 100"
-      preserveAspectRatio="none"
-    >
-      {READERS.map((r) => (
-        <g key={r.id} className="lk-open-wire" data-for={r.id}>
-          <line x1="50" y1="50" x2={narrow ? r.nx : r.x} y2={narrow ? r.ny : r.y} className="lk-open-wire-base" vectorEffect="non-scaling-stroke" />
-          <line x1="50" y1="50" x2={narrow ? r.nx : r.x} y2={narrow ? r.ny : r.y} className="lk-open-wire-flow" vectorEffect="non-scaling-stroke" />
-        </g>
-      ))}
-    </svg>
-  );
-}
-
-export function TablesDiagram({ copy }: { copy: OpenCopy["tables"] }) {
-  const label = { clickhouse: "ClickHouse", engine: copy.engine, notebook: copy.notebook } as const;
-  return (
-    <div className="lk-open-tables relative h-full min-h-[200px] overflow-hidden rounded-2xl">
-      <p className="sr-only">{copy.sr}</p>
-      {/* O38 review fix: the diagram lives in a centred box 24 px inside the
-          panel and at most 560 px wide, so no reader chip ever reaches an
-          edge, however large the panel. */}
-      <div aria-hidden="true" className="absolute inset-6 mx-auto max-w-[560px]">
-        <Wires />
-        <Wires narrow />
-        {/* The table in the middle: one Iceberg table, its snapshots stacked behind it. */}
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
-          <div className="lk-open-table relative rounded-xl px-3.5 py-2.5">
-            <span className="lk-open-table-back absolute inset-0 rounded-xl" />
-            <span className="relative flex items-center gap-2">
-              <Table2 className="size-4 text-[#8fcbff]" strokeWidth={2} />
-              <code className="!text-[13px] !leading-5 font-medium text-[#E8F4FF]">{copy.table}</code>
-            </span>
-            <span className="relative mt-0.5 block text-[11px] leading-4 text-[#E8F4FF]/60">{copy.format}</span>
-          </div>
-        </div>
-        {READERS.map((r) => {
-          const Icon = r.icon;
-          return (
-            <span
-              key={r.id}
-              className="lk-open-reader absolute inline-flex -translate-x-1/2 -translate-y-1/2 items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] leading-4 whitespace-nowrap"
-              data-for={r.id}
-              style={{ "--x": `${r.x}%`, "--y": `${r.y}%`, "--nx": `${r.nx}%`, "--ny": `${r.ny}%` } as React.CSSProperties}
-            >
-              <Icon className="size-3.5 shrink-0 text-[#8fcbff]" strokeWidth={2} />
-              <span className="text-[#E8F4FF]/90">{label[r.id]}</span>
-              {r.id === "clickhouse" && <span className="text-[#E8F4FF]/50">· {copy.builtIn}</span>}
-            </span>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-// ---- Your servers or ours: the same stack, two homes ----------------------
-
-/**
- * A two-way switch built from radio buttons: no script, a real keyboard
- * control (arrow keys move between the two), and the picture follows
- * through `:has(:checked)` in CSS. The stack slides from a rack to a cloud.
- * "Run for you" says only what the copy claims: talk to us about it.
- */
-export function HostingSwitch({ copy }: { copy: OpenCopy["hosting"] }) {
-  return (
-    <div className="lk-open-host flex h-full flex-col gap-3 p-4">
-      <fieldset className="lk-open-seg relative inline-grid w-full grid-cols-2 rounded-xl p-1 text-[13px] leading-5 font-medium">
-        <legend className="sr-only">{copy.label}</legend>
-        <span aria-hidden="true" className="lk-open-seg-thumb absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-lg" />
-        <label className="lk-open-seg-opt relative z-10 cursor-pointer rounded-lg px-3 py-1.5 text-center">
-          <input type="radio" name="lk-host" value="yours" defaultChecked className="sr-only" />
-          {copy.yours}
-        </label>
-        <label className="lk-open-seg-opt relative z-10 cursor-pointer rounded-lg px-3 py-1.5 text-center">
-          <input type="radio" name="lk-host" value="ours" className="sr-only" />
-          {copy.ours}
-        </label>
-      </fieldset>
-      <div aria-hidden="true" className="lk-open-stage relative min-h-[150px] flex-1 overflow-hidden rounded-2xl">
-        {/* Your servers: a rack whose lights blink. */}
-        <span className="lk-open-rack absolute bottom-7 left-4 flex w-[42%] max-w-[220px] flex-col gap-1.5">
-          {[0, 1, 2].map((i) => (
-            <span key={i} className="lk-open-unit flex h-5 items-center gap-1.5 rounded-md px-2">
-              <span className="lk-open-led size-1 rounded-full" style={{ animationDelay: `${i * 0.7}s` }} />
-              <span className="lk-open-led size-1 rounded-full" style={{ animationDelay: `${i * 0.7 + 0.35}s` }} />
-              <span className="ml-auto h-px w-1/3 bg-[#E8F4FF]/15" />
-            </span>
-          ))}
-        </span>
-        {/* Ours: a cloud drifting. */}
-        <span className="lk-open-cloud absolute top-4 right-3 grid w-[44%] max-w-[170px] place-items-center">
-          <Cloud className="h-auto w-full text-[#8fcbff]" strokeWidth={1} />
-        </span>
-        {/* The stack itself: the same Lakehouse in either home. */}
-        <span className="lk-open-stack absolute left-4 flex w-[42%] max-w-[220px] flex-col items-center gap-1 rounded-xl px-2 py-2">
-          <MascotMark className="h-4 w-auto" />
-          <span className="flex w-full flex-col gap-0.5">
-            <span className="h-1 rounded-full bg-[#C8834A]" />
-            <span className="h-1 rounded-full bg-[#B9C6D3]" />
-            <span className="h-1 rounded-full bg-[#F2C14E]" />
-          </span>
-        </span>
-        <span className="lk-open-note absolute inset-x-0 bottom-1.5 text-center text-[11px] leading-4 text-[#E8F4FF]/65">
-          <span className="lk-open-note-yours">{copy.yoursNote}</span>
-          <span className="lk-open-note-ours">{copy.oursNote}</span>
-        </span>
-      </div>
     </div>
   );
 }

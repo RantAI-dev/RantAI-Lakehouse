@@ -302,14 +302,37 @@
       "builtIn": "built in",
       "engine": "Your query engine",
       "notebook": "Your notebook",
-      "sr": "An Apache Iceberg table in the middle, read by ClickHouse, which the Lakehouse runs, and by any other engine or notebook that reads Iceberg."
+      "sr": "An Apache Iceberg table in the middle, read by ClickHouse, which the Lakehouse runs, and by any other engine or notebook that reads Iceberg.",
+      "anyEngine": "Any engine that reads Iceberg",
+      "storage": "Your object storage",
+      "snapshots": "Snapshots",
+      "rows": "{n} rows",
+      "current": "current",
+      "dbTitle": "Same files, no copy"
     },
     "hosting": {
       "label": "Where it runs",
       "yours": "Your servers",
       "ours": "Run for you",
-      "yoursNote": "On your own infrastructure",
-      "oursNote": "Talk to us about running it"
+      "yourNetwork": "Your network",
+      "inside": "Your data stays inside",
+      "ranBy": "Run by RantAI for you",
+      "insideOurs": "Your sources connect in",
+      "starting": "Starting",
+      "started": "Started",
+      "allStarted": "8 services started",
+      "talk": "Talk to us about running it for you",
+      "sourcesLabel": "Your sources",
+      "roles": {
+        "console": "the app you use",
+        "api": "Rust, checks every request",
+        "postgres": "settings and history",
+        "clickhouse": "fast queries",
+        "lakekeeper": "Iceberg catalog",
+        "rustfs": "your files",
+        "openfga": "who sees what",
+        "dagster": "runs pipelines"
+      }
     },
     "console": {
       "window": "Home",

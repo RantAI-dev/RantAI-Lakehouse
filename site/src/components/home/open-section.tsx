@@ -4,7 +4,9 @@ import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { LINKS } from "@/lib/home-content";
 import { Container, CtaLink, DisplayHeading } from "@/components/shared/primitives";
 import { SplitWords } from "@/components/shared/reveal";
-import { CodePanel, ConsoleHome, HostingSwitch, TablesDiagram } from "./open-visuals";
+import { CodePanel, ConsoleHome } from "./open-visuals";
+import { HostingStack } from "./hosting-stack";
+import { TablesAnatomy } from "./tables-anatomy";
 import { OpenShowcase } from "./open-showcase";
 
 /**
@@ -31,7 +33,7 @@ import { OpenShowcase } from "./open-showcase";
 const NO_SCRIPT_CSS =
   "@media (min-width:64rem){.lk-show{grid-template-columns:minmax(0,1fr)!important;grid-template-rows:none!important;row-gap:16px!important}.lk-show-mark{display:none!important}.lk-show-pin,.lk-show-cols,.lk-show-list,.lk-show-stage{display:contents!important}.lk-show-visual{opacity:1!important;visibility:visible!important;transform:none!important;height:auto!important;min-height:260px!important;max-width:40rem!important;margin-bottom:32px!important;grid-area:auto!important}.lk-show-item .lk-show-title,.lk-show-item .lk-show-line{color:inherit!important}.lk-show-item{border-left-color:rgba(232,244,255,.1)!important}}";
 
-export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: CommonCopy["cta"] }) {
+export function OpenSection({ copy, cta, contactHref }: { copy: HomeCopy["open"]; cta: CommonCopy["cta"]; contactHref: string }) {
   const [source, tables, servers] = copy.cards;
   const items = [
     {
@@ -49,8 +51,8 @@ export function OpenSection({ copy, cta }: { copy: HomeCopy["open"]; cta: Common
         />
       ),
     },
-    { title: tables.title, body: tables.body, visual: <TablesDiagram copy={copy.tables} /> },
-    { title: servers.title, body: servers.body, visual: <HostingSwitch copy={copy.hosting} /> },
+    { title: tables.title, body: tables.body, visual: <TablesAnatomy copy={copy.tables} /> },
+    { title: servers.title, body: servers.body, visual: <HostingStack copy={copy.hosting} contactHref={contactHref} /> },
     {
       title: copy.console.label,
       body: copy.console.caption,

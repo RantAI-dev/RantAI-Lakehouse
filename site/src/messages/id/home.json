@@ -302,14 +302,37 @@
       "builtIn": "bawaan",
       "engine": "Query engine Anda",
       "notebook": "Notebook Anda",
-      "sr": "Sebuah tabel Apache Iceberg di tengah, dibaca oleh ClickHouse yang dijalankan Lakehouse, dan oleh engine atau notebook lain yang membaca Iceberg."
+      "sr": "Sebuah tabel Apache Iceberg di tengah, dibaca oleh ClickHouse yang dijalankan Lakehouse, dan oleh engine atau notebook lain yang membaca Iceberg.",
+      "anyEngine": "Engine apa pun yang membaca Iceberg",
+      "storage": "Object storage Anda",
+      "snapshots": "Snapshot",
+      "rows": "{n} baris",
+      "current": "terkini",
+      "dbTitle": "File yang sama, tanpa salinan"
     },
     "hosting": {
       "label": "Tempat berjalan",
       "yours": "Server Anda",
       "ours": "Kami jalankan",
-      "yoursNote": "Di infrastruktur Anda sendiri",
-      "oursNote": "Bicarakan dengan kami"
+      "yourNetwork": "Jaringan Anda",
+      "inside": "Data Anda tetap di dalam",
+      "ranBy": "Dijalankan RantAI untuk Anda",
+      "insideOurs": "Sumber data Anda tersambung masuk",
+      "starting": "Memulai",
+      "started": "Berjalan",
+      "allStarted": "8 layanan berjalan",
+      "talk": "Bicarakan dengan kami soal menjalankannya untuk Anda",
+      "sourcesLabel": "Sumber data Anda",
+      "roles": {
+        "console": "aplikasi yang Anda pakai",
+        "api": "Rust, memeriksa tiap permintaan",
+        "postgres": "pengaturan dan riwayat",
+        "clickhouse": "query cepat",
+        "lakekeeper": "katalog Iceberg",
+        "rustfs": "file Anda",
+        "openfga": "siapa melihat apa",
+        "dagster": "menjalankan pipeline"
+      }
     },
     "console": {
       "window": "Beranda",
