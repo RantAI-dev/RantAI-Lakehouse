@@ -74,8 +74,11 @@ function Panel({ copy }: { copy: AssistantCopy }) {
   return (
     <div aria-hidden="true" className="lk-ast lk-ast-still" data-s={ALL_STEPS}>
       {/* Header: the guide's mark (WEB-5 D14 S4) and its name. O35: no status, no divider. */}
-      <div className="flex items-center gap-2 px-5 pt-4">
-        <MascotMark className="h-3 w-auto" />
+      <div className="flex items-center gap-3 px-5 pt-4">
+        {/* The mark sits in the avatar's own 24px slot, so both marks share one vertical axis. */}
+        <span className="grid size-6 shrink-0 place-items-center">
+          <MascotMark className="h-[11px] w-auto" />
+        </span>
         <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/80">{copy.name}</span>
       </div>
 
