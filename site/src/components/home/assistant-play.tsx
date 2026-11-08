@@ -11,14 +11,50 @@ import * as React from "react";
  * wiping it in view). When the panel is really on show (see below) it loads the
  * timed script as its own chunk and plays it once, pausing while it is not.
  */
+/**
+ * The conversation is stacked from the bottom, so once it has settled the oldest user
+ * bubble can sit half out of the top of the log, under the fade. A half bubble reads as a
+ * rendering fault, so a bubble that is not whole is let go entirely (`data-clipped`);
+ * assistant replies are tall and keep scrolling out as they do in a real chat.
+ */
+function hideClippedBubbles(panel: HTMLElement) {
+  const log = panel.querySelector(".lk-ast-log");
+  if (!log) return;
+  const top = log.getBoundingClientRect().top;
+  for (const b of log.querySelectorAll<HTMLElement>(".lk-ast-user")) {
+    b.removeAttribute("data-clipped");
+    if (b.getBoundingClientRect().top < top + 8) b.setAttribute("data-clipped", "");
+  }
+}
+
 export function AssistantPlay({ children }: { children: React.ReactNode }) {
   const ref = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
     const panel = ref.current?.firstElementChild;
     if (!(panel instanceof HTMLElement)) return;
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    // Re-measure whenever the panel has reached its last step or is resized.
+    let settle = 0;
+    const settled = () => {
+      window.clearTimeout(settle);
+      if (!panel.dataset.s?.split(" ").includes("12")) {
+        for (const b of panel.querySelectorAll("[data-clipped]")) b.removeAttribute("data-clipped");
+      }
+      settle = window.setTimeout(() => {
+        if (panel.dataset.s?.split(" ").includes("12")) hideClippedBubbles(panel);
+      }, 750);
+    };
+    const mo = new MutationObserver(settled);
+    mo.observe(panel, { attributes: true, attributeFilter: ["data-s"] });
+    window.addEventListener("resize", settled);
+    settled();
+    const stopSettle = () => {
+      mo.disconnect();
+      window.clearTimeout(settle);
+      window.removeEventListener("resize", settled);
+    };
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return stopSettle;
     const box = panel.getBoundingClientRect();
-    if (box.top < window.innerHeight && box.bottom > 0) return;
+    if (box.top < window.innerHeight && box.bottom > 0) return stopSettle;
     panel.dataset.s = "";
     panel.classList.remove("lk-ast-still");
     // Owner QA: the play starts only when the panel is really on show: the depths stage above it
@@ -59,6 +95,7 @@ export function AssistantPlay({ children }: { children: React.ReactNode }) {
     onScroll();
     return () => {
       gone = true;
+      stopSettle();
       if (frame) cancelAnimationFrame(frame);
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", onScroll);

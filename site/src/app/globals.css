@@ -1700,6 +1700,14 @@ section[data-role="admin"] .lk-gv-closed {
   -webkit-mask-image: linear-gradient(to bottom, transparent, #000 20px);
 }
 
+/* A user bubble that settled half out of the top is let go whole (assistant-play.tsx). */
+.lk-ast-user {
+  transition: opacity 0.2s ease;
+}
+.lk-ast-user[data-clipped] {
+  opacity: 0;
+}
+
 /* A message opens its height from zero, so the panel grows under it. */
 .lk-ast-grow {
   display: grid;
