@@ -94,30 +94,47 @@ const PROBE = `(async () => {
 })()`;
 
 /**
- * Owner QA (the depths rail, 3D path): the rail's labels must never touch the stage's heading or
- * its line. For each width, language and stage (Bronze, Silver, Gold: the pinned section at 1/6,
- * 1/2 and 5/6 of its scroll), no rail row (`.lk-depth-rail > div`: tick and label) may come
- * within GAP px of the heading or the body line. GAP is 32 from md up; on phones the rows are
- * the bare ticks and must only not intersect.
+ * Owner QA (the depths stage, 3D path): from md up, the active depth's heading and line sit directly
+ * under its rail label (`.lk-depth-rail`), on the label's text edge, and never touch another label.
+ * For each width, language and stage (Bronze, Silver, Gold: the pinned section at 1/6, 1/2 and
+ * 5/6 of its scroll) it measures, after the 350 ms swap has settled:
+ * - the block's left x against the active label text's (within 2 px) and its top below the label's bottom;
+ * - no intersection with any other label row;
+ * - the heading and the line stay inside the window (bottom clear of the edge by BOTTOM px, for the language toast).
+ * On phones the rail is the bare line and the heading stays in the flow: the rows (`.lk-depth-rail-m > div`)
+ * must only not intersect the heading or its line.
  */
-const RAIL_PROBE = (gap: number) => `(async () => {
+const RAIL_PROBE = (md: boolean, bottom: number) => `(async () => {
   const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
   const sec = document.querySelector('#depths');
   const top = sec.getBoundingClientRect().top + scrollY;
-  const worst = [];
+  const res = [];
   for (const k of [1 / 6, 1 / 2, 5 / 6]) {
-    scrollTo(0, top + k * (sec.offsetHeight - innerHeight)); await frame(); await new Promise((r) => setTimeout(r, 900));
-    const rows = [...document.querySelectorAll('.lk-depth-rail > div')].map((e) => e.getBoundingClientRect());
-    const text = [...document.querySelectorAll('.lk-depth-grid-stage h3, .lk-depth-grid-stage h3 + p')].map((e) => e.getBoundingClientRect());
-    let min = 1e9;
-    for (const a of rows) for (const b of text) {
-      const v = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
-      if (v <= 0) continue; // not at the same height: cannot collide
-      min = Math.min(min, b.left - a.right);
+    scrollTo(0, top + k * (sec.offsetHeight - innerHeight)); await frame(); await new Promise((r) => setTimeout(r, 1200));
+    const errs = [];
+    if (${md}) {
+      const items = [...document.querySelectorAll('.lk-depth-rail > div')];
+      const act = items.find((e) => e.querySelector('.lk-depth-block[aria-live]'));
+      const lab = act.querySelector('span.uppercase').getBoundingClientRect();
+      const h = act.querySelector('h3').getBoundingClientRect(), p = act.querySelector('h3 + p').getBoundingClientRect();
+      if (Math.abs(h.left - lab.left) > 2) errs.push('left ' + Math.round(h.left - lab.left));
+      if (h.top < lab.bottom) errs.push('heading above label');
+      for (const it of items) if (it !== act) {
+        const r = it.querySelector('span.uppercase').getBoundingClientRect();
+        for (const b of [h, p]) if (Math.min(r.bottom, b.bottom) - Math.max(r.top, b.top) > 0 && Math.min(r.right, b.right) - Math.max(r.left, b.left) > 0) errs.push('hits a label');
+        if (r.top < p.bottom && r.bottom > h.top) errs.push('label beside block');
+      }
+      if (h.top < 64 || p.bottom > innerHeight - ${bottom}) errs.push('outside window ' + Math.round(h.top) + '..' + Math.round(p.bottom) + '/' + innerHeight);
+      res.push(errs.length ? errs.join(',') : 'ok(+' + Math.round(h.top - lab.bottom) + ')');
+    } else {
+      const rows = [...document.querySelectorAll('.lk-depth-rail-m > div')].map((e) => e.getBoundingClientRect());
+      const text = [...document.querySelectorAll('.lk-depth-grid-stage h3, .lk-depth-grid-stage h3 + p')].map((e) => e.getBoundingClientRect()).filter((r) => r.width > 0);
+      let hit = false;
+      for (const a of rows) for (const b of text) if (Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0 && Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0) hit = true;
+      res.push(hit ? 'hit' : 'ok');
     }
-    worst.push(Math.round(min));
   }
-  return { min: Math.min(...worst), gap: ${gap} };
+  return res;
 })()`;
 
 /**
@@ -192,14 +209,14 @@ for (const [w, h] of [[1190, 960], [1150, 810], [1440, 900]]) {
   console.log("assistant 1190x960", errors.length ? `FAIL: ${errors.join("; ")}` : `ok (steps at first sight ${r.startSteps}, rail opacity ${r.railWorst})`);
   if (errors.length) failed++;
 }
-for (const w of [390, 1024, 1190, 1280, 1440]) {
+for (const [w, h] of [[390, 844], [1024, 800], [1190, 735], [1190, 960], [1280, 800], [1440, 900]]) {
   for (const lang of ["", "id/"]) {
     const url = new URL(lang, base).href;
-    const p = await open(w, w < 600 ? 844 : 800, url);
-    const r = (await p.ev(RAIL_PROBE(w < 768 ? 1 : 32))) as { min: number; gap: number };
+    const p = await open(w, h, url);
+    const r = (await p.ev(RAIL_PROBE(w >= 768, 24))) as string[];
     p.close();
-    const bad = r.min < r.gap;
-    console.log(`rail ${w} ${lang || "en/"}`, bad ? `FAIL: gap ${r.min}px < ${r.gap}px` : `ok (gap ${r.min > 1e8 ? "n/a" : r.min + "px"})`);
+    const bad = r.some((x) => !x.startsWith("ok"));
+    console.log(`depths ${w}x${h} ${lang || "en/"} (bronze, silver, gold)`, bad ? `FAIL: ${r.join(" | ")}` : r.join(" "));
     if (bad) failed++;
   }
 }
