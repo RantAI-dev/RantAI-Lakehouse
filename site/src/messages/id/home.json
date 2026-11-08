@@ -347,19 +347,21 @@
     "sub": "Cukup Docker.",
     "steps": [
       {
-        "title": "Clone repository-nya"
+        "title": "Clone repository-nya",
+        "note": "Repository publik, lengkap dengan semua yang dibutuhkan stack-nya."
       },
       {
-        "title": "Atur konfigurasinya"
+        "title": "Atur konfigurasinya",
+        "note": "Menulis `.env` berisi secret yang dibuat otomatis. Isi `AUTH_BOOTSTRAP_EMAIL` dan `AUTH_BOOTSTRAP_PASSWORD` di sana untuk akun pertama Anda."
       },
       {
-        "title": "Jalankan"
+        "title": "Jalankan",
+        "note": "Lalu buka `http://localhost:3000`."
       }
     ],
     "copy": "Salin",
     "copied": "Tersalin",
     "copyFailed": "Terpilih: tekan Ctrl+C atau ⌘C",
-    "ready": "Siap di localhost:3000",
     "more": "Quickstart lengkap, konfigurasi, dan troubleshooting"
   },
   "faq": {

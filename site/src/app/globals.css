@@ -2184,44 +2184,30 @@ section[data-role="admin"] .lk-gv-closed {
     animation-timeline: --lk-gs;
     animation-range: cover 50vh cover calc(100% - 50vh);
   }
-  .lk-gs-num {
-    animation: lk-gs-lit linear both;
-    animation-timeline: view();
-    animation-range: cover calc(50vh - 48px) cover 50vh;
-  }
 }
 @keyframes lk-gs-fill {
   from {
     transform: scaleY(0);
   }
 }
-@keyframes lk-gs-lit {
-  from {
-    color: rgba(255, 255, 255, 0.5);
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2);
-    scale: 0.88;
-  }
+/* A step's number lights when its block reaches the middle of the screen
+   (get-started-play.tsx); settled without JavaScript or under reduced motion. */
+.lk-gs-num {
+  transition:
+    color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+    scale 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+[data-js] .lk-gs-steps > li:not([data-lit]) .lk-gs-num {
+  color: rgba(255, 255, 255, 0.5);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2);
+  scale: 0.88;
 }
 
-/* O45 rollback (and audit #5): every command shows at once, so no step
-   sits blank while another types; only what the commands print waits for
-   its terminal to come into view, then appears line by line. */
-.lk-gs-term[data-term="idle"] :is(.lk-gs-line, .lk-gs-ready) {
-  opacity: 0;
-}
 /* O35 follow-up: a flat terminal, one step lighter than the water, with a
    hairline. */
 .lk-gs-term {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
-}
-.lk-gs-term[data-term="done"] .lk-gs-line {
-  animation: lk-fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) 0.3s backwards;
-}
-.lk-gs-term[data-term="done"] .lk-gs-line:nth-child(2) {
-  animation-delay: 0.7s;
-}
-.lk-gs-term[data-term="done"] .lk-gs-ready {
-  animation: lk-fade-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) 1.1s backwards;
 }
 
 /* The copy button: the icon morphs between copy, check and select, and a

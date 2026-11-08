@@ -347,19 +347,21 @@
     "sub": "All it needs is Docker.",
     "steps": [
       {
-        "title": "Clone it"
+        "title": "Clone it",
+        "note": "The public repository, with everything the stack needs."
       },
       {
-        "title": "Configure it"
+        "title": "Configure it",
+        "note": "Writes `.env` with generated secrets. Set `AUTH_BOOTSTRAP_EMAIL` and `AUTH_BOOTSTRAP_PASSWORD` there for your first account."
       },
       {
-        "title": "Start it"
+        "title": "Start it",
+        "note": "Then open `http://localhost:3000`."
       }
     ],
     "copy": "Copy",
     "copied": "Copied",
     "copyFailed": "Selected: press Ctrl+C or ⌘C",
-    "ready": "Ready on localhost:3000",
     "more": "Full Quickstart, configuration and troubleshooting"
   },
   "faq": {
