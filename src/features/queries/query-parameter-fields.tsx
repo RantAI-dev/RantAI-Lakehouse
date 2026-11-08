@@ -73,7 +73,10 @@ function ParameterField({
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-1">
         {def.type === "dateRange" ? (
-          <span className="text-xs font-medium">{def.name}</span>
+          // The range's inputs are a group named by this label.
+          <span id={`${id}-label`} className="text-xs font-medium">
+            {def.name}
+          </span>
         ) : (
           <Label htmlFor={id} className="text-xs">
             {def.name}

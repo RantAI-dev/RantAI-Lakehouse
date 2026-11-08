@@ -85,7 +85,7 @@ Run, Run all and Estimate send the values and the definitions of the names the S
 
 When the server refuses a run or an estimate, its sentence shows where a run's error shows, and the field the sentence names is marked. The mark goes when that field's value or definition changes.
 
-Saving sends the definitions with their defaults, never the current values. Opening a saved query fills its definitions, and each field starts at its default. The version history shows "Parameters changed" with the names of the parameters that changed. History's "open in studio" opens the statement that ran, with its values already printed in it, so it opens with no fields.
+Saving sends the definitions with their defaults, never the current values. Opening a saved query fills its definitions, and each field starts at its default. A version whose parameters differ from the next older version shows "Parameters changed" with the names of the parameters that version holds, or "Parameters removed" when it holds none. The oldest version shows neither line. History's "open in studio" opens the statement that ran, with its values already printed in it, so it opens with no fields.
 
 After `{{`, the editor offers the names that the tab defines.
 
@@ -117,13 +117,10 @@ After `{{`, the editor offers the names that the tab defines.
   typed into a parameter stays in the caller's own History for 14 days.
   Download and "open in studio" need no values, because the statement already
   holds them.
-- A dropdown cannot be set back to "no value" once a person has picked an
-  option. The menu's Clear default button clears only the default.
-- Completion after `{{` starts on the first letter typed or with Ctrl+Space.
-  It offers nothing after a dot, as in `{{name.`.
+- A dropdown cannot be set back to "no value" once a person has picked an option. The menu's Clear default button clears only the default.
+- Completion after `{{` starts on the first letter typed or with Ctrl+Space, and it offers nothing after a dot, as in `{{name.`.
 - The editor's keyword completion may still list SQL keywords after `{{`.
-- An option list made in the console keeps its option values as text, so a
-  numeric list is printed as text literals.
+- An option list made in the console keeps its option values as text, so a numeric list is printed as text literals.
 - A dashboard cannot drive a query's parameters yet, and a dropdown cannot be
   filled from another query. Both are part 2.
 - A string literal that contains a well-formed `{{name}}` written by hand, for
@@ -173,7 +170,7 @@ ids on this page otherwise number part 1 only.
 | `QS-5-AC13` | (console) Type `x' OR '1'='1` in a text field, run it on ClickHouse, then run it on Trino | The field keeps the text as typed, and each run gives what `QS-5-AC2` expects, with nothing else run | Not run |
 | `QS-5-AC14` | (console) Write `{{region}}` with no default and no value, then run; type `EU` in the field and run again | The estimate shows nothing and asks for none while the field is empty; the first run is refused with "Fill in {{region}} to run this query.", and the field is marked; the second run goes, and the mark goes with the value | Not run |
 | `QS-5-AC15` | (console) Save a query with a text field whose default is `EU` and a dropdown with two options and no default; change the text field to `US` in the tab; save; reopen the saved query | The reopened fields show `EU` and no choice in the dropdown; `US` is not kept | Not run |
-| `QS-5-AC16` | (console) Open a saved query, change only the default of one field, save, and open its version history | The new version shows "Parameters changed" with that field's name; the first version shows no such line | Not run |
+| `QS-5-AC16` | (console) Open a saved query, change only the default of one field, save, and open its version history | The new version shows "Parameters changed" and lists the names of every parameter it holds, including that field; the oldest version shows no such line | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

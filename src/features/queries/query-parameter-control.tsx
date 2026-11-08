@@ -141,10 +141,22 @@ function isRange(value: QueryParamValue | undefined): value is QueryDateRange {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
+/** Whether two values are the same date range, or the same plain value. */
+function sameValue(a: QueryParamValue | undefined, b: QueryParamValue | undefined) {
+  if (isRange(a) && isRange(b)) return a.start === b.start && a.end === b.end
+  return a === b
+}
+
 /**
  * Two date inputs. The value is `{ start, end }` only when both are set; one
  * end alone is a half-typed range, so the control keeps it and reports no
  * value until the other end comes.
+ *
+ * The half-typed draft is kept only while the range is incomplete, and only
+ * while the person stays in it. It goes when focus leaves both inputs, and
+ * when the value changes without the control having reported it (a saved
+ * query opened into the same tab empties the values): the inputs then show
+ * what the next run will use.
  */
 function RangeInputs({
   id,
@@ -157,16 +169,37 @@ function RangeInputs({
   readonly invalid: boolean
   readonly onChange: (value: QueryParamValue | undefined) => void
 }) {
-  const [draft, setDraft] = React.useState<{ start?: string; end?: string }>({})
-  const start = draft.start ?? (isRange(value) ? value.start : "")
-  const end = draft.end ?? (isRange(value) ? value.end : "")
+  const [draft, setDraft] = React.useState<{ start: string; end: string } | null>(null)
+  // The value the draft was typed against. It follows the value the control
+  // itself reported (the render after `set`), and any other change drops the draft.
+  const [base, setBase] = React.useState(value)
+  const [reported, setReported] = React.useState(false)
+  if (reported) {
+    setReported(false)
+    setBase(value)
+  } else if (!sameValue(value, base)) {
+    setBase(value)
+    setDraft(null)
+  }
+  const start = draft?.start ?? (isRange(value) ? value.start : "")
+  const end = draft?.end ?? (isRange(value) ? value.end : "")
   function set(part: "start" | "end", next: string) {
     const merged = { start, end, [part]: next }
-    setDraft(merged)
-    onChange(merged.start && merged.end ? { start: merged.start, end: merged.end } : undefined)
+    const complete = merged.start !== "" && merged.end !== ""
+    setDraft(complete ? null : merged)
+    setReported(true)
+    onChange(complete ? { start: merged.start, end: merged.end } : undefined)
   }
   return (
-    <div className="flex items-center gap-2">
+    <div
+      role="group"
+      aria-labelledby={`${id}-label`}
+      className="flex items-center gap-2"
+      onBlur={(event) => {
+        // Moving from one end to the other stays inside the range.
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDraft(null)
+      }}
+    >
       <label className="flex items-center gap-1 text-xs text-muted-foreground" htmlFor={`${id}-start`}>
         Start
       </label>

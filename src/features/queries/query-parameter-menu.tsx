@@ -124,7 +124,13 @@ export function ParameterMenu({
           </Select>
         </div>
         <div className="space-y-1">
-          <Label htmlFor={`${id}-default`}>Default</Label>
+          {/* A range has two inputs, so its label names the group instead. */}
+          <Label
+            id={`${id}-default-label`}
+            htmlFor={def.type === "dateRange" ? undefined : `${id}-default`}
+          >
+            Default
+          </Label>
           <div className="flex items-center gap-2">
             <ParameterControl
               id={`${id}-default`}

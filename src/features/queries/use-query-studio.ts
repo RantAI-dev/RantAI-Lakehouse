@@ -622,6 +622,14 @@ export function useQueryStudio() {
     return { from, to }
   }, [])
 
+  // The names `{{` completes: every definition the open tab holds, the ones
+  // whose name is not in the SQL yet included. The source is built once, so
+  // it reads the names through this ref.
+  const parameterNamesRef = React.useRef<string[]>([])
+  React.useEffect(() => {
+    parameterNamesRef.current = parameterDefinitions.map((def) => def.name)
+  }, [parameterDefinitions])
+
   // The suggestions the editor offers. The source is built once and reads
   // the cache when it is asked, so a keystroke never waits for the network.
   const completionSource = React.useMemo(
@@ -633,14 +641,6 @@ export function useQueryStudio() {
       }),
     [tables]
   )
-
-  // The names `{{` completes: every definition the open tab holds, the ones
-  // whose name is not in the SQL yet included. The source is built once, so
-  // it reads the names through this ref.
-  const parameterNamesRef = React.useRef<string[]>([])
-  React.useEffect(() => {
-    parameterNamesRef.current = parameterDefinitions.map((def) => def.name)
-  }, [parameterDefinitions])
 
   // The key binding runs the selection when there is one and the whole tab
   // otherwise. It reads the action through a ref: the extension array must

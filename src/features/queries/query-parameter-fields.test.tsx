@@ -220,6 +220,132 @@ describe("QueryParameterFields", () => {
   })
 })
 
+/**
+ * The fields over state that an outside action can reset, the way
+ * `loadSql` empties the tab's values while the same tab (and so the same
+ * fields) stays mounted.
+ */
+function ResettableHarness({ definitions }: { definitions: QueryParamDef[] }) {
+  const [values, setValues] = React.useState<Values>({})
+  const [unrelated, setUnrelated] = React.useState(0)
+  return (
+    <>
+      <button type="button" onClick={() => setValues({})}>
+        Load saved query
+      </button>
+      <button
+        type="button"
+        onClick={() => setValues({ period: { start: "2026-03-01", end: "2026-03-31" } })}
+      >
+        Load saved query with a range
+      </button>
+      <button type="button" onClick={() => setUnrelated((count) => count + 1)}>
+        Touch {unrelated}
+      </button>
+      <QueryParameterFields
+        definitions={definitions}
+        values={values}
+        onValueChange={(name, value) =>
+          setValues((previous) => {
+            const next = { ...previous }
+            if (value === undefined) delete next[name]
+            else next[name] = value
+            return next
+          })
+        }
+        onDefinitionChange={() => {}}
+      />
+    </>
+  )
+}
+
+describe("QueryParameterFields date range after an outside reset", () => {
+  const PERIOD: QueryParamDef = { name: "period", type: "dateRange" }
+  const input = (label: string) => screen.getByLabelText(label) as HTMLInputElement
+
+  it("shows nothing after the values are reset while a complete range was typed", () => {
+    render(<ResettableHarness definitions={[PERIOD]} />)
+    fireEvent.change(input("Start"), { target: { value: "2026-11-01" } })
+    fireEvent.change(input("End"), { target: { value: "2026-11-07" } })
+    fireEvent.click(screen.getByRole("button", { name: "Load saved query" }))
+    expect(input("Start").value).toBe("")
+    expect(input("End").value).toBe("")
+  })
+
+  it("shows the default after the values are reset while a complete range was typed", () => {
+    render(
+      <ResettableHarness
+        definitions={[
+          { ...PERIOD, default: { start: "2026-01-01", end: "2026-01-31" } },
+        ]}
+      />
+    )
+    fireEvent.change(input("Start"), { target: { value: "2026-11-01" } })
+    fireEvent.change(input("End"), { target: { value: "2026-11-07" } })
+    fireEvent.click(screen.getByRole("button", { name: "Load saved query" }))
+    expect(input("Start").value).toBe("2026-01-01")
+    expect(input("End").value).toBe("2026-01-31")
+  })
+
+  it("drops a half-filled range once focus leaves it and the values are reset", () => {
+    render(<ResettableHarness definitions={[PERIOD]} />)
+    fireEvent.change(input("Start"), { target: { value: "2026-11-01" } })
+    expect(input("Start").value).toBe("2026-11-01")
+    fireEvent.blur(input("Start"))
+    fireEvent.click(screen.getByRole("button", { name: "Load saved query" }))
+    expect(input("Start").value).toBe("")
+  })
+
+  it("shows the loaded range, not a half-filled draft, when a saved query brings its own value", () => {
+    render(<ResettableHarness definitions={[PERIOD]} />)
+    fireEvent.change(input("Start"), { target: { value: "2026-11-01" } })
+    fireEvent.click(screen.getByRole("button", { name: "Load saved query with a range" }))
+    expect(input("Start").value).toBe("2026-03-01")
+    expect(input("End").value).toBe("2026-03-31")
+  })
+
+  it("keeps a half-filled range while the person is still typing in it", () => {
+    render(<ResettableHarness definitions={[PERIOD]} />)
+    fireEvent.change(input("Start"), { target: { value: "2026-11-01" } })
+    fireEvent.click(screen.getByRole("button", { name: /^Touch/ }))
+    expect(input("Start").value).toBe("2026-11-01")
+    // Moving from one end to the other is still inside the range.
+    fireEvent.blur(input("Start"), { relatedTarget: input("End") })
+    expect(input("Start").value).toBe("2026-11-01")
+  })
+
+  it("keeps the typed end when one end of a complete range is cleared", () => {
+    render(<ResettableHarness definitions={[PERIOD]} />)
+    fireEvent.change(input("Start"), { target: { value: "2026-11-01" } })
+    fireEvent.change(input("End"), { target: { value: "2026-11-07" } })
+    fireEvent.change(input("Start"), { target: { value: "" } })
+    expect(input("Start").value).toBe("")
+    expect(input("End").value).toBe("2026-11-07")
+  })
+})
+
+describe("QueryParameterFields date range names", () => {
+  it("names each range as a group, so two ranges are told apart", () => {
+    mountOver([
+      { name: "period", type: "dateRange" },
+      { name: "compare", type: "dateRange" },
+    ])
+    const period = screen.getByRole("group", { name: "period" })
+    const compare = screen.getByRole("group", { name: "compare" })
+    expect(within(period).getByLabelText("Start")).toBeTruthy()
+    expect(within(period).getByLabelText("End")).toBeTruthy()
+    expect(within(compare).getByLabelText("Start")).not.toBe(within(period).getByLabelText("Start"))
+  })
+
+  it("names the default of a range in the definition menu", () => {
+    mountOver([{ name: "period", type: "dateRange" }])
+    fireEvent.click(screen.getByRole("button", { name: "Edit definition of period" }))
+    const group = screen.getByRole("group", { name: "Default" })
+    expect(within(group).getByLabelText("Start")).toBeTruthy()
+    expect(within(group).getByLabelText("End")).toBeTruthy()
+  })
+})
+
 describe("QueryParameterFields definition menu", () => {
   it("opens from a button that names the parameter", () => {
     mountOver([{ name: "region", type: "text" }])
