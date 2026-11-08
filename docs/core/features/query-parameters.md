@@ -35,9 +35,7 @@ which values in it are meant to change.
    assistant's `run_sql` and `run_saved_query` take a `parameters` object, and
    the assistant asks when a value is missing.
 
-This page is part 1 of `QS-5`. The server and the assistant ship first. The
-Query Studio fields where a person types the values follow in a later pull
-request of the same feature.
+This page is part 1 of `QS-5`: the server, the assistant and the Query Studio fields. The Query Studio part is described in [Query Studio fields](#query-studio-fields).
 
 ## How this differs from Parameters (`BI-11`)
 
@@ -56,8 +54,6 @@ Linking a query's parameter to a global one is part 2.
   a query. They are later parts of `QS-5`.
 - Parameters in the SQL of a dashboard's SQL source. The server refuses them
   (decision 15).
-- The Query Studio fields for values and definitions. They arrive in a later
-  pull request of this feature.
 - The SQL help check inside the editor: that is the variables part of
   `AI-12`.
 
@@ -74,6 +70,24 @@ guessing. A refusal inside a tool is not written to History; the HTTP run
 records it as blocked. `save_query` refuses SQL that holds a `{{name}}`
 placeholder, because the tool cannot give definitions. The person saves such
 a query in Query Studio. The AI team reviews this part.
+
+## Query Studio fields
+
+Under the SQL editor, the tab shows one field for each `{{name}}` in its SQL, in the order each name first appears. A name in a comment or in a quoted string gets no field. A `{{name.start}}` and a `{{name.end}}` pair make one date range field. A new name gets text, or a date range when the SQL writes it only as `.start` and `.end`.
+
+Each field has the control for its type: a text or number input, a date picker, a start and an end date for a date range, a select for a dropdown, and a multi-select control for a multi-select. A field starts at its default when the tab holds no value for it.
+
+To set a field's type, default or options, press the small menu button on the field. The menu holds the type, the default with a Clear default button and, for a dropdown or a multi-select, the options: a label and a value for each, with Add option and a remove button. A list takes at most 200 options. Changing the type keeps the default only when it fits the new type, and keeps the options only for a dropdown or a multi-select. A value that no longer fits the new type is cleared.
+
+The tab keeps its definitions and its values across a reload, in this browser. A name that leaves the SQL drops its field, but the tab keeps what the person set for that name until the tab is closed, so a cut and paste does not lose it. A definition that nobody has edited and that has no value is dropped as its name leaves, so typing `{{re` on the way to `{{region}}` leaves no field behind.
+
+Run, Run all and Estimate send the values and the definitions of the names the SQL uses. When the SQL has no placeholder, they send the same request as before. The estimate waits while a value is missing: it sends no request and the panel shows no estimate until every field has a value.
+
+When the server refuses a run or an estimate, its sentence shows where a run's error shows, and the field the sentence names is marked. The mark goes when that field's value or definition changes.
+
+Saving sends the definitions with their defaults, never the current values. Opening a saved query fills its definitions, and each field starts at its default. A version whose parameters differ from the next older version shows "Parameters changed" with the names of the parameters that version holds, or "Parameters removed" when it holds none. The oldest version shows neither line. History's "open in studio" opens the statement that ran, with its values already printed in it, so it opens with no fields.
+
+After `{{`, the editor offers the names that the tab defines.
 
 ## Decisions
 
@@ -103,9 +117,10 @@ a query in Query Studio. The AI team reviews this part.
   typed into a parameter stays in the caller's own History for 14 days.
   Download and "open in studio" need no values, because the statement already
   holds them.
-- The server and the assistant take parameters first. The Query Studio fields
-  for values and definitions arrive in a later pull request of this feature,
-  so until then a person supplies values through the API or the assistant.
+- A dropdown cannot be set back to "no value" once a person has picked an option. The menu's Clear default button clears only the default.
+- Completion after `{{` starts on the first letter typed or with Ctrl+Space, and it offers nothing after a dot, as in `{{name.`.
+- The editor's keyword completion may still list SQL keywords after `{{`.
+- An option list made in the console keeps its option values as text, so a numeric list is printed as text literals.
 - A dashboard cannot drive a query's parameters yet, and a dropdown cannot be
   filled from another query. Both are part 2.
 - A string literal that contains a well-formed `{{name}}` written by hand, for
@@ -133,8 +148,7 @@ a query in Query Studio. The AI team reviews this part.
 ## Acceptance checklist
 
 Run by the product owner. A step not performed is never a pass. Rows marked
-(operator) call the API or run on a running build; the row marked (console)
-needs the Query Studio fields and waits for the later pull request. `AC2`
+(operator) call the API or run on a running build; rows marked (console) are run in Query Studio on a running console. `AC2`
 is the spec's `QS-5-AC2`. The spec's `AC1` (a dashboard filter drives a
 parameter) and `AC3` (a chart from a result) belong to later parts, and the
 ids on this page otherwise number part 1 only.
@@ -151,6 +165,12 @@ ids on this page otherwise number part 1 only.
 | `QS-5-AC8` | Sign in as a user without `query:read` and run a parameterised statement | Refused with a permission message, and nothing runs on the engine | Not run |
 | `QS-5-AC9` | (operator) Run a parameterised statement, open History, and use Download on that run | History shows the statement with the values printed in it, and Download returns the same rows without asking for values | Not run |
 | `QS-5-AC10` | (operator) Put a parameterised statement in a dashboard's SQL source | Refused with "Parameters in a dashboard's SQL source come later: give the value in the SQL for now." | Not run |
+| `QS-5-AC11` | (console) On ClickHouse, write one statement that uses a text, a number, a date, a date range, a dropdown and a multi-select parameter; set each type in its field's menu, give each field a value, and run | Rows come back filtered by the six values, and History shows the statement with the values printed in it | Not run |
+| `QS-5-AC12` | (console) The same as `QS-5-AC11`, on Trino | The same result as on ClickHouse | Not run |
+| `QS-5-AC13` | (console) Type `x' OR '1'='1` in a text field, run it on ClickHouse, then run it on Trino | The field keeps the text as typed, and each run gives what `QS-5-AC2` expects, with nothing else run | Not run |
+| `QS-5-AC14` | (console) Write `{{region}}` with no default and no value, then run; type `EU` in the field and run again | The estimate shows nothing and asks for none while the field is empty; the first run is refused with "Fill in {{region}} to run this query.", and the field is marked; the second run goes, and the mark goes with the value | Not run |
+| `QS-5-AC15` | (console) Save a query with a text field whose default is `EU` and a dropdown with two options and no default; change the text field to `US` in the tab; save; reopen the saved query | The reopened fields show `EU` and no choice in the dropdown; `US` is not kept | Not run |
+| `QS-5-AC16` | (console) Open a saved query, change only the default of one field, save, and open its version history | The new version shows "Parameters changed" and lists the names of every parameter it holds, including that field; the oldest version shows no such line | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

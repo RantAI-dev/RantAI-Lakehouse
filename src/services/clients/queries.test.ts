@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { ServiceError } from "../errors"
-import type { SavedQueryAccessList } from "../contracts/queries"
+import type { QueryParamDef, SavedQueryAccessList } from "../contracts/queries"
 import { clickhouseQueryService } from "./queries"
 
 const originalFetch = global.fetch
@@ -463,6 +463,7 @@ describe("the saved-query console client (QS-3)", () => {
     folderId: null,
     ownerId: "u-1",
     level: "manage",
+    parameters: [],
   }
 
   const FOLDER = {
@@ -704,6 +705,7 @@ describe("the saved-query console client (QS-3)", () => {
           authorName: "Rina Wijaya",
           label: "Restored version 1",
           createdAt: "2026-11-04T10:00:00.000Z",
+          parameters: [],
         },
       ]),
     )
@@ -717,6 +719,7 @@ describe("the saved-query console client (QS-3)", () => {
         authorName: "Rina Wijaya",
         label: "Restored version 1",
         createdAt: "2026-11-04T10:00:00.000Z",
+        parameters: [],
       },
     ])
     expect(calls[0]!.url).toBe("/api/query/saved/q-1/versions")
@@ -908,5 +911,116 @@ describe("the saved-query console client (QS-3)", () => {
     expect(err.message).toBe(
       "This folder still holds queries, some of them in the trash. Move or restore them first.",
     )
+  })
+})
+
+describe("query parameters on the wire (QS-5)", () => {
+  const DEFINITIONS: QueryParamDef[] = [
+    { name: "region", type: "text", default: "EU" },
+    {
+      name: "tier",
+      type: "dropdown",
+      default: "gold",
+      options: [
+        { value: "gold", label: "Gold" },
+        { value: "silver", label: "Silver" },
+      ],
+    },
+  ]
+  const VALUES = { region: "US", span: { start: "2026-11-01", end: "2026-11-07" }, ids: ["a", "b"] }
+  const SQL = "SELECT {{region}}"
+
+  it("posts exactly {sql, engine} to run when the caller has no parameters and no definitions", async () => {
+    const calls = stubFetch(() => json({ id: "r", columns: [], rows: [] }))
+    await clickhouseQueryService.run("SELECT 1", { engine: "trino" })
+    expect(calls[0]!.init.body).toBe('{"sql":"SELECT 1","engine":"trino"}')
+  })
+
+  it("posts the values and the definitions to run when the caller gives them", async () => {
+    const calls = stubFetch(() => json({ id: "r", columns: [], rows: [] }))
+    await clickhouseQueryService.run(SQL, {
+      engine: "clickhouse",
+      parameters: VALUES,
+      definitions: DEFINITIONS,
+    })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      sql: SQL,
+      engine: "clickhouse",
+      parameters: VALUES,
+      definitions: DEFINITIONS,
+    })
+  })
+
+  it("posts the values to run without definitions when the caller has none", async () => {
+    const calls = stubFetch(() => json({ id: "r", columns: [], rows: [] }))
+    await clickhouseQueryService.run(SQL, { engine: "clickhouse", parameters: { region: "US" } })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      sql: SQL,
+      engine: "clickhouse",
+      parameters: { region: "US" },
+    })
+  })
+
+  it("posts exactly {sql} to estimate when the caller has no parameters and no definitions", async () => {
+    const calls = stubFetch(() => json({ estimatedBytes: null }))
+    await clickhouseQueryService.estimate("SELECT 1")
+    expect(calls[0]!.url).toBe("/api/query/estimate")
+    expect(calls[0]!.init.body).toBe('{"sql":"SELECT 1"}')
+  })
+
+  it("posts the values and the definitions to estimate when the caller gives them", async () => {
+    const calls = stubFetch(() => json({ estimatedBytes: null }))
+    await clickhouseQueryService.estimate(SQL, { parameters: VALUES, definitions: DEFINITIONS })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      sql: SQL,
+      parameters: VALUES,
+      definitions: DEFINITIONS,
+    })
+  })
+
+  it("stops an estimate through the signal that follows the parameters", async () => {
+    const calls = stubFetch(() => json({ estimatedBytes: null }))
+    const controller = new AbortController()
+    await clickhouseQueryService.estimate("SELECT 1", undefined, controller.signal)
+    expect(calls[0]!.init.signal).toBe(controller.signal)
+  })
+
+  it("saves a query with its definitions", async () => {
+    const calls = stubFetch(() => json({}, 201))
+    await clickhouseQueryService.saveQuery({
+      title: "By region",
+      sql: SQL,
+      tags: [],
+      parameters: DEFINITIONS,
+    })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      title: "By region",
+      sql: SQL,
+      tags: [],
+      parameters: DEFINITIONS,
+    })
+  })
+
+  it("changes the definitions of a query, and an empty list clears them", async () => {
+    const calls = stubFetch(() => json({}))
+    await clickhouseQueryService.updateSaved("q-1", { parameters: DEFINITIONS })
+    await clickhouseQueryService.updateSaved("q-1", { parameters: [] })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({ parameters: DEFINITIONS })
+    expect(JSON.parse(String(calls[1]!.init.body))).toStrictEqual({ parameters: [] })
+  })
+
+  it("leaves the definitions of a query alone when the change names none", async () => {
+    const calls = stubFetch(() => json({}))
+    await clickhouseQueryService.updateSaved("q-1", { title: "By region" })
+    expect(calls[0]!.init.body).toBe('{"title":"By region"}')
+  })
+
+  it("hands back the definitions a saved query and its versions carry", async () => {
+    stubFetch(() => json({ id: "q-1", parameters: DEFINITIONS }))
+    const saved = await clickhouseQueryService.getSaved("q-1")
+    expect(saved.parameters).toEqual(DEFINITIONS)
+    stubFetch(() => json([{ version: 1, parameters: DEFINITIONS }]))
+    const versions = await clickhouseQueryService.listSavedVersions("q-1")
+    expect(versions[0]!.parameters).toEqual(DEFINITIONS)
   })
 })

@@ -202,6 +202,7 @@ export function QueryStudioPage() {
         open={saveOpen}
         onOpenChange={setSaveOpen}
         sql={studio.targetStatement?.text ?? ""}
+        parameters={studio.saveParameters}
         saving={studio.saveAct.status === "pending"}
         error={studio.saveAct.error?.message ?? null}
         onSave={studio.save}
