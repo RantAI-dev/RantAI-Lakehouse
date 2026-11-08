@@ -48,6 +48,7 @@ once a first release is tagged.
 - Query Studio fixes from the owner's QA of 2026-11-04/05 (backlog `QS-1`, `QS-2`, `QS-4`). A Bronze table inserts and completes as `iceberg.bronze.<table>` on a Trino tab, and a ClickHouse tab says to switch to Trino instead of inserting a broken name. `Ctrl+Shift+[` folds and `Ctrl+Shift+]` unfolds the statement at the cursor. Format writes no space before `;` and puts each statement on its own line. The column statistics say "of the 1 row shown" for one row.
 - The catalog's "Open in Query Studio" and snapshot links for a Bronze table open a Trino tab with `iceberg.bronze.<table>`, as the schema browser does (backlog `QS-1`).
 - The assistant's tool descriptions are shorter. A build turn offers 56 tools in 57,764 characters, down from 59,753, under the 60,000 bar (backlog `AI-15`).
+- The offered tools of a build turn drop two repeated descriptions, the per-value number format of `format_chart` and the nested parts of `update_metric`. The turn offers 56 tools in 57,251 characters, 656 fewer than before this change (57,907, which includes the `parameters` property that `run_sql` gained with query parameters). No tool's behaviour, permission, type, enum or required field changes (backlog `AI-15`, #423).
 
 ## [0.2.1] - 2026-11-04
 
