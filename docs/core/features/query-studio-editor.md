@@ -44,6 +44,7 @@ comment toggling, bracket matching or folding in this editor.
 8. Use find and replace, toggle a comment, see the matching bracket, fold a
    block, and open a list of the keyboard shortcuts.
 9. Reload the page and find unsaved text where it was.
+10. Write `{{name}}` in the SQL to get a field for it under the editor, and type `{{` to complete the names the tab defines. See [`query-parameters.md`](query-parameters.md).
 
 ## Not included
 
