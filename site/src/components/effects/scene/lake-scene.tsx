@@ -13,20 +13,25 @@ export default function LakeScene({
   observe,
   onReady,
   onFail,
+  onEngine,
 }: {
   mode: EngineMode;
   /** The element whose visibility gates the render loop. */
   observe: React.RefObject<HTMLElement | null>;
   onReady: () => void;
   onFail: () => void;
+  /** The lab (`/lab/hero/`) takes the engine to set its day look and framing; the home page passes nothing. */
+  onEngine?: (engine: LakeEngine | null) => void;
 }) {
   const hostRef = React.useRef<HTMLDivElement>(null);
   // Held in refs so a parent re-render never rebuilds the renderer.
   const onReadyRef = React.useRef(onReady);
   const onFailRef = React.useRef(onFail);
+  const onEngineRef = React.useRef(onEngine);
   React.useEffect(() => {
     onReadyRef.current = onReady;
     onFailRef.current = onFail;
+    onEngineRef.current = onEngine;
   });
 
   React.useEffect(() => {
@@ -55,8 +60,10 @@ export default function LakeScene({
     }
     // One frame later, so the first rendered frame is on screen before the
     // DOM fallback fades.
+    onEngineRef.current?.(engine);
     const id = requestAnimationFrame(() => onReadyRef.current());
     return () => {
+      onEngineRef.current?.(null);
       cancelAnimationFrame(id);
       engine.dispose();
       canvas.remove();

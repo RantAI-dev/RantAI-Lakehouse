@@ -15,6 +15,7 @@ import {
   Scene,
   ShaderMaterial,
   SphereGeometry,
+  Vector2,
   Vector3,
   WebGLRenderTarget,
   WebGLRenderer,
@@ -37,6 +38,9 @@ export type SkyUniforms = {
   uMoonDir: IUniform<Vector3>;
   uMoonColor: IUniform<Color>;
   uMoonBoost: IUniform<number>;
+  /** The disc's edge (cosines of its inner and outer angle) and a gain on its halo: the sun is bigger and softer than the moon (day look). */
+  uMoonDisc: IUniform<Vector2>;
+  uMoonHalo: IUniform<number>;
   /** 0 above the surface, 1 below it: the dome then shows the water's fog (WEB-5 O5). */
   uUnder: IUniform<number>;
 };
@@ -51,6 +55,8 @@ export function createSkyUniforms(): SkyUniforms {
     uMoonDir: { value: new Vector3(...MOON_DIR) },
     uMoonColor: { value: new Color("#cfe6ff") },
     uMoonBoost: { value: 7 },
+    uMoonDisc: { value: new Vector2(0.99978, 0.99988) },
+    uMoonHalo: { value: 1 },
     uUnder: { value: 0 },
   };
 }

@@ -132,6 +132,8 @@ export const SKY_FRAG = /* glsl */ `
 uniform vec3 uMoonDir;
 uniform vec3 uMoonColor;
 uniform float uMoonBoost;
+uniform vec2 uMoonDisc;
+uniform float uMoonHalo;
 uniform float uUnder;
 varying vec3 vDir;
 ${SKY_GRADIENT_GLSL}
@@ -140,9 +142,9 @@ void main(){
   vec3 d = normalize(vDir);
   vec3 col = skyGradient(d);
   float m = dot(d, uMoonDir);
-  float disc = smoothstep(0.99978, 0.99988, m);
+  float disc = smoothstep(uMoonDisc.x, uMoonDisc.y, m);
   float halo = pow(max(m, 0.0), 900.0) * 0.5 + pow(max(m, 0.0), 60.0) * 0.12 + pow(max(m, 0.0), 8.0) * 0.03;
-  col += uMoonColor * (disc * uMoonBoost + halo);
+  col += uMoonColor * (disc * uMoonBoost + halo * uMoonHalo);
   // Under the surface the "sky" is the water itself, far away: the same
   // direction-dependent colour every fogged object fades to (O5), so the
   // far water is a gradient with no horizon line.

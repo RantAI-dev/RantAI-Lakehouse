@@ -64,7 +64,37 @@ export type EngineOptions = {
   onContextLost: () => void;
 };
 
-export type LakeEngine = { dispose: () => void };
+export type LakeEngine = {
+  dispose: () => void;
+  /**
+   * Day look (the lab's `/lab/hero/` only; the home page never calls it, so
+   * the lake stays the night scene). 0 is night, exactly as built; 1 is a
+   * calm day: a pale sky, a soft sun for the moon, brighter water. Any value
+   * between blends the two, so the lab can ease from one to the other.
+   */
+  setTimeOfDay: (day: number) => void;
+  /**
+   * Lab framing (`/lab/hero/` only). `box`: put the creature where the page's
+   * `[data-hero-box]` element is (its top is the dome's top, its bottom the
+   * waterline), easing there when the page moves it. `sun`: put the sun (or
+   * the moon) at `x` of the width and `above` of the height above the horizon;
+   * null keeps the scene's own direction.
+   */
+  setLab: (lab: { box: boolean; sun: { x: number; above: number } | null }) => void;
+  /** Measure the page again (the lab calls it after it moves the creature's box). */
+  refit: () => void;
+};
+
+/** The day look, as the colours the night scene builds with and the ones it blends to (WEB-5 lab). */
+const DAY = {
+  horizon: new Color("#e3eef8"),
+  mid: new Color("#a9cdee"),
+  zenith: new Color("#6fa6e3"),
+  sun: new Color("#fff3d6"),
+  deep: new Color("#0f4a86"),
+  light: new Color("#fff2dc"),
+  ambient: new Color("#6d90c8"),
+} as const;
 
 const clamp = MathUtils.clamp;
 const lerp = MathUtils.lerp;
@@ -193,6 +223,41 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   const clock = { t: still ? STILL_TIME : 0, last: 0 };
 
+  // ---- Day look (lab only) ----------------------------------------------
+  // The night values are read back from what the scene was built with, so
+  // blending to 0 restores them exactly.
+  const NIGHT = {
+    horizon: skyUniforms.uSkyHorizon.value.clone(),
+    mid: skyUniforms.uSkyMid.value.clone(),
+    zenith: skyUniforms.uSkyZenith.value.clone(),
+    moon: skyUniforms.uMoonColor.value.clone(),
+    deep: (water.uniforms.uDeep.value as Color).clone(),
+    light: moonLight.color.clone(),
+    ambient: ambient.color.clone(),
+  };
+  let dayK = 0;
+  const applyDay = (k: number) => {
+    dayK = k;
+    skyUniforms.uSkyHorizon.value.copy(NIGHT.horizon).lerp(DAY.horizon, k);
+    skyUniforms.uSkyMid.value.copy(NIGHT.mid).lerp(DAY.mid, k);
+    skyUniforms.uSkyZenith.value.copy(NIGHT.zenith).lerp(DAY.zenith, k);
+    airFog.copy(skyUniforms.uSkyHorizon.value);
+    skyUniforms.uMoonColor.value.copy(NIGHT.moon).lerp(DAY.sun, k);
+    skyUniforms.uMoonBoost.value = lerp(7, 5, k);
+    // The sun is a soft, wide disc with a broad glow; the moon stays small and sharp.
+    skyUniforms.uMoonDisc.value.set(lerp(0.99978, 0.9991, k), lerp(0.99988, 0.9996, k));
+    skyUniforms.uMoonHalo.value = lerp(1, 2.6, k);
+    stars.uniforms.uAlpha.value = 1 - k;
+    stars.points.visible = k < 0.999;
+    (water.uniforms.uDeep.value as Color).copy(NIGHT.deep).lerp(DAY.deep, k);
+    water.uniforms.uWaveGain.value = lerp(1, 0.5, k);
+    water.uniforms.uFogDensity.value = lerp(0.021, 0.013, k);
+    renderer.toneMappingExposure = lerp(1, 1.12, k);
+    scene.environmentIntensity = lerp(0.95, 0.7, k);
+    moonLight.color.copy(NIGHT.light).lerp(DAY.light, k);
+    ambient.color.copy(NIGHT.ambient).lerp(DAY.ambient, k);
+  };
+
   // ---- Input -------------------------------------------------------------
   const pointer = { x: 0, y: 0, seen: false, lastInput: -100 };
   const tilt = { x: 0, y: 0, active: false };
@@ -249,6 +314,14 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     }
   };
 
+  // Lab state (`/lab/hero/`): all inert unless `setLab` is called.
+  const lab: { on: boolean; box: boolean; sun: { x: number; above: number } | null } = {
+    on: false,
+    box: false,
+    sun: null,
+  };
+  const goal = { x: 0, y: 0, d: 1 };
+  let started = false;
   const anchorHero = { x: 0, y: 0 };
   const anchorDepths = { x: 0, y: 0 };
   // WEB-5 O8/O11 framed the whale here, between the hero and the depths;
@@ -260,6 +333,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   let width = 1;
   let height = 1;
   const resize = () => {
+    const before = { x: anchorHero.x, y: anchorHero.y, d: distScaleHero };
     width = Math.max(1, host.clientWidth);
     height = Math.max(1, host.clientHeight);
     phone = window.innerWidth < 768;
@@ -288,8 +362,19 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // height) ease towards it in `update`.
     anchorDepths.x = depthsTarget.x;
     anchorDepths.y = depthsTarget.y;
-    if (phone && view === "hero") fitHeroToRoom();
+    if (lab.box && view === "hero") fitHeroToBox();
+    else if (phone && view === "hero") fitHeroToRoom();
     if (view === "final") fitFinal();
+    // Lab: the creature eases to its new place instead of jumping (see `update`).
+    goal.x = anchorHero.x;
+    goal.y = anchorHero.y;
+    goal.d = distScaleHero;
+    if (lab.on && !still && started) {
+      anchorHero.x = before.x;
+      anchorHero.y = before.y;
+      distScaleHero = before.d;
+    }
+    aimSun();
     viewKey = "";
     measure();
     camera.updateProjectionMatrix();
@@ -445,6 +530,28 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   };
 
   /**
+   * Lab: the creature goes where the page's `[data-hero-box]` is, whatever
+   * the width: its dome top to waterline fills the box, and its centre is
+   * the box's centre. The same steps as `fitHeroToRoom`, now in x as well.
+   */
+  const fitHeroToBox = () => {
+    const box = document.querySelector("[data-hero-box]");
+    if (!box) return;
+    const hostR = host.getBoundingClientRect();
+    const r = box.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
+    let dist = distScaleHero;
+    for (let i = 0; i < 4; i++) {
+      const span = heroCreatureSpan(dist, 0);
+      dist *= (span.bottom - span.top) / r.height;
+    }
+    const span = heroCreatureSpan(dist, 0);
+    distScaleHero = dist;
+    anchorHero.y = (2 * ((span.top + span.bottom) / 2 - (r.top - hostR.top + r.height / 2))) / height;
+    anchorHero.x = (2 * (r.left - hostR.left + r.width / 2 - width / 2)) / width;
+  };
+
+  /**
    * WEB-5 O53: in the final call the whale takes the place of the 2D one,
    * framed like the hero (the same camera pose, so the sky, the moon and its
    * path on the water read the same), sized and placed from the 2D stage
@@ -513,12 +620,57 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     if (view === "final") moonDir.copy(moonFinal);
   };
 
+  /**
+   * Lab: the sun (or moon) at a place on the screen, `x` of the width and
+   * `above` of the height over the horizon, seen from the hero camera as the
+   * creature is framed now. The sky, the water's glitter and the light on the
+   * creature all follow `moonDir`.
+   */
+  const aimSun = () => {
+    if (!lab.on || view !== "hero") return;
+    if (!lab.sun) {
+      moonDir.set(...MOON_DIR);
+      return;
+    }
+    const hero = sceneStateAt(0, layout);
+    fitPoint.set(hero.look[0], hero.look[1], hero.look[2]);
+    fitCam.aspect = width / height;
+    fitCam.position
+      .set(hero.position[0] - hero.look[0], hero.position[1] - hero.look[1], hero.position[2] - hero.look[2])
+      .multiplyScalar(goal.d)
+      .add(fitPoint);
+    fitCam.lookAt(fitPoint);
+    fitCam.setViewOffset(width, height, (-goal.x * width) / 2, (goal.y * height) / 2, width, height);
+    fitCam.updateProjectionMatrix();
+    fitCam.updateMatrixWorld();
+    const horizonY = ((1 - moonProbe.set(fitCam.position.x, 0, fitCam.position.z - 400).project(fitCam).y) / 2) * height;
+    const sy = horizonY - lab.sun.above * height;
+    moonFinal
+      .set(lab.sun.x * 2 - 1, 1 - (sy / height) * 2, 0.5)
+      .unproject(fitCam)
+      .sub(fitCam.position)
+      .normalize();
+    if (moonFinal.y < 0.05) moonFinal.setY(0.05).normalize();
+    moonDir.copy(moonFinal);
+  };
+
   const ro = new ResizeObserver(resize);
   ro.observe(host);
   if (finalHost) ro.observe(finalHost);
   // The room changes with the copy's height (fonts, language).
-  const heroRoom = document.querySelector("[data-hero-room]");
-  if (heroRoom) ro.observe(heroRoom);
+  // The elements whose size or place the creature follows. The lab swaps
+  // them when it changes layout, so `watchHeroEls` is called again then.
+  const watched: Record<string, Element | null> = { "[data-hero-room]": null, "[data-hero-box]": null };
+  const watchHeroEls = () => {
+    for (const sel of Object.keys(watched)) {
+      const el = document.querySelector(sel);
+      if (el === watched[sel]) continue;
+      if (watched[sel]) ro.unobserve(watched[sel]);
+      if (el) ro.observe(el);
+      watched[sel] = el;
+    }
+  };
+  watchHeroEls();
   // The zone's own height changes when fonts load or sections reflow.
   const roZone = new ResizeObserver(measure);
   roZone.observe(observe);
@@ -559,6 +711,15 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // O53: the final call is the hero's pose, whatever the scroll.
     state = sceneStateAt(view === "final" ? 0 : smoothY, layout);
     const uw = state.underwater;
+    if (lab.on && !still) {
+      // Lab: ease the creature's framing to its goal (about 250 ms).
+      const glide = 1 - Math.exp(-dt * 11);
+      anchorHero.x += (goal.x - anchorHero.x) * glide;
+      anchorHero.y += (goal.y - anchorHero.y) * glide;
+      distScaleHero += (goal.d - distScaleHero) * glide;
+      if (Math.abs(goal.d - distScaleHero) < 1e-4) distScaleHero = goal.d;
+      aimSun();
+    }
 
     // Camera: the scroll path, plus a small pointer parallax while above the water.
     const heroPointer = 1 - state.dive;
@@ -634,7 +795,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     fog.uWfUp.value.copy(underColor).lerp(UNDER_LIGHT, 0.55 * Math.exp(-depth / 12));
     fog.uWfDown.value.copy(underColor).multiplyScalar(0.42);
     fog.uWfDensity.value = lerp(0.034, 0.042, depthK);
-    water.uniforms.uFogDensity.value = 0.021;
+    water.uniforms.uFogDensity.value = lerp(0.021, 0.013, dayK);
 
     sky.position.copy(camera.position);
     stars.points.position.copy(camera.position);
@@ -669,7 +830,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     water.mesh.position.y = under ? Math.max(0, y + PLANE_CLEAR) : Math.min(0, y - PLANE_CLEAR);
     fog.uWfOn.value = under ? 1 : 0;
     skyUniforms.uUnder.value = under ? 1 : 0;
-    stars.points.visible = !under;
+    stars.points.visible = !under && dayK < 0.999;
     shafts.group.visible = under;
     snow.points.visible = under;
     slabs.group.visible = under;
@@ -681,8 +842,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
       ambient.intensity = 1.1;
     } else {
       moonLight.position.copy(moonDir).multiplyScalar(10);
-      moonLight.intensity = 3.2;
-      ambient.intensity = 0.8;
+      moonLight.intensity = lerp(3.2, 2.7, dayK);
+      ambient.intensity = lerp(0.8, 1.15, dayK);
     }
   }
 
@@ -880,9 +1041,25 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   // Still frame: a ring already out on the water, then a single render.
   if (still) water.spawnRipple(STILL_TIME - 2.2, 0.55);
   resize();
+  started = true;
   if (!still) start();
 
   return {
+    setTimeOfDay(day) {
+      applyDay(clamp(day, 0, 1));
+      renderOnceIfStill();
+    },
+    setLab(next) {
+      watchHeroEls();
+      lab.on = true;
+      lab.box = next.box;
+      lab.sun = next.sun;
+      resize();
+    },
+    refit() {
+      watchHeroEls();
+      resize();
+    },
     dispose() {
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
