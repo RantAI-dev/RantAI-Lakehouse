@@ -74,11 +74,11 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
   return (
     <div
       ref={tableRef}
-      className="overflow-hidden rounded-3xl border border-white/10 bg-[var(--lk-n-surface)]"
+      className="overflow-hidden rounded-3xl bg-[var(--lk-n-surface)]"
     >
       {/* O32: no visible "Illustration" label (the owner's decision; the data is plainly fictional and the
           caption for screen readers stays). The policy chip leads; the switch sits at the right. */}
-      <div className="flex flex-wrap items-center justify-between gap-3 px-4 pt-3 pb-1 md:px-6 md:pt-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 px-6 pt-4 pb-1 md:px-8 md:pt-5">
         <PolicyChip copy={copy} role={role} />
         <RoleToggle copy={copy} role={role} onChange={choose} />
       </div>
@@ -96,7 +96,7 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
                 <th
                   key={c.key}
                   scope="col"
-                  className={cn("px-4 py-2 font-medium md:px-6", COL_WIDTH[c.key], c.key === "amount" && "text-right")}
+                  className={cn("px-6 py-2 font-medium md:px-8", COL_WIDTH[c.key], c.key === "amount" && "text-right")}
                 >
                   <span className="inline-flex items-center gap-2">
                     {copy.columns[c.key]}
@@ -107,27 +107,27 @@ export function GovernanceTable({ copy }: { copy: GovernanceCopy }) {
             </tr>
           </thead>
           <tbody>
-            {GOVERNANCE_ROWS.slice(0, 4).map((r, i) => (
+            {GOVERNANCE_ROWS.slice(0, 3).map((r, i) => (
               <tr
                 key={r.email}
-                className="border-t border-white/8 text-[14px] text-white/90 transition-colors duration-200 hover:bg-white/[0.04]"
+                className={cn("text-[14px] text-white/90 transition-colors duration-200 hover:bg-white/[0.04]", i > 0 && "border-t border-white/[0.04]")}
               >
-                <td className="px-4 py-2 whitespace-nowrap md:px-6">
+                <td className="px-6 py-[7px] whitespace-nowrap md:px-8">
                   <span className="inline-flex items-center gap-3">
                     <Avatar name={r.name} masked={role === "analyst"} />
                     <Cell value={r.name} masked={maskName(r.name)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
                   </span>
                 </td>
-                <td className="px-4 py-2 whitespace-nowrap md:px-6">
+                <td className="px-6 py-[7px] whitespace-nowrap md:px-8">
                   <Cell value={r.email} masked={maskEmail(r.email)} role={role} row={i} animate={!reduced} tip={copy.maskedTip} />
                 </td>
-                <td className="px-4 py-2 whitespace-nowrap md:px-6">
+                <td className="px-6 py-[7px] whitespace-nowrap md:px-8">
                   <span className="inline-flex items-center gap-1.5">
                     <MapPin aria-hidden="true" className="size-3.5 text-[#44A6FA]/70" />
                     {r.city}
                   </span>
                 </td>
-                <td className="px-4 py-2 text-right whitespace-nowrap tabular-nums md:px-6">€{r.amount}</td>
+                <td className="px-6 py-[7px] text-right whitespace-nowrap tabular-nums md:px-8">€{r.amount}</td>
               </tr>
             ))}
           </tbody>
@@ -279,13 +279,13 @@ function RoleToggle({ copy, role, onChange }: { copy: GovernanceCopy; role: Role
         role="radiogroup"
         aria-labelledby="lk-view-as"
         onKeyDown={onKey}
-        className="relative grid grid-cols-2 rounded-full bg-white/[0.06] p-0.5 ring-1 ring-white/12"
+        className="relative grid grid-cols-2 rounded-full bg-white/[0.06] p-0.5"
       >
         {/* The thumb slides under the chosen role. */}
         <span
           aria-hidden="true"
           // Audit #12: the site's one selected style (lake tint, light hairline), not a glowing primary button.
-          className="absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-[#44A6FA]/15 ring-1 ring-[#8fcbff]/60 ring-inset transition-transform duration-[220ms] ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none"
+          className="absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-[#44A6FA]/25 transition-transform duration-[220ms] ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none"
           style={{ transform: role === "admin" ? "translateX(100%)" : "translateX(0)" }}
         />
         {ROLES.map((r, i) => (

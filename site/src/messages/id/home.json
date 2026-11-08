@@ -241,12 +241,12 @@
       },
       "proof": {
         "title": "Masking teruji",
-        "line": "Uji penerimaan otomatis memeriksanya dari awal sampai akhir.",
+        "line": "Diperiksa uji otomatis, ujung ke ujung.",
         "badge": "Teruji menyeluruh"
       },
       "audit": {
         "title": "Setiap aksi tercatat",
-        "line": "Aksi asisten yang berisiko menunggu persetujuan orang.",
+        "line": "Aksi berisiko menunggu persetujuan orang.",
         "rows": [
           "Membuat chart “Kunjungan per wilayah”",
           "Memperbarui revenue_by_city",
@@ -257,7 +257,7 @@
       },
       "catalog": {
         "title": "Katalog tepercaya",
-        "line": "Cari, lalu lihat mana yang certified atau deprecated.",
+        "line": "Lihat mana yang certified atau deprecated.",
         "query": "revenue",
         "certified": "Certified",
         "deprecated": "Deprecated",

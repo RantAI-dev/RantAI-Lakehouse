@@ -241,7 +241,7 @@
       },
       "proof": {
         "title": "Masking, tested",
-        "line": "An automated acceptance test checks it end to end.",
+        "line": "Checked end to end by an automated test.",
         "badge": "Tested end to end"
       },
       "audit": {
@@ -257,7 +257,7 @@
       },
       "catalog": {
         "title": "A catalog you can trust",
-        "line": "Search, then see what is certified or deprecated.",
+        "line": "See what is certified or deprecated.",
         "query": "revenue",
         "certified": "Certified",
         "deprecated": "Deprecated",
