@@ -81,7 +81,7 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                   })}
                 </ul>
               </div>
-              <p className="mt-2.5 text-[14px] leading-6 text-[#E8F4FF]/65">
+              <p className="mt-2.5 text-[14px] leading-6 text-pretty text-[#E8F4FF]/65">
                 <Inline text={step.note} />
               </p>
             </Reveal>
