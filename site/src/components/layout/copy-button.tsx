@@ -5,19 +5,23 @@ import { Check, Copy } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /**
- * Lab only (CTA variants). One button that copies a string and says so: the label turns to
+ * One button that copies a string and says so: the label turns to
  * "Copied" with a check for 1.8 s (announced politely), the icon swaps with a short soft
  * transition, and a press settles the button down. If the clipboard is blocked, the label says
- * "Copy failed" and the text stays selectable next to it.
+ * so and the text stays selectable next to it.
  */
 export function CopyButton({
   text,
-  label = "Copy",
+  label,
+  copiedLabel,
+  failedLabel,
   className,
   ariaLabel,
 }: {
   text: string;
-  label?: string;
+  label: string;
+  copiedLabel: string;
+  failedLabel: string;
   className?: string;
   ariaLabel?: string;
 }) {
@@ -49,7 +53,7 @@ export function CopyButton({
         <Copy aria-hidden="true" className="absolute size-4 transition-[opacity,transform] duration-200 ease-out group-data-[state=copied]/copy:scale-50 group-data-[state=copied]/copy:opacity-0" />
         <Check aria-hidden="true" strokeWidth={2.5} className="absolute size-4 scale-50 opacity-0 transition-[opacity,transform] duration-200 ease-out group-data-[state=copied]/copy:scale-100 group-data-[state=copied]/copy:opacity-100" />
       </span>
-      <span aria-live="polite">{state === "copied" ? "Copied" : state === "failed" ? "Copy failed" : label}</span>
+      <span aria-live="polite">{state === "copied" ? copiedLabel : state === "failed" ? failedLabel : label}</span>
     </button>
   );
 }

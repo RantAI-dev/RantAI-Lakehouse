@@ -4,32 +4,16 @@ import { localizedPath } from "@/i18n/paths";
 import type { Locale } from "@/i18n/routing";
 import type { CommonCopy } from "@/lib/copy";
 import { CONTACT_EMAIL, FOOTER_SECTIONS, LINKS, RANTAI_PRODUCTS, SOCIAL_LINKS } from "@/lib/home-content";
-import { DisplayHeading, Eyebrow } from "@/components/shared/primitives";
 import { MascotMark } from "@/components/shared/mascot-svg";
-import { SplitWords } from "@/components/shared/reveal";
 import { SocialIcon } from "@/components/shared/social-icons";
 import { BackToTop, FooterWordmark, Reveal } from "./footer-motion";
-import { SourceFlow } from "./source-flow";
-import { SourceIcon, type SourceIconId } from "@/components/shared/brand-icons";
+import { FooterCta } from "./footer-cta";
 
 /**
  * WEB-5 O14: the sources the footer card offers, ten of the sources the
  * product connects to today (the sources section's own, claimed there),
  * with their marks (`components/shared/brand-icons.tsx`).
  */
-const FLOW_SOURCES: readonly { name: string; icon: SourceIconId }[] = [
-  // O46: the first five get a chip; the rest are behind the "+N" select.
-  { name: "PostgreSQL", icon: "postgresql" },
-  { name: "MySQL", icon: "mysql" },
-  { name: "MongoDB", icon: "mongodb" },
-  { name: "Salesforce", icon: "app" },
-  { name: "Excel", icon: "spreadsheet" },
-  { name: "Kafka", icon: "apachekafka" },
-  { name: "SQL Server", icon: "database" },
-  { name: "HubSpot", icon: "hubspot" },
-  { name: "CSV", icon: "spreadsheet" },
-  { name: "REST API", icon: "rest" },
-];
 
 /**
  * S9 — the footer, on rantai-page's footer structure in the lake's look
@@ -60,13 +44,10 @@ export function SiteFooter({
   locale,
   page = "home",
   copy,
-  cta: ctaSlot,
 }: {
   locale: Locale;
   page?: "home" | "contact";
   copy: CommonCopy["footer"];
-  /** Lab only (`components/lab/cta`): a variant's card in place of the call-to-action card. */
-  cta?: React.ReactNode;
 }) {
   const home = localizedPath(locale, "/");
   const columns: { title: string; links: FooterLink[] }[] = [
@@ -129,40 +110,18 @@ export function SiteFooter({
     },
   ];
 
-  const cta = copy.cta;
   return (
     // No background of its own (O28): at rest the page-wide water (or, on the contact page, the
     // abyss) shows here anyway, and once the pull lifts the footer with a transform it would
     // paint its own dark fill over the water.
-    <footer className="flex flex-col gap-3 px-3 pb-3 sm:gap-4 sm:px-4 sm:pb-4">
-      {/* 1. The call to action, as a card (rantai-page's FooterCtaCard). On
-          the home page it is the action after the story's end (the final
-          section); on the contact page it points back up to the form
-          instead of repeating it. */}
-      {/* O46: compact, two columns, a flat solid panel with a hairline (no water, no rings). */}
-      {ctaSlot ?? (
-      <section aria-labelledby="footer-cta-heading" className="relative isolate rounded-[28px] bg-[#070F3A] ring-1 ring-[#E8F4FF]/10">
-        <div className="mx-auto max-w-6xl">
-          <SourceFlow
-            names={FLOW_SOURCES.map((s) => s.name)}
-            marks={FLOW_SOURCES.map((s) => <SourceIcon key={s.name} id={s.icon} />)}
-            text={cta}
-            to={CONTACT_EMAIL}
-            page={page}
-            installHref={page === "home" ? "#get-started" : `${home}#get-started`}
-            intro={
-              <>
-                <Eyebrow>{cta.eyebrow}</Eyebrow>
-                <DisplayHeading id="footer-cta-heading" size="sm" className="mt-4 max-w-[16ch]">
-                  <SplitWords text={cta.title} />
-                </DisplayHeading>
-                <p className="mt-3 max-w-[40ch] text-[15px] leading-6 text-[#E8F4FF]/70">{cta.line}</p>
-              </>
-            }
-          />
-        </div>
-      </section>
-      )}
+    <footer className="relative z-[1] flex flex-col gap-3 bg-[#020514] px-3 pb-3 sm:gap-4 sm:px-4 sm:pb-4">
+      {/* 1. The call to action: no card (owner QA 2026-11-08), straight on the page; see footer-cta.tsx. */}
+      <FooterCta
+        copy={copy.cta}
+        installHref={page === "home" ? "#get-started" : `${home}#get-started`}
+        contactHref={localizedPath(locale, "/contact")}
+        page={page}
+      />
 
       {/* WEB-5 owner QA O15: from here down, a 1:1 copy of rantai-page's
           footer.tsx ("Links sit straight on the page…"): the same markup,
