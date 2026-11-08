@@ -28,13 +28,19 @@ import { SLAB_Y } from "./scene-config";
  * and bright at Gold. The slab the visitor is at lights up. All of it is
  * driven by one number, the continuous `focus` (0 Bronze, 1 Silver, 2 Gold)
  * from `scroll-timeline.ts`. WEB-5 O40: only the focused slab shows, as the
- * depths card's pedestal; the others are below it, out of sight, and take
- * its place in turn (the one leaving sinks and fades as the next rises).
+ * depths card's pedestal; the others wait below it, and take
+ * its place in turn (the one leaving rises on and fades as the next comes up).
  */
 
 export const SLAB_SIZE = { w: 7, h: 0.46, d: 4.7 } as const;
-/** O40: how far a slab sinks below the pedestal as it leaves or before it arrives. */
-const SINK = 2.2;
+/**
+ * How far a slab sits below the pedestal before it arrives and above it after it has gone. The
+ * journey is one way, upward: a slab comes up from below, stands under the card while it is the
+ * focus, and goes on up as the next one comes in. Nothing ever moves down.
+ */
+const TRAVEL = 3.4;
+/** How far (in focus steps) a slab is still on screen from its own stage: wide, so the hand-over has no gap. */
+const REACH = 1.15;
 const smooth01 = (x: number): number => {
   const t = Math.min(1, Math.max(0, x));
   return t * t * (3 - 2 * t);
@@ -61,6 +67,8 @@ export type Slabs = {
   setFootprint: (scale: number) => void;
   /** The footprint last set (1 = full size). */
   footprint: () => number;
+  /** The three slabs' centre heights as last placed (dev probes only). */
+  heights: () => number[];
   /** The light that makes the glass catch something; follows the focus. */
   light: PointLight;
   dispose: () => void;
@@ -199,6 +207,7 @@ export function createSlabs(lowQuality: boolean): Slabs {
       for (const s of slabs) s.root.scale.set(scale, 1, scale);
     },
     footprint: () => footprint,
+    heights: () => slabs.map((s) => s.root.position.y),
     update({ time, focus, reveal, pixelRatio, pedestalY }) {
       group.visible = reveal > 0.003;
       if (!group.visible) return;
@@ -208,11 +217,11 @@ export function createSlabs(lowQuality: boolean): Slabs {
         const d = i - focus;
         // 1 at the focused slab, falling to 0 a full slab away.
         const w = clamp01(1 - Math.abs(d) * 1.25);
-        // WEB-5 O40: the focused slab stands on the pedestal under the depths
-        // card; the one leaving sinks and fades as the next rises into place,
-        // so only one slab is ever under the card.
-        const there = 1 - smooth01(Math.abs(d) / 0.85);
-        s.root.position.y = pedestalY - SINK * Math.min(1, Math.abs(d));
+        // The focused slab stands on the pedestal under the depths card; the one before it has gone
+        // on up (and fades), the one after it is still coming up from below, so there is always one
+        // slab under the card and the motion is only ever upward.
+        const there = 1 - smooth01(Math.abs(d) / REACH);
+        s.root.position.y = pedestalY - TRAVEL * Math.max(-REACH, Math.min(REACH, d));
         ys.push(s.root.position.y);
         const grow = 1 + 0.035 * w;
         s.root.scale.set(footprint * grow, 1, footprint * grow);

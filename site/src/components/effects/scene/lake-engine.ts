@@ -698,6 +698,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
   // ---- Frame -------------------------------------------------------------
   const aim: Aim = { x: 0, y: 0 };
   const mascotNdc = new Vector3();
+  const lagDir = new Vector3();
+  const lagPoint = new Vector3();
   const look = new Vector3();
   const underColor = new Color();
   let smoothY = still ? 0 : window.scrollY;
@@ -840,8 +842,25 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     const ease = 1 - Math.exp(-dt * 5);
     anchorDepths.x += (depthsTarget.x - anchorDepths.x) * ease;
     anchorDepths.y += (depthsTarget.y - anchorDepths.y) * ease;
-    const pedestalY = clamp(state.look[1] + 0.3, SLAB_Y[2], SLAB_Y[0]);
+    // The slabs come up with the depths section, from below: until its pin starts they sit as far
+    // below their rest as the section's stage is below the top of the screen, so they rise at least
+    // as fast as the page scrolls and never show up high and then sink to the card.
+    const lagPx = Math.min(1.5 * height, Math.max(0, layout.depthsTop - smoothY));
+    camera.getWorldDirection(lagDir);
+    const lagDist = camera.position.distanceTo(lagPoint.set(0, SLAB_Y[0], 0));
+    const lagWorld =
+      (lagPx * 2 * lagDist * Math.tan((CAMERA_FOV * Math.PI) / 360)) / height / Math.max(0.3, Math.sqrt(1 - lagDir.y * lagDir.y));
+    const pedestalY = clamp(state.look[1] + 0.3, SLAB_Y[2], SLAB_Y[0]) - lagWorld;
     slabs.update({ time: t, focus: state.focus, reveal: state.slabsReveal, pixelRatio: dpr, pedestalY });
+    // Dev only (removed from the export): each slab's centre on screen and its visibility, for frame-strip probes.
+    if (process.env.NODE_ENV === "development") {
+      host.dataset.lkSlabScreen = JSON.stringify(
+        slabs.heights().map((y, i) => {
+          const v = new Vector3(0, y, 0).project(camera);
+          return [Number((((1 - v.y) * height) / 2).toFixed(1)), slabs.group.visible && slabs.group.children[i]?.visible ? 1 : 0];
+        }),
+      );
+    }
 
     // WEB-1 review round 1 SHOULD-FIX 2: the canvas layer is sticky only inside
     // the zone, so where S3 ends it used to be cut by a hard horizontal edge
