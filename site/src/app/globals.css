@@ -2321,9 +2321,15 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-show-mark {
   display: none;
 }
+.lk-show-pin,
+.lk-show-cols,
 .lk-show-list,
 .lk-show-stage {
   display: contents;
+}
+.lk-show-head {
+  order: -1;
+  margin-bottom: 32px;
 }
 .lk-show-item[data-i="0"] {
   order: 0;
@@ -2373,11 +2379,10 @@ section[data-role="admin"] .lk-gv-closed {
    middle of the screen, its items one under another; the pictures are one
    sticky box, stacked, one shown. Both release together after the last
    marker. */
-@media (min-width: 64rem) and (min-height: 34rem) {
+@media (min-width: 64rem) and (min-height: 44rem) {
   .lk-show {
-    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: repeat(4, auto);
-    column-gap: 64px;
     row-gap: 0;
   }
   .lk-show-mark {
@@ -2398,8 +2403,10 @@ section[data-role="admin"] .lk-gv-closed {
   .lk-show-mark[data-i="3"] {
     grid-row: 4;
   }
-  .lk-show-list,
-  .lk-show-stage {
+  /* Owner QA: the heading, the list and the panel are one unit, held at the middle of the screen
+     (the unit is about 600 px tall; 44 rem is the shortest window that holds it under the top bar). */
+  .lk-show-pin {
+    grid-column: 1;
     grid-row: 1 / -1;
     align-self: start;
     position: -webkit-sticky;
@@ -2409,15 +2416,28 @@ section[data-role="admin"] .lk-gv-closed {
     display: flex;
     flex-direction: column;
     justify-content: center;
+    gap: 48px;
+  }
+  .lk-show-head {
+    margin-bottom: 0;
+  }
+  .lk-show-head > h2 {
+    font-size: clamp(2.5rem, 9svh, 4.5rem);
+  }
+  .lk-show-cols {
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    column-gap: 64px;
+    align-items: start;
   }
   .lk-show-list {
-    grid-column: 1;
+    display: flex;
+    flex-direction: column;
     gap: 12px;
   }
   .lk-show-stage {
-    grid-column: 2;
     display: grid;
-    align-content: center;
+    align-content: start;
   }
   .lk-show-item {
     border-left-color: rgba(255, 255, 255, 0.1);
@@ -2446,7 +2466,7 @@ section[data-role="admin"] .lk-gv-closed {
   /* The four pictures share one cell of the stage. */
   .lk-show-visual {
     grid-area: 1 / 1;
-    height: min(440px, calc(100svh - 7rem));
+    height: min(440px, calc(100svh - 4rem - 11.5rem));
     max-width: none;
     margin: 0;
     opacity: 0;
@@ -2471,7 +2491,7 @@ section[data-role="admin"] .lk-gv-closed {
     animation-play-state: paused !important;
   }
 }
-@media (min-width: 64rem) and (min-height: 34rem) and (prefers-reduced-motion: reduce) {
+@media (min-width: 64rem) and (min-height: 44rem) and (prefers-reduced-motion: reduce) {
   .lk-show-visual,
   .lk-show-visual[data-on] {
     transition: none;

@@ -141,7 +141,47 @@ const ASSISTANT_PROBE = `(async () => {
   }
   return out;
 })()`;
+/**
+ * Owner QA, "Yours to keep": while the showcase is pinned (at its first and its third promise) the
+ * heading is fully on screen and below the top bar, it is at most 96 px above the first item, and
+ * the list and the panel are not clipped by the bottom of the window.
+ */
+const SHOW_PROBE = `(async () => {
+  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const out = { pinned: false, headTop: 0, headBottom: 0, gap: 0, bottom: 0, vh: innerHeight };
+  const marks = [...document.querySelectorAll('.lk-show-mark')];
+  if (getComputedStyle(marks[0]).display === 'none') return out;
+  out.pinned = true;
+  for (const i of [0, 2]) {
+    const m = marks[i].getBoundingClientRect();
+    scrollTo(0, scrollY + m.top + m.height / 2 - innerHeight / 2); await frame(); await new Promise((r) => setTimeout(r, 700));
+    const h = document.querySelector('.lk-show-head h2').getBoundingClientRect();
+    const first = document.querySelector('.lk-show-item').getBoundingClientRect();
+    const list = document.querySelector('.lk-show-list').getBoundingClientRect();
+    const vis = document.querySelector('.lk-show-visual[data-on]').getBoundingClientRect();
+    out.headTop = out.headTop ? Math.min(out.headTop, h.top) : h.top;
+    out.headBottom = Math.max(out.headBottom, h.bottom);
+    out.gap = Math.max(out.gap, first.top - h.bottom);
+    out.bottom = Math.max(out.bottom, list.bottom, vis.bottom);
+  }
+  return out;
+})()`;
 let failed = 0;
+for (const [w, h] of [[1190, 960], [1150, 810], [1440, 900]]) {
+  const p = await open(w, h);
+  const r = (await p.ev(SHOW_PROBE)) as { pinned: boolean; headTop: number; headBottom: number; gap: number; bottom: number; vh: number };
+  p.close();
+  const errors: string[] = [];
+  if (!r.pinned) errors.push("the showcase is not pinned at this size");
+  else {
+    if (r.headTop < 64) errors.push(`the heading is under the top bar (top ${Math.round(r.headTop)}px)`);
+    if (r.headBottom > r.vh) errors.push("the heading is below the window");
+    if (r.gap > 96 || r.gap < 0) errors.push(`heading to first item gap ${Math.round(r.gap)}px (want 0 to 96)`);
+    if (r.bottom > r.vh) errors.push(`the unit is clipped by ${Math.round(r.bottom - r.vh)}px`);
+  }
+  console.log(`showcase ${w}x${h}`, errors.length ? `FAIL: ${errors.join("; ")}` : `ok (head top ${Math.round(r.headTop)}, gap ${Math.round(r.gap)}, bottom ${Math.round(r.bottom)}/${r.vh})`);
+  if (errors.length) failed++;
+}
 {
   const p = await open(1190, 960);
   const r = (await p.ev(ASSISTANT_PROBE)) as { startSteps: number; railWorst: number };

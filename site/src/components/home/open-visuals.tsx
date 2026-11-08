@@ -78,7 +78,6 @@ export function CodePanel({ copy, action }: { copy: OpenCopy["code"]; action?: R
         <FileCode2 className="size-3.5 text-[#E8F4FF]/55" strokeWidth={2} />
         <code className="!text-[12px] !leading-4 text-[#E8F4FF]/75">{CODE_FILE}</code>
         <span className="lk-open-license ml-auto inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] leading-4 font-medium">
-          <span className="size-1.5 rounded-full bg-current" />
           {copy.license}
         </span>
       </div>
