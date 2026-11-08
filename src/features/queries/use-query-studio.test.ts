@@ -41,6 +41,7 @@ const SAVED = {
   folderId: null,
   ownerId: "u1",
   level: "edit",
+  parameters: [],
 }
 
 /** One row of a result, as the API sends it. */
@@ -523,5 +524,490 @@ describe("useQueryStudio statements", () => {
     expect(run).toHaveBeenCalledTimes(1)
     expect(run.mock.calls[0]?.[0]).toBe("SELECT 2")
     view.destroy()
+  })
+})
+
+describe("useQueryStudio parameters", () => {
+  it("gives a name the SQL gains a text definition, and a range name a dateRange one", () => {
+    const hook = mountWith("SELECT {{region}} WHERE d > {{day.start}} AND d < {{day.end}}")
+    expect(hook.result.current.parameters).toEqual([
+      { name: "region", type: "text" },
+      { name: "day", type: "dateRange" },
+    ])
+    expect(hook.result.current.tabs[0]?.parameters).toEqual([
+      { name: "region", type: "text" },
+      { name: "day", type: "dateRange" },
+    ])
+  })
+
+  it("makes no field of a placeholder in a comment or a string", () => {
+    const hook = mountWith("SELECT '{{a}}' -- {{b}}\n/* {{c}} */")
+    expect(hook.result.current.parameters).toEqual([])
+  })
+
+  it("keeps the value a field was given, and takes it away when the field is emptied", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    expect(hook.result.current.parameterValues).toEqual({ region: "EU" })
+    act(() => hook.result.current.setParameterValue("region", undefined))
+    expect(hook.result.current.parameterValues).toEqual({})
+    expect(Object.hasOwn(hook.result.current.tabs[0]?.values ?? {}, "region")).toBe(false)
+  })
+
+  it("hides the field of a name that left the SQL and brings it back with its definition and value", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() =>
+      hook.result.current.setParameterDefinition({
+        name: "region",
+        type: "dropdown",
+        options: [{ value: "eu", label: "Europe" }],
+      })
+    )
+    act(() => hook.result.current.setParameterValue("region", "eu"))
+
+    act(() => hook.result.current.setSql("SELECT 1"))
+    expect(hook.result.current.parameters).toEqual([])
+    expect(hook.result.current.tabs[0]?.parameters.map((def) => def.name)).toEqual(["region"])
+    expect(hook.result.current.parameterValues).toEqual({ region: "eu" })
+
+    act(() => hook.result.current.setSql("SELECT {{region}}"))
+    expect(hook.result.current.parameters).toEqual([
+      { name: "region", type: "dropdown", options: [{ value: "eu", label: "Europe" }] },
+    ])
+    expect(hook.result.current.parameterValues).toEqual({ region: "eu" })
+  })
+
+  it("clears a value that no longer fits when the type changes", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    act(() => hook.result.current.setParameterDefinition({ name: "region", type: "number" }))
+    expect(hook.result.current.parameters).toEqual([{ name: "region", type: "number" }])
+    expect(hook.result.current.parameterValues).toEqual({})
+  })
+
+  it("writes the definitions and values to the draft", async () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    await waitFor(() => {
+      const stored = JSON.parse(window.localStorage.getItem("rantai-lakehouse:query-studio-draft") ?? "{}")
+      expect(stored.tabs?.[0]?.values).toEqual({ region: "EU" })
+      expect(stored.tabs?.[0]?.parameters).toEqual([{ name: "region", type: "text" }])
+    })
+  })
+
+  it("completes the tab's defined names after {{, including one the SQL does not use yet", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterDefinition({ name: "spare", type: "number" }))
+    const sql = "SELECT {{region}}, {{"
+    act(() => hook.result.current.setSql(sql))
+    const context = {
+      state: { doc: { toString: () => sql } },
+      pos: sql.length,
+    } as unknown as Parameters<typeof hook.result.current.completionSource>[0]
+    const answer = hook.result.current.completionSource(context) as unknown as {
+      options: { label: string }[]
+    }
+    expect(answer.options.map((option) => option.label)).toEqual(["region", "spare"])
+  })
+})
+
+describe("useQueryStudio parameter requests", () => {
+  const ESTIMATE = { estimatedBytes: null } as never
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  /** Mounts the hook over a statement with the estimate and the lists answered. */
+  function mountParams(sql: string) {
+    spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    return mountWith(sql)
+  }
+
+  /** The options the first `run` call got, and the ones of call `at`. */
+  function optionsOf(run: { mock: { calls: unknown[][] } }, at = 0) {
+    return run.mock.calls[at]?.[1] as Record<string, unknown>
+  }
+
+  it("sends the run the options it sent before parameters when the SQL has no placeholder", async () => {
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    const { result } = mountParams("SELECT 1")
+    act(() => result.current.setParameterValue("region", "EU"))
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    // A value the tab holds for a name the SQL does not use is not sent.
+    expect(Object.keys(optionsOf(run)).sort()).toEqual(["engine", "runId"])
+  })
+
+  it("posts a body byte for byte the one it posted before parameters when the SQL has no placeholder", async () => {
+    const calls: { url: string; body: unknown }[] = []
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: init?.body })
+      return new Response(JSON.stringify(RESULT), { status: 200, headers: { "Content-Type": "application/json" } })
+    }) as unknown as typeof fetch)
+    const { result } = mountParams("SELECT 1")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const posted = calls.find((call) => call.url.endsWith("/api/query/run"))
+    expect(posted?.body).toBe('{"sql":"SELECT 1","engine":"clickhouse"}')
+  })
+
+  it("posts the values and the definitions when the SQL has a placeholder", async () => {
+    const calls: { url: string; body: unknown }[] = []
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: init?.body })
+      return new Response(JSON.stringify(RESULT), { status: 200, headers: { "Content-Type": "application/json" } })
+    }) as unknown as typeof fetch)
+    const { result } = mountParams("SELECT {{region}}")
+    act(() => result.current.setParameterValue("region", "EU"))
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const posted = calls.find((call) => call.url.endsWith("/api/query/run"))
+    expect(JSON.parse(String(posted?.body))).toStrictEqual({
+      sql: "SELECT {{region}}",
+      engine: "clickhouse",
+      parameters: { region: "EU" },
+      definitions: [{ name: "region", type: "text" }],
+    })
+  })
+
+  it("sends the definitions with their defaults and the values only for names that have one", async () => {
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    const { result } = mountParams("SELECT {{region}}, {{n}}")
+    act(() => result.current.setParameterDefinition({ name: "region", type: "text", default: "EU" }))
+    act(() => result.current.setParameterValue("n", 3))
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const options = optionsOf(run)
+    // The default lives in the definition; it is not copied into the values.
+    expect(options.parameters).toStrictEqual({ n: 3 })
+    expect(options.definitions).toStrictEqual([
+      { name: "region", type: "text", default: "EU" },
+      { name: "n", type: "text" },
+    ])
+  })
+
+  it("sends the definitions of the names the SQL uses, and not the one of a name that left it", async () => {
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    const { result } = mountParams("SELECT {{kept}}, {{left}}")
+    act(() =>
+      result.current.setParameterDefinition({ name: "left", type: "number", default: 1 })
+    )
+    act(() => result.current.setParameterValue("left", 2))
+    act(() => result.current.setParameterValue("kept", "x"))
+    act(() => result.current.setSql("SELECT {{kept}}"))
+    // The tab still holds the definition and the value of the name that left.
+    expect(result.current.tabs[0]?.parameters.map((def) => def.name)).toEqual(["kept", "left"])
+    expect(result.current.tabs[0]?.values).toEqual({ kept: "x", left: 2 })
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const options = optionsOf(run)
+    expect(options.parameters).toStrictEqual({ kept: "x" })
+    expect(options.definitions).toStrictEqual([{ name: "kept", type: "text" }])
+  })
+
+  it("sends the same values and definitions with each statement of a run all", async () => {
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    const { result } = mountParams("SELECT {{a}}; SELECT {{a}} + 1; SELECT 3")
+    act(() => result.current.setParameterValue("a", "x"))
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    expect(run).toHaveBeenCalledTimes(3)
+    for (const at of [0, 1, 2]) {
+      expect(optionsOf(run, at).parameters).toStrictEqual({ a: "x" })
+      expect(optionsOf(run, at).definitions).toStrictEqual([{ name: "a", type: "text" }])
+    }
+  })
+
+  it("shows the server's sentence and marks the field it names, and only that one", async () => {
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "Fill in {{region}} to run this query.")
+    )
+    const { result } = mountParams("SELECT {{region}}, {{ab}}")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    const open = result.current.activeRun
+    expect(open?.status === "error" && open.error.message).toBe("Fill in {{region}} to run this query.")
+    expect([...result.current.invalidParameters]).toEqual(["region"])
+  })
+
+  it("marks no field for a refusal that names none", async () => {
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "This query has a {{ that is not a parameter.")
+    )
+    const { result } = mountParams("SELECT {{region}}")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    expect(result.current.invalidParameters.size).toBe(0)
+  })
+
+  it("marks no field for a failure that is not a refusal of the request", async () => {
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("unavailable", "Fill in {{region}} to run this query.")
+    )
+    const { result } = mountParams("SELECT {{region}}")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    expect(result.current.invalidParameters.size).toBe(0)
+  })
+
+  it("takes the mark off a field when its value or its definition changes, and off all when the next run starts", async () => {
+    const run = spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "{{a}} and {{b}} are both wrong")
+    )
+    const { result } = mountParams("SELECT {{a}}, {{b}}")
+    await act(async () => {
+      await result.current.runQuery()
+    })
+    expect([...result.current.invalidParameters].sort()).toEqual(["a", "b"])
+
+    act(() => result.current.setParameterValue("a", "x"))
+    expect([...result.current.invalidParameters]).toEqual(["b"])
+
+    act(() => result.current.setParameterDefinition({ name: "b", type: "number" }))
+    expect(result.current.invalidParameters.size).toBe(0)
+
+    // The next run starts clean, then marks again what the new refusal names.
+    run.mockRejectedValue(new ServiceError("invalid_request", "Fill in {{a}} to run this query."))
+    await act(async () => {
+      await result.current.runQuery()
+    })
+    expect([...result.current.invalidParameters]).toEqual(["a"])
+    run.mockImplementation(() => new Promise(() => {}))
+    await act(async () => {
+      void result.current.runQuery()
+    })
+    expect(result.current.invalidParameters.size).toBe(0)
+  })
+
+  it("marks the field in no other tab", async () => {
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "Fill in {{region}} to run this query.")
+    )
+    const { result } = mountParams("SELECT {{region}}")
+    await act(async () => {
+      await result.current.runQuery()
+    })
+    expect(result.current.invalidParameters.size).toBe(1)
+
+    act(() => {
+      result.current.addTab({ sql: "SELECT {{region}}" })
+    })
+
+    expect(result.current.invalidParameters.size).toBe(0)
+  })
+
+  it("skips the estimate while a name has no value and no default, and asks once it has one", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT {{region}}")
+
+    await sleep(700)
+    expect(estimate).not.toHaveBeenCalled()
+    // The panel says what it says for an empty editor, and shows no error.
+    expect(result.current.estimatable).toBe(false)
+    expect(result.current.estimateAct.status).toBe("idle")
+
+    act(() => result.current.setParameterValue("region", "EU"))
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+    expect(estimate.mock.calls[0]?.[0]).toBe("SELECT {{region}}")
+    expect(estimate.mock.calls[0]?.[1]).toStrictEqual({
+      parameters: { region: "EU" },
+      definitions: [{ name: "region", type: "text" }],
+    })
+    expect(result.current.estimatable).toBe(true)
+  })
+
+  it("does not skip the estimate for a name that has a default", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT {{region}}")
+    act(() => result.current.setParameterDefinition({ name: "region", type: "text", default: "EU" }))
+
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+    expect(estimate.mock.calls[0]?.[1]).toStrictEqual({
+      parameters: {},
+      definitions: [{ name: "region", type: "text", default: "EU" }],
+    })
+  })
+
+  it("asks again when a value changes", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT {{region}}")
+    act(() => result.current.setParameterValue("region", "EU"))
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+
+    act(() => result.current.setParameterValue("region", "US"))
+
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(2))
+    expect(estimate.mock.calls[1]?.[1]).toStrictEqual({
+      parameters: { region: "US" },
+      definitions: [{ name: "region", type: "text" }],
+    })
+  })
+
+  it("estimates SQL without a placeholder as it did before parameters", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    mountWith("SELECT 1")
+
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+    expect(estimate.mock.calls[0]?.[0]).toBe("SELECT 1")
+    expect(estimate.mock.calls[0]?.[1]).toBeUndefined()
+  })
+
+  it("marks the field an estimate's refusal names", async () => {
+    spyOn(queryService, "estimate").mockRejectedValue(
+      new ServiceError("invalid_request", "{{region}} is inside quotes: write it without them, for example = {{region}}.")
+    )
+    const { result } = mountWith("SELECT {{region}}")
+    act(() => result.current.setParameterValue("region", "EU"))
+
+    await waitFor(() => expect([...result.current.invalidParameters]).toEqual(["region"]))
+  })
+
+  it("hands the save sheet no definitions while the tab holds several statements and none is picked", () => {
+    const { result } = mountParams("SELECT {{a}}; SELECT {{b}}")
+    act(() => result.current.setParameterDefinition({ name: "a", type: "text", default: "EU" }))
+    act(() => result.current.setParameterDefinition({ name: "b", type: "number" }))
+    act(() => result.current.setParameterValue("a", "US"))
+    act(() => result.current.setParameterValue("b", 7))
+    expect(result.current.targetStatement).toBeNull()
+
+    expect(result.current.saveParameters).toEqual([])
+  })
+
+  it("saves the definitions of the one statement the tab holds, with the default and not the value", () => {
+    const { result } = mountParams("SELECT {{a}}")
+    act(() => result.current.setParameterDefinition({ name: "a", type: "text", default: "EU" }))
+    act(() => result.current.setParameterValue("a", "US"))
+
+    expect(result.current.saveParameters).toStrictEqual([{ name: "a", type: "text", default: "EU" }])
+  })
+
+  it("saves nothing for a statement without a placeholder, whatever the tab still holds", () => {
+    const { result } = mountParams("SELECT {{a}}")
+    act(() => result.current.setParameterDefinition({ name: "a", type: "text", default: "EU" }))
+    act(() => result.current.setSql("SELECT 1"))
+
+    expect(result.current.saveParameters).toEqual([])
+  })
+
+  it("sends the definitions a save-back is given to the saved query it changes", async () => {
+    const { hook } = await mountWithSaved("edit")
+    const updateSaved = spyOn(queryService, "updateSaved").mockResolvedValue(SAVED)
+    const definitions = [{ name: "a", type: "text" as const, default: "EU" }]
+
+    await act(async () => {
+      await hook.result.current.save({
+        title: "Orders",
+        sql: "SELECT {{a}}",
+        tags: [],
+        parameters: definitions,
+      })
+    })
+
+    expect(updateSaved.mock.calls[0]?.[1]).toStrictEqual({
+      title: "Orders",
+      sql: "SELECT {{a}}",
+      tags: [],
+      parameters: definitions,
+    })
+  })
+
+  it("lets a save-back clear the parameters with an empty list, and leaves them alone without the key", async () => {
+    const { hook } = await mountWithSaved("edit")
+    const updateSaved = spyOn(queryService, "updateSaved").mockResolvedValue(SAVED)
+
+    await act(async () => {
+      await hook.result.current.save({ title: "Orders", sql: "SELECT 1", tags: [], parameters: [] })
+      await hook.result.current.save({ title: "Orders", sql: "SELECT 1", tags: [] })
+    })
+
+    expect(updateSaved.mock.calls[0]?.[1]).toStrictEqual({
+      title: "Orders",
+      sql: "SELECT 1",
+      tags: [],
+      parameters: [],
+    })
+    expect(updateSaved.mock.calls[1]?.[1]).toStrictEqual({ title: "Orders", sql: "SELECT 1", tags: [] })
+  })
+
+  it("opens a saved query with its definitions and no values, so each field starts at its default", async () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    const definitions = [
+      { name: "region", type: "text" as const, default: "EU" },
+      {
+        name: "tier",
+        type: "dropdown" as const,
+        default: "gold",
+        options: [{ value: "gold", label: "Gold" }],
+      },
+    ]
+    spyOn(queryService, "getSaved").mockResolvedValue({
+      ...SAVED,
+      sql: "SELECT {{region}}, {{tier}}",
+      parameters: definitions,
+    })
+    visit("/query-studio?saved=q1")
+    const hook = renderHook(() => useQueryStudio())
+    await waitFor(() => expect(hook.result.current.tabs[0]?.savedId).toBe("q1"))
+
+    expect(hook.result.current.tabs[0]?.parameters).toEqual(definitions)
+    expect(hook.result.current.tabs[0]?.values).toEqual({})
+    expect(hook.result.current.parameters).toEqual(definitions)
+
+    // A run from that tab gives no value and sends the definitions, defaults in them.
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
+    await act(async () => {
+      await hook.result.current.runQuery()
+    })
+    expect(optionsOf(run).parameters).toStrictEqual({})
+    expect(optionsOf(run).definitions).toStrictEqual(definitions)
+  })
+
+  it("puts a saved query's definitions in the open tab when its SQL is loaded from the list", () => {
+    const { result } = mountParams("SELECT {{old}}")
+    act(() => result.current.setParameterValue("old", "x"))
+    const definitions = [{ name: "region", type: "text" as const, default: "EU" }]
+
+    act(() => result.current.loadSql("SELECT {{region}}", definitions))
+
+    expect(result.current.tabs[0]?.parameters).toEqual(definitions)
+    expect(result.current.tabs[0]?.values).toEqual({})
+  })
+
+  it("keeps the tab's definitions when a statement without any is loaded", () => {
+    const { result } = mountParams("SELECT {{old}}")
+    act(() => result.current.setParameterValue("old", "x"))
+
+    act(() => result.current.loadSql("SELECT {{old}} + 1"))
+
+    expect(result.current.tabs[0]?.values).toEqual({ old: "x" })
   })
 })

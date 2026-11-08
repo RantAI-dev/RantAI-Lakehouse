@@ -12,7 +12,8 @@
  * query that was there and nothing else.
  */
 
-import type { QueryEngine } from "@/services/contracts/queries"
+import type { QueryEngine, QueryParamDef, QueryParamValue } from "@/services/contracts/queries"
+import { parseDefinitions, parseValues } from "@/lib/query-params"
 
 export const QUERY_DRAFT_KEY = "rantai-lakehouse:query-studio-draft"
 
@@ -35,6 +36,14 @@ export type QueryTab = {
   name: string
   sql: string
   engine: QueryEngine
+  /**
+   * The definitions of the tab's `{{name}}` parameters (`QS-5`). A name that
+   * leaves the SQL keeps its definition until the tab is closed or saved,
+   * so a cut and paste does not lose it.
+   */
+  parameters: QueryParamDef[]
+  /** The value each parameter has right now, by name. Not what a save stores: that is the default. */
+  values: Record<string, QueryParamValue>
   /**
    * The saved query this tab came from, when it came from one (`QS-3` C4).
    * Absent for a tab that holds a query nobody saved.
@@ -89,7 +98,18 @@ function parseTab(value: unknown): QueryTab | null {
   if (typeof tab.name !== "string") return null
   if (typeof tab.sql !== "string") return null
   if (!isEngine(tab.engine)) return null
-  const parsed: QueryTab = { id: tab.id, name: tab.name, sql: tab.sql, engine: tab.engine }
+  // A tab stored before parameters existed has neither field and gets none.
+  // A malformed definition or value is dropped on its own: it must not take
+  // the tab, and the SQL in it, along.
+  const parameters = parseDefinitions(tab.parameters)
+  const parsed: QueryTab = {
+    id: tab.id,
+    name: tab.name,
+    sql: tab.sql,
+    engine: tab.engine,
+    parameters,
+    values: parseValues(tab.values, parameters),
+  }
   // A tab that came from a saved query keeps its id and the caller's level:
   // they say what "Save" may do with the query. A draft written before this
   // change has neither and stays usable, and a field that is not one of
@@ -150,7 +170,16 @@ export function parseTabs(raw: string | null): QueryTabs | null {
   const sql = typeof stored.sql === "string" ? stored.sql : ""
   if (!sql.trim() && !question.trim()) return null
   return {
-    tabs: [{ id: "tab-1", name: "Query 1", sql, engine: "clickhouse" }],
+    tabs: [
+      {
+        id: "tab-1",
+        name: "Query 1",
+        sql,
+        engine: "clickhouse",
+        parameters: [],
+        values: {},
+      },
+    ],
     activeId: "tab-1",
     question,
     tab: editor,

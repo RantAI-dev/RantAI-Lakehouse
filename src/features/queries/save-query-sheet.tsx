@@ -9,7 +9,12 @@ import { levelAtLeast } from "@/features/dashboards/access-level"
 import { useService } from "@/hooks/use-service"
 import { sqlSummary } from "@/lib/sql-text"
 import { queryService } from "@/services"
-import type { QueryFolder, SaveQueryInput, SavedQuery } from "@/services/contracts/queries"
+import type {
+  QueryFolder,
+  QueryParamDef,
+  SaveQueryInput,
+  SavedQuery,
+} from "@/services/contracts/queries"
 import { FolderSharingNote } from "./folder-sharing-note"
 import {
   PERSONAL_SPACE_LABEL,
@@ -30,6 +35,8 @@ const PERSONAL_SPACE = "personal"
 /** What the picker sends for the shared space: the root of the tree. */
 const SHARED_SPACE = "shared"
 
+const NO_PARAMETERS: readonly QueryParamDef[] = []
+
 /**
  * Name the SQL in the editor and keep it.
  *
@@ -42,6 +49,7 @@ export function SaveQuerySheet({
   open,
   onOpenChange,
   sql,
+  parameters = NO_PARAMETERS,
   saving,
   error,
   onSave,
@@ -52,6 +60,11 @@ export function SaveQuerySheet({
   readonly open: boolean
   readonly onOpenChange: (open: boolean) => void
   readonly sql: string
+  /**
+   * The definitions of the `{{name}}` parameters in `sql` (`QS-5`), with their
+   * defaults. Never the values the tab holds: a saved query starts at its defaults.
+   */
+  readonly parameters?: readonly QueryParamDef[]
   readonly saving: boolean
   readonly error?: string | null
   readonly onSave: (input: SaveQueryInput) => Promise<unknown>
@@ -157,6 +170,12 @@ export function SaveQuerySheet({
             .filter(Boolean),
         }
         if (folderId !== undefined) input.folderId = folderId
+        // A new query without placeholders sends no parameters at all. A
+        // change that drops the placeholders a saved query had sends an
+        // empty list, so the server clears the definitions with the SQL.
+        const had = source.status === "success" ? (source.data?.parameters.length ?? 0) : 0
+        if (parameters.length > 0) input.parameters = [...parameters]
+        else if (mode === "update" && had > 0) input.parameters = []
         void onSave(input).then((saved) => {
           if (saved) onOpenChange(false)
         })

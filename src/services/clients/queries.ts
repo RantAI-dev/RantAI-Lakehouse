@@ -309,7 +309,14 @@ export const clickhouseQueryService: QueryService = {
   run(sql, options, signal) {
     return postJson<QueryResult>(
       "/api/query/run",
-      { sql, engine: options.engine },
+      {
+        sql,
+        engine: options.engine,
+        // Left out, not sent as `null`, when absent: a statement with no
+        // placeholder posts the body it posted before `QS-5`.
+        ...(options.parameters !== undefined && { parameters: options.parameters }),
+        ...(options.definitions !== undefined && { definitions: options.definitions }),
+      },
       signal,
       options.runId ? { [RUN_ID_HEADER]: options.runId } : undefined
     );
@@ -318,8 +325,16 @@ export const clickhouseQueryService: QueryService = {
     return postJson<{ stopped: number }>("/api/query/cancel", { runId }, signal);
   },
   download,
-  estimate(sql, signal) {
-    return postJson<QueryEstimate>("/api/query/estimate", { sql }, signal);
+  estimate(sql, options, signal) {
+    return postJson<QueryEstimate>(
+      "/api/query/estimate",
+      {
+        sql,
+        ...(options?.parameters !== undefined && { parameters: options.parameters }),
+        ...(options?.definitions !== undefined && { definitions: options.definitions }),
+      },
+      signal
+    );
   },
 
   // ── real (the copilot's chat engine) ───────────────────────────────────

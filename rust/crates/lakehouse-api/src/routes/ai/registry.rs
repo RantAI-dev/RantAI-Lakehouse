@@ -482,9 +482,14 @@ fn style_properties() -> Value {
             field.remove("description");
         }
     }
+    // `format` states the meaning of each part of a number format; the
+    // per-value formats of `valueFormats` are the same shape and would repeat
+    // it word for word, so they keep only the types and enums (`AI-15`).
+    let mut later_value_format = value_format.clone();
+    strip_descriptions(&mut later_value_format);
     json!({
         "format": { "oneOf": [value_format, { "type": "null" }], "description": "how every number of the chart is written (the number format). null removes it. Changing it with format_chart keeps everything else of the chart" },
-        "valueFormats": { "type": ["object", "null"], "additionalProperties": value_format, "description": "a number format per value, keyed by the value's result name; replaces `format` for that value" },
+        "valueFormats": { "type": ["object", "null"], "additionalProperties": later_value_format, "description": "a number format per value, keyed by the value's result name; replaces `format` for that value" },
         "dateFormat": { "type": ["object", "null"], "properties": {
             "style": { "type": "string", "enum": ["auto", "short", "medium", "long", "iso", "monthYear"] },
             "hour12": { "type": "boolean" }, "abbreviate": { "type": "boolean", "description": "short month and day names" } },
@@ -672,17 +677,18 @@ fn strip_descriptions(node: &mut Value) {
     }
 }
 
-/// Drops the `description` of each field of a `properties` object, and only
-/// of the field itself, which is word for word the create tool's. The
-/// descriptions nested inside a field (the parts of `filters`, for example)
-/// stay: the create tool carries them too, but this trim covers the
-/// field-level prose only.
+/// Drops the `description` of each field of a `properties` object, and of
+/// everything nested inside a field (the parts of `filters`, for example).
+/// All of it is word for word the create tool's, and the two are always
+/// offered together: `create_metric` and `update_metric` are both
+/// `metric:write` and `WriteLow`, neither is in [`DASHBOARD_SCOPED`], they
+/// sit in one prompt domain (`prompt.rs`) and both are in the console's tool
+/// allowlist (`capabilities.ts`). The nested descriptions of `update_metric`
+/// are those of `filters_schema`, which `create_metric` carries.
 fn without_field_descriptions(mut properties: Value) -> Value {
     if let Some(fields) = properties.as_object_mut() {
         for field in fields.values_mut() {
-            if let Some(field) = field.as_object_mut() {
-                field.remove("description");
-            }
+            strip_descriptions(field);
         }
     }
     properties
@@ -3404,11 +3410,10 @@ mod tests {
                     property.get("description").is_none(),
                     "{update_name}.{name} repeats the description of {create_name}"
                 );
-                // Everything but the prose is the create tool's.
+                // Everything but the prose, nested prose included, is the
+                // create tool's.
                 let mut expected = create_properties[name].clone();
-                if let Value::Object(map) = &mut expected {
-                    map.remove("description");
-                }
+                strip_descriptions(&mut expected);
                 assert_eq!(property, &expected, "{update_name}.{name} changed shape");
             }
         }
@@ -3436,6 +3441,80 @@ mod tests {
                 json!({ "type": "string" })
             );
         }
+    }
+
+    /// Whether a `description` key sits on a schema node or anywhere under it.
+    fn has_description(node: &Value) -> bool {
+        match node {
+            Value::Object(map) => {
+                map.contains_key("description") || map.values().any(has_description)
+            }
+            Value::Array(items) => items.iter().any(has_description),
+            _ => false,
+        }
+    }
+
+    /// `AI-15`: `format_chart` writes the meaning of a number format once, in
+    /// `format`. `valueFormats` keeps its own description and the type and
+    /// enums of the same format per value, without the prose.
+    #[test]
+    fn format_chart_describes_a_value_format_once() {
+        let schema = (find("format_chart").expect("registered tool").schema)();
+        let properties = &schema["function"]["parameters"]["properties"];
+        let format = &properties["format"]["oneOf"][0];
+        assert!(
+            format["properties"]["style"]["description"].is_string(),
+            "format lost the description of its style: {format}"
+        );
+        assert!(
+            properties["valueFormats"]["description"].is_string(),
+            "valueFormats lost its own description"
+        );
+        let per_value = &properties["valueFormats"]["additionalProperties"];
+        assert!(
+            !has_description(per_value),
+            "valueFormats repeats the descriptions of format: {per_value}"
+        );
+        let mut expected = format.clone();
+        strip_descriptions(&mut expected);
+        assert_eq!(
+            per_value, &expected,
+            "the format of one value changed shape"
+        );
+    }
+
+    /// `AI-15`: `update_metric` leaves the meaning of its fields, nested parts
+    /// such as `filters` included, to `create_metric`, which the same turn
+    /// offers. Only `id` keeps a description, and `create_metric` keeps its own.
+    #[test]
+    fn update_metric_has_no_description_below_id_and_create_metric_keeps_its_own() {
+        let create = (find("create_metric").expect("registered tool").schema)();
+        let update = (find("update_metric").expect("registered tool").schema)();
+        let update_properties = update["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object");
+        for (name, property) in update_properties {
+            if name == "id" {
+                assert!(
+                    property["description"].is_string(),
+                    "update_metric.id lost its description"
+                );
+                continue;
+            }
+            assert!(
+                !has_description(property),
+                "update_metric.{name} carries a description: {property}"
+            );
+        }
+        let mut filters = create["function"]["parameters"]["properties"]["filters"].clone();
+        filters
+            .as_object_mut()
+            .expect("an object")
+            .remove("description");
+        assert!(
+            has_description(&filters),
+            "create_metric.filters lost its nested descriptions: {filters}"
+        );
     }
 
     /// `AI-15`: `update_chart`'s fields carry the type and list shape of the

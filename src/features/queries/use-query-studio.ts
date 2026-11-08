@@ -22,6 +22,14 @@ import {
   type QueryTabs,
 } from "@/lib/query-draft"
 import {
+  activeParameters,
+  fieldsNamedBy,
+  missingRequiredValue,
+  paramInputs,
+  reconcileDefinitions,
+  replaceDefinition,
+} from "@/lib/query-param-names"
+import {
   tablesInStatement,
   type ColumnState,
   type CompletionTable,
@@ -37,6 +45,9 @@ import { toServiceError, type ServiceError } from "@/services/errors"
 import type {
   NlAnswer,
   QueryEngine,
+  QueryParamDef,
+  QueryParamInputs,
+  QueryParamValue,
   QueryResult,
   SaveQueryInput,
   SavedQuery,
@@ -56,6 +67,13 @@ const ESTIMATE_DEBOUNCE_MS = 500
 
 /** How long to wait before writing the draft to storage. */
 const DRAFT_DEBOUNCE_MS = 400
+
+/** What a tab without definitions or values holds; one object, so the memo that reads it stays put. */
+const NO_DEFINITIONS: QueryParamDef[] = []
+const NO_VALUES: Record<string, QueryParamValue> = {}
+/** What a request carries for SQL with no placeholder: nothing, one object so a memo that reads it stays put. */
+const NO_INPUTS: QueryParamInputs = {}
+const NO_NAMES: ReadonlySet<string> = new Set()
 
 /**
  * The id of the tab that is there before anything is read from storage.
@@ -207,7 +225,14 @@ export function useQueryStudio() {
   const [tab, setTab] = React.useState<StudioTab>("nl")
   const [question, setQuestion] = React.useState("")
   const [tabs, setTabs] = React.useState<QueryTab[]>(() => [
-    { id: FIRST_TAB_ID, name: "Query 1", sql: STARTER_SQL, engine: "clickhouse" },
+    {
+      id: FIRST_TAB_ID,
+      name: "Query 1",
+      sql: STARTER_SQL,
+      engine: "clickhouse",
+      parameters: [],
+      values: {},
+    },
   ])
   const [activeTabId, setActiveTabId] = React.useState(FIRST_TAB_ID)
   // What every statement of every run did. It belongs to the tab that ran
@@ -245,6 +270,25 @@ export function useQueryStudio() {
   const sql = activeTab?.sql ?? ""
   const engine = activeTab?.engine ?? "clickhouse"
 
+  // The `{{name}}` parameters of the open tab (`QS-5`). The tab keeps every
+  // definition it has had; the fields are the ones whose name the SQL uses
+  // now, so a name cut out of the SQL loses its field and not its
+  // definition or value. Read on `sql` and the definitions only, so a
+  // keystroke that changes neither the names nor the definitions does not
+  // rebuild the list the fields are drawn from.
+  const parameterDefinitions = activeTab?.parameters ?? NO_DEFINITIONS
+  const parameterValues = activeTab?.values ?? NO_VALUES
+  const parameters = React.useMemo(
+    () => activeParameters(sql, parameterDefinitions),
+    [sql, parameterDefinitions]
+  )
+  // What a run carries for them: the values and the definitions of the names
+  // the SQL uses, or nothing when it uses none (`paramInputs`).
+  const runInputs = React.useMemo(
+    () => (parameters.length === 0 ? NO_INPUTS : paramInputs(parameters, parameterValues)),
+    [parameters, parameterValues]
+  )
+
   // The saved query the open tab came from, when it came from one (`QS-3`
   // C4). Its level says what "Save" may do with it.
   const activeSaved = React.useMemo(() => {
@@ -270,12 +314,69 @@ export function useQueryStudio() {
   const setSql = React.useCallback(
     (next: string) => {
       setTabs((previous) =>
-        previous.map((open) => (open.id === activeTabId ? { ...open, sql: next } : open))
+        previous.map((open) =>
+          open.id === activeTabId
+            ? {
+                ...open,
+                sql: next,
+                parameters: reconcileDefinitions(next, open.parameters, open.values),
+              }
+            : open
+        )
       )
       setFixResult(null)
       setFixStatement(null)
     },
     [activeTabId]
+  )
+  // The fields the server's last refusal of a run named (`QS-5`). The wire
+  // gives a sentence and no field, so `fieldsNamedBy` reads the names out of
+  // it. A field is marked until its value or definition changes, and every
+  // mark goes when the next run starts.
+  const [refused, setRefused] = React.useState<{
+    tabId: string
+    names: ReadonlySet<string>
+  } | null>(null)
+  const unmark = React.useCallback(
+    (name: string) => {
+      setRefused((previous) => {
+        if (!previous || previous.tabId !== activeTabId || !previous.names.has(name)) return previous
+        const names = new Set(previous.names)
+        names.delete(name)
+        return names.size === 0 ? null : { tabId: previous.tabId, names }
+      })
+    },
+    [activeTabId]
+  )
+  /** Gives the parameter a value; `undefined` takes the value away (the default applies). */
+  const setParameterValue = React.useCallback(
+    (name: string, value: QueryParamValue | undefined) => {
+      unmark(name)
+      setTabs((previous) =>
+        previous.map((open) => {
+          if (open.id !== activeTabId) return open
+          const values = { ...open.values }
+          if (value === undefined) delete values[name]
+          else values[name] = value
+          return { ...open, values }
+        })
+      )
+    },
+    [activeTabId, unmark]
+  )
+  /** Replaces the definition of the parameter it names; a value that no longer fits its type goes. */
+  const setParameterDefinition = React.useCallback(
+    (def: QueryParamDef) => {
+      unmark(def.name)
+      setTabs((previous) =>
+        previous.map((open) =>
+          open.id === activeTabId
+            ? { ...open, ...replaceDefinition(open.parameters, open.values, def) }
+            : open
+        )
+      )
+    },
+    [activeTabId, unmark]
   )
   const setEngine = React.useCallback(
     (next: QueryEngine) => {
@@ -289,16 +390,36 @@ export function useQueryStudio() {
   const generateAct = useServiceAction((signal, q: string) =>
     queryService.generateSql(q, signal)
   )
-  const estimateAct = useServiceAction((signal, s: string) =>
-    queryService.estimate(s, signal)
+  const estimateAct = useServiceAction((signal, s: string, inputs: QueryParamInputs) =>
+    // SQL with no placeholder asks as it did before `QS-5`: no options at all.
+    queryService.estimate(s, inputs.definitions ? inputs : undefined, signal)
   )
+  // The fields to mark: the ones the last run's refusal named, and the ones
+  // the estimate's refusal names. An estimate's mark goes with its error,
+  // when the next estimate starts.
+  const estimateError = estimateAct.error
+  const invalidParameters = React.useMemo<ReadonlySet<string>>(() => {
+    const marked = new Set(refused && refused.tabId === activeTabId ? refused.names : NO_NAMES)
+    if (estimateError?.code === "invalid_request") {
+      const names = parameters.map((def) => def.name)
+      for (const name of fieldsNamedBy(estimateError.message, names)) marked.add(name)
+    }
+    return marked.size === 0 ? NO_NAMES : marked
+  }, [refused, activeTabId, estimateError, parameters])
   const saveAct = useServiceAction((signal: AbortSignal, input: SaveQueryInput) => {
     // A change of a saved query leaves it where it is: the folder is the
     // Move dialog's business, so the body carries no folder at all.
     if (savesSavedQuery && activeSaved) {
       return queryService.updateSaved(
         activeSaved.id,
-        { title: input.title, sql: input.sql, tags: input.tags },
+        {
+          title: input.title,
+          sql: input.sql,
+          tags: input.tags,
+          // The definitions of the SQL being saved. An empty list clears
+          // them; absent leaves the query's as they are.
+          ...(input.parameters !== undefined && { parameters: input.parameters }),
+        },
         signal
       )
     }
@@ -501,6 +622,14 @@ export function useQueryStudio() {
     return { from, to }
   }, [])
 
+  // The names `{{` completes: every definition the open tab holds, the ones
+  // whose name is not in the SQL yet included. The source is built once, so
+  // it reads the names through this ref.
+  const parameterNamesRef = React.useRef<string[]>([])
+  React.useEffect(() => {
+    parameterNamesRef.current = parameterDefinitions.map((def) => def.name)
+  }, [parameterDefinitions])
+
   // The suggestions the editor offers. The source is built once and reads
   // the cache when it is asked, so a keystroke never waits for the network.
   const completionSource = React.useMemo(
@@ -508,6 +637,7 @@ export function useQueryStudio() {
       createSqlCompletionSource({
         tables,
         columns: () => columnsRef.current,
+        parameters: () => parameterNamesRef.current,
       }),
     [tables]
   )
@@ -587,6 +717,8 @@ export function useQueryStudio() {
           name: nextTabName(stored.tabs),
           sql: linkedSql,
           engine,
+          parameters: [],
+          values: {},
         }
         setTabs([...stored.tabs, linked])
         setActiveTabId(linked.id)
@@ -604,6 +736,8 @@ export function useQueryStudio() {
         name: "Query 1",
         sql: linkedSql,
         engine,
+        parameters: [],
+        values: {},
       }
       placeholderRef.current = false
       setTabs([linked])
@@ -634,30 +768,72 @@ export function useQueryStudio() {
   )
   // Whether there is anything to run at all.
   const runnable = statements.length > 0
+  // What a save of that statement keeps: the definitions of the names it
+  // uses. A save is checked against the SQL it holds, so a name only another
+  // statement uses, or one that left the SQL, would be refused.
+  const saveParameters = React.useMemo(
+    () => activeParameters(targetStatement?.text ?? "", parameterDefinitions),
+    [targetStatement, parameterDefinitions]
+  )
 
   // ── Estimate ─────────────────────────────────────────────────────────
   const runEstimate = estimateAct.run
-  const estimateDebounced = useDebouncedCallback((next: string) => {
-    void runEstimate(next)
-  }, ESTIMATE_DEBOUNCE_MS)
+  const resetEstimate = estimateAct.reset
+  // `null` inputs mean "skip": the statement has a name with nothing to run
+  // with, so no estimate is asked for and the one on screen goes.
+  const estimateDebounced = useDebouncedCallback(
+    (next: string, inputs: QueryParamInputs | null) => {
+      if (inputs === null) resetEstimate()
+      else void runEstimate(next, inputs)
+    },
+    ESTIMATE_DEBOUNCE_MS
+  )
   // The estimate is asked for one statement at a time: the server plans a
   // statement, not a buffer with several of them.
-  const estimatable = targetStatement !== null
   const targetText = targetStatement?.text ?? null
+  // The names the statement itself uses (`QS-5`): a name that only another
+  // statement of the tab uses is not this estimate's business.
+  const estimateDefinitions = React.useMemo(
+    () => activeParameters(targetText ?? "", parameterDefinitions),
+    [targetText, parameterDefinitions]
+  )
+  const estimateInputs = React.useMemo(
+    () =>
+      estimateDefinitions.length === 0 ? NO_INPUTS : paramInputs(estimateDefinitions, parameterValues),
+    [estimateDefinitions, parameterValues]
+  )
+  // A name with no value and no default would only be refused ("Fill in
+  // ..."). The estimate waits for it instead, and the panel says what it
+  // says for an empty editor. SQL with no placeholder is never held back.
+  const estimateWaits = missingRequiredValue(estimateDefinitions, parameterValues)
+  const estimatable = targetStatement !== null && !estimateWaits
   React.useEffect(() => {
     // A buffer holding only the starter comment has nothing to estimate,
     // and asking anyway put an EXPLAIN ESTIMATE on ClickHouse for every
     // keystroke, including the ones that typed the comment.
-    if (targetText !== null) estimateDebounced(targetText)
-  }, [targetText, estimateDebounced])
+    if (targetText !== null) estimateDebounced(targetText, estimateWaits ? null : estimateInputs)
+  }, [targetText, estimateWaits, estimateInputs, estimateDebounced])
 
   // ── Actions ──────────────────────────────────────────────────────────
+  /**
+   * Puts `next` in the open tab. A saved query's `definitions` come with its
+   * SQL (`QS-5`) and every field starts at its default; a statement from
+   * History has none to bring, and the tab's own stay.
+   */
   const loadSql = React.useCallback(
-    (next: string) => {
+    (next: string, definitions?: QueryParamDef[]) => {
       setSql(next)
+      if (definitions) {
+        setTabs((previous) =>
+          previous.map((open) =>
+            open.id === activeTabId ? { ...open, parameters: definitions, values: {} } : open
+          )
+        )
+        setRefused(null)
+      }
       setTab("sql")
     },
-    [setSql]
+    [setSql, activeTabId]
   )
 
   /**
@@ -673,6 +849,8 @@ export function useQueryStudio() {
         name: nextTabName(tabs),
         sql: options?.sql ?? STARTER_SQL,
         engine: options?.engine ?? "clickhouse",
+        parameters: [],
+        values: {},
       }
       setTabs((previous) =>
         previous.length >= MAX_QUERY_TABS ? previous : [...previous, opened]
@@ -758,10 +936,16 @@ export function useQueryStudio() {
    * after the first one is a call that must not cancel the one before it.
    */
   const runBatch = React.useCallback(
-    async (tabId: string, list: SqlStatement[], runEngine: QueryEngine) => {
+    async (
+      tabId: string,
+      list: SqlStatement[],
+      runEngine: QueryEngine,
+      inputs: QueryParamInputs
+    ) => {
       // A run means the person has moved on from the proposal; its diff is stale.
       setFixResult(null)
       setFixStatement(null)
+      setRefused(null)
       setRuns((previous) => ({
         ...previous,
         [tabId]: list.map(
@@ -816,7 +1000,10 @@ export function useQueryStudio() {
             batch.runId = runId
             const result = await queryService.run(
               list[index].text,
-              { engine: runEngine, runId },
+              // Every statement gets the tab's values and definitions: the
+              // server reads the names its own statement uses and ignores
+              // the rest. Nothing is added when the tab has no placeholder.
+              { engine: runEngine, runId, ...inputs },
               controller.signal
             )
             setRuns((previous) => ({
@@ -835,6 +1022,13 @@ export function useQueryStudio() {
               break
             }
             const serviceError = toServiceError(error)
+            if (serviceError.code === "invalid_request") {
+              const names = fieldsNamedBy(
+                serviceError.message,
+                (inputs.definitions ?? []).map((def) => def.name)
+              )
+              setRefused(names.size > 0 ? { tabId, names } : null)
+            }
             const isPermissionRefusal = serviceError.code === "permission_denied"
             // A permission refusal denies execution rights for the entire
             // batch, so subsequent statements are marked refused without
@@ -887,8 +1081,8 @@ export function useQueryStudio() {
       )
       return
     }
-    await runBatch(activeTabId, statements, engine)
-  }, [statements, activeTabId, engine, runBatch])
+    await runBatch(activeTabId, statements, engine, runInputs)
+  }, [statements, activeTabId, engine, runBatch, runInputs])
 
   /**
    * Runs the selection when there is one, and the whole tab otherwise.
@@ -909,13 +1103,14 @@ export function useQueryStudio() {
         await runBatch(
           activeTabId,
           [{ text: picked, from: selection.from, to: selection.to }],
-          engine
+          engine,
+          runInputs
         )
         return
       }
     }
     await runQuery()
-  }, [readSelection, sql, activeTabId, engine, runBatch, runQuery])
+  }, [readSelection, sql, activeTabId, engine, runBatch, runQuery, runInputs])
 
   /**
    * Stops the batch: the statement in flight and the ones after it did not
@@ -1125,6 +1320,9 @@ export function useQueryStudio() {
         name,
         sql: linkedSaved.sql,
         engine: "clickhouse",
+        // Its definitions, and no values: each field starts at its default.
+        parameters: linkedSaved.parameters,
+        values: {},
         savedId: linkedSaved.id,
         level: linkedSaved.level,
       }
@@ -1178,6 +1376,19 @@ export function useQueryStudio() {
     setSql,
     engine,
     setEngine,
+    /** The parameters whose `{{name}}` the open tab's SQL uses, in order, with their definitions. */
+    parameters,
+    /** The open tab's values by name; a parameter without one is not given. */
+    parameterValues,
+    setParameterValue,
+    setParameterDefinition,
+    /** The parameters the last refusal of a run or an estimate named, by name. */
+    invalidParameters,
+    /**
+     * The definitions a save of the statement in `targetStatement` carries:
+     * the ones its SQL uses, defaults included, and never a current value.
+     */
+    saveParameters,
     tabs,
     activeTabId,
     addTab,
@@ -1242,7 +1453,7 @@ export function useQueryStudio() {
     runQuery,
     runSelectionOrAll,
     reEstimate: () => {
-      if (targetText !== null) void runEstimate(targetText)
+      if (targetText !== null && !estimateWaits) void runEstimate(targetText, estimateInputs)
     },
     save,
     /**

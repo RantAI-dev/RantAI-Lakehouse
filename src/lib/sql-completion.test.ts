@@ -321,3 +321,58 @@ test("sqlCompletionOptions menghitung dari awal kata yang sedang diselesaikan", 
   })
   assert.equal(from, sql.indexOf("am"))
 })
+
+test("sqlCompletionOptions offers the defined parameter names after {{ and nothing else", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE status = {{"
+  const { from, options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  assert.equal(from, sql.length)
+  assert.deepEqual(
+    options.map((option) => [option.label, option.kind, option.apply]),
+    [
+      ["region", "parameter", "region"],
+      ["day", "parameter", "day"],
+    ]
+  )
+})
+
+test("sqlCompletionOptions completes a parameter name that is half typed, past blanks inside the braces", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE status = {{  re"
+  const { from, options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region"],
+  })
+  assert.equal(from, sql.indexOf("re"))
+  assert.deepEqual(options.map((option) => option.label), ["region"])
+})
+
+test("sqlCompletionOptions offers no parameter name outside the braces", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE "
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region"],
+  })
+  assert.equal(options.some((option) => option.kind === "parameter"), false)
+})
+
+test("sqlCompletionOptions offers nothing after {{ when the tab defines no parameter", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE status = {{"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options, [])
+})
