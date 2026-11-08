@@ -1,0 +1,420 @@
+/*
+ * The hero lab (/lab/hero/). Everything here is scoped to `.lab-hero`, and
+ * the stylesheet is imported only by the lab's component, so no other page
+ * loads it. Day colours are dark ink on a light sky; every pair is at least
+ * 4.5:1 once the wash behind the words is counted.
+ */
+
+@property --lab-h {
+  syntax: "<length-percentage>";
+  inherits: true;
+  initial-value: 61.2%;
+}
+@property --lab-sx {
+  syntax: "<length-percentage>";
+  inherits: true;
+  initial-value: 62%;
+}
+@property --lab-sy {
+  syntax: "<length-percentage>";
+  inherits: true;
+  initial-value: 40%;
+}
+
+.lab-hero {
+  --lab-scale: 1;
+  --lab-h1: clamp(4.5rem, 9vw, 7.5rem);
+  --lab-day-ink: #08183a;
+}
+.lab-hero .lab-stage {
+  --lab-sx: 62%;
+  --lab-sy: calc(8% + 23vmin);
+  transition:
+    --lab-h 250ms cubic-bezier(0.4, 0, 0.2, 1),
+    --lab-sx 250ms cubic-bezier(0.4, 0, 0.2, 1),
+    --lab-sy 250ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.lab-hero[data-layout="B"] .lab-stage {
+  --lab-sx: 82%;
+  --lab-sy: calc(var(--lab-h) - 7%);
+}
+.lab-hero[data-layout="C"] .lab-stage {
+  --lab-sx: 80%;
+  --lab-sy: calc(var(--lab-h) - 8%);
+}
+@media (max-width: 767.98px) {
+  .lab-hero[data-layout="B"] .lab-stage {
+    --lab-sx: 86%;
+  }
+  .lab-hero[data-layout="C"] .lab-stage {
+    --lab-sx: 84%;
+  }
+}
+
+/* ---- Headline sizes by layout, and the fonts ---- */
+.lab-hero[data-layout="B"] {
+  --lab-h1: clamp(2.75rem, 6.2vw, 5.5rem);
+}
+.lab-hero[data-layout="C"] {
+  --lab-h1: clamp(3rem, 11.4vw, 11.5rem);
+}
+.lab-hero .lab-h1 {
+  font-size: calc(var(--lab-h1) * var(--lab-scale));
+  transition: color 250ms ease;
+}
+.lab-hero[data-layout="B"] .lab-h1 {
+  text-wrap: balance;
+}
+.lab-hero[data-layout="C"] .lab-h1 {
+  line-height: 0.94;
+  max-width: 14ch;
+}
+.lab-hero[data-layout="C"][data-font="3"] .lab-h1,
+.lab-hero[data-layout="C"][data-font="4"] .lab-h1 {
+  line-height: 0.9;
+}
+
+/* 2: Fraunces, a soft modern serif, upright. */
+.lab-hero[data-font="2"] {
+  --lab-scale: 0.9;
+}
+.lab-hero[data-font="2"] .lab-h1 {
+  font-family: var(--font-lab-fraunces), ui-serif, Georgia, serif;
+  font-style: normal;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  line-height: 1.04;
+}
+/* 3: Inter Tight, tight-tracked and bold. */
+.lab-hero[data-font="3"] {
+  --lab-scale: 0.82;
+}
+.lab-hero[data-font="3"] .lab-h1 {
+  font-family: var(--font-lab-inter-tight), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: -0.05em;
+  line-height: 0.98;
+}
+.lab-hero[data-font="3"] .lab-eyebrow,
+.lab-hero[data-font="3"] .lab-lead {
+  font-family: var(--font-lab-inter-tight), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+}
+/* 4: Bricolage Grotesque, with character. */
+.lab-hero[data-font="4"] {
+  --lab-scale: 0.84;
+}
+.lab-hero[data-font="4"] .lab-h1 {
+  font-family: var(--font-lab-bricolage), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 0.99;
+}
+.lab-hero[data-font="4"] .lab-eyebrow,
+.lab-hero[data-font="4"] .lab-lead {
+  font-family: var(--font-lab-bricolage), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* ---- The change of font or layout: the words and the creature leave and arrive ---- */
+.lab-hero .lab-fade {
+  transition: opacity 120ms ease-out;
+}
+.lab-hero[data-swap="1"] .lab-fade {
+  opacity: 0;
+}
+
+/* ---- Text colours ---- */
+.lab-hero .lab-eyebrow,
+.lab-hero .lab-lead,
+.lab-hero .lab-reassure,
+.lab-hero .lab-ghost {
+  transition:
+    color 250ms ease,
+    border-color 250ms ease,
+    background-color 200ms ease,
+    transform 200ms ease-out,
+    box-shadow 200ms ease-out;
+}
+.lab-hero .lab-reassure {
+  color: rgb(232 244 255 / 0.7);
+}
+.lab-hero[data-time="day"] .lab-h1 {
+  color: var(--lab-day-ink);
+}
+.lab-hero[data-time="day"] .lab-eyebrow {
+  color: #083f82;
+}
+.lab-hero[data-time="day"] .lab-lead {
+  color: rgb(8 24 58 / 0.88);
+}
+.lab-hero[data-time="day"] .lab-reassure {
+  color: rgb(8 24 58 / 0.8);
+}
+.lab-hero[data-time="day"] .lab-reassure li::before {
+  color: #1d6ccf;
+}
+.lab-hero[data-time="day"] .lab-ghost {
+  color: var(--lab-day-ink);
+  border-color: rgb(8 24 58 / 0.42);
+}
+.lab-hero[data-time="day"] .lab-ghost:hover {
+  color: var(--lab-day-ink);
+  border-color: rgb(8 24 58 / 0.75);
+  background-color: rgb(8 24 58 / 0.08);
+}
+
+/* ---- Washes: keep the words readable over any frame of the scene ---- */
+.lab-hero .lab-wash {
+  transition: opacity 250ms ease;
+}
+.lab-hero .lab-wash-day,
+.lab-hero[data-time="day"] .lab-wash-night {
+  opacity: 0;
+}
+.lab-hero[data-time="day"] .lab-wash-day {
+  opacity: 1;
+}
+.lab-hero[data-layout="A"] .lab-wash-night {
+  background: linear-gradient(90deg, rgba(2, 5, 20, 0.72) 0%, rgba(2, 5, 20, 0.45) 38%, transparent 62%);
+}
+.lab-hero[data-layout="A"] .lab-wash-day {
+  background: linear-gradient(90deg, rgba(238, 246, 253, 0.8) 0%, rgba(238, 246, 253, 0.55) 38%, transparent 62%);
+}
+.lab-hero[data-layout="B"] .lab-wash-night {
+  background:
+    radial-gradient(ellipse 78% 44% at 50% 26%, rgba(2, 5, 20, 0.6) 0%, rgba(2, 5, 20, 0.3) 55%, transparent 80%),
+    linear-gradient(0deg, rgba(2, 5, 20, 0.78) 0%, rgba(2, 5, 20, 0.5) 18%, transparent 34%);
+}
+.lab-hero[data-layout="B"] .lab-wash-day {
+  background:
+    radial-gradient(ellipse 78% 44% at 50% 26%, rgba(238, 246, 253, 0.74) 0%, rgba(238, 246, 253, 0.4) 55%, transparent 80%),
+    linear-gradient(0deg, rgba(238, 246, 253, 0.86) 0%, rgba(238, 246, 253, 0.6) 18%, transparent 34%);
+}
+.lab-hero[data-layout="C"] .lab-wash-night {
+  background: linear-gradient(0deg, rgba(2, 5, 20, 0.88) 0%, rgba(2, 5, 20, 0.72) 36%, transparent 62%);
+}
+.lab-hero[data-layout="C"] .lab-wash-day {
+  background: linear-gradient(0deg, rgba(238, 246, 253, 0.92) 0%, rgba(238, 246, 253, 0.78) 36%, transparent 62%);
+}
+@media (max-width: 767.98px) {
+  .lab-hero[data-layout="A"] .lab-wash-night {
+    background: linear-gradient(0deg, rgba(2, 5, 20, 0.92) 0%, rgba(2, 5, 20, 0.84) 52%, rgba(2, 5, 20, 0.4) 70%, transparent 86%);
+  }
+  .lab-hero[data-layout="A"] .lab-wash-day {
+    background: linear-gradient(0deg, rgba(238, 246, 253, 0.94) 0%, rgba(238, 246, 253, 0.86) 52%, rgba(238, 246, 253, 0.45) 70%, transparent 86%);
+  }
+  .lab-hero[data-layout="B"] .lab-wash-night {
+    background:
+      linear-gradient(180deg, rgba(2, 5, 20, 0.7) 0%, rgba(2, 5, 20, 0.55) 34%, transparent 50%),
+      linear-gradient(0deg, rgba(2, 5, 20, 0.85) 0%, rgba(2, 5, 20, 0.6) 20%, transparent 36%);
+  }
+  .lab-hero[data-layout="B"] .lab-wash-day {
+    background:
+      linear-gradient(180deg, rgba(238, 246, 253, 0.8) 0%, rgba(238, 246, 253, 0.62) 34%, transparent 50%),
+      linear-gradient(0deg, rgba(238, 246, 253, 0.9) 0%, rgba(238, 246, 253, 0.66) 20%, transparent 36%);
+  }
+  .lab-hero[data-layout="C"] .lab-wash-night {
+    background: linear-gradient(0deg, rgba(2, 5, 20, 0.92) 0%, rgba(2, 5, 20, 0.8) 44%, transparent 70%);
+  }
+  .lab-hero[data-layout="C"] .lab-wash-day {
+    background: linear-gradient(0deg, rgba(238, 246, 253, 0.94) 0%, rgba(238, 246, 253, 0.82) 44%, transparent 70%);
+  }
+}
+
+/* ---- The DOM picture: night as the home page draws it, and a day to match ---- */
+.lab-hero .lab-sky {
+  transition: opacity 250ms ease;
+}
+.lab-hero .lab-sky-night {
+  background: linear-gradient(
+    180deg,
+    #020514 0%,
+    #050a30 calc(var(--lab-h) * 0.62),
+    #0a1f55 calc(var(--lab-h) - 0.2%),
+    #0b2a66 calc(var(--lab-h) + 0.2%),
+    #061440 calc(var(--lab-h) + (100% - var(--lab-h)) * 0.33),
+    #030b2a 100%
+  );
+}
+.lab-hero .lab-sky-day {
+  opacity: 0;
+  background: linear-gradient(
+    180deg,
+    #5d99dc 0%,
+    #86b6e8 calc(var(--lab-h) * 0.55),
+    #bcd9f1 calc(var(--lab-h) * 0.88),
+    #e3eef8 calc(var(--lab-h) - 0.2%),
+    #a9cdea calc(var(--lab-h) + 0.2%),
+    #6fa6d6 calc(var(--lab-h) + (100% - var(--lab-h)) * 0.33),
+    #3d82c0 calc(var(--lab-h) + (100% - var(--lab-h)) * 0.7),
+    #2a6aa8 100%
+  );
+}
+.lab-hero[data-time="day"] .lab-sky-day {
+  opacity: 1;
+}
+
+.lab-hero .lab-moon-glow,
+.lab-hero .lab-sun-halo {
+  left: var(--lab-sx);
+  top: calc(var(--lab-sy) - 23vmin);
+  width: 46vmin;
+  height: 46vmin;
+  transform: translateX(-50%);
+  border-radius: 9999px;
+  transition: opacity 250ms ease;
+}
+.lab-hero .lab-moon-glow {
+  background: radial-gradient(circle, rgba(232, 244, 255, 0.22) 0%, rgba(68, 166, 250, 0.1) 38%, transparent 70%);
+}
+.lab-hero .lab-sun-halo {
+  top: calc(var(--lab-sy) - 35vmin);
+  width: 70vmin;
+  height: 70vmin;
+  opacity: 0;
+  background: radial-gradient(
+    circle,
+    rgba(255, 249, 230, 0.9) 0%,
+    rgba(255, 241, 204, 0.5) 9%,
+    rgba(255, 234, 186, 0.18) 30%,
+    transparent 66%
+  );
+}
+.lab-hero .lab-sun-disc {
+  left: var(--lab-sx);
+  top: calc(var(--lab-sy) - 4vmin);
+  width: 8vmin;
+  height: 8vmin;
+  transform: translateX(-50%);
+  border-radius: 9999px;
+  opacity: 0;
+  background: radial-gradient(circle, #fffefa 0%, #fff9e8 58%, rgba(255, 246, 216, 0) 100%);
+  filter: blur(1.5px);
+  transition: opacity 250ms ease;
+}
+.lab-hero[data-time="day"] .lab-moon-glow {
+  opacity: 0;
+}
+.lab-hero[data-time="day"] .lab-sun-halo,
+.lab-hero[data-time="day"] .lab-sun-disc {
+  opacity: 1;
+}
+
+/* The moon's path on the water, and the sun's glitter. */
+.lab-hero .lab-streak {
+  left: var(--lab-sx);
+  top: var(--lab-h);
+  width: 14vw;
+  height: 34vh;
+  transform: translateX(-50%);
+  transition: opacity 250ms ease;
+}
+.lab-hero .lab-streak-night {
+  background: radial-gradient(ellipse at top, rgba(68, 166, 250, 0.35) 0%, transparent 70%);
+  filter: blur(12px);
+}
+.lab-hero .lab-streak-day {
+  opacity: 0;
+  width: 16vw;
+  background: repeating-linear-gradient(180deg, rgba(255, 252, 240, 0.7) 0 2px, transparent 2px 9px);
+  background-size: 100% 18px;
+  -webkit-mask-image: radial-gradient(ellipse 48% 100% at 50% 0%, #000 0%, transparent 78%);
+  mask-image: radial-gradient(ellipse 48% 100% at 50% 0%, #000 0%, transparent 78%);
+  animation: lab-glitter 3.2s linear infinite;
+}
+@keyframes lab-glitter {
+  to {
+    background-position: 0 18px;
+  }
+}
+.lab-hero[data-time="day"] .lab-streak-night {
+  opacity: 0;
+}
+.lab-hero[data-time="day"] .lab-streak-day {
+  opacity: 1;
+}
+
+.lab-hero .lab-waterline {
+  top: calc(var(--lab-h) - 6px);
+  color: rgb(68 166 250 / 0.35);
+  transition: color 250ms ease;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, transparent 50%, #000 64%, #000 90%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0%, transparent 50%, #000 64%, #000 90%, transparent 100%);
+}
+.lab-hero:not([data-layout="A"]) .lab-waterline {
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 16%, #000 84%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0%, #000 16%, #000 84%, transparent 100%);
+}
+.lab-hero[data-time="day"] .lab-waterline {
+  color: rgb(255 255 255 / 0.6);
+}
+
+/* ---- The top bar's light variant, on this page only ---- */
+.lab-hero header {
+  transition: color 250ms ease;
+}
+.lab-hero[data-time="day"] header {
+  color: var(--lab-day-ink);
+}
+.lab-hero[data-time="day"] header [class*="text-[#E8F4FF]"] {
+  color: rgb(8 24 58 / 0.78);
+  transition: color 250ms ease;
+}
+.lab-hero[data-time="day"] header a[href$="#hero"] {
+  color: var(--lab-day-ink);
+}
+.lab-hero[data-time="day"] header [class*="text-[#E8F4FF]"]:hover,
+.lab-hero[data-time="day"] header [aria-current] {
+  color: var(--lab-day-ink);
+  background-color: rgb(8 24 58 / 0.08);
+}
+.lab-hero[data-time="day"] header [class*=" bg-[#E8F4FF]/[0.06]"] {
+  background-color: rgb(8 24 58 / 0.07);
+}
+.lab-hero[data-time="day"] header svg path[fill="white"] {
+  fill: #0a1250;
+}
+.lab-hero[data-time="day"] header a[class*="bg-[var(--lk-primary)]"] {
+  color: #fff;
+}
+
+/* The creature's own little pool of water is a night shade; on the day water it is only a hint. */
+.lab-hero .lab-fade svg g[aria-hidden="true"] {
+  transition: opacity 250ms ease;
+}
+.lab-hero[data-time="day"] svg g[aria-hidden="true"] {
+  opacity: 0.35;
+}
+
+/* ---- The control bar's sliding highlight ---- */
+.lab-pill {
+  transition:
+    transform 220ms cubic-bezier(0.4, 0, 0.2, 1),
+    width 220ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lab-hero .lab-stage,
+  .lab-hero .lab-fade,
+  .lab-hero .lab-wash,
+  .lab-hero .lab-sky,
+  .lab-hero .lab-sun-halo,
+  .lab-hero .lab-sun-disc,
+  .lab-hero .lab-moon-glow,
+  .lab-hero .lab-streak,
+  .lab-hero .lab-waterline,
+  .lab-hero .lab-h1,
+  .lab-hero .lab-eyebrow,
+  .lab-hero .lab-lead,
+  .lab-hero .lab-reassure,
+  .lab-hero .lab-ghost,
+  .lab-hero header,
+  .lab-hero header [class*="text-[#E8F4FF]"],
+  .lab-pill {
+    transition: none;
+  }
+  .lab-hero .lab-streak-day {
+    animation: none;
+  }
+}
