@@ -1,13 +1,14 @@
 import * as React from "react";
-import { Database, HardDriveDownload, Layers, Table2, Terminal, Zap } from "lucide-react";
+import { HardDriveDownload, Table2 } from "lucide-react";
+import { hoverColour, SourceIcon } from "@/components/shared/brand-icons";
 import type { HomeCopy } from "@/lib/copy";
 
 /**
  * "Open tables", drawn as the anatomy of one open table (owner QA 2026-11-08: "feels so empty"):
  * three tiers, top to bottom, joined by wires.
  * 1. The engines that read it. Only ClickHouse is claimed as built in (BLD-3); the others are
- *    examples of engines that read Apache Iceberg, under that label. Neutral icons: no licensed
- *    mark for them is in the site (DESIGN.md: never a fake logo).
+ *    examples of engines that read Apache Iceberg, under that label. Their marks are Simple Icons
+ *    (CC0), see shared/brand-icons.tsx: one lake-blue colour, the brand's own on hover.
  * 2. The Iceberg table (`orders`): its columns with their types, and a snapshot timeline that
  *    shows the history is kept; a snapshot's dot names its row count on hover or focus.
  * 3. Your object storage: the plain files as they sit there.
@@ -17,10 +18,10 @@ import type { HomeCopy } from "@/lib/copy";
  * down to the same files. Under reduced motion it is the settled picture.
  */
 const ENGINES = [
-  { id: "clickhouse", name: "ClickHouse", query: "SELECT sum(amount)", result: "Rp 1.33M", icon: Zap, builtIn: true },
-  { id: "duckdb", name: "DuckDB", query: "SELECT count(*)", result: "12", icon: Terminal, builtIn: false },
-  { id: "spark", name: "Apache Spark", query: "SUM(amount)", result: "Rp 1.33M", icon: Layers, builtIn: false },
-  { id: "trino", name: "Trino", query: "SELECT max(ts)", result: "11-04", icon: Database, builtIn: false },
+  { id: "clickhouse", name: "ClickHouse", query: "SELECT sum(amount)", result: "Rp 1.33M", icon: "clickhouse", builtIn: true },
+  { id: "duckdb", name: "DuckDB", query: "SELECT count(*)", result: "12", icon: "duckdb", builtIn: false },
+  { id: "spark", name: "Apache Spark", query: "SUM(amount)", result: "Rp 1.33M", icon: "apachespark", builtIn: false },
+  { id: "trino", name: "Trino", query: "SELECT max(ts)", result: "11-04", icon: "trino", builtIn: false },
 ] as const;
 const COLUMNS = [
   ["order_id", "int"],
@@ -41,11 +42,13 @@ export function TablesAnatomy({ copy }: { copy: HomeCopy["open"]["tables"] }) {
           <p className="lk-tb-label">{copy.anyEngine}</p>
           <ul className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
             {ENGINES.map((e, i) => {
-              const Icon = e.icon;
               return (
                 <li key={e.id} className="lk-tb-engine" data-id={e.id} style={{ "--i": i } as React.CSSProperties}>
                   <span className="flex items-center gap-1.5 text-[12px] leading-4 font-medium text-[#E8F4FF]/90">
-                    <Icon className="size-3.5 shrink-0 text-[#8fcbff]" strokeWidth={2} />
+                    {/* A fixed 16px slot, so the names start on one line whatever the mark's width. */}
+                    <span className="lk-tb-mark grid size-4 shrink-0 place-items-center" style={{ "--brand": hoverColour(e.icon) } as React.CSSProperties}>
+                      <SourceIcon id={e.icon} className="size-3.5" />
+                    </span>
                     <span className="truncate">{e.name}</span>
                   </span>
                   {e.builtIn && <span className="mt-0.5 block text-[10.5px] leading-4 text-[#E8F4FF]/50">{copy.builtIn}</span>}

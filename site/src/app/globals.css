@@ -2897,6 +2897,15 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-tb-snap:hover .lk-tb-snaptip {
   opacity: 1;
 }
+/* The engine's mark: lake blue at rest, its brand colour when lit. */
+.lk-tb-mark {
+  color: #8fcbff;
+  transition: color 0.2s ease;
+}
+.lk-tb-engine:hover .lk-tb-mark,
+.lk-tb-engine:focus-within .lk-tb-mark {
+  color: var(--brand);
+}
 /* An engine lit: its own stem, the table's wire and every file light up (the same files, no copy). */
 .lk-tb-engine:hover {
   box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
