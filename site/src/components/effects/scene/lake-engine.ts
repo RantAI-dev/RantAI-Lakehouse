@@ -62,6 +62,8 @@ export type EngineOptions = {
   observe: Element;
   /** The WebGL context was lost; the page falls back to the DOM hero. */
   onContextLost: () => void;
+  /** The visitor tapped the sun or the moon in the sky (the home page toggles day and night). */
+  onSkyTap?: () => void;
 };
 
 export type LakeEngine = {
@@ -73,6 +75,12 @@ export type LakeEngine = {
    * between blends the two, so the lab can ease from one to the other.
    */
   setTimeOfDay: (day: number) => void;
+  /**
+   * The home page's day and night: ease to `target` (0 night, 1 day) over `ms`
+   * (0 is at once). The scene shows it only above the water: the day fades out
+   * as the camera dives, so the underwater sections stay exactly as they were.
+   */
+  setDay: (target: number, ms: number) => void;
   /**
    * Lab framing (`/lab/hero/` only). `box`: put the creature where the page's
    * `[data-hero-box]` element is (its top is the dome's top, its bottom the
@@ -236,6 +244,8 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     ambient: ambient.color.clone(),
   };
   let dayK = 0;
+  // The chosen mode and its cross-fade; what is drawn is this times (1 - underwater).
+  const tod = { from: 0, goal: 0, prog: 1, secs: 0.6, base: 0 };
   const applyDay = (k: number) => {
     dayK = k;
     skyUniforms.uSkyHorizon.value.copy(NIGHT.horizon).lerp(DAY.horizon, k);
@@ -248,7 +258,7 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     skyUniforms.uMoonDisc.value.set(lerp(0.99978, 0.9991, k), lerp(0.99988, 0.9996, k));
     skyUniforms.uMoonHalo.value = lerp(1, 2.6, k);
     stars.uniforms.uAlpha.value = 1 - k;
-    stars.points.visible = k < 0.999;
+    stars.points.visible = k < 0.999 && lastAbove !== false;
     (water.uniforms.uDeep.value as Color).copy(NIGHT.deep).lerp(DAY.deep, k);
     water.uniforms.uWaveGain.value = lerp(1, 0.5, k);
     water.uniforms.uFogDensity.value = lerp(0.021, 0.013, k);
@@ -278,6 +288,16 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     if (still || (view === "hero" && window.scrollY > layout.vh * 0.5) || isInteractive(e.target)) return;
     ndc.set(pointer.x, pointer.y);
     raycaster.setFromCamera(ndc, camera);
+    // The sun or the moon: a tap on it (not on text) changes day and night.
+    if (
+      opts.onSkyTap &&
+      lastAbove !== false &&
+      !(e.target instanceof Element && e.target.closest("h1,h2,p,li")) &&
+      raycaster.ray.direction.dot(moonDir) > 0.9985
+    ) {
+      opts.onSkyTap();
+      return;
+    }
     if (raycaster.intersectObject(mascot.dome, false).length > 0) mascot.dip(clock.t);
   };
   const onTilt = (e: DeviceOrientationEvent) => {
@@ -711,6 +731,13 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
     // O53: the final call is the hero's pose, whatever the scroll.
     state = sceneStateAt(view === "final" ? 0 : smoothY, layout);
     const uw = state.underwater;
+    if (tod.prog < 1) {
+      tod.prog = Math.min(1, tod.prog + dt / tod.secs);
+      const e = tod.prog < 0.5 ? 2 * tod.prog * tod.prog : 1 - Math.pow(-2 * tod.prog + 2, 2) / 2;
+      tod.base = tod.from + (tod.goal - tod.from) * e;
+    }
+    const dayNow = tod.base * (1 - uw);
+    if (Math.abs(dayNow - dayK) > 1e-4) applyDay(dayNow);
     if (lab.on && !still) {
       // Lab: ease the creature's framing to its goal (about 250 ms).
       const glide = 1 - Math.exp(-dt * 11);
@@ -1046,8 +1073,24 @@ export function createLakeEngine(opts: EngineOptions): LakeEngine {
 
   return {
     setTimeOfDay(day) {
-      applyDay(clamp(day, 0, 1));
+      tod.from = tod.goal = tod.base = clamp(day, 0, 1);
+      tod.prog = 1;
+      applyDay(tod.base * (1 - state.underwater));
       renderOnceIfStill();
+    },
+    setDay(target, ms) {
+      const goal = clamp(target, 0, 1);
+      if (ms <= 0 || still) {
+        tod.from = tod.goal = tod.base = goal;
+        tod.prog = 1;
+        applyDay(goal * (1 - state.underwater));
+        renderOnceIfStill();
+        return;
+      }
+      tod.from = tod.base;
+      tod.goal = goal;
+      tod.prog = 0;
+      tod.secs = ms / 1000;
     },
     setLab(next) {
       watchHeroEls();

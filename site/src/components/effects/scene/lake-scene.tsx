@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { getTod, subscribeTod, toggleTod, TOD_FADE_MS } from "@/lib/tod";
 import { createLakeEngine, type EngineMode, type LakeEngine } from "./lake-engine";
 
 /**
@@ -51,6 +52,8 @@ export default function LakeScene({
         mode,
         observe: target,
         onContextLost: () => onFailRef.current(),
+        // The home page: the sun and the moon in the sky also change day and night.
+        onSkyTap: onEngineRef.current ? undefined : toggleTod,
       });
     } catch {
       // No usable GPU, or the context could not be created: the DOM hero stays.
@@ -61,9 +64,17 @@ export default function LakeScene({
     // One frame later, so the first rendered frame is on screen before the
     // DOM fallback fades.
     onEngineRef.current?.(engine);
+    // The home page's day and night (the lab drives its own through `onEngine`).
+    let unsubscribe = () => {};
+    if (!onEngineRef.current) {
+      const show = (ms: number) => engine.setDay(getTod() === "day" ? 1 : 0, ms);
+      show(0);
+      unsubscribe = subscribeTod(() => show(TOD_FADE_MS));
+    }
     const id = requestAnimationFrame(() => onReadyRef.current());
     return () => {
       onEngineRef.current?.(null);
+      unsubscribe();
       cancelAnimationFrame(id);
       engine.dispose();
       canvas.remove();
