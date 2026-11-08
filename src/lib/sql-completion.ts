@@ -46,8 +46,8 @@ export type ColumnState =
 export type CompletionOption = {
   /** What the person reads in the list. */
   label: string
-  /** What the suggestion is: a column, a table, or a note about the catalog. */
-  kind: "column" | "table" | "message"
+  /** What the suggestion is: a column, a table, a query parameter, or a note about the catalog. */
+  kind: "column" | "table" | "parameter" | "message"
   /** The type shown next to the label, e.g. `Int64`. */
   detail?: string
   /**
@@ -75,6 +75,8 @@ export type CompletionRequest = {
   tables: CompletionTable[]
   /** The columns fetched so far, keyed by the catalog id of the table. */
   columns: Record<string, ColumnState>
+  /** The names of the tab's `{{name}}` parameter definitions (`QS-5`). Absent means none. */
+  parameters?: readonly string[]
 }
 
 /** What the completion answers. */
@@ -166,6 +168,9 @@ const NOT_AN_ALIAS = new Set([
   "WHERE",
   "WITH",
 ])
+
+/** `{{`, with blanks allowed after it, right before the word being completed. */
+const OPENS_PLACEHOLDER = /\{\{\s*$/
 
 /**
  * The dotted name right before the word being completed: `o` in `o.am`,
@@ -393,7 +398,9 @@ export function tablesInStatement(sql: string, tables: CompletionTable[]): Named
 /**
  * The suggestions for the place the cursor is in.
  *
- * Three places, in order:
+ * Four places, in order:
+ * - after `{{`: the names of the tab's parameter definitions, and nothing
+ *   else, because nothing else can be written there;
  * - after a qualifier (`o.`, `silver.orders.`): the columns of that one
  *   table, or the note that says they are not there yet;
  * - after `FROM` or `JOIN`: the tables;
@@ -408,9 +415,17 @@ export function sqlCompletionOptions({
   cursor,
   tables,
   columns,
+  parameters = [],
 }: CompletionRequest): CompletionAnswer {
   const tokens = tokenizeSql(sql)
   const from = wordStart(sql, cursor)
+
+  if (OPENS_PLACEHOLDER.test(sql.slice(0, from))) {
+    return {
+      from,
+      options: parameters.map((name) => ({ label: name, kind: "parameter", apply: name })),
+    }
+  }
 
   const qualifier = qualifierBefore(sql, from)
   if (qualifier) {

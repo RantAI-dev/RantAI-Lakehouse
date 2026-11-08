@@ -526,3 +526,87 @@ describe("useQueryStudio statements", () => {
     view.destroy()
   })
 })
+
+describe("useQueryStudio parameters", () => {
+  it("gives a name the SQL gains a text definition, and a range name a dateRange one", () => {
+    const hook = mountWith("SELECT {{region}} WHERE d > {{day.start}} AND d < {{day.end}}")
+    expect(hook.result.current.parameters).toEqual([
+      { name: "region", type: "text" },
+      { name: "day", type: "dateRange" },
+    ])
+    expect(hook.result.current.tabs[0]?.parameters).toEqual([
+      { name: "region", type: "text" },
+      { name: "day", type: "dateRange" },
+    ])
+  })
+
+  it("makes no field of a placeholder in a comment or a string", () => {
+    const hook = mountWith("SELECT '{{a}}' -- {{b}}\n/* {{c}} */")
+    expect(hook.result.current.parameters).toEqual([])
+  })
+
+  it("keeps the value a field was given, and takes it away when the field is emptied", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    expect(hook.result.current.parameterValues).toEqual({ region: "EU" })
+    act(() => hook.result.current.setParameterValue("region", undefined))
+    expect(hook.result.current.parameterValues).toEqual({})
+    expect(Object.hasOwn(hook.result.current.tabs[0]?.values ?? {}, "region")).toBe(false)
+  })
+
+  it("hides the field of a name that left the SQL and brings it back with its definition and value", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() =>
+      hook.result.current.setParameterDefinition({
+        name: "region",
+        type: "dropdown",
+        options: [{ value: "eu", label: "Europe" }],
+      })
+    )
+    act(() => hook.result.current.setParameterValue("region", "eu"))
+
+    act(() => hook.result.current.setSql("SELECT 1"))
+    expect(hook.result.current.parameters).toEqual([])
+    expect(hook.result.current.tabs[0]?.parameters.map((def) => def.name)).toEqual(["region"])
+    expect(hook.result.current.parameterValues).toEqual({ region: "eu" })
+
+    act(() => hook.result.current.setSql("SELECT {{region}}"))
+    expect(hook.result.current.parameters).toEqual([
+      { name: "region", type: "dropdown", options: [{ value: "eu", label: "Europe" }] },
+    ])
+    expect(hook.result.current.parameterValues).toEqual({ region: "eu" })
+  })
+
+  it("clears a value that no longer fits when the type changes", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    act(() => hook.result.current.setParameterDefinition({ name: "region", type: "number" }))
+    expect(hook.result.current.parameters).toEqual([{ name: "region", type: "number" }])
+    expect(hook.result.current.parameterValues).toEqual({})
+  })
+
+  it("writes the definitions and values to the draft", async () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterValue("region", "EU"))
+    await waitFor(() => {
+      const stored = JSON.parse(window.localStorage.getItem("rantai-lakehouse:query-studio-draft") ?? "{}")
+      expect(stored.tabs?.[0]?.values).toEqual({ region: "EU" })
+      expect(stored.tabs?.[0]?.parameters).toEqual([{ name: "region", type: "text" }])
+    })
+  })
+
+  it("completes the tab's defined names after {{, including one the SQL does not use yet", () => {
+    const hook = mountWith("SELECT {{region}}")
+    act(() => hook.result.current.setParameterDefinition({ name: "spare", type: "number" }))
+    const sql = "SELECT {{region}}, {{"
+    act(() => hook.result.current.setSql(sql))
+    const context = {
+      state: { doc: { toString: () => sql } },
+      pos: sql.length,
+    } as unknown as Parameters<typeof hook.result.current.completionSource>[0]
+    const answer = hook.result.current.completionSource(context) as unknown as {
+      options: { label: string }[]
+    }
+    expect(answer.options.map((option) => option.label)).toEqual(["region", "spare"])
+  })
+})

@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/select"
 import { useFormatSettings } from "./use-format-settings"
 import { KeyboardShortcutsDialog } from "./keyboard-shortcuts-dialog"
+import { QueryParameterFields } from "./query-parameter-fields"
 import type { useQueryStudio } from "./use-query-studio"
 
 /** What the keyword case is called in the settings control. */
@@ -75,6 +76,11 @@ export function SqlPanel({
     setSql,
     engine,
     setEngine,
+    parameters,
+    parameterValues,
+    setParameterValue,
+    setParameterDefinition,
+    activeTabId,
     editorExtensions,
     statements,
     running,
@@ -124,6 +130,15 @@ export function SqlPanel({
         onChange={setSql}
         extensions={editorExtensions}
         onView={(view) => studio.setEditorView(view)}
+      />
+      {/* One field per `{{name}}` in the SQL (`QS-5`); none, and nothing is drawn.
+          The tab is the key: another tab starts its fields over. */}
+      <QueryParameterFields
+        key={activeTabId}
+        definitions={parameters}
+        values={parameterValues}
+        onValueChange={setParameterValue}
+        onDefinitionChange={setParameterDefinition}
       />
       <div className="flex flex-wrap items-center gap-2">
         <Select value={engine} onValueChange={(v) => setEngine(v as typeof engine)}>

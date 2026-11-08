@@ -22,6 +22,11 @@ import {
   type QueryTabs,
 } from "@/lib/query-draft"
 import {
+  activeParameters,
+  reconcileDefinitions,
+  replaceDefinition,
+} from "@/lib/query-param-names"
+import {
   tablesInStatement,
   type ColumnState,
   type CompletionTable,
@@ -37,6 +42,8 @@ import { toServiceError, type ServiceError } from "@/services/errors"
 import type {
   NlAnswer,
   QueryEngine,
+  QueryParamDef,
+  QueryParamValue,
   QueryResult,
   SaveQueryInput,
   SavedQuery,
@@ -56,6 +63,10 @@ const ESTIMATE_DEBOUNCE_MS = 500
 
 /** How long to wait before writing the draft to storage. */
 const DRAFT_DEBOUNCE_MS = 400
+
+/** What a tab without definitions or values holds; one object, so the memo that reads it stays put. */
+const NO_DEFINITIONS: QueryParamDef[] = []
+const NO_VALUES: Record<string, QueryParamValue> = {}
 
 /**
  * The id of the tab that is there before anything is read from storage.
@@ -252,6 +263,19 @@ export function useQueryStudio() {
   const sql = activeTab?.sql ?? ""
   const engine = activeTab?.engine ?? "clickhouse"
 
+  // The `{{name}}` parameters of the open tab (`QS-5`). The tab keeps every
+  // definition it has had; the fields are the ones whose name the SQL uses
+  // now, so a name cut out of the SQL loses its field and not its
+  // definition or value. Read on `sql` and the definitions only, so a
+  // keystroke that changes neither the names nor the definitions does not
+  // rebuild the list the fields are drawn from.
+  const parameterDefinitions = activeTab?.parameters ?? NO_DEFINITIONS
+  const parameterValues = activeTab?.values ?? NO_VALUES
+  const parameters = React.useMemo(
+    () => activeParameters(sql, parameterDefinitions),
+    [sql, parameterDefinitions]
+  )
+
   // The saved query the open tab came from, when it came from one (`QS-3`
   // C4). Its level says what "Save" may do with it.
   const activeSaved = React.useMemo(() => {
@@ -277,10 +301,46 @@ export function useQueryStudio() {
   const setSql = React.useCallback(
     (next: string) => {
       setTabs((previous) =>
-        previous.map((open) => (open.id === activeTabId ? { ...open, sql: next } : open))
+        previous.map((open) =>
+          open.id === activeTabId
+            ? {
+                ...open,
+                sql: next,
+                parameters: reconcileDefinitions(next, open.parameters, open.values),
+              }
+            : open
+        )
       )
       setFixResult(null)
       setFixStatement(null)
+    },
+    [activeTabId]
+  )
+  /** Gives the parameter a value; `undefined` takes the value away (the default applies). */
+  const setParameterValue = React.useCallback(
+    (name: string, value: QueryParamValue | undefined) => {
+      setTabs((previous) =>
+        previous.map((open) => {
+          if (open.id !== activeTabId) return open
+          const values = { ...open.values }
+          if (value === undefined) delete values[name]
+          else values[name] = value
+          return { ...open, values }
+        })
+      )
+    },
+    [activeTabId]
+  )
+  /** Replaces the definition of the parameter it names; a value that no longer fits its type goes. */
+  const setParameterDefinition = React.useCallback(
+    (def: QueryParamDef) => {
+      setTabs((previous) =>
+        previous.map((open) =>
+          open.id === activeTabId
+            ? { ...open, ...replaceDefinition(open.parameters, open.values, def) }
+            : open
+        )
+      )
     },
     [activeTabId]
   )
@@ -515,9 +575,18 @@ export function useQueryStudio() {
       createSqlCompletionSource({
         tables,
         columns: () => columnsRef.current,
+        parameters: () => parameterNamesRef.current,
       }),
     [tables]
   )
+
+  // The names `{{` completes: every definition the open tab holds, the ones
+  // whose name is not in the SQL yet included. The source is built once, so
+  // it reads the names through this ref.
+  const parameterNamesRef = React.useRef<string[]>([])
+  React.useEffect(() => {
+    parameterNamesRef.current = parameterDefinitions.map((def) => def.name)
+  }, [parameterDefinitions])
 
   // The key binding runs the selection when there is one and the whole tab
   // otherwise. It reads the action through a ref: the extension array must
@@ -1193,6 +1262,12 @@ export function useQueryStudio() {
     setSql,
     engine,
     setEngine,
+    /** The parameters whose `{{name}}` the open tab's SQL uses, in order, with their definitions. */
+    parameters,
+    /** The open tab's values by name; a parameter without one is not given. */
+    parameterValues,
+    setParameterValue,
+    setParameterDefinition,
     tabs,
     activeTabId,
     addTab,

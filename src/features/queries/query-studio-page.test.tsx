@@ -340,3 +340,49 @@ describe("QueryStudioPage schema browser", () => {
     expect(toggle.getAttribute("aria-pressed")).toBe("false")
   })
 })
+
+describe("QueryStudioPage parameters", () => {
+  it("shows no field for SQL without a placeholder", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+    await screen.findByRole("button", { name: "Run query" })
+    expect(screen.queryByRole("group", { name: "Query parameters" })).toBeNull()
+  })
+
+  it("shows a field for each placeholder, above the toolbar, and a field for a name typed later", async () => {
+    stubNetwork()
+    seedDraft("SELECT {{region}}")
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    const runButton = screen.getByRole("button", { name: "Run query" })
+    expect(within(fields).getByLabelText("region")).toBeTruthy()
+    // The row sits between the editor and the toolbar.
+    expect(fields.compareDocumentPosition(runButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it("restores the fields of a reload at the values the tab held", async () => {
+    stubNetwork()
+    window.localStorage.setItem(
+      QUERY_DRAFT_KEY,
+      JSON.stringify({
+        tabs: [
+          {
+            id: "tab-1",
+            name: "Query 1",
+            sql: "SELECT {{region}}",
+            engine: "clickhouse",
+            parameters: [{ name: "region", type: "text", default: "EU" }],
+            values: { region: "US" },
+          },
+        ],
+        activeId: "tab-1",
+        question: "",
+        tab: "sql",
+      })
+    )
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    expect((within(fields).getByLabelText("region") as HTMLInputElement).value).toBe("US")
+  })
+})
