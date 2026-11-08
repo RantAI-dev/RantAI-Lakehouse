@@ -5,6 +5,7 @@ import { LINKS } from "@/lib/home-content";
 import { Container, CtaLink, DisplayHeading } from "@/components/shared/primitives";
 import { SplitWords } from "@/components/shared/reveal";
 import { CodePanel, ConsoleHome } from "./open-visuals";
+import { ConsolePlay } from "./console-play";
 import { HostingStack } from "./hosting-stack";
 import { TablesAnatomy } from "./tables-anatomy";
 import { OpenShowcase } from "./open-showcase";
@@ -59,9 +60,9 @@ export function OpenSection({ copy, cta, contactHref }: { copy: HomeCopy["open"]
       visual: (
         <figure className="h-full">
           <figcaption className="sr-only">{copy.console.alt}</figcaption>
-          <div aria-hidden="true" className="h-full">
+          <ConsolePlay>
             <ConsoleHome windowTitle={copy.console.window} />
-          </div>
+          </ConsolePlay>
         </figure>
       ),
     },

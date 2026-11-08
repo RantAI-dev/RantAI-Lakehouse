@@ -2,8 +2,10 @@ import * as React from "react";
 import {
   ArrowUp,
   BarChart3,
+  Check,
   FileCode2,
   GitBranch,
+  MousePointer2,
   Plug,
   SlidersHorizontal,
 } from "lucide-react";
@@ -115,72 +117,137 @@ export function CodePanel({ copy, action }: { copy: OpenCopy["code"]; action?: R
  * console ships both, and the dark one sits on this page without a bright
  * slab, which is what the owner disliked in the crop. O38: the showcase
  * panel is its window, with the title strip drawn here.
+ *
+ * Owner QA 2026-11-08 ("the animation still feels too standard"): it is a visitor using the
+ * console now. `console-play.tsx` loads `console-script.ts` when the panel is shown; it types a
+ * question, completes it with Tab, switches Ask to Build, moves a pointer to a shortcut, presses it
+ * and morphs the composer into a small result (a dashboard assembling, or sources connecting),
+ * then loops with another question. Hovering the panel pauses it and a click on a shortcut plays
+ * its result at once. The markup below is the settled console: what reduced motion and no
+ * JavaScript show, and what the script starts from.
  */
-const PROMPTS = [
-  "Which tables changed in the last day?",
-  "What data do we have?",
-  "Row counts for every gold mart",
-  "Summarize yesterday's pipeline runs",
-];
+import { CONSOLE_PROMPTS } from "./console-prompts";
+
 const SHORTCUTS = [
-  { title: "Connect a source", icon: Plug },
-  { title: "Create a pipeline", icon: GitBranch },
-  { title: "Build a dashboard", icon: BarChart3 },
+  { id: "src", title: "Connect a source", icon: Plug },
+  { id: "pipe", title: "Create a pipeline", icon: GitBranch },
+  { id: "dash", title: "Build a dashboard", icon: BarChart3 },
 ] as const;
+const SOURCES = ["PostgreSQL", "MySQL", "HubSpot"] as const;
 
 export function ConsoleHome({ windowTitle }: { windowTitle: string }) {
   return (
-    <div className="lk-con @container flex h-full flex-col">
+    <div className="lk-con @container relative flex h-full flex-col" data-mode="ask">
       {/* The window's title strip: the mark and what it shows. No traffic lights, no address bar. */}
       <div className="flex items-center gap-2 px-5 pt-4 pb-1">
         <MascotMark className="h-3 w-auto" />
         <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/75">{windowTitle}</span>
       </div>
       <div className="flex flex-1 flex-col justify-center p-4 sm:p-6">
-      <div className="lk-con-box rounded-2xl px-4 pt-3.5 pb-2.5">
-        <p className="relative h-6 text-[15px] leading-6">
-          <span className="lk-con-caret absolute top-0.5 left-0 h-5 w-px bg-[#8fcbff]" />
-          {PROMPTS.map((p, i) => (
-            <span
-              key={p}
-              className="lk-con-prompt absolute inset-y-0 left-1.5 flex items-center gap-2 whitespace-nowrap"
-              data-first={i === 0 || undefined}
-              style={{ "--i": i } as React.CSSProperties}
-            >
-              <span className="lk-con-text text-[#E8F4FF]/55">{p}</span>
-              <span className="lk-con-tab rounded border border-[#E8F4FF]/15 px-1 text-[10px] leading-4 text-[#E8F4FF]/45 max-sm:hidden">Tab</span>
-            </span>
-          ))}
-        </p>
-        <div className="mt-5 flex items-center gap-3 text-[12px] leading-4 font-medium">
-          <span className="inline-flex rounded-lg bg-[#E8F4FF]/[0.06] p-0.5">
-            <span className="rounded-md bg-[#E8F4FF]/14 px-2.5 py-1 text-[#E8F4FF]">Ask</span>
-            <span className="px-2.5 py-1 text-[#E8F4FF]/60">Build</span>
-          </span>
-          <span className="inline-flex items-center gap-1.5 text-[#E8F4FF]/60">
-            <SlidersHorizontal className="size-3.5" strokeWidth={2} />
-            Tools
-          </span>
-          <span className="ml-auto grid size-8 place-items-center rounded-lg bg-[#E8F4FF]/10 text-[#E8F4FF]/55">
-            <ArrowUp className="size-4" strokeWidth={2.25} />
-          </span>
+        <div className="lk-con-stage relative">
+          <div className="lk-con-main">
+            <div className="lk-con-box rounded-2xl px-4 pt-3.5 pb-2.5">
+              <p className="relative h-6 text-[15px] leading-6" aria-hidden="true">
+                <span className="lk-con-caret absolute top-0.5 left-0 h-5 w-px bg-[#8fcbff]" />
+                <span className="absolute inset-y-0 left-1.5 flex items-center gap-2 whitespace-nowrap">
+                  <span>
+                    <span data-typed className="text-[#E8F4FF]" />
+                    <span data-ghost className="text-[#E8F4FF]/45">{CONSOLE_PROMPTS.ask}</span>
+                  </span>
+                  <span className="lk-con-tab rounded bg-[#E8F4FF]/[0.08] px-1.5 text-[10px] leading-4 text-[#E8F4FF]/55 max-sm:hidden">Tab</span>
+                </span>
+              </p>
+              <div className="mt-5 flex items-center gap-3 text-[12px] leading-4 font-medium">
+                <span className="lk-con-seg relative inline-flex rounded-lg bg-[#E8F4FF]/[0.06] p-0.5" aria-hidden="true">
+                  <span className="lk-con-thumb absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-md bg-[#E8F4FF]/14" />
+                  <span className="lk-con-opt relative px-2.5 py-1" data-m="ask">Ask</span>
+                  <span className="lk-con-opt relative px-2.5 py-1" data-m="build">Build</span>
+                </span>
+                <span className="inline-flex items-center gap-1.5 text-[#E8F4FF]/60" aria-hidden="true">
+                  <SlidersHorizontal className="size-3.5" strokeWidth={2} />
+                  Tools
+                </span>
+                <span className="ml-auto grid size-8 place-items-center rounded-lg bg-[#E8F4FF]/10 text-[#E8F4FF]/55" aria-hidden="true">
+                  <ArrowUp className="size-4" strokeWidth={2.25} />
+                </span>
+              </div>
+            </div>
+            {/* Three across only where the panel itself has room (a container query), so no shortcut is cut. */}
+            <div className="mt-2.5 grid gap-2 @xl:grid-cols-3">
+              {SHORTCUTS.map((s) => {
+                const Icon = s.icon;
+                return (
+                  <button
+                    key={s.id}
+                    type="button"
+                    data-sc={s.id}
+                    className="lk-con-short relative flex min-h-10 items-stretch overflow-hidden rounded-xl text-left outline-none focus-visible:ring-2 focus-visible:ring-[#8fcbff]"
+                  >
+                    <span className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5 text-[13px] leading-5 font-medium text-[#E8F4FF]/90">
+                      <Icon aria-hidden="true" className="lk-con-short-icon size-4 shrink-0 text-[#E8F4FF]/60" strokeWidth={2} />
+                      <span className="truncate">{s.title}</span>
+                    </span>
+                    <span aria-hidden="true" className="lk-con-ripple pointer-events-none absolute inset-0" />
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* The results the composer morphs into (the script shows one at a time). */}
+          <div className="lk-con-result absolute inset-0 rounded-2xl p-4" data-kind="" aria-hidden="true">
+            <div className="lk-cv lk-cv-dash flex h-full flex-col">
+              <div className="flex items-center justify-between">
+                <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/90">Visits by region</span>
+                <span className="rounded-full bg-[#E8F4FF]/[0.08] px-2 py-0.5 text-[10.5px] leading-4 text-[#E8F4FF]/60">Illustrative</span>
+              </div>
+              <div className="mt-3 grid flex-1 grid-cols-3 gap-2">
+                <div className="lk-cv-tile flex flex-col justify-between rounded-xl bg-[#E8F4FF]/[0.06] p-2.5" style={{ "--i": 0 } as React.CSSProperties}>
+                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55">Visits</span>
+                  <span data-count="12.4" className="text-[20px] leading-6 font-medium text-[#E8F4FF] tabular-nums">12.4k</span>
+                </div>
+                <div className="lk-cv-tile flex flex-col justify-between rounded-xl bg-[#E8F4FF]/[0.06] p-2.5" style={{ "--i": 1 } as React.CSSProperties}>
+                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55">Trend</span>
+                  <svg viewBox="0 0 80 32" className="h-8 w-full overflow-visible" fill="none">
+                    <path className="lk-cv-line" d="M2 26 C 14 24, 18 12, 30 14 S 48 24, 56 12 S 70 4, 78 4" stroke="#44A6FA" strokeWidth="2" strokeLinecap="round" pathLength={1} />
+                  </svg>
+                </div>
+                <div className="lk-cv-tile flex flex-col justify-between rounded-xl bg-[#E8F4FF]/[0.06] p-2.5" style={{ "--i": 2 } as React.CSSProperties}>
+                  <span className="text-[10.5px] leading-4 text-[#E8F4FF]/55">By region</span>
+                  <span className="flex h-8 items-end gap-1">
+                    {[100, 74, 62, 42].map((h, k) => (
+                      <span key={h} className="lk-cv-bar w-full rounded-sm bg-[#44A6FA]" style={{ height: `${h}%`, opacity: 1 - k * 0.18, "--k": k } as React.CSSProperties} />
+                    ))}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="lk-cv lk-cv-src flex h-full flex-col">
+              <div className="flex items-center justify-between">
+                <span className="text-[13px] leading-5 font-medium text-[#E8F4FF]/90">Connect a source</span>
+                <span className="rounded-full bg-[#E8F4FF]/[0.08] px-2 py-0.5 text-[10.5px] leading-4 text-[#E8F4FF]/60">Illustrative</span>
+              </div>
+              <ul className="mt-3 flex flex-1 flex-col justify-center gap-2">
+                {SOURCES.map((name, i) => (
+                  <li key={name} className="lk-cv-chip flex items-center gap-2 rounded-xl bg-[#E8F4FF]/[0.06] px-3 py-2 text-[13px] leading-5 text-[#E8F4FF]/90" data-state="connected" style={{ "--i": i } as React.CSSProperties}>
+                    {name}
+                    <span className="lk-cv-state ml-auto inline-flex items-center gap-1 text-[11.5px] font-medium">
+                      <span className="lk-cv-wait text-[#E8F4FF]/50">Connecting…</span>
+                      <span className="lk-cv-ok inline-flex items-center gap-1 text-[#7be0b0]">
+                        <Check aria-hidden="true" className="size-3" strokeWidth={2.75} />
+                        Connected
+                      </span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
         </div>
       </div>
-      {/* Three across only where the panel itself has room (a container query), so no shortcut is cut. */}
-      <div className="mt-2.5 grid gap-2 @xl:grid-cols-3">
-        {SHORTCUTS.map((s) => {
-          const Icon = s.icon;
-          return (
-            <span key={s.title} className="lk-con-short flex items-stretch overflow-hidden rounded-xl">
-              <span className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5 text-[13px] leading-5 font-medium text-[#E8F4FF]/90">
-                <Icon className="lk-con-short-icon size-4 shrink-0 text-[#E8F4FF]/60" strokeWidth={2} />
-                <span className="truncate">{s.title}</span>
-              </span>
-            </span>
-          );
-        })}
-      </div>
-      </div>
+      <span aria-hidden="true" className="lk-con-pointer pointer-events-none absolute top-0 left-0 z-20 opacity-0">
+        <MousePointer2 className="size-5 fill-[#E8F4FF] text-[#0b1a2d]" strokeWidth={1.5} />
+      </span>
     </div>
   );
 }

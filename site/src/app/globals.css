@@ -2550,20 +2550,6 @@ section[data-role="admin"] .lk-gv-closed {
   color: rgba(255, 255, 255, 0.5);
   background: rgba(255, 255, 255, 0.06);
 }
-.lk-con-tab {
-  animation: lk-con-tab 16s infinite;
-  animation-delay: inherit;
-}
-@keyframes lk-con-tab {
-  0%,
-  9% {
-    opacity: 0;
-  }
-  11%,
-  100% {
-    opacity: 1;
-  }
-}
 
 /* Your servers or ours: two radio buttons drive the picture. */
 .lk-open-seg {
@@ -2585,85 +2571,170 @@ section[data-role="admin"] .lk-gv-closed {
   outline: 2px solid #8fcbff;
   outline-offset: 1px;
 }
-/* The console's home: a dark recreation whose placeholder types prompts in turn. */
+/* The console's home (home/open-visuals.tsx, console-script.ts): the settled console is the
+   markup; the script drives it through attributes. */
+.lk-con {
+  --lk-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
 .lk-con-box {
   background: var(--lk-n-raised);
-}
-.lk-con-prompt {
-  opacity: 0;
-  animation: lk-con-cycle 16s infinite;
-  animation-delay: calc(var(--i) * 4s);
-}
-.lk-con-text {
-  clip-path: inset(0 100% 0 0);
-  animation: lk-con-type 16s infinite;
-  animation-delay: calc(var(--i) * 4s);
-}
-@keyframes lk-con-cycle {
-  0%,
-  22% {
-    opacity: 1;
-  }
-  25%,
-  100% {
-    opacity: 0;
-  }
-}
-@keyframes lk-con-type {
-  0% {
-    clip-path: inset(0 100% 0 0);
-    animation-timing-function: steps(28, end);
-  }
-  9%,
-  100% {
-    clip-path: inset(0 0 0 0);
-  }
 }
 .lk-con-caret {
   animation: lk-twinkle 1s steps(2, jump-none) infinite;
 }
+.lk-con-tab {
+  transition: transform 0.12s ease, background-color 0.12s ease, box-shadow 0.12s ease;
+}
+.lk-con-tab[data-pressed] {
+  transform: translateY(1px) scale(0.94);
+  background: rgba(232, 244, 255, 0.2);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+  color: #e8f4ff;
+}
+.lk-con-thumb {
+  transition: transform 0.25s cubic-bezier(0.34, 1.4, 0.5, 1);
+}
+.lk-con[data-mode="build"] .lk-con-thumb {
+  transform: translateX(100%);
+}
+.lk-con-opt {
+  color: rgba(232, 244, 255, 0.6);
+  transition: color 0.2s ease;
+}
+.lk-con[data-mode="ask"] .lk-con-opt[data-m="ask"],
+.lk-con[data-mode="build"] .lk-con-opt[data-m="build"] {
+  color: #e8f4ff;
+}
 .lk-con-short {
   background: var(--lk-n-raised);
   transition:
-    transform 0.25s var(--lk-ease),
-    box-shadow 0.25s ease;
+    transform 0.2s var(--lk-ease),
+    box-shadow 0.2s ease;
 }
-.lk-con-short:hover {
+.lk-con-short:hover,
+.lk-con-short[data-hover] {
   transform: translateY(-2px);
   box-shadow: inset 0 0 0 1px rgba(143, 203, 255, 0.5);
 }
-.lk-con-short:hover .lk-con-short-icon {
+.lk-con-short:hover .lk-con-short-icon,
+.lk-con-short[data-hover] .lk-con-short-icon {
   color: #8fcbff;
+}
+.lk-con-short:active,
+.lk-con-short[data-press] {
+  transform: scale(0.98);
+  transition-duration: 0.12s;
+}
+.lk-con-ripple {
+  background: radial-gradient(circle at var(--rx, 50%) var(--ry, 50%), rgba(143, 203, 255, 0.35), transparent 60%);
+  opacity: 0;
+}
+.lk-con-short[data-press] .lk-con-ripple {
+  animation: lk-con-ripple 0.5s ease-out;
+}
+@keyframes lk-con-ripple {
+  from {
+    opacity: 1;
+    transform: scale(0.3);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.2);
+  }
+}
+.lk-con-pointer {
+  transition:
+    transform 0.7s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.25s ease;
+}
+.lk-con-main {
+  transition: opacity 0.2s ease, transform 0.25s var(--lk-ease);
+}
+.lk-con-stage[data-result] .lk-con-main {
+  opacity: 0;
+  transform: scale(0.985);
+  pointer-events: none;
+}
+.lk-con-result {
+  background: var(--lk-n-raised);
+  opacity: 0;
+  visibility: hidden;
+  transform-origin: 0 0;
+}
+.lk-con-stage[data-result] .lk-con-result {
+  opacity: 1;
+  visibility: visible;
+}
+.lk-cv {
+  display: none;
+}
+.lk-con-result[data-kind="dash"] .lk-cv-dash,
+.lk-con-result[data-kind="src"] .lk-cv-src {
+  display: flex;
+}
+/* The result assembles piece by piece (only once the script marks it shown). */
+.lk-con-result[data-show] .lk-cv-tile {
+  animation: lk-cv-in 0.35s var(--lk-ease) backwards;
+  animation-delay: calc(0.15s + var(--i) * 0.28s);
+}
+.lk-con-result[data-show] .lk-cv-line {
+  stroke-dasharray: 1;
+  animation: lk-cv-draw 0.9s ease-out backwards;
+  animation-delay: 0.45s;
+}
+.lk-con-result[data-show] .lk-cv-bar {
+  transform-origin: bottom;
+  animation: lk-cv-grow 0.5s var(--lk-ease) backwards;
+  animation-delay: calc(0.75s + var(--k) * 0.08s);
+}
+.lk-cv-chip .lk-cv-ok {
+  display: inline-flex;
+}
+.lk-cv-chip .lk-cv-wait {
+  display: none;
+}
+.lk-cv-chip[data-state="connecting"] .lk-cv-ok {
+  display: none;
+}
+.lk-cv-chip[data-state="connecting"] .lk-cv-wait {
+  display: inline;
+}
+.lk-con-result[data-show] .lk-cv-chip {
+  animation: lk-cv-in 0.35s var(--lk-ease) backwards;
+  animation-delay: calc(0.1s + var(--i) * 0.2s);
+}
+@keyframes lk-cv-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+@keyframes lk-cv-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+}
+@keyframes lk-cv-grow {
+  from {
+    transform: scaleY(0);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .lk-open-band,
   .lk-con-caret,
-  .lk-con-short {
+  .lk-con-short,
+  .lk-con-thumb,
+  .lk-con-tab,
+  .lk-con-main {
     animation: none !important;
     transition: none !important;
   }
   .lk-con-short:hover {
     transform: none;
   }
-  .lk-con-prompt,
-  .lk-con-text {
-    animation: none !important;
-  }
-  .lk-con-prompt {
-    opacity: 0;
-  }
-  .lk-con-prompt[data-first] {
-    opacity: 1;
-  }
-  .lk-con-text {
-    clip-path: none;
-  }
   .lk-open-band {
     transform: translateY(calc(5 * 19px));
-  }
-  .lk-con-tab {
-    animation: none !important;
   }
 }
 
