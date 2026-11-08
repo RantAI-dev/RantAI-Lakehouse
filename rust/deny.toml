@@ -58,11 +58,9 @@ targets = []
 # into the next stream on a reused context), RUSTSEC-2026-0398 and
 # RUSTSEC-2026-0403 (`zstd-safe` 7.2.4: `Seekable::decompress` sets a
 # `Vec` length past its capacity; a failed legacy frame extends a `Vec`
-# over uninitialized memory), and RUSTSEC-2026-0410 (`zstd-sys` 2.0.16:
-# the wasm32 allocator shim corrupts memory on allocation failure). Four
-# advisories in one stack, each with a fixed release upstream (`zstd`
-# >= 0.14.3, `zstd-safe` >= 8.2.0, `zstd-sys` >= 2.1.2) that this tree
-# cannot take yet. The chain is:
+# over uninitialized memory) and RUSTSEC-2026-0410 (`zstd-sys` 2.0.16:
+# the wasm32 allocator shim corrupts memory on allocation failure) are
+# FIXED in `Cargo.lock`, not ignored. The chain is:
 #
 #   zstd <- apache-avro, parquet <- iceberg <- lakehouse-iceberg
 #                                <- lakehouse-api
@@ -71,12 +69,28 @@ targets = []
 # for the upload readers; `iceberg` enables `apache-avro`'s `zstandard`
 # feature and depends on `zstd` itself.)
 #
-# There is no fix available today. `iceberg` 0.10.1 is the latest release
-# and requires `zstd ^0.13.3`, `parquet ^58` and `apache-avro ^0.21`;
-# `apache-avro` 0.22.0, the latest, still requires `zstd ^0.13.3`; only
-# `parquet` 60 moved to `zstd` 0.14, and `iceberg` cannot take it. So no
-# `cargo update` changes any of the three versions, and there is no
-# patched release to wait for either.
+# `SEC-53` (PR #261) ignored all four ids, because on
+# 2026-10-26 no released version could reach the fix: `iceberg` 0.10.1,
+# the latest release, requires `zstd ^0.13.3`, `parquet ^58` and
+# `apache-avro ^0.21`, and the only fixed releases upstream were `zstd`
+# >= 0.14.3, `zstd-safe` >= 8.2.0 and `zstd-sys` >= 2.1.2, which
+# `iceberg` cannot take (`iceberg` 0.11.0, released 2026-11-03, still
+# requires `zstd ^0.13.3`). On 2026-11-01 `zstd-rs` published the
+# backports `zstd` 0.13.4 and `zstd-safe` 7.4.0, and RustSec widened the
+# patched ranges to accept them: `zstd` is patched in `^0.13.4` or
+# `>= 0.14.3`, `zstd-safe` in `^7.4.0` or `>= 8.2.0`. `zstd-sys` needed
+# no backport: its patched range stayed `>= 2.1.2`.
+#
+# `Cargo.lock` now holds `zstd` 0.13.4, `zstd-safe` 7.4.0 and
+# `zstd-sys` 2.1.2+zstd.1.5.7 (`cargo update -p zstd -p zstd-safe -p
+# zstd-sys`; the bundled C library is the same zstd 1.5.7 in all three,
+# only the Rust shim changed). Every one of them is a version
+# `iceberg ^0.13.3` accepts, so no upstream release of `iceberg`,
+# `apache-avro` or `parquet` is needed. All four ids are therefore gone
+# from this list, and so are the ten `zstd-safe` advisories `cargo audit`
+# printed as warnings (`RUSTSEC-2026-0395`, `-0396`, `-0397`, `-0399`,
+# `-0400`, `-0401`, `-0402`, `-0404`, `-0405`, `-0406`): they are
+# patched in the same `zstd-safe` 7.4.0.
 #
 # Reachability, checked against the code rather than assumed:
 #
@@ -92,22 +106,23 @@ targets = []
 #   `avro.codec` from the header and refuses every codec but `null`
 #   BEFORE `apache_avro::Reader::new` (`PR #186 review BLOCKER 1`), so an
 #   uploaded `zstandard` Avro is refused before a block is read.
-# - None of the four advisories' affected functions is on that path.
-#   0391 is `zstd::stream::raw::{Decoder,Encoder}::with_context`, the
-#   only constructors that take a BORROWED context; every context in
+# - None of the four advisories' affected functions was on that path
+#   either, which is why the fix above was a version bump and not a
+#   refusal. 0391 is `zstd::stream::raw::{Decoder,Encoder}::with_context`,
+#   the only constructors that take a BORROWED context; every context in
 #   this tree is created fresh and owned (`zstd::bulk::*`,
 #   `zstd::stream::decode_all`, `zstd::{Encoder,Decoder}::new`), so no
 #   context is ever reused across streams. 0398 is
 #   `zstd_safe::seekable::Seekable::decompress`; that module is
 #   `#[cfg(feature = "seekable")]`, the feature is not a default, and
-#   `zstd` 0.13.3 has no `seekable` feature and no `seekable` module at
+#   `zstd` 0.13.4 has no `seekable` feature and no `seekable` module at
 #   all, so the function is not even compiled into our binaries. 0403 is
 #   `zstd_safe::DCtx::decompress_stream`, whose length extension only
 #   happens for a `Vec<u8>` destination; the advisory states the read
 #   decoder, `decode_all` and the bulk API are not affected, and this
 #   tree uses only those (never `zstd::stream::write::Decoder`). 0410 is
-#   the wasm32 allocator shim ("Affected Architectures: wasm32"); we
-#   build x86_64 Linux.
+#   "Affected Architectures: wasm32", and this tree builds x86_64 Linux
+#   (no workflow passes `--target`).
 # - The Iceberg side reads the same stack: `lakehouse-iceberg`'s
 #   `read_all` scans Parquet data files (the Gold mart's are written by
 #   this workspace and are UNCOMPRESSED, parquet's default codec; the
@@ -116,13 +131,11 @@ targets = []
 #   `apache-avro`, which would honour a `zstandard` codec if a manifest
 #   declared one. Those files are written by the Iceberg clients and the
 #   catalog, not by an upload.
-# - So no advisory is reachable today, but the code a fix would land in
-#   is a user-controlled one: an uploaded Parquet file's pages are
-#   decompressed by Rust. A mitigation (refusing zstd-compressed
-#   uploads in the API) is the product owner's call, tracked as `SEC-53`.
-#
-# Drop when `iceberg` releases a version on parquet >= 60 and
-# apache-avro on zstd >= 0.14.3, then `cargo update`.
+# - So no advisory was reachable, but the code a fix would land in is a
+#   user-controlled one: an uploaded Parquet file's pages are decompressed
+#   by Rust. That is still true after the bump, so a mitigation (refusing
+#   zstd-compressed uploads in the API) remains the product owner's call;
+#   the version bump removes the advisory, it does not remove the reach.
 #
 # RUSTSEC-2026-0440 (`astral-tokio-tar` is unmaintained): the advisory is
 # `informational = "unmaintained"` with `patched = []`, not a
@@ -167,10 +180,6 @@ targets = []
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
-    "RUSTSEC-2026-0391",
-    "RUSTSEC-2026-0398",
-    "RUSTSEC-2026-0403",
-    "RUSTSEC-2026-0410",
     "RUSTSEC-2026-0440",
 ]
 

@@ -52,14 +52,19 @@ jobs:
       #
       # RUSTSEC-2026-0391 (zstd 0.13.3), RUSTSEC-2026-0398 and
       # RUSTSEC-2026-0403 (zstd-safe 7.2.4) and RUSTSEC-2026-0410
-      # (zstd-sys 2.0.16) are the zstd stack under `iceberg` 0.10.1.
-      # No fix is available: `iceberg` 0.10.1 pins `zstd ^0.13.3`,
-      # `parquet ^58` and `apache-avro ^0.21`, and `apache-avro` 0.22.0
-      # still needs `zstd ^0.13.3`. None of the four affected functions is
-      # reachable from this tree (see rust/deny.toml for the reachability
-      # result and the drop condition).
+      # (zstd-sys 2.0.16) are the zstd stack under `iceberg`. They are
+      # NOT ignored any more: on 2026-10-26 no release could reach the
+      # fix, so SEC-53 (PR #261) ignored all four of them, but on
+      # 2026-11-01 `zstd-rs` published the backports `zstd` 0.13.4 and
+      # `zstd-safe` 7.4.0 and RustSec widened the patched ranges to
+      # accept them (`zstd` `^0.13.4`, `zstd-safe` `^7.4.0`); `zstd-sys`
+      # was already patched in 2.1.2. Cargo.lock now holds `zstd` 0.13.4,
+      # `zstd-safe` 7.4.0 and `zstd-sys` 2.1.2+zstd.1.5.7, every version
+      # `iceberg`'s `zstd ^0.13.3` still allows, so all four ids and the
+      # ten `zstd-safe` advisories that printed as warnings are gone.
+      # See rust/deny.toml for the versions and the reachability result.
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0410
+        run: cargo audit --ignore RUSTSEC-2023-0071
         working-directory: rust
 
   cargo-deny:
