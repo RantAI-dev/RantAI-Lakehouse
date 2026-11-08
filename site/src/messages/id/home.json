@@ -2,7 +2,7 @@
   "hero": {
     "eyebrow": "Untuk tim data yang mengelola sistemnya sendiri",
     "headline": "Rumah bagi data Anda.",
-    "sub": "Satu lakehouse dengan dashboard bawaan. Satukan semua sumber, simpan dalam tabel terbuka, dan tanyakan jawabannya dengan bahasa sehari-hari.",
+    "sub": "Satu lakehouse dengan dashboard bawaan. Tabel terbuka, tanya dengan bahasa sehari-hari.",
     "reassurance": [
       "Gratis & open source (AGPL-3.0)",
       "Jalan di server Anda",
@@ -12,7 +12,7 @@
   },
   "sources": {
     "headline": "Semua mengalir.",
-    "sub": "Database, file, stream, API, dan aplikasi bisnis masuk ke satu tempat, terjadwal atau setiap kali datanya berubah.",
+    "sub": "Database, file, stream, API, dan aplikasi bisnis, semuanya di satu tempat.",
     "items": [
       "PostgreSQL",
       "MySQL",
@@ -34,7 +34,7 @@
       "JSON, JSON Lines, Avro",
       "Arsip gzip dan zip"
     ],
-    "caption": "Change capture langsung untuk PostgreSQL. Dedupe atau simpan riwayat saat load, temukan tabel di semua sumber, dan unggah 10 file sekaligus ke folder."
+    "caption": "Change capture langsung untuk PostgreSQL. Dedupe atau simpan riwayat."
   },
   "depths": {
     "eyebrow": "Tiga kedalaman",
@@ -285,11 +285,11 @@
       },
       {
         "title": "Tabel terbuka.",
-        "body": "Di bawahnya Apache Iceberg, jadi engine apa pun yang membaca Iceberg bisa membacanya."
+        "body": "Di bawahnya Apache Iceberg, jadi engine Iceberg mana pun bisa membacanya."
       },
       {
         "title": "Server Anda atau kami.",
-        "body": "Pasang di infrastruktur Anda sendiri, atau bicarakan dengan kami agar kami yang menjalankannya."
+        "body": "Pasang di infrastruktur Anda, atau minta kami yang menjalankannya."
       }
     ],
     "code": {

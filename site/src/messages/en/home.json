@@ -2,7 +2,7 @@
   "hero": {
     "eyebrow": "For data teams who run their own stack",
     "headline": "Your data has a home now.",
-    "sub": "One lakehouse with dashboards built in. Bring every source in, keep it in open tables, and ask for answers in plain language.",
+    "sub": "One lakehouse with dashboards built in. Open tables, answers in plain words.",
     "reassurance": [
       "Free & open source (AGPL-3.0)",
       "Runs on your servers",
@@ -12,7 +12,7 @@
   },
   "sources": {
     "headline": "Everything flows in.",
-    "sub": "Databases, files, streams, APIs and business apps land in one place, on a schedule or as they change.",
+    "sub": "Databases, files, streams, APIs and business apps, all in one place.",
     "items": [
       "PostgreSQL",
       "MySQL",
@@ -34,7 +34,7 @@
       "JSON, JSON Lines and Avro",
       "gzip and zip archives"
     ],
-    "caption": "Live change capture for PostgreSQL. Dedupe or keep history on load, discover tables in any source, and upload 10 files at once, in folders."
+    "caption": "Live change capture for PostgreSQL. Dedupe or keep history on load."
   },
   "depths": {
     "eyebrow": "Three depths",

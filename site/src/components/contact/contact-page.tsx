@@ -47,7 +47,7 @@ export async function ContactPage({ locale }: Readonly<{ locale: Locale }>) {
               <DisplayHeading as="h1" id="contact-heading" size="md" className="mt-5 whitespace-pre-line">
                 {copy.hero.title}
               </DisplayHeading>
-              <LeadText className="mt-6 max-w-[27rem]">{copy.hero.description}</LeadText>
+              <LeadText className="mt-6 max-w-[34rem]">{copy.hero.description}</LeadText>
             </div>
 
             <div className="lg:col-start-2 lg:row-span-2 lg:row-start-1 lg:pt-2">
