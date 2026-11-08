@@ -2845,3 +2845,10 @@ section[data-role="admin"] .lk-gv-closed {
     font-size: 10px;
   }
 }
+
+/* Owner QA: the chat keeps its fixed height, so older messages scroll out under the header;
+   they fade out there over 40 px instead of being cut through. */
+.lk-ast-log {
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 40px);
+  mask-image: linear-gradient(180deg, transparent 0, #000 40px);
+}

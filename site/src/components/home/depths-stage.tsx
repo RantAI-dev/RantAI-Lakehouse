@@ -38,9 +38,41 @@ export function DepthsStage({ copy }: { copy: HomeCopy["depths"] }) {
   });
   const layer = DEPTH_LAYERS[active];
   const text = copy.layers[layer.id];
+  // Owner QA: the rail leaves with the stage. The assistant rides up under this section, so the
+  // rail must be gone before the assistant's heading shows: `--lk-rail-o` is 1 while the assistant's
+  // top is below 95 % of the screen and 0 at 70 %.
+  const stageRef = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    const stage = stageRef.current;
+    const next = document.getElementById("assistant");
+    if (!stage || !next) return;
+    let frame = 0;
+    let last = "";
+    const write = () => {
+      frame = 0;
+      const vh = window.innerHeight;
+      const t = Math.min(1, Math.max(0, (next.getBoundingClientRect().top - 0.7 * vh) / (0.25 * vh)));
+      const v = t.toFixed(2);
+      if (v !== last) {
+        last = v;
+        stage.style.setProperty("--lk-rail-o", v);
+      }
+    };
+    const on = () => {
+      if (!frame) frame = requestAnimationFrame(write);
+    };
+    write();
+    window.addEventListener("scroll", on, { passive: true });
+    window.addEventListener("resize", on);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      window.removeEventListener("scroll", on);
+      window.removeEventListener("resize", on);
+    };
+  }, []);
 
   return (
-    <div className="lk-depth-stage sticky top-0 h-[100svh] overflow-hidden motion-reduce:hidden">
+    <div ref={stageRef} className="lk-depth-stage sticky top-0 h-[100svh] overflow-hidden motion-reduce:hidden">
       <Container className="relative h-full">
         {/* Owner QA (1210 px, 3D path): the rail has its own column, sized by its longest label, so
             the heading always starts a full grid gap (48 px) clear of it, at any width and in either
@@ -112,7 +144,7 @@ function DepthGauge({
   return (
     <div
       aria-hidden="true"
-      className="lk-depth-rail pointer-events-none absolute top-[18%] bottom-[14%] left-3 z-10 w-16 md:static md:z-auto md:my-[4svh] md:w-[8.5rem] md:self-stretch min-[1200px]:w-[12.5rem]"
+      className="lk-depth-rail pointer-events-none opacity-[var(--lk-rail-o,1)] absolute top-[18%] bottom-[14%] left-3 z-10 w-16 md:static md:z-auto md:my-[4svh] md:w-[8.5rem] md:self-stretch min-[1200px]:w-[12.5rem]"
     >
       <span className="absolute top-0 left-[7px] h-full w-px bg-[#E8F4FF]/20" />
       {DEPTH_LAYERS.map((l, i) => (

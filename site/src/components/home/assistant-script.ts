@@ -29,35 +29,50 @@ const SCRIPT: readonly (readonly [Step, number])[] = [
 ];
 const TYPE_MS = 30;
 
-export function play(panel: HTMLElement): () => void {
+export type Player = { stop: () => void; pause: () => void; resume: () => void };
+
+/**
+ * Plays the script. `pause` and `resume` hold and continue it where it was (the visitor scrolled
+ * back up and the panel is no longer in view): a step waiting for its turn waits again, and a
+ * question half typed carries on from the letter it reached.
+ */
+export function play(panel: HTMLElement): Player {
   const typed = panel.querySelector<HTMLElement>("[data-typed]");
   const questions = [...panel.querySelectorAll<HTMLElement>("[data-q]")].map((q) => q.textContent?.trim() ?? "");
   const reached: Step[] = [];
   let timer = 0;
   let typing = 0;
+  let paused = false;
+  let again: (() => void) | null = null;
 
   const enter = (step: Step) => {
     reached.push(step);
     panel.dataset.s = reached.join(" ");
   };
-  const type = (text: string, done: () => void) => {
-    let n = 0;
+  const type = (text: string, from: number, done: () => void) => {
+    let n = from;
+    again = () => type(text, n, done);
     typing = window.setInterval(() => {
       n += 1;
       if (typed) typed.textContent = text.slice(0, n);
       if (n >= text.length) {
         window.clearInterval(typing);
+        again = null;
         done();
       }
     }, TYPE_MS);
   };
   const run = (i: number) => {
-    if (i >= SCRIPT.length) return;
+    if (i >= SCRIPT.length) {
+      again = null;
+      return;
+    }
     const [step, wait] = SCRIPT[i];
+    again = () => run(i);
     timer = window.setTimeout(() => {
       enter(step);
       if (step === S.type1 || step === S.type2) {
-        type(questions[step === S.type1 ? 0 : 1] ?? "", () => run(i + 1));
+        type(questions[step === S.type1 ? 0 : 1] ?? "", 0, () => run(i + 1));
         return;
       }
       if ((step === S.ask1 || step === S.ask2) && typed) typed.textContent = "";
@@ -66,10 +81,23 @@ export function play(panel: HTMLElement): () => void {
   };
   run(0);
 
-  return () => {
-    window.clearTimeout(timer);
-    window.clearInterval(typing);
-    if (typed) typed.textContent = "";
-    panel.dataset.s = SCRIPT.map(([s]) => s).join(" ");
+  return {
+    stop: () => {
+      window.clearTimeout(timer);
+      window.clearInterval(typing);
+      if (typed) typed.textContent = "";
+      panel.dataset.s = SCRIPT.map(([s]) => s).join(" ");
+    },
+    pause: () => {
+      if (paused || !again) return;
+      paused = true;
+      window.clearTimeout(timer);
+      window.clearInterval(typing);
+    },
+    resume: () => {
+      if (!paused) return;
+      paused = false;
+      again?.();
+    },
   };
 }

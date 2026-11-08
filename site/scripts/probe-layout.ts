@@ -120,7 +120,38 @@ const RAIL_PROBE = (gap: number) => `(async () => {
   return { min: Math.min(...worst), gap: ${gap} };
 })()`;
 
+/**
+ * Owner QA, the assistant: (1) the chat must not have played before the visitor can see it: at the
+ * first scroll position where the depths stage has (nearly) left: its section's bottom is above 35 % of the screen, `data-s` is still
+ * the start (at most the first two steps), and the panel is not finished; (2) the depths rail is
+ * gone (opacity 0, or out of view) once the assistant's heading is on screen.
+ */
+const ASSISTANT_PROBE = `(async () => {
+  const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const depths = document.querySelector('#depths'), panel = document.querySelector('#assistant .lk-ast'), head = document.querySelector('#assistant h2');
+  const rail = document.querySelector('.lk-depth-rail');
+  const y0 = depths.getBoundingClientRect().top + scrollY + depths.offsetHeight - innerHeight * 1.2;
+  const out = { startSteps: -1, railWorst: 0 };
+  for (let y = y0; y < y0 + innerHeight * 2; y += 25) {
+    scrollTo(0, y); await frame();
+    const p = panel.getBoundingClientRect(), d = depths.getBoundingClientRect(), h = head.getBoundingClientRect();
+    if (out.startSteps < 0 && d.bottom <= innerHeight * 0.35) out.startSteps = (panel.dataset.s || '').split(' ').filter(Boolean).length;
+    const r = rail.getBoundingClientRect();
+    if (h.top < innerHeight && h.bottom > 0 && r.bottom > 0 && r.top < innerHeight) out.railWorst = Math.max(out.railWorst, +getComputedStyle(rail).opacity);
+  }
+  return out;
+})()`;
 let failed = 0;
+{
+  const p = await open(1190, 960);
+  const r = (await p.ev(ASSISTANT_PROBE)) as { startSteps: number; railWorst: number };
+  p.close();
+  const errors: string[] = [];
+  if (r.startSteps > 2) errors.push(`the chat had already played ${r.startSteps} steps when it first came uncovered`);
+  if (r.railWorst > 0.02) errors.push(`the depths rail shows (opacity ${r.railWorst}) over the assistant`);
+  console.log("assistant 1190x960", errors.length ? `FAIL: ${errors.join("; ")}` : `ok (steps at first sight ${r.startSteps}, rail opacity ${r.railWorst})`);
+  if (errors.length) failed++;
+}
 for (const w of [390, 1024, 1190, 1280, 1440]) {
   for (const lang of ["", "id/"]) {
     const url = new URL(lang, base).href;
