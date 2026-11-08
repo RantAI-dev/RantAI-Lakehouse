@@ -3180,7 +3180,9 @@ html[data-tod="day"] #hero [data-intro-copy] p {
   color: rgb(8 24 58 / 0.88);
 }
 html[data-tod="day"] #hero [data-intro-copy] ul {
-  color: rgb(8 24 58 / 0.8);
+  color: rgb(8 24 58 / 0.9);
+  /* The same soft pale wash the copy sits on, so the line stays readable over bright reflections. */
+  text-shadow: 0 0 6px rgb(238 246 253 / 0.95), 0 0 14px rgb(238 246 253 / 0.9), 0 0 26px rgb(238 246 253 / 0.8);
 }
 html[data-tod="day"] #hero [data-intro-copy] li::before {
   color: #1d6ccf;

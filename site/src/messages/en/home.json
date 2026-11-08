@@ -5,8 +5,7 @@
     "sub": "One lakehouse with dashboards built in. Open tables, answers in plain words.",
     "reassurance": [
       "Free & open source (AGPL-3.0)",
-      "Runs on your servers",
-      "Open Iceberg tables"
+      "Runs on your servers"
     ],
     "scrollCue": "Scroll to dive",
     "tod": { "day": "Day", "night": "Night", "label": "Day mode" }

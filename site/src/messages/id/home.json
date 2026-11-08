@@ -5,8 +5,7 @@
     "sub": "Satu lakehouse dengan dashboard bawaan. Tabel terbuka, tanya dengan bahasa sehari-hari.",
     "reassurance": [
       "Gratis & open source (AGPL-3.0)",
-      "Jalan di server Anda",
-      "Tabel Iceberg terbuka"
+      "Jalan di server Anda"
     ],
     "scrollCue": "Gulir untuk menyelam",
     "tod": { "day": "Siang", "night": "Malam", "label": "Mode siang" }

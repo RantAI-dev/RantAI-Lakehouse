@@ -71,9 +71,9 @@ export function HeroSection({
               </CtaLink>
             </div>
             {/* WEB-5 D21 + O50 (audit #7): the doubts answered where people decide, in one quiet line
-                with a dot between the parts; each part is a claim. On a phone the first part takes the
-                first line and the other two share the second, so no part is ever left alone. */}
-            <ul className="mt-6 flex flex-wrap items-center justify-center gap-y-1 text-[13px] leading-5 text-[#E8F4FF]/70 short:mt-4 short:text-[12px] md:justify-start">
+                with a dot between the two parts; each part is a claim. On a phone each part has its own
+                line, so no part is ever left alone. */}
+            <ul className="mt-3 flex flex-wrap items-center justify-center gap-y-0.5 text-[12px] leading-5 text-[#E8F4FF]/65 md:justify-start">
               {copy.reassurance.map((part, i) => (
                 <li
                   key={part}
