@@ -1408,12 +1408,13 @@ section[data-role="admin"] .lk-gv-closed {
 [data-stage="bronze"] .lk-depth-space {
   display: inline;
 }
+/* Owner QA, "badges don't need a border": a muted slate fill, distinct from the amber
+   "×2" (Bronze) and from the red "empty" Silver turns it into. */
 .lk-depth-empty {
-  border: 1px dashed rgba(226, 158, 102, 0.7);
-  color: #f3c49c;
+  background-color: rgba(159, 176, 196, 0.16);
+  color: #b9c6d3;
   transition:
     background-color 0.4s ease,
-    border-color 0.4s ease,
     color 0.4s ease;
 }
 .lk-depth-empty-x {
@@ -1444,8 +1445,6 @@ section[data-role="admin"] .lk-gv-closed {
   }
 }
 [data-stage="silver"] .lk-depth-empty {
-  border-style: solid;
-  border-color: rgba(255, 155, 142, 0.45);
   background-color: rgba(255, 110, 95, 0.12);
   color: var(--lk-depth-bad);
 }
@@ -1473,12 +1472,10 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-depth-badge {
   color: var(--lk-depth-ok);
   background: rgba(126, 226, 176, 0.1);
-  box-shadow: inset 0 0 0 1px rgba(126, 226, 176, 0.25);
 }
 .lk-depth-badge:not([data-ok]) {
   color: var(--lk-depth-bad);
   background: rgba(255, 110, 95, 0.1);
-  box-shadow: inset 0 0 0 1px rgba(255, 155, 142, 0.3);
 }
 
 /* Gold: every row travels to its city's group and fades into it while
@@ -1539,7 +1536,6 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-depth-lag {
   color: #f6d27f;
   background: rgba(242, 193, 78, 0.1);
-  box-shadow: inset 0 0 0 1px rgba(242, 193, 78, 0.28);
 }
 [data-stage="gold"] .lk-depth-spin {
   animation: lk-depth-spin 6s linear infinite;
@@ -1592,7 +1588,7 @@ section[data-role="admin"] .lk-gv-closed {
   text-underline-offset: 3px;
 }
 .lk-depth-legend-empty {
-  border: 1px dashed rgba(226, 158, 102, 0.7);
+  background-color: rgba(159, 176, 196, 0.16);
 }
 [data-stage="bronze"] .lk-depth-swap[data-for="bronze"] .lk-depth-twice {
   display: inline;
@@ -2503,7 +2499,6 @@ section[data-role="admin"] .lk-gv-closed {
 .lk-open-license {
   color: #9fe3bf;
   background: rgba(126, 226, 176, 0.1);
-  box-shadow: inset 0 0 0 1px rgba(126, 226, 176, 0.3);
 }
 .lk-open-band {
   background: rgba(68, 166, 250, 0.1);

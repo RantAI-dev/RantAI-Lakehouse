@@ -143,7 +143,7 @@ function PolicyChip({ copy, role }: { copy: GovernanceCopy; role: Role }) {
     <span
       key={role}
       className={cn(
-        "lk-fade-in inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] font-medium ring-1 ring-white/12",
+        "lk-fade-in inline-flex h-8 items-center gap-1.5 rounded-full bg-white/[0.07] px-3 text-[12px] font-medium",
         role === "analyst" ? "text-[#8fcbff]" : "text-[#7be0b0]",
       )}
     >

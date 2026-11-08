@@ -107,7 +107,7 @@ function Proof({ badge }: { badge: string }) {
           m•••@•••.com
         </span>
       </div>
-      <span className="lk-gv-badge inline-flex items-center gap-1.5 rounded-full bg-[#7be0b0]/10 px-2.5 py-1 text-[12px] font-medium text-[#7be0b0] ring-1 ring-[#7be0b0]/30">
+      <span className="lk-gv-badge inline-flex items-center gap-1.5 rounded-full bg-[#7be0b0]/10 px-2.5 py-1 text-[12px] font-medium text-[#7be0b0]">
         <BadgeCheck className="size-3.5" />
         {badge}
       </span>
@@ -129,11 +129,11 @@ function Audit({ text }: { text: Bento["audit"] }) {
           <span className="min-w-0 flex-1 truncate">{r}</span>
           {i === text.rows.length - 1 ? (
             <span className="relative inline-grid shrink-0">
-              <span className="lk-gv-wait col-start-1 row-start-1 inline-flex items-center gap-1 rounded-full bg-[#F2C14E]/12 px-2 py-0.5 text-[11px] font-medium text-[#F2C14E] ring-1 ring-[#F2C14E]/30">
+              <span className="lk-gv-wait col-start-1 row-start-1 inline-flex items-center gap-1 rounded-full bg-[#F2C14E]/12 px-2 py-0.5 text-[11px] font-medium text-[#F2C14E]">
                 <span className="lk-pulse size-1.5 rounded-full bg-[#F2C14E]" />
                 {text.awaiting}
               </span>
-              <span className="lk-gv-ok col-start-1 row-start-1 inline-flex items-center gap-1 justify-self-end rounded-full bg-[#7be0b0]/12 px-2 py-0.5 text-[11px] font-medium text-[#7be0b0] ring-1 ring-[#7be0b0]/30">
+              <span className="lk-gv-ok col-start-1 row-start-1 inline-flex items-center gap-1 justify-self-end rounded-full bg-[#7be0b0]/12 px-2 py-0.5 text-[11px] font-medium text-[#7be0b0]">
                 <Check className="size-3" />
                 {text.approved}
               </span>

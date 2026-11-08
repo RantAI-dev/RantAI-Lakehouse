@@ -99,7 +99,7 @@ export function GetStartedSection({ copy }: Readonly<{ copy: HomeCopy["getStarte
                     </p>
                   ))}
                   {i === copy.steps.length - 1 && (
-                    <p className="lk-gs-ready mt-3 inline-flex items-center gap-2 rounded-full bg-[#7be0b0]/10 px-3 py-1 text-[12px] leading-5 font-medium text-[#7be0b0] ring-1 ring-[#7be0b0]/30">
+                    <p className="lk-gs-ready mt-3 inline-flex items-center gap-2 rounded-full bg-[#7be0b0]/10 px-3 py-1 text-[12px] leading-5 font-medium text-[#7be0b0]">
                       <span className="lk-gs-ready-dot size-1.5 rounded-full bg-[#7be0b0]" />
                       {copy.ready}
                     </p>
