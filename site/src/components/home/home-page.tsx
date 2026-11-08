@@ -26,6 +26,7 @@ import { HeroSection } from "./hero-section";
 import { OpenSection } from "./open-section";
 import { SceneZone } from "./scene-zone";
 import { SourcesSection } from "./sources-section";
+import { SurfaceRise } from "./surface-rise";
 
 /**
  * The home page (WEB-1's landing page, moved by WEB-5). It is shared by its
@@ -73,8 +74,9 @@ export async function HomePage({ locale }: Readonly<{ locale: Locale }>) {
           {/* Task A: the neutral page feathers into the final call's night sea over 480 px, no hard edge. */}
           <div
             aria-hidden="true"
-            className="pointer-events-none relative z-[1] -mt-[480px] h-[480px] bg-[linear-gradient(180deg,rgba(2,5,20,0)_0%,rgba(2,5,20,0.12)_30%,rgba(2,5,20,0.55)_68%,#020514_100%)]"
+            className="lk-feather pointer-events-none relative z-[1] -mt-[480px] h-[480px] bg-[linear-gradient(180deg,rgba(2,5,20,0)_0%,rgba(2,5,20,0.12)_30%,rgba(2,5,20,0.55)_68%,#020514_100%)]"
           />
+          <SurfaceRise />
           <FinalSection copy={home.final} />
         </main>
         <SiteFooter locale={locale} copy={common.footer} />

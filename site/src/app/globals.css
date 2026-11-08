@@ -3277,3 +3277,124 @@ html[data-tod="day"][data-over-sky="1"] header a[class*="bg-[var(--lk-primary)]"
     animation: none;
   }
 }
+
+/* ---- By day: the way up from the deep water to the day sky (home/surface-rise.tsx) ---- */
+.lk-surf {
+  display: none;
+  height: 115vh;
+}
+html[data-tod="day"] .lk-surf {
+  display: block;
+  margin-bottom: -2px; /* overlaps the final call's first rows, so no sub-pixel line can show between them */
+}
+/* The night feather into the night sea is replaced, by day, by the rise. */
+html[data-tod="day"] .lk-feather {
+  display: none;
+}
+.lk-surf-water {
+  background: linear-gradient(
+    180deg,
+    rgba(8, 70, 110, 0) 0%,
+    rgba(8, 70, 110, 0.04) 10%,
+    rgba(10, 84, 128, 0.16) 22%,
+    rgba(14, 104, 150, 0.38) 36%,
+    rgba(26, 134, 170, 0.6) 50%,
+    rgba(54, 168, 196, 0.78) 63%,
+    rgba(108, 200, 220, 0.92) 76%,
+    rgba(176, 225, 238, 1) 88%,
+    #c9e6f2 100%
+  );
+}
+/* Marine snow, thinning out upward in the page (downward here) and gone by the middle. */
+.lk-surf-snow {
+  background-image:
+    radial-gradient(circle, rgba(220, 240, 255, 0.55) 1px, transparent 1.6px),
+    radial-gradient(circle, rgba(220, 240, 255, 0.4) 1px, transparent 1.4px),
+    radial-gradient(circle, rgba(220, 240, 255, 0.5) 1.2px, transparent 2px),
+    radial-gradient(circle, rgba(220, 240, 255, 0.3) 0.8px, transparent 1.3px);
+  background-size: 131px 97px, 83px 141px, 227px 179px, 61px 223px;
+  background-position: 0 0, 40px 60px, 90px 20px, 13px 110px;
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, 0.5) 22%, transparent 52%);
+  mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, 0.5) 22%, transparent 52%);
+  animation: lk-snow 60s linear infinite;
+}
+@keyframes lk-snow {
+  to {
+    background-position: 0 -194px, 40px -222px, 90px -338px, 13px -336px;
+  }
+}
+/* Sun shafts: soft slanted beams, stronger the nearer the surface. */
+.lk-surf-shafts {
+  -webkit-mask-image: linear-gradient(180deg, transparent 6%, rgba(0, 0, 0, 0.55) 40%, #000 82%, transparent 100%);
+  mask-image: linear-gradient(180deg, transparent 6%, rgba(0, 0, 0, 0.55) 40%, #000 82%, transparent 100%);
+}
+.lk-shaft {
+  top: -12%;
+  height: 130%;
+  transform-origin: 50% 0;
+  background: linear-gradient(180deg, rgba(214, 244, 252, 0) 0%, rgba(214, 244, 252, 0.34) 55%, rgba(214, 244, 252, 0.1) 100%);
+  filter: blur(20px);
+  transform: rotate(13deg);
+  animation: lk-shaft 10s ease-in-out infinite alternate;
+}
+@keyframes lk-shaft {
+  from {
+    transform: rotate(11deg);
+  }
+  to {
+    transform: rotate(15.5deg);
+  }
+}
+.lk-wave {
+  animation: lk-wave 9s ease-in-out infinite alternate;
+}
+.lk-wave-b {
+  animation-duration: 11s;
+  animation-direction: alternate-reverse;
+}
+@keyframes lk-wave {
+  from {
+    transform: translateX(-3%);
+  }
+  to {
+    transform: translateX(3%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-surf-snow,
+  .lk-shaft,
+  .lk-wave {
+    animation: none;
+  }
+}
+/* The final call's top, by day: the surface's own pale haze, easing into the sky. */
+html[data-tod="day"] #final .lk-final-top {
+  height: 20%;
+  opacity: 1 !important;
+  background: linear-gradient(
+    180deg,
+    #c9e6f2 0%,
+    rgba(201, 230, 242, 0.82) 22%,
+    rgba(201, 230, 242, 0.5) 48%,
+    rgba(201, 230, 242, 0.2) 74%,
+    rgba(201, 230, 242, 0) 100%
+  );
+}
+html[data-tod="day"] #final::before {
+  background: linear-gradient(180deg, #c9e6f2 0%, #86b6e8 22%, #86b6e8 36%, #cfe3f4 66%, #6fa6d6 100%);
+}
+#final .lk-final-bottom {
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #final .lk-final-bottom {
+  z-index: 5; /* over the sea, so the water itself melts into the footer */
+  height: 34%;
+  background: linear-gradient(
+    0deg,
+    #f4f7fb 0%,
+    rgba(244, 247, 251, 0.85) 25%,
+    rgba(244, 247, 251, 0.5) 52%,
+    rgba(244, 247, 251, 0.18) 78%,
+    rgba(244, 247, 251, 0) 100%
+  );
+}
