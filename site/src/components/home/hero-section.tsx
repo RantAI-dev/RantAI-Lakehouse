@@ -4,7 +4,8 @@ import type { CommonCopy, HomeCopy } from "@/lib/copy";
 import { Container, CtaLink, DisplayHeading, Eyebrow, LeadText } from "@/components/shared/primitives";
 import { WhaleSvg } from "@/components/shared/whale-svg";
 import { ProgressSection } from "@/components/shared/progress-section";
-import { BackdropFade, HeroCopyMotion, HeroWashFade, ScrollCueFade } from "./hero-motion";
+import { BackdropFade, HeroCopyMotion, HeroWashFade, ScrollCueFade, TodSlot } from "./hero-motion";
+import { TodToggle } from "./tod-toggle";
 
 /**
  * S1 — hero. The DOM hero paints first: a CSS night lake with the logo as
@@ -40,7 +41,9 @@ export function HeroSection({
         {/* A soft dark wash behind the copy keeps it above 4.5:1 over any frame of the canvas.
             WEB-5 O5: it leaves with the copy over the live lake (HeroWashFade). */}
         <HeroWashFade>
-          <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.92)_0%,rgba(2,5,20,0.84)_52%,rgba(2,5,20,0.4)_70%,transparent_86%)]" />
+          <div className="lk-tn absolute inset-0 bg-[linear-gradient(90deg,rgba(2,5,20,0.72)_0%,rgba(2,5,20,0.45)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(2,5,20,0.92)_0%,rgba(2,5,20,0.84)_52%,rgba(2,5,20,0.4)_70%,transparent_86%)]" />
+          {/* Day: the same wash in pale sky, so the dark ink stays above 4.5:1. */}
+          <div className="lk-td absolute inset-0 bg-[linear-gradient(90deg,rgba(238,246,253,0.8)_0%,rgba(238,246,253,0.55)_38%,transparent_62%)] max-md:bg-[linear-gradient(0deg,rgba(238,246,253,0.94)_0%,rgba(238,246,253,0.86)_52%,rgba(238,246,253,0.45)_70%,transparent_86%)]" />
         </HeroWashFade>
         {/* Task A: the DOM hero's stage ends on one colour across its width (#030b2a, the colour the
             scene zone's fallback gradient starts on, scene-zone.tsx), so its bottom edge leaves no line. */}
@@ -90,6 +93,9 @@ export function HeroSection({
         <ScrollCueFade>
           <ScrollCue label={copy.scrollCue} />
         </ScrollCueFade>
+        <TodSlot>
+          <TodToggle copy={copy.tod} />
+        </TodSlot>
       </div>
     </ProgressSection>
   );
@@ -100,15 +106,21 @@ function HeroBackdrop() {
     <BackdropFade>
       {/* Sky to horizon to lake, in the logo's own blues. */}
       <div className="absolute inset-0 bg-[linear-gradient(180deg,#020514_0%,#050A30_38%,#0A1F55_61%,#0B2A66_61.4%,#061440_74%,#030B2A_100%)]" />
+      {/* Day (html[data-tod="day"]): the same stage as a calm daytime lake; it fades in over the night
+          picture, and the sun and the glitter take the moon's place. */}
+      <div className="lk-td absolute inset-0 bg-[linear-gradient(180deg,#5d99dc_0%,#86b6e8_34%,#bcd9f1_54%,#e3eef8_61%,#a9cdea_61.4%,#6fa6d6_74%,#3d82c0_88%,#2a6aa8_100%)]" />
       {/* Moon glow and its reflection streak on the water. */}
-      <div className="absolute top-[8%] left-[62%] size-[46vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.22)_0%,rgba(68,166,250,0.10)_38%,transparent_70%)]" />
-      <div className="absolute top-[62%] left-[62%] h-[34vh] w-[14vw] -translate-x-1/2 bg-[radial-gradient(ellipse_at_top,rgba(68,166,250,0.35)_0%,transparent_70%)] blur-xl" />
+      <div className="lk-tn absolute top-[8%] left-[62%] size-[46vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.22)_0%,rgba(68,166,250,0.10)_38%,transparent_70%)]" />
+      <div className="lk-tn absolute top-[62%] left-[62%] h-[34vh] w-[14vw] -translate-x-1/2 bg-[radial-gradient(ellipse_at_top,rgba(68,166,250,0.35)_0%,transparent_70%)] blur-xl" />
+      <div className="lk-td absolute top-[calc(8%+23vmin-35vmin)] left-[62%] size-[70vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(255,249,230,0.9)_0%,rgba(255,241,204,0.5)_9%,rgba(255,234,186,0.18)_30%,transparent_66%)]" />
+      <div className="lk-td absolute top-[calc(8%+23vmin-4vmin)] left-[62%] size-[8vmin] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,#fffefa_0%,#fff9e8_58%,rgba(255,246,216,0)_100%)] blur-[1.5px]" />
+      <div className="lk-td lk-glitter absolute top-[62%] left-[62%] h-[34vh] w-[16vw] -translate-x-1/2" />
       {/* WEB-5 audit #11: the waterline is wavy and feathered, and kept out of the text column
           (only under the creature on the right; none on phones, where the copy spans the width). */}
       <svg
         viewBox="0 0 1200 12"
         preserveAspectRatio="none"
-        className="absolute inset-x-0 top-[calc(61.2%-6px)] h-3 w-full max-md:hidden [mask-image:linear-gradient(90deg,transparent_0%,transparent_50%,#000_64%,#000_90%,transparent_100%)]"
+        className="lk-waterline absolute inset-x-0 top-[calc(61.2%-6px)] h-3 w-full max-md:hidden [mask-image:linear-gradient(90deg,transparent_0%,transparent_50%,#000_64%,#000_90%,transparent_100%)]"
         aria-hidden="true"
       >
         <path
@@ -120,7 +132,7 @@ function HeroBackdrop() {
           vectorEffect="non-scaling-stroke"
         />
       </svg>
-      <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-[#020514] via-[#020514]/55 to-transparent md:hidden" />
+      <div className="lk-tn absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-[#020514] via-[#020514]/55 to-transparent md:hidden" />
     </BackdropFade>
   );
 }

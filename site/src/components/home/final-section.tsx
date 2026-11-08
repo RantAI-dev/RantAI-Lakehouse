@@ -60,7 +60,7 @@ export function FinalSection({ copy }: { copy: HomeCopy["final"] }) {
       <div aria-hidden="true" data-final-scene="" className="pointer-events-none absolute inset-0 -z-10" />
       <div
         aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[24%] bg-[linear-gradient(180deg,#020514_0%,rgba(2,5,20,0.6)_45%,rgba(2,5,20,0)_100%)] opacity-0 transition-opacity duration-400 group-data-[scene3d=on]/final:opacity-100"
+        className="lk-final-top pointer-events-none absolute inset-x-0 top-0 -z-10 h-[24%] bg-[linear-gradient(180deg,#020514_0%,rgba(2,5,20,0.6)_45%,rgba(2,5,20,0)_100%)] opacity-0 transition-opacity duration-400 group-data-[scene3d=on]/final:opacity-100"
       />
       <div
         aria-hidden="true"
@@ -78,7 +78,7 @@ export function FinalSection({ copy }: { copy: HomeCopy["final"] }) {
           />
         ))}
         {/* A small moon at the upper left, centred in its own glow, as in the hero. */}
-        <div className="absolute top-[13%] left-[13%]">
+        <div className="lk-tn absolute top-[13%] left-[13%]">
           <div className="absolute top-1/2 left-1/2 size-[34vmin] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[radial-gradient(circle,rgba(232,244,255,0.18)_0%,rgba(68,166,250,0.07)_36%,transparent_68%)]" />
           <div className="absolute top-1/2 left-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#E8F4FF] shadow-[0_0_26px_7px_rgba(232,244,255,0.4)]" />
         </div>

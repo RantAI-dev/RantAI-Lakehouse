@@ -8,7 +8,8 @@
       "Jalan di server Anda",
       "Tabel Iceberg terbuka"
     ],
-    "scrollCue": "Gulir untuk menyelam"
+    "scrollCue": "Gulir untuk menyelam",
+    "tod": { "day": "Siang", "night": "Malam", "label": "Mode siang" }
   },
   "sources": {
     "headline": "Semua mengalir.",

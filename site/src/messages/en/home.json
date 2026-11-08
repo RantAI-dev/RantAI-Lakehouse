@@ -8,7 +8,8 @@
       "Runs on your servers",
       "Open Iceberg tables"
     ],
-    "scrollCue": "Scroll to dive"
+    "scrollCue": "Scroll to dive",
+    "tod": { "day": "Day", "night": "Night", "label": "Day mode" }
   },
   "sources": {
     "headline": "Everything flows in.",

@@ -114,6 +114,27 @@ export function ScrollCueFade({ children }: { children: React.ReactNode }) {
 }
 
 /**
+ * The day and night button's slot (bottom right of the hero). It leaves with
+ * the copy over the live lake, and stops taking clicks once it is gone.
+ */
+export function TodSlot({ children }: { children: React.ReactNode }) {
+  const { mode } = useLandingMode();
+  const live = mode === "full";
+  const progress = useProgress();
+  const opacity = useTransform(progress, [0.2, 0.4], live ? [1, 0] : [1, 1]);
+  const pointerEvents = useTransform(progress, (v) => (live && v > 0.38 ? "none" : "auto"));
+  return (
+    <m.div
+      data-intro-scroll-cue=""
+      className="absolute right-4 bottom-5 z-20 md:right-8 md:bottom-6"
+      style={{ opacity, pointerEvents }}
+    >
+      {children}
+    </m.div>
+  );
+}
+
+/**
  * The DOM hero fades out once the lake's first frame is on screen. `className`
  * places the faded layer: the whole stage by default, or the creature's own
  * slot (WEB-5 review fix R12, hero-section.tsx).

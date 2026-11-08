@@ -3106,3 +3106,174 @@ section[data-role="admin"] .lk-gv-closed {
     transition: none !important;
   }
 }
+
+/* ==========================================================================
+   Day and night on the surface scenes (lib/tod.ts). `html[data-tod]` is set
+   before first paint. Night is the base; day only changes the hero, the
+   final call and the top bar while it sits over their sky (`data-over-sky`,
+   components/home/tod-toggle.tsx). Everything under water is untouched.
+   Layers marked `.lk-tn` are night-only and `.lk-td` day-only; they
+   cross-fade in --lk-tod-ms (the same 600 ms as the 3D scene, TOD_FADE_MS).
+   ========================================================================== */
+html {
+  --lk-tod-ms: 600ms;
+  --lk-ink: #08183a;
+}
+.lk-td {
+  opacity: 0;
+}
+.lk-td,
+.lk-tn {
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] .lk-td {
+  opacity: 1;
+}
+html[data-tod="day"] .lk-tn {
+  opacity: 0;
+}
+/* The sun's glitter on the water. */
+.lk-glitter {
+  background: repeating-linear-gradient(180deg, rgba(255, 252, 240, 0.7) 0 2px, transparent 2px 9px);
+  background-size: 100% 18px;
+  -webkit-mask-image: radial-gradient(ellipse 48% 100% at 50% 0%, #000 0%, transparent 78%);
+  mask-image: radial-gradient(ellipse 48% 100% at 50% 0%, #000 0%, transparent 78%);
+  animation: lk-glitter 3.2s linear infinite;
+}
+@keyframes lk-glitter {
+  to {
+    background-position: 0 18px;
+  }
+}
+.lk-waterline path {
+  transition: stroke var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] .lk-waterline path {
+  stroke: #fff;
+  stroke-opacity: 0.6;
+}
+
+/* The hero's words: dark ink by day (>= 4.5:1 on the pale wash). */
+#hero [data-intro-copy] h1,
+#hero [data-intro-copy] p,
+#hero [data-intro-copy] ul,
+#hero [data-intro-copy] a,
+#hero [data-intro-copy] > :first-child {
+  transition: color var(--lk-tod-ms) ease, border-color var(--lk-tod-ms) ease, background-color 200ms ease;
+}
+html[data-tod="day"] #hero [data-intro-copy] h1 {
+  color: var(--lk-ink);
+}
+html[data-tod="day"] #hero [data-intro-copy] > :first-child {
+  color: #083f82;
+  text-shadow: none;
+}
+html[data-tod="day"] #hero [data-intro-copy] p {
+  color: rgb(8 24 58 / 0.88);
+}
+html[data-tod="day"] #hero [data-intro-copy] ul {
+  color: rgb(8 24 58 / 0.8);
+}
+html[data-tod="day"] #hero [data-intro-copy] li::before {
+  color: #1d6ccf;
+}
+html[data-tod="day"] #hero [data-intro-copy] a:not([class*="lk-primary"]) {
+  color: var(--lk-ink);
+  border-color: rgb(8 24 58 / 0.42);
+}
+html[data-tod="day"] #hero [data-intro-copy] a:not([class*="lk-primary"]):hover {
+  border-color: rgb(8 24 58 / 0.75);
+  background-color: rgb(8 24 58 / 0.08);
+}
+/* The creature's own little pool is a night shade; on the day water it is a hint. */
+#hero svg g[aria-hidden="true"] {
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #hero svg g[aria-hidden="true"] {
+  opacity: 0.35;
+}
+/* The button and the cue, over the day sky and water. */
+html[data-tod="day"] #hero .lk-tod-btn {
+  border-color: rgb(8 24 58 / 0.3);
+  background-color: rgb(255 255 255 / 0.55);
+  color: var(--lk-ink);
+}
+html[data-tod="day"] #hero .lk-tod-btn:hover {
+  border-color: rgb(8 24 58 / 0.55);
+  background-color: rgb(255 255 255 / 0.8);
+}
+
+/* The final call: a day sky under the same words, in ink. The night picture stays
+   under it, so the cross-fade has nothing to jump between. */
+#final::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -30;
+  opacity: 0;
+  background: linear-gradient(180deg, #020514 0%, #5f97d6 12%, #86b6e8 36%, #cfe3f4 66%, #6fa6d6 100%);
+  transition: opacity var(--lk-tod-ms) ease;
+  pointer-events: none;
+}
+html[data-tod="day"] #final::before {
+  opacity: 1;
+}
+/* Over the live lake the section's top is dark where the descent meets it; by day only a short band. */
+#final .lk-final-top {
+  transition: opacity 400ms, height var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #final .lk-final-top {
+  height: 11%;
+}
+#final h2 {
+  transition: color var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #final h2 {
+  color: var(--lk-ink);
+}
+#final [class*="lk-twinkle"] {
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] #final [class*="lk-twinkle"] {
+  opacity: 0;
+  animation: none;
+}
+
+/* The top bar's light variant, only while it is over a day sky. */
+header {
+  transition: color var(--lk-tod-ms) ease, background-color 500ms, border-color 500ms, backdrop-filter 500ms;
+}
+html[data-tod="day"][data-over-sky="1"] header {
+  color: var(--lk-ink);
+}
+html[data-tod="day"][data-over-sky="1"] header[data-scrolled] {
+  background-color: rgb(238 246 253 / 0.6);
+  border-color: rgb(8 24 58 / 0.1);
+}
+html[data-tod="day"][data-over-sky="1"] header :where([class*="text-[#E8F4FF]"]):not(dialog *) {
+  color: rgb(8 24 58 / 0.78);
+}
+html[data-tod="day"][data-over-sky="1"] header a[href$="#hero"],
+html[data-tod="day"][data-over-sky="1"] header :where([class*="text-[#E8F4FF]"]):not(dialog *):hover,
+html[data-tod="day"][data-over-sky="1"] header [aria-current]:not(dialog *) {
+  color: var(--lk-ink);
+}
+html[data-tod="day"][data-over-sky="1"] header :where([class*="text-[#E8F4FF]"]):not(dialog *):hover,
+html[data-tod="day"][data-over-sky="1"] header [aria-current]:not(dialog *) {
+  background-color: rgb(8 24 58 / 0.08);
+}
+html[data-tod="day"][data-over-sky="1"] header svg path[fill="white"] {
+  fill: #0a1250;
+}
+html[data-tod="day"][data-over-sky="1"] header a[class*="bg-[var(--lk-primary)]"] {
+  color: #fff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    --lk-tod-ms: 0ms;
+  }
+  .lk-glitter {
+    animation: none;
+  }
+}
