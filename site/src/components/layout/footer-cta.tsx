@@ -28,7 +28,7 @@ export function FooterCta({
       <DisplayHeading id="footer-cta-heading" as="h2" size="lg" className="max-w-[14ch]">
         {copy.title}
       </DisplayHeading>
-      <div className="mt-8 flex max-w-3xl items-center gap-2 rounded-2xl bg-[var(--lk-n-surface)] p-2 pl-4 md:mt-10">
+      <div className="lk-term mt-8 flex max-w-3xl items-center gap-2 rounded-2xl bg-[var(--lk-n-surface)] p-2 pl-4 md:mt-10">
         <span aria-hidden="true" className="text-[#8fcbff]/60 select-none">$</span>
         <div
           className="min-w-0 flex-1 overflow-x-auto [mask-image:linear-gradient(90deg,#000_calc(100%-36px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"

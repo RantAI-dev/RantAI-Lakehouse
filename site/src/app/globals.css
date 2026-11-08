@@ -3398,3 +3398,104 @@ html[data-tod="day"] #final .lk-final-bottom {
     rgba(244, 247, 251, 0) 100%
   );
 }
+
+/* ---- By day: a light, solid footer (map colours only; the markup is rantai.dev's) ---- */
+footer {
+  transition: background-color var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] footer {
+  background-color: #f4f7fb;
+  color: rgb(8 24 58 / 0.62);
+}
+/* A soft run-in above it, where the page above is dark (the contact page); the home
+   page's final call fades into it itself. */
+footer::before {
+  content: "";
+  position: absolute;
+  inset: auto 0 100% 0;
+  height: 280px;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    180deg,
+    rgba(244, 247, 251, 0) 0%,
+    rgba(60, 110, 170, 0.05) 14%,
+    rgba(70, 120, 180, 0.16) 30%,
+    rgba(120, 165, 215, 0.34) 48%,
+    rgba(190, 212, 238, 0.62) 68%,
+    rgba(232, 240, 249, 0.88) 86%,
+    #f4f7fb 100%
+  );
+  transition: opacity var(--lk-tod-ms) ease;
+}
+html[data-tod="day"] footer::before {
+  opacity: 1;
+}
+html[data-tod="day"] main:has(#final) + footer::before {
+  display: none;
+}
+/* Text: solid ink, muted ink, and the hover back to ink. The terminal keeps its own colours. */
+html[data-tod="day"] footer :is([class*=" text-[#E8F4FF] "], [class$=" text-[#E8F4FF]"]):not(.lk-term *, .lk-wm *) {
+  color: var(--lk-ink);
+}
+html[data-tod="day"] footer [class*="text-[#E8F4FF]/"]:not(.lk-term *, .lk-wm *) {
+  color: rgb(8 24 58 / 0.62);
+}
+html[data-tod="day"] footer [class*="hover:text-[#E8F4FF]"]:hover:not(.lk-term *) {
+  color: var(--lk-ink);
+}
+html[data-tod="day"] footer [class*="border-[#E8F4FF]/"]:not(.lk-term *) {
+  border-color: rgb(8 24 58 / 0.08);
+}
+html[data-tod="day"] footer a[class*="border-[#E8F4FF]/35"]:not(.lk-term *) {
+  border-color: rgb(8 24 58 / 0.4);
+}
+html[data-tod="day"] footer a[class*="border-[#E8F4FF]/35"]:not(.lk-term *):hover {
+  border-color: rgb(8 24 58 / 0.75);
+  background-color: rgb(8 24 58 / 0.06);
+}
+html[data-tod="day"] footer [class*="hover:bg-[#E8F4FF]/5"]:hover {
+  background-color: rgb(8 24 58 / 0.06);
+}
+html[data-tod="day"] footer .group:hover [class*="group-hover:bg-[#E8F4FF]"] {
+  background-color: var(--lk-ink);
+  border-color: var(--lk-ink);
+  color: #fff;
+}
+html[data-tod="day"] footer .group:hover [class*="group-hover:border-[#E8F4FF]"] {
+  border-color: var(--lk-ink);
+}
+html[data-tod="day"] footer [class*="text-[#8fcbff]"]:not(.lk-term *) {
+  color: #0b5ec2;
+}
+html[data-tod="day"] footer a[class*="text-[#8fcbff]"]:hover {
+  color: var(--lk-ink);
+}
+html[data-tod="day"] footer [class*="bg-[#44A6FA]/15"] {
+  background-color: rgb(29 108 207 / 0.12);
+}
+html[data-tod="day"] footer code:not(.lk-term code) {
+  background-color: rgb(8 24 58 / 0.07);
+  color: var(--lk-ink);
+}
+/* Logos: the mark's white becomes ink; the product logos (light on dark) are inverted. */
+html[data-tod="day"] footer svg path[fill="white"] {
+  fill: #0a1250;
+}
+html[data-tod="day"] footer img {
+  filter: invert(1) hue-rotate(180deg);
+}
+html[data-tod="day"] footer img[class*="invert"] {
+  filter: brightness(0);
+}
+/* The big wordmark: pale grey on light, as it is dark-on-dark at night. */
+html[data-tod="day"] footer .lk-wm [class*="from-[#E8F4FF]/[0.08]"] {
+  --tw-gradient-from: rgb(8 24 58 / 0.09);
+}
+html[data-tod="day"] footer .lk-wm [class*="from-[#E8F4FF]/[0.42]"] {
+  --tw-gradient-from: rgb(8 24 58 / 0.3);
+  --tw-gradient-to: rgb(8 24 58 / 0.05);
+}
+html[data-tod="day"] footer .lk-wm [class*="text-[#E8F4FF]/[0.12]"] {
+  color: rgb(8 24 58 / 0.1);
+}

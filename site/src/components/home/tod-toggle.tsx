@@ -40,7 +40,7 @@ export function TodToggle({ copy }: { copy: { day: string; night: string; label:
  * `data-over-sky` on <html> only when it flips; removed on leaving the page,
  * so the contact page's bar is never touched.
  */
-export function SkyWatch() {
+export function SkyWatch({ page = "home" }: { page?: "home" | "contact" }) {
   React.useEffect(() => {
     const d = document.documentElement;
     let last = "";
@@ -51,9 +51,19 @@ export function SkyWatch() {
       const vh = window.innerHeight;
       // The live lake keeps its sky under the bar until the camera is under (about 1.55 screens down);
       // the DOM hero's stage has scrolled away by about one.
-      let over = window.scrollY < vh * (d.getAttribute("data-scene") === "full" ? 1.55 : 1);
+      let over = page === "home" && window.scrollY < vh * (d.getAttribute("data-scene") === "full" ? 1.55 : 1);
       const fin = document.getElementById("final")?.getBoundingClientRect();
-      if (!over && fin) over = fin.top + fin.height * 0.28 <= y && fin.top + fin.height * 0.55 >= y;
+      const rise = document.getElementById("surface")?.getBoundingClientRect();
+      if (!over && fin) {
+        // By day the surfacing's bright last part runs into the final call's sky; at night only the sky counts.
+        over =
+          rise && rise.height > 0
+            ? rise.top + rise.height * 0.72 <= y && fin.top + fin.height * 0.55 >= y
+            : fin.top + fin.height * 0.28 <= y && fin.top + fin.height * 0.55 >= y;
+      }
+      // The light footer (by day), with a soft run-in above it.
+      const foot = document.querySelector("footer")?.getBoundingClientRect();
+      if (!over && foot) over = foot.top - 140 <= y;
       const next = over ? "1" : "0";
       if (next !== last) {
         last = next;
@@ -72,6 +82,6 @@ export function SkyWatch() {
       if (raf) cancelAnimationFrame(raf);
       d.removeAttribute("data-over-sky");
     };
-  }, []);
+  }, [page]);
   return null;
 }

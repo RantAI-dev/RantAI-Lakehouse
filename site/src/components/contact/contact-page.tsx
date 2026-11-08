@@ -1,6 +1,8 @@
 import { getMessages } from "next-intl/server";
 import { ArrowUpRight, Mail } from "lucide-react";
 import { HeroIntro } from "@/components/home/hero-intro";
+import { TodBoot } from "@/components/home/tod-boot";
+import { SkyWatch } from "@/components/home/tod-toggle";
 import { SiteFooter } from "@/components/layout/site-footer";
 import { SkipLink } from "@/components/layout/skip-link";
 import { TopBar } from "@/components/layout/top-bar";
@@ -35,6 +37,8 @@ export async function ContactPage({ locale }: Readonly<{ locale: Locale }>) {
     <div className="lk-root relative min-h-screen overflow-x-clip">
       {/* WEB-5 O47: only a light reveal of the heading on this page (home/hero-intro.tsx). */}
       <HeroIntro variant="lite" />
+      <TodBoot />
+      <SkyWatch page="contact" />
       <SkipLink label={common.skipToContent} />
       <TopBar locale={locale} page="contact" nav={common.nav} cta={common.cta} language={common.language} />
       <main id="main" tabIndex={-1} className="relative isolate">

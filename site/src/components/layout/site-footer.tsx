@@ -218,7 +218,7 @@ export function SiteFooter({
             each bound is scaled by 6/9, or the word runs off the page (measured in O7). */}
         <FooterWordmark
           text="Lakehouse"
-          className="mt-4 mb-[-0.2em] text-[clamp(4rem,16vw,14.5rem)] leading-[0.85] font-semibold tracking-[-0.06em]"
+          className="lk-wm mt-4 mb-[-0.2em] text-[clamp(4rem,16vw,14.5rem)] leading-[0.85] font-semibold tracking-[-0.06em]"
         />
       </div>
     </footer>
