@@ -58,15 +58,11 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
                 out.push(' ');
             }
             '/' if next == Some('*') => {
-                i += 2;
-                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-                    i += 1;
-                }
-                i = (i + 2).min(chars.len());
+                i = skip_block_comment(&chars, i);
                 out.push(' ');
             }
             '\'' | '"' | '`' => {
-                i = skip_quoted(&chars, i, c);
+                i = skip_quoted(&chars, i, c, true);
                 out.push(' ');
             }
             _ => {
@@ -78,8 +74,10 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
     out
 }
 
-/// Index just past the end of the line starting at `from`.
-fn skip_to_line_end(chars: &[char], from: usize) -> usize {
+/// Index of the newline that ends the line starting at `from` (the end of
+/// the text when the last line has none), so the caller resumes on the
+/// newline itself.
+pub(crate) fn skip_to_line_end(chars: &[char], from: usize) -> usize {
     let mut i = from;
     while i < chars.len() && chars[i] != '\n' {
         i += 1;
@@ -87,13 +85,33 @@ fn skip_to_line_end(chars: &[char], from: usize) -> usize {
     i
 }
 
+/// Index just past the `/* … */` comment that opens at `from`. An
+/// unterminated comment consumes the rest of the statement.
+pub(crate) fn skip_block_comment(chars: &[char], from: usize) -> usize {
+    let mut i = from + 2;
+    while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+        i += 1;
+    }
+    (i + 2).min(chars.len())
+}
+
 /// Index just past the quoted run that opens at `from` with `quote`.
 /// An unterminated quote consumes the rest of the statement, which is the
 /// safe reading: the guard sees less, not more.
-fn skip_quoted(chars: &[char], from: usize, quote: char) -> usize {
+///
+/// `backslash_escapes` says whether a backslash escapes the next character.
+/// `ClickHouse` does, so the guards here always pass `true`. `Trino` does
+/// not: `'a\'` is a complete string there, so `query_params` passes `false`
+/// when it scans `Trino` SQL.
+pub(crate) fn skip_quoted(
+    chars: &[char],
+    from: usize,
+    quote: char,
+    backslash_escapes: bool,
+) -> usize {
     let mut i = from + 1;
     while i < chars.len() {
-        if chars[i] == '\\' {
+        if backslash_escapes && chars[i] == '\\' {
             i += 2;
             continue;
         }
@@ -258,6 +276,10 @@ pub(crate) enum SqlSourceRefusal {
     /// It reads a table outside `serving` (including `console.*` and
     /// `system.*`), or a bare table name.
     OutsideServing,
+    /// A well-formed `{{name}}` placeholder (`QS-5`). A dashboard source cannot
+    /// take parameters until part 2, and the engine would answer with a
+    /// message about `{`.
+    ParametersLater,
 }
 
 impl SqlSourceRefusal {
@@ -275,6 +297,10 @@ impl SqlSourceRefusal {
             Self::Unparseable => "the SQL could not be parsed, so the tables it reads are unknown.",
             Self::OutsideServing => {
                 "a SQL source may only read Gold tables, written as serving.<table>."
+            }
+            Self::ParametersLater => {
+                "Parameters in a dashboard's SQL source come later: give the value in the SQL \
+                 for now."
             }
         }
     }
@@ -301,6 +327,13 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
     }
     if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
         return Err(SqlSourceRefusal::TooLong);
+    }
+    // `query-parameters.md` decision 15: before anything reads the statement as ClickHouse SQL. The
+    // scanner is the one that knows comments and quotes, so a `{{` in a
+    // comment, or text that is not a well-formed placeholder, changes
+    // nothing here.
+    if crate::query_params::holds_placeholder(trimmed) {
+        return Err(SqlSourceRefusal::ParametersLater);
     }
     let code = strip_sql_noise(trimmed);
     let lower = code.trim_start().to_ascii_lowercase();
@@ -427,6 +460,61 @@ mod sql_source_rules {
     fn unparseable_sql_is_refused_not_passed_through() {
         assert_eq!(
             check_sql_source("SELECT * FROM serving.a WHERE ((("),
+            Err(SqlSourceRefusal::Unparseable)
+        );
+    }
+
+    /// `query-parameters.md` decision 15: parameters in a source come later, so a well-formed
+    /// placeholder is refused with the page's sentence instead of reaching
+    /// the engine parser, which would answer with a message about `{`.
+    #[test]
+    fn a_placeholder_in_a_source_is_refused_with_the_part_two_sentence() {
+        for sql in [
+            "SELECT * FROM serving.a WHERE region = {{region}}",
+            "SELECT * FROM serving.a WHERE region = {{ region }}",
+            "SELECT * FROM serving.a WHERE day >= {{days.start}} AND day <= {{days.end}}",
+            "SELECT * FROM serving.a WHERE region IN ({{regions}})",
+            // The same words in a string are a placeholder the person meant.
+            "SELECT * FROM serving.a WHERE region = '{{region}}'",
+        ] {
+            let refusal = check_sql_source(sql).unwrap_err();
+            assert_eq!(refusal, SqlSourceRefusal::ParametersLater, "{sql}");
+            assert_eq!(
+                refusal.message(),
+                "Parameters in a dashboard's SQL source come later: give the value in the \
+                 SQL for now.",
+                "{sql}"
+            );
+        }
+    }
+
+    /// The refusal comes before the engine parse: a source that holds a
+    /// placeholder and would also fail the parse says the placeholder first.
+    #[test]
+    fn the_placeholder_refusal_comes_before_the_engine_parse() {
+        assert_eq!(
+            check_sql_source("SELECT * FROM serving.a WHERE x = {{x}} AND ((("),
+            Err(SqlSourceRefusal::ParametersLater)
+        );
+    }
+
+    /// A `{{` that is not a well-formed placeholder, or that sits in a
+    /// comment, changes nothing: the source is judged as it was before.
+    #[test]
+    fn braces_that_are_not_a_placeholder_leave_the_verdict_as_it_was() {
+        for sql in [
+            "SELECT * FROM serving.a -- {{region}}",
+            "SELECT * FROM serving.a /* {{region}} */",
+            "SELECT '{{ not closed' AS note FROM serving.a",
+            "SELECT '{{9x}}' AS note FROM serving.a",
+        ] {
+            assert!(check_sql_source(sql).is_ok(), "{sql}");
+        }
+        // A stray `{{` outside quotes and comments is not a well-formed
+        // placeholder either: it keeps failing the way it did (a parse
+        // failure), not with the part-two sentence.
+        assert_eq!(
+            check_sql_source("SELECT * FROM serving.a WHERE x = {{"),
             Err(SqlSourceRefusal::Unparseable)
         );
     }

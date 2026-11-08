@@ -70,7 +70,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::routes::quality::pool;
-use crate::routes::query::{saved_query_scope, saved_query_viewer};
+use crate::routes::query::{checked_saved_definitions, saved_query_scope, saved_query_viewer};
 use crate::sql_guard::is_read_only;
 use crate::state::AppState;
 use crate::upstream_error;
@@ -1013,6 +1013,11 @@ pub struct PatchSavedQueryBody {
     /// or absent to leave it where it is.
     #[serde(default)]
     pub folder_id: FolderField,
+    /// New parameter definitions (`QS-5`), the whole list; absent leaves
+    /// them as they are, `[]` clears them. Raw JSON so a list of the wrong
+    /// shape is refused with a fixed sentence.
+    #[serde(default)]
+    pub parameters: Option<Value>,
 }
 
 /// `PATCH /api/query/saved/{id}` — change a saved query.
@@ -1027,9 +1032,18 @@ pub struct PatchSavedQueryBody {
 /// statement that is not read-only is refused the same way the save route
 /// refuses it, so nothing that can never run is ever stored.
 ///
+/// A change of the SQL or of the parameters is checked as a pair
+/// (`QS-5`): the definitions of the body, or the stored ones, against the
+/// SQL of the body, or the stored SQL. A patch that touches neither does not
+/// read the SQL again, so a query saved before `QS-5` still renames. A
+/// change of the parameters alone writes a version, like a change of the
+/// SQL.
+///
 /// # Errors
 ///
-/// 400 for a malformed body or a blank title; 404 with the fixed sentence
+/// 400 for a malformed body, a blank title or parameters that do not fit
+/// the SQL (the sentence of [`crate::query_params::ParamError`], or the
+/// fixed shape sentence for a list of the wrong shape); 404 with the fixed sentence
 /// of [`QUERY_NOT_FOUND`] for a query the caller may not see; 403 with the
 /// fixed sentence of [`QUERY_FORBIDDEN`] for a query the caller may see
 /// but not change, and for a folder the caller may see but not fill; 403
@@ -1058,7 +1072,9 @@ pub async fn patch_saved(
     // The body is read only now: a query the caller may not see is a 404
     // and a query it may not change is a 403, whatever the body holds.
     let body: PatchSavedQueryBody = serde_json::from_slice(&body).map_err(|_err| {
-        ApiError::BadRequest("Body must be JSON {title?, sql?, tags?, folderId?}.".to_owned())
+        ApiError::BadRequest(
+            "Body must be JSON {title?, sql?, tags?, folderId?, parameters?}.".to_owned(),
+        )
     })?;
     let title = body.title.map(|title| title.trim().to_owned());
     if title.as_deref().is_some_and(str::is_empty) {
@@ -1075,6 +1091,18 @@ pub async fn patch_saved(
     {
         return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
+    // The SQL and the definitions travel as a pair: when either changes,
+    // the pair the query will hold is checked.
+    let parameters = if sql.is_some() || body.parameters.is_some() {
+        let final_sql = sql.as_deref().unwrap_or(&saved.sql);
+        let final_definitions = body.parameters.unwrap_or_else(|| saved.parameters.clone());
+        Some(checked_saved_definitions(
+            final_sql,
+            Some(final_definitions),
+        )?)
+    } else {
+        None
+    };
     let folder = match parse_folder_reference(body.folder_id)? {
         FolderReference::Absent => None,
         FolderReference::SharedSpace => Some(FolderMove::Root),
@@ -1095,6 +1123,7 @@ pub async fn patch_saved(
         sql,
         tags: body.tags,
         folder,
+        parameters,
     };
     let saved = queries::update_saved_query(pool(&state)?, &viewer, &id, &patch)
         .await
@@ -1182,11 +1211,12 @@ pub async fn duplicate_saved(
         crate::tenant_scope::resolve(&principal, &headers)?,
     );
     let owner = principal.display_name.clone();
-    let copy = queries::create_saved_query_at(
+    let copy = queries::create_saved_query_with_parameters(
         pool(&state)?,
         &viewer,
         &source.title,
         &source.sql,
+        &source.parameters,
         &owner,
         &source.tags,
         SavedQueryPlacement::PersonalSpace,

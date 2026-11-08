@@ -10,6 +10,10 @@
           "sql": {
             "type": "string",
             "description": "A ClickHouse SELECT statement"
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Number or text for each {{name}} in sql; {start,end} dates for {{name.start}} and {{name.end}}."
           }
         },
         "required": [
@@ -4676,6 +4680,10 @@
         "properties": {
           "id": {
             "type": "string"
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Values for the query's parameters, by name. Ask the user for a missing one."
           }
         },
         "required": [

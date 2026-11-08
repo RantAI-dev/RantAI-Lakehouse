@@ -23,19 +23,27 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
     FolderMove, HistoryFilter, RecordHistoryInput, SavedQueryPatch, SavedQueryPlacement,
     SavedQueryScope, SavedQueryViewer, VERSION_KEEP, count_history, create_saved_query,
-    create_saved_query_at, get_history_item, get_saved, history_mentioning, history_recent,
-    list_history, list_saved, list_saved_matching, list_saved_trash_entries, list_versions,
-    purge_trashed_before, record_history, restore_saved_query, trash_saved_query,
-    update_saved_query,
+    create_saved_query_at, create_saved_query_with_parameters, get_history_item, get_saved,
+    history_mentioning, history_recent, list_history, list_saved, list_saved_matching,
+    list_saved_trash_entries, list_versions, purge_trashed_before, record_history,
+    restore_saved_query, revert_to_version, trash_saved_query, update_saved_query,
 };
 use lakehouse_store::saved_query_access::{
     FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
     grantee_labels, grants_for_viewer, manages_folder_and_contents, move_folder_for_viewer,
     rename_folder, replace_grants, rules_for_item, search_grantees,
 };
+use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::migrate::Migrator;
+use std::borrow::Cow;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// The migration set this repository applies, compiled in (`sqlx::migrate!`
+/// embeds the files at compile time, so a migration edit needs a rebuild
+/// before a test result means anything).
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 /// The seed lands two saved queries, pointed at marts this lakehouse
 /// actually serves (`0027_query_ownership.sql` repointed them — the
@@ -1711,6 +1719,212 @@ async fn a_version_is_written_for_a_change_and_skipped_when_nothing_changed(
     assert_eq!(versions.len(), 2, "a new title is a new version");
     assert_eq!(versions[0].version, 2);
     assert_eq!(versions[0].title, "Second");
+    Ok(())
+}
+
+/// The two definitions the `QS-5` tests save (decision 3): the store keeps them as
+/// the JSON the route validated and never reads inside them.
+fn region_definitions() -> Value {
+    json!([{"name": "region", "type": "text", "default": "EU"}])
+}
+
+/// The same query with a different default, so a patch that changes only
+/// this differs from the stored list by a single value.
+fn region_definitions_with_default_us() -> Value {
+    json!([{"name": "region", "type": "text", "default": "US"}])
+}
+
+/// `query-parameters.md` decision 3: a saved query keeps its parameters beside its SQL. A change
+/// of the parameters alone writes a version, a change that leaves them as
+/// they were writes none, a change of the title alone keeps them, and a
+/// revert brings back the parameters of the version it went back to.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_saved_query_keeps_its_parameters_in_every_version_and_a_revert_restores_them(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let scope = SavedQueryScope::All {
+        viewer: caller.clone(),
+    };
+    let saved = create_saved_query_with_parameters(
+        &pool,
+        &caller,
+        "By region",
+        "SELECT {{region}}",
+        &region_definitions(),
+        "Rina Wijaya",
+        &[],
+        SavedQueryPlacement::SharedSpace,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.parameters, region_definitions());
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    let read = get_saved(&pool, &saved.id, &scope).await.unwrap().unwrap();
+    assert_eq!(read.parameters, region_definitions(), "get carries them");
+    let listed = list_saved(&pool, scope.clone()).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|q| q.id == saved.id)
+            .map(|q| q.parameters.clone()),
+        Some(region_definitions()),
+        "the list carries them"
+    );
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].parameters, region_definitions());
+
+    // The same list sent again changes nothing.
+    update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            parameters: Some(region_definitions()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list_versions(&pool, query_id).await.unwrap().len(),
+        1,
+        "parameters that are as they were write no version"
+    );
+
+    // A change of the parameters alone is a version.
+    let patched = update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            parameters: Some(region_definitions_with_default_us()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(patched.parameters, region_definitions_with_default_us());
+    assert_eq!(patched.sql, "SELECT {{region}}", "the SQL did not move");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 2, "a parameters-only change is a version");
+    assert_eq!(
+        versions[0].parameters,
+        region_definitions_with_default_us(),
+        "the new version holds the new parameters"
+    );
+    assert_eq!(
+        versions[1].parameters,
+        region_definitions(),
+        "the old version keeps the old ones"
+    );
+
+    // A title-only patch leaves the parameters where they are.
+    let renamed = update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            title: Some("By region, renamed".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(renamed.parameters, region_definitions_with_default_us());
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 3);
+    assert_eq!(
+        versions[0].parameters,
+        region_definitions_with_default_us(),
+        "a version written for a new title still holds the current parameters"
+    );
+
+    // Going back to version 1 brings back its parameters with its SQL.
+    let reverted = revert_to_version(&pool, &caller, query_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(reverted.parameters, region_definitions());
+    assert_eq!(reverted.title, "By region");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 4, "the revert is itself a version");
+    assert_eq!(versions[0].label, "Restored version 1");
+    assert_eq!(versions[0].parameters, region_definitions());
+    Ok(())
+}
+
+/// A query saved the way every caller did before `QS-5` has no parameters:
+/// the list is empty, not missing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_query_saved_without_parameters_reads_an_empty_list(pool: PgPool) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let saved = create_saved_query(
+        &pool,
+        &caller,
+        "Plain",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.parameters, json!([]));
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions[0].parameters, json!([]));
+    Ok(())
+}
+
+/// The migrations a database that stopped at `version` would have applied.
+fn migrations_up_to(version: i64) -> Migrator {
+    let upto: Vec<_> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= version)
+        .cloned()
+        .collect();
+    Migrator {
+        migrations: Cow::Owned(upto),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// `0131` gives every row written before it an empty parameter list, on the
+/// query and on its versions, and the store reads them back as such.
+#[sqlx::test(migrations = false)]
+async fn migration_0131_gives_old_queries_and_versions_an_empty_parameter_list(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    migrations_up_to(130).run(&pool).await.unwrap();
+    let query_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO saved_query (id, title, sql, owner) VALUES ($1, 'Old', 'SELECT 1', 'Rina Wijaya')")
+        .bind(query_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO saved_query_version (query_id, version, title, sql, author_name, label) \
+         VALUES ($1, 7, 'Old', 'SELECT 1', 'Rina Wijaya', '')",
+    )
+    .bind(query_id)
+    .execute(&pool)
+    .await?;
+
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let on_query: Value = sqlx::query_scalar("SELECT parameters FROM saved_query WHERE id = $1")
+        .bind(query_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(on_query, json!([]));
+    let on_version: Value =
+        sqlx::query_scalar("SELECT parameters FROM saved_query_version WHERE query_id = $1")
+            .bind(query_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(on_version, json!([]));
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions[0].parameters, json!([]));
     Ok(())
 }
 

@@ -351,7 +351,8 @@ fn run_sql_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_sql",
         "description": "Run a read-only ClickHouse SELECT and return its rows. Use it for every number you report. Query Gold marts (serving.mart_*) for totals and trends, Silver (silver.<table>) for detail rows. Compute totals, percentages, growth and rankings in the SQL itself. Tables and columns are in the DATA MAP.",
         "parameters": { "type": "object",
-            "properties": { "sql": { "type": "string", "description": "A ClickHouse SELECT statement" } },
+            "properties": { "sql": { "type": "string", "description": "A ClickHouse SELECT statement" },
+                "parameters": { "type": "object", "description": "Number or text for each {{name}} in sql; {start,end} dates for {{name.start}} and {{name.end}}." } },
             "required": ["sql"] } } })
 }
 
@@ -1473,7 +1474,8 @@ fn list_saved_queries_schema() -> Value {
 fn run_saved_query_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_saved_query",
         "description": "Run a saved query (by id) and return its rows. Only read-only statements run, as in Query Studio.",
-        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" },
+            "parameters": { "type": "object", "description": "Values for the query's parameters, by name. Ask the user for a missing one." } },
             "required": ["id"] } } })
 }
 
@@ -3247,6 +3249,27 @@ mod tests {
              regenerate the fixture ONLY for an intentional, reviewed \
              schema change, never to make this test pass during a refactor"
         );
+    }
+
+    /// `query-parameters.md` decision 7: the two tools that run SQL take an optional `parameters`
+    /// object, described in one short line (the build turn's tool list has
+    /// about 2,200 characters of room, `tests/ai_build_tool_list.rs`).
+    #[test]
+    fn run_sql_and_run_saved_query_take_an_optional_parameters_object() {
+        for name in ["run_sql", "run_saved_query"] {
+            let schema = (find(name).expect("registered tool").schema)();
+            let parameters = &schema["function"]["parameters"];
+            let property = &parameters["properties"]["parameters"];
+            assert_eq!(property["type"], "object", "{name}");
+            let line = property["description"].as_str().expect("a description");
+            assert!(!line.is_empty() && !line.contains('\n'), "{name}: {line}");
+            assert!(line.chars().count() <= 120, "{name}: {line}");
+            let required = parameters["required"].as_array().expect("required list");
+            assert!(
+                !required.contains(&json!("parameters")),
+                "{name}: parameters is optional"
+            );
+        }
     }
 
     /// `BI-6` (with `AI-6`): the chart tools take the chart builder's fields, and

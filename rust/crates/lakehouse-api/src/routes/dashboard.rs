@@ -7305,6 +7305,47 @@ mod records_pages {
         assert!(rows.contains("max_execution_time = 60"), "{rows}");
     }
 
+    /// `query-parameters.md` decision 15: a stored source whose SQL holds a placeholder (saved before
+    /// the refusal existed) is not run for a record list: the source gate
+    /// refuses it like any other source that no longer passes. The
+    /// placeholder is in quotes, the one spelling the engine parser accepts,
+    /// so only the placeholder refusal can stop this source.
+    #[tokio::test]
+    async fn a_sql_source_with_a_placeholder_is_refused_and_runs_nothing() {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "FROM console.bi_source FINAL",
+            vec![json!({
+                "id": "s_param", "title": "src",
+                "sql": "SELECT channel FROM serving.mart_x WHERE channel = '{{channel}}'",
+                "columns_json": json!([{"name": "channel", "type": "String"}]).to_string(),
+                "folder_id": "", "created_by": "u", "updated_at": "2026-01-01 00:00:00",
+            })],
+        )
+        .await;
+        answer_rest(&server).await;
+        let q = RecordsQuery {
+            sql_source: Some("s_param".to_owned()),
+            ..RecordsQuery::default()
+        };
+
+        let err = run(&server, q).await.unwrap_err();
+
+        assert!(
+            matches!(&err, ApiError::Unprocessable(m)
+                if m == "this chart's SQL source no longer passes the SQL check"),
+            "{err:?}"
+        );
+        assert!(
+            statements(&server)
+                .await
+                .iter()
+                .all(|s| !s.contains("AS src") && !s.contains("ORDER BY ALL")),
+            "the source's SQL must not be sent"
+        );
+    }
+
     #[tokio::test]
     async fn a_deleted_sql_source_is_a_404_of_ours_and_runs_nothing_else() {
         let server = MockServer::start().await;

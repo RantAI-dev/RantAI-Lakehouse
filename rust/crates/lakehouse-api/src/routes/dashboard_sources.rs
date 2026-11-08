@@ -775,6 +775,35 @@ mod preview_tests {
         );
     }
 
+    /// `query-parameters.md` decision 15: a source with a `{{name}}` placeholder is refused with the
+    /// page's sentence, and nothing reaches `ClickHouse`, not even the probe.
+    #[tokio::test]
+    async fn a_source_with_a_placeholder_is_refused_before_anything_reaches_clickhouse() {
+        let server = MockServer::start().await;
+        mount(&server).await;
+
+        let err = run(
+            &server,
+            json!({ "sql": "SELECT place FROM serving.mart_x WHERE place = {{place}}" }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ApiError::Unprocessable(message) if message
+                    == "Parameters in a dashboard's SQL source come later: give the value in \
+                        the SQL for now."
+            ),
+            "{err:?}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "nothing may reach ClickHouse for a source with a placeholder"
+        );
+    }
+
     #[tokio::test]
     async fn clickhouse_text_from_the_chart_query_never_reaches_the_response() {
         let server = MockServer::start().await;

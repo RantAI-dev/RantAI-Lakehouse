@@ -4930,3 +4930,432 @@ async fn more_rules_do_not_add_a_round_trip_to_an_access_list() {
         "nine rules cost as many checkouts as two"
     );
 }
+
+// ── Parameters (`query-parameters.md`, decision 3) ───────────────────────────────────────
+
+/// The sentence a `parameters` value that is not a list of definitions is
+/// refused with. Fixed: it never quotes the caller's JSON back.
+const PARAMETERS_SHAPE: &str = "parameters must be a list of parameter definitions, each with a \
+     name, a type, a default and options.";
+
+/// The SQL the parameter tests save: one placeholder, `{{region}}`.
+const BY_REGION: &str = "SELECT * FROM serving.mart_wisman WHERE region = {{region}}";
+
+/// A text parameter named `region` whose default is `default`.
+fn region(default: &str) -> Value {
+    json!({"name": "region", "type": "text", "default": default})
+}
+
+/// Save `body` and answer the status and the answer.
+async fn save(router: &axum::Router, cookie: &str, body: Value) -> (StatusCode, Value) {
+    call(router, "POST", "/api/query/saved", cookie, Some(body)).await
+}
+
+/// The id of a saved-query answer.
+fn id_of(saved: &Value) -> String {
+    saved["id"]
+        .as_str()
+        .expect("the saved query has an id")
+        .to_owned()
+}
+
+/// The versions of a query, newest first.
+async fn versions_of(router: &axum::Router, cookie: &str, id: &str) -> Vec<Value> {
+    let (status, versions) = call(
+        router,
+        "GET",
+        &format!("/api/query/saved/{id}/versions"),
+        cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{versions}");
+    versions
+        .as_array()
+        .expect("the versions are an array")
+        .clone()
+}
+
+/// `QS-5-AC4`: a saved query keeps its parameters. Changing only a
+/// parameter's default writes a version, a revert brings back the
+/// parameters of the version with its SQL, and a duplicate carries them.
+#[tokio::test]
+async fn a_saved_query_keeps_its_parameters_in_every_version_and_a_revert_and_a_copy_carry_them() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let (status, saved) = save(
+        &router,
+        &cookie,
+        json!({"title": "By region", "sql": BY_REGION, "parameters": [region("EU")]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["parameters"], json!([region("EU")]));
+    let id = id_of(&saved);
+
+    let (status, read) = call(
+        &router,
+        "GET",
+        &format!("/api/query/saved/{id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["parameters"],
+        json!([region("EU")]),
+        "get carries them"
+    );
+    let (status, listed) = call(&router, "GET", "/api/query/saved", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed = listed
+        .as_array()
+        .expect("the list is an array")
+        .iter()
+        .find(|q| q["id"] == id)
+        .expect("the query is listed")
+        .clone();
+    assert_eq!(listed["parameters"], json!([region("EU")]));
+    let versions = versions_of(&router, &cookie, &id).await;
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0]["parameters"], json!([region("EU")]));
+
+    // Only the default changes: that is a version.
+    let (status, patched) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{id}"),
+        &cookie,
+        Some(json!({"parameters": [region("US")]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["parameters"], json!([region("US")]));
+    assert_eq!(patched["sql"], BY_REGION, "the SQL did not move");
+    let versions = versions_of(&router, &cookie, &id).await;
+    assert_eq!(versions.len(), 2, "a parameters-only change is a version");
+    assert_eq!(versions[0]["parameters"], json!([region("US")]));
+    assert_eq!(versions[1]["parameters"], json!([region("EU")]));
+
+    // The same list again writes nothing, and a new title keeps the list.
+    let (status, again) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{id}"),
+        &cookie,
+        Some(json!({"parameters": [region("US")]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(versions_of(&router, &cookie, &id).await.len(), 2);
+    let (status, renamed) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{id}"),
+        &cookie,
+        Some(json!({"title": "By region, renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    assert_eq!(renamed["parameters"], json!([region("US")]));
+
+    // Back to version 1: its SQL and its parameters together.
+    let (status, reverted) = call(
+        &router,
+        "POST",
+        &format!("/api/query/saved/{id}/versions/1/revert"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reverted}");
+    assert_eq!(reverted["parameters"], json!([region("EU")]));
+    assert_eq!(reverted["sql"], BY_REGION);
+    let versions = versions_of(&router, &cookie, &id).await;
+    assert_eq!(versions[0]["label"], "Restored version 1");
+    assert_eq!(versions[0]["parameters"], json!([region("EU")]));
+
+    let (status, copy) = call(
+        &router,
+        "POST",
+        &format!("/api/query/saved/{id}/duplicate"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{copy}");
+    assert_ne!(copy["id"], id.as_str());
+    assert_eq!(copy["parameters"], json!([region("EU")]));
+    let copy_versions = versions_of(&router, &cookie, &id_of(&copy)).await;
+    assert_eq!(copy_versions[0]["parameters"], json!([region("EU")]));
+}
+
+/// A query with no placeholder and no parameters saves exactly as before,
+/// with an empty list; and a patch that leaves the SQL and the parameters
+/// alone does not read the stored SQL again, so a query saved before `QS-5`
+/// that holds a `{{` still renames.
+#[tokio::test]
+async fn a_query_without_parameters_saves_as_before_and_a_rename_does_not_rescan_old_sql() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let (status, saved) = save(
+        &router,
+        &cookie,
+        json!({"title": "Plain", "sql": "SELECT 1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["parameters"], json!([]));
+    let (status, saved) = save(
+        &router,
+        &cookie,
+        json!({"title": "Explicit", "sql": "SELECT 1", "parameters": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["parameters"], json!([]));
+
+    // A row written before the scanner existed, with a placeholder in quotes.
+    let owner = user_id(&pool, "rina@meridian.example").await;
+    let old: Uuid = sqlx::query_scalar(
+        "INSERT INTO saved_query (title, sql, owner, owner_id, tenant_id) \
+         VALUES ('Old', 'SELECT ''{{x}}''', 'Rina Wijaya', $1, $2) RETURNING id",
+    )
+    .bind(owner)
+    .bind(Uuid::parse_str(GROUP_TENANT).expect("the group tenant id"))
+    .fetch_one(&pool)
+    .await
+    .expect("insert the old query");
+    let (status, renamed) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{old}"),
+        &cookie,
+        Some(json!({"title": "Old, renamed", "tags": ["legacy"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    assert_eq!(renamed["title"], "Old, renamed");
+    assert_eq!(renamed["parameters"], json!([]));
+}
+
+/// `QS-5` decision 11 and the limits of decision 6, on save: a definition
+/// the SQL does not use, a placeholder with no definition, a placeholder in
+/// quotes, a definition of the wrong shape, and 21 / 201 are each a 400 with
+/// a fixed sentence, and nothing is stored.
+#[tokio::test]
+async fn a_save_that_the_definitions_do_not_fit_is_a_400_with_a_fixed_sentence() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let options: Vec<Value> = (0..=200)
+        .map(|n| json!({"value": format!("v{n}"), "label": format!("V{n}")}))
+        .collect();
+    let too_many_definitions: Vec<Value> = (0..=20)
+        .map(|n| json!({"name": format!("p{n}"), "type": "text"}))
+        .collect();
+    let all_placeholders = (0..=20)
+        .map(|n| format!("{{{{p{n}}}}}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "SELECT 1",
+            json!([region("EU")]),
+            "{{region}} has a definition but the SQL does not use it.",
+        ),
+        (
+            BY_REGION,
+            json!([]),
+            "{{region}} is used in the SQL but has no definition.",
+        ),
+        (
+            "SELECT '{{region}}'",
+            json!([region("EU")]),
+            "{{region}} is inside quotes: write it without them, for example = {{region}}.",
+        ),
+        (
+            "SELECT {{ not a parameter }}",
+            json!([]),
+            "This query has a {{ that is not a parameter.",
+        ),
+        (
+            BY_REGION,
+            json!([region("EU"), region("US")]),
+            "Two parameters are named {{region}}.",
+        ),
+        (BY_REGION, json!("nope"), PARAMETERS_SHAPE),
+        (BY_REGION, json!({"name": "region"}), PARAMETERS_SHAPE),
+        (
+            BY_REGION,
+            json!([{"name": "region", "type": "secret-bogus"}]),
+            PARAMETERS_SHAPE,
+        ),
+        (
+            BY_REGION,
+            json!([{"name": "region", "type": "text", "surprise": 1}]),
+            PARAMETERS_SHAPE,
+        ),
+        (
+            "SELECT 1",
+            json!(too_many_definitions),
+            "A query takes at most 20 parameters.",
+        ),
+        (
+            "SELECT {{c}}",
+            json!([{"name": "c", "type": "dropdown", "options": options}]),
+            "{{c}} has more than 200 options; a dropdown or multi-select takes at most 200.",
+        ),
+    ];
+    for (sql, parameters, expected) in cases {
+        let (status, body) = save(
+            &router,
+            &cookie,
+            json!({"title": "Refused", "sql": sql, "parameters": parameters}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}: {body}");
+        assert_eq!(error(&body), expected, "{sql}");
+        assert!(
+            !error(&body).contains("secret-bogus") && !error(&body).contains("surprise"),
+            "the sentence never repeats the caller's own JSON: {body}"
+        );
+    }
+
+    // 21 placeholders and no definition for any: the limit, not 21 sentences.
+    let (status, body) = save(
+        &router,
+        &cookie,
+        json!({"title": "Refused", "sql": format!("SELECT {all_placeholders}")}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(error(&body), "A query takes at most 20 parameters.");
+
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM saved_query WHERE title = 'Refused'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(stored, 0, "a refused save stores nothing");
+}
+
+/// A patch is checked against the SQL the query will have: the new SQL when
+/// the body carries one, the stored SQL otherwise, with the new definitions
+/// or the stored ones. A refused patch writes nothing.
+#[tokio::test]
+async fn a_patch_is_checked_against_the_sql_the_query_will_have() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let (status, saved) = save(
+        &router,
+        &cookie,
+        json!({"title": "By region", "sql": BY_REGION, "parameters": [region("EU")]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let id = id_of(&saved);
+    let path = format!("/api/query/saved/{id}");
+
+    // New SQL that drops the placeholder strands the stored definition.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &path,
+        &cookie,
+        Some(json!({"sql": "SELECT 1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        error(&body),
+        "{{region}} has a definition but the SQL does not use it."
+    );
+
+    // New SQL with a placeholder nobody defined.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &path,
+        &cookie,
+        Some(json!({"sql": format!("{BY_REGION} AND year = {{{{year}}}}")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        error(&body),
+        "{{year}} is used in the SQL but has no definition."
+    );
+
+    // New definitions the stored SQL does not use.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &path,
+        &cookie,
+        Some(json!({"parameters": [region("EU"), {"name": "year", "type": "number"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        error(&body),
+        "{{year}} has a definition but the SQL does not use it."
+    );
+
+    // A malformed list.
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &path,
+        &cookie,
+        Some(json!({"parameters": {"region": "EU"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(error(&body), PARAMETERS_SHAPE);
+
+    let (status, unchanged) = call(&router, "GET", &path, &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{unchanged}");
+    assert_eq!(unchanged["sql"], BY_REGION);
+    assert_eq!(unchanged["parameters"], json!([region("EU")]));
+    assert_eq!(
+        versions_of(&router, &cookie, &id).await.len(),
+        1,
+        "a refused patch writes no version"
+    );
+
+    // The SQL and the definitions move together: valid against the new SQL.
+    let (status, patched) = call(
+        &router,
+        "PATCH",
+        &path,
+        &cookie,
+        Some(json!({
+            "sql": "SELECT * FROM serving.mart_wisman WHERE year = {{year}}",
+            "parameters": [{"name": "year", "type": "number", "default": 2025}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(
+        patched["parameters"],
+        json!([{"name": "year", "type": "number", "default": 2025}])
+    );
+    assert_eq!(versions_of(&router, &cookie, &id).await.len(), 2);
+
+    // Clearing the list with SQL that no longer needs it.
+    let (status, patched) = call(
+        &router,
+        "PATCH",
+        &path,
+        &cookie,
+        Some(json!({"sql": "SELECT 1", "parameters": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["parameters"], json!([]));
+}

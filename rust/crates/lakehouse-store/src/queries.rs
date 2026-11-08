@@ -73,6 +73,10 @@ pub struct SavedQuery {
     pub owner_id: Option<String>,
     /// The level the caller holds on it: "view", "edit" or "manage".
     pub level: String,
+    /// The definitions of the `{{name}}` parameters in its SQL (`QS-5`): a
+    /// JSON array, `[]` when it has none. The store keeps it as the API
+    /// validated it and never reads inside it.
+    pub parameters: serde_json::Value,
 }
 
 /// A saved query, as the database holds it.
@@ -88,6 +92,7 @@ struct SavedQueryRow {
     owner_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
     deleted_at: Option<OffsetDateTime>,
+    parameters: serde_json::Value,
 }
 
 impl SavedQueryRow {
@@ -113,6 +118,7 @@ impl SavedQueryRow {
             folder_id: self.folder_id.map(|id| id.to_string()),
             owner_id: self.owner_id.map(|id| id.to_string()),
             level: level.as_str().to_owned(),
+            parameters: self.parameters,
         }
     }
 }
@@ -322,7 +328,7 @@ pub async fn list_saved_filtered(
         Some(SavedQueryFolder::Folder(id)) => (Some("folder"), Some(id)),
     };
     let rows: Vec<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters \
          FROM saved_query \
          WHERE deleted_at IS NULL \
            AND ($1::uuid IS NULL OR tenant_id = $1 OR ($2::boolean AND tenant_id IS NULL)) \
@@ -404,7 +410,7 @@ async fn get_saved_inner(
         return Ok(None);
     };
     let row: Option<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters \
          FROM saved_query \
          WHERE id = $1 AND ($4::boolean OR deleted_at IS NULL) \
            AND ($2::uuid IS NULL OR tenant_id = $2 OR ($3::boolean AND tenant_id IS NULL))",
@@ -546,6 +552,9 @@ pub enum SavedQueryPlacement {
 /// The first version is written in the same transaction as the row, so the
 /// history of a query never starts later than the query itself.
 ///
+/// The query has no parameters. [`create_saved_query_with_parameters`] saves
+/// one that does.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if a query fails.
@@ -554,6 +563,40 @@ pub async fn create_saved_query_at(
     viewer: &SavedQueryViewer,
     title: &str,
     sql: &str,
+    owner: &str,
+    tags: &[String],
+    placement: SavedQueryPlacement,
+) -> Result<SavedQuery, StoreError> {
+    create_saved_query_with_parameters(
+        pool,
+        viewer,
+        title,
+        sql,
+        &serde_json::json!([]),
+        owner,
+        tags,
+        placement,
+    )
+    .await
+}
+
+/// [`create_saved_query_at`] for a query that keeps the definitions of its
+/// `{{name}}` parameters (`query-parameters.md`, decision 3).
+///
+/// `parameters` is a JSON array, stored as given: the caller has already
+/// validated it against `sql` (`lakehouse-api` `query_params.rs`), and this
+/// crate does not depend on that module. The first version holds the same
+/// list.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn create_saved_query_with_parameters(
+    pool: &PgPool,
+    viewer: &SavedQueryViewer,
+    title: &str,
+    sql: &str,
+    parameters: &serde_json::Value,
     owner: &str,
     tags: &[String],
     placement: SavedQueryPlacement,
@@ -576,9 +619,9 @@ pub async fn create_saved_query_at(
     };
     let mut tx = pool.begin().await?;
     let row: SavedQueryRow = sqlx::query_as(
-        "INSERT INTO saved_query (title, sql, owner, tags, owner_id, tenant_id, folder_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+        "INSERT INTO saved_query (title, sql, owner, tags, owner_id, tenant_id, folder_id, parameters) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters",
     )
     .bind(title)
     .bind(sql)
@@ -587,11 +630,19 @@ pub async fn create_saved_query_at(
     .bind(viewer.id)
     .bind(viewer.tenant_id)
     .bind(folder_id)
+    .bind(parameters)
     .fetch_one(&mut *tx)
     .await?;
     let author = version_author_name(&mut tx, viewer.id, owner).await?;
     write_version(
-        &mut tx, row.id, &row.title, &row.sql, viewer.id, &author, "",
+        &mut tx,
+        row.id,
+        &row.title,
+        &row.sql,
+        &row.parameters,
+        viewer.id,
+        &author,
+        "",
     )
     .await?;
     tx.commit().await?;
@@ -633,6 +684,10 @@ pub struct SavedQueryPatch {
     pub tags: Option<Vec<String>>,
     /// The folder the query moves to. `None` leaves it where it is.
     pub folder: Option<FolderMove>,
+    /// New parameter definitions, a JSON array (`query-parameters.md`, decision 3). `None` leaves
+    /// them as they are; the caller has validated them against the SQL the
+    /// query will have.
+    pub parameters: Option<serde_json::Value>,
 }
 
 /// Where a query moves to.
@@ -652,9 +707,9 @@ pub enum FolderMove {
 /// that may not change the row finds no row at all, so the answer never
 /// says whether it exists.
 ///
-/// A version is written for every change of the title or the SQL, in the
-/// same transaction as the change; a change that leaves both as they
-/// were writes none.
+/// A version is written for every change of the title, the SQL or the
+/// parameters, in the same transaction as the change; a change that leaves
+/// all three as they were writes none.
 ///
 /// # Errors
 ///
@@ -690,6 +745,7 @@ pub async fn update_saved_query(
     let title = patch.title.as_deref().unwrap_or(&row.title);
     let sql = patch.sql.as_deref().unwrap_or(&row.sql);
     let tags = patch.tags.as_deref().unwrap_or(&row.tags);
+    let parameters = patch.parameters.as_ref().unwrap_or(&row.parameters);
     // A named move is re-checked here, before any write, the way the
     // edit level above is (`QS-3` review of #382): the folder a query moves into
     // belongs to the query's own tenant, and a move needs manage on the
@@ -724,20 +780,25 @@ pub async fn update_saved_query(
     let mut tx = pool.begin().await?;
     let updated: SavedQueryRow = sqlx::query_as(
         "UPDATE saved_query \
-         SET title = $2, sql = $3, tags = $4, folder_id = $5, updated_at = now() \
+         SET title = $2, sql = $3, tags = $4, folder_id = $5, parameters = $6, \
+             updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters",
     )
     .bind(query_id)
     .bind(title)
     .bind(sql)
     .bind(tags)
     .bind(folder_id)
+    .bind(parameters)
     .fetch_one(&mut *tx)
     .await?;
-    if title != row.title || sql != row.sql {
+    if title != row.title || sql != row.sql || *parameters != row.parameters {
         let author = version_author_name(&mut tx, viewer.id, &row.owner).await?;
-        write_version(&mut tx, query_id, title, sql, viewer.id, &author, "").await?;
+        write_version(
+            &mut tx, query_id, title, sql, parameters, viewer.id, &author, "",
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(updated.into_saved(level))
@@ -821,7 +882,7 @@ pub async fn restore_saved_query(
         "UPDATE saved_query \
          SET deleted_at = NULL, deleted_by = NULL, updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters",
     )
     .bind(query_id)
     .fetch_one(pool)
@@ -876,7 +937,7 @@ pub async fn list_saved_trash_entries(
         return Ok(Vec::new());
     };
     let rows: Vec<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters \
          FROM saved_query \
          WHERE deleted_at IS NOT NULL \
            AND ($1::uuid IS NULL OR tenant_id = $1 OR ($2::boolean AND tenant_id IS NULL)) \
@@ -942,7 +1003,8 @@ pub async fn purge_trashed_before(
     Ok(removed.rows_affected())
 }
 
-/// One version of a saved query: the title and the SQL it had.
+/// One version of a saved query: the title, the SQL and the parameter
+/// definitions it had.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedQueryVersion {
@@ -952,6 +1014,8 @@ pub struct SavedQueryVersion {
     pub title: String,
     /// The SQL the query had.
     pub sql: String,
+    /// The parameter definitions the query had, a JSON array (`QS-5`).
+    pub parameters: serde_json::Value,
     /// The author's user id, when there is one.
     pub author_id: Option<String>,
     /// The author's name, as the history shows it.
@@ -969,6 +1033,7 @@ struct SavedQueryVersionRow {
     version: i32,
     title: String,
     sql: String,
+    parameters: serde_json::Value,
     author_id: Option<Uuid>,
     author_name: String,
     label: String,
@@ -981,6 +1046,7 @@ impl From<SavedQueryVersionRow> for SavedQueryVersion {
             version: row.version,
             title: row.title,
             sql: row.sql,
+            parameters: row.parameters,
             author_id: row.author_id.map(|id| id.to_string()),
             author_name: row.author_name,
             label: row.label,
@@ -1002,7 +1068,7 @@ pub async fn list_versions(
     query_id: Uuid,
 ) -> Result<Vec<SavedQueryVersion>, StoreError> {
     let rows: Vec<SavedQueryVersionRow> = sqlx::query_as(
-        "SELECT version, title, sql, author_id, author_name, label, created_at \
+        "SELECT version, title, sql, parameters, author_id, author_name, label, created_at \
          FROM saved_query_version WHERE query_id = $1 ORDER BY version DESC",
     )
     .bind(query_id)
@@ -1014,7 +1080,7 @@ pub async fn list_versions(
 /// Go back to an earlier version of a saved query.
 ///
 /// The revert writes a **new** version, holding the content of the
-/// version it went back to, so going back is itself undoable.
+/// version it went back to (its SQL and its parameters together), so going back is itself undoable.
 ///
 /// The caller must hold **edit** on the query.
 ///
@@ -1042,25 +1108,27 @@ pub async fn revert_to_version(
     if level < Level::Edit {
         return Err(StoreError::NotFound);
     }
-    let wanted: Option<(String, String)> = sqlx::query_as(
-        "SELECT title, sql FROM saved_query_version WHERE query_id = $1 AND version = $2",
+    let wanted: Option<(String, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT title, sql, parameters FROM saved_query_version \
+         WHERE query_id = $1 AND version = $2",
     )
     .bind(query_id)
     .bind(version)
     .fetch_optional(pool)
     .await?;
-    let Some((title, sql)) = wanted else {
+    let Some((title, sql, parameters)) = wanted else {
         return Err(StoreError::NotFound);
     };
     let mut tx = pool.begin().await?;
     let updated: SavedQueryRow = sqlx::query_as(
-        "UPDATE saved_query SET title = $2, sql = $3, updated_at = now() \
+        "UPDATE saved_query SET title = $2, sql = $3, parameters = $4, updated_at = now() \
          WHERE id = $1 \
-         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at",
+         RETURNING id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters",
     )
     .bind(query_id)
     .bind(&title)
     .bind(&sql)
+    .bind(&parameters)
     .fetch_one(&mut *tx)
     .await?;
     let author = version_author_name(&mut tx, viewer.id, &row.owner).await?;
@@ -1069,6 +1137,7 @@ pub async fn revert_to_version(
         query_id,
         &title,
         &sql,
+        &parameters,
         viewer.id,
         &author,
         &format!("Restored version {version}"),
@@ -1081,7 +1150,7 @@ pub async fn revert_to_version(
 /// One row, with the columns the access rules need.
 async fn load_row(pool: &PgPool, query_id: Uuid) -> Result<Option<SavedQueryRow>, StoreError> {
     let row: Option<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at \
+        "SELECT id, title, sql, owner, updated_at, tags, folder_id, owner_id, tenant_id, deleted_at, parameters \
          FROM saved_query WHERE id = $1",
     )
     .bind(query_id)
@@ -1114,6 +1183,7 @@ async fn write_version(
     query_id: Uuid,
     title: &str,
     sql: &str,
+    parameters: &serde_json::Value,
     author_id: Option<Uuid>,
     author_name: &str,
     label: &str,
@@ -1126,13 +1196,14 @@ async fn write_version(
     .await?;
     sqlx::query(
         "INSERT INTO saved_query_version \
-         (query_id, version, title, sql, author_id, author_name, label) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         (query_id, version, title, sql, parameters, author_id, author_name, label) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(query_id)
     .bind(next)
     .bind(title)
     .bind(sql)
+    .bind(parameters)
     .bind(author_id)
     .bind(author_name)
     .bind(label)
@@ -1615,6 +1686,7 @@ mod tests {
             folder_id: None,
             owner_id: None,
             level: "view".to_owned(),
+            parameters: serde_json::json!([]),
         };
         let value = serde_json::to_value(&saved).unwrap();
         for key in [
@@ -1627,8 +1699,36 @@ mod tests {
             "folderId",
             "ownerId",
             "level",
+            "parameters",
         ] {
             assert!(value.get(key).is_some(), "SavedQuery is missing `{key}`");
+        }
+
+        let version = SavedQueryVersion {
+            version: 1,
+            title: "t".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            parameters: serde_json::json!([]),
+            author_id: None,
+            author_name: "a".to_owned(),
+            label: String::new(),
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        };
+        let value = serde_json::to_value(&version).unwrap();
+        for key in [
+            "version",
+            "title",
+            "sql",
+            "parameters",
+            "authorId",
+            "authorName",
+            "label",
+            "createdAt",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "SavedQueryVersion is missing `{key}`"
+            );
         }
 
         let history = QueryHistoryItem {
