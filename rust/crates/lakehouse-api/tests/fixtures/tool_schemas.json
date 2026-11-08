@@ -2054,8 +2054,7 @@
                     "currency",
                     "scientific",
                     "compact"
-                  ],
-                  "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before"
+                  ]
                 },
                 "decimals": {
                   "type": "integer",
@@ -2063,12 +2062,10 @@
                   "maximum": 10
                 },
                 "thousands": {
-                  "type": "boolean",
-                  "description": "group thousands (default true)"
+                  "type": "boolean"
                 },
                 "currency": {
-                  "type": "string",
-                  "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR"
+                  "type": "string"
                 },
                 "currencyDisplay": {
                   "type": "string",
@@ -2078,12 +2075,10 @@
                   ]
                 },
                 "prefix": {
-                  "type": "string",
-                  "description": "at most 16 characters"
+                  "type": "string"
                 },
                 "suffix": {
-                  "type": "string",
-                  "description": "at most 16 characters"
+                  "type": "string"
                 }
               }
             },
@@ -3614,8 +3609,7 @@
                   "type": "object",
                   "properties": {
                     "segment": {
-                      "type": "string",
-                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -3639,19 +3633,16 @@
                         "starts_with",
                         "ends_with",
                         "not_contains"
-                      ],
-                      "description": "default in"
+                      ]
                     },
                     "values": {
                       "type": "array",
                       "items": {
                         "type": "string"
-                      },
-                      "description": "in / not_in"
+                      }
                     },
                     "min": {
-                      "type": "string",
-                      "description": "between: a number or a date YYYY-MM-DD"
+                      "type": "string"
                     },
                     "max": {
                       "type": "string"
@@ -3663,8 +3654,7 @@
                       "type": "boolean"
                     },
                     "text": {
-                      "type": "string",
-                      "description": "contains, starts_with, ends_with, not_contains"
+                      "type": "string"
                     },
                     "anchor": {
                       "type": "string",
@@ -3673,8 +3663,7 @@
                         "this",
                         "previous",
                         "next"
-                      ],
-                      "description": "relative"
+                      ]
                     },
                     "unit": {
                       "type": "string",
