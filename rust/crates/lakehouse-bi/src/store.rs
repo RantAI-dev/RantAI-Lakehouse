@@ -4139,7 +4139,7 @@ struct CommonFields {
 /// Validate/normalize the fields shared by every `specFromInput` branch:
 /// `title` (required), `kind` (must be one of [`KINDS`]), `id` (generated if
 /// absent), `board` (defaults to `"default"`), `span` (`1` or `2`), and
-/// `subtitle` (blank becomes `None`).
+/// `subtitle` (blank becomes `None`, and so does the word "null").
 fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<CommonFields, BiError> {
     let title = input.title.trim().to_owned();
     if title.is_empty() {
@@ -4162,11 +4162,17 @@ fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<Common
         .unwrap_or("default")
         .to_owned();
     let span = if input.span == Some(2) { 2 } else { 1 };
+    // A blank subtitle is no subtitle, and so is the word "null": the field is
+    // normalised for every caller of the store, the assistant's tools and the
+    // console's own chart builder alike, so whoever sends the text "null" gets
+    // no subtitle and never sees that word under the title (AI-3, 2026-11-08).
+    // The whole subtitle is compared, so a subtitle that only starts with the
+    // word ("Null values by province") is kept.
     let subtitle = input
         .subtitle
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
         .map(str::to_owned);
     Ok(CommonFields {
         title,
@@ -7092,6 +7098,33 @@ mod tests {
         assert_eq!(input.mart, "mart_wisman");
         assert_eq!(input.dimension, "");
         assert_eq!(input.measures, vec!["total".to_owned()]);
+    }
+
+    // ── the subtitle ───────────────────────────────────────────────────
+
+    /// A subtitle that is only the word "null" is no subtitle: the
+    /// assistant's model writes that text when it follows the build prompt's
+    /// "send `subtitle: null`" against a schema that types the field as a
+    /// string (AI-3, 2026-11-08).
+    #[test]
+    fn a_subtitle_that_is_only_the_word_null_is_no_subtitle() {
+        let subtitle_of = |subtitle: &str| -> Option<String> {
+            let input: ChartInput = serde_json::from_value(serde_json::json!({
+                "title": "t", "kind": "bar", "mart": "mart_x", "subtitle": subtitle,
+            }))
+            .expect("the chart input decodes");
+            derive_common_fields(&input, None)
+                .expect("the common fields derive")
+                .subtitle
+        };
+        for cleared in ["null", " Null ", "NULL", "nUlL", ""] {
+            assert_eq!(subtitle_of(cleared), None, "{cleared:?} is no subtitle");
+        }
+        // A subtitle that only starts with the word is a subtitle.
+        assert_eq!(
+            subtitle_of("Null values by province"),
+            Some("Null values by province".to_owned())
+        );
     }
 
     // ── charts over SQL that is not stored (`spec_from_inline_sql`) ──────
