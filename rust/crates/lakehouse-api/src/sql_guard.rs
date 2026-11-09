@@ -7,6 +7,11 @@
 //! These are word-level checks, not a parser: they run first and cheaply;
 //! `sql_rewrite` (a real `sqlparser` pass) still decides what a statement
 //! may touch.
+//!
+//! The lexical helpers it uses live in [`crate::sql_lex`], the module
+//! that holds the engine's lexical rules (`SEC-62`).
+
+use crate::sql_lex::{skip_block_comment, skip_quoted, skip_to_line_end};
 
 /// Whether `sql` is a read-only statement `ClickHouse` may run from Query
 /// Studio.
@@ -72,60 +77,6 @@ pub(crate) fn strip_sql_noise(sql: &str) -> String {
         }
     }
     out
-}
-
-/// Index of the newline that ends the line starting at `from` (the end of
-/// the text when the last line has none), so the caller resumes on the
-/// newline itself.
-pub(crate) fn skip_to_line_end(chars: &[char], from: usize) -> usize {
-    let mut i = from;
-    while i < chars.len() && chars[i] != '\n' {
-        i += 1;
-    }
-    i
-}
-
-/// Index just past the `/* … */` comment that opens at `from`. An
-/// unterminated comment consumes the rest of the statement.
-pub(crate) fn skip_block_comment(chars: &[char], from: usize) -> usize {
-    let mut i = from + 2;
-    while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-        i += 1;
-    }
-    (i + 2).min(chars.len())
-}
-
-/// Index just past the quoted run that opens at `from` with `quote`.
-/// An unterminated quote consumes the rest of the statement, which is the
-/// safe reading: the guard sees less, not more.
-///
-/// `backslash_escapes` says whether a backslash escapes the next character.
-/// `ClickHouse` does, so the guards here always pass `true`. `Trino` does
-/// not: `'a\'` is a complete string there, so `query_params` passes `false`
-/// when it scans `Trino` SQL.
-pub(crate) fn skip_quoted(
-    chars: &[char],
-    from: usize,
-    quote: char,
-    backslash_escapes: bool,
-) -> usize {
-    let mut i = from + 1;
-    while i < chars.len() {
-        if backslash_escapes && chars[i] == '\\' {
-            i += 2;
-            continue;
-        }
-        if chars[i] == quote {
-            // A doubled quote is an escaped quote, not the end of the run.
-            if chars.get(i + 1) == Some(&quote) {
-                i += 2;
-                continue;
-            }
-            return i + 1;
-        }
-        i += 1;
-    }
-    chars.len()
 }
 
 /// `/^\s*(with|select|show|describe|desc|explain)\b/i.test(sql)` — leading
