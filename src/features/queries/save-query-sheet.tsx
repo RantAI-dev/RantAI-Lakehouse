@@ -174,7 +174,8 @@ export function SaveQuerySheet({
         // change always states the definitions it wants: a statement without
         // a placeholder wants none, so it sends an empty list and the server
         // clears the definitions with the SQL. What the saved query held
-        // does not decide it, and the change does not wait for it to be read.
+        // does not decide it, and the change does not wait for it to be read
+        // (`#422 S1`).
         if (parameters.length > 0) input.parameters = [...parameters]
         else if (mode === "update") input.parameters = []
         void onSave(input).then((saved) => {

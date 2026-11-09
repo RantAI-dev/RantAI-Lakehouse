@@ -401,7 +401,7 @@ fn nests_block_comments(engine: Engine) -> bool {
 /// `clickhouse/clickhouse-server:26.8.15.10`, where `SELECT 1 AS a$$b`
 /// and `SELECT 1 AS a$tag$b` answer `1`, and `SELECT 1 AS a$$b, @@x@@` is a
 /// syntax error at `@@`, which is ordinary SQL the engine reads after the
-/// name.
+/// name. (`#437` review)
 fn heredoc_opener(chars: &[char], from: usize) -> Option<(usize, usize)> {
     if chars.get(from) != Some(&'$') {
         return None;

@@ -172,6 +172,7 @@ export function SavedQueryHistoryDialog({
             }}
             title={`Revert to version ${asking}`}
             description="The query goes back to the content of that version. The revert writes a new version, so it can be undone."
+            // The button names the version it goes back to, so it does not read like Cancel (`#422 S3`).
             confirmLabel={`Restore version ${asking}`}
             confirming={revert.status === "pending"}
             onConfirm={() => {

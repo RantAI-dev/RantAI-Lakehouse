@@ -122,7 +122,7 @@ const keywordSource = keywordCompletionSource(StandardSQL, false)
  * The keywords, without the ones that would show after a `{{`.
  *
  * A placeholder holds a parameter name, so a keyword cannot be written
- * there and does not belong in the list.
+ * there and does not belong in the list (#422 S2).
  */
 const keywords: CompletionSource = (context) => {
   if (inPlaceholder(context.state.doc.toString(), context.pos)) return null

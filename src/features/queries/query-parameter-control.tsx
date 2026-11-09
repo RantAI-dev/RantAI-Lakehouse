@@ -237,7 +237,7 @@ function optionByText(options: readonly QueryParamOption[], text: string) {
  *
  * A person who picked an option could not get back to "no value" before:
  * the list held the options and nothing else. The first item, "No value",
- * reports no value, so the field can be emptied again.
+ * reports no value, so the field can be emptied again (#422 S4).
  */
 function DropdownSelect({
   id,
