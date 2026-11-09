@@ -1,0 +1,147 @@
+[
+  {
+    "name": "catalog:read",
+    "area": "Data",
+    "description": "Browse tables and columns in the catalog."
+  },
+  {
+    "name": "catalog:write",
+    "area": "Data",
+    "description": "Edit catalog entries, descriptions and semantic types."
+  },
+  {
+    "name": "query:read",
+    "area": "Data",
+    "description": "Run SQL and read table data in Query Studio."
+  },
+  {
+    "name": "iceberg:read",
+    "area": "Data",
+    "description": "Read published tables directly over the Iceberg catalog."
+  },
+  {
+    "name": "lineage:read",
+    "area": "Data",
+    "description": "Follow table and column lineage."
+  },
+  {
+    "name": "metric:write",
+    "area": "Data",
+    "description": "Create and edit reusable metrics."
+  },
+  {
+    "name": "dashboard:read",
+    "area": "Dashboards",
+    "description": "View dashboards and charts."
+  },
+  {
+    "name": "dashboard:sql",
+    "area": "Dashboards",
+    "description": "Write raw SQL in dashboard charts."
+  },
+  {
+    "name": "dashboard:write",
+    "area": "Dashboards",
+    "description": "Create and edit dashboards and charts."
+  },
+  {
+    "name": "pipeline:read",
+    "area": "Pipelines",
+    "description": "View pipelines and their runs."
+  },
+  {
+    "name": "pipeline:write",
+    "area": "Pipelines",
+    "description": "Create, edit and trigger pipelines."
+  },
+  {
+    "name": "connector:manage",
+    "area": "Pipelines",
+    "description": "Manage source connections and run ingestion."
+  },
+  {
+    "name": "ingest:read",
+    "area": "Pipelines",
+    "description": "Read ingestible tables and ingestion specs, and report ingest runs."
+  },
+  {
+    "name": "gold:export",
+    "area": "Pipelines",
+    "description": "Publish Gold marts and export them as open files."
+  },
+  {
+    "name": "policy:read",
+    "area": "Governance",
+    "description": "View governance policies and SLAs."
+  },
+  {
+    "name": "policy:write",
+    "area": "Governance",
+    "description": "Create and edit governance policies and SLAs."
+  },
+  {
+    "name": "governance:write",
+    "area": "Governance",
+    "description": "Certify assets, set SLAs, run table maintenance and approve restorations."
+  },
+  {
+    "name": "access:approve",
+    "area": "Governance",
+    "description": "Decide catalog access requests and manage table grants."
+  },
+  {
+    "name": "audit:read",
+    "area": "Governance",
+    "description": "Query the sensitive system tables an audit needs."
+  },
+  {
+    "name": "identity:read",
+    "area": "Administration",
+    "description": "View users, roles, tenants and service identities."
+  },
+  {
+    "name": "identity:write",
+    "area": "Administration",
+    "description": "Manage users, roles, tenants and service identities."
+  },
+  {
+    "name": "identity:sessions:manage",
+    "area": "Administration",
+    "description": "Revoke any person's live session."
+  },
+  {
+    "name": "settings:write",
+    "area": "Administration",
+    "description": "Change workspace settings."
+  },
+  {
+    "name": "storage:restore",
+    "area": "Administration",
+    "description": "Restore storage from a backup."
+  },
+  {
+    "name": "agent:approve",
+    "area": "Assistant",
+    "description": "Approve the actions assistant agents ask about."
+  },
+  {
+    "name": "agent:manage",
+    "area": "Assistant",
+    "description": "Manage assistant agents."
+  },
+  {
+    "name": "alert:write",
+    "area": "Operations",
+    "description": "Create and edit alert rules that watch charts and tables."
+  },
+  {
+    "name": "ops:logs",
+    "area": "Operations",
+    "description": "Read the service's own logs."
+  },
+  {
+    "name": "workload:cancel",
+    "area": "Operations",
+    "description": "Cancel running workloads."
+  }
+]

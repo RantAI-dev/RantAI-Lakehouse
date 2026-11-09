@@ -525,23 +525,17 @@ mod identity {
             let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
             let id = create_role(&app, &admin_cookie, "Reviewers").await;
 
-            let (status, body) = update_role(
-                &app,
-                &admin_cookie,
-                &id,
-                "Senior Reviewers",
-                "policy:review",
-            )
-            .await;
+            let (status, body) =
+                update_role(&app, &admin_cookie, &id, "Senior Reviewers", "policy:write").await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["name"], json!("Senior Reviewers"));
-            assert_eq!(body["permissions"], json!("policy:review"));
+            assert_eq!(body["permissions"], json!("policy:write"));
             assert_eq!(body["description"], json!("changed"));
             assert_eq!(
                 stored_role(&app.pool, &id).await,
                 Some((
                     "Senior Reviewers".to_owned(),
-                    "policy:review".to_owned(),
+                    "policy:write".to_owned(),
                     "changed".to_owned()
                 ))
             );
@@ -560,7 +554,7 @@ mod identity {
             assert_eq!(args["oldName"], json!("Reviewers"));
             assert_eq!(args["newName"], json!("Senior Reviewers"));
             assert_eq!(args["oldPermissions"], json!("query:read"));
-            assert_eq!(args["newPermissions"], json!("policy:review"));
+            assert_eq!(args["newPermissions"], json!("policy:write"));
         }
 
         #[tokio::test]
@@ -659,21 +653,15 @@ mod identity {
             let _elsewhere =
                 create_rule_naming(&app, &admin_cookie, "Analyst masking", "Analyst", true).await;
 
-            let (status, body) = update_role(
-                &app,
-                &admin_cookie,
-                &id,
-                "Senior Reviewers",
-                "policy:review",
-            )
-            .await;
+            let (status, body) =
+                update_role(&app, &admin_cookie, &id, "Senior Reviewers", "policy:write").await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["name"], json!("Senior Reviewers"));
             assert_eq!(
                 stored_role(&app.pool, &id).await,
                 Some((
                     "Senior Reviewers".to_owned(),
-                    "policy:review".to_owned(),
+                    "policy:write".to_owned(),
                     "changed".to_owned()
                 ))
             );
@@ -796,6 +784,166 @@ mod identity {
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
             assert_eq!(body["error"], json!("A built-in role cannot be deleted."));
             assert!(stored_role(&app.pool, SEEDED_ANALYST).await.is_some());
+        }
+
+        #[tokio::test]
+        async fn an_unknown_token_gives_400_naming_it() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+            // 1. Role create refuses unknown permission token.
+            let (status, body) = request(
+                &app,
+                "POST",
+                "/api/identity/roles",
+                Some(&admin_cookie),
+                Some(json!({
+                    "name": "Custom",
+                    "permissions": "query:read, unknown:perm, other:bad",
+                    "description": "test",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], json!("unknown permissions"));
+            assert_eq!(body["unknown"], json!(["unknown:perm", "other:bad"]));
+
+            // 2. Service identity create refuses unknown scopes.
+            let (status, body) = request(
+                &app,
+                "POST",
+                "/api/identity/service-identities",
+                Some(&admin_cookie),
+                Some(json!({
+                    "name": "test-svc",
+                    "scopes": ["query:read", "invalid:scope"],
+                    "environment": "production",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], json!("unknown permissions"));
+            assert_eq!(body["unknown"], json!(["invalid:scope"]));
+        }
+
+        #[tokio::test]
+        async fn wildcards_area_star_and_star_star_are_accepted() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+            // 1. Role create accepts area:* and *:*
+            let (status, body) = request(
+                &app,
+                "POST",
+                "/api/identity/roles",
+                Some(&admin_cookie),
+                Some(json!({
+                    "name": "WildcardRole",
+                    "permissions": "catalog:*, *:*",
+                    "description": "wildcards",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+
+            // 2. Service identity create accepts area:* and *:*
+            let (status, body) = request(
+                &app,
+                "POST",
+                "/api/identity/service-identities",
+                Some(&admin_cookie),
+                Some(json!({
+                    "name": "wildcard-svc",
+                    "scopes": ["catalog:*", "*:*"],
+                    "environment": "production",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        #[tokio::test]
+        async fn an_existing_unknown_token_survives_an_update() {
+            let app = spin_up().await;
+            let admin = create_principal_with_permissions(&app.pool, "identity:write").await;
+            let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO role (id, name, permissions, description) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind("OldRole")
+            .bind("query:read, notebook:run")
+            .bind("legacy role")
+            .execute(&app.pool)
+            .await
+            .expect("insert legacy role");
+
+            // Update preserving the unknown token succeeds.
+            let (status, body) = update_role(
+                &app,
+                &admin_cookie,
+                &id.to_string(),
+                "OldRoleRenamed",
+                "query:read, notebook:run, catalog:read",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            // But adding a NEW unknown token on update is refused.
+            let (status, body) = update_role(
+                &app,
+                &admin_cookie,
+                &id.to_string(),
+                "OldRoleRenamed",
+                "query:read, notebook:run, brand_new:unknown",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], json!("unknown permissions"));
+            assert_eq!(body["unknown"], json!(["brand_new:unknown"]));
+        }
+
+        #[tokio::test]
+        async fn the_permissions_route_is_refused_without_identity_read() {
+            let app = spin_up().await;
+            // 1. Anonymous -> 401
+            let (status, _) = request(&app, "GET", "/api/identity/permissions", None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+            // 2. Caller without identity:read -> 403
+            let plain = create_principal_with_permissions(&app.pool, "query:read").await;
+            let plain_cookie = session_cookie_for_user(&app.pool, plain).await;
+            let (status, _) = request(
+                &app,
+                "GET",
+                "/api/identity/permissions",
+                Some(&plain_cookie),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+
+            // 3. Caller with identity:read -> 200, returns catalog list
+            let reader = create_principal_with_permissions(&app.pool, "identity:read").await;
+            let reader_cookie = session_cookie_for_user(&app.pool, reader).await;
+            let (status, body) = request(
+                &app,
+                "GET",
+                "/api/identity/permissions",
+                Some(&reader_cookie),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let arr = body.as_array().expect("array of permissions");
+            assert_eq!(arr.len(), 29);
+            assert_eq!(arr[0]["name"], json!("catalog:read"));
+            assert_eq!(arr[0]["area"], json!("Data"));
+            assert!(arr[0]["description"].is_string());
         }
     }
 }

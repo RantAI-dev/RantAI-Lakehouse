@@ -1156,6 +1156,7 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users/{id}/reset-password",
             axum::routing::post(identity::reset_user_password),
         )
+        .route("/api/identity/permissions", get(identity::list_permissions))
         .route(
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),
@@ -1853,6 +1854,19 @@ async fn timeout_middleware(State(state): State<AppState>, req: Request, next: N
         )
             .into_response(),
     }
+}
+
+/// Every AI tool permission — `routes::ai::registry::TOOLS`'s non-empty
+/// `permission` fields (`WEB-8` D5). A `pub` fn on this module because
+/// `registry` itself is only `pub(in crate::routes)`: the permission
+/// catalog's drift test (`tests/permission_catalog.rs`) reads the tool
+/// permissions through this, so `PERMISSIONS` cannot fall behind what
+/// the tools gate.
+pub fn ai_tool_permissions() -> impl Iterator<Item = &'static str> {
+    ai::registry::TOOLS
+        .iter()
+        .map(|tool| tool.permission)
+        .filter(|permission| !permission.is_empty())
 }
 
 #[cfg(test)]
