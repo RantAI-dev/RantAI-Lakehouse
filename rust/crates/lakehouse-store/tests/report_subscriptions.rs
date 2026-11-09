@@ -28,12 +28,13 @@ const MERIDIAN_RETAIL: Uuid = Uuid::from_u128(0x11111111_1111_4111_8111_00000000
 async fn user(pool: &PgPool, name: &str) -> Uuid {
     // ADM-11: `username` is NOT NULL; test users carry their email
     // lowercased, the way the `0132_usernames.sql` backfill does it.
+    let clean = name.replace(' ', ".").to_lowercase();
     sqlx::query_scalar(
         "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(name)
-    .bind(format!("{name}@example.com").to_lowercase())
-    .bind(format!("{name}@example.com"))
+    .bind(format!("{clean}@example.com"))
+    .bind(format!("{clean}@example.com"))
     .fetch_one(pool)
     .await
     .unwrap()

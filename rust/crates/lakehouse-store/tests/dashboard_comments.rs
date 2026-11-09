@@ -17,12 +17,13 @@ use uuid::Uuid;
 async fn user(pool: &PgPool, name: &str) -> Uuid {
     // ADM-11: `username` is NOT NULL; test users carry their email
     // lowercased, the way the `0132_usernames.sql` backfill does it.
+    let clean = name.replace(' ', ".").to_lowercase();
     sqlx::query_scalar(
         "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(name)
-    .bind(format!("{name}@example.test").to_lowercase())
-    .bind(format!("{name}@example.test"))
+    .bind(format!("{clean}@example.test"))
+    .bind(format!("{clean}@example.test"))
     .fetch_one(pool)
     .await
     .unwrap()
