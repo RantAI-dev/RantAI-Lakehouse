@@ -58,8 +58,37 @@ jobs:
       # still needs `zstd ^0.13.3`. None of the four affected functions is
       # reachable from this tree (see rust/deny.toml for the reachability
       # result and the drop condition).
+      #
+      # RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1 bundles a C SQLite with
+      # CVE-2026-119375, medium; fixed in `libsqlite3-sys` >= 0.39.0) cannot
+      # reach a binary of this workspace. The crate is in `rust/Cargo.lock`
+      # only through `sqlx-sqlite`, and no crate enables the `sqlite` feature
+      # of `sqlx` (`git grep -n sqlite -- '*Cargo.toml'` prints nothing), so
+      # `cargo tree --locked --workspace --target all -e normal,build -i
+      # libsqlite3-sys` prints "nothing to print". `cargo deny` does not
+      # flag it, so `rust/deny.toml` carries no entry. No upgrade exists:
+      # the newest `sqlx-sqlite` (0.9.0) requires `libsqlite3-sys >=0.30.1,
+      # <0.38.0`. The next step fails the job if the crate ever enters the
+      # build graph, which is what makes this waiver safe to keep. Drop the
+      # ignore when a `sqlx` release allows `libsqlite3-sys` >= 0.39, then
+      # `cargo update` (backlog `SEC-63`).
+      - name: libsqlite3-sys stays out of the build (RUSTSEC-2026-0459 waiver)
+        run: |
+          # `cargo tree -i` exits 0 and prints only a stderr warning ("nothing
+          # to print") when the package is not in the graph; any stdout line
+          # starting with the crate name means it is. The output goes to a
+          # variable first so a cargo failure (for example a lockfile that
+          # `--locked` refuses after a feature change) fails the step with
+          # cargo's own message and `grep` never closes the pipe early.
+          tree="$(cargo tree --locked --workspace --target all -e normal,build -i libsqlite3-sys)"
+          if printf '%s\n' "$tree" | grep '^libsqlite3-sys'; then
+            echo "::error::libsqlite3-sys is in the build graph: RUSTSEC-2026-0459 is reachable, so the cargo audit waiver no longer holds"
+            exit 1
+          fi
+        working-directory: rust
+
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0410
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0410 --ignore RUSTSEC-2026-0459
         working-directory: rust
 
   cargo-deny:

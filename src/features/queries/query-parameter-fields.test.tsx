@@ -182,6 +182,38 @@ describe("QueryParameterFields", () => {
     expect(within(screen.getByLabelText("region")).getByText("Europe")).toBeTruthy()
   })
 
+  it("reads 'No value' while a dropdown holds nothing", () => {
+    mountOver([
+      {
+        name: "region",
+        type: "dropdown",
+        options: [
+          { value: "eu", label: "Europe" },
+          { value: "us", label: "United States" },
+        ],
+      },
+    ])
+    expect(within(screen.getByLabelText("region")).getByText("No value")).toBeTruthy()
+  })
+
+  it("takes a dropdown's value away again when 'No value' is picked", () => {
+    const { onValueChange } = mountOver(
+      [
+        {
+          name: "region",
+          type: "dropdown",
+          options: [
+            { value: "eu", label: "Europe" },
+            { value: "us", label: "United States" },
+          ],
+        },
+      ],
+      { region: "us" }
+    )
+    choose(screen.getByLabelText("region"), "No value")
+    expect(onValueChange).toHaveBeenLastCalledWith("region", undefined)
+  })
+
   it("picks several options of a multi-select and reports them as a list", () => {
     const { onValueChange } = mountOver([
       {

@@ -1,8 +1,9 @@
 /**
  * What the caller may do with one dashboard (`BI-19` part B2, feature B1): the
- * payload's `access.level`. The server checks every write against the same
- * level, so this only decides what the page offers; an answer that cannot be
- * read never widens it.
+ * payload's `access.level`. The same level vocabulary answers for a saved
+ * query and a folder. The server checks every write against the same level,
+ * so this only decides what the page offers; an answer that cannot be read
+ * never widens it.
  */
 export type DashboardLevel = "view" | "edit" | "manage";
 

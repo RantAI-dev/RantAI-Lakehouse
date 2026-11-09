@@ -498,9 +498,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // of the saved-query surface: the level the caller holds on the item
     // (view, edit or manage) is the handler's business, because it is
     // decided by the one resolver in the store and not by the permission
-    // set. The access lists need `manage` — reading the list is part of
-    // sharing — and a grantee that is not of the caller's organisation is
-    // refused before anything is written.
+    // set. The two reads are not the same (`#416`): a query's list is
+    // read at manage, because managing a query includes sharing it,
+    // while a folder's list is read from edit up, because a person who
+    // may save or move a query into a folder is told who that folder is
+    // shared with before they do. Writing either list needs manage, and
+    // a grantee that is not of the caller's organisation is refused
+    // before anything is written.
     ("GET",    "/api/query/saved/{id}/access",             Policy::RequiresPermission("query:read")),
     ("PUT",    "/api/query/saved/{id}/access",             Policy::RequiresPermission("query:read")),
     ("GET",    "/api/query/folders/{id}/access",           Policy::RequiresPermission("query:read")),

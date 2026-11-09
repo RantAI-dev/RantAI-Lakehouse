@@ -1,6 +1,8 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import {
+  inCommentOrString,
+  inPlaceholder,
   sqlCompletionOptions,
   tablesInStatement,
   type ColumnState,
@@ -375,4 +377,70 @@ test("sqlCompletionOptions offers nothing after {{ when the tab defines no param
     columns: COLUMNS,
   })
   assert.deepEqual(options, [])
+})
+
+test("sqlCompletionOptions offers the defined parameter names after a {{ that is half typed", () => {
+  const sql = "SELECT amount FROM silver.orders WHERE status = {{reg"
+  const { from, options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  // The name is half typed, so the list starts where the name starts; the
+  // list itself holds every defined name, and the editor narrows it down.
+  assert.equal(from, sql.indexOf("reg"))
+  assert.deepEqual(options.map((option) => option.label), ["region", "day"])
+})
+
+test("sqlCompletionOptions offers no parameter name after a {{ inside a line comment", () => {
+  const sql = "-- a note with a {{"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  // The braces are text in a comment, so no name belongs there.
+  assert.deepEqual(options.filter((option) => option.kind === "parameter"), [])
+})
+
+test("sqlCompletionOptions offers no parameter name after a {{ inside a block comment", () => {
+  const sql = "/* a note with a {{ */"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.indexOf("{{") + 2,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  assert.deepEqual(options.filter((option) => option.kind === "parameter"), [])
+})
+
+test("sqlCompletionOptions offers no parameter name after a {{ inside a quoted run", () => {
+  const sql = "SELECT 'a {{ b'"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.indexOf("{{") + 2,
+    tables: TABLES,
+    columns: COLUMNS,
+    parameters: ["region", "day"],
+  })
+  assert.deepEqual(options.filter((option) => option.kind === "parameter"), [])
+})
+
+test("inPlaceholder reads the braces before the name, and inCommentOrString the text around the cursor", () => {
+  // The braces open a placeholder, with or without a half typed name.
+  assert.equal(inPlaceholder("SELECT {{", 9), true)
+  assert.equal(inPlaceholder("SELECT {{a", 10), true)
+  assert.equal(inPlaceholder("SELECT a", 8), false)
+  // A comment and a quoted run hold text, not code.
+  assert.equal(inCommentOrString("-- a {{", 6), true)
+  assert.equal(inCommentOrString("/* a {{ */", 6), true)
+  assert.equal(inCommentOrString("SELECT 'a {{'", 12), true)
+  // The cursor right after a closed quoted run writes code again.
+  assert.equal(inCommentOrString("SELECT 'abc'", 12), false)
+  assert.equal(inCommentOrString("SELECT 1", 8), false)
 })

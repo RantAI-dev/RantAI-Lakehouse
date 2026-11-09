@@ -37,7 +37,11 @@ export const CAPABILITIES: Capability[] = [
       // BI-26 slice 2 D10: describing an embed needs no write, so Ask mode
       // offers it here; enabling, the filter modes and the withdrawal are
       // writes and live in the Dashboard Builder.
-      "get_embed_snippet"],
+      "get_embed_snippet",
+      // AI-2 AC1: "show only 2026" narrows the person's own view of the page
+      // and saves nothing, so Ask mode offers it here; the board's default
+      // filters change what every viewer sees and stay in the Dashboard Builder.
+      "set_board_view_filters"],
   },
   {
     key: "dashboard",

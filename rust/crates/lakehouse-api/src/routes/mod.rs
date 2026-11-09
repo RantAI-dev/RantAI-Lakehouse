@@ -1377,10 +1377,13 @@ pub fn router(state: AppState) -> Router {
             "/api/query/folders/{id}",
             axum::routing::patch(saved_queries::patch_folder).delete(saved_queries::delete_folder),
         )
-        // QS-3: the sharing surface. The access lists need `manage` on the
-        // item -- reading who else has access is part of sharing -- and
-        // the grantee search answers with the people and the roles of the
-        // caller's organisation.
+        // QS-3: the sharing surface. A query's access list is read at
+        // `manage` on the item -- reading who else has access is part of
+        // sharing -- while a folder's is read from `edit` up (`#416`): the
+        // save and move dialogs tell a person who may put a query into a
+        // folder who it is shared with. Both lists are written with
+        // `manage`, and the grantee search answers with the people and
+        // the roles of the caller's organisation.
         .route(
             "/api/query/saved/{id}/access",
             get(saved_queries::get_query_access).put(saved_queries::put_query_access),

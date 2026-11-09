@@ -12,7 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { levelAtLeast } from "@/features/dashboards/access-level"
+import { levelAtLeast } from "@/lib/access-level"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { readableErrorMessage } from "@/lib/notify-message"

@@ -27,7 +27,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { levelAtLeast } from "@/features/dashboards/access-level"
+import { levelAtLeast } from "@/lib/access-level"
 import { formatRelativeTime } from "@/lib/format"
 import type { SavedQuery } from "@/services/contracts/queries"
 

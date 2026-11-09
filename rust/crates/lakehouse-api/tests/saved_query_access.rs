@@ -44,6 +44,13 @@ const QUERY_FORBIDDEN: &str = "You do not have permission to change this saved q
 /// The sentence a caller that may not change a folder is told.
 const FOLDER_FORBIDDEN: &str = "You do not have permission to change this folder.";
 
+/// The sentence a caller that may not read a folder's access list is told.
+///
+/// It is not the sentence of a refusal to change: this route changes
+/// nothing, and it says what the caller would need to see the list.
+const FOLDER_ACCESS_FORBIDDEN: &str =
+    "Only someone who can edit this folder can see who it is shared with.";
+
 /// The sentence a move at a level below manage is refused with — the same
 /// sentence for a query and for a folder, so the two moves answer
 /// identically (`QS-3` review of #382: a move needs manage).
@@ -1736,7 +1743,9 @@ async fn a_folder_carries_its_own_rule_and_inherits_its_parents() {
 /// changing it: a person who may only see a query may not see who else has
 /// it. The list of a folder is read from edit up and changed with manage, so
 /// a person who may only see a folder is refused both (QS-3, folder sharing
-/// warning: the case below has view only on the folder).
+/// warning: the case below has view only on the folder). The folder's two
+/// refusals carry two sentences: the one for a refusal to change, and the
+/// one that says what the caller would need to read the list.
 #[tokio::test]
 async fn the_access_list_needs_manage_to_be_read_or_changed() {
     let TestApp { router, pool } = spin_up().await;
@@ -1790,7 +1799,7 @@ async fn the_access_list_needs_manage_to_be_read_or_changed() {
             "GET",
             format!("/api/query/folders/{folder_id}/access"),
             None,
-            FOLDER_FORBIDDEN,
+            FOLDER_ACCESS_FORBIDDEN,
         ),
         (
             "PUT",
@@ -4658,8 +4667,9 @@ async fn an_edit_holder_reads_a_folders_own_and_inherited_rules() {
     );
 }
 
-/// A person who may only view a folder is told no: the sentence is the
-/// folder's fixed one, and the list stays closed below edit.
+/// A person who may only view a folder is told no: the sentence says what
+/// the caller would need to see the list, and the list stays closed below
+/// edit.
 #[tokio::test]
 async fn a_view_holder_is_refused_a_folders_access_list() {
     let TestApp { router, pool } = spin_up().await;
@@ -4678,7 +4688,7 @@ async fn a_view_holder_is_refused_a_folders_access_list() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
     assert_eq!(
         error(&answer),
-        format!("permission_denied: {FOLDER_FORBIDDEN}")
+        format!("permission_denied: {FOLDER_ACCESS_FORBIDDEN}")
     );
 }
 

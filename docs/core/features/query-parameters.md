@@ -6,12 +6,12 @@
 | Backlog | `QS-5` (part 1: parameters in SQL, saved queries and the assistant) |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-5.md` (the spec's *(proposed)* limits are decision 6) |
-| Status | Building |
-| Priority | P2 |
+| Status | In Acceptance |
+| Priority | P1 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Started | 2026-11-07; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | 2026-11-08 (#420, #422) |
 | Evidence | |
 | Plan | Plan files are not kept in the repository. |
 
@@ -108,6 +108,8 @@ After `{{`, the editor offers the names that the tab defines.
 | 13 | The run and the estimate routes take the values and, optionally, the definitions. The server fills the placeholders as soon as it reads the statement, so the read-only check, the Trino check, the table list, the role's row filters and masks, and the settings check all see the final statement. A statement with no placeholder and no values behaves exactly as before | none | Planner's choice, 2026-11-07 |
 | 14 | History records the statement that ran, with the values printed in it, not the text with `{{name}}`. Download and "open in studio" then work without the values. Changing a saved query's parameters alone writes a version, like a change to its SQL, and edit level is enough to change them. Revert and duplicate carry the parameters | none | Planner's choice, 2026-11-07 |
 | 15 | A dashboard's SQL source whose SQL holds a placeholder is refused with "Parameters in a dashboard's SQL source come later: give the value in the SQL for now." The SQL help check is the variables part of `AI-12`: it fills in the tab's values when the request carries them, and otherwise refuses with the missing-value sentence | none | Planner's choice, 2026-11-07 |
+| 16 | On ClickHouse a heredoc (`$$ … $$` and `$tag$ … $tag$`) is read like a quoted string, so a placeholder inside it is refused with the same inside-quotes sentence a placeholder inside a string gets, and an unclosed heredoc runs to the end of the statement. Trino has no heredoc, so nothing changes there | none | Planner's choice, 2026-11-08 |
+| 17 | After `{{` the list holds the tab's defined parameter names and nothing else (no SQL keyword), and a `{{` inside a comment or inside a quoted run offers no name at all | none | Planner's choice, 2026-11-08 |
 
 ## Limits to tell a customer
 
@@ -117,9 +119,10 @@ After `{{`, the editor offers the names that the tab defines.
   typed into a parameter stays in the caller's own History for 14 days.
   Download and "open in studio" need no values, because the statement already
   holds them.
-- A dropdown cannot be set back to "no value" once a person has picked an option. The menu's Clear default button clears only the default.
-- Completion after `{{` starts on the first letter typed or with Ctrl+Space, and it offers nothing after a dot, as in `{{name.`.
-- The editor's keyword completion may still list SQL keywords after `{{`.
+- Completion after `{{` starts on the first letter typed or with Ctrl+Space.
+  The list holds the tab's defined names and nothing else, and inside a
+  comment or a quoted run it holds none. It still offers nothing after a dot,
+  as in `{{name.`.
 - An option list made in the console keeps its option values as text, so a numeric list is printed as text literals.
 - A dashboard cannot drive a query's parameters yet, and a dropdown cannot be
   filled from another query. Both are part 2.
@@ -140,8 +143,8 @@ After `{{`, the editor offers the names that the tab defines.
 - A saved query is checked on save as ClickHouse SQL, so a Trino statement
   with a backslash before a quote can be read differently on save than on a
   Trino run. The result is a refusal, never a bypass.
-- A ClickHouse heredoc string (`$$ ... $$`) is not understood. Do not put a
-  placeholder in one.
+- A ClickHouse heredoc (`$$ ... $$`) reads like a quoted string; a placeholder
+  in it is refused with the inside-quotes sentence. Do not put one in it.
 - A query takes at most 20 parameters, a text value 200 characters, a
   dropdown 200 options and a multi-select 200 values.
 
