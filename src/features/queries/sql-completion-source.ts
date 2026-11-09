@@ -1,8 +1,10 @@
 "use client"
 
-import { StandardSQL, type keywordCompletionSource } from "@codemirror/lang-sql"
+import { autocompletion } from "@codemirror/autocomplete"
+import { StandardSQL, keywordCompletionSource } from "@codemirror/lang-sql"
 import type { Extension } from "@codemirror/state"
 import {
+  inPlaceholder,
   sqlCompletionOptions,
   type ColumnState,
   type CompletionOption,
@@ -12,9 +14,10 @@ import {
 /**
  * The console's own suggestions for the SQL editor.
  *
- * The editor's language extension already offers the SQL keywords. This
- * adds what only the catalog knows: the tables, and the columns of the
- * table behind an alias; and, after `{{`, the names of the tab's parameters.
+ * The SQL language offers the keywords. This adds what only the catalog
+ * knows: the tables, and the columns of the table behind an alias; and,
+ * after `{{`, the names of the tab's parameters. After a `{{` the keywords
+ * stay out: a placeholder holds a parameter name and nothing else.
  *
  * The source is synchronous over the column cache. A keystroke never waits
  * for the network: the cache says whether the columns are there yet, and
@@ -22,9 +25,8 @@ import {
  */
 
 /**
- * The completion source type, taken from the language package that is a
- * dependency: the autocomplete package is not one, so its types are read
- * through the source it hands out.
+ * The completion source type, taken from the language package that hands
+ * the source out: the autocomplete package does not export it.
  */
 type CompletionSource = ReturnType<typeof keywordCompletionSource>
 
@@ -107,11 +109,34 @@ export function createSqlCompletionSource({
 }
 
 /**
- * The extension that adds the console's suggestions to the SQL language.
+ * The keywords the SQL language offers.
  *
- * The language's data facet is additive: the keywords the SQL extension
- * offers stay, and this source is asked beside them.
+ * The editor asks for the standard dialect's keywords directly, so they come
+ * out as the dialect spells them, not upper-cased. Naming the answering
+ * sources replaces the language's own completion, which the `sql()` extension
+ * would install.
+ */
+const keywordSource = keywordCompletionSource(StandardSQL, false)
+
+/**
+ * The keywords, without the ones that would show after a `{{`.
+ *
+ * A placeholder holds a parameter name, so a keyword cannot be written
+ * there and does not belong in the list (#422 S2).
+ */
+const keywords: CompletionSource = (context) => {
+  if (inPlaceholder(context.state.doc.toString(), context.pos)) return null
+  return keywordSource(context)
+}
+
+/**
+ * The extension that gives the SQL editor its suggestions.
+ *
+ * It names the sources that answer, so the console's own source and the
+ * language's keywords are the only two: the keywords stay out of a
+ * placeholder, and the console's source does not offer a parameter name
+ * inside a comment or a quoted run.
  */
 export function sqlCompletionExtension(source: CompletionSource): Extension {
-  return StandardSQL.language.data.of({ autocomplete: source })
+  return autocompletion({ override: [source, keywords] })
 }

@@ -5,7 +5,7 @@ import * as React from "react"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { levelAtLeast } from "@/features/dashboards/access-level"
+import { levelAtLeast } from "@/lib/access-level"
 import { useService } from "@/hooks/use-service"
 import { sqlSummary } from "@/lib/sql-text"
 import { queryService } from "@/services"
@@ -171,11 +171,13 @@ export function SaveQuerySheet({
         }
         if (folderId !== undefined) input.folderId = folderId
         // A new query without placeholders sends no parameters at all. A
-        // change that drops the placeholders a saved query had sends an
-        // empty list, so the server clears the definitions with the SQL.
-        const had = source.status === "success" ? (source.data?.parameters.length ?? 0) : 0
+        // change always states the definitions it wants: a statement without
+        // a placeholder wants none, so it sends an empty list and the server
+        // clears the definitions with the SQL. What the saved query held
+        // does not decide it, and the change does not wait for it to be read
+        // (`#422 S1`).
         if (parameters.length > 0) input.parameters = [...parameters]
-        else if (mode === "update" && had > 0) input.parameters = []
+        else if (mode === "update") input.parameters = []
         void onSave(input).then((saved) => {
           if (saved) onOpenChange(false)
         })

@@ -396,6 +396,62 @@ export function tablesInStatement(sql: string, tables: CompletionTable[]): Named
 }
 
 /**
+ * Whether the token ends with the marker that closes it: a quoted run with
+ * its own quote, a block comment with its closing marker. A line comment
+ * has no such marker: it ends with the text it holds.
+ */
+function closesToken(token: SqlToken): boolean {
+  if (token.kind === "quoted") {
+    const quote = token.text[0] ?? ""
+    return token.text.length > 1 && token.text.endsWith(quote)
+  }
+  return token.text.endsWith("*/")
+}
+
+/**
+ * Whether the cursor is inside a token: a comment or a quoted run.
+ *
+ * The end of a token that closes with a marker is outside it: the cursor
+ * right after a closed quote, or after a closed block comment, writes code
+ * again. A line comment and an open quote end with the text they hold, so
+ * the cursor at their end is still inside them.
+ */
+function insideToken(token: SqlToken, cursor: number): boolean {
+  if (cursor < token.from) return false
+  if (cursor < token.to) return true
+  return !closesToken(token)
+}
+
+/**
+ * Whether the cursor sits inside a comment or a quoted run.
+ *
+ * A `{{` there is text, not a placeholder, so no parameter name belongs
+ * there.
+ */
+export function inCommentOrString(sql: string, cursor: number): boolean {
+  return insideText(tokenizeSql(sql), cursor)
+}
+
+/** Whether the cursor sits inside a comment or a quoted run of these tokens. */
+function insideText(tokens: SqlToken[], cursor: number): boolean {
+  return tokens.some(
+    (token) =>
+      (token.kind === "comment" || token.kind === "quoted") && insideToken(token, cursor)
+  )
+}
+
+/**
+ * Whether the cursor is right after a `{{` that opens a placeholder.
+ *
+ * The name may be half typed: `{{re` is still inside the placeholder, so
+ * the braces are read before the name.
+ */
+export function inPlaceholder(sql: string, cursor: number): boolean {
+  const from = wordStart(sql, cursor)
+  return OPENS_PLACEHOLDER.test(sql.slice(0, from))
+}
+
+/**
  * The suggestions for the place the cursor is in.
  *
  * Four places, in order:
@@ -421,6 +477,11 @@ export function sqlCompletionOptions({
   const from = wordStart(sql, cursor)
 
   if (OPENS_PLACEHOLDER.test(sql.slice(0, from))) {
+    // The braces in a comment or in a quoted run are text, not a
+    // placeholder: they hold no name, so no name is offered there.
+    if (insideText(tokens, cursor)) {
+      return { from, options: [] }
+    }
     return {
       from,
       options: parameters.map((name) => ({ label: name, kind: "parameter", apply: name })),

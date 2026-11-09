@@ -1,6 +1,7 @@
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { pinSnapshot } from "./snapshot-picker"
 import type { AssetDetail } from "@/services/contracts/assets"
+import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import type { QueryEngine } from "@/services/contracts/queries"
 
 /**
@@ -62,39 +63,75 @@ export function assetStandInTable(a: Pick<AssetDetail, "queryTarget" | "tableKey
 }
 
 /**
- * Where Query Studio opens this asset, and what to call it there.
+ * The ClickHouse target for this asset: the name the API resolved when it
+ * sent one — the table it proved the console can read, the ClickHouse
+ * `DataLakeCatalog` name for a Bronze table, the Silver name for a stand-in
+ * — else the `namespace.name` form Query Studio's autocomplete offers,
+ * quoted where needed.
  *
- * A Bronze table that Trino reads opens on a Trino tab with
- * `iceberg.bronze.<table>`, the name the schema browser offers on that tab.
- * The API's `queryTarget` names the table for the console's own reads (for
- * a Bronze table, the ClickHouse `DataLakeCatalog` name), so it does not
- * decide this. A Silver stand-in keeps the API's ClickHouse name: Trino
- * has no table of its own for it. Anything else follows `assetQueryTarget`.
+ * It stands apart from `assetQueryTarget`, which answers Trino for an
+ * Iceberg candidate: a catalog link may only name an Iceberg table the page
+ * has seen (owner, 2026-11-08).
  */
-export function assetStudioTarget(a: Target & Pick<AssetDetail, "tableKey">): {
+function assetClickHouseTarget(a: Target): {
   engine: QueryEngine
   table: string
 } {
-  if (isIcebergCandidate(a) && a.tableName && assetStandInTable(a) === null) {
-    return { engine: "trino", table: trinoBronzeName(a.tableName) }
-  }
-  return assetQueryTarget(a)
+  if (a.queryTarget) return a.queryTarget
+  return { engine: "clickhouse", table: `${quoteIdent(a.namespace)}.${quoteIdent(a.name)}` }
 }
 
-/** A starter `SELECT` for this asset, with explicit columns when there are few. */
-export function assetStarterSql(a: Target & Pick<AssetDetail, "schema" | "tableKey">) {
+/**
+ * Where Query Studio opens this asset, and what to call it there.
+ *
+ * A Bronze table opens on a Trino tab with `iceberg.bronze.<table>` only
+ * when its Iceberg table is proven to exist: `table` is the detail the page
+ * loaded, and `null` while it loads, after it failed, and when the table is
+ * not there at all. The registry's `tableName` says a Bronze table might
+ * exist, not that it does — a Trino tab on a table that is not there
+ * answers "table does not exist" (owner, 2026-11-08; #409 opened the link
+ * for every candidate).
+ *
+ * Without that proof the link is the ClickHouse one: the name the API
+ * resolved, else the `namespace.name` form. A Silver stand-in keeps the
+ * API's ClickHouse name: Trino has no table of its own for it.
+ */
+export function assetStudioTarget(
+  a: Target & Pick<AssetDetail, "tableKey">,
+  table: LakehouseTableDetail | null
+): {
+  engine: QueryEngine
+  table: string
+} {
+  if (isIcebergCandidate(a) && a.tableName && assetStandInTable(a) === null && table !== null) {
+    return { engine: "trino", table: trinoBronzeName(a.tableName) }
+  }
+  return assetClickHouseTarget(a)
+}
+
+/**
+ * A starter `SELECT` for this asset, with explicit columns when there are
+ * few. It reads the table the studio link opens, so it names the same one.
+ */
+export function assetStarterSql(
+  a: Target & Pick<AssetDetail, "schema" | "tableKey">,
+  table: LakehouseTableDetail | null
+) {
   const cols =
     a.schema.length > 0 && a.schema.length <= SNIPPET_MAX_COLUMNS
       ? a.schema.map((c) => `  ${quoteIdent(c.name)}`).join(",\n")
       : "  *"
-  return `SELECT\n${cols}\nFROM ${assetStudioTarget(a).table}\nLIMIT 100`
+  return `SELECT\n${cols}\nFROM ${assetStudioTarget(a, table).table}\nLIMIT 100`
 }
 
 /** Query Studio, opened on this asset's starter query and the engine it needs. */
-export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema" | "tableKey">) {
+export function assetQueryStudioHref(
+  a: Target & Pick<AssetDetail, "schema" | "tableKey">,
+  table: LakehouseTableDetail | null
+) {
   const params = new URLSearchParams({
-    sql: assetStarterSql(a),
-    engine: assetStudioTarget(a).engine,
+    sql: assetStarterSql(a, table),
+    engine: assetStudioTarget(a, table).engine,
   })
   return `/query-studio?${params.toString()}`
 }
@@ -102,9 +139,10 @@ export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema" | "t
 /**
  * Query Studio, opened on a Trino tab with the starter query pinned to one
  * Iceberg snapshot, the table as it was after that load. `null` when the
- * asset is not an Iceberg candidate, when its rows do not open on Trino (a
- * Silver stand-in has no snapshots to go back to), or when the id is not
- * the plain number Iceberg issues.
+ * asset is not an Iceberg candidate, when its Iceberg table is not there
+ * (a version of a table that does not exist is nothing), when its rows do
+ * not open on Trino (a Silver stand-in has no snapshots to go back to), or
+ * when the id is not the plain number Iceberg issues.
  *
  * `pinSnapshot` writes the pin, so the two callers of it cannot drift. The
  * pin is on the table's own reference, the one `FOR VERSION AS OF` belongs
@@ -114,12 +152,13 @@ export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema" | "t
  */
 export function assetSnapshotQueryHref(
   a: Target & Pick<AssetDetail, "schema" | "tableKey">,
-  snapshotId: string
+  snapshotId: string,
+  table: LakehouseTableDetail | null
 ): string | null {
   if (!isIcebergCandidate(a)) return null
-  const target = assetStudioTarget(a)
+  const target = assetStudioTarget(a, table)
   if (target.engine !== "trino") return null
-  const sql = pinSnapshot(assetStarterSql(a), "trino", snapshotId, target.table)
+  const sql = pinSnapshot(assetStarterSql(a, table), "trino", snapshotId, target.table)
   if (sql === null) return null
   const params = new URLSearchParams({ sql, engine: target.engine })
   return `/query-studio?${params.toString()}`

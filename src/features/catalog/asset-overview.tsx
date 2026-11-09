@@ -117,8 +117,11 @@ export function AssetOverview({
   ] as const
   // "Related tables" is the rare case; without one it is a row of noise.
   const shownConnections = connections.filter(([label, n]) => label !== "Related tables" || n > 0)
+  // The Iceberg table, once loaded. It is what proves the table exists, so
+  // the links below open Trino only when it is there (owner, 2026-11-08).
+  const table = icebergTableOf(iceberg)
   // An Iceberg table's own snapshots, once loaded; the API's list otherwise.
-  const snapshotCount = icebergTableOf(iceberg)?.snapshots.length ?? a.snapshots.length
+  const snapshotCount = table?.snapshots.length ?? a.snapshots.length
   const quality = qualitySummary(a.qualityChecks)
   const sensitive = a.schema.filter(isSensitive)
   const maskedCount = a.schema.filter((c) => c.masked).length
@@ -127,7 +130,7 @@ export function AssetOverview({
   // own list otherwise — for a Silver or Gold table, the version the console
   // recorded. That one is dated when the console saw it, so it says
   // "recorded", not a time that would read as the table's own age.
-  const icebergSchema = icebergTableOf(iceberg)?.schemaVersions?.find((v) => v.current)
+  const icebergSchema = table?.schemaVersions?.find((v) => v.current)
   const latestSchema = a.schemaVersions.find((v) => v.current) ?? a.schemaVersions[0]
   const schemaLabel = icebergSchema
     ? `v${icebergSchema.schemaId}` +
@@ -136,7 +139,7 @@ export function AssetOverview({
       ? `v${latestSchema.version} · recorded ${formatRelativeTime(latestSchema.at)}`
       : null
   const recentChanges = a.changeHistory.slice(0, RECENT_CHANGES)
-  const sql = assetStarterSql(a)
+  const sql = assetStarterSql(a, table)
 
   return (
     <div className="flex flex-col gap-2">
@@ -264,7 +267,7 @@ export function AssetOverview({
         size="sm"
         title="Use this data"
         description={`A starter query for ${
-          assetStudioTarget(a).engine === "trino" ? "Trino" : "ClickHouse"
+          assetStudioTarget(a, table).engine === "trino" ? "Trino" : "ClickHouse"
         }. Masking still applies when it runs.`}
         action={
           <div className="flex gap-1.5">
@@ -275,7 +278,7 @@ export function AssetOverview({
             <Button
               size="sm"
               variant="outline"
-              render={<Link href={assetQueryStudioHref(a)} />}
+              render={<Link href={assetQueryStudioHref(a, table)} />}
             >
               Open in Query Studio
             </Button>

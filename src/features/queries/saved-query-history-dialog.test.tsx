@@ -137,6 +137,9 @@ describe("the history of a saved query", () => {
     // Nothing is written before the person says yes.
     expect(revert.mock.calls.length).toBe(0)
     expect(await screen.findByText("Revert to version 2")).toBeDefined()
+    // The button names the version it goes back to, and no other one.
+    expect(screen.getByRole("button", { name: "Restore version 2" })).toBeDefined()
+    expect(screen.queryByRole("button", { name: "Restore version 3" })).toBeNull()
   })
 
   it("goes back to the version the person confirmed", async () => {
@@ -147,7 +150,7 @@ describe("the history of a saved query", () => {
 
     await screen.findByText("SELECT revenue FROM monthly")
     fireEvent.click(screen.getAllByRole("button", { name: "Revert" })[0])
-    fireEvent.click(await screen.findByRole("button", { name: "Go back" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Restore version 2" }))
 
     await waitFor(() => {
       expect(revert.mock.calls.at(-1)?.[0]).toBe("q1")
@@ -163,7 +166,7 @@ describe("the history of a saved query", () => {
 
     await screen.findByText("SELECT revenue FROM monthly")
     fireEvent.click(screen.getAllByRole("button", { name: "Revert" })[0])
-    fireEvent.click(await screen.findByRole("button", { name: "Go back" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Restore version 2" }))
 
     // The server named the version it went back to, not the version it
     // wrote: "Restored version 2", on version 4.
@@ -203,7 +206,7 @@ describe("the history of a saved query", () => {
 
     await screen.findByText("SELECT revenue FROM monthly")
     fireEvent.click(screen.getAllByRole("button", { name: "Revert" })[0])
-    fireEvent.click(await screen.findByRole("button", { name: "Go back" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Restore version 2" }))
 
     expect((await screen.findByRole("alert")).textContent).toBe(
       "You do not have permission to change this saved query.",

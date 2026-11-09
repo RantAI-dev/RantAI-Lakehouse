@@ -22,6 +22,11 @@
 //! quoted run ends, in the scanner and in the printer alike. If the two
 //! disagreed about where a literal ends, a value could leave its literal.
 //!
+//! A `ClickHouse` heredoc (`$$ … $$`) holds raw text, and a value printed
+//! into one would be read by the engine as it stands. So the scanner
+//! refuses a placeholder inside a heredoc (`#420`), and the only place a
+//! value can land is still the quoted literal the printer writes.
+//!
 //! The guards in [`crate::sql_guard`] read a backslash as an escape on both
 //! engines. A `Trino` literal ending in a backslash would look unterminated
 //! to them, so the `Trino` printer never writes a backslash: see
@@ -39,6 +44,17 @@
 //! quoted string or identifier is refused, because writing `'{{region}}'`
 //! looks like it would work and would not. A `{{` outside both that is not a
 //! well-formed placeholder is refused.
+//!
+//! On `ClickHouse` the scanner knows two more places where a value could
+//! hide. A heredoc (`$$ … $$` and `$tag$ … $tag$`) holds raw text, so a
+//! placeholder inside one is refused like one inside quotes, and a heredoc
+//! that is never closed runs to the end of the statement, as an unterminated
+//! quote does. A heredoc opens only where its `$` does not continue a name:
+//! the engine reads `a$$b` as one identifier, so the `$$` belongs to that
+//! name and the text after it is ordinary SQL. A block comment nests there,
+//! so the comment runs to the `*/` that closes the outermost one and a
+//! placeholder inside it is ignored as any other comment's is. `Trino` has
+//! neither a heredoc nor nested comments, and nothing changes there.
 //!
 //! # What a refusal says
 //!
@@ -354,9 +370,108 @@ fn backslash_escapes(engine: Engine) -> bool {
     }
 }
 
+/// Whether a heredoc (`$$ … $$`) opens a run of raw text, as it does on
+/// `ClickHouse`. `Trino` has none.
+fn has_heredoc(engine: Engine) -> bool {
+    match engine {
+        Engine::ClickHouse => true,
+        Engine::Trino => false,
+    }
+}
+
+/// Whether a `/* … */` comment nests, as it does on `ClickHouse`: the
+/// comment then runs to the `*/` that closes the outermost one.
+fn nests_block_comments(engine: Engine) -> bool {
+    match engine {
+        Engine::ClickHouse => true,
+        Engine::Trino => false,
+    }
+}
+
+/// The heredoc delimiter that opens at `from`: `$`, a tag of ASCII letters,
+/// digits and `_` (which may be empty), and a closing `$`.
+///
+/// Returns the range of the delimiter in `chars` and the index just past
+/// it, or `None` when the text there opens no heredoc.
+///
+/// The engine opens a heredoc only where the `$` starts a token: a `$`
+/// that continues a name belongs to that name. The engine reads `a$$b` and
+/// `a$tag$b` as one identifier, so the `$$` is part of the name and the
+/// text after it is ordinary SQL. Measured on
+/// `clickhouse/clickhouse-server:26.8.15.10`, where `SELECT 1 AS a$$b`
+/// and `SELECT 1 AS a$tag$b` answer `1`, and `SELECT 1 AS a$$b, @@x@@` is a
+/// syntax error at `@@`, which is ordinary SQL the engine reads after the
+/// name. (`#437` review)
+fn heredoc_opener(chars: &[char], from: usize) -> Option<(usize, usize)> {
+    if chars.get(from) != Some(&'$') {
+        return None;
+    }
+    // A `$` after a name character is part of that name, and the engine
+    // opens no heredoc there: its bareword reader takes letters, digits,
+    // `_` and `$`.
+    if from > 0 {
+        let before = chars[from - 1];
+        if before.is_ascii_alphanumeric() || matches!(before, '_' | '$') {
+            return None;
+        }
+    }
+    let mut at = from + 1;
+    while at < chars.len() && (chars[at].is_ascii_alphanumeric() || chars[at] == '_') {
+        at += 1;
+    }
+    if chars.get(at) != Some(&'$') {
+        return None;
+    }
+    Some((from, at + 1))
+}
+
+/// Index just past the heredoc that opens with the delimiter
+/// `chars[open..close]`.
+///
+/// The closing delimiter is the opening one, as the engine reads it. A
+/// heredoc that is never closed consumes the rest of the statement, which
+/// is the safe reading: the rest of the statement is inside it.
+fn skip_heredoc(chars: &[char], open: usize, close: usize) -> usize {
+    let delimiter = &chars[open..close];
+    let mut at = close;
+    while at < chars.len() {
+        if chars[at..].starts_with(delimiter) {
+            return at + delimiter.len();
+        }
+        at += 1;
+    }
+    chars.len()
+}
+
+/// Index just past the `/* … */` comment that opens at `from`, counting the
+/// nested ones: `ClickHouse` nests block comments, so the comment ends at
+/// the `*/` that closes the outermost one. An unterminated comment
+/// consumes the rest of the statement.
+fn skip_nested_block_comment(chars: &[char], from: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < chars.len() {
+        match (chars[i], chars.get(i + 1)) {
+            ('/', Some('*')) => {
+                depth += 1;
+                i += 2;
+            }
+            ('*', Some('/')) => {
+                depth = depth.saturating_sub(1);
+                i += 2;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    chars.len()
+}
+
 /// The placeholders the author wrote, in order. Comments are skipped, a
-/// well-formed placeholder inside quotes is refused, and a `{{` that is not
-/// a placeholder outside both is refused.
+/// well-formed placeholder inside quotes or inside a `ClickHouse` heredoc is
+/// refused, and a `{{` that is not a placeholder outside both is refused.
 fn scan(engine: Engine, sql: &str) -> Result<Vec<Found>, ParamError> {
     let chars: Vec<char> = sql.chars().collect();
     // Byte offset of every char, and of the end, so slices of `sql` can be
@@ -372,7 +487,28 @@ fn scan(engine: Engine, sql: &str) -> Result<Vec<Found>, ParamError> {
         match c {
             '-' if next == Some('-') => i = skip_to_line_end(&chars, i),
             '#' => i = skip_to_line_end(&chars, i),
-            '/' if next == Some('*') => i = skip_block_comment(&chars, i),
+            '/' if next == Some('*') => {
+                i = if nests_block_comments(engine) {
+                    skip_nested_block_comment(&chars, i)
+                } else {
+                    skip_block_comment(&chars, i)
+                };
+            }
+            '$' if has_heredoc(engine) => {
+                // The body of a heredoc is raw text, so a placeholder inside
+                // it is a placeholder inside quotes.
+                let end = match heredoc_opener(&chars, i) {
+                    Some((open, close)) => {
+                        let end = skip_heredoc(&chars, open, close);
+                        if let Some(written) = placeholder_within(&chars, i, end) {
+                            return Err(ParamError::InsideQuotes(written));
+                        }
+                        end
+                    }
+                    None => i + 1,
+                };
+                i = end;
+            }
             '\'' | '"' | '`' => {
                 let end = skip_quoted(&chars, i, c, backslash_escapes(engine));
                 if let Some(written) = placeholder_within(&chars, i, end) {
@@ -1439,6 +1575,179 @@ mod tests {
             json!([]),
         );
         assert_eq!(got, "SELECT 'a\\' 'v'");
+    }
+
+    /// A `ClickHouse` heredoc holds raw text, so a placeholder inside one
+    /// would be printed into text the engine reads as it stands. It is
+    /// refused like a placeholder inside quotes.
+    #[test]
+    fn a_placeholder_inside_a_clickhouse_heredoc_is_refused_with_the_inside_quotes_sentence() {
+        for sql in ["SELECT $$ {{x}} $$", "SELECT $t$ {{x}} $t$"] {
+            let err = run(Engine::ClickHouse, sql, json!({"x": "v"}), json!([])).unwrap_err();
+            assert_eq!(
+                err, "{{x}} is inside quotes: write it without them, for example = {{x}}.",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_placeholder_after_a_closed_clickhouse_heredoc_is_filled() {
+        let got = run_ok(
+            Engine::ClickHouse,
+            "SELECT $$ raw $$ AS a, {{x}} AS b",
+            json!({"x": "v"}),
+            json!([]),
+        );
+        assert_eq!(got, "SELECT $$ raw $$ AS a, 'v' AS b");
+    }
+
+    #[test]
+    fn a_heredoc_marker_is_not_a_heredoc_on_trino() {
+        let got = run_ok(
+            Engine::Trino,
+            "SELECT $$ raw $$ AS a, {{x}} AS b",
+            json!({"x": "v"}),
+            json!([]),
+        );
+        assert_eq!(got, "SELECT $$ raw $$ AS a, 'v' AS b");
+    }
+
+    /// The engine opens a heredoc only where the `$` does not follow an
+    /// identifier character: in `a$$b` the `$$` belongs to the identifier
+    /// and the engine reads one name. Measured on
+    /// `clickhouse/clickhouse-server:26.8.15.10`, where `SELECT 1 AS a$$b`
+    /// answers `1`.
+    #[test]
+    fn a_dollar_sign_after_an_identifier_is_not_a_heredoc() {
+        // The text after the identifier is ordinary SQL, so the placeholder
+        // there is a real one and not one inside a heredoc.
+        let got = run_ok(
+            Engine::ClickHouse,
+            "SELECT 1 AS a$$b, {{x}} AS c",
+            json!({"x": "v"}),
+            json!([]),
+        );
+        assert_eq!(got, "SELECT 1 AS a$$b, 'v' AS c");
+        // A heredoc that starts after a space is a heredoc all the same, and
+        // a placeholder inside it is refused.
+        let err = run(
+            Engine::ClickHouse,
+            "SELECT 1 AS a$$b WHERE c = $$ {{x}} $$",
+            json!({"x": "v"}),
+            json!([]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "{{x}} is inside quotes: write it without them, for example = {{x}}."
+        );
+    }
+
+    /// The same holds for a tag: `a$tag$b` is one name to the engine, so
+    /// the `$tag$` opens no heredoc. Measured on
+    /// `clickhouse/clickhouse-server:26.8.15.10`, where
+    /// `SELECT 1 AS a$tag$b` answers `1`.
+    #[test]
+    fn a_tag_after_an_identifier_is_not_a_heredoc() {
+        let got = run_ok(
+            Engine::ClickHouse,
+            "SELECT 1 AS a$tag$b, {{x}} AS c",
+            json!({"x": "v"}),
+            json!([]),
+        );
+        assert_eq!(got, "SELECT 1 AS a$tag$b, 'v' AS c");
+    }
+
+    /// A placeholder written after an identifier that holds a `$` is a real
+    /// placeholder: the engine reads the identifier and then ordinary SQL.
+    /// Measured on `clickhouse/clickhouse-server:26.8.15.10`.
+    #[test]
+    fn a_placeholder_after_an_identifier_with_a_dollar_sign_is_filled() {
+        let got = run_ok(
+            Engine::ClickHouse,
+            "SELECT 1 AS a$$b WHERE c = {{x}}",
+            json!({"x": "v"}),
+            json!([]),
+        );
+        assert_eq!(got, "SELECT 1 AS a$$b WHERE c = 'v'");
+    }
+
+    /// `Trino` has no heredoc at all, so a `$` is nothing to it, whatever
+    /// stands before it.
+    #[test]
+    fn a_dollar_sign_after_an_identifier_is_not_special_on_trino() {
+        assert!(!has_heredoc(Engine::Trino));
+        let got = run_ok(
+            Engine::Trino,
+            "SELECT 1 AS a$$b WHERE c = {{x}}",
+            json!({"x": "v"}),
+            json!([]),
+        );
+        assert_eq!(got, "SELECT 1 AS a$$b WHERE c = 'v'");
+    }
+
+    /// An unclosed heredoc runs to the end of the statement, as an
+    /// unterminated quote does: the rest of the statement is inside it, so
+    /// the `{{` at the end is never read as a malformed placeholder.
+    #[test]
+    fn an_unclosed_clickhouse_heredoc_runs_to_the_end_of_the_statement() {
+        let err = run(
+            Engine::ClickHouse,
+            "SELECT $$ {{x}} {{",
+            json!({"x": "v"}),
+            json!([]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "{{x}} is inside quotes: write it without them, for example = {{x}}."
+        );
+    }
+
+    /// A value that holds the marker of a heredoc is printed inside a
+    /// quoted literal, and the guard still sees the statement after it.
+    #[test]
+    fn a_value_with_a_heredoc_marker_prints_as_one_literal_and_the_guard_sees_the_statement() {
+        for engine in BOTH {
+            let sql = run_ok(
+                engine,
+                "SELECT {{a}}; DROP TABLE t",
+                json!({ "a": "$$" }),
+                json!([]),
+            );
+            assert_eq!(sql, "SELECT '$$'; DROP TABLE t", "{engine:?}");
+            let seen = crate::sql_guard::strip_sql_noise(&sql);
+            assert!(seen.contains("DROP TABLE t"), "{engine:?}: {sql} -> {seen}");
+            assert!(!crate::sql_guard::is_read_only(&sql), "{engine:?}");
+        }
+    }
+
+    /// `ClickHouse` nests block comments, so a comment runs to the `*/`
+    /// that closes the outermost one and `Trino` ends it at the first.
+    #[test]
+    fn a_clickhouse_block_comment_nests_and_a_trino_one_does_not() {
+        // The placeholder sits between the inner `*/` and the outer one: it
+        // is in the comment on `ClickHouse` and out of it on `Trino`.
+        let sql = "SELECT 1 /* a /* b */ {{x}} */ FROM t";
+        assert_eq!(
+            run_ok(Engine::ClickHouse, sql, json!({"x": "v"}), json!([])),
+            sql
+        );
+        assert_eq!(
+            run_ok(Engine::Trino, sql, json!({"x": "v"}), json!([])),
+            "SELECT 1 /* a /* b */ 'v' */ FROM t"
+        );
+        // A placeholder after the outer `*/` is found on both engines.
+        let sql = "SELECT 1 /* a /* b */ c */ {{y}}";
+        assert_eq!(
+            run_ok(Engine::ClickHouse, sql, json!({"y": "v"}), json!([])),
+            "SELECT 1 /* a /* b */ c */ 'v'"
+        );
+        assert_eq!(
+            run_ok(Engine::Trino, sql, json!({"y": "v"}), json!([])),
+            "SELECT 1 /* a /* b */ c */ 'v'"
+        );
     }
 
     #[test]
