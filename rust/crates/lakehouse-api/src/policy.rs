@@ -1456,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_fourteen_public_entries_exist() {
+    fn exactly_fifteen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1481,7 +1481,8 @@ mod tests {
         // map boundary route, each authenticated by its own token: 11 -> 13.
         // REL-2 decision D7 added `GET /health/ready`, the readiness probe an
         // installer or an updater waits on: 13 -> 14.
-        assert_eq!(public_count, 14);
+        // ADM-11 (D4) / ADM-11 review 1 B3 added `GET /api/auth/password-rules`: 14 -> 15.
+        assert_eq!(public_count, 15);
     }
 
     /// SEC-23 (F1): adding a governance rule needs `governance:write`, the
