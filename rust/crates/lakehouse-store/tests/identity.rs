@@ -690,13 +690,46 @@ async fn delete_user_cascades_memberships(pool: PgPool) -> sqlx::Result<()> {
 /// The seed is safe to apply twice.
 ///
 /// `sqlx::migrate!` would never re-run it, so this executes the migration's
-/// SQL directly against an already-seeded database — the situation an
+/// The seed is safe to apply twice.
+///
+/// ADM-11 review 1 B2: `0002_seed_identity.sql` runs before 0132 adds username NOT NULL.
+/// `sqlx::migrate!` would never re-run it, so this executes the migration's
+/// SQL directly against an already-seeded database before 0132 — the situation an
 /// operator creates by hand when re-seeding an environment. Nothing may
 /// fail, and nothing may double up.
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = false)]
 async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()> {
+    // Run all migrations up to 0131
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("../../migrations")
+        .expect("migrations directory exists")
+        .map(|entry| entry.expect("readable migration entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    paths.sort();
+
+    for path in &paths {
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        if file_name.starts_with("0132_") {
+            break;
+        }
+        let sql = std::fs::read_to_string(path).expect("readable migration file");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&pool)
+            .await?;
+    }
+
+    // Re-apply 0002_seed_identity.sql against the database before 0132
     let seed = include_str!("../../../migrations/0002_seed_identity.sql");
-    sqlx::raw_sql(seed).execute(&pool).await?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(seed))
+        .execute(&pool)
+        .await?;
+
+    // Now run migration 0132
+    let sql_0132 = std::fs::read_to_string("../../migrations/0132_usernames.sql")
+        .expect("0132_usernames.sql must be readable");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql_0132.as_str()))
+        .execute(&pool)
+        .await?;
 
     assert_eq!(
         list_users(&pool, &UserFilter::default())
