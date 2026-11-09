@@ -30,6 +30,42 @@ use uuid::Uuid;
 use common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
 
 mod identity {
+
+    /// ADM-11 D7 / ADM-11 review 1 S1: missing or blank username returns 400 "username is required".
+    #[tokio::test]
+    async fn invite_with_missing_or_blank_username_returns_400() {
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+        for body in [
+            json!({
+                "name": "Missing Username",
+                "email": "missing.username@example.com",
+                "roles": ["Analyst"],
+            }),
+            json!({
+                "name": "Blank Username",
+                "username": "   ",
+                "email": "blank.username@example.com",
+                "roles": ["Analyst"],
+            }),
+        ] {
+            let (status, resp_body, _) = post_json(
+                &app,
+                Some(&admin_cookie),
+                "/api/identity/users",
+                &body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                resp_body.get("message").and_then(|m| m.as_str()),
+                Some("username is required")
+            );
+        }
+    }
+
     use super::*;
 
     /// The email every invited user in this file gets. `.example` is the
@@ -127,6 +163,7 @@ mod identity {
             "/api/identity/users",
             &json!({
                 "name": "Rina Guest",
+                "username": "rina.guest",
                 "email": INVITED_EMAIL,
                 "roles": ["Analyst"],
                 "tenants": ["Meridian Retail"],
@@ -355,6 +392,7 @@ mod identity {
                 "/api/identity/users",
                 &json!({
                     "name": "Half Created",
+                    "username": "half.created",
                     "email": INVITED_EMAIL,
                     "roles": roles,
                     "tenants": tenants,

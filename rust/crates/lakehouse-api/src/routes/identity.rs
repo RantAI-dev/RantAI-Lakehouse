@@ -282,14 +282,12 @@ pub async fn create_user(
 ) -> ApiResult<(StatusCode, ApiJson<InviteUserResponse>)> {
     let body: InviteUserBody = parse_body(&body)?;
     let name = required("name", &body.name)?;
-    let raw_email = body.email.as_deref().filter(|e| !e.trim().is_empty());
-    let raw_username = match body.username.as_deref().filter(|u| !u.trim().is_empty()) {
-        Some(u) => u.to_owned(),
-        None => match raw_email {
-            Some(e) => e.to_owned(),
-            None => return Err(ApiError::BadRequest("username is required".to_owned()).into()),
-        },
+    // ADM-11 D7 / ADM-11 review 1 S1: username is required in the invite body; missing or blank -> 400.
+    let raw_username = match body.username.as_deref().map(str::trim) {
+        Some(u) if !u.is_empty() => u.to_owned(),
+        _ => return Err(ApiError::BadRequest("username is required".to_owned()).into()),
     };
+    let raw_email = body.email.as_deref().filter(|e| !e.trim().is_empty());
 
     let has_email = raw_email.is_some();
     let email_string = raw_email.map(str::to_owned);
