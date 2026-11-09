@@ -55,7 +55,7 @@ mod identity {
                 post_json(&app, Some(&admin_cookie), "/api/identity/users", &body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
-                resp_body.get("message").and_then(|m| m.as_str()),
+                resp_body.get("error").and_then(|m| m.as_str()),
                 Some("username is required")
             );
         }
