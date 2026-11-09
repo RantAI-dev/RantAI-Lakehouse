@@ -962,32 +962,15 @@ impl OidcAuthenticator {
                 .or(email_candidate)
                 .unwrap_or(fallback_candidate);
 
-            let mut candidate = base.clone();
-            let mut counter = 1;
-            loop {
-                let taken = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM app_user \
-                         WHERE lower(username) = lower($1) OR lower(email) = lower($1) \
-                     )",
-                )
-                .bind(&candidate)
-                .fetch_one(&mut *tx)
-                .await?;
-
-                if !taken {
-                    break;
-                }
-                counter += 1;
-                let suffix = format!("-{counter}");
-                let max_base_len = 254 - suffix.len();
-                let truncated_base = if base.len() > max_base_len {
-                    &base[..max_base_len]
-                } else {
-                    &base
-                };
-                candidate = format!("{truncated_base}{suffix}");
-            }
+            // ADM-11 review 1 S4: call lakehouse_store::identity::next_free_username_in_tx
+            // instead of a custom suffix loop.
+            let candidate =
+                lakehouse_store::identity::next_free_username_in_tx(&mut tx, &base, None)
+                    .await
+                    .map_err(|err| match err {
+                        lakehouse_store::StoreError::Database(e) => AuthError::Database(e),
+                        other => AuthError::Conflict(other.to_string()),
+                    })?;
 
             let (id,): (Uuid,) = sqlx::query_as(
                 "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
