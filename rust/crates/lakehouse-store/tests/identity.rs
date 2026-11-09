@@ -1093,17 +1093,23 @@ async fn two_case_variant_emails_backfill_to_the_plain_username_and_the_suffixed
     .execute(&pool)
     .await?;
 
-    // Run the migration's backfill query on these two rows
+    // ADM-11 review 1 B1: backfill query matches 0132_usernames.sql
     sqlx::query(
-        "WITH ranked AS (
+        "WITH cleaned AS (
             SELECT id,
-                   lower(email) AS base,
-                   row_number() OVER (
-                       PARTITION BY lower(email)
-                       ORDER BY created_at, id
-                   ) AS rn
+                   created_at,
+                   left(regexp_replace(lower(email), '[^a-z0-9._@+-]', '-', 'g'), 250) AS base
             FROM app_user
             WHERE id IN ($1, $2)
+        ),
+        ranked AS (
+            SELECT id,
+                   base,
+                   row_number() OVER (
+                       PARTITION BY base
+                       ORDER BY created_at, id
+                   ) AS rn
+            FROM cleaned
         )
         UPDATE app_user u
         SET username = CASE
@@ -1136,6 +1142,122 @@ async fn two_case_variant_emails_backfill_to_the_plain_username_and_the_suffixed
     );
     Ok(())
 }
+
+/// ADM-11 review 1 B1: migration 0132 backfills usernames for emails with
+/// special characters (O'Brien), OIDC placeholders (auth0|123), non-ASCII
+/// characters (müller), and case variants. Every resulting username must
+/// pass the check constraint and all usernames must be unique.
+#[sqlx::test(migrations = false)]
+async fn migration_0132_backfills_usernames_safely_for_special_emails(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // Run all migrations up to 0131
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("../../migrations")
+        .expect("migrations directory exists")
+        .map(|entry| entry.expect("readable migration entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    paths.sort();
+
+    for path in &paths {
+        let file_name = path
+            .file_name()
+            .expect("file name")
+            .to_str()
+            .expect("utf-8");
+        if file_name.starts_with("0132_") {
+            break;
+        }
+        let sql = std::fs::read_to_string(path).expect("readable migration file");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&pool)
+            .await?;
+    }
+
+    // Seed rows with O'Brien@x.example, auth0|123@p.oidc.invalid, non-ASCII local part, and two case variants
+    let test_emails = [
+        ("O'Brien", "O'Brien@x.example"),
+        ("Auth0 User", "auth0|123@p.oidc.invalid"),
+        ("Müller", "müller@x.example"),
+        ("Variant 1", "CaseVariant@example.com"),
+        ("Variant 2", "casevariant@example.com"),
+    ];
+
+    for (name, email) in test_emails {
+        sqlx::query("INSERT INTO app_user (name, email) VALUES ($1, $2)")
+            .bind(name)
+            .bind(email)
+            .execute(&pool)
+            .await?;
+    }
+
+    // Now execute migration 0132
+    let sql_0132 = std::fs::read_to_string("../../migrations/0132_usernames.sql")
+        .expect("0132_usernames.sql must be readable");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql_0132.as_str()))
+        .execute(&pool)
+        .await?;
+
+    // Assert that every row gets a username that passes the CHECK and that all usernames are unique
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT username, email FROM app_user")
+            .fetch_all(&pool)
+            .await?;
+
+    let mut seen_usernames = std::collections::HashSet::new();
+
+    for (username, email) in &rows {
+        assert!(
+            (1..=254).contains(&username.len()),
+            "username {username:?} for email {email:?} must be between 1 and 254 characters"
+        );
+        assert!(
+            username
+                .chars()
+                .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '@' | '+' | '-')),
+            "username {username:?} for email {email:?} must contain only allowed characters"
+        );
+        assert!(
+            lakehouse_store::identity::normalize_username(username).is_ok(),
+            "username {username:?} must pass normalize_username"
+        );
+        assert!(
+            seen_usernames.insert(username.to_lowercase()),
+            "username {username:?} must be unique"
+        );
+    }
+
+    // Specifically verify the seeded test emails
+    let obrien: (String,) =
+        sqlx::query_as("SELECT username FROM app_user WHERE email = 'O''Brien@x.example'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(obrien.0, "o-brien@x.example");
+
+    let auth0: (String,) =
+        sqlx::query_as("SELECT username FROM app_user WHERE email = 'auth0|123@p.oidc.invalid'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(auth0.0, "auth0-123@p.oidc.invalid");
+
+    let muller: (String,) =
+        sqlx::query_as("SELECT username FROM app_user WHERE email = 'müller@x.example'")
+            .fetch_one(&pool)
+            .await?;
+    assert!(muller.0.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '@' | '+' | '-')));
+
+    let variants: Vec<(String,)> = sqlx::query_as(
+        "SELECT username FROM app_user WHERE lower(email) = 'casevariant@example.com' ORDER BY username",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(variants.len(), 2);
+    assert_eq!(variants[0].0, "casevariant@example.com");
+    assert_eq!(variants[1].0, "casevariant@example.com-2");
+
+    Ok(())
+}
+
 
 /// ADM-11 D5, one direction: an invite whose username equals ANOTHER
 /// user's email is refused as a field-specific 409

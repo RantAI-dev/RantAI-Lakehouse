@@ -7,12 +7,14 @@
 -- unique handle (sign-in accepts either; `lakehouse-store::identity` and
 -- `lakehouse_auth::password::verify` compare through `lower(...)`).
 --
--- Backfill (D2.2): `username = lower(email)`. When two emails differ only in
--- case, the oldest row (`created_at`, then `id`) keeps the plain lowercased
--- value and the others get `-2`, `-3`, … in that order — the row_number IS
+-- Backfill (D2.2, ADM-11 review 1 B1): `username = lower(email)`, with any
+-- character outside `[a-z0-9._@+-]` replaced by `-` and truncated to 250
+-- characters. When two emails differ only in case or normalize to the same
+-- base, the oldest row (`created_at`, then `id`) keeps the plain value
+-- and the others get `-2`, `-3`, … in that order — the row_number IS
 -- the suffix. No row is skipped: every `app_user` row at migration time has
 -- an email (the column is still `NOT NULL` here), so every row gets a
--- username.
+-- username that passes the CHECK constraint.
 --
 -- `app_user_email_unique` is deliberately KEPT as it is (D2.4): rows may
 -- already hold case-variant duplicates of each other, and dropping or
@@ -23,14 +25,23 @@
 
 ALTER TABLE app_user ADD COLUMN username TEXT;
 
-WITH ranked AS (
+-- ADM-11 review 1 B1: backfill value replaces characters outside [a-z0-9._@+-]
+-- with '-', truncated to 250 chars. Ranking and suffixing partition on that
+-- cleaned base so collisions get -2, -3 suffixes.
+WITH cleaned AS (
     SELECT id,
-           lower(email) AS base,
+           created_at,
+           left(regexp_replace(lower(email), '[^a-z0-9._@+-]', '-', 'g'), 250) AS base
+    FROM app_user
+),
+ranked AS (
+    SELECT id,
+           base,
            row_number() OVER (
-               PARTITION BY lower(email)
+               PARTITION BY base
                ORDER BY created_at, id
            ) AS rn
-    FROM app_user
+    FROM cleaned
 )
 UPDATE app_user u
 SET username = CASE
