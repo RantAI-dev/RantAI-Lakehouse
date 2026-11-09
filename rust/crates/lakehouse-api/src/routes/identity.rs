@@ -1051,6 +1051,12 @@ pub async fn list_permissions() -> ApiResult<ApiJson<Vec<PermissionInfo>>> {
 /// unless it was already held by the existing role (`allowed_existing`).
 /// Tokens are extracted from comma-separated strings or string lists, trimmed,
 /// and deduplicated in order of appearance.
+///
+/// # Errors
+///
+/// Returns [`ApiError::UnknownPermissions`] if any newly-requested token is
+/// not recognized by [`permission_catalog::is_known`].
+// WEB-8 review 1 S1: document errors returned by check_permissions
 fn check_permissions<'a>(
     requested: impl IntoIterator<Item = &'a str>,
     allowed_existing: impl IntoIterator<Item = &'a str>,
