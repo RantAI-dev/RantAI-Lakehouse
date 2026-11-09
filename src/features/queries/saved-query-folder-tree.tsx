@@ -18,7 +18,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { levelAtLeast } from "@/features/dashboards/access-level"
+import { levelAtLeast } from "@/lib/access-level"
 import { useServiceAction } from "@/hooks/use-service"
 import { MAX_FOLDER_DEPTH } from "@/lib/folder-tree"
 import { readableErrorMessage } from "@/lib/notify-message"

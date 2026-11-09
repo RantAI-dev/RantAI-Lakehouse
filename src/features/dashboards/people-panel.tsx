@@ -5,7 +5,7 @@ import { Shield, UserPlus, Users, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { levelAtLeast, type DashboardLevel } from "./access-level";
+import { levelAtLeast, type DashboardLevel } from "@/lib/access-level";
 import { readableErrorMessage } from "@/lib/notify-message";
 // Features import `@/services` only.
 import {
