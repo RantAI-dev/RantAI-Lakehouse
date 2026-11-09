@@ -1897,24 +1897,6 @@ fn tenant_create_audit_event(principal: &Principal, tenant: &Tenant) -> NewAudit
     }
 }
 
-/// Helper copying `settings.rs:761` `parse_body` for missing vs null parsing (ADM-11 D8).
-fn parse_patch_body(
-    body: &Bytes,
-    fields: &[&str],
-    shape: &str,
-) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
-    let parsed: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| ApiError::BadRequest(shape.to_owned()))?;
-    let serde_json::Value::Object(sent) = parsed else {
-        return Err(ApiError::BadRequest(shape.to_owned()));
-    };
-    for key in sent.keys() {
-        if !fields.contains(&key.as_str()) {
-            return Err(ApiError::BadRequest(shape.to_owned()));
-        }
-    }
-    Ok(sent)
-}
 
 /// `PATCH /api/identity/users/{id}` — update a user's username and/or email (ADM-11 D8).
 ///
@@ -1944,7 +1926,8 @@ pub async fn update_user(
 
     let fields = &["username", "email"];
     let shape = "body must be an object with optional 'username' and 'email' fields";
-    let sent = parse_patch_body(&body, fields, shape)?;
+    // ADM-11 review 1 S3: reuse routes::settings::parse_body rather than duplicating it.
+    let sent = crate::routes::settings::parse_body(&body, fields, shape)?;
 
     let mut changed_fields = Vec::new();
     let new_username = if let Some(val) = sent.get("username") {

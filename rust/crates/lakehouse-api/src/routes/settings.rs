@@ -758,7 +758,8 @@ const EMAIL_FIELDS: [&str; 7] = [
 ///
 /// `fields` are the names the body may carry; anything else is refused with
 /// `shape`, the fixed sentence that names them.
-fn parse_body(
+// ADM-11 review 1 S3: pub(crate) so routes::identity reuses this helper for PATCH parsing.
+pub(crate) fn parse_body(
     body: &Bytes,
     fields: &[&str],
     shape: &str,
