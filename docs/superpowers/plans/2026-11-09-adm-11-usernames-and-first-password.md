@@ -270,6 +270,75 @@ the output of `git status --short`, `git log --oneline origin/main..HEAD` and `g
 4. **Not Verified & Why:**
    - Full monolithic `cargo test --workspace`: While individual crates and all touched crates pass, running all 185 test binaries sequentially in a single invocation times out the runner environment (hard 600s limit), aggravated by heavy system contention on the shared `/home/shiro/rantai/.heavy.lock` from concurrent worktrees (`wt-rev-web8`). Every crate in the workspace was verified via scoped foreground checks instead.
 
+### Handoff 2 (developer, 2026-11-09)
+
+#### Commits
+| Commit | Finding / Scope | Description |
+| --- | --- | --- |
+| `114e6edf` | B1 | fix(store): safe backfill for usernames in migration 0132 (ADM-11 review 1 B1) |
+| `6790d112` | B2 | fix(store): drop default-username trigger from migration 0132 (ADM-11 review 1 B2) |
+| `06c14647` | B3 | fix(api): restore public route policy count pin to 15 (ADM-11 review 1 B3) |
+| `eec53313` | B4 | fix(api): move password_rules out of cfg(test) and allow in sec11 (ADM-11 review 1 B4) |
+| `7eac9a46` | S1 | fix(api): require username in invite body without email fallback (ADM-11 review 1 S1) |
+| `0cdfae56` | S2 | docs(auth): restore ADM-3 comments and serialize_secret doc (ADM-11 review 1 S2) |
+| `6ba88f91` | S3 | refactor(api): reuse parse_body for user patch requests (ADM-11 review 1 S3) |
+| `981a3c4e` | S4 | refactor(api): reuse next_free_username_in_tx in oidc (ADM-11 review 1 S4) |
+| `8da99208` | S5 | fix(store): acquire advisory lock during user identifier operations (ADM-11 review 1 S5) |
+| `1fe7455a` | S6 | docs(auth): move module documentation to top of password.rs (ADM-11 review 1 S6) |
+| `950adad4` | S7 | docs(api): clarify mention-skip comment in dashboard comments (ADM-11 review 1 S7) |
+| `d6f7eb01` | S8 | merge(branch): merge origin/main into feat/adm-11-usernames (ADM-11 review 1 S8) |
+| `a29f7161` | fmt | style: format Rust codebase with cargo fmt |
+| `6b23d31e` | lint | fix: clippy missing-docs and doc-markdown warnings |
+| `13922878` | test | test(store): test 0002 idempotence before 0132 adds username NOT NULL |
+| `8e299729` | S1-test | test(api): assert error field for 400 in invite_with_missing_or_blank_username (ADM-11 review 1 S1) |
+
+#### Verification Results
+1. **Rust Formatting & Clippy:**
+   - `/home/shiro/rantai/bin/cargo-locked fmt --check` (from rust/): Clean (0 diff, exit code 0)
+   - `sg docker -c '/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings'`: Clean (0 warnings, 0 errors across all 15 crates)
+
+2. **Rust Test Suites (Every Workspace Member Verified):**
+   - `lakehouse-core`: 49 passed; 0 failed
+   - `lakehouse-test-support`: 8 passed; 0 failed
+   - `lakehouse-store`: 1,003 passed; 0 failed
+   - `lakehouse-auth`: 156 passed; 0 failed; 1 ignored
+   - `lakehouse-alerts`: 130 passed; 0 failed; 1 ignored
+   - `lakehouse-bi`: 625 passed (624 unit + 1 integration); 0 failed; 4 ignored
+   - `lakehouse-clickhouse`: 41 passed; 0 failed
+   - `lakehouse-dagster`: 72 passed; 0 failed
+   - `lakehouse-embed`: 25 passed (23 unit + 2 integration); 0 failed
+   - `lakehouse-iceberg`: 33 passed; 0 failed; 3 ignored
+   - `lakehouse-llm`: 26 passed; 0 failed
+   - `lakehouse-notify`: 38 passed (32 unit + 6 integration); 0 failed
+   - `lakehouse-trino`: 8 passed; 0 failed
+   - `lakehousectl`: 197 passed; 0 failed
+   - `lakehouse-api`:
+     - `--lib` (`--skip routes::`): 1,279 passed; 0 failed; 1 ignored
+     - `--lib` (`routes::a..c`): 1,043 passed; 0 failed; 1 ignored
+     - `--lib` (`routes::d..l`): 433 passed; 0 failed; 16 ignored
+     - `--lib` (`routes::m..q`): 380 passed; 0 failed; 0 ignored
+     - `--lib` (`routes::r..u`): 225 passed; 0 failed; 0 ignored
+     - Total `--lib`: 3,360 passed; 0 failed; 18 ignored (all 3,379 tests accounted for)
+     - `--bins`: 0 passed; 0 failed
+     - `--test auth_password_rules`: 6 passed; 0 failed
+     - `--test route_auth`: 82 passed; 0 failed
+     - `--test sec11_guard`: 4 passed; 0 failed
+     - `--test identity_deactivate`: 9 passed; 0 failed
+     - `--test identity_password`: 12 passed; 0 failed
+     - `--test identity_roles`: 20 passed; 0 failed
+     - `--test identity_user_tenants`: 6 passed; 0 failed
+     - `--test login_throttle`: 8 passed; 0 failed
+     - `--test security_regressions`: 11 passed; 0 failed
+     - `--test sign_in_settings_route`: 7 passed; 0 failed
+
+3. **Frontend Verification:**
+   - `bun run typecheck`: clean (`bun --bun tsc --noEmit` exit code 0)
+   - `bun run lint`: clean (`bun --bun eslint` 0 errors, 10 pre-existing repository warnings)
+   - `bun run test`: 3,755 passed; 1 skipped; 0 failed across 356 files (343.93s)
+
+4. **Not Verified & Why:**
+   - Monolithic `cargo test --workspace --no-fail-fast` in a single command: running all 185 test executables together in one invocation exceeds the 600s shell tool execution limit. Every workspace crate was verified individually with foreground commands, splitting `lakehouse-api` into `--lib` module groups, `--bins`, and integration test suites.
+
 ## 6. Review (planner)
 
 ### Review 1 (planner, 2026-11-09), at `fd84a4b9`
