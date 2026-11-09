@@ -252,3 +252,71 @@ None.
 
 
 ## 6. Review (planner)
+
+### Review 1 (planner, 2026-11-09), S1 at `6a03c274`
+
+Pushes checked: `git ls-remote` shows `6a03c274`; `origin/main..origin/feat/web-8-s1-permission-catalog`
+is the four commits in the handoff plus the plan commit.
+
+**Plan correction (D7).** D7 said the area checkbox writes `area:*`. Areas (Data, Dashboards, …) are
+console groups, not permission resources, so `area:*` is not a token the server knows. The
+correct rule: "All in this area" ticks every listed permission of that area, which is what the
+code does. Resource wildcards (`pipeline:*`, `policy:*`, as Data Engineer and Governance Admin
+hold today) are handled by finding B1.
+
+- **B1 `BLOCKER`: resource wildcards show as "Not recognised".** `permission-picker.tsx`
+  `unknownTokens` treats every token except `*:*` that is not an exact catalog name as unknown.
+  The seeded Data Engineer (`pipeline:*`) and Governance Admin (`policy:*`) roles therefore show
+  their main grant as "Not recognised", with a remove button. That invites an admin to strip a
+  working grant. The server (`is_known`) accepts these.
+  *Fix:* a token `resource:*` is known when some catalog name has that resource, mirroring
+  `permission_catalog::is_known`. Show each held resource wildcard as a checked, removable chip
+  "All `pipeline:` permissions". Show the permissions it covers as checked and disabled, with
+  "covered by `pipeline:*`". `*:*` stays as it is. Add Bun tests for a role holding `pipeline:*`
+  and for one holding `policy:*`.
+- **B2 `BLOCKER`: a failed catalog load turns every grant into "Not recognised".** On a fetch
+  error the picker sets `loading=false` with an empty catalog. Every held token then renders as
+  unknown and removable, and the error is swallowed.
+  *Fix:* load through `useService(identityService.listPermissions)`. That also removes the
+  hand-rolled `useEffect` fetch, which breaks the `useService` rule in `AGENTS.md`. On error,
+  render the existing error state (`components/patterns/page-states.tsx`) with Retry, and do
+  not render the editable picker. Add a Bun test for this case.
+- **S1 `SHOULD-FIX`:** `routes/identity.rs` `check_permissions` returns `Result` but has no
+  `# Errors` section (`AGENTS.md` Rust rule). Add one.
+- **S2 `SHOULD-FIX`: merge `origin/main` into the branch.** The branch was cut from the plan
+  commit `a6f7863a`, and `main` has the squashed `e4de49ea`. The merge conflicts in two docs
+  files:
+  - `docs/core/BACKLOG.md`: take `main`'s;
+  - this plan file: keep the branch's, with the handoff and this review.
+
+  Resolve hunk by hunk (rule 9), then rerun the scoped checks.
+
+**Checked and correct.**
+- The catalog covers every string in the research list.
+- `is_known` matches `PermissionSet::parse`'s grammar.
+- The drift test reads `POLICY_TABLE`, the tool permissions and the `.has("…")` literals.
+- The fixture equality test passes.
+- `check_permissions` keeps held tokens on update.
+- `UnknownPermissions` renders `{"error","unknown"}` with 400 and no upstream text.
+- The new route is in `POLICY_TABLE` and asserted both ways.
+- There is no `query:run` left in `src/`.
+- The service identity scopes use the same picker. There is no service identity update route,
+  so D3's "update" applies only to roles. That is correct.
+
+**Verification rerun by the planner.** Run on `6a03c274` with `origin/main` (`e4de49ea`) merged
+locally (docs conflicts resolved as in S2). Run in the foreground:
+
+```
+cargo fmt --check                                                   clean
+cargo clippy --workspace --all-targets --all-features -- -D warnings  clean (3m57s)
+cargo test --workspace         191 result lines: 7145 passed, 0 failed, 35 ignored
+bun run typecheck                                                   clean
+bun run lint                                                        0 errors, 10 warnings (pre-existing)
+bun run test                   3757 pass, 1 skip, 0 fail, 357 files
+```
+
+The developer's handoff ran `cargo test --workspace --lib` plus named suites, because a single
+workspace run hit their 600-second tool limit, and said so. The full run above covers that
+gap.
+
+**Not verified:** the picker in a real browser (Bun DOM tests only).
