@@ -152,6 +152,7 @@ pub(crate) fn export_failure(
 fn auth_router() -> Router<AppState> {
     Router::new()
         .route("/api/auth/login", axum::routing::post(auth::login))
+        .route("/api/auth/password-rules", get(auth::password_rules))
         .route("/api/auth/logout", axum::routing::post(auth::logout))
         .route("/api/auth/me", get(auth::me))
         .route(

@@ -190,6 +190,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/public/dashboard/{token}/maps/{id}/geojson", Policy::Public),
     ("POST", "/api/embed/maps/{id}/geojson",      Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
+    ("GET",  "/api/auth/password-rules",          Policy::Public),
     // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
     // cookie. Mirrors `/api/auth/login`'s existing `Policy::Public`.
@@ -1214,6 +1215,7 @@ const ALLOWED_WHILE_MUST_CHANGE_PASSWORD: &[(&str, &str)] = &[
     ("POST", "/api/auth/change-password"),
     ("POST", "/api/auth/logout"),
     ("GET", "/api/auth/me"),
+    ("GET", "/api/auth/password-rules"),
 ];
 
 /// Whether `(method, path)` stays reachable for a principal that still

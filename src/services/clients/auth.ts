@@ -44,7 +44,7 @@ async function parse<T>(res: Response, fallback: string): Promise<T> {
       // Same message regardless of *why* — non-enumeration mirrors the
       // backend's own guarantee (see `routes/auth.rs`'s module doc
       // comment): never reveal "no such email" vs "wrong password".
-      throw new ServiceError("permission_denied", json?.error ?? "Invalid email or password.");
+      throw new ServiceError("permission_denied", json?.error ?? "Invalid username/email or password.");
     }
     if (res.status === 400 || res.status === 422) {
       throw new ServiceError("invalid_request", json?.error ?? fallback);
