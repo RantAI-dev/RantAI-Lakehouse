@@ -1392,8 +1392,9 @@ pub struct GranteePerson {
     pub id: Uuid,
     /// The person's display name.
     pub name: String,
-    /// The person's email address.
-    pub email: String,
+    /// The person's email address; `None` when the account has none
+    /// (ADM-11 D1 made the column nullable).
+    pub email: Option<String>,
 }
 
 /// One role a saved query may be shared with.

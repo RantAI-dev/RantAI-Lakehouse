@@ -715,7 +715,9 @@ pub async fn search_active_users(
     needle: &str,
     limit: i64,
     tenant_ids: &[Uuid],
-) -> Result<Vec<(Uuid, String, String)>, StoreError> {
+    // ADM-11 D1: `email` may be NULL now, so the row type carries the
+    // option rather than assuming every active user has an address.
+) -> Result<Vec<(Uuid, String, Option<String>)>, StoreError> {
     let escaped = needle
         .replace('\\', "\\\\")
         .replace('%', "\\%")

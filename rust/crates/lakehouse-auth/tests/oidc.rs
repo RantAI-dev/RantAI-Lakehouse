@@ -582,8 +582,8 @@ async fn a_deactivated_user_is_refused_at_an_oidc_sign_in(pool: PgPool) -> sqlx:
     // already linked to them.
     let user_id = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) \
-         VALUES ($1, 'Switched Off', 'switched-off@meridian.example', 'inactive')",
+        "INSERT INTO app_user (id, name, username, email, status) \
+         VALUES ($1, 'Switched Off', 'switched-off', 'switched-off@meridian.example', 'inactive')",
     )
     .bind(user_id)
     .execute(&pool)
@@ -622,8 +622,8 @@ async fn a_deactivated_user_is_not_re_provisioned_by_jit(pool: PgPool) -> sqlx::
     let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), true);
 
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) \
-         VALUES ($1, 'Switched Off', 'switched-off-jit@meridian.example', 'inactive')",
+        "INSERT INTO app_user (id, name, username, email, status) \
+         VALUES ($1, 'Switched Off', 'switched-off-jit', 'switched-off-jit@meridian.example', 'inactive')",
     )
     .bind(uuid::Uuid::new_v4())
     .execute(&pool)

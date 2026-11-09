@@ -2180,8 +2180,8 @@ async fn personal_space_id(pool: &PgPool, owner: Uuid) -> String {
 async fn a_third_reader(pool: &PgPool) -> String {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) \
-                 VALUES ($1, 'Nadia Rahma', 'nadia@meridian.example', 'active')",
+        "INSERT INTO app_user (id, name, username, email, status) \
+                 VALUES ($1, 'Nadia Rahma', 'nadia', 'nadia@meridian.example', 'active')",
     )
     .bind(id)
     .execute(pool)

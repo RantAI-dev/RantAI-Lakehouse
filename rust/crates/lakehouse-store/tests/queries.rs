@@ -3705,7 +3705,8 @@ async fn the_grantee_search_finds_a_person_by_name_and_by_email(pool: PgPool) ->
         .unwrap();
     assert!(
         by_name.people.iter().any(|grantee| {
-            grantee.name == "Rina Wijaya" && grantee.email == "rina@meridian.example"
+            grantee.name == "Rina Wijaya"
+                && grantee.email.as_deref() == Some("rina@meridian.example")
         }),
         "the person is found by their name"
     );
@@ -3749,11 +3750,14 @@ async fn the_grantee_search_finds_a_role_by_name(pool: PgPool) -> sqlx::Result<(
 async fn the_grantee_search_treats_the_wildcards_literally(pool: PgPool) -> sqlx::Result<()> {
     let group = tenant(GROUP_TENANT);
     let person_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email) VALUES ($1, 'Fifty % Off', $2)")
-        .bind(person_id)
-        .bind("fifty@meridian.example")
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email) VALUES ($1, 'Fifty % Off', $2, $3)",
+    )
+    .bind(person_id)
+    .bind("fifty")
+    .bind("fifty@meridian.example")
+    .execute(&pool)
+    .await?;
     sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
         .bind(person_id)
         .bind(group)
@@ -3789,9 +3793,11 @@ async fn the_grantee_search_answers_with_the_tenants_people_only(pool: PgPool) -
     let group = tenant(GROUP_TENANT);
     let inactive = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Sleepy Person', $2, 'inactive')",
+        "INSERT INTO app_user (id, name, username, email, status) \
+         VALUES ($1, 'Sleepy Person', $2, $3, 'inactive')",
     )
     .bind(inactive)
+    .bind(format!("sleepy-{inactive}"))
     .bind("sleepy@meridian.example")
     .execute(&pool)
     .await?;
@@ -3848,7 +3854,10 @@ async fn grantee_labels_name_a_person_of_the_tenant_and_a_role(pool: PgPool) -> 
     assert_eq!(labels.people.len(), 1, "{labels:?}");
     assert_eq!(labels.people[0].id, person(RINA));
     assert_eq!(labels.people[0].name, "Rina Wijaya");
-    assert_eq!(labels.people[0].email, "rina@meridian.example");
+    assert_eq!(
+        labels.people[0].email.as_deref(),
+        Some("rina@meridian.example")
+    );
     assert_eq!(labels.roles.len(), 1, "{labels:?}");
     assert_eq!(labels.roles[0].id, person(ANALYST_ROLE));
     assert_eq!(labels.roles[0].name, "Analyst");
@@ -3883,9 +3892,11 @@ async fn grantee_labels_keep_the_name_of_an_inactive_person(pool: PgPool) -> sql
     let group = tenant(GROUP_TENANT);
     let inactive = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Sleepy Person', $2, 'inactive')",
+        "INSERT INTO app_user (id, name, username, email, status) \
+         VALUES ($1, 'Sleepy Person', $2, $3, 'inactive')",
     )
     .bind(inactive)
+    .bind(format!("sleepy-{inactive}"))
     .bind("sleepy@meridian.example")
     .execute(&pool)
     .await?;
@@ -3901,7 +3912,10 @@ async fn grantee_labels_keep_the_name_of_an_inactive_person(pool: PgPool) -> sql
 
     assert_eq!(labels.people.len(), 1, "{labels:?}");
     assert_eq!(labels.people[0].name, "Sleepy Person");
-    assert_eq!(labels.people[0].email, "sleepy@meridian.example");
+    assert_eq!(
+        labels.people[0].email.as_deref(),
+        Some("sleepy@meridian.example")
+    );
     Ok(())
 }
 

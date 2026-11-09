@@ -1941,7 +1941,8 @@ async fn seed_user(pool: &PgPool, email: &str) -> Uuid {
         pool,
         &lakehouse_store::identity::InviteUserInput {
             name: "Pipeline Author".to_owned(),
-            email: email.to_owned(),
+            username: email.to_owned(),
+            email: Some(email.to_owned()),
             roles: Vec::new(),
             tenants: Vec::new(),
         },

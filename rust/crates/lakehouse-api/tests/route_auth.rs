@@ -2169,13 +2169,15 @@ async fn create_tenant_writes_an_audit_event_on_success() {
 #[tokio::test]
 async fn delete_session_writes_an_audit_event() {
     let TestApp { router, pool } = spin_up().await;
-    let user_id: Uuid =
-        sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-            .bind("caller")
-            .bind("caller-audit-revoke@x.invalid")
-            .fetch_one(&pool)
-            .await
-            .expect("insert a caller");
+    let user_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind("caller")
+    .bind("caller-audit-revoke")
+    .bind("caller-audit-revoke@x.invalid")
+    .fetch_one(&pool)
+    .await
+    .expect("insert a caller");
 
     // Two sessions: one carries the cookie doing the DELETE, one is
     // the target. `revoke_session` checks ownership via the SQL

@@ -263,7 +263,7 @@ async fn fixture_in(target: &str, tenant: &str) -> Fixture {
         .execute(&app.pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Owner', 'owner@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Owner', 'owner', 'owner@test.invalid', 'active')")
         .bind(owner)
         .execute(&app.pool)
         .await
@@ -399,7 +399,7 @@ async fn an_owner_who_is_disabled_stops_the_alert_and_says_why() {
     let cookie_owner = f.owner;
     // A second, active person triggers the run; the owner is then disabled.
     let other = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Other', 'other@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Other', 'other', 'other@test.invalid', 'active')")
         .bind(other)
         .execute(&f.app.pool)
         .await
@@ -615,7 +615,7 @@ async fn renaming_a_rule_keeps_its_state() {
 async fn an_owner_who_lost_the_dashboard_stops_the_alert() {
     let f = fixture("owner@test.invalid").await;
     let other = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Other', 'o2@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Other', 'o2', 'o2@test.invalid', 'active')")
         .bind(other)
         .execute(&f.app.pool)
         .await
@@ -692,9 +692,10 @@ async fn writer(pool: &PgPool, name: &str, permissions: &str) -> Uuid {
     .await
     .unwrap();
     let user = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, 'active')")
         .bind(user)
         .bind(format!("{name} person"))
+        .bind(user.to_string())
         .bind(format!("{user}@test.invalid"))
         .execute(pool)
         .await
@@ -773,7 +774,7 @@ async fn a_mart_rules_disabled_owner_stops_it_with_the_sentence_and_sends_nothin
     *f.fake.plain.lock().unwrap() = true;
     let owner = f.owner;
     let trigger = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Trigger', 'trigger@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Trigger', 'trigger', 'trigger@test.invalid', 'active')")
         .bind(trigger)
         .execute(&f.app.pool)
         .await

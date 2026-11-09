@@ -789,7 +789,13 @@ async fn notify(state: &AppState, author: &Principal, target: &Target, people: &
             else {
                 continue;
             };
-            let sent = sender.send(person.email.trim(), subject, &html).await;
+            // ADM-11 D9: a mentioned account without an email address is
+            // skipped (T4 records the reason on the send path).
+            let Some(address) = person.email.as_deref() else {
+                tracing::warn!("a mention email was skipped: the user has no email address");
+                continue;
+            };
+            let sent = sender.send(address.trim(), subject, &html).await;
             if !sent.ok {
                 tracing::warn!("a mention email was not sent");
             }

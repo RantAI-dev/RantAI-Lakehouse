@@ -420,7 +420,9 @@ impl GranteeNames {
     /// found, the name alone for a role found, neither otherwise.
     fn of(&self, rule: &ItemRule) -> (Option<String>, Option<String>) {
         if let Some(person) = rule.user_id.and_then(|id| self.people.get(&id)) {
-            return (Some(person.name.clone()), Some(person.email.clone()));
+            // ADM-11 D1: a person's email is itself optional now, so the
+            // clone carries the option, not a nested one.
+            return (Some(person.name.clone()), person.email.clone());
         }
         if let Some(role) = rule.role_id.and_then(|id| self.roles.get(&id)) {
             return (Some(role.name.clone()), None);
@@ -454,8 +456,9 @@ pub struct GranteePersonWire {
     pub id: String,
     /// The person's display name.
     pub name: String,
-    /// The person's email address.
-    pub email: String,
+    /// The person's email address; `None` when the account has none
+    /// (ADM-11 D1), sent as `null`.
+    pub email: Option<String>,
 }
 
 impl GranteePersonWire {

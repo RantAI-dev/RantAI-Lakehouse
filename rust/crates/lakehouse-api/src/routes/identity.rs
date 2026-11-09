@@ -255,9 +255,15 @@ pub async fn create_user(
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<InviteUserResponse>)> {
     let body: InviteUserBody = parse_body(&body)?;
+    let email = required("email", &body.email)?;
     let input = InviteUserInput {
         name: required("name", &body.name)?,
-        email: required("email", &body.email)?,
+        // ADM-11 interim: D7 (later task, same branch) adds `username` to
+        // this body; until that rewrite an invite keeps deriving the
+        // username from the email, exactly as migration 0132's backfill
+        // does and as the bootstrap admin (D12) does.
+        username: email.to_lowercase(),
+        email: Some(email),
         roles: body.roles,
         tenants: body.tenants,
     };

@@ -346,7 +346,10 @@ pub async fn me(
     let (email, roles) = match principal.id {
         PrincipalId::User(user_id) => match state.pg.as_deref() {
             Some(pool) => match identity::get_user(pool, &user_id.to_string()).await {
-                Ok(user) => (Some(user.email), user.roles),
+                // ADM-11 D6: a user may have no email at all, so the
+                // lookup's success no longer implies an address exists —
+                // `None` means the account has none.
+                Ok(user) => (user.email, user.roles),
                 Err(_) => (None, Vec::new()),
             },
             None => (None, Vec::new()),
@@ -593,11 +596,19 @@ pub async fn change_password(
             return Err(ApiError::BadRequest("oldPassword is required".to_owned()).into());
         };
         let user = identity::get_user(pool, &user_id.to_string()).await?;
-        password::verify(pool, &user.email, &Secret::new(old_password))
-            .await
-            .inspect_err(|_| {
-                tracing::warn!("change-password rejected: old password did not verify");
-            })?;
+        // ADM-11 T2 note: this still verifies by identifier (the email, as
+        // before ADM-11); until D6's `verify_for_user` lands in the same
+        // branch, an account without an email cannot pass this check — the
+        // empty identifier matches no local identity.
+        password::verify(
+            pool,
+            user.email.as_deref().unwrap_or(""),
+            &Secret::new(old_password),
+        )
+        .await
+        .inspect_err(|_| {
+            tracing::warn!("change-password rejected: old password did not verify");
+        })?;
     }
 
     password::change_password(pool, user_id, &Secret::new(new_password)).await?;
@@ -2202,12 +2213,14 @@ mod tests {
     ) -> sqlx::Result<()> {
         use lakehouse_test_support as _;
 
-        let user_id: Uuid =
-            sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-                .bind("caller")
-                .bind("caller@x.invalid")
-                .fetch_one(&pool)
-                .await?;
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind("caller")
+        .bind("caller")
+        .bind("caller@x.invalid")
+        .fetch_one(&pool)
+        .await?;
 
         let token = lakehouse_auth::session::create_session(
             &pool,

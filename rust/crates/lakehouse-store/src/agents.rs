@@ -1773,8 +1773,9 @@ pub struct AssetGrant {
     pub id: String,
     /// The grantee's name.
     pub user: String,
-    /// The grantee's e-mail, so two people with one name can be told apart.
-    pub user_email: String,
+    /// The grantee's e-mail, so two people with one name can be told
+    /// apart; `None` when the account has none (ADM-11 D1).
+    pub user_email: Option<String>,
     /// The permission token granted.
     pub permission: String,
     /// When it was granted, ISO 8601.
@@ -1793,7 +1794,7 @@ pub struct AssetGrant {
 struct AssetGrantRow {
     id: String,
     user_name: String,
-    user_email: String,
+    user_email: Option<String>,
     permission: String,
     granted_at: OffsetDateTime,
     expires_at: OffsetDateTime,
@@ -2062,13 +2063,15 @@ mod access_request_tests {
     /// `create_access_request` only needs `requested_by_user_id` to
     /// reference a real `app_user`), returning its id.
     async fn seed_test_user(pool: &PgPool, email: &str) -> Uuid {
-        let (id,): (Uuid,) =
-            sqlx::query_as("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-                .bind(email)
-                .bind(email)
-                .fetch_one(pool)
-                .await
-                .expect("seeding a test app_user must succeed");
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(email)
+        .bind(email.to_lowercase())
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .expect("seeding a test app_user must succeed");
         id
     }
 
@@ -2166,7 +2169,7 @@ mod access_request_tests {
         assert_eq!(here[0].id, made.id);
         assert_eq!(here[0].via, "direct");
         assert_eq!(here[0].permission, "query:read");
-        assert_eq!(here[0].user_email, "user@tenant-a.invalid");
+        assert_eq!(here[0].user_email.as_deref(), Some("user@tenant-a.invalid"));
         assert_eq!(
             here[0].granted_by.as_deref(),
             Some("admin@tenant-a.invalid")

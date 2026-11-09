@@ -1274,7 +1274,11 @@ async fn tell_owner(
         return;
     };
     let address = match lakehouse_store::identity::get_user(pool, &sub.owner_id.to_string()).await {
-        Ok(user) if user.status == "active" => normalise_address(&user.email),
+        Ok(user) if user.status == "active" => {
+            // ADM-11 D9: an owner without an email address has none to
+            // tell — `None`, not an empty string.
+            user.email.as_deref().and_then(normalise_address)
+        }
         _ => None,
     };
     let Some(address) = address else {

@@ -2862,14 +2862,17 @@ mod sql_gate_enforcement {
         .await
         .expect("insert the role");
         let user = Uuid::new_v4();
-        sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, $4)")
-            .bind(user)
-            .bind(format!("{role} person"))
-            .bind(format!("{user}@test.invalid"))
-            .bind(status)
-            .execute(pool)
-            .await
-            .expect("insert the person");
+        sqlx::query(
+            "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(user)
+        .bind(format!("{role} person"))
+        .bind(user.to_string())
+        .bind(format!("{user}@test.invalid"))
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert the person");
         sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
             .bind(user)
             .bind(role_id)
