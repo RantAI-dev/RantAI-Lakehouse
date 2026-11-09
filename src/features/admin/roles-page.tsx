@@ -21,6 +21,7 @@ import { notifySuccess, withNotify } from "@/lib/notify"
 import { identityService } from "@/services"
 import type { Role } from "@/services/contracts/identity"
 import { getRoleColumns } from "./roles-columns"
+import { PermissionPicker } from "./permission-picker"
 
 /**
  * Roles (`WEB-3` S3-D8, was "Teams & Roles"): create, edit and delete a
@@ -207,11 +208,10 @@ function RoleFields({
       </div>
       <div className="space-y-1.5">
         <Label htmlFor={`${idPrefix}-perms`}>Permissions</Label>
-        <Input
+        <PermissionPicker
           id={`${idPrefix}-perms`}
           value={permissions}
-          onChange={(e) => onPermissions(e.target.value)}
-          placeholder="catalog:read, query:run"
+          onChange={onPermissions}
         />
       </div>
       <div className="space-y-1.5">

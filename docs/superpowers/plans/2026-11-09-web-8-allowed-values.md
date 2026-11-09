@@ -183,4 +183,200 @@ Each entry gives the commits, the exact commands with their counts, anything *no
 with the reason, and the output of `git status --short`, `git log --oneline origin/main..HEAD`
 and `git ls-remote --heads origin <branch>`.
 
+### Handoff (developer, 2026-11-09)
+
+Slice S1 is complete, verified, committed, and pushed to `origin/feat/web-8-s1-permission-catalog`.
+
+#### Commits
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1 | `7cc2444f` | `feat(auth): the central permission catalog (WEB-8 T1, D1/D2/D5/D6)` |
+| T2 | `bb78b8e0` | `feat(api): permission catalog route and refusal of unknown permissions (WEB-8 T2, D3/D4)` |
+| T3 | `f939ad0a` | `feat(console): permission picker for roles and service identities (WEB-8 T3, D7)` |
+
+#### Verification Commands & Counts
+
+- **T1:**
+  - `cargo test -p lakehouse-auth permission_catalog`: ok (75 passed in unittests)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test permission_catalog'`: 2 passed; 0 failed; 1 ignored
+  - `clippy`: clean with `-D warnings` on both `lakehouse-auth` and `lakehouse-api`.
+  - **Drift test failure demonstration:** Temporarily removed `catalog:read` from `PERMISSIONS` in `rust/crates/lakehouse-auth/src/permission_catalog.rs` and ran `cargo test -p lakehouse-api --test permission_catalog`:
+    ```
+    thread 'every_permission_the_api_checks_is_in_the_catalog' (2477714) panicked at crates/lakehouse-api/tests/permission_catalog.rs:107:5:
+    permissions the API checks but the catalog does not list: ["catalog:read", ...]
+    failures:
+        every_permission_the_api_checks_is_in_the_catalog
+        the_committed_fixture_equals_the_catalog
+    test result: FAILED. 0 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.13s
+    ```
+    The change was immediately reverted and tests re-verified green.
+
+- **T2:**
+  - `cargo test -p lakehouse-core`: 50 passed; 0 failed
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test identity_roles'`: 24 passed; 0 failed (asserts 400 with unknown tokens list, `area:*` and `*:*` accepted, unknown token preserved on update, `GET /api/identity/permissions` refused without `identity:read`)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test route_auth'`: 83 passed; 0 failed (`permissions_route_is_gated_in_both_directions` asserted both ways)
+  - `cargo test -p lakehouse-api --lib route_policy_tests`: 2 passed; 0 failed (every policy table entry mounted and gated)
+
+- **T3:**
+  - `bun test src/features/admin`: 92 passed; 0 failed across 15 files (including all 6 tests in `permission-picker.test.tsx`: grouped by area, 'All in this area' toggle, 'Not recognised' removable chip, comma string payload, `*:*` full access, zero `query:run` in `src/`)
+  - `bun run typecheck`: clean, exited 0
+  - `bun run lint`: 0 errors, 10 pre-existing warnings
+
+- **Full Verification:**
+  - `cd rust && /home/shiro/rantai/bin/cargo-locked fmt --check`: clean (exit 0)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings'`: clean (exit 0, finished in 3m 18s)
+  - `bun run typecheck`: clean (exit 0)
+  - `bun run lint`: clean (exit 0, 10 warnings, 0 errors)
+  - `bun test`: 3,731 passed; 1 skipped; 0 failed; 11,117 expect() calls across 356 files (finished in 202.54s)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test --workspace --lib'`: 14 crates passed (exit 0, including `lakehouse-api` 3,346 passed, `lakehouse-auth` 75 passed, `lakehouse-core` 50 passed)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-auth'`: 162 passed (75 unittests + 28 oidc + 15 openfga + 5 password + 8 repository + 8 service_token + 9 session + 14 throttle)
+  - *Not verified in full single invocation:* Monolithic `cargo test --workspace` (without `--lib`) timed out at the harness 600s limit due to 75 integration test suites each spinning up docker containers sequentially; all individual affected crates, library suites, and integration test suites were verified directly.
+
+#### Open Mismatches
+None.
+
+#### Git Status & Remote State
+- `git status --short`: clean (no uncommitted changes)
+- `git log --oneline origin/main..HEAD`:
+  ```
+  f939ad0a feat(console): permission picker for roles and service identities (WEB-8 T3, D7)
+  bb78b8e0 feat(api): permission catalog route and refusal of unknown permissions (WEB-8 T2, D3/D4)
+  7cc2444f feat(auth): the central permission catalog (WEB-8 T1, D1/D2/D5/D6)
+  a6f7863a docs(plan): ADM-13, GOV-7, ADM-11, ADM-12, WEB-7 and WEB-8 specs, feature pages and plans
+  ```
+- `git ls-remote --heads origin feat/web-8-s1-permission-catalog`:
+  ```
+  f939ad0abb78728d53e810797ba8a992e8f6248c	refs/heads/feat/web-8-s1-permission-catalog
+  ```
+
+
+### Handoff 2 (developer, 2026-11-09)
+
+Review 1 findings (B1, B2, S1, S2) addressed and verified.
+
+#### Commits
+- **B1:** `ca2b88a8 fix(console): recognise resource wildcards in permission picker (WEB-8 review 1 B1)`
+  A token `resource:*` is known when some catalog name has that resource, mirroring `permission_catalog::is_known`. Shows each held resource wildcard as a checked, removable chip "All `<resource>:` permissions". Shows the permissions it covers as checked and disabled, with "covered by `<resource>:*`". Added Bun tests for roles holding `pipeline:*` and `policy:*`.
+- **B2:** `4db2a603 fix(console): load permissions through useService and render ErrorState on failure (WEB-8 review 1 B2)`
+  Loaded permissions through `useService(identityService.listPermissions)` instead of hand-rolled `useEffect`. On fetch failure, renders `ErrorState` with Retry from `components/patterns/page-states.tsx` and does not render the editable picker or show grants as unrecognised. Added Bun test for fetch failure.
+- **S1:** `18917f0f docs(api): add # Errors section to check_permissions (WEB-8 review 1 S1)`
+  Added `# Errors` section to `check_permissions` rustdoc in `rust/crates/lakehouse-api/src/routes/identity.rs` per `AGENTS.md` Rust rules.
+- **S2:** `7bbb85d6 Merge remote-tracking branch 'origin/main' into feat/web-8-s1-permission-catalog (WEB-8 review 1 S2)`
+  Merged `origin/main` into the branch. Resolved docs conflicts: `docs/core/BACKLOG.md` took `origin/main`'s version, and the plan file kept the branch's version.
+
+#### Verification
+- `bun run typecheck`: clean (exit 0)
+- `bun run lint`: clean (0 errors, 10 pre-existing warnings)
+- `bun test src/features/admin`: 95 pass, 0 fail, 1462 expect() calls across 15 files (including all 9 tests in `permission-picker.test.tsx`)
+- `cd rust && /home/shiro/rantai/bin/cargo-locked fmt --check`: clean (exit 0)
+- `sg docker -c 'CARGO_TARGET_DIR=/home/shiro/rantai/target /home/shiro/rantai/bin/cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings'`: clean (exit 0, finished in 3m 35s)
+- `sg docker -c 'CARGO_TARGET_DIR=/home/shiro/rantai/target /home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test identity_roles'`: 24 passed; 0 failed (exit 0, finished in 12.51s)
+
+#### Anything Not Verified
+Full repository-wide checks (`cargo test --workspace` and `bun test`) were not run in this remediation turn; scoped checks for the touched packages (`src/features/admin` and `lakehouse-api`) were run in the foreground and verified green.
+
+
 ## 6. Review (planner)
+
+### Review 1 (planner, 2026-11-09), S1 at `6a03c274`
+
+Pushes checked: `git ls-remote` shows `6a03c274`; `origin/main..origin/feat/web-8-s1-permission-catalog`
+is the four commits in the handoff plus the plan commit.
+
+**Plan correction (D7).** D7 said the area checkbox writes `area:*`. Areas (Data, Dashboards, …) are
+console groups, not permission resources, so `area:*` is not a token the server knows. The
+correct rule: "All in this area" ticks every listed permission of that area, which is what the
+code does. Resource wildcards (`pipeline:*`, `policy:*`, as Data Engineer and Governance Admin
+hold today) are handled by finding B1.
+
+- **B1 `BLOCKER`: resource wildcards show as "Not recognised".** `permission-picker.tsx`
+  `unknownTokens` treats every token except `*:*` that is not an exact catalog name as unknown.
+  The seeded Data Engineer (`pipeline:*`) and Governance Admin (`policy:*`) roles therefore show
+  their main grant as "Not recognised", with a remove button. That invites an admin to strip a
+  working grant. The server (`is_known`) accepts these.
+  *Fix:* a token `resource:*` is known when some catalog name has that resource, mirroring
+  `permission_catalog::is_known`. Show each held resource wildcard as a checked, removable chip
+  "All `pipeline:` permissions". Show the permissions it covers as checked and disabled, with
+  "covered by `pipeline:*`". `*:*` stays as it is. Add Bun tests for a role holding `pipeline:*`
+  and for one holding `policy:*`.
+- **B2 `BLOCKER`: a failed catalog load turns every grant into "Not recognised".** On a fetch
+  error the picker sets `loading=false` with an empty catalog. Every held token then renders as
+  unknown and removable, and the error is swallowed.
+  *Fix:* load through `useService(identityService.listPermissions)`. That also removes the
+  hand-rolled `useEffect` fetch, which breaks the `useService` rule in `AGENTS.md`. On error,
+  render the existing error state (`components/patterns/page-states.tsx`) with Retry, and do
+  not render the editable picker. Add a Bun test for this case.
+- **S1 `SHOULD-FIX`:** `routes/identity.rs` `check_permissions` returns `Result` but has no
+  `# Errors` section (`AGENTS.md` Rust rule). Add one.
+- **S2 `SHOULD-FIX`: merge `origin/main` into the branch.** The branch was cut from the plan
+  commit `a6f7863a`, and `main` has the squashed `e4de49ea`. The merge conflicts in two docs
+  files:
+  - `docs/core/BACKLOG.md`: take `main`'s;
+  - this plan file: keep the branch's, with the handoff and this review.
+
+  Resolve hunk by hunk (rule 9), then rerun the scoped checks.
+
+**Checked and correct.**
+- The catalog covers every string in the research list.
+- `is_known` matches `PermissionSet::parse`'s grammar.
+- The drift test reads `POLICY_TABLE`, the tool permissions and the `.has("…")` literals.
+- The fixture equality test passes.
+- `check_permissions` keeps held tokens on update.
+- `UnknownPermissions` renders `{"error","unknown"}` with 400 and no upstream text.
+- The new route is in `POLICY_TABLE` and asserted both ways.
+- There is no `query:run` left in `src/`.
+- The service identity scopes use the same picker. There is no service identity update route,
+  so D3's "update" applies only to roles. That is correct.
+
+**Verification rerun by the planner.** Run on `6a03c274` with `origin/main` (`e4de49ea`) merged
+locally (docs conflicts resolved as in S2). Run in the foreground:
+
+```
+cargo fmt --check                                                   clean
+cargo clippy --workspace --all-targets --all-features -- -D warnings  clean (3m57s)
+cargo test --workspace         191 result lines: 7145 passed, 0 failed, 35 ignored
+bun run typecheck                                                   clean
+bun run lint                                                        0 errors, 10 warnings (pre-existing)
+bun run test                   3757 pass, 1 skip, 0 fail, 357 files
+```
+
+The developer's handoff ran `cargo test --workspace --lib` plus named suites, because a single
+workspace run hit their 600-second tool limit, and said so. The full run above covers that
+gap.
+
+**Not verified:** the picker in a real browser (Bun DOM tests only).
+
+### Review 2 (planner, 2026-11-09), S1 at `e45812e5`
+
+- B1 fixed (`ca2b88a8`): resource wildcards (`pipeline:*`, `policy:*`) are recognised by the
+  same rule as `is_known`. They show as removable "All `x:` permissions" chips, and the
+  permissions they cover show as checked and disabled with "covered by". Tests cover both
+  seeded wildcards.
+- B2 fixed (`4db2a603`): the picker loads through `useService`. On error it renders
+  `ErrorState` with Retry and no editable picker. A test covers the failure.
+- S1 fixed (`18917f0f`). S2 done (`7bbb85d6`, `main` merged, docs conflicts resolved as
+  asked).
+- Minor, not blocking: "All in this area" reads as unticked when the area's permissions are
+  covered only by a wildcard. Left as is; it does not change what is saved.
+
+No open `BLOCKER`.
+
+**Verification rerun by the planner on `e45812e5`, in the foreground:**
+
+```
+cargo fmt --check                                                   clean
+cargo clippy --workspace --all-targets --all-features -- -D warnings  clean
+cargo test --workspace --no-fail-fast   191 result lines: 7145 passed, 0 failed, 35 ignored
+bun run typecheck                                                   clean
+bun run lint                                                        0 errors, 10 warnings (pre-existing)
+bun run test                            3760 pass, 1 skip, 0 fail
+```
+
+`upload_routes::two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches` failed
+once in a first workspace run, while two other worktrees were building on this machine. It
+passed alone, and the whole workspace passed on the second run. The branch does not touch
+uploads, so this is a timing-sensitive test and not caused by this PR. I will watch for it in
+CI.
+
+Approved for PR.

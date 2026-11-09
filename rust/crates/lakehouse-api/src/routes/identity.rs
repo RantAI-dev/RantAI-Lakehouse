@@ -60,6 +60,7 @@ use lakehouse_auth::PrincipalId;
 use lakehouse_auth::Secret;
 use lakehouse_auth::openfga::{LakekeeperAdminClient, TenantWarehouseStorage};
 use lakehouse_auth::password;
+use lakehouse_auth::permission_catalog::{self, PermissionInfo};
 use lakehouse_auth::session;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -1033,6 +1034,62 @@ fn user_status_audit_event(
 
 // ── Roles ───────────────────────────────────────────────────────────────
 
+/// `GET /api/identity/permissions` — the central list of permission
+/// strings the API checks (`WEB-8` D1/D4). Served in catalog order for
+/// the console's role and service-identity pickers.
+///
+/// # Security
+///
+/// Requires `identity:read` — see the module doc comment.
+pub async fn list_permissions() -> ApiResult<ApiJson<Vec<PermissionInfo>>> {
+    Ok(ApiJson(permission_catalog::PERMISSIONS.to_vec()))
+}
+
+/// Validate permission tokens against the catalog (`WEB-8` D3).
+///
+/// Refuses any token that is not known ([`permission_catalog::is_known`]),
+/// unless it was already held by the existing role (`allowed_existing`).
+/// Tokens are extracted from comma-separated strings or string lists, trimmed,
+/// and deduplicated in order of appearance.
+///
+/// # Errors
+///
+/// Returns [`ApiError::UnknownPermissions`] if any newly-requested token is
+/// not recognized by [`permission_catalog::is_known`].
+// WEB-8 review 1 S1: document errors returned by check_permissions
+fn check_permissions<'a>(
+    requested: impl IntoIterator<Item = &'a str>,
+    allowed_existing: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ApiError> {
+    let held: std::collections::HashSet<&'a str> = allowed_existing
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut unknown = Vec::new();
+    for token in requested {
+        let trimmed = token.trim();
+        if trimmed.is_empty() || held.contains(trimmed) {
+            continue;
+        }
+        if !permission_catalog::is_known(trimmed) && !unknown.iter().any(|u: &String| u == trimmed)
+        {
+            unknown.push(trimmed.to_owned());
+        }
+    }
+
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::UnknownPermissions(unknown))
+    }
+}
+
+fn parse_permission_tokens(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(',').map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// `GET /api/identity/roles` — every role, with its derived member count.
 ///
 /// # Errors
@@ -1074,6 +1131,10 @@ pub async fn create_role(
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<Role>)> {
     let body: CreateRoleBody = parse_body(&body)?;
+    check_permissions(
+        parse_permission_tokens(&body.permissions),
+        std::iter::empty(),
+    )?;
     let input = CreateRoleInput {
         name: required("name", &body.name)?,
         permissions: body.permissions,
@@ -1136,6 +1197,10 @@ pub async fn update_role(
     };
     let pool = pool(&state)?;
     let before = identity::get_role(pool, &id).await?;
+    check_permissions(
+        parse_permission_tokens(&input.permissions),
+        parse_permission_tokens(&before.permissions),
+    )?;
     // WEB-3 review R2: a rename would take every mask and row filter the
     // rules naming this role carry away from its holders, because rules
     // match on names. Refuse before anything is written, listing the rules
@@ -1675,6 +1740,7 @@ pub async fn create_service_identity(
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<ServiceIdentity>)> {
     let body: CreateServiceIdentityBody = parse_body(&body)?;
+    check_permissions(body.scopes.iter().map(String::as_str), std::iter::empty())?;
     let input = CreateServiceIdentityInput {
         name: required("name", &body.name)?,
         scopes: body.scopes,

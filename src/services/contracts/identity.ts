@@ -10,6 +10,16 @@ export type User = {
   lastActivity: string | null
 }
 
+/**
+ * One entry of the central permission catalog (`WEB-8` D1). Served by
+ * `GET /api/identity/permissions` in catalog order.
+ */
+export type Permission = {
+  name: string
+  area: string
+  description: string
+}
+
 export type Role = {
   id: string
   name: string
@@ -149,6 +159,10 @@ export type RotateServiceIdentityResponse = {
 }
 
 export interface IdentityService {
+  /**
+   * The central list of permission strings the API checks (`WEB-8` D1/D4).
+   */
+  listPermissions(signal?: AbortSignal): Promise<Permission[]>
   listUsers(signal?: AbortSignal): Promise<User[]>
   listRoles(signal?: AbortSignal): Promise<Role[]>
   listTenants(signal?: AbortSignal): Promise<Tenant[]>
