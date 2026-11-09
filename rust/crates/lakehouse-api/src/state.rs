@@ -272,6 +272,10 @@ pub struct AppState {
             lakehouse_store::assistant_settings::AssistantSettings,
         >,
     >,
+    /// The 30-second memo of the saved SSO settings (`ADM-12` plan D1/D3),
+    /// so a request does not read Postgres per check. The SSO `PUT` clears it
+    /// on this process. Shared across clones.
+    pub sso_settings_cache: Arc<crate::runtime_settings::SsoSettingsCache>,
     /// How often each caller may ask for a test email (`ADM-7` plan D10).
     /// Shared across clones.
     pub email_test_limiter: Arc<crate::runtime_settings::TestEmailLimiter>,
@@ -901,6 +905,7 @@ impl AppState {
             email_settings_cache: crate::runtime_settings::email_cache(),
             sign_in_settings_cache: crate::runtime_settings::sign_in_cache(),
             assistant_settings_cache: crate::runtime_settings::assistant_cache(),
+            sso_settings_cache: crate::runtime_settings::sso_cache(),
             email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
             #[cfg(test)]
             webhook_sender_override: None,

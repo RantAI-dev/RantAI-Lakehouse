@@ -62,6 +62,7 @@ use lakehouse_notify::{SmtpCaBundle, SmtpConfig};
 use lakehouse_store::assistant_settings::AssistantSettings;
 use lakehouse_store::email_settings::EmailSettings;
 use lakehouse_store::sign_in_settings::SignInSettings;
+use lakehouse_store::sso_settings::SsoSettings;
 use lakehouse_store::{PgPool, StoreError};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -84,6 +85,9 @@ pub const EMAIL_PASSWORD_SEAL_NAME: &str = "settings/email/password";
 
 /// The associated-data name the assistant's key is sealed under (plan D2).
 pub const ASSISTANT_KEY_SEAL_NAME: &str = "settings/assistant/key";
+
+/// The associated-data name the SSO client secret is sealed under (plan D2).
+pub const SSO_CLIENT_SECRET_SEAL_NAME: &str = "settings/sso/client_secret";
 
 /// Where a field's effective value comes from (plan D1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +297,15 @@ impl SettingsRow for SignInSettings {
 impl SettingsRow for AssistantSettings {
     fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
         lakehouse_store::assistant_settings::get(pool)
+    }
+}
+
+/// The saved SSO settings row, cached for [`SETTINGS_CACHE_TTL`] (plan D1/D3).
+pub type SsoSettingsCache = SettingsCache<SsoSettings>;
+
+impl SettingsRow for SsoSettings {
+    fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
+        lakehouse_store::sso_settings::get(pool)
     }
 }
 
@@ -603,6 +616,13 @@ pub fn sign_in_cache() -> Arc<SettingsCache<SignInSettings>> {
 #[must_use]
 pub fn assistant_cache() -> Arc<SettingsCache<AssistantSettings>> {
     Arc::new(SettingsCache::new())
+}
+
+/// A fresh, empty SSO cache as an [`Arc`] — the value
+/// [`crate::state::AppState`] holds.
+#[must_use]
+pub fn sso_cache() -> Arc<SsoSettingsCache> {
+    Arc::new(SsoSettingsCache::new())
 }
 
 // ── The sign-in limits (`ADM-8`) ──────────────────────────────────────────
@@ -1069,6 +1089,319 @@ pub async fn check_assistant_address(
         .await
         .map(|_| ())
         .map_err(|_| AddressProblem::Internal)
+}
+
+// ── Single Sign-On / OIDC (`ADM-12`) ─────────────────────────────────────
+
+/// One row of the group-to-role mapping.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RoleMapEntry {
+    /// External `IdP` group name.
+    pub group: String,
+    /// Local role name.
+    pub role: String,
+}
+
+/// The resolved single sign-on settings: the effective value of every field
+/// plus where it came from (plan D1/D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveSso {
+    /// OIDC provider issuer URL.
+    pub issuer: Option<String>,
+    /// Where [`Self::issuer`] came from.
+    pub issuer_source: Source,
+    /// Application client ID.
+    pub client_id: Option<String>,
+    /// Where [`Self::client_id`] came from.
+    pub client_id_source: Source,
+    /// Application client secret, as a [`SecretValue`].
+    pub client_secret: SecretValue,
+    /// Whether a client secret is in effect.
+    pub client_secret_set: bool,
+    /// Where [`Self::client_secret`] came from.
+    pub client_secret_source: Source,
+    /// Operator-chosen provider label.
+    pub provider_name: String,
+    /// Where [`Self::provider_name`] came from.
+    pub provider_name_source: Source,
+    /// Claim carrying user groups/roles.
+    pub groups_claim: String,
+    /// Where [`Self::groups_claim`] came from.
+    pub groups_claim_source: Source,
+    /// Role map as a lookup from external group to local role.
+    pub role_map: HashMap<String, String>,
+    /// Role map as ordered rows for the console.
+    pub role_map_rows: Vec<RoleMapEntry>,
+    /// Where the role map came from.
+    pub role_map_source: Source,
+    /// Whether JIT provisioning is enabled.
+    pub jit_provisioning: bool,
+    /// Where [`Self::jit_provisioning`] came from.
+    pub jit_provisioning_source: Source,
+    /// Authorization URL.
+    pub authorize_url: Option<String>,
+    /// Where [`Self::authorize_url`] came from.
+    pub authorize_url_source: Source,
+    /// Token endpoint URL.
+    pub token_url: Option<String>,
+    /// Where [`Self::token_url`] came from.
+    pub token_url_source: Source,
+    /// JWKS URL override.
+    pub jwks_url: Option<String>,
+    /// Where [`Self::jwks_url`] came from.
+    pub jwks_url_source: Source,
+    /// Redirect URI.
+    pub redirect_uri: Option<String>,
+    /// Where [`Self::redirect_uri`] came from.
+    pub redirect_uri_source: Source,
+    /// Clock skew in seconds.
+    pub clock_skew_seconds: u64,
+}
+
+impl EffectiveSso {
+    /// Whether `OIDC` is configured (both `issuer` and `client_id` are set and non-empty).
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.issuer.as_ref().is_some_and(|i| !i.is_empty())
+            && self.client_id.as_ref().is_some_and(|c| !c.is_empty())
+    }
+}
+
+static NO_KEY_LOGGED_SSO: AtomicBool = AtomicBool::new(false);
+static UNOPENABLE_SECRET_LOGGED_SSO: AtomicBool = AtomicBool::new(false);
+
+/// Open the saved SSO client secret, or `None` when it is not set, does not
+/// open (the key changed or is missing), or is not UTF-8 (plan D1/D2).
+fn open_console_client_secret(
+    stored: Option<&SsoSettings>,
+    keyring: Option<&Keyring>,
+) -> Option<String> {
+    let sealed = stored.and_then(|s| s.oidc_client_secret.as_deref())?;
+    let Some(ring) = keyring else {
+        log_once(
+            &NO_KEY_LOGGED_SSO,
+            "no installation key is configured; the saved SSO client secret is treated as not set",
+        );
+        return None;
+    };
+    let Ok(opened) = ring.open(SSO_CLIENT_SECRET_SEAL_NAME, sealed) else {
+        log_once(
+            &UNOPENABLE_SECRET_LOGGED_SSO,
+            "the saved SSO client secret does not open with the configured key; treating it as not set",
+        );
+        return None;
+    };
+    let Ok(plain) = String::from_utf8(opened.plaintext) else {
+        log_once(
+            &UNOPENABLE_SECRET_LOGGED_SSO,
+            "the saved SSO client secret is not UTF-8; treating it as not set",
+        );
+        return None;
+    };
+    if plain.is_empty() {
+        return None;
+    }
+    Some(plain)
+}
+
+fn parse_role_map_json_entries(val: &serde_json::Value) -> Vec<RoleMapEntry> {
+    let mut entries = Vec::new();
+    if let serde_json::Value::Array(items) = val {
+        for item in items {
+            if let (Some(group), Some(role)) = (
+                item.get("group").and_then(|v| v.as_str()),
+                item.get("role").and_then(|v| v.as_str()),
+            ) {
+                let group = group.trim();
+                let role = role.trim();
+                if !group.is_empty() && !role.is_empty() {
+                    entries.push(RoleMapEntry {
+                        group: group.to_owned(),
+                        role: role.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    entries
+}
+
+/// The one merge rule for SSO (plan D1, D3): environment wins as one unit for
+/// the connection (`OIDC_ISSUER` or `OIDC_CLIENT_ID` set), then the saved row,
+/// then the code default. Pure, so it is unit-tested without a database.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat resolver mapping every SSO setting to its effective value and source, matching resolve_email"
+)]
+pub fn resolve_sso(
+    config: &Config,
+    stored: Option<&SsoSettings>,
+    keyring: Option<&Keyring>,
+) -> EffectiveSso {
+    let server_owns_connection = config.oidc_issuer.is_some() || config.oidc_client_id.is_some();
+
+    let (issuer, issuer_source) = if config.oidc_issuer.is_some() {
+        (config.oidc_issuer.clone(), Source::Server)
+    } else if server_owns_connection {
+        (None, Source::Server)
+    } else if let Some(iss) = stored.and_then(|s| s.oidc_issuer.as_deref()) {
+        (Some(iss.to_owned()), Source::Console)
+    } else {
+        (None, Source::Default)
+    };
+
+    let (client_id, client_id_source) = if config.oidc_client_id.is_some() {
+        (config.oidc_client_id.clone(), Source::Server)
+    } else if server_owns_connection {
+        (None, Source::Server)
+    } else if let Some(cid) = stored.and_then(|s| s.oidc_client_id.as_deref()) {
+        (Some(cid.to_owned()), Source::Console)
+    } else {
+        (None, Source::Default)
+    };
+
+    let (client_secret, client_secret_set, client_secret_source) =
+        if let Some(sec) = config.oidc_client_secret.as_ref() {
+            (SecretValue::new(sec.clone()), true, Source::Server)
+        } else if server_owns_connection {
+            (SecretValue::new(""), false, Source::Server)
+        } else if let Some(opened) = open_console_client_secret(stored, keyring) {
+            (SecretValue::new(opened), true, Source::Console)
+        } else {
+            (SecretValue::new(""), false, Source::Default)
+        };
+
+    let (authorize_url, authorize_url_source) = if config.oidc_authorize_url.is_some() {
+        (config.oidc_authorize_url.clone(), Source::Server)
+    } else if server_owns_connection {
+        (None, Source::Server)
+    } else {
+        (None, Source::Default)
+    };
+
+    let (token_url, token_url_source) = if config.oidc_token_url.is_some() {
+        (config.oidc_token_url.clone(), Source::Server)
+    } else if server_owns_connection {
+        (None, Source::Server)
+    } else {
+        (None, Source::Default)
+    };
+
+    let (jwks_url, jwks_url_source) = if config.oidc_jwks_url.is_some() {
+        (config.oidc_jwks_url.clone(), Source::Server)
+    } else if server_owns_connection {
+        (None, Source::Server)
+    } else {
+        (None, Source::Default)
+    };
+
+    let (redirect_uri, redirect_uri_source) = if config.oidc_redirect_uri.is_some() {
+        (config.oidc_redirect_uri.clone(), Source::Server)
+    } else if server_owns_connection {
+        (None, Source::Server)
+    } else {
+        (None, Source::Default)
+    };
+
+    let (provider_name, provider_name_source) = if config.oidc_provider_name_from_env {
+        (config.oidc_provider_name.clone(), Source::Server)
+    } else if let Some(name) = stored.and_then(|s| s.oidc_provider_name.as_deref()) {
+        (name.to_owned(), Source::Console)
+    } else {
+        ("default".to_owned(), Source::Default)
+    };
+
+    let (groups_claim, groups_claim_source) = if config.oidc_groups_claim_from_env {
+        (config.oidc_groups_claim.clone(), Source::Server)
+    } else if let Some(claim) = stored.and_then(|s| s.oidc_groups_claim.as_deref()) {
+        (claim.to_owned(), Source::Console)
+    } else {
+        ("groups".to_owned(), Source::Default)
+    };
+
+    let (jit_provisioning, jit_provisioning_source) = if config.oidc_jit_provisioning_from_env {
+        (config.oidc_jit_provisioning, Source::Server)
+    } else if let Some(jit) = stored.and_then(|s| s.oidc_jit_provisioning) {
+        (jit, Source::Console)
+    } else {
+        (false, Source::Default)
+    };
+
+    let (role_map, role_map_rows, role_map_source) = if config.oidc_role_map_from_env {
+        let mut entries: Vec<RoleMapEntry> = config
+            .oidc_role_map
+            .iter()
+            .map(|(g, r)| RoleMapEntry {
+                group: g.clone(),
+                role: r.clone(),
+            })
+            .collect();
+        entries.sort_by(|a, b| a.group.cmp(&b.group));
+        (config.oidc_role_map.clone(), entries, Source::Server)
+    } else if let Some(val) = stored.and_then(|s| s.oidc_role_map.as_ref()) {
+        let entries = parse_role_map_json_entries(val);
+        let mut map = HashMap::new();
+        for entry in &entries {
+            map.insert(entry.group.clone(), entry.role.clone());
+        }
+        (map, entries, Source::Console)
+    } else {
+        (HashMap::new(), Vec::new(), Source::Default)
+    };
+
+    EffectiveSso {
+        issuer,
+        issuer_source,
+        client_id,
+        client_id_source,
+        client_secret,
+        client_secret_set,
+        client_secret_source,
+        provider_name,
+        provider_name_source,
+        groups_claim,
+        groups_claim_source,
+        role_map,
+        role_map_rows,
+        role_map_source,
+        jit_provisioning,
+        jit_provisioning_source,
+        authorize_url,
+        authorize_url_source,
+        token_url,
+        token_url_source,
+        jwks_url,
+        jwks_url_source,
+        redirect_uri,
+        redirect_uri_source,
+        clock_skew_seconds: config.oidc_clock_skew_seconds,
+    }
+}
+
+/// The saved SSO row for a request, or `None` when no Postgres pool is
+/// configured (a Phase 1 deployment) or nothing was saved.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the store read fails.
+pub async fn sso_row(state: &AppState) -> Result<Option<SsoSettings>, StoreError> {
+    match state.pg.as_deref() {
+        Some(pool) => state.sso_settings_cache.row(pool).await,
+        None => Ok(None),
+    }
+}
+
+/// The effective SSO settings: the environment's, else the console's
+/// saved ones, else the code's defaults.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the saved row cannot be read.
+pub async fn sso_or_fail(state: &AppState) -> Result<EffectiveSso, StoreError> {
+    let stored = sso_row(state).await?;
+    let keyring = state.connector_secret_store.keyring().ok();
+    Ok(resolve_sso(&state.config, stored.as_ref(), keyring))
 }
 
 #[cfg(test)]
@@ -1620,5 +1953,160 @@ mod tests {
         assert!(!eff.key_set);
         assert_eq!(eff.key.expose_secret(), "");
         assert_eq!(eff.key_source, Source::Default);
+    }
+
+    fn stored_sso(over: impl FnOnce(&mut SsoSettings)) -> SsoSettings {
+        let mut s = SsoSettings {
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            oidc_provider_name: None,
+            oidc_groups_claim: None,
+            oidc_role_map: None,
+            oidc_jit_provisioning: None,
+        };
+        over(&mut s);
+        s
+    }
+
+    #[test]
+    fn an_env_issuer_makes_the_connection_server_owned() {
+        let cfg = config(&[
+            ("OIDC_ISSUER", "https://env-issuer.example.com"),
+            ("OIDC_CLIENT_ID", "env-client"),
+            ("OIDC_CLIENT_SECRET", "env-secret"),
+        ]);
+        let ring = keyring();
+        let saved = stored_sso(|s| {
+            s.oidc_issuer = Some("https://console.example.com".to_owned());
+            s.oidc_client_id = Some("console-client".to_owned());
+            s.oidc_client_secret = Some(
+                ring.seal(SSO_CLIENT_SECRET_SEAL_NAME, b"console-secret")
+                    .unwrap(),
+            );
+        });
+        let eff = resolve_sso(&cfg, Some(&saved), Some(&ring));
+
+        assert_eq!(
+            eff.issuer.as_deref(),
+            Some("https://env-issuer.example.com")
+        );
+        assert_eq!(eff.issuer_source, Source::Server);
+        assert_eq!(eff.client_id.as_deref(), Some("env-client"));
+        assert_eq!(eff.client_id_source, Source::Server);
+        assert!(eff.client_secret_set);
+        assert_eq!(eff.client_secret.expose_secret(), "env-secret");
+        assert_eq!(eff.client_secret_source, Source::Server);
+        assert!(eff.is_configured());
+    }
+
+    #[test]
+    fn an_env_client_id_alone_makes_the_connection_server_owned() {
+        let cfg = config(&[("OIDC_CLIENT_ID", "env-client")]);
+        let ring = keyring();
+        let saved = stored_sso(|s| {
+            s.oidc_issuer = Some("https://console.example.com".to_owned());
+        });
+        let eff = resolve_sso(&cfg, Some(&saved), Some(&ring));
+
+        assert_eq!(eff.issuer, None);
+        assert_eq!(eff.issuer_source, Source::Server);
+        assert_eq!(eff.client_id.as_deref(), Some("env-client"));
+        assert_eq!(eff.client_id_source, Source::Server);
+    }
+
+    #[test]
+    fn a_saved_row_is_used_when_the_environment_is_empty() {
+        let cfg = config(&[]);
+        let ring = keyring();
+        let role_map = serde_json::json!([
+            {"group": "admins", "role": "Platform Admin"}
+        ]);
+        let saved = stored_sso(|s| {
+            s.oidc_issuer = Some("https://console.example.com".to_owned());
+            s.oidc_client_id = Some("console-client".to_owned());
+            s.oidc_client_secret = Some(
+                ring.seal(SSO_CLIENT_SECRET_SEAL_NAME, b"console-secret")
+                    .unwrap(),
+            );
+            s.oidc_provider_name = Some("custom-okta".to_owned());
+            s.oidc_groups_claim = Some("custom_groups".to_owned());
+            s.oidc_role_map = Some(role_map);
+            s.oidc_jit_provisioning = Some(true);
+        });
+        let eff = resolve_sso(&cfg, Some(&saved), Some(&ring));
+
+        assert_eq!(eff.issuer.as_deref(), Some("https://console.example.com"));
+        assert_eq!(eff.issuer_source, Source::Console);
+        assert_eq!(eff.client_id.as_deref(), Some("console-client"));
+        assert_eq!(eff.client_id_source, Source::Console);
+        assert!(eff.client_secret_set);
+        assert_eq!(eff.client_secret.expose_secret(), "console-secret");
+        assert_eq!(eff.client_secret_source, Source::Console);
+        assert_eq!(eff.provider_name, "custom-okta");
+        assert_eq!(eff.provider_name_source, Source::Console);
+        assert_eq!(eff.groups_claim, "custom_groups");
+        assert_eq!(eff.groups_claim_source, Source::Console);
+        assert_eq!(
+            eff.role_map.get("admins").map(String::as_str),
+            Some("Platform Admin")
+        );
+        assert_eq!(eff.role_map_source, Source::Console);
+        assert!(eff.jit_provisioning);
+        assert_eq!(eff.jit_provisioning_source, Source::Console);
+        assert!(eff.is_configured());
+    }
+
+    #[test]
+    fn the_defaults_apply_when_both_are_empty() {
+        let cfg = config(&[]);
+        let eff = resolve_sso(&cfg, None, Some(&keyring()));
+
+        assert_eq!(eff.issuer, None);
+        assert_eq!(eff.issuer_source, Source::Default);
+        assert_eq!(eff.client_id, None);
+        assert_eq!(eff.client_id_source, Source::Default);
+        assert!(!eff.client_secret_set);
+        assert_eq!(eff.client_secret.expose_secret(), "");
+        assert_eq!(eff.client_secret_source, Source::Default);
+        assert_eq!(eff.provider_name, "default");
+        assert_eq!(eff.provider_name_source, Source::Default);
+        assert_eq!(eff.groups_claim, "groups");
+        assert_eq!(eff.groups_claim_source, Source::Default);
+        assert!(eff.role_map.is_empty());
+        assert_eq!(eff.role_map_source, Source::Default);
+        assert!(!eff.jit_provisioning);
+        assert_eq!(eff.jit_provisioning_source, Source::Default);
+        assert!(!eff.is_configured());
+    }
+
+    #[test]
+    fn the_secret_opens_and_fails_closed_when_the_key_is_missing() {
+        let cfg = config(&[]);
+        let ring_a = keyring();
+        let sealed = ring_a
+            .seal(SSO_CLIENT_SECRET_SEAL_NAME, b"open-sesame")
+            .unwrap();
+        let saved = stored_sso(|s| s.oidc_client_secret = Some(sealed.clone()));
+
+        // Opens with correct keyring
+        let eff = resolve_sso(&cfg, Some(&saved), Some(&ring_a));
+        assert!(eff.client_secret_set);
+        assert_eq!(eff.client_secret.expose_secret(), "open-sesame");
+        assert_eq!(eff.client_secret_source, Source::Console);
+
+        // Fails closed when keyring is None
+        let eff_none = resolve_sso(&cfg, Some(&saved), None);
+        assert!(!eff_none.client_secret_set);
+        assert_eq!(eff_none.client_secret.expose_secret(), "");
+        assert_eq!(eff_none.client_secret_source, Source::Default);
+
+        // Fails closed when keyring is wrong
+        let other = base64::engine::general_purpose::STANDARD.encode([0x2b_u8; 32]);
+        let ring_b = Keyring::from_values(Some(&other), None).unwrap();
+        let eff_wrong = resolve_sso(&cfg, Some(&saved), Some(&ring_b));
+        assert!(!eff_wrong.client_secret_set);
+        assert_eq!(eff_wrong.client_secret.expose_secret(), "");
+        assert_eq!(eff_wrong.client_secret_source, Source::Default);
     }
 }
