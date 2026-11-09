@@ -3058,7 +3058,7 @@
     "type": "function",
     "function": {
       "name": "set_board_view_filters",
-      "description": "Change the filters visible to the person on this page, this time only. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
+      "description": "Change the filters visible to the person on this page, this time only. Use it for a request to see only some data on this page (\"show only 2026\", \"only Bali\", \"tampilkan hanya …\"), instead of a new chart; a year on a date column is a between filter on that year's first and last day. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
       "parameters": {
         "type": "object",
         "properties": {
