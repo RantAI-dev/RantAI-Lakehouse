@@ -458,3 +458,50 @@ varies under load. It is not caused by this branch, but I name it here.
 
 **Not verified:** the rest of the Rust workspace after the two failures (timed out), and a
 real browser.
+
+### Review 2 (planner, 2026-11-09), at `ff21f890`
+
+Every Review 1 finding is fixed and cited at its fix site:
+
+- B1 `114e6edf`: the backfill replaces characters outside the set, cuts to 250 characters, and
+  ranks on the cleaned value. A migration test covers it.
+- B2 `6790d112`: the default-username trigger is gone.
+- B3 `06c14647`: the public-route count is 15, with the new route named.
+- B4 `eec53313`: `password_rules` now sits above the test module.
+- S1 through S7: `7eac9a46`, `0cdfae56`, `6ba88f91`, `981a3c4e`, `8da99208`, `1fe7455a`,
+  `950adad4`.
+  - The advisory lock now covers invite, rename and JIT.
+  - JIT uses `next_free_username_in_tx`.
+- S8: `main` merged (`d6f7eb01`). The OIDC linking backlog row became `SEC-65`.
+
+Accepted residual risk, not blocking: suffixes are added after ranking. If one user's cleaned
+email is literally another user's suffixed form (for example a real `a@b-2` beside two case
+variants of `a@b`), the unique index stops the migration. This needs a deliberately odd
+address set, and it fails loudly rather than corrupting anything. Recorded here so an
+operator who hits it knows the cause.
+
+No open `BLOCKER`.
+
+**Verification rerun by the planner** on `ff21f890`, with the latest `origin/main` (WEB-8 S1,
+`a965a914`) merged locally. The merge was clean apart from an automatic merge of the identity
+contract and client. Run in the foreground:
+
+```
+cargo fmt --check                                                     clean
+cargo clippy --workspace --all-targets --all-features -- -D warnings  clean
+cargo test --workspace --no-fail-fast (RUST_TEST_THREADS=2)
+                                       192 result lines: 7172 passed, 0 failed, 35 ignored
+bun run typecheck                                                     clean
+bun run lint                                                          0 errors, 10 warnings (pre-existing)
+bun run test                                                          3764 pass, 0 fail
+```
+
+A first workspace run was killed partway through by memory pressure: 11 GB on the machine,
+with another agent's build running. Eight `query_download` tests failed in it. That binary
+passed alone (24/24), and the whole workspace passed on the rerun above.
+
+Handoff 2 listed only ten of `lakehouse-api`'s integration test binaries. The full workspace
+run above covers the rest.
+
+**Not verified:** the console in a real browser, and an upgrade against a real deployment's
+data (the migration test stands in for it). Approved for PR.
