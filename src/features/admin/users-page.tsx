@@ -33,6 +33,7 @@ import { useUrlTab } from "@/hooks/use-url-tab"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
+import * as authClient from "@/services/clients/auth"
 import type { Role, Tenant, User } from "@/services"
 import { SessionsPanel } from "./sessions-page"
 import { getUserColumns, PillList, UserStatusPill } from "./user-columns"
@@ -57,15 +58,20 @@ export function UsersPage() {
   const [selected, setSelected] = React.useState<User | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [name, setName] = React.useState("")
+  const [username, setUsername] = React.useState("")
   const [email, setEmail] = React.useState("")
-  const [roles, setRoles] = React.useState("")
-  const [tenants, setTenants] = React.useState("")
+  const [selectedRoles, setSelectedRoles] = React.useState<string[]>([])
+  const [selectedTenants, setSelectedTenants] = React.useState<string[]>([])
+  const [passwordMode, setPasswordMode] = React.useState<"generate" | "set">("generate")
+  const [setPassword, setSetPassword] = React.useState("")
+  const [mustChangePassword, setMustChangePassword] = React.useState(true)
+  const [revealedMustChange, setRevealedMustChange] = React.useState(true)
+  const passwordRulesState = useService((s) => authClient.passwordRules(s), [])
+  const [editTarget, setEditTarget] = React.useState<User | null>(null)
+  const [editUsername, setEditUsername] = React.useState("")
+  const [editEmail, setEditEmail] = React.useState("")
   // ADM-3 D1/D6: the temporary password the server generated, shown in
-  // the dialog below exactly ONCE. It is never persisted to
-  // localStorage, sessionStorage, or any service-layer cache entry — it
-  // is kept as local component state and cleared when the dialog closes,
-  // so a re-render of the table (a filter keystroke, a refetch landing)
-  // cannot leak it through a hook that stores its argument.
+  // the dialog below exactly ONCE.
   const [revealedPassword, setRevealedPassword] = React.useState<string | null>(null)
   // ADM-4 D7: the user whose roles are being edited, and the role names
   // the editor currently has ticked.
@@ -104,6 +110,11 @@ export function UsersPage() {
     active ? identityService.reactivateUser(id, signal) : identityService.deactivateUser(id, signal)
   )
 
+  const updateIdentity = useServiceAction(
+    (signal, id: string, input: Parameters<typeof identityService.updateUser>[1]) =>
+      identityService.updateUser(id, input, signal)
+  )
+
   // `state.reload` is stable (it is a `useCallback` inside `useService`),
   // so it can be a dependency without re-creating the callbacks below on
   // every render.
@@ -137,6 +148,11 @@ export function UsersPage() {
         onEditRoles: openRoleEditor,
         onRemoveFromTenant: (user) => setTenantTarget(user),
         onToggleStatus: (user) => setStatusTarget(user),
+        onEditIdentity: (user) => {
+          setEditTarget(user)
+          setEditUsername(user.username)
+          setEditEmail(user.email ?? "")
+        },
       }),
     [canWrite, handleResetPassword, openRoleEditor]
   )
@@ -147,7 +163,8 @@ export function UsersPage() {
       search: tableUrlState.search,
       searchFields: [
         (u) => u.name,
-        (u) => u.email,
+        (u) => u.username,
+        (u) => u.email ?? "",
         (u) => u.roles.join(" "),
         (u) => u.tenants.join(" "),
       ],
@@ -178,32 +195,49 @@ export function UsersPage() {
 
   function resetForm() {
     setName("")
+    setUsername("")
     setEmail("")
-    setRoles("")
-    setTenants("")
+    setSelectedRoles([])
+    setSelectedTenants([])
+    setPasswordMode("generate")
+    setSetPassword("")
+    setMustChangePassword(true)
   }
 
   async function handleCreate() {
+    const passwordInput =
+      passwordMode === "generate"
+        ? { mode: "generate" as const }
+        : { mode: "set" as const, value: setPassword }
     const result = await create.run({
       name: name.trim(),
-      email: email.trim(),
-      roles: roles
-        .split(",")
-        .map((r) => r.trim())
-        .filter(Boolean),
-      tenants: tenants
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean),
+      username: username.trim() || undefined,
+      email: email.trim() || undefined,
+      roles: selectedRoles,
+      tenants: selectedTenants,
+      password: passwordInput,
+      mustChangePassword,
     })
     if (result) {
       setCreateOpen(false)
+      if (result.temporaryPassword) {
+        setRevealedPassword(result.temporaryPassword)
+        setRevealedMustChange(mustChangePassword)
+      }
       resetForm()
-      // ADM-3 D1: the server generated a temporary password and returned
-      // it once. Show it, and only here — the server never sends it
-      // again.
-      setRevealedPassword(result.temporaryPassword)
       state.reload()
+    }
+  }
+
+  async function handleSaveIdentity() {
+    if (!editTarget) return
+    const result = await updateIdentity.run(editTarget.id, {
+      username: editUsername.trim() || undefined,
+      email: editEmail.trim() || null,
+    })
+    if (result) {
+      setEditTarget(null)
+      reloadUsers()
     }
   }
 
@@ -286,7 +320,7 @@ export function UsersPage() {
           if (!open) setSelected(null)
         }}
         title={selected?.name ?? ""}
-        description={selected?.email}
+        description={selected?.email ?? selected?.username}
       >
         {selected ? (
           <MetadataList
@@ -320,7 +354,11 @@ export function UsersPage() {
         }}
         title="Invite User"
         description="Invite a user with roles and tenant membership."
-        canSubmit={Boolean(name.trim() && email.trim())}
+        canSubmit={Boolean(
+          name.trim() &&
+            (username.trim() || email.trim()) &&
+            (passwordMode === "generate" || setPassword.length >= 8)
+        )}
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
         submitLabel="Invite"
@@ -330,36 +368,144 @@ export function UsersPage() {
           <Input id="user-name" value={name} onChange={(e) => setName(e.target.value)} />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="user-email">Email</Label>
+          <Label htmlFor="user-username">Username</Label>
+          <Input
+            id="user-username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="e.g. jdoe"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="user-email">Email (optional)</Label>
           <Input
             id="user-email"
             type="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+            placeholder="jdoe@example.com"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="user-roles">Roles (comma-separated)</Label>
-          <Input
-            id="user-roles"
-            value={roles}
-            onChange={(e) => setRoles(e.target.value)}
-            placeholder="Analyst, Viewer"
-          />
+          <Label>Roles</Label>
+          <ul className="grid gap-1 max-h-36 overflow-y-auto rounded-md border border-border p-1">
+            {availableRoles.length === 0 ? (
+              <li className="px-2 py-1 text-xs text-muted-foreground">No roles defined</li>
+            ) : null}
+            {availableRoles.map((role) => (
+              <li key={role.id} className="flex items-center gap-2 px-1.5 py-1 text-sm">
+                <Checkbox
+                  id={`invite-role-${role.id}`}
+                  checked={selectedRoles.includes(role.name)}
+                  aria-label={role.name}
+                  onCheckedChange={(checked) =>
+                    setSelectedRoles((current) =>
+                      checked === true
+                        ? [...current, role.name]
+                        : current.filter((r) => r !== role.name)
+                    )
+                  }
+                />
+                <label
+                  htmlFor={`invite-role-${role.id}`}
+                  className="flex-1 truncate text-xs select-none cursor-pointer"
+                >
+                  {role.name}
+                </label>
+              </li>
+            ))}
+          </ul>
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="user-tenants">Tenants (comma-separated)</Label>
-          <Input
-            id="user-tenants"
-            value={tenants}
-            onChange={(e) => setTenants(e.target.value)}
-            placeholder="acme, demo"
-          />
+          <Label>Tenants</Label>
+          <ul className="grid gap-1 max-h-36 overflow-y-auto rounded-md border border-border p-1">
+            {knownTenants.length === 0 ? (
+              <li className="px-2 py-1 text-xs text-muted-foreground">No tenants defined</li>
+            ) : null}
+            {knownTenants.map((tenant) => (
+              <li key={tenant.id} className="flex items-center gap-2 px-1.5 py-1 text-sm">
+                <Checkbox
+                  id={`invite-tenant-${tenant.id}`}
+                  checked={selectedTenants.includes(tenant.name)}
+                  aria-label={tenant.name}
+                  onCheckedChange={(checked) =>
+                    setSelectedTenants((current) =>
+                      checked === true
+                        ? [...current, tenant.name]
+                        : current.filter((t) => t !== tenant.name)
+                    )
+                  }
+                />
+                <label
+                  htmlFor={`invite-tenant-${tenant.id}`}
+                  className="flex-1 truncate text-xs select-none cursor-pointer"
+                >
+                  {tenant.name}
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div className="space-y-2 pt-2 border-t">
+          <Label>First password</Label>
+          <div className="flex gap-4">
+            <label className="flex items-center gap-1.5 text-xs select-none cursor-pointer">
+              <input
+                type="radio"
+                name="password-mode"
+                value="generate"
+                checked={passwordMode === "generate"}
+                onChange={() => setPasswordMode("generate")}
+              />
+              Generate
+            </label>
+            <label className="flex items-center gap-1.5 text-xs select-none cursor-pointer">
+              <input
+                type="radio"
+                name="password-mode"
+                value="set"
+                checked={passwordMode === "set"}
+                onChange={() => setPasswordMode("set")}
+              />
+              Set it now
+            </label>
+          </div>
+          {passwordMode === "set" ? (
+            <div className="space-y-1.5">
+              <Input
+                id="user-set-password"
+                type="password"
+                value={setPassword}
+                onChange={(e) => setSetPassword(e.target.value)}
+                placeholder="Enter password"
+                aria-label="Password"
+              />
+              <p className="text-xs text-muted-foreground">
+                At least {passwordRulesState.data?.minLength ?? 8} characters. Must not equal the username or email.
+              </p>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              A temporary password will be generated and shown once.
+            </p>
+          )}
+          <div className="flex items-center gap-2 pt-1">
+            <Checkbox
+              id="must-change-password"
+              checked={mustChangePassword}
+              onCheckedChange={(c) => setMustChangePassword(c === true)}
+              aria-label="Must change password at first sign-in"
+            />
+            <label
+              htmlFor="must-change-password"
+              className="text-xs select-none cursor-pointer"
+            >
+              Must change password at first sign-in
+            </label>
+          </div>
         </div>
       </CreateSheet>
-      {/* ADM-3 D1/D6: the temporary password, shown exactly once. The
-          server keeps only the `Argon2id` hash, so it cannot be shown
-          again — the admin has to hand it over now. */}
+      {/* ADM-3 D1/D6: the temporary password, shown exactly once. */}
       <Dialog
         open={revealedPassword !== null}
         onOpenChange={(open) => {
@@ -370,7 +516,9 @@ export function UsersPage() {
           <DialogHeader>
             <DialogTitle>Temporary password</DialogTitle>
             <DialogDescription>
-              Shown once. The user must change it at first sign-in.
+              {revealedMustChange
+                ? "Shown once. The user must change it at first sign-in."
+                : "Shown once."}
             </DialogDescription>
           </DialogHeader>
           <code
@@ -529,6 +677,55 @@ export function UsersPage() {
         confirming={setStatus.status === "pending"}
         onConfirm={() => void handleToggleStatus()}
       />
+
+      {/* ADM-11 D8: Edit username and email */}
+      <Dialog
+        open={editTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setEditTarget(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Edit username and email</DialogTitle>
+            <DialogDescription>
+              Update username and email for {editTarget?.name ?? "user"}.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-username">Username</Label>
+              <Input
+                id="edit-username"
+                value={editUsername}
+                onChange={(e) => setEditUsername(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-email">Email</Label>
+              <Input
+                id="edit-email"
+                type="email"
+                value={editEmail}
+                onChange={(e) => setEditEmail(e.target.value)}
+                placeholder="Empty clears email"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setEditTarget(null)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              disabled={!editUsername.trim() || updateIdentity.status === "pending"}
+              onClick={handleSaveIdentity}
+            >
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

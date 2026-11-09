@@ -36,7 +36,7 @@ export const NOBODY_MANAGES_NOTE =
 
 const LEVELS: readonly DashboardLevel[] = ["view", "edit", "manage"];
 
-type Row = { kind: "user" | "role"; id: string; name: string; email?: string; level: AccessLevel | string };
+type Row = { kind: "user" | "role"; id: string; name: string; email?: string | null; level: AccessLevel | string };
 
 const rowKey = (r: { kind: string; id: string }) => `${r.kind}:${r.id}`;
 

@@ -5,6 +5,7 @@ import { authorChoices, readsAs, readsAsLine, NO_AUTHOR_REASON } from "./pipelin
 
 function user(overrides: Partial<User> & Pick<User, "id" | "name">): User {
   return {
+    username: overrides.name.toLowerCase().replace(/\s+/g, "."),
     email: `${overrides.name.toLowerCase()}@meridian.example`,
     status: "active",
     roles: ["Analyst"],

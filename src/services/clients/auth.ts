@@ -54,11 +54,11 @@ async function parse<T>(res: Response, fallback: string): Promise<T> {
   return json as T;
 }
 
-export async function login(email: string, password: string): Promise<LoginResult> {
+export async function login(identifier: string, password: string): Promise<LoginResult> {
   const res = await apiFetch("/api/auth/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ identifier, password }),
   });
   if (res.status === 429) {
     const json = await res.json().catch(() => null);
@@ -151,4 +151,17 @@ export async function deleteSession(id: string, signal?: AbortSignal): Promise<v
     }
     throw new ServiceError("unavailable", json?.error ?? "Failed to revoke session.");
   }
+}
+
+export type PasswordRulesResponse = {
+  minLength: number;
+  maxLength: number;
+};
+
+/**
+ * `GET /api/auth/password-rules` (ADM-11 D4).
+ */
+export async function passwordRules(signal?: AbortSignal): Promise<PasswordRulesResponse> {
+  const res = await apiFetch("/api/auth/password-rules", { signal });
+  return parse<PasswordRulesResponse>(res, "Failed to load password rules.");
 }
