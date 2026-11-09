@@ -137,7 +137,7 @@ estimate (S, M, L), which the base has no field for.
 
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `SEC-63` | Task | `RUSTSEC-2026-0459` (`libsqlite3-sys` 0.30.1, C SQLite `CVE-2026-119375`, medium, fixed in `libsqlite3-sys` >= 0.39.0) is waived for `cargo audit` because the crate is unreachable: it is in `rust/Cargo.lock` only through `sqlx-sqlite`, and no crate of the workspace enables the `sqlite` feature of `sqlx`, so `cargo tree --locked --workspace --target all -e normal,build -i libsqlite3-sys` prints nothing. No upgrade exists: `sqlx-sqlite` 0.9.0, the newest, requires `libsqlite3-sys >=0.30.1, <0.38.0`. A guard step in the `cargo audit` job fails CI if the crate ever enters the build graph. `cargo deny` does not flag it. Drop the waiver when a `sqlx` release allows `libsqlite3-sys` >= 0.39, then `cargo update` | Administration & Security | P2 | In Progress |  | `cargo audit` on PR #439, 2026-11-09 |
+| `SEC-63` | Task | `RUSTSEC-2026-0459` (`libsqlite3-sys` 0.30.1, C SQLite `CVE-2026-119375`, medium, fixed in `libsqlite3-sys` >= 0.39.0) is waived for `cargo audit` because the crate is unreachable: it is in `rust/Cargo.lock` only through `sqlx-sqlite`, and no crate of the workspace enables the `sqlite` feature of `sqlx`, so `cargo tree --locked --workspace --target all -e normal,build -i libsqlite3-sys` prints nothing. No upgrade exists: `sqlx-sqlite` 0.9.0, the newest, requires `libsqlite3-sys >=0.30.1, <0.38.0`. A guard step in the `cargo audit` job fails CI if the crate ever enters the build graph. `cargo deny` does not flag it. Drop the waiver when a `sqlx` release allows `libsqlite3-sys` >= 0.39, then `cargo update` | Administration & Security | P2 | Done | #440 | `cargo audit` on PR #439, 2026-11-09 |
 | `SEC-64` | Task | The test `the_author_exception_leaves_an_outage_as_the_fixed_message` (`rust/crates/lakehouse-api/src/upstream_error.rs:1018`) fails about 0.2% of runs: the random 10-hex reference id can contain "503" (measured 1,044 of 500,000 ids) and the test asserts the whole message does not contain it. Assert only on the message before `Reference:` | Administration & Security | P2 | Todo |  | batch report 2026-11-09 |
 | `AI-27` | Task | The assistant's `draft_policy` declares `conditions` as a bare string (`routes/ai/registry.rs`, near line 1552) and passes it straight to `create_policy` (`routes/ai/tools/governance.rs`, near line 110), so every policy it drafts is not enforceable and `SEC-61` shows it as "Not enforced". Give the tool the structured shape `PolicyCondition` parses, or say in its result that the draft enforces nothing | AI Copilot | P2 | Todo |  | `SEC-61` handoff D4 (#373) |
 | `REL-17` | Task | A CI check that every pinned third-party image digest still resolves and that its config names the version the pin's tag says. `quay.io/debezium/connect:3.8@sha256:d67d…` was withdrawn upstream and the `3.8` tag moved to 3.8.0.Alpha1 (#264, 2026-11-04; re-pinned to `3.7.0.Final`) | Delivery | P2 | Todo |  | #264 CI, 2026-11-04 |
@@ -574,7 +574,7 @@ set by the product owner and are left empty until they are.
 | `SEC-55` | 2026-11-04 | 2026-11-04 | |
 | `DATA-39` | 2026-11-01 | data part 2026-11-01; assistant part 2026-11-04 | |
 | `ADM-5` | 2026-11-02 |  | |
-| `SEC-63` | 2026-11-09 |  | |
+| `SEC-63` | 2026-11-09 | 2026-11-09 | |
 | `ADM-6` | 2026-11-06 | 2026-11-06 | |
 | `ADM-7` | 2026-11-06 | 2026-11-06 | |
 | `ADM-8` | 2026-11-06 | 2026-11-07 | |
