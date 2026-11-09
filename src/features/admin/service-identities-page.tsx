@@ -26,6 +26,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { identityService } from "@/services"
 import { getServiceIdentityColumns } from "./service-identities-columns"
+import { PermissionPicker } from "./permission-picker"
 
 export function ServiceIdentitiesPage() {
   const { hasPermission } = useAuth()
@@ -201,12 +202,11 @@ export function ServiceIdentitiesPage() {
           <Input id="si-name" value={name} onChange={(e) => setName(e.target.value)} />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="si-scopes">Scopes (comma-separated)</Label>
-          <Input
+          <Label htmlFor="si-scopes">Scopes</Label>
+          <PermissionPicker
             id="si-scopes"
             value={scopes}
-            onChange={(e) => setScopes(e.target.value)}
-            placeholder="query:read, storage:write"
+            onChange={setScopes}
           />
           {/* DATA-5 D10: an admin who grants `iceberg:read` needs the
               address the outside tool points at, and the fact that the

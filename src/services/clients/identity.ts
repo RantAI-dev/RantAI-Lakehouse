@@ -4,6 +4,7 @@ import type {
   CreateTenantInput,
   IdentityService,
   InviteUserInput,
+  Permission,
   InviteUserResponse,
   ResetPasswordResponse,
   Role,
@@ -105,6 +106,13 @@ function del<T>(
 }
 
 export const postgresIdentityService: IdentityService = {
+  listPermissions(signal) {
+    return get<Permission[]>(
+      "/api/identity/permissions",
+      signal,
+      "Failed to load permission list"
+    );
+  },
   listUsers(signal) {
     return get<User[]>("/api/identity/users", signal, "Failed to load user list");
   },
