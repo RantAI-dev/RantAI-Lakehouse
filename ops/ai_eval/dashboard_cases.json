@@ -146,6 +146,20 @@
     ]
   },
   {
+    "id": "chart_to_pivot_with_totals",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Pivot Totals Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Pivot Totals", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Show chart {chart} as a pivot table with totals."],
+    "expect_tool": {"name": "update_chart", "args_contains": {"kind": "pivot"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "kind": "pivot"}, "count": 1}
+    ]
+  },
+  {
     "id": "metric_first",
     "mode": "build",
     "confirm": true,

@@ -306,6 +306,92 @@ fn is_static_content(field: &str, kind: ChartKind) -> bool {
 /// on every other kind, so they are carried only into a Gantt chart.
 const GANTT_FIELDS: [&str; 4] = ["start", "end", "progress", "todayLine"];
 
+/// The kinds that take a stored field, so a kind change leaves out a field
+/// the new kind refuses.
+///
+/// A kind that is not listed refuses the field. The rules are the checks that
+/// refuse the field, not rules of their own: a pivot and a table in rows mode
+/// name their columns in their own fields, not in `dimension`, `measures` or
+/// `breakdown` (`lakehouse-bi/src/store.rs`, `check_measures`), and the
+/// `BI-16` fields are only for the kinds that read them
+/// (`lakehouse-bi/src/tables.rs`, `only_for`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Takes {
+    /// The kind takes the field.
+    Kind(ChartKind),
+    /// A table in rows mode takes the field.
+    RowsTable,
+    /// Every kind but a pivot takes the field. A table in rows mode takes
+    /// none of it: it names its columns in its own fields.
+    AllButPivot,
+}
+
+/// The stored fields and the kinds that take each.
+///
+/// AI-5 AC1 (2026-11-08): a call that changes the kind leaves out a stored
+/// field the new kind refuses, so the model need not clear it with `null`.
+const TAKEN_BY_KIND: [(&str, &[Takes]); 13] = [
+    // A pivot and a table in rows mode name their columns in their own fields
+    // (`lakehouse-bi/src/store.rs`, `check_measures`).
+    ("dimension", &[Takes::AllButPivot]),
+    ("measures", &[Takes::AllButPivot]),
+    ("breakdown", &[Takes::AllButPivot]),
+    // The pivot's own fields (`lakehouse-bi/src/tables.rs`, `only_for`).
+    ("rows", &[Takes::Kind(ChartKind::Pivot)]),
+    ("values", &[Takes::Kind(ChartKind::Pivot)]),
+    ("totals", &[Takes::Kind(ChartKind::Pivot)]),
+    // The columns of a table in rows mode and of a pivot (`only_for`).
+    (
+        "columns",
+        &[Takes::Kind(ChartKind::Pivot), Takes::RowsTable],
+    ),
+    // The sort of a table in rows mode (`only_for`).
+    ("sortColumn", &[Takes::RowsTable]),
+    ("sortDir", &[Takes::RowsTable]),
+    // The fields of a table (`only_for`).
+    ("tableMode", &[Takes::Kind(ChartKind::Table)]),
+    (
+        "columnSettings",
+        &[Takes::Kind(ChartKind::Table), Takes::Kind(ChartKind::Pivot)],
+    ),
+    // The comparison of a KPI (`only_for`).
+    ("compare", &[Takes::Kind(ChartKind::Kpi)]),
+    ("goodDirection", &[Takes::Kind(ChartKind::Kpi)]),
+];
+
+/// Whether the chart of this kind takes the stored field.
+///
+/// A field no rule names is taken by every kind: only the fields the checks
+/// refuse are listed.
+fn kind_takes(field: &str, kind: ChartKind, rows_table: bool) -> bool {
+    let Some((_, takers)) = TAKEN_BY_KIND.iter().find(|(name, _)| *name == field) else {
+        return true;
+    };
+    takers.iter().any(|taker| match taker {
+        Takes::Kind(k) => *k == kind,
+        Takes::RowsTable => rows_table,
+        Takes::AllButPivot => kind != ChartKind::Pivot && !rows_table,
+    })
+}
+
+/// Whether the chart the call describes is a table in rows mode.
+///
+/// The mode is the one the call names, or the stored one the call leaves out:
+/// a table in rows mode names its columns in `columns`, and the checks treat
+/// it as a table of its own.
+fn is_rows_table(args: &Map<String, Value>, call: &ChartInput, stored: &ChartInput) -> bool {
+    if call.kind != ChartKind::Table {
+        return false;
+    }
+    let mode = match args.get("tableMode") {
+        Some(Value::String(text)) => Some(text.as_str()),
+        // A `null` clears the mode: the table is the grouped one.
+        Some(_) => None,
+        None => stored.tables.table_mode.as_deref(),
+    };
+    mode == Some("rows")
+}
+
 /// The args without the keys the call sent as `null`.
 ///
 /// `null` means "clear this field", so the key must behave as if it were left
@@ -342,9 +428,13 @@ fn is_blank(value: &Value) -> bool {
 /// data (a note, a heading, an image) carries only its own content
 /// ([`STATIC_CONTENT`]), and the Gantt fields are carried only into a Gantt
 /// chart. `text` is carried only into a kind that shows it: a data kind drops
-/// it when it builds the chart, so naming it as kept would be wrong. A field
-/// the new kind refuses is not dropped here: the build refuses it as it
-/// refuses any field, and the call clears it with `null`.
+/// it when it builds the chart, so naming it as kept would be wrong.
+///
+/// A call that changes the kind leaves out a stored field the new kind
+/// refuses ([`TAKEN_BY_KIND`]): a bar turned into a pivot keeps no dimension,
+/// no measures and no breakdown, so the build has nothing to refuse (AI-5
+/// AC1, 2026-11-08). The fields the call names itself are sent as given, so a
+/// call that asks for a refused field is still refused by the build.
 ///
 /// The second value is the sorted names of the fields carried over.
 fn args_with_kept_fields(
@@ -353,6 +443,10 @@ fn args_with_kept_fields(
     stored: &ChartInput,
 ) -> (Map<String, Value>, Vec<String>) {
     let mut merged = args.clone();
+    // A call that changes the kind takes other fields: a stored field the new
+    // kind refuses is left out (AI-5 AC1, 2026-11-08).
+    let kind_changed = stored.kind != call.kind;
+    let rows_table = is_rows_table(args, call, stored);
     let Ok(stored) = serde_json::to_value(stored) else {
         return (merged, Vec::new());
     };
@@ -368,6 +462,7 @@ fn args_with_kept_fields(
             || (call.kind.is_static() && !is_static_content(key, call.kind))
             || (key == "text" && !call.kind.is_static())
             || (GANTT_FIELDS.contains(&key.as_str()) && call.kind != ChartKind::Gantt)
+            || (kind_changed && !kind_takes(key, call.kind, rows_table))
         {
             continue;
         }
@@ -456,7 +551,8 @@ async fn kept_formatting(
     // that names no source of its own reads the one the stored chart has.
     let (args, source_kept) = args_with_kept_source(&args, &call, &stored.def);
     // Every other field the call leaves out is carried over too, also when the
-    // kind changes. The `null` keys stay in `args` until here so that they
+    // kind changes, except the ones the new kind refuses (AI-5 AC1,
+    // 2026-11-08). The `null` keys stay in `args` until here so that they
     // count as named and are not carried; they are removed last.
     let (args, fields_kept) = args_with_kept_fields(&args, &call, &stored.def);
     Ok(KeptFormatting {
@@ -2308,6 +2404,132 @@ mod tests {
         assert!(row.contains("\"dimension\":\"province\""), "{row}");
         assert!(row.contains("\"measures\":[\"visitors\"]"), "{row}");
         assert!(!row.contains("muted"), "{row}");
+    }
+
+    /// A bar chart turned into a pivot keeps no field the pivot refuses: the
+    /// dimension, the measures and the breakdown are left out, because the
+    /// pivot names its columns in its own fields (AI-5 AC1, 2026-11-08).
+    #[test]
+    fn a_kind_change_leaves_out_the_fields_the_new_kind_refuses() {
+        let stored = input(stored_bar_with_data());
+        let args = arguments(json!({
+            "id": "c_1",
+            "title": "Visitors",
+            "kind": "pivot",
+            "rows": ["province"],
+            "values": [{ "column": "visitors", "aggregate": "sum" }],
+            "totals": "grand",
+        }));
+        let call = input(json!({
+            "title": "Visitors",
+            "kind": "pivot",
+            "rows": ["province"],
+            "values": [{ "column": "visitors", "aggregate": "sum" }],
+            "totals": "grand",
+        }));
+        let (merged, carried) = args_with_kept_fields(&args, &call, &stored);
+        assert_eq!(carried, vec!["filters".to_owned()]);
+        assert!(!merged.contains_key("dimension"), "{merged:?}");
+        assert!(!merged.contains_key("measures"), "{merged:?}");
+        assert!(!merged.contains_key("breakdown"), "{merged:?}");
+    }
+
+    /// A pivot turned into a bar chart keeps no field the bar refuses: the
+    /// pivot's own fields are left out, and the bar takes the dimension and
+    /// the measures the call names.
+    #[test]
+    fn a_kind_change_to_a_bar_leaves_out_the_pivot_fields() {
+        let stored = input(json!({
+            "title": "Visitors",
+            "kind": "pivot",
+            "mart": "mart_x",
+            "rows": ["province"],
+            "columns": ["region"],
+            "values": [{ "column": "visitors", "aggregate": "sum" }],
+            "totals": "grand",
+        }));
+        let args = arguments(json!({
+            "id": "c_1",
+            "title": "Visitors",
+            "kind": "bar",
+            "dimension": "province",
+            "measures": ["visitors"],
+        }));
+        let call = input(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "dimension": "province",
+            "measures": ["visitors"],
+        }));
+        let (merged, carried) = args_with_kept_fields(&args, &call, &stored);
+        assert!(carried.is_empty(), "{carried:?}");
+        assert!(!merged.contains_key("rows"), "{merged:?}");
+        assert!(!merged.contains_key("values"), "{merged:?}");
+        assert!(!merged.contains_key("totals"), "{merged:?}");
+        assert!(!merged.contains_key("columns"), "{merged:?}");
+    }
+
+    /// A bar chart turned into a pivot table is built without a refusal: the
+    /// pivot names its columns in its own fields, so the fields of the bar
+    /// are left out and the build has nothing to refuse (AI-5 AC1,
+    /// 2026-11-08).
+    #[tokio::test]
+    async fn a_chart_turned_into_a_pivot_is_built_without_a_refusal() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({
+                "kind": "pivot",
+                "rows": ["province"],
+                "values": [{ "column": "visitors", "aggregate": "sum" }],
+                "totals": "grand",
+            })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["kind"], json!("pivot"), "{reply}");
+        assert_eq!(reply["fieldsKept"], json!(["filters"]), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        // The definition holds the empty dimension and the empty measures of
+        // a pivot, and no breakdown at all.
+        assert!(row.contains("\"dimension\":\"\""), "{row}");
+        assert!(row.contains("\"measures\":[]"), "{row}");
+        assert!(!row.contains("\"breakdown\""), "{row}");
+        assert!(row.contains("\"rows\":[\"province\"]"), "{row}");
+        assert!(row.contains("\"totals\":\"grand\""), "{row}");
+    }
+
+    /// A call that names a field the new kind refuses is refused by the
+    /// build: the model asked for it on purpose, so the tool says why.
+    #[tokio::test]
+    async fn a_pivot_call_that_names_the_measures_is_refused_by_the_build() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({
+                "kind": "pivot",
+                "rows": ["province"],
+                "values": [{ "column": "visitors", "aggregate": "sum" }],
+                "totals": "grand",
+                "measures": ["visitors"],
+            })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(
+            reply["error"],
+            json!(
+                "a pivot names its columns in its own fields, not in dimension, measures or breakdown."
+            ),
+            "{reply}"
+        );
     }
 
     /// `null` clears a field of any type, not only an optional one: a call
