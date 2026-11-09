@@ -715,7 +715,11 @@ fn create_chart_schema() -> Value {
             json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
-            "title": { "type": "string" }, "subtitle": { "type": "string" },
+            "title": { "type": "string" },
+            // The build prompt asks for `subtitle: null` when a chart has no
+            // subtitle, so the field takes a string or a null (AI-3,
+            // 2026-11-08).
+            "subtitle": { "type": ["string", "null"] },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
             "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "text": { "type": "string" }, "caption": { "type": "string" },
