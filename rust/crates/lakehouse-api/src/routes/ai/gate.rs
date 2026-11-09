@@ -718,6 +718,14 @@ pub fn permission_granted(
     if perms.is_some_and(|p| p.has(spec.permission)) {
         return true;
     }
+    // ADM-13 (D6): for a Risk::Read tool whose permission is query:read or catalog:read,
+    // holding assistant:ask also grants it.
+    if spec.risk == Risk::Read
+        && (spec.permission == "query:read" || spec.permission == "catalog:read")
+        && perms.is_some_and(|p| p.has("assistant:ask"))
+    {
+        return true;
+    }
     super::registry::reach_offers(spec.name, spec.permission, reach)
 }
 
@@ -1415,6 +1423,50 @@ mod tests {
                 "{tool} must be allowed with query:read"
             );
         }
+    }
+
+    /// ADM-13 (D6): `run_sql` is granted to `assistant:ask` without `query:read`.
+    /// A principal with only `assistant:use` and no `query:read` is still refused `run_sql`.
+    /// A principal with neither is still refused `run_sql`.
+    #[test]
+    fn run_sql_is_granted_to_assistant_ask_and_refused_to_assistant_use_alone() {
+        let ask = PermissionSet::parse("assistant:ask");
+        assert_eq!(
+            decide_by_name(false, Some(&ask), "run_sql", &no_args(), None, None),
+            None,
+            "run_sql must be granted to assistant:ask"
+        );
+
+        let use_only = PermissionSet::parse("assistant:use");
+        let refused_use = decide_by_name(false, Some(&use_only), "run_sql", &no_args(), None, None)
+            .expect("assistant:use alone must be refused run_sql without query:read");
+        assert_eq!(refused_use["reason"], json!("permission"));
+        assert_eq!(refused_use["required"], json!("query:read"));
+
+        let neither = PermissionSet::default();
+        let refused_neither =
+            decide_by_name(false, Some(&neither), "run_sql", &no_args(), None, None)
+                .expect("principal with neither must be refused run_sql");
+        assert_eq!(refused_neither["reason"], json!("permission"));
+        assert_eq!(refused_neither["required"], json!("query:read"));
+    }
+
+    /// ADM-13 (D6): a write tool call in ask mode (or forced to ask mode
+    /// for an AskOnly principal) is refused with the Ask-mode message.
+    #[test]
+    fn write_tool_in_ask_mode_is_refused_with_ask_mode_message() {
+        let ask = PermissionSet::parse("assistant:ask");
+        let refused = decide_by_name(false, Some(&ask), "create_chart", &no_args(), None, None)
+            .expect("write tool in ask mode must be refused");
+        assert_eq!(refused, ask_mode_refusal("create_chart"));
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Ask mode cannot run a tool that changes anything"),
+            "refusal error must mention Ask mode: {:?}",
+            refused["error"]
+        );
     }
 
     /// SEC-23 (F3): the copilot was a second way to add a governance rule

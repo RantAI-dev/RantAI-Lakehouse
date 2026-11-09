@@ -2906,12 +2906,19 @@ pub fn tool_schemas_for(
     perms: Option<&lakehouse_auth::PermissionSet>,
     anywhere: Option<lakehouse_bi::access::Level>,
 ) -> Vec<Value> {
+    let access = super::AssistantAccess::from_perms(perms);
     TOOLS
         .iter()
         .zip(tool_schemas())
         .filter(|(t, _)| {
+            if access.is_ask_only() && t.risk != Risk::Read {
+                return false;
+            }
             t.permission.is_empty()
                 || perms.is_some_and(|p| p.has(t.permission))
+                || (t.risk == Risk::Read
+                    && (t.permission == "query:read" || t.permission == "catalog:read")
+                    && perms.is_some_and(|p| p.has("assistant:ask")))
                 || reach_offers(t.name, t.permission, anywhere)
         })
         .map(|(_, schema)| schema)
@@ -3903,6 +3910,40 @@ mod tests {
         assert!(!offered_names.contains(&"describe_mart"));
         assert!(!offered_names.contains(&"create_chart"));
         assert!(!offered_names.contains(&"list_boards"));
+    }
+
+    /// ADM-13 (D6): an `assistant:ask`-only principal gets only Read tools in the schema list.
+    /// It sees tools granted by assistant:ask (query:read and catalog:read read tools),
+    /// and authenticated-only read tools, but no write tools and no lineage tools.
+    #[test]
+    fn tool_schemas_for_assistant_ask_only_offers_only_read_tools() {
+        let perms = lakehouse_auth::PermissionSet::parse("assistant:ask");
+        let offered = tool_schemas_for(Some(&perms), None);
+        assert!(!offered.is_empty());
+        for schema in &offered {
+            let name = schema["function"]["name"].as_str().expect("tool name");
+            let spec = find(name).expect("tool spec exists");
+            assert_eq!(
+                spec.risk,
+                Risk::Read,
+                "tool {name} offered to assistant:ask must be Risk::Read"
+            );
+        }
+        let offered_names: Vec<&str> = offered
+            .iter()
+            .map(|v| v["function"]["name"].as_str().expect("name"))
+            .collect();
+        // Granted via assistant:ask:
+        assert!(offered_names.contains(&"run_sql"));
+        assert!(offered_names.contains(&"list_datasets"));
+        assert!(offered_names.contains(&"describe_dataset"));
+        assert!(offered_names.contains(&"lakehouse_overview"));
+        // Not granted (lineage:read):
+        assert!(!offered_names.contains(&"get_lineage"));
+        // Write tools excluded:
+        assert!(!offered_names.contains(&"create_chart"));
+        assert!(!offered_names.contains(&"create_pipeline"));
+        assert!(!offered_names.contains(&"run_pipeline"));
     }
 
     /// With no principal at all, only empty-`permission` tools are offered.
