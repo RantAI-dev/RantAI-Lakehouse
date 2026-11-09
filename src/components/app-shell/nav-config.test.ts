@@ -100,8 +100,6 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
 
     it("allows any signed-in user on routes with requires: []", () => {
       const hasNone = () => false
-      expect(canOpen("/", hasNone)).toBe(true)
-      expect(canOpen("/copilot/history", hasNone)).toBe(true)
       expect(canOpen("/account/change-password", hasNone)).toBe(true)
     })
 

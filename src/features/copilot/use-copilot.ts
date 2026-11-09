@@ -720,11 +720,54 @@ export function CopilotProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Access the shared Copilot brain. */
+const NOOP_COPILOT: CopilotValue = {
+  sessionTitle: "",
+  mode: "ask",
+  setMode: () => {},
+  messages: [],
+  busy: false,
+  error: null,
+  askNotice: null,
+  sessionId: null,
+  sessions: [],
+  enabledCaps: new Set<string>(),
+  toggleCap: () => {},
+  pageContext: derivePageContext("/"),
+  setPageContext: () => {},
+  send: async () => {},
+  newChat: () => {},
+  loadSession: async () => {},
+  removeSession: async () => false,
+  renameSession: async () => false,
+  refreshSessions: async () => {},
+  stop: () => {},
+  retry: () => {},
+  editAndResend: () => {},
+  deleteMessage: () => {},
+  clearError: () => {},
+  answerAskOption: async () => {},
+  confirmTool: async () => {},
+  cancelTool: () => {},
+  completeToolStep: () => {},
+  confirmingKey: null,
+  dockPosition: "bottom",
+  setDockPosition: () => {},
+  expanded: false,
+  setExpanded: () => {},
+  sidebarWidth: 380,
+  setSidebarWidth: () => {},
+};
+
+const NOOP_STREAM: CopilotStreamValue = {
+  draft: "",
+  liveReasoning: "",
+  progress: null,
+};
+
+/** Access the shared Copilot brain. Returns no-op fallback when outside CopilotProvider. */
 export function useCopilot(): CopilotValue {
   const ctx = React.useContext(CopilotContext);
-  if (!ctx) throw new Error("useCopilot must be used within a CopilotProvider");
-  return ctx;
+  return ctx ?? NOOP_COPILOT;
 }
 
 /**
@@ -734,8 +777,7 @@ export function useCopilot(): CopilotValue {
  */
 export function useCopilotStream(): CopilotStreamValue {
   const ctx = React.useContext(CopilotStreamContext);
-  if (!ctx) throw new Error("useCopilotStream must be used within a CopilotProvider");
-  return ctx;
+  return ctx ?? NOOP_STREAM;
 }
 
 /** A stream value for a test or a story that renders the message list alone. */

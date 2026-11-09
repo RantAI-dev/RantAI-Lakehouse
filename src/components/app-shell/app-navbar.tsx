@@ -42,8 +42,9 @@ export function AppNavbar() {
   const pathname = usePathname()
   const pageTitle = pageTitleFor(pathname)
   const router = useRouter()
-  const { user, logout, activeTenantId, setActiveTenant } = useAuth()
+  const { user, logout, activeTenantId, setActiveTenant, hasPermission } = useAuth()
   const copilot = useCopilot()
+  const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask")
   const isCopilotPage = pathname?.startsWith("/copilot")
   // Bell dot lights only for a real, currently open/pending item — never
   // on `supported: false` (an unsupported deployment shows no dot, not a
@@ -136,7 +137,7 @@ export function AppNavbar() {
               router.refresh()
             }}
           />
-          {!isCopilotPage && (
+          {!isCopilotPage && hasAssistant && (
             <Button
               variant="ghost"
               size="icon"

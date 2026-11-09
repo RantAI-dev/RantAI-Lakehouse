@@ -80,12 +80,26 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Home",
     icon: Home,
-    items: [{ title: "Home", href: "/", icon: Home, requires: [] }],
+    items: [
+      {
+        title: "Home",
+        href: "/",
+        icon: Home,
+        requires: ["assistant:use", "assistant:ask"],
+      },
+    ],
   },
   {
     label: "History",
     icon: History,
-    items: [{ title: "History", href: "/copilot/history", icon: History, requires: [] }],
+    items: [
+      {
+        title: "History",
+        href: "/copilot/history",
+        icon: History,
+        requires: ["assistant:use", "assistant:ask"],
+      },
+    ],
   },
   {
     label: "Dashboards",
@@ -261,9 +275,9 @@ export type RouteAccessEntry = {
  */
 export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // Home and AI
-  { pattern: "/", requires: [] },
+  { pattern: "/", requires: ["assistant:use", "assistant:ask"] },
   { pattern: "/copilot", requires: ["assistant:use", "assistant:ask"] },
-  { pattern: "/copilot/history", requires: [] },
+  { pattern: "/copilot/history", requires: ["assistant:use", "assistant:ask"] },
 
   // Dashboards
   { pattern: "/dashboards", requires: ["dashboard:read"] },
