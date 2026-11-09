@@ -3911,6 +3911,7 @@ async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
         ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
         ("POST", "/api/identity/users/{id}/deactivate"),
         ("POST", "/api/identity/users/{id}/reactivate"),
+        ("PATCH", "/api/identity/users/{id}"),
     ] {
         assert_eq!(
             POLICY_TABLE

@@ -1764,6 +1764,97 @@ pub async fn delete_service_identity(pool: &PgPool, id: &str) -> Result<(), Stor
     Ok(())
 }
 
+/// Describes an update to a user's email address (ADM-11 D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailUpdate<'a> {
+    /// Leave the existing email address unchanged.
+    Unchanged,
+    /// Clear the email address (set to NULL).
+    Clear,
+    /// Set a new email address.
+    Set(&'a str),
+}
+
+/// Update a user's username and/or email address (ADM-11 D8).
+///
+/// Refuses with [`StoreError::FieldConflict`] if the new username or email clashes
+/// with another user's username or email (case-insensitively, ADM-11 D5).
+/// Refuses with [`StoreError::Validation`] if the username breaks ADM-11 D3 rules.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `user_id` does not exist,
+/// [`StoreError::FieldConflict`] on unique clash, [`StoreError::Validation`] on
+/// invalid format, or [`StoreError::Database`] on query failure.
+pub async fn update_user_identity(
+    pool: &PgPool,
+    user_id: Uuid,
+    new_username: Option<&str>,
+    new_email: EmailUpdate<'_>,
+) -> Result<User, StoreError> {
+    let mut tx = pool.begin().await?;
+    let user = update_user_identity_in_tx(&mut tx, user_id, new_username, new_email).await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// [`update_user_identity`], inside a transaction the caller owns.
+///
+/// # Errors
+///
+/// Same as [`update_user_identity`].
+pub async fn update_user_identity_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    new_username: Option<&str>,
+    new_email: EmailUpdate<'_>,
+) -> Result<User, StoreError> {
+    let current = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT username, email FROM app_user WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+
+    let target_username = match new_username {
+        Some(u) => normalize_username(u)?,
+        None => current.0,
+    };
+
+    let target_email = match new_email {
+        EmailUpdate::Set(e) => normalize_email(Some(e))?,
+        EmailUpdate::Clear => None,
+        EmailUpdate::Unchanged => current.1,
+    };
+
+    let (username_taken, email_taken) =
+        username_email_taken_in_tx(tx, &target_username, target_email.as_deref(), Some(user_id))
+            .await?;
+    if username_taken {
+        return Err(StoreError::FieldConflict(
+            "Username already in use".to_owned(),
+        ));
+    }
+    if email_taken {
+        return Err(StoreError::FieldConflict("Email already in use".to_owned()));
+    }
+
+    sqlx::query("UPDATE app_user SET username = $1, email = $2, updated_at = now() WHERE id = $3")
+        .bind(&target_username)
+        .bind(&target_email)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+
+    let sql = format!("{USER_SELECT} WHERE u.id = $1");
+    let row: UserRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(row.into())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

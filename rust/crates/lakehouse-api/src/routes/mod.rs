@@ -1114,6 +1114,11 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users",
             get(identity::list_users).post(identity::create_user),
         )
+        // ADM-11 D8: update a user's username and/or email.
+        .route(
+            "/api/identity/users/{id}",
+            axum::routing::patch(identity::update_user),
+        )
         // Give an existing user a tenant. Both ids are validated inside
         // the handler (400 when malformed, 404 when unknown).
         .route(
