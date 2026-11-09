@@ -1231,6 +1231,30 @@ fn session_revoke_audit_event(principal: &Principal, session_id: Uuid) -> NewAud
     }
 }
 
+/// Response body for `GET /api/auth/password-rules` (ADM-11 D4, moved above tests for ADM-11 review 1 B4).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordRulesResponse {
+    /// Minimum password length.
+    pub min_length: usize,
+    /// Maximum password length.
+    pub max_length: usize,
+}
+
+/// `GET /api/auth/password-rules` — public endpoint returning password length constraints (ADM-11 D4).
+///
+/// ADM-11 review 1 B4: placed above `#[cfg(test)]` so the SEC-11 scan does not skip it.
+///
+/// # Errors
+///
+/// This handler never fails and returns `Ok`.
+pub async fn password_rules() -> ApiResult<ApiJson<PasswordRulesResponse>> {
+    Ok(ApiJson(PasswordRulesResponse {
+        min_length: password::MIN_PASSWORD_LENGTH,
+        max_length: password::MAX_PASSWORD_LENGTH,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2277,24 +2301,3 @@ mod tests {
     }
 }
 
-/// Response body for `GET /api/auth/password-rules` (ADM-11 D4).
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PasswordRulesResponse {
-    /// Minimum password length.
-    pub min_length: usize,
-    /// Maximum password length.
-    pub max_length: usize,
-}
-
-/// `GET /api/auth/password-rules` — public endpoint returning password length constraints (ADM-11 D4).
-///
-/// # Errors
-///
-/// This handler never fails and returns `Ok`.
-pub async fn password_rules() -> ApiResult<ApiJson<PasswordRulesResponse>> {
-    Ok(ApiJson(PasswordRulesResponse {
-        min_length: password::MIN_PASSWORD_LENGTH,
-        max_length: password::MAX_PASSWORD_LENGTH,
-    }))
-}
