@@ -16,6 +16,9 @@ const MOCK_PERMISSIONS: Permission[] = [
   { name: "dashboard:read", area: "Dashboards", description: "View dashboards and charts." },
   { name: "dashboard:write", area: "Dashboards", description: "Create and edit dashboards and charts." },
   { name: "pipeline:read", area: "Pipelines", description: "View pipelines and their runs." },
+  { name: "pipeline:write", area: "Pipelines", description: "Create, edit and trigger pipelines." },
+  { name: "policy:read", area: "Governance", description: "View governance policies and SLAs." },
+  { name: "policy:write", area: "Governance", description: "Create and edit governance policies and SLAs." },
 ]
 
 describe("PermissionPicker (WEB-8 T3 / D7)", () => {
@@ -32,6 +35,7 @@ describe("PermissionPicker (WEB-8 T3 / D7)", () => {
     expect(screen.getByText("Data")).toBeDefined()
     expect(screen.getByText("Dashboards")).toBeDefined()
     expect(screen.getByText("Pipelines")).toBeDefined()
+    expect(screen.getByText("Governance")).toBeDefined()
 
     // Verify checkboxes in their groups
     expect(screen.getByRole("checkbox", { name: /catalog:read/i })).toBeDefined()
@@ -39,6 +43,9 @@ describe("PermissionPicker (WEB-8 T3 / D7)", () => {
     expect(screen.getByRole("checkbox", { name: /dashboard:read/i })).toBeDefined()
     expect(screen.getByRole("checkbox", { name: /dashboard:write/i })).toBeDefined()
     expect(screen.getByRole("checkbox", { name: /pipeline:read/i })).toBeDefined()
+    expect(screen.getByRole("checkbox", { name: /pipeline:write/i })).toBeDefined()
+    expect(screen.getByRole("checkbox", { name: /policy:read/i })).toBeDefined()
+    expect(screen.getByRole("checkbox", { name: /policy:write/i })).toBeDefined()
   })
 
   it("each area has an 'All in this area' checkbox that toggles all in that area", () => {
@@ -53,9 +60,9 @@ describe("PermissionPicker (WEB-8 T3 / D7)", () => {
       />
     )
 
-    // Data has catalog:read and query:read. Currently only catalog:read is checked.
+    // Data, Dashboards, Pipelines, Governance
     const allDataCheckboxes = screen.getAllByRole("checkbox", { name: /All in this area/i })
-    expect(allDataCheckboxes.length).toBe(3) // Data, Dashboards, Pipelines
+    expect(allDataCheckboxes.length).toBe(4)
 
     // Clicking "All in this area" for Data checks all in Data
     fireEvent.click(allDataCheckboxes[0])
@@ -153,6 +160,92 @@ describe("PermissionPicker (WEB-8 T3 / D7)", () => {
 
     // Unchecking *:* removes it
     fireEvent.click(screen.getByRole("checkbox", { name: /Full access/i }))
+    expect(saved).toBe("")
+  })
+
+  // WEB-8 review 1 B1: test role holding pipeline:*
+  it("holders of pipeline:* see checked removable chip and disabled covered permissions", () => {
+    let saved = "pipeline:*"
+    const { rerender } = render(
+      <PermissionPicker
+        value={saved}
+        onChange={(v) => {
+          saved = v
+        }}
+        permissions={MOCK_PERMISSIONS}
+      />
+    )
+
+    // Shows chip "All pipeline: permissions"
+    expect(screen.getByText(/All pipeline: permissions/i)).toBeDefined()
+    // Not treated as unrecognised
+    expect(screen.queryByText("(Not recognised)")).toBeNull()
+
+    // Covered permissions pipeline:read and pipeline:write are checked and disabled
+    const readCb = screen.getByRole("checkbox", { name: "pipeline:read" })
+    expect(readCb.getAttribute("aria-checked")).toBe("true")
+    expect(readCb.hasAttribute("disabled")).toBe(true)
+
+    const writeCb = screen.getByRole("checkbox", { name: "pipeline:write" })
+    expect(writeCb.getAttribute("aria-checked")).toBe("true")
+    expect(writeCb.hasAttribute("disabled")).toBe(true)
+
+    // Shows "covered by pipeline:*"
+    expect(screen.getAllByText(/covered by pipeline:\*/i).length).toBe(2)
+
+    // Click remove button on the chip
+    const removeBtn = screen.getByRole("button", { name: /Remove pipeline:\*/i })
+    fireEvent.click(removeBtn)
+    expect(saved).toBe("")
+
+    // Rerender with saved = ""
+    rerender(
+      <PermissionPicker
+        value={saved}
+        onChange={(v) => {
+          saved = v
+        }}
+        permissions={MOCK_PERMISSIONS}
+      />
+    )
+    const readCbAfter = screen.getByRole("checkbox", { name: "pipeline:read" })
+    expect(readCbAfter.getAttribute("aria-checked")).toBe("false")
+    expect(readCbAfter.hasAttribute("disabled")).toBe(false)
+  })
+
+  // WEB-8 review 1 B1: test role holding policy:*
+  it("holders of policy:* see checked removable chip and disabled covered permissions", () => {
+    let saved = "policy:*"
+    render(
+      <PermissionPicker
+        value={saved}
+        onChange={(v) => {
+          saved = v
+        }}
+        permissions={MOCK_PERMISSIONS}
+      />
+    )
+
+    // Shows chip "All policy: permissions"
+    expect(screen.getByText(/All policy: permissions/i)).toBeDefined()
+    // Not treated as unrecognised
+    expect(screen.queryByText("(Not recognised)")).toBeNull()
+
+    // Covered permissions policy:read and policy:write are checked and disabled
+    const readCb = screen.getByRole("checkbox", { name: "policy:read" })
+    expect(readCb.getAttribute("aria-checked")).toBe("true")
+    expect(readCb.hasAttribute("disabled")).toBe(true)
+
+    const writeCb = screen.getByRole("checkbox", { name: "policy:write" })
+    expect(writeCb.getAttribute("aria-checked")).toBe("true")
+    expect(writeCb.hasAttribute("disabled")).toBe(true)
+
+    // Shows "covered by policy:*"
+    expect(screen.getAllByText(/covered by policy:\*/i).length).toBe(2)
+
+    // Click remove button on the chip
+    const removeBtn = screen.getByRole("button", { name: /Remove policy:\*/i })
+    fireEvent.click(removeBtn)
     expect(saved).toBe("")
   })
 

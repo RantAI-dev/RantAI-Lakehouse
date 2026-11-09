@@ -1,11 +1,12 @@
 "use client"
 
 import * as React from "react"
+import { Badge } from "@/components/ui/badge"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
-import { Badge } from "@/components/ui/badge"
 import { identityService, type Permission } from "@/services"
-import { XIcon } from "lucide-react"
+import { Check, XIcon } from "lucide-react"
+import { cn } from "@/lib/utils"
 
 export type PermissionPickerProps = {
   id?: string
@@ -25,6 +26,35 @@ function parseTokens(raw: string): string[] {
 
 function serializeTokens(tokens: string[]): string {
   return tokens.join(", ")
+}
+
+// WEB-8 review 1 B1: split permission token into (resource, action) parts, mirroring permission_catalog::split_parts
+function splitParts(token: string): [string, string] | null {
+  const trimmed = token.trim()
+  const idx = trimmed.indexOf(":")
+  if (idx === -1) return null
+  const resource = trimmed.slice(0, idx).trim()
+  const action = trimmed.slice(idx + 1).trim()
+  if (!resource || !action) return null
+  return [resource, action]
+}
+
+// WEB-8 review 1 B1: check whether token is known, mirroring permission_catalog::is_known
+function isKnownToken(token: string, catalog: Permission[]): boolean {
+  const parts = splitParts(token)
+  if (!parts) return false
+  const [resource, action] = parts
+  if (resource === "*" && action === "*") return true
+  if (action === "*") {
+    return catalog.some((p) => {
+      const pParts = splitParts(p.name)
+      return pParts !== null && pParts[0] === resource
+    })
+  }
+  return catalog.some((p) => {
+    const pParts = splitParts(p.name)
+    return pParts !== null && pParts[0] === resource && pParts[1] === action
+  })
 }
 
 export function PermissionPicker({
@@ -62,14 +92,23 @@ export function PermissionPicker({
 
   const tokens = React.useMemo(() => parseTokens(value), [value])
 
-  const knownNames = React.useMemo(
-    () => new Set(catalog.map((p) => p.name)),
-    [catalog]
-  )
+  // WEB-8 review 1 B1: identify held resource wildcards (e.g. pipeline:*, policy:*)
+  const heldWildcards = React.useMemo(() => {
+    return tokens.filter((t) => {
+      const parts = splitParts(t)
+      return (
+        parts !== null &&
+        parts[0] !== "*" &&
+        parts[1] === "*" &&
+        isKnownToken(t, catalog)
+      )
+    })
+  }, [tokens, catalog])
 
+  // WEB-8 review 1 B1: unknown tokens exclude known resource wildcards and *:*
   const unknownTokens = React.useMemo(() => {
-    return tokens.filter((t) => t !== "*:*" && !knownNames.has(t))
-  }, [tokens, knownNames])
+    return tokens.filter((t) => !isKnownToken(t, catalog))
+  }, [tokens, catalog])
 
   const areas = React.useMemo(() => {
     const map = new Map<string, Permission[]>()
@@ -120,6 +159,45 @@ export function PermissionPicker({
     onChange(serializeTokens(next))
   }
 
+  // WEB-8 review 1 B1: handle removing held resource wildcard
+  function handleRemoveWildcard(tokenToRemove: string) {
+    const next = tokens.filter((t) => t !== tokenToRemove)
+    onChange(serializeTokens(next))
+  }
+
+  // WEB-8 review 1 B1: show each held resource wildcard as a checked, removable chip
+  const renderHeldWildcards = () => (
+    <div className="space-y-1.5" data-testid="held-wildcards">
+      <div className="flex flex-wrap gap-1.5">
+        {heldWildcards.map((token) => {
+          const parts = splitParts(token)
+          const resource = parts ? parts[0] : token
+          return (
+            <Badge
+              key={token}
+              variant="outline"
+              className="gap-1.5 border-primary/30 bg-primary/10 text-primary py-1 px-2 text-xs font-normal"
+              data-testid={`wildcard-${resource}`}
+            >
+              <Check className="size-3 text-primary" aria-hidden="true" />
+              <span>All {resource}: permissions</span>
+              <button
+                type="button"
+                className="hover:text-foreground inline-flex items-center justify-center cursor-pointer ml-0.5"
+                onClick={() => handleRemoveWildcard(token)}
+                aria-label={`Remove ${token}`}
+                title={`Remove ${token}`}
+                disabled={disabled}
+              >
+                <XIcon className="size-3" />
+              </button>
+            </Badge>
+          )
+        })}
+      </div>
+    </div>
+  )
+
   const renderUnknownTokens = () => (
     <div className="space-y-1.5" data-testid="unknown-tokens">
       <Label className="text-xs font-medium text-muted-foreground">Not recognised</Label>
@@ -138,6 +216,7 @@ export function PermissionPicker({
               onClick={() => handleRemoveUnknown(token)}
               aria-label={`Remove ${token}`}
               title={`Remove ${token}`}
+              disabled={disabled}
             >
               <XIcon className="size-3" />
             </button>
@@ -182,13 +261,21 @@ export function PermissionPicker({
 
   return (
     <div className="space-y-4" id={id} data-testid="permission-picker">
+      {heldWildcards.length > 0 && renderHeldWildcards()}
       {unknownTokens.length > 0 && renderUnknownTokens()}
 
       <div className="space-y-3">
         {areas.map(({ area, permissions: areaPerms }) => {
           const areaNames = areaPerms.map((p) => p.name)
           const allChecked =
-            areaNames.length > 0 && areaNames.every((name) => tokens.includes(name))
+            areaNames.length > 0 &&
+            areaPerms.every((perm) => {
+              const coveringWildcard = heldWildcards.find((w) => {
+                const parts = splitParts(w)
+                return parts !== null && perm.name.startsWith(`${parts[0]}:`)
+              })
+              return Boolean(coveringWildcard) || tokens.includes(perm.name)
+            })
 
           return (
             <div
@@ -218,7 +305,13 @@ export function PermissionPicker({
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-0.5">
                 {areaPerms.map((perm) => {
-                  const isChecked = tokens.includes(perm.name)
+                  // WEB-8 review 1 B1: show permissions covered by resource wildcard as checked and disabled
+                  const coveringWildcard = heldWildcards.find((w) => {
+                    const parts = splitParts(w)
+                    return parts !== null && perm.name.startsWith(`${parts[0]}:`)
+                  })
+                  const isCovered = Boolean(coveringWildcard)
+                  const isChecked = isCovered || tokens.includes(perm.name)
                   const permId = `${id}-${perm.name.replace(/[:*]/g, "-")}`
                   return (
                     <div key={perm.name} className="flex items-start gap-2">
@@ -226,18 +319,28 @@ export function PermissionPicker({
                         id={permId}
                         aria-label={perm.name}
                         checked={isChecked}
-                        disabled={disabled}
+                        disabled={disabled || isCovered}
                         onCheckedChange={(checked) =>
                           handleTokenToggle(perm.name, Boolean(checked))
                         }
                       />
                       <div className="grid gap-0.5 leading-none">
-                        <Label
-                          htmlFor={permId}
-                          className="text-xs font-mono font-medium cursor-pointer"
-                        >
-                          {perm.name}
-                        </Label>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <Label
+                            htmlFor={permId}
+                            className={cn(
+                              "text-xs font-mono font-medium cursor-pointer",
+                              isCovered && "text-muted-foreground"
+                            )}
+                          >
+                            {perm.name}
+                          </Label>
+                          {coveringWildcard && (
+                            <span className="text-[10px] text-muted-foreground font-sans">
+                              covered by {coveringWildcard}
+                            </span>
+                          )}
+                        </div>
                         <p className="text-[11px] text-muted-foreground leading-snug">
                           {perm.description}
                         </p>
