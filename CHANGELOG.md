@@ -51,6 +51,7 @@ once a first release is tagged.
 - The catalog's "Open in Query Studio" and snapshot links for a Bronze table open a Trino tab with `iceberg.bronze.<table>`, as the schema browser does (backlog `QS-1`).
 - The assistant's tool descriptions are shorter. A build turn offers 56 tools in 57,764 characters, down from 59,753, under the 60,000 bar (backlog `AI-15`).
 - The offered tools of a build turn drop two repeated descriptions, the per-value number format of `format_chart` and the nested parts of `update_metric`. The turn offers 56 tools in 57,251 characters, 656 fewer than before this change (57,907, which includes the `parameters` property that `run_sql` gained with query parameters). No tool's behaviour, permission, type, enum or required field changes (backlog `AI-15`, #423).
+- In Ask mode the assistant narrows the dashboard's view instead of drafting a new chart: a request to see only some of the data on the page, for example "show only 2026" or "only Bali", sets the person's own filters on the page for this visit only. Nothing is saved, so the board's default filters and every other viewer's view stay as they are; saving the board's default filters is a separate tool (`save_board_filters`) and stays in the Dashboard Builder (backlog `AI-2`).
 
 ## [0.2.1] - 2026-11-04
 
