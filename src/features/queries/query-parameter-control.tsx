@@ -231,6 +231,14 @@ function optionByText(options: readonly QueryParamOption[], text: string) {
   return options.find((option) => String(option.value) === text)
 }
 
+/**
+ * A dropdown: a list of the options the definition holds, and a first item
+ * that takes the value away again.
+ *
+ * A person who picked an option could not get back to "no value" before:
+ * the list held the options and nothing else. The first item, "No value",
+ * reports no value, so the field can be emptied again (#422 S4).
+ */
 function DropdownSelect({
   id,
   options,
@@ -244,7 +252,12 @@ function DropdownSelect({
   readonly invalid: boolean
   readonly onChange: (value: QueryParamValue | undefined) => void
 }) {
-  const items = options.map((option) => ({ value: String(option.value), label: option.label }))
+  // The first item holds no value: `null` is how the select says "nothing is
+  // chosen", and the label of that item is what the trigger reads then.
+  const items = [
+    { value: null, label: "No value" },
+    ...options.map((option) => ({ value: String(option.value), label: option.label })),
+  ]
   const chosen = typeof value === "string" || typeof value === "number" ? String(value) : null
   return (
     <Select
@@ -259,6 +272,7 @@ function DropdownSelect({
         <SelectValue placeholder="Choose" />
       </SelectTrigger>
       <SelectContent>
+        <SelectItem value={null}>No value</SelectItem>
         {options.map((option) => (
           <SelectItem key={String(option.value)} value={String(option.value)}>
             {option.label}

@@ -15,7 +15,7 @@ import { cn } from "@/lib/utils"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { StandInNotice } from "./asset-stand-in"
-import type { IcebergTableState } from "./asset-storage"
+import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { SampleGrid, type Picked } from "./sample-grid"
 import { SampleInspector } from "./sample-inspector"
 
@@ -117,7 +117,7 @@ export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg
   // left the title and description a few characters wide (the Schema tab's card met the same slot).
   const controls = (
     <div className="mb-2 flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
-      <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a)} />}>
+      <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a, icebergTableOf(iceberg))} />}>
         Open in Query Studio
       </Button>
     </div>

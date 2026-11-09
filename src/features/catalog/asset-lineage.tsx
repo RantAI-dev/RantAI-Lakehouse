@@ -16,6 +16,7 @@ import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LineageGraph } from "@/services/contracts/governance"
 import { LineageMindmap, edgePipeline, mindmapModel } from "./asset-lineage-map"
+import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ColumnLineageCard, MappingList } from "./column-lineage"
 
 /**
@@ -282,8 +283,19 @@ function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
  * The Lineage tab: the recorded graph around the asset, the column view
  * (which columns feed a column and what is built from it), what reads it, and any table the catalog relates to it
  * outside the graph.
+ *
+ * `iceberg` is the page's own state for the Iceberg table, so the query
+ * link opens Trino only when that table is there (owner, 2026-11-08).
  */
-export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: AssetLineageState }) {
+export function AssetLineage({
+  asset: a,
+  state,
+  iceberg,
+}: {
+  asset: AssetDetail
+  state: AssetLineageState
+  iceberg: IcebergTableState
+}) {
   const graph = state.status === "success" ? state.data : null
   const dependents = assetDependents(a, graph)
   const related = relatedTables(a, graph)
@@ -299,7 +311,7 @@ export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: A
         >
           Open lineage graph
         </Button>
-        <Button size="sm" variant="ghost" render={<Link href={assetQueryStudioHref(a)} />}>
+        <Button size="sm" variant="ghost" render={<Link href={assetQueryStudioHref(a, icebergTableOf(iceberg))} />}>
           Query this asset
         </Button>
       </div>

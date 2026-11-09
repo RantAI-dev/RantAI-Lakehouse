@@ -78,7 +78,7 @@ import { DrillMenu, NoteDialog, RecordsDialog, type DrillTarget } from "./drill"
 import { DrillTrail, useTileDrills } from "./tile-drills";
 import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
-import { offerFor } from "./access-level";
+import { offerFor } from "@/lib/access-level";
 import { ShareDialog } from "./share-dialog";
 import { CommentsDialog } from "./comments-panel";
 import { TileBody } from "./tile-body";
