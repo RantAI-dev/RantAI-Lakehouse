@@ -111,3 +111,14 @@ A spec is not a plan. Before building, a task still needs a feature page in [`..
 | [`QS-3`](qs-3.md) | Saved queries done properly | Next | M |
 | [`QS-4`](qs-4.md) | History and query profile | Next | M |
 | [`QS-5`](qs-5.md) | Parameters, snippets and charts from results | Next | L |
+
+### Access, sign-in and forms
+
+| ID | Spec | When | Size |
+| --- | --- | --- | --- |
+| [`ADM-13`](adm-13.md) | Each role sees only the pages it may use | Now | M |
+| [`GOV-7`](gov-7.md) | Read access per schema and table | Now | L |
+| [`ADM-11`](adm-11.md) | Usernames, optional email, admin-set first password | Next | M |
+| [`ADM-12`](adm-12.md) | Single sign-on in Settings (OIDC; SAML after ADR 0017) | Next | M |
+| [`WEB-7`](web-7.md) | Side-panel forms become full pages | Next | M |
+| [`WEB-8`](web-8.md) | Forms offer the allowed values | Next | M, in two parts |

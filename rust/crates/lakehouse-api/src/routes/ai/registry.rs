@@ -1144,7 +1144,7 @@ fn move_chart_schema() -> Value {
 
 fn set_board_view_filters_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_board_view_filters",
-        "description": "Change the filters visible to the person on this page, this time only. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
+        "description": "Change the filters visible to the person on this page, this time only. Use it for a request to see only some data on this page (\"show only 2026\", \"only Bali\", \"tampilkan hanya …\"), instead of a new chart; a year on a date column is a between filter on that year's first and last day. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string" },
             "filters": filters_array_property() },
@@ -3224,6 +3224,25 @@ mod tests {
             assert!(
                 description.contains(clause),
                 "set_cache_rule must say: {clause}"
+            );
+        }
+    }
+
+    /// `AI-2` AC1: the model's own wording for a request to see only some of
+    /// the data on the page. Without it the model drafts a chart instead of
+    /// setting the view's filters.
+    #[test]
+    fn set_board_view_filters_names_the_request_it_is_for() {
+        let schema = (find("set_board_view_filters")
+            .expect("registered tool")
+            .schema)();
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("set_board_view_filters has a description");
+        for clause in ["show only", "instead of a new chart"] {
+            assert!(
+                description.contains(clause),
+                "set_board_view_filters must say: {clause}"
             );
         }
     }

@@ -55,6 +55,7 @@ once a first release is tagged.
 - The offered tools of a build turn drop two repeated descriptions, the per-value number format of `format_chart` and the nested parts of `update_metric`. The turn offers 56 tools in 57,251 characters, 656 fewer than before this change (57,907, which includes the `parameters` property that `run_sql` gained with query parameters). No tool's behaviour, permission, type, enum or required field changes (backlog `AI-15`, #423).
 - The catalog's "Open in Query Studio" and snapshot links for a Bronze table open the Trino tab only when the Bronze table's Iceberg table exists, and the ClickHouse link otherwise (backlog `QS-3`).
 - Saving a query in update mode always states the parameter definitions it wants, so a statement without a placeholder clears them; the editor's list after `{{` holds the tab's defined names and nothing else, and offers none inside a comment or a quoted run; a dropdown can be set back to "no value" (backlog `QS-5`).
+- In Ask mode the assistant narrows the dashboard's view instead of drafting a new chart: a request to see only some of the data on the page, for example "show only 2026" or "only Bali", sets the person's own filters on the page for this visit only. Nothing is saved, so the board's default filters and every other viewer's view stay as they are; saving the board's default filters is a separate tool (`save_board_filters`) and stays in the Dashboard Builder (backlog `AI-2`).
 
 ## [0.2.1] - 2026-11-04
 
