@@ -1244,7 +1244,12 @@ async fn migration_0132_backfills_usernames_safely_for_special_emails(
         sqlx::query_as("SELECT username FROM app_user WHERE email = 'müller@x.example'")
             .fetch_one(&pool)
             .await?;
-    assert!(muller.0.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '@' | '+' | '-')));
+    assert!(
+        muller
+            .0
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '@' | '+' | '-'))
+    );
 
     let variants: Vec<(String,)> = sqlx::query_as(
         "SELECT username FROM app_user WHERE lower(email) = 'casevariant@example.com' ORDER BY username",
@@ -1257,7 +1262,6 @@ async fn migration_0132_backfills_usernames_safely_for_special_emails(
 
     Ok(())
 }
-
 
 /// ADM-11 D5, one direction: an invite whose username equals ANOTHER
 /// user's email is refused as a field-specific 409

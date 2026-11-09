@@ -1897,7 +1897,6 @@ fn tenant_create_audit_event(principal: &Principal, tenant: &Tenant) -> NewAudit
     }
 }
 
-
 /// `PATCH /api/identity/users/{id}` — update a user's username and/or email (ADM-11 D8).
 ///
 /// # Errors

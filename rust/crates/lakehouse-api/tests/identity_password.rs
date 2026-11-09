@@ -51,13 +51,8 @@ mod identity {
                 "roles": ["Analyst"],
             }),
         ] {
-            let (status, resp_body, _) = post_json(
-                &app,
-                Some(&admin_cookie),
-                "/api/identity/users",
-                &body,
-            )
-            .await;
+            let (status, resp_body, _) =
+                post_json(&app, Some(&admin_cookie), "/api/identity/users", &body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
                 resp_body.get("message").and_then(|m| m.as_str()),
