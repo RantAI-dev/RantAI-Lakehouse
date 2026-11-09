@@ -1,9 +1,9 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock } from "bun:test"
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { PermissionPicker } from "./permission-picker"
-import type { Permission } from "@/services"
+import { identityService, type Permission } from "@/services"
 
 afterEach(() => {
   cleanup()
@@ -247,6 +247,26 @@ describe("PermissionPicker (WEB-8 T3 / D7)", () => {
     const removeBtn = screen.getByRole("button", { name: /Remove policy:\*/i })
     fireEvent.click(removeBtn)
     expect(saved).toBe("")
+  })
+
+  // WEB-8 review 1 B2: test failed catalog load renders ErrorState with Retry
+  it("renders ErrorState with Retry on failed permissions fetch and does not render editable picker", async () => {
+    spyOn(identityService, "listPermissions").mockRejectedValue(new Error("Failed to load permissions"))
+
+    render(
+      <PermissionPicker
+        value="catalog:read"
+        onChange={() => {}}
+      />
+    )
+
+    // Wait for the error state to render
+    expect(await screen.findByRole("status")).toBeDefined()
+    expect(screen.getByRole("button", { name: /Retry/i })).toBeDefined()
+    // Does not render editable picker
+    expect(screen.queryByTestId("area-group-data")).toBeNull()
+    // Does not render held tokens as Not recognised
+    expect(screen.queryByText(/Not recognised/i)).toBeNull()
   })
 
   it("there is no query:run anywhere in src/", () => {

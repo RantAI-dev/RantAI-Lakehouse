@@ -5,6 +5,8 @@ import { Badge } from "@/components/ui/badge"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
 import { identityService, type Permission } from "@/services"
+import { useService } from "@/hooks/use-service"
+import { ErrorState } from "@/components/patterns/page-states"
 import { Check, XIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -64,31 +66,22 @@ export function PermissionPicker({
   disabled = false,
   permissions: permissionsProp,
 }: PermissionPickerProps) {
-  const [catalog, setCatalog] = React.useState<Permission[]>(permissionsProp ?? [])
-  const [loading, setLoading] = React.useState(!permissionsProp)
+  // WEB-8 review 1 B2: load through useService(identityService.listPermissions)
+  const serviceState = useService(
+    (signal) => identityService.listPermissions(signal),
+    []
+  )
 
-  React.useEffect(() => {
-    if (permissionsProp) {
-      setCatalog(permissionsProp)
-      setLoading(false)
-      return
-    }
-    let active = true
-    identityService
-      .listPermissions()
-      .then((perms) => {
-        if (active && Array.isArray(perms)) {
-          setCatalog(perms)
-        }
-        if (active) setLoading(false)
-      })
-      .catch(() => {
-        if (active) setLoading(false)
-      })
-    return () => {
-      active = false
-    }
-  }, [permissionsProp])
+  const catalog = React.useMemo<Permission[]>(() => {
+    if (permissionsProp) return permissionsProp
+    if (Array.isArray(serviceState.data)) return serviceState.data
+    return []
+  }, [permissionsProp, serviceState.data])
+  const loading = !permissionsProp && serviceState.status === "loading"
+  const error =
+    !permissionsProp && serviceState.status === "error"
+      ? serviceState.error
+      : null
 
   const tokens = React.useMemo(() => parseTokens(value), [value])
 
@@ -225,6 +218,15 @@ export function PermissionPicker({
       </div>
     </div>
   )
+
+  // WEB-8 review 1 B2: on fetch error render ErrorState with Retry, and do not render the editable picker
+  if (error) {
+    return (
+      <div id={id} data-testid="permission-picker-error">
+        <ErrorState error={error} onRetry={serviceState.reload} />
+      </div>
+    )
+  }
 
   if (loading && catalog.length === 0) {
     return (
