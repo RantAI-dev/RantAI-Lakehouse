@@ -425,4 +425,49 @@ describe("QueryStudioPage parameters", () => {
       definitions: [{ name: "region", type: "text" }],
     })
   })
+
+  it("runs with no value for a dropdown whose value was taken away", async () => {
+    stubNetwork()
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT)
+    window.localStorage.setItem(
+      QUERY_DRAFT_KEY,
+      JSON.stringify({
+        tabs: [
+          {
+            id: "tab-1",
+            name: "Query 1",
+            sql: "SELECT {{region}}",
+            engine: "clickhouse",
+            parameters: [
+              {
+                name: "region",
+                type: "dropdown",
+                options: [
+                  { value: "eu", label: "Europe" },
+                  { value: "us", label: "United States" },
+                ],
+              },
+            ],
+            values: { region: "eu" },
+          },
+        ],
+        activeId: "tab-1",
+        question: "",
+        tab: "sql",
+      })
+    )
+    renderPage()
+    const fields = await screen.findByRole("group", { name: "Query parameters" })
+    // The value the tab held is taken away again, the way a person does it.
+    fireEvent.click(within(fields).getByLabelText("region"))
+    const none = await screen.findByRole("option", { name: "No value" })
+    fireEvent.focus(none)
+    fireEvent.click(none)
+
+    fireEvent.click(screen.getByRole("button", { name: "Run query" }))
+
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    // The run holds no value for the parameter: the name is not sent at all.
+    expect(run.mock.calls[0]?.[1]).toMatchObject({ parameters: {} })
+  })
 })
