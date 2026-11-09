@@ -301,12 +301,7 @@ pub async fn must_change_password(pool: &PgPool, app_user_id: Uuid) -> Result<bo
     row.map(|(flag,)| flag).ok_or(AuthError::NotFound)
 }
 
-/// Verify an `identifier`/`password` pair and, on success, load the
-/// caller's [`Principal`]. See the module doc comment for the
-/// non-enumeration guarantee this makes.
-///
-/// # Errors
-///
+// ADM-11 review 1 S6: fixed doc comments (removed orphan doc above MIN_PASSWORD_LENGTH).
 /// Minimum length for a user password (ADM-11 D4).
 pub const MIN_PASSWORD_LENGTH: usize = 8;
 /// Maximum length for a user password (ADM-11 D4).
@@ -618,8 +613,8 @@ mod tests {
         assert_ne!(first.expose(), second.expose());
     }
 
-    /// The generated password is a [`Secret`]: it cannot be logged by
-    /// accident, which is half of ADM-3 D1's "never logged" promise.
+    /// ADM-11 review 1 S6 / ADM-11 D4: check_rules verifies password length
+    /// and ensures password is not equal to username or email.
     #[test]
     fn password_rules_checks_length_and_equality() {
         assert_eq!(
@@ -654,6 +649,8 @@ mod tests {
         assert_eq!(check_rules("valid-pass-123", None, None), Ok(()));
     }
 
+    /// The generated password is a [`Secret`]: it cannot be logged by
+    /// accident, which is half of ADM-3 D1's "never logged" promise (ADM-11 review 1 S6).
     #[test]
     fn a_generated_temporary_password_never_renders_itself() {
         let password = generate_temporary_password();
