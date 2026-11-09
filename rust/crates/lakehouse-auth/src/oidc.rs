@@ -919,6 +919,12 @@ impl OidcAuthenticator {
 
         let mut tx = self.pool.begin().await?;
 
+        // ADM-11 review 1 S5: serialize identifier writes under USER_IDENTIFIER_LOCK_KEY.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lakehouse_store::identity::USER_IDENTIFIER_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
+
         // ADM-11 D10: Linking an existing account by email is unchanged.
         let existing_user: Option<(Uuid, String)> = if let Some(ref em) = email {
             sqlx::query_as("SELECT id, status FROM app_user WHERE lower(email) = lower($1)")

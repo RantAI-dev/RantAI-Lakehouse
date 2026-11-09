@@ -465,8 +465,9 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
 ///
 /// * [`StoreError::FieldConflict`] (409) — the username (or the email,
 ///   when one is given) equals another user's username or email,
-///   case-insensitively (ADM-11 D5). The check and the insert share this
-///   transaction, so two concurrent invites cannot both pass the check.
+///   case-insensitively (ADM-11 D5). Serialized by
+///   `pg_advisory_xact_lock(USER_IDENTIFIER_LOCK_KEY)` (ADM-11 review 1 S5),
+///   so two concurrent invites cannot both pass the check.
 /// * [`StoreError::Validation`] (400) — the username breaks the ADM-11 D3
 ///   rule, or a given email is blank.
 /// * [`StoreError::ForeignKeyViolation`] (400) — a role or tenant name in
@@ -476,6 +477,13 @@ pub async fn create_user_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: &InviteUserInput,
 ) -> Result<Uuid, StoreError> {
+    // ADM-11 review 1 S5: serialize identifier checks and writes under USER_IDENTIFIER_LOCK_KEY
+    // so concurrent invites cannot both pass the check.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(USER_IDENTIFIER_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+
     let username = normalize_username(&input.username)?;
     let email = normalize_email(input.email.as_deref())?;
     // ADM-11 D5: one sign-in box must never match two people, so the
@@ -1029,6 +1037,11 @@ pub async fn delete_role(pool: &PgPool, id: &str) -> Result<(), StoreError> {
 /// The seed's fixed ids are the only marker it writes — there is no
 /// `system` column — and they are what this list pins. Ids, not names, so a
 /// rename (`update_role`) never turns a built-in role into a removable one.
+/// Advisory lock key used to serialize identifier (username / email) checks and writes
+/// across concurrent invites, user identity updates, and OIDC JIT provisioning
+/// (ADM-11 review 1 S5).
+pub const USER_IDENTIFIER_LOCK_KEY: i64 = 0x4c48_5f55_5345_5253; // "LH_USERS"
+
 pub const BUILT_IN_ROLE_IDS: [&str; 7] = [
     "22222222-2222-4222-8222-000000000001",
     "22222222-2222-4222-8222-000000000002",
@@ -1809,6 +1822,12 @@ pub async fn update_user_identity_in_tx(
     new_username: Option<&str>,
     new_email: EmailUpdate<'_>,
 ) -> Result<User, StoreError> {
+    // ADM-11 review 1 S5: serialize identifier checks and writes under USER_IDENTIFIER_LOCK_KEY.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(USER_IDENTIFIER_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+
     let current = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT username, email FROM app_user WHERE id = $1",
     )
