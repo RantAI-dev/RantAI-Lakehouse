@@ -204,6 +204,12 @@ pub struct InviteUserBody {
     pub must_change_password: bool,
 }
 
+/// Serialize a [`Secret`] as the plain string it wraps.
+///
+/// ADM-11 review 1 S2 / ADM-3 D1: The ONE place a secret leaves the type that
+/// keeps it out of log lines: a [`Secret`]'s own `Debug`/`Display` render a
+/// fixed redaction marker, so a response that must carry the value has to unwrap
+/// it explicitly, here, in one place. Nothing else in this crate serializes a secret.
 fn serialize_secret<S: serde::Serializer>(
     secret: &Secret,
     serializer: S,
@@ -211,7 +217,10 @@ fn serialize_secret<S: serde::Serializer>(
     serializer.serialize_str(secret.expose())
 }
 
-#[allow(clippy::ref_option)]
+#[allow(
+    clippy::ref_option,
+    reason = "serde serialize_with requires &Option<T> signature (ADM-11 review 1 S2)"
+)]
 fn serialize_optional_secret<S: serde::Serializer>(
     secret: &Option<Secret>,
     serializer: S,
@@ -292,6 +301,9 @@ pub async fn create_user(
     let has_email = raw_email.is_some();
     let email_string = raw_email.map(str::to_owned);
 
+    // ADM-3 D1 / ADM-11 D7 (ADM-11 review 1 S2): password choice — generated from the OS random
+    // source (wrapped in a Secret so it cannot be logged by accident), or typed by the admin
+    // and validated against system password rules.
     let (secret_to_store, temporary_password_to_return, password_mode_str) = match &body.password {
         PasswordInput::Generate => {
             let temp = password::generate_temporary_password();
@@ -313,6 +325,11 @@ pub async fn create_user(
     };
     let pool = pool(&state)?;
 
+    // ADM-3 D1 (ADM-11 review 1 S2): user, memberships and credential in ONE transaction. The
+    // store owns the user tables and `lakehouse-auth` owns the credential
+    // table, so the transaction is opened HERE and handed to both — see
+    // `lakehouse_store::identity::create_user_in_tx` and
+    // `lakehouse_auth::password::create_local_identity_in_tx`.
     let mut tx = pool.begin().await.map_err(StoreError::from)?;
     let user_id = identity::create_user_in_tx(&mut tx, &input).await?;
     password::create_local_identity_in_tx(
@@ -326,6 +343,9 @@ pub async fn create_user(
 
     let user = identity::get_user(pool, &user_id.to_string()).await?;
 
+    // ADM-3 D5 (ADM-11 review 1 S2): the audit row names the actor and the new user,
+    // the password mode, and must-change flag. It never carries the password —
+    // not even its length.
     let audit_event = user_invite_audit_event(
         &principal,
         &user,
