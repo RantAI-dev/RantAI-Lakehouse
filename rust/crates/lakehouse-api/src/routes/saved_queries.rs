@@ -98,6 +98,14 @@ pub(crate) const QUERY_FORBIDDEN: &str = "You do not have permission to change t
 /// The sentence a caller that may not change a folder is told.
 pub(crate) const FOLDER_FORBIDDEN: &str = "You do not have permission to change this folder.";
 
+/// The sentence a caller that may not read a folder's access list is told.
+///
+/// It is not the sentence of a refusal to change ([`FOLDER_FORBIDDEN`]):
+/// this route changes nothing, and it says what the caller would need to
+/// see the list. `#416`.
+pub(crate) const FOLDER_ACCESS_FORBIDDEN: &str =
+    "Only someone who can edit this folder can see who it is shared with.";
+
 /// The sentence a move at a level below manage is refused with: the same
 /// sentence for a query move and for a folder move, and the sentence the
 /// store's own refusal carries (`StoreError::NotAllowed`, and
@@ -1776,11 +1784,12 @@ pub async fn put_query_access(
 /// caller may not see, for an id that is not a UUID and for a caller that
 /// acts for no organisation; 404 for an `X-Tenant` header that names a
 /// tenant the caller does not belong to; 403 with the fixed sentence of
-/// [`FOLDER_FORBIDDEN`] for a folder the caller may see but only view; 503
-/// when no database pool is configured, which `pool` raises before any
-/// store call, or when the tenant scope cannot verify the deployment's
-/// tenant count; 500 with the fixed sentence `database error` on a
-/// database failure inside a store call, through
+/// [`FOLDER_ACCESS_FORBIDDEN`] — "Only someone who can edit this folder can
+/// see who it is shared with." — for a folder the caller may see but only
+/// view; 503 when no database pool is configured, which `pool` raises
+/// before any store call, or when the tenant scope cannot verify the
+/// deployment's tenant count; 500 with the fixed sentence `database error`
+/// on a database failure inside a store call, through
 /// `From<StoreError> for ApiError`. This route does not use
 /// `folder_failure`, which only the writes use.
 pub async fn get_folder_access(
@@ -1798,9 +1807,11 @@ pub async fn get_folder_access(
     let level = folder_level(pool(&state)?, &viewer, folder_id).await?;
     // Edit reads the list, manage changes it (`QS-3`, folder sharing
     // warning): a person who may save or move a query into a folder is
-    // told who that folder is shared with before they do.
+    // told who that folder is shared with before they do. The refusal
+    // names the level the list is read at, not a change the caller never
+    // asked for (`#416`).
     if level < Level::Edit {
-        return Err(ApiError::PermissionDenied(FOLDER_FORBIDDEN.to_owned()).into());
+        return Err(ApiError::PermissionDenied(FOLDER_ACCESS_FORBIDDEN.to_owned()).into());
     }
     let item = AccessItem::Folder { id: folder_id };
     Ok(ApiJson(
