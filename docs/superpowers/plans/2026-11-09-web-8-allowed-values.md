@@ -183,4 +183,72 @@ Each entry gives the commits, the exact commands with their counts, anything *no
 with the reason, and the output of `git status --short`, `git log --oneline origin/main..HEAD`
 and `git ls-remote --heads origin <branch>`.
 
+### Handoff (developer, 2026-11-09)
+
+Slice S1 is complete, verified, committed, and pushed to `origin/feat/web-8-s1-permission-catalog`.
+
+#### Commits
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1 | `7cc2444f` | `feat(auth): the central permission catalog (WEB-8 T1, D1/D2/D5/D6)` |
+| T2 | `bb78b8e0` | `feat(api): permission catalog route and refusal of unknown permissions (WEB-8 T2, D3/D4)` |
+| T3 | `f939ad0a` | `feat(console): permission picker for roles and service identities (WEB-8 T3, D7)` |
+
+#### Verification Commands & Counts
+
+- **T1:**
+  - `cargo test -p lakehouse-auth permission_catalog`: ok (75 passed in unittests)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test permission_catalog'`: 2 passed; 0 failed; 1 ignored
+  - `clippy`: clean with `-D warnings` on both `lakehouse-auth` and `lakehouse-api`.
+  - **Drift test failure demonstration:** Temporarily removed `catalog:read` from `PERMISSIONS` in `rust/crates/lakehouse-auth/src/permission_catalog.rs` and ran `cargo test -p lakehouse-api --test permission_catalog`:
+    ```
+    thread 'every_permission_the_api_checks_is_in_the_catalog' (2477714) panicked at crates/lakehouse-api/tests/permission_catalog.rs:107:5:
+    permissions the API checks but the catalog does not list: ["catalog:read", ...]
+    failures:
+        every_permission_the_api_checks_is_in_the_catalog
+        the_committed_fixture_equals_the_catalog
+    test result: FAILED. 0 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.13s
+    ```
+    The change was immediately reverted and tests re-verified green.
+
+- **T2:**
+  - `cargo test -p lakehouse-core`: 50 passed; 0 failed
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test identity_roles'`: 24 passed; 0 failed (asserts 400 with unknown tokens list, `area:*` and `*:*` accepted, unknown token preserved on update, `GET /api/identity/permissions` refused without `identity:read`)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test route_auth'`: 83 passed; 0 failed (`permissions_route_is_gated_in_both_directions` asserted both ways)
+  - `cargo test -p lakehouse-api --lib route_policy_tests`: 2 passed; 0 failed (every policy table entry mounted and gated)
+
+- **T3:**
+  - `bun test src/features/admin`: 92 passed; 0 failed across 15 files (including all 6 tests in `permission-picker.test.tsx`: grouped by area, 'All in this area' toggle, 'Not recognised' removable chip, comma string payload, `*:*` full access, zero `query:run` in `src/`)
+  - `bun run typecheck`: clean, exited 0
+  - `bun run lint`: 0 errors, 10 pre-existing warnings
+
+- **Full Verification:**
+  - `cd rust && /home/shiro/rantai/bin/cargo-locked fmt --check`: clean (exit 0)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings'`: clean (exit 0, finished in 3m 18s)
+  - `bun run typecheck`: clean (exit 0)
+  - `bun run lint`: clean (exit 0, 10 warnings, 0 errors)
+  - `bun test`: 3,731 passed; 1 skipped; 0 failed; 11,117 expect() calls across 356 files (finished in 202.54s)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test --workspace --lib'`: 14 crates passed (exit 0, including `lakehouse-api` 3,346 passed, `lakehouse-auth` 75 passed, `lakehouse-core` 50 passed)
+  - `sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-auth'`: 162 passed (75 unittests + 28 oidc + 15 openfga + 5 password + 8 repository + 8 service_token + 9 session + 14 throttle)
+  - *Not verified in full single invocation:* Monolithic `cargo test --workspace` (without `--lib`) timed out at the harness 600s limit due to 75 integration test suites each spinning up docker containers sequentially; all individual affected crates, library suites, and integration test suites were verified directly.
+
+#### Open Mismatches
+None.
+
+#### Git Status & Remote State
+- `git status --short`: clean (no uncommitted changes)
+- `git log --oneline origin/main..HEAD`:
+  ```
+  f939ad0a feat(console): permission picker for roles and service identities (WEB-8 T3, D7)
+  bb78b8e0 feat(api): permission catalog route and refusal of unknown permissions (WEB-8 T2, D3/D4)
+  7cc2444f feat(auth): the central permission catalog (WEB-8 T1, D1/D2/D5/D6)
+  a6f7863a docs(plan): ADM-13, GOV-7, ADM-11, ADM-12, WEB-7 and WEB-8 specs, feature pages and plans
+  ```
+- `git ls-remote --heads origin feat/web-8-s1-permission-catalog`:
+  ```
+  f939ad0abb78728d53e810797ba8a992e8f6248c	refs/heads/feat/web-8-s1-permission-catalog
+  ```
+
+
 ## 6. Review (planner)
