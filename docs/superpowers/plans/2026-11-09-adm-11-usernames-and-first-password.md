@@ -505,3 +505,24 @@ run above covers the rest.
 
 **Not verified:** the console in a real browser, and an upgrade against a real deployment's
 data (the migration test stands in for it). Approved for PR.
+
+
+### Handoff 3 (developer, 2026-11-09)
+
+#### Commits
+- `9190d061`: `fix(ops): G8 gates give app_user a username (ADM-11 CI, migration 0132)`
+
+#### Context
+CI acceptance gates (`Rust · G8 time travel keeps the policy (trino)` and `Rust · G8 governance masking (clickhouse)`) failed with:
+`psql failed: ERROR: null value in column "username" of relation "app_user" violates not-null constraint`
+Migration 0132 made `app_user.username` NOT NULL with no default trigger (per review 1 B2). Direct seeding of the analyst user in `ops/g8/g8_governance_test.py` and `ops/g8/g8_time_travel_test.py` omitted `username` in their `INSERT INTO app_user` queries. Both scripts now explicitly supply `username` using `{ANALYST_EMAIL.lower()}` (which conforms to D3 lowercase `[a-z0-9._@+-]`, 1–254 chars) while keeping existing `ON CONFLICT (email)` clauses intact.
+
+No other raw `INSERT INTO app_user` statements exist across `ops/`, `dagster/`, or any `*.sh`/`*.py`/`*.sql` outside `rust/migrations/`.
+
+#### Foreground Checks
+- `python3 -m py_compile ops/g8/g8_governance_test.py ops/g8/g8_time_travel_test.py`: Clean (exit code 0)
+- `python3 ops/lint/check_intra_package_imports.py`: OK: all intra-package dispar_orchestrate imports resolve (exit code 0)
+- `python3 ops/lint/check_bare_iceberg_count.py`: R11 guard: no bare count() against a Bronze Iceberg table found (0 violations, exit code 0)
+
+#### Not Verified & Why
+- *not verified locally, CI runs them*: The G8 acceptance gates themselves require the full CI stack (Trino, ClickHouse, Dagster orchestrator, live MinIO Iceberg catalog, Postgres).
