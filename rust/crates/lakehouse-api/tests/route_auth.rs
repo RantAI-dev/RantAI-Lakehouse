@@ -4047,3 +4047,28 @@ async fn role_edit_and_delete_are_gated_in_both_directions() {
         "a refused update leaves the role alone"
     );
 }
+
+/// `WEB-8` D4: GET /api/identity/permissions requires identity:read both ways.
+#[tokio::test]
+async fn permissions_route_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/identity/permissions")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("identity:read")),
+    );
+    let anonymous = request_with_cookie(&router, "GET", "/api/identity/permissions", "").await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let plain = create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, plain).await;
+    let refused = request_with_cookie(&router, "GET", "/api/identity/permissions", &cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let reader = create_principal_with_permissions(&pool, "identity:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", "/api/identity/permissions", &cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+}

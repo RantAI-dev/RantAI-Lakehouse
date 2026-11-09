@@ -881,6 +881,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // handler adds the escalation rule on top (D3): only an unrestricted
     // `"*:*"` caller may reset a user who holds `"*:*"`.
     ("POST", "/api/identity/users/{id}/reset-password", Policy::RequiresPermission("identity:write")),
+    ("GET",  "/api/identity/permissions",            Policy::RequiresPermission("identity:read")),
     ("GET",  "/api/identity/roles",                  Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/roles",                  Policy::RequiresPermission("identity:write")),
     // WEB-3 S3a-D2: editing or removing a role is exactly the privilege
@@ -1512,6 +1513,10 @@ mod tests {
     /// merely `RequiresAuth` — see the module doc comment.
     #[test]
     fn identity_routes_require_identity_permissions() {
+        assert_eq!(
+            policy_for("GET", "/api/identity/permissions"),
+            Some(Policy::RequiresPermission("identity:read"))
+        );
         assert_eq!(
             policy_for("GET", "/api/identity/roles"),
             Some(Policy::RequiresPermission("identity:read"))

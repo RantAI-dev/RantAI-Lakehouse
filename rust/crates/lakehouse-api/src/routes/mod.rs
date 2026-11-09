@@ -1150,6 +1150,7 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users/{id}/reset-password",
             axum::routing::post(identity::reset_user_password),
         )
+        .route("/api/identity/permissions", get(identity::list_permissions))
         .route(
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),
