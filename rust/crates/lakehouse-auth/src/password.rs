@@ -613,7 +613,7 @@ mod tests {
         assert_ne!(first.expose(), second.expose());
     }
 
-    /// ADM-11 review 1 S6 / ADM-11 D4: check_rules verifies password length
+    /// ADM-11 review 1 S6 / ADM-11 D4: `check_rules` verifies password length
     /// and ensures password is not equal to username or email.
     #[test]
     fn password_rules_checks_length_and_equality() {

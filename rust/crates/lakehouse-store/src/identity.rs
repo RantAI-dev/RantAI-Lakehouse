@@ -1030,6 +1030,11 @@ pub async fn delete_role(pool: &PgPool, id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Advisory lock key used to serialize identifier (username / email) checks and writes
+/// across concurrent invites, user identity updates, and OIDC JIT provisioning
+/// (ADM-11 review 1 S5).
+pub const USER_IDENTIFIER_LOCK_KEY: i64 = 0x4c48_5f55_5345_5253; // "LH_USERS"
+
 /// The roles `0002_seed_identity.sql` creates: the product's built-in
 /// permission bundles, which a deployment starts with and which
 /// `DELETE /api/identity/roles/{id}` refuses (`WEB-3` S3a-D2).
@@ -1037,11 +1042,6 @@ pub async fn delete_role(pool: &PgPool, id: &str) -> Result<(), StoreError> {
 /// The seed's fixed ids are the only marker it writes — there is no
 /// `system` column — and they are what this list pins. Ids, not names, so a
 /// rename (`update_role`) never turns a built-in role into a removable one.
-/// Advisory lock key used to serialize identifier (username / email) checks and writes
-/// across concurrent invites, user identity updates, and OIDC JIT provisioning
-/// (ADM-11 review 1 S5).
-pub const USER_IDENTIFIER_LOCK_KEY: i64 = 0x4c48_5f55_5345_5253; // "LH_USERS"
-
 pub const BUILT_IN_ROLE_IDS: [&str; 7] = [
     "22222222-2222-4222-8222-000000000001",
     "22222222-2222-4222-8222-000000000002",
