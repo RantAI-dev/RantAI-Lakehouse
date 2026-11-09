@@ -346,3 +346,37 @@ workspace run hit their 600-second tool limit, and said so. The full run above c
 gap.
 
 **Not verified:** the picker in a real browser (Bun DOM tests only).
+
+### Review 2 (planner, 2026-11-09), S1 at `e45812e5`
+
+- B1 fixed (`ca2b88a8`): resource wildcards (`pipeline:*`, `policy:*`) are recognised by the
+  same rule as `is_known`. They show as removable "All `x:` permissions" chips, and the
+  permissions they cover show as checked and disabled with "covered by". Tests cover both
+  seeded wildcards.
+- B2 fixed (`4db2a603`): the picker loads through `useService`. On error it renders
+  `ErrorState` with Retry and no editable picker. A test covers the failure.
+- S1 fixed (`18917f0f`). S2 done (`7bbb85d6`, `main` merged, docs conflicts resolved as
+  asked).
+- Minor, not blocking: "All in this area" reads as unticked when the area's permissions are
+  covered only by a wildcard. Left as is; it does not change what is saved.
+
+No open `BLOCKER`.
+
+**Verification rerun by the planner on `e45812e5`, in the foreground:**
+
+```
+cargo fmt --check                                                   clean
+cargo clippy --workspace --all-targets --all-features -- -D warnings  clean
+cargo test --workspace --no-fail-fast   191 result lines: 7145 passed, 0 failed, 35 ignored
+bun run typecheck                                                   clean
+bun run lint                                                        0 errors, 10 warnings (pre-existing)
+bun run test                            3760 pass, 1 skip, 0 fail
+```
+
+`upload_routes::two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches` failed
+once in a first workspace run, while two other worktrees were building on this machine. It
+passed alone, and the whole workspace passed on the second run. The branch does not touch
+uploads, so this is a timing-sensitive test and not caused by this PR. I will watch for it in
+CI.
+
+Approved for PR.
