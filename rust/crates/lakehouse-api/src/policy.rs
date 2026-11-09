@@ -134,6 +134,9 @@ pub enum Policy {
     /// An authenticated [`lakehouse_auth::Principal`] whose
     /// [`lakehouse_auth::Principal::has`] this exact string.
     RequiresPermission(&'static str),
+    /// An authenticated [`lakehouse_auth::Principal`] who holds at least one
+    /// of the listed permissions (`ADM-13` D4).
+    RequiresAnyPermission(&'static [&'static str]),
 }
 
 /// `(HTTP method, axum route pattern, policy)`, one entry per route
@@ -305,14 +308,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    Data Engineer permission `workload:cancel` (0020). `/api/ops/logs`
     //    (WS5 item G1) is registered ahead of the `{kind}` wildcard, same
     //    literal-before-parameter precedent as `/api/governance/lineage`
-    //    below — router-level floor is `RequiresAuth`; the ClickHouse
-    //    branch's stricter `"ops:logs"` check (only Platform Admin's
+    //    below — router-level floor is `RequiresPermission("ops:read")` (ADM-13 D5);
+    //    the ClickHouse branch's stricter `"ops:logs"` check (only Platform Admin's
     //    `*:*` satisfies it — `system.text_log` carries every query's SQL
     //    text verbatim) lives inside the handler, matching
     //    `routes/alerts.rs::check_run_token`'s "auth-only router gate,
     //    stricter handler guard" pattern for `/api/alerts/run`. ─────────
-    ("GET",  "/api/ops/logs",                      Policy::RequiresAuth),
-    ("GET",  "/api/ops/{kind}",                    Policy::RequiresAuth),
+    ("GET",  "/api/ops/logs",                      Policy::RequiresPermission("ops:read")),
+    ("GET",  "/api/ops/{kind}",                    Policy::RequiresPermission("ops:read")),
     ("POST", "/api/ops/workloads/{id}/cancel",     Policy::RequiresPermission("workload:cancel")),
 
     // ── Governance: seeded `policy:*` / `lineage:read`. `{kind}` (quality,
@@ -383,12 +386,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Rewriting or removing a rule is a governance decision, like setting an SLA.
     ("PUT", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
-    // SEC-23 (F1): reading rules stays open to any login, but adding one
-    // (quality, classification, residency) takes `governance:write` — the
-    // grant that rewriting or removing the same rule already takes above.
-    // It used to be `RequiresAuth`, so anyone logged in could add a rule
-    // they could not then edit or delete.
-    ("GET",  "/api/governance/{kind}",    Policy::RequiresAuth),
+    // SEC-23 (F1), ADM-13 (D5): reading rules, audit logs and maintenance
+    // requires `governance:read`; adding a rule (quality, classification,
+    // residency) takes `governance:write` — the grant that rewriting or
+    // removing the same rule already takes above.
+    ("GET",  "/api/governance/{kind}",    Policy::RequiresPermission("governance:read")),
     ("POST", "/api/governance/{kind}",    Policy::RequiresPermission("governance:write")),
 
     // ── Storage: no seeded resource — auth only. Restore (destructive)
@@ -409,7 +411,8 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    before; with it unset, only a `PrincipalId::Service` principal is
     //    allowed through, not merely `RequiresAuth`'s "any authenticated
     //    principal" — this table entry is a floor, not the whole guard. ──
-    ("GET",    "/api/alerts",      Policy::RequiresAuth),
+    // ADM-13 (D5): GET /api/alerts and other alert GETs require alert:read or alert:write.
+    ("GET",    "/api/alerts",      Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
     // `BI-19` part C (C3): signed in is the floor. Anybody who can view a chart
     // may save an alert on it for themselves (and remove their own), so the
     // handler decides: `alert:write` for every other rule or target, the
@@ -419,15 +422,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/alerts",      Policy::RequiresAuth),
     ("PUT",    "/api/alerts",      Policy::RequiresAuth),
     ("DELETE", "/api/alerts",      Policy::RequiresAuth),
-    // `SRC-7` D9: whether run reports can arrive; auth only, it reads no rule.
-    ("GET",    "/api/alerts/status", Policy::RequiresAuth),
+    // `SRC-7` D9, ADM-13 D5: whether run reports can arrive; alert:read or alert:write.
+    ("GET",    "/api/alerts/status", Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
     // `BI-40` D1/D2: a signed-in person tests one rule they may manage. The
     // handler decides (the same shape as `POST /api/alerts`): 404 for a rule
     // they cannot see, 403 without `alert:write` on a rule that is not their
     // own chart alert. `/api/alerts/run` below is the scheduler's door and is
     // unchanged — `check_run_token` still guards it (D4 not weakened).
     ("POST",   "/api/alerts/test",  Policy::RequiresAuth),
-    ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
+    ("GET",    "/api/alerts/run",  Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
     // ── Gold export (ADR 0010, Rust/Phase-P6-only — no TypeScript route to
@@ -822,20 +825,22 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/query/cancel",           Policy::RequiresAuth),
     ("PUT",    "/api/settings/limits",        Policy::RequiresPermission("settings:write")),
 
-    // ── Agent / AI: no seeded resource for free-form ask/chat — auth only.
-    ("POST", "/api/ai/chat",             Policy::RequiresAuth),
-    ("POST", "/api/ai/tool",             Policy::RequiresAuth),
-    ("GET",    "/api/ai/sessions",       Policy::RequiresAuth),
-    ("POST",   "/api/ai/sessions",       Policy::RequiresAuth),
-    ("PATCH",  "/api/ai/sessions",       Policy::RequiresAuth),
-    ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),
-    ("GET",  "/api/ai/build-status",     Policy::RequiresAuth),
+    // ── Agent / AI: assistant access (`ADM-13` D5). Any caller holding
+    //    `assistant:use` (full assistant, as before) or `assistant:ask`
+    //    (Ask-mode read-only assistant) passes the auth gate. Tool permissions
+    //    and mode enforcement are judged inside the handlers. ─────────
+    ("POST", "/api/ai/chat",             Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("POST", "/api/ai/tool",             Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("GET",    "/api/ai/sessions",       Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("POST",   "/api/ai/sessions",       Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("PATCH",  "/api/ai/sessions",       Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("DELETE", "/api/ai/sessions",       Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("GET",  "/api/ai/build-status",     Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
     // The caller's own remembered words for the chat (`routes::ai::terms`):
-    // keyed by the principal like Copilot sessions, so the `RequiresAuth`
-    // floor is the whole policy. A caller can only ever reach their own rows.
-    ("GET",    "/api/ai/terms",          Policy::RequiresAuth),
-    ("PUT",    "/api/ai/terms",          Policy::RequiresAuth),
-    ("DELETE", "/api/ai/terms",          Policy::RequiresAuth),
+    // keyed by the principal like Copilot sessions, gated by assistant permissions.
+    ("GET",    "/api/ai/terms",          Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("PUT",    "/api/ai/terms",          Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
+    ("DELETE", "/api/ai/terms",          Policy::RequiresAnyPermission(&["assistant:use", "assistant:ask"])),
 
     // WS5 item F1: navbar bell — same `RequiresAuth` floor as every other
     // authenticated-but-not-permission-scoped read in this table (e.g.
@@ -1282,7 +1287,7 @@ pub async fn auth_gate(
 
     match policy {
         Policy::Public => Ok(next.run(req).await),
-        Policy::RequiresAuth | Policy::RequiresPermission(_) => {
+        Policy::RequiresAuth | Policy::RequiresPermission(_) | Policy::RequiresAnyPermission(_) => {
             let (mut parts, body) = req.into_parts();
             let AuthenticatedPrincipal(principal) =
                 AuthenticatedPrincipal::from_request_parts(&mut parts, &state).await?;
@@ -1290,6 +1295,11 @@ pub async fn auth_gate(
                 && !principal.has(permission)
             {
                 return Err(ApiError::PermissionDenied(permission.to_owned()).into());
+            }
+            if let Policy::RequiresAnyPermission(permissions) = policy
+                && !permissions.iter().any(|perm| principal.has(perm))
+            {
+                return Err(ApiError::PermissionDenied(permissions.join(", ")).into());
             }
             if principal.must_change_password
                 && !allowed_while_must_change_password(&method, matched_path.as_str())
@@ -1486,17 +1496,17 @@ mod tests {
         assert_eq!(public_count, 14);
     }
 
-    /// SEC-23 (F1): adding a governance rule needs `governance:write`, the
-    /// same grant as changing or removing one; listing rules needs a login.
+    /// SEC-23 (F1), ADM-13 (D5): adding a governance rule needs `governance:write`;
+    /// listing rules needs `governance:read`.
     #[test]
-    fn adding_a_governance_rule_needs_governance_write_but_listing_needs_a_login() {
+    fn adding_a_governance_rule_needs_governance_write_and_listing_needs_governance_read() {
         assert_eq!(
             policy_for("POST", "/api/governance/{kind}"),
             Some(Policy::RequiresPermission("governance:write"))
         );
         assert_eq!(
             policy_for("GET", "/api/governance/{kind}"),
-            Some(Policy::RequiresAuth)
+            Some(Policy::RequiresPermission("governance:read"))
         );
     }
 

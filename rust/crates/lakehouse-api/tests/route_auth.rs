@@ -167,6 +167,14 @@ async fn zero_permission_principal_is_denied_every_gated_route_and_let_past_auth
                     ));
                 }
             }
+            Policy::RequiresAnyPermission(perms) => {
+                if status != StatusCode::FORBIDDEN {
+                    failures.push(format!(
+                        "{method} {pattern}: a zero-permission principal must get 403 \
+                         (missing any of {perms:?}), got {status}"
+                    ));
+                }
+            }
             Policy::RequiresAuth => {
                 if status == StatusCode::UNAUTHORIZED {
                     failures.push(format!(
@@ -207,6 +215,51 @@ async fn platform_admin_principal_is_never_refused_by_the_auth_gate() {
                 "{method} {pattern} ({policy:?}): a Platform Admin (*:*) must never be \
                  refused by the auth gate, got {status}"
             ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// ADM-13 D4: every `Policy::RequiresAnyPermission` row allows a principal
+/// holding ANY ONE of the listed permissions alone (and neither 401 nor 403),
+/// and refuses a principal holding only an unrelated permission with 403.
+#[tokio::test]
+async fn requires_any_permission_rows_accept_each_permission_alone_and_refuse_unrelated() {
+    let TestApp { router, pool } = spin_up().await;
+
+    // A principal with only an unrelated permission: "settings:write" is
+    // unrelated to assistant (*:use/ask) and alerts (*:read/write).
+    let unrelated_user = create_principal_with_permissions(&pool, "settings:write").await;
+
+    let mut failures = Vec::new();
+    for (method, pattern, policy) in POLICY_TABLE {
+        let Policy::RequiresAnyPermission(perms) = policy else {
+            continue;
+        };
+
+        let path = concretize(pattern);
+
+        // 1. Unrelated permission -> 403
+        let unrelated_cookie = session_cookie_for_user(&pool, unrelated_user).await;
+        let resp = request_with_cookie(&router, method, &path, &unrelated_cookie).await;
+        if resp.status() != StatusCode::FORBIDDEN {
+            failures.push(format!(
+                "{method} {pattern}: principal with unrelated permission must get 403, got {}",
+                resp.status()
+            ));
+        }
+
+        // 2. Each listed permission alone -> not 401/403
+        for perm in *perms {
+            let user = create_principal_with_permissions(&pool, perm).await;
+            let cookie = session_cookie_for_user(&pool, user).await;
+            let resp = request_with_cookie(&router, method, &path, &cookie).await;
+            let status = resp.status();
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                failures.push(format!(
+                    "{method} {pattern}: principal with {perm} alone must pass auth gate, got {status}"
+                ));
+            }
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
@@ -1910,7 +1963,14 @@ fn policy_table_is_non_trivial_and_every_entry_is_walked_by_construction() {
         .iter()
         .filter(|(_, _, p)| matches!(p, Policy::RequiresPermission(_)))
         .count();
-    assert_eq!(public + auth_only + permissioned, POLICY_TABLE.len());
+    let any_permissioned = POLICY_TABLE
+        .iter()
+        .filter(|(_, _, p)| matches!(p, Policy::RequiresAnyPermission(_)))
+        .count();
+    assert_eq!(
+        public + auth_only + permissioned + any_permissioned,
+        POLICY_TABLE.len()
+    );
     assert!(
         POLICY_TABLE.len() > 50,
         "POLICY_TABLE looks suspiciously small ({}) for a ~30-route-module service",
@@ -3998,7 +4058,7 @@ async fn role_edit_and_delete_are_gated_in_both_directions() {
             .expect("read the role"),
         (
             "Analyst".to_owned(),
-            "query:read, catalog:read, lineage:read".to_owned()
+            "query:read, catalog:read, lineage:read,assistant:use,ops:read,alert:read,governance:read".to_owned()
         ),
         "a refused caller must not rewrite the role"
     );
