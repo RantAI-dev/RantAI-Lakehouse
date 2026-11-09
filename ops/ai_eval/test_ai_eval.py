@@ -2015,6 +2015,38 @@ class DashboardCasesTests(unittest.TestCase):
         case = cases["view_filter_year"]
         self.assertIn("{board}", case.get("context", ""))
 
+    def test_the_two_value_view_filter_case_narrows_the_view_in_build_mode(self) -> None:
+        # "show only 2024 and only Malaysia" is one request for two filters,
+        # not a request for a chart. The case runs in build mode, because that
+        # is the mode where the model drafted a chart instead, and it checks
+        # that the board's saved filters stay empty and that no chart was made.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["view_filter_two_values_build"]
+        self.assertEqual(case["mode"], "build")
+        # The tool is a read on the view, so the case waits for no confirm.
+        self.assertNotIn("confirm", case)
+        self.assertIn("{board}", case.get("context", ""))
+        self.assertEqual(
+            case["expect_tool"],
+            {"name": "set_board_view_filters", "args_contains": {"board": "{board}", "filters": "tahun"}},
+        )
+        self.assertEqual(case["expect_no_tool"], ["create_chart"])
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards",
+             "where": {"id": "{board}", "filters[].column": "tahun"}, "count": 0},
+            case["expect_state"],
+        )
+        self.assertIn(
+            {"path": "/api/dashboard/specs", "list": "charts",
+             "where": {"board": "{board}"}, "count": 1},
+            case["expect_state"],
+        )
+        # The mart carries both a year column and a country column, so one
+        # page can be narrowed by both.
+        setup = {step["name"]: step for step in case["setup"]}
+        self.assertEqual(setup["chart"]["body"]["mart"], "mart_wisman")
+        self.assertIn("Malaysia", case["turns"][0])
+
 
 class ForecastAndDeprecationCaseTests(unittest.TestCase):
     """The two cases the chart-tools plan added: a forecast line, and a mart

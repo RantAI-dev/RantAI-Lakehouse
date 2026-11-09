@@ -40,6 +40,16 @@ describe("toolsFromCaps", () => {
   it("does not offer ask_user when Query Data is off", () => {
     expect(toolsFromCaps(new Set(["dashboard"]), "build")).not.toContain("ask_user")
   })
+
+  // AI-2 AC1: "show only 2026" changes the person's own view of the page and
+  // nothing else, so Ask mode offers it through Query Data; saving the board's
+  // default filters changes what every viewer sees and stays in the Builder.
+  it("offers set_board_view_filters with Query Data in both modes and keeps save_board_filters in the builder (AI-2)", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("set_board_view_filters")
+      expect(toolsFromCaps(new Set(["data"]), mode)).not.toContain("save_board_filters")
+    }
+  })
 })
 
 // BI-26 slice 2 D10 (AI-11-AC3): the embed tools, named here or they never

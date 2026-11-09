@@ -479,6 +479,22 @@
     ]
   },
   {
+    "id": "view_filter_two_values_build",
+    "mode": "build",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval View Two Values"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval View Two Values Chart", "kind": "kpi", "mart": "mart_wisman", "measures": ["jumlah"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "context": "The user is viewing the dashboard \"Eval View Two Values\" (board id: {board}). Time grain: each chart's own. Active filters: none. Tiles and the data they currently show (built-in tiles are not editable):\n- \"Eval View Two Values Chart\" (kpi, id {chart}; mart_wisman): not loaded",
+    "turns": ["Show only 2024 and only Malaysia."],
+    "expect_tool": {"name": "set_board_view_filters", "args_contains": {"board": "{board}", "filters": "tahun"}},
+    "expect_no_tool": ["create_chart"],
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "filters[].column": "tahun"}, "count": 0},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"board": "{board}"}, "count": 1}
+    ]
+  },
+  {
     "id": "save_filters_only_when_asked",
     "modes": ["ask", "build"],
     "confirm": true,
