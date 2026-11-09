@@ -36,6 +36,7 @@ once a first release is tagged.
 ### Fixed
 
 - The assistant's `update_chart` keeps every field the request does not name, and `null` clears one, so a rename no longer empties a chart (backlog `AI-3`). The reply lists the kept fields as `fieldsKept`.
+- A chart's subtitle no longer shows the word "null" after the assistant changes the chart (backlog `AI-3`). The build prompt asks for `subtitle: null` when a chart has no subtitle, but the chart tools took only a string, so the model wrote the text "null" and it was stored. The tools now take a subtitle as a string or a null, and the store treats a subtitle of only the word "null" as no subtitle. Charts that already show "null" stay as they are; a new edit from the assistant fixes them.
 - The assistant can turn an existing chart into another kind, for example a pivot table with totals, without the chart's old fields getting in the way: when the kind changes, a stored field the new kind refuses is left out. The fields the call names itself are still sent as given, so a call that asks for a refused field is still refused (backlog `AI-5`).
 - A chart the assistant changes keeps its place on the dashboard instead of moving to the last tile (backlog `AI-3`).
 - A chart the assistant moves to the top of a dashboard now stays on top: the server settles the layout before it saves it, so the tile the chart lands on moves down (backlog `AI-1`).
