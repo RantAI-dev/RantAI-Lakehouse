@@ -251,6 +251,32 @@ None.
   ```
 
 
+### Handoff 2 (developer, 2026-11-09)
+
+Review 1 findings (B1, B2, S1, S2) addressed and verified.
+
+#### Commits
+- **B1:** `ca2b88a8 fix(console): recognise resource wildcards in permission picker (WEB-8 review 1 B1)`
+  A token `resource:*` is known when some catalog name has that resource, mirroring `permission_catalog::is_known`. Shows each held resource wildcard as a checked, removable chip "All `<resource>:` permissions". Shows the permissions it covers as checked and disabled, with "covered by `<resource>:*`". Added Bun tests for roles holding `pipeline:*` and `policy:*`.
+- **B2:** `4db2a603 fix(console): load permissions through useService and render ErrorState on failure (WEB-8 review 1 B2)`
+  Loaded permissions through `useService(identityService.listPermissions)` instead of hand-rolled `useEffect`. On fetch failure, renders `ErrorState` with Retry from `components/patterns/page-states.tsx` and does not render the editable picker or show grants as unrecognised. Added Bun test for fetch failure.
+- **S1:** `18917f0f docs(api): add # Errors section to check_permissions (WEB-8 review 1 S1)`
+  Added `# Errors` section to `check_permissions` rustdoc in `rust/crates/lakehouse-api/src/routes/identity.rs` per `AGENTS.md` Rust rules.
+- **S2:** `7bbb85d6 Merge remote-tracking branch 'origin/main' into feat/web-8-s1-permission-catalog (WEB-8 review 1 S2)`
+  Merged `origin/main` into the branch. Resolved docs conflicts: `docs/core/BACKLOG.md` took `origin/main`'s version, and the plan file kept the branch's version.
+
+#### Verification
+- `bun run typecheck`: clean (exit 0)
+- `bun run lint`: clean (0 errors, 10 pre-existing warnings)
+- `bun test src/features/admin`: 95 pass, 0 fail, 1462 expect() calls across 15 files (including all 9 tests in `permission-picker.test.tsx`)
+- `cd rust && /home/shiro/rantai/bin/cargo-locked fmt --check`: clean (exit 0)
+- `sg docker -c 'CARGO_TARGET_DIR=/home/shiro/rantai/target /home/shiro/rantai/bin/cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings'`: clean (exit 0, finished in 3m 35s)
+- `sg docker -c 'CARGO_TARGET_DIR=/home/shiro/rantai/target /home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test identity_roles'`: 24 passed; 0 failed (exit 0, finished in 12.51s)
+
+#### Anything Not Verified
+Full repository-wide checks (`cargo test --workspace` and `bun test`) were not run in this remediation turn; scoped checks for the touched packages (`src/features/admin` and `lakehouse-api`) were run in the foreground and verified green.
+
+
 ## 6. Review (planner)
 
 ### Review 1 (planner, 2026-11-09), S1 at `6a03c274`
