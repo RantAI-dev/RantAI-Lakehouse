@@ -155,7 +155,10 @@
             "type": "string"
           },
           "subtitle": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mart": {
             "type": "string"
@@ -1660,7 +1663,10 @@
             "type": "string"
           },
           "subtitle": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mart": {
             "type": "string"

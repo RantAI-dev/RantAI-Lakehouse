@@ -2315,6 +2315,13 @@ mod tests {
         })
     }
 
+    /// The same stored bar, with a subtitle the update has to clear.
+    fn stored_bar_with_subtitle() -> Value {
+        let mut def = stored_bar_with_data();
+        def["subtitle"] = json!("Visitors by province");
+        def
+    }
+
     /// The call that renames a chart and sends nothing but `id`, `title` and
     /// `kind`: the shape the tool's description asks for.
     fn bare_rename_call(extra: Value) -> Map<String, Value> {
@@ -2380,6 +2387,60 @@ mod tests {
         let row = chart_row(&sent(&server).await);
         assert!(!row.contains("\"breakdown\""), "{row}");
         assert!(row.contains("\"measures\":[\"visitors\"]"), "{row}");
+    }
+
+    /// A call that sends the word "null" as the subtitle stores no subtitle:
+    /// the assistant's model writes that text when it follows the build
+    /// prompt's "send `subtitle: null`" against a schema that types the
+    /// field as a string (AI-3, 2026-11-08).
+    ///
+    /// The prepared chart's subtitle is read off the written row, not off the
+    /// reply: the reply's definition digest carries no subtitle field, while
+    /// the stored chart has a `subtitle` key only when it has a subtitle.
+    #[tokio::test]
+    async fn an_update_that_sends_the_word_null_as_the_subtitle_stores_no_subtitle() {
+        let server =
+            stored_chart_server_on(wide_mart_server().await, stored_bar_with_subtitle()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "subtitle": "null" })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("\"subtitle\""), "{row}");
+    }
+
+    /// A call that clears the subtitle with a real `null` stores no subtitle
+    /// either: the server drops the key, so the subtitle the chart had is
+    /// not carried over. This is the "null clears it" contract the tool's
+    /// description promises, and it held before the store guard of
+    /// AI-3 (2026-11-08); that guard is what handles the *text* "null", while
+    /// this test pins the contract around it rather than the guard itself.
+    ///
+    /// The prepared chart's subtitle is read off the written row, not off the
+    /// reply: the reply's definition digest carries no subtitle field, while
+    /// the stored chart has a `subtitle` key only when it has a subtitle.
+    #[tokio::test]
+    async fn an_update_that_clears_the_subtitle_with_null_stores_no_subtitle() {
+        let server =
+            stored_chart_server_on(wide_mart_server().await, stored_bar_with_subtitle()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "subtitle": null })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("\"subtitle\""), "{row}");
     }
 
     /// A chart changed to another kind keeps its data fields, but not its
