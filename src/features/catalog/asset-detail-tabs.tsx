@@ -161,7 +161,7 @@ export function AssetDetailTabs({
         </TabsContent>
 
         <TabsContent value="lineage">
-          <AssetLineage asset={a} state={lineage} />
+          <AssetLineage asset={a} state={lineage} iceberg={iceberg} />
         </TabsContent>
 
         <TabsContent value="activity">

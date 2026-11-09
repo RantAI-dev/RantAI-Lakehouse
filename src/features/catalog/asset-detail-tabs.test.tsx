@@ -223,6 +223,7 @@ function stubApi({
   grants = [],
   grantRefusal,
   tableMissing = false,
+  tablePending = false,
   snapshotAuthor = null,
   restoreRefusal,
   revokeRefusal,
@@ -245,6 +246,8 @@ function stubApi({
   grantRefusal?: { status: number; error: string }
   /** The Iceberg table is gone (404), as after a drop (`DATA-15`). */
   tableMissing?: boolean
+  /** The Iceberg table's detail never arrives, so the page stays loading. */
+  tablePending?: boolean
   /** The author the table's one snapshot recorded (`DATA-15`); `null` when it recorded none. */
   snapshotAuthor?: string | null
   /** When set, `POST .../restore` is refused with this status and sentence. */
@@ -322,6 +325,7 @@ function stubApi({
     if (method === "GET" && path.includes("/api/semantic/")) return json({ entries: [] })
     if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) {
       if (tableMissing) return json({ error: "table not found" }, 404)
+      if (tablePending) return new Promise<Response>(() => {})
       return json({ ...TABLE, snapshots: TABLE.snapshots.map((snap) => ({ ...snap, author: snapshotAuthor })) })
     }
     return json({ error: "not stubbed" }, 404)
@@ -470,6 +474,26 @@ describe("Lineage tab", () => {
 
     expect(await screen.findByText("Lineage needs lineage access")).toBeTruthy()
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/api/governance/lineage"))).toBe(false)
+  })
+
+  it("opens the asset's query on Trino once its Iceberg table is there", async () => {
+    stubApi()
+    url.search = "tab=lineage"
+    renderTabs()
+
+    const href = () => screen.getByText("Query this asset").closest("a")?.getAttribute("href") ?? ""
+    // The engine follows the Iceberg table, so it is Trino only once the
+    // table's own detail has loaded.
+    await waitFor(() => expect(new URL(href(), "http://x").searchParams.get("engine")).toBe("trino"))
+  })
+
+  it("opens the asset's query on ClickHouse when its Iceberg table is not there", async () => {
+    stubApi({ tableMissing: true })
+    url.search = "tab=lineage"
+    renderTabs()
+
+    const href = screen.getByText("Query this asset").closest("a")?.getAttribute("href") ?? ""
+    expect(new URL(href, "http://x").searchParams.get("engine")).toBe("clickhouse")
   })
 })
 
@@ -2199,16 +2223,44 @@ describe("Access tab: enforcing and deleting a policy", () => {
 describe("Overview: the starter query", () => {
   const useData = async () =>
     (await screen.findByText("Use this data")).closest("[data-slot=card]") as HTMLElement
+  /** The engine the card's link opens Query Studio on. */
+  const engineOf = (card: HTMLElement) => {
+    const href = within(card).getByText("Open in Query Studio").closest("a")?.getAttribute("href") ?? ""
+    return new URL(href, "http://x").searchParams
+  }
 
   it("says Trino and opens Query Studio on Trino for a Bronze table the API can read", async () => {
     stubApi()
     renderTabs()
 
     const card = await useData()
-    expect(within(card).getByText(/^A starter query for Trino\./)).toBeTruthy()
-    const href = within(card).getByText("Open in Query Studio").closest("a")?.getAttribute("href") ?? ""
-    expect(new URL(href, "http://x").searchParams.get("engine")).toBe("trino")
+    // The engine follows the Iceberg table, so it is Trino only once the
+    // table's own detail has loaded.
+    await waitFor(() => expect(within(card).getByText(/^A starter query for Trino\./)).toBeTruthy())
+    const params = engineOf(card)
+    expect(params.get("engine")).toBe("trino")
     expect(within(card).getByText(/FROM iceberg\.bronze\.demo_orders/)).toBeTruthy()
+  })
+
+  it("says ClickHouse and opens Query Studio on ClickHouse for a Bronze asset whose Iceberg table is not there", async () => {
+    stubApi({ tableMissing: true })
+    renderTabs()
+
+    const card = await useData()
+    await waitFor(() => expect(within(card).getByText(/^A starter query for ClickHouse\./)).toBeTruthy())
+    const params = engineOf(card)
+    expect(params.get("engine")).toBe("clickhouse")
+    // The table the API proved the console can read, not the Iceberg one.
+    expect(params.get("sql")).toContain("FROM icecat_api.`bronze.demo_orders`")
+  })
+
+  it("says ClickHouse while the Iceberg table is still loading", async () => {
+    stubApi({ tablePending: true })
+    renderTabs()
+
+    const card = await useData()
+    expect(within(card).getByText(/^A starter query for ClickHouse\./)).toBeTruthy()
+    expect(engineOf(card).get("engine")).toBe("clickhouse")
   })
 
   it("says ClickHouse for the Silver model that stands in for a Bronze table", async () => {
