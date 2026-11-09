@@ -119,6 +119,8 @@ struct Claims<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_username: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     groups: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nonce: Option<&'a str>,
@@ -139,6 +141,7 @@ impl<'a> Claims<'a> {
             nbf: None,
             email: None,
             name: None,
+            preferred_username: None,
             groups: None,
             nonce: None,
             claim_names: None,
@@ -1038,5 +1041,55 @@ async fn an_unknown_kid_re_reads_the_discovery_document(pool: PgPool) -> sqlx::R
             .any(|path| path == "/.well-known/openid-configuration"),
         "an unknown kid must re-read the discovery document, got {paths:?}"
     );
+    Ok(())
+}
+
+/// ADM-11 D10: JIT provisioning uses `preferred_username` when present and valid,
+/// stores NULL for email when token has no email (never `.oidc.invalid`),
+/// and resolves username clashes with `-2`, `-3`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn jit_provisioning_with_preferred_username_and_no_email(pool: PgPool) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+    let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), true);
+
+    let mut claims = Claims::valid("user-pref-1");
+    claims.preferred_username = Some("alice.w");
+    claims.email = None;
+    let token = sign(&claims, &key, Algorithm::RS256);
+    let principal = auth
+        .authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .unwrap();
+
+    let user_row: (String, Option<String>) =
+        sqlx::query_as("SELECT username, email FROM app_user WHERE id = $1")
+            .bind(principal.id.uuid())
+            .fetch_one(&pool)
+            .await?;
+
+    assert_eq!(user_row.0, "alice.w");
+    assert_eq!(user_row.1, None, "email must be NULL, never .oidc.invalid");
+
+    // Second user with same preferred_username gets tiebreaker -2
+    let mut claims2 = Claims::valid("user-pref-2");
+    claims2.preferred_username = Some("alice.w");
+    claims2.email = None;
+    let token2 = sign(&claims2, &key, Algorithm::RS256);
+    let principal2 = auth
+        .authenticate(&Credential::Bearer(Secret::new(token2)))
+        .await
+        .unwrap();
+
+    let user_row2: (String, Option<String>) =
+        sqlx::query_as("SELECT username, email FROM app_user WHERE id = $1")
+            .bind(principal2.id.uuid())
+            .fetch_one(&pool)
+            .await?;
+
+    assert_eq!(user_row2.0, "alice.w-2");
+    assert_eq!(user_row2.1, None);
+
     Ok(())
 }

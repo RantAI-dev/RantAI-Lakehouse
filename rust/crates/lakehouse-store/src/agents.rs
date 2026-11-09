@@ -1753,16 +1753,26 @@ pub struct GrantTarget {
 /// [`StoreError::Database`] on any query failure.
 pub async fn find_user_by_email(
     pool: &PgPool,
-    email: &str,
+    identifier: &str,
 ) -> Result<Option<GrantTarget>, StoreError> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, name FROM app_user WHERE lower(email) = lower($1) \
-         ORDER BY (email = $1) DESC, created_at LIMIT 1",
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM app_user \
+         WHERE lower(username) = lower($1) OR lower(email) = lower($1) \
+         LIMIT 2",
     )
-    .bind(email)
-    .fetch_optional(pool)
+    .bind(identifier)
+    .fetch_all(pool)
     .await?;
-    Ok(row.map(|(id, name)| GrantTarget { id, name }))
+
+    if rows.len() > 1 {
+        return Err(StoreError::Validation(
+            "Ambiguous identifier matches multiple users.".to_owned(),
+        ));
+    }
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|(id, name)| GrantTarget { id, name }))
 }
 
 /// A grant made from an asset's page, as the page lists it (`DATA-15` F3).
@@ -2306,6 +2316,22 @@ mod access_request_tests {
                 .unwrap()
                 .is_none()
         );
+
+        // Can find by username
+        let (u2_id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind("Unique User")
+        .bind("unique.username")
+        .bind(None as Option<String>)
+        .fetch_one(&pool)
+        .await?;
+        let found2 = super::find_user_by_email(&pool, "unique.username")
+            .await
+            .unwrap()
+            .expect("found by username");
+        assert_eq!(found2.id, u2_id);
+
         Ok(())
     }
 }

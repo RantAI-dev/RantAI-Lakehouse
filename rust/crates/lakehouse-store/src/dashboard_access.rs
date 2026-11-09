@@ -260,12 +260,12 @@ pub async fn user_names(
     // ADM-11 D1: `email` may be NULL now, so the row type carries the
     // option rather than assuming every user has an address.
 ) -> Result<Vec<(Uuid, String, Option<String>)>, StoreError> {
-    Ok(
-        sqlx::query_as("SELECT id, name, email FROM app_user WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(pool)
-            .await?,
+    Ok(sqlx::query_as(
+        "SELECT id, name, COALESCE(email, username) AS email FROM app_user WHERE id = ANY($1)",
     )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// `(id, name)` for each of these roles that still exists.

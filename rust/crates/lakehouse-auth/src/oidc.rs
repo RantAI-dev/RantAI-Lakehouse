@@ -580,6 +580,9 @@ struct OidcClaims {
     /// provisioning only.
     #[serde(default)]
     name: Option<String>,
+    /// The caller's preferred username, if the token carries one (ADM-11 D10).
+    #[serde(default)]
+    preferred_username: Option<String>,
     /// Every other claim, keyed by name.
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -899,18 +902,33 @@ impl OidcAuthenticator {
     /// concurrent first-time logins), or [`AuthError::Database`] on any
     /// other storage failure.
     async fn provision_user(&self, claims: &OidcClaims) -> Result<Uuid, AuthError> {
-        let email = claims.email.clone().unwrap_or_else(|| {
-            format!("{}@{}.oidc.invalid", claims.sub, self.config.provider_name)
+        let email = claims.email.as_deref().and_then(|e| {
+            let trimmed = e.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
         });
-        let name = claims.name.clone().unwrap_or_else(|| email.clone());
+        let name = claims
+            .name
+            .clone()
+            .or_else(|| claims.preferred_username.clone())
+            .or_else(|| email.clone())
+            .unwrap_or_else(|| claims.sub.clone());
 
         let mut tx = self.pool.begin().await?;
 
-        let existing_user: Option<(Uuid, String)> =
-            sqlx::query_as("SELECT id, status FROM app_user WHERE email = $1")
-                .bind(&email)
+        // ADM-11 D10: Linking an existing account by email is unchanged.
+        let existing_user: Option<(Uuid, String)> = if let Some(ref em) = email {
+            sqlx::query_as("SELECT id, status FROM app_user WHERE lower(email) = lower($1)")
+                .bind(em)
                 .fetch_optional(&mut *tx)
-                .await?;
+                .await?
+        } else {
+            None
+        };
+
         let app_user_id = if let Some((id, status)) = existing_user {
             // ADM-4 D4: a deactivated account is refused, never
             // re-provisioned — and the row is left exactly as it is.
@@ -919,12 +937,66 @@ impl OidcAuthenticator {
             }
             id
         } else {
-            let (id,): (Uuid,) =
-                sqlx::query_as("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-                    .bind(&name)
-                    .bind(&email)
-                    .fetch_one(&mut *tx)
-                    .await?;
+            // ADM-11 D10: Username is lower(claims.preferred_username) if it passes D3/D5,
+            // else lower(email), else lower(sub)@<provider>. A clash gets -2, -3, ...
+            let preferred_candidate = claims
+                .preferred_username
+                .as_deref()
+                .and_then(|u| lakehouse_store::identity::normalize_username(u).ok());
+
+            let email_candidate = email
+                .as_deref()
+                .and_then(|e| lakehouse_store::identity::normalize_username(e).ok());
+
+            let fallback_candidate = {
+                let raw = format!(
+                    "{}@{}",
+                    claims.sub.to_lowercase(),
+                    self.config.provider_name.to_lowercase()
+                );
+                lakehouse_store::identity::normalize_username(&raw)
+                    .unwrap_or_else(|_| "oidc-user".to_owned())
+            };
+
+            let base = preferred_candidate
+                .or(email_candidate)
+                .unwrap_or(fallback_candidate);
+
+            let mut candidate = base.clone();
+            let mut counter = 1;
+            loop {
+                let taken = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM app_user \
+                         WHERE lower(username) = lower($1) OR lower(email) = lower($1) \
+                     )",
+                )
+                .bind(&candidate)
+                .fetch_one(&mut *tx)
+                .await?;
+
+                if !taken {
+                    break;
+                }
+                counter += 1;
+                let suffix = format!("-{counter}");
+                let max_base_len = 254 - suffix.len();
+                let truncated_base = if base.len() > max_base_len {
+                    &base[..max_base_len]
+                } else {
+                    &base
+                };
+                candidate = format!("{truncated_base}{suffix}");
+            }
+
+            let (id,): (Uuid,) = sqlx::query_as(
+                "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(&name)
+            .bind(&candidate)
+            .bind(&email)
+            .fetch_one(&mut *tx)
+            .await?;
             id
         };
 
@@ -1119,6 +1191,7 @@ mod tests {
             sub: "user-1".to_owned(),
             email: None,
             name: None,
+            preferred_username: None,
             extra: HashMap::from([(
                 "groups".to_owned(),
                 Value::Array(vec![Value::String("lakehouse-admins".to_owned())]),
@@ -1133,6 +1206,7 @@ mod tests {
             sub: "user-1".to_owned(),
             email: None,
             name: None,
+            preferred_username: None,
             extra: HashMap::new(),
         };
         assert_eq!(claims.groups("groups"), [] as [std::string::String; 0]);
@@ -1144,6 +1218,7 @@ mod tests {
             sub: "user-1".to_owned(),
             email: None,
             name: None,
+            preferred_username: None,
             extra: HashMap::from([(
                 "groups".to_owned(),
                 Value::String("not-an-array".to_owned()),

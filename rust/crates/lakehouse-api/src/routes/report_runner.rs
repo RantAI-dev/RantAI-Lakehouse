@@ -1520,6 +1520,26 @@ mod tests {
     /// BI-19 B1 owner decision Q-R12: for a restricted dashboard the runner
     /// passes no allowed domain, so every outside address is left out and
     /// counted while the console users who may receive it still get it.
+    /// ADM-11 D9: A user without an email address is skipped, and counted in `left_out`.
+    #[test]
+    fn a_user_without_an_email_address_is_left_out() {
+        let rows = vec![
+            RecipientRow {
+                user_id: Some(Uuid::new_v4()),
+                email: None,
+                user_name: Some("No Email User".to_owned()),
+                user_email: None,
+                user_status: Some("active".to_owned()),
+            },
+            user_row("active", "ann@company.example"),
+        ];
+        let everyone: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().filter_map(|r| r.user_id).collect();
+        let got = audience_of(&rows, &["company.example".to_owned()], &everyone);
+        assert_eq!(got.addresses, ["ann@company.example"]);
+        assert_eq!(got.left_out, 1, "the user without an email is left out");
+    }
+
     #[test]
     fn a_restricted_dashboards_report_leaves_out_every_outside_address() {
         let rows = vec![
