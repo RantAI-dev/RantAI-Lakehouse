@@ -67,19 +67,5 @@ ALTER TABLE app_user ADD CONSTRAINT app_user_username_format
 
 ALTER TABLE app_user ALTER COLUMN email DROP NOT NULL;
 
--- Default username to lower(email) for legacy or idempotent seed scripts
--- (e.g. 0002_seed_identity.sql) that insert without specifying username.
-CREATE OR REPLACE FUNCTION app_user_default_username()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.username IS NULL AND NEW.email IS NOT NULL THEN
-        NEW.username := lower(NEW.email);
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER app_user_default_username_trigger
-BEFORE INSERT ON app_user
-FOR EACH ROW
-EXECUTE FUNCTION app_user_default_username();
+-- ADM-11 review 1 B2: no default-username trigger; every insert must supply
+-- username explicitly rather than bypassing normalize_username and D5.
