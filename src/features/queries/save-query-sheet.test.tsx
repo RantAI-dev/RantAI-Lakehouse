@@ -191,7 +191,7 @@ describe("the save sheet parameters (QS-5)", () => {
     expect((onSave.mock.calls[0]?.[0] as SaveQueryInput).parameters).toStrictEqual([])
   })
 
-  it("sends no parameters key when a change drops nothing because the saved query had none", async () => {
+  it("sends an empty list when a change has no placeholder, whatever the saved query held", async () => {
     spyOn(queryService, "getSaved").mockResolvedValue({ ...SAVED, level: "edit", parameters: [] })
     const { onSave } = renderSheet({ mode: "update", savedId: "q1", parameters: [] })
     await waitFor(() =>
@@ -201,7 +201,33 @@ describe("the save sheet parameters (QS-5)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
-    expect("parameters" in (onSave.mock.calls[0]?.[0] as SaveQueryInput)).toBe(false)
+    // The change says which definitions it wants, and it wants none. The
+    // saved query's own definitions do not decide it.
+    expect((onSave.mock.calls[0]?.[0] as SaveQueryInput).parameters).toStrictEqual([])
+  })
+
+  it("sends an empty list when a change has no placeholder and the saved query is not read yet", async () => {
+    // The saved query is still loading: the change does not wait for it to
+    // say what the definitions are.
+    spyOn(queryService, "getSaved").mockReturnValue(new Promise<SavedQuery>(() => {}))
+    const { onSave } = renderSheet({ mode: "update", savedId: "q1", parameters: [] })
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect((onSave.mock.calls[0]?.[0] as SaveQueryInput).parameters).toStrictEqual([])
+  })
+
+  it("sends an empty list when a change has no placeholder and the saved query could not be read", async () => {
+    spyOn(queryService, "getSaved").mockRejectedValue(
+      new ServiceError("unavailable", "unavailable: The saved query could not be read.")
+    )
+    const { onSave } = renderSheet({ mode: "update", savedId: "q1", parameters: [] })
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect((onSave.mock.calls[0]?.[0] as SaveQueryInput).parameters).toStrictEqual([])
   })
 
   it("sends the new definitions when a change keeps placeholders", async () => {

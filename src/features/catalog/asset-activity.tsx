@@ -43,7 +43,7 @@ import type { AssetDetail } from "@/services/contracts/assets"
 import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
 import { FreshnessTargetDialog } from "@/features/governance/freshness-target-dialog"
 import { lineageKey } from "./asset-lineage"
-import type { IcebergTableState } from "./asset-storage"
+import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ALL, CountToggle } from "./count-toggle"
 
 /** How many snapshots, or changes, are listed before the reader asks for more. */
@@ -200,7 +200,7 @@ function IcebergSnapshots({
         </TableHeader>
         <TableBody>
           {snapshots.map((s, i) => {
-            const href = assetSnapshotQueryHref(a, s.id)
+            const href = assetSnapshotQueryHref(a, s.id, icebergTableOf(state))
             return (
               <TableRow key={s.id}>
                 <TableCell className="py-1.5 text-xs" title={formatDateTime(msToIso(s.timestampMs))}>

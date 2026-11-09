@@ -11,7 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { levelAtLeast } from "@/features/dashboards/access-level"
+import { levelAtLeast } from "@/lib/access-level"
 import { readableErrorMessage } from "@/lib/notify-message"
 import type { QueryFolder } from "@/services/contracts/queries"
 import { FolderSharingNote } from "./folder-sharing-note"

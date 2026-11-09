@@ -13,7 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
-import { levelAtLeast } from "@/features/dashboards/access-level"
+import { levelAtLeast } from "@/lib/access-level"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { readableErrorMessage } from "@/lib/notify-message"
 import { queryService } from "@/services"

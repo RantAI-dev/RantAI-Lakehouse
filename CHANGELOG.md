@@ -26,12 +26,14 @@ once a first release is tagged.
 - History and the history API no longer keep the engine's error text (backlog `QS-4`). A run that fails in the engine records a fixed sentence by cause and a `Reference: <id>`, with no `Code:` and no catalog name; the result tab still shows the engine's diagnosis. Migration `0127` replaces the engine text already stored for ClickHouse runs with the default sentence and keeps the reference id. Stored Trino messages are not changed, and a Trino statement error shows the default sentence because the Trino client does not keep the error name.
 - The assistant's draft check of a chart change reads the chart as the person asking, so a draft cannot reveal a chart they cannot see (backlog `AI-3`).
 - The assistant's chart draft runs the same permission and source checks as the save, so a draft can no longer name the columns of a SQL source the person cannot see (backlog `AI-3`).
+- On ClickHouse a heredoc (`$$ … $$`, `$tag$ … $tag$`) is read like a quoted string, so a placeholder inside it is refused with the inside-quotes sentence and an unclosed heredoc runs to the end of the statement. Trino is unchanged (backlog `QS-5`).
 
 ### Changed
 
 - A saved query's delete and restore need edit instead of manage, and the trash list shows what the caller may edit.
 - Anyone with edit on a folder reads who it has been shared with: `GET /api/query/folders/{id}/access` answers at edit, and every rule in an access list now carries `granteeName` and `granteeEmail` (`null` outside the caller's organisation). The save sheet and the move dialog name who a chosen folder is shared with before the user confirms, and the share panel shows names instead of ids (backlog `QS-3`).
 - A run ended with Stop shows as Stopped in History (backlog `QS-2`, `QS-4`). The status `stopped` is a filter value in place of `cancelled`, and migration `0127` moves the rows already stored. The History page pages by number: `GET /api/query/history` takes `page` instead of `before` and answers `runs`, `total`, `page` and `pageSize`, 50 runs per page, and the pills read Completed, Failed, Stopped and Refused.
+- The revert confirmation button reads "Restore version N" (backlog `QS-3`), and the folder access list answers at edit with a sentence that says only someone who can edit the folder can see who it is shared with (backlog `QS-3`).
 
 ### Fixed
 
@@ -51,6 +53,9 @@ once a first release is tagged.
 - The catalog's "Open in Query Studio" and snapshot links for a Bronze table open a Trino tab with `iceberg.bronze.<table>`, as the schema browser does (backlog `QS-1`).
 - The assistant's tool descriptions are shorter. A build turn offers 56 tools in 57,764 characters, down from 59,753, under the 60,000 bar (backlog `AI-15`).
 - The offered tools of a build turn drop two repeated descriptions, the per-value number format of `format_chart` and the nested parts of `update_metric`. The turn offers 56 tools in 57,251 characters, 656 fewer than before this change (57,907, which includes the `parameters` property that `run_sql` gained with query parameters). No tool's behaviour, permission, type, enum or required field changes (backlog `AI-15`, #423).
+- The catalog's "Open in Query Studio" and snapshot links for a Bronze table open the Trino tab only when the Bronze table's Iceberg table exists, and the ClickHouse link otherwise (backlog `QS-3`).
+- Saving a query in update mode always states the parameter definitions it wants, so a statement without a placeholder clears them; the editor's list after `{{` holds the tab's defined names and nothing else, and offers none inside a comment or a quoted run; a dropdown can be set back to "no value" (backlog `QS-5`).
+- In Ask mode the assistant narrows the dashboard's view instead of drafting a new chart: a request to see only some of the data on the page, for example "show only 2026" or "only Bali", sets the person's own filters on the page for this visit only. Nothing is saved, so the board's default filters and every other viewer's view stay as they are; saving the board's default filters is a separate tool (`save_board_filters`) and stays in the Dashboard Builder (backlog `AI-2`).
 
 ## [0.2.1] - 2026-11-04
 
