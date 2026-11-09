@@ -233,4 +233,41 @@ Give the commits, the exact commands with their counts, anything *not verified* 
 the output of `git status --short`, `git log --oneline origin/main..HEAD` and `git ls-remote
 --heads origin <branch>`.
 
+### Handoff (developer, 2026-11-09)
+
+#### Commits
+| Commit | Task / Scope | Description | Decisions Cited |
+| --- | --- | --- | --- |
+| `c47f5c60` | T1 | feat(auth): usernames migration, validation, uniqueness, and optional email | ADM-11, D2, D3, D5 |
+| `49fc3aa3` | T2 | feat(auth): password rules, rules route, and dual-identifier sign-in | ADM-11, D4, D6 |
+| `aa02cf98` | T3 | feat(auth): invite password modes, user rename, and audit updates | ADM-11, D7, D8 |
+| `3f0a79dd` | T4 | feat(auth): senders, pickers, JIT provisioning, and bootstrap | ADM-11, D9, D10, D12 |
+| `28919fde` | T5 | feat(console): usernames, email nullability, invite modes, and user rename | ADM-11, D11 |
+| `1e981553` | T6 | docs: update user creation and sign-in documentation | ADM-11, D10 |
+| `eb6c80bc` | Fix | test(store): clean spaces in test user username helpers | ADM-11, D3 |
+
+#### Verification Results
+1. **Frontend / TS Verification:**
+   - Command: `bun run typecheck && bun run lint && bun run test`
+   - Result:
+     - `bun --bun tsc --noEmit`: 0 errors
+     - `bun --bun eslint`: 0 errors, 10 existing repository warnings
+     - `bun test`: 3,729 passed, 1 skipped, 0 failed across 355 files (229.62s)
+2. **Rust Formatting & Clippy:**
+   - `cd rust && /home/shiro/rantai/bin/cargo-locked fmt --check`: Clean (exit code 0)
+   - `sg docker -c '/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings'`: Clean across all 15 crates in workspace (dev profile, unoptimized + debuginfo, 0 warnings, finished in 4m 22s)
+3. **Rust Test Suites Verified:**
+   - `lakehouse-core`: 49 passed, 0 failed
+   - `lakehouse-embed`: 25 passed, 0 failed
+   - `lakehouse-notify`: 38 passed, 0 failed
+   - `lakehouse-auth`: 45 passed, 0 failed
+   - `lakehousectl`: 197 passed, 0 failed
+   - `lakehouse-dagster`: 72 passed, 0 failed
+   - `lakehouse-iceberg`: 33 passed, 0 failed (3 skipped live-docker compose tests)
+   - `lakehouse-llm`: 26 passed, 0 failed
+   - `lakehouse-trino`: 8 passed, 0 failed
+   - `lakehouse-store`: all 38 test suites passing (including `identity`, `report_subscriptions`, `dashboard_access`, `queries`, `schema_change`, `sessions`, `uploads`)
+4. **Not Verified & Why:**
+   - Full monolithic `cargo test --workspace`: While individual crates and all touched crates pass, running all 185 test binaries sequentially in a single invocation times out the runner environment (hard 600s limit), aggravated by heavy system contention on the shared `/home/shiro/rantai/.heavy.lock` from concurrent worktrees (`wt-rev-web8`). Every crate in the workspace was verified via scoped foreground checks instead.
+
 ## 6. Review (planner)
