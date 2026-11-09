@@ -758,7 +758,8 @@ const EMAIL_FIELDS: [&str; 7] = [
 ///
 /// `fields` are the names the body may carry; anything else is refused with
 /// `shape`, the fixed sentence that names them.
-fn parse_body(
+// ADM-11 review 1 S3: pub(crate) so routes::identity reuses this helper for PATCH parsing.
+pub(crate) fn parse_body(
     body: &Bytes,
     fields: &[&str],
     shape: &str,
@@ -1264,7 +1265,11 @@ pub async fn post_email_test(
     let user = lakehouse_store::identity::get_user(pool, &user_id.to_string())
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
-    let Some(address) = crate::routes::report_runner::normalise_address(&user.email) else {
+    let Some(address) = user
+        .email
+        .as_deref()
+        .and_then(crate::routes::report_runner::normalise_address)
+    else {
         return Err(ApiError::BadRequest(NO_ACCOUNT_ADDRESS.to_owned()).into());
     };
     // The effective settings: what a send would use, saved or from the

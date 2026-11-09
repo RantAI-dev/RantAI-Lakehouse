@@ -30,6 +30,37 @@ use uuid::Uuid;
 use common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
 
 mod identity {
+
+    /// ADM-11 D7 / ADM-11 review 1 S1: missing or blank username returns 400 "username is required".
+    #[tokio::test]
+    async fn invite_with_missing_or_blank_username_returns_400() {
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+        for body in [
+            json!({
+                "name": "Missing Username",
+                "email": "missing.username@example.com",
+                "roles": ["Analyst"],
+            }),
+            json!({
+                "name": "Blank Username",
+                "username": "   ",
+                "email": "blank.username@example.com",
+                "roles": ["Analyst"],
+            }),
+        ] {
+            let (status, resp_body, _) =
+                post_json(&app, Some(&admin_cookie), "/api/identity/users", &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                resp_body.get("error").and_then(|m| m.as_str()),
+                Some("username is required")
+            );
+        }
+    }
+
     use super::*;
 
     /// The email every invited user in this file gets. `.example` is the
@@ -127,6 +158,7 @@ mod identity {
             "/api/identity/users",
             &json!({
                 "name": "Rina Guest",
+                "username": "rina.guest",
                 "email": INVITED_EMAIL,
                 "roles": ["Analyst"],
                 "tenants": ["Meridian Retail"],
@@ -355,6 +387,7 @@ mod identity {
                 "/api/identity/users",
                 &json!({
                     "name": "Half Created",
+                    "username": "half.created",
                     "email": INVITED_EMAIL,
                     "roles": roles,
                     "tenants": tenants,
@@ -515,6 +548,201 @@ mod identity {
     /// ADM-3 D3: a caller may not reset their OWN password here — that is
     /// what `POST /api/auth/change-password` is for, and it proves the old
     /// password instead of replacing it behind the holder's back.
+    async fn patch_json(
+        app: &TestApp,
+        cookie: Option<&str>,
+        uri: &str,
+        body: &Value,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(body.to_string()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// ADM-11 D7: `set` with `mustChangePassword: false` signs in directly,
+    /// returns no `temporaryPassword`, and can immediately reach a gated route.
+    #[tokio::test]
+    async fn invite_with_set_and_must_change_password_false_works_directly() {
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+        let typed_pass = "AdminTypedPassword123";
+        let (status, body, _) = post_json(
+            &app,
+            Some(&admin_cookie),
+            "/api/identity/users",
+            &json!({
+                "name": "Ana Set",
+                "username": "ana.set",
+                "roles": ["Analyst"],
+                "tenants": ["Meridian Retail"],
+                "password": { "mode": "set", "value": typed_pass },
+                "mustChangePassword": false
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            body.get("temporaryPassword").is_none(),
+            "set mode must not return a temporary password: {body}"
+        );
+
+        // Sign in with the typed password
+        let (login_status, login_body, cookie_header) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({
+                "identifier": "ana.set",
+                "password": typed_pass
+            }),
+        )
+        .await;
+        assert_eq!(login_status, StatusCode::OK, "{login_body}");
+        assert_eq!(login_body["mustChangePassword"], json!(false));
+        let user_cookie = session_cookie_from(cookie_header);
+
+        // Can reach a gated route immediately
+        let (gate_status, _) = get_json(&app, Some(&user_cookie), "/api/home/layout").await;
+        assert_eq!(gate_status, StatusCode::OK);
+
+        // Audit row holds no password and no email
+        let row: Value = sqlx::query_scalar(
+            "SELECT args FROM audit_event WHERE action = 'identity.user.invite' AND resource_id = $1",
+        )
+        .bind(body["id"].as_str().unwrap())
+        .fetch_one(&app.pool)
+        .await
+        .expect("audit row");
+        assert_eq!(row["username"], json!("ana.set"));
+        assert_eq!(row["hasEmail"], json!(false));
+        assert_eq!(row["passwordMode"], json!("set"));
+        assert_eq!(row["mustChangePassword"], json!(false));
+        assert!(row.get("email").is_none());
+        assert!(!row.to_string().contains(typed_pass));
+    }
+
+    /// ADM-11 D8: rename lets the new username sign in and the old one not.
+    #[tokio::test]
+    async fn rename_lets_new_username_sign_in_and_old_one_not() {
+        let app = spin_up().await;
+        let admin = create_principal_with_permissions(&app.pool, "*:*").await;
+        let admin_cookie = session_cookie_for_user(&app.pool, admin).await;
+
+        let pass = "TypedPassWord123";
+        let (create_status, create_body, _) = post_json(
+            &app,
+            Some(&admin_cookie),
+            "/api/identity/users",
+            &json!({
+                "name": "Budi Test",
+                "username": "budi.original",
+                "roles": ["Analyst"],
+                "tenants": ["Meridian Retail"],
+                "password": { "mode": "set", "value": pass },
+                "mustChangePassword": false
+            }),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED);
+        let user_id = create_body["id"].as_str().unwrap();
+
+        // Rename via PATCH /api/identity/users/{id}
+        let (patch_status, patch_body) = patch_json(
+            &app,
+            Some(&admin_cookie),
+            &format!("/api/identity/users/{user_id}"),
+            &json!({
+                "username": "budi.renamed"
+            }),
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::OK, "{patch_body}");
+        assert_eq!(patch_body["username"], "budi.renamed");
+
+        // New username signs in
+        let (status_new, _, _) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({
+                "identifier": "budi.renamed",
+                "password": pass
+            }),
+        )
+        .await;
+        assert_eq!(status_new, StatusCode::OK);
+
+        // Old username no longer signs in
+        let (status_old, _, _) = post_json(
+            &app,
+            None,
+            "/api/auth/login",
+            &json!({
+                "identifier": "budi.original",
+                "password": pass
+            }),
+        )
+        .await;
+        assert_eq!(status_old, StatusCode::UNAUTHORIZED);
+
+        // Audit row for update holds changedFields, no password, no email
+        let audit: Value = sqlx::query_scalar(
+            "SELECT args FROM audit_event WHERE action = 'identity.user.update' AND resource_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("update audit row");
+        assert_eq!(audit["changedFields"], json!(["username"]));
+        assert!(audit.get("email").is_none());
+        assert!(!audit.to_string().contains(pass));
+    }
+
+    /// ADM-11 D8: a non-*:* caller renaming a *:* user gets 404 (same as for an unknown user).
+    #[tokio::test]
+    async fn non_unrestricted_caller_renaming_unrestricted_user_gets_404() {
+        let app = spin_up().await;
+        let unrestricted_target = create_principal_with_permissions(&app.pool, "*:*").await;
+        let scoped_caller = create_principal_with_permissions(&app.pool, "identity:write").await;
+        let caller_cookie = session_cookie_for_user(&app.pool, scoped_caller).await;
+
+        let (status, body) = patch_json(
+            &app,
+            Some(&caller_cookie),
+            &format!("/api/identity/users/{unrestricted_target}"),
+            &json!({
+                "username": "hacked.admin"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "record not found");
+    }
+
     #[tokio::test]
     async fn a_caller_may_not_reset_its_own_password_here() {
         let app = spin_up().await;

@@ -54,12 +54,15 @@ use uuid::Uuid;
 /// (which runs a transaction with role/tenant joins that complicates the
 /// test setup, see the module doc comment).
 async fn seed_user(pool: &PgPool, email: &str) -> Uuid {
-    sqlx::query_scalar::<_, Uuid>("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-        .bind(email.split('@').next().unwrap_or(email))
-        .bind(email)
-        .fetch_one(pool)
-        .await
-        .expect("insert app_user")
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(email.split('@').next().unwrap_or(email))
+    .bind(email.to_lowercase())
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .expect("insert app_user")
 }
 
 /// Insert a live (`revoked_at = NULL`, `expires_at > now()`) `session`

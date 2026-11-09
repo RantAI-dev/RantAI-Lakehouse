@@ -569,6 +569,49 @@ async fn a_caller_without_an_account_address_is_refused_with_a_sentence() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
+/// ADM-11 D9: A user with `settings:write` but no email address is refused
+/// with a 400 when calling test email.
+#[tokio::test]
+async fn a_user_without_an_email_address_gets_400_for_test_email() {
+    let TestApp { router, pool } = spin_up().await;
+    let (user_id,): (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO app_user (name, username, email, status) VALUES ($1, $2, NULL, 'active') RETURNING id",
+    )
+    .bind("No Email Admin")
+    .bind("no.email.admin")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let (role_id,): (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO role (name, permissions, description) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind("Settings Admin Role No Email")
+    .bind("settings:write")
+    .bind("Can write settings")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(role_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let cookie = session_cookie_for_user(&pool, user_id).await;
+    let (status, body) = call(&router, "POST", EMAIL_TEST, &cookie, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no email address"),
+        "{body}"
+    );
+}
+
 // ── The relay ────────────────────────────────────────────────────────────
 
 /// The CA and the server certificate it signs, minted for one test.

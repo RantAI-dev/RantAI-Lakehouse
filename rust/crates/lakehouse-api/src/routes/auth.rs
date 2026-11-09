@@ -94,10 +94,12 @@ fn cleared_session_cookie_header(is_dev: bool) -> HeaderValue {
     session_cookie_header(is_dev, "", Duration::ZERO)
 }
 
-/// `{ email, password }` — `POST /api/auth/login` body.
+/// `{ identifier, password }` — `POST /api/auth/login` body.
+/// Accepts `email` as an alias for backwards compatibility (ADM-11 D6).
 #[derive(Debug, Deserialize)]
 struct LoginBody {
-    email: String,
+    #[serde(alias = "email")]
+    identifier: String,
     password: String,
 }
 
@@ -161,10 +163,13 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
                 .to_owned(),
         )
     })?;
-    let LoginBody { email, password } = serde_json::from_slice(&body)
+    let LoginBody {
+        identifier,
+        password,
+    } = serde_json::from_slice(&body)
         .map_err(|err| ApiError::BadRequest(format!("invalid JSON body: {err}")))?;
 
-    let key = throttle::key_for(&email);
+    let key = throttle::key_for(&identifier);
 
     if let Some(locked_until) = throttle::locked_until(pool, &key).await? {
         return Err(locked_response(Some(locked_until)).into());
@@ -188,7 +193,7 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
     }
 
     let credential = Credential::Password {
-        identifier: email,
+        identifier,
         password: Secret::new(password),
     };
     match auth.local.authenticate(&credential).await {
@@ -196,7 +201,10 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
             throttle::clear(pool, &key).await?;
             let PrincipalId::User(user_id) = principal.id else {
                 tracing::warn!("login failed");
-                return Err(ApiError::invalid_or_expired().into());
+                return Err(ApiError::Unauthorized(
+                    "Invalid username/email or password.".to_owned(),
+                )
+                .into());
             };
             let must_change_password = password::must_change_password(pool, user_id)
                 .await
@@ -249,7 +257,7 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
                 }
             }
             tracing::warn!("login failed");
-            Err(ApiError::invalid_or_expired().into())
+            Err(ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into())
         }
         Err(err) => {
             // SEC-49: the try was counted before hashing; a storage error is
@@ -346,7 +354,10 @@ pub async fn me(
     let (email, roles) = match principal.id {
         PrincipalId::User(user_id) => match state.pg.as_deref() {
             Some(pool) => match identity::get_user(pool, &user_id.to_string()).await {
-                Ok(user) => (Some(user.email), user.roles),
+                // ADM-11 D6: a user may have no email at all, so the
+                // lookup's success no longer implies an address exists —
+                // `None` means the account has none.
+                Ok(user) => (user.email, user.roles),
                 Err(_) => (None, Vec::new()),
             },
             None => (None, Vec::new()),
@@ -592,13 +603,16 @@ pub async fn change_password(
         let Some(old_password) = old_password else {
             return Err(ApiError::BadRequest("oldPassword is required".to_owned()).into());
         };
-        let user = identity::get_user(pool, &user_id.to_string()).await?;
-        password::verify(pool, &user.email, &Secret::new(old_password))
+        password::verify_for_user(pool, user_id, &Secret::new(old_password))
             .await
             .inspect_err(|_| {
                 tracing::warn!("change-password rejected: old password did not verify");
             })?;
     }
+
+    let user = identity::get_user(pool, &user_id.to_string()).await?;
+    password::check_rules(&new_password, Some(&user.username), user.email.as_deref())
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
 
     password::change_password(pool, user_id, &Secret::new(new_password)).await?;
     session::revoke_all_sessions_for_user(pool, user_id).await?;
@@ -1215,6 +1229,30 @@ fn session_revoke_audit_event(principal: &Principal, session_id: Uuid) -> NewAud
         outcome: "executed".to_owned(),
         ..Default::default()
     }
+}
+
+/// Response body for `GET /api/auth/password-rules` (ADM-11 D4, moved above tests for ADM-11 review 1 B4).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordRulesResponse {
+    /// Minimum password length.
+    pub min_length: usize,
+    /// Maximum password length.
+    pub max_length: usize,
+}
+
+/// `GET /api/auth/password-rules` — public endpoint returning password length constraints (ADM-11 D4).
+///
+/// ADM-11 review 1 B4: placed above `#[cfg(test)]` so the SEC-11 scan does not skip it.
+///
+/// # Errors
+///
+/// This handler never fails and returns `Ok`.
+pub async fn password_rules() -> ApiResult<ApiJson<PasswordRulesResponse>> {
+    Ok(ApiJson(PasswordRulesResponse {
+        min_length: password::MIN_PASSWORD_LENGTH,
+        max_length: password::MAX_PASSWORD_LENGTH,
+    }))
 }
 
 #[cfg(test)]
@@ -2202,12 +2240,14 @@ mod tests {
     ) -> sqlx::Result<()> {
         use lakehouse_test_support as _;
 
-        let user_id: Uuid =
-            sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-                .bind("caller")
-                .bind("caller@x.invalid")
-                .fetch_one(&pool)
-                .await?;
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind("caller")
+        .bind("caller")
+        .bind("caller@x.invalid")
+        .fetch_one(&pool)
+        .await?;
 
         let token = lakehouse_auth::session::create_session(
             &pool,

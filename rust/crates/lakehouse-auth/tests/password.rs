@@ -154,3 +154,121 @@ async fn linking_a_second_local_identity_to_the_same_user_conflicts(
     assert!(matches!(err, AuthError::Conflict(_)));
     Ok(())
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_accepts_username_and_email_in_any_case(pool: PgPool) -> sqlx::Result<()> {
+    let rina_id = Uuid::parse_str(RINA).unwrap();
+    // Update username so it differs from email
+    sqlx::query("UPDATE app_user SET username = 'rina' WHERE id = $1")
+        .bind(rina_id)
+        .execute(&pool)
+        .await?;
+
+    create_local_identity(
+        &pool,
+        rina_id,
+        &Secret::new("correct horse battery staple"),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let principal_by_user = verify(&pool, "rina", &Secret::new("correct horse battery staple"))
+        .await
+        .unwrap();
+    assert_eq!(principal_by_user.display_name, "Rina Wijaya");
+
+    let principal_by_email_caps = verify(
+        &pool,
+        "RINA@MERIDIAN.EXAMPLE",
+        &Secret::new("correct horse battery staple"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(principal_by_email_caps.display_name, "Rina Wijaya");
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_refuses_ambiguous_identifier(pool: PgPool) -> sqlx::Result<()> {
+    let rina_id = Uuid::parse_str(RINA).unwrap();
+    // Update Rina's username so it differs from her email
+    sqlx::query("UPDATE app_user SET username = 'rina.w' WHERE id = $1")
+        .bind(rina_id)
+        .execute(&pool)
+        .await?;
+
+    create_local_identity(
+        &pool,
+        rina_id,
+        &Secret::new("correct horse battery staple"),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let second_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email) VALUES ($1, 'Impostor', $2, 'impostor@example.com')",
+    )
+    .bind(second_id)
+    .bind("rina@meridian.example")
+    .execute(&pool)
+    .await?;
+
+    create_local_identity(
+        &pool,
+        second_id,
+        &Secret::new("correct horse battery staple"),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let err = verify(
+        &pool,
+        "rina@meridian.example",
+        &Secret::new("correct horse battery staple"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidCredentials));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_for_user_verifies_without_identifier_lookup(pool: PgPool) -> sqlx::Result<()> {
+    let rina_id = Uuid::parse_str(RINA).unwrap();
+    create_local_identity(
+        &pool,
+        rina_id,
+        &Secret::new("correct horse battery staple"),
+        false,
+    )
+    .await
+    .unwrap();
+
+    lakehouse_auth::password::verify_for_user(
+        &pool,
+        rina_id,
+        &Secret::new("correct horse battery staple"),
+    )
+    .await
+    .unwrap();
+
+    let err =
+        lakehouse_auth::password::verify_for_user(&pool, rina_id, &Secret::new("wrong-password"))
+            .await
+            .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidCredentials));
+
+    let unknown_id = Uuid::new_v4();
+    let err_unknown =
+        lakehouse_auth::password::verify_for_user(&pool, unknown_id, &Secret::new("any-password"))
+            .await
+            .unwrap_err();
+    assert!(matches!(err_unknown, AuthError::InvalidCredentials));
+
+    Ok(())
+}
