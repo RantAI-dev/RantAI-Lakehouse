@@ -283,3 +283,26 @@ describe("CommandPalette empty state and recents (BI-18 part C review fix R12)",
     expect(screen.getAllByText("Map demo")).toHaveLength(1)
   })
 })
+
+describe("CommandPalette catalog order", () => {
+  it("keeps the server's order of assets, not cmdk's fuzzy order (QA LH-DATA-11-06)", async () => {
+    // "Revenue" would score above "A long rev note" under fuzzy match.
+    stubCatalog({
+      assets: [
+        asset(1, { name: "A long note about rev" }),
+        asset(2, { name: "Zzz" }),
+        asset(3, { name: "Revenue" }),
+      ],
+    })
+    await search("rev")
+    await screen.findByText("Revenue")
+    const names = [...document.querySelectorAll('[cmdk-item=""]')]
+      .map((el) => el.textContent ?? "")
+      .filter((t) => /A long note about rev|Zzz|Revenue/.test(t))
+    expect(names.map((t) => t.replace(/\W+$/, ""))).toEqual([
+      "A long note about rev",
+      "Zzz",
+      "Revenue",
+    ])
+  })
+})

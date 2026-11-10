@@ -10,6 +10,8 @@
  * (`matchedOnLabel`), shared with the Data Explorer so both say it alike.
  */
 
+import { defaultFilter } from "cmdk"
+
 import type { Asset } from "@/services/contracts/assets"
 
 /** The palette shows at most this many catalog-asset results per search. */
@@ -55,4 +57,25 @@ export function matchedOnLabel(matchedOn: Asset["matchedOn"]): string | null {
       what = field
   }
   return approximate ? `${what} · approximate match` : what
+}
+
+/** The `value` prefix of a catalog-asset row in the palette (`command-palette.tsx`). */
+export const ASSET_VALUE_PREFIX = "asset "
+
+/**
+ * cmdk's `filter` for the palette. QA LH-DATA-11-06: cmdk scores every item
+ * by fuzzy match and re-sorts, so the server's own order of catalog assets
+ * (its relevance order) was lost. Every asset row gets one score, so the sort
+ * (stable) leaves them in the order they were rendered. The score is the best
+ * one cmdk would have given any asset row, so the asset group keeps the
+ * position among the other groups that it has today (cmdk orders groups by
+ * their best item). Every other item keeps cmdk's own score.
+ */
+export function makePaletteFilter(assetValues: string[]) {
+  return (value: string, search: string, keywords?: string[]): number => {
+    if (!value.startsWith(ASSET_VALUE_PREFIX)) return defaultFilter(value, search, keywords)
+    let best = 0
+    for (const v of assetValues) best = Math.max(best, defaultFilter(v, search, keywords))
+    return best
+  }
 }
