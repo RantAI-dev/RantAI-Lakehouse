@@ -125,7 +125,16 @@ export type StatementRun =
       runId: string
     }
   | { status: "error"; statement: SqlStatement; error: ServiceError }
-  | { status: "not-run"; statement: SqlStatement }
+  | {
+      status: "not-run"
+      statement: SqlStatement
+      /**
+       * QA LH-QS-4-10: why it did not run. A failure of an earlier statement
+       * stops the batch; so does the person's Stop, and the page must not
+       * tell them a failure did it.
+       */
+      reason: "failure" | "stopped"
+    }
 
 /** A range of the buffer, in the buffer's own offsets. */
 type BufferRange = { from: number; to: number }
@@ -970,13 +979,13 @@ export function useQueryStudio() {
       batchRef.current = batch
       setRunning(true)
 
-      const markNotRun = (from: number) => {
+      const markNotRun = (from: number, reason: "failure" | "stopped") => {
         setRuns((previous) => {
           const current = previous[tabId] ?? []
           return {
             ...previous,
             [tabId]: current.map((run, at) =>
-              at >= from ? { status: "not-run", statement: run.statement } : run
+              at >= from ? { status: "not-run", statement: run.statement, reason } : run
             ),
           }
         })
@@ -985,7 +994,7 @@ export function useQueryStudio() {
       try {
         for (let index = 0; index < list.length; index += 1) {
           if (controller.signal.aborted) {
-            markNotRun(index)
+            markNotRun(index, "stopped")
             break
           }
           batch.index = index
@@ -1018,7 +1027,7 @@ export function useQueryStudio() {
             if (controller.signal.aborted) {
               // The person stopped the batch: the statement that was in
               // flight did not finish, and neither did the ones after it.
-              markNotRun(index)
+              markNotRun(index, "stopped")
               break
             }
             const serviceError = toServiceError(error)
@@ -1045,7 +1054,7 @@ export function useQueryStudio() {
                   : run
               ),
             }))
-            if (!isPermissionRefusal) markNotRun(index + 1)
+            if (!isPermissionRefusal) markNotRun(index + 1, "failure")
             break
           }
         }
@@ -1139,7 +1148,7 @@ export function useQueryStudio() {
       return {
         ...previous,
         [batch.tabId]: current.map((run, at) =>
-          at >= batch.index ? { status: "not-run", statement: run.statement } : run
+          at >= batch.index ? { status: "not-run", statement: run.statement, reason: "stopped" } : run
         ),
       }
     })

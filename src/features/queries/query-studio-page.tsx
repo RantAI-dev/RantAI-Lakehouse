@@ -175,7 +175,10 @@ export function QueryStudioPage() {
           ) : null}
           {openRun?.status === "not-run" ? (
             <p className="text-sm text-muted-foreground">
-              Not run: the batch stopped at the failure before this statement.
+              {/* QA LH-QS-4-10: a statement the person stopped is not one a failure skipped. */}
+              {openRun.reason === "stopped"
+                ? "Stopped: you stopped the run before this statement finished."
+                : "Not run: the batch stopped at the failure before this statement."}
             </p>
           ) : null}
           {openRun?.status === "pending" || openRun?.status === "running" ? (
