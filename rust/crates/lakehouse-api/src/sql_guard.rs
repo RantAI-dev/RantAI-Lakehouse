@@ -7,8 +7,46 @@
 //! These are word-level checks, not a parser: they run first and cheaply;
 //! `sql_rewrite` (a real `sqlparser` pass) still decides what a statement
 //! may touch.
+//!
+//! # The rules the guard reads with
+//!
+//! The guard reads the statement the way the engine that will run it reads
+//! it, and the rules are [`crate::sql_lex`]'s — one set, one lexer, one
+//! place (`SEC-62`; the findings came out of the `#420` and `#437`
+//! reviews). The guard takes the engine as an argument for that
+//! reason: a `ClickHouse` statement and a `Trino` statement are not the
+//! same text, and a copy of the rules that does not know the engine's is a
+//! hole rather than a nuisance.
+//!
+//! What that buys, in the two directions:
+//!
+//! - A write the old rules hid is now refused. `ClickHouse`'s heredoc
+//!   (`$$…$$`) is a quoted run, so the `'` inside it opens no string, and
+//!   `Trino` reads a `\` as a plain character, so `'a\'` is a complete
+//!   string there. The old guard read both the other way round and let a
+//!   `DROP` hide behind them.
+//! - A write is not invented either. A `#` line is a comment on `ClickHouse`
+//!   only, and a `/* … */` comment nests on `ClickHouse` only: the guard
+//!   follows the engine on both.
+//!
+//! ## The one case where `ClickHouse` is the more permissive engine
+//!
+//! `ClickHouse` nests block comments: `/* /* */ ; DROP TABLE t */` is one
+//! comment there, and the write inside it cannot run. `Trino` ends the
+//! comment at the first `*/`, so the same text is code there and the write
+//! is refused. The `ClickHouse` verdict is the more permissive one, and it
+//! is the correct one: the engine reads the whole run as a comment, so
+//! there is nothing there to write. `sqlparser`'s `ClickHouseDialect`
+//! nests block comments as well, so the rewrite that runs after this guard
+//! reads the text the same way.
+//!
+//! The lexer it reads with lives in [`crate::sql_lex`], the module that
+//! holds the engine's lexical rules (`SEC-62`).
 
-/// Whether `sql` is a read-only statement `ClickHouse` may run from Query
+use crate::sql_lex::{SpanKind, lex};
+use crate::sql_rewrite::Engine;
+
+/// Whether `sql` is a read-only statement `engine` may run from Query
 /// Studio.
 ///
 /// Both halves of the check run against [`strip_sql_noise`]'s output
@@ -26,106 +64,48 @@
 /// with a read keyword, and smuggled DML such as `SELECT 1; DELETE FROM t`
 /// — the semicolon trick is why the denied-word test looks at the whole
 /// statement rather than just its first word.
+///
+/// `engine` says which engine's lexical rules the statement is read with
+/// ([`crate::sql_lex`]); the caller knows it, and the run path takes it
+/// from the request.
 #[must_use]
-pub(crate) fn is_read_only(sql: &str) -> bool {
-    let code = strip_sql_noise(sql);
+pub(crate) fn is_read_only(sql: &str, engine: Engine) -> bool {
+    let code = strip_sql_noise(sql, engine);
     starts_with_allowed_keyword(&code) && !contains_denied_keyword(&code)
 }
 
 /// `sql` with comments and quoted literals blanked out, so the guard reads
 /// only the parts of a statement that can actually do something.
 ///
-/// Removed: `-- line` and `# line` comments, `/* block */` comments, and
-/// `'single'`, `"double"` and `` `backtick` `` quoted runs (doubled quotes
-/// and backslash escapes inside them included). Each is replaced by a
-/// single space rather than deleted, so words either side of it cannot be
-/// glued into one.
+/// Removed: the comments and the quoted runs `engine` reads — `-- line`
+/// and `# line` comments, `/* block */` comments, and `'single'`,
+/// `"double"` and `` `backtick` `` quoted runs, the heredoc `$$…$$`
+/// included (the backtick run is blanked on `Trino` too, where such a
+/// statement is invalid anyway). Each is replaced by a single space
+/// rather than deleted, so words either side of it cannot be glued into
+/// one.
+///
+/// Kept: everything the engine reads as code, and the two texts it does
+/// not read as a comment. The run after a `#` the engine does not read as
+/// a comment start: the engine refuses the statement there, so the text
+/// cannot run. And the tail of a heredoc that is never closed: the engine
+/// reads that tail as code (`ClickHouse` opens a heredoc only when the
+/// closing delimiter is found again in the text), so a denied keyword in
+/// it is a keyword the engine would run. The guard reads both as they
+/// stand.
 #[must_use]
-pub(crate) fn strip_sql_noise(sql: &str) -> String {
+pub(crate) fn strip_sql_noise(sql: &str, engine: Engine) -> String {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(sql.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        match c {
-            '-' if next == Some('-') => {
-                i = skip_to_line_end(&chars, i);
-                out.push(' ');
+    for span in lex(engine, sql) {
+        match span.kind {
+            SpanKind::Code | SpanKind::NotCode | SpanKind::UnclosedHeredoc => {
+                out.extend(chars[span.start..span.end].iter());
             }
-            '#' => {
-                i = skip_to_line_end(&chars, i);
-                out.push(' ');
-            }
-            '/' if next == Some('*') => {
-                i = skip_block_comment(&chars, i);
-                out.push(' ');
-            }
-            '\'' | '"' | '`' => {
-                i = skip_quoted(&chars, i, c, true);
-                out.push(' ');
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
+            SpanKind::Comment | SpanKind::Literal => out.push(' '),
         }
     }
     out
-}
-
-/// Index of the newline that ends the line starting at `from` (the end of
-/// the text when the last line has none), so the caller resumes on the
-/// newline itself.
-pub(crate) fn skip_to_line_end(chars: &[char], from: usize) -> usize {
-    let mut i = from;
-    while i < chars.len() && chars[i] != '\n' {
-        i += 1;
-    }
-    i
-}
-
-/// Index just past the `/* … */` comment that opens at `from`. An
-/// unterminated comment consumes the rest of the statement.
-pub(crate) fn skip_block_comment(chars: &[char], from: usize) -> usize {
-    let mut i = from + 2;
-    while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-        i += 1;
-    }
-    (i + 2).min(chars.len())
-}
-
-/// Index just past the quoted run that opens at `from` with `quote`.
-/// An unterminated quote consumes the rest of the statement, which is the
-/// safe reading: the guard sees less, not more.
-///
-/// `backslash_escapes` says whether a backslash escapes the next character.
-/// `ClickHouse` does, so the guards here always pass `true`. `Trino` does
-/// not: `'a\'` is a complete string there, so `query_params` passes `false`
-/// when it scans `Trino` SQL.
-pub(crate) fn skip_quoted(
-    chars: &[char],
-    from: usize,
-    quote: char,
-    backslash_escapes: bool,
-) -> usize {
-    let mut i = from + 1;
-    while i < chars.len() {
-        if backslash_escapes && chars[i] == '\\' {
-            i += 2;
-            continue;
-        }
-        if chars[i] == quote {
-            // A doubled quote is an escaped quote, not the end of the run.
-            if chars.get(i + 1) == Some(&quote) {
-                i += 2;
-                continue;
-            }
-            return i + 1;
-        }
-        i += 1;
-    }
-    chars.len()
 }
 
 /// `/^\s*(with|select|show|describe|desc|explain)\b/i.test(sql)` — leading
@@ -316,6 +296,10 @@ impl SqlSourceRefusal {
 /// `policy_engine::rewrite_sql_for_roles` pass every execution goes through,
 /// which runs before the source is probed or stored.
 ///
+/// A dashboard SQL source runs on `ClickHouse`, so the guard reads it with
+/// the `ClickHouse` rules ([`crate::sql_lex`]), as the rewrite behind it
+/// does with `ClickHouse`'s dialect.
+///
 /// # Errors
 ///
 /// The [`SqlSourceRefusal`] naming the first rule `sql` breaks.
@@ -335,7 +319,7 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
     if crate::query_params::holds_placeholder(trimmed) {
         return Err(SqlSourceRefusal::ParametersLater);
     }
-    let code = strip_sql_noise(trimmed);
+    let code = strip_sql_noise(trimmed, Engine::ClickHouse);
     let lower = code.trim_start().to_ascii_lowercase();
     let starts_select = ["select", "with"].iter().any(|kw| {
         lower
@@ -344,7 +328,7 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
     });
     // `is_read_only` also admits SHOW/DESCRIBE/EXPLAIN, which cannot be a
     // derived table, hence the narrower first-word check.
-    if !starts_select || !is_read_only(trimmed) {
+    if !starts_select || !is_read_only(trimmed, Engine::ClickHouse) {
         return Err(SqlSourceRefusal::NotASelect);
     }
     if code.contains(';') {
@@ -365,6 +349,110 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
         return Err(SqlSourceRefusal::OutsideServing);
     }
     Ok(trimmed.to_owned())
+}
+
+#[cfg(test)]
+mod engine_aware_rules {
+    use super::{is_read_only, strip_sql_noise};
+    use crate::sql_rewrite::Engine;
+
+    /// A `ClickHouse` heredoc is a quoted run, so the `'` inside it opens
+    /// no string and the write behind it is code the engine runs.
+    ///
+    /// `Trino` has no heredoc: the `'` opens a string there, and the write
+    /// behind it is inside that string, so there is nothing to refuse.
+    #[test]
+    fn a_clickhouse_heredoc_hides_no_write_behind_it() {
+        let sql = "SELECT $$'$$; DROP TABLE t; SELECT '";
+        assert!(
+            !is_read_only(sql, Engine::ClickHouse),
+            "the write behind the heredoc is code on ClickHouse"
+        );
+        assert!(
+            is_read_only(sql, Engine::Trino),
+            "the write is inside a quoted run on Trino"
+        );
+    }
+
+    /// A `ClickHouse` heredoc is a literal: its body is raw text the engine
+    /// reads as it stands and never as SQL again, so a write inside it is
+    /// a word, not a statement. `Trino` has no heredoc, so the same text
+    /// is code there and the write is a write.
+    #[test]
+    fn a_write_inside_a_clickhouse_heredoc_is_a_literal() {
+        let sql = "SELECT $$DROP TABLE t$$";
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    /// `Trino` reads a `\` as a plain character, so `'a\'` is a complete
+    /// string there and the write behind it is code. `ClickHouse` reads
+    /// `\'` as an escaped quote, so the string runs on and the write
+    /// cannot run.
+    #[test]
+    fn a_trino_backslash_ends_the_string_and_a_clickhouse_one_does_not() {
+        let sql = "SELECT 'a\\'; DROP TABLE t; SELECT '";
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+    }
+
+    /// `ClickHouse` nests block comments, so the comment runs to the `*/`
+    /// that closes the outermost one and the write inside it cannot run.
+    /// `Trino` ends the comment at the first `*/`, so the write behind it
+    /// is code.
+    #[test]
+    fn a_nested_clickhouse_comment_hides_no_write() {
+        let sql = "SELECT 1 /* /* */ ; DROP TABLE t */";
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    /// `#` starts a comment on `ClickHouse` only when a space or a `!`
+    /// follows it. `Trino` has no `#` comment, so the text behind it is
+    /// code.
+    #[test]
+    fn a_hash_is_a_comment_on_clickhouse_only() {
+        let sql = "SELECT 1 # ; DROP TABLE t";
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    /// A heredoc that is never closed is no heredoc to the engine: the `$`
+    /// opens nothing and the text behind it is ordinary SQL to run.
+    #[test]
+    fn an_unclosed_heredoc_is_code_on_clickhouse() {
+        assert!(
+            !is_read_only("SELECT 1$b$ ; DROP TABLE t", Engine::ClickHouse),
+            "the tail of an unclosed heredoc is code on ClickHouse"
+        );
+    }
+
+    /// A `#` line is a comment on `ClickHouse` and text the engine refuses
+    /// on `Trino`, so the statement behind it is code there.
+    #[test]
+    fn a_hash_comment_line_is_refused_on_trino() {
+        let sql = "# hash comment\nSELECT 1";
+        assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    /// Where the two engines read the text the same way, the blanked text
+    /// is the same too.
+    #[test]
+    fn the_blanked_text_is_the_same_where_the_engines_read_the_same() {
+        assert_eq!(
+            strip_sql_noise("SELECT /* x */ 1", Engine::Trino),
+            "SELECT   1"
+        );
+        assert_eq!(
+            strip_sql_noise("SELECT 'a' , \"b\" , `c`", Engine::Trino),
+            "SELECT   ,   ,  "
+        );
+        assert_eq!(
+            strip_sql_noise("SELECT 'unterminated", Engine::Trino),
+            "SELECT  "
+        );
+    }
 }
 
 #[cfg(test)]

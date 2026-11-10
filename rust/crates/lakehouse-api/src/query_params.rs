@@ -27,10 +27,11 @@
 //! refuses a placeholder inside a heredoc (`#420`), and the only place a
 //! value can land is still the quoted literal the printer writes.
 //!
-//! The guards in [`crate::sql_guard`] read a backslash as an escape on both
-//! engines. A `Trino` literal ending in a backslash would look unterminated
-//! to them, so the `Trino` printer never writes a backslash: see
-//! `trino_text`.
+//! The guards in [`crate::sql_guard`] read each engine's text the way that
+//! engine reads it, so the `Trino` guard ends a quoted run at the quote,
+//! like `Trino` does. The `Trino` printer keeps writing a backslash as
+//! `chr(92)` pieces, so that no raw backslash reaches the statement and no
+//! reader of it can take the backslash for an escape: see `trino_text`.
 //!
 //! # What is scanned, and when
 //!
@@ -49,12 +50,22 @@
 //! hide. A heredoc (`$$ … $$` and `$tag$ … $tag$`) holds raw text, so a
 //! placeholder inside one is refused like one inside quotes, and a heredoc
 //! that is never closed runs to the end of the statement, as an unterminated
-//! quote does. A heredoc opens only where its `$` does not continue a name:
-//! the engine reads `a$$b` as one identifier, so the `$$` belongs to that
-//! name and the text after it is ordinary SQL. A block comment nests there,
-//! so the comment runs to the `*/` that closes the outermost one and a
-//! placeholder inside it is ignored as any other comment's is. `Trino` has
-//! neither a heredoc nor nested comments, and nothing changes there.
+//! quote does. That last one is the scanner's reading and not the engine's:
+//! `ClickHouse` opens a heredoc only when its closing delimiter is found
+//! again, so the tail of one that is never closed is ordinary SQL to the
+//! engine. The scanner cannot know that the author meant a heredoc, so it
+//! reads that tail as raw text and refuses a placeholder in it as it
+//! refuses one inside quotes. A heredoc opens only where its `$` starts a
+//! token: the engine reads `a$$b` as one identifier, so the `$$` belongs to
+//! that name and the text after it is ordinary SQL, but it reads a number
+//! without the `$`, so `1$$` opens a heredoc. A block comment nests there
+//! (`#437`), so the comment runs to the `*/` that closes the outermost one
+//! and a placeholder inside it is ignored as any other comment's is.
+//! `Trino` has neither a heredoc nor nested comments, and nothing changes
+//! there.
+//!
+//! The rules that say all this live in [`crate::sql_lex`], one set for both
+//! engines, and the scanner reads the statement with them (`SEC-62`).
 //!
 //! # What a refusal says
 //!
@@ -74,7 +85,7 @@ use lakehouse_core::ident::SqlLiteral;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::sql_guard::{skip_block_comment, skip_quoted, skip_to_line_end};
+use crate::sql_lex::{SpanKind, lex};
 pub use crate::sql_rewrite::Engine;
 
 /// Most parameters one query takes (feature decision 6).
@@ -362,116 +373,13 @@ struct Found {
     end: usize,
 }
 
-/// Whether a backslash escapes the next character inside a quoted run.
-fn backslash_escapes(engine: Engine) -> bool {
-    match engine {
-        Engine::ClickHouse => true,
-        Engine::Trino => false,
-    }
-}
-
-/// Whether a heredoc (`$$ … $$`) opens a run of raw text, as it does on
-/// `ClickHouse`. `Trino` has none.
-fn has_heredoc(engine: Engine) -> bool {
-    match engine {
-        Engine::ClickHouse => true,
-        Engine::Trino => false,
-    }
-}
-
-/// Whether a `/* … */` comment nests, as it does on `ClickHouse`: the
-/// comment then runs to the `*/` that closes the outermost one.
-fn nests_block_comments(engine: Engine) -> bool {
-    match engine {
-        Engine::ClickHouse => true,
-        Engine::Trino => false,
-    }
-}
-
-/// The heredoc delimiter that opens at `from`: `$`, a tag of ASCII letters,
-/// digits and `_` (which may be empty), and a closing `$`.
-///
-/// Returns the range of the delimiter in `chars` and the index just past
-/// it, or `None` when the text there opens no heredoc.
-///
-/// The engine opens a heredoc only where the `$` starts a token: a `$`
-/// that continues a name belongs to that name. The engine reads `a$$b` and
-/// `a$tag$b` as one identifier, so the `$$` is part of the name and the
-/// text after it is ordinary SQL. Measured on
-/// `clickhouse/clickhouse-server:26.8.15.10`, where `SELECT 1 AS a$$b`
-/// and `SELECT 1 AS a$tag$b` answer `1`, and `SELECT 1 AS a$$b, @@x@@` is a
-/// syntax error at `@@`, which is ordinary SQL the engine reads after the
-/// name. (`#437` review)
-fn heredoc_opener(chars: &[char], from: usize) -> Option<(usize, usize)> {
-    if chars.get(from) != Some(&'$') {
-        return None;
-    }
-    // A `$` after a name character is part of that name, and the engine
-    // opens no heredoc there: its bareword reader takes letters, digits,
-    // `_` and `$`.
-    if from > 0 {
-        let before = chars[from - 1];
-        if before.is_ascii_alphanumeric() || matches!(before, '_' | '$') {
-            return None;
-        }
-    }
-    let mut at = from + 1;
-    while at < chars.len() && (chars[at].is_ascii_alphanumeric() || chars[at] == '_') {
-        at += 1;
-    }
-    if chars.get(at) != Some(&'$') {
-        return None;
-    }
-    Some((from, at + 1))
-}
-
-/// Index just past the heredoc that opens with the delimiter
-/// `chars[open..close]`.
-///
-/// The closing delimiter is the opening one, as the engine reads it. A
-/// heredoc that is never closed consumes the rest of the statement, which
-/// is the safe reading: the rest of the statement is inside it.
-fn skip_heredoc(chars: &[char], open: usize, close: usize) -> usize {
-    let delimiter = &chars[open..close];
-    let mut at = close;
-    while at < chars.len() {
-        if chars[at..].starts_with(delimiter) {
-            return at + delimiter.len();
-        }
-        at += 1;
-    }
-    chars.len()
-}
-
-/// Index just past the `/* … */` comment that opens at `from`, counting the
-/// nested ones: `ClickHouse` nests block comments, so the comment ends at
-/// the `*/` that closes the outermost one. An unterminated comment
-/// consumes the rest of the statement.
-fn skip_nested_block_comment(chars: &[char], from: usize) -> usize {
-    let mut depth = 0usize;
-    let mut i = from;
-    while i < chars.len() {
-        match (chars[i], chars.get(i + 1)) {
-            ('/', Some('*')) => {
-                depth += 1;
-                i += 2;
-            }
-            ('*', Some('/')) => {
-                depth = depth.saturating_sub(1);
-                i += 2;
-                if depth == 0 {
-                    return i;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    chars.len()
-}
-
 /// The placeholders the author wrote, in order. Comments are skipped, a
 /// well-formed placeholder inside quotes or inside a `ClickHouse` heredoc is
 /// refused, and a `{{` that is not a placeholder outside both is refused.
+///
+/// The text is read the way the engine reads it, by the one lexer in
+/// [`crate::sql_lex`]: a comment and a quoted run are spans, so a
+/// placeholder inside one is known to be inside one.
 fn scan(engine: Engine, sql: &str) -> Result<Vec<Found>, ParamError> {
     let chars: Vec<char> = sql.chars().collect();
     // Byte offset of every char, and of the end, so slices of `sql` can be
@@ -480,55 +388,38 @@ fn scan(engine: Engine, sql: &str) -> Result<Vec<Found>, ParamError> {
     offsets.push(sql.len());
 
     let mut found = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        match c {
-            '-' if next == Some('-') => i = skip_to_line_end(&chars, i),
-            '#' => i = skip_to_line_end(&chars, i),
-            '/' if next == Some('*') => {
-                i = if nests_block_comments(engine) {
-                    skip_nested_block_comment(&chars, i)
-                } else {
-                    skip_block_comment(&chars, i)
-                };
-            }
-            '$' if has_heredoc(engine) => {
-                // The body of a heredoc is raw text, so a placeholder inside
-                // it is a placeholder inside quotes.
-                let end = match heredoc_opener(&chars, i) {
-                    Some((open, close)) => {
-                        let end = skip_heredoc(&chars, open, close);
-                        if let Some(written) = placeholder_within(&chars, i, end) {
-                            return Err(ParamError::InsideQuotes(written));
-                        }
-                        end
+    for span in lex(engine, sql) {
+        match span.kind {
+            SpanKind::Code => {
+                let mut at = span.start;
+                while at < span.end {
+                    if chars[at] == '{' && chars.get(at + 1) == Some(&'{') {
+                        let Some((name, part, end)) = parse_placeholder(&chars, at) else {
+                            return Err(ParamError::NotAParameter);
+                        };
+                        found.push(Found {
+                            name,
+                            part,
+                            start: offsets[at],
+                            end: offsets[end],
+                        });
+                        at = end;
+                    } else {
+                        at += 1;
                     }
-                    None => i + 1,
-                };
-                i = end;
+                }
             }
-            '\'' | '"' | '`' => {
-                let end = skip_quoted(&chars, i, c, backslash_escapes(engine));
-                if let Some(written) = placeholder_within(&chars, i, end) {
+            // The body of a heredoc is raw text, and so is the tail of a
+            // heredoc that is never closed: the scanner cannot know that
+            // the author meant a heredoc, so it refuses a placeholder
+            // there as it refuses one inside quotes.
+            SpanKind::Literal | SpanKind::UnclosedHeredoc => {
+                if let Some(written) = placeholder_within(&chars, span.start, span.end) {
                     return Err(ParamError::InsideQuotes(written));
                 }
-                i = end;
             }
-            '{' if next == Some('{') => {
-                let Some((name, part, end)) = parse_placeholder(&chars, i) else {
-                    return Err(ParamError::NotAParameter);
-                };
-                found.push(Found {
-                    name,
-                    part,
-                    start: offsets[i],
-                    end: offsets[end],
-                });
-                i = end;
-            }
-            _ => i += 1,
+            // A comment, and text the engine cannot run: nothing to fill.
+            SpanKind::Comment | SpanKind::NotCode => {}
         }
     }
     Ok(found)
@@ -833,12 +724,13 @@ fn print_value(engine: Engine, value: &ParamValue) -> String {
 
 /// Text as a `Trino` expression that contains no backslash.
 ///
-/// `Trino` has no backslash escape, so `'a\'` is a complete string there.
-/// The guards in [`crate::sql_guard`] read a backslash as an escape, as
-/// `ClickHouse` does, so a literal ending in one would look unterminated to
-/// them and hide the rest of the statement from their keyword scan. A text
-/// with a backslash is therefore written as its pieces between the
-/// backslashes, joined by `chr(92)`: `a\b` becomes `('a' || chr(92) || 'b')`.
+/// `Trino` has no backslash escape, so `'a\'` is a complete string there,
+/// and the guards in [`crate::sql_guard`] read it that way too: each
+/// engine's statement is read with that engine's own rules (`SEC-62`).
+/// A text with a backslash is written as its pieces between the
+/// backslashes, joined by `chr(92)`, so that no raw backslash reaches the
+/// statement and no reader of it can take the backslash for an escape:
+/// `a\b` becomes `('a' || chr(92) || 'b')`.
 /// A quote inside a piece is doubled, as in any `Trino` literal.
 fn trino_text(text: &str) -> String {
     let quote = |piece: &str| format!("'{}'", piece.replace('\'', "''"));
@@ -856,6 +748,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::sql_lex::has_heredoc;
 
     const BOTH: [Engine; 2] = [Engine::ClickHouse, Engine::Trino];
 
@@ -1072,12 +965,15 @@ mod tests {
                     json!({ "a": value }),
                     json!([]),
                 );
-                let seen = crate::sql_guard::strip_sql_noise(&sql);
+                let seen = crate::sql_guard::strip_sql_noise(&sql, engine);
                 assert!(
                     seen.contains("DROP TABLE t"),
                     "{engine:?} {value}: {sql} -> {seen}"
                 );
-                assert!(!crate::sql_guard::is_read_only(&sql), "{engine:?} {value}");
+                assert!(
+                    !crate::sql_guard::is_read_only(&sql, engine),
+                    "{engine:?} {value}"
+                );
             }
         }
     }
@@ -1673,6 +1569,50 @@ mod tests {
         assert_eq!(got, "SELECT 1 AS a$$b WHERE c = 'v'");
     }
 
+    /// A `$` opens a heredoc where it starts a token, and the engine reads a
+    /// number without the `$`: `1$$` is a heredoc to `ClickHouse`, so a
+    /// placeholder inside one is refused like one inside quotes.
+    ///
+    /// Measured on `clickhouse/clickhouse-server:26.8.15.10`, where
+    /// `SELECT concat('x', 1$$a$$)` is a syntax error whose token is the
+    /// heredoc `$$a$$`, and `SELECT concat('x', 1$$a)b$$)` shows the heredoc
+    /// body `a)b` — the `)` inside it did not close the parenthesis. The
+    /// `#437` review read the same rule out of `ClickHouse`'s own lexer.
+    #[test]
+    fn a_placeholder_inside_a_clickhouse_heredoc_that_opens_after_a_number_is_refused() {
+        for sql in [
+            "SELECT 1$$ {{x}} $$",
+            "SELECT 1a$$ {{x}} $$",
+            "SELECT 1.5$$ {{x}} $$",
+            "SELECT 0x1F$$ {{x}} $$",
+        ] {
+            let err = substitute(Engine::ClickHouse, sql, &Map::new(), &[]).unwrap_err();
+            assert_eq!(err, ParamError::InsideQuotes("x".to_owned()), "{sql}");
+            assert_eq!(
+                err.to_string(),
+                "{{x}} is inside quotes: write it without them, for example = {{x}}.",
+                "{sql}"
+            );
+        }
+    }
+
+    /// A `$` inside a name is part of the name: the engine's bareword reader
+    /// takes letters, digits, `_` and `$`, so `a$$b` is one identifier, no
+    /// heredoc opens, and the text after it is ordinary SQL. A placeholder
+    /// there is a real one.
+    ///
+    /// Measured on `clickhouse/clickhouse-server:26.8.15.10`, where
+    /// `SELECT 'x' AS a$$b` answers `x` and `SELECT 'x' AS _a$$b$$` is the
+    /// identifier `_a$$b$$`.
+    #[test]
+    fn a_name_that_holds_a_dollar_sign_leaves_the_text_after_it_ordinary_sql() {
+        for name in ["a$$b", "_a$$b", "a1$$b"] {
+            let sql = format!("SELECT 1 AS {name}, {{{{x}}}} AS c");
+            let got = run_ok(Engine::ClickHouse, &sql, json!({"x": "v"}), json!([]));
+            assert_eq!(got, format!("SELECT 1 AS {name}, 'v' AS c"), "{name}");
+        }
+    }
+
     /// `Trino` has no heredoc at all, so a `$` is nothing to it, whatever
     /// stands before it.
     #[test]
@@ -1717,9 +1657,9 @@ mod tests {
                 json!([]),
             );
             assert_eq!(sql, "SELECT '$$'; DROP TABLE t", "{engine:?}");
-            let seen = crate::sql_guard::strip_sql_noise(&sql);
+            let seen = crate::sql_guard::strip_sql_noise(&sql, engine);
             assert!(seen.contains("DROP TABLE t"), "{engine:?}: {sql} -> {seen}");
-            assert!(!crate::sql_guard::is_read_only(&sql), "{engine:?}");
+            assert!(!crate::sql_guard::is_read_only(&sql, engine), "{engine:?}");
         }
     }
 
