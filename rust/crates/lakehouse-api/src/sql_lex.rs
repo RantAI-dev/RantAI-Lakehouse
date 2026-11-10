@@ -48,8 +48,14 @@
 //!   emits a heredoc token only then, and when the delimiter is not found
 //!   again the `$` opens nothing — it is a standalone `$` or the start of
 //!   one bareword, and the text after it is ordinary SQL to the engine.
-//!   Measured: `SELECT 1$b$` answers `1` (the run is an alias), and
-//!   `SELECT 1$b$ ; DROP TABLE t` is two statements to the engine.
+//!   Measured: `SELECT 1$b$` answers `1` over HTTP (the run is read as an
+//!   alias), and the native client splits `SELECT 1$b$ ; DROP TABLE t` on
+//!   the `;` and runs both halves (the `DROP TABLE` runs) — two statements
+//!   to that client. Over the HTTP interface the console uses, the engine
+//!   reads the body as one statement and refuses it with `Multi-statements
+//!   are not allowed` (HTTP 400), so the second statement does not run on
+//!   that path — and the console's read-only guard refuses the statement
+//!   before it is sent.
 //! - A `$` opens a heredoc only where it starts a token. The run of
 //!   `[A-Za-z0-9_$]` before it is a name when it starts with a letter, `_`
 //!   or `$` — the engine's bareword reader takes those — and a number
@@ -498,9 +504,10 @@ mod tests {
     /// standalone `$` or the start of one bareword, and the text after it
     /// is ordinary SQL to the engine.
     ///
-    /// Measured on `clickhouse/clickhouse-server:26.8.15.10`, where
-    /// `SELECT 1$b$` answers `1` and `SELECT 1$b$ ; DROP TABLE t` is two
-    /// statements to the engine.
+    /// Measured: `SELECT 1$b$ ; DROP TABLE t` is two statements to the
+    /// native client, which splits on the `;` and runs both halves; the
+    /// HTTP interface the console uses parses the body as one statement
+    /// and refuses two (`Multi-statements are not allowed`, HTTP 400).
     #[test]
     fn an_unclosed_clickhouse_heredoc_is_the_tail_the_engine_reads_as_code() {
         assert_eq!(
