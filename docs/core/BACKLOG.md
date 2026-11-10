@@ -403,7 +403,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-10`, `ADM-11`, `ADM-12`, `ADM-13`, `ADM-2`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-42`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-4`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `GOV-7`, `INT-2`, `OPS-17`, `OPS-18`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SEC-62`, `SEC-64`, `SEC-65`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-4`, `WEB-6`, `WEB-7`, `WEB-8`
+`ADM-1`, `ADM-10`, `ADM-11`, `ADM-12`, `ADM-13`, `ADM-2`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-42`, `BIZ-1`, `BIZ-2`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-4`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-6`, `DATA-8`, `GOV-1`, `GOV-3`, `GOV-7`, `INT-2`, `OPS-17`, `OPS-18`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QRY-1`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SEC-64`, `SEC-65`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-4`, `WEB-6`, `WEB-7`, `WEB-8`
 
 ## Dates
 
