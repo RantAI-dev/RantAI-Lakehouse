@@ -256,4 +256,112 @@ Two environment problems came first, and neither is code: `node_modules` was mis
 
 ## 6. Review
 
-(Planner appends here.)
+Reviewer: Claude Opus (planner), 2026-11-10, on `ebedac18` (code at `b2ec27c1`), diff
+`git diff main...HEAD` against `46b1cc05`. Result: **no BLOCKER; four SHOULD-FIX (R1–R4).**
+
+### Verification, re-run by the reviewer (foreground, on `ebedac18`)
+
+```bash
+bun run typecheck   # exit 0, no output
+bun run lint        # exit 0; 10 warnings, 0 errors, in 9 files — none of them a file this branch changes
+bun run test        # 3778 pass, 1 skip, 0 fail, 11253 expect() calls, 3779 tests across 358 files, 228.52s
+git status          # only the four untracked files that were there before the branch
+```
+
+The handoff said 11252 `expect()` calls; this run counted 11253 with the same pass/skip/fail
+counts. Not a finding (a count that varies by one between runs), noted so nobody reads it as a
+quoting error.
+
+**The new tests fail against the old code.** In a scratch worktree with the base (`main`)
+versions of the 15 changed product files and this branch's tests:
+`use-data-table-filters.test.tsx` 2 fail (both new), `command-palette.test.tsx` the new order
+test fails, `upload-file-page.test.tsx` 85 pass / 2 fail (T3 a, b), `chart-builder.test.tsx`
+38 / 2 (T4 metric, T6 choices), `chart-option.test.ts` 15 / 2 (both T5), `chart-click.test.ts`
+the new test fails, `layers-section.test.tsx` 9 / 1 (T7 at the limit), `use-query-studio.test.ts`
+both extended tests fail. The ones that pass on the base are the controls the plan asked for
+(T3 c, T4 plain column, T7 below the limit) and T6's "no bin" test (see T6 below).
+
+### Findings
+
+- **R1 SHOULD-FIX (T3, D4).** `src/features/connectors/upload-file-page.tsx:220-226` turns Load
+  off only when `check.status === "done"` with bad values. On the QA path itself (Table step →
+  "Add to its rows" → Next) the preview re-reads with the table's types and the check re-runs
+  (`use-column-choices.ts:71-99`: `CHECK_DELAY_MS` 400 ms plus the request), so the Review step
+  opens with the check still `"checking"`, no list, and Load **on** (`ready` is true while
+  checking, `use-column-choices.ts:116`). A person who clicks Load in that window gets the
+  server's refusal, which is the failure LH-DATA-18-08 reported. The developer must: with
+  `onBadValue === "stop"`, keep Load off while `choices.check.status === "checking"` too, and
+  show one line on the Review step while it checks ("Checking the values against the
+  columns…"). Fail closed (principle 3); this stays inside D4 (Load is off until we know the
+  values fit). Cite `QA fails part A review R1` at the site.
+- **R2 SHOULD-FIX (T3 test).** The three new tests in
+  `src/features/connectors/upload-file-page.test.tsx:1563-1589` reach the bad values by changing
+  a type on the Check step, where the list already showed on the base. None takes the path of
+  the QA case: append to an existing table, types from the table, the check re-run after the
+  Table step. Add one test that chooses "Add to its rows" on the Table step, lets the re-run
+  check answer bad values, and asserts the Review step lists them with Load off; and, with R1,
+  that Load is off while that check is still running.
+- **R3 SHOULD-FIX (T1 test).** `src/hooks/use-data-table-filters.test.tsx` covers the two hook
+  sites (`use-data-table-filters.ts:97`, `:160`). The plan's check asks for adding **and
+  duplicating**; the duplicate site (`src/components/data-table/data-table-add-filter.tsx:101`)
+  and the seeded first rule (`:82`) have no test. Add a test that renders
+  `DataTableAdvancedFilterPanel` with `crypto.randomUUID` absent and asserts the seeded rule and
+  a duplicate each get an 8-character `filterId`, and that the two differ. The current stub
+  (`getRandomValues: (a) => a.fill(7)`) gives every call the same id, so it cannot show that;
+  use a stub that varies its bytes.
+- **R4 SHOULD-FIX (T8, principle 1 / rule 1).** The module comment at
+  `src/features/queries/query-result-tabs.tsx:11-13` still says "Not run" is "the whole truth
+  about it: the batch stopped at the failure before it". Since T8 a not-run statement may have
+  been stopped by the person. Reword it to name both reasons (`reason: "failure" | "stopped"`),
+  keeping that the tab label is "Not run" either way.
+
+### Checked, no finding
+
+- **D1 / rule 13.** Every commit body names its QA case and backlog ID; every fix site carries a
+  `QA LH-…` comment.
+- **D2 / rule 4.** T1 reuses `newRunId()`, T4 `entriesFromRows`, T3 `BadValuesList` (wrapped in
+  `BadValuesReport`, which moved the Check step's heading rather than copying it). T5's
+  `categoryLabel` is one function, imported by `chart-option.ts` and `combined-option.ts`; the
+  two local `str`/`text` helpers it replaced are gone.
+- **T1.** The four sites are changed. The handoff's grep is right for the plan's literal pattern
+  `crypto.randomUUID(`; `src/features/queries/use-query-studio.ts:214`
+  (`globalThis.crypto?.randomUUID?.()`) does not match it and already guards itself.
+- **T2.** `makePaletteFilter` (`src/lib/palette-search.ts:74`) gives every asset row the best
+  score any asset row would get, so the stable sort keeps the server's order and the group's
+  place is unchanged (cmdk ranks a group by its best item). At most `PALETTE_ASSET_RESULT_LIMIT`
+  (8) rows, so the 8×8 scoring per keystroke is not a cost.
+- **T4.** A plain column still travels as its name: single-number kinds take the `default`
+  branch of `measureLimits` (`src/lib/chart-shape.ts:189`, `own: false`), so `entriesFromRows`
+  never wraps it as `{ column, aggregate }`. The goal column is unchanged.
+- **T5 / D5.** `drillTarget` (`src/lib/chart-click.ts:142-147`) is the only place a drawn name is
+  read back into a filter; a placeholder label names nothing unless a row holds that text, as a
+  blank label did before. `binTarget` / `bucketTarget` refuse the placeholders. Table cells are
+  not changed (D5 covers axis, legend and tooltip only).
+- **T6.** The rule is narrower than the plan's (`layers.length > 0 && takesLayers(kind) &&
+  !rowsMode`, `chart-builder.tsx:628`); layers only exist where `takesLayers`, so that is the
+  same set. `builder-rules.ts` is unchanged. The comment's claim that `pickDimension` clears the
+  bin holds (`chart-builder.tsx:638`). The "no bin" test also passes on the base, because bins
+  are off beside questions in both; it is a guard, not a proof of the fix, and the choices test
+  is the one that fails on the base. Accepted.
+- **T7.** The changed assertion in `layers-section.test.tsx:38` is the behaviour the plan asks
+  for (the button stays, off), not a weakened test; the commit body says so.
+- **T8.** Every `not-run` the hook makes carries a `reason` (the type makes it required, so
+  `tsc` would catch a missed one); the page shows the D3 sentence. Only the hook is tested, as
+  the plan asked.
+- **Commit `d28af52b`'s body** claims two "Table step, folders" tests fail on the base; they do
+  not. The handoff corrects it by name; the commit is not to be amended for it.
+- **No weakened test, lint rule, allowlist or threshold**; no file outside `src/` and the plan.
+
+### Not verified by the reviewer
+
+- Nothing in a browser and nothing on staging: the QA cases still need the owner's run before
+  the PR (plan header).
+- CI: the branch is not pushed. No check was compared against `main`'s CI.
+- `main`'s own full suite was not re-run; nothing in this run failed, so no red-on-`main` check
+  needed naming.
+
+### Open at the end of this review
+
+No BLOCKER. R1–R4 go back to the developer (rule 13: cite `QA fails part A review R<n>` at each
+fix site and in the commit body). R1 and R2 should land before the owner's browser QA of
+LH-DATA-18-08, since R1 is on that case's own path.
