@@ -323,6 +323,13 @@ impl JwksClient {
         )
     }
 
+    /// Override the HTTP client used for fetching discovery documents and key sets.
+    #[must_use]
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = client;
+        self
+    }
+
     /// The one place a [`JwksClient`]'s fields are assembled, so every
     /// constructor caches the same way.
     fn with_source(source: JwksSource, ttl: StdDuration) -> Self {
@@ -678,11 +685,31 @@ impl OidcAuthenticator {
     /// discovery document names (`SEC-38`).
     #[must_use]
     pub fn new(config: OidcConfig, pool: PgPool) -> Self {
-        let jwks = match &config.jwks_url {
+        Self::new_with_http_client(config, None, pool)
+    }
+
+    /// Build an authenticator for `config`, backed by `pool`, fetching JWKS
+    /// with an optional custom HTTP client (e.g. for pinned DNS resolution).
+    #[must_use]
+    pub fn new_with_http_client(
+        config: OidcConfig,
+        http: Option<reqwest::Client>,
+        pool: PgPool,
+    ) -> Self {
+        let mut jwks = match &config.jwks_url {
             Some(url) => JwksClient::new(url.clone()),
             None => JwksClient::discovering(config.issuer.clone(), DEFAULT_JWKS_TTL),
         };
+        if let Some(client) = http {
+            jwks = jwks.with_http_client(client);
+        }
         Self::with_jwks_client(config, jwks, pool)
+    }
+
+    /// The [`OidcConfig`] this authenticator was built with.
+    #[must_use]
+    pub fn config(&self) -> &OidcConfig {
+        &self.config
     }
 
     /// Build an authenticator with an explicit [`JwksClient`] — the seam

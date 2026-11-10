@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_auth::throttle::ThrottlePolicy;
 use lakehouse_auth::{
-    LocalPasswordAuthenticator, OidcAuthenticator, OidcConfig, Secret, ServiceTokenAuthenticator,
-    SessionAuthenticator,
+    LocalPasswordAuthenticator, Secret, ServiceTokenAuthenticator, SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::secret::{
@@ -53,13 +52,6 @@ pub struct AuthState {
     pub session: Arc<SessionAuthenticator>,
     /// Verifies the opaque `Authorization: Bearer` service token.
     pub service: Arc<ServiceTokenAuthenticator>,
-    /// Verifies a `JWT` `Authorization: Bearer` id token against a
-    /// configured `OIDC` provider's `JWKS` (Task 3.5). `None` when
-    /// `OIDC_ISSUER`/`OIDC_CLIENT_ID` are not both set — see
-    /// [`AppState::new`]. When `None`, `crate::auth`'s bearer dispatch
-    /// simply never tries the `OIDC` path, which is exactly what "OIDC
-    /// unconfigured behaves like today" requires.
-    pub oidc: Option<Arc<OidcAuthenticator>>,
 }
 
 /// State shared across all route handlers.
@@ -86,6 +78,10 @@ pub struct AppState {
     /// `RwLock` over an `Arc`, so a reader takes the client out and never
     /// holds the lock across a model call.
     pub llm: Arc<RwLock<Arc<crate::runtime_settings::AssistantClient>>>,
+    /// Swappable `OIDC` authenticator (`ADM-12` plan D4): a save in the console
+    /// takes effect on the next sign-in with no restart. Cached beside its
+    /// effective settings and cleared on save.
+    pub oidc: Arc<RwLock<Option<crate::runtime_settings::SwappableOidc>>>,
     /// Phase 2 OLTP pool (`lakehouse-store`).
     ///
     /// `Option`, not a bare `Arc<PgPool>`: `lakehouse_store::connect_lazy`
@@ -654,40 +650,10 @@ pub(crate) fn connector_allowed_patterns(manager: Option<SecretManagerKind>) -> 
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
 /// [`lakehouse_auth::OidcConfig`], or `None` if `OIDC` is not configured.
-///
-/// `OIDC` is considered configured only when BOTH `OIDC_ISSUER` and
-/// `OIDC_CLIENT_ID` are set — see [`Config::oidc_issuer`]'s doc comment.
-/// This is the one place that decision is made; every other piece of this
-/// module and `crate::auth` just reacts to [`AuthState::oidc`] being
-/// present or absent.
-///
-/// `SEC-38`: an operator-set `OIDC_JWKS_URL` is passed through unchanged
-/// and no discovery request is ever made; when it is unset the key set's
-/// address comes from the provider's discovery document
-/// (`{issuer}/.well-known/openid-configuration`), read lazily on the first
-/// key lookup, so an unreachable provider never stops the API from
-/// starting.
-fn oidc_config(config: &Config) -> Option<OidcConfig> {
-    let issuer = config.oidc_issuer.as_ref()?;
-    let client_id = config.oidc_client_id.as_ref()?;
-    let mut oidc = match config.oidc_jwks_url.clone() {
-        Some(jwks_url) => OidcConfig::new(
-            issuer.clone(),
-            client_id.clone(),
-            config.oidc_provider_name.clone(),
-            jwks_url,
-        ),
-        None => OidcConfig::with_discovery(
-            issuer.clone(),
-            client_id.clone(),
-            config.oidc_provider_name.clone(),
-        ),
-    };
-    oidc.jit_provisioning = config.oidc_jit_provisioning;
-    oidc.role_map.clone_from(&config.oidc_role_map);
-    oidc.groups_claim.clone_from(&config.oidc_groups_claim);
-    oidc.clock_skew_seconds = config.oidc_clock_skew_seconds;
-    Some(oidc)
+#[cfg(test)]
+pub(crate) fn oidc_config(config: &Config) -> Option<lakehouse_auth::OidcConfig> {
+    let sso = crate::runtime_settings::resolve_sso(config, None, None);
+    sso.is_configured().then(|| sso.to_oidc_config())
 }
 
 /// The Phase 2 Postgres pool, or `None` when there is nothing to connect to.
@@ -777,8 +743,6 @@ impl AppState {
             local: Arc::new(LocalPasswordAuthenticator::new((**pool).clone())),
             session: Arc::new(SessionAuthenticator::new((**pool).clone())),
             service: Arc::new(ServiceTokenAuthenticator::new((**pool).clone())),
-            oidc: oidc_config(&config)
-                .map(|oidc_config| Arc::new(OidcAuthenticator::new(oidc_config, (**pool).clone()))),
         });
         // `TrinoConfig::new` supplies the documented `max_rows`/`paging_cap`
         // defaults; only `base_url` and `max_rows` are overridden from
@@ -847,6 +811,24 @@ impl AppState {
             &config,
             connector_secret_store.keyring().ok(),
         );
+        let initial_sso = crate::runtime_settings::resolve_sso(
+            &config,
+            None,
+            connector_secret_store.keyring().ok(),
+        );
+        let initial_oidc = pg
+            .as_ref()
+            .and_then(|pool| {
+                crate::runtime_settings::initial_oidc_authenticator(
+                    &config,
+                    connector_secret_store.keyring().ok(),
+                    (**pool).clone(),
+                )
+            })
+            .map(|authenticator| crate::runtime_settings::SwappableOidc {
+                authenticator,
+                settings: initial_sso,
+            });
         let upload_receive = ReceiveLimiter::new(
             config.upload_max_concurrent_per_user,
             config.upload_max_concurrent,
@@ -872,6 +854,7 @@ impl AppState {
             clickhouse,
             dagster: Arc::new(dagster),
             llm: Arc::new(RwLock::new(llm)),
+            oidc: Arc::new(RwLock::new(initial_oidc)),
             pg,
             db_ready: Arc::new(AtomicBool::new(false)),
             connector_secret_resolver: connector_secret_resolver(

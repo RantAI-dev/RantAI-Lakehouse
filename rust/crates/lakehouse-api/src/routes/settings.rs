@@ -1045,6 +1045,8 @@ fn deployment_features(
     state: &AppState,
     email: &EffectiveEmail,
     assistant: &EffectiveAssistant,
+    sso: &crate::runtime_settings::EffectiveSso,
+    single_sign_on: bool,
 ) -> Vec<Value> {
     let config = &state.config;
     // PDF export needs all three of these (feature decision 6).
@@ -1058,17 +1060,12 @@ fn deployment_features(
     if config.render_token_secret.is_none() {
         pdf_missing.push("RENDER_TOKEN_SECRET");
     }
-    // Single sign-on is on when the `OIDC` authenticator was built, which
-    // needs an issuer and a client id (`state.rs`'s `oidc_config`).
-    let single_sign_on = state
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.oidc.as_ref())
-        .is_some();
     let sso_missing: Vec<&str> = if single_sign_on {
         Vec::new()
-    } else {
+    } else if sso.issuer_source == Source::Server {
         vec!["OIDC_ISSUER", "OIDC_CLIENT_ID"]
+    } else {
+        vec!["issuer", "clientId"]
     };
     // The assistant is on when it has a key — the environment's or the
     // console's (`ADM-9` reads the saved one; the environment owns the key
@@ -1116,7 +1113,16 @@ fn deployment_features(
                 "console"
             },
         ),
-        feature("singleSignOn", single_sign_on, &sso_missing, "server"),
+        feature(
+            "singleSignOn",
+            single_sign_on,
+            &sso_missing,
+            if sso.issuer_source == Source::Server {
+                "server"
+            } else {
+                "console"
+            },
+        ),
         feature(
             "assistant",
             assistant_on,
@@ -1149,8 +1155,12 @@ pub async fn get_deployment(State(state): State<AppState>) -> ApiResult<ApiJson<
     let assistant = crate::runtime_settings::assistant_or_fail(&state)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let sso = crate::runtime_settings::sso_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let single_sign_on = crate::runtime_settings::oidc(&state).await.is_some();
     Ok(ApiJson(json!({
-        "features": deployment_features(&state, &email, &assistant),
+        "features": deployment_features(&state, &email, &assistant, &sso, single_sign_on),
     })))
 }
 
@@ -1629,6 +1639,84 @@ fn assistant_url_sentence(problem: crate::runtime_settings::AddressProblem) -> &
         AddressProblem::Unresolved => URL_UNRESOLVED_REFUSED,
         AddressProblem::Internal => URL_INTERNAL_REFUSED,
     }
+}
+
+/// What the person is told when the issuer address is not https.
+#[allow(dead_code)]
+pub(crate) const ISSUER_NOT_HTTPS: &str = "issuer must start with https://.";
+
+/// What the person is told when the issuer address resolves to an internal network.
+#[allow(dead_code)]
+pub(crate) const ISSUER_INTERNAL_REFUSED: &str =
+    "issuer must be an external address, not an address inside this deployment's network.";
+
+/// What the person is told when the issuer address does not resolve.
+#[allow(dead_code)]
+pub(crate) const ISSUER_UNRESOLVED_REFUSED: &str =
+    "issuer must be an address this deployment can reach: its name did not resolve.";
+
+/// The sentence for each way an issuer address is refused (plan D6).
+#[allow(dead_code)]
+pub(crate) fn issuer_url_sentence(
+    problem: crate::runtime_settings::AddressProblem,
+) -> &'static str {
+    use crate::runtime_settings::AddressProblem;
+    match problem {
+        AddressProblem::NotHttps | AddressProblem::NoHost => ISSUER_NOT_HTTPS,
+        AddressProblem::Unresolved => ISSUER_UNRESOLVED_REFUSED,
+        AddressProblem::Internal => ISSUER_INTERNAL_REFUSED,
+    }
+}
+
+/// Validate a console-supplied issuer address (plan D6).
+#[allow(dead_code)]
+pub(crate) async fn validate_sso_issuer(
+    url: &str,
+    internal_hosts: &crate::internal_hosts::InternalHosts,
+) -> Result<String, ApiError> {
+    let text = url.trim().trim_end_matches('/');
+    if text.is_empty() {
+        return Err(ApiError::BadRequest(ISSUER_NOT_HTTPS.to_owned()));
+    }
+    crate::runtime_settings::check_issuer_address(text, internal_hosts)
+        .await
+        .map_err(|problem| ApiError::BadRequest(issuer_url_sentence(problem).to_owned()))?;
+    Ok(text.to_owned())
+}
+
+/// Validate role map rows: each entry must have group and role text, and the role
+/// must exist in the deployment (plan D7).
+#[allow(dead_code)]
+pub(crate) fn validate_role_map_entries(
+    items: &[serde_json::Value],
+    known_roles: &[String],
+) -> Result<Vec<crate::runtime_settings::RoleMapEntry>, ApiError> {
+    let mut entries = Vec::new();
+    for item in items {
+        let (Some(group), Some(role)) = (
+            item.get("group").and_then(Value::as_str),
+            item.get("role").and_then(Value::as_str),
+        ) else {
+            return Err(ApiError::BadRequest(
+                "Each roleMap entry must have group and role text.".to_owned(),
+            ));
+        };
+        let group = group.trim();
+        let role = role.trim();
+        if group.is_empty() || role.is_empty() {
+            return Err(ApiError::BadRequest(
+                "roleMap group and role must not be empty.".to_owned(),
+            ));
+        }
+        if !known_roles.iter().any(|r| r == role) {
+            return Err(ApiError::BadRequest(format!("Unknown role: \"{role}\".")));
+        }
+        entries.push(crate::runtime_settings::RoleMapEntry {
+            group: group.to_owned(),
+            role: role.to_owned(),
+        });
+    }
+    Ok(entries)
 }
 
 /// The assistant answer: the effective address and model, and whether a key

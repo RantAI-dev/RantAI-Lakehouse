@@ -1049,22 +1049,16 @@ impl std::fmt::Display for AddressProblem {
     }
 }
 
-/// Check the provider address the console chose: it must be an `https://`
-/// address, and its host must pass the same internal-address check the
-/// connector dials use (`connector_probe::resolve_checked`), so an
-/// administrator's account cannot be used to make the API call a service
-/// inside the deployment's network (plan D13).
+/// Check an external `https://` address: it must be `https://` and its host
+/// must pass the internal-address check (`connector_probe::resolve_checked`).
 ///
-/// The environment's own address is NOT checked here: it is the operator's
-/// file, and an on-premises deployment may point its assistant at a gateway
-/// inside its own network.
+/// Shared by [`check_assistant_address`] and [`check_issuer_address`] (plan D6).
 ///
 /// # Errors
 ///
-/// The [`AddressProblem`] that refused the address. The caller turns it into
-/// a fixed sentence; the reason never carries an address the caller did not
-/// send.
-pub async fn check_assistant_address(
+/// Returns [`AddressProblem`] if the URL is not `https://`, names no host,
+/// does not resolve, or resolves to an internal address.
+pub async fn check_external_https_address(
     url: &str,
     internal_hosts: &InternalHosts,
 ) -> Result<(), AddressProblem> {
@@ -1089,6 +1083,41 @@ pub async fn check_assistant_address(
         .await
         .map(|_| ())
         .map_err(|_| AddressProblem::Internal)
+}
+
+/// Check the provider address the console chose: it must be an `https://`
+/// address, and its host must pass the same internal-address check the
+/// connector dials use (`connector_probe::resolve_checked`), so an
+/// administrator's account cannot be used to make the API call a service
+/// inside the deployment's network (plan D13).
+///
+/// The environment's own address is NOT checked here: it is the operator's
+/// file, and an on-premises deployment may point its assistant at a gateway
+/// inside its own network.
+///
+/// # Errors
+///
+/// The [`AddressProblem`] that refused the address. The caller turns it into
+/// a fixed sentence; the reason never carries an address the caller did not
+/// send.
+pub async fn check_assistant_address(
+    url: &str,
+    internal_hosts: &InternalHosts,
+) -> Result<(), AddressProblem> {
+    check_external_https_address(url, internal_hosts).await
+}
+
+/// Check the OIDC issuer address set in the console: must be `https://` and
+/// external (plan D6).
+///
+/// # Errors
+///
+/// Returns [`AddressProblem`] describing why the address was refused.
+pub async fn check_issuer_address(
+    url: &str,
+    internal_hosts: &InternalHosts,
+) -> Result<(), AddressProblem> {
+    check_external_https_address(url, internal_hosts).await
 }
 
 // ── Single Sign-On / OIDC (`ADM-12`) ─────────────────────────────────────
@@ -1164,6 +1193,31 @@ impl EffectiveSso {
     pub fn is_configured(&self) -> bool {
         self.issuer.as_ref().is_some_and(|i| !i.is_empty())
             && self.client_id.as_ref().is_some_and(|c| !c.is_empty())
+    }
+
+    /// Build an [`lakehouse_auth::oidc::OidcConfig`] from these effective settings.
+    #[must_use]
+    pub fn to_oidc_config(&self) -> lakehouse_auth::oidc::OidcConfig {
+        let issuer = self.issuer.clone().unwrap_or_default();
+        let client_id = self.client_id.clone().unwrap_or_default();
+        let mut config = match self.jwks_url.clone() {
+            Some(jwks_url) => lakehouse_auth::oidc::OidcConfig::new(
+                issuer,
+                client_id,
+                self.provider_name.clone(),
+                jwks_url,
+            ),
+            None => lakehouse_auth::oidc::OidcConfig::with_discovery(
+                issuer,
+                client_id,
+                self.provider_name.clone(),
+            ),
+        };
+        config.jit_provisioning = self.jit_provisioning;
+        config.role_map.clone_from(&self.role_map);
+        config.groups_claim.clone_from(&self.groups_claim);
+        config.clock_skew_seconds = self.clock_skew_seconds;
+        config
     }
 }
 
@@ -1402,6 +1456,155 @@ pub async fn sso_or_fail(state: &AppState) -> Result<EffectiveSso, StoreError> {
     let stored = sso_row(state).await?;
     let keyring = state.connector_secret_store.keyring().ok();
     Ok(resolve_sso(&state.config, stored.as_ref(), keyring))
+}
+
+/// Swappable `OIDC` authenticator wrapper paired with the effective settings it
+/// was built from, allowing cache invalidation when settings change (plan D4).
+#[derive(Clone)]
+pub struct SwappableOidc {
+    /// The authenticator instance.
+    pub authenticator: Arc<lakehouse_auth::oidc::OidcAuthenticator>,
+    /// The effective settings used to build [`Self::authenticator`].
+    pub settings: EffectiveSso,
+}
+
+/// The effective `SSO` settings for a request: the environment's, else the
+/// console's saved ones, else the code's defaults.
+pub async fn sso(state: &AppState) -> EffectiveSso {
+    {
+        let guard = state.oidc.read().await;
+        if let Some(current) = guard.as_ref()
+            && current.settings.issuer_source == Source::Server
+        {
+            return current.settings.clone();
+        }
+    }
+    match sso_or_fail(state).await {
+        Ok(sso) => sso,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "reading saved SSO settings failed; using the environment's values"
+            );
+            resolve_sso(&state.config, None, None)
+        }
+    }
+}
+
+/// The initial `OIDC` authenticator built at startup from environment configuration.
+#[must_use]
+pub fn initial_oidc_authenticator(
+    config: &Config,
+    keyring: Option<&Keyring>,
+    pool: sqlx::PgPool,
+) -> Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>> {
+    let settings = resolve_sso(config, None, keyring);
+    if !settings.is_configured() {
+        return None;
+    }
+    let oidc_config = settings.to_oidc_config();
+    Some(Arc::new(lakehouse_auth::oidc::OidcAuthenticator::new(
+        oidc_config,
+        pool,
+    )))
+}
+
+/// The `OIDC` authenticator for the effective `SSO` settings, rebuilt when they
+/// change (plan D4).
+///
+/// Cached in [`AppState::oidc`] and cleared on save, matching the assistant
+/// client pattern.
+#[allow(
+    clippy::too_many_lines,
+    reason = "checks cache freshness, validates console-set issuer address, pins allowlisted resolver, and builds authenticator"
+)]
+pub async fn oidc(state: &AppState) -> Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>> {
+    {
+        let guard = state.oidc.read().await;
+        if let Some(current) = guard.as_ref()
+            && current.settings.issuer_source == Source::Server
+        {
+            return Some(current.authenticator.clone());
+        }
+    }
+    let pool = (**state.pg.as_ref()?).clone();
+    let desired = sso(state).await;
+    if !desired.is_configured() {
+        let mut guard = state.oidc.write().await;
+        *guard = None;
+        return None;
+    }
+    {
+        let guard = state.oidc.read().await;
+        if let Some(current) = guard.as_ref()
+            && current.settings == desired
+        {
+            return Some(current.authenticator.clone());
+        }
+    }
+
+    let mut guard = state.oidc.write().await;
+    if let Some(current) = guard.as_ref()
+        && current.settings == desired
+    {
+        return Some(current.authenticator.clone());
+    }
+
+    let mut http_client = None;
+    if desired.issuer_source == Source::Console {
+        let Some(ref issuer) = desired.issuer else {
+            *guard = None;
+            return None;
+        };
+        let internal_hosts = state.config.connector_internal_hosts();
+        if let Err(problem) = check_issuer_address(issuer, &internal_hosts).await {
+            tracing::warn!(
+                %problem,
+                "the OIDC issuer address is not one this deployment may reach; authenticator was not built"
+            );
+            *guard = None;
+            return None;
+        }
+        if let Some((host, port)) = crate::connector_probe::parse_endpoint_host_port(issuer) {
+            match crate::connector_probe::resolve_checked(host, port, &internal_hosts).await {
+                Ok(approved) => {
+                    let mut builder =
+                        reqwest::Client::builder().resolve_to_addrs(host, approved.all());
+                    if let Some(ref jwks_url) = desired.jwks_url
+                        && let Some((j_host, j_port)) =
+                            crate::connector_probe::parse_endpoint_host_port(jwks_url)
+                        && let Ok(j_appr) =
+                            crate::connector_probe::resolve_checked(j_host, j_port, &internal_hosts)
+                                .await
+                    {
+                        builder = builder.resolve_to_addrs(j_host, j_appr.all());
+                    }
+                    if let Ok(client) = builder.build() {
+                        http_client = Some(client);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "resolving checked issuer host failed");
+                    *guard = None;
+                    return None;
+                }
+            }
+        }
+    }
+
+    let oidc_config = desired.to_oidc_config();
+    let authenticator = Arc::new(
+        lakehouse_auth::oidc::OidcAuthenticator::new_with_http_client(
+            oidc_config,
+            http_client,
+            pool,
+        ),
+    );
+    *guard = Some(SwappableOidc {
+        authenticator: authenticator.clone(),
+        settings: desired,
+    });
+    Some(authenticator)
 }
 
 #[cfg(test)]

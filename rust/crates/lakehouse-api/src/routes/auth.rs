@@ -739,25 +739,24 @@ pub async fn oidc_start(
     // uses the configured `OidcAuthenticator` to verify the id token this
     // flow eventually produces. This route only needs to know OIDC is
     // configured at all before it starts a flow for it.
-    state
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.oidc.as_ref())
-        .ok_or_else(|| {
-            ApiError::Unavailable("OIDC is not configured on this deployment".to_owned())
-        })?;
-    let authorize_url =
-        state.config.oidc_authorize_url.as_deref().ok_or_else(|| {
-            ApiError::Unavailable("OIDC_AUTHORIZE_URL is not configured".to_owned())
-        })?;
-    let redirect_uri =
-        state.config.oidc_redirect_uri.as_deref().ok_or_else(|| {
-            ApiError::Unavailable("OIDC_REDIRECT_URI is not configured".to_owned())
-        })?;
-    let client_id = state
-        .config
-        .oidc_client_id
+    crate::runtime_settings::oidc(&state).await.ok_or_else(|| {
+        ApiError::Unavailable("OIDC is not configured on this deployment".to_owned())
+    })?;
+    let sso = crate::runtime_settings::sso(&state).await;
+    let authorize_url = sso
+        .authorize_url
         .as_deref()
+        .or(state.config.oidc_authorize_url.as_deref())
+        .ok_or_else(|| ApiError::Unavailable("OIDC_AUTHORIZE_URL is not configured".to_owned()))?;
+    let redirect_uri = sso
+        .redirect_uri
+        .as_deref()
+        .or(state.config.oidc_redirect_uri.as_deref())
+        .ok_or_else(|| ApiError::Unavailable("OIDC_REDIRECT_URI is not configured".to_owned()))?;
+    let client_id = sso
+        .client_id
+        .as_deref()
+        .or(state.config.oidc_client_id.as_deref())
         .ok_or_else(|| ApiError::Unavailable("OIDC_CLIENT_ID is not configured".to_owned()))?;
 
     // `state`/`nonce`/PKCE `code_verifier` all come from the same CSPRNG
@@ -842,10 +841,11 @@ pub struct ProvidersResponse {
 /// in-memory state (`AppState::auth`, `Config::oidc_provider_name`), never
 /// a database or network call.
 pub async fn providers(State(state): State<AppState>) -> ApiResult<ApiJson<ProvidersResponse>> {
-    let oidc = state.auth.as_ref().and_then(|a| a.oidc.as_ref());
+    let oidc = crate::runtime_settings::oidc(&state).await;
+    let sso = crate::runtime_settings::sso(&state).await;
     Ok(ApiJson(ProvidersResponse {
         oidc: oidc.is_some(),
-        provider_name: oidc.map(|_| state.config.oidc_provider_name.clone()),
+        provider_name: oidc.map(|_| sso.provider_name.clone()),
     }))
 }
 
@@ -969,23 +969,27 @@ pub async fn oidc_callback(
     // a "no credentials presented" 401/403 for [`crate::policy::POLICY_TABLE`]'s
     // `Policy::Public` purposes, and nothing has been read from `headers`
     // yet, so there is no cookie to clear on this path.
-    let Some(auth) = state.auth.as_ref().and_then(|a| a.oidc.as_ref()) else {
+    let Some(auth) = crate::runtime_settings::oidc(&state).await else {
         return Ok(unavailable("OIDC is not configured on this deployment"));
     };
+    let sso = crate::runtime_settings::sso(&state).await;
     let (Some(token_url), Some(redirect_uri)) = (
-        state.config.oidc_token_url.as_deref(),
-        state.config.oidc_redirect_uri.as_deref(),
+        sso.token_url
+            .as_deref()
+            .or(state.config.oidc_token_url.as_deref()),
+        sso.redirect_uri
+            .as_deref()
+            .or(state.config.oidc_redirect_uri.as_deref()),
     ) else {
         return Ok(unavailable(
             "OIDC_TOKEN_URL/OIDC_REDIRECT_URI are not configured",
         ));
     };
-    // `AuthState::oidc` is `Some` only when `OIDC_ISSUER`/`OIDC_CLIENT_ID`
-    // are both set (`state::oidc_config`), the same invariant `oidc_start`
-    // relies on for `client_id` — reading it the
-    // same fail-closed way here, rather than sending an empty
-    // `client_id` to the token endpoint.
-    let Some(client_id) = state.config.oidc_client_id.as_deref() else {
+    let Some(client_id) = sso
+        .client_id
+        .as_deref()
+        .or(state.config.oidc_client_id.as_deref())
+    else {
         return Ok(unavailable("OIDC_CLIENT_ID is not configured"));
     };
 
@@ -1012,11 +1016,16 @@ pub async fn oidc_callback(
         return Ok(unauthorized());
     }
 
+    let client_secret = if sso.client_secret_set {
+        Some(sso.client_secret.expose_secret())
+    } else {
+        state.config.oidc_client_secret.as_deref()
+    };
     let Some(id_token) = exchange_code_for_id_token(
-        &state,
         token_url,
         redirect_uri,
         client_id,
+        client_secret,
         &code,
         &flow.code_verifier,
     )
@@ -1142,10 +1151,10 @@ fn decode_flow_cookie(headers: &HeaderMap) -> Option<OidcFlow> {
 /// to the caller or into anything but a `tracing::warn!` line (AGENTS.md
 /// principle 4; see [`oidc_callback`]'s `# Errors` doc comment).
 async fn exchange_code_for_id_token(
-    state: &AppState,
     token_url: &str,
     redirect_uri: &str,
     client_id: &str,
+    client_secret: Option<&str>,
     code: &str,
     code_verifier: &str,
 ) -> Option<String> {
@@ -1157,7 +1166,7 @@ async fn exchange_code_for_id_token(
         ("code_verifier", code_verifier),
         ("client_id", client_id),
     ];
-    if let Some(secret) = state.config.oidc_client_secret.as_deref() {
+    if let Some(secret) = client_secret {
         form.push(("client_secret", secret));
     }
     let token_response = http
@@ -2013,6 +2022,97 @@ mod tests {
         let without_oidc = AppState::new(Config::from_map(&HashMap::new()).unwrap());
         let body = get_json(&without_oidc, "/api/auth/providers").await;
         assert_eq!(body["oidc"], serde_json::json!(false));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn saving_a_config_makes_the_next_providers_call_report_oidc_with_no_restart(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        let config = Config::from_map(&env).expect("valid config");
+        let state = AppState::new(config);
+
+        // At first, no OIDC is configured
+        let body = get_json(&state, "/api/auth/providers").await;
+        assert_eq!(body["oidc"], serde_json::json!(false));
+
+        // Save SSO configuration to the database
+        lakehouse_store::sso_settings::upsert(
+            &pool,
+            &lakehouse_store::sso_settings::SsoSettings {
+                oidc_issuer: Some("https://127.0.0.1:8443".to_owned()),
+                oidc_client_id: Some("saved-client-id".to_owned()),
+                oidc_client_secret: None,
+                oidc_provider_name: Some("saved-provider".to_owned()),
+                oidc_groups_claim: None,
+                oidc_role_map: None,
+                oidc_jit_provisioning: None,
+            },
+            "test-user",
+        )
+        .await
+        .unwrap();
+
+        // Clear cache as a console save does
+        state.sso_settings_cache.clear().await;
+        *state.oidc.write().await = None;
+
+        // Next call reports oidc: true and provider_name without restart!
+        let body = get_json(&state, "/api/auth/providers").await;
+        assert_eq!(body["oidc"], serde_json::json!(true));
+        assert_eq!(body["providerName"], serde_json::json!("saved-provider"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_http_or_internal_issuer_gives_400() {
+        use crate::internal_hosts::InternalHosts;
+        use crate::routes::settings::validate_sso_issuer;
+
+        let internal_hosts = InternalHosts::NONE;
+
+        // http:// is refused
+        let err = validate_sso_issuer("http://idp.example.com", &internal_hosts)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), crate::routes::settings::ISSUER_NOT_HTTPS);
+
+        // internal address (e.g. 127.0.0.1) is refused
+        let err = validate_sso_issuer("https://127.0.0.1:8443", &internal_hosts)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            crate::routes::settings::ISSUER_INTERNAL_REFUSED
+        );
+    }
+
+    #[test]
+    fn an_unknown_role_in_the_map_gives_400() {
+        use crate::routes::settings::validate_role_map_entries;
+
+        let known_roles = vec!["Platform Admin".to_owned(), "Analyst".to_owned()];
+
+        let bad_map = serde_json::json!([
+            {"group": "admins", "role": "Platform Admin"},
+            {"group": "devs", "role": "UnknownRole"}
+        ]);
+        let items = bad_map.as_array().unwrap();
+        let err = validate_role_map_entries(items, &known_roles).unwrap_err();
+        assert_eq!(err.to_string(), "Unknown role: \"UnknownRole\".");
+
+        let good_map = serde_json::json!([
+            {"group": "admins", "role": "Platform Admin"},
+            {"group": "devs", "role": "Analyst"}
+        ]);
+        let items = good_map.as_array().unwrap();
+        assert!(validate_role_map_entries(items, &known_roles).is_ok());
     }
 
     // ── `GET /api/auth/sessions` routing shape ──────
