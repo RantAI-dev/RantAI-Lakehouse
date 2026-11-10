@@ -2047,6 +2047,14 @@ class DashboardCasesTests(unittest.TestCase):
         self.assertEqual(setup["chart"]["body"]["mart"], "mart_wisman")
         self.assertIn("Malaysia", case["turns"][0])
 
+    def test_the_save_filters_case_tells_the_assistant_which_board_to_save(self) -> None:
+        # The console always sends the open dashboard with its board id; a
+        # case without that context never tells the assistant whose default
+        # filters "Save this filter as the default for everyone" saves.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["save_filters_only_when_asked"]
+        self.assertIn("{board}", case.get("context", ""))
+
 
 class ForecastAndDeprecationCaseTests(unittest.TestCase):
     """The two cases the chart-tools plan added: a forecast line, and a mart
