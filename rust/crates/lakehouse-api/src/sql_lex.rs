@@ -25,9 +25,9 @@
 //!
 //! ## `ClickHouse`
 //!
-//! The rules this module implements, measured on
-//! `clickhouse/clickhouse-server:26.8.15.10` and read out of `ClickHouse`'s
-//! own lexer (`src/Parsers/Lexer.cpp`):
+//! The rules this module implements, measured 2026-11-10 on
+//! `clickhouse/clickhouse-server:26.8` (server version `26.8.15.10`) and
+//! read out of `ClickHouse`'s own lexer (`src/Parsers/Lexer.cpp`):
 //!
 //! - `'…'`, `"…"` and `` `…` `` are quoted runs. A `\` escapes the next
 //!   character, and a doubled quote is an escaped quote.
@@ -51,7 +51,10 @@
 //! - `$tag$ … $tag$` is a heredoc: a literal whose body is raw text, read
 //!   as it stands and not read as SQL again. Measured: `SELECT $$'; SELECT
 //!   42; SELECT '$$` answers the literal `'; SELECT 42; SELECT '` and does
-//!   not run the `SELECT 42`.
+//!   not run the `SELECT 42`. Measured on `26.8` (2026-11-10): the tag is
+//!   empty or `[A-Za-z0-9_]+`, digits included — `$1$x$1$` runs and
+//!   answers `x` — while `$a b$`, `$'$` and `$é$` are no heredocs: the
+//!   engine refuses the statement.
 //! - A heredoc opens only when its closing delimiter is found again in the
 //!   text: `src/Parsers/Lexer.cpp` (the `$` branch of `nextTokenImpl`)
 //!   emits a heredoc token only then, and when the delimiter is not found
@@ -68,7 +71,10 @@
 //! - A `$` opens a heredoc only where it starts a token. The run of
 //!   `[A-Za-z0-9_$]` before it is a name when it starts with a letter, `_`
 //!   or `$` — the engine's bareword reader takes those — and a number
-//!   otherwise, so the `$` opens the heredoc. A non-ASCII character is
+//!   otherwise, so the `$` opens the heredoc. Measured on `26.8`
+//!   (2026-11-10), a `$` beside name characters is part of one identifier
+//!   instead: `$a-b$x$a-b$` parses as the identifiers `$a`, `b$x$a` and
+//!   `b$`, not as a heredoc. A non-ASCII character is
 //!   not in that set, so it ends the run and the `$` after it opens the
 //!   heredoc — but the engine refuses the statement at that character
 //!   with "Unrecognized token", so the statement never runs and the
