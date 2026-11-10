@@ -7,7 +7,7 @@ import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useService } from "@/hooks/use-service"
-import { assetQueryStudioHref } from "@/lib/asset-query"
+import { assetHasReadableTable, assetQueryStudioHref } from "@/lib/asset-query"
 import { typeFamily } from "@/lib/column-type"
 import { nextSort, sortedOrder, type SortState } from "@/lib/sample-grid"
 import { formatNumber } from "@/lib/format"
@@ -115,13 +115,19 @@ export function AssetSample({ asset: a, iceberg }: { asset: AssetDetail; iceberg
 
   // In the card's body, not its header action: that slot cannot shrink, so at phone width the controls
   // left the title and description a few characters wide (the Schema tab's card met the same slot).
-  const controls = (
+  //
+  // The link is offered only for an asset with a table the console can
+  // read: it would name a table that is not there otherwise (owner,
+  // 2026-11-09).
+  const table = icebergTableOf(iceberg)
+  const readable = assetHasReadableTable(a, table, iceberg.status === "loading")
+  const controls = readable ? (
     <div className="mb-2 flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
-      <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a, icebergTableOf(iceberg))} />}>
+      <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a, table)} />}>
         Open in Query Studio
       </Button>
     </div>
-  )
+  ) : null
   // The larger sample failed but rows are on the page: keep them, say so above them.
   const failedMore = more.status === "error" && rows.length > 0
 
