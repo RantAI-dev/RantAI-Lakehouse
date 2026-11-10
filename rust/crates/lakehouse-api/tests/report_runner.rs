@@ -238,9 +238,10 @@ struct F {
 
 async fn person(pool: &PgPool, name: &str, role_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, 'active')")
         .bind(id)
         .bind(name)
+        .bind(name.to_lowercase())
         .bind(format!("{}@company.example", name.to_lowercase()))
         .execute(pool)
         .await

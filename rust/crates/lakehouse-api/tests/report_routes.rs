@@ -190,17 +190,20 @@ fn body(recipients: Value) -> Value {
 
 async fn user_id(pool: &PgPool, name: &str, status: &str) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, $4)")
-        .bind(id)
-        .bind(name)
-        .bind(format!(
-            "{}@company.example",
-            name.to_lowercase().replace(' ', ".")
-        ))
-        .bind(status)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(name.to_lowercase().replace(' ', "."))
+    .bind(format!(
+        "{}@company.example",
+        name.to_lowercase().replace(' ', ".")
+    ))
+    .bind(status)
+    .execute(pool)
+    .await
+    .unwrap();
     id
 }
 

@@ -897,7 +897,7 @@ async fn access_json(state: &AppState, subject: &Subject) -> Result<Value, ApiEr
             json!({
                 "kind": "user", "id": user,
                 "name": found.map_or("", |(_, name, _)| name.as_str()),
-                "email": found.map_or("", |(_, _, email)| email.as_str()),
+                "email": found.map_or("", |(_, _, email)| email.as_deref().unwrap_or("")),
                 "level": r.level,
             })
         } else {

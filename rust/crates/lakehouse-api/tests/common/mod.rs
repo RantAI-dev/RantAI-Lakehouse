@@ -473,9 +473,10 @@ pub async fn create_zero_permission_principal(pool: &PgPool) -> Uuid {
 
     let user_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Zero Perm Test User', $2, 'active')",
+        "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Zero Perm Test User', $2, $3, 'active')",
     )
     .bind(user_id)
+    .bind(format!("zero-perm-{user_id}"))
     .bind(format!("zero-perm-{user_id}@test.invalid"))
     .execute(pool)
     .await
@@ -517,9 +518,10 @@ pub async fn create_principal_with_permissions(pool: &PgPool, permissions: &str)
 
     let user_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Single Perm Test User', $2, 'active')",
+        "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Single Perm Test User', $2, $3, 'active')",
     )
     .bind(user_id)
+    .bind(format!("single-perm-{user_id}"))
     .bind(format!("single-perm-{user_id}@test.invalid"))
     .execute(pool)
     .await

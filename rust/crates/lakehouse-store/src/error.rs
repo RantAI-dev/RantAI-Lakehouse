@@ -48,6 +48,16 @@ pub enum StoreError {
     /// A unique-constraint violation (e.g. a duplicate email or slug).
     #[error("a record with that value already exists")]
     Conflict,
+    /// A field the caller tried to set is already taken by ANOTHER user's
+    /// username or email, compared case-insensitively (ADM-11 D5: one
+    /// sign-in box must never match two people). Unlike [`Self::Conflict`],
+    /// which says only "some value collides", this names the field so the
+    /// route can answer 409 with the field-specific sentence the invite and
+    /// rename forms show. The message is this crate's own fixed sentence —
+    /// never an upstream error's text — the same discipline
+    /// [`Self::Validation`] and [`Self::NotAllowed`] follow.
+    #[error("{0}")]
+    FieldConflict(String),
     /// A foreign-key violation: the caller referenced a row that does not
     /// exist (or tried to delete a row something else still references,
     /// under `ON DELETE RESTRICT`).
@@ -149,7 +159,13 @@ impl From<StoreError> for ApiError {
     fn from(err: StoreError) -> Self {
         let message = err.to_string();
         match err {
-            StoreError::Conflict => Self::Conflict(message),
+            // ADM-11 D5: a username/email that would make one sign-in box
+            // match two people is a 409 that names the field ("Username
+            // already in use"), so the invite and rename forms can point at
+            // the field that must change. Same refusal shape as
+            // `Conflict`, with the field-specific sentence instead of the
+            // generic one — hence one arm for both variants.
+            StoreError::Conflict | StoreError::FieldConflict(_) => Self::Conflict(message),
             // `ForeignKeyViolation` and `Validation` both map to `BadRequest`
             // for different reasons (see the module doc comment's mapping
             // table): the former because the caller referenced a row that
@@ -185,6 +201,16 @@ mod tests {
     fn conflict_maps_to_409() {
         let api: ApiError = StoreError::Conflict.into();
         assert_eq!(api.status(), 409);
+    }
+
+    /// ADM-11 D5: a field-specific username/email clash maps to 409 and
+    /// carries the store's own fixed sentence, so an invite or rename form
+    /// can show "Username already in use" at the field that must change.
+    #[test]
+    fn field_conflict_maps_to_409_and_carries_the_field_sentence() {
+        let api: ApiError = StoreError::FieldConflict("Username already in use".to_owned()).into();
+        assert_eq!(api.status(), 409);
+        assert_eq!(api.to_string(), "Username already in use");
     }
 
     /// `Validation` must map to 400, never `Internal` (500) -- an invalid

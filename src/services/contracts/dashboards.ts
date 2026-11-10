@@ -393,7 +393,7 @@ export type ItemAccessInput = {
 }
 
 export type GranteeMatches = {
-  people: { id: string; name: string; email: string }[]
+  people: { id: string; name: string; email: string | null }[]
   roles: { id: string; name: string }[]
 }
 

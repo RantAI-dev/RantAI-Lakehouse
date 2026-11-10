@@ -71,7 +71,7 @@ function stubLoginApi(status: number, body: unknown, headers: Record<string, str
 async function submitCredentials(email: string, password: string): Promise<void> {
   // The form only renders once the mount-time session check resolved;
   // awaiting the email field is what makes these tests deterministic.
-  fireEvent.change(await screen.findByLabelText("Email"), { target: { value: email } })
+  fireEvent.change(await screen.findByLabelText("Username or email"), { target: { value: email } })
   fireEvent.change(screen.getByLabelText("Password"), { target: { value: password } })
   fireEvent.click(screen.getByRole("button", { name: /sign in/i }))
 }
@@ -109,7 +109,7 @@ describe("LoginPage lockout surface (plan T5)", () => {
     const alert = await screen.findByRole("alert")
     // One generic message regardless of cause — the page must not leak
     // the server's non-enumeration constant ("invalid_or_expired").
-    expect(alert.textContent).toBe("Invalid email or password.")
+    expect(alert.textContent).toBe("Invalid username/email or password.")
     expect(alert.textContent).not.toContain("invalid_or_expired")
   })
 })

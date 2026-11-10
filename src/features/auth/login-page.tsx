@@ -152,7 +152,7 @@ export function LoginPage() {
       } else {
         setError(
           serviceError.code === "permission_denied"
-            ? "Invalid email or password."
+            ? "Invalid username/email or password."
             : serviceError.message || "Could not sign in. Try again."
         );
       }
@@ -237,7 +237,7 @@ export function LoginPage() {
                 <form onSubmit={onSubmit} className="flex flex-col gap-5" noValidate>
                   <Field data-invalid={!!error}>
                     <FieldLabel htmlFor="login-email" className="text-sm">
-                      Email
+                      Username or email
                     </FieldLabel>
                     <InputGroup className="h-11">
                       <InputGroupAddon className="pl-3">
@@ -245,11 +245,11 @@ export function LoginPage() {
                       </InputGroupAddon>
                       <InputGroupInput
                         id="login-email"
-                        type="email"
-                        autoComplete="email"
+                        type="text"
+                        autoComplete="username"
                         autoFocus
                         required
-                        placeholder="you@company.com"
+                        placeholder="you or you@company.com"
                         className="text-sm"
                         aria-invalid={!!error}
                         aria-describedby={error ? "login-error" : undefined}

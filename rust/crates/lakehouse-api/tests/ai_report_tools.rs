@@ -199,7 +199,7 @@ async fn the_quoted_request_creates_a_monday_pdf_subscription_for_the_person_aft
 async fn naming_another_recipient_waits_for_approval_and_the_report_stays_the_requesters() {
     let f = fixture().await;
     let colleague: Uuid = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Colleague', 'colleague@company.example', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Colleague', 'colleague', 'colleague@company.example', 'active')")
         .bind(colleague)
         .execute(&f.app.pool)
         .await
@@ -488,7 +488,7 @@ async fn subscription_with_outsiders(f: &F) -> String {
     .await
     .unwrap();
     let colleague = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Colleague', 'colleague@company.example', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Colleague', 'colleague', 'colleague@company.example', 'active')")
         .bind(colleague)
         .execute(&f.app.pool)
         .await
