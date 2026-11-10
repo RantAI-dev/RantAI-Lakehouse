@@ -128,11 +128,11 @@ async fn unique_constraint_rejects_duplicate(pool: PgPool) -> sqlx::Result<()> {
 /// non-unique column is caught here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unique_constraints_cover_every_natural_key(pool: PgPool) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO app_user (name, email) VALUES ('Probe', 'probe@example.com')")
+    sqlx::query("INSERT INTO app_user (name, username, email) VALUES ('Probe', 'probe', 'probe@example.com')")
         .execute(&pool)
         .await?;
     let dup_email =
-        sqlx::query("INSERT INTO app_user (name, email) VALUES ('Probe 2', 'probe@example.com')")
+        sqlx::query("INSERT INTO app_user (name, username, email) VALUES ('Probe 2', 'probe-2', 'probe@example.com')")
             .execute(&pool)
             .await;
     assert!(dup_email.is_err());
@@ -169,7 +169,7 @@ async fn unique_constraints_cover_every_natural_key(pool: PgPool) -> sqlx::Resul
 #[sqlx::test(migrations = "../../migrations")]
 async fn app_user_status_check_rejects_unknown_value(pool: PgPool) -> sqlx::Result<()> {
     let result = sqlx::query(
-        "INSERT INTO app_user (name, email, status) VALUES ('X', 'x@example.com', 'pending')",
+        "INSERT INTO app_user (name, username, email, status) VALUES ('X', 'x', 'x@example.com', 'pending')",
     )
     .execute(&pool)
     .await;
@@ -191,7 +191,7 @@ async fn tenant_delete_is_restricted_while_a_user_belongs_to_it(pool: PgPool) ->
     .fetch_one(&pool)
     .await?;
     let (user_id,): (uuid::Uuid,) = sqlx::query_as(
-        "INSERT INTO app_user (name, email) VALUES ('U', 'u@example.com') RETURNING id",
+        "INSERT INTO app_user (name, username, email) VALUES ('U', 'u', 'u@example.com') RETURNING id",
     )
     .fetch_one(&pool)
     .await?;

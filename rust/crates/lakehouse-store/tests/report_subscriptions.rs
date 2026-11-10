@@ -26,12 +26,18 @@ const MERIDIAN_GROUP: Uuid = Uuid::from_u128(0x11111111_1111_4111_8111_000000000
 const MERIDIAN_RETAIL: Uuid = Uuid::from_u128(0x11111111_1111_4111_8111_000000000002);
 
 async fn user(pool: &PgPool, name: &str) -> Uuid {
-    sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-        .bind(name)
-        .bind(format!("{name}@example.com"))
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    // ADM-11: `username` is NOT NULL; test users carry their email
+    // lowercased, the way the `0132_usernames.sql` backfill does it.
+    let clean = name.replace(' ', ".").to_lowercase();
+    sqlx::query_scalar(
+        "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(name)
+    .bind(format!("{clean}@example.com"))
+    .bind(format!("{clean}@example.com"))
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 fn new_sub(owner: Uuid, board: &str, next_run_at: OffsetDateTime) -> NewSubscription {
@@ -624,8 +630,8 @@ async fn a_retry_brings_the_next_time_forward_and_never_pushes_it_back(
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_name_picker_never_matches_an_email_substring(pool: PgPool) -> sqlx::Result<()> {
     let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO app_user (name, email) VALUES ('Zelda Quill', 'kzx9@mailhost.test') \
-         RETURNING id",
+        "INSERT INTO app_user (name, username, email) \
+         VALUES ('Zelda Quill', 'kzx9@mailhost.test', 'kzx9@mailhost.test') RETURNING id",
     )
     .fetch_one(&pool)
     .await?;

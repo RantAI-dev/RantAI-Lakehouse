@@ -715,7 +715,11 @@ fn create_chart_schema() -> Value {
             json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
-            "title": { "type": "string" }, "subtitle": { "type": "string" },
+            "title": { "type": "string" },
+            // The build prompt asks for `subtitle: null` when a chart has no
+            // subtitle, so the field takes a string or a null (AI-3,
+            // 2026-11-08).
+            "subtitle": { "type": ["string", "null"] },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
             "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "text": { "type": "string" }, "caption": { "type": "string" },
@@ -1142,9 +1146,13 @@ fn move_chart_schema() -> Value {
             "required": ["id", "board"] } } })
 }
 
+/// `AI-2` AC1: the view filter tool. Its year sentence names the year
+/// column, because a year column holds the year itself and a date column
+/// does not: a model told only about the date column's between filter saves
+/// a year column's value as a date range the column cannot match.
 fn set_board_view_filters_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_board_view_filters",
-        "description": "Change the filters visible to the person on this page, this time only. Use it for a request to see only some data on this page (\"show only 2026\", \"only Bali\", \"tampilkan hanya …\"), instead of a new chart; a year on a date column is a between filter on that year's first and last day. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
+        "description": "Change the filters visible to the person on this page, this time only. Use it for a request to see only some data on this page (\"show only 2026\", \"only Bali\", \"tampilkan hanya …\"), instead of a new chart; a year is an `in` filter with the year on a year column (such as `tahun`), or a between filter on a date column's first and last day of that year when the source has no year column. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string" },
             "filters": filters_array_property() },
@@ -3239,7 +3247,15 @@ mod tests {
         let description = schema["function"]["description"]
             .as_str()
             .expect("set_board_view_filters has a description");
-        for clause in ["show only", "instead of a new chart"] {
+        // The year clause: a year column holds the year itself, so a year is
+        // an `in` filter there. The model reads a date column's between
+        // filter as the rule for every year, and saves a year column's
+        // value as a date range it cannot match.
+        for clause in [
+            "show only",
+            "instead of a new chart",
+            "an `in` filter with the year on a year column",
+        ] {
             assert!(
                 description.contains(clause),
                 "set_board_view_filters must say: {clause}"

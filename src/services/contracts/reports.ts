@@ -88,7 +88,7 @@ export type ReportList = {
   pdfSupported: boolean
 }
 
-export type ReportPerson = { id: string; name: string; email: string }
+export type ReportPerson = { id: string; name: string; email: string | null }
 
 export interface ReportService {
   list(board: string, signal?: AbortSignal): Promise<ReportList>

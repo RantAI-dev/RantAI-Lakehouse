@@ -88,7 +88,9 @@ pub(crate) async fn address_of(state: &AppState, owner: &str) -> Option<String> 
     lakehouse_store::identity::get_user(pg, owner)
         .await
         .ok()
-        .map(|u| u.email.trim().to_ascii_lowercase())
+        // ADM-11 D9: an account without an email address has no target —
+        // `None`, not an empty string.
+        .and_then(|u| u.email.map(|e| e.trim().to_ascii_lowercase()))
 }
 
 /// Whether the rule's only target is the owner's own address (decision 1).

@@ -256,7 +256,7 @@ export type AccessRuleInput = {
 export type SavedQueryAccessInput = { rules: AccessRuleInput[] }
 
 /** One person the caller may share a saved query with (`GET /api/query/grantees`). */
-export type GranteePerson = { id: string; name: string; email: string }
+export type GranteePerson = { id: string; name: string; email: string | null }
 
 /** One role the caller may share a saved query with. */
 export type GranteeRole = { id: string; name: string }

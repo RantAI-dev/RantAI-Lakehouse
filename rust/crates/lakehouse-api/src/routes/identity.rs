@@ -60,6 +60,7 @@ use lakehouse_auth::PrincipalId;
 use lakehouse_auth::Secret;
 use lakehouse_auth::openfga::{LakekeeperAdminClient, TenantWarehouseStorage};
 use lakehouse_auth::password;
+use lakehouse_auth::permission_catalog::{self, PermissionInfo};
 use lakehouse_auth::session;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -158,30 +159,58 @@ pub async fn list_users(
     Ok(ApiJson(identity::list_users(pool(&state)?, &filter).await?))
 }
 
+/// Password specification for `POST /api/identity/users` (ADM-11 D7).
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum PasswordInput {
+    /// Server generates a temporary password, returned once in the response.
+    #[default]
+    Generate,
+    /// Administrator types the password directly, checked against password rules.
+    Set {
+        /// Plaintext password chosen by the administrator.
+        value: String,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// The `POST /api/identity/users` body. Mirrors `InviteUserInput` in
 /// `contracts/identity.ts`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteUserBody {
     /// Display name.
-    name: String,
-    /// Email address.
-    email: String,
+    pub name: String,
+    /// Unique username (ADM-11 D7).
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Email address (optional, ADM-11 D2.4).
+    #[serde(default)]
+    pub email: Option<String>,
     /// Role names to grant. Optional in the wire format (defaults to none)
     /// so an invite with no roles doesn't have to send `[]`.
     #[serde(default)]
-    roles: Vec<String>,
+    pub roles: Vec<String>,
     /// Tenant names to join.
     #[serde(default)]
-    tenants: Vec<String>,
+    pub tenants: Vec<String>,
+    /// Password choice: generate or set (ADM-11 D7).
+    #[serde(default)]
+    pub password: PasswordInput,
+    /// Whether the user must change password at first sign-in (ADM-11 D7).
+    #[serde(default = "default_true")]
+    pub must_change_password: bool,
 }
 
 /// Serialize a [`Secret`] as the plain string it wraps.
 ///
-/// The ONE place a secret leaves the type that keeps it out of log lines:
-/// a [`Secret`]'s own `Debug`/`Display` render a fixed redaction marker,
-/// so a response that must carry the value has to unwrap it explicitly,
-/// here, in one place. Nothing else in this crate serializes a secret.
+/// ADM-11 review 1 S2 / ADM-3 D1: The ONE place a secret leaves the type that
+/// keeps it out of log lines: a [`Secret`]'s own `Debug`/`Display` render a
+/// fixed redaction marker, so a response that must carry the value has to unwrap
+/// it explicitly, here, in one place. Nothing else in this crate serializes a secret.
 fn serialize_secret<S: serde::Serializer>(
     secret: &Secret,
     serializer: S,
@@ -189,25 +218,32 @@ fn serialize_secret<S: serde::Serializer>(
     serializer.serialize_str(secret.expose())
 }
 
+#[allow(
+    clippy::ref_option,
+    reason = "serde serialize_with requires &Option<T> signature (ADM-11 review 1 S2)"
+)]
+fn serialize_optional_secret<S: serde::Serializer>(
+    secret: &Option<Secret>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match secret {
+        Some(s) => serializer.serialize_str(s.expose()),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// The `POST /api/identity/users` 201 body: the created [`User`] plus the
-/// temporary password.
-///
-/// ADM-3 D1: the temporary password is returned **once**, on this response
-/// and nowhere else. It is never stored in clear (the database keeps the
-/// `Argon2id` hash), never logged, never audited, and never listed by
-/// `GET /api/identity/users` — the [`User`] shape has no field for it.
-///
-/// The [`User`] is flattened into this object, so the body is the user
-/// with one extra key rather than a user nested under a key.
+/// temporary password (if generated).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteUserResponse {
     /// The created user.
     #[serde(flatten)]
     pub user: User,
-    /// The generated temporary password, shown once.
-    #[serde(serialize_with = "serialize_secret")]
-    pub temporary_password: Secret,
+    /// The generated temporary password, shown once (omitted for set mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_optional_secret")]
+    pub temporary_password: Option<Secret>,
 }
 
 /// The `POST /api/identity/users/{id}/reset-password` body: the new
@@ -255,34 +291,70 @@ pub async fn create_user(
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<InviteUserResponse>)> {
     let body: InviteUserBody = parse_body(&body)?;
+    let name = required("name", &body.name)?;
+    // ADM-11 D7 / ADM-11 review 1 S1: username is required in the invite body; missing or blank -> 400.
+    let raw_username = match body.username.as_deref().map(str::trim) {
+        Some(u) if !u.is_empty() => u.to_owned(),
+        _ => return Err(ApiError::BadRequest("username is required".to_owned()).into()),
+    };
+    let raw_email = body.email.as_deref().filter(|e| !e.trim().is_empty());
+
+    let has_email = raw_email.is_some();
+    let email_string = raw_email.map(str::to_owned);
+
+    // ADM-3 D1 / ADM-11 D7 (ADM-11 review 1 S2): password choice — generated from the OS random
+    // source (wrapped in a Secret so it cannot be logged by accident), or typed by the admin
+    // and validated against system password rules.
+    let (secret_to_store, temporary_password_to_return, password_mode_str) = match &body.password {
+        PasswordInput::Generate => {
+            let temp = password::generate_temporary_password();
+            (temp.clone(), Some(temp), "generate")
+        }
+        PasswordInput::Set { value } => {
+            password::check_rules(value, Some(&raw_username), raw_email)
+                .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+            (Secret::new(value.clone()), None, "set")
+        }
+    };
+
     let input = InviteUserInput {
-        name: required("name", &body.name)?,
-        email: required("email", &body.email)?,
+        name,
+        username: raw_username,
+        email: email_string,
         roles: body.roles,
         tenants: body.tenants,
     };
     let pool = pool(&state)?;
 
-    // ADM-3 D1: the server chooses the password, from the OS random
-    // source. It is wrapped in a `Secret` from here on, so it cannot be
-    // logged by accident.
-    let temporary_password = password::generate_temporary_password();
-
-    // ADM-3 D1: user, memberships and credential in ONE transaction. The
+    // ADM-3 D1 (ADM-11 review 1 S2): user, memberships and credential in ONE transaction. The
     // store owns the user tables and `lakehouse-auth` owns the credential
     // table, so the transaction is opened HERE and handed to both — see
     // `lakehouse_store::identity::create_user_in_tx` and
     // `lakehouse_auth::password::create_local_identity_in_tx`.
     let mut tx = pool.begin().await.map_err(StoreError::from)?;
     let user_id = identity::create_user_in_tx(&mut tx, &input).await?;
-    password::create_local_identity_in_tx(&mut tx, user_id, &temporary_password, true).await?;
+    password::create_local_identity_in_tx(
+        &mut tx,
+        user_id,
+        &secret_to_store,
+        body.must_change_password,
+    )
+    .await?;
     tx.commit().await.map_err(StoreError::from)?;
 
     let user = identity::get_user(pool, &user_id.to_string()).await?;
 
-    // ADM-3 D5: the audit row names the actor and the new user. It never
-    // carries the password — not even its length.
-    let audit_event = user_invite_audit_event(&principal, &user, &input);
+    // ADM-3 D5 (ADM-11 review 1 S2): the audit row names the actor and the new user,
+    // the password mode, and must-change flag. It never carries the password —
+    // not even its length.
+    let audit_event = user_invite_audit_event(
+        &principal,
+        &user,
+        &input,
+        has_email,
+        password_mode_str,
+        body.must_change_password,
+    );
     if let Err(err) = store_audit::insert(pool, audit_event).await {
         tracing::warn!(
             %err,
@@ -296,7 +368,7 @@ pub async fn create_user(
         StatusCode::CREATED,
         ApiJson(InviteUserResponse {
             user,
-            temporary_password,
+            temporary_password: temporary_password_to_return,
         }),
     ))
 }
@@ -312,6 +384,9 @@ fn user_invite_audit_event(
     principal: &Principal,
     user: &User,
     input: &InviteUserInput,
+    has_email: bool,
+    password_mode: &str,
+    must_change_password: bool,
 ) -> NewAuditEvent {
     NewAuditEvent {
         action: "identity.user.invite".to_owned(),
@@ -322,7 +397,10 @@ fn user_invite_audit_event(
         actor_label: Some(principal.display_name.clone()),
         outcome: "executed".to_owned(),
         args: Some(serde_json::json!({
-            "email": user.email,
+            "username": user.username,
+            "hasEmail": has_email,
+            "passwordMode": password_mode,
+            "mustChangePassword": must_change_password,
             "roles": input.roles,
             "tenants": input.tenants,
         })),
@@ -1033,6 +1111,62 @@ fn user_status_audit_event(
 
 // ── Roles ───────────────────────────────────────────────────────────────
 
+/// `GET /api/identity/permissions` — the central list of permission
+/// strings the API checks (`WEB-8` D1/D4). Served in catalog order for
+/// the console's role and service-identity pickers.
+///
+/// # Security
+///
+/// Requires `identity:read` — see the module doc comment.
+pub async fn list_permissions() -> ApiResult<ApiJson<Vec<PermissionInfo>>> {
+    Ok(ApiJson(permission_catalog::PERMISSIONS.to_vec()))
+}
+
+/// Validate permission tokens against the catalog (`WEB-8` D3).
+///
+/// Refuses any token that is not known ([`permission_catalog::is_known`]),
+/// unless it was already held by the existing role (`allowed_existing`).
+/// Tokens are extracted from comma-separated strings or string lists, trimmed,
+/// and deduplicated in order of appearance.
+///
+/// # Errors
+///
+/// Returns [`ApiError::UnknownPermissions`] if any newly-requested token is
+/// not recognized by [`permission_catalog::is_known`].
+// WEB-8 review 1 S1: document errors returned by check_permissions
+fn check_permissions<'a>(
+    requested: impl IntoIterator<Item = &'a str>,
+    allowed_existing: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ApiError> {
+    let held: std::collections::HashSet<&'a str> = allowed_existing
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut unknown = Vec::new();
+    for token in requested {
+        let trimmed = token.trim();
+        if trimmed.is_empty() || held.contains(trimmed) {
+            continue;
+        }
+        if !permission_catalog::is_known(trimmed) && !unknown.iter().any(|u: &String| u == trimmed)
+        {
+            unknown.push(trimmed.to_owned());
+        }
+    }
+
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::UnknownPermissions(unknown))
+    }
+}
+
+fn parse_permission_tokens(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(',').map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// `GET /api/identity/roles` — every role, with its derived member count.
 ///
 /// # Errors
@@ -1074,6 +1208,10 @@ pub async fn create_role(
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<Role>)> {
     let body: CreateRoleBody = parse_body(&body)?;
+    check_permissions(
+        parse_permission_tokens(&body.permissions),
+        std::iter::empty(),
+    )?;
     let input = CreateRoleInput {
         name: required("name", &body.name)?,
         permissions: body.permissions,
@@ -1136,6 +1274,10 @@ pub async fn update_role(
     };
     let pool = pool(&state)?;
     let before = identity::get_role(pool, &id).await?;
+    check_permissions(
+        parse_permission_tokens(&input.permissions),
+        parse_permission_tokens(&before.permissions),
+    )?;
     // WEB-3 review R2: a rename would take every mask and row filter the
     // rules naming this role carry away from its holders, because rules
     // match on names. Refuse before anything is written, listing the rules
@@ -1675,6 +1817,7 @@ pub async fn create_service_identity(
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<ServiceIdentity>)> {
     let body: CreateServiceIdentityBody = parse_body(&body)?;
+    check_permissions(body.scopes.iter().map(String::as_str), std::iter::empty())?;
     let input = CreateServiceIdentityInput {
         name: required("name", &body.name)?,
         scopes: body.scopes,
@@ -1815,6 +1958,100 @@ fn tenant_create_audit_event(principal: &Principal, tenant: &Tenant) -> NewAudit
         args: Some(serde_json::json!({
             "slug": tenant.slug,
             "provisioningStatus": tenant.provisioning_status,
+        })),
+        ..Default::default()
+    }
+}
+
+/// `PATCH /api/identity/users/{id}` — update a user's username and/or email (ADM-11 D8).
+///
+/// # Errors
+///
+/// 400 on malformed body, invalid username, or invalid email; 404 if user not found
+/// or if caller does not have permission to rename an unrestricted user; 409 on clash.
+pub async fn update_user(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<User>> {
+    let user_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("user id must be a UUID".to_owned()))?;
+    let pool = pool(&state)?;
+
+    if !identity::user_exists(pool, user_id).await? {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    }
+
+    let target_holds_unrestricted =
+        lakehouse_auth::repository::user_holds_unrestricted(pool, user_id).await?;
+    if target_holds_unrestricted && !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    }
+
+    let fields = &["username", "email"];
+    let shape = "body must be an object with optional 'username' and 'email' fields";
+    // ADM-11 review 1 S3: reuse routes::settings::parse_body rather than duplicating it.
+    let sent = crate::routes::settings::parse_body(&body, fields, shape)?;
+
+    let mut changed_fields = Vec::new();
+    let new_username = if let Some(val) = sent.get("username") {
+        if val.is_null() {
+            return Err(ApiError::BadRequest("username cannot be null".to_owned()).into());
+        }
+        let u = val
+            .as_str()
+            .ok_or_else(|| ApiError::BadRequest("username must be a string".to_owned()))?;
+        changed_fields.push("username".to_owned());
+        Some(u)
+    } else {
+        None
+    };
+
+    let new_email = if let Some(val) = sent.get("email") {
+        changed_fields.push("email".to_owned());
+        if val.is_null() {
+            lakehouse_store::identity::EmailUpdate::Clear
+        } else {
+            let e = val
+                .as_str()
+                .ok_or_else(|| ApiError::BadRequest("email must be a string or null".to_owned()))?;
+            lakehouse_store::identity::EmailUpdate::Set(e)
+        }
+    } else {
+        lakehouse_store::identity::EmailUpdate::Unchanged
+    };
+
+    let user = identity::update_user_identity(pool, user_id, new_username, new_email).await?;
+
+    let audit_event = user_update_audit_event(&principal, user_id, &changed_fields);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.user.update",
+            user_id = %user_id,
+            "failed to record user-update audit event"
+        );
+    }
+
+    Ok(ApiJson(user))
+}
+
+fn user_update_audit_event(
+    principal: &Principal,
+    user_id: Uuid,
+    changed_fields: &[String],
+) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "identity.user.update".to_owned(),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user_id.to_string()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(serde_json::json!({
+            "changedFields": changed_fields,
         })),
         ..Default::default()
     }

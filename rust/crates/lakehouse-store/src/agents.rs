@@ -1753,16 +1753,26 @@ pub struct GrantTarget {
 /// [`StoreError::Database`] on any query failure.
 pub async fn find_user_by_email(
     pool: &PgPool,
-    email: &str,
+    identifier: &str,
 ) -> Result<Option<GrantTarget>, StoreError> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, name FROM app_user WHERE lower(email) = lower($1) \
-         ORDER BY (email = $1) DESC, created_at LIMIT 1",
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM app_user \
+         WHERE lower(username) = lower($1) OR lower(email) = lower($1) \
+         LIMIT 2",
     )
-    .bind(email)
-    .fetch_optional(pool)
+    .bind(identifier)
+    .fetch_all(pool)
     .await?;
-    Ok(row.map(|(id, name)| GrantTarget { id, name }))
+
+    if rows.len() > 1 {
+        return Err(StoreError::Validation(
+            "Ambiguous identifier matches multiple users.".to_owned(),
+        ));
+    }
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|(id, name)| GrantTarget { id, name }))
 }
 
 /// A grant made from an asset's page, as the page lists it (`DATA-15` F3).
@@ -1773,8 +1783,9 @@ pub struct AssetGrant {
     pub id: String,
     /// The grantee's name.
     pub user: String,
-    /// The grantee's e-mail, so two people with one name can be told apart.
-    pub user_email: String,
+    /// The grantee's e-mail, so two people with one name can be told
+    /// apart; `None` when the account has none (ADM-11 D1).
+    pub user_email: Option<String>,
     /// The permission token granted.
     pub permission: String,
     /// When it was granted, ISO 8601.
@@ -1793,7 +1804,7 @@ pub struct AssetGrant {
 struct AssetGrantRow {
     id: String,
     user_name: String,
-    user_email: String,
+    user_email: Option<String>,
     permission: String,
     granted_at: OffsetDateTime,
     expires_at: OffsetDateTime,
@@ -2062,13 +2073,15 @@ mod access_request_tests {
     /// `create_access_request` only needs `requested_by_user_id` to
     /// reference a real `app_user`), returning its id.
     async fn seed_test_user(pool: &PgPool, email: &str) -> Uuid {
-        let (id,): (Uuid,) =
-            sqlx::query_as("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-                .bind(email)
-                .bind(email)
-                .fetch_one(pool)
-                .await
-                .expect("seeding a test app_user must succeed");
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(email)
+        .bind(email.to_lowercase())
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .expect("seeding a test app_user must succeed");
         id
     }
 
@@ -2166,7 +2179,7 @@ mod access_request_tests {
         assert_eq!(here[0].id, made.id);
         assert_eq!(here[0].via, "direct");
         assert_eq!(here[0].permission, "query:read");
-        assert_eq!(here[0].user_email, "user@tenant-a.invalid");
+        assert_eq!(here[0].user_email.as_deref(), Some("user@tenant-a.invalid"));
         assert_eq!(
             here[0].granted_by.as_deref(),
             Some("admin@tenant-a.invalid")
@@ -2303,6 +2316,22 @@ mod access_request_tests {
                 .unwrap()
                 .is_none()
         );
+
+        // Can find by username
+        let (u2_id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind("Unique User")
+        .bind("unique.username")
+        .bind(None as Option<String>)
+        .fetch_one(&pool)
+        .await?;
+        let found2 = super::find_user_by_email(&pool, "unique.username")
+            .await
+            .unwrap()
+            .expect("found by username");
+        assert_eq!(found2.id, u2_id);
+
         Ok(())
     }
 }

@@ -2169,13 +2169,15 @@ async fn create_tenant_writes_an_audit_event_on_success() {
 #[tokio::test]
 async fn delete_session_writes_an_audit_event() {
     let TestApp { router, pool } = spin_up().await;
-    let user_id: Uuid =
-        sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-            .bind("caller")
-            .bind("caller-audit-revoke@x.invalid")
-            .fetch_one(&pool)
-            .await
-            .expect("insert a caller");
+    let user_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind("caller")
+    .bind("caller-audit-revoke")
+    .bind("caller-audit-revoke@x.invalid")
+    .fetch_one(&pool)
+    .await
+    .expect("insert a caller");
 
     // Two sessions: one carries the cookie doing the DELETE, one is
     // the target. `revoke_session` checks ownership via the SQL
@@ -3909,6 +3911,7 @@ async fn the_adm_4_identity_write_routes_are_gated_in_both_directions() {
         ("DELETE", "/api/identity/users/{id}/tenants/{tenant_id}"),
         ("POST", "/api/identity/users/{id}/deactivate"),
         ("POST", "/api/identity/users/{id}/reactivate"),
+        ("PATCH", "/api/identity/users/{id}"),
     ] {
         assert_eq!(
             POLICY_TABLE
@@ -4046,4 +4049,29 @@ async fn role_edit_and_delete_are_gated_in_both_directions() {
         "Analyst",
         "a refused update leaves the role alone"
     );
+}
+
+/// `WEB-8` D4: GET /api/identity/permissions requires identity:read both ways.
+#[tokio::test]
+async fn permissions_route_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/identity/permissions")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("identity:read")),
+    );
+    let anonymous = request_with_cookie(&router, "GET", "/api/identity/permissions", "").await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let plain = create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, plain).await;
+    let refused = request_with_cookie(&router, "GET", "/api/identity/permissions", &cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let reader = create_principal_with_permissions(&pool, "identity:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", "/api/identity/permissions", &cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
 }

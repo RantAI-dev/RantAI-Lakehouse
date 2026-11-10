@@ -52,6 +52,17 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "invalid JSON body: {err}",
         "serde error over the caller's own request body",
     ),
+    // ADM-11 review 1 B4: password rule validation error messages are written in this repo
+    (
+        "auth.rs",
+        ".map_err(|err| ApiError::BadRequest(err.to_string()))?;",
+        "password::check_rules validation error text, written in this repository (ADM-11 D4)",
+    ),
+    (
+        "identity.rs",
+        ".map_err(|err| ApiError::BadRequest(err.to_string()))?;",
+        "password::check_rules validation error text, written in this repository (ADM-11 D4)",
+    ),
     (
         "catalog_query.rs",
         "invalid `filters` JSON: {err}",

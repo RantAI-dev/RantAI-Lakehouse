@@ -43,6 +43,7 @@ pub mod error;
 pub mod oidc;
 pub mod openfga;
 pub mod password;
+pub mod permission_catalog;
 pub mod permissions;
 pub mod principal;
 pub mod repository;

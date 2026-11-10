@@ -4,6 +4,7 @@ import type {
   CreateTenantInput,
   IdentityService,
   InviteUserInput,
+  Permission,
   InviteUserResponse,
   ResetPasswordResponse,
   Role,
@@ -11,6 +12,7 @@ import type {
   ServiceIdentity,
   Tenant,
   UpdateRoleInput,
+  UpdateUserInput,
   User,
 } from "../contracts/identity";
 import { apiFetch } from "../http";
@@ -76,6 +78,25 @@ function post<T>(
   );
 }
 
+/** `PATCH` a JSON body (ADM-11 D8 user rename). */
+function patch<T>(
+  url: string,
+  body: unknown,
+  signal: AbortSignal | undefined,
+  fallback: string
+): Promise<T> {
+  return request<T>(
+    url,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    },
+    fallback
+  );
+}
+
 /** `PUT` a JSON body. ADM-4 D1's role change is the only caller today. */
 function put<T>(
   url: string,
@@ -105,6 +126,13 @@ function del<T>(
 }
 
 export const postgresIdentityService: IdentityService = {
+  listPermissions(signal) {
+    return get<Permission[]>(
+      "/api/identity/permissions",
+      signal,
+      "Failed to load permission list"
+    );
+  },
   listUsers(signal) {
     return get<User[]>("/api/identity/users", signal, "Failed to load user list");
   },
@@ -210,6 +238,14 @@ export const postgresIdentityService: IdentityService = {
   },
   // ADM-4 D3: switch a user off, and back on again. Both routes take no
   // body, so both are empty-body POSTs.
+  updateUser(id: string, input: UpdateUserInput, signal) {
+    return patch<User>(
+      `/api/identity/users/${id}`,
+      input,
+      signal,
+      "Failed to update user"
+    );
+  },
   deactivateUser(id: string, signal) {
     return post<User>(
       `/api/identity/users/${id}/deactivate`,

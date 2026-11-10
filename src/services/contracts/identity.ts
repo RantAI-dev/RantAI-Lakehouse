@@ -1,13 +1,24 @@
 export type User = {
   id: string
   name: string
-  email: string
+  username: string
+  email: string | null
   status: "active" | "inactive"
   roles: string[]
   tenants: string[]
   // Nothing writes app_user.last_activity_at (no login, session, or token
   // use records it), so the server never serves a fabricated value here.
   lastActivity: string | null
+}
+
+/**
+ * One entry of the central permission catalog (`WEB-8` D1). Served by
+ * `GET /api/identity/permissions` in catalog order.
+ */
+export type Permission = {
+  name: string
+  area: string
+  description: string
 }
 
 export type Role = {
@@ -45,11 +56,23 @@ export type ServiceIdentity = {
   lastUsedAt: string | null
 }
 
+export type PasswordInput =
+  | { mode: "generate" }
+  | { mode: "set"; value: string }
+
 export type InviteUserInput = {
   name: string
-  email: string
+  username?: string
+  email?: string | null
   roles: string[]
   tenants: string[]
+  password?: PasswordInput
+  mustChangePassword?: boolean
+}
+
+export type UpdateUserInput = {
+  username?: string
+  email?: string | null
 }
 
 /**
@@ -69,7 +92,7 @@ export type InviteUserResponse = User & {
    * The server-generated temporary password. Shown once and never
    * recoverable: the user must change it at first sign-in.
    */
-  temporaryPassword: string
+  temporaryPassword?: string
 }
 
 /**
@@ -149,6 +172,10 @@ export type RotateServiceIdentityResponse = {
 }
 
 export interface IdentityService {
+  /**
+   * The central list of permission strings the API checks (`WEB-8` D1/D4).
+   */
+  listPermissions(signal?: AbortSignal): Promise<Permission[]>
   listUsers(signal?: AbortSignal): Promise<User[]>
   listRoles(signal?: AbortSignal): Promise<Role[]>
   listTenants(signal?: AbortSignal): Promise<Tenant[]>
@@ -212,6 +239,7 @@ export interface IdentityService {
    * Switch a user off (ADM-4 D3): they can no longer sign in, and every
    * session they hold ends at once. Their data stays.
    */
+  updateUser(id: string, input: UpdateUserInput, signal?: AbortSignal): Promise<User>
   deactivateUser(id: string, signal?: AbortSignal): Promise<User>
   /**
    * Switch a user back on (ADM-4 D3).

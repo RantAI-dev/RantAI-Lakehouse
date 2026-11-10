@@ -338,8 +338,8 @@ def step_seed_analyst_login() -> None:
     creates no password credential), the same pattern
     `g8_governance_test.py` uses. Idempotent upserts."""
     user_id = psql(
-        "INSERT INTO app_user (id, name, email, status) "
-        f"VALUES (gen_random_uuid(), 'G8 Time Travel Analyst', '{ANALYST_EMAIL}', 'active') "
+        "INSERT INTO app_user (id, name, email, username, status) "
+        f"VALUES (gen_random_uuid(), 'G8 Time Travel Analyst', '{ANALYST_EMAIL}', '{ANALYST_EMAIL.lower()}', 'active') "
         "ON CONFLICT (email) DO UPDATE SET status = 'active' RETURNING id;"
     )
     phc_hash = PasswordHasher().hash(ANALYST_PASSWORD)

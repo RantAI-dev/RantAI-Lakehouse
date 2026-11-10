@@ -1392,8 +1392,9 @@ pub struct GranteePerson {
     pub id: Uuid,
     /// The person's display name.
     pub name: String,
-    /// The person's email address.
-    pub email: String,
+    /// The person's email address; `None` when the account has none
+    /// (ADM-11 D1 made the column nullable).
+    pub email: Option<String>,
 }
 
 /// One role a saved query may be shared with.
@@ -1458,12 +1459,12 @@ pub async fn search_grantees(
     let limit = limit.max(0);
     let pattern = escape_like_pattern(needle.trim());
     let people: Vec<GranteePerson> = sqlx::query_as(
-        "SELECT u.id, u.name, u.email FROM app_user u \
+        "SELECT u.id, u.name, COALESCE(u.email, u.username) AS email FROM app_user u \
          WHERE u.status = 'active' \
            AND ($1::uuid IS NULL OR EXISTS ( \
                 SELECT 1 FROM app_user_tenant t \
                  WHERE t.user_id = u.id AND t.tenant_id = $1)) \
-           AND (u.name ILIKE $2 OR u.email ILIKE $2) \
+           AND (u.name ILIKE $2 OR u.username ILIKE $2 OR u.email ILIKE $2) \
          ORDER BY u.name, u.email LIMIT $3",
     )
     .bind(tenant_id)

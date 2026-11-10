@@ -70,6 +70,7 @@ export const identityService = postgresIdentityService
 export type {
   InviteUserInput,
   InviteUserResponse,
+  Permission,
   ResetPasswordResponse,
   Role,
   ServiceIdentity,

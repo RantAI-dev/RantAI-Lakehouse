@@ -152,6 +152,7 @@ pub(crate) fn export_failure(
 fn auth_router() -> Router<AppState> {
     Router::new()
         .route("/api/auth/login", axum::routing::post(auth::login))
+        .route("/api/auth/password-rules", get(auth::password_rules))
         .route("/api/auth/logout", axum::routing::post(auth::logout))
         .route("/api/auth/me", get(auth::me))
         .route(
@@ -1113,6 +1114,11 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users",
             get(identity::list_users).post(identity::create_user),
         )
+        // ADM-11 D8: update a user's username and/or email.
+        .route(
+            "/api/identity/users/{id}",
+            axum::routing::patch(identity::update_user),
+        )
         // Give an existing user a tenant. Both ids are validated inside
         // the handler (400 when malformed, 404 when unknown).
         .route(
@@ -1150,6 +1156,7 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users/{id}/reset-password",
             axum::routing::post(identity::reset_user_password),
         )
+        .route("/api/identity/permissions", get(identity::list_permissions))
         .route(
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),
@@ -1847,6 +1854,19 @@ async fn timeout_middleware(State(state): State<AppState>, req: Request, next: N
         )
             .into_response(),
     }
+}
+
+/// Every AI tool permission — `routes::ai::registry::TOOLS`'s non-empty
+/// `permission` fields (`WEB-8` D5). A `pub` fn on this module because
+/// `registry` itself is only `pub(in crate::routes)`: the permission
+/// catalog's drift test (`tests/permission_catalog.rs`) reads the tool
+/// permissions through this, so `PERMISSIONS` cannot fall behind what
+/// the tools gate.
+pub fn ai_tool_permissions() -> impl Iterator<Item = &'static str> {
+    ai::registry::TOOLS
+        .iter()
+        .map(|tool| tool.permission)
+        .filter(|permission| !permission.is_empty())
 }
 
 #[cfg(test)]
