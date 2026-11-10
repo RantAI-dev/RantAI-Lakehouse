@@ -399,11 +399,12 @@ pub(super) async fn scope_for_write(
 }
 
 /// Who may make a `create_chart` or `update_chart` call and on which
-/// dashboards: a signed-in person ([`scope_for_write`]), then the level checks
-/// of the console's write routes (`specs_create`/`specs_update`), `edit` on the
-/// dashboard the chart is on and on the one it moves to (`BI-19` B2 review
-/// B2-1). The one copy of these checks: the dispatcher runs it before the save
-/// and [`check_draft`] runs it before the draft, so a draft is refused with the
+/// dashboards: a signed-in person ([`scope_for_write`]), then the map the call
+/// names ([`maps::require_known_map`]), then the level checks of the console's
+/// write routes (`specs_create`/`specs_update`), `edit` on the dashboard the
+/// chart is on and on the one it moves to (`BI-19` B2 review B2-1). The one
+/// copy of these checks: the dispatcher runs it before the save and
+/// [`check_draft`] runs it before the draft, so a draft is refused with the
 /// reply the save gives (`PR #391 review`, `PR #402 review`).
 ///
 /// Returns the caller's [`Scope`](crate::routes::dashboard_access::Scope),
@@ -415,6 +416,12 @@ async fn require_chart_call_allowed(
     args: &Map<String, Value>,
 ) -> Result<crate::routes::dashboard_access::Scope, Value> {
     let scope = scope_for_write(state, principal).await?;
+    // `AI-6`: a chart call that names a map that does not exist is refused
+    // here, so the draft and the save refuse it with one sentence. It runs
+    // after the writer check (nobody without `dashboard:write` learns which
+    // maps exist) and before the board checks (the map catalogue needs no
+    // dashboard).
+    maps::require_known_map(state, name, args).await?;
     if name == "create_chart" {
         require_edit_on(state, &scope, &arg_str(args, "board")).await?;
     } else {
@@ -1006,6 +1013,99 @@ mod tests {
                 .is_some_and(|message| message.contains("there is none")),
             "{saved}"
         );
+    }
+
+    /// `AI-6`: a chart call that names a map that does not exist is refused by
+    /// the draft check and by the save, with one sentence that names the maps
+    /// the model may use.
+    #[tokio::test]
+    async fn the_draft_of_a_create_on_a_map_that_does_not_exist_is_refused_as_the_save_is() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "board": "b1", "title": "T", "kind": "geomap", "map": "indonesia",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = assert_the_draft_is_refused_as_the_save_is(
+            &state,
+            Some(&writer),
+            "create_chart",
+            &args,
+        )
+        .await;
+        assert_eq!(
+            saved["error"],
+            json!(
+                "map 'indonesia' does not exist. Use one of: dki-jakarta, id-provinces, id-regencies, world, adm1-<iso3> for a country's provinces, or an uploaded map from list_maps."
+            ),
+            "{saved}"
+        );
+    }
+
+    /// A chart on a map that exists is not refused by the map check: the
+    /// built-in ids and a country's map pass it.
+    #[tokio::test]
+    async fn a_chart_on_a_map_that_exists_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        for map in ["id-provinces", "world", "adm1-usa"] {
+            let args = json!({
+                "board": "b1", "title": "T", "kind": "geomap", "map": map,
+            })
+            .as_object()
+            .cloned()
+            .unwrap();
+            let saved = run_tool(&state, Some(&writer), "create_chart", &args).await;
+            assert!(
+                !saved["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("does not exist. Use one of:"),
+                "{map} may be named: {saved}"
+            );
+        }
+    }
+
+    /// An update that names no map — none at all, a `null` one or a blank one
+    /// — keeps the stored one, so the map check has nothing to refuse.
+    #[tokio::test]
+    async fn an_update_that_names_no_map_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        for map in [None, Some(json!(null)), Some(json!("   "))] {
+            let mut args = json!({ "id": "c1", "title": "T", "kind": "bar" })
+                .as_object()
+                .cloned()
+                .unwrap();
+            if let Some(map) = map.as_ref() {
+                args.insert("map".to_owned(), map.clone());
+            }
+            let saved = run_tool(&state, Some(&writer), "update_chart", &args).await;
+            assert!(
+                !saved["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("does not exist. Use one of:"),
+                "{map:?}: {saved}"
+            );
+        }
     }
 
     // PR review fix (SHOULD-FIX): `AI_ASK_BACK=false` only hid `ask_user` from
