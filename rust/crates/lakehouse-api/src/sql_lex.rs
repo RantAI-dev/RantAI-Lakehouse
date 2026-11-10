@@ -33,9 +33,13 @@
 //!   character, and a doubled quote is an escaped quote.
 //! - `--` starts a line comment. `#` starts one only when the next
 //!   character is a space or `!`; every other `#` is an "Unrecognized
-//!   token" error. `Lexer.cpp` says so: "For less ambiguity, we will
-//!   recognize a comment only if # is followed by whitespace. or #! as a
-//!   special case for "shebang"."
+//!   token" error. A tab is not a comment either: on `26.8.15.10` a tab
+//!   after the `#` is refused with "Unrecognized token"
+//!   (`a_tab_after_a_hash_is_not_a_comment_on_clickhouse` pins it). The
+//!   engine's own comment in `Lexer.cpp` says: "For less ambiguity, we
+//!   will recognize a comment only if # is followed by whitespace. or #!
+//!   as a special case for "shebang"." — that "whitespace" is the
+//!   engine's wording; the measurement is what the code follows.
 //! - `/* … */` comments nest: the comment runs to the `*/` that closes the
 //!   outermost one. The `#437` review read the nesting rule out of
 //!   `ClickHouse`'s own lexer.
@@ -59,10 +63,17 @@
 //! - A `$` opens a heredoc only where it starts a token. The run of
 //!   `[A-Za-z0-9_$]` before it is a name when it starts with a letter, `_`
 //!   or `$` — the engine's bareword reader takes those — and a number
-//!   otherwise, so the `$` opens the heredoc. Measured: `SELECT 'x' AS
-//!   a$$b` answers `x` and `SELECT 'x' AS _a$$b$$` is the identifier
+//!   otherwise, so the `$` opens the heredoc. A non-ASCII character is
+//!   not in that set, so it ends the run and the `$` after it opens the
+//!   heredoc — but the engine refuses the statement at that character
+//!   with "Unrecognized token", so the statement never runs and the
+//!   heredoc question never decides it. Measured: `SELECT 'x' AS a$$b`
+//!   answers `x` and `SELECT 'x' AS _a$$b$$` is the identifier
 //!   `_a$$b$$`, while `1$$`, `1.5$$`, `0x1F$$` and `1a$$` each open a
-//!   heredoc. (`#437` review)
+//!   heredoc; on `26.8.15.10` `SELECT 'x' AS aé$$b` and `SELECT 'x' AS
+//!   中$$b` are refused at the non-ASCII character
+//!   (`a_dollar_after_a_non_ascii_character_opens_a_heredoc_on_clickhouse`
+//!   pins it). (`#437` review)
 //!
 //! ## `Trino`
 //!
