@@ -413,7 +413,8 @@ def where_matches(item: Any, where: dict[str, Any]) -> bool:
     own field; a dotted key reads into it (`def.grain` is the `grain` of the
     item's `def`, as `GET /api/dashboard/specs` nests it). A key that is absent
     does not match. A field that holds a list matches when the value is one of
-    its members (`def.measures` names a measure the chart uses)."""
+    its members, or when a member is an object whose `column` names it
+    (`def.measures` names a measure the chart uses)."""
     if not isinstance(item, dict):
         return False
     for key, want in where.items():
@@ -426,8 +427,23 @@ def where_matches(item: Any, where: dict[str, Any]) -> bool:
 
 
 def _is_or_holds(got: Any, want: Any) -> bool:
+    """Whether a value read from an item satisfies a `where` value.
+
+    A list matches when the wanted value is one of its members, or when the
+    wanted value is a string and a member is an object whose `column` names
+    it: the model writes a measure as `{"column": "per_event", "aggregate":
+    "sum"}`, so a case that asks for the measure `per_event` has to match
+    that object. Only the column names the measure; the aggregate does not.
+    The column match is exact and case-sensitive, like the string arm."""
     if isinstance(got, list):
-        return want in got
+        if want in got:
+            return True
+        if isinstance(want, str):
+            return any(
+                isinstance(member, dict) and member.get("column") == want
+                for member in got
+            )
+        return False
     return got == want
 
 
