@@ -376,7 +376,7 @@ macro_rules! limits_and_freshness {
 /// Appended in ask mode.
 pub(super) const SYSTEM_ASK_SUFFIX: &str = concat!("
 
-MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode.", limits_and_freshness!());
+MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode. A name describe_mart does not list may be a calculated field: to explain one, or before saying a field does not exist, call list_calculated_fields for that mart or SQL source, which explains the formula in plain words, and run no SQL for it.", limits_and_freshness!());
 
 /// What the model is told when the person cannot change dashboards (`BI-18`
 /// part C review fix (SHOULD-FIX) R30). The tools that write are then not in
@@ -760,6 +760,23 @@ const DOMAINS: &[Domain] = &[
             "delete_parameter",
         ],
     },
+    // AI-4 (plan 72): a question about a field. The dashboard domain's word
+    // list holds `calculated` and `formula`, but not the bare word "field",
+    // which is how a person asks about a calculated field in Ask mode, where
+    // the dashboard domain's writes are dropped anyway. The bare word "kolom"
+    // is not a word here: an Indonesian question uses it for a physical column
+    // all the time.
+    Domain {
+        words: &[
+            "field",
+            "kolom kalkulasi",
+            "formula",
+            "rumus",
+            "calculated",
+            "kolom hitung",
+        ],
+        tools: &["list_calculated_fields"],
+    },
     // BI-5 / D7: the query limits and Stop.
     Domain {
         words: &[
@@ -1096,6 +1113,41 @@ mod tests {
         assert!(!tools.contains("create_chart"));
     }
 
+    /// `AI-4` (plan 72): a question about a field must reach
+    /// `list_calculated_fields` in Ask mode too. The dashboard domain's word
+    /// list holds `calculated` and `formula`, but not the bare word "field",
+    /// which is how a person asks about a calculated field.
+    #[test]
+    fn a_question_about_a_field_offers_list_calculated_fields() {
+        for question in [
+            "Jelaskan field total_tamu di mart_event",
+            "What does the calculated field per_event do?",
+        ] {
+            let tools = select_tools(&[question], false);
+            assert!(
+                tools.contains("list_calculated_fields"),
+                "`{question}` should offer list_calculated_fields: {tools:?}"
+            );
+        }
+    }
+
+    /// `AI-4` (plan 72): a question that names no field keeps its own tool
+    /// list. The bare word "kolom" is not a word of the domain either, because
+    /// an Indonesian question uses it for a physical column all the time.
+    #[test]
+    fn a_question_without_a_field_word_does_not_offer_list_calculated_fields() {
+        for question in [
+            "How many foreign tourists came in 2024?",
+            "Berapa kolom di mart_event?",
+        ] {
+            let tools = select_tools(&[question], false);
+            assert!(
+                !tools.contains("list_calculated_fields"),
+                "`{question}` should not offer list_calculated_fields: {tools:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_domain_word_brings_in_that_domain_only() {
         let tools = select_tools(&["Make a bar chart of events per year"], false);
@@ -1348,8 +1400,9 @@ mod tests {
     /// breakdown, so "top N of Y over time" has two honest shapes and the
     /// model says which it made; it states no count a tool did not give; it
     /// renames a chart when its content changes; it explains a calculated
-    /// field with `list_calculated_fields`. Build mode only: the Ask prompt
-    /// is pinned by hash and has no chart to describe.
+    /// field with `list_calculated_fields`. The chart rules are Build mode
+    /// only: the Ask prompt carries its own calculated-field sentence (plan
+    /// 72) and has no chart to describe.
     #[test]
     fn the_build_prompt_says_what_a_limit_counts_and_four_rules_for_what_the_model_states() {
         for clause in [
@@ -1704,6 +1757,20 @@ mod tests {
             SYSTEM_BUILD_SUFFIX
                 .contains("a name describe_mart does not list may be a calculated field"),
             "the reason for the lookup is missing from the build prompt"
+        );
+    }
+
+    /// `AI-4` (plan 72): the Ask prompt carries its own calculated-field
+    /// sentence, worded apart from the build one, so a person who asks in Ask
+    /// mode gets the field explained instead of "there is no field with that
+    /// name".
+    #[test]
+    fn the_ask_prompt_sends_a_missing_field_to_list_calculated_fields_first() {
+        assert!(
+            SYSTEM_ASK_SUFFIX.contains(
+                "A name describe_mart does not list may be a calculated field: to explain one, or before saying a field does not exist, call list_calculated_fields for that mart or SQL source, which explains the formula in plain words, and run no SQL for it."
+            ),
+            "the calculated-field lookup rule is missing from the ask prompt"
         );
     }
 
