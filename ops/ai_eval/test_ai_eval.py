@@ -957,12 +957,41 @@ class WhereMatchTests(unittest.TestCase):
         self.assertTrue(m.where_matches(REAL_SPEC_ITEM, {"def.measures": "jumlah"}))
         self.assertFalse(m.where_matches(REAL_SPEC_ITEM, {"def.measures": "other"}))
 
+    def test_a_measure_written_as_an_object_matches_by_its_column(self) -> None:
+        # The model writes a measure as `{"column": ..., "aggregate": ...}`,
+        # so a where value that names the column must still match it.
+        item = {"def": {"measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        self.assertTrue(m.where_matches(item, {"def.measures": "per_event"}))
+
+    def test_a_measure_object_does_not_match_another_name_or_its_aggregate(self) -> None:
+        # Only the column names the measure; an aggregate is not a column.
+        item = {"def": {"measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        self.assertFalse(m.where_matches(item, {"def.measures": "other"}))
+        self.assertFalse(m.where_matches(item, {"def.measures": "sum"}))
+
+    def test_a_list_that_mixes_a_string_and_a_measure_object_matches_either_name(self) -> None:
+        item = {"def": {"measures": ["jumlah", {"column": "per_event", "aggregate": "sum"}]}}
+        self.assertTrue(m.where_matches(item, {"def.measures": "jumlah"}))
+        self.assertTrue(m.where_matches(item, {"def.measures": "per_event"}))
+
     def test_a_state_check_with_a_dotted_key_counts_matching_charts(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("GET", "/api/dashboard/specs"): {"charts": [REAL_SPEC_ITEM]}})
         check = {"path": "/api/dashboard/specs", "list": "charts",
                  "where": {"kind": "line", "def.grain": "month"}, "count": 1}
         self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-real"}), [])
+
+    def test_a_state_check_counts_a_chart_whose_measure_is_written_as_an_object(self) -> None:
+        # The `calc_then_chart` case checks `{"mart": ..., "def.measures":
+        # "per_event"}`, and the model writes the measure as an object.
+        chart = {"id": "c-1", "mart": "mart_event",
+                 "def": {"mart": "mart_event",
+                         "measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        cfg = make_cfg()
+        session = FakeSession({("GET", "/api/dashboard/specs"): {"charts": [chart]}})
+        check = {"path": "/api/dashboard/specs", "list": "charts",
+                 "where": {"mart": "mart_event", "def.measures": "per_event"}, "count": 1}
+        self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-1"}), [])
 
     def test_a_path_with_an_index_reads_the_element_at_that_place_in_a_list(self) -> None:
         # `tabs[0].title` is the first tab's title, so a case can check the
