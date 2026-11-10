@@ -6330,9 +6330,11 @@ mod tests {
             let trino = trino_answering_one_row().await;
             let state = state_without_pool("http://unused.invalid", &trino.uri());
 
-            // The guard reads a backslash as an escape. A raw `'\'` would
-            // look unterminated to it and hide the `DROP` from its keyword
-            // scan; the Trino printer writes the backslash as `chr(92)`.
+            // The `Trino` printer writes the backslash as `chr(92)`, so no
+            // raw backslash reaches the statement, and the guard reads the
+            // statement the way `Trino` reads it: a backslash is a plain
+            // character there, so the quoted run ends at its quote and the
+            // `DROP` behind the value stays visible to the keyword scan.
             let (status, message) = refusal(
                 run(
                     State(state),

@@ -27,10 +27,11 @@
 //! refuses a placeholder inside a heredoc (`#420`), and the only place a
 //! value can land is still the quoted literal the printer writes.
 //!
-//! The guards in [`crate::sql_guard`] read a backslash as an escape on both
-//! engines. A `Trino` literal ending in a backslash would look unterminated
-//! to them, so the `Trino` printer never writes a backslash: see
-//! `trino_text`.
+//! The guards in [`crate::sql_guard`] read each engine's text the way that
+//! engine reads it, so the `Trino` guard ends a quoted run at the quote,
+//! like `Trino` does. The `Trino` printer keeps writing a backslash as
+//! `chr(92)` pieces, so that no raw backslash reaches the statement and no
+//! reader of it can take the backslash for an escape: see `trino_text`.
 //!
 //! # What is scanned, and when
 //!
@@ -57,10 +58,11 @@
 //! refuses one inside quotes. A heredoc opens only where its `$` starts a
 //! token: the engine reads `a$$b` as one identifier, so the `$$` belongs to
 //! that name and the text after it is ordinary SQL, but it reads a number
-//! without the `$`, so `1$$` opens a heredoc. A block comment nests there,
-//! so the comment runs to the `*/` that closes the outermost one and a
-//! placeholder inside it is ignored as any other comment's is. `Trino` has
-//! neither a heredoc nor nested comments, and nothing changes there.
+//! without the `$`, so `1$$` opens a heredoc. A block comment nests there
+//! (`#437`), so the comment runs to the `*/` that closes the outermost one
+//! and a placeholder inside it is ignored as any other comment's is.
+//! `Trino` has neither a heredoc nor nested comments, and nothing changes
+//! there.
 //!
 //! The rules that say all this live in [`crate::sql_lex`], one set for both
 //! engines, and the scanner reads the statement with them (`SEC-62`).
@@ -722,12 +724,13 @@ fn print_value(engine: Engine, value: &ParamValue) -> String {
 
 /// Text as a `Trino` expression that contains no backslash.
 ///
-/// `Trino` has no backslash escape, so `'a\'` is a complete string there.
-/// The guards in [`crate::sql_guard`] read a backslash as an escape, as
-/// `ClickHouse` does, so a literal ending in one would look unterminated to
-/// them and hide the rest of the statement from their keyword scan. A text
-/// with a backslash is therefore written as its pieces between the
-/// backslashes, joined by `chr(92)`: `a\b` becomes `('a' || chr(92) || 'b')`.
+/// `Trino` has no backslash escape, so `'a\'` is a complete string there,
+/// and the guards in [`crate::sql_guard`] read it that way too: each
+/// engine's statement is read with that engine's own rules (`SEC-62`).
+/// A text with a backslash is written as its pieces between the
+/// backslashes, joined by `chr(92)`, so that no raw backslash reaches the
+/// statement and no reader of it can take the backslash for an escape:
+/// `a\b` becomes `('a' || chr(92) || 'b')`.
 /// A quote inside a piece is doubled, as in any `Trino` literal.
 fn trino_text(text: &str) -> String {
     let quote = |piece: &str| format!("'{}'", piece.replace('\'', "''"));

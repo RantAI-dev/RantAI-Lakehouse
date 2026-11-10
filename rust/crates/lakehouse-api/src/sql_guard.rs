@@ -12,7 +12,8 @@
 //!
 //! The guard reads the statement the way the engine that will run it reads
 //! it, and the rules are [`crate::sql_lex`]'s — one set, one lexer, one
-//! place (`SEC-62`). The guard takes the engine as an argument for that
+//! place (`SEC-62`; the findings came out of the `#420` and `#437`
+//! reviews). The guard takes the engine as an argument for that
 //! reason: a `ClickHouse` statement and a `Trino` statement are not the
 //! same text, and a copy of the rules that does not know the engine's is a
 //! hole rather than a nuisance.
