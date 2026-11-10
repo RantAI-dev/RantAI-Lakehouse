@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { Button } from "@/components/ui/button"
 import { MetadataList, type MetadataItem } from "@/components/patterns/metadata-list"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
 import {
@@ -14,7 +15,9 @@ import {
 } from "@/lib/uploads"
 import type { Upload, UploadLoadMode, UploadOnBadValue, UploadPreviewColumn } from "@/services/contracts/uploads"
 import type { UploadPreviewView } from "./upload-check-step"
+import { BadValuesReport } from "./upload-columns"
 import { Refusal } from "./upload-parts"
+import type { CheckState } from "./use-column-choices"
 
 const DATE_WORDS = { iso: "year first", dmy: "day first", mdy: "month first" } as const
 
@@ -48,6 +51,8 @@ export function UploadReviewStep({
   mode,
   columns,
   onBadValue,
+  check,
+  onBackToCheck,
   error,
   otherFiles,
 }: {
@@ -62,6 +67,10 @@ export function UploadReviewStep({
   readonly columns: readonly UploadPreviewColumn[]
   /** What happens to a value that does not fit. */
   readonly onBadValue: UploadOnBadValue
+  /** The check of the column list against the sample; its bad values are listed here (QA LH-DATA-18-08). */
+  readonly check: CheckState
+  /** Goes back to the Check step, where the types can be changed. */
+  readonly onBackToCheck: () => void
   readonly error: React.ComponentProps<typeof Refusal>["error"] | null
   /** The names of the files loaded with the first (`DATA-17` slice 5); empty for a load of one file. */
   readonly otherFiles: readonly string[]
@@ -76,8 +85,28 @@ export function UploadReviewStep({
       ? `The rows already in the table stay, and ${several ? "these files'" : "this file's"} are added after them.`
       : `Any rows the table already holds are replaced by ${several ? "these files'" : "this file's"}.`
 
+  // QA LH-DATA-18-08 (AC8): "the mismatch is listed before loading". After "Add to its rows"
+  // the types come from the table and the check re-runs; only the Check step showed it.
+  const bad = check.status === "done" && check.result.count > 0 ? check.result : null
+
   return (
     <div className="space-y-4">
+      {bad ? (
+        <section
+          className="space-y-3 rounded-lg border border-destructive/30 bg-destructive/5 p-4"
+          aria-label="Values that do not fit"
+        >
+          <BadValuesReport bad={bad} />
+          <p className="text-sm">
+            {onBadValue === "stop"
+              ? "The load stops at the first of these and writes nothing."
+              : "These values are loaded as empty."}
+          </p>
+          <Button type="button" variant="outline" size="sm" onClick={onBackToCheck}>
+            Back to Check
+          </Button>
+        </section>
+      ) : null}
       <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-muted/30">
         <Group
           title={several ? "Files" : "File"}

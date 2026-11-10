@@ -217,7 +217,13 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
         ? view.ready && choices.ready && group.ready
         : step === TABLE_STEP
           ? tableName !== "" && nameProblem === null
-          : view.ready && choices.ready && group.ready && tableName !== "" && nameProblem === null
+          : view.ready &&
+            choices.ready &&
+            group.ready &&
+            tableName !== "" &&
+            nameProblem === null &&
+            // QA LH-DATA-18-08 (D4): with "stop" a load of values that do not fit writes nothing.
+            !(choices.check.status === "done" && choices.check.result.count > 0 && choices.onBadValue === "stop")
 
   const notices =
     upload !== null && step !== FILE_STEP ? (
@@ -297,6 +303,8 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
           mode={effectiveMode}
           columns={choices.columns}
           onBadValue={choices.onBadValue}
+          check={choices.check}
+          onBackToCheck={() => setStep(CHECK_STEP)}
           error={ingest.error}
           otherFiles={group.files.map((f) => f.name)}
         />

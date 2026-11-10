@@ -1529,6 +1529,65 @@ describe("UploadFilePage, column types", () => {
     ])
   })
 
+  // QA LH-DATA-18-08 (DATA-18-AC8): the mismatch is listed on the Review step, before loading.
+  const BAD = {
+    sampledRows: 3,
+    count: 2,
+    byColumn: [{ column: "sku", count: 2 }],
+    rows: [
+      { row: 1, column: "sku", value: "A-1" },
+      { row: 3, column: "sku", value: "B-2" },
+    ],
+  }
+  const NONE = { sampledRows: 3, count: 0, byColumn: [], rows: [] }
+
+  /** Changes sku to integer (so the check runs) and goes on to Review. */
+  async function toReview(result: typeof BAD | typeof NONE) {
+    const calls = await openColumns({
+      check: () => result,
+      ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
+    })
+    fireEvent.change(screen.getByLabelText("Type of sku"), { target: { value: "integer" } })
+    if (result.count > 0) await screen.findByText(/2 values do not fit/, {}, { timeout: 2000 })
+    return calls
+  }
+
+  async function goOn() {
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(next())
+    await screen.findByText(/^Load reads/)
+  }
+
+  it("lists the values that do not fit on the Review step and turns Load off while the choice is Stop", async () => {
+    await toReview(BAD)
+    await goOn()
+    const panel = screen.getByLabelText("Values that do not fit")
+    expect(panel.textContent).toContain("2 values do not fit in the first 3 rows")
+    expect(within(panel).getByText("A-1")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(true)
+    // Back to Check returns to the step that can change the types.
+    fireEvent.click(within(panel).getByRole("button", { name: "Back to Check" }))
+    expect(await screen.findByLabelText("Type of sku")).toBeDefined()
+  })
+
+  it("lists them on the Review step with the 'loaded as empty' line and keeps Load on when the choice is empty", async () => {
+    await toReview(BAD)
+    fireEvent.click(screen.getByLabelText(/Load them as empty/))
+    await goOn()
+    const panel = screen.getByLabelText("Values that do not fit")
+    expect(panel.textContent).toContain("These values are loaded as empty.")
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it("shows nothing extra on the Review step when every value fits, and Load is on", async () => {
+    await toReview(NONE)
+    await goOn()
+    expect(screen.queryByLabelText("Values that do not fit")).toBeNull()
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
   it("keeps Next off until 'day first or month first?' is answered", async () => {
     const asking = typedColumns()
     asking[2] = { source: "Due", name: "due", type: "date", guessedType: "date", askDateOrder: true }

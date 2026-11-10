@@ -192,6 +192,22 @@ export function BadValuesList({ bad }: { readonly bad: UploadBadValues }) {
 }
 
 /**
+ * The "N values do not fit" heading and the list under it. The Check step and the Review
+ * step show the same one (QA LH-DATA-18-08: the mismatch is listed before loading).
+ */
+export function BadValuesReport({ bad }: { readonly bad: UploadBadValues & { sampledRows?: number } }) {
+  return (
+    <>
+      <h3 className="text-sm font-semibold text-destructive">
+        {formatNumber(bad.count)} {bad.count === 1 ? "value does" : "values do"} not fit
+        {bad.sampledRows ? ` in the first ${formatNumber(bad.sampledRows)} rows` : ""}
+      </h3>
+      <BadValuesList bad={bad} />
+    </>
+  )
+}
+
+/**
  * Before Load: the check of the column list against the sample, and the choice of
  * what to do with a value that does not fit (`DATA-18` decision 6). **Stop** is
  * pre-selected. Nothing is shown while every value fits, except that they do.
@@ -221,15 +237,7 @@ export function UploadBadValuesPanel({ choices, sampledRows }: { readonly choice
           All {formatNumber(check.result.sampledRows || sampledRows)} sampled rows fit these types.
         </p>
       ) : null}
-      {bad ? (
-        <>
-          <h3 className="text-sm font-semibold text-destructive">
-            {formatNumber(bad.count)} {bad.count === 1 ? "value does" : "values do"} not fit
-            {bad.sampledRows ? ` in the first ${formatNumber(bad.sampledRows)} rows` : ""}
-          </h3>
-          <BadValuesList bad={bad} />
-        </>
-      ) : null}
+      {bad ? <BadValuesReport bad={bad} /> : null}
       <fieldset className="space-y-1.5">
         <legend className="text-sm font-medium">What should happen to a value that does not fit?</legend>
         <label className="flex items-center gap-2 text-sm">
