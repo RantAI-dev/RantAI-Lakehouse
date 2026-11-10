@@ -9,6 +9,7 @@ import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useService, type ServiceState } from "@/hooks/use-service"
+import { BRONZE_NAMESPACE } from "@/lib/asset-query"
 import { formatBytes, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/format"
 import {
   isIcebergCandidate,
@@ -25,12 +26,6 @@ import type {
   LakehouseSnapshot,
   LakehouseTableDetail,
 } from "@/services/contracts/lakehouse"
-
-/**
- * Every Iceberg candidate lives in this namespace (dlt writes Bronze with
- * `dataset_name="bronze"`, see the module comment in `catalog.rs`).
- */
-const BRONZE_NAMESPACE = "bronze"
 
 /**
  * The asset's Iceberg table, loaded once for every tab that shows a part

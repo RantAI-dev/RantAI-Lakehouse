@@ -5,7 +5,7 @@ import { ChevronDown, ChevronRight, Lock, RotateCcw, X } from "lucide-react"
 
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
-import { quoteIdent } from "@/lib/asset-query"
+import { quoteIdent, NO_READABLE_TABLE } from "@/lib/asset-query"
 import type { CompletionTable } from "@/lib/sql-completion"
 import { DATA_LAYER_LABEL, type DataLayer } from "@/lib/status"
 import type { useQueryStudio } from "./use-query-studio"
@@ -44,7 +44,7 @@ export function SchemaBrowser({
   readonly studio: ReturnType<typeof useQueryStudio>
   readonly onClose: () => void
 }) {
-  const { assetsState, tables, columns, engine, loadColumns, insertAtCursor } = studio
+  const { assetsState, tables, columns, engine, loadColumns, insertAtCursor, proofs } = studio
   const [expanded, setExpanded] = React.useState<ReadonlySet<string>>(new Set())
 
   const toggle = (id: string) => {
@@ -111,6 +111,7 @@ export function SchemaBrowser({
                       engine={engine}
                       open={expanded.has(table.id)}
                       state={columns[table.id]}
+                      proof={proofs[table.id]}
                       onToggle={() => toggle(table.id)}
                       onInsert={insertAtCursor}
                       onRetry={() => loadColumns(table.id, { retry: true })}
@@ -131,6 +132,7 @@ function TableRow({
   engine,
   open,
   state,
+  proof,
   onToggle,
   onInsert,
   onRetry,
@@ -139,12 +141,21 @@ function TableRow({
   readonly engine: ReturnType<typeof useQueryStudio>["engine"]
   readonly open: boolean
   readonly state: ReturnType<typeof useQueryStudio>["columns"][string] | undefined
+  readonly proof: ReturnType<typeof useQueryStudio>["proofs"][string] | undefined
   readonly onToggle: () => void
   readonly onInsert: (text: string) => void
   readonly onRetry: () => void
 }) {
   const insertable = table.reference !== ""
-  const missingReason = table.trinoOnly && engine !== "trino" ? BRONZE_NEEDS_TRINO : NO_SQL_NAME
+  // Why the table cannot be inserted, in the order a person meets them: a
+  // ClickHouse tab reads a Bronze table with Trino, and a Bronze table whose
+  // Iceberg table is not there has no table to read at all.
+  const missingReason =
+    table.trinoOnly && engine !== "trino"
+      ? BRONZE_NEEDS_TRINO
+      : proof?.status === "missing"
+        ? NO_READABLE_TABLE
+        : NO_SQL_NAME
   return (
     <li>
       <div className="flex items-center gap-1">
