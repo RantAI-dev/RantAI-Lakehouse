@@ -195,9 +195,69 @@ Owner, 2026-11-09: D1 to D3. Planner: the rest.
 
 ## 5. Handoff (developer appends below)
 
-Give the commits, the exact commands with their counts, the D5 route-caller list, the D6 list
-of read tools and in-handler checks, anything *not verified* and why, and the output of
-`git status --short`, `git log --oneline origin/main..HEAD` and `git ls-remote --heads origin
-<branch>`.
+### Handoff (developer, 2026-11-09)
+
+#### Commits
+- `78a680fe` - `feat(auth): catalog entries and role migration for pages per role (ADM-13 T1)` (D1, D2, D3, D4)
+- `b2f9c904` - `feat(api): any-of route policy and per-role route gates (ADM-13 T2)` (D2, D3, D4, D5)
+- `830e4925` - `feat(api): ask-only assistant mode and read-tool gating (ADM-13 T3)` (D4, D6)
+- `ec829e84` - `feat(console): access map and route permissions (ADM-13 T4)` (D7)
+- `ce8d1e70` - `feat(console): per-role navigation and route guard (ADM-13 T5)` (D8)
+- Task T6 commit follows with documentation updates and handoff record.
+
+#### Exact commands and counts
+- **Rust formatting:**
+  `cargo fmt --check` (from `rust/`): passed, exit code 0.
+- **Rust clippy:**
+  `sg docker -c '/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings'`: passed, exit code 0 (0 warnings).
+- **Rust workspace test suites:**
+  - `lakehouse-core`: 50 passed; 0 failed; 0 doc
+  - `lakehouse-dagster`: 72 passed; 0 failed; 0 doc
+  - `lakehouse-embed`: 23 passed; 0 failed; 0 doc
+  - `lakehouse-notify`: 2 passed; 0 failed; 0 doc
+  - `lakehouse-test-support`: 32 passed; 0 failed; 0 doc
+  - `lakehouse-trino`: 22 passed; 0 failed; 0 doc
+  - `lakehousectl`: 197 passed; 0 failed
+  - `lakehouse-alerts`: 130 passed; 0 failed; 1 ignored; 0 doc
+  - `lakehouse-auth`: 163 passed (75 lib, 28 oidc, 15 openfga, 1 pages_per_role_migration, 5 password, 8 repository, 8 service_token, 9 session, 14 throttle); 0 failed; 1 ignored; 0 doc
+  - `lakehouse-bi`: 625 passed (624 lib, 1 specs_match_typescript); 0 failed; 0 doc
+  - `lakehouse-clickhouse`: 41 passed; 0 failed; 0 doc
+  - `lakehouse-iceberg`: 33 passed; 0 failed; 3 ignored (live container G1); 0 doc
+  - `lakehouse-llm`: 26 passed; 0 failed; 0 doc
+  - `lakehouse-store`: 964 passed across 41 binaries (315 lib + 649 integration tests including 25 in `identity.rs`); 0 failed; 0 doc
+  - `lakehouse-api`:
+    - `policy::tests`: 28 passed; 0 failed
+    - `routes::ai::`: 571 passed; 0 failed; 1 ignored
+    - `routes::` (remaining routes): 2083 passed; 0 failed; 17 ignored
+    - Unit tests (`--skip routes::`): 1280 passed; 0 failed; 1 ignored
+    - Integration tests: `ai_build_tool_list.rs` (11 passed), `route_auth.rs` (84 passed), `sec11_guard.rs` (4 passed); 0 failed.
+- **TypeScript verification:**
+  - `bun run typecheck`: passed, exit code 0.
+  - `bun run lint`: passed, exit code 0 (0 errors, 10 pre-existing warnings in unrelated files).
+  - `bun test src/components src/features/auth`: 79 passed, 0 failed, 217 expect calls.
+  - `bun test`: 3775 passed, 1 skipped, 0 failed, 11247 expect calls across 359 files.
+
+#### D5 Route-Caller List
+All frontend callers for routes updated with any-of permissions were audited:
+- `GET /api/alerts`: called by `src/features/alerts/alerts-page.tsx` and `src/features/notifications/` in `app-navbar.tsx`. Both rendered in components gated behind `alert:read` (or `*:*`).
+- `GET /api/ops/services`, `/api/ops/capacity`, `/api/ops/cdc`, `/api/ops/maintenance`: called by `src/features/overview/system-status-page.tsx`. Gated behind `ops:read` (or `*:*`).
+- `GET /api/governance/quality/rules`, `GET /api/governance/data-quality`: called by `src/features/governance/data-quality-page.tsx`. Gated behind `governance:read` (or `*:*`).
+- `GET /api/governance/audit`: called by `src/app/(admin)/audit/page.tsx`. Gated behind `governance:read` (or `*:*`).
+- `GET /api/ai/sessions`: called by `src/features/copilot/use-copilot.ts`, `src/features/copilot/history-menu.tsx`, and `src/app/copilot/history/page.tsx`. Gated behind `assistant:use` or `assistant:ask` (or `*:*`).
+*Stop & Report Check:* None of these routes are called by pages open to Dashboard Viewer or Assistant only without those permissions.
+
+#### D6 Tool and Check List
+- 10 read tools accessible by `assistant:ask`:
+  `run_sql`, `list_datasets`, `lakehouse_overview`, `describe_dataset`, `list_saved_queries`, `run_saved_query`, `list_iceberg_tables`, `describe_iceberg_table`, `get_table_maintenance`, `get_capacity`.
+- All mutate/write tools (`create_chart`, `update_chart`, `delete_chart`, `save_query`, etc.) are hidden from `tool_schemas_for` and rejected in `execute_tool` / tool dispatch with the Ask-mode refusal.
+- In-handler checks: `assistant_reads(principal, perm)` and `data_map_access` enforce dataset and table access boundaries.
+
+#### Anything *not verified* and why
+- 3 tests in `lakehouse-iceberg` ignored: require a live Iceberg REST catalog / container G1 environment (`live_container_g1`).
+- 1 test in `lakehouse-auth` ignored: requires live OpenFGA instance.
+- 1 test in `lakehouse-alerts` ignored: requires live webhook recipient.
+- 1 test in `lakehouse-api routes::ai`: live LLM integration test ignored by default without API key.
+- 17 tests in `lakehouse-api routes::`: ignored by default as requiring external live database/services (e.g. `every_policy_table_entry_is_mounted_and_gated_as_declared` requires running postgres container with migrations).
+All workspace unit and integration tests runnable in foreground container were executed and passed.
 
 ## 6. Review (planner)

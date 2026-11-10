@@ -387,7 +387,7 @@ async fn the_offered_tools_of_a_build_turn_fit_a_small_context() {
 
 /// ADM-13 (D6): an assistant:ask-only user is forced into Ask mode even when
 /// the request asks for "build" mode. Only Read tools are offered, no write tools
-/// (like create_chart) are offered, and the system prompt declares Ask mode.
+/// (like `create_chart`) are offered, and the system prompt declares Ask mode.
 #[tokio::test]
 async fn an_assistant_ask_only_user_in_build_mode_receives_only_read_tools() {
     let llm = mock_model().await;

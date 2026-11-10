@@ -1288,6 +1288,53 @@ The bootstrap admin is **not** re-activated by a restart: it is seeded
 only when an account with that email does not exist yet, so a bootstrap
 admin an administrator deliberately switched off stays off.
 
+## Roles and pages per role (ADM-13)
+
+Under ADM-13, the console enforces per-role page gating: users only see navigation
+links and pages their role permissions permit. Direct navigation to an unauthorized
+page renders an access-denied state without issuing backend API requests.
+
+### The two new roles
+
+1. **Dashboard Viewer**
+   - **Permissions:** `dashboard:read`
+   - **Access:** Only the Dashboards section (`/dashboards`, `/dashboards/browse`, `/dashboards/:id`).
+   - **Restrictions:** No AI Assistant (dock and Home are hidden; `/` redirects directly to `/dashboards`), no Query Studio, no Catalog, no Observability, and no Administration.
+   - **Use case:** External or business stakeholders who only consume dashboards and charts.
+
+2. **Assistant only**
+   - **Permissions:** `assistant:ask, dashboard:read`
+   - **Access:** Home (`/`), History (`/copilot/history`), Dashboards (`/dashboards`), and the Copilot dock.
+   - **Restrictions:** Operates in ask-only mode (`assistant:ask`). Can ask conversational questions and run read-only tools (`run_sql`, `list_datasets`, `lakehouse_overview`, `describe_dataset`, `list_saved_queries`, `run_saved_query`, `list_iceberg_tables`, `describe_iceberg_table`, `get_table_maintenance`, `get_capacity`). Cannot perform write or mutate actions (`is_build = false`), cannot create charts or dashboards via tools, and cannot edit assets.
+
+### What the upgrade adds to existing roles
+
+Migration `0132_pages_per_role.sql` ensures existing roles retain access to pages they previously used:
+
+| Role | Added Permissions | Rationale |
+| --- | --- | --- |
+| `Data Engineer` | `assistant:use`, `ops:read`, `alert:read`, `governance:read` | Retains full Copilot build/ask capabilities, System status, Alerts, and Governance pages |
+| `Data Analyst` | `assistant:use`, `ops:read`, `alert:read`, `governance:read` | Retains full Copilot, Monitoring, and Governance access |
+| `Data Scientist` | `assistant:use`, `ops:read`, `alert:read`, `governance:read` | Retains full Copilot, Monitoring, and Governance access |
+| `Workspace Admin` | `assistant:use`, `ops:read`, `alert:read`, `governance:read` | Retains full Copilot, Monitoring, and Governance access |
+| `Operator` | `assistant:use`, `governance:read` | Retains full Copilot and Governance access (already held `ops:read`, `alert:read`) |
+| `Platform Admin` | *(None)* | Already holds unrestricted `*:*` |
+
+### How to take the assistant away from a role
+
+To revoke the AI Copilot assistant from any role:
+
+1. **In the Console:** Navigate to **Administration → Roles**, edit the role, and uncheck both:
+   - `assistant:use` (Full interactive build and query assistant)
+   - `assistant:ask` (Read-only conversational analytics assistant)
+2. **Via API or SQL:** Remove `assistant:use` and `assistant:ask` from the role's permissions list in `app_role`.
+
+**Effect on users with that role:**
+- The Copilot dock and composer toggle disappear entirely.
+- The Home (`/`) and History (`/copilot/history`) items are hidden in the sidebar.
+- Visiting `/` automatically redirects to the first available page (e.g. `/dashboards`).
+- Any direct API requests to `/api/ai/*` return `403 Forbidden`.
+
 ## Postgres: unreachable is loud, a mismatched schema refuses to start
 
 `lakehouse_store::connect_lazy` never does network I/O at startup, so a

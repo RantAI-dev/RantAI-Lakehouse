@@ -3919,7 +3919,7 @@ mod tests {
     fn tool_schemas_for_assistant_ask_only_offers_only_read_tools() {
         let perms = lakehouse_auth::PermissionSet::parse("assistant:ask");
         let offered = tool_schemas_for(Some(&perms), None);
-        assert!(!offered.is_empty());
+        assert_ne!(offered.len(), 0);
         for schema in &offered {
             let name = schema["function"]["name"].as_str().expect("tool name");
             let spec = find(name).expect("tool spec exists");

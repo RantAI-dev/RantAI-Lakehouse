@@ -1452,7 +1452,7 @@ mod tests {
     }
 
     /// ADM-13 (D6): a write tool call in ask mode (or forced to ask mode
-    /// for an AskOnly principal) is refused with the Ask-mode message.
+    /// for an `AskOnly` principal) is refused with the Ask-mode message.
     #[test]
     fn write_tool_in_ask_mode_is_refused_with_ask_mode_message() {
         let ask = PermissionSet::parse("assistant:ask");
