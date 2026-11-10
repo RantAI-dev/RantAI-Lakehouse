@@ -623,7 +623,9 @@ export function ChartBuilder({
     () => (fields?.measures ?? []).filter((m) => !wholeMeasure.has(m) && fields?.kinds?.[m] === "number"),
     [fields, wholeMeasure],
   );
-  const dimensionChoices = isHistogram ? numberColumns : binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
+  // QA LH-BI-13-01: bins are off beside more questions (builder-rules), but a number column (a year) is still a
+  // real column the server takes as the dimension, so it stays offered, unbinned (`pickDimension` clears the bin).
+  const dimensionChoices = isHistogram ? numberColumns : binKind || (layers.length > 0 && takesLayers(kind) && !rowsMode) ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
   const breakdownChoices = (binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? []).filter((d) => d !== dimension);
   const startingBin = onSqlSource ? ({ mode: "width", count: "10", width: "" } as const) : AUTO_BIN;
   const isNumber = (column: string) => fields?.kinds?.[column] === "number";
