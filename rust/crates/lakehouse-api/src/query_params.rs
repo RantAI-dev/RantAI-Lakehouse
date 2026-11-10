@@ -962,12 +962,15 @@ mod tests {
                     json!({ "a": value }),
                     json!([]),
                 );
-                let seen = crate::sql_guard::strip_sql_noise(&sql);
+                let seen = crate::sql_guard::strip_sql_noise(&sql, engine);
                 assert!(
                     seen.contains("DROP TABLE t"),
                     "{engine:?} {value}: {sql} -> {seen}"
                 );
-                assert!(!crate::sql_guard::is_read_only(&sql), "{engine:?} {value}");
+                assert!(
+                    !crate::sql_guard::is_read_only(&sql, engine),
+                    "{engine:?} {value}"
+                );
             }
         }
     }
@@ -1651,9 +1654,9 @@ mod tests {
                 json!([]),
             );
             assert_eq!(sql, "SELECT '$$'; DROP TABLE t", "{engine:?}");
-            let seen = crate::sql_guard::strip_sql_noise(&sql);
+            let seen = crate::sql_guard::strip_sql_noise(&sql, engine);
             assert!(seen.contains("DROP TABLE t"), "{engine:?}: {sql} -> {seen}");
-            assert!(!crate::sql_guard::is_read_only(&sql), "{engine:?}");
+            assert!(!crate::sql_guard::is_read_only(&sql, engine), "{engine:?}");
         }
     }
 
