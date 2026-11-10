@@ -94,9 +94,10 @@ The bar path converts through `entriesFromRows` and works.
 - Anchor: `src/features/dashboards/chart-builder.tsx:1035` (`measures: [measure, …]`;
   `measure` is `measureRows[0]?.column`, `:416`).
 - Change: build the first measure with `entriesFromRows(measureRows.slice(0, 1), limits.own)`;
-  keep the goal column as today. Confirm against `rust/crates/lakehouse-bi/src/store.rs:3402-3408`
-  that a plain column still travels in the shape the server expects for kpi/gauge/progress
-  (existing single-number tests must stay green unchanged).
+  keep the goal column as today. The server already keeps a KPI on a metric
+  (`kpi_measure`, `rust/crates/lakehouse-bi/src/store.rs:3313`, "BI-2 review fix (BLOCKER) R1");
+  it rejects the raw `"metric:…"` string at `:3401` (`Ident::new`). A plain column must still
+  travel exactly as today (existing single-number tests stay green unchanged).
 - Check: a unit test of the payload for a kpi on a metric (`{ metric: "qa_total_wisman" }`)
   and on a plain column (unchanged).
 
