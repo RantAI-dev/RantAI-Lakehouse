@@ -195,18 +195,22 @@ owner's browser QA, as the plan says).
 
 The two plan commits are `023f0d49` (the plan) and `e82f896c` (the corrected KPI anchor).
 
-### Verification (in the foreground, on the final code commit `b2ec27c1`; this handoff is the commit after it)
+### Verification (in the foreground, on the final code commit `dfd5d83d`; this handoff is the commit after it)
 
 ```bash
 bun run typecheck   # no output, exit 0
 bun run lint        # exit 0; 10 warnings, 0 errors — all pre-existing, none in a changed file
-bun run test        # 3778 pass, 1 skip, 0 fail, 11252 expect() calls, 358 files, 224.71s
+bun run test        # 3781 pass, 1 skip, 0 fail, 11289 expect() calls, 3782 tests across 359 files, 234.03s
 git status          # only the four untracked files that were there before the branch
 ```
 
+The review re-ran the block itself on `ebedac18` and counted 3778 pass / 1 skip / 0 fail; the three
+tests that came after it are the review fixes' own (R2's one and R3's two).
+
 Nothing else ran: only `src/` changed, so there was no cargo, no pytest and no compose check
 (plan §3). Per-file runs while working: `bun test src/features/connectors/upload-file-page.test.tsx`
-(87 pass / 0 fail), `src/features/dashboards/chart-builder.test.tsx` (40 pass / 0 fail).
+(88 pass / 0 fail), `src/components/data-table/data-table-add-filter.test.tsx` (2 pass / 0 fail),
+`src/features/dashboards/chart-builder.test.tsx` (40 pass / 0 fail).
 
 Two environment problems came first, and neither is code: `node_modules` was missing `three`
 (a `bun install` installed it) and `.next/dev/types/validator.ts` was stale generated output from
@@ -215,9 +219,11 @@ Two environment problems came first, and neither is code: `node_modules` was mis
 
 ### What the plan asked the handoff to report
 
-- **T1, the other `crypto.randomUUID(` sites.** One: `src/features/copilot/use-copilot.ts:68`, in
-  `newMsgId()`. It already guards itself (`"randomUUID" in crypto`, else an `m_…` fallback) and is
-  not on the filter path, so it is unchanged.
+- **T1, the other `randomUUID` sites.** Two, both guarded and both off the filter path:
+  `src/features/copilot/use-copilot.ts:68` (`newMsgId()`: `"randomUUID" in crypto`, else an `m_…`
+  fallback) and `src/features/queries/use-query-studio.ts:214` (`newTabId()`:
+  `globalThis.crypto?.randomUUID?.()`, else a counter). The plan's literal pattern
+  `crypto.randomUUID(` misses the second one, which is why the first handoff named only one.
 - **T2, the score chosen.** The best score cmdk would have given any asset row
   (`makePaletteFilter`, `src/lib/palette-search.ts`). Every asset row gets that one score, so the
   stable sort keeps the server's order inside the group, and the group's place among the other
@@ -229,6 +235,18 @@ Two environment problems came first, and neither is code: `node_modules` was mis
   stored value and never the label. A "(No value)"/"(Empty)" mark names no value, as the blank
   label of a NULL did before, unless a row really holds that text — so no filter on the literal
   "(No value)" is ever made. `binTarget` and `bucketTarget` refuse a placeholder label too.
+
+### Review fixes (R1–R4)
+
+The review (`## 6. Review`, no BLOCKER, four SHOULD-FIX) is answered by four commits, one per
+finding; each cites `QA fails part A review R<n>` at the fix site and in the commit body.
+
+| Finding | Commit | What the developer did |
+| --- | --- | --- |
+| R1 | `5d505948`, `ec9b3714` | With `"stop"` the load waits for the check's answer: Load is off while `check.status === "checking"` (`upload-file-page.tsx`), and the Review step says "Checking the values against the columns…". With `"null"` the load still goes (plan D4). The two tests that pressed Load right after arriving on the Review step now wait for the button. |
+| R2 | `7cd48aff` | A test that takes the QA case's own path: the file is added to an existing table, the types come from the table, the check re-runs after "Add to its rows" and answers that the values do not fit. The Review step lists them and the load waits while the check runs. The stub now awaits a route that answers later (the `Answer` type has always allowed a promise). |
+| R3 | `214b1460` | A test of the add-filter panel: with no `crypto.randomUUID` the seeded rule and a duplicate each get an 8-character `filterId`, and the two differ. Both tests fail on the base commit (the panel throws there). |
+| R4 | `dfd5d83d` | The module comment of `query-result-tabs.tsx` names both reasons a statement did not run (a failure, or the person's Stop); the tab label stays "Not run". |
 
 ### Corrections and notes
 
