@@ -41,6 +41,17 @@ describe("toolsFromCaps", () => {
     expect(toolsFromCaps(new Set(["dashboard"]), "build")).not.toContain("ask_user")
   })
 
+  // AI-4: explaining a calculated field is a read, so Ask mode offers it
+  // through Query Data; the tools that change a formula stay in the
+  // Dashboard Builder.
+  it("offers list_calculated_fields with Query Data in both modes and keeps the formula writes in the builder (AI-4)", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_calculated_fields")
+      expect(toolsFromCaps(new Set(["data"]), mode)).not.toContain("create_calculated_field")
+      expect(toolsFromCaps(new Set(["data"]), mode)).not.toContain("validate_formula")
+    }
+  })
+
   // AI-2 AC1: "show only 2026" changes the person's own view of the page and
   // nothing else, so Ask mode offers it through Query Data; saving the board's
   // default filters changes what every viewer sees and stays in the Builder.
