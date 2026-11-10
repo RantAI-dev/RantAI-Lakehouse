@@ -1585,7 +1585,8 @@ describe("UploadFilePage, column types", () => {
     await toReview(NONE)
     await goOn()
     expect(screen.queryByLabelText("Values that do not fit")).toBeNull()
-    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false)
+    // The load waits for the check's answer (review R1), so it is on once the check has answered.
+    await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
   })
 
   it("keeps Next off until 'day first or month first?' is answered", async () => {
@@ -1614,6 +1615,8 @@ describe("UploadFilePage, column types", () => {
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
     fireEvent.click(next())
+    // The load waits for the check's answer (review R1); the check re-runs after the change.
+    await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
     const body = calls.find((c) => c.url.endsWith("/ingest"))?.body as { columns: { name: string }[] }
