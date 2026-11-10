@@ -397,8 +397,16 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // timeout question ("or \"why did this chart time out?\"" is gone), and the
 // second one, which answers it from `get_query_limits` without SQL on
 // `system.*` tables, stays. (Before: `534a2e9b...1e91`.)
+//
+// Updated by hand for plan 72 (`AI-4`): the Ask suffix gained one sentence of
+// its own, that a name `describe_mart` does not list may be a calculated field
+// and that `list_calculated_fields` explains it. The new hash is the old bytes
+// plus exactly that sentence (hashing the prompt with that sentence removed
+// gives the previous pin `a3836866...2a09`). The offered-tool list above is
+// untouched, because the test's turn ("berapa tamu bulan ini?") holds no word
+// of the new domain. The AI team reviews the sentence (Assistant parity).
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "a383686693eae1ecc15195d708140e34934f637763f92fdb3dc6494b71ec2a09";
+    "bdb95459f2cb24d2754c555dc908beb2428489eadac1918551b98010ead5f810";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;
