@@ -176,7 +176,83 @@ Do not run prettier (the repo has no prettier config; match the file's style by 
 
 ## 5. Handoff
 
-(Developer appends here: commits, commands with counts, anything not verified.)
+Developer: a non-Opus coding agent (Claude Sonnet 5.5), 2026-11-10. Base: `main` `46b1cc05`.
+Branch: `fix/qa-fails-part-a` (local only, not pushed, no PR — the planner opens it after the
+owner's browser QA, as the plan says).
+
+### Commits (one per task, in plan order)
+
+| Task | Commit | What it does |
+| --- | --- | --- |
+| T1 | `0b87f0a2` | `crypto.randomUUID().slice(0, 8)` → `newRunId().slice(0, 8)` at the four filterId sites (`use-data-table-filters.ts` ×2, `data-table-add-filter.tsx` ×2). |
+| T2 | `21aeae80` | The palette's cmdk `filter` gives every asset row one score, so the server's order survives (`src/lib/palette-search.ts`, `makePaletteFilter`). |
+| T3 | `d28af52b` | The Review step shows the check's bad values (`BadValuesReport`, shared with the Check step) and a "Back to Check" action; with `onBadValue === "stop"` Load is off while values do not fit. |
+| T4 | `6a3183f9` | The single-number path builds its first measure with `entriesFromRows`, so a metric goes out as `{ metric }`. |
+| T5 | `d20f4bdb` | `categoryLabel` (`src/lib/chart-transforms.ts`) names a NULL "(No value)" and an empty string "(Empty)" on every axis, legend and tooltip. |
+| T6 | `6acae28b` | `dimensionChoices` keeps the number columns when the chart has questions; `builder-rules.ts` is unchanged. |
+| T7 | `300b64d4` | "+ Add a question" stays at the limit, disabled, with "A chart takes at most five questions." under it. |
+| T8 | `b2ec27c1` | The `not-run` variant carries `reason: "failure" \| "stopped"`; the page says which. |
+
+The two plan commits are `023f0d49` (the plan) and `e82f896c` (the corrected KPI anchor).
+
+### Verification (in the foreground, on the final code commit `b2ec27c1`; this handoff is the commit after it)
+
+```bash
+bun run typecheck   # no output, exit 0
+bun run lint        # exit 0; 10 warnings, 0 errors — all pre-existing, none in a changed file
+bun run test        # 3778 pass, 1 skip, 0 fail, 11252 expect() calls, 358 files, 224.71s
+git status          # only the four untracked files that were there before the branch
+```
+
+Nothing else ran: only `src/` changed, so there was no cargo, no pytest and no compose check
+(plan §3). Per-file runs while working: `bun test src/features/connectors/upload-file-page.test.tsx`
+(87 pass / 0 fail), `src/features/dashboards/chart-builder.test.tsx` (40 pass / 0 fail).
+
+Two environment problems came first, and neither is code: `node_modules` was missing `three`
+(a `bun install` installed it) and `.next/dev/types/validator.ts` was stale generated output from
+2026-10-25 naming pages that no longer exist (removed; `.next` is gitignored). Before the
+`bun install`, `bun run typecheck` failed on `three` and on that stale file.
+
+### What the plan asked the handoff to report
+
+- **T1, the other `crypto.randomUUID(` sites.** One: `src/features/copilot/use-copilot.ts:68`, in
+  `newMsgId()`. It already guards itself (`"randomUUID" in crypto`, else an `m_…` fallback) and is
+  not on the filter path, so it is unchanged.
+- **T2, the score chosen.** The best score cmdk would have given any asset row
+  (`makePaletteFilter`, `src/lib/palette-search.ts`). Every asset row gets that one score, so the
+  stable sort keeps the server's order inside the group, and the group's place among the other
+  groups is unchanged (cmdk orders groups by their best item). Every other item keeps cmdk's
+  `defaultFilter`.
+- **T5, the sites that read a category back into a filter.** `drillTarget`
+  (`src/lib/chart-click.ts:137`) is the only one; the dashboard's click handler
+  (`src/features/dashboards/dashboard-page.tsx:979`) sends that target's `value`, which is the
+  stored value and never the label. A "(No value)"/"(Empty)" mark names no value, as the blank
+  label of a NULL did before, unless a row really holds that text — so no filter on the literal
+  "(No value)" is ever made. `binTarget` and `bucketTarget` refuse a placeholder label too.
+
+### Corrections and notes
+
+- `d28af52b` says the two "Table step, folders" tests in `upload-file-page.test.tsx` fail on the
+  base commit. **They do not**: at `46b1cc05` (base code and base test file) the file is 84 pass /
+  0 fail, and on this branch 87 pass / 0 fail. The failure the developer saw was the environment
+  above (the stale `node_modules`), not the code. The note stays in the commit body; this entry
+  corrects it.
+- The plan's T6 check has two halves: the number column is in the Dimension (X) choices, **and**
+  the saved payload has no bin for it. The second half was missing and was added while writing
+  this handoff; it is folded into the T6 commit, so that commit is rewritten (`3a9345ef` →
+  `6acae28b`) and T7 and T8 were re-applied on top. The T6 fixture changed with it: a question's
+  own dimension must line up with the chart's (both numbers, as a year column does) or the builder
+  drops it and sends nothing at all.
+- Anchor note for T8: `use-query-studio.ts:988` is the loop-top abort check (Stop), not the failure
+  path; the failure path is the `markNotRun(index + 1)` further down. Said in the commit body.
+
+### Not verified
+
+- **Nothing in a browser.** The fixes are covered by unit tests only. The owner still has to run
+  the QA cases on staging (LH-DATA-11-08, LH-DATA-12-03, LH-DATA-12-13, LH-DATA-11-06,
+  LH-DATA-18-08, LH-BI-2-01, LH-BI-6-38, LH-BI-13-01, LH-BI-13-06, LH-QS-4-10) before the PR.
+- No staging run, no screenshot, no console check, no `docker compose up` (nothing in compose
+  changed).
 
 ## 6. Review
 
