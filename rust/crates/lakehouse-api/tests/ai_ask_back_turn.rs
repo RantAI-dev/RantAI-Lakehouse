@@ -2,8 +2,10 @@
 //!
 //! `run_chat` enforces it, not the prompt: an accepted `ask_user` ends the
 //! turn with its question as the answer and runs nothing after it, and an
-//! `ask_user` that comes after a tool that ran in the same turn is refused
-//! with a result the model reads. The one exception is an `ask_user` right
+//! `ask_user` that comes after a tool that returned data in the same turn is
+//! refused with a result the model reads — a lookup that only found which
+//! metrics or tables exist is not a query, and does not make the ask late
+//! (`AI-17`). The one exception is an `ask_user` right
 //! after another tool's call failed, because a refusal just said the call
 //! cannot be built as asked and the person is the only one who can choose.
 //! The mocked model here answers each round with plain JSON, so the
@@ -101,19 +103,25 @@ async fn mock_model(rounds: Vec<Value>) -> MockServer {
     llm
 }
 
-/// `ClickHouse` for `run_sql`: the dry run gets `EXPLAIN AST`'s text dump
-/// of a `SELECT` (`dry_run_sql` reads its first line), the real query gets
-/// one row.
-async fn mock_clickhouse() -> MockServer {
-    let ch = MockServer::start().await;
+/// The dry-run mock every test's `ClickHouse` starts with: a body carrying
+/// `EXPLAIN AST` gets that statement's text dump of a `SELECT`
+/// (`dry_run_sql` reads its first line).
+async fn mount_dry_run_mock(ch: &MockServer) {
     Mock::given(method("POST"))
         .and(body_string_contains("EXPLAIN AST"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string("SelectWithUnionQuery (children 1)\n ExpressionList ...\n"),
         )
-        .mount(&ch)
+        .mount(ch)
         .await;
+}
+
+/// The catch-all every test's `ClickHouse` falls back to: any POST whose
+/// body carries no `EXPLAIN AST` gets one row, `{"n": 5}`. Mount it LAST:
+/// `wiremock` answers with the first matching mock in mount order, so the
+/// catch-all only serves what nothing more specific matched.
+async fn mount_catch_all_mock(ch: &MockServer) {
     Mock::given(method("POST"))
         .and(BodyDoesNotContain("EXPLAIN AST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -121,8 +129,78 @@ async fn mock_clickhouse() -> MockServer {
             "data": [{"n": 5}],
             "rows": 1,
         })))
+        .mount(ch)
+        .await;
+}
+
+/// `ClickHouse` for `run_sql`: the dry run gets `EXPLAIN AST`'s text dump
+/// of a `SELECT` (`dry_run_sql` reads its first line), the real query gets
+/// one row.
+async fn mock_clickhouse() -> MockServer {
+    let ch = MockServer::start().await;
+    mount_dry_run_mock(&ch).await;
+    mount_catch_all_mock(&ch).await;
+    ch
+}
+
+/// `ClickHouse` for the metric lookups: `console.bi_metric` holds one live
+/// `mart` metric, so `describe_metric` finds it and `query_metric` reads its
+/// value; the catch-all answers everything else. The specific mocks are
+/// mounted BEFORE the catch-all (`wiremock` takes the first match in mount
+/// order). The body details that matter beyond "200 OK": every mock's
+/// envelope `meta` entry carries BOTH `name` and `type` — `ChResult` fails
+/// to parse otherwise and reads as an EMPTY result, without an error — the
+/// metric row needs `source_kind: "mart"` plus `formula`, what
+/// `row_to_metric` keeps; the mart's existence count comes back as the JSON
+/// STRING `"1"`, since `validated_mart_columns` parses `Value::as_str` and
+/// a numeric `1` would parse as 0, "Gold mart not found"; and
+/// `system.columns` returns the column the metric's `formula` names, so the
+/// value query compiles.
+async fn mock_clickhouse_with_metric() -> MockServer {
+    let ch = MockServer::start().await;
+    mount_dry_run_mock(&ch).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("console.bi_metric"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+                {"name": "id", "type": "String"}, {"name": "name", "type": "String"},
+                {"name": "source_kind", "type": "String"}, {"name": "source_id", "type": "String"},
+                {"name": "formula", "type": "String"},
+            ],
+            "data": [{
+                "id": "metric_kunjungan",
+                "name": "kunjungan",
+                "source_kind": "mart",
+                "source_id": "kunjungan_harian",
+                "formula": "sum(total)",
+            }],
+            "rows": 1,
+        })))
         .mount(&ch)
         .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM system.tables WHERE database='serving'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name": "n", "type": "String"}],
+            "data": [{"n": "1"}],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM system.columns WHERE database='serving'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+            "data": [{"name": "total", "type": "UInt64"}],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    mount_catch_all_mock(&ch).await;
     ch
 }
 
@@ -390,4 +468,148 @@ async fn a_rejected_ask_does_not_open_the_way_for_a_second_ask_after_a_query() {
     );
     assert_eq!(trace[3]["tool"], "ask_user");
     assert_eq!(trace[3]["result"]["error"], LATE_ASK_REFUSAL);
+}
+
+#[tokio::test]
+async fn an_ask_after_a_successful_metric_lookup_is_accepted() {
+    // `AI-17`: a lookup is not a query. `list_metrics` answers names and
+    // labels, not data rows, so the ask after it is on time.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "list_metrics", "{}")]),
+        model_round(None, &[("call_2", "ask_user", ASK_TWO)]),
+    ])
+    .await;
+    let ch = mock_clickhouse().await;
+
+    let body = chat(&llm, &ch, "berapa sales?").await;
+
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 2, "the lookup then the ask: {trace:?}");
+    assert_eq!(trace[0]["tool"], "list_metrics");
+    assert_eq!(
+        trace[0]["ok"], true,
+        "the lookup must have succeeded on the shared mocks: {trace:?}"
+    );
+    assert_eq!(trace[1]["tool"], "ask_user");
+    assert_eq!(
+        trace[1]["ok"], true,
+        "a lookup does not make the ask late: {trace:?}"
+    );
+    assert_eq!(
+        body["answer"], "Which table do you mean by sales?",
+        "the accepted ask ends the turn with its question: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_ask_after_three_successful_lookups_is_still_accepted() {
+    // `AI-17`: none of `list_metrics`, `describe_metric` or `list_datasets`
+    // returns data rows, so even the full lookup sequence leaves the turn
+    // free to ask.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "list_metrics", "{}")]),
+        model_round(
+            None,
+            &[("call_2", "describe_metric", r#"{"name":"kunjungan"}"#)],
+        ),
+        model_round(None, &[("call_3", "list_datasets", "{}")]),
+        model_round(None, &[("call_4", "ask_user", ASK_TWO)]),
+    ])
+    .await;
+    let ch = mock_clickhouse_with_metric().await;
+
+    let body = chat(&llm, &ch, "berapa sales?").await;
+
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 4, "three lookups then the ask: {trace:?}");
+    assert_eq!(trace[0]["tool"], "list_metrics");
+    assert_eq!(trace[0]["ok"], true, "the lookup must have run: {trace:?}");
+    assert_eq!(trace[1]["tool"], "describe_metric");
+    assert_eq!(
+        trace[1]["ok"], true,
+        "describe_metric must have found the saved metric, or the ask below would pass through the failed-call exception instead: {trace:?}"
+    );
+    assert_eq!(trace[2]["tool"], "list_datasets");
+    assert_eq!(
+        trace[2]["ok"], true,
+        "the dataset list must have run: {trace:?}"
+    );
+    assert_eq!(trace[3]["tool"], "ask_user");
+    assert_eq!(
+        trace[3]["ok"], true,
+        "lookups are not queries: the ask is accepted: {trace:?}"
+    );
+    assert_eq!(
+        body["answer"], "Which table do you mean by sales?",
+        "the accepted ask ends the turn with its question: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_ask_after_a_lookup_followed_by_a_query_is_still_refused() {
+    // `AI-17` narrowed the late-ask rule to tools that read data; `run_sql`
+    // is one of them, so a lookup before it changes nothing.
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "list_metrics", "{}")]),
+        model_round(None, &[("call_2", "run_sql", RUN_SQL)]),
+        model_round(None, &[("call_3", "ask_user", ASK_TWO)]),
+        model_round(Some("Ada 5 baris."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse().await;
+
+    let body = chat(&llm, &ch, "berapa sales?").await;
+
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 3, "lookup, query, refused ask: {trace:?}");
+    assert_eq!(trace[0]["tool"], "list_metrics");
+    assert_eq!(trace[0]["ok"], true, "the lookup must have run: {trace:?}");
+    assert_eq!(trace[1]["tool"], "run_sql");
+    assert_eq!(trace[1]["ok"], true, "the query must have run: {trace:?}");
+    assert_eq!(trace[2]["tool"], "ask_user");
+    assert_eq!(trace[2]["ok"], false);
+    assert_eq!(trace[2]["result"]["error"], LATE_ASK_REFUSAL);
+    assert_eq!(
+        body["answer"], "Ada 5 baris.",
+        "the refused ask left the turn open: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_ask_after_a_successful_metric_value_query_is_refused() {
+    // `AI-17`: `query_metric` returns data rows, so it counts as a query and
+    // the ask after it is late. It must SUCCEED here: a failed query_metric
+    // would make the ask pass through the failed-call exception instead,
+    // which this test must not rely on.
+    let llm = mock_model(vec![
+        model_round(
+            None,
+            &[("call_1", "query_metric", r#"{"name":"kunjungan"}"#)],
+        ),
+        model_round(None, &[("call_2", "ask_user", ASK_TWO)]),
+        model_round(Some("Ada 5 baris."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse_with_metric().await;
+
+    let body = chat(&llm, &ch, "berapa sales?").await;
+
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(
+        trace.len(),
+        2,
+        "the value query then the refused ask: {trace:?}"
+    );
+    assert_eq!(trace[0]["tool"], "query_metric");
+    assert_eq!(
+        trace[0]["ok"], true,
+        "query_metric must have returned data here, or the refusal below is the failed-call exception, not the late-ask rule: {trace:?}"
+    );
+    assert_eq!(trace[1]["tool"], "ask_user");
+    assert_eq!(trace[1]["ok"], false);
+    assert_eq!(trace[1]["result"]["error"], LATE_ASK_REFUSAL);
+    assert_eq!(
+        body["answer"], "Ada 5 baris.",
+        "the refused ask left the turn open: {body}"
+    );
 }
