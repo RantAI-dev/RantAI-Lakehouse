@@ -28,6 +28,7 @@ once a first release is tagged.
 - The assistant's draft check of a chart change reads the chart as the person asking, so a draft cannot reveal a chart they cannot see (backlog `AI-3`).
 - The assistant's chart draft runs the same permission and source checks as the save, so a draft can no longer name the columns of a SQL source the person cannot see (backlog `AI-3`).
 - On ClickHouse a heredoc (`$$ … $$`, `$tag$ … $tag$`) is read like a quoted string, so a placeholder inside it is refused with the inside-quotes sentence and an unclosed heredoc runs to the end of the statement. Trino is unchanged (backlog `QS-5`).
+- The read-only guard and the parameter scanner read a statement with the rules of the engine that will run it, not with one fixed set (backlog `SEC-62`): a ClickHouse heredoc (`$$ … $$`) and a Trino backslash before a quote can no longer hide a write from the keyword scan, and a placeholder in a heredoc that a number opens (`SELECT 1$$ {{x}} $$`) is refused with the inside-quotes sentence. The one case where the guard is more permissive, a nested block comment on ClickHouse, is a comment to that engine as well.
 
 ### Changed
 

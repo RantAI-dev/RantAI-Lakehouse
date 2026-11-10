@@ -246,6 +246,18 @@ pub(super) fn clean_sql_error(err: &str) -> String {
 /// — the cheap first filter [`run_sql`] applies to the model's SQL. Distinct
 /// from `query/run`'s guard (`routes::query::is_read_only`): only
 /// `with`/`select` are allowed here (no `show`/`describe`/`explain`).
+///
+/// This filter reads the raw text: it does not lex SQL and knows no
+/// engine's quoting or comment rules, so it cannot be moved onto the
+/// shared lexer (`crate::sql_lex`) without changing what it refuses. That
+/// is why it is stricter than the shared guard and never weaker — it
+/// refuses a statement whose text holds a denied word anywhere, inside a
+/// quoted run included (`SELECT 'drop' AS a` is refused here and allowed
+/// by the shared guard), so it can refuse more than the shared guard,
+/// never less. It stays the cheap first filter (`WS7 item F4`), and the
+/// authoritative guard behind it — `routes::query::run`'s `is_read_only`,
+/// which reads the statement with the rules of the engine the run names —
+/// decides whether the statement runs.
 fn is_read_only_sql(sql: &str) -> bool {
     starts_with_with_or_select(sql) && !contains_denied_keyword_full(sql)
 }
