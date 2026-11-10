@@ -532,6 +532,39 @@ mod tests {
         );
     }
 
+    /// A `$` after a non-ASCII character opens a heredoc: the bareword
+    /// reader takes ASCII letters, digits, `_` and `$` only, so the
+    /// non-ASCII character ends the name run and the `$` starts a token.
+    ///
+    /// Measured on `clickhouse/clickhouse-server:26.8.15.10`: `SELECT 'x' AS
+    /// aé$$b` answers `Code: 62. DB::Exception: Unrecognized token: Syntax
+    /// error: failed at position 16 (é): é$$b. (SYNTAX_ERROR)`. The engine
+    /// reads no non-ASCII character as part of a bareword and refuses the
+    /// statement there, so the statement never runs and the heredoc
+    /// question never decides it.
+    #[test]
+    fn a_dollar_after_a_non_ascii_character_opens_a_heredoc_on_clickhouse() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 'x' AS aé$$b"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Literal, "'x'".to_owned()),
+                (SpanKind::Code, " AS aé".to_owned()),
+                (SpanKind::UnclosedHeredoc, "$$b".to_owned()),
+            ]
+        );
+        // A closing delimiter makes the heredoc a closed one.
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 'x' AS aé$$b$$"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Literal, "'x'".to_owned()),
+                (SpanKind::Code, " AS aé".to_owned()),
+                (SpanKind::Literal, "$$b$$".to_owned()),
+            ]
+        );
+    }
+
     #[test]
     fn a_hash_is_a_comment_on_clickhouse_only_after_a_space_or_bang() {
         assert_eq!(
@@ -561,6 +594,27 @@ mod tests {
             vec![
                 (SpanKind::Code, "SELECT 1 ".to_owned()),
                 (SpanKind::NotCode, "# c".to_owned()),
+            ]
+        );
+    }
+
+    /// A tab is not the space the rule asks for: the engine reads a
+    /// comment only after a space or a `!`.
+    ///
+    /// Measured on `clickhouse/clickhouse-server:26.8.15.10`: `SELECT 1
+    /// #<TAB>comment` answers `Code: 62. DB::Exception: Unrecognized token:
+    /// Syntax error: failed at position 10 (#): #<TAB>comment.
+    /// (SYNTAX_ERROR)`, so the engine refuses the statement there and the
+    /// text cannot run. The engine's own lexer comment says it recognizes
+    /// a comment "only if # is followed by whitespace", but the measurement
+    /// shows the rule is a space or a `!`.
+    #[test]
+    fn a_tab_after_a_hash_is_not_a_comment_on_clickhouse() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT 1 #\tcomment"),
+            vec![
+                (SpanKind::Code, "SELECT 1 ".to_owned()),
+                (SpanKind::NotCode, "#\tcomment".to_owned()),
             ]
         );
     }
