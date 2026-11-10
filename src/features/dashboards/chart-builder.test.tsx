@@ -151,6 +151,20 @@ describe("ChartBuilder kind rules (phase 2 QA R5)", () => {
   })
 })
 
+describe("ChartBuilder single-number payload (QA LH-BI-2-01)", () => {
+  it("sends a reusable metric of a KPI as { metric }, not as the raw row column", async () => {
+    renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: [{ metric: "coba_metrik" }] as never, aggregate: "sum" })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.measures).toEqual([{ metric: "coba_metrik" }])
+  })
+
+  it("keeps a plain column of a KPI as the column name, as before", async () => {
+    renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: ["visitors"], aggregate: "sum" })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.measures).toEqual(["visitors"])
+  })
+})
+
 describe("ChartBuilder kind switch (phase 2 QA R6)", () => {
   it("keeps the dimension as the first grouping of a data table and back as the dimension of a chart", async () => {
     renderBuilder({ ...barDef, breakdown: "category" })

@@ -1031,8 +1031,12 @@ export function ChartBuilder({
       };
     } else if (isSingle) {
       const goalColumn = goalMeasureColumn(kind, typeDraft);
+      // QA LH-BI-2-01: a reusable metric must go out as `{ metric }` like on the other paths; the raw row
+      // column `"metric:…"` is refused by the server (400 "invalid or missing measure column"). A plain
+      // column, and an empty row (kept as today so the preview says what is missing), still go as the name.
+      const [firstMeasure] = entriesFromRows(measureRows.slice(0, 1), limits.own);
       payload = {
-        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [measure, ...(goalColumn ? [goalColumn] : [])], aggregate, span, board: targetBoard,
+        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [firstMeasure ?? measure, ...(goalColumn ? [goalColumn] : [])], aggregate, span, board: targetBoard,
         caption: (isKpi || isProgress) && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
         ...draftPayload(kind, tableDraft),
