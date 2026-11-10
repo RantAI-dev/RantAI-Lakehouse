@@ -88,9 +88,15 @@ export function UploadReviewStep({
   // QA LH-DATA-18-08 (AC8): "the mismatch is listed before loading". After "Add to its rows"
   // the types come from the table and the check re-runs; only the Check step showed it.
   const bad = check.status === "done" && check.result.count > 0 ? check.result : null
+  // QA fails part A review R1: while the check runs, the Review step says so; with "stop"
+  // the load waits for the answer (the load would write nothing and fail).
+  const checking = check.status === "checking"
 
   return (
     <div className="space-y-4">
+      {checking ? (
+        <p className="text-sm text-muted-foreground">Checking the values against the columns…</p>
+      ) : null}
       {bad ? (
         <section
           className="space-y-3 rounded-lg border border-destructive/30 bg-destructive/5 p-4"
