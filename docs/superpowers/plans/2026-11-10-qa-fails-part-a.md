@@ -489,6 +489,18 @@ git status
 
 A full `cargo test --workspace` is CI's job on this VM; quote what ran and what did not.
 
+### 7.3a Change of verification, 2026-11-11 (owner's decision)
+
+The first local build of `lakehouse-api` in test mode did not finish: one `rustc` held 5.2 GB
+for 1 h 40 min on this 11 GB VM, swap was full, and the owner stopped it. From here on, slice 2
+runs **no cargo command on this VM except `cargo fmt`** (`cargo fmt --check` per Rust commit;
+rustfmt is cheap). Clippy and every Rust test run on the PR in CI (the `test` job is
+`cargo nextest run --workspace`, REL-20). The handoff lists every Rust check as *not verified
+locally, CI* (rule 7); the reviewer reads the Rust diff by hand and merges only on a green CI.
+TypeScript checks run locally as in 7.3. Slice 2 moves to branch `fix/qa-fails-part-a-s2`
+(from `fix/qa-fails-part-a` at `608ced3b` plus this plan) and gets its own PR, because PR #453
+(slice 1) merges on its own.
+
 ### 7.4 Out of scope for slice 2
 
 DATA-12-07 F2 (Data Engineer `catalog:read`) and BI-11-07 stay out (owner / AI team).
