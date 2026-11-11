@@ -17,16 +17,17 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { PolicyActions } from "@/features/governance/policy-actions"
-import { useServiceAction } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
-import { governanceService } from "@/services"
+import { governanceService, identityService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { CreatePolicyInput } from "@/services/contracts/governance"
 import { AssetGrants } from "./asset-grants"
-import { policyCondition, policyTable, type PolicyForm } from "./asset-policy"
+import { policyCondition, policyTable, roleNames, type PolicyForm } from "./asset-policy"
 
 type PolicySummary = AssetDetail["policySummary"][number]
 
@@ -111,6 +112,22 @@ function AddPolicyDialog({
     governanceService.createPolicy(input, signal)
   )
   const condition = policyCondition(table, form)
+  // WEB-8 D8: the roles are the ones the deployment has, from
+  // `identityService.listRoles`. Without that read the field stays the free
+  // text it was, with the reason, rather than an empty list of checkboxes.
+  const rolesState = useService((signal) => identityService.listRoles(signal), [])
+  const roles = rolesState.status === "success" ? rolesState.data : null
+  const chosenRoles = roleNames(form.roles)
+
+  function toggleRole(roleName: string) {
+    setForm((f) => {
+      const current = roleNames(f.roles)
+      const next = current.includes(roleName)
+        ? current.filter((r) => r !== roleName)
+        : [...current, roleName]
+      return { ...f, roles: next.join(", ") }
+    })
+  }
 
   function toggle(column: string) {
     setForm((f) => ({
@@ -147,12 +164,42 @@ function AddPolicyDialog({
         <div className="grid gap-3">
           <div className="grid gap-1.5">
             <Label htmlFor="policy-roles">Roles it applies to</Label>
-            <Input
-              id="policy-roles"
-              value={form.roles}
-              onChange={(e) => setForm((f) => ({ ...f, roles: e.target.value }))}
-              placeholder="Analyst, Dashboard Viewer"
-            />
+            {roles === null ? (
+              <>
+                <Input
+                  id="policy-roles"
+                  value={form.roles}
+                  onChange={(e) => setForm((f) => ({ ...f, roles: e.target.value }))}
+                  placeholder="Analyst, Dashboard Viewer"
+                />
+                {rolesState.status === "error" ? (
+                  <p className="text-xs text-muted-foreground">
+                    Could not read the roles; type them as a comma-separated list.
+                  </p>
+                ) : null}
+              </>
+            ) : roles.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No roles defined</p>
+            ) : (
+              <ul className="grid max-h-40 gap-1 overflow-y-auto rounded-md border border-border p-1">
+                {roles.map((role) => (
+                  <li key={role.id} className="flex items-center gap-2 px-1.5 py-1 text-sm">
+                    <Checkbox
+                      id={`policy-role-${role.id}`}
+                      checked={chosenRoles.includes(role.name)}
+                      aria-label={role.name}
+                      onCheckedChange={() => toggleRole(role.name)}
+                    />
+                    <label
+                      htmlFor={`policy-role-${role.id}`}
+                      className="flex-1 cursor-pointer truncate text-xs select-none"
+                    >
+                      {role.name}
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
           <fieldset className="grid gap-1.5">
             <legend className="mb-1.5 text-sm font-medium">Columns to mask</legend>

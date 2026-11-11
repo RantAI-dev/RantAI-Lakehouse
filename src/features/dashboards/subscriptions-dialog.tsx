@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useService } from "@/hooks/use-service";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
+import { listTimeZones } from "@/lib/time-zones";
 import { reportService } from "@/services";
 import type {
   ReportPerson,
@@ -278,7 +279,14 @@ function SubscriptionForm({
     }
   }
 
+  // WEB-8 D8: the zone names the browser's own IANA list plus UTC and the
+  // zone already held (`listTimeZones`), the same source the report settings
+  // page offers — a datalist, because a few hundred names are only usable
+  // as suggestions typed against. The server still checks the name.
+  const zones = React.useMemo(() => listTimeZones(zone.trim() || reportZone), [zone, reportZone]);
+
   const summary = schedule ? describeSchedule(schedule, zone.trim() || reportZone) : "";
+
   return (
     <div className="flex flex-col gap-4">
       <fieldset className="flex flex-col gap-2">
@@ -317,7 +325,18 @@ function SubscriptionForm({
             </Label>
           )}
           <Label className="flex flex-col gap-1 text-xs font-normal">Time zone
-            <Input aria-label="Time zone" value={zone} onChange={(e) => setZone(e.target.value)} className="w-44" />
+            <Input
+              aria-label="Time zone"
+              list="subscription-time-zones"
+              value={zone}
+              onChange={(e) => setZone(e.target.value)}
+              placeholder="Search a time zone"
+              autoComplete="off"
+              className="w-44"
+            />
+            <datalist id="subscription-time-zones">
+              {zones.map((name) => <option key={name} value={name} />)}
+            </datalist>
           </Label>
         </div>
         <p className="text-xs text-muted-foreground" aria-live="polite">{summary}</p>

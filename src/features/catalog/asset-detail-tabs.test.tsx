@@ -232,6 +232,7 @@ function stubApi({
   incidents = [],
   schedules = [],
   learning = LEARNING,
+  roles,
 }: {
   permissions?: string[]
   lineage?: unknown
@@ -263,6 +264,8 @@ function stubApi({
   schedules?: unknown[]
   /** What `GET /api/governance/quality/learning/{asset}` answers. */
   learning?: unknown
+  /** The roles `GET /api/identity/roles` answers; absent means the read fails. */
+  roles?: unknown[]
 } = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -284,6 +287,9 @@ function stubApi({
         return revokeRefusal ? json({ error: revokeRefusal.error }, revokeRefusal.status) : json({ ok: true })
       }
     }
+    // WEB-8 D8: the roles the Add policy dialog offers as checkboxes. Left
+    // out, the read fails and the field stays free text.
+    if (method === "GET" && path.endsWith("/api/identity/roles") && roles !== undefined) return json(roles)
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     // DATA-14: the Quality tab's incidents, schedule and learning state.
     if (method === "GET" && path.includes("/api/governance/quality/incidents")) return json({ incidents })
@@ -2080,6 +2086,46 @@ describe("Access tab: adding a policy", () => {
         },
       ],
     ])
+  })
+
+  it("offers the deployment's roles as checkboxes and sends the ones ticked (WEB-8 D8)", async () => {
+    const fetchSpy = stubApi({
+      roles: [
+        { id: "r1", name: "Analyst", members: 2, permissions: "", description: "" },
+        { id: "r2", name: "Dashboard Viewer", members: 1, permissions: "", description: "" },
+      ],
+    })
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs(BRONZE, reloaded)
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    // Once the roles are read, each one is a checkbox and the comma-separated
+    // text field is gone.
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Analyst" }))
+    expect(screen.queryByLabelText("Roles it applies to")).toBeNull()
+    fireEvent.click(screen.getByRole("checkbox", { name: "Dashboard Viewer" }))
+    fireEvent.click(screen.getByLabelText("amount"))
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)[0]?.[2]).toMatchObject({
+      kind: "Column mask",
+      subjects: "Analyst, Dashboard Viewer",
+    })
+  })
+
+  it("falls back to typing the roles, with the reason, when they cannot be read (WEB-8 D8)", async () => {
+    stubApi()
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    expect(await screen.findByText(/Could not read the roles; type them as a comma-separated list/)).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("Roles it applies to"), {
+      target: { value: "Analyst" },
+    })
+    expect((screen.getByLabelText("Roles it applies to") as HTMLInputElement).value).toBe("Analyst")
   })
 
   it("offers no policy form without policy:write", async () => {
