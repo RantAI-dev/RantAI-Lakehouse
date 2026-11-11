@@ -1132,28 +1132,33 @@ impl PolicyView {
 }
 
 /// The body of `GET /api/governance/row-filter-grammar` (`WEB-8` S2 T8,
-/// D8): the function names and operator tokens [`row_filter_grammar`]
-/// serves, read directly from the constants
-/// [`validate_row_filter_expr`](crate::sql_rewrite::validate_row_filter_expr)
-/// checks against — never a second list, so a change to what a save
-/// accepts changes the console's help line with it.
+/// D8; forms added by S2 review round 1, S2): the function names, operator
+/// tokens and expression forms [`row_filter_grammar`] serves, read directly
+/// from the constants in [`crate::sql_rewrite`] — never a second list, so a
+/// change to what a save accepts changes the console's help line with it.
 #[derive(Debug, Serialize)]
 pub struct RowFilterGrammar {
     /// Function names, in `ALLOWED_ROW_FILTER_FUNCTIONS`'s order.
     functions: &'static [&'static str],
     /// Operator tokens, in `ALLOWED_ROW_FILTER_OPERATORS`'s order.
     operators: &'static [&'static str],
+    /// Expression forms, in `ALLOWED_ROW_FILTER_FORMS`'s order.
+    forms: &'static [&'static str],
 }
 
-/// `GET /api/governance/row-filter-grammar` (`WEB-8` S2 T8, D8) — the
-/// functions and operators a row filter may use. Gated by `policy:read` in
+/// `GET /api/governance/row-filter-grammar` (`WEB-8` S2 T8, D8; forms added
+/// by S2 review round 1, S2) — the functions, operators and forms a row
+/// filter may use. Gated by `policy:read` in
 /// [`POLICY_TABLE`](crate::policy::POLICY_TABLE): the same grant that lists
 /// the policies this grammar authors.
 ///
 /// The answer is built from
-/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_FUNCTIONS`] and
-/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_OPERATORS`], the constants the
-/// validator itself reads (rule 4: no second copy, in Rust or TypeScript).
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_FUNCTIONS`],
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_OPERATORS`] and
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_FORMS`] (rule 4: no second copy,
+/// in Rust or TypeScript). The forms are shapes rather than a membership
+/// list; the test below feeds each name back to the validator, which is what
+/// keeps this list honest.
 ///
 /// # Errors
 ///
@@ -1163,6 +1168,7 @@ pub async fn row_filter_grammar() -> ApiResult<ApiJson<RowFilterGrammar>> {
     Ok(ApiJson(RowFilterGrammar {
         functions: crate::sql_rewrite::ALLOWED_ROW_FILTER_FUNCTIONS,
         operators: crate::sql_rewrite::ALLOWED_ROW_FILTER_OPERATORS,
+        forms: crate::sql_rewrite::ALLOWED_ROW_FILTER_FORMS,
     }))
 }
 
@@ -2117,6 +2123,33 @@ mod tests {
         assert!(
             validate_row_filter_expr("a || b", &columns, Engine::ClickHouse).is_err(),
             "the validator accepts an operator the route does not name"
+        );
+
+        // `WEB-8` S2 review round 1, S2: one filter per named form, checked
+        // on both engines the validator knows — the forms are match arms, not
+        // a membership list, so this loop is what ties the constant to the
+        // arms. `a IS TRUE` is a shape the validator refuses and the route
+        // does not name.
+        for form in grammar.forms {
+            let filter = match *form {
+                "LIKE" => "a LIKE 'x%'",
+                "ILIKE" => "a ILIKE 'x%'",
+                "BETWEEN" => "a BETWEEN 1 AND 2",
+                "IN" => "a IN (1, 2)",
+                "IS NULL" => "a IS NULL",
+                "IS NOT NULL" => "a IS NOT NULL",
+                other => panic!("the route names form '{other}' with no filter in this test"),
+            };
+            for engine in [Engine::ClickHouse, Engine::Trino] {
+                assert!(
+                    validate_row_filter_expr(filter, &columns, engine).is_ok(),
+                    "the route names form '{form}' but the validator refuses '{filter}' on {engine:?}"
+                );
+            }
+        }
+        assert!(
+            validate_row_filter_expr("a IS TRUE", &columns, Engine::ClickHouse).is_err(),
+            "the validator accepts a form the route does not name"
         );
     }
 

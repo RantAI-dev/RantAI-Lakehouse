@@ -1392,6 +1392,19 @@ pub const ALLOWED_ROW_FILTER_OPERATORS: &[&str] = &[
     "=", "<>", "<", "<=", ">", ">=", "AND", "OR", "+", "-", "*", "/", "%", "NOT",
 ];
 
+/// The other forms a row filter may take, spelled as the filter writes them
+/// (`WEB-8` S2 review round 1, S2). These are **shapes**, match arms in
+/// [`validate_expr_shape`] rather than a list it tests membership in — so
+/// this constant is not what makes them pass. It names them for
+/// `GET /api/governance/row-filter-grammar`, and that route's test feeds one
+/// filter per name back to [`validate_row_filter_expr`] on both
+/// [`Engine::ClickHouse`] and [`Engine::Trino`], which is what ties the list
+/// to the match arms. The forms here are the only ones beyond the operators'
+/// two comparisons: `NOT LIKE`, `NOT ILIKE`, `NOT BETWEEN` and `NOT IN`
+/// stay accepted through the same arms.
+pub const ALLOWED_ROW_FILTER_FORMS: &[&str] =
+    &["LIKE", "ILIKE", "BETWEEN", "IN", "IS NULL", "IS NOT NULL"];
+
 /// The one entry point WS7 item B6 calls. Parses `sql`, and for EVERY
 /// `TableFactor::Table` this module can reach — any `FROM`, any
 /// `JOIN`'s relation, inside a CTE's own body, inside each `UNION`

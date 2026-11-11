@@ -1759,6 +1759,12 @@ async fn row_filter_grammar_route_needs_policy_read_both_ways() {
             .is_some_and(|operators| !operators.is_empty()),
         "the route answers its operators: {body}"
     );
+    assert!(
+        body["forms"]
+            .as_array()
+            .is_some_and(|forms| !forms.is_empty()),
+        "the route answers its forms: {body}"
+    );
 }
 
 /// SEC-23 (F1/F2): a principal holding other write permissions but NOT
