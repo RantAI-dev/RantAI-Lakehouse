@@ -51,7 +51,7 @@ use crate::sql_rewrite::Engine;
 ///
 /// Public so the engine-corpus test (`tests/sql_lex_corpus.rs`) can
 /// compare this verdict, statement by statement, with what a
-/// real `ClickHouse` reads; every in-crate caller is inside this crate.
+/// real `ClickHouse` reads; apart from that test, every caller is inside this crate.
 ///
 /// Both halves of the check run against [`strip_sql_noise`]'s output
 /// rather than the raw text, which is the difference from the
