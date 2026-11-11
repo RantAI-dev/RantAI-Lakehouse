@@ -231,10 +231,28 @@ fn has_letters(text: &str) -> bool {
 /// Whether every letter in `text` is a Latin one (ASCII or accented), with
 /// at least one letter present. A message in Chinese, Arabic or Cyrillic is
 /// not, and keeps the plain "reply in the user's language" line.
-fn is_latin_script(text: &str) -> bool {
+pub(super) fn is_latin_script(text: &str) -> bool {
     let mut letters = text.chars().filter(|c| c.is_alphabetic()).peekable();
     letters.peek().is_some()
         && letters.all(|c| c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c))
+}
+
+/// Whether `text` holds any character of the CJK scripts: Han, Hiragana,
+/// Katakana, or Hangul (syllables and Jamo). `AI-17`: the prompt's "never in
+/// Chinese" line was ignored on staging, so the chat loop (`routes::ai`)
+/// checks the final answer itself — an answer to a question written in
+/// Latin script is asked once for a rewrite when this is true. The base
+/// blocks only, no extensions: a character outside them is not read as CJK.
+pub(super) fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(c,
+            '\u{4E00}'..='\u{9FFF}' // Han
+            | '\u{3040}'..='\u{309F}' // Hiragana
+            | '\u{30A0}'..='\u{30FF}' // Katakana
+            | '\u{AC00}'..='\u{D7AF}' // Hangul syllables
+            | '\u{1100}'..='\u{11FF}' // Hangul Jamo
+        )
+    })
 }
 
 /// Everyday Indonesian function words: common in any Indonesian sentence,
@@ -1679,6 +1697,25 @@ mod tests {
         }
         // No letters at all is not "Latin".
         assert!(!closing("123 ?", None).contains("Latin script"));
+    }
+
+    /// `AI-17`: the server-side CJK check must see each CJK script, so an
+    /// answer to a Latin-script question cannot hide Chinese, Japanese or
+    /// Korean text from it, and must not read accented Latin or plain ASCII
+    /// as CJK, or every Latin answer would be sent for a rewrite.
+    #[test]
+    fn the_cjk_check_sees_han_hiragana_katakana_and_hangul_and_no_latin_script() {
+        for cjk in ["吸", "あ", "カ", "한", "吸引力", "총"] {
+            assert!(contains_cjk(cjk), "{cjk} should be read as CJK");
+        }
+        for latin in [
+            "Bogotá",
+            "Berapa total kunjungan?",
+            "Total kunjungan adalah 5.",
+            "",
+        ] {
+            assert!(!contains_cjk(latin), "{latin} should not be read as CJK");
+        }
     }
 
     // The two `None` lines of `closing` as they were before the default
