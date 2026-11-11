@@ -277,6 +277,153 @@ this machine; no cargo command was run (no Rust change); no compose check (no co
 `git status --short` before the commit: exactly the six S1 files, the new test untracked; after
 it, clean apart from this handoff and then clean.
 
+### Handoff (developer, 2026-11-11, S2)
+
+Branch `feat/web-7-s2-editors`, off `origin/main` at `d95480d3`. TypeScript only: no Rust, no
+migration, no compose. `tool_schemas.json` is untouched.
+
+**Commits**
+
+- `0066f5f3` — T5/D2/D5: Save query and Save as SQL source are pages, with the sessionStorage
+  draft handoff.
+- `58c34f58` — T6/D2/D4/D6: the chart builder is a page; the save moves to `dashboardService`;
+  the openers (dashboard and assistant draft) navigate; the parameter values ride in the address.
+- `b94d8efb` — T7/D2/D4/D7/D8: the alert rule form is a page; the two `apiFetch` loads move to
+  `dashboardService`; `CreateSheet` is deleted.
+- This handoff is its own docs commit.
+
+**Anchors re-found** (the plan's were verified at `dcaae8a5`; `main` moved to `d95480d3`)
+
+| Anchor | At `dcaae8a5` | At `d95480d3` (before this branch) |
+| --- | --- | --- |
+| `chart-builder.tsx` `ChartBuilder` | 351 | 351 (unchanged) |
+| `chart-builder.tsx` the specs `apiFetch` | "1180-1237" | preview 1160, save 1222; the span the plan names is the preview block, not the save |
+| `chart-builder.tsx` `<ParamDialog` | 1656 | 1662 (+6) |
+| `chart-builder.tsx` the dialog wrapper | 1773-1779 | 1779-1785 (+6) |
+| `chart-builder.tsx` Formula/ValueGroup/Hierarchy dialogs | 1883/1903/1917 | 1889/1909/1923 (+6) |
+| `dashboard-page.tsx` edit opener | 1438 | 1438 (unchanged) |
+| `dashboard-page.tsx` new opener | 1443 | 1443 (unchanged) |
+| `chart-draft-card.tsx` `<ChartBuilder>` | 267 | 267 (unchanged) |
+| `alerts-page.tsx` `alertRuleFormFields` | 147 | 147 (unchanged) |
+| `alerts-page.tsx` `alertRuleSaveInput` | 186 | 186 (unchanged) |
+| `alerts-page.tsx` `RuleEditDialog` | 479 | 479 (unchanged) |
+| `alerts-page.tsx` the raw loads | "766-787" | boards 754, fields 762, `loadFields` 775-787 — the plan's span was already ~12 lines low at `dcaae8a5` |
+| `alerts-page.tsx` `<RuleEditDialog>` render | 952 | 952 (unchanged) |
+| `create-sheet.tsx` | 18-72 | 18-72 (unchanged); deleted here |
+| `save-query-sheet.tsx` | — | `SaveQuerySheet` 48, `<CreateSheet>` 150; deleted here |
+| `save-sql-source-sheet.tsx` | — | `SaveSqlSourceSheet` 23, `<CreateSheet>` 44; deleted here |
+| `query-studio-page.tsx` save openers | — | 107 (`onSave`), 204/217 (the two sheets); deleted here |
+
+**D2 "requires", checked against the server**
+
+| Form | Route | Server route and permission | `ROUTE_ACCESS` used |
+| --- | --- | --- | --- |
+| Save query | `/query-studio/save` | `POST /api/query/saved` → `query:read` (`policy.rs:475`) | `query:read` |
+| Save as SQL source | `/query-studio/save-source` | `POST /api/dashboard/sources` → `dashboard:sql` (`policy.rs:680`) | `dashboard:sql` |
+| New chart | `/dashboards/[id]/charts/new` | `POST /api/dashboard/specs` → `RequiresAuth`, level resolved in the handler (`policy.rs:647`) | `[]` |
+| Edit chart | `/dashboards/[id]/charts/[chartId]/edit` | `PUT /api/dashboard/specs` → `RequiresAuth`, same (`policy.rs:648`) | `[]` |
+| New alert rule | `/alerts/rules/new` | `POST /api/alerts` → `RequiresAuth`, handler decides (`policy.rs:424`) | `alert:write` |
+| Edit alert rule | `/alerts/rules/[id]/edit` | `PUT /api/alerts` → `RequiresAuth`, same (`policy.rs:425`) | `alert:write` |
+
+Three of these differ from the plan's table, because the server's rule is wider or narrower:
+
+- **Charts.** The plan wrote "`dashboard:write` or the board's edit level". The route is
+  `RequiresAuth` and the handler requires `edit` on the dashboard, which a rule can grant without
+  `dashboard:write`; a `dashboard:write` entry would shut a rule-only editor out. So both entries
+  are `[]` and the page loads the board and renders `PermissionState` below `edit` (the plan's
+  parenthetical).
+- **The built-in dashboard.** `GET /api/dashboard/access` refuses `default` with 400 — it is not a
+  stored row (`managed_subject`, `BUILT_IN`). The page reads the level the server uses at the
+  root instead (`chart-page.ts` `builtInBoardEditable`: `identity:write` or `dashboard:write`,
+  matching `baseline_of` / `level_at_root`). Without that the most common board would have shown
+  an error.
+- **Alert rules.** The plan's `alert:write` is what this form's saves take, but the route floor is
+  `RequiresAuth`: an owner may change their own chart alert without `alert:write`
+  (`policy.rs:417-425`, `may_manage`). This page's create form cannot produce a chart alert (that
+  dialog stays on the dashboard), so the entry states the permission its own writes need. The
+  gap it leaves: a chart alert's owner without `alert:write` is refused by the *edit* page's
+  entry although the server would allow the save. Flagged, not worked around.
+
+**D5 — does the editor keep its text across the trip?** Yes, verified before building. Query
+Studio keeps its tabs in `localStorage` under `QUERY_DRAFT_KEY`
+(`rantai-lakehouse:query-studio-draft`, `lib/query-draft.ts`), restores them on mount in
+`use-query-studio.ts`, and writes them through `useDebouncedCallback` (400 ms), which **flushes
+the pending write on unmount** (`hooks/use-debounced-callback.ts`). Navigating to the save page
+unmounts the studio, so the last keystrokes are flushed and the same SQL, tabs, parameters and
+`values` come back on return. No persistence was added by this slice.
+
+**D6 — `paramValues`.** They are preview-only, as the plan suspected. `buildPayload` adds
+`payload.params = paramValues` only when `forPreview` is set (`chart-builder.tsx`), and the
+preview effect keys on them; the save body never carries `params` or the values.
+`chart-builder-page.test.tsx` ("draws the preview with the address's parameter values and saves
+the chart without them") asserts both halves against the request bodies. The card they travel in
+is `?params=<encodeURIComponent(JSON.stringify(values))>`, read by `chartParamValues`.
+
+**D6 — the assistant draft path (for the AI team).** The draft card no longer opens the builder.
+"Edit in builder" writes `{ board, def, complete? }` to `sessionStorage` under
+`lakehouse.chartDraft` (`features/dashboards/chart-page.ts` `writeChartDraft`), where `def` is the
+same chart definition the card already sends to `/specs/preview`, and `complete` names the chat's
+message and step indices when the card came from a pending `create_chart`. It then pushes
+`/dashboards/<board>/charts/new`. The New chart page takes the draft once on mount with
+`takeChartDraft(board)`, which deletes the key whatever it held, ignores a draft for another
+board, and returns it only if it still parses; the builder then shows it filled in. On a
+successful save the page calls the app frame's `useCopilot().completeToolStep(messageIndex,
+stepIndex, { created: true, title, kind, mart, board, via: "builder" })`, so the chat marks the
+step saved as it did when the card's own builder closed — the Copilot provider lives in
+`AppFrame` and survives the navigation. `tool_schemas.json` does not change.
+
+**D8 grep (`grep -rn 'CreateSheet' src --include=*.tsx --include=*.ts`)** — no import and no
+render: `create-sheet.tsx` is gone. Six prose mentions remain, each saying where a form came
+from: `form-page.tsx:12`, `tag-key-form-page.tsx:24`, `quality-rule-create-page.tsx:22`,
+`tenant-create-page.tsx:14`, `invite-user-page.tsx:16`, `service-identity-create-page.tsx:15`.
+
+**What changed in behaviour, beyond the pages themselves**
+
+- Saving query: the page shares the editor's "change or copy" rule
+  (`saved-query-write.ts`), and after a successful save it points the stored query tab at the
+  query it produced (`rememberSavedTab`, `lib/query-draft.ts`). That is what the sheet did in
+  place; without it, a copy just made would still offer "Save as new".
+  `useQueryStudio.save`/`saveAct` now have no UI caller; I kept them (their tests assert the
+  create/update decision, and their assertions are also in the new page test) rather than
+  deleting tested code the plan did not ask me to remove — flagged for the review.
+- Charts: `onSaved` goes back to `/dashboards/<id>`, which reloads. The dialog's in-place
+  placement on the open tab (`loadAndPlace`) is gone with it, so with several tabs a new chart is
+  drawn where the board draws charts with no stored box, not on the tab that was open. The plan
+  asks for the reload; this is the difference it implies.
+- Charts: Edit reads the chart through `GET /api/dashboard/specs` (the list) because the server
+  has no by-id route; that is one whole-list read per Edit visit, noted as a cost.
+- Alerts: the list still owns "New rule"/"Edit" as navigation, and still writes a rule back when
+  toggled, with the same `alertRuleSaveInput`.
+
+**Commands run (foreground, this machine, final commit `b94d8efb`)**
+
+- `bun install --frozen-lockfile` → `Checked 779 installs across 753 packages (no changes)`.
+- `bun run typecheck` → `$ bun --bun tsc --noEmit`, no errors.
+- `bun run lint` → 0 errors, 10 warnings, the same set S1 recorded (`data-table.tsx`,
+  `ui/sidebar.tsx`, `alerts-page.tsx` — its `rules` conditional in the list, pre-existing, now at
+  128 — `login-page.tsx`, `use-copilot.ts`, `use-data-table.ts`, `dashboard-specs.ts`,
+  `uploads.test.ts`, `services/http.ts`). No touched file gained one.
+- `bun test src/features/queries` → 377 pass, 0 fail, 28 files.
+- `bun test src/features/dashboards` → 622 pass, 0 fail, 2542 expect() calls, 79 files.
+- `bun test src/features/copilot` → 140 pass, 0 fail, 500 expect() calls, 12 files.
+- `bun test src/features/alerts` → 38 pass, 0 fail, 100 expect() calls, 3 files.
+- `bun test src/components/app-shell` → 27 pass, 0 fail, 115 expect() calls, 4 files (the ADM-13
+  route-coverage test with the six new pages, and the new `canOpen` assertions).
+- `bun test src/components/patterns` → 15 pass, 0 fail, 30 expect() calls, 3 files (after
+  `create-sheet.tsx` was deleted).
+- `bun test src/services` → 212 pass, 0 fail, 593 expect() calls, 19 files.
+- `bun test src/lib/query-draft.test.ts` → 20 pass, 0 fail, 1 file. A single file rather than the
+  folder: `rememberSavedTab` (the tab handoff) belongs in `lib/query-draft.ts`, which owns the
+  draft's shape, and the brief's folder list does not include `src/lib`.
+
+**Not verified locally: the rest, left to CI.** `bun run test` (the whole suite) was not run on
+this machine; no cargo command was run (no Rust change); no compose check (no compose change).
+
+`git status --short` after the three code commits: clean (only this handoff pending).
+`git log --oneline origin/main..HEAD`: `0066f5f3`, `58c34f58`, `b94d8efb`.
+`git ls-remote --heads origin feat/web-7-s2-editors`: the branch exists and points at the pushed
+head.
+
 
 ## 6. Review (planner)
 
