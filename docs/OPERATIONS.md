@@ -1613,7 +1613,7 @@ immediately.
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay; for a relay behind a private CA, set `SMTP_CA_FILE` as well (see "Email through an internal relay" above) |
 | Scheduled reports by email (`RPT-1`) | SMTP, plus `RENDER_TOKEN_SECRET` for PDF attachments | A subscription can be saved but nothing is sent | Set `SMTP_HOST` (and friends) and `CONSOLE_PUBLIC_URL` (the link in the email) |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
-| SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs); `OIDC_JWKS_URL` is optional — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
+| SSO / OIDC login | An OIDC provider | Local password auth only | Set in **Settings → Sign-in** (by a Platform Admin, no restart needed) or set `OIDC_ISSUER` + `OIDC_CLIENT_ID` in `.env` (and, for the browser flow, the four URLs) — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 
 ## Login throttling and session cleanup
 
@@ -1775,6 +1775,57 @@ otherwise every token is refused with the same generic 401 and a `warn` line
 names the failed check. Set `OIDC_JWKS_URL` to skip discovery entirely, for
 a provider that publishes no discovery document or one this deployment
 cannot reach.
+
+### Setting up single sign-on in Settings
+
+Platform Admins can configure OIDC single sign-on directly from the console under **Settings → Sign-in** without restarting the API service. The configuration takes effect immediately upon saving.
+
+**Set `CONSOLE_PUBLIC_URL` first.** A sign-in has to return the person to
+this deployment, so the callback address is
+`<CONSOLE_PUBLIC_URL>/api/auth/oidc/callback` (the API's own configuration,
+never a request header). `OIDC_REDIRECT_URI` still wins when it is set. With
+neither set, the connection cannot be used: **Settings → Sign-in** shows
+`ready: false` with the sentence "Set CONSOLE_PUBLIC_URL …", and the sign-in
+page shows no SSO button. Saving still works, so an administrator can fill the
+form first and set the address afterwards.
+
+**The addresses come from the provider's discovery document.** A connection
+saved in Settings stores only the issuer, the client ID and the secret. The
+authorize address, the token address and the key set are read from
+`<issuer>/.well-known/openid-configuration` (`authorization_endpoint`,
+`token_endpoint`, `jwks_uri`) the first time the connection is used, and cached
+with the settings. Each of them must be an `https://` address outside this
+deployment's network, checked the same way the issuer is; one that is not
+leaves the connection "not ready" and nothing is sent to it. A value set in
+`.env` (`OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_JWKS_URL`,
+`OIDC_REDIRECT_URI`) still wins per value and shows as "Set by the server".
+
+The settings form provides:
+- **Issuer URL**: The base URL of the OIDC provider (must be a valid `https://` endpoint).
+- **Client ID**: The OIDC client identifier.
+- **Client secret**: Stored securely as a sealed secret in the database and never returned over the wire; can be replaced or cleared.
+- **Provider display name**: Optional friendly name shown on the sign-in button (defaults to `default`).
+- **Groups claim**: The claim key in the ID token that carries groups (defaults to `groups`).
+- **Just-in-time provisioning**: When enabled, creates local user accounts automatically upon first successful sign-in.
+- **Role mapping**: Maps external IdP group names to local deployment roles (`admin`, `developer`, `viewer`, etc.).
+
+**Testing sign-in.** The **Test sign-in** button tests the current draft settings before saving:
+- It launches an authorization-code flow in a new browser window, using the draft's own discovery document for the authorize, token and key-set addresses — never the saved connection's.
+- Upon completion, the IdP redirects back to the deployment's callback, which validates the token claims and role mapping without creating a user, session, or login audit row.
+- A result card displays the returned subject, email, whether the provider verified that email, extracted groups, mapped roles and whether the groups claim was replaced by an overage marker, or any classified error (for example, "The provider refused the client ID or secret", or "The identity provider could not be reached").
+- A run uses only the client secret sealed into it when it was created; it never falls back to `OIDC_CLIENT_SECRET`.
+
+#### Environment variable precedence (`.env` wins)
+
+Settings defined in the environment (`/opt/rantai-lakehouse/.env`) take precedence over values saved in the console:
+- **Connection as a unit**: If `OIDC_ISSUER` or `OIDC_CLIENT_ID` is set in the environment, the connection parameters (`issuer`, `client ID`, `client secret`, `authorize URL`, `token URL`, `JWKS URL`, and `redirect URI`) are server-owned and become read-only in the console with the label "Set by the server". The server refuses updates to any server-owned field with HTTP 409 (`SET_BY_THE_SERVER`).
+- **Individual settings**: `OIDC_PROVIDER_NAME`, `OIDC_GROUPS_CLAIM`, `OIDC_ROLE_MAP`, and `OIDC_JIT_PROVISIONING` are server-owned only if their specific environment variable is set.
+
+#### Internal IdP via `.env`
+
+For security, the console restricts `Issuer URL` to public `https://` endpoints that resolve outside private network IP ranges (SSRF protection). If you run an internal or development identity provider (such as Keycloak inside the Docker compose network or a private IdP reachable only via HTTP or internal IP), configure it in `/opt/rantai-lakehouse/.env`:
+- Set `OIDC_ISSUER` (and endpoints such as `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, and `OIDC_JWKS_URL`) in `.env`.
+- Ensure `CONNECTOR_INTERNAL_HOSTS` includes the host name or IP of the internal IdP so the API's SSRF probe permits connections to it.
 
 ### Keycloak
 

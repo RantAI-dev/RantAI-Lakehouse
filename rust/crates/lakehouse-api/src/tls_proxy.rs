@@ -127,6 +127,142 @@ impl Drop for TlsProxy {
     }
 }
 
+/// A certificate authority minted for one test (`ADM-12` review round 1,
+/// B1): an `https://` mock provider needs a certificate a test client can
+/// verify, and no certificate is committed to this repository (a committed
+/// private key is a leak — `SEC-36`).
+#[cfg(test)]
+pub(crate) struct MintedCa {
+    /// The CA's own parameters, which signing a leaf needs again: `rcgen`
+    /// 0.14 unbundles them from the issued certificate.
+    params: rcgen::CertificateParams,
+    certificate: rcgen::Certificate,
+    key: rcgen::KeyPair,
+}
+
+#[cfg(test)]
+impl MintedCa {
+    /// A fresh CA, valid to sign server certificates.
+    pub(crate) fn new(common_name: &str) -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).expect("CA parameters");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let key = rcgen::KeyPair::generate().expect("a CA key pair");
+        let certificate = params.self_signed(&key).expect("a self-signed CA");
+        Self {
+            params,
+            certificate,
+            key,
+        }
+    }
+
+    /// A server certificate for `subject` (a DNS name or an IP literal),
+    /// signed by this CA.
+    fn server_certificate(&self, subject: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let mut params =
+            rcgen::CertificateParams::new(vec![subject.to_owned()]).expect("server params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, subject);
+        let key = rcgen::KeyPair::generate().expect("a server key pair");
+        let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
+        let certificate = params
+            .signed_by(&key, &issuer)
+            .expect("a certificate signed by the test CA");
+        (certificate, key)
+    }
+
+    /// The CA as a PEM `CERTIFICATE` block, the shape `reqwest`'s
+    /// `add_root_certificate` takes.
+    pub(crate) fn pem(&self) -> String {
+        pem_certificate(self.certificate.der())
+    }
+}
+
+/// An HTTPS front in front of a plain mock provider (`ADM-12` review round
+/// 1, B1): a sign-in test has to reach the provider at an `https://` address,
+/// and `wiremock` serves plaintext only. It accepts TLS the moment a client
+/// connects (no `PostgreSQL` `SSLRequest`, unlike [`TlsProxy`]) and forwards
+/// the decrypted bytes to the mock. Stopped when it is dropped.
+#[cfg(test)]
+pub(crate) struct HttpsFront {
+    port: u16,
+    ca_pem: String,
+    accept_task: JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl HttpsFront {
+    /// Start a front in front of `plain_host:plain_port`, presenting a
+    /// certificate for `subject` signed by a CA this call mints.
+    pub(crate) async fn start(plain_host: &str, plain_port: u16, subject: &str) -> Self {
+        let ca = MintedCa::new("ADM-12 test CA");
+        let (certificate, key) = ca.server_certificate(subject);
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+        );
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("the TLS versions rustls supports by default")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.der().clone()], key_der)
+        .expect("the minted certificate and key form a usable server identity");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener for the HTTPS front");
+        let port = listener
+            .local_addr()
+            .expect("the bound front address")
+            .port();
+        let plain = format!("{plain_host}:{plain_port}");
+        let accept_task = tokio::spawn(async move {
+            while let Ok((inbound, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let plain = plain.clone();
+                tokio::spawn(async move {
+                    let Ok(mut inbound) = acceptor.accept(inbound).await else {
+                        return;
+                    };
+                    let Ok(mut outbound) = TcpStream::connect(plain.as_str()).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+        });
+
+        Self {
+            port,
+            ca_pem: ca.pem(),
+            accept_task,
+        }
+    }
+
+    /// The loopback port to dial instead of the plain server's.
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The CA's certificate as a PEM block, for a client that must verify
+    /// the front's server certificate.
+    pub(crate) fn ca_pem(&self) -> &str {
+        &self.ca_pem
+    }
+}
+
+#[cfg(test)]
+impl Drop for HttpsFront {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
 /// A [`TlsAcceptor`] for a freshly generated self-signed certificate, plus
 /// that certificate as PEM. `ring` is named explicitly, as in
 /// `pg_probe::client_config`: the default provider is process-global and

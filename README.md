@@ -128,7 +128,7 @@ linked section.
 | AI assistant and plain-language queries | An OpenAI-compatible model: `LLM_URL`, `LLM_MODEL`, `LLM_KEY` |
 | Dashboard PDF export | `CONSOLE_INTERNAL_URL=http://console:3000` (the secret it also needs is already generated) |
 | Email: alerts, digests and scheduled reports | `SMTP_HOST` and the other `SMTP_*` settings; `CONSOLE_PUBLIC_URL` for the link in a report |
-| Single sign-on | `OIDC_ISSUER`, `OIDC_CLIENT_ID` and the sign-in URLs |
+| Single sign-on | Set in the console under **Settings → Sign-in**, or in `/opt/rantai-lakehouse/.env` with `OIDC_ISSUER`, `OIDC_CLIENT_ID` and the sign-in URLs |
 | Signed dashboard embeds | `EMBED_SECRET` |
 
 Each one is explained in [docs/OPERATIONS.md](docs/OPERATIONS.md), "Features
