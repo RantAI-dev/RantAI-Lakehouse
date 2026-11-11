@@ -670,11 +670,13 @@ fn safe_return_path(raw: Option<&str>) -> String {
 /// stays confined to this one function's validation, not duplicated at
 /// two call sites that could drift.
 #[derive(Debug, Serialize, Deserialize)]
-struct OidcFlow {
-    state: String,
-    nonce: String,
-    code_verifier: String,
-    next: String,
+pub(crate) struct OidcFlow {
+    pub(crate) state: String,
+    pub(crate) nonce: String,
+    pub(crate) code_verifier: String,
+    pub(crate) next: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) test_run_id: Option<Uuid>,
 }
 
 const OIDC_FLOW_COOKIE_NAME: &str = "lh_oidc_flow";
@@ -684,7 +686,7 @@ const OIDC_FLOW_TTL_SECONDS: i64 = 600;
 /// the `lh_oidc_flow` cookie. `Secure` follows the exact same condition
 /// [`session_cookie_header`] uses — see that function's doc comment for
 /// why the default fails closed to `Secure`.
-fn oidc_flow_cookie_header(is_dev: bool, flow: Option<&OidcFlow>) -> HeaderValue {
+pub(crate) fn oidc_flow_cookie_header(is_dev: bool, flow: Option<&OidcFlow>) -> HeaderValue {
     let (value, max_age) = match flow {
         Some(flow) => {
             let json = serde_json::to_string(flow).unwrap_or_default();
@@ -775,6 +777,7 @@ pub async fn oidc_start(
         nonce: nonce.expose().to_owned(),
         code_verifier: code_verifier.expose().to_owned(),
         next: safe_return_path(query.next.as_deref()),
+        test_run_id: None,
     };
 
     let mut redirect = url::Url::parse(authorize_url)
@@ -1001,6 +1004,10 @@ pub async fn oidc_callback(
         return Ok(unauthorized());
     };
 
+    if let Some(test_run_id) = flow.test_run_id {
+        return handle_oidc_test_callback(state, query, flow, test_run_id).await;
+    }
+
     let (Some(code), Some(returned_state)) = (query.code, query.state) else {
         tracing::warn!("oidc callback: missing code or state");
         return Ok(unauthorized());
@@ -1219,6 +1226,227 @@ fn oidc_login_audit_event(principal: &Principal, user_id: Uuid) -> NewAuditEvent
         outcome: "executed".to_owned(),
         detail: Some(format!("provider={}", principal.provider)),
         ..Default::default()
+    }
+}
+
+async fn handle_oidc_test_callback(
+    state: AppState,
+    query: OidcCallbackQuery,
+    flow: OidcFlow,
+    test_run_id: Uuid,
+) -> ApiResult<Response> {
+    let clear_cookie = || oidc_flow_cookie_header(state.config.is_dev, None);
+    let unauthorized_and_clear = |mut resp: Response| {
+        resp.headers_mut()
+            .append(header::SET_COOKIE, clear_cookie());
+        resp
+    };
+    let unauthorized =
+        || unauthorized_and_clear(crate::error::ApiRejection(ApiError::unauthorized()).into_response());
+    let unavailable_and_clear = |msg: &str| {
+        unauthorized_and_clear(
+            crate::error::ApiRejection(ApiError::Unavailable(msg.to_owned())).into_response(),
+        )
+    };
+
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(unavailable_and_clear(
+            "authentication unavailable: no Postgres pool is configured (set DATABASE_URL)",
+        ));
+    };
+
+    let run = match lakehouse_store::sso_settings::get_test_run(pool, test_run_id).await {
+        Ok(Some(r)) if r.expires_at > time::OffsetDateTime::now_utc() => r,
+        _ => return Ok(unauthorized()),
+    };
+
+    let redirect_url = format!("/admin/settings?section=sign-in&ssoTest={test_run_id}");
+    let mut redirect_resp = (StatusCode::FOUND, ()).into_response();
+    if let Ok(loc) = HeaderValue::from_str(&redirect_url) {
+        redirect_resp.headers_mut().insert(header::LOCATION, loc);
+    }
+    redirect_resp.headers_mut().append(header::SET_COOKIE, clear_cookie());
+
+    let (Some(code), Some(returned_state)) = (query.code, query.state) else {
+        tracing::warn!("oidc test callback: missing code or state");
+        let result = serde_json::json!({
+            "ok": false,
+            "error": "The identity provider returned no authorization code or state.",
+        });
+        let _ = lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
+        audit_sso_test(pool, run.created_by, "failed", &result).await;
+        return Ok(redirect_resp);
+    };
+
+    let state_matches =
+        Secret::new(returned_state).constant_time_eq(&Secret::new(flow.state.clone()));
+    if !state_matches {
+        tracing::warn!("oidc test callback: state mismatch");
+        let result = serde_json::json!({
+            "ok": false,
+            "error": "State parameter mismatch in identity provider response.",
+        });
+        let _ = lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
+        audit_sso_test(pool, run.created_by, "failed", &result).await;
+        return Ok(redirect_resp);
+    }
+
+    let draft = run.draft;
+    let issuer = draft
+        .get("issuer")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let client_id = draft
+        .get("clientId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let provider_name = draft
+        .get("providerName")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default");
+    let groups_claim = draft
+        .get("groupsClaim")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("groups");
+    let role_map = draft
+        .get("roleMap")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| crate::runtime_settings::parse_role_map_json_entries(&serde_json::Value::Array(arr.clone())))
+        .unwrap_or_default();
+
+    let client_secret = if let Some(ref sealed) = run.draft_secret {
+        state
+            .connector_secret_store
+            .keyring()
+            .ok()
+            .and_then(|r| r.open(crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME, sealed).ok())
+            .and_then(|o| String::from_utf8(o.plaintext).ok())
+    } else {
+        state.config.oidc_client_secret.clone()
+    };
+
+    let sso = crate::runtime_settings::sso(&state).await;
+    let token_url = sso
+        .token_url
+        .as_deref()
+        .or(state.config.oidc_token_url.as_deref())
+        .unwrap_or("");
+    let redirect_uri = sso
+        .redirect_uri
+        .as_deref()
+        .or(state.config.oidc_redirect_uri.as_deref())
+        .unwrap_or("/api/auth/oidc/callback");
+
+    let Some(id_token) = exchange_code_for_id_token(
+        token_url,
+        redirect_uri,
+        client_id,
+        client_secret.as_deref(),
+        &code,
+        &flow.code_verifier,
+    )
+    .await
+    else {
+        tracing::warn!("oidc test callback: token exchange failed");
+        let result = serde_json::json!({
+            "ok": false,
+            "error": "The provider refused the client ID or secret.",
+        });
+        let _ = lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
+        audit_sso_test(pool, run.created_by, "failed", &result).await;
+        return Ok(redirect_resp);
+    };
+
+    let mut oidc_config = match sso.jwks_url.clone() {
+        Some(jwks_url) => lakehouse_auth::oidc::OidcConfig::new(
+            issuer.to_owned(),
+            client_id.to_owned(),
+            provider_name.to_owned(),
+            jwks_url,
+        ),
+        None => lakehouse_auth::oidc::OidcConfig::with_discovery(
+            issuer.to_owned(),
+            client_id.to_owned(),
+            provider_name.to_owned(),
+        ),
+    };
+    for entry in role_map {
+        oidc_config.role_map.insert(entry.group, entry.role);
+    }
+    oidc_config.groups_claim = groups_claim.to_owned();
+    oidc_config.clock_skew_seconds = state.config.oidc_clock_skew_seconds;
+
+    let internal_hosts = state.config.connector_internal_hosts();
+    let mut http_client = None;
+    if let Some((host, port)) = crate::connector_probe::parse_endpoint_host_port(issuer) {
+        if let Ok(approved) = crate::connector_probe::resolve_checked(host, port, &internal_hosts).await {
+            let mut builder = reqwest::Client::builder().resolve_to_addrs(host, approved.all());
+            if let Some(ref jwks_url) = sso.jwks_url
+                && let Some((j_host, j_port)) = crate::connector_probe::parse_endpoint_host_port(jwks_url)
+                && let Ok(j_appr) = crate::connector_probe::resolve_checked(j_host, j_port, &internal_hosts).await
+            {
+                builder = builder.resolve_to_addrs(j_host, j_appr.all());
+            }
+            if let Ok(client) = builder.build() {
+                http_client = Some(client);
+            }
+        }
+    }
+
+    let draft_auth = lakehouse_auth::oidc::OidcAuthenticator::new_with_http_client(
+        oidc_config,
+        http_client,
+        pool.clone(),
+    );
+
+    match draft_auth.validate_for_test(&Secret::new(id_token), &flow.nonce).await {
+        Ok(test_claims) => {
+            let result = serde_json::json!({
+                "ok": true,
+                "subject": test_claims.subject,
+                "email": test_claims.email,
+                "groups": test_claims.groups,
+                "mappedRoles": test_claims.mapped_roles,
+            });
+            let _ = lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
+            audit_sso_test(pool, run.created_by, "executed", &result).await;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "oidc test callback: id token validation failed");
+            let result = serde_json::json!({
+                "ok": false,
+                "error": "ID token verification failed.",
+            });
+            let _ = lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
+            audit_sso_test(pool, run.created_by, "failed", &result).await;
+        }
+    }
+
+    Ok(redirect_resp)
+}
+
+pub(crate) async fn audit_sso_test(
+    pool: &PgPool,
+    created_by: Uuid,
+    outcome: &str,
+    result: &serde_json::Value,
+) {
+    let event = NewAuditEvent {
+        principal_id: Some(created_by.to_string()),
+        principal_kind: Some("user".to_owned()),
+        actor_label: None,
+        action: "settings.sso.test".to_owned(),
+        resource_kind: Some("settings".to_owned()),
+        resource_id: Some("sso".to_owned()),
+        args: Some(result.clone()),
+        outcome: outcome.to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::warn!(%err, action = "settings.sso.test", "failed to record the sso test audit event");
     }
 }
 
@@ -1484,6 +1712,7 @@ mod tests {
                 nonce: "nonce-1".to_owned(),
                 code_verifier: "verifier-1".to_owned(),
                 next: "/dashboards".to_owned(),
+                test_run_id: None,
             }),
         );
         let response = app
@@ -1678,6 +1907,7 @@ mod tests {
             nonce: "nonce-from-start".to_owned(),
             code_verifier: "verifier-1".to_owned(),
             next: "/dashboards".to_owned(),
+            test_run_id: None,
         };
 
         let id_token = sign_id_token(
@@ -1804,6 +2034,7 @@ mod tests {
             nonce: "nonce-from-start".to_owned(),
             code_verifier: "verifier-1".to_owned(),
             next: "/dashboards".to_owned(),
+            test_run_id: None,
         };
 
         let id_token = sign_id_token(
@@ -1900,6 +2131,7 @@ mod tests {
             nonce: "nonce-from-start".to_owned(),
             code_verifier: "verifier-1".to_owned(),
             next: "/dashboards".to_owned(),
+            test_run_id: None,
         };
 
         let id_token = sign_id_token(

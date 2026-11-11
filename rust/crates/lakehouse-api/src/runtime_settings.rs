@@ -1258,7 +1258,7 @@ fn open_console_client_secret(
     Some(plain)
 }
 
-fn parse_role_map_json_entries(val: &serde_json::Value) -> Vec<RoleMapEntry> {
+pub(crate) fn parse_role_map_json_entries(val: &serde_json::Value) -> Vec<RoleMapEntry> {
     let mut entries = Vec::new();
     if let serde_json::Value::Array(items) = val {
         for item in items {

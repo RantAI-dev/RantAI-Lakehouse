@@ -59,6 +59,9 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use lakehouse_auth::Principal;
 use lakehouse_bi::embed_access::validate_content_sites;
 use lakehouse_bi::formatting::{COMPANY_PALETTE_LEN, NUMBER_LOCALES, SHIPPED_FONTS, is_hex_color};
@@ -69,11 +72,14 @@ use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Digest as _;
+use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::runtime_settings::{
-    EffectiveAssistant, EffectiveEmail, EffectiveSignIn, Source, check_assistant_address,
+    EffectiveAssistant, EffectiveEmail, EffectiveSignIn, EffectiveSso, Source,
+    check_assistant_address,
 };
 use crate::state::AppState;
 use crate::upstream_error;
@@ -1642,21 +1648,17 @@ fn assistant_url_sentence(problem: crate::runtime_settings::AddressProblem) -> &
 }
 
 /// What the person is told when the issuer address is not https.
-#[allow(dead_code)]
 pub(crate) const ISSUER_NOT_HTTPS: &str = "issuer must start with https://.";
 
 /// What the person is told when the issuer address resolves to an internal network.
-#[allow(dead_code)]
 pub(crate) const ISSUER_INTERNAL_REFUSED: &str =
     "issuer must be an external address, not an address inside this deployment's network.";
 
 /// What the person is told when the issuer address does not resolve.
-#[allow(dead_code)]
 pub(crate) const ISSUER_UNRESOLVED_REFUSED: &str =
     "issuer must be an address this deployment can reach: its name did not resolve.";
 
 /// The sentence for each way an issuer address is refused (plan D6).
-#[allow(dead_code)]
 pub(crate) fn issuer_url_sentence(
     problem: crate::runtime_settings::AddressProblem,
 ) -> &'static str {
@@ -1669,7 +1671,6 @@ pub(crate) fn issuer_url_sentence(
 }
 
 /// Validate a console-supplied issuer address (plan D6).
-#[allow(dead_code)]
 pub(crate) async fn validate_sso_issuer(
     url: &str,
     internal_hosts: &crate::internal_hosts::InternalHosts,
@@ -1686,7 +1687,6 @@ pub(crate) async fn validate_sso_issuer(
 
 /// Validate role map rows: each entry must have group and role text, and the role
 /// must exist in the deployment (plan D7).
-#[allow(dead_code)]
 pub(crate) fn validate_role_map_entries(
     items: &[serde_json::Value],
     known_roles: &[String],
@@ -1963,6 +1963,528 @@ async fn audit_settings_update(
     if let Err(err) = store_audit::insert(pool, event).await {
         tracing::warn!(%err, action, "failed to record the settings audit event");
     }
+}
+
+// ── Single Sign-On / OIDC (`ADM-12`) ─────────────────────────────────────
+
+/// What the person is told when the body is not the SSO fields.
+const SSO_BODY_SHAPE: &str = "body must be {\"issuer\"?: string|null, \"clientId\"?: string|null, \
+\"clientSecret\"?: string|null, \"providerName\"?: string|null, \"groupsClaim\"?: string|null, \
+\"roleMap\"?: array|null, \"jitProvisioning\"?: boolean|null}";
+
+/// The fields the body of an SSO save may carry (`ADM-12`, plan D1).
+const SSO_FIELDS: [&str; 7] = [
+    "issuer",
+    "clientId",
+    "clientSecret",
+    "providerName",
+    "groupsClaim",
+    "roleMap",
+    "jitProvisioning",
+];
+
+/// What the person is told when the client ID is not text.
+const CLIENT_ID_REFUSED: &str = "clientId must be text.";
+
+/// What the person is told when the client secret is not text.
+const CLIENT_SECRET_REFUSED: &str = "clientSecret must be text.";
+
+/// What the person is told when the provider name is not text.
+const PROVIDER_NAME_REFUSED: &str = "providerName must be text.";
+
+/// What the person is told when the groups claim is not text.
+const GROUPS_CLAIM_REFUSED: &str = "groupsClaim must be text.";
+
+/// What the person is told when the role map is not a list.
+const ROLE_MAP_REFUSED: &str = "roleMap must be a list of {group, role} objects.";
+
+/// What the person is told when the JIT provisioning toggle is not a boolean.
+const JIT_REFUSED: &str = "jitProvisioning must be a boolean.";
+
+/// The new value of a boolean field, and whether the stored value moves.
+fn boolean_field(
+    sent: Option<&Value>,
+    old: Option<bool>,
+    refused: &str,
+) -> Result<(Option<bool>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old, false));
+    };
+    if value.is_null() {
+        return Ok((None, old.is_some()));
+    }
+    let Some(b) = value.as_bool() else {
+        return Err(ApiError::BadRequest(refused.to_owned()));
+    };
+    let changed = old != Some(b);
+    Ok((Some(b), changed))
+}
+
+/// The new value of the role map field, and whether the stored value moves.
+fn role_map_field(
+    sent: Option<&Value>,
+    old: Option<&Value>,
+    known_roles: &[String],
+) -> Result<(Option<Value>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old.cloned(), false));
+    };
+    if value.is_null() {
+        return Ok((None, old.is_some()));
+    }
+    let Some(arr) = value.as_array() else {
+        return Err(ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()));
+    };
+    let entries = validate_role_map_entries(arr, known_roles)?;
+    let new_val = serde_json::to_value(&entries)
+        .map_err(|_| ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()))?;
+    let changed = old != Some(&new_val);
+    Ok((Some(new_val), changed))
+}
+
+/// The new console-supplied issuer address, and whether the stored one moves.
+async fn sso_issuer_field(
+    state: &AppState,
+    sent: Option<&Value>,
+    old: Option<&str>,
+) -> Result<(Option<String>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old.map(str::to_owned), false));
+    };
+    let Some(text) = string_field(ISSUER_NOT_HTTPS, value)? else {
+        return Ok((None, old.is_some()));
+    };
+    let checked = validate_sso_issuer(&text, &state.config.connector_internal_hosts()).await?;
+    let changed = old != Some(checked.as_str());
+    Ok((Some(checked), changed))
+}
+
+/// Format the single sign-on settings response with each field's value and source.
+fn sso_settings_json(effective: &EffectiveSso, can_edit: bool) -> Value {
+    json!({
+        "issuer": field_json(effective.issuer.clone(), effective.issuer_source),
+        "clientId": field_json(effective.client_id.clone(), effective.client_id_source),
+        "clientSecret": {
+            "set": effective.client_secret_set,
+            "source": effective.client_secret_source.as_str(),
+        },
+        "providerName": field_json(effective.provider_name.clone(), effective.provider_name_source),
+        "groupsClaim": field_json(effective.groups_claim.clone(), effective.groups_claim_source),
+        "roleMap": field_json(
+            serde_json::to_value(&effective.role_map_rows).unwrap_or_default(),
+            effective.role_map_source,
+        ),
+        "jitProvisioning": field_json(effective.jit_provisioning, effective.jit_provisioning_source),
+        "canEdit": can_edit,
+    })
+}
+
+/// `GET /api/settings/sso` — the effective single sign-on settings, and where
+/// each value comes from (`ADM-12`, plan D1, D3).
+///
+/// Floor: `RequiresPermission("settings:write")`.
+/// Returns `canEdit: bool`, true if caller is unrestricted (`*:*`).
+pub async fn get_sso(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    let effective = crate::runtime_settings::sso_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let can_edit = crate::routes::catalog::is_unrestricted(&principal);
+    Ok(ApiJson(sso_settings_json(&effective, can_edit)))
+}
+
+/// `PUT /api/settings/sso` — save the SSO / OIDC settings (`ADM-12`, plan D1, D5).
+///
+/// Floor: `RequiresPermission("settings:write")`.
+/// Choke point: Also requires `crate::routes::catalog::is_unrestricted(&principal)`
+/// returning 403 Forbidden because a role map can grant Platform Admin.
+pub async fn put_sso(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // Choke point (D5): only a Platform Admin (*:*) may configure SSO or role mapping,
+    // because role mapping can grant Platform Admin.
+    if !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::Forbidden.into());
+    }
+
+    let parsed = parse_body(&body, &SSO_FIELDS, SSO_BODY_SHAPE)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+
+    let effective = crate::runtime_settings::sso_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    for (sent, source) in [
+        (parsed.contains_key("issuer"), effective.issuer_source),
+        (parsed.contains_key("clientId"), effective.client_id_source),
+        (parsed.contains_key("clientSecret"), effective.client_secret_source),
+        (parsed.contains_key("providerName"), effective.provider_name_source),
+        (parsed.contains_key("groupsClaim"), effective.groups_claim_source),
+        (parsed.contains_key("roleMap"), effective.role_map_source),
+        (parsed.contains_key("jitProvisioning"), effective.jit_provisioning_source),
+    ] {
+        if sent && source == Source::Server {
+            return Err(ApiError::Conflict(SET_BY_THE_SERVER.to_owned()).into());
+        }
+    }
+
+    let current = lakehouse_store::sso_settings::get(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    let old_issuer = current.as_ref().and_then(|c| c.oidc_issuer.as_deref());
+    let old_client_id = current.as_ref().and_then(|c| c.oidc_client_id.as_deref());
+    let old_secret = current.as_ref().and_then(|c| c.oidc_client_secret.as_deref());
+    let old_provider_name = current.as_ref().and_then(|c| c.oidc_provider_name.as_deref());
+    let old_groups_claim = current.as_ref().and_then(|c| c.oidc_groups_claim.as_deref());
+    let old_role_map = current.as_ref().and_then(|c| c.oidc_role_map.as_ref());
+    let old_jit = current.as_ref().and_then(|c| c.oidc_jit_provisioning);
+
+    let (issuer, issuer_changed) = sso_issuer_field(&state, parsed.get("issuer"), old_issuer).await?;
+    let (client_id, client_id_changed) = text_field(
+        parsed.get("clientId"),
+        old_client_id,
+        CLIENT_ID_REFUSED,
+        |text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        },
+    )?;
+    let (client_secret, secret_changed) = secret_field(
+        &state,
+        parsed.get("clientSecret"),
+        old_secret,
+        crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME,
+        CLIENT_SECRET_REFUSED,
+    )?;
+    let (provider_name, provider_name_changed) = text_field(
+        parsed.get("providerName"),
+        old_provider_name,
+        PROVIDER_NAME_REFUSED,
+        |text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        },
+    )?;
+    let (groups_claim, groups_claim_changed) = text_field(
+        parsed.get("groupsClaim"),
+        old_groups_claim,
+        GROUPS_CLAIM_REFUSED,
+        |text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        },
+    )?;
+
+    let known_roles: Vec<String> = sqlx::query_scalar("SELECT name FROM role")
+        .fetch_all(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    let (role_map, role_map_changed) = role_map_field(parsed.get("roleMap"), old_role_map, &known_roles)?;
+    let (jit_provisioning, jit_changed) = boolean_field(parsed.get("jitProvisioning"), old_jit, JIT_REFUSED)?;
+
+    let mut changed: Vec<&'static str> = Vec::new();
+    if issuer_changed {
+        changed.push("issuer");
+    }
+    if client_id_changed {
+        changed.push("clientId");
+    }
+    if secret_changed {
+        changed.push("clientSecret");
+    }
+    if provider_name_changed {
+        changed.push("providerName");
+    }
+    if groups_claim_changed {
+        changed.push("groupsClaim");
+    }
+    if role_map_changed {
+        changed.push("roleMap");
+    }
+    if jit_changed {
+        changed.push("jitProvisioning");
+    }
+
+    lakehouse_store::sso_settings::upsert(
+        pool,
+        &lakehouse_store::sso_settings::SsoSettings {
+            oidc_issuer: issuer,
+            oidc_client_id: client_id,
+            oidc_client_secret: client_secret,
+            oidc_provider_name: provider_name,
+            oidc_groups_claim: groups_claim,
+            oidc_role_map: role_map,
+            oidc_jit_provisioning: jit_provisioning,
+        },
+        &principal.id.uuid().to_string(),
+    )
+    .await
+    .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    // Clear runtime settings cache and swappable OIDC authenticator so the next request
+    // picks up the changes immediately.
+    state.sso_settings_cache.clear().await;
+    *state.oidc.write().await = None;
+
+    audit_settings_update(
+        pool,
+        &principal,
+        "settings.sso.update",
+        "sso",
+        &changed,
+    )
+    .await;
+
+    let effective = crate::runtime_settings::sso_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let can_edit = crate::routes::catalog::is_unrestricted(&principal);
+    Ok(ApiJson(sso_settings_json(&effective, can_edit)))
+}
+
+/// `POST /api/settings/sso/test` — begin a test sign-in flow against a draft configuration (`ADM-12`, plan D8).
+///
+/// Floor: `RequiresPermission("settings:write")`.
+/// Choke point: Also requires `crate::routes::catalog::is_unrestricted(&principal)`.
+pub async fn post_sso_test(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    // Choke point (D5): only a Platform Admin (*:*) may test SSO settings.
+    if !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::Forbidden.into());
+    }
+
+    let parsed = parse_body(&body, &SSO_FIELDS, SSO_BODY_SHAPE)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+
+    let issuer_val = parsed.get("issuer").ok_or_else(|| {
+        ApiError::BadRequest("issuer is required for a test sign-in.".to_owned())
+    })?;
+    let issuer_str = string_field(ISSUER_NOT_HTTPS, issuer_val)?
+        .ok_or_else(|| ApiError::BadRequest("issuer is required for a test sign-in.".to_owned()))?;
+    let validated_issuer = validate_sso_issuer(&issuer_str, &state.config.connector_internal_hosts()).await?;
+
+    let client_id_val = parsed.get("clientId").ok_or_else(|| {
+        ApiError::BadRequest("clientId is required for a test sign-in.".to_owned())
+    })?;
+    let client_id_str = string_field(CLIENT_ID_REFUSED, client_id_val)?
+        .ok_or_else(|| ApiError::BadRequest("clientId is required for a test sign-in.".to_owned()))?;
+    let client_id_str = client_id_str.trim().to_owned();
+    if client_id_str.is_empty() {
+        return Err(ApiError::BadRequest(CLIENT_ID_REFUSED.to_owned()).into());
+    }
+
+    let provider_name = if let Some(v) = parsed.get("providerName") {
+        string_field(PROVIDER_NAME_REFUSED, v)?.unwrap_or_else(|| "default".to_owned())
+    } else {
+        "default".to_owned()
+    };
+
+    let groups_claim = if let Some(v) = parsed.get("groupsClaim") {
+        string_field(GROUPS_CLAIM_REFUSED, v)?.unwrap_or_else(|| "groups".to_owned())
+    } else {
+        "groups".to_owned()
+    };
+
+    let known_roles: Vec<String> = sqlx::query_scalar("SELECT name FROM role")
+        .fetch_all(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    let role_map_json = if let Some(v) = parsed.get("roleMap") {
+        if v.is_null() {
+            None
+        } else {
+            let Some(arr) = v.as_array() else {
+                return Err(ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()).into());
+            };
+            let entries = validate_role_map_entries(arr, &known_roles)?;
+            Some(serde_json::to_value(&entries).map_err(|_| ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()))?)
+        }
+    } else {
+        None
+    };
+
+    let jit_provisioning = if let Some(v) = parsed.get("jitProvisioning") {
+        if v.is_null() {
+            None
+        } else {
+            let Some(b) = v.as_bool() else {
+                return Err(ApiError::BadRequest(JIT_REFUSED.to_owned()).into());
+            };
+            Some(b)
+        }
+    } else {
+        None
+    };
+
+    // Client secret: if provided in draft, seal it.
+    // If not provided in draft (or null), reuse saved sealed secret or env secret.
+    let draft_secret = if let Some(v) = parsed.get("clientSecret") {
+        if let Some(plain) = string_field(CLIENT_SECRET_REFUSED, v)? {
+            let keyring = state
+                .connector_secret_store
+                .keyring()
+                .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
+            Some(keyring.seal(crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME, plain.as_bytes())
+                .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?)
+        } else {
+            None
+        }
+    } else {
+        // Reuse saved secret if any
+        let current = lakehouse_store::sso_settings::get(pool)
+            .await
+            .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+        if let Some(s) = current.and_then(|c| c.oidc_client_secret) {
+            Some(s)
+        } else if let Some(ref env_sec) = state.config.oidc_client_secret {
+            let keyring = state
+                .connector_secret_store
+                .keyring()
+                .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
+            Some(keyring.seal(crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME, env_sec.as_bytes())
+                .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?)
+        } else {
+            None
+        }
+    };
+
+    let test_run_id = Uuid::new_v4();
+    let draft = json!({
+        "issuer": validated_issuer,
+        "clientId": client_id_str,
+        "providerName": provider_name,
+        "groupsClaim": groups_claim,
+        "roleMap": role_map_json,
+        "jitProvisioning": jit_provisioning,
+    });
+
+    let new_run = lakehouse_store::sso_settings::NewSsoTestRun {
+        id: test_run_id,
+        created_by: principal.id.uuid(),
+        draft,
+        draft_secret,
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(10),
+    };
+
+    lakehouse_store::sso_settings::create_test_run(pool, &new_run)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    // Build authorize URL for the test run using the draft's settings
+    let sso = crate::runtime_settings::sso(&state).await;
+    let authorize_base = sso
+        .authorize_url
+        .as_deref()
+        .or(state.config.oidc_authorize_url.as_deref())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{validated_issuer}/authorize"));
+    let redirect_uri = sso
+        .redirect_uri
+        .as_deref()
+        .or(state.config.oidc_redirect_uri.as_deref())
+        .unwrap_or("/api/auth/oidc/callback");
+
+    let state_token = lakehouse_auth::generate_opaque_token();
+    let nonce = lakehouse_auth::generate_opaque_token();
+    let code_verifier = lakehouse_auth::generate_opaque_token();
+    let challenge_digest = sha2::Sha256::digest(code_verifier.expose().as_bytes());
+    let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge_digest);
+
+    let flow = crate::routes::auth::OidcFlow {
+        state: state_token.expose().to_owned(),
+        nonce: nonce.expose().to_owned(),
+        code_verifier: code_verifier.expose().to_owned(),
+        next: String::new(),
+        test_run_id: Some(test_run_id),
+    };
+
+    let mut redirect = url::Url::parse(&authorize_base)
+        .map_err(|_| ApiError::Unavailable("OIDC authorize URL is not a valid URL".to_owned()))?;
+    redirect
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &client_id_str)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", "openid email profile")
+        .append_pair("state", &flow.state)
+        .append_pair("nonce", &flow.nonce)
+        .append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256");
+
+    let authorize_url = redirect.to_string();
+
+    let mut response = (
+        StatusCode::OK,
+        ApiJson(json!({
+            "id": test_run_id,
+            "authorizeUrl": authorize_url,
+        })),
+    )
+        .into_response();
+
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        crate::routes::auth::oidc_flow_cookie_header(state.config.is_dev, Some(&flow)),
+    );
+
+    Ok(response)
+}
+
+/// `GET /api/settings/sso/test/{id}` — read the result of a test sign-in run (`ADM-12`, plan D8).
+///
+/// Floor: `RequiresPermission("settings:write")`.
+/// Only `created_by` may read it, and only before expiry. Anyone else gets 404.
+pub async fn get_sso_test(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> ApiResult<ApiJson<Value>> {
+    // Choke point (D5): only a Platform Admin (*:*) may view SSO test results.
+    if !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::Forbidden.into());
+    }
+
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+
+    let run = lakehouse_store::sso_settings::get_test_run(pool, id)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    let Some(run) = run else {
+        return Err(ApiError::NotFound("test run not found".to_owned()).into());
+    };
+
+    // Plan D8: Only created_by may read it, and only before expiry. Anyone else gets 404.
+    if run.created_by != principal.id.uuid() || run.expires_at <= time::OffsetDateTime::now_utc() {
+        return Err(ApiError::NotFound("test run not found".to_owned()).into());
+    }
+
+    Ok(ApiJson(run.result.unwrap_or(serde_json::Value::Null)))
 }
 
 #[cfg(test)]
@@ -2426,5 +2948,96 @@ mod tests {
             body_json(&TimeContext::default(), &f, true, true)["reportAllowedDomains"],
             json!(["x.example"])
         );
+    }
+
+    #[test]
+    fn sso_body_shape_refuses_unknown_fields_and_malformed_json() {
+        let valid = Bytes::from(r#"{"issuer":"https://idp.example.com","clientId":"client-1"}"#);
+        assert!(parse_body(&valid, &SSO_FIELDS, SSO_BODY_SHAPE).is_ok());
+
+        let unknown = Bytes::from(r#"{"issuer":"https://idp.example.com","extra":123}"#);
+        let err = parse_body(&unknown, &SSO_FIELDS, SSO_BODY_SHAPE).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg == SSO_BODY_SHAPE));
+
+        let malformed = Bytes::from("not-json");
+        let err = parse_body(&malformed, &SSO_FIELDS, SSO_BODY_SHAPE).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg == SSO_BODY_SHAPE));
+    }
+
+    #[test]
+    fn sso_boolean_field_accepts_bool_and_null_and_refuses_other() {
+        let true_val = json!(true);
+        let (val, changed) = boolean_field(Some(&true_val), None, JIT_REFUSED).unwrap();
+        assert_eq!(val, Some(true));
+        assert!(changed);
+
+        let null_val = Value::Null;
+        let (val, changed) = boolean_field(Some(&null_val), Some(true), JIT_REFUSED).unwrap();
+        assert_eq!(val, None);
+        assert!(changed);
+
+        let bad_val = json!("not-a-bool");
+        assert!(boolean_field(Some(&bad_val), None, JIT_REFUSED).is_err());
+    }
+
+    #[test]
+    fn sso_role_map_field_validates_roles_and_refuses_unknown_roles() {
+        let known = vec!["Platform Admin".to_owned(), "Analyst".to_owned()];
+        let valid_rows = json!([{"group": "admins", "role": "Platform Admin"}]);
+        let (val, changed) = role_map_field(Some(&valid_rows), None, &known).unwrap();
+        assert!(val.is_some());
+        assert!(changed);
+
+        let unknown_role = json!([{"group": "admins", "role": "Superuser"}]);
+        let err = role_map_field(Some(&unknown_role), None, &known).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("Unknown role")));
+
+        let missing_role = json!([{"group": "admins"}]);
+        let err = role_map_field(Some(&missing_role), None, &known).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("Each roleMap entry")));
+    }
+
+    #[test]
+    fn sso_settings_json_formats_sources_and_can_edit() {
+        let effective = EffectiveSso {
+            issuer: Some("https://idp.example.com".to_owned()),
+            issuer_source: Source::Console,
+            client_id: Some("client-123".to_owned()),
+            client_id_source: Source::Console,
+            client_secret: lakehouse_core::secret::SecretValue::new("secret"),
+            client_secret_set: true,
+            client_secret_source: Source::Console,
+            provider_name: "okta".to_owned(),
+            provider_name_source: Source::Console,
+            groups_claim: "groups".to_owned(),
+            groups_claim_source: Source::Default,
+            role_map: std::collections::HashMap::new(),
+            role_map_rows: vec![crate::runtime_settings::RoleMapEntry {
+                group: "admins".to_owned(),
+                role: "Platform Admin".to_owned(),
+            }],
+            role_map_source: Source::Console,
+            jit_provisioning: true,
+            jit_provisioning_source: Source::Console,
+            authorize_url: None,
+            authorize_url_source: Source::Default,
+            token_url: None,
+            token_url_source: Source::Default,
+            jwks_url: None,
+            jwks_url_source: Source::Default,
+            redirect_uri: None,
+            redirect_uri_source: Source::Default,
+            clock_skew_seconds: 60,
+        };
+
+        let json_val = sso_settings_json(&effective, true);
+        assert_eq!(json_val["issuer"]["value"], "https://idp.example.com");
+        assert_eq!(json_val["issuer"]["source"], "console");
+        assert_eq!(json_val["clientSecret"]["set"], true);
+        assert_eq!(json_val["clientSecret"]["source"], "console");
+        assert_eq!(json_val["canEdit"], true);
+
+        let json_readonly = sso_settings_json(&effective, false);
+        assert_eq!(json_readonly["canEdit"], false);
     }
 }

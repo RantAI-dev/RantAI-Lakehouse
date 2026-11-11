@@ -668,6 +668,20 @@ pub struct OidcLogin {
     pub notice: Option<SignInNotice>,
 }
 
+/// The outcome of validating an ID token during a test sign-in run,
+/// before any user or session creation (`ADM-12` plan D8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcTestClaims {
+    /// The subject claim from the ID token.
+    pub subject: String,
+    /// The email claim, if present.
+    pub email: Option<String>,
+    /// The groups present in the token's configured groups claim.
+    pub groups: Vec<String>,
+    /// The roles mapped from [`Self::groups`] via the configured role map.
+    pub mapped_roles: Vec<String>,
+}
+
 /// [`Authenticator`] for [`Credential::Bearer`] — the concrete `OIDC`
 /// implementor the module doc comment (and [`crate::authenticator`]'s doc
 /// comment before it) sketched.
@@ -896,6 +910,41 @@ impl OidcAuthenticator {
             principal,
             mapped_role_names,
             notice: group_overage.then_some(SignInNotice::GroupOverage),
+        })
+    }
+
+    /// Validate an ID token for a test sign-in run (`ADM-12` plan D8).
+    ///
+    /// Validates the token's cryptographic signature, algorithm, issuer,
+    /// audience, expiration, not-before, and `expected_nonce`, then extracts
+    /// the groups and mapped roles without provisioning an `app_user` or
+    /// creating a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::InvalidCredentials`] if the token signature, claims,
+    /// or nonce fail verification.
+    pub async fn validate_for_test(
+        &self,
+        token: &Secret,
+        expected_nonce: &str,
+    ) -> Result<OidcTestClaims, AuthError> {
+        let claims = self.validate_token(token.expose()).await?;
+        let actual_nonce = claims
+            .extra
+            .get("nonce")
+            .and_then(Value::as_str)
+            .ok_or(AuthError::InvalidCredentials)?;
+        if actual_nonce != expected_nonce {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let groups = claims.groups(&self.config.groups_claim);
+        let mapped_roles = self.mapped_role_names(&claims);
+        Ok(OidcTestClaims {
+            subject: claims.sub,
+            email: claims.email,
+            groups,
+            mapped_roles,
         })
     }
 

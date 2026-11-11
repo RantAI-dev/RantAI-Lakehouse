@@ -1703,6 +1703,19 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/assistant/test",
             axum::routing::post(settings::post_assistant_test),
         )
+        // The deployment's SSO / OIDC settings (`ADM-12`). See `routes::settings`.
+        .route(
+            "/api/settings/sso",
+            get(settings::get_sso).put(settings::put_sso),
+        )
+        .route(
+            "/api/settings/sso/test",
+            axum::routing::post(settings::post_sso_test),
+        )
+        .route(
+            "/api/settings/sso/test/{id}",
+            get(settings::get_sso_test),
+        )
         // Time and row limits of charts and Query Studio (`BI-5`); see
         // `routes::query_limits`.
         // Stop (`BI-5`): ends the caller's own queries of one run.
