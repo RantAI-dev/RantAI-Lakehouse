@@ -497,6 +497,82 @@ feat/adm-12-oidc-in-settings`:
 `6022c9f8918653c218cef1abfd03e51f29acce8b	refs/heads/feat/adm-12-oidc-in-settings`.
 
 
+### Handoff (developer, 2026-11-11, round 3 fix)
+
+Base `70069879` (the round 3 review, after the `origin/main` merge in
+`86cf7085`). Branch `feat/adm-12-oidc-in-settings`, pushed after every commit.
+
+| Commit | What |
+| --- | --- |
+| `a9fa2722` | A server-owned SSO runtime is kept for the life of the process (R3-S1). |
+| this commit | This handoff. |
+
+**R3-S1 — closed.** `runtime_settings::is_fresh` returns true for a runtime
+whose `base.issuer_source` is `Source::Server` as soon as the `base` matches:
+no TTL, no retry, ready for sign-in or not. That is `main`'s shape — the
+authenticator is built once at start-up and kept — and it stops the 30-second
+rebuild that gave a bearer-only `.env` connection a new authenticator with an
+empty key-set cache. Only a save (`routes::settings::put_sso` clears
+`state.oidc`) or a different `base` replaces it. A console-set connection
+keeps the round 2 rule unchanged: ready for `READY_SSO_RUNTIME_TTL`, not
+ready retried after `SETTINGS_CACHE_TTL`. The doc comments that describe the
+cache say this: `READY_SSO_RUNTIME_TTL`, `sso_runtime_or_fail`, `cached_or_build`,
+`cached_runtime` and `is_fresh`.
+
+`is_fresh` now takes `now: Instant` (both callers pass `Instant::now()`), so a
+test can ask about a moment later than the machine has been up: `Instant` is
+monotonic since boot, and a CI host may have booted less than ten minutes
+ago, which makes `built_ago(READY_SSO_RUNTIME_TTL + 30s)` a panic waiting for
+a fresh runner. The tests age the runtime through that `now` instead.
+
+Tests, next to the two that stay (`a_ready_runtime_is_kept_for_ten_minutes`,
+`a_save_clears_a_ready_runtime_at_once`):
+
+- `a_server_owned_runtime_without_sign_in_addresses_is_kept_for_the_process`
+  — aged past `SETTINGS_CACHE_TTL`, same authenticator (`Arc::ptr_eq`), same
+  `built_at`; a different `base` does rebuild it.
+- `a_server_owned_runtime_with_sign_in_addresses_is_kept_past_ten_minutes` —
+  `is_fresh` is true 10.5 minutes on, and `cached_or_build` reuses it.
+- `a_console_set_runtime_keeps_the_ready_and_not_ready_ttls` — the console
+  path is unchanged: not ready fresh at 1 s and stale at
+  `SETTINGS_CACHE_TTL + 1 s`; ready fresh at `READY_SSO_RUNTIME_TTL - 1 s`
+  and stale at `READY_SSO_RUNTIME_TTL + 1 s`. The runtime is marked
+  `Source::Console` rather than built, because building a console-set
+  connection reads discovery over the network and this is a unit test.
+
+**The existing expectation that changed, and why.** The round 2 test
+`a_not_ready_runtime_is_retried_after_the_settings_ttl` asserted that a
+server-owned runtime without the three sign-in addresses is rebuilt after 30
+seconds. R3-S1 names exactly that as the bug: the `.env` cannot gain those
+addresses while the process runs, so the retry only threw away a working
+authenticator. It is replaced by
+`a_server_owned_runtime_without_sign_in_addresses_is_kept_for_the_process`.
+
+**Commands run, with counts** (`cargo-locked` from `rust/`, foreground, one
+cargo command at a time).
+
+- `cargo fmt --check`: clean (twice: before the first clippy run, and on the
+  final tree).
+- `cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings`:
+  finished clean in 3m 36s after one fix — the first run failed with
+  `unchecked_time_subtraction` on `READY_SSO_RUNTIME_TTL - Duration::from_secs(1)`
+  in the new console test, changed to `saturating_sub`.
+- `cargo-locked test -p lakehouse-api --lib runtime_settings`: 32 passed, 0
+  failed, 3429 filtered out.
+- `cargo-locked test -p lakehouse-api --lib routes::auth`: 88 passed, 0
+  failed, 3373 filtered out (the filter also takes `routes::authored_pipelines`).
+- `cargo-locked test -p lakehouse-api --lib auth::tests`: 56 passed, 0 failed,
+  3405 filtered out.
+
+**Not verified locally: the rest, left to CI.** Nothing outside
+`rust/crates/lakehouse-api/src/runtime_settings.rs` changed, so no other
+crate, the console, Python or compose checks were run; the full workspace
+suite, `cargo test --doc` and the integration binaries are CI's.
+
+`git status --short`: empty. `git log --oneline 70069879..HEAD`: `a9fa2722`
+(the fix) and this handoff commit. `git ls-remote --heads origin
+feat/adm-12-oidc-in-settings` is quoted in the final answer.
+
 ## 6. Review (planner)
 
 ### Round 1 (planner, 2026-11-11) — branch at `ee51567b`
