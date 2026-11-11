@@ -702,3 +702,23 @@ that carries this note; it merged without a conflict and adds no migration. I ra
 locally: the pull request (#454) runs the whole suite on that commit, and it is merged only
 when every check that passes on `main` passes there.
 
+### Round 4 (planner, 2026-11-11) — branch at `bb2a39fb`
+
+CI on `e582bf9c` (run 42964927372) failed in `Rust · test 1/3`, `2/3` and `3/3`: 82 tests in
+16 files of `rust/crates/lakehouse-api/tests/`. Every other check passed. The first developer
+had run 3 of the 110 files (round 1, S7).
+
+- 81 of the 82 created a person with a narrow permission and called a route that D5 or D10 now
+  gates, so the person got 403 before reaching what the test is about. The 82nd,
+  `identity_roles::…the_permissions_route_is_refused_without_identity_read`, counts the
+  permission list: 29 before, 34 now (D2 adds five).
+- Read the fix (`e582bf9c..bb2a39fb`): only `tests/` and this plan changed, no product code.
+  No assertion was removed and no `#[ignore]` added; the one changed value is 29 to 34. The
+  new helper `common::create_assistant_principal` adds `assistant:use` to what the test
+  already grants; `create_principal_with_permissions` is unchanged for the tests that are not
+  about the assistant. The refusal tests keep their point: the caller holds `assistant:use`
+  only and is refused by the tool the test names.
+
+**No open BLOCKER.** `origin/main` (`81d9cf27`, #453) is merged in the commit that carries
+this note. Merged only when #454 is green on that commit.
+
