@@ -1,12 +1,33 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react"
+// `WEB-7` D6: "Edit in builder" is a route now, so the card asks the router
+// for it; the module is stubbed before any import resolves.
+let pushed: string[] = []
+mock.module("next/navigation", () => ({
+  usePathname: () => "/copilot",
+  useSearchParams: () => new URLSearchParams(),
+  useRouter: () => ({
+    push: (href: string) => {
+      pushed.push(href)
+    },
+    replace: () => {},
+    refresh: () => {},
+    back: () => {},
+    forward: () => {},
+    prefetch: () => {},
+  }),
+}))
+
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 
+import { takeChartDraft } from "@/features/dashboards/chart-page"
 import { ChartDraftCard, chartDefFromArgs, previewSpecWithDef } from "./chart-draft-card"
 
 const originalFetch = global.fetch
 afterEach(() => {
   cleanup()
   global.fetch = originalFetch
+  window.sessionStorage.clear()
+  pushed = []
 })
 
 // What the server's preview answers: the render spec (no `def`) and one row.
@@ -51,7 +72,7 @@ describe("the draft preview of a progress bar and a bullet graph", () => {
     render(
       <ChartDraftCard
         args={{ title: "Total visitors vs goal 300,000", kind: "progress", mart: "mart_demo_map_points", measures: [{ metric: "total_visitors_demo" }], aggregate: "sum", goal: 300000, board: "b1" }}
-        confirming={false} onConfirm={noop} onCancel={noop} onSavedInBuilder={noop}
+        confirming={false} onConfirm={noop} onCancel={noop}
       />,
     )
     await waitFor(() => expect(screen.getByRole("progressbar")).toBeTruthy())
@@ -80,11 +101,42 @@ describe("the draft of an image card", () => {
         confirming={false}
         onConfirm={noop}
         onCancel={noop}
-        onSavedInBuilder={noop}
       />,
     )
     // The picture is drawn, so the card was not blocked.
     await waitFor(() => expect(screen.getByRole("img")).toBeTruthy())
     expect(screen.queryByText("This site is no longer allowed")).toBeNull()
+  })
+})
+
+// `WEB-7` D6: "Edit in builder" is the chart builder's own page now. The card
+// leaves the draft where that page reads it, once, and goes there.
+describe("Edit in builder ('WEB-7' D6)", () => {
+  it("leaves the draft for the chart page and goes to it", async () => {
+    // An image card is drawn from its own fields, so nothing is left pending
+    // when the click unmounts the card.
+    settingsOf(["https://img.example"])
+    render(
+      <ChartDraftCard
+        args={{ title: "Logo", kind: "image", url: "https://img.example/logo.png", alt: "The logo", board: "b1" }}
+        confirming={false}
+        onConfirm={noop}
+        onCancel={noop}
+      />,
+    )
+    await screen.findByRole("img", { name: "The logo" })
+
+    fireEvent.click(screen.getByRole("button", { name: /Edit in builder/ }))
+
+    expect(pushed).toEqual(["/dashboards/b1/charts/new"])
+    expect(takeChartDraft("b1")).toMatchObject({
+      board: "b1",
+      def: {
+        title: "Logo",
+        kind: "image",
+        url: "https://img.example/logo.png",
+        alt: "The logo",
+      },
+    })
   })
 })

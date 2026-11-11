@@ -4,8 +4,10 @@ import { normalizeDef } from "@/lib/params";
 import * as React from "react";
 import { useTheme } from "next-themes";
 import { ChartColumn, PencilRuler } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { ChartBuilder, type ChartDef } from "@/features/dashboards/chart-builder";
+import type { ChartDef } from "@/features/dashboards/chart-builder";
+import { chartNewHref, writeChartDraft } from "@/features/dashboards/chart-page";
 import { ReportingProvider } from "@/features/dashboards/reporting-context";
 import { TileBody } from "@/features/dashboards/tile-body";
 import { useService } from "@/hooks/use-service";
@@ -148,18 +150,23 @@ export function draftMeasureLabel(def: ChartDef, metricLabels: Readonly<Record<s
 /**
  * A `create_chart` waiting for confirmation, shown as the chart it would
  * create: rendered through the builder's preview endpoint, so what you see is
- * exactly what "Add to dashboard" saves. "Edit in builder" opens the manual
- * builder prefilled with the same draft for anything the model got wrong.
+ * exactly what "Add to dashboard" saves. "Edit in builder" leaves the same
+ * draft for the builder's own page and goes there (`WEB-7` D6), for anything
+ * the model got wrong.
  */
 export function ChartDraftCard({
-  args, confirming, onConfirm, onCancel, onSavedInBuilder,
+  args, confirming, onConfirm, onCancel, stepAddress,
 }: {
   args: Record<string, unknown>;
   confirming: boolean;
   onConfirm: () => void;
   onCancel: () => void;
-  /** The draft was saved from the builder instead — it no longer needs confirming. */
-  onSavedInBuilder: (def: ChartDef) => void;
+  /**
+   * Where this draft sits in the chat. The builder's page carries it with the
+   * draft and marks the step saved once the chart is written (`WEB-7` D6),
+   * so the chat does not offer the same chart again.
+   */
+  stepAddress?: { messageIndex: number; stepIndex: number };
 }) {
   const { resolvedTheme } = useTheme();
   // `args` is rebuilt on every render; key the draft on its content so the
@@ -170,7 +177,7 @@ export function ChartDraftCard({
   const [preview, setPreview] = React.useState<Preview | null>(null);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
-  const [builderOpen, setBuilderOpen] = React.useState(false);
+  const router = useRouter();
 
   React.useEffect(() => {
     const controller = new AbortController();
@@ -255,7 +262,23 @@ export function ChartDraftCard({
         <Button size="sm" onClick={onConfirm} disabled={confirming}>
           {confirming ? "Adding…" : "Add to dashboard"}
         </Button>
-        <Button size="sm" variant="outline" onClick={() => setBuilderOpen(true)} disabled={confirming}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={confirming}
+          // `WEB-7` D6: the builder is a page. The draft is left for that
+          // page in this browser session, under the key it reads once, and
+          // the card goes there; the page it opens is the draft's own board.
+          onClick={() => {
+            const board = def.board ?? "default";
+            writeChartDraft({
+              board,
+              def: def as Record<string, unknown>,
+              ...(stepAddress && { complete: stepAddress }),
+            });
+            router.push(chartNewHref(board));
+          }}
+        >
           <PencilRuler className="size-3.5" /> Edit in builder
         </Button>
         <Button size="sm" variant="ghost" className="ml-auto" onClick={onCancel} disabled={confirming}>
@@ -263,19 +286,6 @@ export function ChartDraftCard({
         </Button>
       </div>
 
-      {builderOpen ? (
-        <ChartBuilder
-          hideTrigger
-          open={builderOpen}
-          onOpenChange={setBuilderOpen}
-          initial={def}
-          board={def.board ?? "default"}
-          onSaved={(saved) => {
-            setBuilderOpen(false);
-            onSavedInBuilder(saved);
-          }}
-        />
-      ) : null}
     </div>
   );
 }

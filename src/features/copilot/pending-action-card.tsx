@@ -12,16 +12,19 @@ import { asObj, type ToolStep } from "./tool-step";
  */
 export function PendingActionCard({
   step,
+  messageIndex,
+  stepIndex,
   confirming,
   onConfirm,
   onCancel,
-  onSavedInBuilder,
 }: {
   readonly step: ToolStep;
+  /** Where the step sits in the chat, so the builder's page can mark it saved. */
+  readonly messageIndex: number;
+  readonly stepIndex: number;
   readonly confirming: boolean;
   readonly onConfirm: () => void;
   readonly onCancel: () => void;
-  readonly onSavedInBuilder: (result: Record<string, unknown>) => void;
 }) {
   const res = asObj(step.result);
   const args = asObj(res.args ?? step.args);
@@ -34,16 +37,7 @@ export function PendingActionCard({
         confirming={confirming}
         onConfirm={onConfirm}
         onCancel={onCancel}
-        onSavedInBuilder={(saved) =>
-          onSavedInBuilder({
-            created: true,
-            title: saved.title,
-            kind: saved.kind,
-            mart: saved.mart,
-            board: saved.board,
-            via: "builder",
-          })
-        }
+        stepAddress={{ messageIndex, stepIndex }}
       />
     );
   }

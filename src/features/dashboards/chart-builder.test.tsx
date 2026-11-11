@@ -52,7 +52,7 @@ afterEach(() => {
 const barDef: ChartDef = { title: "Visitors", kind: "bar", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" }
 
 function renderBuilder(initial?: ChartDef) {
-  return render(<ChartBuilder open onOpenChange={() => {}} hideTrigger onSaved={() => {}} initial={initial} editId={initial ? "c_1" : undefined} />)
+  return render(<ChartBuilder onSaved={() => {}} onCancel={() => {}} initial={initial} editId={initial ? "c_1" : undefined} />)
 }
 
 describe("ChartBuilder sections (phase 2 QA R3)", () => {
@@ -432,16 +432,25 @@ describe("ChartBuilder labels (phase 2 QA R20)", () => {
     await waitFor(() => expect(field.getAttribute("placeholder")).toBe("Coba metrik by category"))
   })
 
-  it("shows the kind after the chevron of the breadcrumb, and no chevron when the list is folded", async () => {
+  // `WEB-7` D6: the breadcrumb was the dialog's; the page title is FormPage's,
+  // and the kind is named beside the type list, or on the control that changes
+  // it when that list is folded.
+  it("names the page in the header and the kind beside the list, and no chevron in the title", async () => {
     const { unmount } = renderBuilder()
-    const title = screen.getByText("New chart").parentElement as HTMLElement
-    expect(title.textContent).toContain("Horizontal bar")
-    expect(title.querySelector("svg")).not.toBeNull()
+    const heading = screen.getByRole("heading", { level: 1 })
+    expect(heading.textContent).toBe("New chart")
+    expect(heading.querySelector("svg")).toBeNull()
+    // The kind follows a chevron in the builder's own header row.
+    const kind = document.querySelector("[data-slot=chart-kind]") as HTMLElement
+    expect(kind.textContent).toContain("Horizontal bar")
+    expect(kind.querySelector("svg")).not.toBeNull()
     unmount()
     cleanup()
     renderBuilder(barDef)
-    const folded = screen.getByText("Edit chart").parentElement as HTMLElement
-    expect(folded.querySelector("svg")).toBeNull()
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Edit chart")
+    // Folded, the same name is on the control that changes it.
+    expect(screen.getByRole("button", { name: /Change chart type, now Bar/ })).toBeTruthy()
+    expect(document.querySelector("[data-slot=chart-kind]")).toBeNull()
   })
 })
 

@@ -286,6 +286,13 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   { pattern: "/dashboards/browse", requires: ["dashboard:read"] },
   { pattern: "/dashboards/metrics", requires: ["dashboard:read"] },
   { pattern: "/dashboards/[id]", requires: ["dashboard:read"] },
+  // WEB-7 D6: the chart builder's pages. `POST`/`PUT /api/dashboard/specs`
+  // are `RequiresAuth` with the level resolved in the handler
+  // (`policy.rs`), and a person can hold edit on one dashboard through a
+  // rule without `dashboard:write`; so the entry opens to any signed-in
+  // person and the page says "You don't have access" below edit.
+  { pattern: "/dashboards/[id]/charts/new", requires: [] },
+  { pattern: "/dashboards/[id]/charts/[chartId]/edit", requires: [] },
 
   // Data & Catalog
   { pattern: "/catalog", requires: ["catalog:read"] },
