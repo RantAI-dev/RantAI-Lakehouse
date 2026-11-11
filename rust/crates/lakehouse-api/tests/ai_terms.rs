@@ -1,8 +1,9 @@
 //! HTTP-level tests for `GET`/`PUT`/`DELETE /api/ai/terms`: the round trip,
 //! that two users never see, overwrite or delete each other's terms, that a
-//! broken rule is a 400 naming the field, and that the list is capped. The
-//! `RequiresAuth` floor itself is asserted for all three methods by the
-//! `POLICY_TABLE` loops in `tests/route_auth.rs`.
+//! broken rule is a 400 naming the field, and that the list is capped. Since
+//! `ADM-13` D5 the route takes `assistant:use` or `assistant:ask` (asserted
+//! both ways in `tests/route_auth.rs`), so every person here holds
+//! `assistant:use` and the terms themselves are what the test is about.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -13,7 +14,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{create_zero_permission_principal, session_cookie_for_user, spin_up};
+use common::{create_assistant_principal, session_cookie_for_user, spin_up};
 
 async fn send(
     router: &axum::Router,
@@ -57,7 +58,7 @@ fn term_names(body: &Value) -> Vec<&str> {
 #[tokio::test]
 async fn a_new_user_has_no_terms_then_save_list_and_delete_round_trip() {
     let app = spin_up().await;
-    let user = create_zero_permission_principal(&app.pool).await;
+    let user = create_assistant_principal(&app.pool, "").await;
     let cookie = session_cookie_for_user(&app.pool, user).await;
 
     let (status, body) = send(&app.router, "GET", TERMS, Some(&cookie), None).await;
@@ -93,7 +94,7 @@ async fn a_new_user_has_no_terms_then_save_list_and_delete_round_trip() {
 #[tokio::test]
 async fn deleting_a_term_that_does_not_exist_is_a_200() {
     let app = spin_up().await;
-    let user = create_zero_permission_principal(&app.pool).await;
+    let user = create_assistant_principal(&app.pool, "").await;
     let cookie = session_cookie_for_user(&app.pool, user).await;
 
     let uri = format!("{TERMS}?term=nothing");
@@ -105,8 +106,8 @@ async fn deleting_a_term_that_does_not_exist_is_a_200() {
 #[tokio::test]
 async fn one_user_never_reads_overwrites_or_deletes_another_users_term() {
     let app = spin_up().await;
-    let alice = create_zero_permission_principal(&app.pool).await;
-    let bob = create_zero_permission_principal(&app.pool).await;
+    let alice = create_assistant_principal(&app.pool, "").await;
+    let bob = create_assistant_principal(&app.pool, "").await;
     let alice_cookie = session_cookie_for_user(&app.pool, alice).await;
     let bob_cookie = session_cookie_for_user(&app.pool, bob).await;
 
@@ -146,7 +147,7 @@ async fn one_user_never_reads_overwrites_or_deletes_another_users_term() {
 #[tokio::test]
 async fn a_broken_rule_is_a_400_naming_the_field_and_saves_nothing() {
     let app = spin_up().await;
-    let user = create_zero_permission_principal(&app.pool).await;
+    let user = create_assistant_principal(&app.pool, "").await;
     let cookie = session_cookie_for_user(&app.pool, user).await;
 
     let cases = [
@@ -206,7 +207,7 @@ async fn a_broken_rule_is_a_400_naming_the_field_and_saves_nothing() {
 #[tokio::test]
 async fn the_101st_term_is_a_400_and_an_existing_term_still_updates() {
     let app = spin_up().await;
-    let user = create_zero_permission_principal(&app.pool).await;
+    let user = create_assistant_principal(&app.pool, "").await;
     let cookie = session_cookie_for_user(&app.pool, user).await;
 
     for i in 0..100 {

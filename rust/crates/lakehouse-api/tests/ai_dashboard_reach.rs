@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
 };
 use lakehouse_store::dashboard_access::{NewRule, replace_item};
 use serde_json::{Value, json};
@@ -178,7 +179,7 @@ fn gate_passed(body: &Value) -> bool {
 #[tokio::test]
 async fn a_person_with_only_a_rule_is_judged_by_their_level_on_the_dashboard() {
     let (app, _ch, _llm) = app().await;
-    let analyst = create_principal_with_permissions(&app.pool, "query:read").await;
+    let analyst = create_assistant_principal(&app.pool, "query:read").await;
     replace_item(&app.pool, "board", "b1", &[view(analyst)], false, None)
         .await
         .unwrap();
@@ -227,7 +228,7 @@ async fn a_person_with_only_a_rule_is_judged_by_their_level_on_the_dashboard() {
 
     // Nothing else is widened: `run_sql` still needs `query:read`, which this
     // person does not hold (the same principal has it, so a second one).
-    let nobody = create_principal_with_permissions(&app.pool, "").await;
+    let nobody = create_assistant_principal(&app.pool, "").await;
     let nobody_cookie = session_cookie_for_user(&app.pool, nobody).await;
     let sql = call(
         &app,
@@ -246,7 +247,7 @@ async fn a_person_with_only_a_rule_is_judged_by_their_level_on_the_dashboard() {
 #[tokio::test]
 async fn edit_on_the_dashboard_lets_the_write_tools_reach_their_handler() {
     let (app, _ch, _llm) = app().await;
-    let editor = create_principal_with_permissions(&app.pool, "").await;
+    let editor = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[edit(editor)], false, None)
         .await
         .unwrap();
@@ -284,7 +285,7 @@ async fn edit_on_the_dashboard_lets_the_write_tools_reach_their_handler() {
 async fn the_draft_of_an_update_that_moves_a_chart_onto_a_view_only_dashboard_is_refused_as_the_save_is()
  {
     let (app, _ch, _llm) = app().await;
-    let editor = create_principal_with_permissions(&app.pool, "").await;
+    let editor = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[edit(editor)], false, None)
         .await
         .unwrap();
@@ -321,7 +322,7 @@ async fn the_draft_of_an_update_that_moves_a_chart_onto_a_view_only_dashboard_is
 #[tokio::test]
 async fn a_chat_offers_the_listed_tools_to_a_person_who_holds_only_a_rule() {
     let (app, _ch, llm) = app().await;
-    let analyst = create_principal_with_permissions(&app.pool, "catalog:read").await;
+    let analyst = create_assistant_principal(&app.pool, "catalog:read").await;
     replace_item(&app.pool, "board", "b1", &[view(analyst)], false, None)
         .await
         .unwrap();
@@ -371,7 +372,7 @@ async fn a_chat_offers_the_listed_tools_to_a_person_who_holds_only_a_rule() {
 async fn an_approved_delete_chart_runs_for_an_approver_with_a_rule_on_that_dashboard() {
     let (app, _ch, _llm) = app().await;
     // The requester holds manage on b1 only, and names no one else.
-    let requester = create_principal_with_permissions(&app.pool, "").await;
+    let requester = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[manage(requester)], false, None)
         .await
         .unwrap();
@@ -405,7 +406,7 @@ async fn an_approved_delete_chart_runs_for_an_approver_with_a_rule_on_that_dashb
 #[tokio::test]
 async fn an_approver_with_no_rule_is_refused_and_the_run_records_it() {
     let (app, _ch, _llm) = app().await;
-    let requester = create_principal_with_permissions(&app.pool, "").await;
+    let requester = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[manage(requester)], false, None)
         .await
         .unwrap();

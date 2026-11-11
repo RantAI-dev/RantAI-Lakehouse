@@ -15,9 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
-use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
-};
+use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
 use lakehouse_store::dashboard_access::replace_item;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -131,13 +129,14 @@ impl Respond for FakeCh {
 struct Fixture {
     app: TestApp,
     fake: FakeCh,
-    /// The email `create_principal_with_permissions` gave the person.
+    /// The email `create_assistant_principal` gave the person.
     email: String,
     _ch: MockServer,
 }
 
-/// A person with `permissions`, and a chart the caller can see unless
-/// `chart_visible` says otherwise.
+/// A person with `permissions` besides `assistant:use` (every test here calls
+/// `POST /api/ai/tool`), and a chart the caller can see unless `chart_visible`
+/// says otherwise.
 async fn fixture(permissions: &str, chart_visible: bool) -> (Fixture, Uuid) {
     let fake = FakeCh {
         held: Arc::new(Mutex::new(Held {
@@ -167,7 +166,7 @@ async fn fixture(permissions: &str, chart_visible: bool) -> (Fixture, Uuid) {
         ),
     ]);
     let app = spin_up_with_env(&env).await;
-    let user = create_principal_with_permissions(&app.pool, permissions).await;
+    let user = create_assistant_principal(&app.pool, permissions).await;
     common::in_the_catalog_tenant(&app.pool, user).await;
     let fixture = Fixture {
         app,
