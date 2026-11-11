@@ -107,6 +107,31 @@ another agent.
   - Contracts: `SsoSettings`, `SsoSettingsInput`, `SsoTestResult` in
     `contracts/settings.ts`, then the client, then the service.
 
+- **D10. Where a connection set in Settings gets its addresses** (planner, 2026-11-11, added
+  in review round 1; a gap in this plan, not a developer error). D2 stores an issuer, a client
+  ID and a secret, and D3 reads the authorize, token and redirect addresses from `.env` only,
+  so a connection saved in Settings had nowhere to send a person.
+  - **Authorize, token and key-set addresses** come from the issuer's discovery document
+    (`authorization_endpoint`, `token_endpoint`, `jwks_uri`). Extend the discovery read that
+    `lakehouse-auth/src/oidc.rs` already has and caches (`SEC-38`); do not write a second
+    fetcher (rule 4).
+  - The document is remote input. Each address it names must be `https://` and its host must
+    pass `resolve_checked` before anything is sent there (D6). One that does not is "SSO is
+    not ready", with a plain reason; nothing is fetched from it.
+  - **Redirect address:** `<CONSOLE_PUBLIC_URL>/api/auth/oidc/callback` (`config.rs`
+    `console_public_url`). Never taken from a request header.
+  - **`.env` still wins per value:** a set `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`,
+    `OIDC_JWKS_URL` or `OIDC_REDIRECT_URI` is used as it is today and shows as set by the
+    server.
+  - **Not ready is said, not hidden.** When a saved connection cannot be used (no
+    `CONSOLE_PUBLIC_URL` and no `OIDC_REDIRECT_URI`, discovery unreachable, an address
+    refused), `GET /api/settings/sso` returns `"ready": false` with `"notReadyReason"`, a
+    plain sentence naming what to set; `GET /api/auth/providers` reports no OIDC, so the
+    sign-in page shows no button that would fail; the Settings form shows the reason.
+    `PUT` still saves.
+  - **A test sign-in uses the draft's own discovery** for all three addresses, never the live
+    connection's.
+
 ## 2. Anchors (verified at `dcaae8a5`)
 
 - `rust/crates/lakehouse-api/src/config.rs:552-617,1609,1789-1849`.
@@ -180,3 +205,69 @@ evidence, anything *not verified* and why, and the output of `git status --short
 --oneline origin/main..HEAD` and `git ls-remote --heads origin <branch>`.
 
 ## 6. Review (planner)
+
+### Round 1 (planner, 2026-11-11) — branch at `ee51567b`
+
+Read the server side of the diff against `origin/main` (`routes/auth.rs`,
+`routes/settings.rs` SSO handlers, `runtime_settings.rs` resolver and authenticator, the store
+module, the migration, `lakehouse-auth/oidc.rs`, compose). **Not read this round:** the
+console (`sso-page.tsx` and its tests); D10 changes what the form shows, so it is reviewed
+after the fix. I ran no check locally; the pull request (#455, draft) runs the suite.
+
+There is no developer handoff. The first session died on 2026-11-10 after T1 and T2; the
+second pushed T3 to T5 and I stopped it during its final local run, because the findings
+below need a new round anyway. The D4 reader list and the compose `up` evidence are still
+owed (S7).
+
+**BLOCKER**
+
+- **B1. A provider set in Settings cannot sign anyone in** (D10; the plan's gap).
+  `resolve_sso` fills the authorize, token and redirect addresses from `.env` only
+  (`runtime_settings.rs:1329-1359`), and nothing reads `authorization_endpoint` or
+  `token_endpoint` from discovery. With no `OIDC_*` variable set and a connection saved in
+  Settings, `GET /api/auth/providers` reports OIDC, the sign-in page shows the button, and
+  `oidc_start` answers 503 "OIDC_AUTHORIZE_URL is not configured". The tests do not see it
+  because `sso_settings_route.rs:139-141` sets `OIDC_TOKEN_URL` and `OIDC_JWKS_URL`.
+  - *Accept:* one test with **no `OIDC_*` variable set at all**: save through `PUT`, then
+    `oidc_start` redirects to the discovery document's authorization endpoint with the
+    redirect address built from `CONSOLE_PUBLIC_URL`, and the callback exchanges the code at
+    the discovery's token endpoint and creates the session. A second test: no
+    `CONSOLE_PUBLIC_URL` gives `"ready": false`, and `providers` reports no OIDC.
+- **B2. The test sign-in talks to the wrong provider.**
+  - `post_sso_test` (`routes/settings.rs:2433-2443`) takes the authorize address from the
+    **live** connection, or else guesses `<issuer>/authorize`. No common provider serves that
+    path (principle 14), and the redirect falls back to a relative `/api/auth/oidc/callback`.
+  - `handle_oidc_test_callback` (`routes/auth.rs`) exchanges the code at the **live**
+    `token_url`, or at an empty string, and checks the token against the **live** `jwks_url`.
+    With a live connection saved, the draft's client secret is sent to a different provider.
+  - All three come from the draft's discovery (D10).
+- **B3. The address check fails open** (principle 3; D6).
+  - In `handle_oidc_test_callback`, `if let Some(..) && let Ok(approved) = resolve_checked(..)`
+    leaves `http_client = None` when the check **fails**, and
+    `new_with_http_client(config, None, ..)` then fetches with the default client. A refused
+    address must store a plain result ("The provider's address is not one this deployment may
+    reach") and fetch nothing.
+  - In `runtime_settings::oidc` the same `&& let Ok(j_appr)` shape skips the key-set host
+    silently when its check fails.
+  - The addresses a discovery document names are not checked at all.
+
+**SHOULD-FIX**
+
+- **S1. Every failed code exchange is reported as "The provider refused the client ID or
+  secret"**, including a provider that cannot be reached. Tell them apart: refused
+  (`invalid_client`), unreachable, anything else. Fixed sentences only, never the provider's
+  text.
+- **S2. The result lacks `emailVerified` and `overage`** (D8). `emailVerified` is what
+  `SEC-65` will need an administrator to see.
+- **S3. `sqlx::query_scalar("SELECT name FROM role")` is written twice in
+  `routes/settings.rs`.** The store already lists roles (rule 4).
+- **S4. A run with no secret falls back to `OIDC_CLIENT_SECRET` in the callback.** A run uses
+  only what was sealed into it when it was created.
+- **S5. The authenticator is built twice by hand** (pinned client, role map, clock skew): in
+  `runtime_settings::oidc` and in `handle_oidc_test_callback`. One function, two callers
+  (rule 4). The same for the nonce check in `validate_for_test`: use the check the sign-in
+  path uses.
+- **S6. D9 gains a line:** the form shows `notReadyReason` when `ready` is false.
+- **S7. The next handoff owes** the D4 reader list, the compose `up` evidence (rule 8) and
+  every command with its counts.
+
