@@ -610,3 +610,21 @@ locally; #463 runs the suite.
   note). Remove them and the tests that only exercise them; the rule they held is in
   `saved-query-write.ts`, which is tested.
 
+### S2, round 2 (planner, 2026-11-11) — branch at `0ab131af`
+
+Read the three fixes (`cdbe7465..83de7f5b`).
+
+- **S1: closed.** The draft's step records its conversation and its tool. The page marks the
+  step only when the open conversation has the same id; for a conversation not saved yet,
+  only when the open one is unsaved too and the message at that index still carries a step
+  for the same tool. In every other case nothing is marked and the page goes back.
+  **For the AI team:** the path is in the developer's S2 handoffs in section 5 ("the
+  assistant draft path" and "S2 round 1 fixes"); `tool_schemas.json` is unchanged.
+- **S2: closed.** A chart that sits on another dashboard shows "Chart not found".
+- **S3: closed.** `save` and `saveAct` are gone with the five tests that only exercised them;
+  the developer's grep shows no other caller.
+
+**No open BLOCKER and no open SHOULD-FIX.** `origin/main` is merged in the commit that
+carries this note; no conflict. I ran no check locally; merged only when #463 is green on
+its last commit.
+
