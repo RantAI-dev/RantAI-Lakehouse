@@ -1048,3 +1048,17 @@ not run by me; #468 runs them.
 
 **No open BLOCKER.** R2-S1 is fixed before merge because #468 waits in the queue behind
 #466 and #467 anyway.
+
+### S2, round 3 (planner, 2026-11-11) — branch at `9b6143d1`
+
+Read the fix (`0d21aaad`). Run by me at `9b6143d1`: `bun run typecheck` (pass),
+`bun run lint` (0 errors, 11 warnings), `bun test src/features/admin src/services`
+(354 pass, 0 fail, one run).
+
+- **R2-S1: closed.** `tableKey` is declared on `Asset`, the picker's row type is
+  `Pick<Asset, "id" | "tableKey">`, and the comments say a Silver or Gold list row carries
+  no `tableKey`. The five server functions the comments name exist in `catalog.rs`.
+
+**No open BLOCKER and no open SHOULD-FIX.** The Rust suite and the whole `bun run test`
+were not run by me; #468 runs them. Merged only when #468 is green on its last commit, after
+#467.
