@@ -7,8 +7,10 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { EditorView } from "@codemirror/view"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { assetService, queryService } from "@/services"
+import { NO_READABLE_TABLE } from "@/lib/asset-query"
+import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
+import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import { SchemaBrowser } from "./schema-browser"
 import { SqlPanel } from "./sql-panel"
 import { useQueryStudio } from "./use-query-studio"
@@ -34,6 +36,12 @@ function visitTrinoTab() {
 const BRONZE_NEEDS_TRINO = "Bronze tables are read with Trino: switch this tab to Trino to insert it."
 
 /**
+ * What the browser says about a Bronze table whose Iceberg table read
+ * failed: the read failed, not the table.
+ */
+const TABLE_PROOF_FAILED = "The table could not be read."
+
+/**
  * A Bronze table's detail as the API sends it: the registry slug `demo_orders`
  * is its id, `queryTarget` is the ClickHouse `DataLakeCatalog` name (never a
  * Trino one), and `tableName` is what the Trino name is built from.
@@ -55,6 +63,23 @@ const ASSETS = [
   { id: "serving.mart_wisman", name: "Mart Wisman", namespace: "serving", layer: "gold" },
   { id: "demo_orders", name: "Demo Orders", namespace: "bronze", layer: "raw" },
 ] as never[]
+
+/** The Iceberg table the studio reads to prove a Bronze table is there. */
+const ICEBERG_TABLE = {
+  schema: [],
+  partitionSpec: [],
+  properties: {},
+  snapshots: [],
+  stats: {
+    fileCount: 1,
+    smallFileCount: null,
+    smallFileThresholdBytes: null,
+    recordCount: 1,
+    totalBytes: 1,
+    snapshotCount: 0,
+    metadataLogCount: 0,
+  },
+} as unknown as LakehouseTableDetail
 
 /** The page's two halves that matter here: the editor with its toolbar, and the browser. */
 function Harness() {
@@ -78,7 +103,7 @@ function stubServices(options: { assets?: "ok" | "forbidden" } = {}) {
   } else {
     spyOn(assetService, "listAssets").mockResolvedValue(ASSETS)
   }
-  return spyOn(assetService, "getAsset").mockImplementation((async (id: string) => {
+  const getAsset = spyOn(assetService, "getAsset").mockImplementation((async (id: string) => {
     if (id === "silver.orders") {
       return {
         schema: [
@@ -89,6 +114,10 @@ function stubServices(options: { assets?: "ok" | "forbidden" } = {}) {
     }
     return { schema: [] }
   }) as never)
+  // The Iceberg table the studio reads to learn whether a Bronze table is
+  // there at all (QS-4 D3): the same read the catalog page makes.
+  const getTableDetail = spyOn(lakehouseService, "getTableDetail").mockResolvedValue(ICEBERG_TABLE)
+  return { getAsset, getTableDetail }
 }
 
 /** The editor's view, found the way the editor's own DOM exposes it. */
@@ -127,7 +156,7 @@ describe("SchemaBrowser", () => {
   })
 
   it("fetches a table's columns once, however often it is collapsed and expanded", async () => {
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     render(<Harness />)
 
     const toggle = await screen.findByRole("button", { name: "Columns of Orders" })
@@ -165,7 +194,7 @@ describe("SchemaBrowser", () => {
   })
 
   it("inserts a table's SQL name at the cursor", async () => {
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     const { container } = render(<Harness />)
     const view = editorView(container)
     setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
@@ -193,7 +222,7 @@ describe("SchemaBrowser", () => {
   })
 
   it("keeps saying so on a ClickHouse tab once the detail has loaded, and offers no ClickHouse name", async () => {
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     getAsset.mockResolvedValueOnce(bronzeDetail())
     const { container } = render(<Harness />)
     const view = editorView(container)
@@ -212,7 +241,7 @@ describe("SchemaBrowser", () => {
 
   it("inserts a Bronze table's Trino name on a Trino tab once its detail names the table", async () => {
     visitTrinoTab()
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     getAsset.mockResolvedValueOnce(bronzeDetail())
     const { container } = render(<Harness />)
     const view = editorView(container)
@@ -227,9 +256,84 @@ describe("SchemaBrowser", () => {
     await act(async () => {})
   })
 
+  it("keeps a Bronze table out of the editor until its Iceberg table is proven", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValueOnce(bronzeDetail())
+    // The read that proves the table is there never comes back.
+    getTableDetail.mockReturnValue(new Promise<never>(() => {}))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    // The detail is there, but the table itself is not proven: the entry
+    // offers nothing.
+    expect(await screen.findByText("oid")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /^Insert iceberg/ }) === null).toBe(true)
+    const row = screen.getByRole("button", { name: "Demo Orders" })
+    expect(row.getAttribute("aria-disabled")).toBe("true")
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
+  })
+
+  it("disables a Bronze table with the sentence when its Iceberg table is not there", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValueOnce(bronzeDetail())
+    getTableDetail.mockRejectedValue(new ServiceError("not_found", "table not found", 404))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    await waitFor(() => {
+      const row = screen.getByRole("button", { name: "Demo Orders" })
+      expect(row.getAttribute("title")).toBe(NO_READABLE_TABLE)
+    })
+    expect(screen.queryByRole("button", { name: /^Insert iceberg/ }) === null).toBe(true)
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
+  })
+
+  it("says the table could not be read, with retry, when the proof read fails, and reads it again on the next open", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    // A 5xx says nothing about whether the table is there; the read itself
+    // failed (#448 review SHOULD-FIX).
+    getTableDetail.mockRejectedValue(new ServiceError("unavailable", "warehouse down", 503))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    // The entry holds the load-failed sentence, never the no-table one,
+    // with a Retry affordance.
+    expect(await screen.findByText(TABLE_PROOF_FAILED)).toBeTruthy()
+    expect(screen.queryByText(NO_READABLE_TABLE)).toBeNull()
+    const row = screen.getByRole("button", { name: "Demo Orders" })
+    expect(row.getAttribute("title")).toBe(TABLE_PROOF_FAILED)
+    const retry = screen.getByRole("button", {
+      name: "Retry reading the table of Demo Orders",
+    })
+
+    // Retry reads the table again.
+    const afterFirstRead = getTableDetail.mock.calls.length
+    fireEvent.click(retry)
+    await waitFor(() => expect(getTableDetail.mock.calls.length).toBeGreaterThan(afterFirstRead))
+
+    // And so does the next open of the entry.
+    const afterRetry = getTableDetail.mock.calls.length
+    fireEvent.click(screen.getByRole("button", { name: "Columns of Demo Orders" }))
+    fireEvent.click(screen.getByRole("button", { name: "Columns of Demo Orders" }))
+    await waitFor(() => expect(getTableDetail.mock.calls.length).toBeGreaterThan(afterRetry))
+  })
+
   it("inserts a quoted Trino name as it is formed, without quoting its parts again", async () => {
     visitTrinoTab()
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     getAsset.mockResolvedValueOnce(bronzeDetail("order lines"))
     const { container } = render(<Harness />)
     const view = editorView(container)
@@ -257,7 +361,7 @@ describe("SchemaBrowser", () => {
   })
 
   it("shows the catalog's reason when a table's columns were refused, and retries on request", async () => {
-    const getAsset = stubServices()
+    const { getAsset } = stubServices()
     getAsset.mockResolvedValueOnce({
       supported: false,
       reason: "This tenant has no catalog configured",

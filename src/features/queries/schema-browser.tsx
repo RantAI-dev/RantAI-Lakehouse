@@ -5,7 +5,7 @@ import { ChevronDown, ChevronRight, Lock, RotateCcw, X } from "lucide-react"
 
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
-import { quoteIdent } from "@/lib/asset-query"
+import { quoteIdent, NO_READABLE_TABLE } from "@/lib/asset-query"
 import type { CompletionTable } from "@/lib/sql-completion"
 import { DATA_LAYER_LABEL, type DataLayer } from "@/lib/status"
 import type { useQueryStudio } from "./use-query-studio"
@@ -20,6 +20,13 @@ const NO_SQL_NAME =
  */
 const BRONZE_NEEDS_TRINO =
   "Bronze tables are read with Trino: switch this tab to Trino to insert it."
+
+/**
+ * What an entry says while its Iceberg table read has failed: the read
+ * failed, not the table, so the no-table sentence stays out until a read
+ * answers "not found" (#448 review SHOULD-FIX).
+ */
+const TABLE_PROOF_FAILED = "The table could not be read."
 
 /** The layers in the order the console lists them everywhere. */
 const LAYERS = Object.keys(DATA_LAYER_LABEL) as DataLayer[]
@@ -44,7 +51,7 @@ export function SchemaBrowser({
   readonly studio: ReturnType<typeof useQueryStudio>
   readonly onClose: () => void
 }) {
-  const { assetsState, tables, columns, engine, loadColumns, insertAtCursor } = studio
+  const { assetsState, tables, columns, engine, loadColumns, insertAtCursor, proofs } = studio
   const [expanded, setExpanded] = React.useState<ReadonlySet<string>>(new Set())
 
   const toggle = (id: string) => {
@@ -111,6 +118,7 @@ export function SchemaBrowser({
                       engine={engine}
                       open={expanded.has(table.id)}
                       state={columns[table.id]}
+                      proof={proofs[table.id]}
                       onToggle={() => toggle(table.id)}
                       onInsert={insertAtCursor}
                       onRetry={() => loadColumns(table.id, { retry: true })}
@@ -131,6 +139,7 @@ function TableRow({
   engine,
   open,
   state,
+  proof,
   onToggle,
   onInsert,
   onRetry,
@@ -139,12 +148,24 @@ function TableRow({
   readonly engine: ReturnType<typeof useQueryStudio>["engine"]
   readonly open: boolean
   readonly state: ReturnType<typeof useQueryStudio>["columns"][string] | undefined
+  readonly proof: ReturnType<typeof useQueryStudio>["proofs"][string] | undefined
   readonly onToggle: () => void
   readonly onInsert: (text: string) => void
   readonly onRetry: () => void
 }) {
   const insertable = table.reference !== ""
-  const missingReason = table.trinoOnly && engine !== "trino" ? BRONZE_NEEDS_TRINO : NO_SQL_NAME
+  // Why the table cannot be inserted, in the order a person meets them: a
+  // ClickHouse tab reads a Bronze table with Trino, a Bronze table whose
+  // Iceberg table is not there has no table to read at all, and one whose
+  // read failed says so until the read answers (#448 review SHOULD-FIX).
+  const missingReason =
+    table.trinoOnly && engine !== "trino"
+      ? BRONZE_NEEDS_TRINO
+      : proof?.status === "missing"
+        ? NO_READABLE_TABLE
+        : proof?.status === "failed"
+          ? TABLE_PROOF_FAILED
+          : NO_SQL_NAME
   return (
     <li>
       <div className="flex items-center gap-1">
@@ -223,6 +244,22 @@ function TableRow({
               ))}
             </ul>
           )}
+          {proof?.status === "failed" ? (
+            // A failed read is not an answer about the table: it says so and
+            // is read again here, on the next open or on request.
+            <div className="py-1 text-xs">
+              <p className="text-muted-foreground">{TABLE_PROOF_FAILED}</p>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={onRetry}
+                aria-label={`Retry reading the table of ${table.label}`}
+              >
+                <RotateCcw className="size-3" aria-hidden />
+                Retry
+              </Button>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </li>

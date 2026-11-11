@@ -5,7 +5,7 @@ import * as React from "react"
 import { Prec } from "@codemirror/state"
 import { EditorView, keymap } from "@codemirror/view"
 
-import { assetQueryTarget, trinoBronzeName } from "@/lib/asset-query"
+import { assetQueryTarget, BRONZE_NAMESPACE, trinoBronzeName } from "@/lib/asset-query"
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
@@ -40,7 +40,7 @@ import {
   splitStatements,
   type SqlStatement,
 } from "@/lib/sql-text"
-import { assetService, queryService } from "@/services"
+import { assetService, lakehouseService, queryService } from "@/services"
 import { toServiceError, type ServiceError } from "@/services/errors"
 import type {
   NlAnswer,
@@ -101,6 +101,20 @@ export const SAVED_QUERY_UNAVAILABLE = "This query is not available to you."
 const SQL_TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$/
 
 export type StudioTab = "nl" | "sql"
+
+/**
+ * What the studio knows about a Bronze table's Iceberg table: that it is
+ * there (`there`), that it is not (`missing` — a read that answered "not
+ * found"), or that the read itself failed (`failed`), which says nothing
+ * about the table and is tried again the next time the entry opens.
+ *
+ * A table with no proof yet has none either: the registry's `tableName`
+ * says a Bronze table might exist, not that it does, and a Trino tab on a
+ * table that is not there answers "table does not exist" (QS-4 D3, owner
+ * 2026-11-09). Holding a failed read as `missing` would state as fact
+ * what was only a failed request (#448 review SHOULD-FIX).
+ */
+export type TableProof = { status: "there" | "missing" | "failed" }
 
 /**
  * What one statement of a run did.
@@ -444,6 +458,27 @@ export function useQueryStudio() {
   // is a nicety, and Query Studio works without it.
   const assetsState = useService((s) => assetService.listAssets({}, s), [])
 
+  // Whether the page is still there: a request that comes back after the
+  // person left it must not set state.
+  const mountedRef = React.useRef(true)
+  React.useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  // Whether a table's Iceberg table is there, by catalog id. It is read
+  // once, with the table's own detail, and kept for the session: a Bronze
+  // table's Trino name is offered only for a table that is proven to be
+  // there (QS-4 D3).
+  const [proofs, setProofs] = React.useState<Record<string, TableProof>>({})
+  const rememberProof = React.useCallback((id: string, proof: TableProof) => {
+    // The person may have left the page while the request was in flight.
+    if (!mountedRef.current) return
+    setProofs((previous) => ({ ...previous, [id]: proof }))
+  }, [])
+
   // The query target a table's detail named, keyed by the catalog id. The
   // detail is already fetched for a table a person expands or a statement
   // names; the same answer carries the SQL form.
@@ -480,10 +515,14 @@ export function useQueryStudio() {
         const trino = detail?.bronzeTable ? trinoBronzeName(detail.bronzeTable) : ""
         // Both spellings of a Trino name resolve to this table, whatever its id.
         if (detail?.bronzeTable) names.push(trino, `bronze.${detail.bronzeTable}`)
+        // The Trino name is offered only once the Iceberg table is proven to
+        // be there: the registry's `tableName` says a Bronze table might
+        // exist, not that it does (QS-4 D3, owner 2026-11-09).
+        const proven = proofs[asset.id]?.status === "there"
         return {
           id: asset.id,
           label: asset.name,
-          reference: engine === "trino" ? trino : "",
+          reference: engine === "trino" && proven ? trino : "",
           layer: asset.layer,
           names,
           trinoOnly: true,
@@ -498,7 +537,7 @@ export function useQueryStudio() {
         names,
       }
     })
-  }, [assetsState.status, assetsState.data, targets, engine])
+  }, [assetsState.status, assetsState.data, targets, proofs, engine])
 
   // The columns of the tables the buffer names: fetched once each and kept
   // for the session. A table that cannot be read is kept as a failure too,
@@ -509,19 +548,11 @@ export function useQueryStudio() {
   // state update is not there yet at that point.
   const [columns, setColumns] = React.useState<Record<string, ColumnState>>({})
   const columnsRef = React.useRef<Record<string, ColumnState>>({})
-  const mountedRef = React.useRef(true)
   const rememberColumns = React.useCallback((id: string, state: ColumnState) => {
     columnsRef.current[id] = state
     // The person may have left the page while the request was in flight.
     if (!mountedRef.current) return
     setColumns((previous) => ({ ...previous, [id]: state }))
-  }, [])
-
-  React.useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-    }
   }, [])
 
   // Fetches one table's columns and keeps what came back.
@@ -549,6 +580,26 @@ export function useQueryStudio() {
               ...previous,
               [id]: { target: assetQueryTarget(detail), bronzeTable },
             }))
+            // The Iceberg table itself: a Bronze table's Trino name is
+            // offered only once the table is proven to be there, and only
+            // a read that answered "not found" proves it is not (QS-4 D3).
+            // Any other rejection failed, and is held as failed so the
+            // entry offers a retry instead of a false "not there" (#448
+            // review SHOULD-FIX).
+            if (bronzeTable) {
+              void lakehouseService
+                .getTableDetail(BRONZE_NAMESPACE, bronzeTable)
+                .then(
+                  () => rememberProof(id, { status: "there" }),
+                  (error: unknown) =>
+                    rememberProof(
+                      id,
+                      toServiceError(error).code === "not_found"
+                        ? { status: "missing" }
+                        : { status: "failed" }
+                    )
+                )
+            }
           }
           rememberColumns(id, {
             status: "ready",
@@ -563,7 +614,7 @@ export function useQueryStudio() {
         () => rememberColumns(id, { status: "failed" })
       )
     },
-    [rememberColumns]
+    [rememberColumns, rememberProof]
   )
 
   React.useEffect(() => {
@@ -580,14 +631,22 @@ export function useQueryStudio() {
   // The schema browser asks for a table's columns when a person expands it.
   // It shares the cache above, so a table the statement already named is not
   // fetched twice. Only a person pressing "Retry" (`retry`) may fetch a
-  // failed table again: a keystroke never does.
+  // failed table again: a keystroke never does. An entry whose proof read
+  // failed is read again whenever it opens — the open is its retry — while
+  // a keystroke still never is (#448 review SHOULD-FIX).
   const loadColumns = React.useCallback(
     (id: string, options: { retry?: boolean } = {}) => {
       const cached = columnsRef.current[id]
-      if (cached && !(options.retry && cached.status === "failed")) return
+      if (
+        cached &&
+        !(options.retry && cached.status === "failed") &&
+        proofs[id]?.status !== "failed"
+      ) {
+        return
+      }
       fetchColumns(id)
     },
-    [fetchColumns]
+    [fetchColumns, proofs]
   )
 
   // The editor's view is kept in a ref: the browser needs it at click time
@@ -1430,6 +1489,11 @@ export function useQueryStudio() {
     assetsState,
     tables,
     columns,
+    /**
+     * Whether a table's Iceberg table is there, by catalog id. A table
+     * with no entry has no proof yet, and is offered nothing (QS-4 D3).
+     */
+    proofs,
     loadColumns,
     setEditorView,
     insertAtCursor,

@@ -3,8 +3,9 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { EditorView } from "@codemirror/view"
 import * as React from "react"
 import * as notify from "@/lib/notify"
-import { assetService, queryService } from "@/services"
+import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
+import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import { useQueryStudio } from "./use-query-studio"
 
 // The explain and fix actions of Query Studio: what Accept, Reject and the
@@ -379,7 +380,26 @@ describe("useQueryStudio Bronze tables", () => {
     queryTarget: { engine: "clickhouse", table: "icecat_api.`bronze.orders`" },
   }
 
-  function mountWithBronze() {
+  /** The Iceberg table the studio reads to prove a Bronze table is there. */
+  const ICEBERG_TABLE = {
+    schema: [],
+    partitionSpec: [],
+    properties: {},
+    snapshots: [],
+    stats: {
+      fileCount: 1,
+      smallFileCount: null,
+      smallFileThresholdBytes: null,
+      recordCount: 1,
+      totalBytes: 1,
+      snapshotCount: 0,
+      metadataLogCount: 0,
+    },
+  } as unknown as LakehouseTableDetail
+
+  function mountWithBronze(
+    options: { tableMissing?: boolean; tableError?: ServiceError } = {}
+  ) {
     spyOn(queryService, "listSaved").mockResolvedValue([])
     spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
@@ -387,6 +407,14 @@ describe("useQueryStudio Bronze tables", () => {
       { id: "demo_orders", name: "Demo Orders", namespace: "bronze", layer: "raw" },
     ] as never)
     spyOn(assetService, "getAsset").mockResolvedValue(BRONZE_DETAIL as never)
+    // The studio asks the Iceberg table whether it is there, before it offers
+    // a Bronze table's Trino name (QS-4 D3).
+    const tableAnswer = options.tableMissing
+      ? () => Promise.reject(new ServiceError("not_found", "table not found", 404))
+      : options.tableError
+        ? () => Promise.reject(options.tableError)
+        : () => Promise.resolve(ICEBERG_TABLE)
+    spyOn(lakehouseService, "getTableDetail").mockImplementation(tableAnswer)
     return renderHook(() => useQueryStudio())
   }
 
@@ -406,6 +434,37 @@ describe("useQueryStudio Bronze tables", () => {
     )
     expect(hook.result.current.tables[0]?.names).toContain("iceberg.bronze.orders")
     expect(hook.result.current.tables[0]?.names).toContain("bronze.orders")
+  })
+
+  it("gives a Bronze table no Trino name when its Iceberg table is not there", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const hook = mountWithBronze({ tableMissing: true })
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+
+    await waitFor(() =>
+      expect(hook.result.current.proofs["demo_orders"]?.status).toBe("missing")
+    )
+    expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
+  })
+
+  it("holds a proof read that failed as failed, not missing", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const hook = mountWithBronze({
+      tableError: new ServiceError("unavailable", "warehouse down", 503),
+    })
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+
+    // A 5xx says nothing about the table: the proof is held as failed so
+    // the entry can offer a retry, never as "missing" (#448 review
+    // SHOULD-FIX).
+    await waitFor(() =>
+      expect(hook.result.current.proofs["demo_orders"]?.status).toBe("failed")
+    )
+    expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
   })
 
   it("gives the table no name on a ClickHouse tab, whatever the ClickHouse name the detail carries", async () => {

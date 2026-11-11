@@ -99,9 +99,10 @@ answers 404 (not found).
 ## Asking the assistant
 
 This page is the assistant. Ask mode answers a question about the data and
-reads the console; Build mode acts. A question the assistant cannot answer
-honestly is refused with the reason, and a change it may not make is
-refused with the permission it lacks.
+reads the console; Build mode acts. In Ask mode it explains a calculated
+field with `list_calculated_fields` and runs no SQL for the answer. A
+question the assistant cannot answer honestly is refused with the reason,
+and a change it may not make is refused with the permission it lacks.
 
 ## Decisions
 
