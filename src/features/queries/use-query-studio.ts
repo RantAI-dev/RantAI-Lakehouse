@@ -49,7 +49,6 @@ import type {
   QueryParamInputs,
   QueryParamValue,
   QueryResult,
-  SaveQueryInput,
   SavedQuery,
   SqlFixOutcome,
 } from "@/services/contracts/queries"
@@ -57,7 +56,6 @@ import {
   createSqlCompletionSource,
   sqlCompletionExtension,
 } from "./sql-completion-source"
-import { savedQueryRequest } from "./saved-query-write"
 import { useQueryDownload } from "./use-query-download"
 
 /** What the editor holds before anyone types. */
@@ -430,18 +428,6 @@ export function useQueryStudio() {
     }
     return marked.size === 0 ? NO_NAMES : marked
   }, [refused, activeTabId, estimateError, parameters])
-  const saveAct = useServiceAction((signal: AbortSignal, input: SaveQueryInput) => {
-    // `WEB-7` D5: the rule for "change the saved query or copy it" lives in
-    // `saved-query-write.ts`, so the Save query page sends the same write.
-    const request = savedQueryRequest(
-      { mode: savesSavedQuery ? "update" : "create", savedId: activeSaved?.id ?? null },
-      input
-    )
-    if (request.kind === "update") {
-      return queryService.updateSaved(request.id, request.body, signal)
-    }
-    return queryService.saveQuery(request.input, signal)
-  })
   const savedState = useService((s) => queryService.listSaved(s), [])
   const historyState = useService((s) => queryService.listHistory(undefined, s), [])
 
@@ -1212,25 +1198,6 @@ export function useQueryStudio() {
     }
   }, [historyState, stopDownload])
 
-  const save = React.useCallback(
-    async (input: SaveQueryInput) => {
-      const saved = await saveAct.run(input)
-      if (!saved) return null
-      savedState.reload()
-      // The tab is the query the server made: a copy made from a saved query
-      // becomes one of its own, and a change keeps the id it had.
-      setTabs((previous) =>
-        previous.map((open) =>
-          open.id === activeTabId
-            ? { ...open, savedId: saved.id, level: saved.level }
-            : open
-        )
-      )
-      return saved
-    },
-    [saveAct, savedState, activeTabId]
-  )
-
   // Agentic ask: one call to the chat's engine, which writes the SQL, runs
   // it as the caller (masking and row filters apply), corrects itself on
   // error and explains the result (`/api/ai/chat`).
@@ -1496,7 +1463,6 @@ export function useQueryStudio() {
     estimatable,
     generateAct,
     estimateAct,
-    saveAct,
     savedState,
     historyState,
     agent: { busy: agentBusy, result: agentResult, error: agentError, ask },
@@ -1522,10 +1488,12 @@ export function useQueryStudio() {
     reEstimate: () => {
       if (targetText !== null && !estimateWaits) void runEstimate(targetText, estimateInputs)
     },
-    save,
     /**
      * What the Save button on the open tab does: "Save" changes the saved
-     * query the tab came from, "Save as new" makes a copy of it.
+     * query the tab came from, "Save as new" makes a copy of it. The write
+     * itself is the Save query page's (`save-query-page.tsx`, through
+     * `savedQueryRequest`); this hook reads only what the button offers
+     * (`WEB-7` D5 — its own unused `save` left in the S2 review, S3).
      */
     saveTarget: {
       mode: savesSavedQuery ? ("update" as const) : ("create" as const),
