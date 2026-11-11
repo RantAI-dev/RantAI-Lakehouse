@@ -135,13 +135,19 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
     (signal) => goldService.getPublication(mart, signal),
     [mart]
   )
+  // QA LH-DATA-1-02 (plan D7): the publish history is read through routes
+  // that need gold:export. A person without it got a 4xx there, and the
+  // console read a 401 as an expired session. So nothing is requested until
+  // the publication says this person may; the card still shows its state.
+  const mayReadHistory = pub.status === "success" && pub.data.canEdit
   const lastExport = useService<GoldReadBack | null>(async (signal) => {
+    if (!mayReadHistory) return null
     try {
       return await goldService.getLastExport(mart, signal)
     } catch {
       return null
     }
-  }, [mart])
+  }, [mart, mayReadHistory])
   const readers = useService<GoldConsumers>(
     (signal) => goldService.getConsumers(mart, signal),
     [mart]
@@ -284,10 +290,13 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
                 </p>
               )}
             </div>
-            <div>
-              <h4 className="mb-1 text-sm font-medium">Last 5 publish runs</h4>
-              <LastFiveRuns mart={mart} />
-            </div>
+            {/* QA LH-DATA-1-02 (plan D7): the run list needs gold:export too. */}
+            {canEdit && (
+              <div>
+                <h4 className="mb-1 text-sm font-medium">Last 5 publish runs</h4>
+                <LastFiveRuns mart={mart} />
+              </div>
+            )}
             <Link
               href="/gold-exports"
               className="self-start text-sm text-primary hover:underline"
