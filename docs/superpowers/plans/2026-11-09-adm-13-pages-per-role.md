@@ -396,6 +396,132 @@ documentation commit changed only Markdown and ran no check.
 not verified locally: the rest, left to CI (`bun run test` in full, `cargo` workspace
 and the compose config check).
 
+### Handoff (developer, 2026-11-11, CI test fixes)
+
+#### Commits
+- `5bf4a996` — `test(api): the assistant tests give their person the route's permission (ADM-13, CI run 42964927372)`
+- `2f31c21b` — `test(api): alert:read and ops:read for the tests that read those lists (ADM-13, CI run 42964927372)`
+- `629a2ff7` — `test(api): the permissions count follows the catalogue ADM-13 added (ADM-13, CI run 42964927372)`
+- (this commit) — `docs(plan): developer handoff for the ADM-13 CI test fixes (ADM-13, CI run 42964927372)`
+
+#### Why the run was red
+CI run `42964927372`, the three `Rust · test` jobs: 33 + 28 + 21 = 82 failing tests.
+All but one were `403 {"error":"permission_denied: assistant:use, assistant:ask"}`
+(or `alert:read, alert:write`, or `ops:read`): the test minted a narrow principal
+after the migrations ran (`create_principal_with_permissions`), so the role
+never received `0133_pages_per_role.sql`'s appended grants, and D5's new route
+floor refused the request before the tool or handler the test is about.
+
+#### Helper(s) changed
+One new helper, `common::create_assistant_principal(pool, permissions)`: it
+creates the same fresh person `create_principal_with_permissions` creates and
+appends `assistant:use` to the role's permissions (`permissions` may be empty,
+which yields `assistant:use` alone). Every caller in this slice is a person who
+calls `/api/ai/*`, so "assistant user" is true of all of them; the helper's doc
+comment says so and says why. `create_principal_with_permissions` and
+`create_zero_permission_principal` are unchanged — their other callers are tests
+about non-assistant surfaces, where `assistant:use` is not what the person means.
+
+#### Per test file
+- `ai_alert_tools` — the shared `fixture(permissions, …)` person (the caller of
+  `POST /api/ai/tool` in all 7 tests) now holds `assistant:use` besides
+  `dashboard:read` / `dashboard:read, alert:write`. The chart-alert save without
+  `alert:write` still proves the own-address rule.
+- `ai_cache_rule` — `app()`'s principal now holds `dashboard:read,
+  dashboard:write, assistant:use`.
+- `ai_chart_draft` — `post_as`'s narrow-principal branch holds `assistant:use`
+  besides its `permissions`; the `WRITER` const names it. The seeded `fajar` path
+  is unchanged.
+- `ai_comment_tool` — the six `dashboard:read` principals hold `assistant:use`
+  besides. The service identity in
+  `a_service_identity_is_refused_in_the_routes_sentence` gains
+  `assistant:use` in its scopes, so the request reaches the tool and its own
+  service-identity sentence is still the refusal under test.
+- `ai_dashboard_reach` — every principal that calls a tool (`query:read`,
+  `catalog:read`, empty) holds `assistant:use` besides. The two `agent:approve`
+  approvers only call the decide route and are unchanged.
+- `ai_embed_tools` — `manager()` (empty permissions) and the two inline
+  `dashboard:read` viewers hold `assistant:use` besides. Approvers unchanged.
+- `ai_export_tools` — `app()`'s `dashboard:read` principal holds
+  `assistant:use` besides; `without_dashboard_read_the_tools_are_refused_by_the_gate`
+  holds `assistant:use` only, so the tool's `dashboard:read` gate still refuses.
+- `ai_report_tools` — the fixture requester (`dashboard:read, dashboard:write`)
+  and the `stranger` (`dashboard:read`) hold `assistant:use` besides. The
+  approvers, the principal the model may not name as owner, and the
+  `dashboard:read, agent:approve, settings:write` administrator (decide route
+  only) are unchanged.
+- `ai_sessions` — both people hold `assistant:use` only; the tests are about
+  whose conversation each may read.
+- `ai_sql_help` — `system_prompt_for_user_holding` adds `assistant:use`; the
+  map tests keep their point, because `dashboard:read` still has no
+  `catalog:read` and `catalog:read` is still what opens the map.
+- `ai_terms` — all six people hold `assistant:use` only; the tests are about
+  per-person terms.
+- `ai_tool` — `missing_permission_refuses_and_audits_with_permission_reason`,
+  `the_sql_tools_are_refused_without_query_read_and_never_reach_an_engine`
+  and `new_tools_are_refused_for_a_zero_permission_principal` hold
+  `assistant:use` and nothing else, so each tool's own refusal is still what
+  they assert; `set_board_view_filters_works_with_dashboard_read_only` and
+  `set_cache_rule_is_refused_without_dashboard_write` hold `assistant:use`
+  besides `dashboard:read`.
+- `chart_alerts` — the fixture's `Chart Owner` role holds
+  `dashboard:read, alert:read`; the tests that must prove saving for anybody
+  else needs `alert:write` still get their 403 on the write, and the two rule
+  lists reach the handler.
+- `dashboard_access_routes` — the five tests that call `/api/ai/tool`
+  (`list_boards`, `create_alert_rule` digest, the four chart tools, `list_charts`,
+  the calculated-field tools) hold `assistant:use` besides their
+  `dashboard:read`/`dashboard:write`/`query:read`/`alert:write` permissions.
+- `ops_workloads` — `the_workloads_route_answers_200_with_the_documented_fields`
+  reads `GET /api/ops/workloads` as a person holding `ops:read` only (was a
+  zero-permission principal); the route's stale "RequiresAuth" comment is
+  corrected.
+- `identity_roles` — **the one failure not explained by a missing permission**:
+  `identity::role_admin::the_permissions_route_is_refused_without_identity_read`
+  passes its 401/403 halves and then failed `arr.len() == 29` with 34. Verified:
+  `permission_catalog.rs` and `tests/fixtures/permissions.json` both hold 34,
+  and the branch's diff adds exactly five names — `assistant:use`,
+  `assistant:ask`, `ops:read`, `governance:read`, `alert:read` (T1/D2). The
+  expectation is now 34 with the reason at the assertion; it stays a literal.
+
+#### Tests stopped on
+None. Every failure in the run was fixed; no assertion was deleted, no expected
+value was loosened, no `#[ignore]` was added, and nothing under `src/` changed.
+
+#### Exact commands and counts (foreground, one file per call)
+Each of these was run as
+`sg docker -c '/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test <file>'`
+from `rust/`:
+
+| file | result |
+| --- | --- |
+| `ai_alert_tools` | 8 passed, 0 failed |
+| `ai_cache_rule` | 3 passed, 0 failed |
+| `ai_chart_draft` | 20 passed, 0 failed |
+| `ai_comment_tool` | 7 passed, 0 failed |
+| `ai_dashboard_reach` | 7 passed, 0 failed |
+| `ai_embed_tools` | 11 passed, 0 failed |
+| `ai_export_tools` | 12 passed, 0 failed |
+| `ai_report_tools` | 12 passed, 0 failed |
+| `ai_sessions` | 6 passed, 0 failed |
+| `ai_sql_help` | 17 passed, 0 failed |
+| `ai_terms` | 7 passed, 0 failed |
+| `ai_tool` | 25 passed, 0 failed |
+| `chart_alerts` | 19 passed, 0 failed |
+| `dashboard_access_routes` | 36 passed, 0 failed |
+| `identity_roles` | 24 passed, 0 failed |
+| `ops_workloads` | 3 passed, 0 failed |
+
+217 tests in 16 files, 0 failed. `cargo fmt --check` passed before each of the
+three code commits.
+
+`git status --short` before each commit held only the test files that commit
+names.
+
+not verified locally: the rest, left to CI — the other test binaries in
+`rust/crates/lakehouse-api/tests/`, the workspace clippy/test/fmt block, and
+every TypeScript, Python, Dagster and compose check.
+
 ## 6. Review (planner)
 
 ### Round 1 (planner, 2026-11-11) — branch at `3497f25e`
