@@ -6,6 +6,7 @@ import { FormPage } from "@/components/patterns/form-page"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { authService, identityService } from "@/services"
 import { rememberInvitePassword } from "./invite-password"
@@ -22,6 +23,9 @@ import { rememberInvitePassword } from "./invite-password"
  */
 export function InviteUserPage() {
   const router = useRouter()
+  // WEB-7 S1 review round 1, S1: the password is attributed to whoever is
+  // signed in, so the list can refuse it to anyone else.
+  const { user } = useAuth()
   const backHref = "/admin/users"
   const rolesState = useService((s) => identityService.listRoles(s), [])
   const tenantsState = useService((s) => identityService.listTenants(s), [])
@@ -55,11 +59,17 @@ export function InviteUserPage() {
       mustChangePassword,
     })
     if (!result) return
-    if (result.temporaryPassword) {
-      rememberInvitePassword({
-        password: result.temporaryPassword,
-        mustChangePassword,
-      })
+    // WEB-7 S1 review round 1, S1: no principal means no attribution, and an
+    // unattributed password is the leak the finding named — so it is dropped
+    // rather than handed to whoever opens the list next.
+    if (result.temporaryPassword && user) {
+      rememberInvitePassword(
+        {
+          password: result.temporaryPassword,
+          mustChangePassword,
+        },
+        user.id
+      )
     }
     router.push(backHref)
   }

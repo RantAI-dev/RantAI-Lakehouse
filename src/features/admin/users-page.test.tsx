@@ -512,10 +512,13 @@ describe("UsersPage tabs (WEB-3 S3-D7)", () => {
 
 describe("UsersPage shown-once invite password (ADM-3, WEB-7 D3)", () => {
   it("opens the dialog for the password the invite page left in memory, then forgets it", async () => {
-    rememberInvitePassword({
-      password: TEMPORARY_PASSWORD,
-      mustChangePassword: false,
-    })
+    rememberInvitePassword(
+      {
+        password: TEMPORARY_PASSWORD,
+        mustChangePassword: false,
+      },
+      "u1"
+    )
     setupFetch()
     const { unmount } = renderPage()
 
@@ -525,7 +528,7 @@ describe("UsersPage shown-once invite password (ADM-3, WEB-7 D3)", () => {
     expect(JSON.stringify(localStorage)).not.toContain(TEMPORARY_PASSWORD)
     expect(JSON.stringify(sessionStorage)).not.toContain(TEMPORARY_PASSWORD)
     // The store was read once; nothing is left to reopen it.
-    expect(takeInvitePassword()).toBeNull()
+    expect(takeInvitePassword("u1")).toBeNull()
 
     // Leaving and coming back does not show it again. (The dialog's own
     // close button starts a Base UI exit animation that happy-dom never
@@ -534,6 +537,25 @@ describe("UsersPage shown-once invite password (ADM-3, WEB-7 D3)", () => {
     renderPage()
     await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
     expect(screen.queryByTestId("revealed-password")).toBeNull()
+  })
+
+  // WEB-7 S1 review round 1, S1: signing out is a client-side push, so a
+  // value left by a different administrator in this tab must not reach the
+  // one who signs in next.
+  it("does not show a password another user left in this tab, and forgets it", async () => {
+    rememberInvitePassword(
+      {
+        password: TEMPORARY_PASSWORD,
+        mustChangePassword: false,
+      },
+      "u-other"
+    )
+    setupFetch()
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    expect(screen.queryByTestId("revealed-password")).toBeNull()
+    // Cleared by the mismatched read, not kept for a later visit.
+    expect(takeInvitePassword("u-other")).toBeNull()
   })
 })
 

@@ -48,7 +48,7 @@ type UsersTab = (typeof USERS_TABS)[number]
  */
 export function UsersPage() {
   const [tab, setTab] = useUrlTab("tab", USERS_TABS)
-  const { hasPermission } = useAuth()
+  const { hasPermission, user } = useAuth()
   const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listUsers(s), [])
   // ADM-4 D7: the role editor needs the roles that exist, and the tenant
@@ -79,12 +79,19 @@ export function UsersPage() {
   // WEB-7 D3: the invite page leaves the generated password here. Reading
   // it in an effect (not during render) keeps the one-shot read out of the
   // render pass; the store itself clears it as it is taken.
+  //
+  // WEB-7 S1 review round 1, S1: the read waits for the principal and asks
+  // for THAT id, so a password left by a signed-out administrator is
+  // cleared here (and not shown) instead of reaching whoever signs in next
+  // in this tab.
+  const authUserId = user?.id ?? null
   React.useEffect(() => {
-    const pending = takeInvitePassword()
+    if (!authUserId) return
+    const pending = takeInvitePassword(authUserId)
     if (!pending) return
     setRevealedMustChange(pending.mustChangePassword)
     setRevealedPassword(pending.password)
-  }, [])
+  }, [authUserId])
 
   const reset = useServiceAction(
     (signal, id: string) => identityService.resetPassword(id, signal)

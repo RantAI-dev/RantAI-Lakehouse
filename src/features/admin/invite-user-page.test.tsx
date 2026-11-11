@@ -64,7 +64,7 @@ afterEach(() => {
   pushed = []
   // The store is module-level and single-use; a test that never reached the
   // list would otherwise leave a password for the next one.
-  takeInvitePassword()
+  takeInvitePassword("u1")
 })
 
 beforeEach(() => {
@@ -237,7 +237,7 @@ describe("InviteUserPage (WEB-7 D2/D3)", () => {
       expect(body.mustChangePassword).toBe(false)
     })
     await waitFor(() => expect(pushed).toEqual(["/admin/users"]))
-    expect(takeInvitePassword()).toBeNull()
+    expect(takeInvitePassword("u1")).toBeNull()
   })
 
   it("a failed invite stays on the page, shows the API's answer, and remembers no password", async () => {
@@ -249,7 +249,7 @@ describe("InviteUserPage (WEB-7 D2/D3)", () => {
 
     expect(await screen.findByRole("alert")).toBeTruthy()
     expect(pushed).toEqual([])
-    expect(takeInvitePassword()).toBeNull()
+    expect(takeInvitePassword("u1")).toBeNull()
   })
 
   // WEB-7 D3: the redirect carries no password — not in the URL, not in
@@ -266,12 +266,12 @@ describe("InviteUserPage (WEB-7 D2/D3)", () => {
     expect(pushed.join(" ")).not.toContain(TEMPORARY_PASSWORD)
     expect(JSON.stringify(localStorage)).not.toContain(TEMPORARY_PASSWORD)
     expect(JSON.stringify(sessionStorage)).not.toContain(TEMPORARY_PASSWORD)
-    expect(takeInvitePassword()).toEqual({
+    expect(takeInvitePassword("u1")).toEqual({
       password: TEMPORARY_PASSWORD,
       mustChangePassword: true,
     })
     // Single-use: a second read finds nothing, so the dialog cannot reopen.
-    expect(takeInvitePassword()).toBeNull()
+    expect(takeInvitePassword("u1")).toBeNull()
   })
 
   it("cancel goes back to the list without inviting", async () => {
