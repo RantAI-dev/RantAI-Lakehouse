@@ -178,6 +178,35 @@ export const clickhouseDashboardService: DashboardService = {
     }
   },
   /**
+   * The marts, by name (`WEB-7` D7). The route answers rows with them; the
+   * picker only needs what to call each one.
+   */
+  async listMarts(signal) {
+    const json = await request<{ marts?: { name?: string; rows?: number }[] }>(
+      "/api/dashboard/fields",
+      { cache: "no-store", signal },
+      "The marts could not be loaded"
+    )
+    return (json.marts ?? [])
+      .filter((mart): mart is { name: string; rows?: number } =>
+        typeof mart.name === "string" && mart.name.length > 0
+      )
+      .map((mart) => ({ name: mart.name }))
+  },
+  /**
+   * The measures of one mart (`WEB-7` D7). The route also answers its
+   * dimensions and kinds; a rule watches measures, so those are what it
+   * returns.
+   */
+  async listMartMeasures(mart, signal) {
+    const json = await request<{ measures?: string[] }>(
+      `/api/dashboard/fields?mart=${encodeURIComponent(mart)}`,
+      { cache: "no-store", signal },
+      "The fields could not be loaded"
+    )
+    return json.measures ?? []
+  },
+  /**
    * One stored chart, read from the list the console already calls. The list
    * is what the server has: there is no by-id route, and adding one is not
    * this change's business (`WEB-7` D6).

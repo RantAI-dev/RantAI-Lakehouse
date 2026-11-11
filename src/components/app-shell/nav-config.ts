@@ -341,6 +341,12 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // Monitoring
   { pattern: "/health", requires: ["ops:read"] },
   { pattern: "/alerts", requires: ["alert:read", "alert:write"] },
+  // WEB-7 D2/D7: the rule form left the list's dialog. `POST`/`PUT
+  // /api/alerts` are `RequiresAuth` with the handler deciding (an owner's own
+  // chart alert needs no `alert:write`, `policy.rs:424`); this page builds the
+  // non-chart rules the list shows, whose writes take `alert:write`.
+  { pattern: "/alerts/rules/new", requires: ["alert:write"] },
+  { pattern: "/alerts/rules/[id]/edit", requires: ["alert:write"] },
 
   // Intelligence / Agents
   // ADM-13 review round 1, S4: agent runs requires [] (any signed-in user, RequiresAuth on GET)

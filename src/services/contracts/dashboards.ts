@@ -102,6 +102,18 @@ export type DashboardService = {
    */
   saveChart(input: Record<string, unknown>, edit: boolean, signal?: AbortSignal): Promise<void>
   /**
+   * The marts a chart or an alert rule can be built on
+   * (`GET /api/dashboard/fields`), by name. `WEB-7` D7 moved the alerts
+   * page's own `fetch` here; only the names are returned, which is all the
+   * rule form's picker needs.
+   */
+  listMarts(signal?: AbortSignal): Promise<{ name: string }[]>
+  /**
+   * The measures of the mart `mart` (`GET /api/dashboard/fields?mart=`) — the
+   * columns an alert rule may watch. `WEB-7` D7.
+   */
+  listMartMeasures(mart: string, signal?: AbortSignal): Promise<string[]>
+  /**
    * One stored chart's saved definition and the dashboard it sits on, read
    * from the chart list the console already calls
    * (`GET /api/dashboard/specs`), or `null` when nothing the caller may see
