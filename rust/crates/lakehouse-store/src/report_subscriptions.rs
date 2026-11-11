@@ -715,14 +715,16 @@ pub async fn search_active_users(
     needle: &str,
     limit: i64,
     tenant_ids: &[Uuid],
-) -> Result<Vec<(Uuid, String, String)>, StoreError> {
+    // ADM-11 D1: `email` may be NULL now, so the row type carries the
+    // option rather than assuming every active user has an address.
+) -> Result<Vec<(Uuid, String, Option<String>)>, StoreError> {
     let escaped = needle
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
     Ok(sqlx::query_as(
-        "SELECT id, name, email FROM app_user \
-         WHERE status = 'active' AND (name ILIKE $1 OR email ILIKE $1) \
+        "SELECT id, name, COALESCE(email, username) AS email FROM app_user \
+         WHERE status = 'active' AND (name ILIKE $1 OR username ILIKE $1 OR email ILIKE $1) \
          AND (cardinality($3::uuid[]) = 0 \
               OR EXISTS (SELECT 1 FROM app_user_tenant ut \
                          WHERE ut.user_id = app_user.id AND ut.tenant_id = ANY($3::uuid[]))) \

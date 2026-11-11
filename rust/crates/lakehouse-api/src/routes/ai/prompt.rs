@@ -346,9 +346,14 @@ pub(super) fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 /// `"Indonesian"` or `"English"` for `text`, or `None` when neither clearly
-/// wins (a one-word message, a table name, another language). Words both
-/// languages use ("data") are in neither list; an English message needs
-/// two more English words than Indonesian ones to be read as English.
+/// wins (a message whose words are all in neither list, a table name,
+/// another language). Words both languages use ("data") are in neither
+/// list; an English message needs two more English words than Indonesian
+/// ones to be read as English. A short Indonesian question carries one
+/// function word ("berapa", "tampilkan"), so one Indonesian word with no
+/// English word reads as Indonesian (`AI-17`, 2026-11-10). One English
+/// word does not read as English: single English data words ("total",
+/// "data") are in neither list.
 pub(super) fn reply_language(text: &str) -> Option<&'static str> {
     let words: Vec<String> = tokens(text).collect();
     let count = |list: &[&str]| words.iter().filter(|w| list.contains(&w.as_str())).count();
@@ -357,6 +362,10 @@ pub(super) fn reply_language(text: &str) -> Option<&'static str> {
         Some("Indonesian")
     } else if en >= 2 && en >= id + 2 {
         Some("English")
+    } else if id >= 1 && en == 0 {
+        // `AI-17`: the one listed word is a function word, and no English
+        // word contradicts it.
+        Some("Indonesian")
     } else {
         None
     }
@@ -376,7 +385,7 @@ macro_rules! limits_and_freshness {
 /// Appended in ask mode.
 pub(super) const SYSTEM_ASK_SUFFIX: &str = concat!("
 
-MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode.", limits_and_freshness!());
+MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode. A name describe_mart does not list may be a calculated field: to explain one, or before saying a field does not exist, call list_calculated_fields for that mart or SQL source, which explains the formula in plain words, and run no SQL for it.", limits_and_freshness!());
 
 /// What the model is told when the person cannot change dashboards (`BI-18`
 /// part C review fix (SHOULD-FIX) R30). The tools that write are then not in
@@ -760,6 +769,23 @@ const DOMAINS: &[Domain] = &[
             "delete_parameter",
         ],
     },
+    // AI-4 (plan 72): a question about a field. The dashboard domain's word
+    // list holds `calculated` and `formula`, but not the bare word "field",
+    // which is how a person asks about a calculated field in Ask mode, where
+    // the dashboard domain's writes are dropped anyway. The bare word "kolom"
+    // is not a word here: an Indonesian question uses it for a physical column
+    // all the time.
+    Domain {
+        words: &[
+            "field",
+            "kolom kalkulasi",
+            "formula",
+            "rumus",
+            "calculated",
+            "kolom hitung",
+        ],
+        tools: &["list_calculated_fields"],
+    },
     // BI-5 / D7: the query limits and Stop.
     Domain {
         words: &[
@@ -1096,6 +1122,41 @@ mod tests {
         assert!(!tools.contains("create_chart"));
     }
 
+    /// `AI-4` (plan 72): a question about a field must reach
+    /// `list_calculated_fields` in Ask mode too. The dashboard domain's word
+    /// list holds `calculated` and `formula`, but not the bare word "field",
+    /// which is how a person asks about a calculated field.
+    #[test]
+    fn a_question_about_a_field_offers_list_calculated_fields() {
+        for question in [
+            "Jelaskan field total_tamu di mart_event",
+            "What does the calculated field per_event do?",
+        ] {
+            let tools = select_tools(&[question], false);
+            assert!(
+                tools.contains("list_calculated_fields"),
+                "`{question}` should offer list_calculated_fields: {tools:?}"
+            );
+        }
+    }
+
+    /// `AI-4` (plan 72): a question that names no field keeps its own tool
+    /// list. The bare word "kolom" is not a word of the domain either, because
+    /// an Indonesian question uses it for a physical column all the time.
+    #[test]
+    fn a_question_without_a_field_word_does_not_offer_list_calculated_fields() {
+        for question in [
+            "How many foreign tourists came in 2024?",
+            "Berapa kolom di mart_event?",
+        ] {
+            let tools = select_tools(&[question], false);
+            assert!(
+                !tools.contains("list_calculated_fields"),
+                "`{question}` should not offer list_calculated_fields: {tools:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_domain_word_brings_in_that_domain_only() {
         let tools = select_tools(&["Make a bar chart of events per year"], false);
@@ -1348,8 +1409,9 @@ mod tests {
     /// breakdown, so "top N of Y over time" has two honest shapes and the
     /// model says which it made; it states no count a tool did not give; it
     /// renames a chart when its content changes; it explains a calculated
-    /// field with `list_calculated_fields`. Build mode only: the Ask prompt
-    /// is pinned by hash and has no chart to describe.
+    /// field with `list_calculated_fields`. The chart rules are Build mode
+    /// only: the Ask prompt carries its own calculated-field sentence (plan
+    /// 72) and has no chart to describe.
     #[test]
     fn the_build_prompt_says_what_a_limit_counts_and_four_rules_for_what_the_model_states() {
         for clause in [
@@ -1552,13 +1614,55 @@ mod tests {
             reply_language("Why did gold_export_job fail?"),
             Some("English")
         );
-        // One Indonesian word is still not enough to decide.
-        assert_eq!(reply_language("Jelaskan chart ini"), None);
+        // A message whose words are all in neither list stays undecided:
+        // "total" and "revenue" name no language, so no arm may read them.
+        assert_eq!(reply_language("total revenue"), None);
+    }
+
+    /// `AI-17` (2026-11-10): the admin's staging question carried one listed
+    /// function word ("berapa"); "total" and "kunjungan" are in neither list.
+    /// Left undecided, the model answered in English.
+    #[test]
+    fn a_short_question_with_one_indonesian_word_and_no_english_word_is_read_as_indonesian() {
+        assert_eq!(
+            reply_language("Berapa total kunjungan?"),
+            Some("Indonesian")
+        );
+    }
+
+    /// `AI-17`: a short request carries its function word ("tampilkan") the
+    /// same way; "revenue" is in neither list.
+    #[test]
+    fn a_short_request_with_one_indonesian_word_and_no_english_word_is_read_as_indonesian() {
+        assert_eq!(reply_language("Tampilkan revenue"), Some("Indonesian"));
+    }
+
+    /// Decision 1 keeps the English arms as they are: one English data word
+    /// in neither list ("total") does not weaken the English reading.
+    #[test]
+    fn an_english_question_with_an_unlisted_data_word_is_still_read_as_english() {
+        assert_eq!(reply_language("What is the total?"), Some("English"));
+    }
+
+    /// No arm reads a message whose every word is in neither list: data
+    /// words of both languages and table names name no language.
+    #[test]
+    fn a_message_whose_words_are_all_in_neither_list_stays_undecided() {
+        assert_eq!(reply_language("total revenue"), None);
+        assert_eq!(reply_language("mart_event"), None);
+    }
+
+    /// The one-word arm needs the message to carry no English word: a mixed
+    /// message shows it may be English and is still left to the model and
+    /// the default.
+    #[test]
+    fn a_message_with_one_indonesian_word_and_an_english_word_stays_undecided() {
+        assert_eq!(reply_language("berapa the total"), None);
     }
 
     #[test]
     fn an_undecided_latin_script_message_is_never_answered_in_another_script() {
-        for text in ["ok", "Jelaskan chart ini", "mart_wisman"] {
+        for text in ["ok", "total revenue", "mart_wisman"] {
             let line = closing(text, None);
             assert!(line.contains("Latin script"), "{text}: {line}");
             assert!(line.contains("never in Chinese"), "{text}: {line}");
@@ -1585,14 +1689,14 @@ mod tests {
 
     #[test]
     fn without_a_default_the_undecided_lines_are_unchanged() {
-        assert_eq!(closing("Jelaskan chart ini", None), LATIN_SCRIPT_LINE);
+        assert_eq!(closing("total revenue", None), LATIN_SCRIPT_LINE);
         assert_eq!(closing("123 ?", None), PLAIN_LINE);
         assert_eq!(closing("这个图表是什么", None), PLAIN_LINE);
     }
 
     #[test]
     fn an_indonesian_default_replaces_english_as_the_latin_script_fallback() {
-        let line = closing("Jelaskan chart ini", Some(ReplyLanguage::Indonesian));
+        let line = closing("total revenue", Some(ReplyLanguage::Indonesian));
         assert!(line.contains("Indonesian if you cannot tell"), "{line}");
         assert!(line.contains("Latin script"), "{line}");
         assert!(line.contains("never in Chinese"), "{line}");
@@ -1602,7 +1706,7 @@ mod tests {
     #[test]
     fn an_english_default_leaves_the_latin_script_line_as_it_was() {
         assert_eq!(
-            closing("Jelaskan chart ini", Some(ReplyLanguage::English)),
+            closing("total revenue", Some(ReplyLanguage::English)),
             LATIN_SCRIPT_LINE
         );
     }
@@ -1704,6 +1808,20 @@ mod tests {
             SYSTEM_BUILD_SUFFIX
                 .contains("a name describe_mart does not list may be a calculated field"),
             "the reason for the lookup is missing from the build prompt"
+        );
+    }
+
+    /// `AI-4` (plan 72): the Ask prompt carries its own calculated-field
+    /// sentence, worded apart from the build one, so a person who asks in Ask
+    /// mode gets the field explained instead of "there is no field with that
+    /// name".
+    #[test]
+    fn the_ask_prompt_sends_a_missing_field_to_list_calculated_fields_first() {
+        assert!(
+            SYSTEM_ASK_SUFFIX.contains(
+                "A name describe_mart does not list may be a calculated field: to explain one, or before saying a field does not exist, call list_calculated_fields for that mart or SQL source, which explains the formula in plain words, and run no SQL for it."
+            ),
+            "the calculated-field lookup rule is missing from the ask prompt"
         );
     }
 

@@ -118,13 +118,15 @@ mod tests {
 
     /// Insert one `app_user` with a unique email and return its id.
     async fn seed_app_user(pool: &PgPool, email: &str) -> Uuid {
-        let (id,): (Uuid,) =
-            sqlx::query_as("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-                .bind("cleanup test user")
-                .bind(email)
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind("cleanup test user")
+        .bind(email.to_lowercase())
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .unwrap();
         id
     }
 

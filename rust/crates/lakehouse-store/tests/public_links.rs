@@ -323,7 +323,7 @@ async fn the_copy_leaves_a_link_a_board_already_has(pool: PgPool) -> sqlx::Resul
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_deleted_user_leaves_the_link_in_place(pool: PgPool) -> sqlx::Result<()> {
     let user: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO app_user (name, email) VALUES ('a', 'a@example.com') RETURNING id",
+        "INSERT INTO app_user (name, username, email) VALUES ('a', 'a', 'a@example.com') RETURNING id",
     )
     .fetch_one(&pool)
     .await?;
@@ -358,7 +358,7 @@ async fn a_link_records_its_tenant_and_keeps_it(pool: PgPool) -> sqlx::Result<()
     .fetch_one(&pool)
     .await?;
     let user: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO app_user (name, email) VALUES ('a', 'a@example.com') RETURNING id",
+        "INSERT INTO app_user (name, username, email) VALUES ('a', 'a', 'a@example.com') RETURNING id",
     )
     .fetch_one(&pool)
     .await?;
@@ -408,7 +408,7 @@ async fn a_link_records_its_tenant_and_keeps_it(pool: PgPool) -> sqlx::Result<()
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_link_without_a_tenant_names_none(pool: PgPool) -> sqlx::Result<()> {
     let user: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO app_user (name, email) VALUES ('a', 'a@example.com') RETURNING id",
+        "INSERT INTO app_user (name, username, email) VALUES ('a', 'a', 'a@example.com') RETURNING id",
     )
     .fetch_one(&pool)
     .await?;

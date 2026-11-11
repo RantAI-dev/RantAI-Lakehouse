@@ -47,6 +47,19 @@
 //! authorization rules (who may make the change) live in
 //! `lakehouse-api`'s routes, like every other route's rules; nothing here
 //! decides who may call it.
+//!
+//! # ADM-11: usernames, and a case-insensitive uniqueness rule
+//!
+//! Every user now carries a required `username` (1 to 254 characters from
+//! `a-z 0-9 . _ @ + -`, stored lowercase), and `email` is optional. One
+//! validator ([`normalize_username`]) and one clash rule (ADM-11 D5: a
+//! username may not equal another user's username OR email, and the
+//! reverse — so one sign-in box can never match two people) are enforced
+//! HERE, inside the caller's transaction, so invite, rename and the OIDC
+//! just-in-time provisioning in `lakehouse-auth` all go through the same
+//! rule instead of three private copies of it. The schema-level backstops
+//! are `app_user_username_lower_key` (unique on `lower(username)`) and the
+//! `app_user_username_format` CHECK (`0132_usernames.sql`).
 
 use serde::Serialize;
 use sqlx::FromRow;
@@ -105,8 +118,11 @@ pub struct User {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Email address; the table's natural key.
-    pub email: String,
+    /// The unique sign-in handle, stored lowercase (ADM-11 D3).
+    pub username: String,
+    /// Email address; optional since ADM-11 (D2.4). `None` when the
+    /// account has none — senders skip such an account and say so (D9).
+    pub email: Option<String>,
     /// `"active"` or `"inactive"` — the closed union the contract declares,
     /// enforced by `app_user_status_check`.
     pub status: String,
@@ -136,7 +152,8 @@ pub struct User {
 struct UserRow {
     id: Uuid,
     name: String,
-    email: String,
+    username: String,
+    email: Option<String>,
     status: String,
     roles: Vec<String>,
     tenants: Vec<String>,
@@ -147,6 +164,7 @@ impl From<UserRow> for User {
         Self {
             id: row.id.to_string(),
             name: row.name,
+            username: row.username,
             email: row.email,
             status: row.status,
             roles: row.roles,
@@ -173,7 +191,7 @@ pub struct UserFilter {
 /// yields an empty array (not a `[null]` from `array_agg`), and the two
 /// independent many-to-many relationships cannot multiply each other's row
 /// counts the way two joins in one query would.
-const USER_SELECT: &str = "SELECT u.id, u.name, u.email, u.status, \
+const USER_SELECT: &str = "SELECT u.id, u.name, u.username, u.email, u.status, \
      ARRAY(SELECT r.name FROM app_user_role ur JOIN role r ON r.id = ur.role_id \
            WHERE ur.user_id = u.id ORDER BY r.name) AS roles, \
      ARRAY(SELECT t.name FROM app_user_tenant ut JOIN tenant t ON t.id = ut.tenant_id \
@@ -220,18 +238,187 @@ pub async fn get_user(pool: &PgPool, id: &str) -> Result<User, StoreError> {
     Ok(row.into())
 }
 
-/// Everything [`create_user`] needs. Mirrors `InviteUserInput` in
-/// `contracts/identity.ts`.
+/// Everything [`create_user`] needs. Mirrors the invite body of
+/// `POST /api/identity/users` (ADM-11 D7).
 #[derive(Debug, Clone)]
 pub struct InviteUserInput {
     /// Display name.
     pub name: String,
-    /// Email address; must not collide with an existing user.
-    pub email: String,
+    /// The unique sign-in handle. Lowercased and checked against the
+    /// ADM-11 D3 rule here; refused with
+    /// [`StoreError::FieldConflict`] when another user already holds it
+    /// (or its email) as their own username or email (D5).
+    pub username: String,
+    /// Email address; optional since ADM-11 (D2.4). When present, refused
+    /// with [`StoreError::FieldConflict`] if it equals (case-insensitively)
+    /// another user's email or username (D5).
+    pub email: Option<String>,
     /// Role *names* to grant. Every name must already exist in `role`.
     pub roles: Vec<String>,
     /// Tenant *names* to join. Every name must already exist in `tenant`.
     pub tenants: Vec<String>,
+}
+
+/// The one sentence the username validator answers with, naming the ADM-11
+/// D3 rule. The [`StoreError::Validation`] message is safe to surface, so
+/// an invite or rename form can show it verbatim.
+pub(crate) const USERNAME_RULE: &str =
+    "Username must be 1 to 254 characters from a-z, 0-9, dot, underscore, at, plus and hyphen.";
+
+/// Lowercase, trim, and check `raw` against the ADM-11 D3 rule: 1 to 254
+/// characters from `a-z 0-9 . _ @ + -`, stored lowercase.
+///
+/// This is THE validator (plan D3): the invite route, the rename route and
+/// the OIDC just-in-time provisioning in `lakehouse-auth` all call it, so
+/// there is no second copy of the character-set rule anywhere. The
+/// 254-character bound mirrors `app_user_username_format`'s CHECK
+/// (`0132_usernames.sql`), and counting characters (not bytes) matches
+/// `char_length` on the database side.
+///
+/// # Errors
+///
+/// [`StoreError::Validation`] (HTTP 400) with [`USERNAME_RULE`] when the
+/// value is empty, longer than 254 characters, or carries a character
+/// outside the set.
+#[must_use = "the normalized username is the value to store"]
+pub fn normalize_username(raw: &str) -> Result<String, StoreError> {
+    let lowered = raw.trim().to_lowercase();
+    if lowered.is_empty()
+        || lowered.chars().count() > 254
+        || !lowered
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '@' | '+' | '-'))
+    {
+        return Err(StoreError::Validation(USERNAME_RULE.to_owned()));
+    }
+    Ok(lowered)
+}
+
+/// Trim the email a caller wants to store, keeping `None` as "no email"
+/// (ADM-11 D2.4) and refusing an empty string: an empty address is a
+/// typo, not an absence, and storing it would fabricate a value.
+///
+/// # Errors
+///
+/// [`StoreError::Validation`] (HTTP 400) when the value is present but
+/// blank.
+fn normalize_email(raw: Option<&str>) -> Result<Option<String>, StoreError> {
+    match raw {
+        None => Ok(None),
+        Some(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(StoreError::Validation(
+                    "Email must not be empty.".to_owned(),
+                ));
+            }
+            Ok(Some(trimmed.to_owned()))
+        }
+    }
+}
+
+/// Whether ANOTHER user (never `exclude`) already holds `username` as their
+/// username or email, or `email` as their email or username — all compared
+/// case-insensitively (ADM-11 D5). One statement, run inside the caller's
+/// transaction, so a concurrent invite or rename that commits first makes
+/// this one see it.
+///
+/// `username` must already be [`normalize_username`]'s output (lowercase);
+/// `email` is compared through `lower()` here.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any storage failure.
+async fn username_email_taken_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    username: &str,
+    email: Option<&str>,
+    exclude: Option<Uuid>,
+) -> Result<(bool, bool), StoreError> {
+    let row: (bool, bool) = sqlx::query_as(
+        "SELECT \
+           EXISTS (SELECT 1 FROM app_user o \
+                   WHERE ($1::uuid IS NULL OR o.id <> $1) \
+                     AND (lower(o.username) = $2 \
+                          OR (o.email IS NOT NULL AND lower(o.email) = $2))), \
+           EXISTS (SELECT 1 FROM app_user o \
+                   WHERE ($1::uuid IS NULL OR o.id <> $1) \
+                     AND $3::text IS NOT NULL \
+                     AND (lower(o.username) = lower($3) \
+                          OR (o.email IS NOT NULL AND lower(o.email) = lower($3))))",
+    )
+    .bind(exclude)
+    .bind(username)
+    .bind(email)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(row)
+}
+
+/// Whether ANOTHER user holds `candidate` (case-insensitively) as their
+/// username or email — the single-question form of
+/// [`username_email_taken_in_tx`] that [`next_free_username_in_tx`]'s
+/// suffix loop asks. `candidate` must already be lowercase.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any storage failure.
+async fn identifier_taken_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    candidate: &str,
+    exclude: Option<Uuid>,
+) -> Result<bool, StoreError> {
+    let (taken,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM app_user o \
+         WHERE ($1::uuid IS NULL OR o.id <> $1) \
+           AND (lower(o.username) = $2 \
+                OR (o.email IS NOT NULL AND lower(o.email) = $2)))",
+    )
+    .bind(exclude)
+    .bind(candidate)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(taken)
+}
+
+/// The first username built on `base` that no other user holds: `base`
+/// itself when free, else `base-2`, `base-3`, … — the same suffix rule the
+/// `0132_usernames.sql` backfill applies to case-variant emails (ADM-11
+/// D10: an OIDC-provisioned user whose preferred handle clashes gets the
+/// next free one instead of an error). The answer is guaranteed to pass
+/// [`normalize_username`]'s length bound only when `base` does with room
+/// for the suffix; a `base` at the 254-character limit can overflow it and
+/// is refused like any other invalid username.
+///
+/// `base` must already be [`normalize_username`]'s output (lowercase).
+///
+/// # Errors
+///
+/// [`StoreError::Validation`] when a suffixed candidate would break the
+/// D3 length bound, or [`StoreError::Database`] on any storage failure.
+pub async fn next_free_username_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    base: &str,
+    exclude: Option<Uuid>,
+) -> Result<String, StoreError> {
+    if !identifier_taken_in_tx(tx, base, exclude).await? {
+        return Ok(base.to_owned());
+    }
+    // The first candidate is taken; the numbered ones start at -2, like the
+    // backfill's `row_number` suffix. The loop always returns from inside:
+    // either a free candidate is found, or the candidate outgrows the D3
+    // length bound and is refused rather than stored broken.
+    let mut suffix: u64 = 2;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if normalize_username(&candidate).is_err() {
+            return Err(StoreError::Validation(USERNAME_RULE.to_owned()));
+        }
+        if !identifier_taken_in_tx(tx, &candidate, exclude).await? {
+            return Ok(candidate);
+        }
+        suffix += 1;
+    }
 }
 
 /// Create a user and its role/tenant memberships.
@@ -241,7 +428,11 @@ pub struct InviteUserInput {
 ///
 /// # Errors
 ///
-/// * [`StoreError::Conflict`] (409) — the email is already taken.
+/// * [`StoreError::FieldConflict`] (409) — the username (or the email,
+///   when one is given) equals another user's username or email,
+///   case-insensitively (ADM-11 D5). The message names the field.
+/// * [`StoreError::Validation`] (400) — the username breaks the D3 rule,
+///   or a given email is blank.
 /// * [`StoreError::ForeignKeyViolation`] (400) — a role or tenant name in
 ///   `input` does not exist. Membership rows are inserted by *name*
 ///   (`INSERT ... SELECT id FROM role WHERE name = $2`), so an unknown name
@@ -272,7 +463,13 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
 ///
 /// # Errors
 ///
-/// * [`StoreError::Conflict`] (409) — the email is already taken.
+/// * [`StoreError::FieldConflict`] (409) — the username (or the email,
+///   when one is given) equals another user's username or email,
+///   case-insensitively (ADM-11 D5). Serialized by
+///   `pg_advisory_xact_lock(USER_IDENTIFIER_LOCK_KEY)` (ADM-11 review 1 S5),
+///   so two concurrent invites cannot both pass the check.
+/// * [`StoreError::Validation`] (400) — the username breaks the ADM-11 D3
+///   rule, or a given email is blank.
 /// * [`StoreError::ForeignKeyViolation`] (400) — a role or tenant name in
 ///   `input` does not exist.
 /// * [`StoreError::Database`] (500) — anything else.
@@ -280,12 +477,37 @@ pub async fn create_user_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: &InviteUserInput,
 ) -> Result<Uuid, StoreError> {
-    let (id,): (Uuid,) =
-        sqlx::query_as("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-            .bind(&input.name)
-            .bind(&input.email)
-            .fetch_one(&mut **tx)
-            .await?;
+    // ADM-11 review 1 S5: serialize identifier checks and writes under USER_IDENTIFIER_LOCK_KEY
+    // so concurrent invites cannot both pass the check.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(USER_IDENTIFIER_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+
+    let username = normalize_username(&input.username)?;
+    let email = normalize_email(input.email.as_deref())?;
+    // ADM-11 D5: one sign-in box must never match two people, so the
+    // username is refused when it equals another user's username OR email,
+    // and the reverse for the email. Inside this transaction, so a
+    // concurrent invite or rename that commits first is seen.
+    let (username_taken, email_taken) =
+        username_email_taken_in_tx(tx, &username, email.as_deref(), None).await?;
+    if username_taken {
+        return Err(StoreError::FieldConflict(
+            "Username already in use".to_owned(),
+        ));
+    }
+    if email_taken {
+        return Err(StoreError::FieldConflict("Email already in use".to_owned()));
+    }
+    let (id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(&input.name)
+    .bind(&username)
+    .bind(&email)
+    .fetch_one(&mut **tx)
+    .await?;
 
     for role in &input.roles {
         let affected = sqlx::query(
@@ -807,6 +1029,11 @@ pub async fn delete_role(pool: &PgPool, id: &str) -> Result<(), StoreError> {
     }
     Ok(())
 }
+
+/// Advisory lock key used to serialize identifier (username / email) checks and writes
+/// across concurrent invites, user identity updates, and OIDC JIT provisioning
+/// (ADM-11 review 1 S5).
+pub const USER_IDENTIFIER_LOCK_KEY: i64 = 0x4c48_5f55_5345_5253; // "LH_USERS"
 
 /// The roles `0002_seed_identity.sql` creates: the product's built-in
 /// permission bundles, which a deployment starts with and which
@@ -1550,6 +1777,103 @@ pub async fn delete_service_identity(pool: &PgPool, id: &str) -> Result<(), Stor
     Ok(())
 }
 
+/// Describes an update to a user's email address (ADM-11 D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailUpdate<'a> {
+    /// Leave the existing email address unchanged.
+    Unchanged,
+    /// Clear the email address (set to NULL).
+    Clear,
+    /// Set a new email address.
+    Set(&'a str),
+}
+
+/// Update a user's username and/or email address (ADM-11 D8).
+///
+/// Refuses with [`StoreError::FieldConflict`] if the new username or email clashes
+/// with another user's username or email (case-insensitively, ADM-11 D5).
+/// Refuses with [`StoreError::Validation`] if the username breaks ADM-11 D3 rules.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `user_id` does not exist,
+/// [`StoreError::FieldConflict`] on unique clash, [`StoreError::Validation`] on
+/// invalid format, or [`StoreError::Database`] on query failure.
+pub async fn update_user_identity(
+    pool: &PgPool,
+    user_id: Uuid,
+    new_username: Option<&str>,
+    new_email: EmailUpdate<'_>,
+) -> Result<User, StoreError> {
+    let mut tx = pool.begin().await?;
+    let user = update_user_identity_in_tx(&mut tx, user_id, new_username, new_email).await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// [`update_user_identity`], inside a transaction the caller owns.
+///
+/// # Errors
+///
+/// Same as [`update_user_identity`].
+pub async fn update_user_identity_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    new_username: Option<&str>,
+    new_email: EmailUpdate<'_>,
+) -> Result<User, StoreError> {
+    // ADM-11 review 1 S5: serialize identifier checks and writes under USER_IDENTIFIER_LOCK_KEY.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(USER_IDENTIFIER_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+
+    let current = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT username, email FROM app_user WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+
+    let target_username = match new_username {
+        Some(u) => normalize_username(u)?,
+        None => current.0,
+    };
+
+    let target_email = match new_email {
+        EmailUpdate::Set(e) => normalize_email(Some(e))?,
+        EmailUpdate::Clear => None,
+        EmailUpdate::Unchanged => current.1,
+    };
+
+    let (username_taken, email_taken) =
+        username_email_taken_in_tx(tx, &target_username, target_email.as_deref(), Some(user_id))
+            .await?;
+    if username_taken {
+        return Err(StoreError::FieldConflict(
+            "Username already in use".to_owned(),
+        ));
+    }
+    if email_taken {
+        return Err(StoreError::FieldConflict("Email already in use".to_owned()));
+    }
+
+    sqlx::query("UPDATE app_user SET username = $1, email = $2, updated_at = now() WHERE id = $3")
+        .bind(&target_username)
+        .bind(&target_email)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+
+    let sql = format!("{USER_SELECT} WHERE u.id = $1");
+    let row: UserRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(row.into())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1566,7 +1890,8 @@ mod tests {
         let user = User {
             id: "u".to_owned(),
             name: "Rina".to_owned(),
-            email: "rina@meridian.example".to_owned(),
+            username: "rina".to_owned(),
+            email: Some("rina@meridian.example".to_owned()),
             status: "active".to_owned(),
             roles: vec!["Analyst".to_owned()],
             tenants: vec!["Meridian Group".to_owned()],
@@ -1576,6 +1901,7 @@ mod tests {
         for key in [
             "id",
             "name",
+            "username",
             "email",
             "status",
             "roles",

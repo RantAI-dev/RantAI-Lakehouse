@@ -1040,12 +1040,15 @@ async fn create_linked_approval_attaches_to_existing_run_and_real_employee(
 /// foreign key points at `app_user`, never at `service_identity`).
 /// Test-only fixture helper.
 async fn insert_requester(pool: &PgPool, email: &str) -> uuid::Uuid {
-    sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-        .bind("Requester Test User")
-        .bind(email)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(
+        "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind("Requester Test User")
+    .bind(email.to_lowercase())
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 /// A `tool_call` approval created for a person who asked for it stores

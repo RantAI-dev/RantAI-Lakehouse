@@ -152,6 +152,7 @@ pub(crate) fn export_failure(
 fn auth_router() -> Router<AppState> {
     Router::new()
         .route("/api/auth/login", axum::routing::post(auth::login))
+        .route("/api/auth/password-rules", get(auth::password_rules))
         .route("/api/auth/logout", axum::routing::post(auth::logout))
         .route("/api/auth/me", get(auth::me))
         .route(
@@ -1112,6 +1113,11 @@ fn identity_router() -> Router<AppState> {
         .route(
             "/api/identity/users",
             get(identity::list_users).post(identity::create_user),
+        )
+        // ADM-11 D8: update a user's username and/or email.
+        .route(
+            "/api/identity/users/{id}",
+            axum::routing::patch(identity::update_user),
         )
         // Give an existing user a tenant. Both ids are validated inside
         // the handler (400 when malformed, 404 when unknown).

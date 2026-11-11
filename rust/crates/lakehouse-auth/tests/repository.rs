@@ -232,9 +232,10 @@ async fn the_first_tenant_is_the_lowest_id_whatever_the_insert_order(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email) VALUES ($1, $2, $3)")
+    sqlx::query("INSERT INTO app_user (id, name, username, email) VALUES ($1, $2, $3, $4)")
         .bind(user_id)
         .bind("Tenant Order Probe")
+        .bind(format!("tenant-order-{user_id}"))
         .bind(format!("tenant-order-{user_id}@meridian.example"))
         .execute(&pool)
         .await

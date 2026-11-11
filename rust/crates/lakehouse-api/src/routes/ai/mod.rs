@@ -122,9 +122,20 @@ you used, and say in one sentence which reading it is. Do not end with a \
 question: if another reading is possible, name it as a statement. Reply in \
 the language of the user's question.";
 
-/// Whether an `ask_user` made now is a late ask: the turn has run a tool that
-/// succeeded, and the step just before this call is not a failed call to
-/// another tool. A refusal or tool error says the call cannot be built as
+/// The tools whose success makes a later `ask_user` late (`AI-17`,
+/// 2026-11-10): they are the only registered tools that return data rows,
+/// so their success means the turn has answered from data — the refusal's
+/// own words, "runs a query". A lookup that only finds which metrics or
+/// tables exist (`list_metrics`, `describe_metric`, `list_datasets`) is not
+/// that, and since the prompt sends the model to those lookups first
+/// (`AI-7`), counting them would take the ask away exactly when the model
+/// obeys the prompt.
+const QUERY_TOOLS: [&str; 3] = ["run_sql", "query_metric", "run_saved_query"];
+
+/// Whether an `ask_user` made now is a late ask: the turn has run a query
+/// (a tool from [`QUERY_TOOLS`]) that succeeded, and the step just before
+/// this call is not a failed call to another tool. A refusal or tool error
+/// says the call cannot be built as
 /// asked, so asking the person is the honest next step (for example which
 /// column to bin), even after a query. Only another tool's failure opens the
 /// way: a failed `ask_user` (a rejected ask) is not one; otherwise a rejected ask
@@ -136,7 +147,10 @@ fn ask_is_late(tool_trace: &[Value]) -> bool {
     });
     !previous_call_failed
         && tool_trace.iter().any(|step| {
-            step["tool"].as_str() != Some(registry::ASK_USER) && step["ok"].as_bool() == Some(true)
+            step["tool"]
+                .as_str()
+                .is_some_and(|tool| QUERY_TOOLS.contains(&tool))
+                && step["ok"].as_bool() == Some(true)
         })
 }
 

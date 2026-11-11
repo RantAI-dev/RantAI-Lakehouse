@@ -79,13 +79,13 @@ sign-in:
 
 ```text
 lakehousectl: the console is at http://<this host>:3000
-lakehousectl: the first administrator is admin@example.com.
+lakehousectl: the first administrator is admin (email admin@example.com).
 lakehousectl: its password is shown once, and it must be changed at first
 lakehousectl: sign-in:
   <generated password>
 ```
 
-Open that address, sign in, and set a new password. **Copy the password
+Open that address, sign in with `admin` (or `admin@example.com`), and set a new password. **Copy the password
 before you close the terminal: it is shown only once.**
 
 To install somewhere else, add `--dir <path>`. To skip one of the checks,

@@ -10,7 +10,7 @@ import { useAuth } from "@/features/auth/auth-provider"
 import { KIND_LABEL, focusIds, type LineageNode } from "@/features/governance/lineage-graph"
 import { UsedBy } from "@/features/governance/used-by"
 import { useService, type ServiceState } from "@/hooks/use-service"
-import { assetQueryStudioHref } from "@/lib/asset-query"
+import { assetHasReadableTable, assetQueryStudioHref } from "@/lib/asset-query"
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
@@ -300,6 +300,11 @@ export function AssetLineage({
   const dependents = assetDependents(a, graph)
   const related = relatedTables(a, graph)
   const mappings = graph?.columnMappings ?? []
+  // The query link is offered only for an asset with a table the console can
+  // read: it would name a table that is not there otherwise (owner,
+  // 2026-11-09).
+  const table = icebergTableOf(iceberg)
+  const readable = assetHasReadableTable(a, table, iceberg.status === "loading")
 
   return (
     <div className="flex flex-col gap-2">
@@ -311,9 +316,11 @@ export function AssetLineage({
         >
           Open lineage graph
         </Button>
-        <Button size="sm" variant="ghost" render={<Link href={assetQueryStudioHref(a, icebergTableOf(iceberg))} />}>
-          Query this asset
-        </Button>
+        {readable ? (
+          <Button size="sm" variant="ghost" render={<Link href={assetQueryStudioHref(a, table)} />}>
+            Query this asset
+          </Button>
+        ) : null}
       </div>
 
       <GraphCard a={a} state={state} />

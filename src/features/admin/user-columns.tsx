@@ -64,6 +64,7 @@ export function getUserColumns({
   onEditRoles,
   onRemoveFromTenant,
   onToggleStatus,
+  onEditIdentity,
 }: {
   onSelect: (user: User) => void
   /**
@@ -92,6 +93,8 @@ export function getUserColumns({
    * user's current status.
    */
   onToggleStatus?: (user: User) => void
+  /** ADM-11 D8: edit a user's username and email. */
+  onEditIdentity?: (user: User) => void
 }): ColumnDef<User>[] {
   return [
     {
@@ -111,7 +114,7 @@ export function getUserColumns({
             >
               {user.name}
             </button>
-            <span className="text-xs text-muted-foreground">{user.email}</span>
+            <span className="text-xs text-muted-foreground">{user.email ?? user.username}</span>
           </div>
         )
       },
@@ -125,18 +128,46 @@ export function getUserColumns({
       },
     },
     {
+      id: "username",
+      accessorKey: "username",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Username" />
+      ),
+      cell: ({ row }) => (
+        <Copyable value={row.original.username} className="max-w-48 truncate">
+          <span className="font-mono text-xs text-foreground">
+            {row.original.username}
+          </span>
+        </Copyable>
+      ),
+      enableColumnFilter: true,
+      enableSorting: true,
+      meta: {
+        label: "Username",
+        placeholder: "Filter username…",
+        variant: "text",
+        icon: UserIcon,
+      },
+    },
+    {
       id: "email",
       accessorKey: "email",
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Email" />
       ),
-      cell: ({ row }) => (
-        <Copyable value={row.original.email} className="max-w-48 truncate">
-          <span className="font-mono text-xs text-foreground">
-            {row.original.email}
-          </span>
-        </Copyable>
-      ),
+      cell: ({ row }) => {
+        const email = row.original.email
+        if (!email) {
+          return <span className="text-muted-foreground">—</span>
+        }
+        return (
+          <Copyable value={email} className="max-w-48 truncate">
+            <span className="font-mono text-xs text-foreground">
+              {email}
+            </span>
+          </Copyable>
+        )
+      },
       enableColumnFilter: true,
       enableSorting: true,
       meta: {
@@ -237,13 +268,23 @@ export function getUserColumns({
                   <span>View details</span>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
+                {user.email ? (
+                  <DropdownMenuItem
+                    onClick={() => {
+                      void navigator.clipboard.writeText(user.email ?? "")
+                    }}
+                  >
+                    <Copy className="size-4" />
+                    <span>Copy email</span>
+                  </DropdownMenuItem>
+                ) : null}
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(user.email)
+                    void navigator.clipboard.writeText(user.username)
                   }}
                 >
                   <Copy className="size-4" />
-                  <span>Copy email</span>
+                  <span>Copy username</span>
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
@@ -253,6 +294,20 @@ export function getUserColumns({
                   <UserIcon className="size-4" />
                   <span>Copy user ID</span>
                 </DropdownMenuItem>
+                {onEditIdentity ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={!canWrite}
+                      onClick={() => {
+                        onEditIdentity(user)
+                      }}
+                    >
+                      <UserIcon className="size-4" />
+                      <span>Edit username and email</span>
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
                 {onResetPassword ? (
                   <>
                     <DropdownMenuSeparator />

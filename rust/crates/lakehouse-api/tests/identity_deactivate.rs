@@ -135,10 +135,13 @@ mod identity {
     /// A user with a local credential, so the test can sign in as them.
     async fn make_user_with_password(pool: &PgPool, email: &str) -> Uuid {
         let user_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
-            .bind(user_id)
-            .bind("Switched Off Test User")
-            .bind(email)
+        sqlx::query(
+            "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, 'active')",
+        )
+        .bind(user_id)
+        .bind("Switched Off Test User")
+        .bind(email.to_lowercase())
+        .bind(email)
             .execute(pool)
             .await
             .expect("insert the test user");

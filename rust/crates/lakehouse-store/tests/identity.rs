@@ -86,7 +86,8 @@ async fn counts_are_derived_from_the_join_tables(pool: PgPool) -> sqlx::Result<(
         &pool,
         &InviteUserInput {
             name: "Sinta Dewi".to_owned(),
-            email: "sinta@meridian.example".to_owned(),
+            username: "sinta@meridian.example".to_owned(),
+            email: Some("sinta@meridian.example".to_owned()),
             roles: vec!["Analyst".to_owned()],
             tenants: vec!["Meridian Group".to_owned()],
         },
@@ -120,7 +121,8 @@ async fn create_user_links_roles_and_tenants_by_name(pool: PgPool) -> sqlx::Resu
         &pool,
         &InviteUserInput {
             name: "Sinta Dewi".to_owned(),
-            email: "sinta@meridian.example".to_owned(),
+            username: "sinta@meridian.example".to_owned(),
+            email: Some("sinta@meridian.example".to_owned()),
             roles: vec!["Analyst".to_owned(), "Approver".to_owned()],
             tenants: vec!["Meridian Group".to_owned(), "Meridian Retail".to_owned()],
         },
@@ -153,7 +155,8 @@ async fn create_user_rejects_an_unknown_role_and_rolls_back(pool: PgPool) -> sql
         &pool,
         &InviteUserInput {
             name: "Ghost".to_owned(),
-            email: "ghost@meridian.example".to_owned(),
+            username: "ghost@meridian.example".to_owned(),
+            email: Some("ghost@meridian.example".to_owned()),
             roles: vec!["No Such Role".to_owned()],
             tenants: vec!["Meridian Group".to_owned()],
         },
@@ -167,7 +170,9 @@ async fn create_user_rejects_an_unknown_role_and_rolls_back(pool: PgPool) -> sql
 
     let users = list_users(&pool, &UserFilter::default()).await.unwrap();
     assert!(
-        !users.iter().any(|u| u.email == "ghost@meridian.example"),
+        !users
+            .iter()
+            .any(|u| u.email.as_deref() == Some("ghost@meridian.example")),
         "the failed invite must be rolled back entirely"
     );
     Ok(())
@@ -182,7 +187,8 @@ async fn setting_the_roles_replaces_the_whole_set(pool: PgPool) -> sqlx::Result<
         &pool,
         &InviteUserInput {
             name: "Sinta Dewi".to_owned(),
-            email: "sinta@meridian.example".to_owned(),
+            username: "sinta@meridian.example".to_owned(),
+            email: Some("sinta@meridian.example".to_owned()),
             roles: vec!["Analyst".to_owned(), "Approver".to_owned()],
             tenants: vec!["Meridian Group".to_owned()],
         },
@@ -243,7 +249,8 @@ async fn removing_a_user_from_a_tenant_takes_the_membership_away(pool: PgPool) -
         &pool,
         &InviteUserInput {
             name: "Sinta Dewi".to_owned(),
-            email: "sinta@meridian.example".to_owned(),
+            username: "sinta@meridian.example".to_owned(),
+            email: Some("sinta@meridian.example".to_owned()),
             roles: vec!["Analyst".to_owned()],
             tenants: vec!["Meridian Group".to_owned(), "Meridian Retail".to_owned()],
         },
@@ -283,7 +290,8 @@ async fn setting_the_status_switches_the_user_without_touching_their_memberships
         &pool,
         &InviteUserInput {
             name: "Sinta Dewi".to_owned(),
-            email: "sinta@meridian.example".to_owned(),
+            username: "sinta@meridian.example".to_owned(),
+            email: Some("sinta@meridian.example".to_owned()),
             roles: vec!["Analyst".to_owned()],
             tenants: vec!["Meridian Group".to_owned()],
         },
@@ -319,21 +327,29 @@ async fn setting_the_status_switches_the_user_without_touching_their_memberships
 
 /// Every natural key collides as a 409, not a 500: this is the case the
 /// `StoreError` mapping exists for, exercised through the repository rather
-/// than through raw SQL.
+/// than through raw SQL. The user clash is ADM-11 D5's field-specific
+/// `FieldConflict` (the store's own check inside the transaction answers
+/// before the database's unique indexes can), and it fires for a username
+/// that duplicates ANOTHER user's email even when the email itself is
+/// absent.
 #[sqlx::test(migrations = "../../migrations")]
 async fn duplicate_natural_keys_are_conflicts(pool: PgPool) -> sqlx::Result<()> {
     let dup_email = create_user(
         &pool,
         &InviteUserInput {
             name: "Rina Again".to_owned(),
-            email: "rina@meridian.example".to_owned(),
+            username: "rina@meridian.example".to_owned(),
+            email: Some("rina@meridian.example".to_owned()),
             roles: vec![],
             tenants: vec![],
         },
     )
     .await
-    .expect_err("email is unique");
-    assert!(matches!(dup_email, StoreError::Conflict), "{dup_email:?}");
+    .expect_err("the username and email are both taken");
+    assert!(
+        matches!(dup_email, StoreError::FieldConflict(_)),
+        "{dup_email:?}"
+    );
 
     let dup_slug = create_tenant(
         &pool,
@@ -644,7 +660,7 @@ async fn delete_user_cascades_memberships(pool: PgPool) -> sqlx::Result<()> {
     .unwrap();
     let victim = users
         .iter()
-        .find(|u| u.email == "maya@meridian.example")
+        .find(|u| u.email.as_deref() == Some("maya@meridian.example"))
         .expect("seeded user");
 
     delete_user(&pool, &victim.id).await.unwrap();
@@ -675,13 +691,46 @@ async fn delete_user_cascades_memberships(pool: PgPool) -> sqlx::Result<()> {
 /// The seed is safe to apply twice.
 ///
 /// `sqlx::migrate!` would never re-run it, so this executes the migration's
-/// SQL directly against an already-seeded database — the situation an
+/// The seed is safe to apply twice.
+///
+/// ADM-11 review 1 B2: `0002_seed_identity.sql` runs before 0132 adds username NOT NULL.
+/// `sqlx::migrate!` would never re-run it, so this executes the migration's
+/// SQL directly against an already-seeded database before 0132 — the situation an
 /// operator creates by hand when re-seeding an environment. Nothing may
 /// fail, and nothing may double up.
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = false)]
 async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()> {
+    // Run all migrations up to 0131
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("../../migrations")
+        .expect("migrations directory exists")
+        .map(|entry| entry.expect("readable migration entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    paths.sort();
+
+    for path in &paths {
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        if file_name.starts_with("0132_") {
+            break;
+        }
+        let sql = std::fs::read_to_string(path).expect("readable migration file");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&pool)
+            .await?;
+    }
+
+    // Re-apply 0002_seed_identity.sql against the database before 0132
     let seed = include_str!("../../../migrations/0002_seed_identity.sql");
-    sqlx::raw_sql(seed).execute(&pool).await?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(seed))
+        .execute(&pool)
+        .await?;
+
+    // Now run migration 0132
+    let sql_0132 = std::fs::read_to_string("../../migrations/0132_usernames.sql")
+        .expect("0132_usernames.sql must be readable");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql_0132.as_str()))
+        .execute(&pool)
+        .await?;
 
     assert_eq!(
         list_users(&pool, &UserFilter::default())
@@ -1027,5 +1076,346 @@ async fn rotate_response_secret_matches_the_mint_callback_output(pool: PgPool) -
         "the response must carry the freshly re-read identity, including the post-rotation expires_at/rotation_status"
     );
     assert_eq!(response.identity.rotation_status, "current");
+    Ok(())
+}
+
+// ── ADM-11: usernames, optional email, and the D5 clash rule ────────────
+
+/// ADM-11 D2: the `0132_usernames.sql` backfill gives every pre-existing
+/// user `lower(email)` as their username — here, the seeded fixture set,
+/// whose emails are already lowercase, so the username IS the email.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_migration_backfills_username_as_the_lowercased_email(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let users = list_users(&pool, &UserFilter::default()).await.unwrap();
+    assert!(!users.is_empty(), "the seed provides the fixture users");
+    for user in &users {
+        let email = user
+            .email
+            .as_deref()
+            .expect("seeded users all carry an email");
+        assert_eq!(user.username, email.to_lowercase());
+    }
+    Ok(())
+}
+
+/// ADM-11 D2.2: two emails that differ only in case backfill to `x` and
+/// `x-2` — the older row (`created_at`, then `id`) keeps the plain value,
+/// the newer one gets the `row_number` suffix. No row is skipped.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_case_variant_emails_backfill_to_the_plain_username_and_the_suffixed_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // Insert in id order so `created_at` (default `now()`, same statement
+    // round) and then `id` decide which row is the oldest: the lower id is
+    // written first and wins the plain username.
+    let older = uuid::Uuid::from_u128(1);
+    let newer = uuid::Uuid::from_u128(2);
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email) VALUES ($1, 'Older', 'temp-older', $2)",
+    )
+    .bind(older)
+    .bind("X@tenant-a.invalid")
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email) VALUES ($1, 'Newer', 'temp-newer', $2)",
+    )
+    .bind(newer)
+    .bind("x@TENANT-A.invalid")
+    .execute(&pool)
+    .await?;
+
+    // ADM-11 review 1 B1: backfill query matches 0132_usernames.sql
+    sqlx::query(
+        "WITH cleaned AS (
+            SELECT id,
+                   created_at,
+                   left(regexp_replace(lower(email), '[^a-z0-9._@+-]', '-', 'g'), 250) AS base
+            FROM app_user
+            WHERE id IN ($1, $2)
+        ),
+        ranked AS (
+            SELECT id,
+                   base,
+                   row_number() OVER (
+                       PARTITION BY base
+                       ORDER BY created_at, id
+                   ) AS rn
+            FROM cleaned
+        )
+        UPDATE app_user u
+        SET username = CASE
+            WHEN r.rn = 1 THEN r.base
+            ELSE r.base || '-' || r.rn::text
+        END
+        FROM ranked r
+        WHERE u.id = r.id;",
+    )
+    .bind(older)
+    .bind(newer)
+    .execute(&pool)
+    .await?;
+
+    let older_name: (String,) = sqlx::query_as("SELECT username FROM app_user WHERE id = $1")
+        .bind(older)
+        .fetch_one(&pool)
+        .await?;
+    let newer_name: (String,) = sqlx::query_as("SELECT username FROM app_user WHERE id = $1")
+        .bind(newer)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        older_name.0, "x@tenant-a.invalid",
+        "the older row keeps the plain value"
+    );
+    assert_eq!(
+        newer_name.0, "x@tenant-a.invalid-2",
+        "the newer row gets the -2 suffix"
+    );
+    Ok(())
+}
+
+/// ADM-11 review 1 B1: migration 0132 backfills usernames for emails with
+/// special characters (O'Brien), OIDC placeholders (auth0|123), non-ASCII
+/// characters (müller), and case variants. Every resulting username must
+/// pass the check constraint and all usernames must be unique.
+#[sqlx::test(migrations = false)]
+async fn migration_0132_backfills_usernames_safely_for_special_emails(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // Run all migrations up to 0131
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("../../migrations")
+        .expect("migrations directory exists")
+        .map(|entry| entry.expect("readable migration entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    paths.sort();
+
+    for path in &paths {
+        let file_name = path
+            .file_name()
+            .expect("file name")
+            .to_str()
+            .expect("utf-8");
+        if file_name.starts_with("0132_") {
+            break;
+        }
+        let sql = std::fs::read_to_string(path).expect("readable migration file");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&pool)
+            .await?;
+    }
+
+    // Seed rows with O'Brien@x.example, auth0|123@p.oidc.invalid, non-ASCII local part, and two case variants
+    let test_emails = [
+        ("O'Brien", "O'Brien@x.example"),
+        ("Auth0 User", "auth0|123@p.oidc.invalid"),
+        ("Müller", "müller@x.example"),
+        ("Variant 1", "CaseVariant@example.com"),
+        ("Variant 2", "casevariant@example.com"),
+    ];
+
+    for (name, email) in test_emails {
+        sqlx::query("INSERT INTO app_user (name, email) VALUES ($1, $2)")
+            .bind(name)
+            .bind(email)
+            .execute(&pool)
+            .await?;
+    }
+
+    // Now execute migration 0132
+    let sql_0132 = std::fs::read_to_string("../../migrations/0132_usernames.sql")
+        .expect("0132_usernames.sql must be readable");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql_0132.as_str()))
+        .execute(&pool)
+        .await?;
+
+    // Assert that every row gets a username that passes the CHECK and that all usernames are unique
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT username, email FROM app_user")
+            .fetch_all(&pool)
+            .await?;
+
+    let mut seen_usernames = std::collections::HashSet::new();
+
+    for (username, email) in &rows {
+        assert!(
+            (1..=254).contains(&username.len()),
+            "username {username:?} for email {email:?} must be between 1 and 254 characters"
+        );
+        assert!(
+            username
+                .chars()
+                .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '@' | '+' | '-')),
+            "username {username:?} for email {email:?} must contain only allowed characters"
+        );
+        assert!(
+            lakehouse_store::identity::normalize_username(username).is_ok(),
+            "username {username:?} must pass normalize_username"
+        );
+        assert!(
+            seen_usernames.insert(username.to_lowercase()),
+            "username {username:?} must be unique"
+        );
+    }
+
+    // Specifically verify the seeded test emails
+    let obrien: (String,) =
+        sqlx::query_as("SELECT username FROM app_user WHERE email = 'O''Brien@x.example'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(obrien.0, "o-brien@x.example");
+
+    let auth0: (String,) =
+        sqlx::query_as("SELECT username FROM app_user WHERE email = 'auth0|123@p.oidc.invalid'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(auth0.0, "auth0-123@p.oidc.invalid");
+
+    let muller: (String,) =
+        sqlx::query_as("SELECT username FROM app_user WHERE email = 'müller@x.example'")
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        muller
+            .0
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '@' | '+' | '-'))
+    );
+
+    let variants: Vec<(String,)> = sqlx::query_as(
+        "SELECT username FROM app_user WHERE lower(email) = 'casevariant@example.com' ORDER BY username",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(variants.len(), 2);
+    assert_eq!(variants[0].0, "casevariant@example.com");
+    assert_eq!(variants[1].0, "casevariant@example.com-2");
+
+    Ok(())
+}
+
+/// ADM-11 D5, one direction: an invite whose username equals ANOTHER
+/// user's email is refused as a field-specific 409
+/// ([`StoreError::FieldConflict`]), inside the same transaction — so the
+/// refused invite leaves nothing behind.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_invite_whose_username_equals_another_users_email_is_a_field_conflict(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // Move the seeded user's username off her email, so the clash below can
+    // only come from the EMAIL side of the username check (after the
+    // backfill her username equals her email, which would make the clash
+    // ambiguous between the two sides).
+    let rina: (uuid::Uuid,) =
+        sqlx::query_as("SELECT id FROM app_user WHERE email = 'rina@meridian.example'")
+            .fetch_one(&pool)
+            .await?;
+    sqlx::query("UPDATE app_user SET username = 'rina' WHERE id = $1")
+        .bind(rina.0)
+        .execute(&pool)
+        .await?;
+    let err = create_user(
+        &pool,
+        &InviteUserInput {
+            name: "Clash".to_owned(),
+            // `rina@meridian.example` is now only a seeded user's EMAIL.
+            username: "rina@meridian.example".to_owned(),
+            email: Some("clash@meridian.example".to_owned()),
+            roles: vec![],
+            tenants: vec![],
+        },
+    )
+    .await
+    .expect_err("another user's email is taken");
+    let StoreError::FieldConflict(message) = err else {
+        panic!("expected FieldConflict, got {err:?}");
+    };
+    assert_eq!(message, "Username already in use");
+    assert_eq!(
+        list_users(&pool, &UserFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        12,
+        "the refused invite leaves no half-created user"
+    );
+    Ok(())
+}
+
+/// ADM-11 D5, the other direction: an invite whose EMAIL equals another
+/// user's USERNAME is refused the same way — the rule is symmetric.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_invite_whose_email_equals_another_users_username_is_a_field_conflict(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // Give the seeded admin a username that is not an email-shaped string,
+    // so the clash below can only come from the username side.
+    let admin: (uuid::Uuid,) =
+        sqlx::query_as("SELECT id FROM app_user WHERE email = 'fajar@meridian.example'")
+            .fetch_one(&pool)
+            .await?;
+    sqlx::query("UPDATE app_user SET username = 'fajar' WHERE id = $1")
+        .bind(admin.0)
+        .execute(&pool)
+        .await?;
+    let err = create_user(
+        &pool,
+        &InviteUserInput {
+            name: "Clash".to_owned(),
+            username: "clash".to_owned(),
+            email: Some("Fajar".to_owned()),
+            roles: vec![],
+            tenants: vec![],
+        },
+    )
+    .await
+    .expect_err("an email equal to another user's username is taken");
+    let StoreError::FieldConflict(message) = err else {
+        panic!("expected FieldConflict, got {err:?}");
+    };
+    // Case-insensitive on both sides: `Fajar` lowered is the username the
+    // admin holds, so the Email sentence names the field that must change.
+    assert_eq!(message, "Email already in use");
+    Ok(())
+}
+
+/// ADM-11 D3: a username carrying a character outside `a-z 0-9 . _ @ + -`
+/// is refused with the rule-naming 400 ([`StoreError::Validation`]) before
+/// anything is written, and a blank username is the empty case of the same
+/// rule.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_invite_with_a_disallowed_username_character_is_a_validation_error(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let err = create_user(
+        &pool,
+        &InviteUserInput {
+            name: "Bad".to_owned(),
+            username: "ana!.smile".to_owned(),
+            email: Some("bad@meridian.example".to_owned()),
+            roles: vec![],
+            tenants: vec![],
+        },
+    )
+    .await
+    .expect_err("`!` is not in the allowed set");
+    let StoreError::Validation(message) = err else {
+        panic!("expected Validation, got {err:?}");
+    };
+    assert!(
+        message.contains("1 to 254 characters"),
+        "the message must name the rule: {message}"
+    );
+    assert_eq!(
+        list_users(&pool, &UserFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        12,
+        "the refused invite leaves no half-created user"
+    );
     Ok(())
 }

@@ -23,6 +23,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { toast } from "sonner"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import { NO_READABLE_TABLE } from "@/lib/asset-query"
 import { formatDate } from "@/lib/format"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
@@ -2274,6 +2275,68 @@ describe("Overview: the starter query", () => {
     expect(within(card).getByText(/^A starter query for ClickHouse\./)).toBeTruthy()
     const href = within(card).getByText("Open in Query Studio").closest("a")?.getAttribute("href") ?? ""
     expect(new URL(href, "http://x").searchParams.get("engine")).toBe("clickhouse")
+  })
+
+  it("shows one sentence and no link for an asset with no readable table", async () => {
+    stubApi({ tableMissing: true })
+    renderTabs({ ...BRONZE, queryTarget: undefined })
+
+    const card = await useData()
+    expect(await within(card).findByText(NO_READABLE_TABLE)).toBeTruthy()
+    // Nothing to copy and nowhere to go: the link and the starter query go
+    // with the sentence.
+    expect(within(card).queryByText("Open in Query Studio")).toBeNull()
+    expect(within(card).queryByText("Copy")).toBeNull()
+    expect(within(card).queryByText(/FROM /)).toBeNull()
+  })
+
+  it("keeps the starter query while the Iceberg table is still loading", async () => {
+    stubApi({ tablePending: true })
+    renderTabs({ ...BRONZE, queryTarget: undefined })
+
+    const card = await useData()
+    // The sentence waits for the read: until it has answered, the card
+    // keeps the starter query it has always shown.
+    expect(within(card).getByText(/^A starter query for ClickHouse\./)).toBeTruthy()
+    expect(within(card).queryByText(NO_READABLE_TABLE)).toBeNull()
+  })
+})
+
+describe("Sample and Lineage tabs: the Query Studio link", () => {
+  /** The link the tab offers, and the engine it opens Query Studio on. */
+  const hrefOf = (text: string) =>
+    screen.getByText(text).closest("a")?.getAttribute("href") ?? ""
+
+  it("offers no Query Studio link on the Sample tab for an asset with no readable table", async () => {
+    stubApi({ tableMissing: true })
+    url.search = "tab=sample"
+    renderTabs({ ...BRONZE, queryTarget: undefined })
+
+    expect(await screen.findByText("Sample rows")).toBeTruthy()
+    // The link is there while the Iceberg read runs, and gone once it has
+    // answered with no table: the wait is what proves the read has settled.
+    // The comparison answers with a boolean, so a failure prints one value
+    // and not the whole page.
+    await waitFor(() => expect(screen.queryByText("Open in Query Studio") === null).toBe(true))
+  })
+
+  it("offers no Query Studio link on the Lineage tab for an asset with no readable table", async () => {
+    stubApi({ tableMissing: true })
+    url.search = "tab=lineage"
+    renderTabs({ ...BRONZE, queryTarget: undefined })
+
+    expect(await screen.findByText("Open lineage graph")).toBeTruthy()
+    await waitFor(() => expect(screen.queryByText("Query this asset") === null).toBe(true))
+  })
+
+  it("keeps the link on the Sample tab for an asset whose Iceberg table is there", async () => {
+    stubApi()
+    url.search = "tab=sample"
+    renderTabs({ ...BRONZE, queryTarget: undefined })
+
+    // The link names Trino only once the Iceberg table has loaded, so the
+    // engine in it is also the sign that the read has settled.
+    await waitFor(() => expect(hrefOf("Open in Query Studio")).toContain("engine=trino"))
   })
 })
 

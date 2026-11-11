@@ -28,9 +28,10 @@ async fn exporter(pool: &PgPool) -> Uuid {
         .unwrap();
     let user_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Exporter', $2, 'active')",
+        "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Exporter', $2, $3, 'active')",
     )
     .bind(user_id)
+    .bind(format!("exporter-{user_id}"))
     .bind(format!("exporter-{user_id}@test.invalid"))
     .execute(pool)
     .await

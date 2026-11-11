@@ -635,7 +635,7 @@ mod tests {
             .execute(&pool)
             .await?;
         let caller_id = Uuid::from_u128(11);
-        sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Rina', 'rina@test.invalid', 'active')")
+        sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Rina', 'rina', 'rina@test.invalid', 'active')")
             .bind(caller_id)
             .execute(&pool)
             .await?;

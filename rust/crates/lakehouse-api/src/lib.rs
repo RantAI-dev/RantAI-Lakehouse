@@ -54,6 +54,7 @@ pub mod rustfs_client;
 pub mod secret_crypto;
 pub mod secret_manager;
 pub mod sql_guard;
+pub mod sql_lex;
 pub mod sql_lineage;
 pub mod sql_rewrite;
 pub mod state;
@@ -498,12 +499,16 @@ async fn rotate_secrets_key(config: &Config) -> anyhow::Result<()> {
 ///
 /// This does not check "does the bootstrap admin already exist" before
 /// inserting — it just tries the insert and treats the natural outcome of
-/// re-running it (`app_user.email` already taken, surfaced as
-/// [`lakehouse_store::StoreError::Conflict`] from
-/// [`lakehouse_store::identity::create_user`]) as "already seeded, nothing
-/// to do", logged at `info`. Every other failure logs at `error` and
-/// leaves the process to boot anyway — a broken bootstrap-admin seed must
-/// not stop [`run`] from serving the rest of the API.
+/// re-running it (the bootstrap e-mail already taken) as "already seeded,
+/// nothing to do", logged at `info`. ADM-11 adds a second path to that
+/// same outcome: the username is the lowercased bootstrap e-mail (D12),
+/// so a re-run now trips the username side of [`lakehouse_store::StoreError::FieldConflict`]
+/// from [`lakehouse_store::identity::create_user`] before the insert even
+/// reaches the e-mail unique index's [`lakehouse_store::StoreError::Conflict`].
+/// Both mean "already seeded" and both are handled the same way. Every
+/// other failure logs at `error` and leaves the process to boot anyway —
+/// a broken bootstrap-admin seed must not stop [`run`] from serving the
+/// rest of the API.
 ///
 /// # What happens when the env vars are absent
 ///
@@ -534,13 +539,18 @@ async fn bootstrap_admin(state: &AppState) {
 
     let input = lakehouse_store::identity::InviteUserInput {
         name: "Bootstrap Admin".to_owned(),
-        email,
+        // ADM-11 D12: the username is the lowercased bootstrap e-mail —
+        // the local login accepts the same string for either field.
+        username: email.to_lowercase(),
+        email: Some(email),
         roles: vec!["Platform Admin".to_owned()],
         tenants: Vec::new(),
     };
     let user = match lakehouse_store::identity::create_user(pool, &input).await {
         Ok(user) => user,
-        Err(lakehouse_store::StoreError::Conflict) => {
+        Err(
+            lakehouse_store::StoreError::Conflict | lakehouse_store::StoreError::FieldConflict(_),
+        ) => {
             tracing::info!("bootstrap admin already exists; nothing to seed");
             return;
         }

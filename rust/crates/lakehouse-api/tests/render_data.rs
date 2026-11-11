@@ -151,9 +151,10 @@ async fn user(pool: &PgPool, role: &str) -> Uuid {
         .await
         .unwrap();
     let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, 'active')")
         .bind(user_id)
         .bind(format!("User of {role}"))
+        .bind(format!("{role}-{user_id}").replace(' ', "-").to_lowercase())
         .bind(format!("{role}-{user_id}@test.invalid").replace(' ', "-"))
         .execute(pool)
         .await
@@ -202,7 +203,7 @@ async fn fixture(secret: Option<&str>) -> Fixture {
         .execute(&app.pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Owner', 'owner@test.invalid', 'active')")
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Owner', 'owner', 'owner@test.invalid', 'active')")
         .bind(owner_id)
         .execute(&app.pool)
         .await

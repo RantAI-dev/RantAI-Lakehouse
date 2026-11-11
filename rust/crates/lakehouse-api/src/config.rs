@@ -986,7 +986,7 @@ pub struct Config {
     pub catalog_tenant_id: Option<Uuid>,
     /// Language the copilot replies in when the latest chat message is too
     /// short for `routes::ai::prompt::reply_language` to detect one
-    /// (`Jelaskan chart ini`, `2024?`). `None` when unset or empty: the
+    /// (`total revenue`, `2024?`). `None` when unset or empty: the
     /// prompt's wording is then unchanged from before the setting existed
     /// (the Latin-script line keeps its English fallback, a message with no
     /// letters gets none). A detected language always wins over this

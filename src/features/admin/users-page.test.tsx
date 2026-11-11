@@ -61,6 +61,7 @@ const RESET_PASSWORD = "test-only-reset-password"
 const ROW: User = {
   id: "11111111-1111-4111-8111-000000000001",
   name: "Rina Wijaya",
+  username: "rina",
   email: "rina@meridian.example",
   status: "active",
   roles: ["Analyst"],
@@ -240,6 +241,18 @@ function setupFetch(opts: {
         return jsonResponse(TENANTS, status)
       }
 
+      if (url.includes("/api/auth/password-rules")) {
+        return jsonResponse({ minLength: 8, maxLength: 1024 })
+      }
+
+      if (method === "PATCH" && url.includes("/api/identity/users/")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          username?: string
+          email?: string | null
+        }
+        return jsonResponse({ ...row, ...body }, 200)
+      }
+
       if (method === "POST" && url.endsWith("/reset-password")) {
         const status = opts.resetStatus ?? 200
         if (status >= 400) {
@@ -253,8 +266,26 @@ function setupFetch(opts: {
         if (status >= 400) {
           return jsonResponse({ error: "invite failed" }, status)
         }
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          name?: string
+          username?: string
+          email?: string | null
+          roles?: string[]
+          tenants?: string[]
+          password?: { mode?: string; value?: string }
+          mustChangePassword?: boolean
+        }
+        const tempPassword =
+          body.password?.mode === "set" ? null : TEMPORARY_PASSWORD
         return jsonResponse(
-          { ...ROW, id: "22222222-2222-4222-8222-000000000002", temporaryPassword: TEMPORARY_PASSWORD },
+          {
+            ...ROW,
+            id: "22222222-2222-4222-8222-000000000002",
+            name: body.name ?? "New User",
+            username: body.username ?? "newuser",
+            email: body.email ?? null,
+            temporaryPassword: tempPassword,
+          },
           status
         )
       }
@@ -298,14 +329,55 @@ function renderPage() {
 }
 
 /** Fill the invite sheet and submit it. */
-async function inviteUser() {
+async function inviteUser(opts: {
+  name?: string
+  username?: string
+  email?: string
+  roles?: string[]
+  tenants?: string[]
+  passwordMode?: "generate" | "set"
+  password?: string
+  mustChangePassword?: boolean
+} = {}) {
   fireEvent.click(screen.getByRole("button", { name: /invite user/i }))
   fireEvent.change(await screen.findByLabelText("Name"), {
-    target: { value: "Rina Guest" },
+    target: { value: opts.name ?? "Rina Guest" },
   })
-  fireEvent.change(screen.getByLabelText("Email"), {
-    target: { value: "rina.guest@meridian.example" },
+  fireEvent.change(screen.getByLabelText("Username"), {
+    target: { value: opts.username ?? "rinaguest" },
   })
+  if (opts.email !== undefined) {
+    fireEvent.change(screen.getByLabelText("Email (optional)"), {
+      target: { value: opts.email },
+    })
+  } else {
+    fireEvent.change(screen.getByLabelText("Email (optional)"), {
+      target: { value: "rina.guest@meridian.example" },
+    })
+  }
+  if (opts.roles) {
+    for (const r of opts.roles) {
+      fireEvent.click(screen.getByLabelText(r))
+    }
+  }
+  if (opts.tenants) {
+    for (const t of opts.tenants) {
+      fireEvent.click(screen.getByLabelText(t))
+    }
+  }
+  if (opts.passwordMode === "set") {
+    fireEvent.click(screen.getByLabelText("Set it now"))
+    if (opts.password) {
+      fireEvent.change(screen.getByLabelText("Password"), {
+        target: { value: opts.password },
+      })
+    }
+  }
+  if (opts.mustChangePassword === false) {
+    fireEvent.click(
+      screen.getByLabelText("Must change password at first sign-in")
+    )
+  }
   fireEvent.click(screen.getByRole("button", { name: "Invite" }))
 }
 
@@ -339,7 +411,7 @@ describe("UsersPage invite (temporary password shown once, never persisted)", ()
     // immediate one-shot display, with the Copy button as a courtesy.
     const password = await screen.findByTestId("revealed-password")
     expect(password.textContent).toBe(TEMPORARY_PASSWORD)
-    expect(screen.getByText(/shown once/i)).toBeDefined()
+    expect(screen.getAllByText(/shown once/i).length).toBeGreaterThan(0)
     expect(screen.getByText(/must change it at first sign-in/i)).toBeDefined()
   })
 
@@ -405,6 +477,54 @@ describe("UsersPage invite (temporary password shown once, never persisted)", ()
       expect(posts.length).toBeGreaterThan(0)
     })
     expect(screen.queryByTestId("revealed-password")).toBeNull()
+  })
+
+  it("setting password upfront sends password mode set and does NOT open the revealed-password dialog", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await inviteUser({
+      name: "User With Password",
+      username: "userpass",
+      passwordMode: "set",
+      password: "customPassword123!",
+      mustChangePassword: false,
+    })
+
+    await waitFor(() => {
+      const post = fetchCalls.find(
+        (c) => c.method === "POST" && c.url.endsWith("/api/identity/users")
+      )
+      expect(post).toBeDefined()
+      const body = JSON.parse(post?.body ?? "{}")
+      expect(body.password).toEqual({ mode: "set", value: "customPassword123!" })
+      expect(body.mustChangePassword).toBe(false)
+    })
+    expect(screen.queryByTestId("revealed-password")).toBeNull()
+  })
+
+  it("invite sends full payload with selected roles and tenants as checkboxes", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await inviteUser({
+      name: "Role User",
+      username: "roleuser",
+      roles: ["Analyst"],
+      tenants: ["Meridian Retail"],
+    })
+
+    await waitFor(() => {
+      const post = fetchCalls.find(
+        (c) => c.method === "POST" && c.url.endsWith("/api/identity/users")
+      )
+      expect(post).toBeDefined()
+      const body = JSON.parse(post?.body ?? "{}")
+      expect(body.roles).toEqual(["Analyst"])
+      expect(body.tenants).toEqual(["Meridian Retail"])
+      expect(body.password).toEqual({ mode: "generate" })
+      expect(body.mustChangePassword).toBe(true)
+    })
   })
 })
 
@@ -566,5 +686,42 @@ describe("UsersPage tabs (WEB-3 S3-D7)", () => {
     expect(screen.getByRole("tab", { name: "Sessions" }).getAttribute("aria-selected")).toBe("true")
     expect(screen.queryByRole("button", { name: /invite user/i })).toBeNull()
     expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy()
+  })
+})
+
+
+describe("UsersPage edit username and email (ADM-11 D8/D11)", () => {
+  it("editing username and email calls PATCH /api/identity/users/{id} and reloads", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await openRowAction(/edit username and email/i)
+
+    const usernameInput = await screen.findByLabelText("Username")
+    const emailInput = screen.getByLabelText("Email")
+    fireEvent.change(usernameInput, { target: { value: "rinanew" } })
+    fireEvent.change(emailInput, { target: { value: "rinanew@meridian.example" } })
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => {
+      const patch = fetchCalls.find(
+        (c) => c.method === "PATCH" && c.url.endsWith(`/api/identity/users/${ROW.id}`)
+      )
+      expect(patch).toBeDefined()
+      expect(JSON.parse(patch?.body ?? "{}")).toEqual({
+        username: "rinanew",
+        email: "rinanew@meridian.example",
+      })
+    })
+  })
+})
+
+describe("UsersPage email display (ADM-11 D2/D11)", () => {
+  it("a user with null email displays an em dash in the email column", async () => {
+    setupFetch({ row: { ...ROW, email: null } })
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(1)
   })
 })

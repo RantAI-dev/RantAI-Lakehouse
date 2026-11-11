@@ -72,6 +72,7 @@ use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::routes::quality::pool;
 use crate::routes::query::{checked_saved_definitions, saved_query_scope, saved_query_viewer};
 use crate::sql_guard::is_read_only;
+use crate::sql_rewrite::Engine;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -428,7 +429,9 @@ impl GranteeNames {
     /// found, the name alone for a role found, neither otherwise.
     fn of(&self, rule: &ItemRule) -> (Option<String>, Option<String>) {
         if let Some(person) = rule.user_id.and_then(|id| self.people.get(&id)) {
-            return (Some(person.name.clone()), Some(person.email.clone()));
+            // ADM-11 D1: a person's email is itself optional now, so the
+            // clone carries the option, not a nested one.
+            return (Some(person.name.clone()), person.email.clone());
         }
         if let Some(role) = rule.role_id.and_then(|id| self.roles.get(&id)) {
             return (Some(role.name.clone()), None);
@@ -462,8 +465,9 @@ pub struct GranteePersonWire {
     pub id: String,
     /// The person's display name.
     pub name: String,
-    /// The person's email address.
-    pub email: String,
+    /// The person's email address; `None` when the account has none
+    /// (ADM-11 D1), sent as `null`.
+    pub email: Option<String>,
 }
 
 impl GranteePersonWire {
@@ -1093,9 +1097,11 @@ pub async fn patch_saved(
         return Err(ApiError::BadRequest(TITLE_AND_SQL_REQUIRED.to_owned()).into());
     }
     // Every path that stores a statement goes through the same read-only
-    // guard the save route uses.
+    // guard the save route uses. A saved query records no engine, so the
+    // guard reads the statement with the `ClickHouse` rules; a run that
+    // names `Trino` reads it with the `Trino` rules.
     if let Some(statement) = sql.as_deref()
-        && !is_read_only(statement)
+        && !is_read_only(statement, Engine::ClickHouse)
     {
         return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
@@ -1202,8 +1208,9 @@ pub async fn duplicate_saved(
     let source = queries::get_saved(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    // The copy stores the same statement, so it meets the same guard.
-    if !is_read_only(&source.sql) {
+    // The copy stores the same statement, so it meets the same guard: a
+    // saved query records no engine, so the `ClickHouse` rules apply.
+    if !is_read_only(&source.sql, Engine::ClickHouse) {
         return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
     // The copy is a new row, so it belongs to the tenant the request acts
@@ -1367,13 +1374,14 @@ pub async fn revert_version(
         .parse()
         .map_err(|_err| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
     // The statement the version holds is about to be stored again, so it
-    // meets the same guard as any other statement that is stored.
+    // meets the same guard as any other statement that is stored: a saved
+    // query records no engine, so the `ClickHouse` rules apply.
     let versions = queries::list_versions(pool(&state)?, query_id).await?;
     let wanted = versions
         .iter()
         .find(|candidate| candidate.version == version)
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if !is_read_only(&wanted.sql) {
+    if !is_read_only(&wanted.sql, Engine::ClickHouse) {
         return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
     let reverted = queries::revert_to_version(pool(&state)?, &viewer, query_id, version)
