@@ -518,10 +518,14 @@ $ git status --short
 $ git log --oneline 5ad8c129..HEAD
 8974f4e8 refactor(gov-7): TableAccess has no Default, so a failed read cannot mean all (S1)
 55a9c58e Merge remote-tracking branch 'origin/main' into feat/gov-7-s1-enforce
+ba2d8f0c feat(console): Query Studio saves, chart builder and alert rule become full pages (WEB-7 S2) (#463)
 
 $ git ls-remote --heads origin feat/gov-7-s1-enforce
 8974f4e8cd0498543bc8d53290e5d1e913981b4f	refs/heads/feat/gov-7-s1-enforce
 ```
+
+(`ba2d8f0c` is `origin/main`'s tip, on this branch only through the merge.
+This handoff's own docs commit sits on top of the three lines above.)
 
 ## 6. Review (planner)
 
