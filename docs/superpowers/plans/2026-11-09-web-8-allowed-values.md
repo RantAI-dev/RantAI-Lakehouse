@@ -649,3 +649,53 @@ uploads, so this is a timing-sensitive test and not caused by this PR. I will wa
 CI.
 
 Approved for PR.
+
+### S2, round 1 (planner, 2026-11-11) — branch at `17a29dcb`
+
+Read: `table-picker.tsx`, `ssl-modes.ts`, the change to `asset-access.tsx`, the whole Rust
+change of T8 (`routes/governance.rs`, `sql_rewrite.rs`, `policy.rs`, `routes/mod.rs`, the
+`route_auth` test). Not read: `pipeline-pickers.tsx` and the pipeline form, the changes to
+the quality, freshness, alert and subscription forms beyond their use of the table picker,
+and the tests. I ran no check locally; #466 runs the suite.
+
+- **T8 does not change what a row filter accepts.** The operator lists that were two
+  `matches!` are now one constant the validator reads through `binary_operator_symbol` and
+  `unary_operator_symbol`; the same thirteen binary operators and `NOT`, `-`, `+` pass. The
+  route serves the validator's own constants, and a test holds both directions.
+- **The pickers do not invent values.** The table picker falls back to text when the catalog
+  cannot be read and keeps a table the catalog does not list.
+- The developer's two notes are accepted: the filter transform's `value` is a literal, not a
+  column, and stays text; the Oracle form needs the "Default" entry because `sslMode: null`
+  is a value it stores.
+
+**BLOCKER**
+
+- **B1. The SQL form now states what each TLS mode does, for every SQL adapter, and nothing
+  shows that is true.** `sql-dial-form.tsx` offers `CDC_SSL_MODES` ("Verify CA and host
+  name", and so on), which are the change-capture worker's four modes. The server stores
+  `SqlDial::ssl_mode` as free text (`ingest_spec.rs:74`) and `ssl-modes.ts` itself says a
+  mode the driver does not know "is silently ignored". If a batch loader for MySQL or SQL
+  Server ignores `verify-full`, the form says the host is verified when it is not. This was
+  the plan's instruction; the plan did not check it.
+  - For each adapter the batch SQL form serves, find where the loader reads `sslMode` (the
+    Dagster code location and the API's probe) and write down, with file and line, what it
+    does with each of the four values.
+  - Offer for an adapter only the modes its loader honours, with a label that says what it
+    does there. Where that cannot be established for an adapter, the field stays free text
+    for that adapter, with one line saying the mode is passed to the driver as typed.
+  - If every adapter honours the four as labelled, say so with the evidence; then nothing
+    changes but the handoff.
+
+**SHOULD-FIX**
+
+- **S1. A role an access rule names that no longer exists is kept but not shown.**
+  `asset-access.tsx` draws a checkbox per existing role; a name in `form.roles` that is not
+  among them stays in the saved value with nothing on screen for it. Show each as a
+  removable "Not recognised" entry, as the permission picker does.
+- **S2. The row filter hint leaves out forms the validator accepts.** `LIKE`, `ILIKE`,
+  `BETWEEN`, `IN` and `IS [NOT] NULL` are accepted and not named, so the line reads as if
+  they were refused. Name them from the server too: one more constant in `sql_rewrite.rs`
+  next to the two, served by the route, and the route's test checks each named form
+  validates. The test is what ties the constant to the match arms.
+- **S3. Merge `origin/main`** (the branch is behind).
+
