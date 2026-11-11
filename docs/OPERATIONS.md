@@ -1336,7 +1336,7 @@ page renders an access-denied state without issuing backend API requests.
 
 ### What the upgrade adds to existing roles
 
-Migration `0132_pages_per_role.sql` ensures existing roles retain access to pages they previously used:
+Migration `0133_pages_per_role.sql` ensures existing roles retain access to pages they previously used:
 
 | Role | Added Permissions | Rationale |
 | --- | --- | --- |

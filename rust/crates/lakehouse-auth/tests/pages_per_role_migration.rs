@@ -1,12 +1,15 @@
-//! ADM-13 T1: migration `0132_pages_per_role.sql` verification (`D2`, `D3`).
+//! ADM-13 review round 1, B1, S1
+//! ADM-13 T1: migration `0133_pages_per_role.sql` verification (`D2`, `D3`).
 //!
 //! Asserts that:
 //! - an Analyst role gets the four permissions (`assistant:use`, `ops:read`, `alert:read`, `governance:read`);
 //! - Dashboard Viewer does not get them;
-//! - a custom role gets them;
 //! - a `*:*` role is untouched;
 //! - Assistant only exists;
-//! - running the UPDATE twice adds nothing twice.
+//! - custom roles with existing permissions get them;
+//! - a role with `*:*` in a list (`catalog:read, *:*`) is untouched (S1);
+//! - a role with empty permissions gets them without a leading comma (S1);
+//! - running the migration file itself twice (`include_str!`, whole file) adds nothing twice.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -14,8 +17,10 @@ use lakehouse_test_support as _;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+const MIGRATION_SQL: &str = include_str!("../../../migrations/0133_pages_per_role.sql");
+
 #[sqlx::test(migrations = "../../migrations")]
-async fn migration_0132_updates_roles_correctly(pool: PgPool) -> sqlx::Result<()> {
+async fn migration_0133_updates_roles_correctly(pool: PgPool) -> sqlx::Result<()> {
     // 1. Analyst gets the four permissions
     let (analyst_perms,): (String,) =
         sqlx::query_as("SELECT permissions FROM role WHERE name = 'Analyst'")
@@ -60,8 +65,8 @@ async fn migration_0132_updates_roles_correctly(pool: PgPool) -> sqlx::Result<()
     assert_eq!(asst_perms, "assistant:ask,dashboard:read");
     assert_ne!(asst_desc, "");
 
-    // 5. A custom role gets them, and running UPDATE twice adds nothing twice:
-    // Create a custom role with initial permissions.
+    // 5. Test custom roles:
+    // a. Standard custom role with one permission
     let custom_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Custom Auditor', 'audit:read', 'A custom role')",
@@ -70,19 +75,26 @@ async fn migration_0132_updates_roles_correctly(pool: PgPool) -> sqlx::Result<()
     .execute(&pool)
     .await?;
 
-    // Execute the exact UPDATE query from 0132_pages_per_role.sql
-    let update_sql = r"
-UPDATE role
-SET permissions = permissions || ',assistant:use,ops:read,alert:read,governance:read'
-WHERE name NOT IN ('Dashboard Viewer', 'Assistant only')
-  AND permissions != '*:*'
-  AND permissions !~ '(^|,)\s*\*:*\s*(,|$)'
-  AND permissions !~ '(^|,)\s*assistant:use\s*(,|$)'
-  AND permissions !~ '(^|,)\s*ops:read\s*(,|$)'
-  AND permissions !~ '(^|,)\s*alert:read\s*(,|$)'
-  AND permissions !~ '(^|,)\s*governance:read\s*(,|$)';
-";
-    sqlx::query(update_sql).execute(&pool).await?;
+    // b. Custom role with wildcard in list: `catalog:read, *:*` (S1)
+    let wildcard_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Custom Wildcard', 'catalog:read, *:*', 'A wildcard role')",
+    )
+    .bind(wildcard_id)
+    .execute(&pool)
+    .await?;
+
+    // c. Custom role with empty permissions: `""` (S1)
+    let empty_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Custom Empty', '', 'An empty role')",
+    )
+    .bind(empty_id)
+    .execute(&pool)
+    .await?;
+
+    // Run the migration file itself (first time over the newly added custom roles)
+    sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await?;
 
     // Check custom role gained them
     let (custom_perms,): (String,) = sqlx::query_as("SELECT permissions FROM role WHERE id = $1")
@@ -94,14 +106,34 @@ WHERE name NOT IN ('Dashboard Viewer', 'Assistant only')
         "audit:read,assistant:use,ops:read,alert:read,governance:read"
     );
 
-    // Capture permissions of all roles before second update
+    // Check custom wildcard role is untouched (S1)
+    let (wildcard_perms,): (String,) = sqlx::query_as("SELECT permissions FROM role WHERE id = $1")
+        .bind(wildcard_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        wildcard_perms, "catalog:read, *:*",
+        "Role with catalog:read, *:* must be untouched"
+    );
+
+    // Check empty role has no leading comma (S1)
+    let (empty_perms,): (String,) = sqlx::query_as("SELECT permissions FROM role WHERE id = $1")
+        .bind(empty_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        empty_perms, "assistant:use,ops:read,alert:read,governance:read",
+        "Role with empty permissions must not have a leading comma"
+    );
+
+    // 6. Idempotence: capture permissions of all roles before running migration file second time
     let roles_before: Vec<(String, String)> =
         sqlx::query_as("SELECT name, permissions FROM role ORDER BY name")
             .fetch_all(&pool)
             .await?;
 
-    // Run the UPDATE a second time
-    sqlx::query(update_sql).execute(&pool).await?;
+    // Run the migration file a second time (S1: whole file, twice)
+    sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await?;
 
     let roles_after: Vec<(String, String)> =
         sqlx::query_as("SELECT name, permissions FROM role ORDER BY name")
@@ -110,7 +142,7 @@ WHERE name NOT IN ('Dashboard Viewer', 'Assistant only')
 
     assert_eq!(
         roles_before, roles_after,
-        "Running the UPDATE twice must add nothing twice"
+        "Running the migration file twice must add nothing twice"
     );
 
     Ok(())

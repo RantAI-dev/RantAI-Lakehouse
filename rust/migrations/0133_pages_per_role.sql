@@ -1,3 +1,4 @@
+-- ADM-13 review round 1, B1, S1
 -- ADM-13: each role sees only the pages it may use (`docs/core/specs/adm-13.md`,
 -- `docs/core/features/pages-per-role.md`, plan `docs/superpowers/plans/2026-11-09-adm-13-pages-per-role.md`).
 --
@@ -24,10 +25,13 @@
 -- nothing twice.
 
 UPDATE role
-SET permissions = permissions || ',assistant:use,ops:read,alert:read,governance:read'
+SET permissions = CASE
+    WHEN trim(permissions) = '' THEN 'assistant:use,ops:read,alert:read,governance:read'
+    ELSE permissions || ',assistant:use,ops:read,alert:read,governance:read'
+END
 WHERE name NOT IN ('Dashboard Viewer', 'Assistant only')
   AND permissions != '*:*'
-  AND permissions !~ '(^|,)\s*\*:*\s*(,|$)'
+  AND permissions !~ '(^|,)\s*\*:\*\s*(,|$)'
   AND permissions !~ '(^|,)\s*assistant:use\s*(,|$)'
   AND permissions !~ '(^|,)\s*ops:read\s*(,|$)'
   AND permissions !~ '(^|,)\s*alert:read\s*(,|$)'
