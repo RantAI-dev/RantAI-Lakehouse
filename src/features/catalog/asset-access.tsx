@@ -2,10 +2,11 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Check, Minus, Plus } from "lucide-react"
+import { Check, Minus, Plus, XIcon } from "lucide-react"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -124,6 +125,13 @@ function AddPolicyDialog({
   const grammarState = useService((signal) => governanceService.getRowFilterGrammar(signal), [])
   const grammar = grammarState.status === "success" ? grammarState.data : null
   const chosenRoles = roleNames(form.roles)
+  // WEB-8 S2 review round 1, S1: a saved role the deployment no longer has
+  // must not be invisible. It stays in `form.roles` (and so in the saved
+  // `subjects`) until the person removes it, shown as a removable "Not
+  // recognised" chip the way `permission-picker.tsx` shows an unknown
+  // permission token.
+  const knownRoleNames = roles?.map((role) => role.name) ?? []
+  const unknownRoles = chosenRoles.filter((name) => !knownRoleNames.includes(name))
 
   function toggleRole(roleName: string) {
     setForm((f) => {
@@ -206,6 +214,34 @@ function AddPolicyDialog({
                 ))}
               </ul>
             )}
+            {roles !== null && unknownRoles.length > 0 ? (
+              <div className="space-y-1.5" data-testid="unknown-roles">
+                <Label className="text-xs font-medium text-muted-foreground">Not recognised</Label>
+                <div className="flex flex-wrap gap-1.5">
+                  {unknownRoles.map((name) => (
+                    <Badge
+                      key={name}
+                      variant="outline"
+                      className="gap-1.5 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 py-1 px-2 font-mono text-xs"
+                    >
+                      <span>{name}</span>
+                      <span className="text-[10px] text-muted-foreground font-sans">
+                        (Not recognised)
+                      </span>
+                      <button
+                        type="button"
+                        className="hover:text-foreground inline-flex items-center justify-center cursor-pointer"
+                        onClick={() => toggleRole(name)}
+                        aria-label={`Remove ${name}`}
+                        title={`Remove ${name}`}
+                      >
+                        <XIcon className="size-3" />
+                      </button>
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </div>
           <fieldset className="grid gap-1.5">
             <legend className="mb-1.5 text-sm font-medium">Columns to mask</legend>
