@@ -511,6 +511,8 @@ describe("useQueryStudio statements", () => {
     expect(run).toHaveBeenCalledTimes(2)
     const runs = result.current.runs[result.current.activeTabId] ?? []
     expect(runs.map((entry) => entry.status)).toEqual(["done", "error", "not-run"])
+    // QA LH-QS-4-10: a failure says "failure", so the page keeps its sentence about the failure.
+    expect(runs[2]).toMatchObject({ status: "not-run", reason: "failure" })
   })
 
   it("a permission refusal refuses every statement of the batch", async () => {
@@ -562,6 +564,8 @@ describe("useQueryStudio statements", () => {
 
     const runs = result.current.runs[result.current.activeTabId] ?? []
     expect(runs.map((entry) => entry.status)).toEqual(["not-run", "not-run", "not-run"])
+    // QA LH-QS-4-10: Stop says "stopped", not a failure.
+    expect(runs.map((entry) => (entry.status === "not-run" ? entry.reason : null))).toEqual(["stopped", "stopped", "stopped"])
     expect(result.current.running).toBe(false)
   })
 

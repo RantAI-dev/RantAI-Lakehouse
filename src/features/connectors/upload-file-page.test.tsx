@@ -117,8 +117,8 @@ type Routes = {
   complete?: Answer<[string]>
   get?: (n: number) => Upload | Response
   preview?: (query: URLSearchParams) => UploadPreview | Response
-  /** `POST /api/uploads/{id}/check`: gets the body the page sent. */
-  check?: (body: { columns: { name: string; type: string }[] }) => unknown | Response
+  /** `POST /api/uploads/{id}/check`: gets the body the page sent; may answer later (a promise). */
+  check?: (body: { columns: { name: string; type: string }[] }) => unknown | Response | Promise<unknown>
   /** `POST /api/uploads/{id}/compare` (several files into one table): gets the body the page sent; the default finds no mismatch. */
   compare?: (body: { alsoUploads: string[]; columns?: { name: string; type: string }[] }) => unknown | Response
   ingest?: Response
@@ -193,7 +193,9 @@ function stubFetch(routes: Routes = {}): Call[] {
     if (/^\/api\/uploads\/[^/]+$/.test(target.pathname) && method === "DELETE") return new Response(null, { status: 204 })
     if (target.pathname.endsWith("/preview") && routes.preview) return reply(routes.preview(target.searchParams))
     if (target.pathname.endsWith("/check") && method === "POST" && routes.check) {
-      return reply(routes.check(body as { columns: { name: string; type: string }[] }))
+      // A route may answer later (`Answer`), so its promise is awaited here.
+      const value = await routes.check(body as { columns: { name: string; type: string }[] })
+      return reply(value)
     }
     if (target.pathname.endsWith("/compare") && method === "POST") {
       const asked = body as { alsoUploads: string[]; columns?: { name: string; type: string }[] }
@@ -1529,6 +1531,118 @@ describe("UploadFilePage, column types", () => {
     ])
   })
 
+  // QA LH-DATA-18-08 (DATA-18-AC8): the mismatch is listed on the Review step, before loading.
+  const BAD = {
+    sampledRows: 3,
+    count: 2,
+    byColumn: [{ column: "sku", count: 2 }],
+    rows: [
+      { row: 1, column: "sku", value: "A-1" },
+      { row: 3, column: "sku", value: "B-2" },
+    ],
+  }
+  const NONE = { sampledRows: 3, count: 0, byColumn: [], rows: [] }
+
+  /** Changes sku to integer (so the check runs) and goes on to Review. */
+  async function toReview(result: typeof BAD | typeof NONE) {
+    const calls = await openColumns({
+      check: () => result,
+      ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
+    })
+    fireEvent.change(screen.getByLabelText("Type of sku"), { target: { value: "integer" } })
+    if (result.count > 0) await screen.findByText(/2 values do not fit/, {}, { timeout: 2000 })
+    return calls
+  }
+
+  async function goOn() {
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(next())
+    await screen.findByText(/^Load reads/)
+  }
+
+  it("lists the values that do not fit on the Review step and turns Load off while the choice is Stop", async () => {
+    await toReview(BAD)
+    await goOn()
+    const panel = screen.getByLabelText("Values that do not fit")
+    expect(panel.textContent).toContain("2 values do not fit in the first 3 rows")
+    expect(within(panel).getByText("A-1")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(true)
+    // Back to Check returns to the step that can change the types.
+    fireEvent.click(within(panel).getByRole("button", { name: "Back to Check" }))
+    expect(await screen.findByLabelText("Type of sku")).toBeDefined()
+  })
+
+  it("lists them on the Review step with the 'loaded as empty' line and keeps Load on when the choice is empty", async () => {
+    await toReview(BAD)
+    fireEvent.click(screen.getByLabelText(/Load them as empty/))
+    await goOn()
+    const panel = screen.getByLabelText("Values that do not fit")
+    expect(panel.textContent).toContain("These values are loaded as empty.")
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it("shows nothing extra on the Review step when every value fits, and Load is on", async () => {
+    await toReview(NONE)
+    await goOn()
+    expect(screen.queryByLabelText("Values that do not fit")).toBeNull()
+    // The load waits for the check's answer (review R1), so it is on once the check has answered.
+    await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  // QA fails part A review R2: the QA case's own path. The file's own types fit, the
+  // table's do not, and the check re-runs after "Add to its rows"; the Review step must
+  // list what does not fit. With review R1, Load is off while that check is still running.
+  it("lists the values that do not fit after 'Add to its rows', and Load waits for the check", async () => {
+    url.search = "?id=up-1"
+    let release: (() => void) | null = null
+    const held = new Promise<Response>((resolve) => {
+      release = () => resolve(json(BAD))
+    })
+    const calls = stubFetch({
+      get: () => upload(),
+      list: [upload({ id: "up-0", status: "ingested", bronzeTable: "stock", assetId: "stock" })],
+      preview: (q) =>
+        preview({
+          columns: ["SKU", "Qty", "Due"],
+          // The table's types: the sku is a number there, so the file's "A-1" does not fit.
+          columnSpecs: typedColumns().map((c) =>
+            q.get("table") ? { ...c, type: "integer", guessedType: "integer" } : c,
+          ),
+          fromTable: q.get("table") !== null,
+          sampledRows: 3,
+        }),
+      // The file's own types fit; the table's do not, and that answer is held until the
+      // test lets it come, so the check is still running when the Review step opens.
+      check: (body) => (body.columns[0].type === "integer" ? held : NONE),
+    })
+    render(<UploadFilePage />)
+    await screen.findByLabelText("Type of qty")
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(await screen.findByRole("radio", { name: "Add to its rows" }))
+    // The preview is read again with the table, and the check is asked with the table's types.
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (c) =>
+            c.url.endsWith("/check") &&
+            (c.body as { columns: { type: string }[] }).columns[0].type === "integer",
+        ),
+      ).toBe(true),
+    )
+    fireEvent.click(next())
+    // The check has not answered yet: the Review step says so, and the load waits (review R1).
+    expect(await screen.findByText("Checking the values against the columns…")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(true)
+    release!()
+    const panel = await screen.findByLabelText("Values that do not fit")
+    expect(panel.textContent).toContain("2 values do not fit")
+    expect(within(panel).getByText("A-1")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it("keeps Next off until 'day first or month first?' is answered", async () => {
     const asking = typedColumns()
     asking[2] = { source: "Due", name: "due", type: "date", guessedType: "date", askDateOrder: true }
@@ -1555,6 +1669,8 @@ describe("UploadFilePage, column types", () => {
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
     fireEvent.click(next())
+    // The load waits for the check's answer (review R1); the check re-runs after the change.
+    await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
     const body = calls.find((c) => c.url.endsWith("/ingest"))?.body as { columns: { name: string }[] }

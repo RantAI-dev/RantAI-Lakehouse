@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/popover";
 import { Separator } from "@/components/ui/separator";
 import { getDefaultFilterOperator } from "@/lib/data-table";
+import { newRunId } from "@/lib/run-id";
 import { useDataTableFilters } from "@/hooks/use-data-table-filters";
 import { cn } from "@/lib/utils";
 
@@ -78,7 +79,8 @@ export function DataTableAdvancedFilterPanel<TData>({
         operator: getDefaultFilterOperator(
           target.columnDef.meta?.variant ?? "text"
         ),
-        filterId: crypto.randomUUID().slice(0, 8),
+        // QA LH-DATA-11-08: no `crypto.randomUUID` over plain http, `newRunId` has a fallback.
+        filterId: newRunId().slice(0, 8),
       },
     ]);
   }, [columns, filters.length, setFiltersAndResetPage]);
@@ -96,7 +98,8 @@ export function DataTableAdvancedFilterPanel<TData>({
       const index = filters.findIndex((item) => item.filterId === filterId);
       const duplicate = {
         ...source,
-        filterId: crypto.randomUUID().slice(0, 8),
+        // QA LH-DATA-11-08: no `crypto.randomUUID` over plain http, `newRunId` has a fallback.
+        filterId: newRunId().slice(0, 8),
         value: Array.isArray(source.value) ? [...source.value] : source.value,
       };
       const next = [...filters];
