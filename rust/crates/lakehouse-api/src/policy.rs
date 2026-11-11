@@ -298,7 +298,8 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // ── Overview / alerts: no seeded resource maps to these — auth only. ─
     ("GET",  "/api/overview",                                Policy::RequiresAuth),
     ("POST", "/api/overview",                                Policy::RequiresAuth),
-    ("GET",  "/api/overview/alerts",                          Policy::RequiresAuth),
+    // ADM-13 (D10.3), ADM-13 review round 1, B3: Home alerts list takes the same any-of as GET /api/alerts
+    ("GET",  "/api/overview/alerts",                          Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
     ("POST", "/api/overview/alerts/{id}/acknowledge",         Policy::RequiresAuth),
     ("POST", "/api/overview/alerts/{id}/resolve",             Policy::RequiresAuth),
     ("POST", "/api/overview/alerts/{id}/silence",             Policy::RequiresAuth),

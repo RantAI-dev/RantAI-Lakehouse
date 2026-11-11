@@ -4135,3 +4135,42 @@ async fn permissions_route_is_gated_in_both_directions() {
     let allowed = request_with_cookie(&router, "GET", "/api/identity/permissions", &cookie).await;
     assert_eq!(allowed.status(), StatusCode::OK);
 }
+
+/// ADM-13 (D10.2), ADM-13 review round 1, B3:
+/// `GET /api/notifications` is RequiresAuth, but a `dashboard:read`-only principal
+/// gets empty `openAlerts` and `pendingApprovals` without error.
+#[tokio::test]
+async fn notifications_returns_empty_alerts_and_approvals_for_dashboard_read_principal() {
+    let TestApp { router, pool } = spin_up().await;
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+
+    let resp = request_with_cookie(&router, "GET", "/api/notifications", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+    assert_eq!(body["supported"], serde_json::json!(true));
+    assert_eq!(body["openAlerts"], serde_json::json!([]));
+    assert_eq!(body["pendingApprovals"], serde_json::json!([]));
+}
+
+/// ADM-13 (D10.3), ADM-13 review round 1, B3:
+/// `GET /api/overview/alerts` requires alert:read or alert:write; a dashboard:read-only
+/// principal gets 403, and an alert:read principal gets past the gate.
+#[tokio::test]
+async fn overview_alerts_refuses_dashboard_read_principal() {
+    let TestApp { router, pool } = spin_up().await;
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+
+    let resp = request_with_cookie(&router, "GET", "/api/overview/alerts", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let reader = common::create_principal_with_permissions(&pool, "alert:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", "/api/overview/alerts", &cookie).await;
+    assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
+    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+}
