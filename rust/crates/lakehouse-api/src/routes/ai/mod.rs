@@ -254,6 +254,13 @@ struct PreparedChat {
     /// to a tool outside `tools` is refused at dispatch (plan 17); a chat
     /// with no allowlist dispatches as before.
     allowlisted: bool,
+    /// The request's latest user message, exactly as [`prompt::closing`] saw
+    /// it (the mode note is appended to the copy in `messages` later, and
+    /// the loop's pushed messages are nudges and repair requests, not the
+    /// question). `AI-17`: the script gate on the final answer reads this,
+    /// so what the loop pushes mid-turn cannot change which questions are
+    /// checked.
+    latest_user: String,
 }
 
 /// Hard cap on the page context a client may add to the system prompt, in
@@ -761,6 +768,9 @@ async fn prepare_chat(
         tools,
         is_build,
         allowlisted: allow.is_some(),
+        // The same message `system_prompt` read for the closing line: the
+        // latest user message of the request, before any loop message.
+        latest_user: recent_user.last().copied().unwrap_or_default().to_owned(),
     })
 }
 
@@ -881,6 +891,89 @@ async fn model_round_once(
         .await
 }
 
+/// `AI-17` decision 2: the one request for a rewrite that both answer paths
+/// of [`run_chat`] push when an answer to a Latin-script question holds a
+/// CJK character ([`prompt::contains_cjk`]). It names no language: the model
+/// is told to match the question's own.
+const CJK_REWRITE_REQUEST: &str = "Write your answer again in the language of my question, with the same content and no Chinese, Japanese or Korean characters.";
+
+/// What [`cjk_rewrite_round`] decided.
+enum CjkRewrite {
+    /// A usable rewrite: non-empty and free of CJK characters.
+    Clean(String),
+    /// The rewrite was empty or still held a CJK character; the caller keeps
+    /// its first answer.
+    Discarded,
+    /// The streaming client has gone; the caller ends the turn as "stopped".
+    ClientGone,
+}
+
+/// `AI-17` decisions 1-2: one tool-free rewrite round for an answer to a
+/// Latin-script question that holds a CJK character. Sends a `status`
+/// event (a streaming client clears its draft on one, or the rewrite's
+/// deltas would be appended to the CJK text; `AI-17` review fix
+/// (SHOULD-FIX 2), the pattern of the citation repair's `verifying`), pushes
+/// [`CJK_REWRITE_REQUEST`] after the answer it asks about, which the caller
+/// has already pushed as the last message of `messages` (the loop pushes
+/// every round's message; the budget-exhausted path pushes its final one
+/// for this; `AI-17` review fix round 2 (BLOCKER)), asks the model once with
+/// no tools (the
+/// iteration budget's final-answer round is the pattern), and cleans the
+/// reply the way an answer is cleaned on the normal path, since a clean
+/// rewrite becomes that path's answer.
+///
+/// A clean rewrite stays in `messages` with its request, as the model's own
+/// message without any tool call (the round offered no tools, so a call in
+/// the reply has no result to follow it; `AI-17` review fix round 2), so a
+/// later round (the citation repair) sees the answer it is
+/// asked to repair. A discarded one is removed together with its request,
+/// which leaves `messages` as it was and keeps the roles alternating for
+/// that later round (`AI-17` review fix (BLOCKER 1)). A discarded rewrite is
+/// logged with `build_run_id` (the runId of a build tool result this turn,
+/// `none` when there is none), never with the answer text.
+///
+/// # Errors
+/// The model round's own failure, verbatim: the caller's 503 path handles it
+/// like any other round's.
+async fn cjk_rewrite_round(
+    state: &AppState,
+    messages: &mut Vec<LlmMessage>,
+    progress: Progress<'_>,
+    build_run_id: Option<&str>,
+) -> Result<CjkRewrite, lakehouse_llm::LlmError> {
+    if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
+        return Ok(CjkRewrite::ClientGone);
+    }
+    let before = messages.len();
+    messages.push(LlmMessage {
+        role: LlmMessageRole::User,
+        content: Some(CJK_REWRITE_REQUEST.to_owned()),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    });
+    let mut rewrite = model_round(state, messages, &[], progress).await?;
+    let cleaned = strip_repair_preamble(&strip_tool_xml(rewrite.content.as_deref().unwrap_or("")));
+    let discard_reason = if cleaned.trim().is_empty() {
+        Some("came back empty")
+    } else if prompt::contains_cjk(&cleaned) {
+        Some("still held a CJK character")
+    } else {
+        None
+    };
+    if let Some(reason) = discard_reason {
+        messages.truncate(before);
+        tracing::warn!(
+            "the rewrite of an answer to a Latin-script question {reason}; the first answer is kept (build run id: {})",
+            build_run_id.unwrap_or("none")
+        );
+        return Ok(CjkRewrite::Discarded);
+    }
+    rewrite.tool_calls = None;
+    messages.push(rewrite);
+    Ok(CjkRewrite::Clean(cleaned))
+}
+
 /// The agentic loop: ask the model, run the tools it calls (through
 /// [`gate::decide_by_name`]), feed the results back, until it answers
 /// without a tool call or [`MAX_ITER`] rounds pass. Returns the response
@@ -903,12 +996,18 @@ async fn run_chat(
         tools,
         is_build,
         allowlisted,
+        latest_user,
     } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
     let mut chart_created = false;
     let mut repaired = false;
     let mut nudged = false;
+    // `AI-17`: set when this turn's one rewrite has been spent, used or
+    // discarded. The normal path can re-enter its answer block (the empty
+    // answer nudge, the citation repair), and the budget-exhausted path
+    // reads the flag too, so a turn never asks for a second rewrite.
+    let mut cjk_rewritten = false;
     // The conversation so far, which the citation check accepts as
     // evidence (`citations::Evidence`): the system prompt, whose DATA MAP
     // row counts, ranges and distinct counts were read from the data
@@ -969,6 +1068,37 @@ async fn run_chat(
                 });
                 continue;
             }
+            // `AI-17` decisions 1-4: an answer to a Latin-script question
+            // must not carry a CJK character, whatever the prompt said. One
+            // tool-free rewrite is asked for here, before the citation
+            // check; a clean rewrite replaces the answer, and a rewrite
+            // that is not clean keeps the first (logged with the build run
+            // id, never the text). `cjk_rewritten` holds the loop to one rewrite per
+            // turn however often the nudge and the citation repair re-enter
+            // this block.
+            let answer = if !cjk_rewritten
+                && prompt::is_latin_script(&latest_user)
+                && prompt::contains_cjk(&answer)
+            {
+                cjk_rewritten = true;
+                match cjk_rewrite_round(state, &mut messages, progress, build_run_id.as_deref())
+                    .await?
+                {
+                    CjkRewrite::Clean(rewrite) => rewrite,
+                    CjkRewrite::Discarded => answer,
+                    CjkRewrite::ClientGone => {
+                        return Ok(chat_response_body(
+                            "",
+                            &tool_trace,
+                            build_run_id.as_deref(),
+                            chart_created,
+                            Some("stopped"),
+                        ));
+                    }
+                }
+            } else {
+                answer
+            };
             let annotated = citations::annotate_answer_in(&answer, &tool_trace, &conversation);
             let (numbers, omitted) = citations::flagged(&annotated);
             if !repaired && (!numbers.is_empty() || omitted) {
@@ -1203,8 +1333,17 @@ async fn run_chat(
         tool_call_id: None,
         name: None,
     });
-    let final_msg = model_round(state, &messages, &[], progress).await?;
-    let final_answer = final_msg.content.unwrap_or_default();
+    let mut final_msg = model_round(state, &messages, &[], progress).await?;
+    // `AI-17` review fix round 2 (BLOCKER): the final answer joins the
+    // conversation, as the loop does for every round, so a rewrite request
+    // follows the answer it asks about and not the "Give your final answer
+    // now" request. Nothing reads `messages` after this except that
+    // rewrite, so pushing without a condition changes nothing else. The
+    // round offered no tools, so a call in the reply is dropped for the same
+    // reason as in `cjk_rewrite_round`.
+    final_msg.tool_calls = None;
+    let final_answer = final_msg.content.clone().unwrap_or_default();
+    messages.push(final_msg);
     // An empty last answer is never the reply: a model that spent every round
     // on refused calls came back with nothing, and the person saw nothing. The
     // fixed text skips the citation check on purpose, since it has no claim to
@@ -1222,6 +1361,31 @@ async fn run_chat(
     // WS7 item F2: the iteration-budget-exhausted final answer is checked
     // the same way as the normal return path — a model that runs out of
     // tool-calling turns is not exempt from citation checking.
+    // `AI-17`: the same one-rewrite check as the normal return path, before
+    // the citation check. The flag is read here so a turn that already spent
+    // its rewrite inside the loop gets no second one; this path runs once by
+    // construction, so it only ever uses a rewrite the loop left unspent and
+    // does not set the flag itself.
+    let final_answer = if !cjk_rewritten
+        && prompt::is_latin_script(&latest_user)
+        && prompt::contains_cjk(&final_answer)
+    {
+        match cjk_rewrite_round(state, &mut messages, progress, build_run_id.as_deref()).await? {
+            CjkRewrite::Clean(rewrite) => rewrite,
+            CjkRewrite::Discarded => final_answer,
+            CjkRewrite::ClientGone => {
+                return Ok(chat_response_body(
+                    "",
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    Some("stopped"),
+                ));
+            }
+        }
+    } else {
+        final_answer
+    };
     let annotated = citations::annotate_answer_in(&final_answer, &tool_trace, &conversation);
     Ok(chat_response_body(
         &annotated,

@@ -211,12 +211,15 @@ export type { ServerHealth } from "./contracts/version"
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and
 // `DELETE /api/auth/sessions/{id}`. Only `providers`,
-// `listSessions`, and `deleteSession` are registered — the other auth
-// methods (login/logout/me/change-password) stay imported directly by
-// `AuthProvider` and the login/change-password pages; see
+// `listSessions`, `deleteSession` and `passwordRules` are registered — the
+// other auth methods (login/logout/me/change-password) stay imported
+// directly by `AuthProvider` and the login/change-password pages; see
 // `services/clients/auth.ts`'s module doc comment for why the split.
 export const authService = {
   providers: authClient.providers,
   listSessions: authClient.listSessions,
   deleteSession: authClient.deleteSession,
+  // WEB-7: the invite form is its own page, and it states the lengths the
+  // server enforces; registering the read keeps the page on `@/services`.
+  passwordRules: authClient.passwordRules,
 }
