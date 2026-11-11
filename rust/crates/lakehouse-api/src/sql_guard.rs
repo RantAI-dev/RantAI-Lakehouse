@@ -49,6 +49,10 @@ use crate::sql_rewrite::Engine;
 /// Whether `sql` is a read-only statement `engine` may run from Query
 /// Studio.
 ///
+/// Public so the engine-corpus test (`tests/sql_lex_corpus.rs`) can
+/// compare this verdict, statement by statement, with what a
+/// real `ClickHouse` reads; apart from that test, every caller is inside this crate.
+///
 /// Both halves of the check run against [`strip_sql_noise`]'s output
 /// rather than the raw text, which is the difference from the
 /// `query/run/route.ts` guard this was ported from. That guard tested the
@@ -69,7 +73,18 @@ use crate::sql_rewrite::Engine;
 /// ([`crate::sql_lex`]); the caller knows it, and the run path takes it
 /// from the request.
 #[must_use]
-pub(crate) fn is_read_only(sql: &str, engine: Engine) -> bool {
+pub fn is_read_only(sql: &str, engine: Engine) -> bool {
+    // A `$`-run no measured rule reads (`SpanKind::Uncertain`) is a shape
+    // the engine's reading of is unknown; the engine refuses every one the
+    // measurements cover with `SYNTAX_ERROR` (code 62, 2026-11-10). Fail
+    // closed (AGENTS.md principle 3): the whole statement is refused
+    // before any word in it is read.
+    if lex(engine, sql)
+        .iter()
+        .any(|span| span.kind == SpanKind::Uncertain)
+    {
+        return false;
+    }
     let code = strip_sql_noise(sql, engine);
     starts_with_allowed_keyword(&code) && !contains_denied_keyword(&code)
 }
@@ -85,21 +100,29 @@ pub(crate) fn is_read_only(sql: &str, engine: Engine) -> bool {
 /// rather than deleted, so words either side of it cannot be glued into
 /// one.
 ///
-/// Kept: everything the engine reads as code, and the two texts it does
+/// Kept: everything the engine reads as code, and the three texts it does
 /// not read as a comment. The run after a `#` the engine does not read as
 /// a comment start: the engine refuses the statement there, so the text
 /// cannot run. And the tail of a heredoc that is never closed: the engine
 /// reads that tail as code (`ClickHouse` opens a heredoc only when the
 /// closing delimiter is found again in the text), so a denied keyword in
-/// it is a keyword the engine would run. The guard reads both as they
-/// stand.
+/// it is a keyword the engine would run. And a `$`-run no measured rule
+/// reads ([`SpanKind::Uncertain`]): [`is_read_only`] refuses the whole
+/// statement when one is present, so keeping it as it stands here cannot
+/// make a statement pass. The guard reads all three as they stand.
 #[must_use]
 pub(crate) fn strip_sql_noise(sql: &str, engine: Engine) -> String {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(sql.len());
     for span in lex(engine, sql) {
         match span.kind {
-            SpanKind::Code | SpanKind::NotCode | SpanKind::UnclosedHeredoc => {
+            // An `Uncertain` span is kept as it stands, like code: the
+            // guard refuses the whole statement when one is present, so
+            // nothing here can make it pass.
+            SpanKind::Code
+            | SpanKind::NotCode
+            | SpanKind::UnclosedHeredoc
+            | SpanKind::Uncertain => {
                 out.extend(chars[span.start..span.end].iter());
             }
             SpanKind::Comment | SpanKind::Literal => out.push(' '),
@@ -405,6 +428,57 @@ mod engine_aware_rules {
         let sql = "SELECT 1 /* /* */ ; DROP TABLE t */";
         assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
         assert!(!is_read_only(sql, Engine::Trino), "{sql}");
+    }
+
+    // ── the rules measured 2026-11-10 on
+    // `clickhouse/clickhouse-server:26.8` ────────────────────────────────
+
+    /// The `#446` review shape: a `$$` written right after the closed
+    /// heredoc `$$x$$`. When the backward scan crossed into that heredoc
+    /// it read the run as part of one name, the `'` behind it opened a
+    /// string, and the `DROP` hid from this guard. Measured on
+    /// `clickhouse/clickhouse-server:26.8` (2026-11-10): the engine
+    /// refuses every shape of the family with `SYNTAX_ERROR` (code 62) and
+    /// runs nothing in it, so the guard refuses the whole statement — the
+    /// adjacent `$`-run is a construct no measured rule reads.
+    #[test]
+    fn an_adjacent_dollar_run_after_a_closed_heredoc_is_refused() {
+        let sql = "SELECT $$x$$$$ ' $$; DROP TABLE t; SELECT 'z'";
+        assert!(
+            !is_read_only(sql, Engine::ClickHouse),
+            "the shape the engine refuses with code 62 must not pass: {sql}"
+        );
+        assert!(!is_read_only("SELECT $$x$$$$y$$", Engine::ClickHouse));
+        assert!(!is_read_only("SELECT $$x$$$$ ' $$", Engine::ClickHouse));
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10): the
+    /// engine refuses `$'$x$'$` with `SYNTAX_ERROR` at the first `$` and
+    /// `$é$x$é$` with "Unrecognized token" at the non-ASCII character. No
+    /// measured rule reads a `$` before a quote or a non-ASCII character,
+    /// so both statements are refused here rather than guessed.
+    #[test]
+    fn a_dollar_no_measured_rule_reads_is_refused() {
+        assert!(!is_read_only("SELECT $'$x$'$", Engine::ClickHouse));
+        assert!(!is_read_only("SELECT $é$x$é$", Engine::ClickHouse));
+    }
+
+    /// The measured shapes that keep their verdicts: `SELECT $1$x$1$` runs
+    /// on the engine (a heredoc with a digit tag), `SELECT $a-b$x$a-b$`
+    /// parses (a `$` beside name characters is one identifier), `SELECT
+    /// $a b$x$a b$` opens no heredoc (the tag scan stops at the space),
+    /// and `//` is a line comment the engine reads. The last three are
+    /// refused by the engine at parse or analysis time, but the refusal
+    /// happens there and not here, so the guard keeps them allowed.
+    #[test]
+    fn the_measured_heredoc_and_slash_shapes_stay_allowed() {
+        assert!(is_read_only("SELECT $1$x$1$", Engine::ClickHouse));
+        assert!(is_read_only("SELECT $a-b$x$a-b$", Engine::ClickHouse));
+        assert!(is_read_only("SELECT $a b$x$a b$", Engine::ClickHouse));
+        assert!(is_read_only("SELECT 1 // c", Engine::ClickHouse));
+        assert!(is_read_only("SELECT 8 // 3", Engine::ClickHouse));
+        assert!(is_read_only("SELECT 1 // '\n, 2", Engine::ClickHouse));
+        assert!(is_read_only("SELECT 1 /\n-- c\n2", Engine::ClickHouse));
     }
 
     /// `#` starts a comment on `ClickHouse` only when a space or a `!`
