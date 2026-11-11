@@ -1368,24 +1368,15 @@ Migration `0133_pages_per_role.sql` introduces four new read permissions (`assis
 | `Platform Admin` | `*:*` | *(None)* | Unrestricted `*:*` platform administration |
 | `Dashboard Viewer` | `dashboard:read` | *(None)* | Retains `dashboard:read` only; assistant dock and operational pages hidden |
 
-Any custom roles created before the upgrade similarly have `assistant:use,ops:read,alert:read,governance:read` appended unless they held `*:*`.
+Any custom roles created before the upgrade similarly have `assistant:use,ops:read,alert:read,governance:read` appended unless they held `*:*` or already held one of the four.
 
 ### How to take the assistant away from a role
 
-To revoke the AI Copilot assistant from any role:
+To revoke the AI Copilot assistant from any role, use **Administration → Roles**: edit the
+role and uncheck both:
 
-1. **In the Console:** Navigate to **Administration → Roles**, edit the role, and uncheck both:
-   - `assistant:use` (Full interactive build and query assistant)
-   - `assistant:ask` (Read-only conversational analytics assistant)
-2. **Via SQL:** Update the `role` table in Postgres:
-   ```sql
-   UPDATE role
-   SET permissions = trim(both ',' from regexp_replace(
-       regexp_replace(permissions, '(^|,)\s*assistant:(use|ask)\s*(,|$)', '\1\3', 'g'),
-       ',+', ',', 'g'
-   ))
-   WHERE name = '<role_name>';
-   ```
+- `assistant:use` (Full interactive build and query assistant)
+- `assistant:ask` (Read-only conversational analytics assistant)
 
 **Effect on users with that role:**
 - The Copilot dock and composer toggle disappear entirely.
