@@ -108,6 +108,11 @@ pub(crate) async fn read(
     table: &str,
 ) -> Result<Value, ApiError> {
     let key = table_key(table).ok_or_else(|| ApiError::BadRequest(BAD_TABLE.to_owned()))?;
+    // `GOV-7` D6: a table the caller's roles hide is not described, and the
+    // charts that read it are not named — the answer is the same 404 an
+    // unknown asset gets, before any chart is read.
+    let access = crate::routes::catalog::table_access_for(state, principal).await?;
+    crate::routes::catalog::ensure_key_readable_with(&access, &key)?;
     let tenant = crate::tenant_scope::resolve(principal, headers)?;
     let shared = crate::routes::catalog::catalog_tenant_refusal(state, principal, headers)
         .await?

@@ -96,13 +96,18 @@ async fn every_feature_is_off_and_names_what_is_missing() {
             "where": "console",
         })
     );
+    // `ADM-12` review round 2, R2-B2: the connection can now be saved in
+    // Settings, so with nothing set the console owns it and names the two
+    // fields as the form names them — the same shape `consoleAddress` has.
+    // (`D3` still lets the environment own the whole connection once
+    // `OIDC_ISSUER` is set, and then the names are the environment's.)
     assert_eq!(
         feature(&features, "singleSignOn"),
         json!({
             "feature": "singleSignOn",
             "on": false,
-            "missing": ["OIDC_ISSUER", "OIDC_CLIENT_ID"],
-            "where": "server",
+            "missing": ["issuer", "clientId"],
+            "where": "console",
         })
     );
     // `ADM-9`: the assistant's key is the console's to set when the

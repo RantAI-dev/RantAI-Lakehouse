@@ -433,15 +433,25 @@ async fn the_demo_tables_against_the_live_engine() {
         return;
     };
     let ch = lakehouse_clickhouse::ChClient::new(url, "default".to_owned(), String::new());
-    let key_join = super::join_suggestions_value(&ch, Some(VISITS_NAME), Some(CAPACITY_NAME))
-        .await
-        .unwrap();
+    let key_join = super::join_suggestions_value(
+        &ch,
+        &crate::table_access::TableAccess::All,
+        Some(VISITS_NAME),
+        Some(CAPACITY_NAME),
+    )
+    .await
+    .unwrap();
     println!("SUGGEST visits->capacity: {key_join}");
     assert_eq!(key_join["coversRightKey"], true);
     assert_eq!(key_join["pairs"][0]["rank"], "keys");
-    let by_province = super::join_suggestions_value(&ch, Some(VISITS_NAME), Some(VISITS_NAME))
-        .await
-        .unwrap();
+    let by_province = super::join_suggestions_value(
+        &ch,
+        &crate::table_access::TableAccess::All,
+        Some(VISITS_NAME),
+        Some(VISITS_NAME),
+    )
+    .await
+    .unwrap();
     println!("SUGGEST visits->visits: {by_province}");
     // The three key columns are all shared, so the suggested pairs cover the key;
     // the multiplication below comes from a pair set that leaves part of it out,
@@ -452,9 +462,14 @@ async fn the_demo_tables_against_the_live_engine() {
         Some(3),
         "{by_province}"
     );
-    let missing = super::join_suggestions_value(&ch, Some(VISITS_NAME), Some("no_such_mart"))
-        .await
-        .unwrap_err();
+    let missing = super::join_suggestions_value(
+        &ch,
+        &crate::table_access::TableAccess::All,
+        Some(VISITS_NAME),
+        Some("no_such_mart"),
+    )
+    .await
+    .unwrap_err();
     println!("SUGGEST unknown table: {missing:?}");
     // A join on a column that is not unique in the joined table multiplies sums.
     let multiplied = chart(
