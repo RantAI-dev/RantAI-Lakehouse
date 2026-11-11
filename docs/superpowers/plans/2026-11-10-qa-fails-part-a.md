@@ -552,4 +552,32 @@ integration tests: all of it. Rust tests I added or changed, to find in the CI l
 
 ## 9. Slice 2 review
 
-(Planner appends here.)
+Reviewer: Claude Opus, 2026-11-11, on `140087c0` (commits `0f7f6103`..`da55f14c`). Read every
+line of the Rust and TypeScript diff against D6–D10 and AGENTS.md. **No BLOCKER, no SHOULD-FIX.**
+
+- **D6, the plan was wrong and the developer was right.** `ApiError::Forbidden` renders the
+  fixed body `embedding_disabled` (`lakehouse-core/src/error.rs:46-57`, test at `:232`), so
+  `PermissionDenied("gold:export")` (also `403`, `:174`) is the correct variant. The new branch
+  fires only for a `PrincipalId::User` that presented no token; a wrong token and no principal
+  still give `401` (three new unit tests). No existing expectation changed:
+  `tests/gold_publication.rs:236` configures no token, so it stays on the `503` path.
+- **D8.** `Err(e)` goes through `upstream_error::ch_error_as(.., FailedAs::ServiceUnavailable)`
+  with fixed words; `Ok(None)` stays `404`. The two new `sqlx::test`s sit in `tenant_scoping`
+  and use its own helpers (`state_for`, `principal`, `response_json`, `mock_clickhouse`), the
+  same calling pattern as the existing `serving.mart_x` tests. `"Reference:"` comes from the
+  `Display` of the upstream failure (`upstream_error.rs:297`).
+- **D9.** `detail_of` reuses `catalog_governance::grant_summary` (now `pub(super)`) instead of
+  a second copy (rule 4) and reads only `permission`, `grantee`, `expiresAt`. `source_of` keeps
+  `"copilot"` as the fallback, matching the actor label. The developer found no reader of
+  `source` in `src/`, `ops/` or the tests.
+- **D10.** `format_for` takes only the last extension (`sales.parquet/data` stays on the
+  configured format, tested) and is applied after `head`, so a missing object still fails the
+  same way.
+- **Console.** `open-format-card` requests the read-back only after the publication says
+  `canEdit` and hides "Last 5 publish runs" otherwise; `getAsset` uses the file's `errorFor`
+  and tolerates a non-JSON body; the drawer shows "Detail" only when present.
+
+**Not verified by the reviewer:** no Rust check ran on this VM (7.3a). Merge only when CI on the
+PR is green, including `cargo clippy` and the nextest partitions that hold the 11 new Rust
+tests. If CI is red, the first suspect is the D8 outage test (it assumes the mock's `500`
+becomes an `Err` from `clickhouse_source`).
