@@ -6,14 +6,14 @@
 | Backlog | `ADM-11` |
 | Kind | Feature |
 | Spec | `docs/core/specs/adm-11.md` |
-| Status | Planned |
+| Status | In Acceptance |
 | Priority | P2 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | `docs/superpowers/plans/2026-11-09-adm-11-usernames-and-first-password.md` |
 | Started | 2026-11-09 |
-| Shipped | |
-| Evidence | |
+| Shipped | 2026-11-09 |
+| Evidence | PR #442 |
 
 ## Problem
 

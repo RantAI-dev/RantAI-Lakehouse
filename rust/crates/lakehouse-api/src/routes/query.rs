@@ -1591,7 +1591,9 @@ pub(crate) async fn check_statement_would_run(
     sql: &str,
     engine: &str,
 ) -> Result<(), String> {
-    if !is_read_only(sql) {
+    // The statement is read with the rules of the engine the request
+    // names (`SEC-62`), as `run` reads it.
+    if !is_read_only(sql, crate::sql_rewrite::Engine::from_name(engine)) {
         return Err(
             "Only read statements (SELECT/SHOW/DESCRIBE/EXPLAIN) can be proposed.".to_owned(),
         );
@@ -1784,7 +1786,10 @@ pub(crate) async fn run_statement(
     // decisions 3 and 4).
     let tables_read = referenced_table_names(statement, is_trino_engine(engine));
 
-    if !is_read_only(statement) {
+    // The statement is read with the rules of the engine that will run it
+    // (`SEC-62`): a `Trino` statement is not `ClickHouse` text, and the
+    // guard reads each one the way its own engine reads it.
+    if !is_read_only(statement, crate::sql_rewrite::Engine::from_name(engine)) {
         let refusal = ApiError::Unprocessable(
             "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
@@ -2428,7 +2433,9 @@ pub async fn estimate(
     // status and message, and does so before the rewrite below, whose policy
     // prefetch already queries the engine. `EXPLAIN ESTIMATE` is the only
     // statement this route may send, so a non-read never reaches it.
-    if !is_read_only(&sql) {
+    // The estimate always asks `ClickHouse`, so the guard reads the
+    // statement with the `ClickHouse` rules.
+    if !is_read_only(&sql, crate::sql_rewrite::Engine::ClickHouse) {
         return Err(ApiError::Unprocessable(
             "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
@@ -2929,7 +2936,11 @@ pub async fn create_saved(
     if title.is_empty() || sql.is_empty() {
         return Err(ApiError::BadRequest(TITLE_AND_SQL_REQUIRED.to_owned()).into());
     }
-    if !is_read_only(&sql) {
+    // A saved query records no engine — the body names none — so the
+    // guard reads it with the `ClickHouse` rules, as it did before. A run
+    // that names `Trino` reads the same statement with the `Trino` rules,
+    // and may refuse what the save accepted.
+    if !is_read_only(&sql, crate::sql_rewrite::Engine::ClickHouse) {
         return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
     }
     // `QS-5`: the definitions must fit the SQL they are saved with.
@@ -3405,8 +3416,10 @@ pub async fn download(
     // Defense in depth: `routes::query::run` already refused a non-read-only
     // statement at insert time, so this should be unreachable in practice —
     // re-checked here because this route is about to re-execute the stored
-    // SQL, not merely read it back.
-    if !is_read_only(&item.sql) {
+    // SQL, not merely read it back. The download runs on `ClickHouse` only
+    // (the check above), so the guard reads the stored statement with the
+    // `ClickHouse` rules.
+    if !is_read_only(&item.sql, crate::sql_rewrite::Engine::ClickHouse) {
         return Err(ApiError::Unprocessable("stored query is not read-only".to_owned()).into());
     }
 
@@ -3900,6 +3913,7 @@ mod tests {
 
     use super::*;
     use crate::sql_guard::strip_sql_noise;
+    use crate::sql_rewrite::Engine;
 
     fn database_url_for(pool: &PgPool) -> String {
         let options = pool.connect_options();
@@ -4056,7 +4070,10 @@ mod tests {
             "DESC t",
             "EXPLAIN SELECT 1",
         ] {
-            assert!(is_read_only(sql), "expected allowed: {sql}");
+            assert!(
+                is_read_only(sql, Engine::ClickHouse),
+                "expected allowed: {sql}"
+            );
         }
     }
 
@@ -4067,38 +4084,62 @@ mod tests {
             "attach", "detach", "grant", "revoke",
         ] {
             let sql = format!("SELECT 1; {kw} something");
-            assert!(!is_read_only(&sql), "expected denied: {sql}");
+            assert!(
+                !is_read_only(&sql, Engine::ClickHouse),
+                "expected denied: {sql}"
+            );
         }
     }
 
     #[test]
     fn denies_bare_dml() {
-        assert!(!is_read_only("INSERT INTO x VALUES (1)"));
-        assert!(!is_read_only("DROP TABLE x"));
+        assert!(!is_read_only(
+            "INSERT INTO x VALUES (1)",
+            Engine::ClickHouse
+        ));
+        assert!(!is_read_only("DROP TABLE x", Engine::ClickHouse));
     }
 
     #[test]
     fn allows_leading_whitespace() {
-        assert!(is_read_only("   \n\t SELECT 1"));
+        assert!(is_read_only("   \n\t SELECT 1", Engine::ClickHouse));
     }
 
     #[test]
     fn allows_a_comment_before_the_statement() {
         // The editor opens with exactly this shape — a starter comment,
         // then the user's query underneath — and it used to be refused.
-        assert!(is_read_only("-- Write SQL here\nSELECT 1"));
-        assert!(is_read_only("/* c */ SELECT 1"));
-        assert!(is_read_only("# hash comment\nSELECT 1"));
+        assert!(is_read_only(
+            "-- Write SQL here\nSELECT 1",
+            Engine::ClickHouse
+        ));
+        assert!(is_read_only("/* c */ SELECT 1", Engine::ClickHouse));
+        assert!(is_read_only("# hash comment\nSELECT 1", Engine::ClickHouse));
     }
 
     #[test]
     fn a_dml_word_inside_a_comment_or_string_is_not_dml() {
-        assert!(is_read_only("SELECT 1 -- drop this later"));
-        assert!(is_read_only("/* TODO: delete */ SELECT 1"));
-        assert!(is_read_only("SELECT * FROM t WHERE action = 'drop'"));
-        assert!(is_read_only("SELECT 'it''s an update' AS note"));
+        assert!(is_read_only(
+            "SELECT 1 -- drop this later",
+            Engine::ClickHouse
+        ));
+        assert!(is_read_only(
+            "/* TODO: delete */ SELECT 1",
+            Engine::ClickHouse
+        ));
+        assert!(is_read_only(
+            "SELECT * FROM t WHERE action = 'drop'",
+            Engine::ClickHouse
+        ));
+        assert!(is_read_only(
+            "SELECT 'it''s an update' AS note",
+            Engine::ClickHouse
+        ));
         // …but real DML beside a decoy string still is.
-        assert!(!is_read_only("SELECT 'drop' AS a; DROP TABLE t"));
+        assert!(!is_read_only(
+            "SELECT 'drop' AS a; DROP TABLE t",
+            Engine::ClickHouse
+        ));
     }
 
     #[test]
@@ -4106,18 +4147,42 @@ mod tests {
         // Exact spacing is irrelevant to the guard — what matters is that
         // the comment is gone and the words around it are not glued
         // together.
-        let stripped = strip_sql_noise("SELECT 1 -- drop\nFROM t");
+        let stripped = strip_sql_noise("SELECT 1 -- drop\nFROM t", Engine::ClickHouse);
         assert!(!stripped.contains("drop"), "{stripped}");
         assert!(stripped.contains("SELECT 1"), "{stripped}");
         assert!(stripped.contains("FROM t"), "{stripped}");
-        assert_eq!(strip_sql_noise("SELECT /* x */ 1"), "SELECT   1");
         assert_eq!(
-            strip_sql_noise("SELECT 'a' , \"b\" , `c`"),
+            strip_sql_noise("SELECT /* x */ 1", Engine::ClickHouse),
+            "SELECT   1"
+        );
+        assert_eq!(
+            strip_sql_noise("SELECT 'a' , \"b\" , `c`", Engine::ClickHouse),
             "SELECT   ,   ,  "
         );
         // An unterminated quote swallows the rest, which is the safe way
         // round: the guard then sees less, never more.
-        assert_eq!(strip_sql_noise("SELECT 'unterminated"), "SELECT  ");
+        assert_eq!(
+            strip_sql_noise("SELECT 'unterminated", Engine::ClickHouse),
+            "SELECT  "
+        );
+    }
+
+    /// A save request names no engine and the saved row records none, so
+    /// there is no engine to read the statement with at save time: the
+    /// save path reads it with the `ClickHouse` rules, and the run path
+    /// reads it with the rules of the engine the run request names. A
+    /// statement the `ClickHouse` rules hide is refused on a `Trino` run.
+    #[test]
+    fn the_save_path_reads_with_the_clickhouse_rules_and_a_trino_run_with_its_own() {
+        let sql = "SELECT 'a\\'; DROP TABLE t WHERE x = {{v}}";
+        assert!(
+            is_read_only(sql, Engine::ClickHouse),
+            "the save path: {sql}"
+        );
+        assert!(
+            !is_read_only(sql, Engine::from_name("trino")),
+            "the run path: {sql}"
+        );
     }
 
     /// `DATA-21` D2/D4: only the TIMESTAMP form is refused now — a past
@@ -4157,28 +4222,31 @@ mod tests {
 
     #[test]
     fn is_case_insensitive() {
-        assert!(is_read_only("SeLeCt 1"));
-        assert!(!is_read_only("select 1; DeLeTe from t"));
+        assert!(is_read_only("SeLeCt 1", Engine::ClickHouse));
+        assert!(!is_read_only("select 1; DeLeTe from t", Engine::ClickHouse));
     }
 
     #[test]
     fn smuggled_dml_after_select_via_semicolon_is_rejected() {
-        assert!(!is_read_only("SELECT 1 AS a; DELETE FROM t"));
+        assert!(!is_read_only(
+            "SELECT 1 AS a; DELETE FROM t",
+            Engine::ClickHouse
+        ));
     }
 
     #[test]
     fn word_boundary_avoids_false_positive_substring_match() {
         // "createdAt" contains "create" but not as a whole word.
-        assert!(is_read_only("SELECT createdAt FROM t"));
+        assert!(is_read_only("SELECT createdAt FROM t", Engine::ClickHouse));
         // "updated_at" contains "update" but not as a whole word (the
         // trailing `_` is a \w character, so no boundary there).
-        assert!(is_read_only("SELECT updated_at FROM t"));
+        assert!(is_read_only("SELECT updated_at FROM t", Engine::ClickHouse));
     }
 
     #[test]
     fn rejects_statement_starting_with_disallowed_keyword() {
-        assert!(!is_read_only("TRUNCATE t"));
-        assert!(!is_read_only("GRANT SELECT ON t TO u"));
+        assert!(!is_read_only("TRUNCATE t", Engine::ClickHouse));
+        assert!(!is_read_only("GRANT SELECT ON t TO u", Engine::ClickHouse));
     }
 
     #[test]
@@ -5111,6 +5179,126 @@ mod tests {
             let recorded_user = p.id.uuid().to_string();
             assert_eq!(recorded_user, Uuid::nil().to_string());
             assert_ne!(recorded_user, p.display_name);
+        }
+
+        // ── the routes read the statement with the engine's own rules ──
+        //
+        // The guard takes an engine, so a statement is read the way the
+        // engine that will run it reads it. These tests go through the
+        // route functions, so they pin which engine each route reads
+        // with — a unit test of the guard alone cannot: it would pass
+        // with every route wired to the wrong engine.
+
+        /// The run path reads the statement with the rules of the engine
+        /// the request names. `Trino` ends a quoted run at the quote even
+        /// when a `\` precedes it, so the write behind it is code there:
+        /// the run is refused with the read-only sentence, and it is
+        /// refused before the engine is dialed.
+        #[tokio::test]
+        async fn a_trino_run_reads_the_statement_with_the_trino_rules() {
+            let server = MockServer::start().await;
+            let state = test_state_with_trino(&server.uri());
+            let sql = "SELECT 'a\\'; DROP TABLE t; SELECT '";
+            let result = run(
+                State(state),
+                Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
+                trino_body(sql),
+            )
+            .await;
+            let Err(err) = result else {
+                panic!("expected {sql:?} to be refused");
+            };
+            assert_eq!(err.0.status(), 422);
+            assert_eq!(
+                err.0.to_string(),
+                "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
+            );
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("mock server records requests")
+                    .is_empty(),
+                "{sql:?} must never reach Trino"
+            );
+        }
+
+        /// The save path reads the statement with the `ClickHouse` rules.
+        /// The body of a save request names no engine and the saved row
+        /// records none, so there is no other engine to read it with.
+        ///
+        /// This statement is a write the `ClickHouse` rules see: the
+        /// heredoc closes at the second `$$`, so the `DROP` behind it is
+        /// code the engine runs. The `Trino` rules would approve it —
+        /// `Trino` has no heredoc, so the whole text is one quoted run and
+        /// the `DROP` is inside it. The refusal is what proves the save
+        /// path reads with the `ClickHouse` rules.
+        #[tokio::test]
+        async fn the_save_path_reads_with_the_clickhouse_rules() {
+            let server = MockServer::start().await;
+            let state = test_state_with_trino(&server.uri());
+            let sql = "SELECT $$'$$; DROP TABLE t; SELECT '";
+            let result = create_saved(
+                State(state),
+                Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
+                saved_body(sql),
+            )
+            .await;
+            let Err(err) = result else {
+                panic!("expected {sql:?} to be refused");
+            };
+            assert_eq!(err.0.status(), 422);
+            assert_eq!(err.0.to_string(), NOT_READ_ONLY);
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("mock server records requests")
+                    .is_empty(),
+                "the save path dials no engine"
+            );
+        }
+
+        /// The save path lets through what the `ClickHouse` rules
+        /// accept. `ClickHouse` reads `\'` as an escaped quote, so the
+        /// whole text is one string literal and there is no write to
+        /// refuse; the `Trino` rules would refuse it.
+        ///
+        /// The guard must let this statement through, so the request fails
+        /// later — at the store, which has no Postgres here and answers
+        /// 503 — and not with the read-only refusal.
+        #[tokio::test]
+        async fn the_save_path_accepts_what_the_clickhouse_rules_accept() {
+            let server = MockServer::start().await;
+            let state = test_state_with_trino(&server.uri());
+            let sql = "SELECT 'a\\'; DROP TABLE t; SELECT '";
+            let result = create_saved(
+                State(state),
+                Some(principal_with_display_name("alice")),
+                HeaderMap::new(),
+                saved_body(sql),
+            )
+            .await;
+            let Err(err) = result else {
+                panic!("expected the save to fail at the store");
+            };
+            assert_eq!(
+                err.0.status(),
+                503,
+                "the guard must let the statement through: {}",
+                err.0
+            );
+            assert_ne!(err.0.to_string(), NOT_READ_ONLY);
+        }
+
+        /// The body of a save request: a title and the statement.
+        fn saved_body(sql: &str) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({"title": "a saved query", "sql": sql}))
+                    .expect("the body is JSON"),
+            )
         }
     }
 
@@ -6142,9 +6330,11 @@ mod tests {
             let trino = trino_answering_one_row().await;
             let state = state_without_pool("http://unused.invalid", &trino.uri());
 
-            // The guard reads a backslash as an escape. A raw `'\'` would
-            // look unterminated to it and hide the `DROP` from its keyword
-            // scan; the Trino printer writes the backslash as `chr(92)`.
+            // The `Trino` printer writes the backslash as `chr(92)`, so no
+            // raw backslash reaches the statement, and the guard reads the
+            // statement the way `Trino` reads it: a backslash is a plain
+            // character there, so the quoted run ends at its quote and the
+            // `DROP` behind the value stays visible to the keyword scan.
             let (status, message) = refusal(
                 run(
                     State(state),

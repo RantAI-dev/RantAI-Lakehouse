@@ -501,6 +501,7 @@
     "setup": [
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Save Filters"}, "id_at": "board.id"}
     ],
+    "context": "The user is viewing the dashboard \"Eval Save Filters\" (board id: {board}). Time grain: each chart's own. Active filters: none. Tiles and the data they currently show (built-in tiles are not editable):\nnone yet",
     "turns": [
       "Show me 2024 only.",
       "Save this filter as the default for everyone."

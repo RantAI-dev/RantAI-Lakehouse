@@ -21,7 +21,7 @@ Part 1:
 2. Get suggestions for columns and functions while typing, with a line of help per function.
 3. See a mistake marked at its position, and be unable to save a formula that does not check out.
 4. Pick a saved field in any chart on that source, like a column; others with access to the source can pick it too.
-5. Ask the assistant: "add profit as revenue minus cost"; it writes the formula, never SQL, and can explain an existing one.
+5. Ask the assistant: "add profit as revenue minus cost"; it writes the formula, never SQL, and can explain an existing one. In Ask mode it explains an existing field the same way, with `list_calculated_fields`, and runs no SQL for the answer.
 
 Part 2:
 
