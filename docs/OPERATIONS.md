@@ -1857,6 +1857,7 @@ client also sets `OIDC_CLIENT_SECRET`.
 | `OIDC_GROUPS_CLAIM` | no | `groups` | Which token claim carries the caller's groups. |
 | `OIDC_ROLE_MAP` | no | empty | `group=Role Name,...`; a group not named here is ignored. |
 | `OIDC_JIT_PROVISIONING` | no | `false` | Exactly the string `true` (not `TRUE`/`1`/`yes`) creates an `app_user` on first sign-in. |
+| `OIDC_TRUST_EMAIL` | no | `false` | Exactly the string `true` joins an existing account by email even when the token does not carry `email_verified: true` (`SEC-65`). Only for a provider that never sends the claim; check yours with the test sign-in. |
 | `OIDC_CLOCK_SKEW_SECONDS` | no | `60` | Leeway on `exp`/`nbf`; an unparseable value falls back to `60` instead of failing boot. |
 
 **Where the signing keys come from.** With `OIDC_JWKS_URL` unset, the API
@@ -1904,7 +1905,55 @@ The settings form provides:
 - **Provider display name**: Optional friendly name shown on the sign-in button (defaults to `default`).
 - **Groups claim**: The claim key in the ID token that carries groups (defaults to `groups`).
 - **Just-in-time provisioning**: When enabled, creates local user accounts automatically upon first successful sign-in.
+- **Trust this provider's emails**: Off by default. When on, a first sign-in joins an existing account by email even though the provider did not confirm the address (`SEC-65`, below). Read-only when `OIDC_TRUST_EMAIL` is set in the environment.
 - **Role mapping**: Maps external IdP group names to local deployment roles (`admin`, `developer`, `viewer`, etc.).
+
+#### Joining an existing account: a confirmed email is required
+
+When single sign-on creates an account (just-in-time provisioning on) and
+the token carries an email, the API joins it to an existing local account
+with that address only when the provider confirmed the address: the ID
+token must carry `email_verified: true` (backlog `SEC-65`; OpenID Connect
+Core 1.0 section 5.1). A missing claim and `false` mean the same thing — not
+confirmed — because a provider that lets people type any address would
+otherwise let them sign in as an existing Lakehouse user, a Platform Admin
+included.
+
+- **Not confirmed, an account has that address:** the sign-in is refused.
+  Nothing is created and the existing account's row is not changed. The
+  person is sent back to the sign-in page with "Your identity provider did
+  not confirm your email address, so this sign-in cannot be joined to your
+  existing account. Ask an administrator.", and the Audit Log gains
+  `auth.oidc.link_refused` (outcome `refused`) with the provider label and
+  the subject — never the email.
+- **Not confirmed, no account has that address:** a new account is created
+  **without** the email. The unconfirmed address is not stored and is not
+  used as the display name; the username falls back to
+  `preferred_username`, else `sub@<provider>`.
+- **Confirmed, an account has that address:** joined, exactly as before.
+- **A deactivated account** answers as it did before this change (`ADM-4`):
+  the generic credentials refusal, whether the email was confirmed or not.
+- **Someone already joined** (an `auth_identity` row exists for this
+  provider and subject) signs in as before; the rule only decides a *new*
+  join, by email.
+
+**Trusting a provider's emails (`OIDC_TRUST_EMAIL`, default off).** Some
+providers do not send `email_verified`. This document does not claim which
+ones: use **Test sign-in** (Settings → Sign-in), which shows `Email
+verified: Yes`, `No` or `Not reported` for a real token from your provider.
+If it is not `Yes` and those people must reach existing accounts, turn on
+**Trust this provider's emails** in Settings → Sign-in, or set
+`OIDC_TRUST_EMAIL=true` in `.env`. It is one switch for the deployment's one
+provider, off by default; a value in the environment owns it and the console
+shows it read-only. Turning it on says "whatever address this provider
+reports is this person's address", so turn it on only for a provider whose
+accounts you trust to hold the right one. Every change is recorded by the
+existing `settings.sso.update` audit row, naming the field.
+
+**On upgrade.** A first sign-in through single sign-on is no longer joined
+to an existing account unless the provider confirms the email or the switch
+is on. People already joined are unaffected. After the upgrade, check the
+Audit Log for `auth.oidc.link_refused`.
 
 **Testing sign-in.** The **Test sign-in** button tests the current draft settings before saving:
 - It launches an authorization-code flow in a new browser window, using the draft's own discovery document for the authorize, token and key-set addresses — never the saved connection's.
@@ -1916,7 +1965,7 @@ The settings form provides:
 
 Settings defined in the environment (`/opt/rantai-lakehouse/.env`) take precedence over values saved in the console:
 - **Connection as a unit**: If `OIDC_ISSUER` or `OIDC_CLIENT_ID` is set in the environment, the connection parameters (`issuer`, `client ID`, `client secret`, `authorize URL`, `token URL`, `JWKS URL`, and `redirect URI`) are server-owned and become read-only in the console with the label "Set by the server". The server refuses updates to any server-owned field with HTTP 409 (`SET_BY_THE_SERVER`).
-- **Individual settings**: `OIDC_PROVIDER_NAME`, `OIDC_GROUPS_CLAIM`, `OIDC_ROLE_MAP`, and `OIDC_JIT_PROVISIONING` are server-owned only if their specific environment variable is set.
+- **Individual settings**: `OIDC_PROVIDER_NAME`, `OIDC_GROUPS_CLAIM`, `OIDC_ROLE_MAP`, `OIDC_JIT_PROVISIONING` and `OIDC_TRUST_EMAIL` are server-owned only if their specific environment variable is set.
 
 #### Internal IdP via `.env`
 

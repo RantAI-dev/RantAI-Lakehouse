@@ -54,6 +54,9 @@ The assistant's data map, SQL and metric answers follow the rule. Changing a rol
 - A temporary access grant gives a permission, not a table.
 - Dagster's own builds and quality checks run as the system and are not narrowed.
 - Narrowing the Dashboard Viewer role also narrows every embed and public link.
+- A scheduled agent run has no person behind it and is not narrowed either (`SEC-68`).
+- Names are compared without regard to case, as masks are. Two tables that differ only by case share one grant.
+- The check costs one database read per governed request: about 3.4 ms at the median and 4.6 to 5.1 ms at p95, measured in an unoptimised test build on a shared machine (plan, S1 handoff, T5). A release build is not measured.
 
 ## Acceptance checklist
 

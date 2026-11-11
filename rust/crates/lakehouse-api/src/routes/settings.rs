@@ -1970,10 +1970,11 @@ async fn audit_settings_update(
 /// What the person is told when the body is not the SSO fields.
 const SSO_BODY_SHAPE: &str = "body must be {\"issuer\"?: string|null, \"clientId\"?: string|null, \
 \"clientSecret\"?: string|null, \"providerName\"?: string|null, \"groupsClaim\"?: string|null, \
-\"roleMap\"?: array|null, \"jitProvisioning\"?: boolean|null}";
+\"roleMap\"?: array|null, \"jitProvisioning\"?: boolean|null, \"trustEmail\"?: boolean|null}";
 
-/// The fields the body of an SSO save may carry (`ADM-12`, plan D1).
-const SSO_FIELDS: [&str; 7] = [
+/// The fields the body of an SSO save may carry (`ADM-12`, plan D1;
+/// `SEC-65` D3 adds `trustEmail`).
+const SSO_FIELDS: [&str; 8] = [
     "issuer",
     "clientId",
     "clientSecret",
@@ -1981,6 +1982,7 @@ const SSO_FIELDS: [&str; 7] = [
     "groupsClaim",
     "roleMap",
     "jitProvisioning",
+    "trustEmail",
 ];
 
 /// What the person is told when the client ID is not text.
@@ -2000,6 +2002,10 @@ const ROLE_MAP_REFUSED: &str = "roleMap must be a list of {group, role} objects.
 
 /// What the person is told when the JIT provisioning toggle is not a boolean.
 const JIT_REFUSED: &str = "jitProvisioning must be a boolean.";
+
+/// What the person is told when the "trust this provider's emails" toggle is
+/// not a boolean (`SEC-65` D3).
+const TRUST_EMAIL_REFUSED: &str = "trustEmail must be a boolean.";
 
 /// The new value of a boolean field, and whether the stored value moves.
 fn boolean_field(
@@ -2082,6 +2088,7 @@ fn sso_settings_json(
             effective.role_map_source,
         ),
         "jitProvisioning": field_json(effective.jit_provisioning, effective.jit_provisioning_source),
+        "trustEmail": field_json(effective.trust_email, effective.trust_email_source),
         "canEdit": can_edit,
         "ready": not_ready_reason.is_none(),
         "notReadyReason": not_ready_reason,
@@ -2167,6 +2174,10 @@ pub async fn put_sso(
             parsed.contains_key("jitProvisioning"),
             effective.jit_provisioning_source,
         ),
+        (
+            parsed.contains_key("trustEmail"),
+            effective.trust_email_source,
+        ),
     ] {
         if sent && source == Source::Server {
             return Err(ApiError::Conflict(SET_BY_THE_SERVER.to_owned()).into());
@@ -2190,6 +2201,7 @@ pub async fn put_sso(
         .and_then(|c| c.oidc_groups_claim.as_deref());
     let old_role_map = current.as_ref().and_then(|c| c.oidc_role_map.as_ref());
     let old_jit = current.as_ref().and_then(|c| c.oidc_jit_provisioning);
+    let old_trust = current.as_ref().and_then(|c| c.oidc_trust_email);
 
     let (issuer, issuer_changed) =
         sso_issuer_field(&state, parsed.get("issuer"), old_issuer).await?;
@@ -2242,6 +2254,8 @@ pub async fn put_sso(
         role_map_field(parsed.get("roleMap"), old_role_map, &known_roles)?;
     let (jit_provisioning, jit_changed) =
         boolean_field(parsed.get("jitProvisioning"), old_jit, JIT_REFUSED)?;
+    let (trust_email, trust_changed) =
+        boolean_field(parsed.get("trustEmail"), old_trust, TRUST_EMAIL_REFUSED)?;
 
     let mut changed: Vec<&'static str> = Vec::new();
     if issuer_changed {
@@ -2265,6 +2279,9 @@ pub async fn put_sso(
     if jit_changed {
         changed.push("jitProvisioning");
     }
+    if trust_changed {
+        changed.push("trustEmail");
+    }
 
     lakehouse_store::sso_settings::upsert(
         pool,
@@ -2276,6 +2293,7 @@ pub async fn put_sso(
             oidc_groups_claim: groups_claim,
             oidc_role_map: role_map,
             oidc_jit_provisioning: jit_provisioning,
+            oidc_trust_email: trust_email,
         },
         &principal.id.uuid().to_string(),
     )
@@ -2397,6 +2415,21 @@ pub async fn post_sso_test(
         None
     };
 
+    // `SEC-65` D3: the draft carries the switch, so a test sign-in shows
+    // what a provider that does not confirm the email would do with it on.
+    let trust_email = if let Some(v) = parsed.get("trustEmail") {
+        if v.is_null() {
+            None
+        } else {
+            let Some(b) = v.as_bool() else {
+                return Err(ApiError::BadRequest(TRUST_EMAIL_REFUSED.to_owned()).into());
+            };
+            Some(b)
+        }
+    } else {
+        None
+    };
+
     // Client secret: if provided in draft, seal it.
     // If not provided in draft (or null), reuse saved sealed secret or env secret.
     let draft_secret = if let Some(v) = parsed.get("clientSecret") {
@@ -2453,6 +2486,7 @@ pub async fn post_sso_test(
         "groupsClaim": groups_claim,
         "roleMap": role_map_json,
         "jitProvisioning": jit_provisioning,
+        "trustEmail": trust_email,
     });
     let draft_runtime = crate::runtime_settings::sso_runtime_for_settings(
         &state,
@@ -3037,6 +3071,10 @@ mod tests {
         let valid = Bytes::from(r#"{"issuer":"https://idp.example.com","clientId":"client-1"}"#);
         assert!(parse_body(&valid, &SSO_FIELDS, SSO_BODY_SHAPE).is_ok());
 
+        // `SEC-65` D3: the new switch is an accepted field of a save.
+        let with_trust = Bytes::from(r#"{"trustEmail":true}"#);
+        assert!(parse_body(&with_trust, &SSO_FIELDS, SSO_BODY_SHAPE).is_ok());
+
         let unknown = Bytes::from(r#"{"issuer":"https://idp.example.com","extra":123}"#);
         let err = parse_body(&unknown, &SSO_FIELDS, SSO_BODY_SHAPE).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(msg) if msg == SSO_BODY_SHAPE));
@@ -3101,6 +3139,8 @@ mod tests {
             role_map_source: Source::Console,
             jit_provisioning: true,
             jit_provisioning_source: Source::Console,
+            trust_email: false,
+            trust_email_source: Source::Default,
             authorize_url: None,
             authorize_url_source: Source::Default,
             token_url: None,
@@ -3117,6 +3157,10 @@ mod tests {
         assert_eq!(json_val["issuer"]["source"], "console");
         assert_eq!(json_val["clientSecret"]["set"], true);
         assert_eq!(json_val["clientSecret"]["source"], "console");
+        // `SEC-65` D3: the switch is reported like every other field, with
+        // where its value came from.
+        assert_eq!(json_val["trustEmail"]["value"], false);
+        assert_eq!(json_val["trustEmail"]["source"], "default");
         assert_eq!(json_val["canEdit"], true);
         assert_eq!(json_val["ready"], true);
         assert_eq!(json_val["notReadyReason"], serde_json::Value::Null);

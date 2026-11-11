@@ -1131,6 +1131,47 @@ impl PolicyView {
     }
 }
 
+/// The body of `GET /api/governance/row-filter-grammar` (`WEB-8` S2 T8,
+/// D8; forms added by S2 review round 1, S2): the function names, operator
+/// tokens and expression forms [`row_filter_grammar`] serves, read directly
+/// from the constants in [`crate::sql_rewrite`] — never a second list, so a
+/// change to what a save accepts changes the console's help line with it.
+#[derive(Debug, Serialize)]
+pub struct RowFilterGrammar {
+    /// Function names, in `ALLOWED_ROW_FILTER_FUNCTIONS`'s order.
+    functions: &'static [&'static str],
+    /// Operator tokens, in `ALLOWED_ROW_FILTER_OPERATORS`'s order.
+    operators: &'static [&'static str],
+    /// Expression forms, in `ALLOWED_ROW_FILTER_FORMS`'s order.
+    forms: &'static [&'static str],
+}
+
+/// `GET /api/governance/row-filter-grammar` (`WEB-8` S2 T8, D8; forms added
+/// by S2 review round 1, S2) — the functions, operators and forms a row
+/// filter may use. Gated by `policy:read` in
+/// [`POLICY_TABLE`](crate::policy::POLICY_TABLE): the same grant that lists
+/// the policies this grammar authors.
+///
+/// The answer is built from
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_FUNCTIONS`],
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_OPERATORS`] and
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_FORMS`] (rule 4: no second copy,
+/// in Rust or TypeScript). The forms are shapes rather than a membership
+/// list; the test below feeds each name back to the validator, which is what
+/// keeps this list honest.
+///
+/// # Errors
+///
+/// This handler has no failing path; it returns `ApiResult` only so every
+/// route in this crate has the same `ApiResult<ApiJson<T>>` shape.
+pub async fn row_filter_grammar() -> ApiResult<ApiJson<RowFilterGrammar>> {
+    Ok(ApiJson(RowFilterGrammar {
+        functions: crate::sql_rewrite::ALLOWED_ROW_FILTER_FUNCTIONS,
+        operators: crate::sql_rewrite::ALLOWED_ROW_FILTER_OPERATORS,
+        forms: crate::sql_rewrite::ALLOWED_ROW_FILTER_FORMS,
+    }))
+}
+
 /// `GET /api/governance/policies` — every authored policy, each with the
 /// engine's verdict on whether it can be enforced (`SEC-61`) and the catalog
 /// asset it governs, where one can be named (`WEB-3` S3a-D1).
@@ -2028,6 +2069,89 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `WEB-8` S2 T8 (D8): the grammar route's answer is what the validator
+    /// accepts. Every function and operator the route names is accepted in a
+    /// filter, and a function and an operator it does not name are refused —
+    /// which is why the route reads the validator's own constants instead of
+    /// carrying a list of its own.
+    #[tokio::test]
+    async fn row_filter_grammar_names_only_what_the_validator_accepts() {
+        use crate::sql_rewrite::{Engine, validate_row_filter_expr};
+
+        let columns = vec!["a".to_owned(), "b".to_owned()];
+        let grammar = row_filter_grammar()
+            .await
+            .expect("the route has no failure path")
+            .0;
+
+        for function in grammar.functions {
+            let filter = format!("{function}(a) = 1");
+            assert!(
+                validate_row_filter_expr(&filter, &columns, Engine::ClickHouse).is_ok(),
+                "the route names function '{function}' but the validator refuses '{filter}'"
+            );
+        }
+        for operator in grammar.operators {
+            let filter = match *operator {
+                "=" => "a = 1".to_owned(),
+                "<>" => "a <> 1".to_owned(),
+                "<" => "a < 1".to_owned(),
+                "<=" => "a <= 1".to_owned(),
+                ">" => "a > 1".to_owned(),
+                ">=" => "a >= 1".to_owned(),
+                "AND" => "a = 1 AND b = 2".to_owned(),
+                "OR" => "a = 1 OR b = 2".to_owned(),
+                "+" => "a + 1 = 2".to_owned(),
+                "-" => "a - 1 = 0".to_owned(),
+                "*" => "a * 2 = 2".to_owned(),
+                "/" => "a / 2 = 1".to_owned(),
+                "%" => "a % 2 = 1".to_owned(),
+                "NOT" => "NOT a = 1".to_owned(),
+                other => panic!("the route names operator '{other}' with no filter in this test"),
+            };
+            assert!(
+                validate_row_filter_expr(&filter, &columns, Engine::ClickHouse).is_ok(),
+                "the route names operator '{operator}' but the validator refuses '{filter}'"
+            );
+        }
+
+        assert!(
+            validate_row_filter_expr("nope(a) = 1", &columns, Engine::ClickHouse).is_err(),
+            "the validator accepts a function the route does not name"
+        );
+        assert!(
+            validate_row_filter_expr("a || b", &columns, Engine::ClickHouse).is_err(),
+            "the validator accepts an operator the route does not name"
+        );
+
+        // `WEB-8` S2 review round 1, S2: one filter per named form, checked
+        // on both engines the validator knows — the forms are match arms, not
+        // a membership list, so this loop is what ties the constant to the
+        // arms. `a IS TRUE` is a shape the validator refuses and the route
+        // does not name.
+        for form in grammar.forms {
+            let filter = match *form {
+                "LIKE" => "a LIKE 'x%'",
+                "ILIKE" => "a ILIKE 'x%'",
+                "BETWEEN" => "a BETWEEN 1 AND 2",
+                "IN" => "a IN (1, 2)",
+                "IS NULL" => "a IS NULL",
+                "IS NOT NULL" => "a IS NOT NULL",
+                other => panic!("the route names form '{other}' with no filter in this test"),
+            };
+            for engine in [Engine::ClickHouse, Engine::Trino] {
+                assert!(
+                    validate_row_filter_expr(filter, &columns, engine).is_ok(),
+                    "the route names form '{form}' but the validator refuses '{filter}' on {engine:?}"
+                );
+            }
+        }
+        assert!(
+            validate_row_filter_expr("a IS TRUE", &columns, Engine::ClickHouse).is_err(),
+            "the validator accepts a form the route does not name"
+        );
+    }
 
     #[test]
     fn create_policy_rejects_a_conditions_blob_with_no_real_obligation() {

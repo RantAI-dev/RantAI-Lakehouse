@@ -171,3 +171,31 @@ describe("SubscriptionsDialog", () => {
     expect(calls.length).toBeGreaterThan(0)
   })
 })
+
+describe("the subscription time zone picker (WEB-8 D8)", () => {
+  it("offers the zone names listTimeZones names, including UTC and the report's own zone", async () => {
+    mockApi()
+    render(<SubscriptionsDialog {...props} />)
+    fireEvent.click(await screen.findByRole("button", { name: "New subscription" }))
+    const field = screen.getByLabelText("Time zone") as HTMLInputElement
+    expect(field.getAttribute("list")).toBe("subscription-time-zones")
+    const names = Array.from(document.querySelectorAll("#subscription-time-zones option")).map(
+      (o) => o.getAttribute("value")
+    )
+    expect(names).toContain("UTC")
+    expect(names).toContain("Asia/Jakarta")
+    expect(names).toContain("Europe/Berlin")
+  })
+
+  it("sends the zone picked from the list", async () => {
+    const calls = mockApi()
+    render(<SubscriptionsDialog {...props} />)
+    fireEvent.click(await screen.findByRole("button", { name: "New subscription" }))
+    // A zone the list offers, chosen as a datalist choice would set it.
+    fireEvent.change(screen.getByLabelText("Time zone"), { target: { value: "Europe/Berlin" } })
+    fireEvent.click(screen.getByRole("button", { name: "Subscribe" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "POST")).toBe(true))
+    const post = calls.find((c) => c.method === "POST")?.body as Record<string, unknown>
+    expect(post.timeZone).toBe("Europe/Berlin")
+  })
+})

@@ -89,6 +89,7 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
   const [providerName, setProviderName] = React.useState("")
   const [groupsClaim, setGroupsClaim] = React.useState("")
   const [jitProvisioning, setJitProvisioning] = React.useState(false)
+  const [trustEmail, setTrustEmail] = React.useState(false)
   const [roleMapRows, setRoleMapRows] = React.useState<RoleMapRow[]>([])
 
   const [dismissedTest, setDismissedTest] = React.useState(false)
@@ -106,6 +107,7 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
     setProviderName(loaded.providerName.value ?? "")
     setGroupsClaim(loaded.groupsClaim.value ?? "")
     setJitProvisioning(loaded.jitProvisioning.value ?? false)
+    setTrustEmail(loaded.trustEmail.value ?? false)
     setRoleMapRows(loaded.roleMap.value ?? [])
   }, [loaded])
 
@@ -146,6 +148,9 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
     if (loaded.jitProvisioning.source !== "server") {
       input.jitProvisioning = jitProvisioning
     }
+    if (loaded.trustEmail.source !== "server") {
+      input.trustEmail = trustEmail
+    }
     if (loaded.roleMap.source !== "server") {
       input.roleMap = roleMapRows
         .map((r) => ({ group: r.group.trim(), role: r.role.trim() }))
@@ -172,6 +177,7 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
       providerName: providerName.trim() === "" ? null : providerName.trim(),
       groupsClaim: groupsClaim.trim() === "" ? null : groupsClaim.trim(),
       jitProvisioning,
+      trustEmail,
       roleMap: roleMapRows
         .map((r) => ({ group: r.group.trim(), role: r.role.trim() }))
         .filter((r) => r.group !== "" && r.role !== ""),
@@ -287,6 +293,15 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
                         : "No"}
                   </span>
                 </p>
+                {/* `SEC-65` D6: say what the missing confirmation means
+                    before it is saved, and the same sentence is the one an
+                    administrator can act on. */}
+                {testResult.emailVerified !== true && !trustEmail ? (
+                  <p className="text-muted-foreground">
+                    This provider did not confirm the email. Existing accounts will not be
+                    joined unless you trust this provider&apos;s emails.
+                  </p>
+                ) : null}
               </div>
             )
           ) : null}
@@ -437,6 +452,27 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
               />
               <Label htmlFor="sso-jit-provisioning" className="text-xs font-normal text-muted-foreground">
                 Create accounts for new SSO users automatically.
+              </Label>
+            </div>
+          </SettingField>
+
+          <SettingField
+            label="Trust this provider's emails"
+            source={loaded.trustEmail.source}
+            id="sso-trust-email"
+          >
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="sso-trust-email"
+                aria-label="Trust this provider's emails"
+                checked={trustEmail}
+                onCheckedChange={(checked) => setTrustEmail(Boolean(checked))}
+                disabled={!canEdit || loaded.trustEmail.source === "server"}
+              />
+              <Label htmlFor="sso-trust-email" className="text-xs font-normal text-muted-foreground">
+                Join an existing account by email even when the provider does not confirm
+                the address. Off by default: only turn this on for a provider that never
+                sends the confirmation.
               </Label>
             </div>
           </SettingField>

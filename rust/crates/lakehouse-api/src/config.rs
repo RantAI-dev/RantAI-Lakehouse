@@ -586,6 +586,14 @@ pub struct Config {
     pub oidc_jit_provisioning: bool,
     /// Whether `OIDC_JIT_PROVISIONING` was set and non-empty in the environment.
     pub oidc_jit_provisioning_from_env: bool,
+    /// Whether this provider's emails are trusted even when the token does
+    /// not carry `email_verified: true` (`SEC-65` D3). Default `false` —
+    /// the safe value the task establishes. `true` only when
+    /// `OIDC_TRUST_EMAIL` is exactly `"true"` (`AGENTS.md`: booleans from
+    /// the environment are parsed that way).
+    pub oidc_trust_email: bool,
+    /// Whether `OIDC_TRUST_EMAIL` was set and non-empty in the environment.
+    pub oidc_trust_email_from_env: bool,
     /// Maps an `OIDC` group/role claim value to a local `role.name`, parsed
     /// from `OIDC_ROLE_MAP` (e.g.
     /// `"lakehouse-admins=Platform Admin,analysts=Analyst"`). Empty when
@@ -1232,6 +1240,8 @@ impl std::fmt::Debug for Config {
                 "oidc_jit_provisioning_from_env",
                 &self.oidc_jit_provisioning_from_env,
             )
+            .field("oidc_trust_email", &self.oidc_trust_email)
+            .field("oidc_trust_email_from_env", &self.oidc_trust_email_from_env)
             .field("oidc_role_map", &self.oidc_role_map)
             .field("oidc_role_map_from_env", &self.oidc_role_map_from_env)
             .field("oidc_groups_claim", &self.oidc_groups_claim)
@@ -1817,6 +1827,8 @@ impl Config {
                 .get("OIDC_JIT_PROVISIONING")
                 .is_some_and(|v| v == "true"),
             oidc_jit_provisioning_from_env: truthy(env, "OIDC_JIT_PROVISIONING").is_some(),
+            oidc_trust_email: env.get("OIDC_TRUST_EMAIL").is_some_and(|v| v == "true"),
+            oidc_trust_email_from_env: truthy(env, "OIDC_TRUST_EMAIL").is_some(),
             oidc_role_map: parse_role_map(env.get("OIDC_ROLE_MAP").map_or("", String::as_str)),
             oidc_role_map_from_env: truthy(env, "OIDC_ROLE_MAP").is_some(),
             oidc_groups_claim: truthy(env, "OIDC_GROUPS_CLAIM")

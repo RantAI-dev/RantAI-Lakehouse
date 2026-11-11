@@ -162,6 +162,17 @@ pub struct OidcConfig {
     /// over-broad issuer/audience configuration would otherwise let any
     /// token that merely validates mint an account.
     pub jit_provisioning: bool,
+    /// Whether this connection's emails are trusted even when the provider
+    /// did not confirm them (`SEC-65` D3). Defaults to `false`.
+    ///
+    /// With `false`, [`OidcAuthenticator::provision_user`] joins an
+    /// existing account by email only when the token carries
+    /// `email_verified: true`; a missing or `false` claim is treated the
+    /// same (not confirmed). Some providers never send the claim, so an
+    /// administrator can turn this on for one connection instead of
+    /// leaving everyone unable to reach their existing account (`D3`,
+    /// default off).
+    pub trust_email: bool,
     /// Maps an external group/role claim value (e.g. an Okta group name)
     /// to a local `role.name`. Unmapped groups are ignored, not fatal —
     /// see [`OidcAuthenticator::mapped_permissions`].
@@ -175,8 +186,9 @@ pub struct OidcConfig {
 
 impl OidcConfig {
     /// Build a config with [`DEFAULT_CLOCK_SKEW_SECONDS`] clock skew, no
-    /// role mapping, JIT provisioning off, and `jwks_url` set explicitly —
-    /// the safe defaults a caller only needs to override explicitly.
+    /// role mapping, JIT provisioning off, this provider's emails not
+    /// trusted (`SEC-65` D3), and `jwks_url` set explicitly — the safe
+    /// defaults a caller only needs to override explicitly.
     #[must_use]
     pub fn new(
         issuer: impl Into<String>,
@@ -190,6 +202,7 @@ impl OidcConfig {
             provider_name: provider_name.into(),
             jwks_url: Some(jwks_url.into()),
             jit_provisioning: false,
+            trust_email: false,
             role_map: HashMap::new(),
             groups_claim: "groups".to_owned(),
             clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
@@ -210,6 +223,7 @@ impl OidcConfig {
             provider_name: provider_name.into(),
             jwks_url: None,
             jit_provisioning: false,
+            trust_email: false,
             role_map: HashMap::new(),
             groups_claim: "groups".to_owned(),
             clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
@@ -1118,6 +1132,40 @@ impl OidcAuthenticator {
     /// account with two linked identities, not two accounts with the same
     /// email.
     ///
+    /// # The email must be confirmed before it can join an account (`SEC-65`)
+    ///
+    /// An email is only evidence of identity when the provider vouched for
+    /// it: the token's `email_verified` claim must be exactly `true`, or
+    /// this connection must be marked as trusting its provider's emails
+    /// ([`OidcConfig::trust_email`], D3). A missing claim and `false` mean
+    /// the same thing — not confirmed (D1) — because a provider that lets
+    /// people type any address, or an account that was never confirmed,
+    /// would otherwise let anyone sign in as an existing Lakehouse user by
+    /// claiming its email (the account takeover this task closes).
+    ///
+    /// The three outcomes when the email is not confirmed:
+    ///
+    /// * an **active** account holds that email: the sign-in is refused
+    ///   with [`AuthError::EmailNotVerified`] and nothing is created or
+    ///   changed (D2). The refusal is audited here, where the provider
+    ///   label and the subject are known, because the error variant
+    ///   deliberately carries no claim text. The existing row is only ever
+    ///   READ in this case, never used as the target account.
+    /// * **no** account holds that email: a new account is created WITHOUT
+    ///   the email (D4) — an unconfirmed address is neither stored nor
+    ///   mailed, and cannot block a real person's account later. The
+    ///   username falls back exactly as it does today when there is no
+    ///   email (`preferred_username`, else `sub@provider`), and the
+    ///   unconfirmed address is not used as the display name either.
+    /// * a **deactivated** account holds that email: see below — it is
+    ///   refused first, whether the email was confirmed or not.
+    ///
+    /// A person who already has an `auth_identity` row for this
+    /// provider/subject never reaches this function at all
+    /// ([`OidcAuthenticator::resolve_principal`] finds them by
+    /// `(provider, external_subject)` first), so an existing join keeps
+    /// signing in with no `email_verified` claim (D5).
+    ///
     /// # A deactivated account is NOT re-provisioned (ADM-4 D4)
     ///
     /// An `app_user` with the same email but `status = 'inactive'` is a
@@ -1126,14 +1174,18 @@ impl OidcAuthenticator {
     /// to walk around the deactivation with nothing but the identity
     /// provider. So the sign-in is refused instead: the same
     /// [`AuthError::InvalidCredentials`] every other failure here answers
-    /// with, so nothing about the account's state leaks.
+    /// with, so nothing about the account's state leaks. `SEC-65` keeps
+    /// this check first and its answer unchanged: a deactivated account
+    /// answers `InvalidCredentials` whether the email was confirmed or
+    /// not, so the new refusal cannot become an oracle for account state.
     ///
     /// # Errors
     ///
     /// Returns [`AuthError::InvalidCredentials`] if the email belongs to a
-    /// deactivated account, [`AuthError::Conflict`] on an email race (two
-    /// concurrent first-time logins), or [`AuthError::Database`] on any
-    /// other storage failure.
+    /// deactivated account, [`AuthError::EmailNotVerified`] if it belongs
+    /// to an active account the provider did not confirm, [`AuthError::Conflict`]
+    /// on an email race (two concurrent first-time logins), or
+    /// [`AuthError::Database`] on any other storage failure.
     async fn provision_user(&self, claims: &OidcClaims) -> Result<Uuid, AuthError> {
         let email = claims.email.as_deref().and_then(|e| {
             let trimmed = e.trim();
@@ -1143,11 +1195,20 @@ impl OidcAuthenticator {
                 Some(trimmed.to_owned())
             }
         });
+        // `SEC-65` D1/D3: only a confirmed email (or one from a connection
+        // whose provider emails are trusted) may join an existing account
+        // or be stored. `None` and `Some(false)` are the same: not
+        // confirmed.
+        let email_confirmed = claims.email_verified == Some(true) || self.config.trust_email;
+        // The address that may be written to `app_user`: an unconfirmed
+        // one is not a fact about the person, so it is not stored, not
+        // mailed and not used as the display name (D4).
+        let email_for_storage = email.as_ref().filter(|_| email_confirmed);
         let name = claims
             .name
             .clone()
             .or_else(|| claims.preferred_username.clone())
-            .or_else(|| email.clone())
+            .or_else(|| email_for_storage.cloned())
             .unwrap_or_else(|| claims.sub.clone());
 
         let mut tx = self.pool.begin().await?;
@@ -1158,7 +1219,12 @@ impl OidcAuthenticator {
             .execute(&mut *tx)
             .await?;
 
-        // ADM-11 D10: Linking an existing account by email is unchanged.
+        // `ADM-11` D10 linked an existing account by email here. `SEC-65`
+        // D2 still has to know whether an account holds the address — that
+        // is what decides "refuse" from "create one without the email" —
+        // but D1 says the row is joined only when the email is confirmed,
+        // so the value read below is never used as the target unless
+        // `email_confirmed` is true.
         let existing_user: Option<(Uuid, String)> = if let Some(ref em) = email {
             sqlx::query_as("SELECT id, status FROM app_user WHERE lower(email) = lower($1)")
                 .bind(em)
@@ -1170,21 +1236,38 @@ impl OidcAuthenticator {
 
         let app_user_id = if let Some((id, status)) = existing_user {
             // ADM-4 D4: a deactivated account is refused, never
-            // re-provisioned — and the row is left exactly as it is.
+            // re-provisioned — and the row is left exactly as it is. This
+            // check stays FIRST and its answer stays `InvalidCredentials`
+            // whether the email was confirmed or not, exactly as before
+            // `SEC-65` (D2).
             if status != "active" {
                 return Err(AuthError::InvalidCredentials);
+            }
+            if !email_confirmed {
+                // `SEC-65` D2: nothing is created and nothing is changed;
+                // the existing account's row is untouched. The transaction
+                // has only read so far, so rolling it back changes
+                // nothing — do it before the audit write, which must not
+                // disappear with a rolled-back transaction.
+                if let Err(err) = tx.rollback().await {
+                    tracing::warn!(error = %err, "rolling back the refused link failed");
+                }
+                self.audit_link_refused(&claims.sub).await;
+                return Err(AuthError::EmailNotVerified);
             }
             id
         } else {
             // ADM-11 D10: Username is lower(claims.preferred_username) if it passes D3/D5,
             // else lower(email), else lower(sub)@<provider>. A clash gets -2, -3, ...
+            // `SEC-65` D4: the email candidate is absent when the address
+            // was not confirmed, so the fallback is exactly the one for a
+            // token that carries no email.
             let preferred_candidate = claims
                 .preferred_username
                 .as_deref()
                 .and_then(|u| lakehouse_store::identity::normalize_username(u).ok());
 
-            let email_candidate = email
-                .as_deref()
+            let email_candidate = email_for_storage
                 .and_then(|e| lakehouse_store::identity::normalize_username(e).ok());
 
             let fallback_candidate = {
@@ -1216,7 +1299,7 @@ impl OidcAuthenticator {
             )
             .bind(&name)
             .bind(&candidate)
-            .bind(&email)
+            .bind(email_for_storage.map(String::as_str))
             .fetch_one(&mut *tx)
             .await?;
             id
@@ -1235,6 +1318,35 @@ impl OidcAuthenticator {
 
         tx.commit().await?;
         Ok(app_user_id)
+    }
+
+    /// Record a refused join (`SEC-65` D2): `auth.oidc.link_refused`,
+    /// `outcome = 'refused'`, with the provider label and the subject.
+    /// Never the email — it is the value the provider did not confirm.
+    ///
+    /// Written here rather than in the route because the route only sees
+    /// [`AuthError::EmailNotVerified`], which deliberately carries no
+    /// claim text out of this crate. Best-effort, like every other audit
+    /// write: a failed audit insert is logged and swallowed, so the caller
+    /// still gets the refusal rather than a storage error.
+    async fn audit_link_refused(&self, subject: &str) {
+        let event = lakehouse_store::audit::NewAuditEvent {
+            action: "auth.oidc.link_refused".to_owned(),
+            resource_kind: Some("auth_identity".to_owned()),
+            args: Some(serde_json::json!({
+                "provider": self.provider_label,
+                "subject": subject,
+            })),
+            outcome: "refused".to_owned(),
+            ..Default::default()
+        };
+        if let Err(err) = lakehouse_store::audit::insert(&self.pool, event).await {
+            tracing::warn!(
+                error = %err,
+                action = "auth.oidc.link_refused",
+                "failed to record the refused single sign-on link"
+            );
+        }
     }
 
     /// Compute the [`PermissionSet`] `claims`' mapped groups grant, per

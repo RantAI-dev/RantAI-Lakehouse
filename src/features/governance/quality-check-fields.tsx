@@ -92,6 +92,12 @@ export function CheckFields({
               value={form.column}
               onChange={(e) => onChange({ column: e.target.value })}
             >
+              {/* WEB-8 D8: a column the rule already names that this table
+                  does not have is still shown, so opening the picker cannot
+                  replace it with whatever sorts first. */}
+              {form.column !== "" && !columns.includes(form.column) ? (
+                <option value={form.column}>{form.column} (not in this table)</option>
+              ) : null}
               {columns.map((c) => (
                 <option key={c} value={c}>
                   {c}

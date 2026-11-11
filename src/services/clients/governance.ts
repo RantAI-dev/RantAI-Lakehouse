@@ -19,6 +19,7 @@ import type { UsedBy,
   UpdateQualityRuleInput,
   CreateClassificationRuleInput,
   DatasetSla,
+  RowFilterGrammar,
 } from "../contracts/governance";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -120,6 +121,11 @@ export const clickhouseGovernanceService: GovernanceService = {
   // ── Postgres (authored config) ──────────────────────────────────────────
   listPolicies(signal) {
     return get<Policy[]>("/api/governance/policies", signal);
+  },
+  // WEB-8 S2 T8 (D8): the row filter grammar, read from the server so the
+  // console never carries a second copy of the validator's list.
+  getRowFilterGrammar(signal) {
+    return get<RowFilterGrammar>("/api/governance/row-filter-grammar", signal);
   },
   createPolicy(input: CreatePolicyInput, signal) {
     return post<Policy>("/api/governance/policies", input, signal);

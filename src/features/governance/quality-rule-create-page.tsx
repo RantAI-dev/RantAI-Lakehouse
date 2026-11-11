@@ -14,6 +14,7 @@ import { governanceService } from "@/services"
 import { SEVERITY_OPTIONS } from "./data-quality-columns"
 import { CheckFields, ThresholdForms } from "./quality-check-fields"
 import { EMPTY_FORM, KINDS, ruleThreshold, type RuleForm } from "./quality-checks"
+import { TablePicker, useTableCatalog, useTableColumns } from "./table-picker"
 
 const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
@@ -43,6 +44,11 @@ export function QualityRuleCreatePage() {
   const finalDimension =
     formDimension.trim() || (typedThreshold ? "" : KINDS[checkForm.kind].dimension)
   const [severity, setSeverity] = React.useState<Severity>("medium")
+  // WEB-8 D8: the table is picked from the catalog, and its columns come
+  // from that table's own schema — so the check's column field is a list
+  // too, instead of the free text it had while the table was typed.
+  const catalog = useTableCatalog()
+  const ruleColumns = useTableColumns(catalog.idOf(asset))
 
   const create = useServiceAction(
     withNotify(
@@ -92,10 +98,7 @@ export function QualityRuleCreatePage() {
         <Label htmlFor="qr-name">Name</Label>
         <Input id="qr-name" value={name} onChange={(e) => setName(e.target.value)} />
       </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="qr-asset">Asset</Label>
-        <Input id="qr-asset" value={asset} onChange={(e) => setAsset(e.target.value)} />
-      </div>
+      <TablePicker id="qr-asset" label="Asset" value={asset} onChange={setAsset} catalog={catalog} />
       {typedThreshold ? (
         <div className="space-y-1.5">
           <Label htmlFor="qr-threshold">Threshold</Label>
@@ -116,7 +119,7 @@ export function QualityRuleCreatePage() {
           <CheckFields
             form={checkForm}
             onChange={(patch) => setCheckForm((f) => ({ ...f, ...patch }))}
-            columns={null}
+            columns={ruleColumns}
             idPrefix="qr"
           />
           <p className="text-xs text-muted-foreground">

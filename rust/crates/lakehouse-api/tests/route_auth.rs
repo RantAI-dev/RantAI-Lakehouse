@@ -1812,6 +1812,59 @@ async fn governance_write_only_principal_may_put_but_not_get_sla() {
     );
 }
 
+/// `WEB-8` S2 T8 (D8): `GET /api/governance/row-filter-grammar` needs
+/// `policy:read` and nothing less, asserted both ways: no session is 401, a
+/// principal with another permission is 403, and a `policy:read` holder gets
+/// past the gate with the grammar's two lists.
+#[tokio::test]
+async fn row_filter_grammar_route_needs_policy_read_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/governance/row-filter-grammar";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == uri)
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("policy:read")),
+    );
+
+    let none = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+
+    let analyst = create_principal_with_permissions(&pool, "query:read").await;
+    let analyst_cookie = session_cookie_for_user(&pool, analyst).await;
+    let refused = request_with_cookie(&router, "GET", uri, &analyst_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let reader = create_principal_with_permissions(&pool, "policy:read").await;
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", uri, &reader_cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let body = to_bytes(allowed.into_body(), usize::MAX)
+        .await
+        .expect("the grammar body reads");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("the body is JSON");
+    assert!(
+        body["functions"]
+            .as_array()
+            .is_some_and(|functions| !functions.is_empty()),
+        "the route answers its functions: {body}"
+    );
+    assert!(
+        body["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty()),
+        "the route answers its operators: {body}"
+    );
+    assert!(
+        body["forms"]
+            .as_array()
+            .is_some_and(|forms| !forms.is_empty()),
+        "the route answers its forms: {body}"
+    );
+}
+
 /// SEC-23 (F1/F2): a principal holding other write permissions but NOT
 /// `governance:write` is refused (403) when it adds a quality,
 /// classification or residency rule, and nothing is stored. The bodies are

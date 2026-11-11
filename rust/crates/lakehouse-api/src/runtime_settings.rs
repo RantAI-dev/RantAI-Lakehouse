@@ -1182,6 +1182,11 @@ pub struct EffectiveSso {
     pub jit_provisioning: bool,
     /// Where [`Self::jit_provisioning`] came from.
     pub jit_provisioning_source: Source,
+    /// Whether this provider's emails are trusted without `email_verified`
+    /// (`SEC-65` D3). Off by default.
+    pub trust_email: bool,
+    /// Where [`Self::trust_email`] came from.
+    pub trust_email_source: Source,
     /// Authorization URL.
     pub authorize_url: Option<String>,
     /// Where [`Self::authorize_url`] came from.
@@ -1229,6 +1234,7 @@ impl EffectiveSso {
             ),
         };
         config.jit_provisioning = self.jit_provisioning;
+        config.trust_email = self.trust_email;
         config.role_map.clone_from(&self.role_map);
         config.groups_claim.clone_from(&self.groups_claim);
         config.clock_skew_seconds = self.clock_skew_seconds;
@@ -1397,6 +1403,17 @@ pub fn resolve_sso(
         (false, Source::Default)
     };
 
+    // `SEC-65` D3: resolved per value, not per connection, like
+    // `jit_provisioning` — a server-set `OIDC_TRUST_EMAIL` owns it, else the
+    // console's saved value, else the safe default (off).
+    let (trust_email, trust_email_source) = if config.oidc_trust_email_from_env {
+        (config.oidc_trust_email, Source::Server)
+    } else if let Some(trust) = stored.and_then(|s| s.oidc_trust_email) {
+        (trust, Source::Console)
+    } else {
+        (false, Source::Default)
+    };
+
     let (role_map, role_map_rows, role_map_source) = if config.oidc_role_map_from_env {
         let mut entries: Vec<RoleMapEntry> = config
             .oidc_role_map
@@ -1436,6 +1453,8 @@ pub fn resolve_sso(
         role_map_source,
         jit_provisioning,
         jit_provisioning_source,
+        trust_email,
+        trust_email_source,
         authorize_url,
         authorize_url_source,
         token_url,
@@ -1767,6 +1786,14 @@ pub fn draft_sso_settings(config: &Config, draft: &serde_json::Value) -> Effecti
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         jit_provisioning_source: Source::Console,
+        // `SEC-65` D3/D6: the test sign-in's draft carries the switch too,
+        // so a provider that does not confirm the email can be tried with
+        // it on before it is saved.
+        trust_email: draft
+            .get("trustEmail")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        trust_email_source: Source::Console,
         authorize_url: None,
         authorize_url_source: Source::Default,
         token_url: None,
@@ -2635,6 +2662,7 @@ mod tests {
             oidc_groups_claim: None,
             oidc_role_map: None,
             oidc_jit_provisioning: None,
+            oidc_trust_email: None,
         };
         over(&mut s);
         s
@@ -2748,7 +2776,50 @@ mod tests {
         assert_eq!(eff.role_map_source, Source::Default);
         assert!(!eff.jit_provisioning);
         assert_eq!(eff.jit_provisioning_source, Source::Default);
+        // `SEC-65` D3: trusting a provider's emails is off by default, and
+        // the authenticator this config builds is told so.
+        assert!(!eff.trust_email);
+        assert_eq!(eff.trust_email_source, Source::Default);
+        assert!(!eff.to_oidc_config().trust_email);
         assert!(!eff.is_configured());
+    }
+
+    /// `SEC-65` D3: the environment owns `trustEmail` when
+    /// `OIDC_TRUST_EMAIL` is set, and the console's saved value (even the
+    /// opposite one) is not used.
+    #[test]
+    fn the_environment_owns_the_trust_email_switch() {
+        let cfg = config(&[("OIDC_TRUST_EMAIL", "true")]);
+        let saved = stored_sso(|s| s.oidc_trust_email = Some(false));
+        let eff = resolve_sso(&cfg, Some(&saved), Some(&keyring()));
+
+        assert!(eff.trust_email);
+        assert_eq!(eff.trust_email_source, Source::Server);
+        assert!(eff.to_oidc_config().trust_email);
+    }
+
+    /// `SEC-65` D3: a saved value is used when the environment is empty.
+    #[test]
+    fn a_saved_trust_email_is_used_when_the_environment_is_empty() {
+        let cfg = config(&[]);
+        let saved = stored_sso(|s| s.oidc_trust_email = Some(true));
+        let eff = resolve_sso(&cfg, Some(&saved), Some(&keyring()));
+
+        assert!(eff.trust_email);
+        assert_eq!(eff.trust_email_source, Source::Console);
+        assert!(eff.to_oidc_config().trust_email);
+    }
+
+    /// `SEC-65` D3: `OIDC_TRUST_EMAIL` is parsed the way every boolean
+    /// environment value is — exactly `"true"`.
+    #[test]
+    fn trust_email_requires_the_exact_string_true() {
+        for (value, expected) in [("TRUE", false), ("1", false), ("true", true)] {
+            let cfg = config(&[("OIDC_TRUST_EMAIL", value)]);
+            let eff = resolve_sso(&cfg, None, Some(&keyring()));
+            assert_eq!(eff.trust_email, expected, "OIDC_TRUST_EMAIL={value}");
+            assert_eq!(eff.trust_email_source, Source::Server);
+        }
     }
 
     #[test]

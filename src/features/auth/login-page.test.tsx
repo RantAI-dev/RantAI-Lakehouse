@@ -8,8 +8,13 @@ import { afterEach, describe, expect, it, mock } from "bun:test"
 // by bun's test runner, so the stub is in place before the `import`
 // statements below pull in the page (same pattern as
 // `src/components/app-shell/tenant-switcher.test.tsx`).
+// `SEC-65` D2: `LoginPage` also renders `SsoNotice`, which reads
+// `useSearchParams()`; each test sets `search` before rendering.
+let search = new URLSearchParams()
+
 mock.module("next/navigation", () => ({
   usePathname: () => "/login",
+  useSearchParams: () => search,
   useRouter: () => ({
     push: () => {},
     replace: () => {},
@@ -37,6 +42,7 @@ afterEach(() => {
   // `findByLabelText` would find two email fields.
   cleanup()
   global.fetch = originalFetch
+  search = new URLSearchParams()
 })
 
 /**
@@ -95,6 +101,23 @@ describe("LoginPage lockout surface (plan T5)", () => {
     // 300 s renders as the whole-minute wait, pluralised properly
     // ("minutes", not "minute(s)" — review SHOULD-FIX 6, 2026-10-03).
     expect(alert.textContent).toContain("Try again in about 5 minutes.")
+  })
+
+  it("shows the SEC-65 refusal sentence the callback redirects with", async () => {
+    // `SEC-65` D2: the API sends a refused single sign-on here with
+    // `ssoNotice=email_not_verified`; the sentence is the console's.
+    search = new URLSearchParams("ssoNotice=email_not_verified")
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+
+    const notice = await screen.findByRole("status")
+    expect(notice.textContent).toContain(
+      "Your identity provider did not confirm your email address, so this sign-in cannot be joined to your existing account.",
+    )
   })
 
   it("still shows the credentials message on a 401", async () => {
