@@ -10,9 +10,13 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
-import { identityService } from "@/services"
-import type { Role } from "@/services/contracts/identity"
+import { identityService, type Role, type SetRoleTableAccessInput } from "@/services"
 import { PermissionPicker } from "./permission-picker"
+import {
+  grantsUnrestricted,
+  RoleTableAccessSection,
+  type TableAccessDraft,
+} from "./role-table-access"
 
 /**
  * The three fields a role has, shared by Create and Edit (`WEB-3` S3-D8).
@@ -156,16 +160,71 @@ function RoleEditForm({ role }: { role: Role }) {
         identityService.updateRole(role.id, input, signal)
     )
   )
+  // GOV-7 D8: the role's tables belong to the same Save. The draft starts
+  // from what the API stored, so a grant the catalog does not list still
+  // travels back in the PUT until the person removes it.
+  const accessState = useService(
+    (signal) => identityService.getRoleTableAccess(role.id, signal),
+    [role.id]
+  )
+  const [tableAccessDraft, setTableAccessDraft] = React.useState<TableAccessDraft | null>(null)
+  const access = accessState.status === "success" ? accessState.data : null
+  const tableAccess: TableAccessDraft | null = React.useMemo(
+    () => tableAccessDraft ?? (access ? { scope: access.scope, grants: access.grants } : null),
+    [tableAccessDraft, access]
+  )
+  const saveAccess = useServiceAction(
+    withNotify(
+      { success: "Table access saved", error: "Failed to save table access" },
+      (signal, input: SetRoleTableAccessInput) =>
+        identityService.setRoleTableAccess(role.id, input, signal)
+    )
+  )
+  const [accessSkipped, setAccessSkipped] = React.useState(false)
   const renamed = name.trim() !== role.name
+  // The API refuses to narrow a role that holds `*:*` (GOV-7 D4), so the
+  // section is disabled with the server's own sentence and no table-access
+  // write is sent for such a role.
+  const fullAccess = grantsUnrestricted(permissions)
+  const loadingAccess = accessState.status === "loading"
 
   async function handleSave() {
+    setAccessSkipped(false)
+    // The role first, then its tables: the table-access write is a separate
+    // request, so either can fail on its own and the page says which.
     const saved = await update.run({
       name: name.trim(),
       permissions: permissions.trim(),
       description: description.trim(),
     })
-    if (saved) router.push(backHref)
+    if (!saved) return
+    if (fullAccess) {
+      // A `*:*` role reads every table whatever its stored grants say; the
+      // API refuses the narrowing write, and the section is disabled.
+      router.push(backHref)
+      return
+    }
+    if (!tableAccess) {
+      // Its stored grants never arrived: writing now would replace grants
+      // nobody saw. The role is saved and the page says what was left.
+      setAccessSkipped(true)
+      return
+    }
+    const accessSaved = await saveAccess.run({
+      scope: tableAccess.scope,
+      grants: tableAccess.scope === "listed" ? tableAccess.grants : [],
+    })
+    if (accessSaved) router.push(backHref)
   }
+
+  const saveError =
+    update.status === "error"
+      ? `The role was not saved: ${update.error.message}`
+      : saveAccess.status === "error"
+        ? `The role was saved, but its tables were not: ${saveAccess.error.message}`
+        : accessSkipped
+          ? "The role was saved. Its tables were not saved because they could not be loaded; retry above and save again."
+          : null
 
   return (
     <FormPage
@@ -175,9 +234,9 @@ function RoleEditForm({ role }: { role: Role }) {
       backLabel="Back to Roles"
       submitLabel="Save"
       submittingLabel="Saving…"
-      canSubmit={Boolean(name.trim() && permissions.trim() && description.trim())}
-      submitting={update.status === "pending"}
-      error={update.status === "error" ? update.error.message : null}
+      canSubmit={Boolean(name.trim() && permissions.trim() && description.trim()) && !loadingAccess}
+      submitting={update.status === "pending" || saveAccess.status === "pending"}
+      error={saveError}
       onSubmit={() => void handleSave()}
       onCancel={() => router.push(backHref)}
     >
@@ -189,6 +248,17 @@ function RoleEditForm({ role }: { role: Role }) {
         onName={setName}
         onPermissions={setPermissions}
         onDescription={setDescription}
+      />
+      <RoleTableAccessSection
+        idPrefix="edit-role"
+        value={tableAccess}
+        onChange={setTableAccessDraft}
+        disabledReason={fullAccess ? "A role with full access cannot be narrowed" : null}
+        accessError={
+          accessState.status === "error"
+            ? { message: accessState.error.message, retry: accessState.reload }
+            : null
+        }
       />
       {renamed && name.trim() ? (
         <p className="text-sm text-muted-foreground">

@@ -17,9 +17,39 @@ import { filterDataClientSide } from "@/lib/data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
-import { identityService } from "@/services"
+import { identityService, type RoleTableAccess } from "@/services"
 import type { Role } from "@/services/contracts/identity"
-import { getRoleColumns } from "./roles-columns"
+import { getRoleColumns, type RoleRow } from "./roles-columns"
+import { tableAccessSummary } from "./role-table-access"
+
+/**
+ * Each role's read access, one read per role (`GOV-7` S2). The roles list
+ * endpoint does not carry `read_scope`, and the API is not widened for the
+ * console, so this is N requests for N roles on a page an administrator
+ * opens by hand. One role's failure is a `null` entry — its row says "—" —
+ * rather than failing the whole list.
+ */
+async function loadRoleTableAccesses(
+  ids: readonly string[],
+  signal: AbortSignal
+): Promise<Record<string, RoleTableAccess | null>> {
+  const entries = await Promise.all(
+    ids.map(async (id): Promise<[string, RoleTableAccess | null]> => {
+      try {
+        return [id, await identityService.getRoleTableAccess(id, signal)]
+      } catch {
+        return [id, null]
+      }
+    })
+  )
+  return Object.fromEntries(entries)
+}
+
+/**
+ * The summary column's empty map, kept as one object so a render while the
+ * reads are in flight does not rebuild the rows.
+ */
+const EMPTY_ACCESS: Record<string, RoleTableAccess | null> = {}
 
 /**
  * Roles (`WEB-3` S3-D8, was "Teams & Roles"): create, edit and delete a
@@ -35,6 +65,35 @@ export function RolesPage() {
   const state = useService((s) => identityService.listRoles(s), [])
   const [deleting, setDeleting] = React.useState<Role | null>(null)
 
+  // The summary column's values. Keyed by the ids the list returned, so a
+  // refresh does not read a role that left the list.
+  const roleIds = (state.data ?? []).map((role) => role.id)
+  const roleIdsKey = roleIds.join(",")
+  const tableAccessState = useService(
+    (signal) => loadRoleTableAccesses(roleIdsKey ? roleIdsKey.split(",") : [], signal),
+    [roleIdsKey]
+  )
+  const accessLoaded = tableAccessState.status === "success"
+  const accessById: Record<string, RoleTableAccess | null> = accessLoaded
+    ? tableAccessState.data
+    : EMPTY_ACCESS
+
+  // The rows the table renders, with the summary worked out here. `columns`
+  // stays the same object while the summaries arrive: a rebuild would
+  // remount every cell, closing a row's open menu under the reader.
+  const rows = React.useMemo<RoleRow[]>(
+    () =>
+      (state.data ?? []).map((role) => {
+        const access = accessById[role.id] ?? null
+        return {
+          ...role,
+          tables: tableAccessSummary(access, role.permissions),
+          tablesFailed: accessLoaded && access === null,
+        }
+      }),
+    [state.data, accessById, accessLoaded]
+  )
+
   const columns = React.useMemo(
     () =>
       canWrite
@@ -49,7 +108,7 @@ export function RolesPage() {
   const tableUrlState = useTableUrlState()
   const filteredData = React.useMemo(
     () =>
-      filterDataClientSide(state.data ?? [], {
+      filterDataClientSide(rows, {
         search: tableUrlState.search,
         searchFields: [
           (r) => r.name,
@@ -59,7 +118,7 @@ export function RolesPage() {
         filters: tableUrlState.filters,
         joinOperator: tableUrlState.joinOperator,
       }),
-    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+    [rows, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
   )
 
   const { table } = useDataTable({

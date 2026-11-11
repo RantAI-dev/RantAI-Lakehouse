@@ -142,6 +142,39 @@ export type UpdateRoleInput = {
   description: string
 }
 
+/**
+ * One schema or table a role may read (`GOV-7` D3/D7). `table: "*"` means
+ * the whole schema. A name need not exist in the catalog yet: a grant may
+ * name a table a pipeline creates later.
+ */
+export type RoleTableGrant = {
+  schema: string
+  table: string
+}
+
+/**
+ * A role's read access, as `GET /api/identity/roles/{id}/table-access`
+ * answers it and `PUT` stores it (`GOV-7` D7, `role.read_scope` plus
+ * `role_read_grant`).
+ *
+ * `"all"` is the default for every existing and new role, so an upgrade
+ * changes nobody's access (D1); `"listed"` reads only the granted schemas
+ * and tables. The server sorts `grants` and stores none for `"all"`.
+ */
+export type RoleTableAccess = {
+  scope: "all" | "listed"
+  grants: RoleTableGrant[]
+}
+
+/**
+ * What `PUT …/table-access` takes: the role's COMPLETE access, not a delta
+ * — a grant left out is a grant the role no longer holds.
+ */
+export type SetRoleTableAccessInput = {
+  scope: "all" | "listed"
+  grants: RoleTableGrant[]
+}
+
 export type CreateTenantInput = {
   name: string
   slug: string
@@ -195,6 +228,22 @@ export interface IdentityService {
    * own sentence when people still hold it, or when it is a built-in role.
    */
   deleteRole(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * What a role may read (`GOV-7` D7); needs `identity:read`. A role nobody
+   * narrowed answers `"all"` with no grants.
+   */
+  getRoleTableAccess(id: string, signal?: AbortSignal): Promise<RoleTableAccess>
+  /**
+   * Replace a role's read scope and its grants in one request (`GOV-7` D7);
+   * needs `identity:write`. The API refuses a role holding `*:*` ("A role
+   * with full access cannot be narrowed") and a name that is not a plain
+   * identifier, each with a 400 carrying its own sentence.
+   */
+  setRoleTableAccess(
+    id: string,
+    input: SetRoleTableAccessInput,
+    signal?: AbortSignal
+  ): Promise<RoleTableAccess>
   createTenant(input: CreateTenantInput, signal?: AbortSignal): Promise<Tenant>
   createServiceIdentity(
     input: CreateServiceIdentityInput,

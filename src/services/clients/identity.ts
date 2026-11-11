@@ -9,7 +9,9 @@ import type {
   ResetPasswordResponse,
   Role,
   RotateServiceIdentityResponse,
+  RoleTableAccess,
   ServiceIdentity,
+  SetRoleTableAccessInput,
   Tenant,
   UpdateRoleInput,
   UpdateUserInput,
@@ -179,6 +181,25 @@ export const postgresIdentityService: IdentityService = {
       `/api/identity/roles/${encodeURIComponent(id)}`,
       signal,
       "Failed to delete role"
+    );
+  },
+  // GOV-7 D7: what a role may read. A `*:*` role and a name that is not a
+  // plain identifier are refused on the write with a 400; `errorFor` keeps
+  // the API's own sentence in `ServiceError.message`, so the page shows it
+  // unchanged.
+  getRoleTableAccess(id, signal) {
+    return get<RoleTableAccess>(
+      `/api/identity/roles/${encodeURIComponent(id)}/table-access`,
+      signal,
+      "Failed to load the role's tables"
+    );
+  },
+  setRoleTableAccess(id, input: SetRoleTableAccessInput, signal) {
+    return put<RoleTableAccess>(
+      `/api/identity/roles/${encodeURIComponent(id)}/table-access`,
+      input,
+      signal,
+      "Failed to save the role's tables"
     );
   },
   createTenant(input: CreateTenantInput, signal) {
