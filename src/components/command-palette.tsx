@@ -16,7 +16,7 @@ import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
 import type { ShortcutItem } from "@/services/contracts/dashboards";
 import { itemHref } from "@/lib/dashboard-organise";
-import { PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
+import { ASSET_VALUE_PREFIX, PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, makePaletteFilter, matchedOnLabel } from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
  * (WS2 §13). */
@@ -29,6 +29,8 @@ const CATALOG_SEARCH_DEBOUNCE_MS = 250;
  * scores zero for any typed word and, with equal scores keeping their order,
  * stays after the assets (DATA-11 review SHOULD-FIX 6). */
 const SEE_ALL_VALUE = "\u2192";
+
+const assetItemValue = (a: Asset) => `${ASSET_VALUE_PREFIX}${a.id} ${a.name}`;
 
 const OPEN_EVENT = "rantai:open-command";
 /** Call from anywhere (e.g. the navbar search box) to open the palette. */
@@ -223,6 +225,12 @@ export function CommandPalette() {
     } catch { /* ignore */ }
   }, [pathname]);
 
+  // QA LH-DATA-11-06: one score for every asset row keeps the server's order.
+  const paletteFilter = React.useMemo(
+    () => makePaletteFilter(assetResults.map((a) => assetItemValue(a))),
+    [assetResults],
+  );
+
   const go = (href: string) => { setOpen(false); router.push(href); };
   const run = (fn: () => void) => { setOpen(false); fn(); };
 
@@ -231,6 +239,7 @@ export function CommandPalette() {
       open={open}
       onOpenChange={setOpen}
       label="Command Palette"
+      filter={paletteFilter}
       contentClassName="fixed left-1/2 top-[18%] z-[100] w-[min(92vw,560px)] -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover shadow-2xl"
       overlayClassName="fixed inset-0 z-[99] bg-black/40 backdrop-blur-sm"
     >
@@ -348,7 +357,7 @@ export function CommandPalette() {
                 label={a.name}
                 badge={<CertificationBadge certification={a.certification} />}
                 detail={matchedOnLabel(a.matchedOn)}
-                value={`asset ${a.id} ${a.name}`}
+                value={assetItemValue(a)}
                 onSelect={() => go(`/data/assets/${a.id}`)}
               />
             ))}

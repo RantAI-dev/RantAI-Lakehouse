@@ -188,13 +188,13 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
           </div>
         );
       })}
-      {layers.length < MAX_LAYERS ? (
-        <div>
-          <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={disabled || !!blocked} onClick={() => onChange([...layers, emptyLayer()])}>
-            <Plus className="size-3" aria-hidden /> Add a question
-          </Button>
-        </div>
-      ) : null}
+      {/* QA LH-BI-13-06: the button stays at the limit, off, with the reason under it (the chart's own question is the fifth). */}
+      <div className="space-y-1">
+        <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={disabled || !!blocked || layers.length >= MAX_LAYERS} onClick={() => onChange([...layers, emptyLayer()])}>
+          <Plus className="size-3" aria-hidden /> Add a question
+        </Button>
+        {layers.length >= MAX_LAYERS ? <p className="px-2 text-xs text-muted-foreground">A chart takes at most five questions.</p> : null}
+      </div>
     </div>
   );
 }
