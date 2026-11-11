@@ -317,6 +317,31 @@ fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
     }
 }
 
+/// The `source` an `audit_event` row reports (QA LH-DATA-15-03 F3, plan D9):
+/// where the action came from, following `principal_kind`. No recorded kind
+/// keeps `"copilot"`, the same fallback the actor label uses in [`audit`].
+fn source_of(principal_kind: Option<&str>) -> &'static str {
+    match principal_kind {
+        Some("user") => "console",
+        Some("schedule") => "schedule",
+        Some("service") => "service",
+        _ => "copilot",
+    }
+}
+
+/// One sentence saying what a catalog grant or revoke did, for the audit
+/// row's `detail` (QA LH-DATA-15-03 F1, plan D9). Built by
+/// `catalog_governance::grant_summary` from the stored `permission`,
+/// `grantee` and `expiresAt` only, so an unknown `args` blob is never
+/// echoed; every other action has no detail.
+fn detail_of(action: &str, args: &Value) -> Option<String> {
+    if action != "catalog.grant" && action != "catalog.revoke" {
+        return None;
+    }
+    let arg = |key: &str| args.get(key).and_then(Value::as_str);
+    Some(super::catalog_governance::grant_summary(action, arg))
+}
+
 /// Same narrowing for `outcome`: `audit_event.outcome` has eight values,
 /// the TS `AuditOutcome` union has four (`"success" | "denied" | "error" |
 /// "pending"`). `needs_confirmation`/`needs_approval` are in-flight: the
@@ -350,7 +375,8 @@ fn policy_decision_of(outcome: &str) -> &'static str {
 
 /// `GET /api/governance/audit`. Unions `audit_event` rows (copilot/console
 /// actions) onto the `Dagster`-run-derived pipeline history, adding a
-/// `source: "copilot" | "pipeline"` field so a consumer can filter by
+/// `source` field (`"console" | "copilot" | "schedule" | "service"` for
+/// stored events, `"pipeline"` for runs) so a consumer can filter by
 /// origin. This is additive: every field the pre-existing response shape
 /// had is still present with the same meaning, so
 /// `src/services/clients/governance.ts` and the `/audit` page keep
@@ -404,7 +430,7 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
                 (None, Some(id)) => id.clone(),
                 (None, None) => e.action.clone(),
             };
-            json!({
+            let mut row = json!({
                 "id": e.id,
                 "at": e.at,
                 // AI-23 (product owner 2026-11-02): one name for the
@@ -418,8 +444,18 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
                 "policyDecision": policy_decision_of(&e.outcome),
                 "obligations": [],
                 "approvalId": e.approval_id,
-                "source": "copilot",
-            })
+                // QA LH-DATA-15-03 F3 (plan D9): every row used to say
+                // "copilot", whoever acted.
+                "source": source_of(e.principal_kind.as_deref()),
+            });
+            // QA LH-DATA-15-03 F1 (plan D9): the row names who got which
+            // permission, from the stored fields only.
+            if let (Some(detail), Some(o)) =
+                (detail_of(&e.action, &e.args), row.as_object_mut())
+            {
+                o.insert("detail".to_owned(), json!(detail));
+            }
+            row
         }));
     }
     // Newest first across both sources: both `at` values are the same
@@ -2774,6 +2810,58 @@ mod tests {
         assert_eq!(actor_kind_of(Some("copilot")), "agent");
         assert_eq!(actor_kind_of(Some("schedule")), "agent");
         assert_eq!(actor_kind_of(None), "agent");
+    }
+
+    #[test]
+    fn source_of_follows_the_principal_kind() {
+        assert_eq!(source_of(Some("user")), "console");
+        assert_eq!(source_of(Some("copilot")), "copilot");
+        assert_eq!(source_of(Some("schedule")), "schedule");
+        assert_eq!(source_of(Some("service")), "service");
+        assert_eq!(source_of(None), "copilot");
+    }
+
+    #[test]
+    fn detail_of_a_grant_names_the_permission_the_grantee_and_the_day_it_ends() {
+        let args = json!({
+            "permission": "query:read",
+            "grantee": "QA Approver <qa-approver@example.test>",
+            "expiresAt": "2026-12-06T08:00:00Z",
+            "unrelated": "never echoed",
+        });
+        let detail = detail_of("catalog.grant", &args).expect("a grant has a detail");
+        assert_eq!(
+            detail,
+            "Granted query:read to QA Approver <qa-approver@example.test> until 2026-12-06"
+        );
+        assert!(!detail.contains("never echoed"));
+    }
+
+    #[test]
+    fn detail_of_a_grant_without_an_expiry_does_not_invent_a_date() {
+        let args = json!({ "permission": "query:read", "grantee": "A <a@example.test>" });
+        let detail = detail_of("catalog.grant", &args).expect("a grant has a detail");
+        assert_eq!(
+            detail,
+            "Granted query:read to A <a@example.test> until its expiry"
+        );
+    }
+
+    #[test]
+    fn detail_of_a_revoke_names_the_permission_and_the_grantee() {
+        let args = json!({ "permission": "query:read", "grantee": "A <a@example.test>" });
+        assert_eq!(
+            detail_of("catalog.revoke", &args).as_deref(),
+            Some("Revoked query:read from A <a@example.test>")
+        );
+    }
+
+    #[test]
+    fn detail_of_any_other_action_is_none() {
+        assert_eq!(
+            detail_of("catalog.annotate", &json!({ "fields": ["x"] })),
+            None
+        );
     }
 
     #[test]

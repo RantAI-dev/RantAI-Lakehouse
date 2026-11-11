@@ -747,7 +747,7 @@ fn mark_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> Stri
 /// (`DATA-15` F3): the permission, the grantee, and for a grant the day it
 /// ends (the day, not the instant). The actor is the entry's own `actor`, so
 /// the history names both people.
-fn grant_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> String {
+pub(super) fn grant_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> String {
     let permission = arg("permission").unwrap_or("a permission");
     let grantee = arg("grantee").unwrap_or("a user");
     if action == "catalog.grant" {
