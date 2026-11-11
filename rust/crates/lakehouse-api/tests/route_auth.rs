@@ -4137,7 +4137,7 @@ async fn permissions_route_is_gated_in_both_directions() {
 }
 
 /// ADM-13 (D10.2), ADM-13 review round 1, B3:
-/// `GET /api/notifications` is RequiresAuth, but a `dashboard:read`-only principal
+/// `GET /api/notifications` is `RequiresAuth`, but a `dashboard:read`-only principal
 /// gets empty `openAlerts` and `pendingApprovals` without error.
 #[tokio::test]
 async fn notifications_returns_empty_alerts_and_approvals_for_dashboard_read_principal() {
