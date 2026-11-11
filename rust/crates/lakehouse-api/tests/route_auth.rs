@@ -294,6 +294,54 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
     }
 }
 
+/// `GOV-7` D7: a role's table access is read with `identity:read` and changed
+/// with `identity:write` — both directions, with real principals. A holder of
+/// the read alone may look, never change; a holder of the write alone may
+/// change, never look; a seeded Analyst (neither) is refused both.
+#[tokio::test]
+async fn the_role_table_access_routes_split_read_from_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let role = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions) VALUES ($1, 'Gov7 Route Role', 'query:read')",
+    )
+    .bind(role)
+    .execute(&pool)
+    .await
+    .expect("insert the role the route addresses");
+    let path = format!("/api/identity/roles/{role}/table-access");
+
+    let reader = create_principal_with_permissions(&pool, "identity:read").await;
+    let writer = create_principal_with_permissions(&pool, "identity:write").await;
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let writer_cookie = session_cookie_for_user(&pool, writer).await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    for (method, cookie, expect_forbidden) in [
+        ("GET", &reader_cookie, false),
+        ("PUT", &reader_cookie, true),
+        ("PUT", &writer_cookie, false),
+        ("GET", &writer_cookie, true),
+        ("GET", &analyst, true),
+        ("PUT", &analyst, true),
+    ] {
+        let resp = request_with_cookie(&router, method, &path, cookie).await;
+        let status = resp.status();
+        if expect_forbidden {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path}: this principal must be denied"
+            );
+        } else {
+            assert!(
+                !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+                "{method} {path}: this principal must pass the auth gate, got {status}"
+            );
+        }
+    }
+}
+
 /// `BI-19` part C (C3): `/api/alerts` is "signed in" at the router, because a
 /// person who can view a chart may alert on it for themselves; the handler asks
 /// for `alert:write` for everything else. Both directions, with real principals:
