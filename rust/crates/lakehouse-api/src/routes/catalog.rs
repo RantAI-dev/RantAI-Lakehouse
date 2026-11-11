@@ -1533,7 +1533,7 @@ fn bronze_catalog_row(
         // The key the rule and the other reads address this dataset by. It
         // is the registry's own table name, never the slug: the slug is the
         // dataset's identity, the table key is what a grant names.
-        "tableKey": if table_name.is_empty() { Value::Null } else { json!(format!("bronze.{table_name}")) },
+        "tableKey": bronze_table_key(table_name).map_or(Value::Null, Value::String),
     })
 }
 
@@ -3141,7 +3141,7 @@ fn bronze_detail_body(
         "tableName": if table_name.is_empty() { Value::Null } else { json!(table_name) },
         // The key the lineage graph, policies and quality rules name this
         // dataset by: its Bronze table, not the registry slug in `id`.
-        "tableKey": if table_name.is_empty() { Value::Null } else { json!(format!("bronze.{table_name}")) },
+        "tableKey": bronze_table_key(table_name).map_or(Value::Null, Value::String),
         "_meta": {
             "frekuensi": frekuensi,
             "satuan": satuan,
@@ -3191,6 +3191,17 @@ pub(crate) fn asset_table_key(asset: &Value) -> Option<&str> {
         .filter(|id| id.contains('.'))
 }
 
+/// The canonical key a Bronze dataset's table is addressed by, or `None`
+/// when the registry records no table name. One definition for the three
+/// places that build it — [`bronze_catalog_row`], [`bronze_detail_body`] and
+/// [`ensure_asset_readable`] — so the literal cannot drift between them and
+/// stays out of the list row, where it made the R11 text guard read a
+/// `count(` of `system.parts` as a count of a Bronze table (`GOV-7` S2, CI
+/// on #468).
+fn bronze_table_key(table_name: &str) -> Option<String> {
+    (!table_name.is_empty()).then(|| format!("bronze.{table_name}"))
+}
+
 /// Whether `asset` may be listed for a principal holding `access`. An asset
 /// whose table cannot be named is hidden from a narrowed principal: nothing
 /// proves the grant covers it (fail closed, `GOV-7` D6).
@@ -3227,10 +3238,16 @@ pub(crate) async fn ensure_asset_readable(
     let key = if id.starts_with("silver.") || id.starts_with("serving.") {
         id.to_owned()
     } else {
-        format!(
-            "bronze.{}",
-            super::catalog_profile::bronze_table_name(state, id).await?
-        )
+        let table_name = super::catalog_profile::bronze_table_name(state, id).await?;
+        match bronze_table_key(&table_name) {
+            Some(key) => key,
+            // An empty registry name keeps the key this site has always built
+            // (`bronze.`) rather than refusing outright: a role granted the
+            // whole `bronze` schema still reads it and a narrower one still
+            // gets the same 404, so the outcome does not change (`GOV-7` S2,
+            // CI on #468).
+            None => "bronze.".to_owned(),
+        }
     };
     ensure_key_readable_with(&access, &key)
 }
