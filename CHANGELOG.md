@@ -40,6 +40,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- A short question in Indonesian, such as "Berapa total kunjungan?", now gets its answer in Indonesian: one Indonesian word with no English word is read as Indonesian, where before two were required (backlog `AI-17`).
 - The assistant can still ask which reading a word has after it has only looked up which metrics or tables exist; a question comes too late only after it has queried data (`run_sql`, `query_metric`, `run_saved_query`), because a turn may ask only before it runs a query (backlog `AI-17`).
 - The assistant can no longer save a map chart on a map that does not exist: a `create_chart` or `update_chart` whose `map` names neither a bundled map (`dki-jakarta`, `id-provinces`, `id-regencies`, `world`), an uploaded one from `list_maps`, nor a country's `adm1-<iso3>` map is refused by the draft and by the save with the maps it may use, so no tile is left saying "Map not available" (backlog `AI-6`).
 - The workloads read answers again (backlog `OPS-19`). `GET /api/ops/workloads` named a computed column with the alias `elapsed`, which shadows the `system.processes.elapsed` column, so `ClickHouse` refused the statement (error 43: a `String` multiplied by a number) and the route answered 503; the assistant's `list_workloads` failed with it. The column is named `elapsed_s` now, in the workloads statement and in the cancel route's copy of it. The JSON the route answers keeps its field names and types.
