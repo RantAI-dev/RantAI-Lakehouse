@@ -424,6 +424,102 @@ this machine; no cargo command was run (no Rust change); no compose check (no co
 `git ls-remote --heads origin feat/web-7-s2-editors`: the branch exists and points at the pushed
 head.
 
+### Handoff (developer, 2026-11-11, S2 round 1 fixes)
+
+Base `cdbe7465`; three commits, one per finding, each pushed on its own.
+
+- `30bb0026` fix(console): a drafted chart marks the step of its own conversation only — S1.
+- `e5c7bebe` fix(console): the edit page shows only a chart of the dashboard it names — S2.
+- `83de7f5b` refactor(console): drop the query studio's unused save and saveAct — S3.
+
+**S1 (closed): the builder can no longer mark another conversation's step.**
+
+- The draft's `complete` is now a `ChartDraftStep` (`chart-page.ts`): the two indexes, the
+  conversation it came from (`sessionId`, from `useCopilot().sessionId`), and the tool the step
+  ran (`tool`, `create_chart`). `PendingActionCard` reads `sessionId` from `useCopilot()` — the
+  card is rendered inside the Copilot provider, which the provider fallback keeps honest outside
+  it — and passes it, with `step.tool`, in `stepAddress`; `ChartDraftCard` writes it unchanged.
+  `takeChartDraft` drops an address it cannot read in full: a negative index, a `sessionId` that
+  is neither a string nor `null`, an empty `tool`, or a draft an older build wrote (no
+  conversation at all). A dropped address means the chat is not touched, which is the honest
+  outcome.
+- When the step is marked, in plain words: on save, the page marks the step **only if** the
+  draft names a saved conversation (`sessionId` is a string) **and** the conversation open now
+  has that same id. A conversation still being composed has no id (`null`), so then the page
+  marks the step **only if** the open conversation is also unsaved (`null`) **and** the message
+  at `messageIndex` still carries a step at `stepIndex` whose `tool` is the same one the draft
+  recorded. If the draft's conversation is unsaved and the open one is saved, or the message
+  moved, or the step is gone, nothing is marked. `useCopilot()` exposes both `sessionId` and
+  `messages`, so this is established from what it publishes; there was no case where it could
+  not be. The page goes back to the dashboard in every case (`isDraftStepOpen` in
+  `chart-builder-page.tsx`).
+- Tests: `chart-page.test.ts` (a saved conversation, an unsaved one, a negative index, an old
+  draft with no conversation, an empty tool); `chart-builder-page.test.tsx` — the same
+  conversation marks the step and never before the save; another conversation marks nothing and
+  still goes back; an unsaved conversation marks its step while it is still there and marks
+  nothing once the message list no longer has it; `chart-draft-preview.test.tsx` — the card
+  writes the conversation into the draft.
+
+**S2 (closed): the edit page shows only a chart of the dashboard in its address.** The chart
+record already carries its dashboard (`chart.data.board`, from `StoredChart`), and the page now
+shows the existing "Chart not found" state when that board is not the one in the address
+(`chartOnBoard` in `chart-builder-page.tsx`). A chart whose board is `""` or `"default"` is the
+built-in dashboard's, read through `isBuiltInBoard` on both sides, so `/dashboards/default/...`
+still opens it. Tests: a chart of another dashboard shows "Chart not found" (no form, back link
+to the address's board); a chart of the built-in board opens on `/dashboards/default`.
+
+**S3 (closed): `useQueryStudio.save` and `saveAct` are gone.** The grep, before the change
+(`rg` is not installed on this machine, so the same expression with `grep -rnE`):
+
+```
+$ grep -rnE "\.save\b|saveAct" src/features/queries
+src/features/queries/use-query-studio.test.ts:188:      await hook.result.current.save({
+src/features/queries/use-query-studio.test.ts:218:      await hook.result.current.save({ title: "Copy", sql: "SELECT 2", tags: [] })
+src/features/queries/use-query-studio.test.ts:234:      await hook.result.current.save({ title: "Copy", sql: "SELECT 2", tags: [] })
+src/features/queries/use-query-studio.test.ts:986:      await hook.result.current.save({
+src/features/queries/use-query-studio.test.ts:1007:      await hook.result.current.save({ title: "Orders", sql: "SELECT 1", tags: [], parameters: [] })
+src/features/queries/use-query-studio.test.ts:1008:      await hook.result.current.save({ title: "Orders", sql: "SELECT 1", tags: [] })
+src/features/queries/use-query-studio.ts:433:  const saveAct = useServiceAction((signal: AbortSignal, input: SaveQueryInput) => {
+src/features/queries/use-query-studio.ts:1217:      const saved = await saveAct.run(input)
+src/features/queries/use-query-studio.ts:1231:    [saveAct, savedState, activeTabId]
+src/features/queries/use-query-studio.ts:1499:    saveAct,
+```
+
+Every hit was the pair itself or a test calling it; nothing else in `src/` calls them (the other
+matches for `save` in the tree are `chatSessionService.save`, `saveAction` in the pipelines and
+alerts pages, and a local `save` in the catalog's meaning view — none of them this hook). After
+the change the same grep prints 0 lines. Removed with them: the `savedQueryRequest` and
+`SaveQueryInput` imports only they used, the five tests that only called `save` (three in
+"useQueryStudio saving", two parameter save-backs), and the `mountWithSaved` helper those were
+the only users of. Kept, because the page reads them: `saveTarget` (the button's label, mode and
+`id`) and `savedState` (the saved-query list, `query-studio-page.tsx:220`). The create-or-update
+rule and the parameters rule stay tested in `saved-query-write.test.ts` and
+`save-query-page.test.tsx`.
+
+**Commands run (foreground, this machine, on final commit `83de7f5b`)**
+
+- `bun run typecheck` → `$ bun --bun tsc --noEmit`, no errors.
+- `bun run lint` → 0 errors, 10 warnings, the same set the S2 handoff recorded; no touched file
+  gained one.
+- `bun test src/features/dashboards` → 627 pass, 0 fail, 2559 expect() calls, 79 files (622
+  before; +5 for S1 and S2 while one S1 test was rewritten).
+- `bun test src/features/copilot` → 140 pass, 0 fail, 500 expect() calls, 12 files (unchanged
+  count; the new assertion went into the existing "Edit in builder" test).
+- `bun test src/features/queries` → 372 pass, 0 fail, 1055 expect() calls, 28 files (377
+  before; the five S3 removed).
+
+`bun install` was not run: `node_modules` was already in place and the lockfile is untouched.
+`git diff cdbe7465..HEAD --stat` touches nine TypeScript files; `git diff --stat
+cdbe7465..HEAD -- rust/` is empty, so `tests/fixtures/tool_schemas.json` is unchanged.
+
+**Not verified locally: the rest, left to CI.** The whole suite (`bun run test`) was not run on
+this machine; no cargo command (no Rust change); no compose check (no compose change); the
+alerts, app-shell, patterns, services and `lib` folders were not re-run (no file there changed).
+
+`git status --short` before this handoff: clean.
+`git log --oneline cdbe7465..HEAD`: `30bb0026`, `e5c7bebe`, `83de7f5b`.
+`git ls-remote --heads origin feat/web-7-s2-editors`: the branch points at the pushed head.
+
 
 ## 6. Review (planner)
 
