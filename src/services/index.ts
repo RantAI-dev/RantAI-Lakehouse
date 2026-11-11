@@ -179,6 +179,18 @@ export type {
   AssistantSettingsInput,
   AssistantTestResult,
 } from "./contracts/settings"
+/**
+ * The deployment's SSO / OIDC settings (`ADM-12`): issuer, client ID, secret,
+ * provider name, groups claim, role map rows and JIT provisioning, each with
+ * its source, and test sign-in shapes.
+ */
+export type {
+  RoleMapRow,
+  SsoSettings,
+  SsoSettingsInput,
+  SsoTestResult,
+  SsoTestStartResult,
+} from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
