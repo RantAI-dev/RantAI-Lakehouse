@@ -2196,13 +2196,21 @@ describe("Access tab: adding a policy", () => {
     expect((screen.getByLabelText("Roles it applies to") as HTMLInputElement).value).toBe("Analyst")
   })
 
-  it("names the functions and operators the row filter accepts (WEB-8 T8, D8)", async () => {
-    stubApi({ grammar: { functions: ["lower", "upper"], operators: ["=", "AND"] } })
+  it("names the functions, operators and forms the row filter accepts (WEB-8 T8, D8; S2 review round 1, S2)", async () => {
+    stubApi({
+      grammar: {
+        functions: ["lower", "upper"],
+        operators: ["=", "AND"],
+        forms: ["LIKE", "ILIKE", "BETWEEN", "IN", "IS NULL", "IS NOT NULL"],
+      },
+    })
     url.search = "tab=access"
     renderTabs()
 
     fireEvent.click(await screen.findByText("Add policy"))
-    const help = await screen.findByText("Functions: lower, upper. Operators: =, AND.")
+    const help = await screen.findByText(
+      "Functions: lower, upper. Operators: =, AND. Forms: LIKE, ILIKE, BETWEEN, IN, IS NULL, IS NOT NULL."
+    )
     expect(help).toBeTruthy()
     expect(screen.getByLabelText("Row filter (optional)").getAttribute("aria-describedby")).toBe(
       "policy-filter-help"

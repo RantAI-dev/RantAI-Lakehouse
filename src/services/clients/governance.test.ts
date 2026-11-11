@@ -22,9 +22,13 @@ function stubFetch(answer: () => Response): Call[] {
   return calls
 }
 
-describe("governanceService: row filter grammar (WEB-8 D8)", () => {
-  it("reads the functions and operators the server's validator serves", async () => {
-    const grammar = { functions: ["lower", "upper"], operators: ["=", "AND"] }
+describe("governanceService: row filter grammar (WEB-8 D8; S2 review round 1, S2)", () => {
+  it("reads the functions, operators and forms the server's validator serves", async () => {
+    const grammar = {
+      functions: ["lower", "upper"],
+      operators: ["=", "AND"],
+      forms: ["LIKE", "BETWEEN"],
+    }
     const calls = stubFetch(() => json(grammar))
     expect(await service.getRowFilterGrammar()).toEqual(grammar)
     expect(calls[0].url).toBe("/api/governance/row-filter-grammar")
