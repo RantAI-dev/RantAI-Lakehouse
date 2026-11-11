@@ -222,8 +222,6 @@ maps the error, the D5 gap list, the T5 numbers or *not verified*, and the outpu
 `git status --short`, `git log --oneline origin/main..HEAD` and `git ls-remote --heads origin
 <branch>`.
 
-## 6. Review (planner)
-
 ### Handoff (developer, 2026-11-11, S1)
 
 Branch `feat/gov-7-s1-enforce`, base `origin/main` at `4189c0b1` (`ADM-13`
@@ -439,3 +437,58 @@ service identity, the Iceberg door, or Dagster, as "Out of scope" says.
 
 No mismatch between plan and code was found except the two noted above (the
 Accept command shape, and the T5 p95 landing on the budget).
+
+## 6. Review (planner)
+
+### S1, round 1 (planner, 2026-11-11) — branch at `3f6b5569`
+
+Read in full: the migration, `table_access.rs`, the change to
+`policy_engine::rewrite_sql_for_roles` and its error mapping, `sql_rewrite::gate_targets`,
+the two routes in `routes/identity.rs`, and every place that builds `TableAccess::All` or
+handles a failed read of the rule. Sampled, not read line by line: the list filters of D6
+(`catalog.rs` entry and helper, the assistant's map and tools); their tests are in
+`tests/table_access.rs` (1,141 lines), which I did not read either. I ran no check locally;
+#459 runs the suite. (The S1 handoff sat under this heading; it is moved up into section 5,
+unchanged.)
+
+- **The rule fails closed where it must.** A database that cannot be read refuses the
+  statement (`PolicyEngineError::Store`), returns the route's error on the lists, and hides
+  every table from the assistant's map. A role name with no row gives nothing, never all.
+- **The refusal is the tenant gate's own sentence and status** (`table_not_available_message`,
+  one definition used by both).
+- **Statements that name no table are covered** through the tenant gate's resolver:
+  `DESCRIBE`, `SHOW COLUMNS`, listings, `system.*`. Table functions were already refused for
+  everyone.
+- **The write route** checks the scope, refuses a `*:*` role, validates names with
+  `Ident::new`, and audits before and after.
+- The CI failure on T2 was the test fixture naming a role with no row; the fixture now
+  creates the role and the assertion is unchanged, which is the right fix under D4.
+
+**No BLOCKER.**
+
+**SHOULD-FIX**
+
+- **S1. `TableAccess` derives `Default`, and the default is `All`.** Nothing uses it today,
+  but it makes `unwrap_or_default()` on a failed read mean "every table", the one mistake
+  this type must not allow. Remove the derive and the `#[default]`.
+- **S2. Merge `origin/main`** (the branch is behind). `ADM-12` (#455) merges first and
+  carries migration `0134`; this branch keeps `0135`.
+
+**The plan's own mistake (planner).** The *Accept* lines in section 3 are written as
+`cargo test -p lakehouse-api <filter>`, which builds all 110 integration test files before
+filtering (47 GB on 2026-11-11). Read each as `--lib <filter>` or `--test <file>`. S2's
+brief says so.
+
+**For the product owner**
+
+- **The check costs about 3.4 ms at the median and 4.6 to 5.1 ms at p95** per governed read
+  (developer's measurement: unoptimised test build, shared machine, 10 roles and 200 grants).
+  The budget on the feature page is 5 ms *(proposed)*. It is one database read per request
+  and was not cached, as the plan says. A release build should be faster; that is not
+  measured.
+- **A run with no person behind it reads every table.** A scheduled agent run and a service
+  identity carry no roles, so the rule does not narrow them (spec, "Not included"). A person
+  who may manage agents could have an agent read a table their own role hides. A backlog item
+  is filed at merge.
+- **Names are compared without regard to case**, as masks are (D4). Two tables that differ
+  only by case share one grant. Added to the feature page's limits at merge.
