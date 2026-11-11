@@ -19,6 +19,12 @@ export function quoteIdent(part: string) {
 }
 
 /**
+ * Every Iceberg candidate lives in this namespace: `dlt` writes Bronze with
+ * `dataset_name="bronze"` (see the module comment in `catalog.rs`).
+ */
+export const BRONZE_NAMESPACE = "bronze"
+
+/**
  * A Bronze table's name in Trino: `iceberg.bronze.<table>`.
  *
  * A table name that is not a plain identifier comes out quoted
@@ -107,6 +113,43 @@ export function assetStudioTarget(
     return { engine: "trino", table: trinoBronzeName(a.tableName) }
   }
   return assetClickHouseTarget(a)
+}
+
+/**
+ * What an asset with no readable table shows, in place of a starter query
+ * and a link to Query Studio (owner, 2026-11-09). One sentence, one place:
+ * the Studio's schema browser says the same about a Bronze table that is
+ * not there.
+ */
+export const NO_READABLE_TABLE = "No readable table for this asset yet."
+
+/**
+ * Whether this asset has a table the console can read, and so may offer a
+ * Query Studio link for it.
+ *
+ * The proof is one of two: the API named a table it resolved — a Silver
+ * model standing in for a Bronze table the console cannot read comes with
+ * one — or the Iceberg table is there, proven by the detail the page loaded
+ * (owner, 2026-11-09; #437). Without either, the link would name a table
+ * that does not exist.
+ *
+ * `loading` says the Iceberg read is still in flight. While it is, the
+ * asset is given the benefit of the doubt, so the sentence shows only once
+ * the load has finished with no table.
+ */
+export function assetHasReadableTable(
+  a: Target,
+  table: LakehouseTableDetail | null,
+  loading: boolean
+): boolean {
+  // The API's own target: the table it resolved and can read, or the Silver
+  // model that stands in for a Bronze table the console cannot read (the
+  // stand-in is read out of that same target).
+  if (a.queryTarget) return true
+  // The Iceberg table, proven by the detail the page loaded.
+  if (table !== null) return true
+  // The read is still running: the sentence waits for it.
+  return loading
 }
 
 /**

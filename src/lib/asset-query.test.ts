@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test"
 import {
+  assetHasReadableTable,
   assetQueryStudioHref,
   assetQueryTarget,
   assetSnapshotQueryHref,
   assetStarterSql,
   assetStudioTarget,
+  NO_READABLE_TABLE,
   trinoBronzeName,
 } from "./asset-query"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
@@ -256,5 +258,36 @@ describe("a catalog link to a Bronze table whose Iceberg table is not there", ()
 
   it("offers no snapshot link, for a table with no versions of its own", () => {
     expect(assetSnapshotQueryHref(readable, "42", null)).toBeNull()
+  })
+})
+
+// The rule of 2026-11-09: an asset with no readable table offers no Query
+// Studio link. It shows one sentence instead.
+describe("assetHasReadableTable", () => {
+  it("gives the table the API resolved", () => {
+    expect(assetHasReadableTable(readable, null, false)).toBe(true)
+  })
+
+  it("gives the Silver model that stands in for a Bronze table", () => {
+    expect(assetHasReadableTable(standIn, null, false)).toBe(true)
+  })
+
+  it("gives the Iceberg table that is there", () => {
+    expect(assetHasReadableTable(iceberg, table, false)).toBe(true)
+  })
+
+  it("takes the table away from an asset that has none", () => {
+    expect(assetHasReadableTable(iceberg, null, false)).toBe(false)
+  })
+
+  it("waits for the read that is still running", () => {
+    // The load has not finished, so the sentence must not show yet.
+    expect(assetHasReadableTable(iceberg, null, true)).toBe(true)
+  })
+})
+
+describe("NO_READABLE_TABLE", () => {
+  it("is the sentence the console shows for an asset with no readable table", () => {
+    expect(NO_READABLE_TABLE).toBe("No readable table for this asset yet.")
   })
 })

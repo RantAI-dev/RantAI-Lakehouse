@@ -41,7 +41,10 @@ export const CAPABILITIES: Capability[] = [
       // AI-2 AC1: "show only 2026" narrows the person's own view of the page
       // and saves nothing, so Ask mode offers it here; the board's default
       // filters change what every viewer sees and stay in the Dashboard Builder.
-      "set_board_view_filters"],
+      "set_board_view_filters",
+      // AI-4: explaining a calculated field is a read, so Ask mode offers it
+      // here; the tools that write a formula stay in the Dashboard Builder.
+      "list_calculated_fields"],
   },
   {
     key: "dashboard",

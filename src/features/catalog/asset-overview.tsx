@@ -15,7 +15,13 @@ import {
 } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { formatRelativeTime } from "@/lib/format"
-import { assetQueryStudioHref, assetStarterSql, assetStudioTarget } from "@/lib/asset-query"
+import {
+  assetHasReadableTable,
+  assetQueryStudioHref,
+  assetStarterSql,
+  assetStudioTarget,
+  NO_READABLE_TABLE,
+} from "@/lib/asset-query"
 import { isIcebergCandidate, snapshotRelativeTime } from "@/lib/lakehouse-view"
 import { notifyError, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
@@ -120,6 +126,12 @@ export function AssetOverview({
   // The Iceberg table, once loaded. It is what proves the table exists, so
   // the links below open Trino only when it is there (owner, 2026-11-08).
   const table = icebergTableOf(iceberg)
+  // Whether this asset has a table the console can read at all. Without one
+  // the starter query and the Query Studio link would name a table that is
+  // not there, so the card says so instead (owner, 2026-11-09). While the
+  // Iceberg read is still running the asset is given the benefit of the
+  // doubt: the sentence waits for the answer.
+  const readable = assetHasReadableTable(a, table, iceberg.status === "loading")
   // An Iceberg table's own snapshots, once loaded; the API's list otherwise.
   const snapshotCount = table?.snapshots.length ?? a.snapshots.length
   const quality = qualitySummary(a.qualityChecks)
@@ -266,26 +278,36 @@ export function AssetOverview({
       <SectionCard
         size="sm"
         title="Use this data"
-        description={`A starter query for ${
-          assetStudioTarget(a, table).engine === "trino" ? "Trino" : "ClickHouse"
-        }. Masking still applies when it runs.`}
+        description={
+          readable
+            ? `A starter query for ${
+                assetStudioTarget(a, table).engine === "trino" ? "Trino" : "ClickHouse"
+              }. Masking still applies when it runs.`
+            : undefined
+        }
         action={
-          <div className="flex gap-1.5">
-            <Button size="sm" variant="ghost" onClick={() => void copyText(sql, "SQL")}>
-              <Copy />
-              Copy
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              render={<Link href={assetQueryStudioHref(a, table)} />}
-            >
-              Open in Query Studio
-            </Button>
-          </div>
+          readable ? (
+            <div className="flex gap-1.5">
+              <Button size="sm" variant="ghost" onClick={() => void copyText(sql, "SQL")}>
+                <Copy />
+                Copy
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                render={<Link href={assetQueryStudioHref(a, table)} />}
+              >
+                Open in Query Studio
+              </Button>
+            </div>
+          ) : undefined
         }
       >
-        <CodeBlock>{sql}</CodeBlock>
+        {readable ? (
+          <CodeBlock>{sql}</CodeBlock>
+        ) : (
+          <p className="text-sm text-muted-foreground">{NO_READABLE_TABLE}</p>
+        )}
       </SectionCard>
 
       <div className="grid gap-2 lg:grid-cols-2">
