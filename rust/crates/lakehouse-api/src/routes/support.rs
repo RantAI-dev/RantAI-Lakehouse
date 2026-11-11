@@ -1462,6 +1462,16 @@ mod run_spec_sql_enforcement {
         .expect("seeding the governing policy must succeed");
         let analyst = vec!["Analyst".to_owned()];
         let admin = vec!["Admin".to_owned()];
+        // GOV-7 D4: a role name is resolved against `role` BY NAME, and a name
+        // with no row contributes nothing (it is not "all"). This fixture
+        // names a role the seed migrations do not create, so the fixture
+        // creates it with the migration's default `read_scope = 'all'` — the
+        // assertion below is unchanged and D4 is not loosened. Production
+        // never sees this: every name in `principal.role_names` came from a
+        // `role` row.
+        sqlx::query("INSERT INTO role (name, permissions) VALUES ('Admin', '') ON CONFLICT (name) DO NOTHING")
+            .execute(&pool)
+            .await?;
         for order in [[&analyst, &admin], [&admin, &analyst]] {
             let server = MockServer::start().await;
             // Nothing in `system.parts`: the table is not watched, which is
