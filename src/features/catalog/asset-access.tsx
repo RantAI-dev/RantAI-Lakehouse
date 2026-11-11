@@ -117,6 +117,12 @@ function AddPolicyDialog({
   // text it was, with the reason, rather than an empty list of checkboxes.
   const rolesState = useService((signal) => identityService.listRoles(signal), [])
   const roles = rolesState.status === "success" ? rolesState.data : null
+  // WEB-8 S2 T8 (D8): the row filter grammar comes from the server's own
+  // validator constants. While it loads, or when the read fails, there is no
+  // help line at all — a guessed or stale list would invite a save the
+  // server refuses.
+  const grammarState = useService((signal) => governanceService.getRowFilterGrammar(signal), [])
+  const grammar = grammarState.status === "success" ? grammarState.data : null
   const chosenRoles = roleNames(form.roles)
 
   function toggleRole(roleName: string) {
@@ -223,8 +229,15 @@ function AddPolicyDialog({
               value={form.rowFilter}
               onChange={(e) => setForm((f) => ({ ...f, rowFilter: e.target.value }))}
               placeholder="region = 'ID'"
+              aria-describedby={grammar ? "policy-filter-help" : undefined}
               className="font-mono"
             />
+            {grammar ? (
+              <p id="policy-filter-help" className="text-xs text-muted-foreground">
+                Functions: {grammar.functions.join(", ")}. Operators:{" "}
+                {grammar.operators.join(", ")}.
+              </p>
+            ) : null}
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="policy-name">Name</Label>

@@ -233,6 +233,7 @@ function stubApi({
   schedules = [],
   learning = LEARNING,
   roles,
+  grammar,
 }: {
   permissions?: string[]
   lineage?: unknown
@@ -266,6 +267,8 @@ function stubApi({
   learning?: unknown
   /** The roles `GET /api/identity/roles` answers; absent means the read fails. */
   roles?: unknown[]
+  /** The row filter grammar `GET /api/governance/row-filter-grammar` answers; absent means it fails. */
+  grammar?: unknown
 } = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -290,6 +293,11 @@ function stubApi({
     // WEB-8 D8: the roles the Add policy dialog offers as checkboxes. Left
     // out, the read fails and the field stays free text.
     if (method === "GET" && path.endsWith("/api/identity/roles") && roles !== undefined) return json(roles)
+    // WEB-8 S2 T8 (D8): the row filter grammar the dialog's help line names.
+    // Left out, the read fails and no help line is shown.
+    if (method === "GET" && path.endsWith("/api/governance/row-filter-grammar") && grammar !== undefined) {
+      return json(grammar)
+    }
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     // DATA-14: the Quality tab's incidents, schedule and learning state.
     if (method === "GET" && path.includes("/api/governance/quality/incidents")) return json({ incidents })
@@ -2126,6 +2134,32 @@ describe("Access tab: adding a policy", () => {
       target: { value: "Analyst" },
     })
     expect((screen.getByLabelText("Roles it applies to") as HTMLInputElement).value).toBe("Analyst")
+  })
+
+  it("names the functions and operators the row filter accepts (WEB-8 T8, D8)", async () => {
+    stubApi({ grammar: { functions: ["lower", "upper"], operators: ["=", "AND"] } })
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    const help = await screen.findByText("Functions: lower, upper. Operators: =, AND.")
+    expect(help).toBeTruthy()
+    expect(screen.getByLabelText("Row filter (optional)").getAttribute("aria-describedby")).toBe(
+      "policy-filter-help"
+    )
+  })
+
+  it("shows no row filter help line when the grammar cannot be read (WEB-8 T8, D8)", async () => {
+    stubApi()
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    // The roles read fails too; waiting for its sentence proves the dialog's
+    // reads have settled before the absence is asserted.
+    await screen.findByText(/Could not read the roles; type them as a comma-separated list/)
+    expect(screen.queryByText(/Functions:/)).toBeNull()
+    expect(screen.getByLabelText("Row filter (optional)").getAttribute("aria-describedby")).toBeNull()
   })
 
   it("offers no policy form without policy:write", async () => {

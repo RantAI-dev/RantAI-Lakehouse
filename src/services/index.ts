@@ -53,6 +53,12 @@ export const agentService = postgresAgentService
 // Governance is now fully real — reads from ClickHouse/Dagster,
 // policies + create*Rule from Postgres. mock/governance.ts has been deleted.
 export const governanceService = clickhouseGovernanceService
+/**
+ * The row filter grammar the server's validator accepts (`WEB-8` S2 D8).
+ * The contract owns the shape, and it is exported here so a feature imports
+ * it from `@/services`.
+ */
+export type { RowFilterGrammar } from "./contracts/governance"
 // Ops is real — the service list from ClickHouse+Dagster. WEB-3 slice 1
 // removed the observability and workloads reads with their pages; the
 // backend routes stay registered (WEB-4 retires them).

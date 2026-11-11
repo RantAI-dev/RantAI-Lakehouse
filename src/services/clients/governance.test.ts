@@ -22,6 +22,24 @@ function stubFetch(answer: () => Response): Call[] {
   return calls
 }
 
+describe("governanceService: row filter grammar (WEB-8 D8)", () => {
+  it("reads the functions and operators the server's validator serves", async () => {
+    const grammar = { functions: ["lower", "upper"], operators: ["=", "AND"] }
+    const calls = stubFetch(() => json(grammar))
+    expect(await service.getRowFilterGrammar()).toEqual(grammar)
+    expect(calls[0].url).toBe("/api/governance/row-filter-grammar")
+    expect(calls[0].init.method ?? "GET").toBe("GET")
+  })
+
+  it("maps a refused read onto the error the API's sentence names", async () => {
+    stubFetch(() => json({ error: "permission_denied: policy:read" }, 403))
+    await expect(service.getRowFilterGrammar()).rejects.toMatchObject({
+      code: "permission_denied",
+      message: "permission_denied: policy:read",
+    })
+  })
+})
+
 describe("governanceService: quality incidents, schedules and history (DATA-14)", () => {
   it("lists open incidents by default and narrows by status and table", async () => {
     const calls = stubFetch(() => json({ incidents: [] }))
