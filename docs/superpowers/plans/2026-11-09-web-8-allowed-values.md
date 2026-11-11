@@ -546,6 +546,172 @@ line in a real browser (Bun DOM tests only).
   34992020e8219e814a33d422026fc1d40ff615e1	refs/heads/feat/web-8-s2-pickers
   ```
 
+### Handoff (developer, 2026-11-11, S2 round 1 fixes)
+
+Section 6's "S2, round 1" findings are implemented in order S3, B1, S1, S2,
+on `feat/web-8-s2-pickers`, pushed after every commit.
+
+#### Commits
+
+| Finding | Commit | Subject |
+| --- | --- | --- |
+| S3 | `199785ec` | `Merge remote-tracking branch 'origin/main' into feat/web-8-s2-pickers'` |
+| B1 | `0a85fe40` | `fix(console): the batch SQL form stops claiming TLS modes its loaders ignore (WEB-8 S2 review round 1, B1)` |
+| S1 | `cf13ccdf` | `fix(console): an access rule's unknown role is shown and removable (WEB-8 S2 review round 1, S1)` |
+| S2, Rust | `d933427d` | `feat(api): the row filter grammar names the forms the validator accepts (WEB-8 S2 review round 1, S2)` |
+| S2, console | `b85183ba` | `fix(console): the row filter help line names the forms the server accepts (WEB-8 S2 review round 1, S2)` |
+
+#### S3: merge `origin/main`
+
+`origin/main` was one commit ahead (`f4a89384`, a `docs/core/BACKLOG.md`
+status line: `WEB-7` Done). **Conflicts: none.** The merge is `199785ec`.
+`bun install --frozen-lockfile` answered "678 packages installed" with no
+lockfile change; `bun run typecheck` was clean.
+
+#### B1: which adapters the batch SQL form serves, and what reads `sslMode`
+
+`DialFormFor` (`src/features/connectors/connector-form-parts.tsx:264`)
+routes adapter `sql` to `SqlDialForm` unless `typeName === "Oracle"`; the
+drivers behind it come from `driverForType` (`:248`): **PostgreSQL**, **MySQL**
+(**MariaDB** shares the driver) and **SQL Server**. Oracle has its own form and
+is reported at the end of this section, not fixed.
+
+The API stores `SqlDial::ssl_mode` as free text with no value check
+(`rust/crates/lakehouse-store/src/ingest_spec.rs:72-74`; `Dial::parse` at
+`:662`; the only TLS rule, `validate_sql_dial_post_parse` at `:1543`, is
+Oracle's DN requirement at `:1573-1584`). What each loader and the API's
+probe then do with the value:
+
+| Adapter | Where `sslMode` is read (file and line) | `require` | `verify-ca` | `verify-full` | `disable` | a value it does not know | What the connection does instead |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| PostgreSQL | Loader `dagster/dispar_orchestrate/dlt_pipeline.py:188` `from_dial`, `:239-249`, `:296-319`; probe `rust/crates/lakehouse-api/src/connector_probe.rs:490-500` (`From<&SqlDial>`), `:1291-1309` (`pg_options_for_address`) | not read | not read | not read | not read | not read | Loader: libpq's own default (TLS attempted, plaintext fallback). Probe: `PgSslMode::Require`, or `VerifyCa` when a CA is configured — chosen by the CA, never by the dial |
+| MySQL / MariaDB | Loader `dagster/dispar_orchestrate/adapters/sql.py:212-262` (credentials at `:241-248`, no SSL option); probe `connector_probe.rs:1350-1363` (`mysql_connect_options`) | not read | not read | not read | not read | not read | Loader: no `ssl` parameter, so no TLS. Probe: `MySqlSslMode::Preferred` |
+| SQL Server | Loader `adapters/sql.py:157-186` (`_mssql_connection_string`, called at `:234`); probe `connector_probe.rs:1335-1341` (`apply_mssql_tls`) | not read | not read | not read | not read | not read | Loader: the ODBC string hard-codes `Encrypt=yes;TrustServerCertificate=no`. Probe: `EncryptionLevel::Required`, chain checked with a CA or accepted without one |
+
+`dlt_pipeline.BronzeIngestConfig.from_dial` copies host, port, user, password
+and database and drops the rest; `adapters/sql.py` never names `sslMode` at
+all (grep of non-test `dagster/`: under `adapters/` the only reader is
+`adapters/oracle.py:145`). `DialTarget` (`connector_probe.rs:482-512`) carries
+no `ssl_mode`, so every probe loses it before a driver sees a dial.
+
+**So: no adapter the batch SQL form serves honours any of the four values.**
+The form's `Select` over `CDC_SSL_MODES` therefore made a false claim for all
+three (the change-capture worker's modes, labelled "[c]ertificate not checked"
+and so on, while a load reads none of them).
+
+What changed:
+
+- `src/features/connectors/dial-forms/sql-dial-form.tsx`: the SSL mode is the
+  free text it was before T4 — `Input` writing `dial.sslMode` as typed and
+  `null` when cleared, which is exactly `SqlDial::ssl_mode: Option<String>` —
+  with a help line: "Stored with the connector and sent to the ingestion job
+  as typed. This build's batch loaders for PostgreSQL, MySQL/MariaDB and SQL
+  Server set their own TLS posture and do not read this value."
+- `src/features/connectors/dial-forms/ssl-modes.ts`: the module doc says the
+  batch SQL form offers no list and why. `CDC_SSL_MODES` and
+  `ORACLE_SSL_MODES` stay; the change-capture form still uses them, and the
+  Oracle form still uses `ORACLE_SSL_MODES` (see the report below).
+- `dial-forms.test.tsx`: the three SQL picker tests became three tests of the
+  text field — an `INPUT` with the honest line, the typed value sent and
+  cleared to `null`, and a stored value shown and kept. The Oracle picker test
+  is unchanged.
+
+**Reported, not fixed (B1's own limit):** the batch Oracle form shows the same
+problem with a different label. `DialFormFor` sends batch `Oracle` to
+`OracleDialForm`, which offers `ORACLE_SSL_MODES`; its `require` label says
+"native network encryption, server not authenticated", which is the
+change-capture worker's meaning (`CdcSslMode`, `ingest_spec.rs:143-169`). The
+batch loader reads any value except `disable` as TLS (`adapters/oracle.py:145`)
+and connects with `protocol="tcps"` plus an operator-supplied
+`ssl_server_cert_dn` (`:163-170`), i.e. it does compare a certificate DN. That
+form is outside B1's instruction, so its label is left as it is and this note
+is the report. The change-capture form routes to `CdcDialForm`, whose
+`database.sslmode` values are the four `CdcSslMode::as_debezium` spells
+(`ingest_spec.rs:157-169`); it is unchanged and was not read further for B1.
+
+#### S1: an unknown role is visible and removable
+
+`AddPolicyDialog` (`src/features/catalog/asset-access.tsx`) now derives
+`unknownRoles` from the chosen names and the roles the deployment listed, and
+draws each as a removable amber `Badge` under a "Not recognised" label, the
+pattern `src/features/admin/permission-picker.tsx:194-220` uses. The name stays
+in `form.roles`, so it is still saved, until the remove button (`aria-label`
+`Remove <name>`, calling the same `toggleRole`) takes it out.
+
+`src/features/catalog/asset-detail-tabs.test.tsx` gained two tests: one types a
+name while the roles read is held open, lets the list arrive, and saves — the
+`subjects` and `conditions` still carry `Retired Role`; the other removes the
+chip and asserts the name is gone. The roles stub accepts a `Promise` for
+this, which is the only change to it.
+
+#### S2: the forms the validator accepts
+
+`rust/crates/lakehouse-api/src/sql_rewrite.rs:1405` adds
+`ALLOWED_ROW_FILTER_FORMS = ["LIKE", "ILIKE", "BETWEEN", "IN", "IS NULL",
+"IS NOT NULL"]`, next to the function and operator constants. Each was checked
+against `validate_expr_shape` (`:2376`): `Expr::Like`/`Expr::ILike` at
+`:2432-2470`, `Expr::Between` at `:2422`, `Expr::InList` at `:2385`,
+`Expr::IsNull`/`Expr::IsNotNull` at `:2419`. The arm does not branch on
+`Engine`, and `translate_row_filter_for_trino` (`:2689`) keeps all of them, so
+all six pass on `ClickHouse` and `Trino`; `a IS TRUE` (an `Expr::IsTrue`, no
+arm) does not and is the test's refused form. The constant is documentation
+for the route, not a list the validator reads — the module doc says so. **The
+validator's accepted set is unchanged.**
+
+`routes/governance.rs:1140` `RowFilterGrammar` gains `forms` and
+`:1167` `row_filter_grammar` serves `ALLOWED_ROW_FILTER_FORMS`.
+`row_filter_grammar_names_only_what_the_validator_accepts` (`:2079`) now feeds
+one filter per form name back to `validate_row_filter_expr` on **both**
+`Engine::ClickHouse` and `Engine::Trino`, and asserts `a IS TRUE` is refused.
+`tests/route_auth.rs:1722` also asserts the body's `forms` array is non-empty.
+
+The console contract `RowFilterGrammar` (`src/services/contracts/governance.ts`)
+takes `forms: string[]`; the client method and its test follow. The help line
+in `asset-access.tsx` now reads "Functions: … Operators: …. Forms: LIKE,
+ILIKE, BETWEEN, IN, IS NULL, IS NOT NULL." from the server, and the test at
+`asset-detail-tabs.test.tsx` pins the full sentence.
+
+#### Verification commands and counts (foreground, on this branch)
+
+- S3: `git merge origin/main` — one file, `docs/core/BACKLOG.md`, no conflict.
+- `bun install --frozen-lockfile`: 678 packages installed, no lockfile change.
+- B1: `bun test src/features/connectors/dial-forms`: **38 pass, 0 fail, 145
+  `expect()` calls** across 2 files (same count as before: three tests
+  replaced three).
+- B1 accept: `bun test src/features/connectors`: **448 pass, 0 fail, 1,858
+  `expect()` calls** across 23 files.
+- S1/S2: `bun test src/features/catalog/asset-detail-tabs.test.tsx`: **160
+  pass, 0 fail, 542 `expect()` calls** across 1 file (the two S1 tests and the
+  updated S2 help-line test).
+- S2 accept: `bun test src/features/catalog`: **368 pass, 0 fail, 1,179
+  `expect()` calls** across 14 files (was 366; the two new S1 tests).
+- S2 client: `bun test src/services`: **214 pass, 0 fail, 597 `expect()`
+  calls** across 19 files (count unchanged; the existing grammar test now
+  includes `forms`).
+- `bun run typecheck`: clean, exit 0, after every commit.
+- `bun run lint`: **0 errors, 10 warnings**, the same ten pre-existing
+  warnings each time (the unused `pickOption` helper B1 made dead was removed
+  rather than left as an eleventh).
+- `cargo fmt --check`: clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: clean
+  (3m 47s).
+- `cargo test -p lakehouse-api --lib row_filter`: **70 passed, 0 failed**,
+  3,367 filtered out (the grammar test was extended, not added).
+- `sg docker -c 'cargo test -p lakehouse-api --test route_auth'`: **87
+  passed, 0 failed**.
+
+*Not verified locally: the rest, left to CI* — the whole-suite `bun run test`,
+  the full Rust workspace run (only `lakehouse-api` and `lakehouse-store` are
+  read; only `lakehouse-api` changed), `cargo test -p lakehouse-api --lib`
+  unfiltered, `--test sec11_guard`, and the rendered help text in a real
+  browser (Bun DOM tests only).
+
+#### Git state
+
+- `git status --short`: clean.
+- `git log --oneline 6dbd8136..HEAD`: the five commits above.
+- `git ls-remote --heads origin feat/web-8-s2-pickers`: `b85183ba`.
+
 ## 6. Review (planner)
 
 ### Review 1 (planner, 2026-11-09), S1 at `6a03c274`
