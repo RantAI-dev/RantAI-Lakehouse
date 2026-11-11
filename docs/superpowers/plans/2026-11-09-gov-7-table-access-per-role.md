@@ -581,3 +581,16 @@ brief says so.
   is filed at merge.
 - **Names are compared without regard to case**, as masks are (D4). Two tables that differ
   only by case share one grant. Added to the feature page's limits at merge.
+
+### S1, round 2 (planner, 2026-11-11) — branch at `ba616e13`
+
+Read the fix (`8974f4e8`, `table_access.rs`).
+
+- **S1: closed.** `TableAccess` has no `Default`; nothing relied on it, so no call site
+  changed.
+- **S2: closed** (`55a9c58e`, no conflict).
+
+**No open BLOCKER and no open SHOULD-FIX.** I ran no check locally. Merged only when #459 is
+green on its last commit, and after `ADM-12` (#455), so the migrations land as 0134 then
+0135; the branch is updated once #455 is in.
+
