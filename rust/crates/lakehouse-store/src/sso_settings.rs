@@ -1,5 +1,5 @@
 //! The deployment's single sign-on (OIDC) settings, saved from the console
-//! (`ADM-12`, migration `0133`): the issuer, client ID, client secret,
+//! (`ADM-12`, migration `0134`): the issuer, client ID, client secret,
 //! provider name, groups claim, role map, and JIT provisioning toggle.
 //!
 //! At most one row exists in `sso_settings` (`singleton`). No row means nothing
