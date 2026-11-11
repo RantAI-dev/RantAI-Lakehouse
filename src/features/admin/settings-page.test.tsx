@@ -57,6 +57,18 @@ function stubApi(permissions = ["settings:write", "governance:write"]) {
         model: { value: "example-model", source: "default" },
         key: { set: false, source: "default" },
       })
+    if (path.includes("/api/settings/sso"))
+      return json({
+        issuer: { value: null, source: "default" },
+        clientId: { value: null, source: "default" },
+        clientSecret: { set: false, source: "default" },
+        providerName: { value: "default", source: "default" },
+        groupsClaim: { value: "groups", source: "default" },
+        roleMap: { value: [], source: "default" },
+        jitProvisioning: { value: false, source: "default" },
+        canEdit: true,
+      })
+    if (path.includes("/api/identity/roles")) return json([])
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
   return paths

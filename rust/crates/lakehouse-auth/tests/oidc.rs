@@ -908,6 +908,75 @@ async fn authenticate_with_nonce_reports_a_group_overage_and_maps_no_role(
 // unset. The token's `iss` is the same server URI, because the configured
 // issuer must still match the token exactly.
 
+/// `ADM-12` D10: the same cached read returns the two endpoints a browser
+/// sign-in needs, whichever key-set address the config names. The key set
+/// here is explicit, so the only request is the discovery read.
+#[tokio::test]
+async fn discovery_endpoints_returns_the_authorize_and_token_addresses() {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+        })))
+        .mount(&server)
+        .await;
+    let config = OidcConfig::new(issuer.clone(), CLIENT_ID, "test", format!("{issuer}/jwks"));
+    let auth = OidcAuthenticator::with_jwks_client(
+        config,
+        JwksClient::new(format!("{issuer}/jwks")),
+        lazy_pool(),
+    );
+
+    let endpoints = auth
+        .discovery_endpoints()
+        .await
+        .expect("a document naming all three endpoints");
+    assert_eq!(
+        endpoints.authorization_endpoint,
+        format!("{issuer}/authorize")
+    );
+    assert_eq!(endpoints.token_endpoint, format!("{issuer}/token"));
+    assert_eq!(endpoints.jwks_uri, format!("{issuer}/jwks"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "one discovery read, no key-set fetch: {requests:?}"
+    );
+}
+
+/// `ADM-12` D10: a thin document (one naming only the key set) is refused
+/// when the sign-in endpoints are asked for, and still serves the
+/// bearer-token path that needs no more than the key set (`SEC-38`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_document_with_no_sign_in_endpoints_is_refused_only_where_they_are_needed(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    let issuer = server.uri();
+    mount_jwks_at(&server, "/keys", &[&key]).await;
+    mount_discovery(&server, &issuer, &format!("{issuer}/keys")).await;
+
+    let auth = discovering_authenticator(&issuer, pool, Duration::from_secs(300), true);
+    let err = auth.discovery_endpoints().await.unwrap_err();
+    assert!(matches!(err, AuthError::InvalidCredentials));
+
+    let mut claims = Claims::valid("user-1");
+    claims.iss = &issuer;
+    let token = sign(&claims, &key, Algorithm::RS256);
+    auth.authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .expect("a thin discovery document must not break the bearer-token path");
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_token_verifies_when_the_key_sets_address_comes_from_discovery(
     pool: PgPool,

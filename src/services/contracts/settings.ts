@@ -164,6 +164,22 @@ export interface SettingsService {
    * or not.
    */
   testAssistant(signal?: AbortSignal): Promise<AssistantTestResult>
+  /** The deployment's SSO / OIDC configuration (`ADM-12`). */
+  getSso(signal?: AbortSignal): Promise<SsoSettings>
+  /**
+   * Save SSO / OIDC settings (`ADM-12`). Server-owned fields are refused with
+   * 409; unknown roles or invalid URLs are refused with 400.
+   */
+  saveSso(input: SsoSettingsInput, signal?: AbortSignal): Promise<SsoSettings>
+  /**
+   * Start an OIDC test sign-in run with the draft settings (`ADM-12`).
+   * Returns `{ id, authorizeUrl }`.
+   */
+  startSsoTest(input: SsoSettingsInput, signal?: AbortSignal): Promise<SsoTestStartResult>
+  /**
+   * Read the result of an OIDC test sign-in run (`ADM-12`).
+   */
+  getSsoTestResult(id: string, signal?: AbortSignal): Promise<SsoTestResult>
 }
 
 /**
@@ -342,4 +358,114 @@ export type DeploymentFeature = {
 export type DeploymentSettings = {
   /** One entry per feature. */
   features: DeploymentFeature[]
+}
+
+/**
+ * One row of the group-to-role mapping (`ADM-12`).
+ * Maps an IdP group name to a local deployment role.
+ */
+export type RoleMapRow = {
+  /** The external IdP group name. */
+  group: string
+  /** The local role name. */
+  role: string
+}
+
+/**
+ * `GET`/`PUT /api/settings/sso` (`ADM-12`): single sign-on (OIDC) settings
+ * for this deployment.
+ *
+ * Server-owned fields are read-only in the console and cannot be changed
+ * without updating the server's environment.
+ */
+export type SsoSettings = {
+  /** The OIDC issuer URL. */
+  issuer: SettingField<string>
+  /** The OIDC client ID. */
+  clientId: SettingField<string>
+  /** The OIDC client secret: only whether one is set, never the secret itself. */
+  clientSecret: SecretSetting
+  /** The OIDC provider display name. */
+  providerName: SettingField<string>
+  /** The claim in the ID token that carries groups. */
+  groupsClaim: SettingField<string>
+  /** Group-to-role mapping rows. */
+  roleMap: SettingField<RoleMapRow[]>
+  /** Whether JIT provisioning is enabled for new SSO users. */
+  jitProvisioning: SettingField<boolean>
+  /** Whether the caller may edit SSO settings (unrestricted Platform Admin). */
+  canEdit: boolean
+  /**
+   * Whether a sign-in can be offered right now (`ADM-12` D10). False when
+   * the saved connection cannot be used — no `CONSOLE_PUBLIC_URL`, an
+   * unreachable discovery document, or an address this deployment may not
+   * reach. The form still saves; the sign-in page shows no button.
+   */
+  ready: boolean
+  /**
+   * Why the connection cannot be used, as a fixed sentence naming what to
+   * set (`ADM-12` D10). Present only when {@link SsoSettings.ready} is
+   * false.
+   */
+  notReadyReason: string | null
+}
+
+/**
+ * What a save sends (`ADM-12`): omitted fields keep what is stored, null
+ * clears it, and values replace it. The client secret is write-only.
+ */
+export type SsoSettingsInput = {
+  issuer?: string | null
+  clientId?: string | null
+  clientSecret?: string | null
+  providerName?: string | null
+  groupsClaim?: string | null
+  roleMap?: RoleMapRow[] | null
+  jitProvisioning?: boolean | null
+}
+
+/**
+ * The answer of `POST /api/settings/sso/test` (`ADM-12`, plan D8):
+ * the test run ID and the authorize URL to open in a new window.
+ */
+export type SsoTestStartResult = {
+  /** The test run ID. */
+  id: string
+  /** The authorize URL to initiate the test flow. */
+  authorizeUrl: string
+}
+
+/**
+ * The answer of `GET /api/settings/sso/test/{id}` (`ADM-12`, plan D8):
+ * test sign-in result or classified error.
+ */
+/** One test sign-in's result: the claims the provider sent, the roles they
+ * map to, and the two claims an administrator needs to see (`ADM-12` D8;
+ * review round 2, S2). Never carries the token or the provider's own error
+ * text — `error` is this deployment's fixed sentence. */
+export type SsoTestResult = {
+  /** Whether the test was successful. */
+  ok?: boolean
+  /** Subject (sub claim). */
+  subject?: string
+  /** Email from ID token. */
+  email?: string | null
+  /**
+   * The provider's `email_verified` claim (`ADM-12` review round 1, S2):
+   * what `SEC-65` will need an administrator to see. `null` when the
+   * provider did not say.
+   */
+  emailVerified?: boolean | null
+  /** Groups resolved from groups claim. */
+  groups?: string[]
+  /** Roles mapped from roleMap. */
+  mappedRoles?: string[]
+  /**
+   * Whether the provider sent a group-overage marker instead of the groups
+   * claim (`SEC-39`, `ADM-12` review round 1, S2): no group-based role was
+   * applied, so the card says so.
+   */
+  overage?: boolean | null
+  /** Classified error message if test failed. */
+  error?: string
 }
