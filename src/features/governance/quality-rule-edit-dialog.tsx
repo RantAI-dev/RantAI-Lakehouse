@@ -19,6 +19,7 @@ import { SEVERITY_LABEL, type Severity } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { QualityRule, UpdateQualityRuleInput } from "@/services/contracts/governance"
 import { ThresholdForms } from "./quality-check-fields"
+import { TablePicker, useTableCatalog } from "./table-picker"
 
 const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
@@ -69,6 +70,9 @@ export function EditRuleDialog({
   const [severity, setSeverity] = React.useState<Severity>(
     isSeverity(rule.severity) ? rule.severity : "medium"
   )
+  // WEB-8 D8: the table is picked from the catalog, with the rule's own
+  // table shown even if the catalog no longer lists it.
+  const catalog = useTableCatalog()
   const save = useServiceAction((signal, input: UpdateQualityRuleInput) =>
     governanceService.updateQualityRule(rule.id, input, signal)
   )
@@ -101,16 +105,13 @@ export function EditRuleDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
-          <div className="grid gap-1.5">
-            <Label htmlFor="edit-rule-asset">Table</Label>
-            <Input
-              id="edit-rule-asset"
-              className="font-mono"
-              value={asset}
-              onChange={(e) => setAsset(e.target.value)}
-              placeholder="silver.orders"
-            />
-          </div>
+          <TablePicker
+            id="edit-rule-asset"
+            label="Table"
+            value={asset}
+            onChange={setAsset}
+            catalog={catalog}
+          />
           <div className="grid gap-1.5">
             <Label htmlFor="edit-rule-threshold">Threshold</Label>
             <Input

@@ -284,6 +284,23 @@ export type CreatePolicyInput = {
   owner?: string
 }
 
+/**
+ * The functions, operators and forms a row filter accepts
+ * (`GET /api/governance/row-filter-grammar`, `WEB-8` S2 D8; forms added by
+ * S2 review round 1, S2). The server builds this from the constants its
+ * validator checks against (the forms are its match arms, held by the
+ * route's test), so the console's help line cannot drift from what a save
+ * will accept; never hard-code a copy here.
+ */
+export type RowFilterGrammar = {
+  /** Function names, as the validator spells them. */
+  functions: string[]
+  /** Operator tokens, as the validator spells them. */
+  operators: string[]
+  /** Expression forms, as the validator spells them (`LIKE`, `BETWEEN`, …). */
+  forms: string[]
+}
+
 export type CreateQualityRuleInput = {
   name: string
   asset: string
@@ -356,6 +373,12 @@ export type DatasetSla = {
 
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
+  /**
+   * The functions and operators a row filter accepts; needs `policy:read`.
+   * A failed read must leave the console with no help line, never a guessed
+   * list.
+   */
+  getRowFilterGrammar(signal?: AbortSignal): Promise<RowFilterGrammar>
   listQuality(signal?: AbortSignal): Promise<QualityRule[]>
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
   /**
