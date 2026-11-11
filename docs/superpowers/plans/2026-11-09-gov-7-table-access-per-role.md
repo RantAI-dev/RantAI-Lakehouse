@@ -193,6 +193,19 @@ S1:
     is not run, write *not verified*.
   - If p95 is over 5 ms, report it. Do not add a cache unasked.
 
+- **D9. Bronze tables are named in the lists (planner, 2026-11-11, from S2 round 1).**
+  - A Bronze row of the catalog list is addressed by a registry slug and named no table, so
+    a narrowed role never saw a Bronze row, whatever it was granted, and the picker could
+    not offer one.
+  - `bronze_catalog_row` emits `tableKey`: `bronze.<table_name>`, or `null` when the registry
+    records no table. It is the same key `bronze_asset_detail_body` already emits.
+    `asset_table_key` is unchanged and now finds it.
+  - The picker reads `tableKey` from the list row. A Bronze table is listed by name under the
+    schema `bronze`. A row with no key counts as unnamed under `bronze`.
+  - The catalog's `namespace` (`primer`, `sekunder`) is a display grouping. It is never
+    offered or sent as a schema: no table lives in a schema of that name, so such a grant
+    reads nothing.
+
 S2:
 
 - **T6 (D8).** The contract (`RoleTableAccess` type, `getRoleTableAccess`,
@@ -204,6 +217,35 @@ S2:
   - *Accept:* `bun run typecheck && bun run lint && bun test src/features/admin`.
 - **T7.** Docs: `docs/OPERATIONS.md` gets "Limiting a role to some schemas or tables", with
   the limits from the feature page.
+- **T8 (D9; S2 round 1 B2).** Rust, `lakehouse-api` only. `bronze_catalog_row` takes the
+  table name and emits `tableKey`.
+  - Tests in `tests/table_access.rs`:
+    - a narrowed role granted one Bronze table sees that row in `GET /api/catalog` and in
+      `GET /api/catalog/query`, and does not see another Bronze row;
+    - a narrowed role granted only a Silver table still sees no Bronze row.
+  - The first test must fail on the branch before the change. Say so in the handoff.
+  - *Accept* (every cargo command through `/home/shiro/rantai/bin/cargo-locked`):
+    `cargo fmt --check`, `cargo clippy -p lakehouse-api --all-targets -- -D warnings`,
+    `cargo test -p lakehouse-api --test table_access`,
+    `cargo test -p lakehouse-api --lib catalog`. Never a bare
+    `cargo test -p lakehouse-api <filter>`.
+- **T9 (D9; S2 round 1 B1, S1, S2).** Console.
+  - `schemaChoices` takes the table from `tableKey` when the row has one, else from an `id`
+    that holds a dot. A row with neither counts as unnamed under `bronze`. `namespace` is not
+    read.
+  - A grant's table is compared without regard to case everywhere in the section, as the
+    rule compares it.
+  - Save sends the table-access request only when the scope or the grants differ from what
+    was loaded.
+  - Bun tests:
+    - a Bronze row with `tableKey: "bronze.orders"` is offered as `orders` under `bronze`;
+    - a Bronze row with no key gives a `bronze` group with the sentence, and no `primer`
+      group;
+    - a stored grant `silver.Orders` shows the catalog's `orders` ticked, and unticking it
+      removes the grant from the body;
+    - saving the role with the section untouched sends no table-access request.
+  - `docs/OPERATIONS.md` says how Bronze tables are named in the section.
+  - *Accept:* `bun run typecheck && bun run lint && bun test src/features/admin src/services`.
 
 ## 4. Out of scope
 
@@ -737,3 +779,90 @@ Read the fix (`8974f4e8`, `table_access.rs`).
 green on its last commit, and after `ADM-12` (#455), so the migrations land as 0134 then
 0135; the branch is updated once #455 is in.
 
+### S2, round 1 (planner, 2026-11-11) — branch at `171275cf`, pull request #468
+
+Read in full: `role-table-access.tsx`, the changes to `role-form-page.tsx`, `roles-page.tsx`,
+`roles-columns.tsx`, the client and the contract, and the new section of
+`docs/OPERATIONS.md`. Read on the server to check the console against it:
+`table_access.rs` (`allows`, `allows_key`), `routes/catalog.rs` (`bronze_catalog_row`,
+`asset_table_key`, `asset_visible`, `ensure_asset_readable`), `tenant.rs` (the namespace
+constants) and `put_role_table_access`. The three test files were sampled, not read line by
+line.
+
+Run by me in a detached worktree at `171275cf`: `bun install --frozen-lockfile`,
+`bun run typecheck` (pass), `bun run lint` (0 errors, 11 warnings, none in a file of this
+slice), `bun test src/features/admin src/services` (349 pass, 0 fail, 40 files). The one
+failure the handoff saw once did not appear. The whole `bun run test` and the Rust suite:
+not run by me; #468 runs them.
+
+What holds:
+
+- **Nothing a role holds is dropped without the person doing it.** The draft starts from the
+  stored grants, a grant the catalog does not list is shown and sent back, and a section
+  that could not be loaded writes nothing.
+- **A failed save stays on the page and says which half failed.**
+- **A `*:*` role** shows the section disabled with the server's sentence and sends no write.
+- **A read that failed is "—" in the Roles list**, never "All tables".
+- The Roles list reads each role's access with one request per role. Accepted for a page an
+  administrator opens by hand; the comment at the site says why.
+
+**BLOCKER**
+
+- **B1. The picker offers `primer` and `sekunder` as schemas, and such a grant reads
+  nothing.**
+  - `schemaChoices` puts a Bronze row under its `namespace`, with a "Whole schema" checkbox
+    and the sentence "Choose the whole schema, or add a table below."
+    (`role-table-access.tsx`, the branch after the `id` has no dot).
+  - `namespace` is a catalog grouping (`tenant.rs` `NAMESPACE_PRIMER`, `NAMESPACE_SEKUNDER`).
+    A Bronze table's key is `bronze.<table>` (`catalog.rs` `ensure_asset_readable`,
+    `bronze_asset_detail_body`), and the rule compares the schema part of that key
+    (`table_access.rs` `allows`).
+  - So `{ "schema": "primer", "table": "*" }` is stored, shown as ticked, and matches no
+    table. An administrator who ticks it believes the role reads the Bronze data. The role
+    reads none of it.
+  - The handoff reported the naming gap and called this handling honest. It is not: the
+    control states an access that does not exist (principle 2).
+  - Fix: D9 and T9. `namespace` is never a schema.
+- **B2. A narrowed role never sees a Bronze row in the catalog lists, whatever it is
+  granted.** This is in S1, already merged (#459), and my S1 review missed it: I sampled the
+  list filters and did not read them.
+  - `retain_visible` keeps a row only when `asset_table_key` names its table.
+    `bronze_catalog_row` emits no `tableKey` and its `id` is a slug with no dot, so the key
+    is `None` and the row is dropped for every narrowed role.
+  - It fails closed: nothing is shown that should be hidden. But a role granted
+    `bronze.orders` can query the table and open its page by address, and cannot find it in
+    the catalog or its search. `tests/table_access.rs` has no Bronze row in a list test, so
+    nothing caught it.
+  - Read from the code, not run. T8's first test proves it by failing before the fix.
+  - Fix: D9 and T8.
+
+**SHOULD-FIX**
+
+- **S1. A grant whose table differs from the catalog's name only by case is invisible.**
+  - `schemaChoices` compares names without regard to case, and `hasGrant` and `toggleTable`
+    compare the table exactly.
+  - With a stored `silver.Orders` and a catalog `orders`: the grant is not listed as "not in
+    the catalog" (the names match without case), and `orders` is not ticked (they differ
+    with case). The grant is sent back on every save and cannot be seen or removed here.
+  - Typing `silver.Orders` into the free-text row does the same: a grant is added and nothing
+    on the page changes.
+  - The module comment says an existing grant is always shown. Compare the table without
+    regard to case, as the rule does (`table_access.rs` `allows`).
+- **S2. Every Save of the role page writes the table access, changed or not.**
+  - The server audits `identity.role.table_access.update` on every write
+    (`put_role_table_access`), so renaming a role records a table-access change nobody made.
+  - It also replaces the stored grants with the copy this page loaded. If another
+    administrator changed them in between, an untouched section silently reverts their
+    change.
+  - Send the request only when the scope or the grants differ from what was loaded. A
+    section that could not be loaded is then an untouched section: the role save completes
+    and nothing more needs saying.
+
+**For the product owner**
+
+- **A Bronze dataset whose registry records no table name stays hidden from a narrowed
+  role's lists** after D9 as well: nothing names the table, so nothing proves a grant covers
+  it. It goes on the feature page's limits at merge.
+- The three limits the S1 review found (a scheduled agent run is not narrowed, names are
+  compared without regard to case, one database read per request) are in
+  `docs/OPERATIONS.md` now and go onto the feature page at merge.
