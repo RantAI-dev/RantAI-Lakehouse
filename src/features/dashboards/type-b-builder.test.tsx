@@ -59,7 +59,7 @@ afterEach(() => {
 function renderBuilder(initial: ChartDef, sites: string[] = ["https://img.example"]) {
   return render(
     <ReportingProvider reporting={{ timeZone: "UTC", weekStart: "monday", contentSites: sites }}>
-      <ChartBuilder open onOpenChange={() => {}} hideTrigger onSaved={() => {}} initial={initial} editId="c_1" />
+      <ChartBuilder onSaved={() => {}} onCancel={() => {}} initial={initial} editId="c_1" />
     </ReportingProvider>,
   )
 }

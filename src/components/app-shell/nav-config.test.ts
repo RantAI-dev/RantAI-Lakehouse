@@ -131,6 +131,8 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       const reader = (p: string) => p === "identity:read" || p === "catalog:read"
       const identityWriter = (p: string) => p === "identity:write"
       const governanceWriter = (p: string) => p === "governance:write"
+      const queryReader = (p: string) => p === "query:read"
+      const sqlAuthor = (p: string) => p === "dashboard:sql"
 
       // A reader who may open the list cannot reach the form ...
       expect(canOpen("/admin/users/invite", reader)).toBe(false)
@@ -150,6 +152,13 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(canOpen("/admin/settings/tag-keys/new", governanceWriter)).toBe(true)
       expect(canOpen("/admin/settings/tag-keys/data_domain/edit", governanceWriter)).toBe(true)
       expect(canOpen("/governance/data-quality/rules/new", governanceWriter)).toBe(true)
+
+      // WEB-7 T5: saving a query is `query:read` (POST /api/query/saved), and
+      // saving an SQL source is `dashboard:sql` (POST /api/dashboard/sources).
+      expect(canOpen("/query-studio/save", queryReader)).toBe(true)
+      expect(canOpen("/query-studio/save", sqlAuthor)).toBe(false)
+      expect(canOpen("/query-studio/save-source", sqlAuthor)).toBe(true)
+      expect(canOpen("/query-studio/save-source", queryReader)).toBe(false)
     })
 
     it("supports any-of permission checks", () => {
