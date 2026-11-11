@@ -1379,7 +1379,18 @@ pub const PRINCIPAL_TENANT_IDS_PLACEHOLDER: &str = "__principal_tenant_ids__";
 /// `CAST(.. AS varchar)`/`CAST(.. AS date)` — see
 /// [`translate_row_filter_for_trino`]). Every other function is refused
 /// on `Trino` too, with a message that names it.
-const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "todate"];
+pub const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "todate"];
+
+/// Operator tokens a row filter may use, spelled as the filter writes them:
+/// the comparisons, `AND`/`OR`, the arithmetic of `+ - * / %`, and unary
+/// `NOT`. [`is_allowed_binary_operator`] and [`validate_unary_op`] both read
+/// this same list, and `GET /api/governance/row-filter-grammar` (`WEB-8` S2
+/// T8, D8) serves it, so the console's help line cannot drift from what the
+/// validator accepts. Not a second copy: this is the one definition the
+/// validator itself uses.
+pub const ALLOWED_ROW_FILTER_OPERATORS: &[&str] = &[
+    "=", "<>", "<", "<=", ">", ">=", "AND", "OR", "+", "-", "*", "/", "%", "NOT",
+];
 
 /// The one entry point WS7 item B6 calls. Parses `sql`, and for EVERY
 /// `TableFactor::Table` this module can reach — any `FROM`, any
@@ -2317,15 +2328,17 @@ fn validate_unary_op(
     real_columns: &[String],
     engine: Engine,
 ) -> Result<(), RewriteError> {
-    if !matches!(
-        op,
-        UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus
-    ) {
+    let Some(symbol) = unary_operator_symbol(op) else {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: OPERATOR_REFUSAL.to_owned(),
+        });
+    };
+    if !ALLOWED_ROW_FILTER_OPERATORS.contains(&symbol) {
         return Err(RewriteError::InvalidRowFilter {
             reason: OPERATOR_REFUSAL.to_owned(),
         });
     }
-    if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
+    if matches!(symbol, "-" | "+")
         && matches!(
             inner,
             Expr::UnaryOp {
@@ -2453,24 +2466,45 @@ fn validate_expr_shape(
 
 /// The binary operators a row filter may use (SEC-43): comparisons, `AND`,
 /// `OR` and the arithmetic of `+ - * / %`. Every other variant is refused,
-/// including the ones a later `sqlparser` adds.
+/// including the ones a later `sqlparser` adds. The accepted set is
+/// [`ALLOWED_ROW_FILTER_OPERATORS`], the one list `GET
+/// /api/governance/row-filter-grammar` serves.
 fn is_allowed_binary_operator(op: &BinaryOperator) -> bool {
-    matches!(
-        op,
-        BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq
-            | BinaryOperator::And
-            | BinaryOperator::Or
-            | BinaryOperator::Plus
-            | BinaryOperator::Minus
-            | BinaryOperator::Multiply
-            | BinaryOperator::Divide
-            | BinaryOperator::Modulo
-    )
+    binary_operator_symbol(op).is_some_and(|symbol| ALLOWED_ROW_FILTER_OPERATORS.contains(&symbol))
+}
+
+/// The token [`is_allowed_binary_operator`] checks `op` against, or `None`
+/// for a variant no row filter accepts. Listing every accepted variant here
+/// (and no other) keeps the spelling in [`ALLOWED_ROW_FILTER_OPERATORS`] the
+/// only place the list is written down.
+fn binary_operator_symbol(op: &BinaryOperator) -> Option<&'static str> {
+    match op {
+        BinaryOperator::Eq => Some("="),
+        BinaryOperator::NotEq => Some("<>"),
+        BinaryOperator::Lt => Some("<"),
+        BinaryOperator::LtEq => Some("<="),
+        BinaryOperator::Gt => Some(">"),
+        BinaryOperator::GtEq => Some(">="),
+        BinaryOperator::And => Some("AND"),
+        BinaryOperator::Or => Some("OR"),
+        BinaryOperator::Plus => Some("+"),
+        BinaryOperator::Minus => Some("-"),
+        BinaryOperator::Multiply => Some("*"),
+        BinaryOperator::Divide => Some("/"),
+        BinaryOperator::Modulo => Some("%"),
+        _ => None,
+    }
+}
+
+/// The token [`validate_unary_op`] checks `op` against, or `None` for a
+/// variant no row filter accepts.
+fn unary_operator_symbol(op: UnaryOperator) -> Option<&'static str> {
+    match op {
+        UnaryOperator::Not => Some("NOT"),
+        UnaryOperator::Minus => Some("-"),
+        UnaryOperator::Plus => Some("+"),
+        _ => None,
+    }
 }
 
 /// A column, with at most one plain table name before it (SEC-43). Only the

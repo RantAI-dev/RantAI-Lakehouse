@@ -675,6 +675,13 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/ingest-runs",
             get(governance::ingest_runs),
         )
+        // WEB-8 S2 T8 (D8): the row filter grammar the console's help line
+        // names, read from the validator's own constants. Static, ahead of
+        // the `{kind}` capture like `lineage`, `policies` and `sla`.
+        .route(
+            "/api/governance/row-filter-grammar",
+            get(governance::row_filter_grammar),
+        )
         .route(
             "/api/governance/policies",
             get(governance::list_policies).post(governance::create_policy_route),
