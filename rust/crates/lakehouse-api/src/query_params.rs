@@ -375,7 +375,13 @@ struct Found {
 
 /// The placeholders the author wrote, in order. Comments are skipped, a
 /// well-formed placeholder inside quotes or inside a `ClickHouse` heredoc is
-/// refused, and a `{{` that is not a placeholder outside both is refused.
+/// refused, a `{{` that is not a placeholder outside both is refused, and a
+/// placeholder in a statement that holds a `$`-run no measured rule reads
+/// ([`SpanKind::Uncertain`]) is refused with the inside-quotes sentence too:
+/// the engine refuses every such shape the measurements cover, so the value
+/// would be printed into text no measured rule reads. A statement that holds
+/// the run and no placeholder comes back as it stands — the guard refuses it
+/// at run.
 ///
 /// The text is read the way the engine reads it, by the one lexer in
 /// [`crate::sql_lex`]: a comment and a quoted run are spans, so a
@@ -388,6 +394,8 @@ fn scan(engine: Engine, sql: &str) -> Result<Vec<Found>, ParamError> {
     offsets.push(sql.len());
 
     let mut found = Vec::new();
+    // Whether the statement holds a `$`-run no measured rule reads.
+    let mut uncertain = false;
     for span in lex(engine, sql) {
         match span.kind {
             SpanKind::Code => {
@@ -414,28 +422,43 @@ fn scan(engine: Engine, sql: &str) -> Result<Vec<Found>, ParamError> {
             // the author meant a heredoc, so it refuses a placeholder
             // there as it refuses one inside quotes.
             SpanKind::Literal | SpanKind::UnclosedHeredoc => {
-                if let Some(written) = placeholder_within(&chars, span.start, span.end) {
-                    return Err(ParamError::InsideQuotes(written));
+                if let Some(text) = placeholder_within(&chars, span.start, span.end) {
+                    return Err(ParamError::InsideQuotes(text));
                 }
             }
             // A comment, and text the engine cannot run: nothing to fill.
             SpanKind::Comment | SpanKind::NotCode => {}
+            // A `$`-run no measured rule reads: recorded, and refused
+            // with the statement's first placeholder below.
+            SpanKind::Uncertain => uncertain = true,
         }
     }
+    // A placeholder in a statement that holds an uncertain
+    // `$`-run is refused, not filled. Without a placeholder the statement
+    // comes back as it stands; the guard refuses it at run.
+    if uncertain && !found.is_empty() {
+        let first = &found[0];
+        return Err(ParamError::InsideQuotes(written(&first.name, first.part)));
+    }
     Ok(found)
+}
+
+/// The text a placeholder holds between its braces: the name, with `.start`
+/// or `.end` when it names one part of a range. The payload of
+/// [`ParamError::InsideQuotes`].
+fn written(name: &str, part: Part) -> String {
+    match part {
+        Part::Whole => name.to_owned(),
+        Part::Start => [name, ".start"].concat(),
+        Part::End => [name, ".end"].concat(),
+    }
 }
 
 /// The text of the first well-formed placeholder in `chars[from..to]`.
 fn placeholder_within(chars: &[char], from: usize, to: usize) -> Option<String> {
     (from..to.saturating_sub(1))
         .filter(|&at| chars[at] == '{' && chars[at + 1] == '{')
-        .find_map(|at| {
-            parse_placeholder(chars, at).map(|(name, part, _)| match part {
-                Part::Whole => name,
-                Part::Start => [name.as_str(), ".start"].concat(),
-                Part::End => [name.as_str(), ".end"].concat(),
-            })
-        })
+        .find_map(|at| parse_placeholder(chars, at).map(|(name, part, _)| written(&name, part)))
 }
 
 /// A well-formed placeholder at `at` (which holds `{{`): optional
@@ -1642,6 +1665,39 @@ mod tests {
         assert_eq!(
             err,
             "{{x}} is inside quotes: write it without them, for example = {{x}}."
+        );
+    }
+
+    /// The pinned review shape (`#446`): a placeholder next to a
+    /// `$`-run the measured rules do not read. The engine refuses the
+    /// whole shape with `SYNTAX_ERROR` (code 62, measured 2026-11-10 on
+    /// `clickhouse/clickhouse-server:26.8`), so the scanner refuses the
+    /// placeholder with the inside-quotes sentence instead of filling a
+    /// value into text the engine would not read.
+    #[test]
+    fn a_placeholder_next_to_an_uncertain_dollar_run_is_refused() {
+        let err = substitute(
+            Engine::ClickHouse,
+            "SELECT $$x$$$$ {{p}} $$",
+            &map(json!({"p": "v"})),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(err, ParamError::InsideQuotes("p".to_owned()), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "{{p}} is inside quotes: write it without them, for example = {{p}}."
+        );
+    }
+
+    /// A statement that holds an uncertain `$`-run and no placeholder is
+    /// left as it stands by the scanner; the guard refuses it at run.
+    #[test]
+    fn a_statement_with_an_uncertain_dollar_run_and_no_placeholder_is_left_alone() {
+        let sql = "SELECT $$x$$$$y$$";
+        assert_eq!(
+            substitute(Engine::ClickHouse, sql, &Map::new(), &[]).unwrap(),
+            sql
         );
     }
 

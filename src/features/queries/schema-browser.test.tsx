@@ -36,6 +36,12 @@ function visitTrinoTab() {
 const BRONZE_NEEDS_TRINO = "Bronze tables are read with Trino: switch this tab to Trino to insert it."
 
 /**
+ * What the browser says about a Bronze table whose Iceberg table read
+ * failed: the read failed, not the table.
+ */
+const TABLE_PROOF_FAILED = "The table could not be read."
+
+/**
  * A Bronze table's detail as the API sends it: the registry slug `demo_orders`
  * is its id, `queryTarget` is the ClickHouse `DataLakeCatalog` name (never a
  * Trino one), and `tableName` is what the Trino name is built from.
@@ -288,6 +294,41 @@ describe("SchemaBrowser", () => {
     })
     expect(screen.queryByRole("button", { name: /^Insert iceberg/ }) === null).toBe(true)
     expect(view.state.doc.toString()).toBe("SELECT * FROM ")
+  })
+
+  it("says the table could not be read, with retry, when the proof read fails, and reads it again on the next open", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    // A 5xx says nothing about whether the table is there; the read itself
+    // failed (#448 review SHOULD-FIX).
+    getTableDetail.mockRejectedValue(new ServiceError("unavailable", "warehouse down", 503))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    // The entry holds the load-failed sentence, never the no-table one,
+    // with a Retry affordance.
+    expect(await screen.findByText(TABLE_PROOF_FAILED)).toBeTruthy()
+    expect(screen.queryByText(NO_READABLE_TABLE)).toBeNull()
+    const row = screen.getByRole("button", { name: "Demo Orders" })
+    expect(row.getAttribute("title")).toBe(TABLE_PROOF_FAILED)
+    const retry = screen.getByRole("button", {
+      name: "Retry reading the table of Demo Orders",
+    })
+
+    // Retry reads the table again.
+    const afterFirstRead = getTableDetail.mock.calls.length
+    fireEvent.click(retry)
+    await waitFor(() => expect(getTableDetail.mock.calls.length).toBeGreaterThan(afterFirstRead))
+
+    // And so does the next open of the entry.
+    const afterRetry = getTableDetail.mock.calls.length
+    fireEvent.click(screen.getByRole("button", { name: "Columns of Demo Orders" }))
+    fireEvent.click(screen.getByRole("button", { name: "Columns of Demo Orders" }))
+    await waitFor(() => expect(getTableDetail.mock.calls.length).toBeGreaterThan(afterRetry))
   })
 
   it("inserts a quoted Trino name as it is formed, without quoting its parts again", async () => {
