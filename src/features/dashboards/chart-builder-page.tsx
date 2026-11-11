@@ -43,6 +43,21 @@ function isDraftStepOpen(
 }
 
 /**
+ * Whether a chart stored on `chartBoard` is one of `boardId`'s (`WEB-7` S2
+ * review round 1, S2).
+ *
+ * The chart record carries the dashboard it sits on. Without this check
+ * `/dashboards/A/charts/<a chart of B>/edit` would open B's chart under A's
+ * back link and A's access check, and the save would still land on B. A chart
+ * on the built-in dashboard may carry no board, or `"default"`; `isBuiltInBoard`
+ * reads both as the built-in one, which is also what the address may say.
+ */
+function chartOnBoard(chartBoard: string, boardId: string): boolean {
+  if (isBuiltInBoard(chartBoard)) return isBuiltInBoard(boardId)
+  return chartBoard.trim() === boardId.trim()
+}
+
+/**
  * `/dashboards/[id]/charts/new` and `.../[chartId]/edit` (`WEB-7` T6, D2/D6):
  * the chart builder as a page.
  *
@@ -56,7 +71,8 @@ function isDraftStepOpen(
  * same "You don't have access" the guard would.
  *
  * Edit loads the chart by id through the chart list (`dashboardService.getChart`),
- * so a reload works. An id that names nothing shows the not-found state.
+ * so a reload works. An id that names nothing, or a chart that sits on another
+ * dashboard, shows the not-found state.
  *
  * The dashboard's parameter values arrive in the address (`chartParamValues`),
  * and the assistant's draft arrives in `sessionStorage` (`takeChartDraft`,
@@ -109,7 +125,9 @@ export function ChartBuilderPage({ boardId, chartId }: { boardId: string; chartI
       : false
   if (!canEdit) return <PermissionState />
   if (chart.status === "error") return <ErrorState error={chart.error} onRetry={chart.reload} />
-  if (chartId && !chart.data) {
+  // `WEB-7` S2 review round 1, S2: the chart must be this dashboard's own, or
+  // the page would show another dashboard's chart under this one's back link.
+  if (chartId && (!chart.data || !chartOnBoard(chart.data.board, boardId))) {
     return (
       <EmptyState
         title="Chart not found"

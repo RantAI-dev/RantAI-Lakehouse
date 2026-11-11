@@ -215,6 +215,45 @@ describe("the chart builder page (WEB-7 D2/D4/D6)", () => {
     )
   })
 
+  // `WEB-7` S2 review round 1, S2: the chart record names its own dashboard, and
+  // an edit address may name another one. The page shows the chart of this
+  // dashboard only.
+  it("shows the not-found state for a chart of another dashboard", async () => {
+    stubPage("edit", { id: "c1", title: "Saved", board: "b2", def: DRAFT })
+    render(<ChartBuilderPage boardId="b1" chartId="c1" />)
+
+    expect(await screen.findByText("Chart not found")).toBeDefined()
+    expect(screen.queryByRole("heading", { level: 1 })).toBeNull()
+    expect(screen.getByText("Back to the dashboard").closest("a")?.getAttribute("href")).toBe(
+      "/dashboards/b1"
+    )
+  })
+
+  it("opens a chart of the built-in dashboard from an address that says `default`", async () => {
+    // The record of a chart on the built-in board carries `"default"` (or no
+    // board at all), and `isBuiltInBoard` reads both as the built-in one.
+    spyOn(dashboardService, "getAccess")
+    spyOn(dashboardService, "listBoards").mockResolvedValue([{ id: "default", name: "Main" }])
+    spyOn(dashboardService, "getChart").mockResolvedValue({
+      id: "c1",
+      title: "Saved",
+      board: "default",
+      def: DRAFT,
+    })
+    permissions = ["dashboard:write"]
+    render(<ChartBuilderPage boardId="default" chartId="c1" />)
+
+    expect(await screen.findByRole("heading", { level: 1 })).toHaveProperty(
+      "textContent",
+      "Edit chart"
+    )
+    await waitFor(() =>
+      expect((screen.getByLabelText(/^Title/) as HTMLInputElement).value).toBe(
+        "Visitors by province"
+      )
+    )
+  })
+
   it("takes the assistant's draft once, for its own board", async () => {
     stubPage("edit")
     writeChartDraft({ board: "b1", def: DRAFT })
