@@ -439,6 +439,10 @@ export type SsoTestStartResult = {
  * The answer of `GET /api/settings/sso/test/{id}` (`ADM-12`, plan D8):
  * test sign-in result or classified error.
  */
+/** One test sign-in's result: the claims the provider sent, the roles they
+ * map to, and the two claims an administrator needs to see (`ADM-12` D8;
+ * review round 2, S2). Never carries the token or the provider's own error
+ * text — `error` is this deployment's fixed sentence. */
 export type SsoTestResult = {
   /** Whether the test was successful. */
   ok?: boolean
@@ -446,10 +450,22 @@ export type SsoTestResult = {
   subject?: string
   /** Email from ID token. */
   email?: string | null
+  /**
+   * The provider's `email_verified` claim (`ADM-12` review round 1, S2):
+   * what `SEC-65` will need an administrator to see. `null` when the
+   * provider did not say.
+   */
+  emailVerified?: boolean | null
   /** Groups resolved from groups claim. */
   groups?: string[]
   /** Roles mapped from roleMap. */
   mappedRoles?: string[]
+  /**
+   * Whether the provider sent a group-overage marker instead of the groups
+   * claim (`SEC-39`, `ADM-12` review round 1, S2): no group-based role was
+   * applied, so the card says so.
+   */
+  overage?: boolean | null
   /** Classified error message if test failed. */
   error?: string
 }

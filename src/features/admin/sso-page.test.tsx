@@ -64,8 +64,10 @@ function mockApi(
     ok: true,
     subject: "user-sub-123",
     email: "test@example.com",
+    emailVerified: true,
     groups: ["engineering", "admins"],
     mappedRoles: ["developer", "admin"],
+    overage: false,
   }
 ) {
   const calls: Call[] = []
@@ -183,6 +185,76 @@ describe("SsoPageForm (ADM-12, D9)", () => {
       expect(screen.getByText("oidc-sub-999")).toBeDefined()
       expect(screen.getByText("engineer@company.com")).toBeDefined()
     })
+  })
+
+  it("the test result card shows emailVerified and overage", async () => {
+    // `ADM-12` review round 2, S2 (D8): the two claims an administrator
+    // needs — `emailVerified` is what `SEC-65` will read, and an overage
+    // means no group-based role was applied.
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi(DEFAULT_SSO, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      emailVerified: false,
+      groups: [],
+      mappedRoles: [],
+      overage: true,
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      const region = screen.getByRole("region", { name: "Test sign-in result" })
+      expect(region.textContent).toContain("Email verified: No")
+      expect(region.textContent).toContain(
+        "Group overage: Yes: no group-based roles were applied"
+      )
+    })
+  })
+
+  it("the test result card says a claim the provider did not send was not reported", async () => {
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi(DEFAULT_SSO, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      groups: ["engineering"],
+      mappedRoles: ["developer"],
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      const region = screen.getByRole("region", { name: "Test sign-in result" })
+      expect(region.textContent).toContain("Email verified: Not reported")
+      expect(region.textContent).toContain("Group overage: Not reported")
+    })
+  })
+
+  it("opens the provider's page without an opener and without a referrer", async () => {
+    // `ADM-12` review round 2, S2: the page being tested must not get a
+    // handle on this console's tab.
+    mockApi()
+    const opened: unknown[][] = []
+    const originalOpen = window.open
+    window.open = ((...args: unknown[]) => {
+      opened.push(args)
+      return null
+    }) as unknown as typeof window.open
+
+    try {
+      render(<SsoPageForm canWrite />)
+      fireEvent.click(await screen.findByRole("button", { name: "Test sign-in" }))
+      await waitFor(() => expect(opened).toHaveLength(1))
+      expect(opened[0]).toEqual([
+        "https://auth.example.com/authorize?response_type=code",
+        "_blank",
+        "noopener,noreferrer",
+      ])
+    } finally {
+      window.open = originalOpen
+    }
   })
 
   it("the test result card renders error message when test fails", async () => {

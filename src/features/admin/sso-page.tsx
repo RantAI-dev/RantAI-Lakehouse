@@ -23,7 +23,6 @@ import {
   settingsService,
   type RoleMapRow,
   type SsoSettingsInput,
-  type SsoTestResult,
 } from "@/services"
 import { SettingField, SET_BY_SERVER } from "./setting-field"
 
@@ -69,6 +68,17 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
     settingsService.startSsoTest(input, signal)
   )
 
+  // `ADM-12` review round 2, S3: the test result is read through
+  // `useService` like every other read on this form — abort on unmount, one
+  // state machine — not a bare call in an effect.
+  const testResultState = useService(
+    (signal) =>
+      ssoTestId
+        ? settingsService.getSsoTestResult(ssoTestId, signal)
+        : Promise.resolve(null),
+    [ssoTestId]
+  )
+
   const loaded = state.status === "success" ? state.data : null
   const canEdit = Boolean(loaded?.canEdit)
 
@@ -81,10 +91,11 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
   const [jitProvisioning, setJitProvisioning] = React.useState(false)
   const [roleMapRows, setRoleMapRows] = React.useState<RoleMapRow[]>([])
 
-  const [testResult, setTestResult] = React.useState<SsoTestResult | null>(null)
-  const [testResultError, setTestResultError] = React.useState<string | null>(null)
-  const [testResultLoading, setTestResultLoading] = React.useState(false)
   const [dismissedTest, setDismissedTest] = React.useState(false)
+
+  React.useEffect(() => {
+    setDismissedTest(false)
+  }, [ssoTestId])
 
   React.useEffect(() => {
     if (!loaded) return
@@ -98,36 +109,10 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
     setRoleMapRows(loaded.roleMap.value ?? [])
   }, [loaded])
 
-  React.useEffect(() => {
-    if (!ssoTestId) {
-      setTestResult(null)
-      setTestResultError(null)
-      return
-    }
-    setDismissedTest(false)
-    setTestResultLoading(true)
-    setTestResultError(null)
-    let cancelled = false
-
-    settingsService
-      .getSsoTestResult(ssoTestId)
-      .then((res) => {
-        if (!cancelled) {
-          setTestResult(res)
-          setTestResultLoading(false)
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setTestResultError(err instanceof Error ? err.message : "Failed to load test result")
-          setTestResultLoading(false)
-        }
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [ssoTestId])
+  const testResult = testResultState.status === "success" ? testResultState.data : null
+  const testResultError =
+    testResultState.status === "error" ? testResultState.error.message : null
+  const testResultLoading = testResultState.status === "loading"
 
   const rolesList = rolesState.status === "success" ? rolesState.data : []
   const rolesRecord = React.useMemo(() => {
@@ -196,7 +181,10 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
     }
     const res = await testAction.run(draft)
     if (res?.authorizeUrl) {
-      window.open(res.authorizeUrl, "_blank")
+      // `ADM-12` review round 2, S2: the page being tested must not get a
+      // handle on this console's tab (`window.opener`), and the referrer
+      // must not follow the sign-in out.
+      window.open(res.authorizeUrl, "_blank", "noopener,noreferrer")
     }
   }
 
@@ -264,6 +252,16 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
                   Email: <span className="font-mono font-medium">{testResult.email ?? "None"}</span>
                 </p>
                 <p>
+                  Email verified:{" "}
+                  <span className="font-mono font-medium">
+                    {testResult.emailVerified == null
+                      ? "Not reported"
+                      : testResult.emailVerified
+                        ? "Yes"
+                        : "No"}
+                  </span>
+                </p>
+                <p>
                   Groups:{" "}
                   <span className="font-mono font-medium">
                     {testResult.groups && testResult.groups.length > 0
@@ -277,6 +275,16 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
                     {testResult.mappedRoles && testResult.mappedRoles.length > 0
                       ? testResult.mappedRoles.join(", ")
                       : "None"}
+                  </span>
+                </p>
+                <p>
+                  Group overage:{" "}
+                  <span className="font-mono font-medium">
+                    {testResult.overage == null
+                      ? "Not reported"
+                      : testResult.overage
+                        ? "Yes: no group-based roles were applied"
+                        : "No"}
                   </span>
                 </p>
               </div>
