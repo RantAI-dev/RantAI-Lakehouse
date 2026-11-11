@@ -964,3 +964,45 @@ What holds:
 - The three limits the S1 review found (a scheduled agent run is not narrowed, names are
   compared without regard to case, one database read per request) are in
   `docs/OPERATIONS.md` now and go onto the feature page at merge.
+
+### S2, round 2 (planner, 2026-11-11) — branch at `a2ff9f66`
+
+Read the two fix commits in full (`55c757dd`, `da16e9ea`), with the two new tests in
+`tests/table_access.rs`.
+
+Run by me in a detached worktree at `a2ff9f66`: `bun run typecheck` (pass), `bun run lint`
+(0 errors, 11 warnings, none in a file of this slice), `bun test src/features/admin
+src/services` 18 times: 354 pass in 16 runs, 353 pass and 1 fail in 2. The failing test,
+captured once, is `AssistantSettingsForm (ADM-9) > never pre-fills the key, and only asks
+for it when it is replaced`. It is not in a file this slice touches and it is the failure
+the S2 handoff saw once without its name. It gets a backlog item at merge. The Rust checks:
+not run by me; #468 runs them.
+
+- **B1: closed.** `schemaChoices` no longer reads `namespace`. A Bronze table comes from the
+  row's `tableKey` and is listed under `bronze`; a row with no key is counted there as
+  unnamed, with a sentence that says no grant covers it.
+- **B2: closed.** `bronze_catalog_row` emits `tableKey`. The test failed before the change
+  with `a granted Bronze table must be listed: {"assets":[],"namespaces":[]}`, which is the
+  gap as read. It now checks both lists, and that a second Bronze row and a Silver-only
+  grant stay apart.
+- **S1: closed.** `hasGrant` and `toggleTable` compare the table without regard to case.
+- **S2: closed.** Save writes the table access only when the scope or the set of grants
+  differs from what was loaded. The comparison is of what would be sent, so a scope of
+  `all` with leftover ticks is not a change.
+
+**SHOULD-FIX**
+
+- **R2-S1. The contract does not declare the field the picker reads, and two comments say
+  more than the server does.**
+  - `tableKey` is declared on `AssetDetail` only (`src/services/contracts/assets.ts`). Its
+    comment now says the list row carries it, and `listAssets` returns `Asset[]`. The picker
+    reads it through its own structural type, so the compiler does not hold the contract to
+    it. Declare `tableKey` on `Asset`.
+  - `tableKeyOf`'s comment says the list row carries "the id itself on Silver/Gold", and
+    `schemaChoices`' comment says a Silver or Gold row's "`tableKey` says the same". The
+    Silver and Gold list rows emit no `tableKey` (`catalog.rs`, the `silver` and `serving`
+    row builders); only the Bronze row and the detail bodies do. The `id` is what names
+    them, which the code handles. Make the comments say that (rule 1).
+
+**No open BLOCKER.** R2-S1 is fixed before merge because #468 waits in the queue behind
+#466 and #467 anyway.
