@@ -882,6 +882,12 @@ pub struct OidcCallbackQuery {
 /// never puts prose — or anything from the token — into the URL.
 const OIDC_NOTICE_PARAM: &str = "ssoNotice";
 
+/// Where a callback refused for `SEC-65` D2 sends the person: the sign-in
+/// page with a fixed notice code (`email_not_verified`). The sentence lives
+/// in the console (`src/features/auth/sso-notice.tsx` `NOTICES`); neither
+/// the email nor the subject ever appears in this address.
+const EMAIL_NOT_VERIFIED_LOCATION: &str = "/login?ssoNotice=email_not_verified";
+
 /// `next` with `ssoNotice=<code>` appended, keeping any query `next`
 /// already carried. `next` has already passed `is_safe_relative_path`
 /// (inside [`oidc_start`], before it was written to the flow cookie), so
@@ -965,6 +971,14 @@ impl ExchangeFailure {
 /// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`]. The
 /// console maps the code to its own sentence; this handler adds no prose.
 ///
+/// `SEC-65` D2: when the provider did not confirm the token's email and an
+/// account already holds it, the answer is a redirect to the sign-in page
+/// with `ssoNotice=email_not_verified`, not the generic 401 body — this is
+/// the one refusal a person can act on. Nothing is created, no session is
+/// minted, and the refusal was audited where it was decided
+/// (`lakehouse_auth::oidc`'s `provision_user`). The code, like every other
+/// notice, is fixed; the email and the subject never appear in the address.
+///
 /// # Errors
 ///
 /// Returns 401 on a missing/undecodable/unparseable flow cookie, a
@@ -972,8 +986,10 @@ impl ExchangeFailure {
 /// via [`lakehouse_auth::Secret::constant_time_eq`] — never `==`, which
 /// would leak how many leading bytes matched through response timing), a
 /// token-exchange HTTP failure, or a verification failure from
-/// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`]. Every
-/// one of those renders the same generic 401 body: per AGENTS.md
+/// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`]. The one
+/// exception is `AuthError::EmailNotVerified` (`SEC-65` D2), which redirects
+/// to the sign-in page with a notice rather than answering 401 (see above).
+/// Every other one of those renders the same generic 401 body: per AGENTS.md
 /// principle 4 ("upstream error text never reaches a response"), this
 /// handler never puts the `IdP`'s own error body, or which specific check
 /// failed, into anything sent back to the browser — only a `tracing::warn!`
@@ -1093,12 +1109,34 @@ pub async fn oidc_callback(
         return Ok(unauthorized());
     };
 
-    let Ok(login) = auth
+    let login = match auth
         .authenticate_with_nonce(&Secret::new(id_token), &flow.nonce)
         .await
-    else {
-        tracing::warn!("oidc callback: id token verification failed");
-        return Ok(unauthorized());
+    {
+        Ok(login) => login,
+        // `SEC-65` D2: the provider did not confirm the email and an
+        // account holds it, so the sign-in is refused. The person is sent
+        // back to the sign-in page with a fixed code instead of the
+        // generic 401 body, because this refusal is something they can
+        // act on ("ask an administrator"); nothing is created, no session
+        // cookie is set, and the refusal itself was already audited where
+        // it was decided (`provision_user`). The flow cookie is cleared
+        // like every other answer from this handler.
+        Err(AuthError::EmailNotVerified) => {
+            let mut response = (StatusCode::FOUND, ()).into_response();
+            response.headers_mut().insert(
+                header::LOCATION,
+                HeaderValue::from_static(EMAIL_NOT_VERIFIED_LOCATION),
+            );
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, clear_cookie());
+            return Ok(response);
+        }
+        Err(_) => {
+            tracing::warn!("oidc callback: id token verification failed");
+            return Ok(unauthorized());
+        }
     };
     let PrincipalId::User(user_id) = login.principal.id else {
         // `authenticate_with_nonce` only ever resolves a
@@ -2350,6 +2388,7 @@ mod tests {
                 oidc_groups_claim: None,
                 oidc_role_map: None,
                 oidc_jit_provisioning: None,
+                oidc_trust_email: None,
             },
             "test-user",
         )
@@ -3029,6 +3068,134 @@ mod tests {
         Ok(())
     }
 
+    /// `SEC-65` D2/AC2: the provider did not confirm the token's email and
+    /// an existing account holds it, so the callback sends the person back
+    /// to the sign-in page with the fixed notice code — not the generic 401
+    /// body — and mints nothing: no session cookie, no identity row. The
+    /// audit row holds the provider and the subject, never the email.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn oidc_callback_redirects_an_unconfirmed_email_to_the_sign_in_notice(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let server = wiremock::MockServer::start().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
+
+        let issuer = server.uri();
+        let client_id = "lakehouse-console";
+        let flow = OidcFlow {
+            state: "state-from-start".to_owned(),
+            nonce: "nonce-from-start".to_owned(),
+            code_verifier: "verifier-1".to_owned(),
+            next: "/dashboards".to_owned(),
+            test_run_id: None,
+        };
+
+        // Rina Wijaya (seeded, `0002_seed_identity.sql`) is an active
+        // account under this address; the token claims it but does not
+        // confirm it (`email_verified` absent).
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "unconfirmed-callback-subject",
+                iss: &issuer,
+                aud: client_id,
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: Some("rina@meridian.example"),
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("OIDC_ISSUER".to_owned(), issuer.clone());
+        env.insert("OIDC_CLIENT_ID".to_owned(), client_id.to_owned());
+        env.insert(
+            "OIDC_AUTHORIZE_URL".to_owned(),
+            format!("{issuer}/authorize"),
+        );
+        env.insert("OIDC_TOKEN_URL".to_owned(), format!("{issuer}/token"));
+        env.insert(
+            "OIDC_REDIRECT_URI".to_owned(),
+            "https://lake.invalid/api/auth/oidc/callback".to_owned(),
+        );
+        env.insert("OIDC_JIT_PROVISIONING".to_owned(), "true".to_owned());
+        let config = Config::from_map(&env).expect("a valid test Config");
+        let state = AppState::new(config);
+        let app = crate::routes::router(state);
+
+        let cookie = oidc_flow_cookie_header(true, Some(&flow));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/auth/oidc/callback?code=auth-code-1&state={}",
+                        flow.state
+                    ))
+                    .header(header::COOKIE, cookie.to_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/login?ssoNotice=email_not_verified",
+            "the refusal goes to the sign-in page's notice, with a fixed code"
+        );
+        let set_cookies: Vec<&str> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert!(
+            !set_cookies
+                .iter()
+                .any(|c| c.starts_with(&format!("{SESSION_COOKIE_NAME}="))),
+            "a refused sign-in mints no session: {set_cookies:?}"
+        );
+        assert!(
+            set_cookies
+                .iter()
+                .any(|c| c.starts_with(&format!("{OIDC_FLOW_COOKIE_NAME}="))
+                    && c.contains("Max-Age=0")),
+            "the flow cookie is still single-use: {set_cookies:?}"
+        );
+
+        let identities: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth_identity WHERE provider = 'oidc:test' \
+             AND external_subject = 'unconfirmed-callback-subject'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(identities, 0, "nothing was linked");
+
+        let audited: (String,) = sqlx::query_as(
+            "SELECT args->>'subject' FROM audit_event \
+             WHERE action = 'auth.oidc.link_refused' AND outcome = 'refused'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(audited.0, "unconfirmed-callback-subject");
+        let with_email: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_event WHERE args::text LIKE '%rina@meridian.example%'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(with_email, 0, "the audit row never carries the email");
+        Ok(())
+    }
+
     // ── `oidc_callback` writes a real `audit_event` row on
     // success. Reuses the wiremock round-trip harness above verbatim —
     // the only addition is the post-response SELECT against
@@ -3339,6 +3506,7 @@ mod tests {
                 oidc_groups_claim: None,
                 oidc_role_map: None,
                 oidc_jit_provisioning: None,
+                oidc_trust_email: None,
             },
             "test-user",
         )
