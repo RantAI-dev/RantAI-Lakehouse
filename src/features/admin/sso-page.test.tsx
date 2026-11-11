@@ -46,6 +46,7 @@ const DEFAULT_SSO = {
     source: "console",
   },
   jitProvisioning: { value: true, source: "console" },
+  trustEmail: { value: false, source: "console" },
   canEdit: true,
   ready: true,
   notReadyReason: null,
@@ -165,6 +166,98 @@ describe("SsoPageForm (ADM-12, D9)", () => {
       expect(putCall).toBeDefined()
       const body = JSON.parse(putCall?.body ?? "{}")
       expect(body.roleMap).toEqual([{ group: "engineering", role: "developer" }])
+    })
+  })
+
+  it("the trust-email checkbox is sent as trustEmail (SEC-65 D3)", async () => {
+    const calls = mockApi()
+
+    render(<SsoPageForm canWrite />)
+
+    // Radix renders the checkbox as a button with `role="checkbox"`, so
+    // its state is `aria-checked`, not `.checked`.
+    const checkbox = await screen.findByRole("checkbox", {
+      name: "Trust this provider's emails",
+    })
+    await waitFor(() => expect(checkbox.getAttribute("aria-checked")).toBe("false"))
+    fireEvent.click(checkbox)
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => {
+      const putCall = calls.find(
+        (c) => c.method === "PUT" && c.path.includes("/api/settings/sso")
+      )
+      expect(putCall).toBeDefined()
+      expect(JSON.parse(putCall?.body ?? "{}").trustEmail).toBe(true)
+    })
+  })
+
+  it("a server-owned trust-email switch is read-only and not sent", async () => {
+    // `SEC-65` D3: `OIDC_TRUST_EMAIL` owns the value; the console cannot
+    // change it.
+    const calls = mockApi({
+      ...DEFAULT_SSO,
+      trustEmail: { value: true, source: "server" },
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    const checkbox = await screen.findByRole("checkbox", {
+      name: "Trust this provider's emails",
+    })
+    await waitFor(() => expect(checkbox.getAttribute("aria-checked")).toBe("true"))
+    expect((checkbox as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => {
+      const putCall = calls.find(
+        (c) => c.method === "PUT" && c.path.includes("/api/settings/sso")
+      )
+      expect(putCall).toBeDefined()
+      expect(JSON.parse(putCall?.body ?? "{}").trustEmail).toBeUndefined()
+    })
+  })
+
+  it("says an unconfirmed email will not be joined unless the provider is trusted (SEC-65 D6)", async () => {
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi(DEFAULT_SSO, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      emailVerified: false,
+      groups: [],
+      mappedRoles: [],
+      overage: false,
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      const region = screen.getByRole("region", { name: "Test sign-in result" })
+      expect(region.textContent).toContain(
+        "This provider did not confirm the email. Existing accounts will not be joined unless you trust this provider's emails."
+      )
+    })
+  })
+
+  it("drops the SEC-65 sentence when the draft trusts the provider's emails", async () => {
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi({ ...DEFAULT_SSO, trustEmail: { value: true, source: "console" } }, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      emailVerified: false,
+      groups: [],
+      mappedRoles: [],
+      overage: false,
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      const region = screen.getByRole("region", { name: "Test sign-in result" })
+      expect(region.textContent).not.toContain("Existing accounts will not be joined")
     })
   })
 

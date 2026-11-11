@@ -393,6 +393,12 @@ export type SsoSettings = {
   roleMap: SettingField<RoleMapRow[]>
   /** Whether JIT provisioning is enabled for new SSO users. */
   jitProvisioning: SettingField<boolean>
+  /**
+   * Whether this provider's emails are trusted without the token's
+   * `email_verified` claim (`SEC-65` D3). Off by default: an existing
+   * account is joined by email only when the provider confirmed it.
+   */
+  trustEmail: SettingField<boolean>
   /** Whether the caller may edit SSO settings (unrestricted Platform Admin). */
   canEdit: boolean
   /**
@@ -422,6 +428,8 @@ export type SsoSettingsInput = {
   groupsClaim?: string | null
   roleMap?: RoleMapRow[] | null
   jitProvisioning?: boolean | null
+  /** `SEC-65` D3: trust this provider's emails; omitted keeps, null clears. */
+  trustEmail?: boolean | null
 }
 
 /**

@@ -1,6 +1,7 @@
 //! The deployment's single sign-on (OIDC) settings, saved from the console
-//! (`ADM-12`, migration `0134`): the issuer, client ID, client secret,
-//! provider name, groups claim, role map, and JIT provisioning toggle.
+//! (`ADM-12`, migration `0134`; `SEC-65`, migration `0136`): the issuer,
+//! client ID, client secret, provider name, groups claim, role map, JIT
+//! provisioning toggle, and "trust this provider's emails" switch.
 //!
 //! At most one row exists in `sso_settings` (`singleton`). No row means nothing
 //! was saved in the console, and the API supplies the environment's values or
@@ -45,6 +46,10 @@ pub struct SsoSettings {
     pub oidc_role_map: Option<serde_json::Value>,
     /// Whether unrecognized OIDC subjects are allowed to provision new users.
     pub oidc_jit_provisioning: Option<bool>,
+    /// Whether this provider's emails are trusted without the
+    /// `email_verified` claim (`SEC-65` D3). `None` means "not set in the
+    /// console", which resolves to the environment or `false`.
+    pub oidc_trust_email: Option<bool>,
 }
 
 /// A sign-in test run against a draft configuration.
@@ -87,7 +92,8 @@ pub struct NewSsoTestRun {
 pub async fn get(pool: &PgPool) -> Result<Option<SsoSettings>, StoreError> {
     Ok(sqlx::query_as(
         "SELECT oidc_issuer, oidc_client_id, oidc_client_secret, oidc_provider_name, \
-                oidc_groups_claim, oidc_role_map, oidc_jit_provisioning \
+                oidc_groups_claim, oidc_role_map, oidc_jit_provisioning, \
+                oidc_trust_email \
          FROM sso_settings",
     )
     .fetch_optional(pool)
@@ -110,8 +116,8 @@ pub async fn upsert(
         "INSERT INTO sso_settings \
              (singleton, oidc_issuer, oidc_client_id, oidc_client_secret, \
               oidc_provider_name, oidc_groups_claim, oidc_role_map, \
-              oidc_jit_provisioning, updated_at, updated_by) \
-         VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, now(), $8) \
+              oidc_jit_provisioning, oidc_trust_email, updated_at, updated_by) \
+         VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8, now(), $9) \
          ON CONFLICT (singleton) DO UPDATE SET \
               oidc_issuer = EXCLUDED.oidc_issuer, \
               oidc_client_id = EXCLUDED.oidc_client_id, \
@@ -120,11 +126,12 @@ pub async fn upsert(
               oidc_groups_claim = EXCLUDED.oidc_groups_claim, \
               oidc_role_map = EXCLUDED.oidc_role_map, \
               oidc_jit_provisioning = EXCLUDED.oidc_jit_provisioning, \
+              oidc_trust_email = EXCLUDED.oidc_trust_email, \
               updated_at = now(), \
               updated_by = EXCLUDED.updated_by \
          RETURNING oidc_issuer, oidc_client_id, oidc_client_secret, \
                    oidc_provider_name, oidc_groups_claim, oidc_role_map, \
-                   oidc_jit_provisioning",
+                   oidc_jit_provisioning, oidc_trust_email",
     )
     .bind(&settings.oidc_issuer)
     .bind(&settings.oidc_client_id)
@@ -133,6 +140,7 @@ pub async fn upsert(
     .bind(&settings.oidc_groups_claim)
     .bind(&settings.oidc_role_map)
     .bind(settings.oidc_jit_provisioning)
+    .bind(settings.oidc_trust_email)
     .bind(updated_by)
     .fetch_one(pool)
     .await?)
@@ -225,6 +233,7 @@ mod tests {
                 oidc_groups_claim: Some("custom_groups".to_owned()),
                 oidc_role_map: Some(role_map.clone()),
                 oidc_jit_provisioning: Some(true),
+                oidc_trust_email: Some(true),
             },
             "user-1",
         )
@@ -262,6 +271,7 @@ mod tests {
                 oidc_groups_claim: None,
                 oidc_role_map: None,
                 oidc_jit_provisioning: None,
+                oidc_trust_email: None,
             },
             "user-1",
         )
@@ -278,6 +288,7 @@ mod tests {
                 oidc_groups_claim: None,
                 oidc_role_map: None,
                 oidc_jit_provisioning: None,
+                oidc_trust_email: None,
             },
             "user-1",
         )
