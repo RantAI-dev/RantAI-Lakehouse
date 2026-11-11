@@ -298,11 +298,12 @@ export type AssetDetail = Asset & {
    */
   registry?: { owner: string | null; description: string | null }
   /**
-   * The `<namespace>.<table>` key the lineage graph, policies and quality
-   * rules name this asset by — `bronze.orders` for a Bronze dataset whose
-   * `id` is the registry slug, the id itself for `silver.*`/`serving.*`.
-   * `null` when the registry recorded no table, absent from an older API
-   * build; fall back to `id` then.
+   * The `<schema>.<table>` key the lineage graph, policies and quality rules
+   * name this asset by — `bronze.orders` for a Bronze dataset whose `id` is
+   * the registry slug, the id itself for `silver.*`/`serving.*`.
+   * `GOV-7` D9: the catalog list row carries it too, which is how the role
+   * table picker names a Bronze table. `null` when the registry recorded no
+   * table, absent from an older API build; fall back to `id` then.
    */
   tableKey?: string | null
   /**

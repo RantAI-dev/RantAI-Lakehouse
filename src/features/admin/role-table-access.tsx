@@ -21,7 +21,9 @@ import { assetService, type RoleTableAccess, type RoleTableGrant } from "@/servi
  * grants. A grant may name a table the catalog does not list — a pipeline
  * creates it later — and an existing grant is always shown and kept until
  * the person removes it: the save sends the complete list, so a grant that
- * silently disappeared here would be silently revoked.
+ * silently disappeared here would be silently revoked. A grant's table is
+ * compared without regard to case, as the rule compares it (`table_access.rs`
+ * `allows`), so a stored `silver.Orders` is the catalog's `orders`.
  */
 
 /** What this section edits: the role's whole access, not a delta. */
@@ -30,8 +32,18 @@ export type TableAccessDraft = {
   grants: RoleTableGrant[]
 }
 
-/** The two catalog fields the picker reads from a list row. */
-type CatalogAsset = { id: string; namespace: string }
+/** The catalog fields the picker reads from a list row. */
+type CatalogAsset = { id: string; tableKey?: string | null }
+
+/**
+ * The schema every Bronze table lives in (`GOV-7` D9). The server addresses
+ * a Bronze dataset as `bronze.<table_name>` — `ensure_asset_readable` and
+ * `bronze_asset_detail_body` in `rust/crates/lakehouse-api/src/routes/
+ * catalog.rs` — and the rule compares the schema part of that key. The
+ * registry's `namespace` (`primer`/`sekunder`) is a catalog grouping that
+ * names no schema, so it is never offered here.
+ */
+const BRONZE_SCHEMA = "bronze"
 
 /**
  * One schema of the picker. `tables` are the catalog's, `unlisted` are
@@ -55,21 +67,38 @@ export function grantsUnrestricted(permissions: string): boolean {
 
 const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
 
+/**
+ * The `<schema>.<table>` key a list row names, or `null` when it names none.
+ * `GOV-7` D9: the list row carries `tableKey` (`bronze.<table_name>` on a
+ * Bronze row, the id itself on Silver/Gold), and the `id` fallback keeps a
+ * Silver/Gold row from an older API build usable.
+ */
+function tableKeyOf(asset: CatalogAsset): string | null {
+  for (const candidate of [asset.tableKey, asset.id]) {
+    const key = candidate?.trim() ?? ""
+    const dot = key.indexOf(".")
+    if (dot > 0 && dot < key.length - 1) return key
+  }
+  return null
+}
+
 const EMPTY_ASSETS: readonly CatalogAsset[] = []
 
 const compareNames = (a: string, b: string) => a.toLowerCase().localeCompare(b.toLowerCase())
 
 /**
- * The schemas the picker offers: the catalog's tables grouped by schema,
- * plus every schema and table the role's grants name.
+ * The schemas the picker offers: the catalog's tables grouped by the schema
+ * their `tableKey` names, plus every schema and table the role's grants
+ * name.
  *
- * A Silver or Gold asset's id IS its `<schema>.<table>` key, so the list
- * names it. A Bronze row is addressed by a registry slug, and its table
- * name is only on the asset's own detail (`tableKey`) — the list does not
- * carry it (`lib/table-key-href.ts`, "the Bronze slug gap"). Such an asset
- * counts towards its namespace's `unnamedAssets`, and its schema is offered
- * with a whole-schema checkbox and the free-text row, never with an
- * invented table name.
+ * A Silver or Gold row's `id` is its `<schema>.<table>` key, and its
+ * `tableKey` says the same. A Bronze row's `id` is a registry slug, and its
+ * table is named only by `tableKey` — `bronze.<table_name>`, the key the
+ * server builds (`GOV-7` D9) — so such a table is offered by name under
+ * `bronze`. A row whose registry records no table name has no key: it is
+ * counted as unnamed under `bronze`, and no grant covers it (the server
+ * hides it from a narrowed role's lists), so it is never offered under an
+ * invented name.
  */
 export function schemaChoices(
   assets: readonly CatalogAsset[],
@@ -86,16 +115,15 @@ export function schemaChoices(
   }
 
   for (const asset of assets) {
-    const id = asset.id.trim()
-    const dot = id.indexOf(".")
-    if (dot > 0 && dot < id.length - 1) {
-      const choice = choiceFor(id.slice(0, dot))
-      const table = id.slice(dot + 1)
-      if (!choice.tables.some((t) => sameName(t, table))) choice.tables.push(table)
+    const key = tableKeyOf(asset)
+    if (!key) {
+      choiceFor(BRONZE_SCHEMA).unnamedAssets += 1
       continue
     }
-    const namespace = asset.namespace.trim()
-    if (namespace) choiceFor(namespace).unnamedAssets += 1
+    const dot = key.indexOf(".")
+    const choice = choiceFor(key.slice(0, dot))
+    const table = key.slice(dot + 1)
+    if (!choice.tables.some((t) => sameName(t, table))) choice.tables.push(table)
   }
 
   for (const grant of grants) {
@@ -178,8 +206,12 @@ export function RoleTableAccessSection({
     assetsState.status === "success" ? assetsState.data : EMPTY_ASSETS
   const choices = React.useMemo(() => schemaChoices(assets, grants), [assets, grants])
 
+  // `GOV-7` S2 review 1 S1: the rule compares a table without regard to case
+  // (`table_access.rs` `allows`), so this section does too — otherwise a
+  // stored `silver.Orders` is neither listed as unlisted nor ticked against
+  // the catalog's `orders`, and cannot be removed here.
   const hasGrant = (schema: string, table: string) =>
-    grants.some((grant) => sameName(grant.schema, schema) && grant.table === table)
+    grants.some((grant) => sameName(grant.schema, schema) && sameName(grant.table, table))
 
   const setGrants = (next: RoleTableGrant[]) => {
     if (value) onChange({ scope: value.scope, grants: next })
@@ -197,7 +229,7 @@ export function RoleTableAccessSection({
 
   function toggleTable(schema: string, table: string, checked: boolean) {
     const rest = grants.filter(
-      (grant) => !(sameName(grant.schema, schema) && grant.table === table)
+      (grant) => !(sameName(grant.schema, schema) && sameName(grant.table, table))
     )
     setGrants(checked ? [...rest, { schema, table }] : rest)
   }
@@ -250,8 +282,8 @@ export function RoleTableAccessSection({
             This role&apos;s tables could not be loaded: {accessError.message}
           </p>
           <p className="text-xs text-muted-foreground">
-            They are left as they are; nothing here can be saved until they load, so a stale
-            choice cannot replace them.
+            They are left as they are: saving the role does not change them, so a stale choice
+            cannot replace them.
           </p>
           {retry ? (
             <Button type="button" variant="outline" size="sm" onClick={retry}>
@@ -332,7 +364,7 @@ export function RoleTableAccessSection({
                     rows.length > 0
                       ? counted(rows.length, "table")
                       : choice.unnamedAssets > 0
-                        ? "The catalog names these assets by slug, not by table name. Choose the whole schema, or add a table below."
+                        ? "The registry records no table name for these assets, so no grant here can cover them: they stay hidden from a role limited to these tables."
                         : "The catalog lists no table here."
                   return (
                     <div

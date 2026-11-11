@@ -10,13 +10,40 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
-import { identityService, type Role, type SetRoleTableAccessInput } from "@/services"
+import { identityService, type Role, type RoleTableAccess, type RoleTableGrant, type SetRoleTableAccessInput } from "@/services"
 import { PermissionPicker } from "./permission-picker"
 import {
   grantsUnrestricted,
   RoleTableAccessSection,
   type TableAccessDraft,
 } from "./role-table-access"
+
+/**
+ * The schema.table names a set of grants covers, compared without regard to
+ * case as the rule compares them (`table_access.rs` `allows`). One name per
+ * grant, sorted so a different order is not a change; duplicates collapse
+ * because the rule reads the grants as a union.
+ */
+function grantNames(grants: readonly RoleTableGrant[]): string {
+  return [...new Set(grants.map((grant) => `${grant.schema}.${grant.table}`.toLowerCase()))]
+    .sort()
+    .join("\n")
+}
+
+/**
+ * Whether the draft differs from what the page loaded (`GOV-7` S2 review 1
+ * S2). Every table-access write is audited and replaces the stored grants, so
+ * an untouched section must not write: a role rename would otherwise record a
+ * table-access change nobody made, and revert a change another administrator
+ * made meanwhile. The comparison is of what the save would send: a scope of
+ * `all` sends no grants.
+ */
+function tableAccessChanged(draft: TableAccessDraft, loaded: RoleTableAccess): boolean {
+  if (draft.scope !== loaded.scope) return true
+  const sent = draft.scope === "listed" ? draft.grants : []
+  const stored = loaded.scope === "listed" ? loaded.grants : []
+  return grantNames(sent) !== grantNames(stored)
+}
 
 /**
  * The three fields a role has, shared by Create and Edit (`WEB-3` S3-D8).
@@ -163,6 +190,9 @@ function RoleEditForm({ role }: { role: Role }) {
   // GOV-7 D8: the role's tables belong to the same Save. The draft starts
   // from what the API stored, so a grant the catalog does not list still
   // travels back in the PUT until the person removes it.
+  // `GOV-7` S2 review 1 S2: what was stored is also what the draft is
+  // compared against, so a Save that did not touch this section sends no
+  // table-access request at all.
   const accessState = useService(
     (signal) => identityService.getRoleTableAccess(role.id, signal),
     [role.id]
@@ -180,7 +210,6 @@ function RoleEditForm({ role }: { role: Role }) {
         identityService.setRoleTableAccess(role.id, input, signal)
     )
   )
-  const [accessSkipped, setAccessSkipped] = React.useState(false)
   const renamed = name.trim() !== role.name
   // The API refuses to narrow a role that holds `*:*` (GOV-7 D4), so the
   // section is disabled with the server's own sentence and no table-access
@@ -191,7 +220,6 @@ function RoleEditForm({ role }: { role: Role }) {
   const loadingAccess = accessState.status === "loading"
 
   async function handleSave() {
-    setAccessSkipped(false)
     // The role first, then its tables: the table-access write is a separate
     // request, so either can fail on its own and the page says which.
     const saved = await update.run({
@@ -200,16 +228,16 @@ function RoleEditForm({ role }: { role: Role }) {
       description: description.trim(),
     })
     if (!saved) return
-    if (fullAccess) {
-      // A `*:*` role reads every table whatever its stored grants say; the
-      // API refuses the narrowing write, and the section is disabled.
+    // `GOV-7` S2 review 1 S2: only a section that changed writes. A `*:*`
+    // role cannot be narrowed, and a section that could not be loaded is an
+    // untouched section: the role save completes and the page goes back.
+    if (
+      fullAccess ||
+      !access ||
+      !tableAccess ||
+      !tableAccessChanged(tableAccess, access)
+    ) {
       router.push(backHref)
-      return
-    }
-    if (!tableAccess) {
-      // Its stored grants never arrived: writing now would replace grants
-      // nobody saw. The role is saved and the page says what was left.
-      setAccessSkipped(true)
       return
     }
     const accessSaved = await saveAccess.run({
@@ -224,9 +252,7 @@ function RoleEditForm({ role }: { role: Role }) {
       ? `The role was not saved: ${update.error.message}`
       : saveAccess.status === "error"
         ? `The role was saved, but its tables were not: ${saveAccess.error.message}`
-        : accessSkipped
-          ? "The role was saved. Its tables were not saved because they could not be loaded; retry above and save again."
-          : null
+        : null
 
   return (
     <FormPage

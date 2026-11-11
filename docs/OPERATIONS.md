@@ -1400,15 +1400,23 @@ role** → *Tables this role can read*:
   or, with the schema opened, individual tables. A table a pipeline has
   not created yet is typed in as `schema.table`; the grant names it now
   and starts covering it when the table appears.
-- **Save** writes the role and then its tables. They are two requests;
-  if the second fails the page says the role was saved but its tables
-  were not, and stays open.
+- **Save** writes the role, and writes its tables too only when the scope
+  or the ticked grants changed while the page was open. They are two
+  requests; if the second fails the page says the role was saved but its
+  tables were not, and stays open. An untouched section — and one whose
+  stored grants could not be loaded — sends no table-access request at all.
 - A role holding `*:*` cannot be narrowed: the section is disabled and
   says why, and the API refuses the write with a 400 ("A role with full
   access cannot be narrowed"), so an administrator cannot lock everyone
   out by narrowing the role that administers the platform.
 - The Roles list shows **All tables**, or how many schemas and single
   tables each role may read.
+
+A **Bronze** table is listed by its registry table name under the schema
+`bronze` (`bronze.orders`), which is the key the rule compares. A dataset
+whose registry records no table name is not listed: nothing names a table
+a grant could match, so it stays hidden from a role limited to these
+tables, in that role's catalog lists and in its search.
 
 **From the API.** `identity:read` reads a role's access, `identity:write`
 changes it (Platform Admin holds both):

@@ -61,6 +61,7 @@ type Stub = {
   access?: { scope: string; grants: { schema: string; table: string }[] }
   assets?: unknown[]
   catalogStatus?: number
+  accessStatus?: number
   tableAccessAnswer?: () => Response
 }
 
@@ -73,6 +74,7 @@ function stubApi({
   access = { scope: "all", grants: [] },
   assets = ASSETS,
   catalogStatus = 200,
+  accessStatus = 200,
   tableAccessAnswer,
 }: Stub = {}) {
   const writes: Write[] = []
@@ -93,7 +95,10 @@ function stubApi({
       ])
     }
     if (path.includes("/table-access")) {
-      if (method === "GET") return json(access)
+      if (method === "GET") {
+        if (accessStatus !== 200) return json({ error: "Access unavailable" }, accessStatus)
+        return json(access)
+      }
       writes.push({ method, path, body })
       if (tableAccessAnswer) return tableAccessAnswer()
       return json({ scope: body?.scope ?? "all", grants: body?.grants ?? [] })
@@ -146,6 +151,10 @@ describe("RoleEditPage (WEB-7 D2/D4)", () => {
     expect((name as HTMLInputElement).value).toBe("Analyst")
     fireEvent.change(name, { target: { value: "Data Analyst" } })
     expect(screen.getByText(/A rename is refused while an access rule names Analyst/)).toBeTruthy()
+    // GOV-7 S2 review 1 S2: the section writes only when it changed, so this
+    // test changes it first ("Only these"); the untouched case is its own
+    // test below.
+    fireEvent.click(await screen.findByRole("radio", { name: "Only these" }))
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
     await waitFor(() =>
@@ -155,14 +164,40 @@ describe("RoleEditPage (WEB-7 D2/D4)", () => {
           path: "/api/identity/roles/r1",
           body: { name: "Data Analyst", permissions: "catalog:read", description: "Reads" },
         },
-        // GOV-7 S2: the same Save sends the role's tables, which were
-        // "all" when the page loaded.
+        // GOV-7 S2: the same Save sends the role's tables, once they changed.
         {
           method: "PUT",
           path: "/api/identity/roles/r1/table-access",
-          body: { scope: "all", grants: [] },
+          body: { scope: "listed", grants: [] },
         },
       ])
+    )
+    await waitFor(() => expect(pushed).toEqual(["/admin/roles"]))
+  })
+
+  it("sends no table-access request when the section was not touched", async () => {
+    const writes = stubApi()
+    renderPage(<RoleEditPage />)
+    await screen.findByRole("radio", { name: "Only these" })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() =>
+      expect(writes.map((write) => write.path)).toEqual(["/api/identity/roles/r1"])
+    )
+    await waitFor(() => expect(pushed).toEqual(["/admin/roles"]))
+  })
+
+  it("saves the role and goes back when its tables could not be loaded", async () => {
+    const writes = stubApi({ accessStatus: 503 })
+    renderPage(<RoleEditPage />)
+    expect(
+      await screen.findByText(/This role's tables could not be loaded: Access unavailable/)
+    ).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    // GOV-7 S2 review 1 S2: an unloaded section is an untouched section.
+    await waitFor(() =>
+      expect(writes.map((write) => write.path)).toEqual(["/api/identity/roles/r1"])
     )
     await waitFor(() => expect(pushed).toEqual(["/admin/roles"]))
   })
@@ -278,6 +313,10 @@ describe("RoleEditPage: tables this role can read (GOV-7 S2-D8)", () => {
     renderPage(<RoleEditPage />)
     expect(await screen.findByText("old_orders")).toBeTruthy()
     expect(screen.getByText("Not in the catalog (kept until removed)")).toBeTruthy()
+    // GOV-7 S2 review 1 S2: a save writes only a changed section, so this
+    // test makes one change (the whole schema) and checks the unlisted grant
+    // is still sent with it.
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Whole schema archived" }))
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
     await waitFor(() =>
@@ -286,7 +325,10 @@ describe("RoleEditPage: tables this role can read (GOV-7 S2-D8)", () => {
         path: "/api/identity/roles/r1/table-access",
         body: {
           scope: "listed",
-          grants: [{ schema: "archived", table: "old_orders" }],
+          grants: [
+            { schema: "archived", table: "old_orders" },
+            { schema: "archived", table: "*" },
+          ],
         },
       })
     )
@@ -300,6 +342,9 @@ describe("RoleEditPage: tables this role can read (GOV-7 S2-D8)", () => {
     })
     renderPage(<RoleEditPage />)
     await screen.findByRole("radio", { name: "Only these" })
+    // GOV-7 S2 review 1 S2: make the section changed, so the refused write is
+    // attempted and the page has to say the role itself was saved.
+    fireEvent.click(screen.getByRole("checkbox", { name: "Whole schema silver" }))
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
     const alert = await screen.findByRole("alert")
@@ -323,12 +368,78 @@ describe("RoleEditPage: tables this role can read (GOV-7 S2-D8)", () => {
       await screen.findByText(/The catalog of tables could not be loaded, so only the tables this role already has are listed here/)
     ).toBeTruthy()
     expect(await screen.findByText("orders")).toBeTruthy()
+    // GOV-7 S2 review 1 S2: change the section first, then the save carries
+    // the grant it kept.
+    fireEvent.click(screen.getByRole("checkbox", { name: "Whole schema silver" }))
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     await waitFor(() =>
       expect(writes[writes.length - 1]).toEqual({
         method: "PUT",
         path: "/api/identity/roles/r1/table-access",
-        body: { scope: "listed", grants: [{ schema: "silver", table: "orders" }] },
+        body: {
+          scope: "listed",
+          grants: [
+            { schema: "silver", table: "orders" },
+            { schema: "silver", table: "*" },
+          ],
+        },
+      })
+    )
+  })
+
+  it("offers a Bronze table by the name the list row's tableKey names", async () => {
+    stubApi({
+      access: { scope: "listed", grants: [] },
+      assets: [{ id: "ds_commerce_orders", tableKey: "bronze.orders" }],
+    })
+    renderPage(<RoleEditPage />)
+    await screen.findByRole("radio", { name: "Only these" })
+
+    // `GOV-7` S2 review 1 B1: the schema is `bronze`, never the registry's
+    // `namespace` (here absent, as it is a catalog grouping and no column of
+    // the rule).
+    expect(await screen.findByText("bronze")).toBeTruthy()
+    expect(screen.queryByText("primer")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Expand bronze" }))
+    expect(await screen.findByRole("checkbox", { name: "bronze.orders" })).toBeTruthy()
+  })
+
+  it("counts a row the registry names no table for under bronze, never under primer", async () => {
+    stubApi({
+      access: { scope: "listed", grants: [] },
+      assets: [{ id: "ds_anonymous" }],
+    })
+    renderPage(<RoleEditPage />)
+    await screen.findByRole("radio", { name: "Only these" })
+
+    expect(await screen.findByText("bronze")).toBeTruthy()
+    expect(screen.queryByText("primer")).toBeNull()
+    expect(
+      screen.getByText(
+        "The registry records no table name for these assets, so no grant here can cover them: they stay hidden from a role limited to these tables."
+      )
+    ).toBeTruthy()
+  })
+
+  it("ticks the catalog's table for a stored grant that differs only by case, and unticking removes it", async () => {
+    const writes = stubApi({
+      access: { scope: "listed", grants: [{ schema: "silver", table: "Orders" }] },
+      assets: [{ id: "silver.orders" }],
+    })
+    renderPage(<RoleEditPage />)
+
+    // `GOV-7` S2 review 1 S1: the rule compares tables without regard to
+    // case, so the stored `silver.Orders` is the catalog's `orders`.
+    const box = await screen.findByRole("checkbox", { name: "silver.orders" })
+    expect(box.getAttribute("aria-checked")).toBe("true")
+    fireEvent.click(box)
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() =>
+      expect(writes[writes.length - 1]).toEqual({
+        method: "PUT",
+        path: "/api/identity/roles/r1/table-access",
+        body: { scope: "listed", grants: [] },
       })
     )
   })
