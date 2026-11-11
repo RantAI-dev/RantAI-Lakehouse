@@ -527,6 +527,149 @@ $ git ls-remote --heads origin feat/gov-7-s1-enforce
 (`ba2d8f0c` is `origin/main`'s tip, on this branch only through the merge.
 This handoff's own docs commit sits on top of the three lines above.)
 
+### Handoff (developer, 2026-11-12, S2)
+
+Branch `feat/gov-7-s2-console`, cut from `origin/main` at `de8430be` (`GOV-7` S1, #459,
+merged). TypeScript and docs only: no Rust, no migration, no API change, no new page and no
+`ROUTE_ACCESS` entry.
+
+#### Commits
+
+- `d599bf2b` T6 — the contract (`RoleTableAccess`, `RoleTableGrant`,
+  `SetRoleTableAccessInput`), the client and `services/index.ts`, the section
+  (`role-table-access.tsx`), the Edit page's Save, the roles-list summary, and the tests.
+- `e80bfed3` T7 — `docs/OPERATIONS.md`, "Limiting a role to some schemas or tables".
+- `b4a19189` — two comments at the sites where grants are kept (no behaviour), so the
+  reason sits at the code (rule 1).
+
+#### The Save decision: one Save for the page
+
+The plan's "The Save button calls `PUT …/table-access`" is read as the page's single
+**Save**. `RoleEditForm` (`role-form-page.tsx`) writes the role first
+(`PUT /api/identity/roles/{id}`), then the tables
+(`PUT /api/identity/roles/{id}/table-access`), and:
+
+- if the role write fails, no table-access request is sent and the error says
+  "The role was not saved: …";
+- if the role write succeeds and the table-access write fails, the page says
+  "The role was saved, but its tables were not: <the server's own sentence>" (a 400's
+  text arrives unchanged through `ServiceError.message`) and does **not** navigate;
+- a role holding `*:*` sends no table-access write at all: the section is disabled with
+  the API's sentence ("A role with full access cannot be narrowed") and the role save
+  navigates as before;
+- if the role's current access could not be read, the role is saved, no table-access
+  write is sent (a write now would replace grants nobody saw), and the page says so and
+  stays. **Save is disabled while that read is in flight**, so this can only follow a
+  failed read, which the section shows with a Retry.
+
+The section's own state is the page's draft, seeded from `GET …/table-access`; grants the
+catalog does not list are rendered ("Not in the catalog (kept until removed)") inside a
+schema group that opens by default, and are sent back unchanged until removed.
+
+#### What the roles-list summary reads
+
+`GET /api/identity/roles` returns the store's `Role` (`id`, `name`, `members`,
+`permissions`, `description`); `ROLE_SELECT` does not read `role.read_scope`, so the list
+carries no table access and the API was **not** changed. `roles-page.tsx` therefore reads
+`GET …/table-access` **once per role**, in parallel (`loadRoleTableAccesses`): N requests
+for N roles, on a page an administrator opens by hand. A role whose read fails is `null`
+and its row says "—" (with a title) rather than "All tables"; while the reads are in
+flight the cell also says "—", never a guessed answer.
+
+The summary is computed into the row (`RoleRow` in `roles-columns.tsx`) rather than into
+the cell from a map, so the `columns` array keeps its identity when the reads land: a
+rebuild remounts every cell and closes a row's open menu under the reader. While loading,
+a role whose permissions hold `*:*` already says "All tables", because D4 makes the rule
+ignore its stored scope.
+
+#### Where the picker's schemas come from, and its one gap (reported, not improvised)
+
+`assetService.listAssets({})` reads `GET /api/catalog`. A Silver or Gold row's `id` **is**
+its `<schema>.<table>` key, so the section groups by the part before the first dot and
+lists the part after it — the names a statement uses.
+
+**A Bronze row cannot be named from the list.** Its `id` is a registry slug and
+`bronze_catalog_row` emits no `tableKey`/`tableName`; only the detail body does
+(`bronze_asset_detail_body`, from `dataset_sync`). The console already documents this as
+"the Bronze slug gap" (`src/lib/table-key-href.ts`). So, for a Bronze asset, the section
+offers its **namespace** (`primer` / `sekunder`) with the "Whole schema" checkbox and the
+sentence "The catalog names these assets by slug, not by table name. Choose the whole
+schema, or add a table below."; the free-text row adds `bronze.<table>` by hand. No table
+name is invented, and nothing the role already holds is dropped. Listing Bronze tables by
+name would need an API change, which S2 does not make.
+
+When the catalog read fails, the section says so and keeps the grants it has (still
+removable) and the free-text row; it never shows an empty list as if there were no tables.
+
+#### Tests added
+
+- `src/features/admin/role-form-page.test.tsx` — 11 tests (6 of them S2): "Only these"
+  with one whole schema sends `{"scope":"listed","grants":[{"schema":"silver","table":"*"}]}`
+  after the role's own PUT; a `*:*` role shows the section disabled with the server's
+  sentence and writes no table access; `bronze.orders_new` typed by hand is sent exactly
+  as typed; a grant the catalog does not list is shown and kept through a save; a refused
+  table-access write says the role was saved but its tables were not and stays on the page;
+  a failed catalog still shows the grant and saves it.
+- `src/features/admin/roles-page.test.tsx` — 9 tests (3 S2): "All tables", "2 schemas,
+  1 table", and "—" (never "All tables") when a role's access cannot be read.
+- `src/services/clients/identity.test.ts` — 4 tests: the GET, the PUT body, the 400
+  sentence kept as `invalid_request`, and 404 as `not_found`.
+
+#### Commands, as run (foreground, final code commit `b4a19189`)
+
+- `bun install --frozen-lockfile` — "Checked 779 installs across 753 packages (no
+  changes)", 1.52 s.
+- `bun run typecheck` — pass (no output).
+- `bun run lint` — **11 problems, 0 errors, 11 warnings**, all pre-existing and none in a
+  file this slice touched (data-table, sidebar, sso-page, alerts-page, login-page,
+  use-copilot, use-data-table, dashboard-specs, uploads.test, services/http.ts). The one
+  warning this slice introduced (an unused `permissions` in the test stub) was removed.
+- `bun test src/features/admin` — **133 passed, 0 failed**, 20 files.
+- `bun test src/services` — **216 passed, 0 failed**, 20 files.
+- `bun test src/components/app-shell` — **27 passed, 0 failed**, 4 files (run though no
+  page or route changed).
+- No cargo command: no Rust file changed.
+
+One run of `bun test src/features/admin` (chained after the other two folders in one
+shell command) reported **132 pass / 1 fail** and the failing name was not captured; ten
+subsequent runs — eight alone and two in the same chained sequence — were **133 pass /
+0 fail**. Recorded as observed. CI runs the full suite on the pull request.
+
+**not verified locally: the rest, left to CI, and the section in a real browser.** Locally
+not run: the whole `bun run test`, and the page against a live API (a real `/api/catalog`
+and the two table-access routes), so the picker's rendering and the two-request Save were
+verified only through the component tests and the client test.
+
+**For the planner:** the feature page's "Limits to tell a customer"
+(`docs/core/features/table-access-per-role.md`) still lists only its original four limits.
+The three from the S1 review — a scheduled agent run is not narrowed, names are compared
+without regard to case, the check is one database read per request — are in
+`docs/OPERATIONS.md` after T7, but not yet on the page. The page is the planner's file, so
+it was not edited here.
+
+No mismatch between the plan and the code was found, except the Bronze naming gap above:
+the plan says "the schemas from `assetService.listAssets`", and the list names no Bronze
+table. Handled honestly, reported here, no decision changed.
+
+#### `git status --short`, `git log --oneline origin/main..HEAD`, remote
+
+```
+$ git status --short
+(clean)
+
+$ git log --oneline origin/main..HEAD
+b4a19189 docs(gov-7): say at the code why a `*:*` role and whole-schema picks keep their grants (T6)
+e80bfed3 docs(gov-7): how to limit a role to some schemas or tables (T7)
+d599bf2b feat(gov-7): pick the schemas and tables a role can read (T6)
+
+$ git ls-remote --heads origin feat/gov-7-s2-console
+b4a191891ba256039650affdc8b2a7a0788aa829	refs/heads/feat/gov-7-s2-console
+```
+
+(This handoff's own docs commit sits on top of the three lines above, as the S1 handoffs'
+did.)
+
+
 ## 6. Review (planner)
 
 ### S1, round 1 (planner, 2026-11-11) — branch at `3f6b5569`
