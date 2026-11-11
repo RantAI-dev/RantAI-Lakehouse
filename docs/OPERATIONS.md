@@ -1711,6 +1711,26 @@ cannot reach.
 
 Platform Admins can configure OIDC single sign-on directly from the console under **Settings → Sign-in** without restarting the API service. The configuration takes effect immediately upon saving.
 
+**Set `CONSOLE_PUBLIC_URL` first.** A sign-in has to return the person to
+this deployment, so the callback address is
+`<CONSOLE_PUBLIC_URL>/api/auth/oidc/callback` (the API's own configuration,
+never a request header). `OIDC_REDIRECT_URI` still wins when it is set. With
+neither set, the connection cannot be used: **Settings → Sign-in** shows
+`ready: false` with the sentence "Set CONSOLE_PUBLIC_URL …", and the sign-in
+page shows no SSO button. Saving still works, so an administrator can fill the
+form first and set the address afterwards.
+
+**The addresses come from the provider's discovery document.** A connection
+saved in Settings stores only the issuer, the client ID and the secret. The
+authorize address, the token address and the key set are read from
+`<issuer>/.well-known/openid-configuration` (`authorization_endpoint`,
+`token_endpoint`, `jwks_uri`) the first time the connection is used, and cached
+with the settings. Each of them must be an `https://` address outside this
+deployment's network, checked the same way the issuer is; one that is not
+leaves the connection "not ready" and nothing is sent to it. A value set in
+`.env` (`OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_JWKS_URL`,
+`OIDC_REDIRECT_URI`) still wins per value and shows as "Set by the server".
+
 The settings form provides:
 - **Issuer URL**: The base URL of the OIDC provider (must be a valid `https://` endpoint).
 - **Client ID**: The OIDC client identifier.
@@ -1721,9 +1741,10 @@ The settings form provides:
 - **Role mapping**: Maps external IdP group names to local deployment roles (`admin`, `developer`, `viewer`, etc.).
 
 **Testing sign-in.** The **Test sign-in** button tests the current draft settings before saving:
-- It launches an authorization-code flow in a new browser window.
+- It launches an authorization-code flow in a new browser window, using the draft's own discovery document for the authorize, token and key-set addresses — never the saved connection's.
 - Upon completion, the IdP redirects back to the deployment's callback, which validates the token claims and role mapping without creating a user, session, or login audit row.
-- A result card displays the returned subject, email, extracted groups, and mapped roles, or any classified error (for example, "The provider refused the client ID or secret").
+- A result card displays the returned subject, email, whether the provider verified that email, extracted groups, mapped roles and whether the groups claim was replaced by an overage marker, or any classified error (for example, "The provider refused the client ID or secret", or "The identity provider could not be reached").
+- A run uses only the client secret sealed into it when it was created; it never falls back to `OIDC_CLIENT_SECRET`.
 
 #### Environment variable precedence (`.env` wins)
 
