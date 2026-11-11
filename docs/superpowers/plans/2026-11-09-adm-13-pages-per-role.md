@@ -554,3 +554,20 @@ D10.1 as built: `governance:read` on `get_audit_history`, `list_quality_rules`,
   also open with `policy:review`, which the code does not do. The table above is the record.
   The next handoff names only what `git diff --stat` and the code show.
 
+### Round 3 (planner, 2026-11-11) — branch at `9125a53e`
+
+Read the three round 2 commits (`30b735e1..9125a53e`, 6 files).
+
+- **R2-B1: closed.** `lib/home-status.ts` takes only the checks that were made and returns
+  `null` when there is none; `home-page.tsx` passes a check only behind its `can…` flag and
+  draws no line for `null`; the fake summary is gone. Tests cover no checks, alerts alone, and
+  Home for `assistant:ask,dashboard:read` with and without `alert:read`.
+- **R2-S1: closed.** The SQL is removed from the operations guide; the custom-role sentence
+  names both exceptions.
+- **R2-S2: closed.** The round 2 handoff names only files in `git diff --stat`.
+
+**No open BLOCKER.** `origin/main` (`6d1ffed7`, #452) is merged into the branch in the commit
+that carries this note; it merged without a conflict and adds no migration. I ran no check
+locally: the pull request (#454) runs the whole suite on that commit, and it is merged only
+when every check that passes on `main` passes there.
+
