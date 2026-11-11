@@ -271,3 +271,44 @@ describe("history, trash, personal space, favourites and search (BI-18 part C, p
     expect(hits[0].name).toBe("50% off")
   })
 })
+
+// `WEB-7` D6: the chart builder's save and the Edit chart page's read live
+// here now, instead of a feature file calling `/api/dashboard/specs` by hand.
+describe("the chart builder's write and read (WEB-7 D6)", () => {
+  it("creates with POST and changes with PUT, carrying the body as the builder built it", async () => {
+    const calls = stubFetch(() => json({ chart: { id: "c1" } }))
+    await clickhouseDashboardService.saveChart({ title: "Visitors", kind: "bar" }, false)
+    expect(calls[0].init.method).toBe("POST")
+    expect(sent(calls[0])).toEqual({ title: "Visitors", kind: "bar" })
+
+    await clickhouseDashboardService.saveChart({ id: "c1", title: "Visitors" }, true)
+    expect(calls[1].init.method).toBe("PUT")
+    expect(sent(calls[1])).toEqual({ id: "c1", title: "Visitors" })
+  })
+
+  it("throws the server's own sentence when the save is refused", async () => {
+    stubFetch(() => json({ error: "invalid or missing measure column" }, 400))
+    await expect(
+      clickhouseDashboardService.saveChart({ title: "T" }, false)
+    ).rejects.toThrow("invalid or missing measure column")
+  })
+
+  it("finds the chart by id in the chart list, and says so when it is not there", async () => {
+    const calls = stubFetch(() =>
+      json({
+        charts: [
+          { id: "c1", title: "Visitors", board: "b_1", def: { kind: "bar" } },
+          { id: "c2", board: "b_2" },
+        ],
+      })
+    )
+    expect(await clickhouseDashboardService.getChart("c1")).toEqual({
+      id: "c1",
+      title: "Visitors",
+      board: "b_1",
+      def: { kind: "bar" },
+    })
+    expect(calls[0].url).toBe("/api/dashboard/specs")
+    expect(await clickhouseDashboardService.getChart("gone")).toBeNull()
+  })
+})

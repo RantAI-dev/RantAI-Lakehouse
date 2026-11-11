@@ -6,11 +6,14 @@
 // `next/navigation` is stubbed before any import resolves (`mock.module` is
 // hoisted), and `TableProviders` supplies the URL state the results table
 // needs, as the root layout does.
+let pushed: string[] = []
 mock.module("next/navigation", () => ({
   usePathname: () => "/query-studio",
   useSearchParams: () => new URLSearchParams(),
   useRouter: () => ({
-    push: () => {},
+    push: (href: string) => {
+      pushed.push(href)
+    },
     replace: () => {},
     refresh: () => {},
     back: () => {},
@@ -29,11 +32,14 @@ import { ServiceError } from "@/services/errors"
 import { QUERY_DRAFT_KEY } from "@/lib/query-draft"
 import { SQL_FORMAT_SETTINGS_KEY } from "@/lib/sql-format-settings"
 import { QueryStudioPage } from "./query-studio-page"
+import { readSaveQueryDraft, readSaveSourceDraft } from "./save-draft"
 
 afterEach(() => {
   cleanup()
   mock.restore()
   window.localStorage.clear()
+  window.sessionStorage.clear()
+  pushed = []
   visit("/query-studio")
 })
 
@@ -47,11 +53,11 @@ function visit(path: string) {
 }
 
 /** Answers the session and the Copilot sessions list; everything else is an empty success. */
-function stubNetwork() {
+function stubNetwork(permissions: string[] = []) {
   spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
     const path = String(input)
     if (path.includes("/api/auth/me")) {
-      return json({ id: "u1", name: "Analyst", email: null, roles: ["Analyst"], permissions: [], tenants: [] })
+      return json({ id: "u1", name: "Analyst", email: null, roles: ["Analyst"], permissions, tenants: [] })
     }
     if (path.includes("/api/ai/sessions")) return json({ sessions: [] })
     return json({})
@@ -469,5 +475,49 @@ describe("QueryStudioPage parameters", () => {
     await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
     // The run holds no value for the parameter: the name is not sent at all.
     expect(run.mock.calls[0]?.[1]).toMatchObject({ parameters: {} })
+  })
+})
+
+// `WEB-7` D5: saving is a page now, so the editor leaves the statement where
+// that page reads it and goes there. The editor's own draft keeps the SQL,
+// which is what makes Cancel and Save return to the same text.
+describe("QueryStudioPage save handoff ('WEB-7' D5)", () => {
+  it("writes the statement and the save mode where the save page reads them, and goes there", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save as new" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/query-studio/save"]))
+    expect(readSaveQueryDraft()).toEqual({
+      sql: "SELECT 1",
+      parameters: [],
+      mode: "create",
+      savedId: null,
+      tabId: "tab-1",
+    })
+    // The statement travels in the browser session, never in the address.
+    expect(window.location.search).toBe("")
+  })
+
+  it("writes the SQL source draft for a caller who may author sources", async () => {
+    stubNetwork(["dashboard:sql"])
+    seedDraft("SELECT * FROM serving.orders")
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save as SQL source" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/query-studio/save-source"]))
+    expect(readSaveSourceDraft()).toEqual({ sql: "SELECT * FROM serving.orders" })
+  })
+
+  it("shows no Save as SQL source button to a caller without dashboard:sql", async () => {
+    stubNetwork()
+    seedDraft("SELECT * FROM serving.orders")
+    renderPage()
+
+    await screen.findByRole("button", { name: "Save as new" })
+    expect(screen.queryByRole("button", { name: "Save as SQL source" })).toBeNull()
   })
 })

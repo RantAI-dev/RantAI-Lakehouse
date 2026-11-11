@@ -1,16 +1,17 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
 import type { AlertRule } from "@/services/contracts/alerts"
+import { RUN_ALERTS_OFF, RunAlertsNotice } from "./alerts-page"
+// `WEB-7` T7: the rule form is its own page now; its pure helpers moved with
+// it, and every assertion below is unchanged.
 import {
-  RUN_ALERTS_OFF,
-  RunAlertsNotice,
   alertRuleFormFields,
   alertRuleSaveInput,
   connectorForKind,
   isMetricRule,
   legacyOwnerNote,
   seesEveryTenant,
-} from "./alerts-page"
+} from "./alert-rule-page"
 import {
   chartAlertHref,
   getRuleColumns,

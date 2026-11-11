@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { useRouter } from "next/navigation"
 
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState } from "@/components/patterns/page-states"
@@ -10,11 +11,10 @@ import { NaturalLanguagePanel } from "./nl-panel"
 import { QueryResultsSection } from "./query-results-section"
 import { QueryResultTabs } from "./query-result-tabs"
 import { QueryStudioTabs } from "./query-studio-tabs"
+import { writeSaveQueryDraft, writeSaveSourceDraft } from "./save-draft"
 import { ExplainCard, FixCard, FixWithAiButton } from "./sql-help-card"
 import { IcebergTimeTravelControls } from "./time-travel-controls"
 import { QueryTransparencyPanel } from "./query-transparency-panel"
-import { SaveQuerySheet } from "./save-query-sheet"
-import { SaveSqlSourceSheet } from "./save-sql-source-sheet"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import { summarizeQuery } from "@/lib/page-context-summary"
@@ -27,11 +27,35 @@ import { useQueryStudio } from "./use-query-studio"
 export function QueryStudioPage() {
   // All the state lives in the hook; this file is the layout.
   const studio = useQueryStudio()
-  const [saveOpen, setSaveOpen] = React.useState(false)
-  const [sourceOpen, setSourceOpen] = React.useState(false)
+  const router = useRouter()
   const [schemaOpen, setSchemaOpen] = React.useState(false)
-  const { hasPermission, user } = useAuth()
+  const { hasPermission } = useAuth()
   const canAuthorSources = hasPermission("dashboard:sql")
+
+  /**
+   * `WEB-7` D5: saving is its own page now, so the statement it would save
+   * is written to `sessionStorage` first (`save-draft.ts`) and the editor
+   * travels with it. The editor keeps its text across the trip through its
+   * own `localStorage` draft (`lib/query-draft.ts`), which is flushed when
+   * this page unmounts (`useDebouncedCallback` flushes on unmount), so
+   * Cancel or Save returns to the same SQL.
+   */
+  function openSavePage() {
+    writeSaveQueryDraft({
+      sql: studio.targetStatement?.text ?? "",
+      parameters: studio.saveParameters,
+      mode: studio.saveTarget.mode,
+      savedId: studio.saveTarget.savedId,
+      tabId: studio.activeTabId,
+    })
+    router.push("/query-studio/save")
+  }
+
+  function openSaveSourcePage() {
+    writeSaveSourceDraft({ sql: studio.targetStatement?.text ?? "" })
+    router.push("/query-studio/save-source")
+  }
+
 
   // Page-aware Copilot (plan §6): the SQL being written and the first rows
   // of its last result. Deferred so typing is not slowed by re-sending the
@@ -104,8 +128,8 @@ export function QueryStudioPage() {
                 <div className="min-w-0">
                   <SqlPanel
                     studio={studio}
-                    onSave={() => setSaveOpen(true)}
-                    onSaveAsSource={canAuthorSources ? () => setSourceOpen(true) : undefined}
+                    onSave={openSavePage}
+                    onSaveAsSource={canAuthorSources ? openSaveSourcePage : undefined}
                     onToggleSchema={() => setSchemaOpen((open) => !open)}
                     schemaOpen={schemaOpen}
                   />
@@ -200,26 +224,6 @@ export function QueryStudioPage() {
           />
         </div>
       </div>
-
-      <SaveQuerySheet
-        open={saveOpen}
-        onOpenChange={setSaveOpen}
-        sql={studio.targetStatement?.text ?? ""}
-        parameters={studio.saveParameters}
-        saving={studio.saveAct.status === "pending"}
-        error={studio.saveAct.error?.message ?? null}
-        onSave={studio.save}
-        mode={studio.saveTarget.mode}
-        savedId={studio.saveTarget.savedId}
-        viewerId={user?.id}
-      />
-      {canAuthorSources ? (
-        <SaveSqlSourceSheet
-          open={sourceOpen}
-          onOpenChange={setSourceOpen}
-          sql={studio.targetStatement?.text ?? ""}
-        />
-      ) : null}
     </div>
   )
 }

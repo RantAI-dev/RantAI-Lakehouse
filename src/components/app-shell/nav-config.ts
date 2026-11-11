@@ -286,6 +286,13 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   { pattern: "/dashboards/browse", requires: ["dashboard:read"] },
   { pattern: "/dashboards/metrics", requires: ["dashboard:read"] },
   { pattern: "/dashboards/[id]", requires: ["dashboard:read"] },
+  // WEB-7 D6: the chart builder's pages. `POST`/`PUT /api/dashboard/specs`
+  // are `RequiresAuth` with the level resolved in the handler
+  // (`policy.rs`), and a person can hold edit on one dashboard through a
+  // rule without `dashboard:write`; so the entry opens to any signed-in
+  // person and the page says "You don't have access" below edit.
+  { pattern: "/dashboards/[id]/charts/new", requires: [] },
+  { pattern: "/dashboards/[id]/charts/[chartId]/edit", requires: [] },
 
   // Data & Catalog
   { pattern: "/catalog", requires: ["catalog:read"] },
@@ -296,6 +303,12 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
 
   // Query Studio
   { pattern: "/query-studio", requires: ["query:read"] },
+  // WEB-7 D2/D5: the save forms left the editor. Both take the permission
+  // their submit route takes: `POST /api/query/saved` is `query:read`
+  // (`policy.rs:475`), and `POST /api/dashboard/sources` is `dashboard:sql`
+  // (`policy.rs:680`), the same grant the editor's button is shown for.
+  { pattern: "/query-studio/save", requires: ["query:read"] },
+  { pattern: "/query-studio/save-source", requires: ["dashboard:sql"] },
   { pattern: "/query-studio/saved", requires: ["query:read"] },
   { pattern: "/query-studio/history", requires: ["query:read"] },
 
@@ -328,6 +341,12 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // Monitoring
   { pattern: "/health", requires: ["ops:read"] },
   { pattern: "/alerts", requires: ["alert:read", "alert:write"] },
+  // WEB-7 D2/D7: the rule form left the list's dialog. `POST`/`PUT
+  // /api/alerts` are `RequiresAuth` with the handler deciding (an owner's own
+  // chart alert needs no `alert:write`, `policy.rs:424`); this page builds the
+  // non-chart rules the list shows, whose writes take `alert:write`.
+  { pattern: "/alerts/rules/new", requires: ["alert:write"] },
+  { pattern: "/alerts/rules/[id]/edit", requires: ["alert:write"] },
 
   // Intelligence / Agents
   // ADM-13 review round 1, S4: agent runs requires [] (any signed-in user, RequiresAuth on GET)
