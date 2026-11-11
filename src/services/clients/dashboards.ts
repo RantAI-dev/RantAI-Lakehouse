@@ -159,6 +159,71 @@ export const clickhouseDashboardService: DashboardService = {
     })
     await checkedWrite<unknown>(res)
   },
+  /**
+   * Save a chart from the builder's high-level input (`WEB-7` D6). The
+   * server answers `{ chart }` on success and its own `{ error }` otherwise;
+   * the error is thrown as the service error whose message the builder
+   * shows, which is what the direct call it replaces did.
+   */
+  async saveChart(input, edit, signal) {
+    const res = await apiFetch("/api/dashboard/specs", {
+      method: edit ? "PUT" : "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    if (!res.ok) {
+      const json = (await res.json().catch(() => null)) as { error?: string } | null
+      throw new ServiceError(codeFor(res.status), json?.error ?? "Failed to save chart", res.status)
+    }
+  },
+  /**
+   * The marts, by name (`WEB-7` D7). The route answers rows with them; the
+   * picker only needs what to call each one.
+   */
+  async listMarts(signal) {
+    const json = await request<{ marts?: { name?: string; rows?: number }[] }>(
+      "/api/dashboard/fields",
+      { cache: "no-store", signal },
+      "The marts could not be loaded"
+    )
+    return (json.marts ?? [])
+      .filter((mart): mart is { name: string; rows?: number } =>
+        typeof mart.name === "string" && mart.name.length > 0
+      )
+      .map((mart) => ({ name: mart.name }))
+  },
+  /**
+   * The measures of one mart (`WEB-7` D7). The route also answers its
+   * dimensions and kinds; a rule watches measures, so those are what it
+   * returns.
+   */
+  async listMartMeasures(mart, signal) {
+    const json = await request<{ measures?: string[] }>(
+      `/api/dashboard/fields?mart=${encodeURIComponent(mart)}`,
+      { cache: "no-store", signal },
+      "The fields could not be loaded"
+    )
+    return json.measures ?? []
+  },
+  /**
+   * One stored chart, read from the list the console already calls. The list
+   * is what the server has: there is no by-id route, and adding one is not
+   * this change's business (`WEB-7` D6).
+   */
+  async getChart(id, signal) {
+    const json = await request<{
+      charts?: { id: string; title?: string; board?: string; def?: Record<string, unknown> }[]
+    }>("/api/dashboard/specs", { cache: "no-store", signal }, "The chart could not be loaded")
+    const found = (json.charts ?? []).find((chart) => chart.id === id)
+    if (!found) return null
+    return {
+      id: found.id,
+      title: found.title ?? found.id,
+      board: found.board ?? "default",
+      def: found.def ?? {},
+    }
+  },
 
   async listSqlSources(signal) {
     const json = await request<{ sources: SqlSource[] }>(

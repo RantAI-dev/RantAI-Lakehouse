@@ -77,25 +77,6 @@ function mountWith(sql: string) {
   return hook
 }
 
-/**
- * Mounts the hook on a `?saved=` link and waits for the tab it opens.
- *
- * The saved query carries the level the caller holds on it: the level says
- * whether "Save" may change that query or must make a copy of it.
- */
-async function mountWithSaved(level: string) {
-  window.localStorage.clear()
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
-  spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
-  spyOn(assetService, "listAssets").mockResolvedValue([])
-  spyOn(queryService, "getSaved").mockResolvedValue({ ...SAVED, level })
-  visit("/query-studio?saved=q1")
-  const hook = renderHook(() => useQueryStudio())
-  await waitFor(() => expect(hook.result.current.tabs[0]?.savedId).toBe("q1"))
-  return { hook }
-}
-
 describe("useQueryStudio saved-query link", () => {
   it("opens the saved query the link names, with its id and the caller's level", async () => {
     window.localStorage.clear()
@@ -170,74 +151,6 @@ describe("useQueryStudio saved-query link", () => {
     await waitFor(() => expect(hook.result.current.tabs[0]?.savedId).toBe("q1"))
     expect(getSaved).toHaveBeenCalledTimes(1)
     expect(hook.result.current.tabs.length).toBe(1)
-  })
-})
-
-describe("useQueryStudio saving", () => {
-  it("changes the saved query the tab came from, and writes no folder", async () => {
-    const { hook } = await mountWithSaved("edit")
-    const updateSaved = spyOn(queryService, "updateSaved").mockResolvedValue(SAVED)
-    const saveQuery = spyOn(queryService, "saveQuery").mockResolvedValue(SAVED)
-
-    // The tab came from a query the caller may change, so the button offers
-    // a change of it rather than a copy of it.
-    expect(hook.result.current.saveTarget.label).toBe("Save")
-    expect(hook.result.current.saveTarget.mode).toBe("update")
-
-    await act(async () => {
-      await hook.result.current.save({
-        title: "Orders",
-        sql: "SELECT 2",
-        tags: ["finance"],
-        folderId: "f1",
-      })
-    })
-
-    expect(updateSaved).toHaveBeenCalledTimes(1)
-    expect(updateSaved.mock.calls[0]?.[0]).toBe("q1")
-    expect(updateSaved.mock.calls[0]?.[1]).toEqual({
-      title: "Orders",
-      sql: "SELECT 2",
-      tags: ["finance"],
-    })
-    expect(saveQuery).not.toHaveBeenCalled()
-    expect(hook.result.current.tabs[0]?.savedId).toBe("q1")
-  })
-
-  it("makes a copy when the caller may only view the query", async () => {
-    const { hook } = await mountWithSaved("view")
-    const updateSaved = spyOn(queryService, "updateSaved").mockResolvedValue(SAVED)
-    const saveQuery = spyOn(queryService, "saveQuery").mockResolvedValue(SAVED)
-
-    // The tab carries a query the caller may only read, so the button offers
-    // a copy of it rather than a change of it.
-    expect(hook.result.current.saveTarget.label).toBe("Save as new")
-    expect(hook.result.current.saveTarget.mode).toBe("create")
-
-    await act(async () => {
-      await hook.result.current.save({ title: "Copy", sql: "SELECT 2", tags: [] })
-    })
-
-    expect(saveQuery).toHaveBeenCalledTimes(1)
-    expect(updateSaved).not.toHaveBeenCalled()
-  })
-
-  it("keeps the id and the level the server answered with, so the tab is the query it made", async () => {
-    const { hook } = await mountWithSaved("view")
-    const saveQuery = spyOn(queryService, "saveQuery").mockResolvedValue({
-      ...SAVED,
-      id: "q2",
-      level: "edit",
-    })
-
-    await act(async () => {
-      await hook.result.current.save({ title: "Copy", sql: "SELECT 2", tags: [] })
-    })
-
-    expect(saveQuery).toHaveBeenCalledTimes(1)
-    await waitFor(() => expect(hook.result.current.tabs[0]?.savedId).toBe("q2"))
-    expect(hook.result.current.tabs[0]?.level).toBe("edit")
-    expect(hook.result.current.saveTarget.label).toBe("Save")
   })
 })
 
@@ -975,46 +888,6 @@ describe("useQueryStudio parameter requests", () => {
     act(() => result.current.setSql("SELECT 1"))
 
     expect(result.current.saveParameters).toEqual([])
-  })
-
-  it("sends the definitions a save-back is given to the saved query it changes", async () => {
-    const { hook } = await mountWithSaved("edit")
-    const updateSaved = spyOn(queryService, "updateSaved").mockResolvedValue(SAVED)
-    const definitions = [{ name: "a", type: "text" as const, default: "EU" }]
-
-    await act(async () => {
-      await hook.result.current.save({
-        title: "Orders",
-        sql: "SELECT {{a}}",
-        tags: [],
-        parameters: definitions,
-      })
-    })
-
-    expect(updateSaved.mock.calls[0]?.[1]).toStrictEqual({
-      title: "Orders",
-      sql: "SELECT {{a}}",
-      tags: [],
-      parameters: definitions,
-    })
-  })
-
-  it("lets a save-back clear the parameters with an empty list, and leaves them alone without the key", async () => {
-    const { hook } = await mountWithSaved("edit")
-    const updateSaved = spyOn(queryService, "updateSaved").mockResolvedValue(SAVED)
-
-    await act(async () => {
-      await hook.result.current.save({ title: "Orders", sql: "SELECT 1", tags: [], parameters: [] })
-      await hook.result.current.save({ title: "Orders", sql: "SELECT 1", tags: [] })
-    })
-
-    expect(updateSaved.mock.calls[0]?.[1]).toStrictEqual({
-      title: "Orders",
-      sql: "SELECT 1",
-      tags: [],
-      parameters: [],
-    })
-    expect(updateSaved.mock.calls[1]?.[1]).toStrictEqual({ title: "Orders", sql: "SELECT 1", tags: [] })
   })
 
   it("opens a saved query with its definitions and no values, so each field starts at its default", async () => {

@@ -218,7 +218,7 @@ function MessageFooter({
 /** The Copilot message list — rich rendering (tool rows, build tree, markdown). */
 export function ChatMessages({
   messages, busy, error, className, onRetry,
-  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey,
+  onConfirmTool, onCancelTool, confirmingKey,
   onEdit, onDelete, onDismissError, onAnswerAsk, askNotice,
 }: {
   messages: Msg[];
@@ -231,8 +231,6 @@ export function ChatMessages({
   onConfirmTool?: (messageIndex: number, stepIndex: number) => void;
   /** Cancel a `needs_confirmation` tool step. */
   onCancelTool?: (messageIndex: number, stepIndex: number) => void;
-  /** Mark a pending step done with this result, without re-running the tool. */
-  onCompleteTool?: (messageIndex: number, stepIndex: number, result: Record<string, unknown>) => void;
   /** `"<messageIndex>:<stepIndex>"` of the step currently being confirmed. */
   confirmingKey?: string | null;
   /** Replace the user message at `index` and ask again from there. */
@@ -377,10 +375,11 @@ export function ChatMessages({
                       <div className="mt-2">
                         <PendingActionCard
                           step={pendingStep}
+                          messageIndex={i}
+                          stepIndex={pendingIndex}
                           confirming={confirmingKey === `${i}:${pendingIndex}`}
                           onConfirm={() => onConfirmTool?.(i, pendingIndex)}
                           onCancel={() => onCancelTool?.(i, pendingIndex)}
-                          onSavedInBuilder={(result) => onCompleteTool?.(i, pendingIndex, result)}
                         />
                       </div>
                     ) : null}
