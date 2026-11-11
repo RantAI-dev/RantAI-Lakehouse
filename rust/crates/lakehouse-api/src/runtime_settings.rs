@@ -1458,153 +1458,436 @@ pub async fn sso_or_fail(state: &AppState) -> Result<EffectiveSso, StoreError> {
     Ok(resolve_sso(&state.config, stored.as_ref(), keyring))
 }
 
-/// Swappable `OIDC` authenticator wrapper paired with the effective settings it
-/// was built from, allowing cache invalidation when settings change (plan D4).
-#[derive(Clone)]
-pub struct SwappableOidc {
-    /// The authenticator instance.
-    pub authenticator: Arc<lakehouse_auth::oidc::OidcAuthenticator>,
-    /// The effective settings used to build [`Self::authenticator`].
-    pub settings: EffectiveSso,
+/// The path a sign-in returns to on this deployment (`ADM-12` D10): built
+/// from the operator's own `CONSOLE_PUBLIC_URL`, never from a request
+/// header.
+const OIDC_CALLBACK_PATH: &str = "/api/auth/oidc/callback";
+
+/// Why a single sign-on connection cannot be used right now (`ADM-12` D10).
+///
+/// One fixed sentence each, and each names what an operator can set. The
+/// provider's own text never appears in one (principle 4): a discovery
+/// document and a token endpoint's answer are remote input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsoNotReady {
+    /// No issuer or client ID is in effect.
+    NotConfigured,
+    /// Settings need a database, and this deployment has none.
+    NoDatabase,
+    /// A console-set connection has no return address to send people to.
+    NoPublicAddress,
+    /// The console-set issuer is not one this deployment may reach.
+    IssuerRefused,
+    /// The issuer's discovery document could not be read.
+    DiscoveryUnreadable,
+    /// The discovery document names an address this deployment may not use.
+    AddressRefused,
+    /// A server-owned connection is missing an address a sign-in needs.
+    ServerAddressesMissing,
 }
 
-/// The effective `SSO` settings for a request: the environment's, else the
-/// console's saved ones, else the code's defaults.
-pub async fn sso(state: &AppState) -> EffectiveSso {
+impl SsoNotReady {
+    /// The one sentence the Settings form and the log show for this reason.
+    #[must_use]
+    pub const fn sentence(self) -> &'static str {
+        match self {
+            Self::NotConfigured => {
+                "Single sign-on is not configured: save an issuer and a client ID."
+            }
+            Self::NoDatabase => "Single sign-on needs a database, and none is configured.",
+            Self::NoPublicAddress => {
+                "Set CONSOLE_PUBLIC_URL to this deployment's public address: a sign-in has to return people here."
+            }
+            Self::IssuerRefused => {
+                "The issuer address is not one this deployment may reach: it must be an https:// address outside its own network."
+            }
+            Self::DiscoveryUnreadable => {
+                "The issuer's discovery document could not be read: check the issuer address and that the provider is reachable."
+            }
+            Self::AddressRefused => {
+                "The provider's discovery document names an address this deployment may not use: it must be an https:// address outside its own network."
+            }
+            Self::ServerAddressesMissing => {
+                "Set OIDC_AUTHORIZE_URL, OIDC_TOKEN_URL and OIDC_REDIRECT_URI: a sign-in needs all three."
+            }
+        }
+    }
+}
+
+/// One built SSO runtime: the addresses a sign-in will use, the
+/// authenticator that verifies the token, and the HTTP client every request
+/// of this connection goes through (`ADM-12` D4, D10).
+///
+/// [`Self::base`] is what [`resolve_sso`] returned before discovery, kept
+/// so the cache can tell whether the saved row moved; [`Self::settings`] is
+/// the same value with the addresses filled in from the provider's
+/// discovery document. [`Self::not_ready`] says why the connection cannot be
+/// used; an authenticator is exposed only when it is `None`.
+#[derive(Clone)]
+pub struct SwappableOidc {
+    /// What [`resolve_sso`] returned, before discovery.
+    pub base: EffectiveSso,
+    /// The effective settings, with the addresses filled in.
+    pub settings: EffectiveSso,
+    /// The authenticator, present only when the connection is ready.
+    pub authenticator: Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>>,
+    /// The HTTP client every request of this connection goes through.
+    pub http: reqwest::Client,
+    /// Why the connection cannot be used, if it cannot.
+    pub not_ready: Option<SsoNotReady>,
+    /// When it was built, so a failed discovery is retried after
+    /// [`SETTINGS_CACHE_TTL`] without waiting for a save.
+    built_at: Instant,
+}
+
+impl SwappableOidc {
+    /// Whether a sign-in can be offered with this runtime (`ADM-12` D10).
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.not_ready.is_none() && self.authenticator.is_some()
+    }
+
+    /// The fixed sentence for why this runtime cannot be used, or `None`.
+    #[must_use]
+    pub fn not_ready_reason(&self) -> Option<&'static str> {
+        self.not_ready.map(SsoNotReady::sentence)
+    }
+}
+
+/// The runtime for the effective settings: the environment's, else the
+/// console's saved ones, else the defaults (`ADM-12` D4, D10).
+///
+/// Cached in [`AppState::oidc`] and cleared on save. Rebuilt when the saved
+/// row or the environment moves, and every [`SETTINGS_CACHE_TTL`] so a
+/// provider that was briefly unreachable becomes usable without a save.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the saved row cannot be read — a
+/// caller that must not claim a value is unset when the database could not
+/// be asked uses this; [`sso`]/[`oidc`] use the infallible wrapper instead.
+pub async fn sso_runtime_or_fail(state: &AppState) -> Result<SwappableOidc, StoreError> {
+    // D3: when the environment owns the connection, nothing the saved row
+    // holds can change where a sign-in goes, so the row is not read at all
+    // — the same shape this resolver had before discovery, and what keeps a
+    // sign-in on a deployment whose database is briefly down from waiting on
+    // it.
+    let config_only = resolve_sso(&state.config, None, None);
+    if config_only.issuer_source == Source::Server {
+        return Ok(cached_or_build(state, config_only).await);
+    }
+    let base = sso_or_fail(state).await?;
+    Ok(cached_or_build(state, base).await)
+}
+
+/// The cached runtime for `base`, or a freshly built one.
+async fn cached_or_build(state: &AppState, base: EffectiveSso) -> SwappableOidc {
     {
         let guard = state.oidc.read().await;
         if let Some(current) = guard.as_ref()
-            && current.settings.issuer_source == Source::Server
+            && current.base == base
+            && current.built_at.elapsed() < SETTINGS_CACHE_TTL
         {
-            return current.settings.clone();
+            return current.clone();
         }
     }
-    match sso_or_fail(state).await {
-        Ok(sso) => sso,
+    let mut guard = state.oidc.write().await;
+    if let Some(current) = guard.as_ref()
+        && current.base == base
+        && current.built_at.elapsed() < SETTINGS_CACHE_TTL
+    {
+        return current.clone();
+    }
+    let pool = state.pg.as_deref().cloned();
+    let runtime = build_sso_runtime(state, base, pool).await;
+    *guard = Some(runtime.clone());
+    runtime
+}
+
+/// [`sso_runtime_or_fail`] with the store failure logged and the
+/// environment's values used instead — the shape every request path needs,
+/// because a database blip must not take sign-in settings down with it.
+pub async fn sso_runtime(state: &AppState) -> SwappableOidc {
+    match sso_runtime_or_fail(state).await {
+        Ok(runtime) => runtime,
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 "reading saved SSO settings failed; using the environment's values"
             );
-            resolve_sso(&state.config, None, None)
+            let base = resolve_sso(&state.config, None, None);
+            let pool = state.pg.as_deref().cloned();
+            build_sso_runtime(state, base, pool).await
         }
     }
 }
 
-/// The initial `OIDC` authenticator built at startup from environment configuration.
-#[must_use]
-pub fn initial_oidc_authenticator(
-    config: &Config,
-    keyring: Option<&Keyring>,
-    pool: sqlx::PgPool,
-) -> Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>> {
-    let settings = resolve_sso(config, None, keyring);
-    if !settings.is_configured() {
-        return None;
-    }
-    let oidc_config = settings.to_oidc_config();
-    Some(Arc::new(lakehouse_auth::oidc::OidcAuthenticator::new(
-        oidc_config,
-        pool,
-    )))
+/// The effective `SSO` settings for a request: the environment's, else the
+/// console's saved ones, else the code's defaults, with the addresses the
+/// provider's discovery document names filled in (`ADM-12` D10).
+pub async fn sso(state: &AppState) -> EffectiveSso {
+    sso_runtime(state).await.settings
 }
 
-/// The `OIDC` authenticator for the effective `SSO` settings, rebuilt when they
-/// change (plan D4).
+/// The `OIDC` authenticator for the effective `SSO` settings, rebuilt when
+/// they change (plan D4). Only a ready connection has one (`ADM-12` D10).
+pub async fn oidc(state: &AppState) -> Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>> {
+    sso_runtime(state).await.authenticator
+}
+
+/// Build one SSO runtime — the ONE place an authenticator and its pinned
+/// HTTP client are assembled for a set of SSO settings (`ADM-12` review
+/// round 1, S5). The live path ([`sso_runtime`]) and the test sign-in
+/// (`routes::settings::post_sso_test`) both call this, so their checks and
+/// their transport cannot drift.
 ///
-/// Cached in [`AppState::oidc`] and cleared on save, matching the assistant
-/// client pattern.
+/// # What is checked, and when
+///
+/// A console-set connection is remote configuration: its issuer must be an
+/// `https://` address outside this deployment's network (D6), and each
+/// address the discovery document names must be too, before anything is
+/// sent to it (D10). One that is refused answers [`SsoNotReady`] and builds
+/// no authenticator, so no key set, token or userinfo request is ever made
+/// to it. A server-owned connection is the operator's own file and is used
+/// as it is, which is today's behaviour (D6).
 #[allow(
     clippy::too_many_lines,
-    reason = "checks cache freshness, validates console-set issuer address, pins allowlisted resolver, and builds authenticator"
+    reason = "one flat builder: the readiness checks and the authenticator they guard, in the order they must run (ADM-12 D10)"
 )]
-pub async fn oidc(state: &AppState) -> Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>> {
-    {
-        let guard = state.oidc.read().await;
-        if let Some(current) = guard.as_ref()
-            && current.settings.issuer_source == Source::Server
-        {
-            return Some(current.authenticator.clone());
-        }
-    }
-    let pool = (**state.pg.as_ref()?).clone();
-    let desired = sso(state).await;
-    if !desired.is_configured() {
-        let mut guard = state.oidc.write().await;
-        *guard = None;
-        return None;
-    }
-    {
-        let guard = state.oidc.read().await;
-        if let Some(current) = guard.as_ref()
-            && current.settings == desired
-        {
-            return Some(current.authenticator.clone());
-        }
-    }
+async fn build_sso_runtime(
+    state: &AppState,
+    base: EffectiveSso,
+    pool: Option<PgPool>,
+) -> SwappableOidc {
+    let built_at = Instant::now();
+    let mut settings = base.clone();
+    let default_http = reqwest::Client::new();
 
-    let mut guard = state.oidc.write().await;
-    if let Some(current) = guard.as_ref()
-        && current.settings == desired
-    {
-        return Some(current.authenticator.clone());
+    if !base.is_configured() {
+        return not_ready_runtime(base, settings, default_http, SsoNotReady::NotConfigured);
     }
-
-    let mut http_client = None;
-    if desired.issuer_source == Source::Console {
-        let Some(ref issuer) = desired.issuer else {
-            *guard = None;
-            return None;
-        };
-        let internal_hosts = state.config.connector_internal_hosts();
-        if let Err(problem) = check_issuer_address(issuer, &internal_hosts).await {
-            tracing::warn!(
-                %problem,
-                "the OIDC issuer address is not one this deployment may reach; authenticator was not built"
+    let Some(pool) = pool else {
+        return not_ready_runtime(base, settings, default_http, SsoNotReady::NoDatabase);
+    };
+    if base.issuer_source != Source::Console {
+        // D3: the environment owns the whole connection, addresses included.
+        // Its values are the operator's file, so they are used as they are
+        // and are not checked (D6).
+        if settings.authorize_url.is_none()
+            || settings.token_url.is_none()
+            || settings.redirect_uri.is_none()
+        {
+            return not_ready_runtime(
+                base,
+                settings,
+                default_http,
+                SsoNotReady::ServerAddressesMissing,
             );
-            *guard = None;
-            return None;
         }
-        if let Some((host, port)) = crate::connector_probe::parse_endpoint_host_port(issuer) {
-            match crate::connector_probe::resolve_checked(host, port, &internal_hosts).await {
-                Ok(approved) => {
-                    let mut builder =
-                        reqwest::Client::builder().resolve_to_addrs(host, approved.all());
-                    if let Some(ref jwks_url) = desired.jwks_url
-                        && let Some((j_host, j_port)) =
-                            crate::connector_probe::parse_endpoint_host_port(jwks_url)
-                        && let Ok(j_appr) =
-                            crate::connector_probe::resolve_checked(j_host, j_port, &internal_hosts)
-                                .await
-                    {
-                        builder = builder.resolve_to_addrs(j_host, j_appr.all());
-                    }
-                    if let Ok(client) = builder.build() {
-                        http_client = Some(client);
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "resolving checked issuer host failed");
-                    *guard = None;
-                    return None;
-                }
+        let authenticator = Arc::new(
+            lakehouse_auth::oidc::OidcAuthenticator::new_with_http_client(
+                settings.to_oidc_config(),
+                None,
+                pool,
+            ),
+        );
+        return SwappableOidc {
+            base,
+            settings,
+            authenticator: Some(authenticator),
+            http: default_http,
+            not_ready: None,
+            built_at,
+        };
+    }
+
+    let Some(issuer) = base.issuer.clone() else {
+        return not_ready_runtime(base, settings, default_http, SsoNotReady::NotConfigured);
+    };
+    let internal_hosts = state.config.connector_internal_hosts();
+
+    // D6: the issuer itself, before a discovery request is made.
+    if check_issuer_address(&issuer, &internal_hosts)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "the OIDC issuer address is not one this deployment may reach; no authenticator was built"
+        );
+        return not_ready_runtime(base, settings, default_http, SsoNotReady::IssuerRefused);
+    }
+
+    // The console's own return address: `<CONSOLE_PUBLIC_URL>` +
+    // `/api/auth/oidc/callback`, never a request header (D10). A set
+    // `OIDC_REDIRECT_URI` still wins per value.
+    let redirect_uri = base
+        .redirect_uri
+        .clone()
+        .or_else(|| state.config.console_public_url.as_deref().map(callback_url));
+    let Some(redirect_uri) = redirect_uri else {
+        return not_ready_runtime(base, settings, default_http, SsoNotReady::NoPublicAddress);
+    };
+
+    // The discovery read is the same one the key set uses (`lakehouse-auth`,
+    // `SEC-38`): one parser, one HTTP client, no second fetcher (rule 4).
+    // The issuer's host is checked and pinned for it.
+    let discovery_http = match state.sso_http_client() {
+        Some(client) => client,
+        None => match pinned_client(&[issuer.as_str()], &internal_hosts).await {
+            Ok(client) => client,
+            Err(()) => {
+                return not_ready_runtime(base, settings, default_http, SsoNotReady::IssuerRefused);
             }
+        },
+    };
+    let Ok(endpoints) =
+        lakehouse_auth::oidc::read_discovery_endpoints(&issuer, discovery_http).await
+    else {
+        return not_ready_runtime(
+            base,
+            settings,
+            default_http,
+            SsoNotReady::DiscoveryUnreadable,
+        );
+    };
+
+    // D10: each address the document names, before anything is sent there.
+    for url in [
+        endpoints.authorization_endpoint.as_str(),
+        endpoints.token_endpoint.as_str(),
+        endpoints.jwks_uri.as_str(),
+    ] {
+        if check_external_https_address(url, &internal_hosts)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "the OIDC discovery document names an address this deployment may not use; no authenticator was built"
+            );
+            return not_ready_runtime(base, settings, default_http, SsoNotReady::AddressRefused);
         }
     }
 
-    let oidc_config = desired.to_oidc_config();
+    // `.env` still wins per value (D10): a set address is used as it is, and
+    // only the discovery-named ones are checked above.
+    settings.authorize_url = base
+        .authorize_url
+        .clone()
+        .or_else(|| Some(endpoints.authorization_endpoint.clone()));
+    settings.token_url = base
+        .token_url
+        .clone()
+        .or_else(|| Some(endpoints.token_endpoint.clone()));
+    settings.jwks_url = base
+        .jwks_url
+        .clone()
+        .or_else(|| Some(endpoints.jwks_uri.clone()));
+    settings.redirect_uri = Some(redirect_uri);
+
+    // One client, pinned to every address this connection was allowed to
+    // reach: the issuer, and the three the document named (or the
+    // environment's own, which resolve normally).
+    let mut urls = vec![issuer.as_str()];
+    urls.extend(
+        [
+            settings.authorize_url.as_deref(),
+            settings.token_url.as_deref(),
+            settings.jwks_url.as_deref(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    let http = match state.sso_http_client() {
+        Some(client) => client,
+        None => match pinned_client(&urls, &internal_hosts).await {
+            Ok(client) => client,
+            Err(()) => {
+                return not_ready_runtime(
+                    base,
+                    settings,
+                    default_http,
+                    SsoNotReady::AddressRefused,
+                );
+            }
+        },
+    };
+
+    // The key-set address is now explicit, so the authenticator never
+    // re-reads a discovery document whose addresses were not checked.
     let authenticator = Arc::new(
         lakehouse_auth::oidc::OidcAuthenticator::new_with_http_client(
-            oidc_config,
-            http_client,
+            settings.to_oidc_config(),
+            Some(http.clone()),
             pool,
         ),
     );
-    *guard = Some(SwappableOidc {
-        authenticator: authenticator.clone(),
-        settings: desired,
-    });
-    Some(authenticator)
+    SwappableOidc {
+        base,
+        settings,
+        authenticator: Some(authenticator),
+        http,
+        not_ready: None,
+        built_at,
+    }
+}
+
+/// A runtime that says, in one fixed sentence, why it cannot be used, and
+/// that exposes no authenticator (`ADM-12` D10: not ready is said, not
+/// hidden, and nothing is fetched from a refused address).
+fn not_ready_runtime(
+    base: EffectiveSso,
+    settings: EffectiveSso,
+    http: reqwest::Client,
+    reason: SsoNotReady,
+) -> SwappableOidc {
+    SwappableOidc {
+        base,
+        settings,
+        authenticator: None,
+        http,
+        not_ready: Some(reason),
+        built_at: Instant::now(),
+    }
+}
+
+/// The sign-in return address for a console-set connection: the operator's
+/// `CONSOLE_PUBLIC_URL` and this deployment's fixed callback path (`ADM-12`
+/// D10). Never taken from a request.
+fn callback_url(public_url: &str) -> String {
+    format!("{}{OIDC_CALLBACK_PATH}", public_url.trim_end_matches('/'))
+}
+
+/// A `reqwest` client pinned to the checked addresses of every host in
+/// `urls` (`ADM-12` D6; `SEC-15`'s allowlisted resolver).
+///
+/// Pinning makes the address that passed [`crate::connector_probe::resolve_checked`]
+/// the one the request goes to, so a name that resolves somewhere else
+/// between the check and the request cannot redirect it — the same reasoning
+/// that module's dials give.
+///
+/// # Errors
+///
+/// `Err(())` when a URL names no host, a host does not resolve, a host
+/// resolves inside this deployment's network, or the client cannot be
+/// built. The caller turns each into a fixed [`SsoNotReady`] sentence.
+async fn pinned_client(
+    urls: &[&str],
+    internal_hosts: &InternalHosts,
+) -> Result<reqwest::Client, ()> {
+    // A provider that never answers must not hold a request open: discovery
+    // and the token exchange are bounded, and a refusal is a plain sentence.
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+    for url in urls {
+        let Some((host, port)) = crate::connector_probe::parse_endpoint_host_port(url) else {
+            return Err(());
+        };
+        let Ok(checked) = crate::connector_probe::resolve_checked(host, port, internal_hosts).await
+        else {
+            return Err(());
+        };
+        builder = builder.resolve_to_addrs(host, checked.all());
+    }
+    builder.build().map_err(|_| ())
 }
 
 #[cfg(test)]

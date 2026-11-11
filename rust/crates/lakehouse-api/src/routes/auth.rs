@@ -737,28 +737,33 @@ pub async fn oidc_start(
     State(state): State<AppState>,
     Query(query): Query<OidcStartQuery>,
 ) -> ApiResult<Response> {
-    // Presence-checked only: `/callback` (a later task) is what actually
-    // uses the configured `OidcAuthenticator` to verify the id token this
-    // flow eventually produces. This route only needs to know OIDC is
-    // configured at all before it starts a flow for it.
-    crate::runtime_settings::oidc(&state).await.ok_or_else(|| {
-        ApiError::Unavailable("OIDC is not configured on this deployment".to_owned())
-    })?;
-    let sso = crate::runtime_settings::sso(&state).await;
+    // `ADM-12` D10: the runtime, not the bare config. It carries the
+    // addresses the provider's discovery document named, and is present
+    // only when the connection is ready — so a saved connection with no
+    // return address or an unreachable discovery answers a plain 503 here
+    // instead of redirecting somewhere that cannot work.
+    let runtime = crate::runtime_settings::sso_runtime(&state).await;
+    let Some(_auth) = runtime.authenticator else {
+        return Err(ApiError::Unavailable(
+            runtime
+                .not_ready_reason()
+                .unwrap_or("Single sign-on is not configured on this deployment.")
+                .to_owned(),
+        )
+        .into());
+    };
+    let sso = runtime.settings;
     let authorize_url = sso
         .authorize_url
         .as_deref()
-        .or(state.config.oidc_authorize_url.as_deref())
         .ok_or_else(|| ApiError::Unavailable("OIDC_AUTHORIZE_URL is not configured".to_owned()))?;
     let redirect_uri = sso
         .redirect_uri
         .as_deref()
-        .or(state.config.oidc_redirect_uri.as_deref())
         .ok_or_else(|| ApiError::Unavailable("OIDC_REDIRECT_URI is not configured".to_owned()))?;
     let client_id = sso
         .client_id
         .as_deref()
-        .or(state.config.oidc_client_id.as_deref())
         .ok_or_else(|| ApiError::Unavailable("OIDC_CLIENT_ID is not configured".to_owned()))?;
 
     // `state`/`nonce`/PKCE `code_verifier` all come from the same CSPRNG
@@ -844,11 +849,15 @@ pub struct ProvidersResponse {
 /// in-memory state (`AppState::auth`, `Config::oidc_provider_name`), never
 /// a database or network call.
 pub async fn providers(State(state): State<AppState>) -> ApiResult<ApiJson<ProvidersResponse>> {
-    let oidc = crate::runtime_settings::oidc(&state).await;
-    let sso = crate::runtime_settings::sso(&state).await;
+    // `ADM-12` D10: readiness, not mere configuration. A saved connection
+    // that cannot be used (no `CONSOLE_PUBLIC_URL`, an unreachable
+    // discovery, a refused address) reports no OIDC, so the sign-in page
+    // shows no button that would fail; the Settings form says why.
+    let runtime = crate::runtime_settings::sso_runtime(&state).await;
+    let ready = runtime.is_ready();
     Ok(ApiJson(ProvidersResponse {
-        oidc: oidc.is_some(),
-        provider_name: oidc.map(|_| sso.provider_name.clone()),
+        oidc: ready,
+        provider_name: ready.then(|| runtime.settings.provider_name.clone()),
     }))
 }
 
@@ -985,24 +994,16 @@ pub async fn oidc_callback(
     let Some(auth) = crate::runtime_settings::oidc(&state).await else {
         return Ok(unavailable("OIDC is not configured on this deployment"));
     };
-    let sso = crate::runtime_settings::sso(&state).await;
-    let (Some(token_url), Some(redirect_uri)) = (
-        sso.token_url
-            .as_deref()
-            .or(state.config.oidc_token_url.as_deref()),
-        sso.redirect_uri
-            .as_deref()
-            .or(state.config.oidc_redirect_uri.as_deref()),
-    ) else {
+    let runtime = crate::runtime_settings::sso_runtime(&state).await;
+    let sso = runtime.settings.clone();
+    let (Some(token_url), Some(redirect_uri)) =
+        (sso.token_url.as_deref(), sso.redirect_uri.as_deref())
+    else {
         return Ok(unavailable(
             "OIDC_TOKEN_URL/OIDC_REDIRECT_URI are not configured",
         ));
     };
-    let Some(client_id) = sso
-        .client_id
-        .as_deref()
-        .or(state.config.oidc_client_id.as_deref())
-    else {
+    let Some(client_id) = sso.client_id.as_deref() else {
         return Ok(unavailable("OIDC_CLIENT_ID is not configured"));
     };
 
@@ -1035,6 +1036,7 @@ pub async fn oidc_callback(
         state.config.oidc_client_secret.as_deref()
     };
     let Some(id_token) = exchange_code_for_id_token(
+        &runtime.http,
         token_url,
         redirect_uri,
         client_id,
@@ -1158,12 +1160,15 @@ fn decode_flow_cookie(headers: &HeaderMap) -> Option<OidcFlow> {
 }
 
 /// POST the authorization code (and PKCE `code_verifier`) to `token_url`
-/// and return the `id_token` from a successful response, or `None` on any
-/// failure — a non-2xx status, a network error, or a response body that
+/// through `http` — the client the connection was built with, so the
+/// address that passed the allowlist check is the one dialled (`ADM-12`
+/// D10) — and return the `id_token` from a successful response, or `None` on
+/// any failure: a non-2xx status, a network error, or a response body that
 /// isn't `{"id_token": "..."}`. Never surfaces the `IdP`'s own status/body
 /// to the caller or into anything but a `tracing::warn!` line (AGENTS.md
 /// principle 4; see [`oidc_callback`]'s `# Errors` doc comment).
 async fn exchange_code_for_id_token(
+    http: &reqwest::Client,
     token_url: &str,
     redirect_uri: &str,
     client_id: &str,
@@ -1171,7 +1176,6 @@ async fn exchange_code_for_id_token(
     code: &str,
     code_verifier: &str,
 ) -> Option<String> {
-    let http = reqwest::Client::new();
     let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -1360,6 +1364,7 @@ async fn handle_oidc_test_callback(
         .unwrap_or("/api/auth/oidc/callback");
 
     let Some(id_token) = exchange_code_for_id_token(
+        &reqwest::Client::new(),
         token_url,
         redirect_uri,
         client_id,
@@ -1858,6 +1863,249 @@ mod tests {
         claim_names: Option<serde_json::Value>,
     }
 
+    // ── `ADM-12` review round 1, B1 + D10: a connection saved in Settings,
+    // with no `OIDC_*` variable at all, signs someone in end to end ────────
+    //
+    // The provider is reached over `https` (`wiremock` through
+    // `tls_proxy::HttpsFront`): a console-set issuer must be `https://` (D6)
+    // and a test must not weaken that check to reach a plaintext mock. The
+    // test supplies the client that trusts the CA the front minted
+    // (`AppState::sso_http_override`, compiled only for this crate's tests);
+    // every address check still runs, and only the pins are replaced.
+
+    /// A reachable `https` mock OIDC provider (`ADM-12` review round 1, B1):
+    /// `wiremock` behind [`crate::tls_proxy::HttpsFront`], with a discovery
+    /// document naming the authorize, token and key-set addresses at the
+    /// same `https` origin, and a client that trusts the CA the front
+    /// minted. Every address check still runs against the real
+    /// `validate`/`resolve_checked` path.
+    async fn https_mock_provider() -> (
+        wiremock::MockServer,
+        crate::tls_proxy::HttpsFront,
+        String,
+        reqwest::Client,
+    ) {
+        let server = wiremock::MockServer::start().await;
+        let plain_port: u16 = url::Url::parse(&server.uri())
+            .expect("the mock's URI parses")
+            .port()
+            .expect("the mock listens on a port");
+        let front = crate::tls_proxy::HttpsFront::start("127.0.0.1", plain_port, "127.0.0.1").await;
+        let issuer = format!("https://127.0.0.1:{}", front.port());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(front.ca_pem().as_bytes())
+                    .expect("the front's CA as a certificate"),
+            )
+            .build()
+            .expect("a client trusting the test CA");
+        (server, front, issuer, client)
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_connection_saved_in_settings_signs_in_with_no_oidc_env(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        // No `OIDC_*` variable at all: the connection comes from `PUT`, the
+        // return address from `CONSOLE_PUBLIC_URL` (D10).
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        // A throwaway installation key, so the console may seal a client
+        // secret (base64 of 32 bytes of 0x2a — not a secret).
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let app = crate::routes::router(state.clone());
+
+        // The seeded Platform Admin holds `*:*`, so it may save SSO (D5).
+        let (admin_id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind("fajar@meridian.example")
+            .fetch_one(&pool)
+            .await?;
+        let session_token = lakehouse_auth::session::create_session(
+            &pool,
+            admin_id,
+            lakehouse_auth::session::DEFAULT_SESSION_TTL,
+            None,
+            None,
+            &[] as &[String],
+        )
+        .await
+        .expect("a session for the seeded admin");
+        let cookie = format!("{}={}", SESSION_COOKIE_NAME, session_token.expose());
+
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/settings/sso")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "issuer": issuer,
+                            "clientId": "lakehouse-console",
+                            "clientSecret": "test-secret",
+                            "providerName": "mock",
+                            "jitProvisioning": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved_body = body_json(saved).await;
+        assert_eq!(saved_body["ready"], true, "{saved_body}");
+
+        // The sign-in page is told there is a provider.
+        let providers = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let providers_body = body_json(providers).await;
+        assert_eq!(providers_body["oidc"], true, "{providers_body}");
+
+        // 1. The sign-in starts at the discovery document's authorization
+        // endpoint, and returns to `CONSOLE_PUBLIC_URL`'s callback.
+        let started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/start?next=/dashboards")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::FOUND);
+        let location = started
+            .headers()
+            .get(header::LOCATION)
+            .expect("a redirect target")
+            .to_str()
+            .expect("an ASCII location")
+            .to_owned();
+        assert!(
+            location.starts_with(&format!("{issuer}/authorize?")),
+            "the authorize address comes from discovery: {location}"
+        );
+        assert!(
+            location.contains(
+                "redirect_uri=https%3A%2F%2Flakehouse.test%2Fapi%2Fauth%2Foidc%2Fcallback"
+            ),
+            "the return address comes from CONSOLE_PUBLIC_URL: {location}"
+        );
+        let flow_cookie = started
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("the flow cookie")
+            .to_str()
+            .expect("an ASCII cookie")
+            .to_owned();
+        let flow = decode_flow_cookie(&flow_cookie);
+
+        // 2. The provider answers the code exchange at the discovery
+        // document's token endpoint.
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "user-saved-in-settings",
+                iss: &issuer,
+                aud: "lakehouse-console",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let callback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/auth/oidc/callback?code=code-1&state={}",
+                        flow.state
+                    ))
+                    .header(
+                        header::COOKIE,
+                        flow_cookie.split(';').next().unwrap_or_default(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::FOUND);
+        assert_eq!(
+            callback
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/dashboards")
+        );
+        assert!(
+            callback
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value.to_str().is_ok_and(
+                    |text| text.starts_with("lh_session=") && !text.contains("Max-Age=0")
+                )),
+            "a session is created"
+        );
+
+        // 3. JIT provisioning created the account for the new subject.
+        let (identities,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM auth_identity \
+             WHERE provider = 'oidc:mock' AND external_subject = 'user-saved-in-settings'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(identities, 1, "the sign-in provisions the new subject");
+        Ok(())
+    }
+
     fn sign_id_token(claims: &IdTokenClaims<'_>, key: &TestKey) -> String {
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         header.kid = Some(key.kid.clone());
@@ -2278,6 +2526,12 @@ mod tests {
             .to_vec()
     }
 
+    /// The same bytes, decoded as JSON — the shape a route test that must
+    /// read a body (`GET /api/settings/sso`, `/api/auth/providers`) uses.
+    async fn body_json(response: Response) -> serde_json::Value {
+        serde_json::from_slice(&body_bytes(response).await).unwrap()
+    }
+
     #[tokio::test]
     async fn providers_reports_oidc_configured_true_only_when_auth_state_has_it() {
         let with_oidc = state_with_oidc_flow_config();
@@ -2293,14 +2547,22 @@ mod tests {
     async fn saving_a_config_makes_the_next_providers_call_report_oidc_with_no_restart(
         pool: sqlx::PgPool,
     ) -> sqlx::Result<()> {
+        // `ADM-12` D10: a saved connection is ready only when it can really
+        // be used, so this needs a provider whose discovery document answers
+        // — the same `https` mock the sign-in test uses.
+        let (server, _front, issuer, http) = https_mock_provider().await;
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
         env.insert(
             "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
             "true".to_owned(),
         );
-        let config = Config::from_map(&env).expect("valid config");
-        let state = AppState::new(config);
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        let mut state = AppState::new(Config::from_map(&env).expect("valid config"));
+        state.sso_http_override = Some(http);
 
         // At first, no OIDC is configured
         let body = get_json(&state, "/api/auth/providers").await;
@@ -2310,7 +2572,7 @@ mod tests {
         lakehouse_store::sso_settings::upsert(
             &pool,
             &lakehouse_store::sso_settings::SsoSettings {
-                oidc_issuer: Some("https://127.0.0.1:8443".to_owned()),
+                oidc_issuer: Some(issuer),
                 oidc_client_id: Some("saved-client-id".to_owned()),
                 oidc_client_secret: None,
                 oidc_provider_name: Some("saved-provider".to_owned()),
@@ -2331,6 +2593,15 @@ mod tests {
         let body = get_json(&state, "/api/auth/providers").await;
         assert_eq!(body["oidc"], serde_json::json!(true));
         assert_eq!(body["providerName"], serde_json::json!("saved-provider"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path() == "/.well-known/openid-configuration"),
+            "the addresses come from the saved issuer's discovery document"
+        );
 
         Ok(())
     }

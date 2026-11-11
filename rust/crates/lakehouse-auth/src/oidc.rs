@@ -349,13 +349,36 @@ pub struct JwksClient {
     discovery: RwLock<Option<CachedDiscovery>>,
 }
 
+/// Read `issuer`'s discovery document through `http` and return the three
+/// addresses it names (`ADM-12` D10).
+///
+/// The same read [`JwksClient`] performs, exposed without an
+/// [`OidcAuthenticator`] (which needs a database pool): the API's SSO
+/// runtime needs the addresses before it has an authenticator, and reuses
+/// this rather than writing a second fetcher (rule 4). The addresses are
+/// returned exactly as the document names them; the caller that enforces a
+/// deployment's own address policy does so on them, before sending anything
+/// to them.
+///
+/// # Errors
+///
+/// Returns [`AuthError::InvalidCredentials`] for the reasons
+/// [`JwksClient`]'s discovery read documents: the document cannot be read,
+/// names another issuer, or names an endpoint this module may not use.
+pub async fn read_discovery_endpoints(
+    issuer: &str,
+    http: reqwest::Client,
+) -> Result<OidcEndpoints, AuthError> {
+    let client = JwksClient::discovering(issuer, DEFAULT_JWKS_TTL).with_http_client(http);
+    client.endpoints(issuer, false).await
+}
+
 impl JwksClient {
     /// Build a client fetching from `url`, caching for [`DEFAULT_JWKS_TTL`].
     #[must_use]
     pub fn new(url: impl Into<String>) -> Self {
         Self::with_ttl(url, DEFAULT_JWKS_TTL)
     }
-
     /// Build a client fetching from `url`, caching for `ttl`. Exposed
     /// mainly for tests that need a short TTL to exercise expiry without
     /// waiting [`DEFAULT_JWKS_TTL`] in real time.

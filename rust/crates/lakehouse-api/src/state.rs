@@ -282,6 +282,17 @@ pub struct AppState {
     /// so a service build has no way to swap the policy.
     #[cfg(test)]
     pub webhook_sender_override: Option<lakehouse_notify::WebhookSender>,
+    /// Test seam for the console-set SSO connection's HTTP client
+    /// (`ADM-12` review round 1, B1): a sign-in test has to reach a mock
+    /// provider at an `https://` address, and nothing in a deployment can
+    /// tell `reqwest` to trust a certificate minted for one test (the
+    /// `rustls` client trusts `webpki` roots only). The test supplies a
+    /// client that trusts its own CA; the `https://` and `resolve_checked`
+    /// address checks still run on every URL, and the pins are the only
+    /// thing this replaces. Compiled only for this crate's tests, so a
+    /// service build has no way to set it.
+    #[cfg(test)]
+    pub sso_http_override: Option<reqwest::Client>,
 }
 
 /// PDFs made at once per API process (`BI-1` D5). Chromium is heavy, and the
@@ -811,24 +822,12 @@ impl AppState {
             &config,
             connector_secret_store.keyring().ok(),
         );
-        let initial_sso = crate::runtime_settings::resolve_sso(
-            &config,
-            None,
-            connector_secret_store.keyring().ok(),
-        );
-        let initial_oidc = pg
-            .as_ref()
-            .and_then(|pool| {
-                crate::runtime_settings::initial_oidc_authenticator(
-                    &config,
-                    connector_secret_store.keyring().ok(),
-                    (**pool).clone(),
-                )
-            })
-            .map(|authenticator| crate::runtime_settings::SwappableOidc {
-                authenticator,
-                settings: initial_sso,
-            });
+        // `ADM-12` D4/D10: the SSO runtime is built on the first request
+        // that needs it, by `runtime_settings::sso_runtime`, because the
+        // checks it makes (the issuer's address, the provider's discovery
+        // document) need the resolved config and the pool this constructor
+        // is still assembling.
+        let initial_oidc: Option<crate::runtime_settings::SwappableOidc> = None;
         let upload_receive = ReceiveLimiter::new(
             config.upload_max_concurrent_per_user,
             config.upload_max_concurrent,
@@ -892,6 +891,8 @@ impl AppState {
             email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
             #[cfg(test)]
             webhook_sender_override: None,
+            #[cfg(test)]
+            sso_http_override: None,
         }
     }
 
@@ -905,6 +906,21 @@ impl AppState {
             return sender.clone();
         }
         crate::webhook_guard::sender(&self.config)
+    }
+
+    /// The HTTP client a console-set SSO connection dials through
+    /// (`ADM-12` review round 1, B1): the test override when one is set, else
+    /// `None`, and the runtime builds its own pinned client. Compiled out
+    /// of every non-test build with the field it reads.
+    #[must_use]
+    pub fn sso_http_client(&self) -> Option<reqwest::Client> {
+        #[cfg(test)]
+        if let Some(client) = &self.sso_http_override {
+            return Some(client.clone());
+        }
+        #[cfg(not(test))]
+        let _ = self;
+        None
     }
 
     /// Whether `GET /health` should report the application database as

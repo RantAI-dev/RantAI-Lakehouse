@@ -36,6 +36,46 @@ const SSO: &str = "/api/settings/sso";
 const SSO_TEST: &str = "/api/settings/sso/test";
 const CONSOLE_ISSUER: &str = "https://localhost:8443";
 
+/// `ADM-12` review round 1, B1: a saved connection with no return address
+/// cannot be used, and says so instead of leaving a sign-in button on the
+/// page that would fail. Nothing is fetched: `CONSOLE_PUBLIC_URL` is checked
+/// before the provider's discovery document is read.
+#[tokio::test]
+async fn without_a_public_address_the_connection_is_not_ready_and_no_button_shows() {
+    let mut env = HashMap::new();
+    env.insert(
+        "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+        "true".to_owned(),
+    );
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let body = json!({
+        "issuer": CONSOLE_ISSUER,
+        "clientId": "lakehouse-test-client",
+    });
+    let (status, saved, _) = call(&router, "PUT", SSO, &cookie, &body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["ready"], false, "{saved}");
+    assert!(
+        saved["notReadyReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("CONSOLE_PUBLIC_URL")),
+        "the reason names what to set: {saved}"
+    );
+
+    // Reading it back says the same thing.
+    let (status, read, _) = call(&router, "GET", SSO, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["ready"], false, "{read}");
+    assert_eq!(read["notReadyReason"], saved["notReadyReason"]);
+
+    // And the sign-in page is told there is no OIDC provider to show.
+    let (status, providers, _) = call(&router, "GET", "/api/auth/providers", "", "").await;
+    assert_eq!(status, StatusCode::OK, "{providers}");
+    assert_eq!(providers["oidc"], false, "{providers}");
+}
+
 fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }

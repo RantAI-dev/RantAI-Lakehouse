@@ -2059,8 +2059,15 @@ async fn sso_issuer_field(
     Ok((Some(checked), changed))
 }
 
-/// Format the single sign-on settings response with each field's value and source.
-fn sso_settings_json(effective: &EffectiveSso, can_edit: bool) -> Value {
+/// Format the single sign-on settings response with each field's value and
+/// source, plus whether a sign-in can be offered and why not (`ADM-12`
+/// D10). `notReadyReason` is a fixed sentence naming what to set; nothing
+/// from the provider appears in it.
+fn sso_settings_json(
+    effective: &EffectiveSso,
+    can_edit: bool,
+    not_ready_reason: Option<&'static str>,
+) -> Value {
     json!({
         "issuer": field_json(effective.issuer.clone(), effective.issuer_source),
         "clientId": field_json(effective.client_id.clone(), effective.client_id_source),
@@ -2076,23 +2083,36 @@ fn sso_settings_json(effective: &EffectiveSso, can_edit: bool) -> Value {
         ),
         "jitProvisioning": field_json(effective.jit_provisioning, effective.jit_provisioning_source),
         "canEdit": can_edit,
+        "ready": not_ready_reason.is_none(),
+        "notReadyReason": not_ready_reason,
     })
 }
 
 /// `GET /api/settings/sso` — the effective single sign-on settings, and where
-/// each value comes from (`ADM-12`, plan D1, D3).
+/// each value comes from (`ADM-12`, plan D1, D3, D10).
 ///
 /// Floor: `RequiresPermission("settings:write")`.
-/// Returns `canEdit: bool`, true if caller is unrestricted (`*:*`).
+/// Returns `canEdit: bool`, true if caller is unrestricted (`*:*`), and
+/// `ready` with `notReadyReason` when a saved connection cannot be used.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the saved row cannot be read: the
+/// answer must not claim a value is "not set" when the database could not
+/// be asked.
 pub async fn get_sso(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<ApiJson<Value>> {
-    let effective = crate::runtime_settings::sso_or_fail(&state)
+    let runtime = crate::runtime_settings::sso_runtime_or_fail(&state)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     let can_edit = crate::routes::catalog::is_unrestricted(&principal);
-    Ok(ApiJson(sso_settings_json(&effective, can_edit)))
+    Ok(ApiJson(sso_settings_json(
+        &runtime.settings,
+        can_edit,
+        runtime.not_ready_reason(),
+    )))
 }
 
 /// `PUT /api/settings/sso` — save the SSO / OIDC settings (`ADM-12`, plan D1, D5).
@@ -2264,11 +2284,17 @@ pub async fn put_sso(
 
     audit_settings_update(pool, &principal, "settings.sso.update", "sso", &changed).await;
 
-    let effective = crate::runtime_settings::sso_or_fail(&state)
+    // `ADM-12` D10: `PUT` saves even when the connection cannot be used
+    // yet; the answer says whether it can, and why not.
+    let runtime = crate::runtime_settings::sso_runtime_or_fail(&state)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     let can_edit = crate::routes::catalog::is_unrestricted(&principal);
-    Ok(ApiJson(sso_settings_json(&effective, can_edit)))
+    Ok(ApiJson(sso_settings_json(
+        &runtime.settings,
+        can_edit,
+        runtime.not_ready_reason(),
+    )))
 }
 
 /// `POST /api/settings/sso/test` — begin a test sign-in flow against a draft configuration (`ADM-12`, plan D8).
@@ -3068,14 +3094,28 @@ mod tests {
             clock_skew_seconds: 60,
         };
 
-        let json_val = sso_settings_json(&effective, true);
+        let json_val = sso_settings_json(&effective, true, None);
         assert_eq!(json_val["issuer"]["value"], "https://idp.example.com");
         assert_eq!(json_val["issuer"]["source"], "console");
         assert_eq!(json_val["clientSecret"]["set"], true);
         assert_eq!(json_val["clientSecret"]["source"], "console");
         assert_eq!(json_val["canEdit"], true);
+        assert_eq!(json_val["ready"], true);
+        assert_eq!(json_val["notReadyReason"], serde_json::Value::Null);
 
-        let json_readonly = sso_settings_json(&effective, false);
+        let json_readonly = sso_settings_json(&effective, false, None);
         assert_eq!(json_readonly["canEdit"], false);
+
+        // `ADM-12` D10: a connection that cannot be used says why.
+        let not_ready = sso_settings_json(
+            &effective,
+            true,
+            Some(crate::runtime_settings::SsoNotReady::NoPublicAddress.sentence()),
+        );
+        assert_eq!(not_ready["ready"], false);
+        assert_eq!(
+            not_ready["notReadyReason"],
+            "Set CONSOLE_PUBLIC_URL to this deployment's public address: a sign-in has to return people here."
+        );
     }
 }
