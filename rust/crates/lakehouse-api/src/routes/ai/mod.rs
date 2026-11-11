@@ -507,12 +507,30 @@ async fn system_prompt(
             } else {
                 None
             };
+            // `GOV-7` D6: the map is built for the caller's table access
+            // BEFORE anything reaches the model. A store that cannot say
+            // which roles may read what hides every table (fail closed) —
+            // the map still renders, with none of its tables in it.
+            let access = match principal {
+                Some(principal) => {
+                    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+                        .await
+                        .unwrap_or_else(|_| {
+                            crate::table_access::TableAccess::Listed(
+                                std::collections::HashSet::new(),
+                                std::collections::HashSet::new(),
+                            )
+                        })
+                }
+                None => crate::table_access::TableAccess::All,
+            };
             data_map::data_map(
                 &state.clickhouse,
                 withheld,
                 &notes,
                 &query_words,
                 state.config.ai_relevant_tables,
+                &access,
             )
             .await
         }

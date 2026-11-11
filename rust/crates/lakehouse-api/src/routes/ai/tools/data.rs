@@ -378,6 +378,30 @@ fn tier_filter(raw: &str) -> &str {
     }
 }
 
+/// `GOV-7` D6: what the caller's roles may read, or an error sentence for the
+/// tool. No principal is a headless run with no roles, which reads everything.
+async fn table_access(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Result<crate::table_access::TableAccess, &'static str> {
+    match principal {
+        Some(principal) => {
+            crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+                .await
+                .map_err(|_| "the table access rule could not be read right now")
+        }
+        None => Ok(crate::table_access::TableAccess::All),
+    }
+}
+
+/// Whether the dataset behind Bronze table `table` is visible: any of its
+/// layers the caller may read makes the dataset itself visible (`GOV-7` D6).
+fn dataset_visible(access: &crate::table_access::TableAccess, table: &str) -> bool {
+    access.is_all()
+        || access.allows_key(&format!("bronze.{table}"))
+        || access.allows_key(&format!("serving.{table}"))
+}
+
 /// Row counts of every table in `serving` and `silver`, keyed
 /// `"db.table"`. `None` for a view (no stored row count).
 async fn table_rows(
@@ -431,7 +455,25 @@ fn layers_for(
     })
 }
 
-pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn list_datasets(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let access = match table_access(state, principal).await {
+        Ok(access) => access,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
+    list_datasets_with(&state.clickhouse, &access, args).await
+}
+
+/// [`list_datasets`] over an already resolved access rule — the body the
+/// tests drive without a `Principal`.
+pub(super) async fn list_datasets_with(
+    ch: &ChClient,
+    access: &crate::table_access::TableAccess,
+    args: &Map<String, Value>,
+) -> Value {
     let Ok(rows) = ch
         .rows(
             &format!("SELECT slug, title, tier, table_name FROM {CATALOG_UNION} LIMIT 500"),
@@ -454,6 +496,10 @@ pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> V
     let hits: Vec<Value> = rows
         .iter()
         .filter(|r| {
+            let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
+            if !dataset_visible(&access, table) {
+                return false;
+            }
             let row_tier = r.get("tier").and_then(Value::as_str).unwrap_or("");
             if !wanted.is_empty() && row_tier != wanted {
                 return false;
@@ -479,7 +525,25 @@ pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> V
     json!({ "total": hits.len(), "datasets": hits })
 }
 
-pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn describe_dataset(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let access = match table_access(state, principal).await {
+        Ok(access) => access,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
+    describe_dataset_with(&state.clickhouse, &access, args).await
+}
+
+/// [`describe_dataset`] over an already resolved access rule — the body the
+/// tests drive without a `Principal`.
+pub(super) async fn describe_dataset_with(
+    ch: &ChClient,
+    access: &crate::table_access::TableAccess,
+    args: &Map<String, Value>,
+) -> Value {
     let slug_raw = arg_str(args, "slug");
     let slug = SqlLiteral::from(slug_raw.as_str());
     let Ok(meta_rows) = ch
@@ -519,13 +583,41 @@ pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -
         .await
         .unwrap_or_default();
     let counts = table_rows(ch).await.unwrap_or_default();
+    // `GOV-7` D6: a dataset every one of whose layers this caller may not
+    // read is not described at all — the same answer an unknown slug gets.
+    let visible = ["bronze", "silver", "serving"]
+        .iter()
+        .any(|db| access.is_all() || access.allows_key(&format!("{db}.{table}")));
+    if !visible {
+        return json!({ "error": format!("no dataset with slug '{slug_raw}'; call list_datasets for the slugs") });
+    }
+    let mut layers = layers_for(&slug_raw, &table, &counts);
+    // The layer entries name their tables; drop the ones the caller may not
+    // read (Bronze keeps its `registered` flag, which names no table).
+    if !access.is_all()
+        && let Some(o) = layers.as_object_mut()
+    {
+        for (db, key) in [("silver", "silver"), ("serving", "gold")] {
+            if !access.allows_key(&format!("{db}.{table}"))
+                && let Some(layer) = o.get_mut(key)
+            {
+                *layer = json!({ "present": false });
+            }
+        }
+    }
+    // The columns are the Bronze table's own; hidden Bronze hides them.
+    let columns = if access.is_all() || access.allows_key(&format!("bronze.{table}")) {
+        cols
+    } else {
+        Vec::new()
+    };
     json!({
         "slug": slug_raw,
         "title": meta.get("title"),
         "description": meta.get("description"),
         "sourceKind": source_kind(meta.get("tier").and_then(Value::as_str).unwrap_or("")),
-        "layers": layers_for(&slug_raw, &table, &counts),
-        "columns": cols,
+        "layers": layers,
+        "columns": columns,
     })
 }
 
@@ -551,6 +643,10 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
         Err(_) => return json!({ "error": "the shared-catalog rule could not be evaluated" }),
     }
     let ch = &state.clickhouse;
+    let access = match table_access(state, Some(principal)).await {
+        Ok(access) => access,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
     let counts = match table_rows(ch).await {
         Ok(c) => c,
         Err(err) => return json!({ "error": err }),
@@ -566,6 +662,9 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
     let (bronze, catalog_note) = match &datasets {
         Ok(rows) => (
             rows.iter()
+                .filter(|r| {
+                    dataset_visible(&access, r.get("table_name").and_then(Value::as_str).unwrap_or(""))
+                })
                 .map(|r| {
                     let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
                     json!({
@@ -585,7 +684,7 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
     let layer = |db: &str| -> Vec<Value> {
         tables
             .iter()
-            .filter(|(k, _)| k.starts_with(&format!("{db}.")))
+            .filter(|(k, _)| k.starts_with(&format!("{db}.")) && access.allows_key(k))
             .map(|(k, rows)| json!({ "table": k, "rows": rows }))
             .collect()
     };
@@ -1892,7 +1991,12 @@ mod registry_clash {
         )
         .await;
 
-        let out = describe_dataset(&ch, &args_for("twice_columns")).await;
+        let out = describe_dataset_with(
+            &ch,
+            &crate::table_access::TableAccess::All,
+            &args_for("twice_columns"),
+        )
+        .await;
         let amount = columns_named(&out, "amount");
         assert_eq!(
             amount.len(),
@@ -1963,7 +2067,12 @@ mod registry_clash {
         )
         .await;
 
-        let out = describe_dataset(&ch, &args_for("clash_columns")).await;
+        let out = describe_dataset_with(
+            &ch,
+            &crate::table_access::TableAccess::All,
+            &args_for("clash_columns"),
+        )
+        .await;
         let id = columns_named(&out, "id");
         assert_eq!(
             id.len(),
@@ -2007,7 +2116,12 @@ mod registry_clash {
         )
         .await;
 
-        let out = describe_dataset(&ch, &args_for("sec_only_columns")).await;
+        let out = describe_dataset_with(
+            &ch,
+            &crate::table_access::TableAccess::All,
+            &args_for("sec_only_columns"),
+        )
+        .await;
         let id = columns_named(&out, "id");
         assert_eq!(id.len(), 1, "the secondary registry's own dataset: {out}");
         assert_eq!(

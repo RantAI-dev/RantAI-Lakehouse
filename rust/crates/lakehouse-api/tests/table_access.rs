@@ -954,3 +954,186 @@ async fn an_authored_pipeline_enforce_call_for_a_narrowed_author_is_not_found() 
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"], REFUSAL, "{body}");
 }
+
+// ── Catalog lists and details (GOV-7 D6, AC1, AC6) ──────────────────────
+
+/// A `ClickHouse` serving the catalog assembly with two Silver tables, one of
+/// which the narrowed role may not read.
+#[derive(Clone)]
+struct CatalogFake {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Respond for CatalogFake {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        self.log
+            .lock()
+            .expect("the statement log")
+            .push(sql.clone());
+        if sql.contains("FROM system.tables") {
+            return rows(
+                &["database", "name", "engine"],
+                &[
+                    json!({"database": "silver", "name": "visible_x", "engine": "MergeTree"}),
+                    json!({"database": "silver", "name": "hidden_x", "engine": "MergeTree"}),
+                ],
+            );
+        }
+        if sql.contains("FROM system.columns") {
+            return rows(
+                &["database", "table", "n"],
+                &[
+                    json!({"database": "silver", "table": "visible_x", "n": "2"}),
+                    json!({"database": "silver", "table": "hidden_x", "n": "2"}),
+                ],
+            );
+        }
+        rows(&[], &[])
+    }
+}
+
+async fn send_get(router: &axum::Router, cookie: &str, uri: &str) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, body)
+}
+
+/// `GOV-7-AC1`/`AC6`: the catalog list omits a hidden table, and its detail is
+/// the SAME 404 an unknown id answers.
+#[tokio::test]
+async fn the_catalog_list_omits_a_hidden_table_and_its_detail_is_the_unknown_404() {
+    let fake = CatalogFake {
+        log: Arc::new(Mutex::new(Vec::new())),
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(fake.clone())
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(
+        &pool,
+        "catalog:read, query:read",
+        &[("silver", "visible_x")],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = send_get(&router, &cookie, "/api/catalog").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["assets"]
+        .as_array()
+        .expect("assets")
+        .iter()
+        .filter_map(|a| a["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"silver.visible_x"), "{body}");
+    assert!(
+        !ids.contains(&"silver.hidden_x"),
+        "a hidden table must not be listed: {body}"
+    );
+    // The namespace's own count is of the visible tables.
+    assert_eq!(body["namespaces"][0]["assetCount"], json!(1), "{body}");
+
+    let (status, hidden) = send_get(&router, &cookie, "/api/catalog/silver.hidden_x").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+    let (status, unknown) = send_get(&router, &cookie, "/api/catalog/silver.no_such_x").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+    assert_eq!(
+        hidden, unknown,
+        "a hidden table answers the same 404 body an unknown id answers"
+    );
+}
+
+/// The paged Data Explorer query filters the same snapshot before it counts.
+#[tokio::test]
+async fn the_paged_catalog_query_omits_a_hidden_table() {
+    let fake = CatalogFake {
+        log: Arc::new(Mutex::new(Vec::new())),
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(fake.clone())
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(&pool, "catalog:read", &[("silver", "visible_x")]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = send_get(&router, &cookie, "/api/catalog/query").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["id"], json!("silver.visible_x"), "{body}");
+    assert_eq!(body["totalItems"], json!(1), "{body}");
+}
+
+/// D6: the chart builder's mart picker drops a hidden mart, and a mart
+/// request for it answers the mart-not-found 404.
+#[tokio::test]
+async fn the_dashboard_field_picker_drops_a_hidden_mart() {
+    #[derive(Clone)]
+    struct MartFake;
+    impl Respond for MartFake {
+        fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+            let sql = String::from_utf8_lossy(&request.body).into_owned();
+            if sql.contains("FROM system.tables") {
+                return rows(
+                    &["name", "total_rows"],
+                    &[
+                        json!({"name": "mart_ok", "total_rows": "10"}),
+                        json!({"name": "mart_hidden", "total_rows": "10"}),
+                    ],
+                );
+            }
+            rows(&[], &[])
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(MartFake)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(&pool, "dashboard:read", &[("serving", "mart_ok")]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = send_get(&router, &cookie, "/api/dashboard/fields").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["marts"]
+        .as_array()
+        .expect("marts")
+        .iter()
+        .filter_map(|m| m["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["mart_ok"], "{body}");
+
+    let (status, hidden) = send_get(
+        &router,
+        &cookie,
+        "/api/dashboard/fields?mart=serving.mart_hidden",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+    let (status, unknown) = send_get(
+        &router,
+        &cookie,
+        "/api/dashboard/fields?mart=serving.mart_nope",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+}

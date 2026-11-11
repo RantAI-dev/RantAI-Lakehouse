@@ -2278,6 +2278,12 @@ pub async fn fields(
     if let Err(err) = require_entitled(&state, &principal).await {
         return crate::error::ApiRejection(err).into_response();
     }
+    // `GOV-7` D6: which tables the caller's roles hide, asked once per
+    // request and applied to every list and detail below.
+    let access = match crate::routes::catalog::table_access_for(&state, &principal).await {
+        Ok(access) => access,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     if let Some(id) = q.source.as_deref() {
         // BI-19 B2 review S4: the columns of a source in a folder the caller
         // cannot see are not theirs to read either.
@@ -2294,13 +2300,19 @@ pub async fn fields(
         q.mart.as_deref(),
         q.joins.as_deref().map(str::trim).filter(|j| !j.is_empty()),
     ) {
-        return match joined_fields_body(&state.clickhouse, mart, raw).await {
+        return match joined_fields_body(&state.clickhouse, &access, mart, raw).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
             Err(rejection) => crate::error::ApiRejection(rejection).into_response(),
         };
     }
+    if let Some(mart) = q.mart.as_deref()
+        && !access.allows_key(&serving_key(mart))
+    {
+        return crate::error::ApiRejection(mart_not_found(mart)).into_response();
+    }
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
         Ok(mut body) => {
+            retain_visible_marts(&access, &mut body);
             if q.mart.is_none() {
                 // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
                 // Only decorate marts if catalog_tenant_refusal allows it:
@@ -2344,9 +2356,21 @@ async fn mark_marts(state: &AppState, body: &mut Value) {
 /// tables and columns `?mart=` lists for any caller who can read dashboards,
 /// and reads no row. The sentence for a join that does not check out is ours
 /// (built from names in the request and the schema), never the database's.
-async fn joined_fields_body(ch: &ChClient, mart: &str, raw: &str) -> Result<Value, ApiError> {
+async fn joined_fields_body(
+    ch: &ChClient,
+    access: &crate::table_access::TableAccess,
+    mart: &str,
+    raw: &str,
+) -> Result<Value, ApiError> {
     let joins: Vec<lakehouse_bi::joins::JoinSpec> = serde_json::from_str(raw)
         .map_err(|_| ApiError::BadRequest("joins is invalid".to_owned()))?;
+    // `GOV-7` D6: a join names its tables, so every one of them is checked
+    // before any column metadata is read.
+    for table in std::iter::once(mart).chain(joins.iter().map(|j| j.mart.as_str())) {
+        if !access.allows_key(&serving_key(table)) {
+            return Err(mart_not_found(table));
+        }
+    }
     let base = strip_non_ident(mart.strip_prefix("serving.").unwrap_or(mart));
     let ident = lakehouse_core::ident::Ident::new(base.clone())
         .map_err(|_| ApiError::BadRequest("invalid mart".to_owned()))?;
@@ -2623,7 +2647,18 @@ pub async fn join_suggestions(
     if let Err(err) = crate::routes::dashboard_access::require_entitled(&state, &principal).await {
         return crate::error::ApiRejection(err).into_response();
     }
-    match join_suggestions_value(&state.clickhouse, q.left.as_deref(), q.right.as_deref()).await {
+    let access = match crate::routes::catalog::table_access_for(&state, &principal).await {
+        Ok(access) => access,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    match join_suggestions_value(
+        &state.clickhouse,
+        &access,
+        q.left.as_deref(),
+        q.right.as_deref(),
+    )
+    .await
+    {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(rejection) => crate::error::ApiRejection(rejection).into_response(),
     }
@@ -2637,6 +2672,7 @@ pub async fn join_suggestions(
 /// database's failure classified (never its text).
 pub(crate) async fn join_suggestions_value(
     ch: &ChClient,
+    access: &crate::table_access::TableAccess,
     left: Option<&str>,
     right: Option<&str>,
 ) -> Result<Value, ApiError> {
@@ -2653,6 +2689,15 @@ pub(crate) async fn join_suggestions_value(
             .map_err(|_| ApiError::BadRequest("invalid table name".to_owned()))
     };
     let (left, right) = (table(left)?, table(right)?);
+    // `GOV-7` D6: a caller's roles decide which tables it may see at all; a
+    // hidden one answers the same 404 an unknown one answers.
+    for name in [&left, &right] {
+        if !access.allows_key(&serving_key(name)) {
+            return Err(ApiError::NotFound(format!(
+                "Gold mart '{name}' not found in serving."
+            )));
+        }
+    }
     let sql = format!(
         "SELECT table, name, type, toString(is_in_sorting_key) AS key FROM system.columns \
          WHERE database='serving' AND table IN ({}, {}) ORDER BY position",
@@ -2693,6 +2738,40 @@ pub(crate) async fn join_suggestions_value(
         "rightKey": suggestions.right_key,
         "coversRightKey": suggestions.covers_right_key,
     }))
+}
+
+/// The canonical key a mart name names: `serving.<mart>`, accepting the
+/// qualified spelling the console sometimes sends.
+fn serving_key(mart: &str) -> String {
+    if mart.contains('.') {
+        crate::sql_rewrite::canonicalize(&[mart.to_owned()])
+    } else {
+        format!("serving.{mart}")
+    }
+}
+
+/// `GOV-7` D6: the 404 sentence a hidden mart answers, the same one an
+/// unknown mart answers.
+fn mart_not_found(mart: &str) -> ApiError {
+    let name = mart.strip_prefix("serving.").unwrap_or(mart);
+    ApiError::NotFound(format!("Gold mart '{name}' not found in serving."))
+}
+
+/// `GOV-7` D6: drop every mart of the picker's `marts` list the caller's
+/// roles hide. A mart whose name cannot be read as a table is kept only for
+/// an unrestricted caller, like every other list here (fail closed).
+fn retain_visible_marts(access: &crate::table_access::TableAccess, body: &mut Value) {
+    if access.is_all() {
+        return;
+    }
+    let Some(marts) = body.get_mut("marts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    marts.retain(|mart| {
+        mart.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| access.allows_key(&serving_key(name)))
+    });
 }
 
 // ── /api/dashboard/records ──────────────────────────────────────────────

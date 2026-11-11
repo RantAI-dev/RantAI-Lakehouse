@@ -96,6 +96,20 @@ fn table_id(db: &str, table: &str) -> String {
     format!("table:{db}.{table}")
 }
 
+/// The canonical `schema.table` a lineage node id names, or `None` when the
+/// node is not a table (`GOV-7` D6): `table:<db>.<t>` and `iceberg:<db>.<t>`
+/// name `db.t`, and `bronze:<t>` names `bronze.t`.
+fn node_table_key(id: &str) -> Option<String> {
+    if let Some(rest) = id
+        .strip_prefix("table:")
+        .or_else(|| id.strip_prefix("iceberg:"))
+    {
+        return rest.contains('.').then(|| rest.to_owned());
+    }
+    id.strip_prefix("bronze:")
+        .map(|table| format!("bronze.{table}"))
+}
+
 /// The node for an authored pipeline's `"zone.table"` end: `bronze` is an
 /// Iceberg Bronze table, `silver` is `ClickHouse` `silver`, and `gold` /
 /// `serving` is `ClickHouse` `serving`.
@@ -605,7 +619,23 @@ pub(crate) async fn build(
     if start.is_empty() {
         return Ok(empty(format!("no recorded lineage mentions {focus}")));
     }
-    let keep = reachable(&g, &start);
+    let mut keep = reachable(&g, &start);
+    // `GOV-7` D6: a node for a table the caller's roles hide is not drawn,
+    // and neither are the edges that touch it. Only table-shaped node ids
+    // (`table:`, `iceberg:`, `bronze:`) name a table; a dataset, chart,
+    // metric, source or pipeline node is not a table read.
+    let access = crate::routes::catalog::table_access_for(state, principal).await?;
+    if !access.is_all() {
+        let hidden: Vec<String> = g
+            .nodes
+            .iter()
+            .filter(|(id, _)| node_table_key(id).is_some_and(|key| !access.allows_key(&key)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in hidden {
+            keep.remove(&id);
+        }
+    }
     let nodes: Vec<Value> = g
         .nodes
         .iter()

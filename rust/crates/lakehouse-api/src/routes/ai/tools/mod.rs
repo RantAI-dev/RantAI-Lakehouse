@@ -158,9 +158,9 @@ pub(in crate::routes) async fn run_tool(
         "run_sql" => data::run_sql(state, principal, args).await,
         "ask_user" => ask::ask_user(args),
         "propose_sql" => propose::propose_sql(state, principal, args).await,
-        "list_datasets" => data::list_datasets(ch, args).await,
+        "list_datasets" => data::list_datasets(state, principal, args).await,
         "lakehouse_overview" => data::lakehouse_overview(state, principal).await,
-        "describe_dataset" => data::describe_dataset(ch, args).await,
+        "describe_dataset" => data::describe_dataset(state, principal, args).await,
         "get_lineage" => data::get_lineage(state, principal, args).await,
         "get_quality" => data::get_quality(ch).await,
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
@@ -194,7 +194,7 @@ pub(in crate::routes) async fn run_tool(
             Err(error) => error,
         },
         "list_sql_sources" | "suggest_join" => match viewer_for(state, principal).await {
-            Ok(viewer) => dashboards::chart_sources(ch, &viewer, name, args).await,
+            Ok(viewer) => dashboards::chart_sources(state, &viewer, principal, name, args).await,
             Err(error) => error,
         },
         "delete_chart" => match scope_for_write(state, principal).await {
@@ -270,8 +270,8 @@ pub(in crate::routes) async fn run_tool(
         "set_pipeline_target_lag" => {
             pipelines::set_pipeline_target_lag(state, principal, args).await
         }
-        "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, args).await,
-        "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, args).await,
+        "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, principal, args).await,
+        "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, principal, args).await,
         "get_table_maintenance" => lakehouse::get_table_maintenance(state, args).await,
         "set_table_maintenance" => lakehouse::set_table_maintenance(state, args).await,
         "get_capacity" => lakehouse::get_capacity(state).await,

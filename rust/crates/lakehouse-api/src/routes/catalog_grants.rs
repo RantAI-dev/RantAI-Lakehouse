@@ -97,6 +97,8 @@ pub async fn list(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     validate_annotation_id(&id)?;
+    // GOV-7 D6: a hidden asset's grants answer the same 404 as an unknown id.
+    crate::routes::catalog::ensure_asset_readable(&state, &principal, &id).await?;
     let pool = annotation_pool(&state)?;
     let grants = lakehouse_store::agents::list_asset_grants(pool, &id).await?;
     Ok(ApiJson(json!({ "grants": grants })))

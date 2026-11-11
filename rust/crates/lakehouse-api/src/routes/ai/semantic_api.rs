@@ -131,8 +131,11 @@ pub async fn list(
         return Ok(refused(reason));
     }
     let entries = semantic::list_all(pool(&state)?).await?;
+    // GOV-7 D6: a table the caller's roles hide is not described here either.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
     let entries: Vec<EntryView> = entries
         .into_iter()
+        .filter(|e| access.is_all() || access.allows_key(&e.asset))
         .map(|e| EntryView::new(e, None))
         .collect();
     Ok(ApiJson(json!({ "entries": entries })))
@@ -155,7 +158,14 @@ pub async fn get_asset(
     if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
         return Ok(refused(reason));
     }
-    let entries = semantic::list_for_asset(pool(&state)?, &asset).await?;
+    // GOV-7 D6: a hidden table answers exactly like one with no entries, so
+    // the route is not an oracle for a table the caller may not read.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    let entries = if access.is_all() || access.allows_key(&asset) {
+        semantic::list_for_asset(pool(&state)?, &asset).await?
+    } else {
+        Vec::new()
+    };
     // No entry, nothing to mark: skip the `ClickHouse` read.
     let live = if entries.is_empty() {
         Vec::new()
