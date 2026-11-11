@@ -39,14 +39,20 @@ mock.module("@/features/auth/auth-provider", () => ({
 }))
 
 // The chat's own provider is the app frame's and survives this navigation
-// (`WEB-7` D6), so the page marks the assistant's step saved through it.
+// (`WEB-7` D6), so the page marks the assistant's step saved through it — and
+// only in the conversation the draft came from (`WEB-7` S2 review round 1, S1),
+// which is why the stub carries a session id and a message list.
 // `mock.module` outlives this file in `bun test src`, so the real exports are
 // kept and put back in `afterAll` (`chart-builder.test.tsx`'s note).
 let completed: { messageIndex: number; stepIndex: number; result: Record<string, unknown> }[] = []
+let chat: { sessionId: string | null; messages: Msg[] } = { sessionId: null, messages: [] }
+import type { Msg } from "@/features/copilot/use-copilot"
 import * as realCopilot from "@/features/copilot/use-copilot"
 const realCopilotModule = { ...realCopilot }
 mock.module("@/features/copilot/use-copilot", () => ({
   useCopilot: () => ({
+    sessionId: chat.sessionId,
+    messages: chat.messages,
     completeToolStep: (
       messageIndex: number,
       stepIndex: number,
@@ -78,6 +84,7 @@ beforeEach(() => {
   permissions = []
   bodies = []
   completed = []
+  chat = { sessionId: null, messages: [] }
   window.localStorage.clear()
   window.sessionStorage.clear()
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -260,10 +267,33 @@ describe("the chart builder page (WEB-7 D2/D4/D6)", () => {
   })
 })
 
+/** The step a drafted chart awaits: an assistant message with `create_chart` at 1:2. */
+const CREATE_CHART_AT = { messageIndex: 1, stepIndex: 2, tool: "create_chart" }
+
+function chatWithCreateChart(): Msg[] {
+  return [
+    { role: "user", content: "Make me a chart" },
+    {
+      role: "assistant",
+      content: "Here is one.",
+      tools: [
+        { tool: "run_sql", args: {}, ok: true },
+        { tool: "run_sql", args: {}, ok: true },
+        { tool: "create_chart", args: DRAFT, ok: false },
+      ],
+    },
+  ] as Msg[]
+}
+
 describe("the draft the assistant made (WEB-7 D6)", () => {
   it("marks the chat's step saved once the chart is written, and never before", async () => {
     stubPage("edit")
-    writeChartDraft({ board: "b1", def: DRAFT, complete: { messageIndex: 1, stepIndex: 2 } })
+    chat = { sessionId: "c1", messages: chatWithCreateChart() }
+    writeChartDraft({
+      board: "b1",
+      def: DRAFT,
+      complete: { ...CREATE_CHART_AT, sessionId: "c1" },
+    })
     render(<ChartBuilderPage boardId="b1" />)
 
     await waitFor(() =>
@@ -291,6 +321,76 @@ describe("the draft the assistant made (WEB-7 D6)", () => {
         },
       },
     ])
+  })
+
+  // `WEB-7` S2 review round 1, S1: the dock may show another conversation by
+  // the time the chart is saved, and its indexes point at steps that never ran.
+  it("marks nothing, and still goes back, when another conversation is open", async () => {
+    stubPage("edit")
+    chat = { sessionId: "c2", messages: chatWithCreateChart() }
+    writeChartDraft({
+      board: "b1",
+      def: DRAFT,
+      complete: { ...CREATE_CHART_AT, sessionId: "c1" },
+    })
+    render(<ChartBuilderPage boardId="b1" />)
+
+    await waitFor(() =>
+      expect((screen.getByLabelText(/^Title/) as HTMLInputElement).value).toBe(
+        "Visitors by province"
+      )
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Create chart" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/dashboards/b1"]))
+    expect(completed).toEqual([])
+  })
+
+  // `WEB-7` S2 review round 1, S1: a conversation that is not saved yet has no
+  // id, so the step itself has to be found before anything is marked.
+  it("marks the step of a conversation that is not saved yet, while its step is still there", async () => {
+    stubPage("edit")
+    chat = { sessionId: null, messages: chatWithCreateChart() }
+    writeChartDraft({
+      board: "b1",
+      def: DRAFT,
+      complete: { ...CREATE_CHART_AT, sessionId: null },
+    })
+    render(<ChartBuilderPage boardId="b1" />)
+
+    await waitFor(() =>
+      expect((screen.getByLabelText(/^Title/) as HTMLInputElement).value).toBe(
+        "Visitors by province"
+      )
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Create chart" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/dashboards/b1"]))
+    expect(completed.length).toBe(1)
+    expect(completed[0]?.messageIndex).toBe(1)
+    expect(completed[0]?.stepIndex).toBe(2)
+  })
+
+  it("marks nothing in an unsaved conversation whose step it cannot find", async () => {
+    stubPage("edit")
+    // The message list is shorter than the draft's address says.
+    chat = { sessionId: null, messages: chatWithCreateChart().slice(0, 1) }
+    writeChartDraft({
+      board: "b1",
+      def: DRAFT,
+      complete: { ...CREATE_CHART_AT, sessionId: null },
+    })
+    render(<ChartBuilderPage boardId="b1" />)
+
+    await waitFor(() =>
+      expect((screen.getByLabelText(/^Title/) as HTMLInputElement).value).toBe(
+        "Visitors by province"
+      )
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Create chart" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/dashboards/b1"]))
+    expect(completed).toEqual([])
   })
 })
 

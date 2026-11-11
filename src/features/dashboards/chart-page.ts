@@ -15,7 +15,9 @@
  * draft to `sessionStorage` under `lakehouse.chartDraft` and navigates to
  * the New chart page, which takes it once (`takeChartDraft`) and then
  * deletes it, so a draft is never applied twice. A draft is a chart
- * definition, not a credential.
+ * definition, not a credential. A draft the chat made also names the
+ * conversation it came from, so the page can mark that conversation's step
+ * saved and no other (`ChartDraftStep`).
  */
 
 import type { ParamValue } from "@/lib/params"
@@ -89,6 +91,28 @@ export function chartParamValues(search: string): Record<string, ParamValue> | u
   return Object.keys(values).length > 0 ? values : undefined
 }
 
+/**
+ * Where the assistant's tool step sat, and which conversation it sat in
+ * (`WEB-7` S2 review round 1, S1).
+ *
+ * A draft outlives the chat that made it by one navigation, and the dock may
+ * show another conversation by the time the chart is saved. Two indexes alone
+ * would then name whatever sits there in the conversation that is open now,
+ * so the draft carries the conversation too and the page checks it first.
+ */
+export type ChartDraftStep = {
+  messageIndex: number
+  stepIndex: number
+  /**
+   * The conversation the draft came from (`useCopilot().sessionId`), or
+   * `null` for one that was not saved yet. A null id identifies nothing, so
+   * the page falls back to recognising the step itself (`tool`).
+   */
+  sessionId: string | null
+  /** The tool the step ran (`create_chart`), so an unsaved conversation's step can be recognised. */
+  tool: string
+}
+
 /** A chart definition the card leaves for the New chart page. */
 export type ChartDraft = {
   /** The dashboard the chart is being built for: the page that takes it. */
@@ -101,7 +125,7 @@ export type ChartDraft = {
    * does not offer to add the same chart again. Absent for a draft a person
    * started themselves.
    */
-  complete?: { messageIndex: number; stepIndex: number }
+  complete?: ChartDraftStep
 }
 
 /** Store a draft for the New chart page, or do nothing when storage refuses. */
@@ -148,13 +172,21 @@ export function takeChartDraft(board: string): ChartDraft | null {
   }
 }
 
-function isStepAddress(value: unknown): value is { messageIndex: number; stepIndex: number } {
+function isStepAddress(value: unknown): value is ChartDraftStep {
   if (typeof value !== "object" || value === null) return false
-  const address = value as Partial<{ messageIndex: number; stepIndex: number }>
+  const address = value as Partial<ChartDraftStep>
+  // `WEB-7` S2 review round 1, S1: a draft with no conversation recorded (one
+  // an older build wrote) cannot say where its step is, so it carries no
+  // address and the page marks nothing. `null` is a conversation that was not
+  // saved yet, and is answered for by the step's own tool.
+  const namedConversation = address.sessionId === null || typeof address.sessionId === "string"
   return (
     Number.isInteger(address.messageIndex) &&
     Number.isInteger(address.stepIndex) &&
     (address.messageIndex ?? -1) >= 0 &&
-    (address.stepIndex ?? -1) >= 0
+    (address.stepIndex ?? -1) >= 0 &&
+    namedConversation &&
+    typeof address.tool === "string" &&
+    address.tool.trim() !== ""
   )
 }

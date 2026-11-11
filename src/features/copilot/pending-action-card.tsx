@@ -4,6 +4,7 @@ import { AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ChartDraftCard } from "./chart-draft-card";
 import { asObj, type ToolStep } from "./tool-step";
+import { useCopilot } from "./use-copilot";
 
 /**
  * The Confirm/Cancel card for a tool step the server held back with
@@ -26,6 +27,11 @@ export function PendingActionCard({
   readonly onConfirm: () => void;
   readonly onCancel: () => void;
 }) {
+  // `WEB-7` S2 review round 1, S1: the draft records the conversation it came
+  // from, so the builder's page marks the step only while that conversation
+  // is the open one. `null` is a conversation that is not saved yet; the page
+  // then recognises the step by its tool (`ChartDraftStep`).
+  const { sessionId } = useCopilot();
   const res = asObj(step.result);
   const args = asObj(res.args ?? step.args);
   const tool = typeof res.tool === "string" ? res.tool : step.tool;
@@ -37,7 +43,7 @@ export function PendingActionCard({
         confirming={confirming}
         onConfirm={onConfirm}
         onCancel={onCancel}
-        stepAddress={{ messageIndex, stepIndex }}
+        stepAddress={{ messageIndex, stepIndex, sessionId, tool: step.tool }}
       />
     );
   }

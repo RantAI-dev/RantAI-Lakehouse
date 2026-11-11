@@ -7,7 +7,7 @@ import { useRouter, useSearchParams } from "next/navigation"
 import { EmptyState, ErrorState, LoadingSkeleton, PermissionState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { useAuth } from "@/features/auth/auth-provider"
-import { useCopilot } from "@/features/copilot/use-copilot"
+import { useCopilot, type Msg } from "@/features/copilot/use-copilot"
 import { useService } from "@/hooks/use-service"
 import { offerFor } from "@/lib/access-level"
 import { dashboardService } from "@/services"
@@ -18,7 +18,29 @@ import {
   isBuiltInBoard,
   takeChartDraft,
   type ChartDraft,
+  type ChartDraftStep,
 } from "./chart-page"
+
+/**
+ * Whether the step the draft names is the one to mark saved (`WEB-7` S2 review
+ * round 1, S1).
+ *
+ * A saved conversation is named by its id, and the same id is the same
+ * conversation. A conversation that is not saved yet has no id, so the step
+ * itself is the proof: the message at `messageIndex` must still carry a step
+ * at `stepIndex` for the same tool. Whenever that cannot be established the
+ * step is left as it is — writing "created" onto a step that never ran would
+ * be a result that never happened (principle 2).
+ */
+function isDraftStepOpen(
+  step: ChartDraftStep,
+  conversation: string | null,
+  messages: Msg[]
+): boolean {
+  if (step.sessionId !== null) return step.sessionId === conversation
+  if (conversation !== null) return false
+  return messages[step.messageIndex]?.tools?.[step.stepIndex]?.tool === step.tool
+}
 
 /**
  * `/dashboards/[id]/charts/new` and `.../[chartId]/edit` (`WEB-7` T6, D2/D6):
@@ -38,7 +60,9 @@ import {
  *
  * The dashboard's parameter values arrive in the address (`chartParamValues`),
  * and the assistant's draft arrives in `sessionStorage` (`takeChartDraft`,
- * read once). Neither is saved with the chart.
+ * read once). Neither is saved with the chart. A draft the chat made also
+ * names its conversation, so saving marks that chat's step and no other
+ * (`WEB-7` S2 review round 1, S1).
  */
 export function ChartBuilderPage({ boardId, chartId }: { boardId: string; chartId?: string }) {
   const router = useRouter()
@@ -118,10 +142,13 @@ export function ChartBuilderPage({ boardId, chartId }: { boardId: string; chartI
       // the dialog's `onSaved` did by re-fetching in place. A draft the
       // assistant made marks its own step saved first, so the chat does not
       // offer the chart again; the Copilot provider is the app frame's and
-      // survives this navigation.
+      // survives this navigation. `WEB-7` S2 review round 1, S1: the mark lands
+      // only when the conversation open now is still the one the draft came
+      // from (`isDraftStepOpen`); the page goes back either way.
       onSaved={(saved) => {
-        if (draft?.complete) {
-          copilot.completeToolStep(draft.complete.messageIndex, draft.complete.stepIndex, {
+        const step = draft?.complete
+        if (step && isDraftStepOpen(step, copilot.sessionId, copilot.messages)) {
+          copilot.completeToolStep(step.messageIndex, step.stepIndex, {
             created: true,
             title: saved.title,
             kind: saved.kind,

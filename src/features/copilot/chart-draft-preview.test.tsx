@@ -122,6 +122,9 @@ describe("Edit in builder ('WEB-7' D6)", () => {
         confirming={false}
         onConfirm={noop}
         onCancel={noop}
+        // `WEB-7` S2 review round 1, S1: the draft carries the conversation the
+        // step sits in, not only its two indexes.
+        stepAddress={{ messageIndex: 3, stepIndex: 1, sessionId: "c1", tool: "create_chart" }}
       />,
     )
     await screen.findByRole("img", { name: "The logo" })
@@ -137,6 +140,7 @@ describe("Edit in builder ('WEB-7' D6)", () => {
         url: "https://img.example/logo.png",
         alt: "The logo",
       },
+      complete: { messageIndex: 3, stepIndex: 1, sessionId: "c1", tool: "create_chart" },
     })
   })
 })

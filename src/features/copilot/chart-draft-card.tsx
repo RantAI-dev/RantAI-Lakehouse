@@ -7,7 +7,7 @@ import { ChartColumn, PencilRuler } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import type { ChartDef } from "@/features/dashboards/chart-builder";
-import { chartNewHref, writeChartDraft } from "@/features/dashboards/chart-page";
+import { chartNewHref, writeChartDraft, type ChartDraftStep } from "@/features/dashboards/chart-page";
 import { ReportingProvider } from "@/features/dashboards/reporting-context";
 import { TileBody } from "@/features/dashboards/tile-body";
 import { useService } from "@/hooks/use-service";
@@ -162,11 +162,12 @@ export function ChartDraftCard({
   onConfirm: () => void;
   onCancel: () => void;
   /**
-   * Where this draft sits in the chat. The builder's page carries it with the
-   * draft and marks the step saved once the chart is written (`WEB-7` D6),
-   * so the chat does not offer the same chart again.
+   * Where this draft sits in the chat, and the conversation it sits in. The
+   * builder's page carries it with the draft and marks the step saved once
+   * the chart is written (`WEB-7` D6), in that conversation only
+   * (`WEB-7` S2 review round 1, S1).
    */
-  stepAddress?: { messageIndex: number; stepIndex: number };
+  stepAddress?: ChartDraftStep;
 }) {
   const { resolvedTheme } = useTheme();
   // `args` is rebuilt on every render; key the draft on its content so the
@@ -269,6 +270,9 @@ export function ChartDraftCard({
           // `WEB-7` D6: the builder is a page. The draft is left for that
           // page in this browser session, under the key it reads once, and
           // the card goes there; the page it opens is the draft's own board.
+          // `WEB-7` S2 review round 1, S1: `stepAddress` also names the
+          // conversation the step sits in, so a step in another chat is
+          // never the one marked saved.
           onClick={() => {
             const board = def.board ?? "default";
             writeChartDraft({

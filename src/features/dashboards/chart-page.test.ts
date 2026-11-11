@@ -73,21 +73,42 @@ test("a draft that cannot be stored leaves the page empty instead of throwing", 
   }
 })
 
-test("a draft the assistant made keeps the step it came from, so the chat can be told", () => {
+test("a draft the assistant made keeps the step it came from, and its conversation (WEB-7 S2 review round 1, S1)", () => {
   window.sessionStorage.clear()
   try {
+    const complete = { messageIndex: 2, stepIndex: 1, sessionId: "s1", tool: "create_chart" }
     writeChartDraft({
       board: "b1",
       def: { title: "Visitors" },
-      complete: { messageIndex: 2, stepIndex: 1 },
+      complete,
     })
-    expect(takeChartDraft("b1")?.complete).toEqual({ messageIndex: 2, stepIndex: 1 })
+    expect(takeChartDraft("b1")?.complete).toEqual(complete)
+    // A conversation that was not saved yet is named as `null`, which the
+    // page answers for by the step's own tool.
+    const unsaved = { messageIndex: 0, stepIndex: 0, sessionId: null, tool: "create_chart" }
+    writeChartDraft({ board: "b1", def: { title: "Visitors" }, complete: unsaved })
+    expect(takeChartDraft("b1")?.complete).toEqual(unsaved)
     // A hand-edited address is not one: the page saves the chart without
     // touching a step it cannot name.
     writeChartDraft({
       board: "b1",
       def: { title: "Visitors" },
-      complete: { messageIndex: -1, stepIndex: 1 } as never,
+      complete: { messageIndex: -1, stepIndex: 1, sessionId: "s1", tool: "create_chart" } as never,
+    })
+    expect(takeChartDraft("b1")?.complete).toBeUndefined()
+    // So is a draft an older build wrote, which recorded no conversation: the
+    // step cannot be named safely, so nothing is marked (S1).
+    writeChartDraft({
+      board: "b1",
+      def: { title: "Visitors" },
+      complete: { messageIndex: 1, stepIndex: 0 } as never,
+    })
+    expect(takeChartDraft("b1")?.complete).toBeUndefined()
+    // A step with no tool is not recognised in an unsaved conversation.
+    writeChartDraft({
+      board: "b1",
+      def: { title: "Visitors" },
+      complete: { messageIndex: 0, stepIndex: 0, sessionId: null, tool: "  " } as never,
     })
     expect(takeChartDraft("b1")?.complete).toBeUndefined()
   } finally {
