@@ -346,9 +346,14 @@ pub(super) fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 /// `"Indonesian"` or `"English"` for `text`, or `None` when neither clearly
-/// wins (a one-word message, a table name, another language). Words both
-/// languages use ("data") are in neither list; an English message needs
-/// two more English words than Indonesian ones to be read as English.
+/// wins (a message whose words are all in neither list, a table name,
+/// another language). Words both languages use ("data") are in neither
+/// list; an English message needs two more English words than Indonesian
+/// ones to be read as English. A short Indonesian question carries one
+/// function word ("berapa", "tampilkan"), so one Indonesian word with no
+/// English word reads as Indonesian (`AI-17`, 2026-11-10). One English
+/// word does not read as English: single English data words ("total",
+/// "data") are in neither list.
 pub(super) fn reply_language(text: &str) -> Option<&'static str> {
     let words: Vec<String> = tokens(text).collect();
     let count = |list: &[&str]| words.iter().filter(|w| list.contains(&w.as_str())).count();
@@ -357,6 +362,10 @@ pub(super) fn reply_language(text: &str) -> Option<&'static str> {
         Some("Indonesian")
     } else if en >= 2 && en >= id + 2 {
         Some("English")
+    } else if id >= 1 && en == 0 {
+        // `AI-17`: the one listed word is a function word, and no English
+        // word contradicts it.
+        Some("Indonesian")
     } else {
         None
     }
@@ -1605,13 +1614,55 @@ mod tests {
             reply_language("Why did gold_export_job fail?"),
             Some("English")
         );
-        // One Indonesian word is still not enough to decide.
-        assert_eq!(reply_language("Jelaskan chart ini"), None);
+        // A message whose words are all in neither list stays undecided:
+        // "total" and "revenue" name no language, so no arm may read them.
+        assert_eq!(reply_language("total revenue"), None);
+    }
+
+    /// `AI-17` (2026-11-10): the admin's staging question carried one listed
+    /// function word ("berapa"); "total" and "kunjungan" are in neither list.
+    /// Left undecided, the model answered in English.
+    #[test]
+    fn a_short_question_with_one_indonesian_word_and_no_english_word_is_read_as_indonesian() {
+        assert_eq!(
+            reply_language("Berapa total kunjungan?"),
+            Some("Indonesian")
+        );
+    }
+
+    /// `AI-17`: a short request carries its function word ("tampilkan") the
+    /// same way; "revenue" is in neither list.
+    #[test]
+    fn a_short_request_with_one_indonesian_word_and_no_english_word_is_read_as_indonesian() {
+        assert_eq!(reply_language("Tampilkan revenue"), Some("Indonesian"));
+    }
+
+    /// Decision 1 keeps the English arms as they are: one English data word
+    /// in neither list ("total") does not weaken the English reading.
+    #[test]
+    fn an_english_question_with_an_unlisted_data_word_is_still_read_as_english() {
+        assert_eq!(reply_language("What is the total?"), Some("English"));
+    }
+
+    /// No arm reads a message whose every word is in neither list: data
+    /// words of both languages and table names name no language.
+    #[test]
+    fn a_message_whose_words_are_all_in_neither_list_stays_undecided() {
+        assert_eq!(reply_language("total revenue"), None);
+        assert_eq!(reply_language("mart_event"), None);
+    }
+
+    /// The one-word arm needs the message to carry no English word: a mixed
+    /// message shows it may be English and is still left to the model and
+    /// the default.
+    #[test]
+    fn a_message_with_one_indonesian_word_and_an_english_word_stays_undecided() {
+        assert_eq!(reply_language("berapa the total"), None);
     }
 
     #[test]
     fn an_undecided_latin_script_message_is_never_answered_in_another_script() {
-        for text in ["ok", "Jelaskan chart ini", "mart_wisman"] {
+        for text in ["ok", "total revenue", "mart_wisman"] {
             let line = closing(text, None);
             assert!(line.contains("Latin script"), "{text}: {line}");
             assert!(line.contains("never in Chinese"), "{text}: {line}");
@@ -1638,14 +1689,14 @@ mod tests {
 
     #[test]
     fn without_a_default_the_undecided_lines_are_unchanged() {
-        assert_eq!(closing("Jelaskan chart ini", None), LATIN_SCRIPT_LINE);
+        assert_eq!(closing("total revenue", None), LATIN_SCRIPT_LINE);
         assert_eq!(closing("123 ?", None), PLAIN_LINE);
         assert_eq!(closing("这个图表是什么", None), PLAIN_LINE);
     }
 
     #[test]
     fn an_indonesian_default_replaces_english_as_the_latin_script_fallback() {
-        let line = closing("Jelaskan chart ini", Some(ReplyLanguage::Indonesian));
+        let line = closing("total revenue", Some(ReplyLanguage::Indonesian));
         assert!(line.contains("Indonesian if you cannot tell"), "{line}");
         assert!(line.contains("Latin script"), "{line}");
         assert!(line.contains("never in Chinese"), "{line}");
@@ -1655,7 +1706,7 @@ mod tests {
     #[test]
     fn an_english_default_leaves_the_latin_script_line_as_it_was() {
         assert_eq!(
-            closing("Jelaskan chart ini", Some(ReplyLanguage::English)),
+            closing("total revenue", Some(ReplyLanguage::English)),
             LATIN_SCRIPT_LINE
         );
     }
