@@ -345,6 +345,72 @@ mod tests {
         Ok(())
     }
 
+    /// `GOV-7` T5: the cost of the access check on the read path, measured
+    /// rather than assumed — 1,000 iterations of `for_roles` plus ten
+    /// `allows` calls, against a database holding 10 narrowed roles and 200
+    /// grants (the plan's shape). The numbers are printed for the handoff and
+    /// deliberately asserted only for correctness: a shared CI runner's p95
+    /// says nothing about the product's budget, and a timing assertion would
+    /// fail on a busy machine instead of reporting.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_access_check_costs_what_the_plan_budgeted(pool: PgPool) -> sqlx::Result<()> {
+        let mut names = Vec::new();
+        for role_index in 0..10 {
+            let id = role(
+                &pool,
+                &format!("Measured {role_index}"),
+                "query:read",
+                "listed",
+            )
+            .await;
+            for grant_index in 0..20 {
+                let schema = format!("schema_{role_index}_{}", grant_index % 4);
+                let table = format!("table_{grant_index}");
+                grant(&pool, id, &schema, &table).await;
+            }
+            names.push(format!("Measured {role_index}"));
+        }
+        let probes: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("schema_0_{}", i % 4), format!("table_{i}")))
+            .collect();
+
+        let mut samples = Vec::with_capacity(1_000);
+        for _ in 0..1_000 {
+            let started = std::time::Instant::now();
+            let access = for_roles(Some(&pool), &names).await.unwrap();
+            for (schema, table) in &probes {
+                assert!(access.allows(schema, table));
+            }
+            samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        // Nearest-rank, in integer arithmetic: the value at this index is the
+        // percentile (`p` is per mille, so 500 is p50 and 950 is p95).
+        let at = |permille: usize| {
+            samples[(samples.len() * permille)
+                .div_ceil(1000)
+                .clamp(1, samples.len())
+                - 1]
+        };
+        // Unrestricted is the shape most deployments run: it must not pay a
+        // query at all.
+        let unrestricted_started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let _ = for_roles(Some(&pool), &[]).await.unwrap();
+        }
+        let unrestricted_per_call =
+            unrestricted_started.elapsed().as_secs_f64() * 1_000.0 / 1_000.0;
+        println!(
+            "GOV-7 T5: for_roles + 10 allows over 10 roles / 200 grants, 1,000 calls: \
+             p50 {:.3} ms, p95 {:.3} ms, max {:.3} ms; no roles: {:.4} ms/call",
+            at(500),
+            at(950),
+            samples[samples.len() - 1],
+            unrestricted_per_call,
+        );
+        Ok(())
+    }
+
     /// Fail closed: a bare, unqualified table name has no schema to match a
     /// grant against, so a narrowed principal cannot read it.
     #[sqlx::test(migrations = "../../migrations")]
