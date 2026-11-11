@@ -3,7 +3,15 @@
 import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import type { SqlDial, SqlDriver } from "@/services/contracts/connectors"
+import { CDC_SSL_MODES, SSL_MODE_DEFAULT, sslModeChoices, sslModeFromChoice } from "./ssl-modes"
 
 /** The port each driver listens on out of the box. */
 export const DEFAULT_SQL_PORT: Record<SqlDriver, number> = {
@@ -45,6 +53,8 @@ export function SqlDialForm({
     sslMode: null,
   }
   const askDriver = !driver || dial.driver !== driver
+  const choices = sslModeChoices(CDC_SSL_MODES, dial.sslMode ?? null)
+  const currentMode = choices.find((mode) => mode.value === (dial.sslMode ?? SSL_MODE_DEFAULT))
   function set<K extends keyof SqlDial>(key: K, v: SqlDial[K]) {
     onChange({ ...dial, [key]: v })
   }
@@ -111,13 +121,27 @@ export function SqlDialForm({
       </div>
       <div className="space-y-1.5 sm:col-span-2">
         <Label htmlFor="sql-dial-ssl-mode">SSL mode (optional)</Label>
-        <Input
-          id="sql-dial-ssl-mode"
-          value={dial.sslMode ?? ""}
-          onChange={(e) => set("sslMode", e.target.value === "" ? null : e.target.value)}
-          placeholder={dial.driver === "postgres" ? "require" : "Leave blank for the driver default"}
-          autoComplete="off"
-        />
+        {/* WEB-8 D8: the adapter's own list, not free text — with "Default"
+            first, which sends no mode at all (`null`), the meaning the blank
+            field has always had. */}
+        <Select
+          value={dial.sslMode ?? SSL_MODE_DEFAULT}
+          onValueChange={(next) => set("sslMode", sslModeFromChoice(next ?? SSL_MODE_DEFAULT))}
+        >
+          <SelectTrigger id="sql-dial-ssl-mode" aria-label="SSL mode (optional)" className="w-full">
+            <SelectValue>{currentMode?.label ?? "Default (no mode sent)"}</SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {choices.map((mode) => (
+              <SelectItem key={mode.value} value={mode.value}>
+                {mode.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-xs text-muted-foreground">
+          Default sends no mode, which is the field&apos;s blank: the driver uses its own.
+        </p>
       </div>
     </div>
   )
