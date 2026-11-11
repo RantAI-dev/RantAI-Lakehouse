@@ -58,6 +58,7 @@ pub mod sql_lex;
 pub mod sql_lineage;
 pub mod sql_rewrite;
 pub mod state;
+pub mod table_access;
 pub mod tenant;
 pub mod tenant_scope;
 pub mod tile_pool;
