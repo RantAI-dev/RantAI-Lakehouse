@@ -438,6 +438,114 @@ this slice; only its roles field changed (T7).
   `8f64b346` (later, after this plan commit, the plan commit).
 
 
+### Handoff (developer, 2026-11-11, S2 T8)
+
+Task T8 (D8, row filter hint) is implemented, verified and pushed to
+`origin/feat/web-8-s2-pickers`. It adds one Rust route and one help line;
+T4–T7 are untouched.
+
+#### Commits
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T8, Rust | `fd61e3a4` | `feat(api): serve the row filter grammar the validator accepts (WEB-8 T8, D8)` |
+| T8, console | `34992020` | `feat(console): the row filter field names the grammar the server accepts (WEB-8 T8, D8)` |
+
+#### Where the validator's allowlist lives, and how the route reads it
+
+The validator is `sql_rewrite::validate_row_filter_expr`
+(`rust/crates/lakehouse-api/src/sql_rewrite.rs:2263`), called by
+`build_masked_filtered_select` (`:2121`) and by the policy preview
+(`routes/governance.rs`, `preview_policy`). It accepts:
+
+- **Functions**: `ALLOWED_ROW_FILTER_FUNCTIONS` (`sql_rewrite.rs:1382`),
+  checked in `validate_function_call` (`:2588`). It already was the one
+  constant the validator reads.
+- **Operators**: before T8 the accepted set was a `matches!` in
+  `is_allowed_binary_operator` (`:2472`) and another in `validate_unary_op`
+  (`:2325`). T8 moved the spellings into `ALLOWED_ROW_FILTER_OPERATORS`
+  (`sql_rewrite.rs:1391`); `binary_operator_symbol` and
+  `unary_operator_symbol` map each enum variant onto its token, and both
+  validators check membership in that one constant. The accepted set is
+  unchanged — every pre-existing `row_filter` test still passes.
+- **Shapes, not a list**: `LIKE`/`ILIKE`, `BETWEEN`, `IN`, `IS [NOT] NULL`
+  and parentheses are match arms in `validate_expr_shape`, not constants, so
+  the route does **not** name them. The help line says "Functions: …" then
+  "Operators: …" only; adding `LIKE` etc. would be a second copy (rule 4),
+  which is why it was not done.
+
+The route is `GET /api/governance/row-filter-grammar`
+(`routes/governance.rs`, `row_filter_grammar`), gated by
+`Policy::RequiresPermission("policy:read")` in `POLICY_TABLE`
+(`policy.rs`), mounted in `governance_static_router` (`routes/mod.rs`)
+ahead of the `/api/governance/{kind}` capture, and asserted both ways in
+`tests/route_auth.rs::row_filter_grammar_route_needs_policy_read_both_ways`
+(no session 401, `query:read` 403, `policy:read` 200 with both lists).
+
+The answer is built from the two constants directly, never a second list:
+
+```json
+{
+  "functions": ["lower", "upper", "tostring", "todate"],
+  "operators": ["=", "<>", "<", "<=", ">", ">=", "AND", "OR", "+", "-", "*", "/", "%", "NOT"]
+}
+```
+
+`routes::governance::tests::row_filter_grammar_names_only_what_the_validator_accepts`
+calls the handler, then feeds every named function and operator to
+`validate_row_filter_expr` and asserts acceptance; `nope(a) = 1` and
+`a || b` are asserted refused.
+
+The console reads it through `GovernanceService.getRowFilterGrammar`
+(contract `RowFilterGrammar`, client `/api/governance/row-filter-grammar`,
+exported from `services/index.ts`). `AddPolicyDialog` in
+`src/features/catalog/asset-access.tsx` shows the line under the Row filter
+input only on a successful read; while loading or after a failed read there
+is no line and no `aria-describedby`.
+
+#### Verification commands and counts (foreground, on this branch)
+
+- `cargo fmt --check`: clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: clean
+  (finished in 3m 16s).
+- `cargo test -p lakehouse-api --lib row_filter`: **70 passed, 0 failed**,
+  3,367 filtered out (the new grammar test plus all pre-existing row-filter
+  tests).
+- `cargo test -p lakehouse-api --lib route_policy_tests`: **2 passed,
+  0 failed** (every `POLICY_TABLE` entry mounted and gated).
+- `cargo test -p lakehouse-api --test route_auth` (containers): **87
+  passed, 0 failed**.
+- `cargo test -p lakehouse-api --test sec11_guard`: **4 passed, 0 failed**.
+- `bun install --frozen-lockfile`: 678 packages installed, no lockfile
+  change.
+- `bun run typecheck`: clean, exit 0.
+- `bun run lint`: **0 errors, 10 warnings**, the same ten pre-existing
+  warnings on `main`.
+- `bun test src/features/catalog`: **366 pass, 0 fail, 1,171 expect()
+  calls** across 14 files (the two new tests are "names the functions and
+  operators…" and "shows no row filter help line when the grammar cannot be
+  read").
+- `bun test src/services`: **214 pass, 0 fail, 597 expect() calls** across
+  19 files (two new tests in `clients/governance.test.ts`).
+
+*Not verified locally: the rest, left to CI* — the whole-suite
+`bun run test`, the Rust workspace run (only `lakehouse-api` is touched),
+`--test permission_catalog` (no permission string changed), and the help
+line in a real browser (Bun DOM tests only).
+
+#### Git state
+
+- `git status --short`: clean.
+- `git log --oneline a6b8c501..HEAD`:
+  ```
+  34992020 feat(console): the row filter field names the grammar the server accepts (WEB-8 T8, D8)
+  fd61e3a4 feat(api): serve the row filter grammar the validator accepts (WEB-8 T8, D8)
+  ```
+- `git ls-remote --heads origin feat/web-8-s2-pickers`:
+  ```
+  34992020e8219e814a33d422026fc1d40ff615e1	refs/heads/feat/web-8-s2-pickers
+  ```
+
 ## 6. Review (planner)
 
 ### Review 1 (planner, 2026-11-09), S1 at `6a03c274`
