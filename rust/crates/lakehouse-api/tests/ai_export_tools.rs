@@ -10,9 +10,7 @@ use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
-use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
-};
+use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use wiremock::matchers::method;
@@ -103,7 +101,7 @@ async fn app(pdf: bool) -> (TestApp, MockServer, String) {
         );
     }
     let app = spin_up_with_env(&env).await;
-    let user = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let user = create_assistant_principal(&app.pool, "dashboard:read").await;
     let cookie = session_cookie_for_user(&app.pool, user).await;
     (app, ch, cookie)
 }
@@ -307,10 +305,13 @@ async fn a_person_switched_off_from_downloading_gets_the_consoles_sentence() {
     }
 }
 
+/// `ADM-13` D5: the route needs an assistant permission, so the person holds
+/// `assistant:use` and nothing else; the tool's own `dashboard:read` gate is
+/// still what refuses the call.
 #[tokio::test]
 async fn without_dashboard_read_the_tools_are_refused_by_the_gate() {
     let (app, _ch, _cookie) = app(true).await;
-    let user = common::create_zero_permission_principal(&app.pool).await;
+    let user = common::create_assistant_principal(&app.pool, "").await;
     let cookie = session_cookie_for_user(&app.pool, user).await;
     let body = call(
         &app,

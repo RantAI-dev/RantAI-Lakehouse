@@ -151,6 +151,11 @@ pub const PERMISSIONS: &[PermissionInfo] = &[
         description: "Create and edit governance policies and SLAs.",
     },
     PermissionInfo {
+        name: "governance:read",
+        area: "Governance",
+        description: "Data Quality and Audit Log lists (GET /api/governance/{kind}).",
+    },
+    PermissionInfo {
         name: "governance:write",
         area: "Governance",
         description: "Certify assets, set SLAs, run table maintenance and approve restorations.",
@@ -193,6 +198,16 @@ pub const PERMISSIONS: &[PermissionInfo] = &[
     },
     // ── Assistant ────────────────────────────────────────────────────────
     PermissionInfo {
+        name: "assistant:use",
+        area: "Assistant",
+        description: "The assistant, as today. Tools still need their own permissions.",
+    },
+    PermissionInfo {
+        name: "assistant:ask",
+        area: "Assistant",
+        description: "The assistant in Ask mode only. Its read tools may read tables, metrics and the catalog that the person may read (masks, row filters and GOV-7 still apply).",
+    },
+    PermissionInfo {
         name: "agent:approve",
         area: "Assistant",
         description: "Approve the actions assistant agents ask about.",
@@ -203,6 +218,16 @@ pub const PERMISSIONS: &[PermissionInfo] = &[
         description: "Manage assistant agents.",
     },
     // ── Operations ───────────────────────────────────────────────────────
+    PermissionInfo {
+        name: "ops:read",
+        area: "Operations",
+        description: "System status (/api/ops/{kind}, /api/ops/logs's floor).",
+    },
+    PermissionInfo {
+        name: "alert:read",
+        area: "Operations",
+        description: "The Alerts list (GET /api/alerts and its other GETs).",
+    },
     PermissionInfo {
         name: "alert:write",
         area: "Operations",

@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
 };
 use lakehouse_embed::{EmbedClaims, EmbedResource, sign_embed, unix_now};
 use lakehouse_store::dashboard_access::{NewRule, replace_item};
@@ -277,10 +278,11 @@ fn manage(user: Uuid) -> NewRule {
     }
 }
 
-/// A manager through a rule alone: no `dashboard:write`, `manage` on `b1` and
+/// A manager through a rule alone: `assistant:use` (every call here is
+/// `POST /api/ai/tool`) and no dashboard permission; `manage` on `b1` and
 /// `b2` through their own rules.
 async fn manager(app: &TestApp) -> (Uuid, String) {
-    let user = create_principal_with_permissions(&app.pool, "").await;
+    let user = create_assistant_principal(&app.pool, "").await;
     for board in ["b1", "b2"] {
         replace_item(&app.pool, "board", board, &[manage(user)], false, None)
             .await
@@ -386,7 +388,7 @@ fn assert_no_secret(result: &Value) {
 #[tokio::test]
 async fn a_requester_without_manage_is_refused_and_no_approval_is_written() {
     let (app, _ch) = app(Some(SECRET), Store::with_earlier_site()).await;
-    let viewer = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let viewer = create_assistant_principal(&app.pool, "dashboard:read").await;
     let cookie = session_cookie_for_user(&app.pool, viewer).await;
     for (tool, args) in [
         (
@@ -809,7 +811,7 @@ async fn the_snippet_needs_manage_names_a_chart_and_the_address_template() {
     );
 
     // A viewer with no manage is refused.
-    let viewer = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let viewer = create_assistant_principal(&app.pool, "dashboard:read").await;
     let viewer_cookie = session_cookie_for_user(&app.pool, viewer).await;
     let refused = call(
         &app,

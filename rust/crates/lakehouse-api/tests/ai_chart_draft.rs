@@ -22,8 +22,8 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
-    session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, session_cookie_for_seeded_user, session_cookie_for_user,
+    spin_up_with_env,
 };
 
 /// The one mart the mock lists in `serving`, its dimension and its measure.
@@ -155,8 +155,8 @@ fn env_for(llm: &MockServer, ch: &MockServer) -> std::collections::HashMap<Strin
 
 /// Posts `body` to `uri` as the seeded user `fajar@meridian.example` (an
 /// administrator, who sees every personal space), or, with `permissions`, as
-/// a new person who holds exactly those permissions. Returns the status and
-/// the body.
+/// a new person who holds those permissions besides `assistant:use` (every
+/// request here is to `/api/ai/*`). Returns the status and the body.
 async fn post_as(
     llm: &MockServer,
     ch: &MockServer,
@@ -168,7 +168,7 @@ async fn post_as(
     let cookie = match permissions {
         None => session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await,
         Some(permissions) => {
-            let user = create_principal_with_permissions(&pool, permissions).await;
+            let user = create_assistant_principal(&pool, permissions).await;
             session_cookie_for_user(&pool, user).await
         }
     };
@@ -722,7 +722,7 @@ fn rename_args() -> String {
 
 /// The person who edits dashboards but administers nothing: unlike the seeded
 /// administrator, they see their own personal space and no one else's.
-const WRITER: &str = "dashboard:read, dashboard:write";
+const WRITER: &str = "dashboard:read, dashboard:write, assistant:use";
 
 /// `POST /api/ai/tool` as the `WRITER`.
 async fn tool_call_as_writer(

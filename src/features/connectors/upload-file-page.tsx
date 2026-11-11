@@ -210,6 +210,17 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     )
   }
 
+  // QA LH-DATA-18-08 (D4) and QA fails part A review R1: with "stop" a load of
+  // values that do not fit writes nothing, so Load waits until the check has
+  // answered. After "Add to its rows" the types are the table's and the check
+  // re-runs, so the Review step opens while the check is still running; Load
+  // must stay off in that window too, or the person gets the server's refusal,
+  // which is the failure the QA case reported. Fail closed (principle 3).
+  const badValuesStop =
+    choices.onBadValue === "stop" &&
+    (choices.check.status === "checking" ||
+      (choices.check.status === "done" && choices.check.result.count > 0))
+
   const canProceed =
     step === FILE_STEP
       ? upload !== null || primary?.state === "received"
@@ -217,7 +228,12 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
         ? view.ready && choices.ready && group.ready
         : step === TABLE_STEP
           ? tableName !== "" && nameProblem === null
-          : view.ready && choices.ready && group.ready && tableName !== "" && nameProblem === null
+          : view.ready &&
+            choices.ready &&
+            group.ready &&
+            tableName !== "" &&
+            nameProblem === null &&
+            !badValuesStop
 
   const notices =
     upload !== null && step !== FILE_STEP ? (
@@ -297,6 +313,8 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
           mode={effectiveMode}
           columns={choices.columns}
           onBadValue={choices.onBadValue}
+          check={choices.check}
+          onBackToCheck={() => setStep(CHECK_STEP)}
           error={ingest.error}
           otherFiles={group.files.map((f) => f.name)}
         />

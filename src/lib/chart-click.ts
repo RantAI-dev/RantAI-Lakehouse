@@ -13,7 +13,7 @@
  * more than 4px from its mouse-down.
  */
 
-import { toBoxplot } from "@/lib/chart-transforms"
+import { isPlaceholderLabel, toBoxplot } from "@/lib/chart-transforms"
 import type { BinInfo } from "@/lib/chart-bins"
 import type { Grain } from "@/lib/time-grain"
 import type { ChartKind, ChartSource } from "@/lib/dashboard-specs"
@@ -139,7 +139,12 @@ export function drillTarget(spec: ClickSpec, hit: ChartHit, ctx: ClickContext = 
   // BI-6: the computed "Other" group is not one stored value, so it has no rows to list.
   if (ctx.otherLabels?.has(hit.name)) return null
   const column = spec.dimension ?? ""
-  const named = (value: string, col = column): DrillValue | null => (value !== "" && col !== "" ? { column: col, value } : null)
+  // QA LH-BI-6-38 (plan D5): "(No value)" / "(Empty)" are display labels of a NULL and an empty string.
+  // Such a mark names no value, as it did when it was blank, unless a row really holds that text.
+  const standsForNothing = (value: string, col: string) =>
+    isPlaceholderLabel(value) && !(ctx.rows ?? []).some((r) => r[col] === value)
+  const named = (value: string, col = column): DrillValue | null =>
+    value !== "" && col !== "" && !standsForNothing(value, col) ? { column: col, value } : null
 
   switch (spec.kind) {
     case "geomap": {
@@ -189,7 +194,7 @@ export function drillTarget(spec: ClickSpec, hit: ChartHit, ctx: ClickContext = 
 function binTarget(column: string, bin: BinInfo, label: string, ctx: ClickContext): DrillValue | null {
   const index = (ctx.labelledRows ?? []).findIndex((r) => String(r[column] ?? "") === label)
   const raw = index >= 0 ? ctx.rows?.[index]?.[column] : undefined
-  if (raw === null || raw === undefined || raw === "" || !Number.isFinite(Number(raw))) return null
+  if (raw === null || raw === undefined || raw === "" || isPlaceholderLabel(String(raw)) || !Number.isFinite(Number(raw))) return null
   return { column, value: String(raw), label, bin }
 }
 
@@ -197,6 +202,7 @@ function binTarget(column: string, bin: BinInfo, label: string, ctx: ClickContex
 function bucketTarget(column: string, grain: Grain, label: string, ctx: ClickContext): DrillValue | null {
   const index = (ctx.labelledRows ?? []).findIndex((r) => String(r[column] ?? "") === label)
   const raw = index >= 0 ? ctx.rows?.[index]?.[column] : undefined
-  if (raw === null || raw === undefined || raw === "") return null
+  // QA LH-BI-6-38: a combined chart's stored values are its drawn keys, so a NULL arrives as its label.
+  if (raw === null || raw === undefined || raw === "" || isPlaceholderLabel(String(raw))) return null
   return { column, value: String(raw), grain, label }
 }

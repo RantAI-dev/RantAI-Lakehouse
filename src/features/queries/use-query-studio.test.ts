@@ -397,7 +397,9 @@ describe("useQueryStudio Bronze tables", () => {
     },
   } as unknown as LakehouseTableDetail
 
-  function mountWithBronze(options: { tableMissing?: boolean } = {}) {
+  function mountWithBronze(
+    options: { tableMissing?: boolean; tableError?: ServiceError } = {}
+  ) {
     spyOn(queryService, "listSaved").mockResolvedValue([])
     spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
@@ -407,11 +409,12 @@ describe("useQueryStudio Bronze tables", () => {
     spyOn(assetService, "getAsset").mockResolvedValue(BRONZE_DETAIL as never)
     // The studio asks the Iceberg table whether it is there, before it offers
     // a Bronze table's Trino name (QS-4 D3).
-    spyOn(lakehouseService, "getTableDetail").mockImplementation(
-      options.tableMissing
-        ? () => Promise.reject(new ServiceError("not_found", "table not found", 404))
+    const tableAnswer = options.tableMissing
+      ? () => Promise.reject(new ServiceError("not_found", "table not found", 404))
+      : options.tableError
+        ? () => Promise.reject(options.tableError)
         : () => Promise.resolve(ICEBERG_TABLE)
-    )
+    spyOn(lakehouseService, "getTableDetail").mockImplementation(tableAnswer)
     return renderHook(() => useQueryStudio())
   }
 
@@ -442,6 +445,24 @@ describe("useQueryStudio Bronze tables", () => {
 
     await waitFor(() =>
       expect(hook.result.current.proofs["demo_orders"]?.status).toBe("missing")
+    )
+    expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
+  })
+
+  it("holds a proof read that failed as failed, not missing", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const hook = mountWithBronze({
+      tableError: new ServiceError("unavailable", "warehouse down", 503),
+    })
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+
+    act(() => hook.result.current.loadColumns("demo_orders"))
+
+    // A 5xx says nothing about the table: the proof is held as failed so
+    // the entry can offer a retry, never as "missing" (#448 review
+    // SHOULD-FIX).
+    await waitFor(() =>
+      expect(hook.result.current.proofs["demo_orders"]?.status).toBe("failed")
     )
     expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
   })
@@ -490,6 +511,8 @@ describe("useQueryStudio statements", () => {
     expect(run).toHaveBeenCalledTimes(2)
     const runs = result.current.runs[result.current.activeTabId] ?? []
     expect(runs.map((entry) => entry.status)).toEqual(["done", "error", "not-run"])
+    // QA LH-QS-4-10: a failure says "failure", so the page keeps its sentence about the failure.
+    expect(runs[2]).toMatchObject({ status: "not-run", reason: "failure" })
   })
 
   it("a permission refusal refuses every statement of the batch", async () => {
@@ -541,6 +564,8 @@ describe("useQueryStudio statements", () => {
 
     const runs = result.current.runs[result.current.activeTabId] ?? []
     expect(runs.map((entry) => entry.status)).toEqual(["not-run", "not-run", "not-run"])
+    // QA LH-QS-4-10: Stop says "stopped", not a failure.
+    expect(runs.map((entry) => (entry.status === "not-run" ? entry.reason : null))).toEqual(["stopped", "stopped", "stopped"])
     expect(result.current.running).toBe(false)
   })
 

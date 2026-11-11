@@ -67,10 +67,20 @@ fn every_permission_the_api_checks_is_in_the_catalog() {
 
     // 1. The route policy table.
     for (_method, _path, policy) in POLICY_TABLE {
-        if let Policy::RequiresPermission(permission) = policy
-            && !listed.contains(permission)
-        {
-            missing.push(permission);
+        match policy {
+            Policy::RequiresPermission(permission) => {
+                if !listed.contains(permission) {
+                    missing.push(permission);
+                }
+            }
+            Policy::RequiresAnyPermission(permissions) => {
+                for permission in *permissions {
+                    if !listed.contains(permission) {
+                        missing.push(permission);
+                    }
+                }
+            }
+            Policy::Public | Policy::RequiresAuth => {}
         }
     }
 

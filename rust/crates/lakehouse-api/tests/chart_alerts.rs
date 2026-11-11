@@ -258,7 +258,10 @@ async fn fixture_in(target: &str, tenant: &str) -> Fixture {
     ]);
     let app = spin_up_with_env(&env).await;
     let role = Uuid::new_v4();
-    sqlx::query("INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Chart Owner', 'dashboard:read', 'test')")
+    // `ADM-13` D5: reading the rule list takes `alert:read` or `alert:write`.
+    // The chart owner holds `alert:read` only, so the tests below still prove
+    // that saving for anybody else needs `alert:write`.
+    sqlx::query("INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Chart Owner', 'dashboard:read, alert:read', 'test')")
         .bind(role)
         .execute(&app.pool)
         .await

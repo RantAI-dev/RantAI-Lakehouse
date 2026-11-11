@@ -15,9 +15,7 @@ use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
-use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
-};
+use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
 use lakehouse_api::routes::dashboard_comments::SERVICE_REFUSED;
 use lakehouse_store::dashboard_access::{NewRule, replace_item};
 use lakehouse_store::dashboard_comments::{PostOutcome, insert};
@@ -159,8 +157,8 @@ async fn seed_thread(app: &TestApp, board: &str, author: Uuid, count: i32) {
 #[tokio::test]
 async fn a_viewer_reads_the_comments_of_a_dashboard_they_see() {
     let (app, _ch) = app().await;
-    let ann = create_principal_with_permissions(&app.pool, "dashboard:read").await;
-    let bo = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let ann = create_assistant_principal(&app.pool, "dashboard:read").await;
+    let bo = create_assistant_principal(&app.pool, "dashboard:read").await;
     post(&app, "b1", ann, "Visitors look wrong for March", &[bo]).await;
     post(&app, "b1", bo, "Check the region filter", &[]).await;
     let cookie = session_cookie_for_user(&app.pool, ann).await;
@@ -197,8 +195,8 @@ async fn a_viewer_reads_the_comments_of_a_dashboard_they_see() {
 #[tokio::test]
 async fn a_dashboard_they_cannot_see_gets_the_routes_not_found() {
     let (app, _ch) = app().await;
-    let listed = create_principal_with_permissions(&app.pool, "dashboard:read").await;
-    let outsider = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let listed = create_assistant_principal(&app.pool, "dashboard:read").await;
+    let outsider = create_assistant_principal(&app.pool, "dashboard:read").await;
     replace_item(&app.pool, "board", "b_secret", &[rule(listed)], true, None)
         .await
         .unwrap();
@@ -223,7 +221,10 @@ async fn a_service_identity_is_refused_in_the_routes_sentence() {
         &app.pool,
         &lakehouse_store::identity::CreateServiceIdentityInput {
             name: "test-comments-tool".to_owned(),
-            scopes: vec!["dashboard:read".to_owned()],
+            // `ADM-13` D5: every `/api/ai/*` route needs an assistant
+            // permission; the scope is here so the request reaches the tool,
+            // whose own service-identity refusal is what this test is about.
+            scopes: vec!["dashboard:read".to_owned(), "assistant:use".to_owned()],
             environment: "test".to_owned(),
         },
     )
@@ -269,7 +270,7 @@ async fn a_service_identity_is_refused_in_the_routes_sentence() {
 #[tokio::test]
 async fn sixty_comments_give_the_newest_fifty_and_say_they_are_truncated() {
     let (app, _ch) = app().await;
-    let ann = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let ann = create_assistant_principal(&app.pool, "dashboard:read").await;
     // Sixty comments from one author would hit `BI-38` D1's posting limit
     // through `insert`, so they are seeded as a thread older than its window
     // (`BI-37` #357, rule 2).
@@ -291,7 +292,7 @@ async fn sixty_comments_give_the_newest_fifty_and_say_they_are_truncated() {
 #[tokio::test]
 async fn a_two_thousand_character_body_is_cut_at_five_hundred() {
     let (app, _ch) = app().await;
-    let ann = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let ann = create_assistant_principal(&app.pool, "dashboard:read").await;
     post(&app, "b1", ann, &"x".repeat(2000), &[]).await;
     post(&app, "b1", ann, "short one", &[]).await;
     let cookie = session_cookie_for_user(&app.pool, ann).await;
@@ -307,7 +308,7 @@ async fn a_two_thousand_character_body_is_cut_at_five_hundred() {
 #[tokio::test]
 async fn a_call_without_a_board_is_refused_with_the_fields_name() {
     let (app, _ch) = app().await;
-    let ann = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let ann = create_assistant_principal(&app.pool, "dashboard:read").await;
     let cookie = session_cookie_for_user(&app.pool, ann).await;
     let body = call(&app, &cookie, json!({})).await;
     assert_eq!(

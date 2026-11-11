@@ -104,14 +104,17 @@ export type StudioTab = "nl" | "sql"
 
 /**
  * What the studio knows about a Bronze table's Iceberg table: that it is
- * there (`there`), or that it is not (`missing`).
+ * there (`there`), that it is not (`missing` — a read that answered "not
+ * found"), or that the read itself failed (`failed`), which says nothing
+ * about the table and is tried again the next time the entry opens.
  *
  * A table with no proof yet has none either: the registry's `tableName`
  * says a Bronze table might exist, not that it does, and a Trino tab on a
  * table that is not there answers "table does not exist" (QS-4 D3, owner
- * 2026-11-09).
+ * 2026-11-09). Holding a failed read as `missing` would state as fact
+ * what was only a failed request (#448 review SHOULD-FIX).
  */
-export type TableProof = { status: "there" | "missing" }
+export type TableProof = { status: "there" | "missing" | "failed" }
 
 /**
  * What one statement of a run did.
@@ -136,7 +139,16 @@ export type StatementRun =
       runId: string
     }
   | { status: "error"; statement: SqlStatement; error: ServiceError }
-  | { status: "not-run"; statement: SqlStatement }
+  | {
+      status: "not-run"
+      statement: SqlStatement
+      /**
+       * QA LH-QS-4-10: why it did not run. A failure of an earlier statement
+       * stops the batch; so does the person's Stop, and the page must not
+       * tell them a failure did it.
+       */
+      reason: "failure" | "stopped"
+    }
 
 /** A range of the buffer, in the buffer's own offsets. */
 type BufferRange = { from: number; to: number }
@@ -569,14 +581,23 @@ export function useQueryStudio() {
               [id]: { target: assetQueryTarget(detail), bronzeTable },
             }))
             // The Iceberg table itself: a Bronze table's Trino name is
-            // offered only once the table is proven to be there, and a
-            // read that fails says it is not there (QS-4 D3).
+            // offered only once the table is proven to be there, and only
+            // a read that answered "not found" proves it is not (QS-4 D3).
+            // Any other rejection failed, and is held as failed so the
+            // entry offers a retry instead of a false "not there" (#448
+            // review SHOULD-FIX).
             if (bronzeTable) {
               void lakehouseService
                 .getTableDetail(BRONZE_NAMESPACE, bronzeTable)
                 .then(
                   () => rememberProof(id, { status: "there" }),
-                  () => rememberProof(id, { status: "missing" })
+                  (error: unknown) =>
+                    rememberProof(
+                      id,
+                      toServiceError(error).code === "not_found"
+                        ? { status: "missing" }
+                        : { status: "failed" }
+                    )
                 )
             }
           }
@@ -610,14 +631,22 @@ export function useQueryStudio() {
   // The schema browser asks for a table's columns when a person expands it.
   // It shares the cache above, so a table the statement already named is not
   // fetched twice. Only a person pressing "Retry" (`retry`) may fetch a
-  // failed table again: a keystroke never does.
+  // failed table again: a keystroke never does. An entry whose proof read
+  // failed is read again whenever it opens — the open is its retry — while
+  // a keystroke still never is (#448 review SHOULD-FIX).
   const loadColumns = React.useCallback(
     (id: string, options: { retry?: boolean } = {}) => {
       const cached = columnsRef.current[id]
-      if (cached && !(options.retry && cached.status === "failed")) return
+      if (
+        cached &&
+        !(options.retry && cached.status === "failed") &&
+        proofs[id]?.status !== "failed"
+      ) {
+        return
+      }
       fetchColumns(id)
     },
-    [fetchColumns]
+    [fetchColumns, proofs]
   )
 
   // The editor's view is kept in a ref: the browser needs it at click time
@@ -1009,13 +1038,13 @@ export function useQueryStudio() {
       batchRef.current = batch
       setRunning(true)
 
-      const markNotRun = (from: number) => {
+      const markNotRun = (from: number, reason: "failure" | "stopped") => {
         setRuns((previous) => {
           const current = previous[tabId] ?? []
           return {
             ...previous,
             [tabId]: current.map((run, at) =>
-              at >= from ? { status: "not-run", statement: run.statement } : run
+              at >= from ? { status: "not-run", statement: run.statement, reason } : run
             ),
           }
         })
@@ -1024,7 +1053,7 @@ export function useQueryStudio() {
       try {
         for (let index = 0; index < list.length; index += 1) {
           if (controller.signal.aborted) {
-            markNotRun(index)
+            markNotRun(index, "stopped")
             break
           }
           batch.index = index
@@ -1057,7 +1086,7 @@ export function useQueryStudio() {
             if (controller.signal.aborted) {
               // The person stopped the batch: the statement that was in
               // flight did not finish, and neither did the ones after it.
-              markNotRun(index)
+              markNotRun(index, "stopped")
               break
             }
             const serviceError = toServiceError(error)
@@ -1084,7 +1113,7 @@ export function useQueryStudio() {
                   : run
               ),
             }))
-            if (!isPermissionRefusal) markNotRun(index + 1)
+            if (!isPermissionRefusal) markNotRun(index + 1, "failure")
             break
           }
         }
@@ -1178,7 +1207,7 @@ export function useQueryStudio() {
       return {
         ...previous,
         [batch.tabId]: current.map((run, at) =>
-          at >= batch.index ? { status: "not-run", statement: run.statement } : run
+          at >= batch.index ? { status: "not-run", statement: run.statement, reason: "stopped" } : run
         ),
       }
     })

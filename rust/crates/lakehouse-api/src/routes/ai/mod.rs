@@ -356,6 +356,62 @@ async fn users_terms(
         })
 }
 
+/// ADM-13 (D6): What level of access the principal has to the assistant.
+///
+/// Decided once per request from the principal:
+/// `Full` if holding `assistant:use`, else `AskOnly` if holding `assistant:ask`.
+/// (The route policy layer already rejected callers holding neither with 403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantAccess {
+    /// Full access: ask and build mode, write tools available.
+    Full,
+    /// Ask-only access: only `Risk::Read` tools, forced Ask mode.
+    AskOnly,
+}
+
+impl AssistantAccess {
+    /// Decide assistant access from a principal.
+    // ADM-13 review round 1, S2: delegates to from_perms (one match helper).
+    #[must_use]
+    pub fn from_principal(principal: Option<&Principal>) -> Self {
+        Self::from_perms(principal.map(|p| &p.permissions))
+    }
+
+    /// Decide assistant access from a permission set.
+    #[must_use]
+    pub fn from_perms(perms: Option<&lakehouse_auth::PermissionSet>) -> Self {
+        match perms {
+            Some(p) if p.has("assistant:use") => Self::Full,
+            Some(p) if p.has("assistant:ask") => Self::AskOnly,
+            // ADM-13 review round 1, S2: A caller with neither permission
+            // defaults to Full because the route gate already refused
+            // unauthenticated/unauthorized callers (RequiresAnyPermission(["assistant:use", "assistant:ask"]));
+            // headless runs (e.g. agents.rs) pass through here unchanged.
+            _ => Self::Full,
+        }
+    }
+
+    /// True if the caller is restricted to Ask-only mode.
+    #[must_use]
+    pub fn is_ask_only(self) -> bool {
+        self == Self::AskOnly
+    }
+}
+
+/// ADM-13 (D6), ADM-13 review round 1, S2: Checks whether `perms` has read permission
+/// `perm` directly, or — for `query:read` and `catalog:read` — via `assistant:ask`.
+/// Single helper used across gate.rs, registry.rs, and `data_map_access` in ai/mod.rs.
+#[must_use]
+pub fn assistant_reads(perms: Option<&lakehouse_auth::PermissionSet>, perm: &str) -> bool {
+    let Some(p) = perms else {
+        return false;
+    };
+    if p.has(perm) {
+        return true;
+    }
+    (perm == "query:read" || perm == "catalog:read") && p.has("assistant:ask")
+}
+
 /// What the DATA MAP may show a caller (`SEC-24`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MapAccess {
@@ -374,11 +430,15 @@ enum MapAccess {
 /// `/api/catalog/{id}/sample`. Both routes need `query:read`, so the ranges
 /// and samples need it too.
 /// `Principal::has` honours wildcards, so a `*:*` holder gets the full map.
+/// ADM-13 (D6): `assistant:ask` counts as `catalog:read` + `query:read` here.
 fn data_map_access(principal: Option<&Principal>) -> MapAccess {
-    match principal {
-        Some(p) if p.has("catalog:read") && p.has("query:read") => MapAccess::Full,
-        Some(p) if p.has("catalog:read") => MapAccess::WithoutSamples,
-        _ => MapAccess::None,
+    let perms = principal.map(|p| &p.permissions);
+    if assistant_reads(perms, "catalog:read") && assistant_reads(perms, "query:read") {
+        MapAccess::Full
+    } else if assistant_reads(perms, "catalog:read") {
+        MapAccess::WithoutSamples
+    } else {
+        MapAccess::None
     }
 }
 
@@ -566,7 +626,8 @@ async fn prepare_chat(
         )
             .into_response());
     }
-    let is_build = parsed.mode.as_deref() == Some("build");
+    let access = AssistantAccess::from_principal(principal);
+    let is_build = !access.is_ask_only() && parsed.mode.as_deref() == Some("build");
     let recent_user: Vec<&str> = parsed
         .messages
         .iter()
@@ -1372,10 +1433,11 @@ pub async fn tool_call(
         )
             .into_response();
     };
-    let is_build = parsed.mode.as_deref() == Some("build");
+    let caller = principal.as_ref().map(|Extension(p)| p);
+    let access = AssistantAccess::from_principal(caller);
+    let is_build = !access.is_ask_only() && parsed.mode.as_deref() == Some("build");
 
     // The two facts the gate needs beyond the arguments (see `gate_facts`).
-    let caller = principal.as_ref().map(|Extension(p)| p);
     let (audience, reach) = gate_facts(&state, caller, &parsed.tool, &parsed.args).await;
     let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience, reach);
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
@@ -3595,5 +3657,29 @@ mod tests {
             fit_messages(&messages, MESSAGES_MAX_BYTES),
             serde_json::to_string(&messages).unwrap()
         );
+    }
+
+    /// ADM-13 (D6): `data_map_access` gives `Full` to `assistant:ask`.
+    #[test]
+    fn data_map_access_gives_full_to_assistant_ask() {
+        use lakehouse_auth::Principal;
+
+        let ask_only = holding("assistant:ask");
+        assert_eq!(data_map_access(Some(&ask_only)), MapAccess::Full);
+
+        let use_only = holding("assistant:use");
+        assert_eq!(data_map_access(Some(&use_only)), MapAccess::None);
+
+        let none: Option<&Principal> = None;
+        assert_eq!(data_map_access(none), MapAccess::None);
+
+        let catalog_only = holding("catalog:read");
+        assert_eq!(
+            data_map_access(Some(&catalog_only)),
+            MapAccess::WithoutSamples
+        );
+
+        let full_perms = holding("catalog:read, query:read");
+        assert_eq!(data_map_access(Some(&full_perms)), MapAccess::Full);
     }
 }

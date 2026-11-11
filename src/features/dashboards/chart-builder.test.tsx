@@ -151,6 +151,63 @@ describe("ChartBuilder kind rules (phase 2 QA R5)", () => {
   })
 })
 
+describe("ChartBuilder single-number payload (QA LH-BI-2-01)", () => {
+  it("sends a reusable metric of a KPI as { metric }, not as the raw row column", async () => {
+    renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: [{ metric: "coba_metrik" }] as never, aggregate: "sum" })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.measures).toEqual([{ metric: "coba_metrik" }])
+  })
+
+  it("keeps a plain column of a KPI as the column name, as before", async () => {
+    renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: ["visitors"], aggregate: "sum" })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.measures).toEqual(["visitors"])
+  })
+})
+
+describe("ChartBuilder dimension beside more questions (QA LH-BI-13-01)", () => {
+  /** The fields answer names `visitors` a number column, as a year column would be. */
+  function withNumberKinds() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const res = await inner(input, init)
+      const url = String(input)
+      if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
+        const body = (await res.json()) as Record<string, unknown>
+        return new Response(JSON.stringify({ ...body, kinds: { visitors: "number", stay: "number" } }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return res
+    }) as unknown as typeof fetch
+  }
+  const layered = {
+    ...barDef,
+    dimension: "provinsi",
+    // The question's own dimension must line up with the chart's (both numbers), as it does
+    // for a year column, or the builder drops it and the chart cannot be sent at all.
+    layers: [{ mart: "mart_visits", dimension: "stay", measures: ["stay"], aggregate: "sum", draw: "line", axis: "right" }],
+  } as unknown as ChartDef
+
+  it("still offers a number column as the dimension when the chart has more questions", async () => {
+    withNumberKinds()
+    renderBuilder({ ...layered, dimension: "visitors" })
+    await screen.findByLabelText("Aggregation of visitors")
+    // The trigger of the Dimension (X) select is the one in the same field as its label.
+    const field = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    fireEvent.click(field.querySelector('[role="combobox"]') as HTMLElement)
+    // `stay` is a number column, in no way a dimension of the source: only the rule that keeps numbers offers it.
+    expect(await screen.findByRole("option", { name: "stay" })).toBeTruthy()
+    expect(screen.getByRole("option", { name: "provinsi" })).toBeTruthy()
+  })
+
+  it("saves that number dimension without a bin, because bins are off beside more questions", async () => {
+    withNumberKinds()
+    renderBuilder({ ...layered, dimension: "visitors" })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.dimension).toBe("visitors")
+    expect(bodies[bodies.length - 1]!.dimensionBin).toBeUndefined()
+  })
+})
+
 describe("ChartBuilder kind switch (phase 2 QA R6)", () => {
   it("keeps the dimension as the first grouping of a data table and back as the dimension of a chart", async () => {
     renderBuilder({ ...barDef, breakdown: "category" })

@@ -715,6 +715,11 @@ pub fn permission_granted(
     if spec.permission.is_empty() {
         return true;
     }
+    // ADM-13 (D6), ADM-13 review round 1, S2: use shared assistant_reads helper
+    // for query:read / catalog:read stand-in when holding assistant:ask.
+    if spec.risk == Risk::Read && super::assistant_reads(perms, spec.permission) {
+        return true;
+    }
     if perms.is_some_and(|p| p.has(spec.permission)) {
         return true;
     }
@@ -1351,13 +1356,13 @@ mod tests {
         assert_eq!(refused["required"], json!("dashboard:read"));
     }
 
-    /// A tool with an empty `permission` (`get_quality`: no narrower route
+    /// A tool with an empty `permission` (`get_query_limits`: no narrower route
     /// permission than `RequiresAuth`) is allowed for any authenticated
     /// principal, even one with no grants at all.
     #[test]
     fn empty_permission_tool_is_allowed_for_any_authenticated_principal() {
         let perms = PermissionSet::default();
-        let empty_perm_spec = spec("get_quality");
+        let empty_perm_spec = spec("get_query_limits");
         assert_eq!(empty_perm_spec.permission, "");
         assert_eq!(
             decide(true, Some(&perms), empty_perm_spec, &no_args()),
@@ -1417,6 +1422,50 @@ mod tests {
         }
     }
 
+    /// ADM-13 (D6): `run_sql` is granted to `assistant:ask` without `query:read`.
+    /// A principal with only `assistant:use` and no `query:read` is still refused `run_sql`.
+    /// A principal with neither is still refused `run_sql`.
+    #[test]
+    fn run_sql_is_granted_to_assistant_ask_and_refused_to_assistant_use_alone() {
+        let ask = PermissionSet::parse("assistant:ask");
+        assert_eq!(
+            decide_by_name(false, Some(&ask), "run_sql", &no_args(), None, None),
+            None,
+            "run_sql must be granted to assistant:ask"
+        );
+
+        let use_only = PermissionSet::parse("assistant:use");
+        let refused_use = decide_by_name(false, Some(&use_only), "run_sql", &no_args(), None, None)
+            .expect("assistant:use alone must be refused run_sql without query:read");
+        assert_eq!(refused_use["reason"], json!("permission"));
+        assert_eq!(refused_use["required"], json!("query:read"));
+
+        let neither = PermissionSet::default();
+        let refused_neither =
+            decide_by_name(false, Some(&neither), "run_sql", &no_args(), None, None)
+                .expect("principal with neither must be refused run_sql");
+        assert_eq!(refused_neither["reason"], json!("permission"));
+        assert_eq!(refused_neither["required"], json!("query:read"));
+    }
+
+    /// ADM-13 (D6): a write tool call in ask mode (or forced to ask mode
+    /// for an `AskOnly` principal) is refused with the Ask-mode message.
+    #[test]
+    fn write_tool_in_ask_mode_is_refused_with_ask_mode_message() {
+        let ask = PermissionSet::parse("assistant:ask");
+        let refused = decide_by_name(false, Some(&ask), "create_chart", &no_args(), None, None)
+            .expect("write tool in ask mode must be refused");
+        assert_eq!(refused, ask_mode_refusal("create_chart"));
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Ask mode cannot run a tool that changes anything"),
+            "refusal error must mention Ask mode: {:?}",
+            refused["error"]
+        );
+    }
+
     /// SEC-23 (F3): the copilot was a second way to add a governance rule
     /// without `governance:write`. `POST /api/governance/{kind}` now needs
     /// it, and so do both rule-drafting tools: an Analyst is refused before
@@ -1462,7 +1511,10 @@ mod tests {
     /// behaves like "authenticated, no grants", not like Ask mode.
     #[test]
     fn absent_principal_is_allowed_empty_permission_tool() {
-        assert_eq!(decide(true, None, spec("get_quality"), &no_args()), None);
+        assert_eq!(
+            decide(true, None, spec("get_query_limits"), &no_args()),
+            None
+        );
     }
 
     /// [`strip_confirmed`] removes only the `confirmed` key, leaving every

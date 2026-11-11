@@ -22,15 +22,18 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { AuthProvider } from "@/features/auth/auth-provider"
 import { CommandPalette } from "./command-palette"
 
 const originalFetch = global.fetch
 const requested: string[] = []
+let authPermissions = ["*:*"]
 
 afterEach(() => {
   global.fetch = originalFetch
   requested.length = 0
   pushed.length = 0
+  authPermissions = ["*:*"]
   cleanup()
 })
 
@@ -38,10 +41,28 @@ function asset(n: number, over: Record<string, unknown> = {}) {
   return { id: `silver.t${n}`, name: `Table ${n}`, namespace: "silver", ...over }
 }
 
+function authResponse() {
+  return new Response(
+    JSON.stringify({
+      id: "u1",
+      name: "User",
+      email: null,
+      roles: ["Admin"],
+      permissions: authPermissions,
+      tenants: [],
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } }
+  )
+}
+
 /** Answer every catalog request with `body` (or a status), and note its URL. */
 function stubCatalog(body: unknown, status = 200) {
   global.fetch = mock(async (input: RequestInfo | URL) => {
-    requested.push(String(input))
+    const url = String(input)
+    if (url.includes("/api/auth/me")) {
+      return authResponse()
+    }
+    requested.push(url)
     return new Response(JSON.stringify(body), {
       status,
       headers: { "Content-Type": "application/json" },
@@ -50,7 +71,11 @@ function stubCatalog(body: unknown, status = 200) {
 }
 
 async function search(term: string) {
-  render(<CommandPalette />)
+  render(
+    <AuthProvider>
+      <CommandPalette />
+    </AuthProvider>
+  )
   fireEvent.keyDown(document, { key: "k", ctrlKey: true })
   const input = await screen.findByPlaceholderText(/Search pages/)
   fireEvent.change(input, { target: { value: term } })
@@ -172,6 +197,7 @@ describe("CommandPalette dashboards and charts", () => {
   function stubByUrl(answers: Record<string, unknown>) {
     global.fetch = mock(async (input: RequestInfo | URL) => {
       const url = String(input)
+      if (url.includes("/api/auth/me")) return authResponse()
       requested.push(url)
       const key = Object.keys(answers).find((k) => url.includes(k))
       return new Response(JSON.stringify(key ? answers[key] : {}), {
@@ -180,6 +206,32 @@ describe("CommandPalette dashboards and charts", () => {
       })
     }) as unknown as typeof fetch
   }
+
+  it("does not send catalog search when caller lacks catalog:read (ADM-13 review round 1, S5)", async () => {
+    authPermissions = ["dashboard:read"]
+    stubCatalog({ assets: [asset(1)] })
+    await search("table")
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(requested.some((u) => u.includes("/api/catalog"))).toBe(false)
+  })
+
+  it("does not send dashboard search or shortcuts when caller lacks dashboard:read (ADM-13 review round 1, S5)", async () => {
+    authPermissions = ["catalog:read"]
+    stubByUrl({
+      "/api/dashboard/shortcuts": { favourites: [], recent: [] },
+      "/api/dashboard/search": { hits: [] },
+    })
+    render(
+      <AuthProvider>
+        <CommandPalette />
+      </AuthProvider>
+    )
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true })
+    const input = await screen.findByPlaceholderText(/Search pages/)
+    fireEvent.change(input, { target: { value: "orders" } })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(requested.some((u) => u.includes("/api/dashboard"))).toBe(false)
+  })
 
   it("finds a dashboard and a chart by name and opens the chart's dashboard", async () => {
     stubByUrl({
@@ -205,7 +257,11 @@ describe("CommandPalette dashboards and charts", () => {
         recent: [{ kind: "board", id: "b_2", name: "Opened lately" }],
       },
     })
-    render(<CommandPalette />)
+    render(
+      <AuthProvider>
+        <CommandPalette />
+      </AuthProvider>
+    )
     fireEvent.keyDown(document, { key: "k", ctrlKey: true })
     expect(await screen.findByText("My favourite")).toBeTruthy()
     expect(screen.getByText("Opened lately")).toBeTruthy()
@@ -214,6 +270,7 @@ describe("CommandPalette dashboards and charts", () => {
   it("says so when the dashboard search is unavailable, and stays quiet for a caller without access", async () => {
     global.fetch = mock(async (input: RequestInfo | URL) => {
       const url = String(input)
+      if (url.includes("/api/auth/me")) return authResponse()
       if (url.includes("/api/dashboard/search")) return new Response(JSON.stringify({ error: "boom" }), { status: 503 })
       return new Response(JSON.stringify({ assets: [] }), { status: 200 })
     }) as unknown as typeof fetch
@@ -223,6 +280,7 @@ describe("CommandPalette dashboards and charts", () => {
     requested.length = 0
     global.fetch = mock(async (input: RequestInfo | URL) => {
       const url = String(input)
+      if (url.includes("/api/auth/me")) return authResponse()
       requested.push(url)
       if (url.includes("/api/dashboard/search")) return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 })
       return new Response(JSON.stringify({ assets: [] }), { status: 200 })
@@ -237,7 +295,11 @@ describe("CommandPalette dashboards and charts", () => {
 
 describe("CommandPalette empty state and recents (BI-18 part C review fix R12)", () => {
   function stubWith(handler: (url: string) => Promise<Response> | Response) {
-    global.fetch = mock(async (input: RequestInfo | URL) => handler(String(input))) as unknown as typeof fetch
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/api/auth/me")) return authResponse()
+      return handler(url)
+    }) as unknown as typeof fetch
   }
   const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
 
@@ -277,9 +339,36 @@ describe("CommandPalette empty state and recents (BI-18 part C review fix R12)",
           })
         : ok({}),
     )
-    render(<CommandPalette />)
+    render(
+      <AuthProvider>
+        <CommandPalette />
+      </AuthProvider>
+    )
     fireEvent.keyDown(document, { key: "k", ctrlKey: true })
     expect(await screen.findByText("Other board")).toBeTruthy()
     expect(screen.getAllByText("Map demo")).toHaveLength(1)
+  })
+})
+
+describe("CommandPalette catalog order", () => {
+  it("keeps the server's order of assets, not cmdk's fuzzy order (QA LH-DATA-11-06)", async () => {
+    // "Revenue" would score above "A long rev note" under fuzzy match.
+    stubCatalog({
+      assets: [
+        asset(1, { name: "A long note about rev" }),
+        asset(2, { name: "Zzz" }),
+        asset(3, { name: "Revenue" }),
+      ],
+    })
+    await search("rev")
+    await screen.findByText("Revenue")
+    const names = [...document.querySelectorAll('[cmdk-item=""]')]
+      .map((el) => el.textContent ?? "")
+      .filter((t) => /A long note about rev|Zzz|Revenue/.test(t))
+    expect(names.map((t) => t.replace(/\W+$/, ""))).toEqual([
+      "A long note about rev",
+      "Zzz",
+      "Revenue",
+    ])
   })
 })

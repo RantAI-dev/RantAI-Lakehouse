@@ -8,14 +8,15 @@ import { useTheme } from "next-themes";
 import {
   Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database, Star,
 } from "lucide-react";
-import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
+import { NAV_GROUPS, pageTitleFor, canOpen } from "@/components/app-shell/nav-config";
+import { useAuth } from "@/features/auth/auth-provider";
 import { CertificationBadge } from "@/components/patterns/status-badge";
 import { assetService, dashboardService } from "@/services";
 import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
 import type { ShortcutItem } from "@/services/contracts/dashboards";
 import { itemHref } from "@/lib/dashboard-organise";
-import { PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
+import { ASSET_VALUE_PREFIX, PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, makePaletteFilter, matchedOnLabel } from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
  * (WS2 §13). */
@@ -28,6 +29,8 @@ const CATALOG_SEARCH_DEBOUNCE_MS = 250;
  * scores zero for any typed word and, with equal scores keeping their order,
  * stays after the assets (DATA-11 review SHOULD-FIX 6). */
 const SEE_ALL_VALUE = "\u2192";
+
+const assetItemValue = (a: Asset) => `${ASSET_VALUE_PREFIX}${a.id} ${a.name}`;
 
 const OPEN_EVENT = "rantai:open-command";
 /** Call from anywhere (e.g. the navbar search box) to open the palette. */
@@ -84,8 +87,15 @@ export function CommandPalette() {
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
+  // ADM-13 review round 1, S5: useAuth() with no fail-open path
+  const { hasPermission } = useAuth();
 
-  const groups = NAV_GROUPS;
+  const groups = React.useMemo(() => {
+    return NAV_GROUPS.map((g) => ({
+      ...g,
+      items: g.items.filter((it) => canOpen(it.href, hasPermission)),
+    })).filter((g) => g.items.length > 0);
+  }, [hasPermission]);
 
   // Server-side catalog search behind the "Catalog assets" group (WS2 §13).
   // Debounced 250ms and abortable on every keystroke so a slow
@@ -94,9 +104,10 @@ export function CommandPalette() {
   // aborted or whose debounce timer never fired. A failed request shows
   // "Catalog search is unavailable", not a spinner that never resolves and
   // not an empty list (DATA-11 T2).
+  // ADM-13 review round 1, S5: do not send search without catalog:read.
   React.useEffect(() => {
     const term = search.trim();
-    if (!term) {
+    if (!term || !hasPermission("catalog:read")) {
       setAssetResults([]);
       setSearchFailed(null);
       setAssetsPending(false);
@@ -129,15 +140,24 @@ export function CommandPalette() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [search]);
+  }, [search, hasPermission]);
 
   // Dashboards and charts, by name (BI-18 part C, part 2). The server decides
   // who may see what, so a private draft or a deleted item is never in the
   // answer; a caller without `dashboard:read` gets a refusal and sees no group.
   // Debounced like the catalog search, and abortable for the same reason.
+  // ADM-13 review round 1, S5: do not send search without dashboard:read.
   React.useEffect(() => {
     if (!open) return;
     const term = search.trim();
+    if (!hasPermission("dashboard:read")) {
+      setDashHits([]);
+      setDashFavourites([]);
+      setDashRecent([]);
+      setDashPending(false);
+      setDashFailed(false);
+      return;
+    }
     let cancelled = false;
     const controller = new AbortController();
     setDashPending(Boolean(term));
@@ -170,7 +190,7 @@ export function CommandPalette() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [open, search]);
+  }, [open, search, hasPermission]);
 
   // Open via ⌘K / Ctrl+K, and via an event from the navbar search box.
   React.useEffect(() => {
@@ -205,6 +225,12 @@ export function CommandPalette() {
     } catch { /* ignore */ }
   }, [pathname]);
 
+  // QA LH-DATA-11-06: one score for every asset row keeps the server's order.
+  const paletteFilter = React.useMemo(
+    () => makePaletteFilter(assetResults.map((a) => assetItemValue(a))),
+    [assetResults],
+  );
+
   const go = (href: string) => { setOpen(false); router.push(href); };
   const run = (fn: () => void) => { setOpen(false); fn(); };
 
@@ -213,6 +239,7 @@ export function CommandPalette() {
       open={open}
       onOpenChange={setOpen}
       label="Command Palette"
+      filter={paletteFilter}
       contentClassName="fixed left-1/2 top-[18%] z-[100] w-[min(92vw,560px)] -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover shadow-2xl"
       overlayClassName="fixed inset-0 z-[99] bg-black/40 backdrop-blur-sm"
     >
@@ -284,17 +311,21 @@ export function CommandPalette() {
 
         {/* Quick actions */}
         <Command.Group heading="Quick actions" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
-          <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/")} />
-          {/* "Open Dashboards" sengaja menuju `/dashboards`: itu penerus yang
-              membawa ke board terakhir, jadi label ini menepati janjinya.
-              Mengelola daftarnya adalah tujuan lain, maka barisnya sendiri. */}
-          <PaletteItem icon={BarChart3} label="Open Dashboards" value="dashboards visualization chart" onSelect={() => go("/dashboards")} />
-          {/* Membuat chart dilakukan DI ATAS sebuah dashboard, bukan di
-              ruang kosong — jadi barisan ini sengaja menuju penerus yang
-              sama, lalu kanvasnya yang menyediakan tombol tambah tile. */}
-          <PaletteItem icon={Plus} label="Add a chart to a dashboard" value="new chart add tile dashboard" onSelect={() => go("/dashboards")} />
-          <PaletteItem icon={LayoutGrid} label="Browse all dashboards" value="dashboards list manage browse rename share" onSelect={() => go("/dashboards/browse")} />
-          <PaletteItem icon={Download} label="Export dashboard (YAML)" value="export yaml dashboard" onSelect={() => run(() => window.open("/api/dashboard/export", "_blank"))} />
+          {(hasPermission("assistant:use") || hasPermission("assistant:ask")) && (
+            <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/")} />
+          )}
+          {hasPermission("dashboard:read") && (
+            <PaletteItem icon={BarChart3} label="Open Dashboards" value="dashboards visualization chart" onSelect={() => go("/dashboards")} />
+          )}
+          {hasPermission("dashboard:write") && (
+            <PaletteItem icon={Plus} label="Add a chart to a dashboard" value="new chart add tile dashboard" onSelect={() => go("/dashboards")} />
+          )}
+          {hasPermission("dashboard:read") && (
+            <PaletteItem icon={LayoutGrid} label="Browse all dashboards" value="dashboards list manage browse rename share" onSelect={() => go("/dashboards/browse")} />
+          )}
+          {hasPermission("dashboard:read") && (
+            <PaletteItem icon={Download} label="Export dashboard (YAML)" value="export yaml dashboard" onSelect={() => run(() => window.open("/api/dashboard/export", "_blank"))} />
+          )}
           <PaletteItem
             icon={resolvedTheme === "dark" ? Sun : Moon}
             label={`Change theme (${resolvedTheme === "dark" ? "light" : "dark"})`}
@@ -326,7 +357,7 @@ export function CommandPalette() {
                 label={a.name}
                 badge={<CertificationBadge certification={a.certification} />}
                 detail={matchedOnLabel(a.matchedOn)}
-                value={`asset ${a.id} ${a.name}`}
+                value={assetItemValue(a)}
                 onSelect={() => go(`/data/assets/${a.id}`)}
               />
             ))}
