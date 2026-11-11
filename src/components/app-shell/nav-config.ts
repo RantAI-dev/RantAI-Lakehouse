@@ -332,10 +332,23 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
 
   // Administration
   { pattern: "/admin/users", requires: ["identity:read"] },
+  // WEB-7 D2: the forms that left the side panel. Each takes the permission
+  // its submit route takes (POST/PUT identity writes are `identity:write`,
+  // `policy.rs`), so a person who may open the list but not write cannot
+  // reach the form.
+  { pattern: "/admin/users/invite", requires: ["identity:write"] },
   { pattern: "/admin/roles", requires: ["identity:read"] },
+  { pattern: "/admin/roles/new", requires: ["identity:write"] },
+  { pattern: "/admin/roles/[id]/edit", requires: ["identity:write"] },
   { pattern: "/admin/tenants", requires: ["identity:read"] },
+  { pattern: "/admin/tenants/new", requires: ["identity:write"] },
   { pattern: "/admin/service-identities", requires: ["identity:read"] },
+  { pattern: "/admin/service-identities/new", requires: ["identity:write"] },
   { pattern: "/admin/settings", requires: ["settings:write", "identity:read"] },
+  // Tag keys are a Settings section; defining or changing one is the
+  // governance write the API route takes (`POST`/`PUT /api/governance/tag-keys`).
+  { pattern: "/admin/settings/tag-keys/new", requires: ["governance:write"] },
+  { pattern: "/admin/settings/tag-keys/[key]/edit", requires: ["governance:write"] },
   { pattern: "/account/change-password", requires: [] },
 ]
 

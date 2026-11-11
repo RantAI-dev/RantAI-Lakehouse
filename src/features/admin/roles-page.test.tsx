@@ -1,13 +1,18 @@
 // WEB-3 S3-D8: "Teams & Roles" is "Roles", with Edit and Delete for
 // someone with identity:write. A 409 from the API (the role is still held,
 // or built in) is shown with the API's own sentence, and the dialog stays
-// open. `AuthProvider` and the table's URL state need `next/navigation`;
-// it is stubbed before any import resolves (`mock.module` is hoisted).
+// open. WEB-7 D2: creating and editing are their own pages, so the list's
+// Edit action navigates there. `AuthProvider` and the table's URL state
+// need `next/navigation`; it is stubbed before any import resolves
+// (`mock.module` is hoisted).
+let pushed: string[] = []
 mock.module("next/navigation", () => ({
   usePathname: () => "/admin/roles",
   useSearchParams: () => new URLSearchParams(),
   useRouter: () => ({
-    push: () => {},
+    push: (href: string) => {
+      pushed.push(href)
+    },
     replace: () => {},
     refresh: () => {},
     back: () => {},
@@ -25,6 +30,7 @@ import { RolesPage } from "./roles-page"
 afterEach(() => {
   cleanup()
   mock.restore()
+  pushed = []
 })
 
 const json = (body: unknown, status = 200) =>
@@ -75,20 +81,18 @@ describe("RolesPage (WEB-3 S3-D8)", () => {
     expect(screen.queryByText("Teams & Roles")).toBeNull()
   })
 
-  it("edits a role and says a rename is refused while a rule names the role", async () => {
-    const writes = stubApi(["identity:read", "identity:write"])
+  it("Edit opens the role's own edit page, which loads it by id (WEB-7 D2)", async () => {
+    stubApi(["identity:read", "identity:write"])
     renderPage()
     await openMenuItem("Edit role")
-    const name = await screen.findByLabelText("Name")
-    expect((name as HTMLInputElement).value).toBe("Analyst")
-    fireEvent.change(name, { target: { value: "Data Analyst" } })
-    expect(screen.getByText(/A rename is refused while an access rule names Analyst/)).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: "Save" }))
-    await waitFor(() =>
-      expect(writes).toEqual([
-        ["PUT", "/api/identity/roles/r1", { name: "Data Analyst", permissions: "catalog:read", description: "Reads" }],
-      ])
-    )
+    expect(pushed).toEqual(["/admin/roles/r1/edit"])
+  })
+
+  it("Create Role opens the new-role page", async () => {
+    stubApi(["identity:read", "identity:write"])
+    renderPage()
+    const create = await screen.findByRole("button", { name: /create role/i })
+    expect(create.getAttribute("href")).toBe("/admin/roles/new")
   })
 
   it("deletes a role nobody holds after confirming", async () => {

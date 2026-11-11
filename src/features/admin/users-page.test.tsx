@@ -35,6 +35,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import type { User } from "@/services"
+import { rememberInvitePassword, takeInvitePassword } from "./invite-password"
 import { UsersPage } from "./users-page"
 
 const originalFetch = global.fetch
@@ -328,59 +329,6 @@ function renderPage() {
   )
 }
 
-/** Fill the invite sheet and submit it. */
-async function inviteUser(opts: {
-  name?: string
-  username?: string
-  email?: string
-  roles?: string[]
-  tenants?: string[]
-  passwordMode?: "generate" | "set"
-  password?: string
-  mustChangePassword?: boolean
-} = {}) {
-  fireEvent.click(screen.getByRole("button", { name: /invite user/i }))
-  fireEvent.change(await screen.findByLabelText("Name"), {
-    target: { value: opts.name ?? "Rina Guest" },
-  })
-  fireEvent.change(screen.getByLabelText("Username"), {
-    target: { value: opts.username ?? "rinaguest" },
-  })
-  if (opts.email !== undefined) {
-    fireEvent.change(screen.getByLabelText("Email (optional)"), {
-      target: { value: opts.email },
-    })
-  } else {
-    fireEvent.change(screen.getByLabelText("Email (optional)"), {
-      target: { value: "rina.guest@meridian.example" },
-    })
-  }
-  if (opts.roles) {
-    for (const r of opts.roles) {
-      fireEvent.click(screen.getByLabelText(r))
-    }
-  }
-  if (opts.tenants) {
-    for (const t of opts.tenants) {
-      fireEvent.click(screen.getByLabelText(t))
-    }
-  }
-  if (opts.passwordMode === "set") {
-    fireEvent.click(screen.getByLabelText("Set it now"))
-    if (opts.password) {
-      fireEvent.change(screen.getByLabelText("Password"), {
-        target: { value: opts.password },
-      })
-    }
-  }
-  if (opts.mustChangePassword === false) {
-    fireEvent.click(
-      screen.getByLabelText("Must change password at first sign-in")
-    )
-  }
-  fireEvent.click(screen.getByRole("button", { name: "Invite" }))
-}
-
 /** Open the row actions menu and click "Reset password". */
 async function resetPassword() {
   // The row menu is a Radix dropdown (`@rantai/design-system/ui/dropdown-menu`),
@@ -397,136 +345,6 @@ async function openRowAction(name: RegExp) {
   const item = await screen.findByRole("menuitem", { name })
   fireEvent.click(item)
 }
-
-describe("UsersPage invite (temporary password shown once, never persisted)", () => {
-  it("the invite shows the temporary password in a Dialog alongside the 'shown once' warning", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser()
-
-    // The password lands in a `<code data-testid="revealed-password">` so
-    // the assertion reads like "the dialog displays the password
-    // verbatim", not "the dialog has a copyable button" — the design is
-    // immediate one-shot display, with the Copy button as a courtesy.
-    const password = await screen.findByTestId("revealed-password")
-    expect(password.textContent).toBe(TEMPORARY_PASSWORD)
-    expect(screen.getAllByText(/shown once/i).length).toBeGreaterThan(0)
-    expect(screen.getByText(/must change it at first sign-in/i)).toBeDefined()
-  })
-
-  it("the invite calls POST /api/identity/users and then refetches the list", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    const getsBefore = fetchCalls.filter(
-      (c) => c.method === "GET" && c.url.includes("/api/identity/users")
-    ).length
-    await inviteUser()
-    await screen.findByTestId("revealed-password")
-    const post = fetchCalls.find(
-      (c) => c.method === "POST" && c.url.endsWith("/api/identity/users")
-    )
-    expect(post).toBeDefined()
-    await waitFor(() => {
-      const getsAfter = fetchCalls.filter(
-        (c) => c.method === "GET" && c.url.includes("/api/identity/users")
-      ).length
-      expect(getsAfter).toBeGreaterThan(getsBefore)
-    })
-  })
-
-  it("the password is gone once the dialog is closed", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser()
-    await screen.findByTestId("revealed-password")
-
-    fireEvent.click(screen.getByRole("button", { name: "Close" }))
-    await waitFor(() => {
-      expect(screen.queryByTestId("revealed-password")).toBeNull()
-    })
-    expect(document.body.textContent).not.toContain(TEMPORARY_PASSWORD)
-  })
-
-  it("the password is never written to localStorage", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser()
-    await screen.findByTestId("revealed-password")
-    // The password must never be persisted client-side beyond the
-    // one-shot dialog prop. `JSON.stringify(localStorage)` collapses
-    // every key+value into one string; if the password (or any fragment
-    // long enough to be a fingerprint of it) leaked into storage, it
-    // would surface here.
-    const snapshot = JSON.stringify(localStorage)
-    expect(snapshot.includes(TEMPORARY_PASSWORD)).toBe(false)
-  })
-
-  it("a failed invite does NOT open the dialog", async () => {
-    setupFetch({ inviteStatus: 500 })
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser()
-    await waitFor(() => {
-      const posts = fetchCalls.filter(
-        (c) => c.method === "POST" && c.url.endsWith("/api/identity/users")
-      )
-      expect(posts.length).toBeGreaterThan(0)
-    })
-    expect(screen.queryByTestId("revealed-password")).toBeNull()
-  })
-
-  it("setting password upfront sends password mode set and does NOT open the revealed-password dialog", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser({
-      name: "User With Password",
-      username: "userpass",
-      passwordMode: "set",
-      password: "customPassword123!",
-      mustChangePassword: false,
-    })
-
-    await waitFor(() => {
-      const post = fetchCalls.find(
-        (c) => c.method === "POST" && c.url.endsWith("/api/identity/users")
-      )
-      expect(post).toBeDefined()
-      const body = JSON.parse(post?.body ?? "{}")
-      expect(body.password).toEqual({ mode: "set", value: "customPassword123!" })
-      expect(body.mustChangePassword).toBe(false)
-    })
-    expect(screen.queryByTestId("revealed-password")).toBeNull()
-  })
-
-  it("invite sends full payload with selected roles and tenants as checkboxes", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser({
-      name: "Role User",
-      username: "roleuser",
-      roles: ["Analyst"],
-      tenants: ["Meridian Retail"],
-    })
-
-    await waitFor(() => {
-      const post = fetchCalls.find(
-        (c) => c.method === "POST" && c.url.endsWith("/api/identity/users")
-      )
-      expect(post).toBeDefined()
-      const body = JSON.parse(post?.body ?? "{}")
-      expect(body.roles).toEqual(["Analyst"])
-      expect(body.tenants).toEqual(["Meridian Retail"])
-      expect(body.password).toEqual({ mode: "generate" })
-      expect(body.mustChangePassword).toBe(true)
-    })
-  })
-})
 
 describe("UsersPage reset password (a new password shown once)", () => {
   it("the reset action calls POST /api/identity/users/{id}/reset-password with the row id and shows the new password", async () => {
@@ -674,7 +492,10 @@ describe("UsersPage tabs (WEB-3 S3-D7)", () => {
     renderPage()
     expect(await screen.findByText("Rina Wijaya")).toBeTruthy()
     expect(screen.getByRole("tab", { name: "People" }).getAttribute("aria-selected")).toBe("true")
-    expect(screen.getByRole("button", { name: /invite user/i })).toBeTruthy()
+    // WEB-7 D2: the invite form is its own page, so this opens its address.
+    expect(
+      screen.getByRole("button", { name: /invite user/i }).getAttribute("href")
+    ).toBe("/admin/users/invite")
     expect(fetchCalls.some((c) => c.url.includes("/api/auth/sessions"))).toBe(false)
   })
 
@@ -686,6 +507,33 @@ describe("UsersPage tabs (WEB-3 S3-D7)", () => {
     expect(screen.getByRole("tab", { name: "Sessions" }).getAttribute("aria-selected")).toBe("true")
     expect(screen.queryByRole("button", { name: /invite user/i })).toBeNull()
     expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy()
+  })
+})
+
+describe("UsersPage shown-once invite password (ADM-3, WEB-7 D3)", () => {
+  it("opens the dialog for the password the invite page left in memory, then forgets it", async () => {
+    rememberInvitePassword({
+      password: TEMPORARY_PASSWORD,
+      mustChangePassword: false,
+    })
+    setupFetch()
+    const { unmount } = renderPage()
+
+    const password = await screen.findByTestId("revealed-password")
+    expect(password.textContent).toBe(TEMPORARY_PASSWORD)
+    expect(screen.getByText(/Shown once\.$/)).toBeTruthy()
+    expect(JSON.stringify(localStorage)).not.toContain(TEMPORARY_PASSWORD)
+    expect(JSON.stringify(sessionStorage)).not.toContain(TEMPORARY_PASSWORD)
+    // The store was read once; nothing is left to reopen it.
+    expect(takeInvitePassword()).toBeNull()
+
+    // Leaving and coming back does not show it again. (The dialog's own
+    // close button starts a Base UI exit animation that happy-dom never
+    // settles, so the property is asserted by a remount instead.)
+    unmount()
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    expect(screen.queryByTestId("revealed-password")).toBeNull()
   })
 })
 

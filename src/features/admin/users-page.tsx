@@ -1,13 +1,13 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { CreateSheet } from "@/components/patterns/create-sheet"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -33,8 +33,8 @@ import { useUrlTab } from "@/hooks/use-url-tab"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
-import * as authClient from "@/services/clients/auth"
 import type { Role, Tenant, User } from "@/services"
+import { takeInvitePassword } from "./invite-password"
 import { SessionsPanel } from "./sessions-page"
 import { getUserColumns, PillList, UserStatusPill } from "./user-columns"
 
@@ -56,23 +56,15 @@ export function UsersPage() {
   const rolesState = useService((s) => identityService.listRoles(s), [])
   const tenantsState = useService((s) => identityService.listTenants(s), [])
   const [selected, setSelected] = React.useState<User | null>(null)
-  const [createOpen, setCreateOpen] = React.useState(false)
-  const [name, setName] = React.useState("")
-  const [username, setUsername] = React.useState("")
-  const [email, setEmail] = React.useState("")
-  const [selectedRoles, setSelectedRoles] = React.useState<string[]>([])
-  const [selectedTenants, setSelectedTenants] = React.useState<string[]>([])
-  const [passwordMode, setPasswordMode] = React.useState<"generate" | "set">("generate")
-  const [setPassword, setSetPassword] = React.useState("")
-  const [mustChangePassword, setMustChangePassword] = React.useState(true)
-  const [revealedMustChange, setRevealedMustChange] = React.useState(true)
-  const passwordRulesState = useService((s) => authClient.passwordRules(s), [])
   const [editTarget, setEditTarget] = React.useState<User | null>(null)
   const [editUsername, setEditUsername] = React.useState("")
   const [editEmail, setEditEmail] = React.useState("")
-  // ADM-3 D1/D6: the temporary password the server generated, shown in
-  // the dialog below exactly ONCE.
+  // ADM-3 D1/D6, WEB-7 D3: the temporary password the server generated,
+  // shown in the dialog below exactly ONCE. The invite form is its own page
+  // now; it hands the password over in memory (`invite-password.ts`), never
+  // through the URL or web storage.
   const [revealedPassword, setRevealedPassword] = React.useState<string | null>(null)
+  const [revealedMustChange, setRevealedMustChange] = React.useState(true)
   // ADM-4 D7: the user whose roles are being edited, and the role names
   // the editor currently has ticked.
   const [rolesTarget, setRolesTarget] = React.useState<User | null>(null)
@@ -84,10 +76,15 @@ export function UsersPage() {
   const [statusTarget, setStatusTarget] = React.useState<User | null>(null)
   const tableUrlState = useTableUrlState()
 
-  const create = useServiceAction(
-    (signal, input: Parameters<typeof identityService.inviteUser>[0]) =>
-      identityService.inviteUser(input, signal)
-  )
+  // WEB-7 D3: the invite page leaves the generated password here. Reading
+  // it in an effect (not during render) keeps the one-shot read out of the
+  // render pass; the store itself clears it as it is taken.
+  React.useEffect(() => {
+    const pending = takeInvitePassword()
+    if (!pending) return
+    setRevealedMustChange(pending.mustChangePassword)
+    setRevealedPassword(pending.password)
+  }, [])
 
   const reset = useServiceAction(
     (signal, id: string) => identityService.resetPassword(id, signal)
@@ -193,42 +190,6 @@ export function UsersPage() {
     },
   })
 
-  function resetForm() {
-    setName("")
-    setUsername("")
-    setEmail("")
-    setSelectedRoles([])
-    setSelectedTenants([])
-    setPasswordMode("generate")
-    setSetPassword("")
-    setMustChangePassword(true)
-  }
-
-  async function handleCreate() {
-    const passwordInput =
-      passwordMode === "generate"
-        ? { mode: "generate" as const }
-        : { mode: "set" as const, value: setPassword }
-    const result = await create.run({
-      name: name.trim(),
-      username: username.trim() || undefined,
-      email: email.trim() || undefined,
-      roles: selectedRoles,
-      tenants: selectedTenants,
-      password: passwordInput,
-      mustChangePassword,
-    })
-    if (result) {
-      setCreateOpen(false)
-      if (result.temporaryPassword) {
-        setRevealedPassword(result.temporaryPassword)
-        setRevealedMustChange(mustChangePassword)
-      }
-      resetForm()
-      state.reload()
-    }
-  }
-
   async function handleSaveIdentity() {
     if (!editTarget) return
     const result = await updateIdentity.run(editTarget.id, {
@@ -277,10 +238,11 @@ export function UsersPage() {
         description="People, their roles and tenants, and the browser sessions signed in."
         actions={
           // Inviting belongs to People; the Sessions tab has nothing to add.
+          // WEB-7 D2: the form is its own page at /admin/users/invite.
           tab === "people" ? (
             <Button
               size="sm"
-              onClick={() => setCreateOpen(true)}
+              render={<Link href="/admin/users/invite" />}
               disabled={!canWrite}
               title={canWrite ? undefined : "You don't have permission to invite users."}
             >
@@ -346,165 +308,6 @@ export function UsersPage() {
           />
         ) : null}
       </DetailDrawer>
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Invite User"
-        description="Invite a user with roles and tenant membership."
-        canSubmit={Boolean(
-          name.trim() &&
-            (username.trim() || email.trim()) &&
-            (passwordMode === "generate" || setPassword.length >= 8)
-        )}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-        submitLabel="Invite"
-      >
-        <div className="space-y-1.5">
-          <Label htmlFor="user-name">Name</Label>
-          <Input id="user-name" value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="user-username">Username</Label>
-          <Input
-            id="user-username"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder="e.g. jdoe"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="user-email">Email (optional)</Label>
-          <Input
-            id="user-email"
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="jdoe@example.com"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label>Roles</Label>
-          <ul className="grid gap-1 max-h-36 overflow-y-auto rounded-md border border-border p-1">
-            {availableRoles.length === 0 ? (
-              <li className="px-2 py-1 text-xs text-muted-foreground">No roles defined</li>
-            ) : null}
-            {availableRoles.map((role) => (
-              <li key={role.id} className="flex items-center gap-2 px-1.5 py-1 text-sm">
-                <Checkbox
-                  id={`invite-role-${role.id}`}
-                  checked={selectedRoles.includes(role.name)}
-                  aria-label={role.name}
-                  onCheckedChange={(checked) =>
-                    setSelectedRoles((current) =>
-                      checked === true
-                        ? [...current, role.name]
-                        : current.filter((r) => r !== role.name)
-                    )
-                  }
-                />
-                <label
-                  htmlFor={`invite-role-${role.id}`}
-                  className="flex-1 truncate text-xs select-none cursor-pointer"
-                >
-                  {role.name}
-                </label>
-              </li>
-            ))}
-          </ul>
-        </div>
-        <div className="space-y-1.5">
-          <Label>Tenants</Label>
-          <ul className="grid gap-1 max-h-36 overflow-y-auto rounded-md border border-border p-1">
-            {knownTenants.length === 0 ? (
-              <li className="px-2 py-1 text-xs text-muted-foreground">No tenants defined</li>
-            ) : null}
-            {knownTenants.map((tenant) => (
-              <li key={tenant.id} className="flex items-center gap-2 px-1.5 py-1 text-sm">
-                <Checkbox
-                  id={`invite-tenant-${tenant.id}`}
-                  checked={selectedTenants.includes(tenant.name)}
-                  aria-label={tenant.name}
-                  onCheckedChange={(checked) =>
-                    setSelectedTenants((current) =>
-                      checked === true
-                        ? [...current, tenant.name]
-                        : current.filter((t) => t !== tenant.name)
-                    )
-                  }
-                />
-                <label
-                  htmlFor={`invite-tenant-${tenant.id}`}
-                  className="flex-1 truncate text-xs select-none cursor-pointer"
-                >
-                  {tenant.name}
-                </label>
-              </li>
-            ))}
-          </ul>
-        </div>
-        <div className="space-y-2 pt-2 border-t">
-          <Label>First password</Label>
-          <div className="flex gap-4">
-            <label className="flex items-center gap-1.5 text-xs select-none cursor-pointer">
-              <input
-                type="radio"
-                name="password-mode"
-                value="generate"
-                checked={passwordMode === "generate"}
-                onChange={() => setPasswordMode("generate")}
-              />
-              Generate
-            </label>
-            <label className="flex items-center gap-1.5 text-xs select-none cursor-pointer">
-              <input
-                type="radio"
-                name="password-mode"
-                value="set"
-                checked={passwordMode === "set"}
-                onChange={() => setPasswordMode("set")}
-              />
-              Set it now
-            </label>
-          </div>
-          {passwordMode === "set" ? (
-            <div className="space-y-1.5">
-              <Input
-                id="user-set-password"
-                type="password"
-                value={setPassword}
-                onChange={(e) => setSetPassword(e.target.value)}
-                placeholder="Enter password"
-                aria-label="Password"
-              />
-              <p className="text-xs text-muted-foreground">
-                At least {passwordRulesState.data?.minLength ?? 8} characters. Must not equal the username or email.
-              </p>
-            </div>
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              A temporary password will be generated and shown once.
-            </p>
-          )}
-          <div className="flex items-center gap-2 pt-1">
-            <Checkbox
-              id="must-change-password"
-              checked={mustChangePassword}
-              onCheckedChange={(c) => setMustChangePassword(c === true)}
-              aria-label="Must change password at first sign-in"
-            />
-            <label
-              htmlFor="must-change-password"
-              className="text-xs select-none cursor-pointer"
-            >
-              Must change password at first sign-in
-            </label>
-          </div>
-        </div>
-      </CreateSheet>
       {/* ADM-3 D1/D6: the temporary password, shown exactly once. */}
       <Dialog
         open={revealedPassword !== null}
