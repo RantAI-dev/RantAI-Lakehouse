@@ -473,3 +473,44 @@ Read the fix (`a88b7237..99ad77b1`, six files under `src/features/admin/`).
 **No open BLOCKER and no open SHOULD-FIX.** I ran no check locally; merged only when #461 is
 green on its last commit.
 
+### S2, round 1 (planner, 2026-11-11) — branch at `cdc600a1`
+
+Read: the six access-map entries, `chart-builder-page.tsx`, `chart-page.ts`, `save-draft.ts`,
+the change to `chart-draft-card.tsx`, and the service additions. The save-query, save-source
+and alert-rule forms are moved code; I checked that their tests moved with them and did not
+shrink (save query 70 assertions to 82, save source 3 to 10, alert rule 16 in its own file,
+none removed from `alerts-page.test.tsx`) rather than reading each field. I ran no check
+locally; #463 runs the suite.
+
+- D5 to D8 are built as planned. `CreateSheet` is deleted; the three direct `apiFetch` calls
+  are in `dashboardService`; SQL and chart drafts travel in `sessionStorage`, the dashboard's
+  parameter values in the address and only into the preview.
+- The three places where the developer used the server's rule instead of the plan's table
+  are accepted:
+  - the chart pages are `[]` and the page asks for `edit` on the dashboard, because
+    `POST`/`PUT /api/dashboard/specs` judge the level in the handler;
+  - the built-in dashboard reads the root level;
+  - the alert rule pages take `alert:write`. A person's own chart alert is edited from the
+    chart's dialog on the dashboard, which stays a dialog (D9), so nothing is lost here.
+
+**No BLOCKER.**
+
+**SHOULD-FIX**
+
+- **S1. The builder can mark the wrong chat step as saved** (T6; for the AI team's review
+  too). The draft carries `complete: { messageIndex, stepIndex }` and nothing that names the
+  conversation. The assistant's dock is on the builder page, so a person can start a new
+  chat or open another conversation before saving; `completeToolStep` then writes "created"
+  onto whatever sits at those two indexes in the conversation that is open now, a result
+  that never happened (principle 2). The draft records the conversation it came from
+  (`useCopilot().sessionId`), and the page marks the step only when the open conversation is
+  still that one. Tests for both.
+- **S2. The edit page takes any chart id.** `dashboardService.getChart(chartId)` is not
+  checked against the dashboard in the address, so `/dashboards/A/charts/<a chart of B>/edit`
+  opens B's chart under A's back link and A's access check. The server still judges the save
+  by the chart's own dashboard; the page should show "Chart not found" when the chart's
+  dashboard is not the one in the address. A test.
+- **S3. `useQueryStudio.save` and `saveAct` have no caller left** (the developer's own
+  note). Remove them and the tests that only exercise them; the rule they held is in
+  `saved-query-write.ts`, which is tested.
+
