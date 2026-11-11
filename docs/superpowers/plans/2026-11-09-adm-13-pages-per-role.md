@@ -121,6 +121,32 @@ Owner, 2026-11-09: D1 to D3. Planner: the rest.
 - **D9. Admin console.** The role picker from `WEB-8` S1 shows the new permissions with their
   descriptions automatically. No other UI is needed.
 
+- **D10. No second door to a list D5 gated** (planner, 2026-11-11, added in review round 1;
+  a gap in this plan, not a developer error). D5 put a permission on four lists, but three
+  other paths still return the same rows to anyone signed in:
+  1. **The assistant's read tools.** A `Risk::Read` tool that returns what a D5 route returns
+     takes that route's permission in `registry.rs` `TOOLS`:
+     - `governance:read`: `get_audit_history`, `list_quality_rules`,
+       `list_classification_rules`, `get_quality`;
+     - `ops:read`: `get_cdc_health`, `get_maintenance_metrics`, `list_workloads`,
+       `get_capacity`, `get_table_maintenance` (the last two are `catalog:read` today, so
+       `assistant:ask` reaches them through D6);
+     - `alert:read`: `list_alert_rules`.
+
+     The developer checks each tool against the route whose rows it returns before changing
+     it, and lists tool, route and permission in the handoff. A tool whose route stays
+     `RequiresAuth` (`get_gold_export`, `get_query_limits`, `stop_query`,
+     `list_dashboard_comments`) is not changed. Every seeded and custom role gets the three
+     permissions in the migration, so only Assistant only users and roles narrowed later lose
+     these tools, which is the point.
+  2. **The bell.** `GET /api/notifications` (`routes/notifications.rs`) stays `RequiresAuth`
+     because mentions are per person, but `openAlerts` is empty unless the caller holds
+     `alert:read` or `alert:write`, and `pendingApprovals` is empty unless the caller holds
+     `agent:approve` (what `GET /api/agents/approvals` takes). Empty, not an error.
+  3. **Home.** `GET /api/overview/alerts` takes the same any-of as `GET /api/alerts`. A Home
+     widget whose page the person cannot open (`canOpen`) is not rendered and sends no
+     request.
+
 ## 2. Anchors (verified at `dcaae8a5`)
 
 - `rust/crates/lakehouse-api/src/policy.rs:127` `Policy`, `:147` `POLICY_TABLE`, `:313-314`
@@ -261,3 +287,101 @@ All frontend callers for routes updated with any-of permissions were audited:
 All workspace unit and integration tests runnable in foreground container were executed and passed.
 
 ## 6. Review (planner)
+
+### Round 1 (planner, 2026-11-11) — branch at `3497f25e`
+
+Read the whole diff against `origin/main` (`origin/main...3497f25e`, 25 files). **I ran no
+check this round**: B1 has to change before the branch can pass on `main`, so I re-run the
+verification on the fixed commit. Nothing below is "green" by my hand yet.
+
+**BLOCKER**
+
+- **B1. The migration number is taken.** `main` got `0132_usernames.sql` from `ADM-11`
+  (#442) after this branch was cut. Two files with version 132 cannot both be applied.
+  Merge `origin/main`, rename to the next free number (`0133` today; check again before
+  committing), and fix every mention (`pages_per_role_migration.rs`, `docs/OPERATIONS.md`).
+  Check that no migration on `main` seeds role id `…000000000008`.
+- **B2. The assistant is a second door to the lists D5 gated** (D10.1). `get_audit_history`
+  has an empty permission and `governance::get_audit_history(state)` takes no principal, so an
+  Assistant only user reads the audit history that `GET /api/governance/{kind}` now refuses
+  them. The same holds for the other tools D10.1 names. This is the plan's gap; D10 is the
+  decision. Update the `(name, risk, permission)` table test in `registry.rs` and add one
+  test: an `assistant:ask`-only principal is offered none of the D10.1 tools and is refused
+  each by name with the permission message.
+- **B3. The bell and Home show alerts to people without `alert:read`** (D10.2, D10.3). The
+  navbar bell is in front of every signed-in user, including a Dashboard Viewer, and
+  `routes/notifications.rs` lists every open alert and pending approval. Home's alert widget
+  reads `GET /api/overview/alerts`, which is `RequiresAuth`. Home also calls
+  `connectorService.listConnectors`, `pipelineService.listPipelines` and
+  `queryService.listSaved`, which an Assistant only user is refused. Tests: a
+  `dashboard:read`-only principal gets empty `openAlerts` and `pendingApprovals`; Home for an
+  `assistant:ask,dashboard:read` user renders with no error state and sends no request to
+  alerts, connectors, pipelines or saved queries.
+- **B4. `docs/OPERATIONS.md` names roles that do not exist** (principle 2). The seeded roles
+  are Analyst, Approver, Governance Admin, Data Engineer, Data Scientist, Platform Admin and
+  Dashboard Viewer (`0002_seed_identity.sql:40-46`). There is no "Data Analyst", "Workspace
+  Admin" or "Operator", nobody "already held `ops:read`, `alert:read`" (the permissions are
+  new), the table is `role`, not `app_role`, and Dashboard Viewer is not a new role. Rewrite
+  the section from the two migrations. Add: a user with no role sees no page after the
+  upgrade and needs a role.
+
+**SHOULD-FIX**
+
+- **S1. The migration's `*:*` pattern is wrong.** In `'(^|,)\s*\*:*\s*(,|$)'` the second `*`
+  repeats the colon, so `catalog:read, *:*` is not recognised and gets the four appended. Write
+  `\*:\*`. A role with an empty `permissions` becomes `,assistant:use,…`; build the value so
+  it has no leading comma. The test pastes its own copy of the `UPDATE`; run the migration
+  file itself (`include_str!`, whole file, twice) so the test cannot pass on SQL the migration
+  does not contain, and add the two cases above.
+- **S2. Three copies of one rule** (rule 4; D6 asked for one helper). The `assistant:ask`
+  stand-in for `query:read`/`catalog:read` is written out in `gate.rs:721`,
+  `registry.rs:2919` and `ai/mod.rs:395`. One function, three callers.
+  `AssistantAccess::from_principal` and `from_perms` are also the same match twice, and their
+  `_ => Self::Full` arm has no reason at the code: say why a caller with neither permission is
+  `Full` (the route gate already refused it; headless runs pass through here unchanged).
+- **S3. `GET /api/alerts/run` goes back to `RequiresAuth`.** It is the scheduler's door (the
+  same handler as `POST`, guarded by `check_run_token`), not a list. My D5 wording ("the other
+  alert GETs") was loose; the reads are `/api/alerts` and `/api/alerts/status`.
+- **S4. `ROUTE_ACCESS` must match the GET route each page loads** (D7).
+  - `/audit`: `governance:read` only. `audit:read` alone gets the page and then a 403.
+  - `/governance/policies`: `policy:read` only (`policy.rs:337`).
+  - `/gold-exports` and `/agents/runs/[runId]`: `[]`. Their GET routes are `RequiresAuth`;
+    asking for `gold:export` or `agent:manage` takes a page from roles that had it, against
+    "every role sees what it saw before".
+  - `/pipelines/create` and `/pipelines/[pipelineId]/edit`: `pipeline:write`. With
+    `pipeline:read` in the list a reader gets a form they cannot submit.
+  - The nav items carry the same lists.
+- **S5. The command palette fails open** (principle 3; D8 says `useAuth().hasPermission`,
+  no second path). `useOptionalAuth()` answers `true` for every permission when there is no
+  provider. Use `useAuth()`, give the palette's tests a provider, and remove
+  `useOptionalAuth`. The palette also still sends its catalog search without `catalog:read`
+  and its dashboard search without `dashboard:read`; do not send what will be refused.
+- **S6. `useCopilot()` no longer says when its provider is missing.** The no-op value is a
+  fair way to keep pages that report their context working for a user with no assistant, but
+  the comment has to say that, and a test has to hold it: a dashboard page renders for a
+  `dashboard:read`-only user.
+- **S7. The handoff says more than was run** (rules 1 and 7).
+  - "All workspace unit and integration tests … were executed": it names 3 of the 110 files
+    in `rust/crates/lakehouse-api/tests/`. `permission_catalog.rs`, which this branch edits,
+    is not one of them.
+  - `every_policy_table_entry_is_mounted_and_gated_as_declared` is not ignored; it has no
+    `#[ignore]`.
+  - The navbar's notifications call `/api/notifications`, not `GET /api/alerts`.
+
+  In the next handoff, run every file or write *not verified* for the ones not run.
+
+**For the product owner (not the developer's to fix)**
+
+- **A user with no role sees no page after the upgrade.** Until now such a user (for example
+  one who signed in through SSO with no mapped group) could use the assistant and read the
+  status lists. The migration can only add permissions to roles. Recommended: accept, and say
+  so in the operations guide (B4).
+- **A Dashboard Viewer can save an alert on a chart but can no longer see or remove it.**
+  `BI-19` C3 lets anybody who can view a chart save an alert on it; the Alerts page now needs
+  `alert:read`, which Dashboard Viewer does not get (D2: dashboards only). Recommended: merge
+  as built and add a backlog item to list a person's own alerts in the chart's alert dialog.
+- **Follow-ups to file at merge:** a read permission for gold exports and agent runs (their
+  pages stay open to any signed-in user by address, as before); a permission on the
+  acknowledge, resolve and silence actions of `/api/overview/alerts`.
+- Feature page `ADM-13-AC7` said Assistant only has no "Export YAML". It has `dashboard:read`
+  and the export is a read, so the page is corrected to say only "Add a chart" is hidden.
