@@ -1,4 +1,4 @@
-import type { Session } from "../contracts/auth";
+import type { PasswordRulesResponse, Session } from "../contracts/auth";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
@@ -11,9 +11,10 @@ import { ServiceError } from "../errors";
  *
  * `providers` IS registered — the SSO admin page reads it via
  * `authService.providers`, and the page has no other way to ask "is OIDC
- * configured on this deployment" (`routes/auth.rs:731`). It is the only
- * auth method that fits the read-only, page-shaped pattern the rest of the
- * service registry follows.
+ * configured on this deployment" (`routes/auth.rs:731`). `passwordRules`
+ * is registered too (`WEB-7`): the Invite user page states the lengths the
+ * server enforces. Those two are the read-only, page-shaped auth methods the
+ * rest of the service registry follows.
  */
 
 /** Mirrors `MeResponse` from `rust/crates/lakehouse-api/src/routes/auth.rs`. */
@@ -152,11 +153,6 @@ export async function deleteSession(id: string, signal?: AbortSignal): Promise<v
     throw new ServiceError("unavailable", json?.error ?? "Failed to revoke session.");
   }
 }
-
-export type PasswordRulesResponse = {
-  minLength: number;
-  maxLength: number;
-};
 
 /**
  * `GET /api/auth/password-rules` (ADM-11 D4).

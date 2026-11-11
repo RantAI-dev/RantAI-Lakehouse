@@ -116,7 +116,10 @@ describe("DataQualityPage: adding a rule", () => {
   it("shows the button with governance:write", async () => {
     stubApi(["governance:write"])
     renderPage()
-    expect(await screen.findByRole("button", { name: "Add Quality Rule" })).toBeTruthy()
+    // WEB-7 T3: the form is its own page.
+    expect(
+      (await screen.findByRole("button", { name: "Add Quality Rule" })).getAttribute("href")
+    ).toBe("/governance/data-quality/rules/new")
   })
 
   it("hides the button without governance:write", async () => {

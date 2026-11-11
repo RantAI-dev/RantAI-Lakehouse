@@ -4,15 +4,12 @@ import * as React from "react"
 import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { CreateSheet } from "@/components/patterns/create-sheet"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { CheckBadge, SeverityBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
@@ -24,24 +21,15 @@ import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { notifyError, withNotify } from "@/lib/notify"
-import type { Severity } from "@/lib/status"
+import { withNotify } from "@/lib/notify"
 import { governanceService } from "@/services"
 import type { QualityRule } from "@/services/contracts/governance"
-import {
-  SEVERITY_OPTIONS,
-  getDataQualityColumns,
-} from "./data-quality-columns"
-import { CheckFields, ThresholdForms } from "./quality-check-fields"
-import { EMPTY_FORM, KINDS, ruleThreshold, type RuleForm } from "./quality-checks"
+import { getDataQualityColumns } from "./data-quality-columns"
 import { QualityIncidents } from "./quality-incidents"
 import { FreshnessTargetsTab } from "./freshness-targets-tab"
 import { EditRuleDialog } from "./quality-rule-edit-dialog"
 import { RuleRuns } from "./quality-rule-runs"
 import { QualitySchedulesTab } from "./quality-schedules-tab"
-
-const selectClassName =
-  "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 const QUALITY_TABS = ["rules", "schedules", "freshness"] as const
 type QualityTab = (typeof QUALITY_TABS)[number]
@@ -57,34 +45,7 @@ export function DataQualityPage() {
   const [tab, setTab] = useUrlTab("tab", QUALITY_TABS)
   const state = useService((s) => governanceService.listQuality(s), [])
   const [selected, setSelected] = React.useState<QualityRule | null>(null)
-  const [createOpen, setCreateOpen] = React.useState(false)
-  const [name, setName] = React.useState("")
-  const [asset, setAsset] = React.useState("")
-  const [formDimension, setFormDimension] = React.useState("")
-  const [threshold, setThreshold] = React.useState("")
-  // DATA-14 (F7): a check is picked by default, so the threshold is always
-  // one the API can run; the typed form stays for what a picker cannot say.
-  const [typedThreshold, setTypedThreshold] = React.useState(false)
-  const [checkForm, setCheckForm] = React.useState<RuleForm>(EMPTY_FORM)
-  const builtThreshold = ruleThreshold(checkForm)
-  const finalThreshold = typedThreshold ? threshold.trim() : (builtThreshold ?? "")
-  const finalDimension =
-    formDimension.trim() || (typedThreshold ? "" : KINDS[checkForm.kind].dimension)
-  const [severity, setSeverity] = React.useState<Severity>("medium")
   const tableUrlState = useTableUrlState()
-
-  const create = useServiceAction(
-    withNotify(
-      {
-        success: "Quality rule created",
-        error: "Failed to create quality rule",
-      },
-      (
-        signal,
-        input: Parameters<typeof governanceService.createQualityRule>[0]
-      ) => governanceService.createQualityRule(input, signal)
-    )
-  )
 
   const runCheck = useServiceAction(
     withNotify(
@@ -143,16 +104,6 @@ export function DataQualityPage() {
     },
   })
 
-  function resetForm() {
-    setName("")
-    setAsset("")
-    setFormDimension("")
-    setThreshold("")
-    setTypedThreshold(false)
-    setCheckForm(EMPTY_FORM)
-    setSeverity("medium")
-  }
-
   async function handleRun(rule: QualityRule) {
     const result = await runCheck.run(rule.id)
     if (!result) return
@@ -176,30 +127,6 @@ export function DataQualityPage() {
     state.reload()
   }
 
-  async function handleCreate() {
-    const result = await create.run({
-      name: name.trim(),
-      asset: asset.trim(),
-      dimension: finalDimension,
-      threshold: finalThreshold,
-      severity,
-    })
-    if (result) {
-      // DATA-14 (AC1): run the new rule once now, so a check that already
-      // fails opens its incident at once; the rule stays whatever this says.
-      if (hasPermission("query:read") && result.evaluable !== false) {
-        try {
-          await governanceService.runQualityRule(result.id)
-        } catch (err) {
-          notifyError("The rule was added, but its first run failed", err)
-        }
-      }
-      setCreateOpen(false)
-      resetForm()
-      state.reload()
-    }
-  }
-
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
@@ -208,9 +135,10 @@ export function DataQualityPage() {
         actions={
           // SEC-23 (F4): the API now refuses adding a rule without
           // governance:write, like editing and deleting one. WEB-3 S3-D5:
-          // adding a rule belongs to the rules tab.
+          // adding a rule belongs to the rules tab. WEB-7 D2: the form is
+          // its own page.
           tab === "rules" && hasPermission("governance:write") ? (
-            <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <Button size="sm" render={<Link href="/governance/data-quality/rules/new" />}>
               <PlusIcon data-icon="inline-start" />
               Add Quality Rule
             </Button>
@@ -356,102 +284,6 @@ export function DataQualityPage() {
         destructive
         onConfirm={() => void handleDelete()}
       />
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Add Quality Rule"
-        description="Define a quality check with dimension, threshold, and severity."
-        canSubmit={Boolean(name.trim() && asset.trim() && finalDimension && finalThreshold)}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-      >
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-name">Name</Label>
-          <Input
-            id="qr-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-asset">Asset</Label>
-          <Input
-            id="qr-asset"
-            value={asset}
-            onChange={(e) => setAsset(e.target.value)}
-          />
-        </div>
-        {typedThreshold ? (
-          <div className="space-y-1.5">
-            <Label htmlFor="qr-threshold">Threshold</Label>
-            <Input
-              id="qr-threshold"
-              className="font-mono"
-              value={threshold}
-              onChange={(e) => setThreshold(e.target.value)}
-              placeholder="email not null >= 99%"
-            />
-            <p className="text-xs text-muted-foreground">
-              To be runnable, write it as one of: <ThresholdForms />. Name the asset as
-              silver.table, serving.table or bronze.table.
-            </p>
-          </div>
-        ) : (
-          <div className="grid gap-3">
-            <CheckFields
-              form={checkForm}
-              onChange={(patch) => setCheckForm((f) => ({ ...f, ...patch }))}
-              columns={null}
-              idPrefix="qr"
-            />
-            <p className="text-xs text-muted-foreground">
-              {builtThreshold ? (
-                <>
-                  Threshold: <span className="font-mono text-foreground">{builtThreshold}</span>
-                </>
-              ) : (
-                "Fill in the check to see its threshold."
-              )}
-            </p>
-          </div>
-        )}
-        <Button
-          type="button"
-          variant="link"
-          size="sm"
-          className="self-start px-0"
-          onClick={() => setTypedThreshold((t) => !t)}
-        >
-          {typedThreshold ? "Pick a check instead" : "Write the threshold myself"}
-        </Button>
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-dim">Dimension</Label>
-          <Input
-            id="qr-dim"
-            value={formDimension}
-            onChange={(e) => setFormDimension(e.target.value)}
-            placeholder={typedThreshold ? "completeness" : KINDS[checkForm.kind].dimension}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-severity">Severity</Label>
-          <select
-            id="qr-severity"
-            className={selectClassName}
-            value={severity}
-            onChange={(e) => setSeverity(e.target.value as Severity)}
-          >
-            {SEVERITY_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </div>
-      </CreateSheet>
     </div>
   )
 }
