@@ -137,4 +137,102 @@ Give the commits, the exact commands with their counts, the D2 "requires" check,
 check result, the D8 grep, anything *not verified* and why, and the output of `git status
 --short`, `git log --oneline origin/main..HEAD` and `git ls-remote --heads origin <branch>`.
 
+### Handoff (developer, 2026-11-11, S1)
+
+Branch `feat/web-7-s1-admin-forms`, off `origin/main` at `8c551164`. Base, developer-side:
+TypeScript only; no Rust, migration, compose or S2 code touched.
+
+**Commits**
+
+- `c4f7e7e2` — T1/D1: `src/components/patterns/form-page.tsx` and its test.
+- `9aac6e87` — T2/D2–D4: Invite user, Create service identity, Create role, Edit role, Create
+  tenant, New tag key and Edit tag key are pages; `ROUTE_ACCESS` entries; the invite's
+  shown-once password crosses the redirect in memory.
+- `8f902808` — T3/D2: Add quality rule is a page.
+- This handoff is its own docs commit.
+
+T4/D8 was **not** done: `CreateSheet` still has two users (`save-query-sheet.tsx`,
+`save-sql-source-sheet.tsx`, both S2), so per the plan it waits for S2 T7. The grep is below.
+
+**Anchors re-found (plan's were verified at `dcaae8a5`; these moved on `main`)**
+
+| Anchor | At `dcaae8a5` | Now (before this branch's edit) |
+| --- | --- | --- |
+| `users-page.tsx` `<CreateSheet>` | 315 | 349 — ADM-11 grew the file by 285 lines; removed here |
+| `service-identities-page.tsx` `<CreateSheet>` | 187 | 188; `openCreateSheet` 133 → 134; removed here |
+| `roles-page.tsx` `<CreateSheet>` | 158 | 159; `RoleFields` 185 → 186; `EditRoleSheet` 236 (unchanged); removed/moved here |
+| `tenants-page.tsx` `<CreateSheet>` | 140 | 140 (unchanged); removed here |
+| `tag-keys-page.tsx` `<CreateSheet>` | 189 | 189 (unchanged); removed here |
+| `data-quality-page.tsx` `<CreateSheet>` | 359 | 359 (unchanged); removed here |
+| `create-sheet.tsx` | 18-72 | 18-72 (unchanged) |
+| `nav-config.ts` `ROUTE_ACCESS` | — | did not exist at `dcaae8a5`; ADM-13 (`4189c0b1`, PR #454) added `ROUTE_ACCESS` and `canOpen` |
+
+**D2 "requires", checked against the server**
+
+| Form | Route | Server route and permission (`policy.rs`) | `ROUTE_ACCESS` used |
+| --- | --- | --- | --- |
+| Invite user | `/admin/users/invite` | `POST /api/identity/users` → `identity:write` (871) | `identity:write` |
+| Create service identity | `/admin/service-identities/new` | `POST /api/identity/service-identities` → `identity:write` (910) | `identity:write` |
+| Create role | `/admin/roles/new` | `POST /api/identity/roles` → `identity:write` (901) | `identity:write` |
+| Edit role | `/admin/roles/[id]/edit` | `PUT /api/identity/roles/{id}` → `identity:write` (905) | `identity:write` |
+| Create tenant | `/admin/tenants/new` | `POST /api/identity/tenants` → `identity:write` (908) | `identity:write` |
+| New tag key | `/admin/settings/tag-keys/new` | `POST /api/governance/tag-keys` → `governance:write` (363) | `governance:write` |
+| Edit tag key | `/admin/settings/tag-keys/[key]/edit` | `PUT /api/governance/tag-keys/{key}` → `governance:write` (364) | `governance:write` |
+| Add quality rule | `/governance/data-quality/rules/new` | `POST /api/governance/{kind}` → `governance:write` (396) | `governance:write` |
+
+No row differs from the plan's table: the tag-keys row ("the permission `tag-keys-page.tsx:44`
+checks") is `governance:write`, the same grant the page already used. The handler adds no
+narrowing on top of the policy for these eight routes.
+
+**What changed in behaviour**
+
+- D1: `FormPage` takes the required `submittingLabel`, so a new page says "Creating…" and an
+  edit page says "Saving…". Nothing renders a sheet.
+- D3: `src/features/admin/invite-password.ts` is a module-level in-memory store. The invite page
+  `rememberInvitePassword`s the temporary password and pushes `/admin/users`; the Users list
+  `takeInvitePassword`s it once in a mount effect and opens the existing one-shot dialog. Tests
+  assert the push target holds no password, `localStorage` and `sessionStorage` do not, and a
+  remount does not reopen the dialog. The invite form had no success toast before, so none was
+  added; the password dialog is its feedback.
+- D4: Edit role and Edit tag key load by id/key through the existing `listRoles` / `tagKeysService.list`
+  reads (no new endpoint exists or was added), so a reload works; an unknown id/key shows
+  `EmptyState`.
+- `GOV-7` S2: the role form body is still `RoleFields`, exported from `role-form-page.tsx` and
+  used by both pages, so a new section lands in one place.
+- Layering: the invite form's password-rules read now goes through `authService` (registered in
+  `services/index.ts`, type moved to `contracts/auth.ts`) instead of importing
+  `@/services/clients/auth` from a feature; the client no longer declares the type.
+- Test infrastructure note: a Base UI dialog's own Close button starts an exit animation
+  happy-dom never settles (the runner hangs after the click). The "shown once" property is
+  asserted by unmounting and remounting the list, which still proves the store is single-use;
+  no assertion was dropped.
+
+**D8 grep (`grep -rn 'CreateSheet' src --include=*.tsx --include=*.ts`)**
+
+Imports remaining: `src/features/queries/save-query-sheet.tsx:5` and
+`src/features/queries/save-sql-source-sheet.tsx:6` only. Every admin and governance user is
+gone; `create-sheet.tsx` itself and doc-comment mentions remain. T4 therefore moves to S2 T7.
+
+**Commands run (foreground, this machine, final commit)**
+
+- `bun run typecheck` → `$ bun --bun tsc --noEmit`, no errors.
+- `bun run lint` → 0 errors, 10 warnings, all pre-existing and none in a touched file
+  (`data-table.tsx`, `ui/sidebar.tsx`, `alerts-page.tsx`, `login-page.tsx`, `use-copilot.ts`,
+  `use-data-table.ts`, `dashboard-specs.ts`, `uploads.test.ts`, `services/http.ts`).
+- `bun test src/components/patterns` → 15 pass, 0 fail, 30 expect() calls, 3 files.
+- `bun test src/components/app-shell` → 27 pass, 0 fail, 111 expect() calls, 4 files (includes
+  the ADM-13 route-coverage test with the eight new pages).
+- `bun test src/features/admin` → 112 pass, 0 fail, 1546 expect() calls, 19 files.
+- `bun test src/features/governance` → 65 pass, 0 fail, 166 expect() calls, 11 files.
+
+**Not verified locally: the rest, left to CI.** The whole `bun run test` suite was not run on
+this machine (its memory ceiling, as briefed); no cargo command was run (no Rust change); D5's
+editor round trip is S2, not measured here.
+
+`git status --short` after the code commits: clean (only this handoff pending).
+`git log --oneline origin/main..HEAD`: `c4f7e7e2`, `9aac6e87`, `8f902808`.
+`git ls-remote --heads origin feat/web-7-s1-admin-forms`: the branch exists and points at the
+pushed head.
+
+
 ## 6. Review (planner)
