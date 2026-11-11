@@ -8,7 +8,12 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService } from "@/hooks/use-service"
-import { assetService, type RoleTableAccess, type RoleTableGrant } from "@/services"
+import {
+  assetService,
+  type Asset,
+  type RoleTableAccess,
+  type RoleTableGrant,
+} from "@/services"
 
 /**
  * The `GOV-7` S2 section on the Edit role page: which schemas and tables the
@@ -32,8 +37,8 @@ export type TableAccessDraft = {
   grants: RoleTableGrant[]
 }
 
-/** The catalog fields the picker reads from a list row. */
-type CatalogAsset = { id: string; tableKey?: string | null }
+/** The catalog fields the picker reads from a list row (`GOV-7 S2 review 2 R2-S1`). */
+type CatalogAsset = Pick<Asset, "id" | "tableKey">
 
 /**
  * The schema every Bronze table lives in (`GOV-7` D9). The server addresses
@@ -69,9 +74,12 @@ const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
 
 /**
  * The `<schema>.<table>` key a list row names, or `null` when it names none.
- * `GOV-7` D9: the list row carries `tableKey` (`bronze.<table_name>` on a
- * Bronze row, the id itself on Silver/Gold), and the `id` fallback keeps a
- * Silver/Gold row from an older API build usable.
+ * `GOV-7` D9: a Bronze list row carries `tableKey` (`bronze.<table_name>`);
+ * a Silver or Gold list row carries none, because its `id` already is its
+ * key (`silver_catalog_row`, `gold_catalog_row`). The `id` is therefore the
+ * second candidate, which is also what keeps a row from an older API build —
+ * one that sends no `tableKey` at all — usable.
+ * `GOV-7 S2 review 2 R2-S1`.
  */
 function tableKeyOf(asset: CatalogAsset): string | null {
   for (const candidate of [asset.tableKey, asset.id]) {
@@ -88,17 +96,18 @@ const compareNames = (a: string, b: string) => a.toLowerCase().localeCompare(b.t
 
 /**
  * The schemas the picker offers: the catalog's tables grouped by the schema
- * their `tableKey` names, plus every schema and table the role's grants
- * name.
+ * part of the `<schema>.<table>` key each row names, plus every schema and
+ * table the role's grants name.
  *
- * A Silver or Gold row's `id` is its `<schema>.<table>` key, and its
- * `tableKey` says the same. A Bronze row's `id` is a registry slug, and its
- * table is named only by `tableKey` — `bronze.<table_name>`, the key the
- * server builds (`GOV-7` D9) — so such a table is offered by name under
- * `bronze`. A row whose registry records no table name has no key: it is
- * counted as unnamed under `bronze`, and no grant covers it (the server
- * hides it from a narrowed role's lists), so it is never offered under an
- * invented name.
+ * A Silver or Gold row's `id` is its `<schema>.<table>` key, and its list
+ * row carries no `tableKey` — that is why the `id` is read. A Bronze row's
+ * `id` is a registry slug, and its table is named only by `tableKey` —
+ * `bronze.<table_name>`, the key the server builds (`GOV-7` D9) — so such a
+ * table is offered by name under `bronze`. A row whose registry records no
+ * table name has no key: it is counted as unnamed under `bronze`, and no
+ * grant covers it (the server hides it from a narrowed role's lists), so it
+ * is never offered under an invented name.
+ * `GOV-7 S2 review 2 R2-S1`.
  */
 export function schemaChoices(
   assets: readonly CatalogAsset[],

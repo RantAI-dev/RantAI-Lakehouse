@@ -37,6 +37,12 @@ import * as authClient from "./clients/auth"
 // has been deleted.
 export const overviewService = clickhouseOverviewService
 export const assetService = clickhouseAssetService
+/**
+ * The catalog's list-row shape (`GOV-7` S2). The contract owns it, and it is
+ * exported here so a feature imports it from `@/services` rather than from
+ * the contract module (`GOV-7 S2 review 2 R2-S1`).
+ */
+export type { Asset } from "./contracts/assets"
 // Pipelines is now fully real — list/get/runs/trigger from Dagster,
 // create/generate from Postgres + LLM, cancel/retry/pause/resume are
 // real Dagster mutations. mock/pipelines.ts has been deleted.
