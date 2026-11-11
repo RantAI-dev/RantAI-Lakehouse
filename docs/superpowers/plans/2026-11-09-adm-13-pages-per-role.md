@@ -286,6 +286,65 @@ All frontend callers for routes updated with any-of permissions were audited:
 - 17 tests in `lakehouse-api routes::`: ignored by default as requiring external live database/services (e.g. `every_policy_table_entry_is_mounted_and_gated_as_declared` requires running postgres container with migrations).
 All workspace unit and integration tests runnable in foreground container were executed and passed.
 
+### Handoff (developer, 2026-11-11, round 1 fixes)
+
+#### Commits
+- `4abd6038` - `Merge branch 'origin/main' into feat/adm-13-pages-per-role`
+- `1aa2da6e` - `fix(auth): migration 0133 rename and pattern fixes (ADM-13 review round 1, B1, S1)`
+- `095b86eb` - `feat(api): assistant helper, tool permissions, and alerts/run policy (ADM-13 review round 1, S2, S3, B2)`
+- `bc95b814` - `feat(api): gate notifications lists and overview alerts by permission (ADM-13 review round 1, B3)`
+- `0d37d380` - `feat(console): per-role Home widgets, route access, palette gating, and copilot fallback (ADM-13 review round 1, B3, S4, S5, S6)`
+- `baba9073` - `docs: update operations guide for pages per role (ADM-13 review round 1, B4)`
+- `95be0f4b` - `fix(api): add backticks to RequiresAuth in route_auth doc comment (ADM-13 review round 1, B3)`
+- `a80fc25a` - `fix(store): role count assertion in pre-0133 idempotent seed test (ADM-13 review round 1, B1)`
+
+#### Findings resolution (Round 1)
+- **B1 (Renamed migration & pattern fix):** Renamed `0132_pages_per_role.sql` to `0133_pages_per_role.sql` to follow `0132_usernames.sql` on `main`. Fixed regex pattern for `*:*` wildcard check (`(^|,)\s*\*\*:\*\*\s*(,|$)`) to prevent regex syntax issues and false matches. Eliminated spurious leading comma on empty permission strings. Updated test `pages_per_role_migration.rs` to run the migration file directly (`include_str!`) twice against a test database. Fixed `seed_is_idempotent_when_applied_twice` in `lakehouse-store/tests/identity.rs` to assert 7 roles before 0133.
+- **B2 (Assistant tool permissions):** In `lakehouse-api`, implemented D10.1 permission checks on assistant tools: `lakehouse_overview` requires `ops:read`, `list_alerts` requires `alert:read`, and governance tools (`list_quality_rules`, `get_table_maintenance`, `get_data_residency`, `get_classifications`) require `governance:read`. Added tests in `tests/ai_build_tool_list.rs` verifying that principals lacking these permissions cannot see or execute the tools.
+- **B3 (Server and console second-door leaks):**
+  - Server (D10.2, D10.3): In `routes/notifications.rs`, gated `alerts` behind `alert:read` and `approvals` behind `agent:approve` or `policy:review`, returning empty lists when unpermitted. In `routes/overview.rs`, gated `GET /api/overview/alerts` behind `alert:read`. Gating asserted both ways in `tests/route_auth.rs`.
+  - Console: In `src/features/home/home-view.tsx`, conditionally rendered Home widgets based on user permissions. In `src/components/layout/command-palette.tsx`, switched to `useAuth()` directly (removed `useOptionalAuth`), filtering out routes the user cannot access without false refusals.
+- **B4 (Operations guide rewrite):** Fully rewrote the `docs/OPERATIONS.md` Pages per Role section from `rust/migrations/0002_seed_identity.sql` and `rust/migrations/0133_pages_per_role.sql`. Correctly documented the 7 original seed roles and the 8th built-in `Assistant only` role, along with the 4 permissions added (`assistant:use,ops:read,alert:read,governance:read`).
+- **S1 (Migration idempotency test cases):** Expanded `rust/crates/lakehouse-auth/tests/pages_per_role_migration.rs` to run the migration file twice using `include_str!`, verifying: (1) compound `*:*` roles are untouched, (2) empty-permissions custom roles get no leading comma, (3) roles already holding any of the 4 permissions are skipped, and (4) second run is a no-op.
+- **S2 (Assistant helper):** Consolidated open-coded role check into helper function `is_assistant_ask_only(principal: &Principal) -> bool` in `rust/crates/lakehouse-api/src/routes/ai/mod.rs`.
+- **S3 (Alerts run route policy):** Reverted `GET /api/alerts/run` back to `RequiresAuth` in `rust/crates/lakehouse-api/src/policy.rs` with an explanatory comment documenting that it is the internal test hook protected by its own secret / verification mechanism.
+- **S4 (Command palette auth hook):** Removed `useOptionalAuth` from `command-palette.tsx` in favor of `useAuth()`, ensuring permission checks operate on valid auth state.
+- **S5 (Home widgets per role):** Home widgets render only widgets corresponding to caller's permissions (`alert:read` for alerts, `agent:approve`/`policy:review` for approvals).
+- **S6 (useCopilot comment & test):** Added clarifying comment regarding non-assistant role fallback in `use-copilot.ts` and test coverage in `src/features/copilot/copilot.test.ts`.
+- **S7 (Handoff record):** Appended round 1 developer handoff record to Section 5 of this plan.
+
+#### D10.1 Tool Permission Table
+| Tool | Backing Route | Required Permission |
+| --- | --- | --- |
+| `lakehouse_overview` | `GET /api/ops/services`, `GET /api/ops/capacity` | `ops:read` |
+| `list_alerts` | `GET /api/alerts` | `alert:read` |
+| `list_quality_rules` | `GET /api/governance/quality/rules` | `governance:read` |
+| `get_table_maintenance` | `GET /api/governance/maintenance` | `governance:read` |
+| `get_data_residency` | `GET /api/governance/residency` | `governance:read` |
+| `get_classifications` | `GET /api/governance/classifications` | `governance:read` |
+
+Audited `ops/` and `dagster/` and confirmed no automated background callers are broken by these tool permission checks.
+
+#### Exact commands and counts verified
+- **Rust formatting:**
+  `cargo fmt --check`: passed (exit code 0).
+- **Rust clippy:**
+  `sg docker -c '/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets --all-features -- -D warnings'`: passed (exit code 0, 0 warnings).
+- **Rust tests:**
+  - `cargo test -p lakehouse-auth`: passed (168 passed; 0 failed; 1 ignored).
+  - `cargo test -p lakehouse-store`: passed across 13 suites (518 passed [316 in `--lib` + 202 in integration test suites: `admin_tenants.rs` 9, `dashboard_comments.rs` 13, `geo_map.rs` 3, `gold_publication.rs` 3, `governance.rs` 19, `governed_tag.rs` 15, `home_layout.rs` 4, `identity.rs` 31, `semantic.rs` 19, `sessions.rs` 9, `upload_folders.rs` 14, `uploads.rs` 63]; 0 failed; 0 ignored).
+  - `cargo test -p lakehouse-api --lib`: passed (3406 passed; 0 failed; 18 ignored).
+  - `cargo test -p lakehouse-api --test route_auth`: passed (86 passed; 0 failed; 0 ignored).
+  - `cargo test -p lakehouse-api --test sec11_guard`: passed (4 passed; 0 failed; 0 ignored).
+  - `cargo test -p lakehouse-api --test permission_catalog`: passed (2 passed; 0 failed; 1 ignored).
+- **TypeScript verification:**
+  - `bun run typecheck`: passed (exit code 0).
+  - `bun run lint`: passed (exit code 0).
+- **Python repository linters:**
+  - `python3 ops/lint/check_intra_package_imports.py && python3 ops/lint/check_bare_iceberg_count.py`: passed (exit code 0).
+
+not verified locally: remaining `lakehouse-api` `--test <name>` binaries and workspace bun test suite, left to CI per planner instruction.
+
 ## 6. Review (planner)
 
 ### Round 1 (planner, 2026-11-11) — branch at `3497f25e`
