@@ -15,6 +15,8 @@ import { SsoNotice } from "@/features/auth/sso-notice";
 import { VersionBanner } from "@/features/version/version-banner";
 import { AppShellSkeleton } from "@/components/app-shell/app-shell-skeleton";
 
+import { RouteGuard } from "@/components/app-shell/route-guard";
+
 /**
  * The app frame (sidebar + navbar + AI dock + command palette). For PUBLIC
  * read-only routes (`/public/*`, `/embed/*`, `/login`) this frame is
@@ -35,15 +37,13 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
 
   return (
     <SidebarProvider>
-      <CopilotProvider>
-        <AuthenticatedFrame>{children}</AuthenticatedFrame>
-      </CopilotProvider>
+      <AuthenticatedShell>{children}</AuthenticatedShell>
     </SidebarProvider>
   );
 }
 
-function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }>) {
-  const { status } = useAuth();
+function AuthenticatedShell({ children }: Readonly<{ children: React.ReactNode }>) {
+  const { status, hasPermission } = useAuth();
   const pathname = usePathname();
 
   if (status !== "authenticated") {
@@ -54,6 +54,26 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
     // the status flip.
     return <AppShellSkeleton pathname={pathname ?? "/"} />;
   }
+
+  const hasAssistant =
+    hasPermission("assistant:use") || hasPermission("assistant:ask");
+
+  if (hasAssistant) {
+    return (
+      <CopilotProvider>
+        <AuthenticatedFrame hasAssistant={true}>{children}</AuthenticatedFrame>
+      </CopilotProvider>
+    );
+  }
+
+  return <AuthenticatedFrame hasAssistant={false}>{children}</AuthenticatedFrame>;
+}
+
+function AuthenticatedFrame({
+  children,
+  hasAssistant,
+}: Readonly<{ children: React.ReactNode; hasAssistant: boolean }>) {
+  const pathname = usePathname();
 
   return (
     <>
@@ -69,7 +89,7 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
           <main
             className={cn(
               "flex-1 min-w-0 p-4 sm:p-5 lg:p-6",
-              !dockHiddenOn(pathname) && "pb-24 sm:pb-24 lg:pb-28",
+              hasAssistant && !dockHiddenOn(pathname) && "pb-24 sm:pb-24 lg:pb-28",
             )}
           >
             {/* `SEC-39`: the SSO callback redirects into the console with
@@ -86,11 +106,11 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
                 banner names both versions; it renders nothing when they
                 match. */}
             <VersionBanner />
-            {children}
+            <RouteGuard>{children}</RouteGuard>
           </main>
-          <CopilotSidebar />
+          {hasAssistant && <CopilotSidebar />}
         </div>
-        <CopilotDock />
+        {hasAssistant && <CopilotDock />}
       </SidebarInset>
       <CommandPalette />
     </>

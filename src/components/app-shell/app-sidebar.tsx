@@ -26,7 +26,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { cn } from "@/lib/utils"
-import { NAV_GROUPS, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
+import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
 
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
@@ -56,10 +56,15 @@ export function AppSidebar() {
   const router = useRouter()
   const pathname = usePathname()
   const activeHref = activeNavHref(pathname)
-  const groups = NAV_GROUPS
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
-  const { user } = useAuth()
+  const { user, hasPermission } = useAuth()
+  const groups = React.useMemo(() => {
+    return NAV_GROUPS.map((g) => ({
+      ...g,
+      items: g.items.filter((it) => canOpen(it.href, hasPermission)),
+    })).filter((g) => g.items.length > 0)
+  }, [hasPermission])
   const activeGroup = groups.find((g) => g.items.some((it) => it.href === activeHref))
   const defaultOpenLabels = React.useMemo(
     () => groups.filter((g) => g.defaultOpen).map((g) => g.label),

@@ -88,11 +88,13 @@ async fn ask_mode_refuses_write_low_tool_and_audits_it() {
 
 /// A principal lacking the tool's permission is refused via
 /// `POST /api/ai/tool`, with the same `reason: "permission"` shape the
-/// chat loop's gate produces, and exactly one audit row.
+/// chat loop's gate produces, and exactly one audit row. It holds
+/// `assistant:use` and nothing else: that is the route's own floor since
+/// `ADM-13` D5, so the call reaches the tool's gate.
 #[tokio::test]
 async fn missing_permission_refuses_and_audits_with_permission_reason() {
     let TestApp { router, pool } = spin_up().await;
-    let user_id = common::create_zero_permission_principal(&pool).await;
+    let user_id = common::create_assistant_principal(&pool, "").await;
     let cookie = common::session_cookie_for_user(&pool, user_id).await;
 
     let resp = post_tool(
@@ -120,13 +122,15 @@ async fn missing_permission_refuses_and_audits_with_permission_reason() {
 
 /// SEC-9-AC2 through the real router: a principal without `query:read` is
 /// refused by both SQL tools, the permission is named, and the audited
-/// outcome is `refused`, not `failed`. The test app's `ClickHouse` upstream is
+/// outcome is `refused`, not `failed`. It holds `assistant:use` and nothing
+/// else — the route's floor since `ADM-13` D5 — so the tools' own gate is
+/// what refuses. The test app's `ClickHouse` upstream is
 /// deliberately dead, so a call that had reached an engine would have been
 /// audited `failed`; `refused` is the proof that nothing was sent.
 #[tokio::test]
 async fn the_sql_tools_are_refused_without_query_read_and_never_reach_an_engine() {
     let TestApp { router, pool } = spin_up().await;
-    let user_id = common::create_zero_permission_principal(&pool).await;
+    let user_id = common::create_assistant_principal(&pool, "").await;
     let cookie = common::session_cookie_for_user(&pool, user_id).await;
 
     for (tool, args) in [
@@ -754,12 +758,13 @@ async fn set_board_view_filters_returns_the_view_payload() {
 }
 
 /// `set_board_view_filters` is available to a Dashboard Viewer (only
-/// `dashboard:read`); the five writing tools are refused with the
-/// permission message.
+/// `dashboard:read`, plus `assistant:use` for the route itself since
+/// `ADM-13` D5); the five writing tools are refused with the permission
+/// message.
 #[tokio::test]
 async fn set_board_view_filters_works_with_dashboard_read_only() {
     let TestApp { router, pool } = spin_up().await;
-    let user_id = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let user_id = common::create_assistant_principal(&pool, "dashboard:read").await;
     let cookie = common::session_cookie_for_user(&pool, user_id).await;
 
     // The view filter call passes the gate; the route is not called, so
@@ -807,12 +812,14 @@ async fn set_board_view_filters_works_with_dashboard_read_only() {
     }
 }
 
-/// A principal with no permissions at all is refused on every new tool,
-/// including the `Read` view filter (which needs `dashboard:read`).
+/// A principal with no tool permission at all — `assistant:use` is the route's
+/// own floor since `ADM-13` D5 and is the only thing it holds — is refused on
+/// every new tool, including the `Read` view filter (which needs
+/// `dashboard:read`).
 #[tokio::test]
 async fn new_tools_are_refused_for_a_zero_permission_principal() {
     let TestApp { router, pool } = spin_up().await;
-    let user_id = common::create_zero_permission_principal(&pool).await;
+    let user_id = common::create_assistant_principal(&pool, "").await;
     let cookie = common::session_cookie_for_user(&pool, user_id).await;
 
     for tool in [
@@ -953,7 +960,7 @@ async fn set_cache_rule_refuses_minutes_out_of_range_with_the_console_sentence()
 #[tokio::test]
 async fn set_cache_rule_is_refused_without_dashboard_write() {
     let TestApp { router, pool } = spin_up().await;
-    let user = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let user = common::create_assistant_principal(&pool, "dashboard:read").await;
     let cookie = common::session_cookie_for_user(&pool, user).await;
     let resp = post_tool(
         &router,

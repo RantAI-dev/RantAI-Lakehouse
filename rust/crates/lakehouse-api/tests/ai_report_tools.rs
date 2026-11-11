@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
 };
 use lakehouse_store::report_subscriptions as subs;
 use serde_json::{Value, json};
@@ -85,7 +86,7 @@ async fn fixture() -> F {
         ),
     ]);
     let app = spin_up_with_env(&env).await;
-    let me = create_principal_with_permissions(&app.pool, "dashboard:read, dashboard:write").await;
+    let me = create_assistant_principal(&app.pool, "dashboard:read, dashboard:write").await;
     let cookie = session_cookie_for_user(&app.pool, me).await;
     // `dashboard:write` is not the tool's permission; it is here so the
     // requester could also use other tools. The approver is a different person.
@@ -448,7 +449,7 @@ async fn someone_elses_subscription_is_not_found_to_the_assistant_and_a_stranger
     args["confirmed"] = json!(true);
     tool(&f, "create_report_subscription", args).await;
     let id = all(&f.app.pool).await[0].id.to_string();
-    let stranger = create_principal_with_permissions(&f.app.pool, "dashboard:read").await;
+    let stranger = create_assistant_principal(&f.app.pool, "dashboard:read").await;
     let stranger_cookie = session_cookie_for_user(&f.app.pool, stranger).await;
     let listed = post(
         &f,

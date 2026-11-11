@@ -384,3 +384,60 @@ async fn the_offered_tools_of_a_build_turn_fit_a_small_context() {
         compact.chars().count()
     );
 }
+
+/// ADM-13 (D6): an assistant:ask-only user is forced into Ask mode even when
+/// the request asks for "build" mode. Only Read tools are offered, no write tools
+/// (like `create_chart`) are offered, and the system prompt declares Ask mode.
+#[tokio::test]
+async fn an_assistant_ask_only_user_in_build_mode_receives_only_read_tools() {
+    let llm = mock_model().await;
+    let ch = mock_clickhouse().await;
+    let mut env = std::collections::HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+
+    let user_id = common::create_principal_with_permissions(&pool, "assistant:ask").await;
+    let cookie = common::session_cookie_for_user(&pool, user_id).await;
+
+    let body = json!({
+        "mode": "build",
+        "messages": [{ "role": "user", "content": "Show the share of foreign visitors by country as a pie." }],
+    });
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/chat")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let requests = llm.received_requests().await.expect("recording is on");
+    let first: Value = serde_json::from_slice(&requests[0].body).expect("a JSON request");
+    let tools = first["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+
+    for write in CHART_CORE_WRITES {
+        assert!(
+            !names.contains(write),
+            "ask-only user must not be offered write tool {write}: {names:?}"
+        );
+    }
+    assert!(names.contains(&"run_sql"), "must offer run_sql: {names:?}");
+
+    let system = first["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system.contains("MODE: ASK (read-only)"),
+        "system prompt must declare Ask mode: {system}"
+    );
+}

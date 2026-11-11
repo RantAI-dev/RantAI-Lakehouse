@@ -2255,7 +2255,9 @@ mod route_policy_tests {
                         ));
                     }
                 }
-                Policy::RequiresAuth | Policy::RequiresPermission(_) => {
+                Policy::RequiresAuth
+                | Policy::RequiresPermission(_)
+                | Policy::RequiresAnyPermission(_) => {
                     if status != StatusCode::UNAUTHORIZED {
                         failures.push(format!(
                             "{method} {pattern}: declared {policy:?} but got {status} (expected 401) with no credentials"
