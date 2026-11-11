@@ -492,6 +492,31 @@ pub async fn create_zero_permission_principal(pool: &PgPool) -> Uuid {
     user_id
 }
 
+/// Creates a fresh `app_user` who may use the assistant (`assistant:use`)
+/// and who holds `permissions` besides — the principal a test about what a
+/// tool does *inside* `/api/ai/*` needs since `ADM-13` D5 put that permission
+/// on every assistant route (before it, any signed-in person reached the
+/// tools; now a tool's own gate is only reached by somebody who may use the
+/// assistant at all).
+///
+/// `permissions` is a `role.permissions`-shaped string and may be empty: a
+/// person whose only grant is the assistant is what a test proving "each tool
+/// refuses somebody without *its* permission" wants, because the request has
+/// to reach the tool for the tool's refusal to be the thing under test.
+///
+/// Not a change to [`create_principal_with_permissions`]: that helper's other
+/// callers are tests about non-assistant surfaces (dashboards, connectors,
+/// the identity routes), where holding `assistant:use` would make the
+/// principal something the test does not mean.
+pub async fn create_assistant_principal(pool: &PgPool, permissions: &str) -> Uuid {
+    let permissions = if permissions.is_empty() {
+        "assistant:use".to_owned()
+    } else {
+        format!("{permissions},assistant:use")
+    };
+    create_principal_with_permissions(pool, &permissions).await
+}
+
 /// Creates a fresh `app_user` holding a role that grants EXACTLY
 /// `permissions` (a `role.permissions`-shaped string, e.g. `"ingest:read"`
 /// or `"connector:manage"`) and returns its `app_user.id`.

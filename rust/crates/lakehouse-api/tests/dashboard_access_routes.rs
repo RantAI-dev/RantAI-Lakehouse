@@ -23,7 +23,8 @@ use uuid::Uuid;
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
 };
 
 /// The dashboards the stand-in store holds: `(id, folder, owner)`. `b_private`
@@ -588,7 +589,7 @@ async fn restricted_folder(pool: &PgPool) {
 async fn the_assistant_does_not_list_a_restricted_dashboard_to_an_unlisted_reader() {
     let (router, pool, _ch) = app().await;
     restricted_folder(&pool).await;
-    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader = create_assistant_principal(&pool, "dashboard:read").await;
     let cookie = session_cookie_for_user(&pool, reader).await;
     let (status, body) = send(
         &router,
@@ -808,8 +809,8 @@ async fn a_manager_of_the_parent_folder_does_not_reach_a_restricted_child() {
 #[tokio::test]
 async fn the_assistant_cannot_save_a_digest_of_a_restricted_dashboard() {
     let (router, pool, _ch) = app().await;
-    let insider = create_principal_with_permissions(&pool, "dashboard:read, alert:write").await;
-    let outsider = create_principal_with_permissions(&pool, "dashboard:read, alert:write").await;
+    let insider = create_assistant_principal(&pool, "dashboard:read, alert:write").await;
+    let outsider = create_assistant_principal(&pool, "dashboard:read, alert:write").await;
     replace_item(&pool, "folder", "f1", &[view_for(insider)], true, None)
         .await
         .unwrap();
@@ -1268,8 +1269,8 @@ async fn the_people_picker_serves_a_rule_only_manager_and_the_report_picker_does
 #[tokio::test]
 async fn the_assistants_chart_tools_need_edit_on_a_restricted_dashboard() {
     let (router, pool, _ch) = app().await;
-    let viewer = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
-    let editor = create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let viewer = create_assistant_principal(&pool, "dashboard:read, dashboard:write").await;
+    let editor = create_assistant_principal(&pool, "dashboard:read, dashboard:write").await;
     replace_item(
         &pool,
         "folder",
@@ -1430,8 +1431,8 @@ fn chart_ids(body: &Value, key: &str) -> Vec<String> {
 async fn the_chart_lists_leave_out_a_restricted_dashboards_charts() {
     let (router, pool, _ch) = app().await;
     restricted_folder(&pool).await;
-    let outsider = create_principal_with_permissions(&pool, "dashboard:read").await;
-    let rule_only = create_principal_with_permissions(&pool, "query:read").await;
+    let outsider = create_assistant_principal(&pool, "dashboard:read").await;
+    let rule_only = create_assistant_principal(&pool, "query:read").await;
     replace_item(
         &pool,
         "board",
@@ -1912,8 +1913,7 @@ async fn every_path_that_names_a_sql_source_hides_one_in_a_restricted_folder() {
 async fn the_assistant_does_not_resolve_a_hidden_sql_source_either() {
     let (router, pool, _ch) = app().await;
     restricted_folder(&pool).await;
-    let outsider =
-        create_principal_with_permissions(&pool, "dashboard:read, dashboard:write").await;
+    let outsider = create_assistant_principal(&pool, "dashboard:read, dashboard:write").await;
     let cookie = session_cookie_for_user(&pool, outsider).await;
     for (tool, args) in [
         ("list_calculated_fields", json!({ "sqlSource": "{}" })),

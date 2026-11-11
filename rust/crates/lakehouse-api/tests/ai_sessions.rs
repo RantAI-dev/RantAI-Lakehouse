@@ -26,9 +26,7 @@ use testcontainers_modules::clickhouse::ClickHouse;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use common::{
-    TestApp, create_zero_permission_principal, session_cookie_for_user, spin_up_with_env,
-};
+use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
 
 static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
     tokio::sync::OnceCell::const_new();
@@ -64,8 +62,10 @@ async fn app_with_two_users() -> (TestApp, String, String, Uuid, Uuid) {
     let mut env = HashMap::new();
     env.insert("CH_URL".to_owned(), ch_url.to_owned());
     let app = spin_up_with_env(&env).await;
-    let owner = create_zero_permission_principal(&app.pool).await;
-    let other = create_zero_permission_principal(&app.pool).await;
+    // `ADM-13` D5: both people may use the assistant and hold nothing else;
+    // the tests are about whose conversation each may read, not permissions.
+    let owner = create_assistant_principal(&app.pool, "").await;
+    let other = create_assistant_principal(&app.pool, "").await;
     let owner_cookie = session_cookie_for_user(&app.pool, owner).await;
     let other_cookie = session_cookie_for_user(&app.pool, other).await;
     (app, owner_cookie, other_cookie, owner, other)
