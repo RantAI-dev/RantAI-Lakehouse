@@ -810,6 +810,48 @@ da16e9eaabf8a3388b7f87fb7c9ddeb2b02f787c	refs/heads/feat/gov-7-s2-console
 ```
 
 
+### Handoff (developer, 2026-11-11, S2 round 2 fix)
+
+R2-S1 only. Branch `feat/gov-7-s2-console` from `248dbfcf`.
+
+- **`0d21aaad` — `fix(admin): hold the table picker to the Asset contract`.**
+  - `src/services/contracts/assets.ts`: `tableKey?: string | null` is declared on `Asset`
+    (the list row) and removed from `AssetDetail`, which inherits it through `AssetDetail =
+    Asset & {…}`. The comment states what the server does, checked against
+    `rust/crates/lakehouse-api/src/routes/catalog.rs`: `bronze_catalog_row` emits
+    `bronze.<table_name>` or `null` (:1536); `silver_catalog_row` (:1648) and
+    `gold_catalog_row` (:1682) emit no `tableKey`; `clickhouse_detail_body` inserts the key
+    into every Silver/Gold detail (:3070) and `bronze_detail_body` into every Bronze one
+    (:3144). The server matched the brief exactly.
+  - `src/services/index.ts`: `Asset` is exported as a type, because it was not, so the
+    feature imports it from `@/services` (the brief asked for this check-and-export).
+  - `src/features/admin/role-table-access.tsx`: `CatalogAsset` is now
+    `Pick<Asset, "id" | "tableKey">`, so the compiler holds the picker to the contract. The
+    comments on `tableKeyOf` and `schemaChoices` now say a Silver or Gold **list** row has
+    no `tableKey` and its `id` names the table — which is why `id` is the second candidate.
+    One further sentence in `schemaChoices`' first paragraph ("grouped by the schema their
+    `tableKey` names") was wrong for the same reason and is corrected to "the schema part of
+    the key each row names".
+  - No behaviour change: the `for` loop over `[asset.tableKey, asset.id]` and every
+    comparison are untouched, and no test was edited — none needed a type-only adjustment.
+
+Commands, as run (foreground, on `0d21aaad`):
+
+- `bun install --frozen-lockfile` — "678 packages installed", 1.73 s.
+- `bun run typecheck` — pass (no output).
+- `bun run lint` — 11 problems, 0 errors, 11 warnings, all pre-existing and none in a file
+  this round touched.
+- `bun test src/features/admin src/services` — **354 pass, 0 fail**, 2,241 `expect()`
+  calls, 40 files. The `AssistantSettingsForm (ADM-9)` flake described in the brief did not
+  occur in this run, so the command ran once.
+
+**Not verified, and why:** no cargo command was run — this round touches no Rust file. The
+whole `bun run test` and the page against a live API were not run; #468's CI covers the
+first, and the picker stays covered by the component tests only.
+
+`git status --short` before the code commit: only the three files above, staged by hand; no
+generated file. Remote head after both pushes is this branch's tip.
+
 ## 6. Review (planner)
 
 ### S1, round 1 (planner, 2026-11-11) — branch at `3f6b5569`
