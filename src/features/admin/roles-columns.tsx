@@ -17,6 +17,18 @@ import { formatNumber } from "@/lib/format"
 import type { Role } from "@/services/contracts/identity"
 
 /**
+ * A Roles-list row: the role plus the table-access summary its column shows
+ * (`GOV-7` D8). The summary is worked out by the page, because the roles
+ * endpoint carries no read scope and each role's access is read once.
+ */
+export type RoleRow = Role & {
+  /** "All tables", "N schemas, M tables", or "—" when the read failed. */
+  tables: string
+  /** The read failed: the cell says it could not be read, not "All tables". */
+  tablesFailed: boolean
+}
+
+/**
  * The Roles list. `onEdit` / `onDelete` are given only to someone with
  * `identity:write` (`WEB-3` S3-D8); without them the menu only copies.
  */
@@ -26,7 +38,7 @@ export function getRoleColumns({
 }: {
   onEdit?: (role: Role) => void
   onDelete?: (role: Role) => void
-} = {}): ColumnDef<Role>[] {
+} = {}): ColumnDef<RoleRow>[] {
   return [
     {
       accessorKey: "name",
@@ -65,6 +77,25 @@ export function getRoleColumns({
         label: "Permissions",
         variant: "text",
       },
+    },
+    {
+      id: "tables",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Tables" />
+      ),
+      cell: ({ row }) => {
+        const item = row.original
+        return (
+          <span
+            className={item.tablesFailed ? "text-muted-foreground" : undefined}
+            title={item.tablesFailed ? "This role's tables could not be read." : undefined}
+          >
+            {item.tables}
+          </span>
+        )
+      },
+      enableSorting: false,
+      enableColumnFilter: false,
     },
     {
       accessorKey: "description",

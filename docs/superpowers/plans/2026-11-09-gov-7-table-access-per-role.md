@@ -193,6 +193,19 @@ S1:
     is not run, write *not verified*.
   - If p95 is over 5 ms, report it. Do not add a cache unasked.
 
+- **D9. Bronze tables are named in the lists (planner, 2026-11-11, from S2 round 1).**
+  - A Bronze row of the catalog list is addressed by a registry slug and named no table, so
+    a narrowed role never saw a Bronze row, whatever it was granted, and the picker could
+    not offer one.
+  - `bronze_catalog_row` emits `tableKey`: `bronze.<table_name>`, or `null` when the registry
+    records no table. It is the same key `bronze_asset_detail_body` already emits.
+    `asset_table_key` is unchanged and now finds it.
+  - The picker reads `tableKey` from the list row. A Bronze table is listed by name under the
+    schema `bronze`. A row with no key counts as unnamed under `bronze`.
+  - The catalog's `namespace` (`primer`, `sekunder`) is a display grouping. It is never
+    offered or sent as a schema: no table lives in a schema of that name, so such a grant
+    reads nothing.
+
 S2:
 
 - **T6 (D8).** The contract (`RoleTableAccess` type, `getRoleTableAccess`,
@@ -204,6 +217,35 @@ S2:
   - *Accept:* `bun run typecheck && bun run lint && bun test src/features/admin`.
 - **T7.** Docs: `docs/OPERATIONS.md` gets "Limiting a role to some schemas or tables", with
   the limits from the feature page.
+- **T8 (D9; S2 round 1 B2).** Rust, `lakehouse-api` only. `bronze_catalog_row` takes the
+  table name and emits `tableKey`.
+  - Tests in `tests/table_access.rs`:
+    - a narrowed role granted one Bronze table sees that row in `GET /api/catalog` and in
+      `GET /api/catalog/query`, and does not see another Bronze row;
+    - a narrowed role granted only a Silver table still sees no Bronze row.
+  - The first test must fail on the branch before the change. Say so in the handoff.
+  - *Accept* (every cargo command through `/home/shiro/rantai/bin/cargo-locked`):
+    `cargo fmt --check`, `cargo clippy -p lakehouse-api --all-targets -- -D warnings`,
+    `cargo test -p lakehouse-api --test table_access`,
+    `cargo test -p lakehouse-api --lib catalog`. Never a bare
+    `cargo test -p lakehouse-api <filter>`.
+- **T9 (D9; S2 round 1 B1, S1, S2).** Console.
+  - `schemaChoices` takes the table from `tableKey` when the row has one, else from an `id`
+    that holds a dot. A row with neither counts as unnamed under `bronze`. `namespace` is not
+    read.
+  - A grant's table is compared without regard to case everywhere in the section, as the
+    rule compares it.
+  - Save sends the table-access request only when the scope or the grants differ from what
+    was loaded.
+  - Bun tests:
+    - a Bronze row with `tableKey: "bronze.orders"` is offered as `orders` under `bronze`;
+    - a Bronze row with no key gives a `bronze` group with the sentence, and no `primer`
+      group;
+    - a stored grant `silver.Orders` shows the catalog's `orders` ticked, and unticking it
+      removes the grant from the body;
+    - saving the role with the section untouched sends no table-access request.
+  - `docs/OPERATIONS.md` says how Bronze tables are named in the section.
+  - *Accept:* `bun run typecheck && bun run lint && bun test src/features/admin src/services`.
 
 ## 4. Out of scope
 
@@ -527,6 +569,333 @@ $ git ls-remote --heads origin feat/gov-7-s1-enforce
 (`ba2d8f0c` is `origin/main`'s tip, on this branch only through the merge.
 This handoff's own docs commit sits on top of the three lines above.)
 
+### Handoff (developer, 2026-11-12, S2)
+
+Branch `feat/gov-7-s2-console`, cut from `origin/main` at `de8430be` (`GOV-7` S1, #459,
+merged). TypeScript and docs only: no Rust, no migration, no API change, no new page and no
+`ROUTE_ACCESS` entry.
+
+#### Commits
+
+- `d599bf2b` T6 — the contract (`RoleTableAccess`, `RoleTableGrant`,
+  `SetRoleTableAccessInput`), the client and `services/index.ts`, the section
+  (`role-table-access.tsx`), the Edit page's Save, the roles-list summary, and the tests.
+- `e80bfed3` T7 — `docs/OPERATIONS.md`, "Limiting a role to some schemas or tables".
+- `b4a19189` — two comments at the sites where grants are kept (no behaviour), so the
+  reason sits at the code (rule 1).
+
+#### The Save decision: one Save for the page
+
+The plan's "The Save button calls `PUT …/table-access`" is read as the page's single
+**Save**. `RoleEditForm` (`role-form-page.tsx`) writes the role first
+(`PUT /api/identity/roles/{id}`), then the tables
+(`PUT /api/identity/roles/{id}/table-access`), and:
+
+- if the role write fails, no table-access request is sent and the error says
+  "The role was not saved: …";
+- if the role write succeeds and the table-access write fails, the page says
+  "The role was saved, but its tables were not: <the server's own sentence>" (a 400's
+  text arrives unchanged through `ServiceError.message`) and does **not** navigate;
+- a role holding `*:*` sends no table-access write at all: the section is disabled with
+  the API's sentence ("A role with full access cannot be narrowed") and the role save
+  navigates as before;
+- if the role's current access could not be read, the role is saved, no table-access
+  write is sent (a write now would replace grants nobody saw), and the page says so and
+  stays. **Save is disabled while that read is in flight**, so this can only follow a
+  failed read, which the section shows with a Retry.
+
+The section's own state is the page's draft, seeded from `GET …/table-access`; grants the
+catalog does not list are rendered ("Not in the catalog (kept until removed)") inside a
+schema group that opens by default, and are sent back unchanged until removed.
+
+#### What the roles-list summary reads
+
+`GET /api/identity/roles` returns the store's `Role` (`id`, `name`, `members`,
+`permissions`, `description`); `ROLE_SELECT` does not read `role.read_scope`, so the list
+carries no table access and the API was **not** changed. `roles-page.tsx` therefore reads
+`GET …/table-access` **once per role**, in parallel (`loadRoleTableAccesses`): N requests
+for N roles, on a page an administrator opens by hand. A role whose read fails is `null`
+and its row says "—" (with a title) rather than "All tables"; while the reads are in
+flight the cell also says "—", never a guessed answer.
+
+The summary is computed into the row (`RoleRow` in `roles-columns.tsx`) rather than into
+the cell from a map, so the `columns` array keeps its identity when the reads land: a
+rebuild remounts every cell and closes a row's open menu under the reader. While loading,
+a role whose permissions hold `*:*` already says "All tables", because D4 makes the rule
+ignore its stored scope.
+
+#### Where the picker's schemas come from, and its one gap (reported, not improvised)
+
+`assetService.listAssets({})` reads `GET /api/catalog`. A Silver or Gold row's `id` **is**
+its `<schema>.<table>` key, so the section groups by the part before the first dot and
+lists the part after it — the names a statement uses.
+
+**A Bronze row cannot be named from the list.** Its `id` is a registry slug and
+`bronze_catalog_row` emits no `tableKey`/`tableName`; only the detail body does
+(`bronze_asset_detail_body`, from `dataset_sync`). The console already documents this as
+"the Bronze slug gap" (`src/lib/table-key-href.ts`). So, for a Bronze asset, the section
+offers its **namespace** (`primer` / `sekunder`) with the "Whole schema" checkbox and the
+sentence "The catalog names these assets by slug, not by table name. Choose the whole
+schema, or add a table below."; the free-text row adds `bronze.<table>` by hand. No table
+name is invented, and nothing the role already holds is dropped. Listing Bronze tables by
+name would need an API change, which S2 does not make.
+
+When the catalog read fails, the section says so and keeps the grants it has (still
+removable) and the free-text row; it never shows an empty list as if there were no tables.
+
+#### Tests added
+
+- `src/features/admin/role-form-page.test.tsx` — 11 tests (6 of them S2): "Only these"
+  with one whole schema sends `{"scope":"listed","grants":[{"schema":"silver","table":"*"}]}`
+  after the role's own PUT; a `*:*` role shows the section disabled with the server's
+  sentence and writes no table access; `bronze.orders_new` typed by hand is sent exactly
+  as typed; a grant the catalog does not list is shown and kept through a save; a refused
+  table-access write says the role was saved but its tables were not and stays on the page;
+  a failed catalog still shows the grant and saves it.
+- `src/features/admin/roles-page.test.tsx` — 9 tests (3 S2): "All tables", "2 schemas,
+  1 table", and "—" (never "All tables") when a role's access cannot be read.
+- `src/services/clients/identity.test.ts` — 4 tests: the GET, the PUT body, the 400
+  sentence kept as `invalid_request`, and 404 as `not_found`.
+
+#### Commands, as run (foreground, final code commit `b4a19189`)
+
+- `bun install --frozen-lockfile` — "Checked 779 installs across 753 packages (no
+  changes)", 1.52 s.
+- `bun run typecheck` — pass (no output).
+- `bun run lint` — **11 problems, 0 errors, 11 warnings**, all pre-existing and none in a
+  file this slice touched (data-table, sidebar, sso-page, alerts-page, login-page,
+  use-copilot, use-data-table, dashboard-specs, uploads.test, services/http.ts). The one
+  warning this slice introduced (an unused `permissions` in the test stub) was removed.
+- `bun test src/features/admin` — **133 passed, 0 failed**, 20 files.
+- `bun test src/services` — **216 passed, 0 failed**, 20 files.
+- `bun test src/components/app-shell` — **27 passed, 0 failed**, 4 files (run though no
+  page or route changed).
+- No cargo command: no Rust file changed.
+
+One run of `bun test src/features/admin` (chained after the other two folders in one
+shell command) reported **132 pass / 1 fail** and the failing name was not captured; ten
+subsequent runs — eight alone and two in the same chained sequence — were **133 pass /
+0 fail**. Recorded as observed. CI runs the full suite on the pull request.
+
+**not verified locally: the rest, left to CI, and the section in a real browser.** Locally
+not run: the whole `bun run test`, and the page against a live API (a real `/api/catalog`
+and the two table-access routes), so the picker's rendering and the two-request Save were
+verified only through the component tests and the client test.
+
+**For the planner:** the feature page's "Limits to tell a customer"
+(`docs/core/features/table-access-per-role.md`) still lists only its original four limits.
+The three from the S1 review — a scheduled agent run is not narrowed, names are compared
+without regard to case, the check is one database read per request — are in
+`docs/OPERATIONS.md` after T7, but not yet on the page. The page is the planner's file, so
+it was not edited here.
+
+No mismatch between the plan and the code was found, except the Bronze naming gap above:
+the plan says "the schemas from `assetService.listAssets`", and the list names no Bronze
+table. Handled honestly, reported here, no decision changed.
+
+#### `git status --short`, `git log --oneline origin/main..HEAD`, remote
+
+```
+$ git status --short
+(clean)
+
+$ git log --oneline origin/main..HEAD
+b4a19189 docs(gov-7): say at the code why a `*:*` role and whole-schema picks keep their grants (T6)
+e80bfed3 docs(gov-7): how to limit a role to some schemas or tables (T7)
+d599bf2b feat(gov-7): pick the schemas and tables a role can read (T6)
+
+$ git ls-remote --heads origin feat/gov-7-s2-console
+b4a191891ba256039650affdc8b2a7a0788aa829	refs/heads/feat/gov-7-s2-console
+```
+
+(This handoff's own docs commit sits on top of the three lines above, as the S1 handoffs'
+did.)
+
+
+### Handoff (developer, 2026-11-11, S2 round 1 fixes)
+
+Fixes `GOV-7` S2 review 1: T8 (B2, Rust) and T9 (B1, S1, S2, console). Decisions unchanged;
+no mismatch between the plan and the code was found.
+
+#### Commits (pushed after each)
+
+- `55c757dd` fix(catalog): a Bronze list row names its table so a narrowed role sees it (T8)
+- `da16e9ea` fix(admin): name Bronze tables under bronze, compare grants without case, write
+  only a changed section (T9)
+
+#### T8 (B2), `rust/`, every command through `/home/shiro/rantai/bin/cargo-locked`
+
+The new test was written first and run against the unfixed branch. It failed with:
+
+```
+thread 'the_catalog_lists_the_bronze_table_a_narrowed_role_is_granted' panicked at
+crates/lakehouse-api/tests/table_access.rs:1132:5:
+a granted Bronze table must be listed: {"assets":[],"namespaces":[]}
+```
+
+Commands, as run on the final T8 code (foreground, shared `CARGO_TARGET_DIR`):
+
+- `cargo-locked fmt --check` — pass (no output).
+- `cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings` — pass,
+  `Finished` with no warning.
+- `cargo-locked test -p lakehouse-api --test table_access` — **14 passed, 0 failed**.
+- `cargo-locked test -p lakehouse-api --lib catalog` — **301 passed, 0 failed**,
+  3,172 filtered out.
+
+`bronze_catalog_row` now takes `table_name` and emits `"tableKey"`:
+`bronze.<table_name>`, or `null` when the registry records none;
+`assemble_bronze_rows` passes `str_col(c, "table_name")`. `asset_table_key`'s logic is
+unchanged, and its doc comment plus the row builder's say what the list carries now. The
+function gained a ninth argument, so it carries `#[allow(clippy::too_many_arguments)]` with
+a reason, the same one `bronze_detail_body` gives. `CatalogFake` now answers the Bronze
+`dataset_catalog` read with two datasets; no existing assertion was weakened.
+
+#### T9 (B1, S1, S2), console
+
+- **B1:** `schemaChoices` reads a row's table from `tableKey`, else from a dotted `id`; a row
+  with neither counts as unnamed under the one `BRONZE_SCHEMA` constant (whose comment names
+  `catalog.rs` `ensure_asset_readable`/`bronze_asset_detail_body`). `namespace` is not read.
+  The module comment, the contract's `tableKey` comment and the unnamed-assets sentence say
+  what is true now.
+- **S1:** `hasGrant` and `toggleTable` compare a grant's table without regard to case, so a
+  stored `silver.Orders` is the catalog's `orders` and unticking removes it.
+- **S2:** `tableAccessChanged` compares the draft's scope and grant set (case-insensitive,
+  order-insensitive) with what was loaded; Save sends the table-access request only when it
+  differs. An unloaded section is untouched: the role save completes and the page goes back.
+  The `accessSkipped` state and its message are removed.
+
+Existing tests changed to make a change before Save (they had assumed a write on every
+Save; no assertion was deleted):
+
+- `loads the role by id, warns about a rename, and saves the whole role` — now picks
+  "Only these" first, so the expected body is `{"scope":"listed","grants":[]}`.
+- `shows a grant the catalog does not list and keeps it through a save` — now also ticks
+  "Whole schema archived"; the body carries the unlisted `old_orders` plus `archived.*`.
+- `says the role was saved when only its tables were refused, and stays` — now unticks
+  "Whole schema silver" so the refused write is attempted.
+- `says so when the catalog fails and still keeps the grant it has` — now ticks "Whole schema
+  silver"; the body carries the kept `orders` plus `silver.*`.
+
+New tests (full-sentence names): a Bronze row with `tableKey: "bronze.orders"` is offered as
+`orders` under `bronze`, and `primer` is not shown; a row with no key gives a `bronze` group
+with the sentence and no `primer` group; a stored `silver.Orders` ticks the catalog's
+`orders` and unticking removes it from the request body; an untouched Save sends no
+table-access request; a role whose tables failed to load still saves and goes back.
+
+`docs/OPERATIONS.md` ("Limiting a role to some schemas or tables"): one paragraph on Bronze
+tables (named under `bronze`; a dataset with no registry table name is not listed and stays
+hidden from a narrowed role's lists), and the Save bullet now says a write happens only when
+the section changed.
+
+Commands, as run (foreground, final T9 code):
+
+- `bun install --frozen-lockfile` — "678 packages installed", 2.11 s.
+- `bun run typecheck` — pass (no output).
+- `bun run lint` — **11 problems, 0 errors, 11 warnings**, all pre-existing, none in a file
+  this round touched.
+- `bun test src/features/admin src/services` — **354 passed, 0 failed**, 40 files.
+
+**Not verified, and why:** the whole `bun run test` and the whole Rust workspace were not
+run locally (the brief scopes them to CI on #468); the page was not opened against a live
+API, so the picker and the two-request Save are covered by the component tests only.
+
+#### `git status --short` and the remote head before this docs commit
+
+```
+$ git status --short
+(clean)
+
+$ git ls-remote --heads origin feat/gov-7-s2-console
+da16e9eaabf8a3388b7f87fb7c9ddeb2b02f787c	refs/heads/feat/gov-7-s2-console
+```
+
+
+### Handoff (developer, 2026-11-11, S2 round 2 fix)
+
+R2-S1 only. Branch `feat/gov-7-s2-console` from `248dbfcf`.
+
+- **`0d21aaad` — `fix(admin): hold the table picker to the Asset contract`.**
+  - `src/services/contracts/assets.ts`: `tableKey?: string | null` is declared on `Asset`
+    (the list row) and removed from `AssetDetail`, which inherits it through `AssetDetail =
+    Asset & {…}`. The comment states what the server does, checked against
+    `rust/crates/lakehouse-api/src/routes/catalog.rs`: `bronze_catalog_row` emits
+    `bronze.<table_name>` or `null` (:1536); `silver_catalog_row` (:1648) and
+    `gold_catalog_row` (:1682) emit no `tableKey`; `clickhouse_detail_body` inserts the key
+    into every Silver/Gold detail (:3070) and `bronze_detail_body` into every Bronze one
+    (:3144). The server matched the brief exactly.
+  - `src/services/index.ts`: `Asset` is exported as a type, because it was not, so the
+    feature imports it from `@/services` (the brief asked for this check-and-export).
+  - `src/features/admin/role-table-access.tsx`: `CatalogAsset` is now
+    `Pick<Asset, "id" | "tableKey">`, so the compiler holds the picker to the contract. The
+    comments on `tableKeyOf` and `schemaChoices` now say a Silver or Gold **list** row has
+    no `tableKey` and its `id` names the table — which is why `id` is the second candidate.
+    One further sentence in `schemaChoices`' first paragraph ("grouped by the schema their
+    `tableKey` names") was wrong for the same reason and is corrected to "the schema part of
+    the key each row names".
+  - No behaviour change: the `for` loop over `[asset.tableKey, asset.id]` and every
+    comparison are untouched, and no test was edited — none needed a type-only adjustment.
+
+Commands, as run (foreground, on `0d21aaad`):
+
+- `bun install --frozen-lockfile` — "678 packages installed", 1.73 s.
+- `bun run typecheck` — pass (no output).
+- `bun run lint` — 11 problems, 0 errors, 11 warnings, all pre-existing and none in a file
+  this round touched.
+- `bun test src/features/admin src/services` — **354 pass, 0 fail**, 2,241 `expect()`
+  calls, 40 files. The `AssistantSettingsForm (ADM-9)` flake described in the brief did not
+  occur in this run, so the command ran once.
+
+**Not verified, and why:** no cargo command was run — this round touches no Rust file. The
+whole `bun run test` and the page against a live API were not run; #468's CI covers the
+first, and the picker stays covered by the component tests only.
+
+`git status --short` before the code commit: only the three files above, staged by hand; no
+generated file. Remote head after both pushes is this branch's tip.
+
+### Handoff (developer, 2026-11-11, S2 CI fix)
+
+R11 guard false positive on #468 only. Branch `feat/gov-7-s2-console` from `34131e21`.
+
+- **`749a8cfe` — `fix(catalog): one bronze_table_key helper, out of the R11 window`.**
+  - `rust/crates/lakehouse-api/src/routes/catalog.rs`: new private
+    `fn bronze_table_key(table_name: &str) -> Option<String>`, next to `asset_table_key`
+    and far from `PART_STATS_COLUMNS`: `None` for an empty name, otherwise
+    `format!("bronze.{table_name}")`. The list row (`bronze_catalog_row`) and the detail
+    body (`bronze_detail_body`) now emit `bronze_table_key(table_name).map_or(Value::Null,
+    Value::String)`, which is the same `null`-for-empty / `bronze.<name>` output as before.
+  - `ensure_asset_readable` uses the helper for a non-empty name and keeps `"bronze."` for
+    an empty one, with a comment. That exact fallback is required for "no behaviour
+    change": `TableAccess::allows_key("bronze.")` is allowed by a schema-level `bronze`
+    grant (`allows("bronze", "")`) and hidden by a table-level grant, so returning `None`'s
+    `404` outright would have changed the schema-grant case. No `bronze.` literal remains
+    in `bronze_catalog_row`'s body or its in-body comment; the doc comment above it keeps
+    one and the guard is green.
+  - `ops/lint/check_bare_iceberg_count.py` is untouched, and `PART_STATS_COLUMNS` has no
+    `WHERE 1` (rule 2).
+
+Commands, as run (foreground, from `rust/` for cargo, on `749a8cfe`):
+
+- `python3 ops/lint/check_bare_iceberg_count.py` — "R11 guard: no bare count() against a
+  Bronze Iceberg table found." (before the fix it failed at
+  `catalog.rs:1544`, as the brief described).
+- `python3 ops/lint/check_intra_package_imports.py` — "OK: all intra-package
+  dispar_orchestrate imports resolve".
+- `/home/shiro/rantai/bin/cargo-locked fmt --check` — pass, exit 0.
+- `/home/shiro/rantai/bin/cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings`
+  — pass, exit 0 ("Finished `dev` profile … in 3m 25s").
+- `/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test table_access` — **14
+  passed, 0 failed** (finished in 6.13 s).
+- `/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --lib catalog` — **301 passed,
+  0 failed, 3172 filtered out** (finished in 27.87 s).
+
+**Not verified, and why:** no workspace-wide `cargo test` / clippy and no TypeScript or
+Python test run — the commit touches one Rust file, and CI on #468 runs the full block. No
+new test was added: the three call sites keep their existing behaviour and are already
+covered by `table_access` and the catalog lib tests.
+
+`git status --short` before the code commit: only `catalog.rs`. Remote head after the push
+is `749a8cfe`.
+
 ## 6. Review (planner)
 
 ### S1, round 1 (planner, 2026-11-11) — branch at `3f6b5569`
@@ -594,3 +963,165 @@ Read the fix (`8974f4e8`, `table_access.rs`).
 green on its last commit, and after `ADM-12` (#455), so the migrations land as 0134 then
 0135; the branch is updated once #455 is in.
 
+### S2, round 1 (planner, 2026-11-11) — branch at `171275cf`, pull request #468
+
+Read in full: `role-table-access.tsx`, the changes to `role-form-page.tsx`, `roles-page.tsx`,
+`roles-columns.tsx`, the client and the contract, and the new section of
+`docs/OPERATIONS.md`. Read on the server to check the console against it:
+`table_access.rs` (`allows`, `allows_key`), `routes/catalog.rs` (`bronze_catalog_row`,
+`asset_table_key`, `asset_visible`, `ensure_asset_readable`), `tenant.rs` (the namespace
+constants) and `put_role_table_access`. The three test files were sampled, not read line by
+line.
+
+Run by me in a detached worktree at `171275cf`: `bun install --frozen-lockfile`,
+`bun run typecheck` (pass), `bun run lint` (0 errors, 11 warnings, none in a file of this
+slice), `bun test src/features/admin src/services` (349 pass, 0 fail, 40 files). The one
+failure the handoff saw once did not appear. The whole `bun run test` and the Rust suite:
+not run by me; #468 runs them.
+
+What holds:
+
+- **Nothing a role holds is dropped without the person doing it.** The draft starts from the
+  stored grants, a grant the catalog does not list is shown and sent back, and a section
+  that could not be loaded writes nothing.
+- **A failed save stays on the page and says which half failed.**
+- **A `*:*` role** shows the section disabled with the server's sentence and sends no write.
+- **A read that failed is "—" in the Roles list**, never "All tables".
+- The Roles list reads each role's access with one request per role. Accepted for a page an
+  administrator opens by hand; the comment at the site says why.
+
+**BLOCKER**
+
+- **B1. The picker offers `primer` and `sekunder` as schemas, and such a grant reads
+  nothing.**
+  - `schemaChoices` puts a Bronze row under its `namespace`, with a "Whole schema" checkbox
+    and the sentence "Choose the whole schema, or add a table below."
+    (`role-table-access.tsx`, the branch after the `id` has no dot).
+  - `namespace` is a catalog grouping (`tenant.rs` `NAMESPACE_PRIMER`, `NAMESPACE_SEKUNDER`).
+    A Bronze table's key is `bronze.<table>` (`catalog.rs` `ensure_asset_readable`,
+    `bronze_asset_detail_body`), and the rule compares the schema part of that key
+    (`table_access.rs` `allows`).
+  - So `{ "schema": "primer", "table": "*" }` is stored, shown as ticked, and matches no
+    table. An administrator who ticks it believes the role reads the Bronze data. The role
+    reads none of it.
+  - The handoff reported the naming gap and called this handling honest. It is not: the
+    control states an access that does not exist (principle 2).
+  - Fix: D9 and T9. `namespace` is never a schema.
+- **B2. A narrowed role never sees a Bronze row in the catalog lists, whatever it is
+  granted.** This is in S1, already merged (#459), and my S1 review missed it: I sampled the
+  list filters and did not read them.
+  - `retain_visible` keeps a row only when `asset_table_key` names its table.
+    `bronze_catalog_row` emits no `tableKey` and its `id` is a slug with no dot, so the key
+    is `None` and the row is dropped for every narrowed role.
+  - It fails closed: nothing is shown that should be hidden. But a role granted
+    `bronze.orders` can query the table and open its page by address, and cannot find it in
+    the catalog or its search. `tests/table_access.rs` has no Bronze row in a list test, so
+    nothing caught it.
+  - Read from the code, not run. T8's first test proves it by failing before the fix.
+  - Fix: D9 and T8.
+
+**SHOULD-FIX**
+
+- **S1. A grant whose table differs from the catalog's name only by case is invisible.**
+  - `schemaChoices` compares names without regard to case, and `hasGrant` and `toggleTable`
+    compare the table exactly.
+  - With a stored `silver.Orders` and a catalog `orders`: the grant is not listed as "not in
+    the catalog" (the names match without case), and `orders` is not ticked (they differ
+    with case). The grant is sent back on every save and cannot be seen or removed here.
+  - Typing `silver.Orders` into the free-text row does the same: a grant is added and nothing
+    on the page changes.
+  - The module comment says an existing grant is always shown. Compare the table without
+    regard to case, as the rule does (`table_access.rs` `allows`).
+- **S2. Every Save of the role page writes the table access, changed or not.**
+  - The server audits `identity.role.table_access.update` on every write
+    (`put_role_table_access`), so renaming a role records a table-access change nobody made.
+  - It also replaces the stored grants with the copy this page loaded. If another
+    administrator changed them in between, an untouched section silently reverts their
+    change.
+  - Send the request only when the scope or the grants differ from what was loaded. A
+    section that could not be loaded is then an untouched section: the role save completes
+    and nothing more needs saying.
+
+**For the product owner**
+
+- **A Bronze dataset whose registry records no table name stays hidden from a narrowed
+  role's lists** after D9 as well: nothing names the table, so nothing proves a grant covers
+  it. It goes on the feature page's limits at merge.
+- The three limits the S1 review found (a scheduled agent run is not narrowed, names are
+  compared without regard to case, one database read per request) are in
+  `docs/OPERATIONS.md` now and go onto the feature page at merge.
+
+### S2, round 2 (planner, 2026-11-11) — branch at `a2ff9f66`
+
+Read the two fix commits in full (`55c757dd`, `da16e9ea`), with the two new tests in
+`tests/table_access.rs`.
+
+Run by me in a detached worktree at `a2ff9f66`: `bun run typecheck` (pass), `bun run lint`
+(0 errors, 11 warnings, none in a file of this slice), `bun test src/features/admin
+src/services` 18 times: 354 pass in 16 runs, 353 pass and 1 fail in 2. The failing test,
+captured once, is `AssistantSettingsForm (ADM-9) > never pre-fills the key, and only asks
+for it when it is replaced`. It is not in a file this slice touches and it is the failure
+the S2 handoff saw once without its name. It gets a backlog item at merge. The Rust checks:
+not run by me; #468 runs them.
+
+- **B1: closed.** `schemaChoices` no longer reads `namespace`. A Bronze table comes from the
+  row's `tableKey` and is listed under `bronze`; a row with no key is counted there as
+  unnamed, with a sentence that says no grant covers it.
+- **B2: closed.** `bronze_catalog_row` emits `tableKey`. The test failed before the change
+  with `a granted Bronze table must be listed: {"assets":[],"namespaces":[]}`, which is the
+  gap as read. It now checks both lists, and that a second Bronze row and a Silver-only
+  grant stay apart.
+- **S1: closed.** `hasGrant` and `toggleTable` compare the table without regard to case.
+- **S2: closed.** Save writes the table access only when the scope or the set of grants
+  differs from what was loaded. The comparison is of what would be sent, so a scope of
+  `all` with leftover ticks is not a change.
+
+**SHOULD-FIX**
+
+- **R2-S1. The contract does not declare the field the picker reads, and two comments say
+  more than the server does.**
+  - `tableKey` is declared on `AssetDetail` only (`src/services/contracts/assets.ts`). Its
+    comment now says the list row carries it, and `listAssets` returns `Asset[]`. The picker
+    reads it through its own structural type, so the compiler does not hold the contract to
+    it. Declare `tableKey` on `Asset`.
+  - `tableKeyOf`'s comment says the list row carries "the id itself on Silver/Gold", and
+    `schemaChoices`' comment says a Silver or Gold row's "`tableKey` says the same". The
+    Silver and Gold list rows emit no `tableKey` (`catalog.rs`, the `silver` and `serving`
+    row builders); only the Bronze row and the detail bodies do. The `id` is what names
+    them, which the code handles. Make the comments say that (rule 1).
+
+**No open BLOCKER.** R2-S1 is fixed before merge because #468 waits in the queue behind
+#466 and #467 anyway.
+
+### S2, round 3 (planner, 2026-11-11) — branch at `9b6143d1`
+
+Read the fix (`0d21aaad`). Run by me at `9b6143d1`: `bun run typecheck` (pass),
+`bun run lint` (0 errors, 11 warnings), `bun test src/features/admin src/services`
+(354 pass, 0 fail, one run).
+
+- **R2-S1: closed.** `tableKey` is declared on `Asset`, the picker's row type is
+  `Pick<Asset, "id" | "tableKey">`, and the comments say a Silver or Gold list row carries
+  no `tableKey`. The five server functions the comments name exist in `catalog.rs`.
+
+**No open BLOCKER and no open SHOULD-FIX.** The Rust suite and the whole `bun run test`
+were not run by me; #468 runs them. Merged only when #468 is green on its last commit, after
+#467.
+
+### S2, CI fix (planner, 2026-11-11) — branch at `d4ee9500`
+
+"Repo lints" was red on #468 at `34131e21`: the R11 guard matches text, and T8's new
+`bronze.` literal sat within its window of `PART_STATS_COLUMNS`, whose `count()` reads
+`system.parts`. A false positive, and mine to have prevented: the round 1 brief did not ask
+for the two repo lints.
+
+Read the fix (`749a8cfe`). Run by me at `d4ee9500`:
+`python3 ops/lint/check_bare_iceberg_count.py` and
+`python3 ops/lint/check_intra_package_imports.py` (both pass). Cargo: not run by me; #468
+runs it.
+
+- The guard and `PART_STATS_COLUMNS` are untouched (rule 2).
+- `bronze_table_key` is the one definition of the key, used by the list row, the detail body
+  and `ensure_asset_readable` (rule 4). An empty registry name keeps the outcome it had at
+  each site.
+
+**No open BLOCKER and no open SHOULD-FIX.**

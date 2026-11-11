@@ -896,6 +896,7 @@ fn assemble_bronze_rows(
             let updated_at = str_col(c, "updated_at");
             let mut row = bronze_catalog_row(
                 slug,
+                str_col(c, "table_name"),
                 str_col(c, "title"),
                 sekunder,
                 owner,
@@ -1484,8 +1485,23 @@ async fn enrich_bronze_assets(
 /// row builder and filled in afterward by `list`'s Iceberg enrichment when
 /// the row's `table_name` names a real Bronze Iceberg table; `health` is
 /// not measured at all — see the module comment above.
+///
+/// `table_key` is the registry's `table_name` as the rule addresses it:
+/// `bronze.<table_name>`, the same key [`bronze_asset_detail_body`] emits,
+/// and `null` when the registry records no table name. `GOV-7` D9: without
+/// it this row's `id` (a registry slug with no dot) names no table, so
+/// [`asset_table_key`] found no key and every narrowed role lost the row
+/// from its lists whatever it was granted (`GOV-7` S2 review 1 B2).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the list-row twin of `bronze_detail_body`, which carries the \
+              same allow for the same reason: every argument is a distinct \
+              already-fetched registry value with no natural grouping, so a \
+              wrapper struct would just move the same fields one level up"
+)]
 fn bronze_catalog_row(
     slug: &str,
+    table_name: &str,
     title: &str,
     sekunder: bool,
     owner: &str,
@@ -1514,6 +1530,10 @@ fn bronze_catalog_row(
         "lastUpdated": last_updated,
         "health": "unknown",
         "residency": TENANT_RESIDENCY.as_str(),
+        // The key the rule and the other reads address this dataset by. It
+        // is the registry's own table name, never the slug: the slug is the
+        // dataset's identity, the table key is what a grant names.
+        "tableKey": bronze_table_key(table_name).map_or(Value::Null, Value::String),
     })
 }
 
@@ -3121,7 +3141,7 @@ fn bronze_detail_body(
         "tableName": if table_name.is_empty() { Value::Null } else { json!(table_name) },
         // The key the lineage graph, policies and quality rules name this
         // dataset by: its Bronze table, not the registry slug in `id`.
-        "tableKey": if table_name.is_empty() { Value::Null } else { json!(format!("bronze.{table_name}")) },
+        "tableKey": bronze_table_key(table_name).map_or(Value::Null, Value::String),
         "_meta": {
             "frekuensi": frekuensi,
             "satuan": satuan,
@@ -3151,8 +3171,11 @@ pub(crate) async fn table_access_for(
 }
 
 /// The canonical `schema.table` key a catalog row or detail body names, or
-/// `None` when it names none: a Bronze row carries `tableKey`, and a
-/// Silver/Gold row's `id` IS its table key (`silver.<name>`/`serving.<name>`).
+/// `None` when it names none: a Bronze row carries `tableKey` — the
+/// registry's `table_name` as `bronze.<table_name>`, `null` when the
+/// registry records none — and a Silver/Gold row's `id` IS its table key
+/// (`silver.<name>`/`serving.<name>`). `GOV-7` D9: the list row carries the
+/// key too, so the rule finds a Bronze row that a grant covers.
 pub(crate) fn asset_table_key(asset: &Value) -> Option<&str> {
     if let Some(key) = asset
         .get("tableKey")
@@ -3166,6 +3189,17 @@ pub(crate) fn asset_table_key(asset: &Value) -> Option<&str> {
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| id.contains('.'))
+}
+
+/// The canonical key a Bronze dataset's table is addressed by, or `None`
+/// when the registry records no table name. One definition for the three
+/// places that build it — [`bronze_catalog_row`], [`bronze_detail_body`] and
+/// [`ensure_asset_readable`] — so the literal cannot drift between them and
+/// stays out of the list row, where it made the R11 text guard read a
+/// `count(` of `system.parts` as a count of a Bronze table (`GOV-7` S2, CI
+/// on #468).
+fn bronze_table_key(table_name: &str) -> Option<String> {
+    (!table_name.is_empty()).then(|| format!("bronze.{table_name}"))
 }
 
 /// Whether `asset` may be listed for a principal holding `access`. An asset
@@ -3204,10 +3238,16 @@ pub(crate) async fn ensure_asset_readable(
     let key = if id.starts_with("silver.") || id.starts_with("serving.") {
         id.to_owned()
     } else {
-        format!(
-            "bronze.{}",
-            super::catalog_profile::bronze_table_name(state, id).await?
-        )
+        let table_name = super::catalog_profile::bronze_table_name(state, id).await?;
+        match bronze_table_key(&table_name) {
+            Some(key) => key,
+            // An empty registry name keeps the key this site has always built
+            // (`bronze.`) rather than refusing outright: a role granted the
+            // whole `bronze` schema still reads it and a narrower one still
+            // gets the same 404, so the outcome does not change (`GOV-7` S2,
+            // CI on #468).
+            None => "bronze.".to_owned(),
+        }
     };
     ensure_key_readable_with(&access, &key)
 }
@@ -4262,6 +4302,7 @@ mod tests {
     fn catalog_rows_never_invent_size_freshness_or_health() {
         let bronze = bronze_catalog_row(
             "slug-1",
+            "slug-1",
             "Title",
             false,
             "owner",
@@ -4856,6 +4897,7 @@ mod tests {
 
     fn bronze_row_with_id(slug: &str) -> Value {
         bronze_catalog_row(
+            slug,
             slug,
             "Title",
             false,
@@ -8214,6 +8256,7 @@ mod tests {
                     let updated_at = str_col(c, "updated_at");
                     let mut row = bronze_catalog_row(
                         slug,
+                        str_col(c, "table_name"),
                         str_col(c, "title"),
                         sekunder,
                         owner.as_str(),
