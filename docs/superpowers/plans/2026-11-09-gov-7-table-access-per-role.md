@@ -438,6 +438,91 @@ service identity, the Iceberg door, or Dagster, as "Out of scope" says.
 No mismatch between plan and code was found except the two noted above (the
 Accept command shape, and the T5 p95 landing on the budget).
 
+### Handoff (developer, 2026-11-11, S1 round 1 fixes)
+
+Branch `feat/gov-7-s1-enforce`, from `5ad8c129`; S2 then S1, one commit each,
+pushed after each.
+
+#### Commits
+
+- `55a9c58e` — S2: `git merge origin/main` (merge commit). `origin/main` was
+  one commit ahead, `ba2d8f0c` WEB-7 S2 (the console, TypeScript only).
+- `8974f4e8` — S1: `TableAccess` no longer derives `Default`.
+
+#### S2: what the merge had
+
+**No conflicts** — the merge resolved on its own and nothing was hand-edited.
+
+`origin/main` still ends at `rust/migrations/0133_pages_per_role.sql`: ADM-12
+(#455) has not merged, so there is no `0134_sso_settings.sql` and no other
+`0135` either. `0135_table_access_per_role.sql` is unchanged and still the
+next free number. The only `main` change was `src/**` (console), so no Rust
+file moved and no migration is affected.
+
+#### S1: the call sites touched
+
+The `Default` derive and `#[default]` on `All` are removed, and the type
+carries the one-line reason ("No `Default` on purpose (`GOV-7` S1 review
+round 1, S1): a default of `All` would make `unwrap_or_default()` on a failed
+read mean 'every table'.").
+
+**No call site needed changing**, because none used it — checked, not assumed:
+
+- `TableAccess::default(` — no match in `src/` or `tests/`.
+- `unwrap_or_default()`/`Default::default()` applied to an access value — no
+  match; the matches in `catalog.rs`, `dashboard_access.rs` and the tests are
+  `String`/`Option<String>`/fixture defaults, unrelated to `TableAccess`.
+- `TableAccess` outside `lakehouse-api` — only `lakehouse-store`'s unrelated
+  `RoleTableAccess` struct.
+
+For the record, the sites whose answer is "no narrowing" say so explicitly
+already and were left as they are: `table_access::for_roles` (`Ok(All)` for no
+pool or no roles), `routes::catalog::table_access_for` (`?`, a refusal), and
+the assistant's three readers — `routes::ai::mod` (a failed read hides every
+table from the map, `All` only when there is no principal at all),
+`ai::tools::data` (a failed read is the tool's error, `All` only for no
+principal) and `ai::tools::dashboards` (the same).
+
+**One doc line changed with it, and only it**: the module doc's "The default
+is [`TableAccess::All`]" now reads "The *stored* default", so the sentence
+names the `role.read_scope = 'all'` column default rather than a Rust
+`Default` that no longer exists.
+
+#### Commands, as run (counts are the test binary's own)
+
+From `rust/`, with `/home/shiro/rantai/bin/cargo-locked`:
+
+- `check -p lakehouse-api --all-targets` after the merge — pass (3m 01s).
+- `fmt --check` — pass.
+- `check -p lakehouse-api --all-targets` after S1 — pass (1m 50s), the compile
+  proof that nothing relied on the removed `Default`.
+- `clippy -p lakehouse-api --all-targets -- -D warnings` — pass (3m 40s).
+- `test -p lakehouse-api --lib table_access` — **11 passed, 0 failed**
+  (3,437 filtered out).
+- `test -p lakehouse-api --lib policy_engine` — **9 passed, 0 failed**
+  (3,439 filtered out).
+- `sg docker -c '… test -p lakehouse-api --test table_access'` — **12 passed,
+  0 failed** (0 filtered out).
+
+**not verified locally: the rest, left to CI** — the other integration test
+files, the workspace-wide `clippy`/`test`, the console (`bun run typecheck`,
+`lint`, `test` for the WEB-7 S2 merge, TypeScript only and already green on
+`main`).
+
+#### `git status --short`, `git log --oneline 5ad8c129..HEAD`, remote
+
+```
+$ git status --short
+(clean)
+
+$ git log --oneline 5ad8c129..HEAD
+8974f4e8 refactor(gov-7): TableAccess has no Default, so a failed read cannot mean all (S1)
+55a9c58e Merge remote-tracking branch 'origin/main' into feat/gov-7-s1-enforce
+
+$ git ls-remote --heads origin feat/gov-7-s1-enforce
+8974f4e8cd0498543bc8d53290e5d1e913981b4f	refs/heads/feat/gov-7-s1-enforce
+```
+
 ## 6. Review (planner)
 
 ### S1, round 1 (planner, 2026-11-11) — branch at `3f6b5569`
