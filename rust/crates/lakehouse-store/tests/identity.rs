@@ -45,7 +45,7 @@ async fn seed_populates_every_identity_list(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(users[0].name, "Rina Wijaya", "fixture order is preserved");
 
     let roles = list_roles(&pool).await.unwrap();
-    assert_eq!(roles.len(), 7);
+    assert_eq!(roles.len(), 8);
 
     let tenants = list_tenants(&pool, &TenantFilter::default()).await.unwrap();
     assert_eq!(tenants.len(), 4);
@@ -206,7 +206,8 @@ async fn setting_the_roles_replaces_the_whole_set(pool: PgPool) -> sqlx::Result<
     assert_eq!(resolved.len(), 2, "both roles exist: {resolved:?}");
     assert_eq!(resolved[0].name, "Approver");
     assert_eq!(
-        resolved[0].permissions, "agent:approve, policy:review",
+        resolved[0].permissions,
+        "agent:approve, policy:review,assistant:use,ops:read,alert:read,governance:read",
         "the role's own grant travels with it, so the caller can judge it"
     );
 

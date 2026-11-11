@@ -19,8 +19,8 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
-    session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, session_cookie_for_seeded_user, session_cookie_for_user,
+    spin_up_with_env,
 };
 
 /// One model round: the given text and tool calls, as an OpenAI-compatible
@@ -705,7 +705,8 @@ async fn the_explain_sentence_inside_a_comment_does_not_end_the_offer() {
     assert!(names.contains(&"propose_sql".to_owned()), "{names:?}");
 }
 
-/// Sends one chat turn as a fresh user who holds exactly `permissions`, and
+/// Sends one chat turn as a fresh user who holds `permissions` besides
+/// `assistant:use` (every request here is to `/api/ai/chat`), and
 /// returns the system prompt the model received and the statements that
 /// reached `ClickHouse`.
 async fn system_prompt_for_user_holding(permissions: &str) -> (String, Vec<String>) {
@@ -715,7 +716,7 @@ async fn system_prompt_for_user_holding(permissions: &str) -> (String, Vec<Strin
     env.insert("LLM_URL".to_owned(), llm.uri());
     env.insert("CH_URL".to_owned(), ch.uri());
     let TestApp { router, pool } = spin_up_with_env(&env).await;
-    let user = create_principal_with_permissions(&pool, permissions).await;
+    let user = create_assistant_principal(&pool, permissions).await;
     let cookie = session_cookie_for_user(&pool, user).await;
     let body = json!({ "messages": [{ "role": "user", "content": "berapa tamu bulan ini?" }] });
     let resp = router

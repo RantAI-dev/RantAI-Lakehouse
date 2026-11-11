@@ -34,6 +34,8 @@ export type NavItem = {
    * expanded sidebar.
    */
   action?: { title: string; href: string; icon: LucideIcon }
+  /** Permissions required to open this nav entry (any-of). Empty means any authenticated user. */
+  requires: readonly string[]
 }
 
 export type NavGroup = {
@@ -78,12 +80,26 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Home",
     icon: Home,
-    items: [{ title: "Home", href: "/", icon: Home }],
+    items: [
+      {
+        title: "Home",
+        href: "/",
+        icon: Home,
+        requires: ["assistant:use", "assistant:ask"],
+      },
+    ],
   },
   {
     label: "History",
     icon: History,
-    items: [{ title: "History", href: "/copilot/history", icon: History }],
+    items: [
+      {
+        title: "History",
+        href: "/copilot/history",
+        icon: History,
+        requires: ["assistant:use", "assistant:ask"],
+      },
+    ],
   },
   {
     label: "Dashboards",
@@ -97,6 +113,7 @@ export const NAV_GROUPS: NavGroup[] = [
         // the resolver); the icon opens the list, where dashboards and
         // their folders are managed.
         action: { title: "Browse all dashboards", href: "/dashboards/browse", icon: LayoutGrid },
+        requires: ["dashboard:read"],
       },
     ],
   },
@@ -105,16 +122,16 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: Database,
     defaultOpen: true,
     items: [
-      { title: "Catalog", href: "/catalog", icon: Library },
-      { title: "Query Studio", href: "/query-studio", icon: SearchCode },
-      { title: "Sources", href: "/connectors", icon: Plug },
+      { title: "Catalog", href: "/catalog", icon: Library, requires: ["catalog:read"] },
+      { title: "Query Studio", href: "/query-studio", icon: SearchCode, requires: ["query:read"] },
+      { title: "Sources", href: "/connectors", icon: Plug, requires: ["connector:manage"] },
     ],
   },
   {
     label: "Build",
     icon: GitBranch,
     items: [
-      { title: "Pipelines", href: "/pipelines", icon: GitBranch },
+      { title: "Pipelines", href: "/pipelines", icon: GitBranch, requires: ["pipeline:read"] },
     ],
   },
   {
@@ -125,14 +142,16 @@ export const NAV_GROUPS: NavGroup[] = [
       // column (a table's Schema tab), and Tag keys is a section of Settings;
       // their old addresses redirect. S3-D4: Policies is "Access rules", at
       // the same address.
-      { title: "Access rules", href: "/governance/policies", icon: ShieldCheck },
+      // ADM-13 review round 1, S4: policy:read only
+      { title: "Access rules", href: "/governance/policies", icon: ShieldCheck, requires: ["policy:read"] },
       {
         title: "Data Quality",
         href: "/governance/data-quality",
         icon: ListChecks,
+        requires: ["governance:read"],
       },
       // Copilot's destructive tools and catalog access requests queue here.
-      { title: "Approvals", href: "/governance/approvals", icon: ClipboardCheck },
+      { title: "Approvals", href: "/governance/approvals", icon: ClipboardCheck, requires: ["access:approve", "agent:approve"] },
     ],
   },
   {
@@ -142,27 +161,29 @@ export const NAV_GROUPS: NavGroup[] = [
       // WEB-3 S2-D2: Services, Capacity, Ingestion (CDC) and Table
       // Maintenance are sections of System status; their old addresses
       // redirect to `/health#<section>`.
-      { title: "System status", href: "/health", icon: HeartPulse },
-      { title: "Alerts", href: "/alerts", icon: BellRing },
-      { title: "Audit Log", href: "/audit", icon: FileText },
+      { title: "System status", href: "/health", icon: HeartPulse, requires: ["ops:read"] },
+      { title: "Alerts", href: "/alerts", icon: BellRing, requires: ["alert:read", "alert:write"] },
+      // ADM-13 review round 1, S4: governance:read only
+      { title: "Audit Log", href: "/audit", icon: FileText, requires: ["governance:read"] },
     ],
   },
   {
     label: "Administration",
     icon: Settings,
     items: [
-      { title: "Users", href: "/admin/users", icon: Users },
+      { title: "Users", href: "/admin/users", icon: Users, requires: ["identity:read"] },
       // WEB-3 S3-D8: the page holds roles only, so it is named for them.
-      { title: "Roles", href: "/admin/roles", icon: Building2 },
-      { title: "Tenants", href: "/admin/tenants", icon: Boxes },
+      { title: "Roles", href: "/admin/roles", icon: Building2, requires: ["identity:read"] },
+      { title: "Tenants", href: "/admin/tenants", icon: Boxes, requires: ["identity:read"] },
       {
         title: "Service Identities",
         href: "/admin/service-identities",
         icon: KeyRound,
+        requires: ["identity:read"],
       },
       // WEB-3 S3-D6, S3-D7: Sessions is a tab of Users and Maps a section
       // of Settings; their old addresses redirect.
-      { title: "Settings", href: "/admin/settings", icon: SlidersHorizontal },
+      { title: "Settings", href: "/admin/settings", icon: SlidersHorizontal, requires: ["settings:write", "identity:read"] },
     ],
   },
 ]
@@ -243,3 +264,124 @@ export function pageTitleFor(pathname: string): string {
   ])
   return match?.title ?? "Rantai Lake"
 }
+
+export type RouteAccessEntry = {
+  pattern: string
+  requires: readonly string[]
+}
+
+/**
+ * Access map covering every non-public, non-redirect page in src/app.
+ * Gated by requires (any-of permissions). An empty array means any signed-in user.
+ * Verified against src/app/** /page.tsx and permissions.json by nav-config.test.ts.
+ */
+export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
+  // Home and AI
+  { pattern: "/", requires: ["assistant:use", "assistant:ask"] },
+  { pattern: "/copilot", requires: ["assistant:use", "assistant:ask"] },
+  { pattern: "/copilot/history", requires: ["assistant:use", "assistant:ask"] },
+
+  // Dashboards
+  { pattern: "/dashboards", requires: ["dashboard:read"] },
+  { pattern: "/dashboards/browse", requires: ["dashboard:read"] },
+  { pattern: "/dashboards/metrics", requires: ["dashboard:read"] },
+  { pattern: "/dashboards/[id]", requires: ["dashboard:read"] },
+
+  // Data & Catalog
+  { pattern: "/catalog", requires: ["catalog:read"] },
+  { pattern: "/data/assets/[assetId]", requires: ["catalog:read"] },
+  { pattern: "/lakehouse/tables/[namespace]/[table]", requires: ["catalog:read"] },
+  // ADM-13 review round 1, S4: gold-exports requires [] (any signed-in user, RequiresAuth on GET)
+  { pattern: "/gold-exports", requires: [] },
+
+  // Query Studio
+  { pattern: "/query-studio", requires: ["query:read"] },
+  { pattern: "/query-studio/saved", requires: ["query:read"] },
+  { pattern: "/query-studio/history", requires: ["query:read"] },
+
+  // Sources / Connectors
+  { pattern: "/connectors", requires: ["connector:manage"] },
+  { pattern: "/connectors/create", requires: ["connector:manage"] },
+  { pattern: "/connectors/upload", requires: ["connector:manage"] },
+  { pattern: "/connectors/[id]", requires: ["connector:manage"] },
+  { pattern: "/connectors/[id]/edit", requires: ["connector:manage"] },
+
+  // Build / Pipelines
+  { pattern: "/pipelines", requires: ["pipeline:read"] },
+  // ADM-13 review round 1, S4: pipeline:write only
+  { pattern: "/pipelines/create", requires: ["pipeline:write"] },
+  { pattern: "/pipelines/[pipelineId]", requires: ["pipeline:read"] },
+  { pattern: "/pipelines/[pipelineId]/edit", requires: ["pipeline:write"] },
+
+  // Governance
+  // ADM-13 review round 1, S4: policy:read only
+  { pattern: "/governance/policies", requires: ["policy:read"] },
+  { pattern: "/governance/data-quality", requires: ["governance:read"] },
+  { pattern: "/governance/approvals", requires: ["access:approve", "agent:approve"] },
+  // ADM-13 review round 1, S4: governance:read only
+  { pattern: "/audit", requires: ["governance:read"] },
+  { pattern: "/lineage", requires: ["lineage:read"] },
+
+  // Monitoring
+  { pattern: "/health", requires: ["ops:read"] },
+  { pattern: "/alerts", requires: ["alert:read", "alert:write"] },
+
+  // Intelligence / Agents
+  // ADM-13 review round 1, S4: agent runs requires [] (any signed-in user, RequiresAuth on GET)
+  { pattern: "/agents/runs/[runId]", requires: [] },
+
+  // Administration
+  { pattern: "/admin/users", requires: ["identity:read"] },
+  { pattern: "/admin/roles", requires: ["identity:read"] },
+  { pattern: "/admin/tenants", requires: ["identity:read"] },
+  { pattern: "/admin/service-identities", requires: ["identity:read"] },
+  { pattern: "/admin/settings", requires: ["settings:write", "identity:read"] },
+  { pattern: "/account/change-password", requires: [] },
+]
+
+/**
+ * Checks if a route pattern matches a given runtime pathname.
+ * Handles exact matches as well as Next.js dynamic segments like `[id]`.
+ */
+export function routeMatches(pattern: string, pathname: string): boolean {
+  const normPath = pathname.split("?")[0].replace(/\/+$/, "") || "/"
+  const normPattern = pattern.replace(/\/+$/, "") || "/"
+  if (normPattern === normPath) return true
+  const patternParts = normPattern.split("/")
+  const pathParts = normPath.split("/")
+  if (patternParts.length !== pathParts.length) return false
+  return patternParts.every((part, i) => {
+    if (part.startsWith("[") && part.endsWith("]")) {
+      return pathParts[i].length > 0
+    }
+    return part === pathParts[i]
+  })
+}
+
+/**
+ * ADM-13 (D7): Fail-closed access check for pathnames against ROUTE_ACCESS.
+ * Unlisted paths return false.
+ * A path with empty `requires` is open to any authenticated user.
+ * Otherwise, returns true if the user holds at least one required permission.
+ */
+export function canOpen(
+  pathname: string,
+  hasPermission: (perm: string) => boolean
+): boolean {
+  const normPath = pathname.split("?")[0].replace(/\/+$/, "") || "/"
+  // Exact match wins over parameterized match
+  const match =
+    ROUTE_ACCESS.find((entry) => entry.pattern === normPath) ??
+    ROUTE_ACCESS.find((entry) => routeMatches(entry.pattern, normPath))
+
+  if (!match) {
+    return false // Fail closed: unlisted routes return false
+  }
+
+  if (match.requires.length === 0) {
+    return true // Any signed-in user
+  }
+
+  return match.requires.some((perm) => hasPermission(perm))
+}
+

@@ -11,9 +11,7 @@ use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
-use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
-};
+use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use wiremock::matchers::method;
@@ -78,8 +76,7 @@ async fn app() -> (TestApp, MockServer, String) {
         .await;
     let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
     let app = spin_up_with_env(&env).await;
-    let user =
-        create_principal_with_permissions(&app.pool, "dashboard:read, dashboard:write").await;
+    let user = create_assistant_principal(&app.pool, "dashboard:read, dashboard:write").await;
     let cookie = session_cookie_for_user(&app.pool, user).await;
     (app, ch, cookie)
 }

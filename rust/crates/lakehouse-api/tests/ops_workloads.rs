@@ -38,8 +38,7 @@ use testcontainers_modules::clickhouse::ClickHouse;
 use tower::ServiceExt;
 
 use common::{
-    TestApp, create_principal_with_permissions, create_zero_permission_principal,
-    session_cookie_for_user, spin_up_with_env,
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
 };
 
 /// A disposable `ClickHouse` 26.8 — the compose file's own tag.
@@ -277,9 +276,10 @@ fn assert_a_documented_row(row: &Value) {
 async fn the_workloads_route_answers_200_with_the_documented_fields() {
     let engine = Engine::start().await;
     let app = engine.app().await;
-    // `RequiresAuth`: any authenticated principal may read the route, so
-    // a principal that holds no permission at all is the caller here.
-    let user = create_zero_permission_principal(&app.pool).await;
+    // `ADM-13` D5: reading the route takes `ops:read`, so the caller holds
+    // exactly that and nothing else — the fields, not any other permission,
+    // are what this test is about.
+    let user = create_principal_with_permissions(&app.pool, "ops:read").await;
     let cookie = session_cookie_for_user(&app.pool, user).await;
     let _held = hold_a_query_open(&engine).await;
 

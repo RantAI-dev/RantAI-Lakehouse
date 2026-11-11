@@ -6,14 +6,14 @@
 | Backlog | `ADM-13` |
 | Kind | Feature |
 | Spec | `docs/core/specs/adm-13.md` |
-| Status | Planned |
+| Status | In Acceptance |
 | Priority | P1 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | `docs/superpowers/plans/2026-11-09-adm-13-pages-per-role.md` |
 | Started | 2026-11-09 |
-| Shipped | |
-| Evidence | |
+| Shipped | 2026-11-11 |
+| Evidence | PR #454 |
 
 ## Problem
 
@@ -50,6 +50,9 @@ An Assistant only user's chat runs in Ask mode: write tools are hidden and refus
 
 - Hiding a page also refuses its API, except for pages whose data is already shared with dashboards (named in the plan's handoff).
 - A person whose roles give both `assistant:use` and `assistant:ask` gets the full assistant.
+- A user with no role sees no page. Before this feature such a user could use the assistant and read the status lists.
+- A Dashboard Viewer can still save an alert on a chart, but cannot list or remove it: the Alerts page needs `alert:read` (`BI-43`).
+- Gold exports and agent run pages have no read permission yet; any signed-in user can open them by address, as before (`SEC-66`).
 
 ## Acceptance checklist
 
@@ -61,7 +64,7 @@ An Assistant only user's chat runs in Ask mode: write tools are hidden and refus
 | `ADM-13-AC4` | Sign in as an Assistant only user | Sees Home (assistant), History and Dashboards only | Not run |
 | `ADM-13-AC5` | As that user, ask "total orders by month" | An answer and a chart from data they may read | Not run |
 | `ADM-13-AC6` | As that user, ask "create a dashboard called Test" | Refused with a plain message; no dashboard created | Not run |
-| `ADM-13-AC7` | As that user, open the command palette | Only their pages and allowed quick actions (no "Add a chart", no "Export YAML") | Not run |
+| `ADM-13-AC7` | As that user, open the command palette | Only their pages and allowed quick actions (no "Add a chart"; "Export YAML" stays, it is a read) | Not run |
 | `ADM-13-AC8` | After upgrading a deployment that had an Analyst and a Data Engineer user | Both see the same pages and assistant as before | Not run |
 | `ADM-13-AC9` | Remove `assistant:use` from Analyst | Analyst users lose the assistant dock and `/api/ai/chat` answers 403 | Not run |
 | `ADM-13-AC10` | Sign in as Platform Admin | Every page is shown | Not run |

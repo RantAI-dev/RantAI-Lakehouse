@@ -2003,11 +2003,9 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "get_quality",
         schema: get_quality_schema,
         risk: Risk::Read,
-        // No route with a narrower permission than `RequiresAuth` covers
-        // quality directly (`GET /api/governance/{kind}` is
-        // `RequiresAuth`) — empty means "authenticated only", see the
-        // `permission` field doc comment.
-        permission: "",
+        // ADM-13 (D10.1), ADM-13 review round 1, B2: returns governance quality rows,
+        // matching GET /api/governance/{kind} (governance:read).
+        permission: "governance:read",
     },
     ToolSpec {
         name: "trigger_lakehouse_build",
@@ -2329,14 +2327,12 @@ pub static TOOLS: &[ToolSpec] = &[
     // ── T1.1 Alerts (Tier 1 of the copilot-operations-handover plan) ────
     // Permission strings verified against `policy.rs::POLICY_TABLE`
     // (plan section 3.7 C1): `GET /api/alerts` is `RequiresAuth` (no
-    // narrower permission — empty string, same convention as
-    // `get_quality`), `POST`/`PUT`/`DELETE /api/alerts` and the live
-    // `/api/alerts/run` evaluation all require `alert:write`.
+    // ADM-13 (D10.1), ADM-13 review round 1, B2: returns alert rules, matching GET /api/alerts (alert:read).
     ToolSpec {
         name: "list_alert_rules",
         schema: list_alert_rules_schema,
         risk: Risk::Read,
-        permission: "",
+        permission: "alert:read",
     },
     ToolSpec {
         name: "create_alert_rule",
@@ -2476,38 +2472,38 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "query:read",
     },
-    // ── T2.1 Governance reads ─────────────────────────────────────────
-    // `GET /api/governance/{kind}` is `RequiresAuth` for every kind
-    // (policy.rs:164, C1) — no narrower permission to carry.
+    // ── T2.1 Governance reads ──────────────────────────────────────────
+    // ADM-13 (D10.1), ADM-13 review round 1, B2: returns governance and ops rows,
+    // matching GET /api/governance/{kind} (governance:read) and GET /api/ops/{kind} (ops:read).
     ToolSpec {
         name: "get_audit_history",
         schema: get_audit_history_schema,
         risk: Risk::Read,
-        permission: "",
+        permission: "governance:read",
     },
     ToolSpec {
         name: "list_classification_rules",
         schema: list_classification_rules_schema,
         risk: Risk::Read,
-        permission: "",
+        permission: "governance:read",
     },
     ToolSpec {
         name: "list_quality_rules",
         schema: list_quality_rules_schema,
         risk: Risk::Read,
-        permission: "",
+        permission: "governance:read",
     },
     ToolSpec {
         name: "get_cdc_health",
         schema: get_cdc_health_schema,
         risk: Risk::Read,
-        permission: "",
+        permission: "ops:read",
     },
     ToolSpec {
         name: "get_maintenance_metrics",
         schema: get_maintenance_metrics_schema,
         risk: Risk::Read,
-        permission: "",
+        permission: "ops:read",
     },
     // ── T2.2 Maintenance (C2: exactly one tool, see its schema doc) ────
     ToolSpec {
@@ -2523,7 +2519,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "list_workloads",
         schema: list_workloads_schema,
         risk: Risk::Read,
-        permission: "",
+        // ADM-13 (D10.1), ADM-13 review round 1, B2: matches GET /api/ops/workloads (ops:read).
+        permission: "ops:read",
     },
     ToolSpec {
         name: "kill_query",
@@ -2650,7 +2647,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "get_table_maintenance",
         schema: get_table_maintenance_schema,
         risk: Risk::Read,
-        permission: "catalog:read",
+        // ADM-13 (D10.1), ADM-13 review round 1, B2: matches GET /api/ops/maintenance (ops:read).
+        permission: "ops:read",
     },
     ToolSpec {
         name: "set_table_maintenance",
@@ -2662,7 +2660,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "get_capacity",
         schema: get_capacity_schema,
         risk: Risk::Read,
-        permission: "catalog:read",
+        // ADM-13 (D10.1), ADM-13 review round 1, B2: matches GET /api/ops/capacity (ops:read).
+        permission: "ops:read",
     },
     // `BI-1` / `AI-10`: a download link, nothing made until the person opens it
     // with their own session, so `Read` and the permission of seeing a
@@ -2910,12 +2909,18 @@ pub fn tool_schemas_for(
     perms: Option<&lakehouse_auth::PermissionSet>,
     anywhere: Option<lakehouse_bi::access::Level>,
 ) -> Vec<Value> {
+    let access = super::AssistantAccess::from_perms(perms);
     TOOLS
         .iter()
         .zip(tool_schemas())
         .filter(|(t, _)| {
+            if access.is_ask_only() && t.risk != Risk::Read {
+                return false;
+            }
+            // ADM-13 review round 1, S2: use shared assistant_reads helper
             t.permission.is_empty()
                 || perms.is_some_and(|p| p.has(t.permission))
+                || (t.risk == Risk::Read && super::assistant_reads(perms, t.permission))
                 || reach_offers(t.name, t.permission, anywhere)
         })
         .map(|(_, schema)| schema)
@@ -3917,6 +3922,40 @@ mod tests {
         assert!(!offered_names.contains(&"list_boards"));
     }
 
+    /// ADM-13 (D6): an `assistant:ask`-only principal gets only Read tools in the schema list.
+    /// It sees tools granted by assistant:ask (query:read and catalog:read read tools),
+    /// and authenticated-only read tools, but no write tools and no lineage tools.
+    #[test]
+    fn tool_schemas_for_assistant_ask_only_offers_only_read_tools() {
+        let perms = lakehouse_auth::PermissionSet::parse("assistant:ask");
+        let offered = tool_schemas_for(Some(&perms), None);
+        assert_ne!(offered.len(), 0);
+        for schema in &offered {
+            let name = schema["function"]["name"].as_str().expect("tool name");
+            let spec = find(name).expect("tool spec exists");
+            assert_eq!(
+                spec.risk,
+                Risk::Read,
+                "tool {name} offered to assistant:ask must be Risk::Read"
+            );
+        }
+        let offered_names: Vec<&str> = offered
+            .iter()
+            .map(|v| v["function"]["name"].as_str().expect("name"))
+            .collect();
+        // Granted via assistant:ask:
+        assert!(offered_names.contains(&"run_sql"));
+        assert!(offered_names.contains(&"list_datasets"));
+        assert!(offered_names.contains(&"describe_dataset"));
+        assert!(offered_names.contains(&"lakehouse_overview"));
+        // Not granted (lineage:read):
+        assert!(!offered_names.contains(&"get_lineage"));
+        // Write tools excluded:
+        assert!(!offered_names.contains(&"create_chart"));
+        assert!(!offered_names.contains(&"create_pipeline"));
+        assert!(!offered_names.contains(&"run_pipeline"));
+    }
+
     /// With no principal at all, only empty-`permission` tools are offered.
     #[test]
     fn tool_schemas_for_none_offers_only_empty_permission_tools() {
@@ -3936,24 +3975,16 @@ mod tests {
         assert_eq!(
             offered_names,
             vec![
-                "get_quality".to_owned(),
                 // BI-5: both limits tools need only a sign-in.
                 "get_query_limits".to_owned(),
                 "stop_query".to_owned(),
-                "list_alert_rules".to_owned(),
                 // BI-37 D2: the two save tools declare no permission; their
                 // own save guard refuses what the console refuses.
                 "create_alert_rule".to_owned(),
                 "update_alert_rule".to_owned(),
                 // BI-37 D8: reading a dashboard's comments is auth-only too.
                 "list_dashboard_comments".to_owned(),
-                "get_audit_history".to_owned(),
-                "list_classification_rules".to_owned(),
-                "list_quality_rules".to_owned(),
-                "get_cdc_health".to_owned(),
-                "get_maintenance_metrics".to_owned(),
                 "run_bronze_maintenance".to_owned(),
-                "list_workloads".to_owned(),
                 "export_gold_mart".to_owned(),
                 "get_gold_export".to_owned(),
                 "ask_user".to_owned(),
@@ -3973,7 +4004,8 @@ mod tests {
     #[test]
     fn tier1_tools_have_the_documented_risk_and_permission() {
         let expected: &[(&str, Risk, &str)] = &[
-            ("list_alert_rules", Risk::Read, ""),
+            // ADM-13 (D10.1), ADM-13 review round 1, B2: alert:read
+            ("list_alert_rules", Risk::Read, "alert:read"),
             // BI-37 D2: the console's floor for `POST`/`PUT /api/alerts` is
             // "signed in" and the handler decides (BI-19 C3), so the two save
             // tools declare no permission and their own save guard refuses what
@@ -4013,13 +4045,14 @@ mod tests {
     #[test]
     fn tier2_tools_have_the_documented_risk_and_permission() {
         let expected: &[(&str, Risk, &str)] = &[
-            ("get_audit_history", Risk::Read, ""),
-            ("list_classification_rules", Risk::Read, ""),
-            ("list_quality_rules", Risk::Read, ""),
-            ("get_cdc_health", Risk::Read, ""),
-            ("get_maintenance_metrics", Risk::Read, ""),
+            // ADM-13 (D10.1), ADM-13 review round 1, B2: governance:read and ops:read
+            ("get_audit_history", Risk::Read, "governance:read"),
+            ("list_classification_rules", Risk::Read, "governance:read"),
+            ("list_quality_rules", Risk::Read, "governance:read"),
+            ("get_cdc_health", Risk::Read, "ops:read"),
+            ("get_maintenance_metrics", Risk::Read, "ops:read"),
             ("run_bronze_maintenance", Risk::WriteHigh, ""),
-            ("list_workloads", Risk::Read, ""),
+            ("list_workloads", Risk::Read, "ops:read"),
             ("kill_query", Risk::WriteHigh, "workload:cancel"),
             ("export_gold_mart", Risk::WriteLow, ""),
             ("get_gold_export", Risk::Read, ""),
@@ -4035,6 +4068,70 @@ mod tests {
             let spec = find(name).unwrap_or_else(|| panic!("{name} must be registered"));
             assert_eq!(spec.risk, *risk, "{name} risk");
             assert_eq!(spec.permission, *permission, "{name} permission");
+        }
+    }
+
+    /// ADM-13 (D10.1), ADM-13 review round 1, B2: an assistant:ask-only
+    /// principal is offered none of the D10.1 tools (they are not query:read
+    /// or catalog:read tools), and is refused each by name with the
+    /// permission refusal message.
+    #[test]
+    fn assistant_ask_only_is_offered_none_of_d10_tools_and_refused_each_with_permission_message() {
+        let perms = lakehouse_auth::PermissionSet::parse("assistant:ask");
+        let offered: Vec<String> = tool_schemas_for(Some(&perms), None)
+            .iter()
+            .map(|v| v["function"]["name"].as_str().expect("name").to_owned())
+            .collect();
+
+        let d10_tools = [
+            ("get_audit_history", "governance:read"),
+            ("list_quality_rules", "governance:read"),
+            ("list_classification_rules", "governance:read"),
+            ("get_quality", "governance:read"),
+            ("get_cdc_health", "ops:read"),
+            ("get_maintenance_metrics", "ops:read"),
+            ("list_workloads", "ops:read"),
+            ("get_capacity", "ops:read"),
+            ("get_table_maintenance", "ops:read"),
+            ("list_alert_rules", "alert:read"),
+        ];
+
+        for (tool, required_perm) in d10_tools {
+            assert!(
+                !offered.contains(&tool.to_string()),
+                "{tool} must NOT be offered to an assistant:ask-only principal"
+            );
+
+            let spec = find(tool).unwrap_or_else(|| panic!("{tool} spec must exist"));
+            assert_eq!(spec.permission, required_perm, "{tool} permission");
+
+            let refused =
+                crate::routes::ai::gate::decide(false, Some(&perms), spec, &serde_json::Map::new())
+                    .unwrap_or_else(|| panic!("{tool} must be refused by gate::decide"));
+
+            assert_eq!(
+                refused["refused"],
+                serde_json::json!(true),
+                "{tool} refused"
+            );
+            assert_eq!(
+                refused["reason"],
+                serde_json::json!("permission"),
+                "{tool} reason"
+            );
+            assert_eq!(refused["tool"], serde_json::json!(tool), "{tool} tool name");
+            assert_eq!(
+                refused["required"],
+                serde_json::json!(required_perm),
+                "{tool} required"
+            );
+            assert_eq!(
+                refused["error"],
+                serde_json::json!(format!(
+                    "refused: this user lacks the '{required_perm}' permission this tool needs"
+                )),
+                "{tool} error message"
+            );
         }
     }
 }
