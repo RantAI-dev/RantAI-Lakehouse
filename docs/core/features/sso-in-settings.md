@@ -6,14 +6,14 @@
 | Backlog | `ADM-12` |
 | Kind | Feature |
 | Spec | `docs/core/specs/adm-12.md` |
-| Status | Planned (OIDC); SAML waits for ADR 0017 |
+| Status | In Acceptance (OIDC); SAML waits for ADR 0017 |
 | Priority | P2 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | `docs/superpowers/plans/2026-11-09-adm-12-sso-in-settings.md` |
 | Started | 2026-11-09 |
-| Shipped | |
-| Evidence | |
+| Shipped | 2026-11-11 (OIDC) |
+| Evidence | PR #455 |
 
 ## Problem
 
