@@ -1158,8 +1158,10 @@ impl ApiSqlGate<'_> {
             &obligations,
         )
         .await
+        // GOV-7 D5: the run history records the not-found sentence itself,
+        // not a generic failure, for a table the owner may not read.
         .map_err(|err| {
-            GateRefusal::Refused(crate::policy_engine::enforcement_error_message(&err).to_owned())
+            GateRefusal::Refused(crate::routes::support::enforcement_refusal(sql, &err).to_string())
         })
     }
 }

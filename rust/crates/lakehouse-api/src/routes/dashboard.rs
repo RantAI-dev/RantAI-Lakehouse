@@ -3403,13 +3403,10 @@ async fn run_records(
             obligations,
         )
         .await
-        .map_err(|err| {
-            // BI-16 C3 review S6: the English `RegionOf` sentence, not the
-            // fixed one, when the refused statement does a region lookup.
-            ApiError::Unprocessable(
-                crate::routes::support::enforcement_message_for(&statement, &err).to_owned(),
-            )
-        })
+        // BI-16 C3 review S6: the English `RegionOf` sentence, not the fixed
+        // one, when the refused statement does a region lookup; GOV-7 D5:
+        // one mapping for every refusal, so a hidden table answers 404.
+        .map_err(|err| crate::routes::support::enforcement_refusal(&statement, &err))
     };
     // `SEC-50` slice 2 M1/M4: the tenant gate runs BEFORE the rewrite, so a
     // drill-down that may not read its table is refused before the engine is
@@ -4137,11 +4134,9 @@ pub(crate) async fn build_chart_file(
         &obligations,
     )
     .await
-    .map_err(|err| {
-        ApiError::Unprocessable(
-            crate::routes::support::enforcement_message_for(&statement, &err).to_owned(),
-        )
-    })?;
+    // GOV-7 D5: one mapping for every refusal (BI-16 C3's `RegionOf`
+    // sentence is inside it), so a hidden table answers 404.
+    .map_err(|err| crate::routes::support::enforcement_refusal(&statement, &err))?;
     let mut stream = state
         .clickhouse
         .query_stream(&rewritten, crate::export::EXPORT_TIMEOUT)
@@ -4551,12 +4546,8 @@ pub(crate) async fn values_with_limit(
         obligations,
     )
     .await
-    .map_err(|err| {
-        // BI-16 C3 review S6 (as in `run_records`).
-        ApiError::Unprocessable(
-            crate::routes::support::enforcement_message_for(&sql, &err).to_owned(),
-        )
-    })?;
+    // BI-16 C3 review S6 (as in `run_records`); GOV-7 D5: one mapping.
+    .map_err(|err| crate::routes::support::enforcement_refusal(&sql, &err))?;
     let rows = ch
         .rows(&rewritten, None)
         .await

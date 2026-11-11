@@ -256,7 +256,9 @@ pub(crate) async fn run_spec_sql(
 #[derive(Debug)]
 pub(crate) enum SpecRunFailure {
     /// Refused by the policy rewrite before any query ran; the text is fixed.
-    Refused(&'static str),
+    /// A `String` because a `GOV-7` refusal names the table (the caller's
+    /// own SQL) with `SEC-20`'s sentence.
+    Refused(String),
     /// `SEC-50` slice 2 M3: refused by the tenant gate before the rewrite
     /// and before the engine.
     ///
@@ -290,7 +292,7 @@ pub(crate) const REGION_OF_REFUSED: &str = "RegionOf is not available to you: yo
 pub(crate) fn enforcement_message_for(
     sql: &str,
     err: &crate::policy_engine::EnforcementError,
-) -> &'static str {
+) -> String {
     let denied = matches!(
         err,
         crate::policy_engine::EnforcementError::Rewrite(
@@ -298,9 +300,37 @@ pub(crate) fn enforcement_message_for(
         )
     );
     if denied && sql.contains("console.geo_dict_m_") {
-        REGION_OF_REFUSED
+        REGION_OF_REFUSED.to_owned()
     } else {
         crate::policy_engine::enforcement_error_message(err)
+    }
+}
+
+/// The ONE mapping from a policy-rewrite refusal to the answer a caller gets
+/// (`GOV-7` D5): every governed read path that builds an `ApiError` from an
+/// `EnforcementError` calls this, so a table a role may not read is answered
+/// with `SEC-20`'s own 404 and sentence (`D2`) and a narrowed principal's
+/// listing with `SEC-20`'s 422 sentence — never "forbidden", and never a
+/// second copy of either sentence.
+///
+/// `sql` is only read for the `RegionOf` sentence above; the table named in a
+/// refusal is the caller's own SQL, never upstream text.
+pub(crate) fn enforcement_refusal(
+    sql: &str,
+    err: &crate::policy_engine::EnforcementError,
+) -> lakehouse_core::ApiError {
+    match err {
+        crate::policy_engine::EnforcementError::TableNotReadable(table) => {
+            lakehouse_core::ApiError::NotFound(crate::policy_engine::table_not_available_message(
+                table,
+            ))
+        }
+        crate::policy_engine::EnforcementError::Unresolvable => {
+            lakehouse_core::ApiError::Unprocessable(
+                crate::policy_engine::LISTING_NOT_AVAILABLE.to_owned(),
+            )
+        }
+        _ => lakehouse_core::ApiError::Unprocessable(enforcement_message_for(sql, err)),
     }
 }
 
@@ -351,7 +381,7 @@ pub(crate) async fn try_run_spec_sql(
     let run = crate::query_limits::QueryRun::current_or_detached();
     let limits = run.limits().await.map_err(|err| {
         tracing::error!(error = %err, "the query limits could not be read");
-        SpecRunFailure::Refused("The query limits could not be read.")
+        SpecRunFailure::Refused("The query limits could not be read.".to_owned())
     })?;
     let seconds = u32::try_from(limits.timeout_seconds()).unwrap_or(u32::MAX);
     // BI-4 part B: the tables are named on the rewritten statement (after the

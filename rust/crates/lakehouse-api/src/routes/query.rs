@@ -397,7 +397,10 @@ async fn rewrite_sql_for_principal_inner(
         {
             return ApiError::Unprocessable(PAST_VERSION_TRINO_MESSAGE.to_owned());
         }
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+        // GOV-7 D5: the ONE place a rewrite refusal becomes an answer,
+        // shared with every other governed read path, so a hidden table gets
+        // the tenant gate's own 404 and sentence.
+        crate::routes::support::enforcement_refusal(&sql, &err)
     })
     // DATA-21 D2: the statement the engine reads is `Trino`'s own form
     // again — the reverse of the pass that made it parseable.
@@ -706,10 +709,12 @@ enum TenantReach {
 /// sentence is the same whether the table exists and belongs to somebody
 /// else or does not exist at all, so the refusal is not an oracle
 /// either.
+///
+/// `GOV-7` D2: a table a role's access does not include is refused with
+/// this SAME sentence and status, from the one definition in
+/// [`crate::policy_engine::table_not_available_message`].
 fn table_not_available(table: &str) -> ApiError {
-    ApiError::NotFound(format!(
-        "Table not found or not available to your organisation: {table}"
-    ))
+    ApiError::NotFound(crate::policy_engine::table_not_available_message(table))
 }
 
 /// `SEC-20`: the one sentence a statement that lists objects without
@@ -723,7 +728,11 @@ fn table_not_available(table: &str) -> ApiError {
 /// A listing is refused rather than passed because no table is named, so
 /// the gate has nothing to compare the caller's tenant against: letting
 /// it through would show one tenant the shared catalog's table names.
-const LISTING_NOT_AVAILABLE: &str = "This statement is not available to your organisation.";
+///
+/// `GOV-7` D5 reuses it for a narrowed principal's statement that names no
+/// resolvable table; [`crate::policy_engine::LISTING_NOT_AVAILABLE`] is the
+/// one definition.
+const LISTING_NOT_AVAILABLE: &str = crate::policy_engine::LISTING_NOT_AVAILABLE;
 
 /// `SEC-20`: the caller's reach over tables, resolved once per request.
 ///
