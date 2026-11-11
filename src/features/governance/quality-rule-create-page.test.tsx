@@ -17,7 +17,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { QualityRuleCreatePage } from "./quality-rule-create-page"
@@ -34,6 +34,24 @@ beforeEach(() => {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
 
+// WEB-8 D8: the table is picked from the catalog, and its columns come from
+// the asset's own detail.
+const CATALOG = [
+  { id: "a-orders", name: "orders", namespace: "silver" },
+  { id: "a-customers", name: "customers", namespace: "silver" },
+]
+const ORDERS_DETAIL = {
+  ...CATALOG[0],
+  schema: [
+    { name: "email", dataType: "string" },
+    { name: "amount", dataType: "double" },
+  ],
+  sample: [],
+  qualityChecks: [],
+  policySummary: [],
+  usage: null,
+}
+
 /** Answers the session; records every write. */
 function stubApi(permissions: string[] = ["governance:write", "query:read"]) {
   const writes: { method: string; path: string; body?: unknown }[] = []
@@ -46,6 +64,14 @@ function stubApi(permissions: string[] = ["governance:write", "query:read"]) {
     if (path.includes("/api/auth/me")) {
       return json({ id: "u1", name: "Admin", email: null, roles: [], permissions, tenants: [] })
     }
+    // Reads the form makes before it can be filled: the catalog's tables and
+    // the picked table's columns. Not writes, so they stay out of `writes`.
+    if (path.startsWith("/api/catalog/")) {
+      return path.endsWith("/a-orders")
+        ? json(ORDERS_DETAIL)
+        : json({ error: "asset not found" }, 404)
+    }
+    if (path.startsWith("/api/catalog")) return json({ assets: CATALOG, namespaces: [] })
     writes.push({
       method,
       path,
@@ -87,12 +113,19 @@ function renderPage() {
   )
 }
 
+/** Picks `table` from the catalog combobox the Asset field is. */
+async function pickTable(table = "silver.orders") {
+  fireEvent.click(await screen.findByRole("button", { name: "Asset" }))
+  fireEvent.click(within(await screen.findByRole("listbox")).getByText(table))
+}
+
 describe("QualityRuleCreatePage (WEB-7 D2/T3)", () => {
   it("builds the threshold from the picked check and goes back to Data Quality", async () => {
     const writes = stubApi()
     renderPage()
     fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "email_filled" } })
-    fireEvent.change(screen.getByLabelText("Asset"), { target: { value: "silver.orders" } })
+    await pickTable()
+    // WEB-8 D8: the column is a list of that table's own columns now.
     fireEvent.change(screen.getByLabelText("Column"), { target: { value: "email" } })
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }))
 
@@ -122,7 +155,7 @@ describe("QualityRuleCreatePage (WEB-7 D2/T3)", () => {
     const writes = stubApi(["governance:write"])
     renderPage()
     fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "custom" } })
-    fireEvent.change(screen.getByLabelText("Asset"), { target: { value: "silver.orders" } })
+    await pickTable()
     fireEvent.click(screen.getByRole("button", { name: "Write the threshold myself" }))
     fireEvent.change(screen.getByLabelText("Threshold"), {
       target: { value: "rows >= 10" },
@@ -155,6 +188,12 @@ describe("QualityRuleCreatePage (WEB-7 D2/T3)", () => {
       if (path.includes("/api/auth/me")) {
         return json({ id: "u1", name: "Admin", email: null, roles: [], permissions: ["governance:write"], tenants: [] })
       }
+      if (path.startsWith("/api/catalog/")) {
+        return path.endsWith("/a-orders")
+          ? json(ORDERS_DETAIL)
+          : json({ error: "asset not found" }, 404)
+      }
+      if (path.startsWith("/api/catalog")) return json({ assets: CATALOG, namespaces: [] })
       if (init?.method === "POST") {
         return json({ error: "threshold: silver.orders is not a table this deployment has" }, 400)
       }
@@ -162,7 +201,8 @@ describe("QualityRuleCreatePage (WEB-7 D2/T3)", () => {
     }) as unknown as typeof fetch)
     renderPage()
     fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "email_filled" } })
-    fireEvent.change(screen.getByLabelText("Asset"), { target: { value: "silver.orders" } })
+    await pickTable()
+    // WEB-8 D8: the column is a list of that table's own columns now.
     fireEvent.change(screen.getByLabelText("Column"), { target: { value: "email" } })
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }))
 
@@ -177,5 +217,78 @@ describe("QualityRuleCreatePage (WEB-7 D2/T3)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
     expect(pushed).toEqual(["/governance/data-quality"])
     expect(writes).toEqual([])
+  })
+})
+
+describe("QualityRuleCreatePage table and column pickers (WEB-8 D8)", () => {
+  it("offers the catalog's tables as namespace.table", async () => {
+    stubApi()
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Asset" }))
+    const list = await screen.findByRole("listbox")
+    expect(within(list).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "silver.customers",
+      "silver.orders",
+    ])
+  })
+
+  it("offers the picked table's own columns, and keeps the field free text while the table is unknown", async () => {
+    stubApi()
+    renderPage()
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "email_filled" } })
+    // No table yet: the check's column is typed, as it always was.
+    expect(screen.getByLabelText("Column")).toHaveProperty("tagName", "INPUT")
+    fireEvent.change(screen.getByLabelText("Column"), { target: { value: "typed_by_hand" } })
+    // Customers has no detail in this stub: the field stays free text rather
+    // than offering an empty list.
+    await pickTable("silver.customers")
+    expect(screen.getByLabelText("Column")).toHaveProperty("tagName", "INPUT")
+    expect((screen.getByLabelText("Column") as HTMLInputElement).value).toBe("typed_by_hand")
+    // Orders is known: the column is now the table's own list, with the typed
+    // value kept and marked (it is not one of them).
+    await pickTable("silver.orders")
+    await waitFor(() =>
+      expect(screen.getByLabelText("Column")).toHaveProperty("tagName", "SELECT")
+    )
+    const column = screen.getByLabelText("Column") as HTMLSelectElement
+    expect(column.value).toBe("typed_by_hand")
+    expect(Array.from(column.options).map((o) => o.value)).toEqual([
+      "typed_by_hand",
+      "email",
+      "amount",
+    ])
+    expect(Array.from(column.options).map((o) => o.textContent)).toContain(
+      "typed_by_hand (not in this table)"
+    )
+  })
+
+  it("keeps a typed column that the table does not have, marked, instead of dropping it", async () => {
+    stubApi()
+    renderPage()
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "email_filled" } })
+    fireEvent.change(screen.getByLabelText("Column"), { target: { value: "old_name" } })
+    await pickTable("silver.orders")
+    await waitFor(() =>
+      expect(screen.getByLabelText("Column")).toHaveProperty("tagName", "SELECT")
+    )
+    const column = screen.getByLabelText("Column") as HTMLSelectElement
+    expect(column.value).toBe("old_name")
+    expect(Array.from(column.options).map((o) => o.textContent)).toContain("old_name (not in this table)")
+  })
+
+  it("is free text when the catalog cannot be read, and says why", async () => {
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return json({ id: "u1", name: "Admin", email: null, roles: [], permissions: ["governance:write"], tenants: [] })
+      }
+      if (path.startsWith("/api/catalog")) return json({ error: "catalog unavailable" }, 503)
+      return json({})
+    }) as unknown as typeof fetch)
+    renderPage()
+    expect((await screen.findByLabelText("Asset")) as HTMLInputElement).toHaveProperty("tagName", "INPUT")
+    expect(screen.getByText(/Could not read the catalog's tables/)).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("Asset"), { target: { value: "silver.orders" } })
+    expect((screen.getByLabelText("Asset") as HTMLInputElement).value).toBe("silver.orders")
   })
 })
