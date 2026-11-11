@@ -444,3 +444,62 @@ verification on the fixed commit. Nothing below is "green" by my hand yet.
   acknowledge, resolve and silence actions of `/api/overview/alerts`.
 - Feature page `ADM-13-AC7` said Assistant only has no "Export YAML". It has `dashboard:read`
   and the export is a read, so the page is corrected to say only "Add a chart" is hidden.
+
+### Round 2 (planner, 2026-11-11) — branch at `80cffce7`
+
+Read every fix commit (`4abd6038..a80fc25a`, 18 files). I ran no check locally: the pull
+request (#454, draft) runs the whole suite and is the final check. Its result is recorded
+below when it finishes.
+
+**Round 1, as the code stands (read in the diff, not taken from the handoff)**
+
+| Finding | State | Where |
+| --- | --- | --- |
+| B1 | Closed | `0133_pages_per_role.sql`; the pre-0132 seed test counts 7 roles again, which is right: it stops before 0133 |
+| B2 | Closed | `registry.rs`: the ten tools below; test `assistant_ask_only_is_offered_none_of_d10_tools_and_refused_each_with_permission_message` |
+| B3 | Server closed; console open as R2-B1 | `notifications.rs` (`openAlerts` needs `alert:read` or `alert:write`, `pendingApprovals` needs `agent:approve`); `GET /api/overview/alerts` is any-of; `home-page.tsx` |
+| B4 | Closed, one line open as R2-S1 | `docs/OPERATIONS.md` |
+| S1 | Closed | Pattern is `\*:\*`; empty permissions handled by `CASE`; the test runs the file twice with `include_str!` |
+| S2 | Closed | `assistant_reads(perms, perm)` in `ai/mod.rs`, called from `gate.rs`, `registry.rs` and `data_map_access` |
+| S3 | Closed | `GET /api/alerts/run` is `RequiresAuth` |
+| S4 | Closed | `nav-config.ts` |
+| S5 | Closed | `command-palette.tsx` uses `useAuth()`; `useOptionalAuth` is gone; neither search is sent without its permission |
+| S6 | Closed | Comment on `useCopilot`; `dashboard-page-role.test.tsx` |
+| S7 | **Not closed**, see R2-S2 | |
+
+D10.1 as built: `governance:read` on `get_audit_history`, `list_quality_rules`,
+`list_classification_rules`, `get_quality`; `ops:read` on `get_cdc_health`,
+`get_maintenance_metrics`, `list_workloads`, `get_capacity`, `get_table_maintenance`;
+`alert:read` on `list_alert_rules`.
+
+**BLOCKER**
+
+- **R2-B1. Home says "All clear" about things it did not check** (principle 2). For a check
+  the person may not see, `home-page.tsx:324-327` passes `state: "ok"` with a count of 0, and
+  `lib/home-status.ts` then lists it as fine. An Assistant only user reads "All clear: no
+  failing pipelines, no open alerts, all sources healthy, every dataset has data" while alerts
+  are open. The file's own header says the line "never reports all clear unless every read
+  succeeded".
+  - A check the person may not see is **left out**: `homeStatus` takes only the checks that
+    were made, and names nothing else, as fine or as a problem.
+  - With no check at all, Home shows no status line.
+  - Do not build a fake summary to skip the read (`{ staleAssets: 0 } as unknown as
+    OverviewSummary`); a read that is not made has no data.
+  - Tests in `src/lib/home-status.test.ts` and `home-page.test.tsx`: an
+    `assistant:ask,dashboard:read` user sees no status line and none of the four sentences; a
+    user with `alert:read` only gets a line that speaks of alerts only.
+
+**SHOULD-FIX**
+
+- **R2-S1. The SQL in the operations guide is untested and wrong for two neighbours.** With
+  `…,assistant:use,assistant:ask,…` the first match eats the comma the second needs, so one
+  permission stays. Remove the SQL; the Roles page is the way. Also: custom roles get the four
+  "unless they held `*:*`" should add "or already held one of the four", which is what the
+  migration does.
+- **R2-S2. The round 1 handoff describes code that is not in the branch** (rules 1 and 7). It
+  names tools (`list_alerts`, `get_data_residency`, `get_classifications`), files
+  (`home-view.tsx`, `components/layout/command-palette.tsx`, `copilot.test.ts`), a function
+  (`is_assistant_ask_only`) and a pattern (`\*\*:\*\*`) that do not exist, and says approvals
+  also open with `policy:review`, which the code does not do. The table above is the record.
+  The next handoff names only what `git diff --stat` and the code show.
+
