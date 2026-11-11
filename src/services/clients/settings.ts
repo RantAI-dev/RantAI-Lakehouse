@@ -12,6 +12,10 @@ import type {
   SettingsService,
   SignInSettings,
   SignInSettingsInput,
+  SsoSettings,
+  SsoSettingsInput,
+  SsoTestResult,
+  SsoTestStartResult,
 } from "../contracts/settings"
 import { ServiceError } from "../errors"
 import { apiFetch } from "../http"
@@ -64,6 +68,10 @@ const SIGN_IN_PATH = "/api/settings/sign-in"
 const ASSISTANT_PATH = "/api/settings/assistant"
 /** One request to the assistant's provider (`ADM-9`). */
 const ASSISTANT_TEST_PATH = "/api/settings/assistant/test"
+/** The deployment's SSO / OIDC settings (`ADM-12`). */
+const SSO_PATH = "/api/settings/sso"
+/** Start and read an SSO / OIDC test sign-in run (`ADM-12`). */
+const SSO_TEST_PATH = "/api/settings/sso/test"
 
 export const settingsService: SettingsService = {
   getLimits: (signal) => call<QueryLimits>("GET", undefined, signal, LIMITS_PATH),
@@ -84,4 +92,11 @@ export const settingsService: SettingsService = {
     call<AssistantSettings>("PUT", input, signal, ASSISTANT_PATH),
   testAssistant: (signal) =>
     call<AssistantTestResult>("POST", undefined, signal, ASSISTANT_TEST_PATH),
+  getSso: (signal) => call<SsoSettings>("GET", undefined, signal, SSO_PATH),
+  saveSso: (input: SsoSettingsInput, signal) =>
+    call<SsoSettings>("PUT", input, signal, SSO_PATH),
+  startSsoTest: (input: SsoSettingsInput, signal) =>
+    call<SsoTestStartResult>("POST", input, signal, SSO_TEST_PATH),
+  getSsoTestResult: (id: string, signal) =>
+    call<SsoTestResult>("GET", undefined, signal, `${SSO_TEST_PATH}/${encodeURIComponent(id)}`),
 }
