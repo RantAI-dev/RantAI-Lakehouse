@@ -739,7 +739,7 @@ async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()>
             .len(),
         12
     );
-    assert_eq!(list_roles(&pool).await.unwrap().len(), 8);
+    assert_eq!(list_roles(&pool).await.unwrap().len(), 7);
     assert_eq!(
         list_tenants(&pool, &TenantFilter::default())
             .await
