@@ -140,6 +140,7 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(canOpen("/admin/service-identities/new", reader)).toBe(false)
       expect(canOpen("/admin/settings/tag-keys/new", reader)).toBe(false)
       expect(canOpen("/admin/settings/tag-keys/data_domain/edit", reader)).toBe(false)
+      expect(canOpen("/governance/data-quality/rules/new", reader)).toBe(false)
       // ... and a writer can, on the permission the API route takes.
       expect(canOpen("/admin/users/invite", identityWriter)).toBe(true)
       expect(canOpen("/admin/roles/new", identityWriter)).toBe(true)
@@ -148,6 +149,7 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(canOpen("/admin/service-identities/new", identityWriter)).toBe(true)
       expect(canOpen("/admin/settings/tag-keys/new", governanceWriter)).toBe(true)
       expect(canOpen("/admin/settings/tag-keys/data_domain/edit", governanceWriter)).toBe(true)
+      expect(canOpen("/governance/data-quality/rules/new", governanceWriter)).toBe(true)
     })
 
     it("supports any-of permission checks", () => {

@@ -317,6 +317,9 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // ADM-13 review round 1, S4: policy:read only
   { pattern: "/governance/policies", requires: ["policy:read"] },
   { pattern: "/governance/data-quality", requires: ["governance:read"] },
+  // WEB-7 D2: adding a rule is the `governance:write` the API takes
+  // (`POST /api/governance/quality`).
+  { pattern: "/governance/data-quality/rules/new", requires: ["governance:write"] },
   { pattern: "/governance/approvals", requires: ["access:approve", "agent:approve"] },
   // ADM-13 review round 1, S4: governance:read only
   { pattern: "/audit", requires: ["governance:read"] },
