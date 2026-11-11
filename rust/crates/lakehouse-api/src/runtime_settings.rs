@@ -1521,15 +1521,31 @@ impl SsoNotReady {
 /// [`Self::base`] is what [`resolve_sso`] returned before discovery, kept
 /// so the cache can tell whether the saved row moved; [`Self::settings`] is
 /// the same value with the addresses filled in from the provider's
-/// discovery document. [`Self::not_ready`] says why the connection cannot be
-/// used; an authenticator is exposed only when it is `None`.
+/// discovery document.
+///
+/// # Two facts, kept apart (`ADM-12` review round 2, R2-B1)
+///
+/// * An **authenticator** exists whenever the issuer and the client ID are
+///   set, as on `main`: it is what the bearer-token path
+///   (`crate::auth::AuthenticatedPrincipal`) and the Deployment page
+///   (`routes::settings::get_deployment`) mean, and a deployment that sets
+///   only `OIDC_ISSUER` and `OIDC_CLIENT_ID` keeps accepting bearer tokens.
+///   For a console-set connection it also needs the address checks to have
+///   passed, because those are what keep a remote value from pointing this
+///   deployment at its own network.
+/// * **Ready for sign-in** additionally needs the authorize, token and
+///   redirect addresses; [`Self::is_ready`] and [`Self::not_ready_reason`]
+///   are this fact, and `providers`, `oidc_start`, the callback and
+///   `GET /api/settings/sso` read it.
 #[derive(Clone)]
 pub struct SwappableOidc {
     /// What [`resolve_sso`] returned, before discovery.
     pub base: EffectiveSso,
     /// The effective settings, with the addresses filled in.
     pub settings: EffectiveSso,
-    /// The authenticator, present only when the connection is ready.
+    /// The authenticator: present whenever the issuer and the client ID are
+    /// set (and, for a console-set connection, the address checks passed) —
+    /// not only when a sign-in can be offered.
     pub authenticator: Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>>,
     /// The HTTP client every request of this connection goes through.
     pub http: reqwest::Client,
@@ -1541,10 +1557,26 @@ pub struct SwappableOidc {
 }
 
 impl SwappableOidc {
-    /// Whether a sign-in can be offered with this runtime (`ADM-12` D10).
+    /// Whether a sign-in can be offered with this runtime (`ADM-12` D10) —
+    /// the second fact in this type's doc comment: the authenticator exists
+    /// *and* the authorize, token and redirect addresses do.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.not_ready.is_none() && self.authenticator.is_some()
+    }
+
+    /// The authenticator of a connection that can sign someone in — what
+    /// `providers`, `oidc_start`, the callback and the test callback take
+    /// (`ADM-12` review round 2, R2-B1). A connection with an authenticator
+    /// but no sign-in addresses is `None` here: it accepts bearer tokens,
+    /// not people ([`Self::authenticator`] keeps that one).
+    #[must_use]
+    pub fn sign_in_authenticator(&self) -> Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>> {
+        if self.is_ready() {
+            self.authenticator.clone()
+        } else {
+            None
+        }
     }
 
     /// The fixed sentence for why this runtime cannot be used, or `None`.
@@ -1697,7 +1729,9 @@ pub async fn sso(state: &AppState) -> EffectiveSso {
 }
 
 /// The `OIDC` authenticator for the effective `SSO` settings, rebuilt when
-/// they change (plan D4). Only a ready connection has one (`ADM-12` D10).
+/// they change (plan D4). Present whenever the issuer and the client ID are
+/// set — the bearer-token path's fact (`ADM-12` review round 2, R2-B1),
+/// not the sign-in readiness [`sso_runtime`]'s callers read.
 pub async fn oidc(state: &AppState) -> Option<Arc<lakehouse_auth::oidc::OidcAuthenticator>> {
     sso_runtime(state).await.authenticator
 }
@@ -1717,6 +1751,17 @@ pub async fn oidc(state: &AppState) -> Option<Arc<lakehouse_auth::oidc::OidcAuth
 /// no authenticator, so no key set, token or userinfo request is ever made
 /// to it. A server-owned connection is the operator's own file and is used
 /// as it is, which is today's behaviour (D6).
+///
+/// # Two facts, kept apart (`ADM-12` review round 2, R2-B1)
+///
+/// The authenticator is built once the issuer and the client ID are set
+/// (for a console-set connection, once the checks above passed); that is
+/// the bearer-token path's fact, as on `main`. `not_ready` is the separate
+/// sign-in fact: the authorize, token and redirect addresses must all be
+/// there. A server-owned connection without them keeps its authenticator and
+/// says why a sign-in is not offered; a console-set connection without a
+/// return address builds nothing, because its addresses are remote
+/// configuration and a sign-in is the only thing they are for.
 #[allow(
     clippy::too_many_lines,
     reason = "one flat builder: the readiness checks and the authenticator they guard, in the order they must run (ADM-12 D10)"
@@ -1740,21 +1785,20 @@ async fn build_sso_runtime(
         // D3: the environment owns the whole connection, addresses included.
         // Its values are the operator's file, so they are used as they are
         // and are not checked (D6).
-        if settings.authorize_url.is_none()
+        //
+        // `ADM-12` review round 2, R2-B1: the authenticator is built
+        // whenever the issuer and the client ID are set, as on `main` — it
+        // verifies bearer tokens whether or not this deployment offers a
+        // console sign-in. The three sign-in addresses are the separate
+        // "ready" fact; without them a sign-in answers `SsoNotReady`, and
+        // the bearer path keeps working.
+        let missing_sign_in_addresses = settings.authorize_url.is_none()
             || settings.token_url.is_none()
-            || settings.redirect_uri.is_none()
-        {
-            return not_ready_runtime(
-                base,
-                settings,
-                default_http,
-                SsoNotReady::ServerAddressesMissing,
-            );
-        }
+            || settings.redirect_uri.is_none();
         let authenticator = Arc::new(
             lakehouse_auth::oidc::OidcAuthenticator::new_with_http_client(
                 settings.to_oidc_config(),
-                None,
+                state.sso_http_client(),
                 pool,
             ),
         );
@@ -1763,7 +1807,7 @@ async fn build_sso_runtime(
             settings,
             authenticator: Some(authenticator),
             http: default_http,
-            not_ready: None,
+            not_ready: missing_sign_in_addresses.then_some(SsoNotReady::ServerAddressesMissing),
             built_at,
         };
     }
@@ -1786,7 +1830,10 @@ async fn build_sso_runtime(
 
     // The console's own return address: `<CONSOLE_PUBLIC_URL>` +
     // `/api/auth/oidc/callback`, never a request header (D10). A set
-    // `OIDC_REDIRECT_URI` still wins per value.
+    // `OIDC_REDIRECT_URI` still wins per value. A console-set connection
+    // cannot offer a sign-in without it, so nothing is built (R2-B1 keeps
+    // this gate for the console path only; the server-owned path above
+    // keeps its authenticator without it).
     let redirect_uri = base
         .redirect_uri
         .clone()

@@ -738,12 +738,14 @@ pub async fn oidc_start(
     Query(query): Query<OidcStartQuery>,
 ) -> ApiResult<Response> {
     // `ADM-12` D10: the runtime, not the bare config. It carries the
-    // addresses the provider's discovery document named, and is present
-    // only when the connection is ready — so a saved connection with no
-    // return address or an unreachable discovery answers a plain 503 here
-    // instead of redirecting somewhere that cannot work.
+    // addresses the provider's discovery document named, and is ready only
+    // when the connection can sign someone in — so a saved connection with
+    // no return address or an unreachable discovery answers a plain 503
+    // here instead of redirecting somewhere that cannot work. Review round
+    // 2, R2-B1: an authenticator without sign-in addresses (a bearer-only
+    // deployment) is not enough for this route.
     let runtime = crate::runtime_settings::sso_runtime(&state).await;
-    let Some(_auth) = runtime.authenticator else {
+    let Some(_auth) = runtime.sign_in_authenticator() else {
         return Err(ApiError::Unavailable(
             runtime
                 .not_ready_reason()
@@ -1026,10 +1028,17 @@ pub async fn oidc_callback(
     // a "no credentials presented" 401/403 for [`crate::policy::POLICY_TABLE`]'s
     // `Policy::Public` purposes, and nothing has been read from `headers`
     // yet, so there is no cookie to clear on this path.
-    let Some(auth) = crate::runtime_settings::oidc(&state).await else {
-        return Ok(unavailable("OIDC is not configured on this deployment"));
-    };
     let runtime = crate::runtime_settings::sso_runtime(&state).await;
+    // R2-B1: a bearer-only deployment has an authenticator but cannot sign
+    // anyone in; this route is a sign-in's second half, so it needs the
+    // ready fact, not merely "an authenticator exists".
+    let Some(auth) = runtime.sign_in_authenticator() else {
+        return Ok(unavailable(
+            runtime
+                .not_ready_reason()
+                .unwrap_or("OIDC is not configured on this deployment"),
+        ));
+    };
     let sso = runtime.settings.clone();
     let (Some(token_url), Some(redirect_uri)) =
         (sso.token_url.as_deref(), sso.redirect_uri.as_deref())
@@ -1414,12 +1423,15 @@ async fn handle_oidc_test_callback(
     }
 
     // B2: the draft's own settings, and the draft's own discovery document.
+    // R2-B1: the draft must be able to sign someone in, so this takes the
+    // ready fact — a draft whose discovery worked but which has no return
+    // address cannot test a sign-in.
     let runtime = crate::runtime_settings::sso_runtime_for_settings(
         &state,
         crate::runtime_settings::draft_sso_settings(&state.config, &draft),
     )
     .await;
-    let Some(authenticator) = runtime.authenticator.clone() else {
+    let Some(authenticator) = runtime.sign_in_authenticator() else {
         let reason = runtime
             .not_ready_reason()
             .unwrap_or("The draft connection cannot be used to test a sign-in.");
@@ -3182,6 +3194,113 @@ mod tests {
         let without_oidc = AppState::new(Config::from_map(&HashMap::new()).unwrap());
         let body = get_json(&without_oidc, "/api/auth/providers").await;
         assert_eq!(body["oidc"], serde_json::json!(false));
+    }
+
+    /// `ADM-12` review round 2, R2-B1: with only `OIDC_ISSUER` and
+    /// `OIDC_CLIENT_ID` set — the shape a deployment that accepts bearer
+    /// tokens uses — the authenticator exists (the bearer path's fact), but
+    /// no sign-in can be offered, so `providers` reports no OIDC and the
+    /// sign-in page shows no button that would fail.
+    #[tokio::test]
+    async fn an_issuer_and_a_client_id_alone_report_no_sign_in_but_keep_the_authenticator() {
+        let mut env = HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            "postgres://user:pass@127.0.0.1:1/nonexistent_db_xyz".to_owned(),
+        );
+        env.insert(
+            "OIDC_ISSUER".to_owned(),
+            "https://idp.example.com".to_owned(),
+        );
+        env.insert("OIDC_CLIENT_ID".to_owned(), "lakehouse-console".to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+        // The bearer-token fact: an authenticator exists.
+        assert!(
+            crate::runtime_settings::oidc(&state).await.is_some(),
+            "an issuer and a client ID alone must still verify bearer tokens"
+        );
+
+        // The sign-in fact: no authorize, token or redirect address, so no
+        // button.
+        let body = get_json(&state, "/api/auth/providers").await;
+        assert_eq!(body["oidc"], serde_json::json!(false));
+        assert_eq!(body["providerName"], serde_json::Value::Null);
+    }
+
+    /// `ADM-12` review round 2, R2-B1, the end-to-end half: a deployment
+    /// that sets only `OIDC_ISSUER` and `OIDC_CLIENT_ID` (no sign-in
+    /// address) still accepts a bearer token, exactly as on `main`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_bearer_token_is_accepted_with_only_an_issuer_and_a_client_id(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let server = wiremock::MockServer::start().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
+        let issuer = server.uri();
+
+        // A user with an `OIDC` identity already linked, so the bearer path
+        // needs no JIT provisioning. `OIDC_PROVIDER_NAME` is unset, so the
+        // label is `oidc:default`.
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO app_user (id, name, username, email, status) \
+             VALUES ($1, 'Bearer Only', 'bearer-only', 'bearer-only@meridian.example', 'active')",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash) \
+             VALUES ('oidc:default', 'bearer-only-subject', $1, NULL)",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("OIDC_ISSUER".to_owned(), issuer.clone());
+        env.insert("OIDC_CLIENT_ID".to_owned(), "lakehouse-console".to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let app = crate::routes::router(state);
+
+        let token = sign_id_token(
+            &IdTokenClaims {
+                sub: "bearer-only-subject",
+                iss: &issuer,
+                aud: "lakehouse-console",
+                exp: (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+                    .unix_timestamp(),
+                nonce: "not-checked-on-the-bearer-path",
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a bearer token must still be accepted when only the issuer and the client ID are set"
+        );
+        Ok(())
     }
 
     #[sqlx::test(migrations = "../../migrations")]
