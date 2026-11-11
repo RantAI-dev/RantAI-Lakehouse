@@ -509,7 +509,46 @@ REST timeouts) is environment.
 
 ## 8. Slice 2 handoff
 
-(Developer appends here.)
+Branch `fix/qa-fails-part-a-s2`, built on `9843e17e`. Per 7.3a no cargo command ran on this VM
+except `cargo fmt`; every Rust check below is *not verified locally, CI*.
+
+### Commits
+
+- `0f7f6103` fix(gold): a signed-in person without gold:export gets 403, not a login loop (LH-DATA-1-02) (T9)
+- `282cea46` fix(catalog): an asset page says "unavailable", not "Not found", when the engine fails (DATA-13, DATA-15) (T10)
+- `81cefc3d` fix(governance): the audit entry of a catalog grant says who got which permission (DATA-15) (T11)
+- `982a9e9f` fix(connectors): an S3 preview reads a file by what it is (SRC-13) (T12)
+- `6f0a6166` fix(catalog): the Gold page stops asking for publish history a person may not read (LH-DATA-1-02) (T13)
+- `a6c44668` fix(catalog): the asset page shows permission, unavailable or not found by the status (DATA-13, DATA-15) (T14)
+- `da55f14c` fix(governance): the audit drawer shows who got which permission (DATA-15) (T15)
+
+### Commands run and counts
+
+- `cd rust && cargo fmt --check`: clean (exit 0) on the final commit; `cargo fmt` applied to the files I touched (it only changed my hunks).
+- `bun run typecheck`: clean.
+- `bun run lint`: 0 errors, 10 warnings (none in files I touched; they pre-exist, e.g. `http.ts:84`).
+- `bun run test`: 3805 pass, 1 skip, 0 fail (3806 tests, 360 files).
+- Per task: `bun test src/features/catalog/open-format-card.test.tsx` 17 pass; `bun test src/services/clients/assets.test.ts` 8 pass; `bun test src/features/governance/audit-page.test.tsx` 2 pass.
+- `git status`: only `AGENTS.md` (modified by `next dev`) and the untracked files that are not mine (`.claude/`, `docs/plans/FEAT-CONNECTORS-REPORT.md`, `lark-import/`, `ops/g3/bronze_catalog.py`) remain; none staged.
+
+### Not verified locally, CI
+
+`cargo clippy` (workspace and `-p lakehouse-api`), `cargo test` / `cargo nextest`, and the `sqlx::test`
+integration tests: all of it. Rust tests I added or changed, to find in the CI log:
+
+- `routes::gold::tests::configured_token_forbids_a_signed_in_user_without_the_permission_who_sent_no_token`, `configured_token_still_401s_a_user_without_the_permission_who_sent_a_wrong_token`, `configured_token_still_401s_when_there_is_no_principal_and_no_token` (new).
+- `routes::catalog::...::detail_of_a_silver_table_says_unavailable_when_the_engine_fails`, `detail_of_a_silver_table_the_engine_does_not_have_is_still_404` (new, `sqlx::test`, wiremock engine). The first relies on a `500` answer from the mock becoming a `ChError` out of `clickhouse_source`; if CI shows it returning another status, that is where to look.
+- `routes::governance::tests::source_of_follows_the_principal_kind`, `detail_of_a_grant_names_the_permission_the_grantee_and_the_day_it_ends`, `detail_of_a_grant_without_an_expiry_does_not_invent_a_date`, `detail_of_a_revoke_names_the_permission_and_the_grantee`, `detail_of_any_other_action_is_none` (new).
+- `connector_listing::tests::a_preview_reads_an_object_by_its_extension_and_falls_back_to_the_configured_format` (new).
+- `tests/sec11_guard.rs` must stay green: the new call in `clickhouse_asset_detail` passes `&e` to `upstream_error::ch_error_as` like `routes/alerts.rs` does.
+
+### Answers the plan asks for
+
+- **T9, changed expectations:** none. `tests/gold_publication.rs:236` does not configure `GOLD_EXPORT_RUN_TOKEN`, so it stays on the `503` path; `tests/gold_export_auth.rs` sends service credentials only (its 401 is at `auth_gate`, before `check_export_token`); `tests/route_auth.rs` has no Gold export entry. The unit test `configured_token_rejects_an_unpermissioned_session_presenting_the_wrong_token` is unchanged and still expects 401.
+- **Plan mismatch (D6):** the plan says `ApiError::Forbidden`, but its fixed body is `embedding_disabled` (`lakehouse-core/src/error.rs:46`), which would mislabel the 403. I used `ApiError::PermissionDenied("gold:export")` (also 403, body `permission_denied: gold:export`). Same status, so the console fix holds either way.
+- **T11, `catalog.revoke`:** it exists (`catalog_grants.rs:254`, args `permission` and `grantee`), so it gets a detail too ("Revoked P from G"). I reused `catalog_governance::grant_summary` (made `pub(super)`) rather than a second copy of the wording (rule 4); the sentence therefore reads "Granted query:read to Name <email> until 2026-12-06", and "until its expiry" when no `expiresAt` is stored (existing wording).
+- **Readers of source `"copilot"`:** none found in `src/`, `ops/` or the Rust tests (the console `AuditEvent` has no `source`; `ops/g3a/g3a_test.py` reads only `resource`).
+- **T13:** the history reads wait for `pub.data.canEdit` (deps `[mart, mayReadHistory]`), so there is no request before the publication answers and none for a read-only person; the "Last 5 publish runs" block is also hidden for them. `getConsumers` (readers) is unchanged and out of this plan.
 
 ## 9. Slice 2 review
 
