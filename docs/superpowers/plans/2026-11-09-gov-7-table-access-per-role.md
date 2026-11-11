@@ -852,6 +852,50 @@ first, and the picker stays covered by the component tests only.
 `git status --short` before the code commit: only the three files above, staged by hand; no
 generated file. Remote head after both pushes is this branch's tip.
 
+### Handoff (developer, 2026-11-11, S2 CI fix)
+
+R11 guard false positive on #468 only. Branch `feat/gov-7-s2-console` from `34131e21`.
+
+- **`749a8cfe` — `fix(catalog): one bronze_table_key helper, out of the R11 window`.**
+  - `rust/crates/lakehouse-api/src/routes/catalog.rs`: new private
+    `fn bronze_table_key(table_name: &str) -> Option<String>`, next to `asset_table_key`
+    and far from `PART_STATS_COLUMNS`: `None` for an empty name, otherwise
+    `format!("bronze.{table_name}")`. The list row (`bronze_catalog_row`) and the detail
+    body (`bronze_detail_body`) now emit `bronze_table_key(table_name).map_or(Value::Null,
+    Value::String)`, which is the same `null`-for-empty / `bronze.<name>` output as before.
+  - `ensure_asset_readable` uses the helper for a non-empty name and keeps `"bronze."` for
+    an empty one, with a comment. That exact fallback is required for "no behaviour
+    change": `TableAccess::allows_key("bronze.")` is allowed by a schema-level `bronze`
+    grant (`allows("bronze", "")`) and hidden by a table-level grant, so returning `None`'s
+    `404` outright would have changed the schema-grant case. No `bronze.` literal remains
+    in `bronze_catalog_row`'s body or its in-body comment; the doc comment above it keeps
+    one and the guard is green.
+  - `ops/lint/check_bare_iceberg_count.py` is untouched, and `PART_STATS_COLUMNS` has no
+    `WHERE 1` (rule 2).
+
+Commands, as run (foreground, from `rust/` for cargo, on `749a8cfe`):
+
+- `python3 ops/lint/check_bare_iceberg_count.py` — "R11 guard: no bare count() against a
+  Bronze Iceberg table found." (before the fix it failed at
+  `catalog.rs:1544`, as the brief described).
+- `python3 ops/lint/check_intra_package_imports.py` — "OK: all intra-package
+  dispar_orchestrate imports resolve".
+- `/home/shiro/rantai/bin/cargo-locked fmt --check` — pass, exit 0.
+- `/home/shiro/rantai/bin/cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings`
+  — pass, exit 0 ("Finished `dev` profile … in 3m 25s").
+- `/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --test table_access` — **14
+  passed, 0 failed** (finished in 6.13 s).
+- `/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --lib catalog` — **301 passed,
+  0 failed, 3172 filtered out** (finished in 27.87 s).
+
+**Not verified, and why:** no workspace-wide `cargo test` / clippy and no TypeScript or
+Python test run — the commit touches one Rust file, and CI on #468 runs the full block. No
+new test was added: the three call sites keep their existing behaviour and are already
+covered by `table_access` and the catalog lib tests.
+
+`git status --short` before the code commit: only `catalog.rs`. Remote head after the push
+is `749a8cfe`.
+
 ## 6. Review (planner)
 
 ### S1, round 1 (planner, 2026-11-11) — branch at `3f6b5569`
