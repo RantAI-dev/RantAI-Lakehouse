@@ -957,8 +957,15 @@ async fn an_authored_pipeline_enforce_call_for_a_narrowed_author_is_not_found() 
 
 // ── Catalog lists and details (GOV-7 D6, AC1, AC6) ──────────────────────
 
+/// The Bronze registry's `dataset_catalog` read, whose result rows carry the
+/// `table_name` a row's `tableKey` is built from (`catalog.rs`
+/// `assemble_bronze_rows`). Two datasets, so a grant for one can be told
+/// apart from a grant for neither.
+const BRONZE_CATALOG_SQL_PREFIX: &str =
+    "SELECT slug, title, description, tier, updated_at, table_name";
+
 /// A `ClickHouse` serving the catalog assembly with two Silver tables, one of
-/// which the narrowed role may not read.
+/// which the narrowed role may not read, and two Bronze registry rows.
 #[derive(Clone)]
 struct CatalogFake {
     log: Arc<Mutex<Vec<String>>>,
@@ -971,6 +978,43 @@ impl Respond for CatalogFake {
             .lock()
             .expect("the statement log")
             .push(sql.clone());
+        // `GOV-7` D9: the Bronze registry read, which is what gives a Bronze
+        // row the table it is addressed by. Its own columns are the registry
+        // names; the secondary registry's copy of the same read and the clash
+        // count are answered empty by the fall-through below.
+        if sql.starts_with(BRONZE_CATALOG_SQL_PREFIX) {
+            return rows(
+                &[
+                    "slug",
+                    "title",
+                    "description",
+                    "tier",
+                    "updated_at",
+                    "table_name",
+                    "lag",
+                ],
+                &[
+                    json!({
+                        "slug": "ds_commerce_orders",
+                        "title": "Commerce orders",
+                        "description": "Bronze orders",
+                        "tier": "primer",
+                        "updated_at": "2026-11-01T00:00:00Z",
+                        "table_name": "commerce_orders",
+                        "lag": "60",
+                    }),
+                    json!({
+                        "slug": "ds_finance_payments",
+                        "title": "Finance payments",
+                        "description": "Bronze payments",
+                        "tier": "primer",
+                        "updated_at": "2026-11-01T00:00:00Z",
+                        "table_name": "finance_payments",
+                        "lag": "60",
+                    }),
+                ],
+            );
+        }
         // The catalog's own reads alias the columns (`database db`), so the
         // fake answers with the names the real engine would send back.
         if sql.contains("FROM system.tables") {
@@ -1059,6 +1103,84 @@ async fn the_catalog_list_omits_a_hidden_table_and_its_detail_is_the_unknown_404
         hidden, unknown,
         "a hidden table answers the same 404 body an unknown id answers"
     );
+}
+
+/// `GOV-7` D9 (`S2 review 1 B2`): a narrowed role granted one Bronze table
+/// finds that Bronze row in both catalog lists, and only that one.
+#[tokio::test]
+async fn the_catalog_lists_the_bronze_table_a_narrowed_role_is_granted() {
+    let fake = CatalogFake {
+        log: Arc::new(Mutex::new(Vec::new())),
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(fake.clone())
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(&pool, "catalog:read", &[("bronze", "commerce_orders")]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = send_get(&router, &cookie, "/api/catalog").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["assets"]
+        .as_array()
+        .expect("assets")
+        .iter()
+        .filter_map(|a| a["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"ds_commerce_orders"),
+        "a granted Bronze table must be listed: {body}"
+    );
+    assert!(
+        !ids.contains(&"ds_finance_payments"),
+        "a Bronze table the role is not granted must not be listed: {body}"
+    );
+
+    let (status, paged) = send_get(&router, &cookie, "/api/catalog/query").await;
+    assert_eq!(status, StatusCode::OK, "{paged}");
+    let items = paged["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{paged}");
+    assert_eq!(items[0]["id"], json!("ds_commerce_orders"), "{paged}");
+    assert_eq!(paged["totalItems"], json!(1), "{paged}");
+}
+
+/// `GOV-7` D9 (`S2 review 1 B2`): a grant for a Silver table does not cover a
+/// Bronze table, so such a role still sees no Bronze row.
+#[tokio::test]
+async fn a_bronze_row_stays_hidden_from_a_role_granted_only_a_silver_table() {
+    let fake = CatalogFake {
+        log: Arc::new(Mutex::new(Vec::new())),
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(fake.clone())
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(&pool, "catalog:read", &[("silver", "visible_x")]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = send_get(&router, &cookie, "/api/catalog").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["assets"]
+        .as_array()
+        .expect("assets")
+        .iter()
+        .filter_map(|a| a["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"silver.visible_x"), "{body}");
+    assert!(
+        !ids.contains(&"ds_commerce_orders") && !ids.contains(&"ds_finance_payments"),
+        "a Silver grant must not reveal a Bronze row: {body}"
+    );
+
+    let (status, paged) = send_get(&router, &cookie, "/api/catalog/query").await;
+    assert_eq!(status, StatusCode::OK, "{paged}");
+    let items = paged["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{paged}");
+    assert_eq!(items[0]["id"], json!("silver.visible_x"), "{paged}");
 }
 
 /// The paged Data Explorer query filters the same snapshot before it counts.
