@@ -1,6 +1,7 @@
 import { displayColumn } from "@/lib/chart-joins";
 import type { EChartsOption } from "echarts";
 import { decimalsFor, monthlyAxisLabel } from "@/lib/chart-axis";
+import { categoryLabel } from "@/lib/chart-transforms";
 import { resolvePalette } from "@/lib/chart-palettes";
 import type { StyleFields } from "@/lib/chart-style";
 import { formatAxisValue, formatValue } from "@/lib/value-format";
@@ -71,7 +72,8 @@ export type Combined = {
   owners: number[];
 };
 
-const text = (v: unknown) => String(v ?? "");
+// QA LH-BI-6-38: a NULL or empty category reads "(No value)" / "(Empty)", as on every other chart.
+const text = categoryLabel;
 const num = (v: unknown) => Number(v ?? 0);
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}/;
 

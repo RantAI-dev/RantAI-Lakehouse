@@ -8,7 +8,7 @@ import { formatAxisValue, formatValue } from "@/lib/value-format";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { planClusters, type ClusterPlan } from "./cluster-plan";
 import { planForecast, withForecastSeries, type ForecastBuckets, type ForecastPlan } from "./forecast-line";
-import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
+import { boxplotNeedsLogAxis, categoryLabel, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 
 /**
  * Phase 2 QA R16: a long series name folds with an ellipsis in the legend and is read in full
@@ -56,7 +56,6 @@ export function showsPointMarkers(kind: string, points: number): boolean {
   return kind === "line" && points <= MARKER_LIMIT;
 }
 const num = (v: unknown) => Number(v ?? 0);
-const str = (v: unknown) => String(v ?? "");
 
 export function buildOption(
   spec: Renderable,
@@ -104,7 +103,9 @@ export function buildOption(
     grid: { left: 8, right: 16, top: 16, bottom: 8, containLabel: true },
   };
 
-  const cat = rows.map((r) => str(r[spec.x]));
+  // QA LH-BI-6-38: every category, legend and tooltip name goes through `categoryLabel`, so a NULL reads
+  // "(No value)" and an empty string "(Empty)"; what a click sends stays the raw value (lib/chart-click.ts).
+  const cat = rows.map((r) => categoryLabel(r[spec.x]));
   // BI-6: legend, axis and tooltip name a measure with its own aggregate as
   // "avg of stay", not by the `avg_stay` it is called in the result.
   const labelOf = (column: string) => spec.measureLabels?.[column] ?? displayColumn(column);
@@ -128,7 +129,7 @@ export function buildOption(
           avoidLabelOverlap: true,
           itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2 },
           label: { show: false },
-          data: rows.map((r) => ({ name: str(r[spec.x]), value: num(r[yCol]) })),
+          data: rows.map((r) => ({ name: categoryLabel(r[spec.x]), value: num(r[yCol]) })),
         },
       ],
     };
@@ -165,7 +166,7 @@ export function buildOption(
       legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [{ type: "pie", roseType: "area", radius: ["15%", "72%"], center: ["50%", "44%"],
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, borderRadius: 4 },
-        label: { show: false }, data: rows.map((r) => ({ name: str(r[spec.x]), value: num(r[y0]) })) }],
+        label: { show: false }, data: rows.map((r) => ({ name: categoryLabel(r[spec.x]), value: num(r[y0]) })) }],
     } as EChartsOption;
   }
 
@@ -176,7 +177,7 @@ export function buildOption(
       series: [{ type: "funnel", left: "8%", right: "8%", top: 10, bottom: 28, sort: "descending", gap: 2,
         label: { show: true, position: "inside", color: "#fff", fontSize: 11, formatter: "{b}" },
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 1 },
-        data: rows.map((r) => ({ name: str(r[spec.x]), value: num(r[y0]) })) }],
+        data: rows.map((r) => ({ name: categoryLabel(r[spec.x]), value: num(r[y0]) })) }],
     } as EChartsOption;
   }
 
@@ -187,7 +188,7 @@ export function buildOption(
         width: "100%", height: "100%", top: 4, left: 4, right: 4, bottom: 4,
         label: { show: true, formatter: "{b}", color: "#fff", fontSize: 11 },
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, gapWidth: 2 },
-        data: rows.map((r, i) => ({ name: str(r[spec.x]), value: num(r[y0]), itemStyle: { color: pc(i) } })) }],
+        data: rows.map((r, i) => ({ name: categoryLabel(r[spec.x]), value: num(r[y0]), itemStyle: { color: pc(i) } })) }],
     } as EChartsOption;
   }
 
@@ -195,7 +196,7 @@ export function buildOption(
     const maxVal = Math.max(1, ...rows.map((r) => num(r[y0])));
     return { ...base, grid: undefined,
       tooltip: { ...base.tooltip, trigger: "item" },
-      radar: { indicator: rows.map((r) => ({ name: str(r[spec.x]), max: maxVal * 1.1 })),
+      radar: { indicator: rows.map((r) => ({ name: categoryLabel(r[spec.x]), max: maxVal * 1.1 })),
         axisName: { color: axis, fontSize: 10 }, splitLine: { lineStyle: { color: split } },
         splitArea: { show: false }, axisLine: { lineStyle: { color: split } } },
       series: [{ type: "radar", symbolSize: 4, areaStyle: { opacity: 0.12 }, lineStyle: { width: 2 },
@@ -222,7 +223,7 @@ export function buildOption(
   if (spec.kind === "scatter" || spec.kind === "bubble") {
     const xc = yArr[0], yc = yArr[1] ?? yArr[0], sc = yArr[2];
     const maxS = spec.kind === "bubble" && sc ? Math.max(1, ...rows.map((r) => num(r[sc]))) : 1;
-    const items = rows.map((r) => ({ name: str(r[spec.x]), value: [num(r[xc]), num(r[yc]), sc ? num(r[sc]) : 0] }));
+    const items = rows.map((r) => ({ name: categoryLabel(r[spec.x]), value: [num(r[xc]), num(r[yc]), sc ? num(r[sc]) : 0] }));
     const symbolSize = spec.kind === "bubble" && sc ? (d: unknown) => { const a = d as number[]; return 8 + 38 * Math.sqrt((a[2] ?? 0) / maxS); } : 12;
     // BI-17 part B (D5): one series per cluster, coloured by the palette and named in the legend with its size and centre.
     const plan = clustersOf(spec, rows, opts.style);
@@ -287,7 +288,7 @@ export function buildOption(
     const seriesCol = spec.series;
     const data: [number, number, number][] = [];
     for (const r of rows) {
-      const xv = str(r[spec.x]); const yv = str(r[seriesCol]);
+      const xv = categoryLabel(r[spec.x]); const yv = categoryLabel(r[seriesCol]);
       let xi = xCats.indexOf(xv); if (xi < 0) { xi = xCats.length; xCats.push(xv); }
       let yi = yCats.indexOf(yv); if (yi < 0) { yi = yCats.length; yCats.push(yv); }
       data.push([xi, yi, num(r[y0])]);
@@ -410,8 +411,8 @@ export function buildOption(
     const groups: string[] = [];
     const lookup = new Map<string, number>();
     for (const r of rows) {
-      const xv = str(r[spec.x]);
-      const gv = str(r[seriesCol]);
+      const xv = categoryLabel(r[spec.x]);
+      const gv = categoryLabel(r[seriesCol]);
       if (!cats.includes(xv)) cats.push(xv);
       if (!groups.includes(gv)) groups.push(gv);
       lookup.set(`${xv}||${gv}`, num(r[valueCol]));

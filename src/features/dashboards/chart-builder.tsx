@@ -623,7 +623,9 @@ export function ChartBuilder({
     () => (fields?.measures ?? []).filter((m) => !wholeMeasure.has(m) && fields?.kinds?.[m] === "number"),
     [fields, wholeMeasure],
   );
-  const dimensionChoices = isHistogram ? numberColumns : binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
+  // QA LH-BI-13-01: bins are off beside more questions (builder-rules), but a number column (a year) is still a
+  // real column the server takes as the dimension, so it stays offered, unbinned (`pickDimension` clears the bin).
+  const dimensionChoices = isHistogram ? numberColumns : binKind || (layers.length > 0 && takesLayers(kind) && !rowsMode) ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
   const breakdownChoices = (binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? []).filter((d) => d !== dimension);
   const startingBin = onSqlSource ? ({ mode: "width", count: "10", width: "" } as const) : AUTO_BIN;
   const isNumber = (column: string) => fields?.kinds?.[column] === "number";
@@ -1031,8 +1033,12 @@ export function ChartBuilder({
       };
     } else if (isSingle) {
       const goalColumn = goalMeasureColumn(kind, typeDraft);
+      // QA LH-BI-2-01: a reusable metric must go out as `{ metric }` like on the other paths; the raw row
+      // column `"metric:…"` is refused by the server (400 "invalid or missing measure column"). A plain
+      // column, and an empty row (kept as today so the preview says what is missing), still go as the name.
+      const [firstMeasure] = entriesFromRows(measureRows.slice(0, 1), limits.own);
       payload = {
-        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [measure, ...(goalColumn ? [goalColumn] : [])], aggregate, span, board: targetBoard,
+        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [firstMeasure ?? measure, ...(goalColumn ? [goalColumn] : [])], aggregate, span, board: targetBoard,
         caption: (isKpi || isProgress) && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
         ...draftPayload(kind, tableDraft),

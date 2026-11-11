@@ -195,3 +195,19 @@ test("PR #199 review O BLOCKER 1: a name with markup in any tooltip is written a
     assert.ok(html.includes(XSS_AS_TEXT), `${c.name}: the name is written as text`)
   }
 })
+
+// QA LH-BI-6-38: a NULL category reads "(No value)", an empty one "(Empty)"; the rows keep the raw values.
+test("a bar labels a NULL category (No value) and an empty one (Empty)", () => {
+  const rows = [{ x: null, v: 1 }, { x: "", v: 2 }, { x: "Bali", v: 3 }]
+  const option = buildOption({ kind: "bar", x: "x", y: "v" }, rows, false)
+  const axis = (option.xAxis ?? option.yAxis) as { data?: string[] }
+  assert.deepEqual(axis.data, ["(No value)", "(Empty)", "Bali"])
+  assert.equal(rows[0].x, null)
+})
+
+test("a pie names a NULL slice (No value) and a breakdown names a NULL series (No value)", () => {
+  const pie = buildOption({ kind: "pie", x: "x", y: "v" }, [{ x: null, v: 1 }, { x: "Bali", v: 3 }], false)
+  assert.deepEqual((pie.series as { data: { name: string }[] }[])[0].data.map((d) => d.name), ["(No value)", "Bali"])
+  const stacked = buildOption({ kind: "bar", x: "x", y: "v", series: "g" }, [{ x: "Bali", g: null, v: 1 }, { x: "Bali", g: "A", v: 2 }], false)
+  assert.deepEqual((stacked.series as { name: string }[]).map((s) => s.name).sort(), ["(No value)", "A"])
+})

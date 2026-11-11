@@ -11,6 +11,18 @@
 
 type Row = Record<string, unknown>
 const str = (v: unknown) => String(v ?? "")
+
+/**
+ * QA LH-BI-6-38: what an axis, a legend or a tooltip calls a category. A NULL and an empty
+ * string used to draw as a blank label, so a bar with no name looked like a bug. Display
+ * only (plan D5): a click, a drill and a cross-filter go on sending the raw value, which
+ * `isPlaceholderLabel` lets them tell from a stored value.
+ */
+export const NO_VALUE_LABEL = "(No value)"
+export const EMPTY_LABEL = "(Empty)"
+export const categoryLabel = (v: unknown): string => (v === null || v === undefined ? NO_VALUE_LABEL : v === "" ? EMPTY_LABEL : String(v))
+/** Whether `label` is one of the two the display gives a NULL or an empty string. */
+export const isPlaceholderLabel = (label: string) => label === NO_VALUE_LABEL || label === EMPTY_LABEL
 const num = (v: unknown) => Number(v ?? 0)
 
 /**
@@ -32,10 +44,10 @@ export function toSankey(
   for (const r of rows) {
     const value = num(r[y])
     if (!(value > 0)) continue // a sankey link needs a positive width
-    const from = `a:${str(r[x])}`
-    const to = `b:${str(r[series])}`
-    nodes.set(from, { name: from, label: str(r[x]) })
-    nodes.set(to, { name: to, label: str(r[series]) })
+    const from = `a:${categoryLabel(r[x])}`
+    const to = `b:${categoryLabel(r[series])}`
+    nodes.set(from, { name: from, label: categoryLabel(r[x]) })
+    nodes.set(to, { name: to, label: categoryLabel(r[series]) })
     const key = `${from}\u0000${to}`
     const link = links.get(key)
     if (link) link.value += value
@@ -52,13 +64,13 @@ export function toSunburst(rows: Row[], x: string, series: string, y: string): S
   for (const r of rows) {
     const value = num(r[y])
     if (!(value > 0)) continue
-    const parentName = str(r[x])
+    const parentName = categoryLabel(r[x])
     let parent = parents.get(parentName)
     if (!parent) {
       parent = { name: parentName, children: [] }
       parents.set(parentName, parent)
     }
-    parent.children!.push({ name: str(r[series]), value })
+    parent.children!.push({ name: categoryLabel(r[series]), value })
   }
   return [...parents.values()]
 }
@@ -83,7 +95,7 @@ export function toBoxplot(
     if (!Array.isArray(v) || v.length !== 5) continue
     const five = v.map(Number)
     if (five.some((n) => !Number.isFinite(n))) continue
-    categories.push(str(r[x]))
+    categories.push(categoryLabel(r[x]))
     data.push(five)
     // ClickHouse sends a UInt64 count as a string in JSON.
     const n = Number(r.__n)
