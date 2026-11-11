@@ -1712,10 +1712,7 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/sso/test",
             axum::routing::post(settings::post_sso_test),
         )
-        .route(
-            "/api/settings/sso/test/{id}",
-            get(settings::get_sso_test),
-        )
+        .route("/api/settings/sso/test/{id}", get(settings::get_sso_test))
         // Time and row limits of charts and Query Studio (`BI-5`); see
         // `routes::query_limits`.
         // Stop (`BI-5`): ends the caller's own queries of one run.

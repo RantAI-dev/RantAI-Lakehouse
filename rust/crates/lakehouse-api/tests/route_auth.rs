@@ -677,7 +677,10 @@ async fn the_sign_in_and_assistant_settings_routes_are_refused_without_settings_
         ("GET", "/api/settings/sso"),
         ("PUT", "/api/settings/sso"),
         ("POST", "/api/settings/sso/test"),
-        ("GET", "/api/settings/sso/test/00000000-0000-0000-0000-000000000001"),
+        (
+            "GET",
+            "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
+        ),
     ] {
         let resp = request_with_cookie(&router, method, path, &analyst).await;
         assert_eq!(
@@ -703,7 +706,10 @@ async fn a_platform_admin_is_not_refused_the_sign_in_and_assistant_settings_rout
         ("GET", "/api/settings/sso"),
         ("PUT", "/api/settings/sso"),
         ("POST", "/api/settings/sso/test"),
-        ("GET", "/api/settings/sso/test/00000000-0000-0000-0000-000000000001"),
+        (
+            "GET",
+            "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
+        ),
     ] {
         let resp = request_with_cookie(&router, method, path, &admin).await;
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
@@ -715,16 +721,17 @@ async fn a_platform_admin_is_not_refused_the_sign_in_and_assistant_settings_rout
 /// read `GET /api/settings/sso` (which reports `canEdit = false`), but is
 /// refused with 403 on `PUT /api/settings/sso`, `POST /api/settings/sso/test`,
 /// and `GET /api/settings/sso/test/{id}` — role mapping can grant Platform Admin.
-#[sqlx::test(migrations = "../../migrations")]
-async fn sso_settings_write_alone_is_denied_put_and_test(pool: PgPool) -> sqlx::Result<()> {
-    let router = test_router_with_pool(pool.clone());
+#[tokio::test]
+async fn sso_settings_write_alone_is_denied_put_and_test() {
+    let TestApp { router, pool } = spin_up().await;
     let user_id = create_principal_with_permissions(&pool, "settings:write").await;
     let cookie = session_cookie_for_user(&pool, user_id).await;
 
     // GET /api/settings/sso succeeds and reports canEdit: false.
     let get_resp = request_with_cookie(&router, "GET", "/api/settings/sso", &cookie).await;
     assert_eq!(get_resp.status(), StatusCode::OK);
-    let body = response_json(get_resp).await;
+    let bytes = to_bytes(get_resp.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["canEdit"], false);
 
     // PUT /api/settings/sso is forbidden (403).
@@ -744,8 +751,6 @@ async fn sso_settings_write_alone_is_denied_put_and_test(pool: PgPool) -> sqlx::
     )
     .await;
     assert_eq!(test_get_resp.status(), StatusCode::FORBIDDEN);
-
-    Ok(())
 }
 
 /// `DATA-12` D1: `PUT /api/catalog/{id}/certification` needs

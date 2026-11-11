@@ -2100,6 +2100,10 @@ pub async fn get_sso(
 /// Floor: `RequiresPermission("settings:write")`.
 /// Choke point: Also requires `crate::routes::catalog::is_unrestricted(&principal)`
 /// returning 403 Forbidden because a role map can grant Platform Admin.
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates each SSO setting field against server ownership, saves sealed secret and role map, clears cache and records audit"
+)]
 pub async fn put_sso(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2126,11 +2130,23 @@ pub async fn put_sso(
     for (sent, source) in [
         (parsed.contains_key("issuer"), effective.issuer_source),
         (parsed.contains_key("clientId"), effective.client_id_source),
-        (parsed.contains_key("clientSecret"), effective.client_secret_source),
-        (parsed.contains_key("providerName"), effective.provider_name_source),
-        (parsed.contains_key("groupsClaim"), effective.groups_claim_source),
+        (
+            parsed.contains_key("clientSecret"),
+            effective.client_secret_source,
+        ),
+        (
+            parsed.contains_key("providerName"),
+            effective.provider_name_source,
+        ),
+        (
+            parsed.contains_key("groupsClaim"),
+            effective.groups_claim_source,
+        ),
         (parsed.contains_key("roleMap"), effective.role_map_source),
-        (parsed.contains_key("jitProvisioning"), effective.jit_provisioning_source),
+        (
+            parsed.contains_key("jitProvisioning"),
+            effective.jit_provisioning_source,
+        ),
     ] {
         if sent && source == Source::Server {
             return Err(ApiError::Conflict(SET_BY_THE_SERVER.to_owned()).into());
@@ -2143,13 +2159,20 @@ pub async fn put_sso(
 
     let old_issuer = current.as_ref().and_then(|c| c.oidc_issuer.as_deref());
     let old_client_id = current.as_ref().and_then(|c| c.oidc_client_id.as_deref());
-    let old_secret = current.as_ref().and_then(|c| c.oidc_client_secret.as_deref());
-    let old_provider_name = current.as_ref().and_then(|c| c.oidc_provider_name.as_deref());
-    let old_groups_claim = current.as_ref().and_then(|c| c.oidc_groups_claim.as_deref());
+    let old_secret = current
+        .as_ref()
+        .and_then(|c| c.oidc_client_secret.as_deref());
+    let old_provider_name = current
+        .as_ref()
+        .and_then(|c| c.oidc_provider_name.as_deref());
+    let old_groups_claim = current
+        .as_ref()
+        .and_then(|c| c.oidc_groups_claim.as_deref());
     let old_role_map = current.as_ref().and_then(|c| c.oidc_role_map.as_ref());
     let old_jit = current.as_ref().and_then(|c| c.oidc_jit_provisioning);
 
-    let (issuer, issuer_changed) = sso_issuer_field(&state, parsed.get("issuer"), old_issuer).await?;
+    let (issuer, issuer_changed) =
+        sso_issuer_field(&state, parsed.get("issuer"), old_issuer).await?;
     let (client_id, client_id_changed) = text_field(
         parsed.get("clientId"),
         old_client_id,
@@ -2190,8 +2213,10 @@ pub async fn put_sso(
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
 
-    let (role_map, role_map_changed) = role_map_field(parsed.get("roleMap"), old_role_map, &known_roles)?;
-    let (jit_provisioning, jit_changed) = boolean_field(parsed.get("jitProvisioning"), old_jit, JIT_REFUSED)?;
+    let (role_map, role_map_changed) =
+        role_map_field(parsed.get("roleMap"), old_role_map, &known_roles)?;
+    let (jit_provisioning, jit_changed) =
+        boolean_field(parsed.get("jitProvisioning"), old_jit, JIT_REFUSED)?;
 
     let mut changed: Vec<&'static str> = Vec::new();
     if issuer_changed {
@@ -2237,14 +2262,7 @@ pub async fn put_sso(
     state.sso_settings_cache.clear().await;
     *state.oidc.write().await = None;
 
-    audit_settings_update(
-        pool,
-        &principal,
-        "settings.sso.update",
-        "sso",
-        &changed,
-    )
-    .await;
+    audit_settings_update(pool, &principal, "settings.sso.update", "sso", &changed).await;
 
     let effective = crate::runtime_settings::sso_or_fail(&state)
         .await
@@ -2257,6 +2275,10 @@ pub async fn put_sso(
 ///
 /// Floor: `RequiresPermission("settings:write")`.
 /// Choke point: Also requires `crate::routes::catalog::is_unrestricted(&principal)`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates test draft configuration, seals secret, creates temporary test run and builds authorization URL"
+)]
 pub async fn post_sso_test(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2275,18 +2297,20 @@ pub async fn post_sso_test(
         .into());
     };
 
-    let issuer_val = parsed.get("issuer").ok_or_else(|| {
-        ApiError::BadRequest("issuer is required for a test sign-in.".to_owned())
-    })?;
+    let issuer_val = parsed
+        .get("issuer")
+        .ok_or_else(|| ApiError::BadRequest("issuer is required for a test sign-in.".to_owned()))?;
     let issuer_str = string_field(ISSUER_NOT_HTTPS, issuer_val)?
         .ok_or_else(|| ApiError::BadRequest("issuer is required for a test sign-in.".to_owned()))?;
-    let validated_issuer = validate_sso_issuer(&issuer_str, &state.config.connector_internal_hosts()).await?;
+    let validated_issuer =
+        validate_sso_issuer(&issuer_str, &state.config.connector_internal_hosts()).await?;
 
     let client_id_val = parsed.get("clientId").ok_or_else(|| {
         ApiError::BadRequest("clientId is required for a test sign-in.".to_owned())
     })?;
-    let client_id_str = string_field(CLIENT_ID_REFUSED, client_id_val)?
-        .ok_or_else(|| ApiError::BadRequest("clientId is required for a test sign-in.".to_owned()))?;
+    let client_id_str = string_field(CLIENT_ID_REFUSED, client_id_val)?.ok_or_else(|| {
+        ApiError::BadRequest("clientId is required for a test sign-in.".to_owned())
+    })?;
     let client_id_str = client_id_str.trim().to_owned();
     if client_id_str.is_empty() {
         return Err(ApiError::BadRequest(CLIENT_ID_REFUSED.to_owned()).into());
@@ -2317,7 +2341,10 @@ pub async fn post_sso_test(
                 return Err(ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()).into());
             };
             let entries = validate_role_map_entries(arr, &known_roles)?;
-            Some(serde_json::to_value(&entries).map_err(|_| ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()))?)
+            Some(
+                serde_json::to_value(&entries)
+                    .map_err(|_| ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()))?,
+            )
         }
     } else {
         None
@@ -2344,8 +2371,14 @@ pub async fn post_sso_test(
                 .connector_secret_store
                 .keyring()
                 .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
-            Some(keyring.seal(crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME, plain.as_bytes())
-                .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?)
+            Some(
+                keyring
+                    .seal(
+                        crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME,
+                        plain.as_bytes(),
+                    )
+                    .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?,
+            )
         } else {
             None
         }
@@ -2361,8 +2394,14 @@ pub async fn post_sso_test(
                 .connector_secret_store
                 .keyring()
                 .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
-            Some(keyring.seal(crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME, env_sec.as_bytes())
-                .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?)
+            Some(
+                keyring
+                    .seal(
+                        crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME,
+                        env_sec.as_bytes(),
+                    )
+                    .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?,
+            )
         } else {
             None
         }
@@ -2396,8 +2435,7 @@ pub async fn post_sso_test(
         .authorize_url
         .as_deref()
         .or(state.config.oidc_authorize_url.as_deref())
-        .map(String::from)
-        .unwrap_or_else(|| format!("{validated_issuer}/authorize"));
+        .map_or_else(|| format!("{validated_issuer}/authorize"), String::from);
     let redirect_uri = sso
         .redirect_uri
         .as_deref()
