@@ -1852,31 +1852,22 @@ async fn build_sso_runtime(
     settings.redirect_uri = Some(redirect_uri);
 
     // One client, pinned to every address this connection was allowed to
-    // reach: the issuer, and the three the document named (or the
-    // environment's own, which resolve normally).
-    let mut urls = vec![issuer.as_str()];
-    urls.extend(
-        [
-            settings.authorize_url.as_deref(),
-            settings.token_url.as_deref(),
-            settings.jwks_url.as_deref(),
-        ]
-        .into_iter()
-        .flatten(),
-    );
-    let http = match state.sso_http_client() {
-        Some(client) => client,
-        None => match pinned_client(&urls, &internal_hosts).await {
-            Ok(client) => client,
-            Err(()) => {
-                return not_ready_runtime(
-                    base,
-                    settings,
-                    default_http,
-                    SsoNotReady::AddressRefused,
-                );
-            }
-        },
+    // reach: the issuer, and the three the document named. A value the
+    // environment set is used as it is (D10) and resolves normally — it is
+    // the operator's own file, not remote input.
+    let http = if let Some(client) = state.sso_http_client() {
+        client
+    } else {
+        let urls = [
+            issuer.as_str(),
+            endpoints.authorization_endpoint.as_str(),
+            endpoints.token_endpoint.as_str(),
+            endpoints.jwks_uri.as_str(),
+        ];
+        let Ok(client) = pinned_client(&urls, &internal_hosts).await else {
+            return not_ready_runtime(base, settings, default_http, SsoNotReady::AddressRefused);
+        };
+        client
     };
 
     // The key-set address is now explicit, so the authenticator never
