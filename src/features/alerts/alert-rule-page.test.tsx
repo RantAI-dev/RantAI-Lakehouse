@@ -37,7 +37,7 @@ mock.module("@/features/auth/auth-provider", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { alertRuleService, connectorService, dashboardService, metricService } from "@/services"
+import { alertRuleService, assetService, connectorService, dashboardService, metricService } from "@/services"
 import type { AlertRule } from "@/services/contracts/alerts"
 import { AlertRulePage } from "./alert-rule-page"
 
@@ -79,6 +79,20 @@ function stubReads(rules: AlertRule[] = []) {
   spyOn(dashboardService, "listMartMeasures").mockResolvedValue(["jumlah", "nights"])
   spyOn(connectorService, "listConnectors").mockResolvedValue([])
   spyOn(metricService, "list").mockResolvedValue([])
+  // WEB-8 D8: the table pickers read the catalog.
+  spyOn(assetService, "listAssets").mockResolvedValue([
+    { id: "a-orders", name: "orders", namespace: "silver" },
+    { id: "a-raw", name: "raw_orders", namespace: "bronze" },
+  ] as never)
+}
+
+/** base-ui's Select commits on the pointer sequence, not on a bare click. */
+function pickOption(option: HTMLElement) {
+  fireEvent.pointerDown(option, { button: 0, pointerType: "mouse" })
+  fireEvent.mouseDown(option, { button: 0 })
+  fireEvent.pointerUp(option, { button: 0, pointerType: "mouse" })
+  fireEvent.mouseUp(option, { button: 0 })
+  fireEvent.click(option)
 }
 
 describe("the alert rule page (WEB-7 T7)", () => {
@@ -186,5 +200,69 @@ describe("the alert rule page (WEB-7 T7)", () => {
       "That webhook address is not allowed."
     )
     expect(pushed).toEqual([])
+  })
+})
+
+// WEB-8 D8: the tables a quality-incident or freshness rule watches are
+// picked from the catalog instead of typed.
+describe("the table pickers on the alert rule page (WEB-8 D8)", () => {
+  async function chooseType(label: string) {
+    fireEvent.click(screen.getByRole("combobox", { name: "Type" }))
+    pickOption(await screen.findByRole("option", { name: label }))
+  }
+
+  it("picks a quality alert's table from the catalog, with Every table still offered", async () => {
+    // Only a user who sees every tenant is offered a quality rule (the API
+    // enforces it too), which is the kind whose table is picked here.
+    permissions = ["*:*"]
+    stubReads()
+    const create = spyOn(alertRuleService, "createRule").mockResolvedValue(RULE)
+    render(<AlertRulePage />)
+    fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), {
+      target: { value: "Quality" },
+    })
+    await chooseType("Quality incident opened")
+
+    const field = await screen.findByRole("button", {
+      name: "Table (zone.table, or * for every table)",
+    })
+    fireEvent.click(field)
+    const options = await screen.findAllByRole("option")
+    expect(options.map((o) => o.textContent)).toEqual([
+      "Every table",
+      "bronze.raw_orders",
+      "silver.orders",
+    ])
+    fireEvent.click(options[2] as HTMLElement)
+
+    fireEvent.change(screen.getByPlaceholderText("https://hooks.slack.com/services/…"), {
+      target: { value: "https://hooks.example.com/x" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
+    expect(create.mock.calls[0]?.[0]).toMatchObject({ type: "quality_incident", asset: "silver.orders" })
+  })
+
+  it("picks a freshness rule's table from the catalog", async () => {
+    stubReads()
+    const create = spyOn(alertRuleService, "createRule").mockResolvedValue(RULE)
+    render(<AlertRulePage />)
+    fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), {
+      target: { value: "Fresh" },
+    })
+    await chooseType("Dataset freshness")
+
+    const field = await screen.findByRole("button", { name: "Table (namespace.table)" })
+    fireEvent.click(field)
+    const options = await screen.findAllByRole("option")
+    expect(options.map((o) => o.textContent)).toEqual(["bronze.raw_orders", "silver.orders"])
+    fireEvent.click(options[0] as HTMLElement)
+
+    fireEvent.change(screen.getByPlaceholderText("https://hooks.slack.com/services/…"), {
+      target: { value: "https://hooks.example.com/x" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
+    expect(create.mock.calls[0]?.[0]).toMatchObject({ type: "freshness", mart: "bronze.raw_orders" })
   })
 })

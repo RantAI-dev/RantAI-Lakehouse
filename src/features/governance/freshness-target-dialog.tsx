@@ -17,6 +17,7 @@ import { useServiceAction } from "@/hooks/use-service"
 import { notifyError, notifySuccess } from "@/lib/notify"
 import { governanceService } from "@/services"
 import type { DatasetSla } from "@/services/contracts/governance"
+import { TablePicker, useTableCatalog } from "./table-picker"
 
 const selectClassName = "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
@@ -76,6 +77,8 @@ export function FreshnessTargetDialog({
   const remove = useServiceAction((signal, name: string) =>
     governanceService.deleteDatasetSla(name, signal)
   )
+  // WEB-8 D8: a new target's table is picked from the catalog.
+  const catalog = useTableCatalog()
   const minutes = slaMinutes(amount, unit)
   const tableName = table ?? tableText.trim()
   const hasSla = currentMinutes !== null && table !== undefined
@@ -109,19 +112,19 @@ export function FreshnessTargetDialog({
           </DialogDescription>
         </DialogHeader>
         {table === undefined ? (
-          <div className="grid gap-1.5">
-            <Label htmlFor="sla-table">Table</Label>
-            <Input
-              id="sla-table"
-              placeholder="silver.orders"
-              value={tableText}
-              onChange={(e) => setTableText(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              The table as <span className="font-mono">namespace.table</span>, the key its
-              freshness is checked under.
-            </p>
-          </div>
+          <TablePicker
+            id="sla-table"
+            label="Table"
+            value={tableText}
+            onChange={setTableText}
+            catalog={catalog}
+            description={
+              <>
+                The table as <span className="font-mono">namespace.table</span>, the key its freshness
+                is checked under.
+              </>
+            }
+          />
         ) : null}
         <div className="grid gap-1.5">
           <Label htmlFor="sla-amount">New data at least every</Label>

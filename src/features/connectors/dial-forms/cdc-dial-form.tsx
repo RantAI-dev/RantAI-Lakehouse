@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { CdcDial, SqlDriver } from "@/services/contracts/connectors"
 import { DEFAULT_SQL_PORT } from "./sql-dial-form"
+import { CDC_SSL_MODES, ORACLE_SSL_MODES } from "./ssl-modes"
 
 /**
  * `dial` for the `cdc` adapter — `SqlDialForm`'s fields plus the setting of
@@ -19,23 +20,6 @@ import { DEFAULT_SQL_PORT } from "./sql-dial-form"
  * so the form starts there and only asks when a stored dial disagrees.
  */
 export const DEFAULT_CDC_SSL_MODE = "require"
-
-/** The TLS modes a person can choose (`SEC-14`: a stored credential is not dialled in plain text unless
- * `disable` is chosen, and it is labelled as such). */
-const CDC_SSL_MODES: { value: string; label: string }[] = [
-  { value: "require", label: "Require (encrypted, certificate not checked)" },
-  { value: "verify-ca", label: "Verify CA" },
-  { value: "verify-full", label: "Verify CA and host name" },
-  { value: "disable", label: "Disable (not encrypted)" },
-]
-
-/** Oracle takes two modes (`SRC-4` slice 6, S6-c): its JDBC driver does TLS only over TCPS with a Java trust store
- * (`SRC-37`), so `require` is Oracle's native network encryption (AES256, SHA256 checksum: encrypted, the server
- * not authenticated) and the verify modes are not offered. */
-const ORACLE_SSL_MODES: { value: string; label: string }[] = [
-  { value: "require", label: "Require (native network encryption, server not authenticated)" },
-  { value: "disable", label: "Disable (not encrypted)" },
-]
 
 /** The dial as the driver wants it: only its own setting, PostgreSQL's two names
  * kept as typed (empty until typed), MySQL's server id only when a number was given, Oracle's

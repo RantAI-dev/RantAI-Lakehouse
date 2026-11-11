@@ -336,6 +336,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // WS3 item 17: surfaces per-connector ingest history, the same
     // audience as the base `/api/connectors` routes above.
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
+    // WEB-8 S2 T8 (D8): the row filter grammar (functions and operators) the
+    // console offers as a help line. `policy:read`, the same grant that lists
+    // the policies it authors: it describes authoring, not any stored data.
+    ("GET",  "/api/governance/row-filter-grammar", Policy::RequiresPermission("policy:read")),
     ("GET",  "/api/governance/policies",  Policy::RequiresPermission("policy:read")),
     ("POST", "/api/governance/policies",  Policy::RequiresPermission("policy:write")),
     // WS7 item A5: only someone who could actually save the policy may
@@ -912,6 +916,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // token (AGENTS.md rule 4).
     ("PUT",  "/api/identity/roles/{id}",             Policy::RequiresPermission("identity:write")),
     ("DELETE", "/api/identity/roles/{id}",           Policy::RequiresPermission("identity:write")),
+    // GOV-7 D7: a role's read access per schema and table. Reading it is the
+    // role form's own read (`identity:read`); changing it takes access away
+    // from everybody who holds the role, so it is the same privilege bundle
+    // write as `PUT` above — no new permission token (rule 4).
+    ("GET",  "/api/identity/roles/{id}/table-access", Policy::RequiresPermission("identity:read")),
+    ("PUT",  "/api/identity/roles/{id}/table-access", Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),

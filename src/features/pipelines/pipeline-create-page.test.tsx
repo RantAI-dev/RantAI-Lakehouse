@@ -30,7 +30,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 import type { PipelineDetail } from "@/services/contracts/pipelines"
 import { PipelineEditor } from "./pipeline-create-page"
@@ -97,9 +97,33 @@ beforeEach(() => {
       return jsonResponse(connectorList)
     }
     if (url.startsWith("/api/lakehouse/namespaces")) {
-      return new Response(JSON.stringify({ namespaces: [{ name: "bronze", tableCount: { value: 2, measured: true } }] }), {
+      return new Response(JSON.stringify({ namespaces: [{ name: "bronze", tableCount: { value: 2, measured: true } }, { name: "silver", tableCount: { value: 1, measured: true } }] }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
+      })
+    }
+    // WEB-8 D8: the source table's own schema, for the column pickers.
+    // Only the tables the listing above names have one; anything else is a
+    // table this deployment does not have (404), which is the case the
+    // free-text fallback covers.
+    if (url.startsWith("/api/lakehouse/tables/")) {
+      const table = url.split("/api/lakehouse/tables/")[1] ?? ""
+      if (!["bronze/orders_raw", "bronze/stock_raw"].includes(table)) {
+        return new Response(JSON.stringify({ error: "table not found" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      return jsonResponse({
+        schema: [
+          { id: 1, name: "id", type: "long", required: true },
+          { id: 2, name: "updated_at", type: "timestamp", required: false },
+          { id: 3, name: "status", type: "string", required: false },
+        ],
+        partitionSpec: [],
+        properties: {},
+        snapshots: [],
+        stats: {},
       })
     }
     if (url.startsWith("/api/lakehouse/tables")) {
@@ -160,6 +184,15 @@ function existing(over: Partial<PipelineDetail> = {}): PipelineDetail {
 }
 
 const reuploadSwitch = () => screen.queryByRole("switch", { name: /re-uploaded/i })
+
+/** base-ui's Select commits on the pointer sequence, not on a bare click. */
+function pickOption(option: HTMLElement) {
+  fireEvent.pointerDown(option, { button: 0, pointerType: "mouse" })
+  fireEvent.mouseDown(option, { button: 0 })
+  fireEvent.pointerUp(option, { button: 0, pointerType: "mouse" })
+  fireEvent.mouseUp(option, { button: 0 })
+  fireEvent.click(option)
+}
 
 /**
  * The form's submit button only exists on its LAST step
@@ -231,7 +264,10 @@ describe("the re-upload switch in the pipeline editor", () => {
     fireEvent.change(screen.getByPlaceholderText("orders_hourly_rollup"), { target: { value: "orders_clean" } })
     fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "orders_raw" } })
     await advance()
-    fireEvent.change(screen.getByPlaceholderText("order_id"), { target: { value: "id" } })
+    // WEB-8 D8: the table now exists, so the key column is picked from its
+    // schema rather than typed.
+    fireEvent.click(await screen.findByRole("combobox", { name: "Key column" }))
+    pickOption(await screen.findByRole("option", { name: "id" }))
     fireEvent.click(screen.getByRole("button", { name: /add transform/i }))
     // Step 2: a target table; step 3's cron is the default.
     await advance()
@@ -246,8 +282,7 @@ describe("the re-upload switch in the pipeline editor", () => {
 })
 
 describe("source-table suggestions in the pipeline editor", () => {
-  it("offers the zone's real table names and still accepts a typed one", async () => {
-    render(<PipelineEditor />)
+  it("offers the zone's real table names and still accepts a typed one", async () => {    render(<PipelineEditor />)
     const input = await screen.findByPlaceholderText("orders_events")
     // The suggestions come from `/api/lakehouse/tables` for the source
     // zone, once the zone is one the lakehouse client lists.
@@ -262,6 +297,58 @@ describe("source-table suggestions in the pipeline editor", () => {
     // Typing is still allowed: a datalist filters, it never narrows.
     fireEvent.change(input, { target: { value: "typed_by_hand" } })
     expect((input as HTMLInputElement).value).toBe("typed_by_hand")
+  })
+})
+
+// WEB-8 D8: zones are the lakehouse's namespaces and columns are the source
+// table's own schema, both read from the page's existing service calls.
+describe("the zone and column pickers in the pipeline editor (WEB-8 D8)", () => {
+  it("offers the namespaces the page loaded as the source zone", async () => {
+    render(<PipelineEditor />)
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Source zone" }).textContent).toContain("bronze")
+    )
+    fireEvent.click(screen.getByRole("combobox", { name: "Source zone" }))
+    // `within` the popup: the Connector field is a native select, and its
+    // options are always in the document.
+    expect(within(await screen.findByRole("listbox")).getAllByRole("option").map((o) => o.textContent)).toEqual(["bronze", "silver"])
+  })
+
+  it("offers the namespaces as the target zone too", async () => {
+    render(<PipelineEditor existing={existing()} />)
+    // Steps 0 and 1 of a stored pipeline are already valid.
+    await advance()
+    await advance()
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Target zone" }).textContent).toContain("silver")
+    )
+  })
+
+  it("takes the columns from the source table's schema once the table exists", async () => {
+    render(<PipelineEditor />)
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "orders_raw" } })
+    // The incremental column is a list of the table's own columns, not free
+    // text; the line that stood in for it is gone.
+    const column = await screen.findByRole("combobox", { name: "Incremental column" })
+    expect(column.textContent).toContain("updated_at")
+    expect(screen.queryByText("Columns appear here once the table exists")).toBeNull()
+    fireEvent.click(column)
+    expect(within(await screen.findByRole("listbox")).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "id",
+      "updated_at",
+      "status",
+    ])
+  })
+
+  it("keeps the fields free text, and says so, while the table does not exist", async () => {
+    render(<PipelineEditor />)
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "no_such_table" } })
+    // The detail read answers 404: the columns are unknown, so the field is
+    // typed and the page says why instead of showing an empty list.
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Incremental column" })).toBeTruthy()
+    )
+    expect(screen.getByText("Columns appear here once the table exists")).toBeTruthy()
   })
 })
 
@@ -379,8 +466,12 @@ describe("changing a pipeline's connector on the edit form (BLD-9)", () => {
     expect(zoneInput().disabled).toBe(true)
 
     fireEvent.change(connectorPicker(), { target: { value: "" } })
-    // "No connector" is a real choice: the zone becomes editable again.
-    await waitFor(() => expect(zoneInput().disabled).toBe(false))
+    // "No connector" is a real choice: the zone becomes editable again —
+    // a picker over the lakehouse's namespaces since WEB-8 D8, so a
+    // combobox rather than the text box the fixed field is.
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Source zone" })).toBeTruthy()
+    )
 
     await walkToReview()
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }))
@@ -440,9 +531,13 @@ describe("FBIC and the plain copy in the pipeline editor (BLD-10)", () => {
     await waitFor(() => expect(plainCopySwitch()).toBeTruthy())
   }
 
-  /** Adds the one transform this form can add with nothing but a placeholder. */
-  function addDedupeTransform() {
-    fireEvent.change(screen.getByPlaceholderText("order_id"), { target: { value: "id" } })
+  /**
+   * Adds the one transform this form can add. `WEB-8` D8: the source table
+   * exists, so the key column is picked from its schema, not typed.
+   */
+  async function addDedupeTransform() {
+    fireEvent.click(await screen.findByRole("combobox", { name: "Key column" }))
+    pickOption(await screen.findByRole("option", { name: "id" }))
     fireEvent.click(screen.getByRole("button", { name: /add transform/i }))
   }
 
@@ -473,7 +568,7 @@ describe("FBIC and the plain copy in the pipeline editor (BLD-10)", () => {
     fireEvent.click(plainCopySwitch())
     await waitFor(() => expect(plainCopySwitch().getAttribute("aria-checked")).toBe("true"))
 
-    addDedupeTransform()
+    await addDedupeTransform()
     await waitFor(() => expect(plainCopySwitch().getAttribute("aria-checked")).toBe("false"))
     expect(plainCopySwitch().getAttribute("aria-disabled")).toBe("true")
   })

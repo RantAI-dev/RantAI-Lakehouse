@@ -3,6 +3,8 @@
 //! Moved out of `ai.rs` unchanged (T0.1 registry refactor).
 
 use lakehouse_auth::Principal;
+
+use crate::state::AppState;
 use lakehouse_bi::access::Viewer;
 use lakehouse_bi::layout::tab_of;
 use lakehouse_bi::specs::{ChartKind, ChartSource};
@@ -998,24 +1000,50 @@ pub(super) async fn list_charts(ch: &ChClient, viewer: &Viewer) -> Value {
 /// `list_sql_sources` and `suggest_join` (one dispatch arm, `run_tool` is at
 /// clippy's line limit).
 pub(super) async fn chart_sources(
-    ch: &ChClient,
+    state: &AppState,
     viewer: &Viewer,
+    principal: Option<&Principal>,
     name: &str,
     args: &Map<String, Value>,
 ) -> Value {
     if name == "suggest_join" {
-        suggest_join(ch, args).await
+        suggest_join(state, principal, args).await
     } else {
-        list_sql_sources(ch, viewer).await
+        list_sql_sources(&state.clickhouse, viewer).await
     }
 }
 
 /// `suggest_join` (`BI-7`): the route's answer for two marts. A refusal that is
 /// ours (unknown mart, bad name) is told in its words; a database failure is
 /// the fixed message the route would give, never the database's text.
-pub(super) async fn suggest_join(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn suggest_join(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let (left, right) = (arg_str(args, "left"), arg_str(args, "right"));
-    match crate::routes::dashboard::join_suggestions_value(ch, Some(&left), Some(&right)).await {
+    // `GOV-7` D6: the marts the caller's roles hide are not described to the
+    // model either; the route's own 404 sentence is the tool's error. No
+    // principal is a headless run with no roles, which reads everything.
+    let access = match principal {
+        Some(principal) => {
+            match crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names).await {
+                Ok(access) => access,
+                Err(_) => {
+                    return json!({ "error": "the tables' columns could not be read right now" });
+                }
+            }
+        }
+        None => crate::table_access::TableAccess::All,
+    };
+    match crate::routes::dashboard::join_suggestions_value(
+        &state.clickhouse,
+        &access,
+        Some(&left),
+        Some(&right),
+    )
+    .await
+    {
         Ok(body) => body,
         Err(
             lakehouse_core::ApiError::BadRequest(sentence)

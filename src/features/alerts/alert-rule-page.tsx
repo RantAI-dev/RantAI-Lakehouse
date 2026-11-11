@@ -25,6 +25,7 @@ import {
   type SaveAlertRuleInput,
 } from "@/services/contracts/alerts"
 import { isLoadAlertKind, isQualityAlertKind, ruleKindLabel } from "./rules-columns"
+import { TablePicker, useTableCatalog } from "@/features/governance/table-picker"
 import type { Metric } from "@/services/contracts/metrics"
 
 /**
@@ -410,6 +411,9 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
   const [f, setF] = React.useState<AlertRule>(EMPTY_FORM)
   const [fields, setFields] = React.useState<string[]>([])
   const [fieldsError, setFieldsError] = React.useState<string | null>(null)
+  // WEB-8 D8: the table fields a quality-incident or freshness rule takes are
+  // picked from the catalog, not typed.
+  const tableCatalog = useTableCatalog()
   const [formErr, setFormErr] = React.useState<string | null>(null)
   // The saved rule the form was filled from: only it knows whether it was
   // ever given an owner, and a rename is not a save of what the form holds.
@@ -551,7 +555,7 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
                   })
                 }
               >
-                <SelectTrigger className="w-full">
+                <SelectTrigger aria-label="Type" className="w-full">
                   <SelectValue>{ruleKindLabel(f.type)}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
@@ -644,29 +648,25 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
           {formFields.note ? <p className="text-xs text-muted-foreground">{formFields.note}</p> : null}
 
           {isQualityAlertKind(f.type) ? (
-            <div className="grid gap-1.5">
-              <Label>Table (zone.table, or * for every table)</Label>
-              <Input
-                value={f.asset ?? ""}
-                onChange={(e) => setF((prev) => ({ ...prev, asset: e.target.value }))}
-                placeholder="silver.orders"
-              />
-              <p className="text-xs text-muted-foreground">
-                Sent when a quality incident opens on the table: a check that fails, or a load far
-                smaller or later than usual. An incident that is still open is not sent again.
-              </p>
-            </div>
+            <TablePicker
+              id="alert-rule-quality-table"
+              label="Table (zone.table, or * for every table)"
+              value={f.asset ?? ""}
+              onChange={(asset) => setF((prev) => ({ ...prev, asset }))}
+              catalog={tableCatalog}
+              allowEveryTable
+              description="Sent when a quality incident opens on the table: a check that fails, or a load far smaller or later than usual. An incident that is still open is not sent again."
+            />
           ) : null}
 
           {formFields.freshnessTarget ? (
-            <div className="grid gap-1.5">
-              <Label>Table (namespace.table)</Label>
-              <Input
-                value={f.mart ?? ""}
-                onChange={(e) => setF((prev) => ({ ...prev, mart: e.target.value }))}
-                placeholder="bronze.orders"
-              />
-            </div>
+            <TablePicker
+              id="alert-rule-freshness-table"
+              label="Table (namespace.table)"
+              value={f.mart ?? ""}
+              onChange={(mart) => setF((prev) => ({ ...prev, mart }))}
+              catalog={tableCatalog}
+            />
           ) : formFields.martMeasure ? (
             <AlertConditionFields
               f={f}

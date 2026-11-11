@@ -232,6 +232,8 @@ function stubApi({
   incidents = [],
   schedules = [],
   learning = LEARNING,
+  roles,
+  grammar,
 }: {
   permissions?: string[]
   lineage?: unknown
@@ -263,6 +265,11 @@ function stubApi({
   schedules?: unknown[]
   /** What `GET /api/governance/quality/learning/{asset}` answers. */
   learning?: unknown
+  /** The roles `GET /api/identity/roles` answers; absent means the read fails.
+   * A `Promise` lets a test hold the read open while the dialog is used. */
+  roles?: unknown[] | Promise<unknown[]>
+  /** The row filter grammar `GET /api/governance/row-filter-grammar` answers; absent means it fails. */
+  grammar?: unknown
 } = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -283,6 +290,16 @@ function stubApi({
       if (method === "DELETE") {
         return revokeRefusal ? json({ error: revokeRefusal.error }, revokeRefusal.status) : json({ ok: true })
       }
+    }
+    // WEB-8 D8: the roles the Add policy dialog offers as checkboxes. Left
+    // out, the read fails and the field stays free text.
+    if (method === "GET" && path.endsWith("/api/identity/roles") && roles !== undefined) {
+      return roles instanceof Promise ? roles.then((list) => json(list)) : json(roles)
+    }
+    // WEB-8 S2 T8 (D8): the row filter grammar the dialog's help line names.
+    // Left out, the read fails and no help line is shown.
+    if (method === "GET" && path.endsWith("/api/governance/row-filter-grammar") && grammar !== undefined) {
+      return json(grammar)
     }
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     // DATA-14: the Quality tab's incidents, schedule and learning state.
@@ -2080,6 +2097,137 @@ describe("Access tab: adding a policy", () => {
         },
       ],
     ])
+  })
+
+  it("offers the deployment's roles as checkboxes and sends the ones ticked (WEB-8 D8)", async () => {
+    const fetchSpy = stubApi({
+      roles: [
+        { id: "r1", name: "Analyst", members: 2, permissions: "", description: "" },
+        { id: "r2", name: "Dashboard Viewer", members: 1, permissions: "", description: "" },
+      ],
+    })
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs(BRONZE, reloaded)
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    // Once the roles are read, each one is a checkbox and the comma-separated
+    // text field is gone.
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Analyst" }))
+    expect(screen.queryByLabelText("Roles it applies to")).toBeNull()
+    fireEvent.click(screen.getByRole("checkbox", { name: "Dashboard Viewer" }))
+    fireEvent.click(screen.getByLabelText("amount"))
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)[0]?.[2]).toMatchObject({
+      kind: "Column mask",
+      subjects: "Analyst, Dashboard Viewer",
+    })
+  })
+
+  it("shows a role the deployment no longer has as Not recognised, and keeps it on save (WEB-8 S2 review round 1, S1)", async () => {
+    let resolveRoles!: (roles: unknown[]) => void
+    const pending = new Promise<unknown[]>((resolve) => {
+      resolveRoles = resolve
+    })
+    const fetchSpy = stubApi({ roles: pending })
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs(BRONZE, reloaded)
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    // Before the roles arrive the field is the free text fallback; a name
+    // typed there is not in the deployment's list once it does.
+    fireEvent.change(await screen.findByLabelText("Roles it applies to"), {
+      target: { value: "Retired Role" },
+    })
+    resolveRoles([{ id: "r1", name: "Analyst", members: 1, permissions: "", description: "" }])
+
+    // The checkboxes appear, and the name they do not cover is still on
+    // screen, marked, not silently kept.
+    expect(await screen.findByText("Not recognised")).toBeTruthy()
+    expect(screen.queryByLabelText("Roles it applies to")).toBeNull()
+    fireEvent.click(screen.getByLabelText("amount"))
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)[0]?.[2]).toMatchObject({
+      kind: "Column mask",
+      subjects: "Retired Role",
+      conditions: JSON.stringify({
+        roles: ["Retired Role"],
+        table: "bronze.demo_orders",
+        mask: ["amount"],
+      }),
+    })
+  })
+
+  it("removes a Not recognised role only when the person asks (WEB-8 S2 review round 1, S1)", async () => {
+    let resolveRoles!: (roles: unknown[]) => void
+    const pending = new Promise<unknown[]>((resolve) => {
+      resolveRoles = resolve
+    })
+    stubApi({ roles: pending })
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    fireEvent.change(await screen.findByLabelText("Roles it applies to"), {
+      target: { value: "Retired Role" },
+    })
+    resolveRoles([{ id: "r1", name: "Analyst", members: 1, permissions: "", description: "" }])
+
+    fireEvent.click(await screen.findByRole("button", { name: "Remove Retired Role" }))
+    await waitFor(() => expect(screen.queryByText("Retired Role")).toBeNull())
+    expect(screen.queryByText("Not recognised")).toBeNull()
+  })
+
+  it("falls back to typing the roles, with the reason, when they cannot be read (WEB-8 D8)", async () => {
+    stubApi()
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    expect(await screen.findByText(/Could not read the roles; type them as a comma-separated list/)).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("Roles it applies to"), {
+      target: { value: "Analyst" },
+    })
+    expect((screen.getByLabelText("Roles it applies to") as HTMLInputElement).value).toBe("Analyst")
+  })
+
+  it("names the functions, operators and forms the row filter accepts (WEB-8 T8, D8; S2 review round 1, S2)", async () => {
+    stubApi({
+      grammar: {
+        functions: ["lower", "upper"],
+        operators: ["=", "AND"],
+        forms: ["LIKE", "ILIKE", "BETWEEN", "IN", "IS NULL", "IS NOT NULL"],
+      },
+    })
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    const help = await screen.findByText(
+      "Functions: lower, upper. Operators: =, AND. Forms: LIKE, ILIKE, BETWEEN, IN, IS NULL, IS NOT NULL."
+    )
+    expect(help).toBeTruthy()
+    expect(screen.getByLabelText("Row filter (optional)").getAttribute("aria-describedby")).toBe(
+      "policy-filter-help"
+    )
+  })
+
+  it("shows no row filter help line when the grammar cannot be read (WEB-8 T8, D8)", async () => {
+    stubApi()
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByText("Add policy"))
+    // The roles read fails too; waiting for its sentence proves the dialog's
+    // reads have settled before the absence is asserted.
+    await screen.findByText(/Could not read the roles; type them as a comma-separated list/)
+    expect(screen.queryByText(/Functions:/)).toBeNull()
+    expect(screen.getByLabelText("Row filter (optional)").getAttribute("aria-describedby")).toBeNull()
   })
 
   it("offers no policy form without policy:write", async () => {

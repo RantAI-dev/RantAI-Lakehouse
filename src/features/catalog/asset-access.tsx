@@ -2,10 +2,11 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Check, Minus, Plus } from "lucide-react"
+import { Check, Minus, Plus, XIcon } from "lucide-react"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -17,16 +18,17 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { PolicyActions } from "@/features/governance/policy-actions"
-import { useServiceAction } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
-import { governanceService } from "@/services"
+import { governanceService, identityService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { CreatePolicyInput } from "@/services/contracts/governance"
 import { AssetGrants } from "./asset-grants"
-import { policyCondition, policyTable, type PolicyForm } from "./asset-policy"
+import { policyCondition, policyTable, roleNames, type PolicyForm } from "./asset-policy"
 
 type PolicySummary = AssetDetail["policySummary"][number]
 
@@ -111,6 +113,35 @@ function AddPolicyDialog({
     governanceService.createPolicy(input, signal)
   )
   const condition = policyCondition(table, form)
+  // WEB-8 D8: the roles are the ones the deployment has, from
+  // `identityService.listRoles`. Without that read the field stays the free
+  // text it was, with the reason, rather than an empty list of checkboxes.
+  const rolesState = useService((signal) => identityService.listRoles(signal), [])
+  const roles = rolesState.status === "success" ? rolesState.data : null
+  // WEB-8 S2 T8 (D8): the row filter grammar comes from the server's own
+  // validator constants (functions, operators and, since S2 review round 1 S2,
+  // forms). While it loads, or when the read fails, there is no help line at
+  // all — a guessed or stale list would invite a save the server refuses.
+  const grammarState = useService((signal) => governanceService.getRowFilterGrammar(signal), [])
+  const grammar = grammarState.status === "success" ? grammarState.data : null
+  const chosenRoles = roleNames(form.roles)
+  // WEB-8 S2 review round 1, S1: a saved role the deployment no longer has
+  // must not be invisible. It stays in `form.roles` (and so in the saved
+  // `subjects`) until the person removes it, shown as a removable "Not
+  // recognised" chip the way `permission-picker.tsx` shows an unknown
+  // permission token.
+  const knownRoleNames = roles?.map((role) => role.name) ?? []
+  const unknownRoles = chosenRoles.filter((name) => !knownRoleNames.includes(name))
+
+  function toggleRole(roleName: string) {
+    setForm((f) => {
+      const current = roleNames(f.roles)
+      const next = current.includes(roleName)
+        ? current.filter((r) => r !== roleName)
+        : [...current, roleName]
+      return { ...f, roles: next.join(", ") }
+    })
+  }
 
   function toggle(column: string) {
     setForm((f) => ({
@@ -147,12 +178,70 @@ function AddPolicyDialog({
         <div className="grid gap-3">
           <div className="grid gap-1.5">
             <Label htmlFor="policy-roles">Roles it applies to</Label>
-            <Input
-              id="policy-roles"
-              value={form.roles}
-              onChange={(e) => setForm((f) => ({ ...f, roles: e.target.value }))}
-              placeholder="Analyst, Dashboard Viewer"
-            />
+            {roles === null ? (
+              <>
+                <Input
+                  id="policy-roles"
+                  value={form.roles}
+                  onChange={(e) => setForm((f) => ({ ...f, roles: e.target.value }))}
+                  placeholder="Analyst, Dashboard Viewer"
+                />
+                {rolesState.status === "error" ? (
+                  <p className="text-xs text-muted-foreground">
+                    Could not read the roles; type them as a comma-separated list.
+                  </p>
+                ) : null}
+              </>
+            ) : roles.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No roles defined</p>
+            ) : (
+              <ul className="grid max-h-40 gap-1 overflow-y-auto rounded-md border border-border p-1">
+                {roles.map((role) => (
+                  <li key={role.id} className="flex items-center gap-2 px-1.5 py-1 text-sm">
+                    <Checkbox
+                      id={`policy-role-${role.id}`}
+                      checked={chosenRoles.includes(role.name)}
+                      aria-label={role.name}
+                      onCheckedChange={() => toggleRole(role.name)}
+                    />
+                    <label
+                      htmlFor={`policy-role-${role.id}`}
+                      className="flex-1 cursor-pointer truncate text-xs select-none"
+                    >
+                      {role.name}
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {roles !== null && unknownRoles.length > 0 ? (
+              <div className="space-y-1.5" data-testid="unknown-roles">
+                <Label className="text-xs font-medium text-muted-foreground">Not recognised</Label>
+                <div className="flex flex-wrap gap-1.5">
+                  {unknownRoles.map((name) => (
+                    <Badge
+                      key={name}
+                      variant="outline"
+                      className="gap-1.5 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 py-1 px-2 font-mono text-xs"
+                    >
+                      <span>{name}</span>
+                      <span className="text-[10px] text-muted-foreground font-sans">
+                        (Not recognised)
+                      </span>
+                      <button
+                        type="button"
+                        className="hover:text-foreground inline-flex items-center justify-center cursor-pointer"
+                        onClick={() => toggleRole(name)}
+                        aria-label={`Remove ${name}`}
+                        title={`Remove ${name}`}
+                      >
+                        <XIcon className="size-3" />
+                      </button>
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </div>
           <fieldset className="grid gap-1.5">
             <legend className="mb-1.5 text-sm font-medium">Columns to mask</legend>
@@ -176,8 +265,15 @@ function AddPolicyDialog({
               value={form.rowFilter}
               onChange={(e) => setForm((f) => ({ ...f, rowFilter: e.target.value }))}
               placeholder="region = 'ID'"
+              aria-describedby={grammar ? "policy-filter-help" : undefined}
               className="font-mono"
             />
+            {grammar ? (
+              <p id="policy-filter-help" className="text-xs text-muted-foreground">
+                Functions: {grammar.functions.join(", ")}. Operators:{" "}
+                {grammar.operators.join(", ")}. Forms: {grammar.forms.join(", ")}.
+              </p>
+            ) : null}
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="policy-name">Name</Label>

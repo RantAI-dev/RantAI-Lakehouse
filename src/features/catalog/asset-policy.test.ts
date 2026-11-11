@@ -3,7 +3,7 @@
 // role, and does something — masks a column or filters rows.
 import { describe, expect, it } from "bun:test"
 import type { AssetDetail } from "@/services/contracts/assets"
-import { policyCondition, policyTable } from "./asset-policy"
+import { policyCondition, policyTable, roleNames } from "./asset-policy"
 
 const asset = (a: Partial<AssetDetail>) => a as AssetDetail
 
@@ -28,6 +28,16 @@ describe("policyTable", () => {
 
   it("falls back to the table key when nothing readable backs the asset", () => {
     expect(policyTable(asset({ id: "serving.mart_orders", tableKey: "serving.mart_orders" }))).toBe("serving.mart_orders")
+  })
+})
+
+describe("roleNames", () => {
+  it("reads the form's comma string the way the checkboxes write it", () => {
+    // WEB-8 D8: the roles field is checkboxes now; the two ticked names come
+    // back as "A, B", and a stray comma or blank is not a role.
+    expect(roleNames("Analyst, Dashboard Viewer")).toEqual(["Analyst", "Dashboard Viewer"])
+    expect(roleNames(" Analyst ,, Viewer , ")).toEqual(["Analyst", "Viewer"])
+    expect(roleNames("")).toEqual([])
   })
 })
 
