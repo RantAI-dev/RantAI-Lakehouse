@@ -222,4 +222,375 @@ maps the error, the D5 gap list, the T5 numbers or *not verified*, and the outpu
 `git status --short`, `git log --oneline origin/main..HEAD` and `git ls-remote --heads origin
 <branch>`.
 
+### Handoff (developer, 2026-11-11, S1)
+
+Branch `feat/gov-7-s1-enforce`, base `origin/main` at `4189c0b1` (`ADM-13`
+merged), plus one `git merge origin/main` (`cf5a9923`, WEB-7 S1 — TypeScript
+only).
+
+#### Commits
+
+- `d64b5055` T1 — migration `0135_table_access_per_role.sql` and
+  `table_access.rs`.
+- `0b2afb50` T2 — the enforcement choke point, the unresolvable-statement
+  refusal, the single error mapping.
+- `47b68b6a` — the PR #459 CI fix: the tile-cache fixture creates the `Admin`
+  role it names. D4 stands; see "Fixture rule" below.
+- `ef90d402` — `wip:` commit made so T3 could be merged with `main` without
+  losing uncommitted work; superseded by `d0459e0a`.
+- `cf5a9923` — merge of `origin/main` (WEB-7 S1, `ai/prompt.rs` and its
+  tests), no Rust conflict.
+- `d0459e0a` T3 — the filtered lists and details.
+- `5817f0d3` T4 — the `table-access` routes, `POLICY_TABLE`, audit.
+- `9097acea` T5 — the latency measurement (report only, no cache).
+
+#### Moved anchors
+
+Every `file:line` in section 2 was verified at `dcaae8a5`; `main` moved all of
+them. Re-found by name, current locations:
+
+- `policy_engine.rs`: `PolicyCondition` :48, the mask matcher
+  (`c.table.eq_ignore_ascii_case`) inside `obligations_for_async` :551,
+  `rewrite_sql_for_roles` :308, `obligations_for_async`'s no-pool branch :565.
+- `sql_rewrite.rs`: `referenced_tables` :118, `Classifier` :4769, `enforce`
+  :5347, `gate_targets` :205 (new dependency of this slice, reused rather
+  than copied).
+- `routes/query.rs`: `table_not_available` :709, `LISTING_NOT_AVAILABLE` :730
+  (both now delegate to `policy_engine`, one definition), the rewrite :352,
+  the gate :482.
+- `routes/support.rs`: `run_spec_sql` :227, `enforcement_message_for` :290,
+  `enforcement_refusal` (new) :310, `try_run_spec_sql` :345.
+- `routes/alerts.rs` `ApiSqlGate` :1072, `routes/embed.rs` rewrite via
+  `support`, `routes/authored_pipelines.rs` :1569, `routes/gold.rs` the
+  `PolicyRefused` mapping :97.
+- `routes/catalog.rs`: `list` :262 and `query` :406 stayed; `detail` :1726,
+  `sample` :2340, the new helpers
+  (`table_access_for`, `asset_table_key`, `asset_visible`, `retain_visible`,
+  `ensure_asset_readable`) beside `not_found` :3165;
+  `catalog_profile::profile` :347, `bronze_table_name` :302.
+- `routes/lakehouse.rs`: `namespaces` :533, `tables` :602, `table_detail`
+  :656.
+- `routes/dashboard.rs`: `fields` :2270, `join_suggestions` :2616.
+- `migrations/0001_init.sql` `role` :41.
+
+#### D5: every call site of `rewrite_sql_for_roles` and its mapping
+
+The new `EnforcementError::TableNotReadable(String)` and
+`EnforcementError::Unresolvable` are mapped in ONE place,
+`routes::support::enforcement_refusal(sql, err) -> ApiError`: the first is the
+tenant gate's own 404 and sentence (`policy_engine::table_not_available_message`),
+the second the gate's 422 sentence (`policy_engine::LISTING_NOT_AVAILABLE`).
+`policy_engine::enforcement_error_message` answers the same two sentences
+(now `String`), for the sites whose answer is a message rather than an
+`ApiError`.
+
+| Call site | Mapping |
+| --- | --- |
+| `routes/query.rs::rewrite_sql_for_principal_inner` | `enforcement_refusal`; the DATA-21 past-timestamp sentence still wins first |
+| `routes/support.rs::try_run_spec_sql` (tiles, embeds, public links) | `SpecRunFailure::Refused(enforcement_message_for(..))` — the tile's error slot carries the not-found sentence; a tile has no status |
+| `routes/dashboard.rs::run_records`, `export_tile_statement`, `filter_values` | `enforcement_refusal` |
+| `routes/dashboard_sources.rs::check_and_rewrite` | `enforcement_refusal` |
+| `routes/alerts.rs::ApiSqlGate::rewrite` | `GateRefusal::Refused(enforcement_refusal(..).to_string())` — the run result's `skipped` records the sentence (AC10) |
+| `routes/authored_pipelines.rs` enforce | `enforcement_refusal` (404 for a hidden table; the GATE's own refusal stays 422 via `gate_refusal_as_unprocessable`, unchanged) |
+| `gold_export.rs::export_batch_sql` | `GoldExportError::PolicyTableRefused(ApiError)`, mapped straight through in `From<GoldExportError> for ApiError` (the route answers 404, not its usual 422) |
+| `routes/ai/tools/data.rs::run_sql` | covered by the Query Studio site it calls (`rewrite_sql_for_principal`) |
+
+#### D5: the gap added
+
+No new `sql_rewrite::Classifier` variant. The classifier already refuses
+table functions (empty allowlist) and sensitive `system.*` tables for every
+principal. What it could NOT see — and what a narrowed principal would
+otherwise pass — is a statement **whose tables do not appear in
+`referenced_tables`**: `DESCRIBE x` / `DESC x` (`Statement::ExplainTable`),
+`SHOW COLUMNS FROM x`, `SHOW TABLES`/`SHOW DATABASES` (`ListsObjects`), and a
+statement whose only sources are `system.*`/`information_schema.*`. Those now
+go through `sql_rewrite::gate_targets` — the tenant gate's own resolver, one
+parse, same collector — inside `rewrite_sql_for_roles`, before the mask
+prefetch: every named table must be allowed (else `TableNotReadable`), and
+`ListsObjects` is refused (`Unresolvable`). A statement naming no table at all
+(`SELECT 1`) still runs. A CTE is followed to its base tables by the same
+collector; a CTE body the collector cannot parse makes the whole statement
+unparseable, which the rewrite already refuses.
+
+#### D6: what `/api/semantic*` lists
+
+It lists **entries**, not tables: each entry carries an `asset` (the table
+key), a `column`, a description, synonyms, a role, status and staleness.
+`GET /api/semantic` now drops the entries whose `asset` the caller's roles
+hide; `GET /api/semantic/{asset}` answers the same empty list an asset with
+no entries answers, so it is not an oracle. Lineage was NOT large: the graph
+node ids already carry the table (`table:`, `iceberg:`, `bronze:`), so
+`lineage::node_table_key` filters nodes (and their edges) in
+`lineage::build`, `lineage::charts::read` and `lineage::used_by::read`
+(the last answers the same 404 a hidden asset answers anywhere else).
+
+#### T5: measurement
+
+`table_access::tests::the_access_check_costs_what_the_plan_budgeted` (in
+`src/table_access.rs`), `sqlx::test` database, 10 narrowed roles and 200
+grants, 1,000 iterations of `for_roles` + ten `allows` calls, unoptimized
+`cargo test` build on the dev machine (11.9 GB RAM, shared with another
+developer's build), three runs:
+
+- run 1: p50 **3.420 ms**, p95 **5.144 ms**, max 8.393 ms
+- run 2: p50 **3.460 ms**, p95 **4.837 ms**, max 85.943 ms (one outlier)
+- run 3: p50 **3.391 ms**, p95 **4.577 ms**, max 9.003 ms
+
+With no roles (a service identity or system run) the call is a constant:
+`for_roles` returns `All` without touching Postgres, 0.0001 ms/call. So the
+cost is one Postgres round trip per statement, as D4 intends. **p95 sits ON
+the 5 ms budget** (4.58–5.14 ms across runs, one run over), in a debug build;
+this is reported as the plan asks, and **no cache was added** (the plan says
+to report first). If the planner wants it under budget with margin, the
+follow-up is a per-request `TableAccess` memo — named here, not built.
+
+#### Fixture rule found by CI (D4)
+
+D4 resolves access by role NAME and an unknown name is not `All`, so a test
+fixture that invents a role name is now refused. One existed:
+`routes::support::run_spec_sql_enforcement::a_masked_and_an_unmasked_viewer_never_share_a_remembered_result`
+passes `"Admin"`. Fixed in `47b68b6a` by creating the role with the migration
+default `read_scope = 'all'`; the assertion is unchanged. Grep of both test
+trees (`rewrite_sql_for_roles(` and every role vector in `src/**` test modules
+and `tests/`) found no other: the remaining role literals are the seeded
+`Analyst` and the fixed `Dashboard Viewer`. Production cannot hit this —
+`principal.role_names` always comes from `role` rows.
+
+#### Commands, as run (counts are the test binary's own)
+
+Rust build/format/lint, from `rust/`, with `/home/shiro/rantai/bin/cargo-locked`:
+
+- `fmt --check` — pass.
+- `clippy -p lakehouse-api --all-targets -- -D warnings` — pass (last at
+  `9097acea`).
+- `clippy -p lakehouse-store --all-targets -- -D warnings` — pass (T4 touched
+  it).
+- `check -p lakehouse-api --all-targets` — pass between edits (not a
+  verification claim).
+
+Unit tests, `--lib <filter>`:
+
+- `query::` 187 passed; `policy_engine` 9; `embed` 20; `alerts` 74;
+  `authored_pipelines` 60 (T2 Accept, run as the plan wrote them — see the
+  note below).
+- `catalog` 301; `lakehouse` 55; `data_map` 79; `dashboard::` 181 (T3 Accept).
+- `identity` 35; `route_policy_tests` 2 (T4 Accept).
+- `run_spec_sql_enforcement` 9 (the CI fix).
+- `table_access` 11 (T1's 10 cases + T5's measurement), also used for T5.
+- **whole lib: 3430 passed, 0 failed, 18 ignored** (`--lib`).
+
+Integration tests, one file at a time (`--test <file>`):
+
+- `table_access` 12 — T2's and T3's end-to-end cases (Query Studio
+  run/estimate/download, dashboard tiles, embed as Dashboard Viewer, alert
+  owner, authored pipeline, listings, masks, catalog list/query/detail, mart
+  picker).
+- `identity_table_access` 8 — T4's routes, refusals and audit row.
+- `route_auth` 87 — the sweep plus the new both-ways case.
+- Because their behaviour this change can alter, also: `query_tenant_scope`
+  19, `dashboard_tenant_scope` 13, `embed_tokens` 48, `chart_alerts` 19,
+  `pipeline_enforce` 18, `explain_rewrite` 7, `alert_test_route` 6,
+  `catalog_grants` 10, `catalog_restore` 9, `lakehouse_maintenance` 6,
+  `chart_lineage_routes` 5, `dashboard_export` 11, `public_links` 16,
+  `ai_tool` 25, `ai_sql_help` 26, `ai_citations` 2, `iceberg_door` 15,
+  `column_lineage_route` 9.
+
+Note on the Accept lines: `cargo test -p lakehouse-api table_access` (and
+`query::`, `catalog`, …) without `--lib` builds all 110 integration binaries
+first — 47 GB of disk and several minutes — before the filter applies. This
+was run that way once (T1) before the cost was known; every later run used
+`--lib` or `--test <file>`. The plan's Accept lines should say so.
+
+`ops/` and `dagster/`: no reference to `read_scope`, `role_read_grant`, the
+new routes or the access rule (grep). `ops/g4` and `ops/g10` assert
+`query:read` for service identities, whose scopes (not roles) govern them, so
+nothing changes there. No assistant tool or schema changed
+(`tests/fixtures/tool_schemas.json` is untouched).
+
+#### `git status --short`, `git log --oneline origin/main..HEAD`, remote
+
+```
+$ git status --short
+(clean)
+
+$ git log --oneline origin/main..HEAD
+9097acea test(gov-7): measure the access check the read path pays (T5)
+5817f0d3 feat(gov-7): the API that sets a role's read access (T4)
+d0459e0a feat(gov-7): filter every list and detail by the caller's table access (T3)
+cf5a9923 Merge remote-tracking branch 'origin/main' into feat/gov-7-s1-enforce
+ef90d402 wip(gov-7): T3 filtered lists in progress (catalog tests still red)
+47b68b6a fix(gov-7): the tile-cache fixture creates the role it names (D4)
+0b2afb50 feat(gov-7): enforce the access check on every governed read (T2)
+d64b5055 feat(gov-7): read access per schema and table, stored per role
+
+$ git ls-remote --heads origin feat/gov-7-s1-enforce
+9097acea6cd881516d76de7a1f8dd0fede8dc34b	refs/heads/feat/gov-7-s1-enforce
+```
+
+(`origin/main` still ends at `0133_pages_per_role.sql`, so
+`0135_table_access_per_role.sql` is free; ADM-12's `0134` is unmerged.)
+
+**not verified locally: the rest, left to CI** — the other ~90 integration
+test files, the workspace-wide `cargo clippy --workspace`/`cargo test
+--workspace`, and S2 (the console). No product behaviour was changed for a
+service identity, the Iceberg door, or Dagster, as "Out of scope" says.
+
+No mismatch between plan and code was found except the two noted above (the
+Accept command shape, and the T5 p95 landing on the budget).
+
+### Handoff (developer, 2026-11-11, S1 round 1 fixes)
+
+Branch `feat/gov-7-s1-enforce`, from `5ad8c129`; S2 then S1, one commit each,
+pushed after each.
+
+#### Commits
+
+- `55a9c58e` — S2: `git merge origin/main` (merge commit). `origin/main` was
+  one commit ahead, `ba2d8f0c` WEB-7 S2 (the console, TypeScript only).
+- `8974f4e8` — S1: `TableAccess` no longer derives `Default`.
+
+#### S2: what the merge had
+
+**No conflicts** — the merge resolved on its own and nothing was hand-edited.
+
+`origin/main` still ends at `rust/migrations/0133_pages_per_role.sql`: ADM-12
+(#455) has not merged, so there is no `0134_sso_settings.sql` and no other
+`0135` either. `0135_table_access_per_role.sql` is unchanged and still the
+next free number. The only `main` change was `src/**` (console), so no Rust
+file moved and no migration is affected.
+
+#### S1: the call sites touched
+
+The `Default` derive and `#[default]` on `All` are removed, and the type
+carries the one-line reason ("No `Default` on purpose (`GOV-7` S1 review
+round 1, S1): a default of `All` would make `unwrap_or_default()` on a failed
+read mean 'every table'.").
+
+**No call site needed changing**, because none used it — checked, not assumed:
+
+- `TableAccess::default(` — no match in `src/` or `tests/`.
+- `unwrap_or_default()`/`Default::default()` applied to an access value — no
+  match; the matches in `catalog.rs`, `dashboard_access.rs` and the tests are
+  `String`/`Option<String>`/fixture defaults, unrelated to `TableAccess`.
+- `TableAccess` outside `lakehouse-api` — only `lakehouse-store`'s unrelated
+  `RoleTableAccess` struct.
+
+For the record, the sites whose answer is "no narrowing" say so explicitly
+already and were left as they are: `table_access::for_roles` (`Ok(All)` for no
+pool or no roles), `routes::catalog::table_access_for` (`?`, a refusal), and
+the assistant's three readers — `routes::ai::mod` (a failed read hides every
+table from the map, `All` only when there is no principal at all),
+`ai::tools::data` (a failed read is the tool's error, `All` only for no
+principal) and `ai::tools::dashboards` (the same).
+
+**One doc line changed with it, and only it**: the module doc's "The default
+is [`TableAccess::All`]" now reads "The *stored* default", so the sentence
+names the `role.read_scope = 'all'` column default rather than a Rust
+`Default` that no longer exists.
+
+#### Commands, as run (counts are the test binary's own)
+
+From `rust/`, with `/home/shiro/rantai/bin/cargo-locked`:
+
+- `check -p lakehouse-api --all-targets` after the merge — pass (3m 01s).
+- `fmt --check` — pass.
+- `check -p lakehouse-api --all-targets` after S1 — pass (1m 50s), the compile
+  proof that nothing relied on the removed `Default`.
+- `clippy -p lakehouse-api --all-targets -- -D warnings` — pass (3m 40s).
+- `test -p lakehouse-api --lib table_access` — **11 passed, 0 failed**
+  (3,437 filtered out).
+- `test -p lakehouse-api --lib policy_engine` — **9 passed, 0 failed**
+  (3,439 filtered out).
+- `sg docker -c '… test -p lakehouse-api --test table_access'` — **12 passed,
+  0 failed** (0 filtered out).
+
+**not verified locally: the rest, left to CI** — the other integration test
+files, the workspace-wide `clippy`/`test`, the console (`bun run typecheck`,
+`lint`, `test` for the WEB-7 S2 merge, TypeScript only and already green on
+`main`).
+
+#### `git status --short`, `git log --oneline 5ad8c129..HEAD`, remote
+
+```
+$ git status --short
+(clean)
+
+$ git log --oneline 5ad8c129..HEAD
+8974f4e8 refactor(gov-7): TableAccess has no Default, so a failed read cannot mean all (S1)
+55a9c58e Merge remote-tracking branch 'origin/main' into feat/gov-7-s1-enforce
+ba2d8f0c feat(console): Query Studio saves, chart builder and alert rule become full pages (WEB-7 S2) (#463)
+
+$ git ls-remote --heads origin feat/gov-7-s1-enforce
+8974f4e8cd0498543bc8d53290e5d1e913981b4f	refs/heads/feat/gov-7-s1-enforce
+```
+
+(`ba2d8f0c` is `origin/main`'s tip, on this branch only through the merge.
+This handoff's own docs commit sits on top of the three lines above.)
+
 ## 6. Review (planner)
+
+### S1, round 1 (planner, 2026-11-11) — branch at `3f6b5569`
+
+Read in full: the migration, `table_access.rs`, the change to
+`policy_engine::rewrite_sql_for_roles` and its error mapping, `sql_rewrite::gate_targets`,
+the two routes in `routes/identity.rs`, and every place that builds `TableAccess::All` or
+handles a failed read of the rule. Sampled, not read line by line: the list filters of D6
+(`catalog.rs` entry and helper, the assistant's map and tools); their tests are in
+`tests/table_access.rs` (1,141 lines), which I did not read either. I ran no check locally;
+#459 runs the suite. (The S1 handoff sat under this heading; it is moved up into section 5,
+unchanged.)
+
+- **The rule fails closed where it must.** A database that cannot be read refuses the
+  statement (`PolicyEngineError::Store`), returns the route's error on the lists, and hides
+  every table from the assistant's map. A role name with no row gives nothing, never all.
+- **The refusal is the tenant gate's own sentence and status** (`table_not_available_message`,
+  one definition used by both).
+- **Statements that name no table are covered** through the tenant gate's resolver:
+  `DESCRIBE`, `SHOW COLUMNS`, listings, `system.*`. Table functions were already refused for
+  everyone.
+- **The write route** checks the scope, refuses a `*:*` role, validates names with
+  `Ident::new`, and audits before and after.
+- The CI failure on T2 was the test fixture naming a role with no row; the fixture now
+  creates the role and the assertion is unchanged, which is the right fix under D4.
+
+**No BLOCKER.**
+
+**SHOULD-FIX**
+
+- **S1. `TableAccess` derives `Default`, and the default is `All`.** Nothing uses it today,
+  but it makes `unwrap_or_default()` on a failed read mean "every table", the one mistake
+  this type must not allow. Remove the derive and the `#[default]`.
+- **S2. Merge `origin/main`** (the branch is behind). `ADM-12` (#455) merges first and
+  carries migration `0134`; this branch keeps `0135`.
+
+**The plan's own mistake (planner).** The *Accept* lines in section 3 are written as
+`cargo test -p lakehouse-api <filter>`, which builds all 110 integration test files before
+filtering (47 GB on 2026-11-11). Read each as `--lib <filter>` or `--test <file>`. S2's
+brief says so.
+
+**For the product owner**
+
+- **The check costs about 3.4 ms at the median and 4.6 to 5.1 ms at p95** per governed read
+  (developer's measurement: unoptimised test build, shared machine, 10 roles and 200 grants).
+  The budget on the feature page is 5 ms *(proposed)*. It is one database read per request
+  and was not cached, as the plan says. A release build should be faster; that is not
+  measured.
+- **A run with no person behind it reads every table.** A scheduled agent run and a service
+  identity carry no roles, so the rule does not narrow them (spec, "Not included"). A person
+  who may manage agents could have an agent read a table their own role hides. A backlog item
+  is filed at merge.
+- **Names are compared without regard to case**, as masks are (D4). Two tables that differ
+  only by case share one grant. Added to the feature page's limits at merge.
+
+### S1, round 2 (planner, 2026-11-11) — branch at `ba616e13`
+
+Read the fix (`8974f4e8`, `table_access.rs`).
+
+- **S1: closed.** `TableAccess` has no `Default`; nothing relied on it, so no call site
+  changed.
+- **S2: closed** (`55a9c58e`, no conflict).
+
+**No open BLOCKER and no open SHOULD-FIX.** I ran no check locally. Merged only when #459 is
+green on its last commit, and after `ADM-12` (#455), so the migrations land as 0134 then
+0135; the branch is updated once #455 is in.
+

@@ -1575,9 +1575,10 @@ pub async fn enforce_pipeline_sql(
         &obligations_source,
     )
     .await
-    .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
-    })?;
+    // GOV-7 D5: a table the author's roles do not include answers the tenant
+    // gate's own 404 here too (the gate's OWN refusal stays the 422 this
+    // route documents above — that is `gate_refusal_as_unprocessable`).
+    .map_err(|err| crate::routes::support::enforcement_refusal(&sql, &err))?;
     // DATA-13 (F2): the API sees the run's real SELECT only here. Keep the SQL
     // as the orchestrator submitted it, not `rewritten` (masking wraps the
     // source in subqueries, which would make every column partial); the

@@ -101,7 +101,9 @@ const SILVER_HEADING: &str = "SILVER (database `silver`, cleaned detail rows):";
 
 /// One table as the cache holds it. Nothing here depends on the question or
 /// on who asks: the cache is shared by every chat, so which tables a
-/// question names is decided afterwards, per request, by [`assemble`].
+/// question names is decided afterwards, per request, by [`assemble`], and
+/// so is which tables the caller's roles may see (`GOV-7` D6).
+#[derive(Clone)]
 struct TablePiece {
     /// `database.table`.
     qualified: String,
@@ -196,6 +198,7 @@ pub(crate) async fn data_map(
     notes: &Notes,
     query_words: &HashSet<String>,
     relevant_enabled: bool,
+    access: &crate::table_access::TableAccess,
 ) -> String {
     let cacheable = withheld.is_some_and(|w| w.masked.is_empty());
     let mut guard = CACHE.lock().await;
@@ -215,7 +218,35 @@ pub(crate) async fn data_map(
         built
     };
     drop(guard);
+    // `GOV-7` D6: the cache stays whole and shared; what one caller's roles
+    // hide is dropped here, before any of it reaches the model.
+    let pieces = visible_pieces(&pieces, access);
     assemble(&pieces, query_words, relevant_enabled, MAX_CHARS)
+}
+
+/// The caller's view of the shared pieces: unchanged for an unrestricted
+/// principal, and with every hidden table dropped for a narrowed one.
+///
+/// The closing line about catalog datasets with no Gold table names slugs,
+/// which a narrowed caller could otherwise read as a table list; it is
+/// dropped for that caller rather than filtered, because it is one string
+/// built from every dataset (`GOV-7` D6, fail closed).
+pub(crate) fn visible_pieces(
+    pieces: &Arc<Pieces>,
+    access: &crate::table_access::TableAccess,
+) -> Arc<Pieces> {
+    if access.is_all() {
+        return Arc::clone(pieces);
+    }
+    Arc::new(Pieces {
+        tables: pieces
+            .tables
+            .iter()
+            .filter(|table| access.allows_key(&table.qualified))
+            .cloned()
+            .collect(),
+        unserved: String::new(),
+    })
 }
 
 /// Drop the cached map, so the next chat rebuilds it. A person's
@@ -2941,7 +2972,15 @@ mod tests {
         );
         let withheld = Withheld::default();
         let ask = async |words: &[&str]| {
-            data_map(&ch, Some(&withheld), &Notes::default(), &query(words), true).await
+            data_map(
+                &ch,
+                Some(&withheld),
+                &Notes::default(),
+                &query(words),
+                true,
+                &crate::table_access::TableAccess::All,
+            )
+            .await
         };
         let shipments = ask(&["swiftpost"]).await;
         let customers = ask(&["northern"]).await;
@@ -3164,5 +3203,52 @@ mod tests {
                 "the secondary registry's own dataset: {descriptions:?}"
             );
         }
+    }
+
+    // ── `GOV-7` D6: the map is built for the caller's table access ───────
+
+    /// A narrowed caller's DATA MAP carries no hidden table and no line that
+    /// names a catalog dataset, while the shared cache keeps every table: the
+    /// filter runs on the caller's view, never on what is cached.
+    #[tokio::test]
+    async fn a_narrowed_callers_map_does_not_name_a_hidden_table() {
+        let piece = |qualified: &str| TablePiece {
+            qualified: qualified.to_owned(),
+            heading: GOLD_HEADING,
+            full: format!("{qualified}: 10 rows\n"),
+            line: format!("{qualified} (10 rows)\n"),
+            words: std::collections::HashSet::new(),
+        };
+        let pieces = std::sync::Arc::new(Pieces {
+            tables: vec![piece("serving.mart_ok"), piece("serving.mart_hidden")],
+            unserved: "\nCatalog datasets with no Gold table: secret_dataset (\"Secret\", \
+                       expected at serving.secret_dataset, not found).\n"
+                .to_owned(),
+        });
+        let access = crate::table_access::TableAccess::Listed(
+            std::collections::HashSet::from([("serving".to_owned(), "mart_ok".to_owned())]),
+            std::collections::HashSet::new(),
+        );
+
+        let visible = visible_pieces(&pieces, &access);
+        let map = assemble(
+            &visible,
+            &std::collections::HashSet::new(),
+            false,
+            MAX_CHARS,
+        );
+
+        assert!(map.contains("serving.mart_ok"), "{map}");
+        assert!(
+            !map.contains("mart_hidden"),
+            "a hidden table's name must not reach the model: {map}"
+        );
+        assert!(
+            !map.contains("secret_dataset"),
+            "the dataset line names tables too: {map}"
+        );
+        // The cache itself still holds every table, so the next caller reads
+        // its own view of the same pieces.
+        assert_eq!(pieces.tables.len(), 2);
     }
 }

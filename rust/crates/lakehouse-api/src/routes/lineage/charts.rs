@@ -615,7 +615,21 @@ pub(crate) async fn read(
     add_chart(&mut g, chart, &deps);
 
     let start = chart_node(&chart.spec.id);
-    let keep = upstream(&g, std::slice::from_ref(&start));
+    let mut keep = upstream(&g, std::slice::from_ref(&start));
+    // `GOV-7` D6: a chart's lineage does not draw a table the caller's roles
+    // hide (nor the edges that touch it), exactly as the graph route does.
+    let access = crate::routes::catalog::table_access_for(state, principal).await?;
+    if !access.is_all() {
+        let hidden: Vec<String> = g
+            .nodes
+            .iter()
+            .filter(|(id, _)| super::node_table_key(id).is_some_and(|key| !access.allows_key(&key)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in hidden {
+            keep.remove(&id);
+        }
+    }
     let dist = distances(&g, &start, &keep);
     let (steps, not_recorded) = steps_json(state, &g, &keep, &dist).await;
     let edges: Vec<Value> = g

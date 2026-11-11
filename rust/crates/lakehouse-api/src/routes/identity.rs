@@ -69,8 +69,8 @@ use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::governance;
 use lakehouse_store::identity::{
     self, CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput, Role,
-    RotateServiceIdentityResponse, ServiceIdentity, ServiceIdentityFilter, Tenant, TenantFilter,
-    User, UserFilter,
+    RoleTableAccess, RotateServiceIdentityResponse, ServiceIdentity, ServiceIdentityFilter,
+    TableGrant, Tenant, TenantFilter, User, UserFilter,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -1359,6 +1359,158 @@ pub async fn delete_role(
         );
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Table access per role (`GOV-7` D7) ─────────────────────────────────
+
+/// The `PUT /api/identity/roles/{id}/table-access` body (`GOV-7` D7).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableAccessBody {
+    /// `"all"` or `"listed"`.
+    scope: String,
+    /// The tables and whole schemas the role may read; ignored when `scope`
+    /// is `"all"`, which stores none.
+    #[serde(default)]
+    grants: Vec<TableGrant>,
+}
+
+/// `GET /api/identity/roles/{id}/table-access` — what a role may read.
+///
+/// The default for every existing and new role is `"all"` (D1), so an
+/// upgrade changes nobody's access.
+///
+/// # Security
+///
+/// Requires `identity:read` — see the module doc comment.
+///
+/// # Errors
+///
+/// 400 for an id that is not a UUID; 404 when no role has that id; 503/500
+/// as above.
+pub async fn get_role_table_access(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<RoleTableAccess>> {
+    Ok(ApiJson(
+        lakehouse_store::identity::get_role_table_access(pool(&state)?, &id).await?,
+    ))
+}
+
+/// `PUT /api/identity/roles/{id}/table-access` — replace a role's read scope
+/// and its grants in one transaction (`GOV-7` D7). Audited as
+/// `identity.role.table_access.update`, naming the scope and grants before
+/// and after.
+///
+/// # Refusals
+///
+/// A role holding the unrestricted `*:*` grant is refused with 400: it
+/// cannot be narrowed (D4), so an administrator cannot lock the platform's
+/// administrators out of the data they administer. A schema or table name
+/// that is not a plain identifier — the rewrite's own rule — is a 400, and
+/// a name needs no table behind it yet: a grant may name a table a pipeline
+/// creates later.
+///
+/// # Security
+///
+/// Requires `identity:write`, the same privilege bundle `PUT
+/// /api/identity/roles/{id}` edits — narrowing a role takes access away.
+///
+/// # Errors
+///
+/// 400 on a malformed body, an unknown scope, a bad identifier, or a `*:*`
+/// role; 404 when no role has that id; 503/500 as above.
+pub async fn put_role_table_access(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<RoleTableAccess>> {
+    let body: TableAccessBody = parse_body(&body)?;
+    if body.scope != "all" && body.scope != "listed" {
+        return Err(ApiError::BadRequest("scope must be all or listed".to_owned()).into());
+    }
+    let pool = pool(&state)?;
+    // 404 before anything else: an unknown id answers the same as it does on
+    // every other role route.
+    let role = identity::get_role(pool, &id).await?;
+    if lakehouse_auth::PermissionSet::parse(&role.permissions).grants_unrestricted() {
+        return Err(
+            ApiError::BadRequest("A role with full access cannot be narrowed".to_owned()).into(),
+        );
+    }
+    // The rewrite's own identifier rule (rule 4): `Ident::new`, with `*`
+    // allowed for a whole schema. Names are deduplicated in first-seen order
+    // so the primary key is never hit twice.
+    let mut grants: Vec<TableGrant> = Vec::new();
+    if body.scope == "listed" {
+        for grant in body.grants {
+            let schema = table_grant_ident(&grant.schema, "schema", false)?;
+            let table = table_grant_ident(&grant.table, "table", true)?;
+            let grant = TableGrant { schema, table };
+            if !grants.contains(&grant) {
+                grants.push(grant);
+            }
+        }
+    }
+    let before = lakehouse_store::identity::get_role_table_access(pool, &id).await?;
+    let after = lakehouse_store::identity::set_role_table_access(
+        pool,
+        &id,
+        &body.scope,
+        &grants,
+        Some(principal.id.uuid()),
+    )
+    .await?;
+    let audit_event = role_table_access_audit_event(&principal, &role, &before, &after);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.role.table_access.update",
+            role_id = %role.id,
+            "failed to record role table-access audit event"
+        );
+    }
+    Ok(ApiJson(after))
+}
+
+/// The identifier rule a grant must pass — the one the rewrite uses
+/// (`lakehouse_core::ident::Ident`), so a stored grant can bind a statement.
+/// `*` is allowed for the table part, meaning the whole schema.
+fn table_grant_ident(raw: &str, what: &str, allow_star: bool) -> Result<String, ApiError> {
+    let name = raw.trim();
+    if allow_star && name == "*" {
+        return Ok("*".to_owned());
+    }
+    lakehouse_core::ident::Ident::new(name)
+        .map(|ident| ident.as_str().to_owned())
+        .map_err(|_| {
+            ApiError::BadRequest(format!(
+                "{what} must be letters, digits and underscores, and not start with a digit"
+            ))
+        })
+}
+
+/// The audit row for a table-access change (`GOV-7` D7, `AC11`): the actor,
+/// the role, and the scope and grants before and after.
+fn role_table_access_audit_event(
+    principal: &Principal,
+    role: &Role,
+    before: &RoleTableAccess,
+    after: &RoleTableAccess,
+) -> NewAuditEvent {
+    role_audit_event(
+        principal,
+        "identity.role.table_access.update",
+        &role.id,
+        serde_json::json!({
+            "name": role.name,
+            "oldScope": before.scope,
+            "newScope": after.scope,
+            "oldGrants": before.grants,
+            "newGrants": after.grants,
+        }),
+    )
 }
 
 /// The 409 sentence for a role people still hold (`WEB-3` S3a-D2, fixed by

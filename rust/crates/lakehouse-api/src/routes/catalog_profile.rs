@@ -359,6 +359,10 @@ pub async fn profile(
              table reachable through this deployment's Iceberg query database.",
         ));
     };
+    // GOV-7 D6: a hidden table's profile answers the same 404 an unknown
+    // asset answers.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    crate::routes::catalog::ensure_key_readable_with(&access, &source.policy_key)?;
     // Underscore-prefixed columns are loader bookkeeping, hidden from the
     // detail schema and sample too.
     let all: Vec<(String, String)> = source
