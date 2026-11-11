@@ -204,6 +204,176 @@ Give the commits, the exact commands with their counts, the D4 reader list, the 
 evidence, anything *not verified* and why, and the output of `git status --short`, `git log
 --oneline origin/main..HEAD` and `git ls-remote --heads origin <branch>`.
 
+### Handoff (developer, 2026-11-11, round 1 fixes)
+
+Base `e606e2c3`. Branch `feat/adm-12-oidc-in-settings`, pushed after every commit.
+
+| Commit | What |
+| --- | --- |
+| `01ffda16` | `lakehouse-auth`: the cached discovery read also returns `authorization_endpoint` and `token_endpoint` (D10 half of B1/B2, S5). |
+| `ddce0a6e` | One SSO runtime builder with a pinned client; addresses from discovery; `ready`/`notReadyReason`; `providers` hides a connection that cannot be used (B1, B3, S5). |
+| `af392fb5` | The test sign-in uses the draft's own discovery; classified exchange failures; `emailVerified`/`overage`; a run's own sealed secret only (B2, S1, S2, S4, S5's nonce check). |
+| `d3449193` | Role names from `lakehouse_store::identity::list_roles` (S3). |
+| `7dc10317` | Console: `ready`/`notReadyReason` in the contract and the reason on the form (S6). |
+| `8c74fbd7` | `docs/OPERATIONS.md`: `CONSOLE_PUBLIC_URL`, and the addresses from the discovery document (T5/D10). |
+| this commit | This handoff. |
+
+**Each finding**
+
+- **B1 — closed.** `resolve_sso` still merges the connection (D3), and
+  `runtime_settings::build_sso_runtime` now fills the authorize, token, key-set
+  and redirect addresses: `.env` wins per value, else the provider's discovery
+  document, and the redirect is `<CONSOLE_PUBLIC_URL>/api/auth/oidc/callback`.
+  `sso_runtime`/`sso`/`oidc` are the one path the live routes and the test path
+  use. `GET /api/settings/sso` answers `ready` and `notReadyReason`;
+  `GET /api/auth/providers` answers `oidc: false` when not ready. `PUT` saves
+  regardless. Tests: `routes::auth::tests::a_connection_saved_in_settings_signs_in_with_no_oidc_env`
+  (no `OIDC_*` at all; `PUT`, `oidc_start` → the discovery document's
+  authorization endpoint with the `CONSOLE_PUBLIC_URL` callback, `oidc_callback`
+  → the discovery token endpoint, session created, JIT identity created) and
+  `tests/sso_settings_route.rs::without_a_public_address_the_connection_is_not_ready_and_no_button_shows`
+  (`PUT` → `ready:false` naming `CONSOLE_PUBLIC_URL`, GET the same,
+  `providers.oidc == false`).
+- **B2 — closed.** `post_sso_test` and `handle_oidc_test_callback` both build a
+  runtime from the run's stored draft (`runtime_settings::draft_sso_settings` +
+  `sso_runtime_for_settings`, the same builder as the live path): authorize,
+  token and key set from the draft's own discovery document; no guessed
+  `<issuer>/authorize`, no live connection, no relative redirect.
+  `routes::auth::tests::a_draft_whose_provider_differs_sends_nothing_to_the_saved_one`
+  asserts the saved provider receives **zero** requests (not even discovery) and
+  the exchange happens at the draft's `/token`.
+- **B3 — closed.** `build_sso_runtime` checks the issuer, then every address the
+  discovery document names, with `check_external_https_address` (https +
+  `resolve_checked`) **before** building any authenticator; a refusal answers a
+  fixed `SsoNotReady` sentence and no client is exposed, so nothing is fetched.
+  The `if let … && let Ok(…)` shapes that left `http_client = None` are gone
+  from both paths. The discovery-named addresses are now checked (they were not
+  before).
+- **S1 — closed.** `exchange_code_for_id_token` returns
+  `ExchangeFailure::{Refused, Unreachable, Other}` (401/403 or
+  `error: invalid_client` = refused; a request that never completed =
+  unreachable; anything else = other) and each has one fixed sentence. The
+  provider's status/body is compared, never stored, logged as text, or returned.
+  Test: `a_test_sign_in_that_cannot_reach_the_provider_says_so` stores
+  "The identity provider could not be reached."
+- **S2 — closed.** `OidcTestClaims`/the stored result carry `emailVerified` and
+  `overage`. Tests: `a_test_sign_in_reports_the_draft_providers_claims_and_creates_nothing`
+  (`email_verified: true` → `emailVerified: true`, `overage: false`) and
+  `a_test_sign_in_with_a_group_overage_says_so` (`overage: true`, no mapped
+  roles).
+- **S3 — closed.** Both `SELECT name FROM role` queries are gone;
+  `put_sso`/`post_sso_test` take the names from
+  `lakehouse_store::identity::list_roles`.
+- **S4 — closed.** The callback opens only `run.draft_secret`; there is no
+  `OIDC_CLIENT_SECRET` fallback. `post_sso_test` still seals the saved (or
+  environment) secret into the run when the draft omits one (D8's "use the saved
+  one"), which is the run's own sealed secret from then on. Test:
+  `a_test_run_with_no_secret_sends_no_client_secret` (`clientSecret: null` with
+  `OIDC_CLIENT_SECRET=env-secret`: the token request has no `client_secret`).
+- **S5 — closed.** One builder (`build_sso_runtime`) makes the authenticator and
+  its client for the live and test paths, and one `check_nonce` is used by
+  `authenticate_with_nonce` and `validate_for_test`.
+- **S6 — closed.** `SsoSettings` carries `ready`/`notReadyReason`; the form
+  shows the reason in a `role="status"` notice and still saves. Test:
+  `sso-page.test.tsx::shows the reason when the saved connection is not ready`.
+- **S7 — closed** by this section.
+
+**The D4 reader list** (every place that reads the authenticator or the SSO
+settings, with file and function):
+
+- `rust/crates/lakehouse-api/src/runtime_settings.rs` — the definitions:
+  `resolve_sso` (pure merge), `sso_row`, `sso_or_fail`, `cached_or_build`,
+  `sso_runtime_or_fail`, `sso_runtime`, `sso`, `oidc`, `build_sso_runtime`,
+  `sso_runtime_for_settings`, `draft_sso_settings`.
+- `rust/crates/lakehouse-api/src/auth.rs` — `AuthenticatedPrincipal::from_request_parts`
+  (the bearer-JWT branch) → `runtime_settings::oidc(state)`.
+- `rust/crates/lakehouse-api/src/routes/auth.rs` — `oidc_start` →
+  `sso_runtime`; `providers` → `sso_runtime`; `oidc_callback` → `oidc` then
+  `sso_runtime`; `handle_oidc_test_callback` → `sso_runtime_for_settings`.
+- `rust/crates/lakehouse-api/src/routes/settings.rs` — `get_sso` →
+  `sso_runtime_or_fail`; `put_sso` → `sso_or_fail` (to know which fields the
+  environment owns) then `sso_runtime_or_fail` after the save; `post_sso_test` →
+  `sso_runtime_for_settings`; `get_deployment` → `sso_or_fail` + `oidc`.
+- `rust/crates/lakehouse-api/src/state.rs` — `AppState::new` starts the cache as
+  `None` (the runtime is built on the first request, because its checks need the
+  resolved config and the pool); `AppState::sso_http_client` is the test seam.
+- `rust/crates/lakehouse-api/src/routes/settings.rs::put_sso` also clears
+  `state.oidc` on save.
+
+**The test seam for the mock provider (and the mismatch with the plan's hint).**
+`CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true` alone is not enough: a console-set
+issuer must be `https://` (D6), `wiremock` serves plaintext only, and the API's
+`reqwest` is built with `rustls-tls` (`webpki-roots`), so it trusts no locally
+minted certificate. Weakening either check to make the test reach a plain mock
+was not an option. The seam used:
+
+1. `src/tls_proxy.rs::HttpsFront` (test-only): a TLS front in front of
+   `wiremock`, presenting a certificate for `127.0.0.1` signed by a CA minted per
+   test (`rcgen`, already a dev-dependency).
+2. `AppState::sso_http_override` (`#[cfg(test)]`, like `webhook_sender_override`):
+   a client that trusts that CA. `build_sso_runtime` uses it instead of the
+   pinned client; the `https://` check and `resolve_checked` still run on every
+   address, and the redirect is still built from `CONSOLE_PUBLIC_URL`. Only the
+   DNS pins are replaced, and only in this crate's test build (a service build
+   has neither the field nor the accessor's `Some` branch).
+
+Consequence to review: integration tests link the library **without**
+`cfg(test)`, so the B1 end-to-end test and the draft tests (B2/S1/S2/S4) live in
+`routes::auth`'s unit tests, not in `tests/sso_settings_route.rs`. That file keeps
+the 403 matrix, the readiness test, the 404/expiry test and the audit test; its
+two old draft tests were removed because they reached the provider through
+`OIDC_TOKEN_URL`/`OIDC_JWKS_URL` in `.env` — exactly what hid B1. The old
+`saving_a_config_makes_the_next_providers_call_report_oidc_with_no_restart`
+asserted `oidc: true` for an unreachable configuration, which is the defect B1
+describes; it now uses the same `https` mock and asserts the discovery document
+was read.
+
+**Compose evidence.** `docker-compose.yml` is changed by this branch (T1/D3), so:
+
+- `docker compose --profile '*' config --quiet` → exit 0 (with throwaway
+  `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`,
+  `LAKEKEEPER_ENCRYPTION_KEY`, `CONNECTOR_SECRETS_KEY`; no `.env` written).
+- `docker compose -p adm12r1 build lakehouse-api` → built
+  `rantai-lakehouse-api:local` from this branch (cache hits for the dependency
+  layer), and `build oidc-mock`.
+- `docker compose -p adm12r1 up -d --no-build lakehouse-api` (host ports moved
+  to 18080/18123/19000/15432 because another developer's stack holds the
+  defaults) → `adm12r1-lakehouse-api-1 … Up (healthy)`; log line
+  `{"message":"lakehouse-api listening","addr":"0.0.0.0:8080"}`; migrations
+  129–134 applied.
+- `curl http://127.0.0.1:18080/api/auth/providers` →
+  `{"oidc":false,"providerName":null}`, `GET /health` → 200.
+- `docker exec … env | grep '^OIDC_'` shows the twelve names compose passes,
+  **all empty** (no `OIDC_*` value set).
+- `docker compose -p adm12r1 down -v --remove-orphans` → volumes and network
+  removed; `docker ps -a --filter name=adm12r1` → nothing.
+
+**Commands run, with counts.**
+
+- `cargo fmt --check` (after every Rust commit): clean.
+- `cargo clippy -p lakehouse-auth -p lakehouse-api --all-targets -- -D warnings`:
+  clean.
+- `cargo test -p lakehouse-auth oidc`: 8 unit tests passed; `--test oidc discovery`
+  5 passed; `--test oidc no_sign_in_endpoints` 1 passed.
+- `cargo test -p lakehouse-api --lib runtime_settings`: 27 passed.
+- `cargo test -p lakehouse-api --lib routes::auth`: 86 passed.
+- `cargo test -p lakehouse-api --lib routes::settings`: 23 passed.
+- `cargo test -p lakehouse-api --test sso_settings_route`: 5 passed.
+- `cargo test -p lakehouse-api --test route_auth`: 84 passed.
+- `cargo test -p lakehouse-api --test sec11_guard`: 4 passed.
+- `bun install --frozen-lockfile`: 678 packages, lockfile unchanged.
+- `bun run typecheck`: clean.
+- `bun run lint`: 0 errors, 11 warnings (all pre-existing, elsewhere).
+- `bun test src/features/admin`: 103 passed, 0 failed. (One whole-suite run had
+  `sign-in-settings.test.tsx` time out in `waitFor`; it passes alone
+  (4 passed) and the suite re-run is 103/0. Not a change in this branch.)
+
+**Not verified locally: the rest, left to CI.** The full workspace
+`cargo test --workspace`, `cargo test --doc`, the other `lakehouse-api`
+integration binaries, and the console's other suites were not run (AGENTS.md:
+scoped checks per commit; CI runs the full suite on the PR).
+
+
 ## 6. Review (planner)
 
 ### Round 1 (planner, 2026-11-11) — branch at `ee51567b`
