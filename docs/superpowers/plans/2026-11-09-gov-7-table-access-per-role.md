@@ -712,6 +712,104 @@ b4a191891ba256039650affdc8b2a7a0788aa829	refs/heads/feat/gov-7-s2-console
 did.)
 
 
+### Handoff (developer, 2026-11-11, S2 round 1 fixes)
+
+Fixes `GOV-7` S2 review 1: T8 (B2, Rust) and T9 (B1, S1, S2, console). Decisions unchanged;
+no mismatch between the plan and the code was found.
+
+#### Commits (pushed after each)
+
+- `55c757dd` fix(catalog): a Bronze list row names its table so a narrowed role sees it (T8)
+- `da16e9ea` fix(admin): name Bronze tables under bronze, compare grants without case, write
+  only a changed section (T9)
+
+#### T8 (B2), `rust/`, every command through `/home/shiro/rantai/bin/cargo-locked`
+
+The new test was written first and run against the unfixed branch. It failed with:
+
+```
+thread 'the_catalog_lists_the_bronze_table_a_narrowed_role_is_granted' panicked at
+crates/lakehouse-api/tests/table_access.rs:1132:5:
+a granted Bronze table must be listed: {"assets":[],"namespaces":[]}
+```
+
+Commands, as run on the final T8 code (foreground, shared `CARGO_TARGET_DIR`):
+
+- `cargo-locked fmt --check` — pass (no output).
+- `cargo-locked clippy -p lakehouse-api --all-targets -- -D warnings` — pass,
+  `Finished` with no warning.
+- `cargo-locked test -p lakehouse-api --test table_access` — **14 passed, 0 failed**.
+- `cargo-locked test -p lakehouse-api --lib catalog` — **301 passed, 0 failed**,
+  3,172 filtered out.
+
+`bronze_catalog_row` now takes `table_name` and emits `"tableKey"`:
+`bronze.<table_name>`, or `null` when the registry records none;
+`assemble_bronze_rows` passes `str_col(c, "table_name")`. `asset_table_key`'s logic is
+unchanged, and its doc comment plus the row builder's say what the list carries now. The
+function gained a ninth argument, so it carries `#[allow(clippy::too_many_arguments)]` with
+a reason, the same one `bronze_detail_body` gives. `CatalogFake` now answers the Bronze
+`dataset_catalog` read with two datasets; no existing assertion was weakened.
+
+#### T9 (B1, S1, S2), console
+
+- **B1:** `schemaChoices` reads a row's table from `tableKey`, else from a dotted `id`; a row
+  with neither counts as unnamed under the one `BRONZE_SCHEMA` constant (whose comment names
+  `catalog.rs` `ensure_asset_readable`/`bronze_asset_detail_body`). `namespace` is not read.
+  The module comment, the contract's `tableKey` comment and the unnamed-assets sentence say
+  what is true now.
+- **S1:** `hasGrant` and `toggleTable` compare a grant's table without regard to case, so a
+  stored `silver.Orders` is the catalog's `orders` and unticking removes it.
+- **S2:** `tableAccessChanged` compares the draft's scope and grant set (case-insensitive,
+  order-insensitive) with what was loaded; Save sends the table-access request only when it
+  differs. An unloaded section is untouched: the role save completes and the page goes back.
+  The `accessSkipped` state and its message are removed.
+
+Existing tests changed to make a change before Save (they had assumed a write on every
+Save; no assertion was deleted):
+
+- `loads the role by id, warns about a rename, and saves the whole role` — now picks
+  "Only these" first, so the expected body is `{"scope":"listed","grants":[]}`.
+- `shows a grant the catalog does not list and keeps it through a save` — now also ticks
+  "Whole schema archived"; the body carries the unlisted `old_orders` plus `archived.*`.
+- `says the role was saved when only its tables were refused, and stays` — now unticks
+  "Whole schema silver" so the refused write is attempted.
+- `says so when the catalog fails and still keeps the grant it has` — now ticks "Whole schema
+  silver"; the body carries the kept `orders` plus `silver.*`.
+
+New tests (full-sentence names): a Bronze row with `tableKey: "bronze.orders"` is offered as
+`orders` under `bronze`, and `primer` is not shown; a row with no key gives a `bronze` group
+with the sentence and no `primer` group; a stored `silver.Orders` ticks the catalog's
+`orders` and unticking removes it from the request body; an untouched Save sends no
+table-access request; a role whose tables failed to load still saves and goes back.
+
+`docs/OPERATIONS.md` ("Limiting a role to some schemas or tables"): one paragraph on Bronze
+tables (named under `bronze`; a dataset with no registry table name is not listed and stays
+hidden from a narrowed role's lists), and the Save bullet now says a write happens only when
+the section changed.
+
+Commands, as run (foreground, final T9 code):
+
+- `bun install --frozen-lockfile` — "678 packages installed", 2.11 s.
+- `bun run typecheck` — pass (no output).
+- `bun run lint` — **11 problems, 0 errors, 11 warnings**, all pre-existing, none in a file
+  this round touched.
+- `bun test src/features/admin src/services` — **354 passed, 0 failed**, 40 files.
+
+**Not verified, and why:** the whole `bun run test` and the whole Rust workspace were not
+run locally (the brief scopes them to CI on #468); the page was not opened against a live
+API, so the picker and the two-request Save are covered by the component tests only.
+
+#### `git status --short` and the remote head before this docs commit
+
+```
+$ git status --short
+(clean)
+
+$ git ls-remote --heads origin feat/gov-7-s2-console
+da16e9eaabf8a3388b7f87fb7c9ddeb2b02f787c	refs/heads/feat/gov-7-s2-console
+```
+
+
 ## 6. Review (planner)
 
 ### S1, round 1 (planner, 2026-11-11) — branch at `3f6b5569`
