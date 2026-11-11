@@ -142,7 +142,8 @@ export const NAV_GROUPS: NavGroup[] = [
       // column (a table's Schema tab), and Tag keys is a section of Settings;
       // their old addresses redirect. S3-D4: Policies is "Access rules", at
       // the same address.
-      { title: "Access rules", href: "/governance/policies", icon: ShieldCheck, requires: ["governance:read", "policy:read"] },
+      // ADM-13 review round 1, S4: policy:read only
+      { title: "Access rules", href: "/governance/policies", icon: ShieldCheck, requires: ["policy:read"] },
       {
         title: "Data Quality",
         href: "/governance/data-quality",
@@ -162,7 +163,8 @@ export const NAV_GROUPS: NavGroup[] = [
       // redirect to `/health#<section>`.
       { title: "System status", href: "/health", icon: HeartPulse, requires: ["ops:read"] },
       { title: "Alerts", href: "/alerts", icon: BellRing, requires: ["alert:read", "alert:write"] },
-      { title: "Audit Log", href: "/audit", icon: FileText, requires: ["audit:read", "governance:read"] },
+      // ADM-13 review round 1, S4: governance:read only
+      { title: "Audit Log", href: "/audit", icon: FileText, requires: ["governance:read"] },
     ],
   },
   {
@@ -289,7 +291,8 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   { pattern: "/catalog", requires: ["catalog:read"] },
   { pattern: "/data/assets/[assetId]", requires: ["catalog:read"] },
   { pattern: "/lakehouse/tables/[namespace]/[table]", requires: ["catalog:read"] },
-  { pattern: "/gold-exports", requires: ["gold:export"] },
+  // ADM-13 review round 1, S4: gold-exports requires [] (any signed-in user, RequiresAuth on GET)
+  { pattern: "/gold-exports", requires: [] },
 
   // Query Studio
   { pattern: "/query-studio", requires: ["query:read"] },
@@ -305,15 +308,18 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
 
   // Build / Pipelines
   { pattern: "/pipelines", requires: ["pipeline:read"] },
-  { pattern: "/pipelines/create", requires: ["pipeline:write", "pipeline:read"] },
+  // ADM-13 review round 1, S4: pipeline:write only
+  { pattern: "/pipelines/create", requires: ["pipeline:write"] },
   { pattern: "/pipelines/[pipelineId]", requires: ["pipeline:read"] },
-  { pattern: "/pipelines/[pipelineId]/edit", requires: ["pipeline:write", "pipeline:read"] },
+  { pattern: "/pipelines/[pipelineId]/edit", requires: ["pipeline:write"] },
 
   // Governance
-  { pattern: "/governance/policies", requires: ["governance:read", "policy:read"] },
+  // ADM-13 review round 1, S4: policy:read only
+  { pattern: "/governance/policies", requires: ["policy:read"] },
   { pattern: "/governance/data-quality", requires: ["governance:read"] },
   { pattern: "/governance/approvals", requires: ["access:approve", "agent:approve"] },
-  { pattern: "/audit", requires: ["audit:read", "governance:read"] },
+  // ADM-13 review round 1, S4: governance:read only
+  { pattern: "/audit", requires: ["governance:read"] },
   { pattern: "/lineage", requires: ["lineage:read"] },
 
   // Monitoring
@@ -321,7 +327,8 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   { pattern: "/alerts", requires: ["alert:read", "alert:write"] },
 
   // Intelligence / Agents
-  { pattern: "/agents/runs/[runId]", requires: ["agent:manage", "agent:approve"] },
+  // ADM-13 review round 1, S4: agent runs requires [] (any signed-in user, RequiresAuth on GET)
+  { pattern: "/agents/runs/[runId]", requires: [] },
 
   // Administration
   { pattern: "/admin/users", requires: ["identity:read"] },

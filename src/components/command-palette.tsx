@@ -9,7 +9,7 @@ import {
   Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database, Star,
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor, canOpen } from "@/components/app-shell/nav-config";
-import { useOptionalAuth } from "@/features/auth/auth-provider";
+import { useAuth } from "@/features/auth/auth-provider";
 import { CertificationBadge } from "@/components/patterns/status-badge";
 import { assetService, dashboardService } from "@/services";
 import { isServiceError } from "@/services/errors";
@@ -85,11 +85,8 @@ export function CommandPalette() {
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
-  const auth = useOptionalAuth();
-  const hasPermission = React.useCallback(
-    (permission: string) => (auth ? auth.hasPermission(permission) : true),
-    [auth],
-  );
+  // ADM-13 review round 1, S5: useAuth() with no fail-open path
+  const { hasPermission } = useAuth();
 
   const groups = React.useMemo(() => {
     return NAV_GROUPS.map((g) => ({
@@ -105,9 +102,10 @@ export function CommandPalette() {
   // aborted or whose debounce timer never fired. A failed request shows
   // "Catalog search is unavailable", not a spinner that never resolves and
   // not an empty list (DATA-11 T2).
+  // ADM-13 review round 1, S5: do not send search without catalog:read.
   React.useEffect(() => {
     const term = search.trim();
-    if (!term) {
+    if (!term || !hasPermission("catalog:read")) {
       setAssetResults([]);
       setSearchFailed(null);
       setAssetsPending(false);
@@ -140,15 +138,24 @@ export function CommandPalette() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [search]);
+  }, [search, hasPermission]);
 
   // Dashboards and charts, by name (BI-18 part C, part 2). The server decides
   // who may see what, so a private draft or a deleted item is never in the
   // answer; a caller without `dashboard:read` gets a refusal and sees no group.
   // Debounced like the catalog search, and abortable for the same reason.
+  // ADM-13 review round 1, S5: do not send search without dashboard:read.
   React.useEffect(() => {
     if (!open) return;
     const term = search.trim();
+    if (!hasPermission("dashboard:read")) {
+      setDashHits([]);
+      setDashFavourites([]);
+      setDashRecent([]);
+      setDashPending(false);
+      setDashFailed(false);
+      return;
+    }
     let cancelled = false;
     const controller = new AbortController();
     setDashPending(Boolean(term));
@@ -181,7 +188,7 @@ export function CommandPalette() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [open, search]);
+  }, [open, search, hasPermission]);
 
   // Open via ⌘K / Ctrl+K, and via an event from the navbar search box.
   React.useEffect(() => {

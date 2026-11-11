@@ -190,8 +190,3 @@ export function useAuth(): AuthContextValue {
   if (!ctx) throw new Error("useAuth must be used within AuthProvider");
   return ctx;
 }
-
-/** Read the current principal / auth status, or null if outside AuthProvider (e.g. isolated component tests). */
-export function useOptionalAuth(): AuthContextValue | null {
-  return React.useContext(AuthContext);
-}

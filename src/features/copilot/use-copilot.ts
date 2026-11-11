@@ -764,7 +764,16 @@ const NOOP_STREAM: CopilotStreamValue = {
   progress: null,
 };
 
-/** Access the shared Copilot brain. Returns no-op fallback when outside CopilotProvider. */
+/**
+ * Access the shared Copilot brain.
+ *
+ * When rendered outside `CopilotProvider` (such as in `AppFrame` for users
+ * who lack assistant permissions like `assistant:use` or `assistant:ask`),
+ * this returns a no-op fallback (`NOOP_COPILOT`) instead of throwing.
+ * This keeps pages and components that report their context or offer optional
+ * assistant hooks (such as dashboard pages) working seamlessly for users
+ * without assistant access (ADM-13 review round 1, S6).
+ */
 export function useCopilot(): CopilotValue {
   const ctx = React.useContext(CopilotContext);
   return ctx ?? NOOP_COPILOT;
