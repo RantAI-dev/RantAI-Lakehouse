@@ -236,3 +236,31 @@ export function writeTabs(tabs: QueryTabs): void {
     // worth interrupting anyone over.
   }
 }
+
+/**
+ * Point a stored tab at the saved query a save produced (`WEB-7` D5).
+ *
+ * The save happens on its own page now, so the editor is unmounted while it
+ * runs and cannot update the tab itself, as it did when the save was a sheet
+ * over it. Without this the tab still names the query it was opened from: a
+ * copy just made would be offered "Save as new" again, and a change would be
+ * offered a change of the query it already changed. The tab is written here
+ * after the server answers; a draft that cannot be written leaves the
+ * editor's button as it was, and nothing else changes.
+ */
+export function rememberSavedTab(
+  tabId: string,
+  savedId: string,
+  level: string | undefined
+): void {
+  const stored = readTabs()
+  if (!stored) return
+  writeTabs({
+    ...stored,
+    tabs: stored.tabs.map((tab) =>
+      tab.id === tabId
+        ? { ...tab, savedId, ...(typeof level === "string" ? { level } : {}) }
+        : tab
+    ),
+  })
+}

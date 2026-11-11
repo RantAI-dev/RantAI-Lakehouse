@@ -296,6 +296,12 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
 
   // Query Studio
   { pattern: "/query-studio", requires: ["query:read"] },
+  // WEB-7 D2/D5: the save forms left the editor. Both take the permission
+  // their submit route takes: `POST /api/query/saved` is `query:read`
+  // (`policy.rs:475`), and `POST /api/dashboard/sources` is `dashboard:sql`
+  // (`policy.rs:680`), the same grant the editor's button is shown for.
+  { pattern: "/query-studio/save", requires: ["query:read"] },
+  { pattern: "/query-studio/save-source", requires: ["dashboard:sql"] },
   { pattern: "/query-studio/saved", requires: ["query:read"] },
   { pattern: "/query-studio/history", requires: ["query:read"] },
 

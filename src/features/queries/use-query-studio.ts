@@ -57,6 +57,7 @@ import {
   createSqlCompletionSource,
   sqlCompletionExtension,
 } from "./sql-completion-source"
+import { savedQueryRequest } from "./saved-query-write"
 import { useQueryDownload } from "./use-query-download"
 
 /** What the editor holds before anyone types. */
@@ -430,23 +431,16 @@ export function useQueryStudio() {
     return marked.size === 0 ? NO_NAMES : marked
   }, [refused, activeTabId, estimateError, parameters])
   const saveAct = useServiceAction((signal: AbortSignal, input: SaveQueryInput) => {
-    // A change of a saved query leaves it where it is: the folder is the
-    // Move dialog's business, so the body carries no folder at all.
-    if (savesSavedQuery && activeSaved) {
-      return queryService.updateSaved(
-        activeSaved.id,
-        {
-          title: input.title,
-          sql: input.sql,
-          tags: input.tags,
-          // The definitions of the SQL being saved. An empty list clears
-          // them; absent leaves the query's as they are.
-          ...(input.parameters !== undefined && { parameters: input.parameters }),
-        },
-        signal
-      )
+    // `WEB-7` D5: the rule for "change the saved query or copy it" lives in
+    // `saved-query-write.ts`, so the Save query page sends the same write.
+    const request = savedQueryRequest(
+      { mode: savesSavedQuery ? "update" : "create", savedId: activeSaved?.id ?? null },
+      input
+    )
+    if (request.kind === "update") {
+      return queryService.updateSaved(request.id, request.body, signal)
     }
-    return queryService.saveQuery(input, signal)
+    return queryService.saveQuery(request.input, signal)
   })
   const savedState = useService((s) => queryService.listSaved(s), [])
   const historyState = useService((s) => queryService.listHistory(undefined, s), [])
