@@ -80,14 +80,19 @@ pub const SETTINGS_CACHE_TTL: Duration = Duration::from_secs(30);
 /// asked again (plan D3).
 pub const EMAIL_CACHE_TTL: Duration = SETTINGS_CACHE_TTL;
 
-/// How long one built SSO runtime that can sign someone in is reused
-/// (`ADM-12` review round 2, R2-S1).
+/// How long one built SSO runtime that can sign someone in is reused, for a
+/// connection the console set (`ADM-12` review round 2, R2-S1).
 ///
-/// A proposed number from that review: a working connection costs a
-/// discovery read, four address look-ups and a fresh key-set cache to
-/// rebuild, so it is kept for ten minutes; a connection that is *not* ready
-/// is still retried after [`SETTINGS_CACHE_TTL`], so a provider that comes
-/// back becomes usable without a save. A save clears either at once.
+/// A proposed number from that review: a working console-set connection
+/// costs a discovery read, four address look-ups and a fresh key-set cache to
+/// rebuild, so it is kept for ten minutes; a console-set connection that is
+/// *not* ready is still retried after [`SETTINGS_CACHE_TTL`], so a provider
+/// that comes back becomes usable without a save. A save clears either at
+/// once.
+///
+/// A server-owned connection is not on this clock at all: its runtime is kept
+/// for the life of the process, ready or not (`ADM-12` review round 3,
+/// R3-S1) — see [`SwappableOidc`] and `is_fresh`.
 pub const READY_SSO_RUNTIME_TTL: Duration = Duration::from_secs(600);
 
 /// The associated-data name the email password is sealed under (plan D2).
@@ -1561,8 +1566,10 @@ pub struct SwappableOidc {
     pub http: reqwest::Client,
     /// Why the connection cannot be used, if it cannot.
     pub not_ready: Option<SsoNotReady>,
-    /// When it was built, so a failed discovery is retried after
-    /// [`SETTINGS_CACHE_TTL`] without waiting for a save.
+    /// When it was built, so a failed discovery on a **console-set**
+    /// connection is retried after [`SETTINGS_CACHE_TTL`] without waiting for
+    /// a save. A server-owned connection is not on this clock: its runtime is
+    /// kept for the life of the process (`ADM-12` review round 3, R3-S1).
     built_at: Instant,
 }
 
@@ -1600,10 +1607,16 @@ impl SwappableOidc {
 /// console's saved ones, else the defaults (`ADM-12` D4, D10).
 ///
 /// Cached in [`AppState::oidc`] and cleared on save. Rebuilt when the saved
-/// row or the environment moves; a ready runtime is kept for
-/// [`READY_SSO_RUNTIME_TTL`], and a not-ready one is retried after
-/// [`SETTINGS_CACHE_TTL`] so a provider that was briefly unreachable
-/// becomes usable without a save (`ADM-12` review round 2, R2-S1).
+/// row or the environment moves. A server-owned connection is the operator's
+/// `.env` and cannot change while the process runs, so its runtime is kept
+/// for the life of the process — ready for sign-in or not — exactly as
+/// `main` built that authenticator once at start-up; only a save
+/// (`put_sso` clears the slot) or a different `base` replaces it (`ADM-12`
+/// review round 3, R3-S1). A console-set connection is remote
+/// configuration: a ready runtime is kept for [`READY_SSO_RUNTIME_TTL`], and
+/// a not-ready one is retried after [`SETTINGS_CACHE_TTL`] so a provider
+/// that was briefly unreachable becomes usable without a save (`ADM-12`
+/// review round 2, R2-S1).
 ///
 /// # Errors
 ///
@@ -1629,9 +1642,12 @@ pub async fn sso_runtime_or_fail(state: &AppState) -> Result<SwappableOidc, Stor
 /// `ADM-12` review round 2, R2-S1: the network work — the discovery read,
 /// the address look-ups and the authenticator's construction — happens
 /// **outside** `state.oidc`'s write lock, so the bearer-token path is never
-/// parked behind a provider that is slow to answer. A ready runtime is kept
-/// for [`READY_SSO_RUNTIME_TTL`]; a not-ready one is retried after
-/// [`SETTINGS_CACHE_TTL`]; a save clears the slot at once (`put_sso`).
+/// parked behind a provider that is slow to answer. A save clears the slot
+/// at once (`put_sso`); beyond that, how old a runtime may be is
+/// [`is_fresh`]'s rule: a server-owned one lives as long as the process, a
+/// console-set ready one for [`READY_SSO_RUNTIME_TTL`], a console-set
+/// not-ready one for [`SETTINGS_CACHE_TTL`] (`ADM-12` review round 3,
+/// R3-S1).
 async fn cached_or_build(state: &AppState, base: EffectiveSso) -> SwappableOidc {
     if let Some(current) = cached_runtime(state, &base).await {
         return current;
@@ -1645,7 +1661,7 @@ async fn cached_or_build(state: &AppState, base: EffectiveSso) -> SwappableOidc 
     // rather than replacing a runtime that is at least as new.
     let mut guard = state.oidc.write().await;
     if let Some(current) = guard.as_ref()
-        && is_fresh(current, &base)
+        && is_fresh(current, &base, Instant::now())
         && current.built_at > runtime.built_at
     {
         return current.clone();
@@ -1660,20 +1676,44 @@ async fn cached_runtime(state: &AppState, base: &EffectiveSso) -> Option<Swappab
     let guard = state.oidc.read().await;
     guard
         .as_ref()
-        .filter(|current| is_fresh(current, base))
+        .filter(|current| is_fresh(current, base, Instant::now()))
         .cloned()
 }
 
-/// Whether a cached runtime is `base`'s and young enough to reuse: a ready
-/// one for [`READY_SSO_RUNTIME_TTL`], a not-ready one for
-/// [`SETTINGS_CACHE_TTL`] (`ADM-12` review round 2, R2-S1).
-fn is_fresh(runtime: &SwappableOidc, base: &EffectiveSso) -> bool {
+/// Whether a cached runtime is `base`'s and young enough to reuse.
+///
+/// Two rules, one per owner of the connection:
+///
+/// * **A server-owned connection** (`issuer_source == Source::Server`, the
+///   `.env` owns it) cannot change while the process runs, so its built
+///   runtime is kept for the life of the process — ready for sign-in or not,
+///   exactly as `main` built that authenticator once at start-up. Only a
+///   save (`put_sso` clears `state.oidc`) or a different `base` replaces it
+///   (`ADM-12` review round 3, R3-S1). Rebuilding it every
+///   [`SETTINGS_CACHE_TTL`] was the bug this fixes: a connection with an
+///   issuer and a client ID but no sign-in addresses accepts bearer tokens,
+///   and there is nothing a retry could make true.
+/// * **A console-set connection** is remote configuration a provider can
+///   make reachable again: a ready runtime is kept for
+///   [`READY_SSO_RUNTIME_TTL`], a not-ready one is retried after
+///   [`SETTINGS_CACHE_TTL`] (`ADM-12` review round 2, R2-S1).
+///
+/// `now` is a parameter, not `Instant::now()`, so a test can ask the same
+/// question about a moment later than the test process (or its machine) has
+/// been alive.
+fn is_fresh(runtime: &SwappableOidc, base: &EffectiveSso, now: Instant) -> bool {
+    if runtime.base != *base {
+        return false;
+    }
+    if runtime.base.issuer_source == Source::Server {
+        return true;
+    }
     let ttl = if runtime.is_ready() {
         READY_SSO_RUNTIME_TTL
     } else {
         SETTINGS_CACHE_TTL
     };
-    runtime.base == *base && runtime.built_at.elapsed() < ttl
+    now.saturating_duration_since(runtime.built_at) < ttl
 }
 
 /// Build a runtime for one set of settings **without touching the cache** —
@@ -2741,11 +2781,13 @@ mod tests {
         assert_eq!(eff_wrong.client_secret_source, Source::Default);
     }
 
-    // `ADM-12` review round 2, R2-S1: the runtime cache keeps a ready
-    // connection for `READY_SSO_RUNTIME_TTL`, retries a not-ready one after
-    // `SETTINGS_CACHE_TTL`, and a save clears it at once. The tests age
-    // `built_at` instead of sleeping, and use a server-owned connection so a
-    // rebuild builds an authenticator without a network read.
+    // `ADM-12` review round 2, R2-S1 and round 3, R3-S1: the runtime cache
+    // keeps a server-owned connection for the life of the process, keeps a
+    // console-set ready one for `READY_SSO_RUNTIME_TTL`, retries a
+    // console-set not-ready one after `SETTINGS_CACHE_TTL`, and a save
+    // clears any of them at once. The tests age `built_at` (or ask about a
+    // later `now`) instead of sleeping, and use a server-owned connection so
+    // a rebuild builds an authenticator without a network read.
 
     /// An `AppState` whose SSO connection is the environment's, with the
     /// three sign-in addresses when `with_sign_in_addresses` is set. The
@@ -2787,6 +2829,16 @@ mod tests {
             .expect("the test process is older than the age asked for")
     }
 
+    /// The instant `age` from now: how a test asks "is this runtime still
+    /// fresh ten minutes later?" without owning an `Instant` that old — the
+    /// machine may have booted less than ten minutes ago, and `Instant` is
+    /// monotonic since boot.
+    fn in_time(age: Duration) -> Instant {
+        Instant::now()
+            .checked_add(age)
+            .expect("the test asks about a time minutes ahead")
+    }
+
     async fn built_runtime(state: &AppState) -> SwappableOidc {
         let pool = state.pg.as_deref().cloned();
         build_sso_runtime(state, environment_base(state), pool).await
@@ -2817,23 +2869,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_not_ready_runtime_is_retried_after_the_settings_ttl() {
+    async fn a_server_owned_runtime_without_sign_in_addresses_is_kept_for_the_process() {
         let state = sso_state(false);
         let first = built_runtime(&state).await;
         assert!(!first.is_ready());
         // The authenticator is there (R2-B1); only a sign-in is missing.
         assert!(first.authenticator.is_some());
 
+        // `ADM-12` review round 3, R3-S1: the `.env` owns this connection,
+        // so nothing can give it sign-in addresses while the process runs —
+        // on `main` its authenticator was built once at start-up. Ageing it
+        // past `SETTINGS_CACHE_TTL` must not rebuild it; the runtime that
+        // used to be retried here every 30 seconds was the bug.
         let mut aged = first.clone();
         aged.built_at = built_ago(SETTINGS_CACHE_TTL + Duration::from_secs(30));
         *state.oidc.write().await = Some(aged.clone());
 
         let next = cached_or_build(&state, environment_base(&state)).await;
         assert!(
-            next.built_at > aged.built_at,
-            "a not-ready runtime must be rebuilt once the settings TTL passed"
+            Arc::ptr_eq(
+                next.authenticator.as_ref().unwrap(),
+                first.authenticator.as_ref().unwrap()
+            ),
+            "a server-owned runtime is not rebuilt for being unready for sign-in"
         );
-        assert!(!next.is_ready());
+        assert_eq!(next.built_at, aged.built_at);
+
+        // Only a different base replaces it.
+        let mut moved = environment_base(&state);
+        moved.client_id = Some("another-console".to_owned());
+        let rebuilt = cached_or_build(&state, moved).await;
+        assert!(
+            !Arc::ptr_eq(
+                rebuilt.authenticator.as_ref().unwrap(),
+                first.authenticator.as_ref().unwrap()
+            ),
+            "a different base is a different connection"
+        );
+    }
+
+    /// `ADM-12` review round 3, R3-S1: a server-owned runtime that is ready
+    /// is kept past `READY_SSO_RUNTIME_TTL` too — the ten-minute rule is the
+    /// console's, not the `.env`'s.
+    #[tokio::test]
+    async fn a_server_owned_runtime_with_sign_in_addresses_is_kept_past_ten_minutes() {
+        let state = sso_state(true);
+        let first = built_runtime(&state).await;
+        assert!(first.is_ready(), "{:?}", first.not_ready);
+        *state.oidc.write().await = Some(first.clone());
+
+        let base = environment_base(&state);
+        assert!(
+            is_fresh(
+                &first,
+                &base,
+                in_time(READY_SSO_RUNTIME_TTL + Duration::from_secs(30))
+            ),
+            "a server-owned runtime outlives the console's ten minutes"
+        );
+
+        let next = cached_or_build(&state, base).await;
+        assert!(
+            Arc::ptr_eq(
+                next.authenticator.as_ref().unwrap(),
+                first.authenticator.as_ref().unwrap()
+            ),
+            "the cached server-owned runtime is reused, not rebuilt"
+        );
+    }
+
+    /// The console's own rule is unchanged (`ADM-12` review round 2,
+    /// R2-S1): ready for ten minutes, not ready retried after
+    /// [`SETTINGS_CACHE_TTL`].
+    #[tokio::test]
+    async fn a_console_set_runtime_keeps_the_ready_and_not_ready_ttls() {
+        let state = sso_state(false);
+        let mut not_ready = built_runtime(&state).await;
+        assert!(!not_ready.is_ready());
+        // A console-set connection is built with a discovery read, so a unit
+        // test cannot build one; the freshness rule reads only who owns the
+        // connection and whether it can sign someone in, so the shape is
+        // taken from a built runtime and marked as the console's.
+        not_ready.base.issuer_source = Source::Console;
+        not_ready.settings.issuer_source = Source::Console;
+        let not_ready_base = not_ready.base.clone();
+        assert!(
+            is_fresh(&not_ready, &not_ready_base, in_time(Duration::from_secs(1))),
+            "a console-set not-ready runtime is not retried before the settings TTL"
+        );
+        assert!(
+            !is_fresh(
+                &not_ready,
+                &not_ready_base,
+                in_time(SETTINGS_CACHE_TTL + Duration::from_secs(1))
+            ),
+            "a console-set not-ready runtime is retried once the settings TTL passed"
+        );
+
+        let with_addresses = sso_state(true);
+        let mut ready = built_runtime(&with_addresses).await;
+        assert!(ready.is_ready());
+        ready.base.issuer_source = Source::Console;
+        ready.settings.issuer_source = Source::Console;
+        let ready_base = ready.base.clone();
+        assert!(
+            is_fresh(
+                &ready,
+                &ready_base,
+                in_time(READY_SSO_RUNTIME_TTL.saturating_sub(Duration::from_secs(1)))
+            ),
+            "a console-set ready runtime is kept inside its ten minutes"
+        );
+        assert!(
+            !is_fresh(
+                &ready,
+                &ready_base,
+                in_time(READY_SSO_RUNTIME_TTL + Duration::from_secs(1))
+            ),
+            "a console-set ready runtime is rebuilt after its ten minutes"
+        );
     }
 
     #[tokio::test]
