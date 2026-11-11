@@ -311,3 +311,18 @@ field. I ran no check locally; the pull request (#461) runs the suite.
   - Tests: another user gets nothing and the value is gone; an old value gets nothing.
 - **S2. Merge `origin/main`** (the branch is behind).
 
+### S1, round 2 (planner, 2026-11-11) — branch at `b8624ce2`
+
+Read the fix (`a88b7237..99ad77b1`, six files under `src/features/admin/`).
+
+- **S1: closed.** `rememberInvitePassword(value, userId, now)` records who and when;
+  `takeInvitePassword(userId, now)` clears the value in every case and returns it only to the
+  same user within `INVITE_PASSWORD_TTL_MS` (two minutes, marked *(proposed)*). The invite
+  page drops a password it cannot attribute; the Users list waits for the signed-in user
+  before it asks. `invite-password.test.ts` covers the same user once, another user, and an
+  old value. The moved tests changed only by passing the reader's id.
+- **S2: closed** (`a88b7237`).
+
+**No open BLOCKER and no open SHOULD-FIX.** I ran no check locally; merged only when #461 is
+green on its last commit.
+
