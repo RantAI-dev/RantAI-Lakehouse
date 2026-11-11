@@ -80,6 +80,16 @@ pub const SETTINGS_CACHE_TTL: Duration = Duration::from_secs(30);
 /// asked again (plan D3).
 pub const EMAIL_CACHE_TTL: Duration = SETTINGS_CACHE_TTL;
 
+/// How long one built SSO runtime that can sign someone in is reused
+/// (`ADM-12` review round 2, R2-S1).
+///
+/// A proposed number from that review: a working connection costs a
+/// discovery read, four address look-ups and a fresh key-set cache to
+/// rebuild, so it is kept for ten minutes; a connection that is *not* ready
+/// is still retried after [`SETTINGS_CACHE_TTL`], so a provider that comes
+/// back becomes usable without a save. A save clears either at once.
+pub const READY_SSO_RUNTIME_TTL: Duration = Duration::from_secs(600);
+
 /// The associated-data name the email password is sealed under (plan D2).
 pub const EMAIL_PASSWORD_SEAL_NAME: &str = "settings/email/password";
 
@@ -1590,8 +1600,10 @@ impl SwappableOidc {
 /// console's saved ones, else the defaults (`ADM-12` D4, D10).
 ///
 /// Cached in [`AppState::oidc`] and cleared on save. Rebuilt when the saved
-/// row or the environment moves, and every [`SETTINGS_CACHE_TTL`] so a
-/// provider that was briefly unreachable becomes usable without a save.
+/// row or the environment moves; a ready runtime is kept for
+/// [`READY_SSO_RUNTIME_TTL`], and a not-ready one is retried after
+/// [`SETTINGS_CACHE_TTL`] so a provider that was briefly unreachable
+/// becomes usable without a save (`ADM-12` review round 2, R2-S1).
 ///
 /// # Errors
 ///
@@ -1613,27 +1625,55 @@ pub async fn sso_runtime_or_fail(state: &AppState) -> Result<SwappableOidc, Stor
 }
 
 /// The cached runtime for `base`, or a freshly built one.
+///
+/// `ADM-12` review round 2, R2-S1: the network work — the discovery read,
+/// the address look-ups and the authenticator's construction — happens
+/// **outside** `state.oidc`'s write lock, so the bearer-token path is never
+/// parked behind a provider that is slow to answer. A ready runtime is kept
+/// for [`READY_SSO_RUNTIME_TTL`]; a not-ready one is retried after
+/// [`SETTINGS_CACHE_TTL`]; a save clears the slot at once (`put_sso`).
 async fn cached_or_build(state: &AppState, base: EffectiveSso) -> SwappableOidc {
-    {
-        let guard = state.oidc.read().await;
-        if let Some(current) = guard.as_ref()
-            && current.base == base
-            && current.built_at.elapsed() < SETTINGS_CACHE_TTL
-        {
-            return current.clone();
-        }
+    if let Some(current) = cached_runtime(state, &base).await {
+        return current;
     }
+
+    let pool = state.pg.as_deref().cloned();
+    let runtime = build_sso_runtime(state, base.clone(), pool).await;
+
+    // Two requests may build at once now that building is lock-free. The
+    // first to finish wins; the other keeps it and drops its own copy
+    // rather than replacing a runtime that is at least as new.
     let mut guard = state.oidc.write().await;
     if let Some(current) = guard.as_ref()
-        && current.base == base
-        && current.built_at.elapsed() < SETTINGS_CACHE_TTL
+        && is_fresh(current, &base)
+        && current.built_at > runtime.built_at
     {
         return current.clone();
     }
-    let pool = state.pg.as_deref().cloned();
-    let runtime = build_sso_runtime(state, base, pool).await;
     *guard = Some(runtime.clone());
     runtime
+}
+
+/// The cached runtime for `base` when it is still fresh, read under the
+/// read lock only (`ADM-12` review round 2, R2-S1).
+async fn cached_runtime(state: &AppState, base: &EffectiveSso) -> Option<SwappableOidc> {
+    let guard = state.oidc.read().await;
+    guard
+        .as_ref()
+        .filter(|current| is_fresh(current, base))
+        .cloned()
+}
+
+/// Whether a cached runtime is `base`'s and young enough to reuse: a ready
+/// one for [`READY_SSO_RUNTIME_TTL`], a not-ready one for
+/// [`SETTINGS_CACHE_TTL`] (`ADM-12` review round 2, R2-S1).
+fn is_fresh(runtime: &SwappableOidc, base: &EffectiveSso) -> bool {
+    let ttl = if runtime.is_ready() {
+        READY_SSO_RUNTIME_TTL
+    } else {
+        SETTINGS_CACHE_TTL
+    };
+    runtime.base == *base && runtime.built_at.elapsed() < ttl
 }
 
 /// Build a runtime for one set of settings **without touching the cache** —
@@ -2699,5 +2739,120 @@ mod tests {
         assert!(!eff_wrong.client_secret_set);
         assert_eq!(eff_wrong.client_secret.expose_secret(), "");
         assert_eq!(eff_wrong.client_secret_source, Source::Default);
+    }
+
+    // `ADM-12` review round 2, R2-S1: the runtime cache keeps a ready
+    // connection for `READY_SSO_RUNTIME_TTL`, retries a not-ready one after
+    // `SETTINGS_CACHE_TTL`, and a save clears it at once. The tests age
+    // `built_at` instead of sleeping, and use a server-owned connection so a
+    // rebuild builds an authenticator without a network read.
+
+    /// An `AppState` whose SSO connection is the environment's, with the
+    /// three sign-in addresses when `with_sign_in_addresses` is set. The
+    /// database URL is well formed and unreachable: `connect_lazy` performs
+    /// no I/O, so the pool is `Some` and nothing dials it.
+    fn sso_state(with_sign_in_addresses: bool) -> AppState {
+        let mut env = vec![
+            (
+                "DATABASE_URL",
+                "postgres://user:pass@127.0.0.1:1/nonexistent_db_xyz",
+            ),
+            ("OIDC_ISSUER", "https://idp.example.com"),
+            ("OIDC_CLIENT_ID", "lakehouse-console"),
+        ];
+        if with_sign_in_addresses {
+            env.extend([
+                ("OIDC_AUTHORIZE_URL", "https://idp.example.com/authorize"),
+                ("OIDC_TOKEN_URL", "https://idp.example.com/token"),
+                (
+                    "OIDC_REDIRECT_URI",
+                    "https://console.example.com/api/auth/oidc/callback",
+                ),
+            ]);
+        }
+        AppState::new(config(&env))
+    }
+
+    /// The `base` `cached_or_build` is asked for on this state.
+    fn environment_base(state: &AppState) -> EffectiveSso {
+        resolve_sso(&state.config, None, None)
+    }
+
+    /// An instant `age` in the past, for a runtime the cache should see as
+    /// old. `checked_sub` rather than `-` because clippy forbids the
+    /// panicking operator outside the type's own arithmetic.
+    fn built_ago(age: Duration) -> Instant {
+        Instant::now()
+            .checked_sub(age)
+            .expect("the test process is older than the age asked for")
+    }
+
+    async fn built_runtime(state: &AppState) -> SwappableOidc {
+        let pool = state.pg.as_deref().cloned();
+        build_sso_runtime(state, environment_base(state), pool).await
+    }
+
+    #[tokio::test]
+    async fn a_ready_runtime_is_kept_for_ten_minutes() {
+        let state = sso_state(true);
+        let first = built_runtime(&state).await;
+        assert!(first.is_ready(), "{:?}", first.not_ready);
+
+        // Older than `SETTINGS_CACHE_TTL`, younger than
+        // `READY_SSO_RUNTIME_TTL`: still reused, so no discovery read and no
+        // new key-set cache for the bearer-token path to wait on.
+        let mut aged = first.clone();
+        aged.built_at = built_ago(SETTINGS_CACHE_TTL + Duration::from_secs(30));
+        *state.oidc.write().await = Some(aged.clone());
+
+        let next = cached_or_build(&state, environment_base(&state)).await;
+        assert!(
+            Arc::ptr_eq(
+                next.authenticator.as_ref().unwrap(),
+                first.authenticator.as_ref().unwrap()
+            ),
+            "a ready runtime must not be rebuilt inside its ten minutes"
+        );
+        assert_eq!(next.built_at, aged.built_at);
+    }
+
+    #[tokio::test]
+    async fn a_not_ready_runtime_is_retried_after_the_settings_ttl() {
+        let state = sso_state(false);
+        let first = built_runtime(&state).await;
+        assert!(!first.is_ready());
+        // The authenticator is there (R2-B1); only a sign-in is missing.
+        assert!(first.authenticator.is_some());
+
+        let mut aged = first.clone();
+        aged.built_at = built_ago(SETTINGS_CACHE_TTL + Duration::from_secs(30));
+        *state.oidc.write().await = Some(aged.clone());
+
+        let next = cached_or_build(&state, environment_base(&state)).await;
+        assert!(
+            next.built_at > aged.built_at,
+            "a not-ready runtime must be rebuilt once the settings TTL passed"
+        );
+        assert!(!next.is_ready());
+    }
+
+    #[tokio::test]
+    async fn a_save_clears_a_ready_runtime_at_once() {
+        let state = sso_state(true);
+        let first = built_runtime(&state).await;
+        *state.oidc.write().await = Some(first.clone());
+
+        // The two lines `routes::settings::put_sso` runs after a save.
+        state.sso_settings_cache.clear().await;
+        *state.oidc.write().await = None;
+
+        let next = cached_or_build(&state, environment_base(&state)).await;
+        assert!(
+            !Arc::ptr_eq(
+                next.authenticator.as_ref().unwrap(),
+                first.authenticator.as_ref().unwrap()
+            ),
+            "a save must not leave the runtime it replaced in the cache, however fresh it is"
+        );
     }
 }
