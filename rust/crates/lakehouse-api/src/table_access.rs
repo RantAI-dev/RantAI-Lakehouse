@@ -4,7 +4,7 @@
 //! # The rule
 //!
 //! [`TableAccess`] is what one principal may read, resolved once from the
-//! names of the roles it holds. The default is [`TableAccess::All`]: a role
+//! names of the roles it holds. The stored default is [`TableAccess::All`]: a role
 //! reads every table until an administrator narrows it, so an upgrade never
 //! changes anybody's access (`GOV-7` D1, owner 2026-11-09). A role holding
 //! the unrestricted `*:*` grant is [`TableAccess::All`] too and cannot be
@@ -43,11 +43,14 @@ use lakehouse_auth::PermissionSet;
 use lakehouse_store::{PgPool, StoreError};
 
 /// What one principal may read, from the roles it holds.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// No `Default` on purpose (`GOV-7` S1 review round 1, S1): a default of
+/// `All` would make `unwrap_or_default()` on a failed read mean "every
+/// table".
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableAccess {
     /// Every table. No role narrowed the principal, or one role grants `*:*`,
     /// or there is no principal at all.
-    #[default]
     All,
     /// Only the listed tables (the first set, canonical `(schema, table)`
     /// pairs) and every table of the listed schemas (the second set).
