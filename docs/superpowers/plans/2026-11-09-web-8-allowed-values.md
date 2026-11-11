@@ -865,3 +865,38 @@ and the tests. I ran no check locally; #466 runs the suite.
   validates. The test is what ties the constant to the match arms.
 - **S3. Merge `origin/main`** (the branch is behind).
 
+### S2, round 2 (planner, 2026-11-11) — branch at `858e1e35`
+
+Read the fix commits (`6dbd8136..b85183ba`) and checked the B1 evidence against the code
+myself: `dagster/dispar_orchestrate/adapters/sql.py` has no TLS option for MySQL and a fixed
+`Encrypt=yes;TrustServerCertificate=no` for SQL Server; `dlt_pipeline.py` has no `sslmode`
+for PostgreSQL. I ran no check locally; #466 runs the suite.
+
+- **B1: closed, and the finding was right.** No batch loader for PostgreSQL, MySQL/MariaDB
+  or SQL Server reads the stored `sslMode`. The SQL form is free text again and says so:
+  "This build's batch loaders … set their own TLS posture and do not read this value." **D8's
+  SSL mode picker for the batch SQL form is withdrawn**: it was this plan's instruction, and
+  it would have put a guarantee on screen that the load does not make. The change-capture
+  form keeps its list (the worker reads it).
+- **S1: closed.** A role the rule names that no longer exists shows as a removable "Not
+  recognised" badge and is kept until removed.
+- **S2: closed.** `ALLOWED_ROW_FILTER_FORMS` names `LIKE`, `ILIKE`, `BETWEEN`, `IN`,
+  `IS NULL`, `IS NOT NULL`; the route's test validates one filter per name on both engines
+  and refuses `IS TRUE`. The validator is unchanged.
+- **S3: closed.**
+
+**No open BLOCKER and no open SHOULD-FIX in this PR.** Merged only when #466 is green on its
+last commit.
+
+**Two things this review found that are not this PR's to fix; both get a backlog item at
+merge.**
+
+- **The batch loaders do not apply the TLS mode a connector stores.** MySQL/MariaDB loads
+  with no TLS option at all; PostgreSQL uses the driver's default, which tries TLS and falls
+  back to plaintext; SQL Server is always encrypted with the certificate checked. The API's
+  connection test uses its own, stricter, settings, so a connector can pass the test and
+  then load over a weaker connection. This is older than `WEB-8`.
+- **The batch Oracle form's `require` label describes the change-capture worker**, not the
+  batch adapter, which connects with TCPS and an operator-supplied server name
+  (`adapters/oracle.py:112`). Reported by the developer, not changed.
+
