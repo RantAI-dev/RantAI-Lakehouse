@@ -151,8 +151,9 @@ import { useHomeLayout } from "./use-home-layout"
  * form before a source or pipeline exists.
  *
  * Everything is read from real services, and a read that fails says so:
- * the status line never reports "all clear" unless every read succeeded,
- * and a list that cannot load says that instead of looking empty.
+ * the status line names only the reads it made, never "all clear" about a
+ * read that failed or was not made, and a list that cannot load says that
+ * instead of looking empty.
  *
  * Whether an LLM is configured is not known up front (no endpoint reports
  * it); when it is not, `POST /api/ai/chat` answers 503 and the
@@ -235,11 +236,9 @@ export function HomePage() {
       canSaved ? queryService.listSaved(signal) : Promise.resolve([]),
     [canSaved],
   )
-  const summary = useService(
+  const summary = useService<OverviewSummary | null>(
     (signal) =>
-      canCatalog
-        ? overviewService.getSummary(signal)
-        : Promise.resolve({ staleAssets: 0 } as unknown as OverviewSummary),
+      canCatalog ? overviewService.getSummary(signal) : Promise.resolve(null),
     [canCatalog],
   )
   // What Home shows and in what order: the saved layout, or the draft while
@@ -320,11 +319,23 @@ export function HomePage() {
       : []),
   ]
 
+  // ADM-13 review round 2, R2-B1: a check is passed only when the person may
+  // open its page. A check that was not made is not passed at all, so the
+  // line cannot say "all clear" about something never read; with none, there
+  // is no line.
   const status = homeStatus({
-    pipelines: { state: canPipelines ? checkState(pipelines.status) : "ok", count: failing.length },
-    alerts: { state: canAlerts ? checkState(alerts.status) : "ok", count: open.length },
-    sources: { state: canConnectors ? checkState(connectors.status) : "ok", count: unhealthy.length },
-    datasets: { state: canCatalog ? checkState(summary.status) : "ok", count: noData },
+    pipelines: canPipelines
+      ? { state: checkState(pipelines.status), count: failing.length }
+      : undefined,
+    alerts: canAlerts
+      ? { state: checkState(alerts.status), count: open.length }
+      : undefined,
+    sources: canConnectors
+      ? { state: checkState(connectors.status), count: unhealthy.length }
+      : undefined,
+    datasets: canCatalog
+      ? { state: checkState(summary.status), count: noData }
+      : undefined,
   })
 
   // The preview follows "where I left off": the board last opened, else
@@ -711,11 +722,14 @@ function StatusLine({
   items,
   onAsk,
 }: {
-  status: HomeStatus
+  status: HomeStatus | null
   items: AttentionItem[]
   onAsk: (prompt: string) => void
 }) {
   const [open, setOpen] = React.useState(false)
+  // ADM-13 review round 2, R2-B1: no check was made, so there is nothing to
+  // report and no line is drawn.
+  if (!status) return null
   if (status.tone === "loading") {
     return (
       <div aria-label="Lakehouse status" className="flex h-5 items-center">
