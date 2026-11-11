@@ -395,6 +395,19 @@ export type SsoSettings = {
   jitProvisioning: SettingField<boolean>
   /** Whether the caller may edit SSO settings (unrestricted Platform Admin). */
   canEdit: boolean
+  /**
+   * Whether a sign-in can be offered right now (`ADM-12` D10). False when
+   * the saved connection cannot be used — no `CONSOLE_PUBLIC_URL`, an
+   * unreachable discovery document, or an address this deployment may not
+   * reach. The form still saves; the sign-in page shows no button.
+   */
+  ready: boolean
+  /**
+   * Why the connection cannot be used, as a fixed sentence naming what to
+   * set (`ADM-12` D10). Present only when {@link SsoSettings.ready} is
+   * false.
+   */
+  notReadyReason: string | null
 }
 
 /**

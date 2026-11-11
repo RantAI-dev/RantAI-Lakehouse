@@ -285,6 +285,16 @@ export function SsoPageForm({ canWrite }: { canWrite: boolean }) {
         </div>
       ) : null}
 
+      {loaded && !loaded.ready ? (
+        <p
+          role="status"
+          className="max-w-sm rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+        >
+          Sign-in is not ready.{" "}
+          {loaded.notReadyReason ?? "The saved connection cannot be used right now."}
+        </p>
+      ) : null}
+
       {loaded ? (
         <div className="flex max-w-sm flex-col gap-4">
           <SettingField label="Issuer URL" source={loaded.issuer.source} id="sso-issuer">

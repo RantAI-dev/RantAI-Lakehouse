@@ -47,6 +47,8 @@ const DEFAULT_SSO = {
   },
   jitProvisioning: { value: true, source: "console" },
   canEdit: true,
+  ready: true,
+  notReadyReason: null,
 }
 
 const ROLES = [
@@ -198,6 +200,26 @@ describe("SsoPageForm (ADM-12, D9)", () => {
         screen.getByText("The provider refused the client ID or secret.")
       ).toBeDefined()
     })
+  })
+
+  it("shows the reason when the saved connection is not ready", async () => {
+    // `ADM-12` review round 1, S6 / D10: a saved connection that cannot be
+    // used says why, so a Platform Admin knows what to set.
+    mockApi({
+      ...DEFAULT_SSO,
+      ready: false,
+      notReadyReason:
+        "Set CONSOLE_PUBLIC_URL to this deployment's public address: a sign-in has to return people here.",
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await screen.findByLabelText("Issuer URL")
+    const notice = await screen.findByRole("status")
+    expect(notice.textContent).toContain("Sign-in is not ready.")
+    expect(notice.textContent).toContain("Set CONSOLE_PUBLIC_URL")
+    // The form still saves: readiness never blocks an administrator.
+    expect(screen.getByRole("button", { name: "Save" })).toBeDefined()
   })
 
   it("the page is read-only without canEdit", async () => {
