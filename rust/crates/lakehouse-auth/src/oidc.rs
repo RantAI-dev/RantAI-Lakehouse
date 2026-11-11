@@ -709,14 +709,35 @@ struct OidcClaims {
     /// The caller's preferred username, if the token carries one (ADM-11 D10).
     #[serde(default)]
     preferred_username: Option<String>,
+    /// Whether the provider vouched for `email` (`ADM-12` D8/S2; `SEC-65`
+    /// will need an administrator to see it). Absent means the provider did
+    /// not say, which is reported as `None`, never as `true`.
+    #[serde(default)]
+    email_verified: Option<bool>,
     /// Every other claim, keyed by name.
     #[serde(flatten)]
     extra: HashMap<String, Value>,
 }
 
+/// The one nonce check both browser sign-in paths use (`ADM-12` review
+/// round 1, S5): the token must carry the `nonce` this deployment put in the
+/// flow cookie, or it is not the answer to *this* authorization request.
+/// Deliberately [`AuthError::InvalidCredentials`], the same variant every
+/// other validation failure here answers with.
+fn check_nonce(claims: &OidcClaims, expected_nonce: &str) -> Result<(), AuthError> {
+    let actual_nonce = claims
+        .extra
+        .get("nonce")
+        .and_then(Value::as_str)
+        .ok_or(AuthError::InvalidCredentials)?;
+    if actual_nonce != expected_nonce {
+        return Err(AuthError::InvalidCredentials);
+    }
+    Ok(())
+}
+
 impl OidcClaims {
-    /// Read `claim_name` as a list of group/role strings. A missing claim,
-    /// a non-array claim, or a non-string array element is treated as "no
+    /// Read `claim_name` as a list of group/role strings. A missing claim,    /// a non-array claim, or a non-string array element is treated as "no
     /// groups" rather than an error — a token that simply doesn't carry
     /// group membership is not a malformed token, and role mapping degrades
     /// gracefully to "no mapped roles" rather than failing the whole
@@ -795,10 +816,17 @@ pub struct OidcTestClaims {
     pub subject: String,
     /// The email claim, if present.
     pub email: Option<String>,
+    /// Whether the provider said it vouched for [`Self::email`]
+    /// (`email_verified`). `None` when the token did not carry it.
+    pub email_verified: Option<bool>,
     /// The groups present in the token's configured groups claim.
     pub groups: Vec<String>,
     /// The roles mapped from [`Self::groups`] via the configured role map.
     pub mapped_roles: Vec<String>,
+    /// Whether the provider replaced the groups claim with an overage
+    /// marker, so no group-based role could be mapped (`SEC-39`, `ADM-12`
+    /// D8). The sign-in itself still succeeded.
+    pub overage: bool,
 }
 
 /// [`Authenticator`] for [`Credential::Bearer`] — the concrete `OIDC`
@@ -1026,14 +1054,7 @@ impl OidcAuthenticator {
         expected_nonce: &str,
     ) -> Result<OidcLogin, AuthError> {
         let claims = self.validate_token(token.expose()).await?;
-        let actual_nonce = claims
-            .extra
-            .get("nonce")
-            .and_then(Value::as_str)
-            .ok_or(AuthError::InvalidCredentials)?;
-        if actual_nonce != expected_nonce {
-            return Err(AuthError::InvalidCredentials);
-        }
+        check_nonce(&claims, expected_nonce)?;
         let group_overage = claims.has_claim_overage(&self.config.groups_claim);
         let principal = self.resolve_principal(&claims).await?;
         let mapped_role_names = self.mapped_role_names(&claims);
@@ -1070,21 +1091,17 @@ impl OidcAuthenticator {
         expected_nonce: &str,
     ) -> Result<OidcTestClaims, AuthError> {
         let claims = self.validate_token(token.expose()).await?;
-        let actual_nonce = claims
-            .extra
-            .get("nonce")
-            .and_then(Value::as_str)
-            .ok_or(AuthError::InvalidCredentials)?;
-        if actual_nonce != expected_nonce {
-            return Err(AuthError::InvalidCredentials);
-        }
+        check_nonce(&claims, expected_nonce)?;
         let groups = claims.groups(&self.config.groups_claim);
         let mapped_roles = self.mapped_role_names(&claims);
+        let overage = claims.has_claim_overage(&self.config.groups_claim);
         Ok(OidcTestClaims {
             subject: claims.sub,
             email: claims.email,
+            email_verified: claims.email_verified,
             groups,
             mapped_roles,
+            overage,
         })
     }
 
@@ -1432,6 +1449,7 @@ mod tests {
             email: None,
             name: None,
             preferred_username: None,
+            email_verified: None,
             extra: HashMap::from([(
                 "groups".to_owned(),
                 Value::Array(vec![Value::String("lakehouse-admins".to_owned())]),
@@ -1447,6 +1465,7 @@ mod tests {
             email: None,
             name: None,
             preferred_username: None,
+            email_verified: None,
             extra: HashMap::new(),
         };
         assert_eq!(claims.groups("groups"), [] as [std::string::String; 0]);
@@ -1459,6 +1478,7 @@ mod tests {
             email: None,
             name: None,
             preferred_username: None,
+            email_verified: None,
             extra: HashMap::from([(
                 "groups".to_owned(),
                 Value::String("not-an-array".to_owned()),

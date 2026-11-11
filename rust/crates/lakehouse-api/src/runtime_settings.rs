@@ -1604,7 +1604,74 @@ async fn cached_or_build(state: &AppState, base: EffectiveSso) -> SwappableOidc 
     runtime
 }
 
-/// [`sso_runtime_or_fail`] with the store failure logged and the
+/// Build a runtime for one set of settings **without touching the cache** —
+/// the test sign-in's draft (`ADM-12` D8): it must use the draft's own
+/// discovery document (B2) and must never replace the live connection's
+/// runtime. Same builder, same checks as the live path (S5).
+pub async fn sso_runtime_for_settings(state: &AppState, settings: EffectiveSso) -> SwappableOidc {
+    let pool = state.pg.as_deref().cloned();
+    build_sso_runtime(state, settings, pool).await
+}
+
+/// The settings a test run's stored draft names (`ADM-12` D8): the fields
+/// the draft carries, the deployment's return address, and no secret — a run
+/// uses only the secret sealed into it when it was created (S4).
+///
+/// Every field is `Source::Console`: the draft is what the administrator
+/// typed on the form, not the environment's.
+#[must_use]
+pub fn draft_sso_settings(config: &Config, draft: &serde_json::Value) -> EffectiveSso {
+    let text = |key: &str| {
+        draft
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let role_map_rows = draft
+        .get("roleMap")
+        .map(parse_role_map_json_entries)
+        .unwrap_or_default();
+    let mut role_map = HashMap::new();
+    for entry in &role_map_rows {
+        role_map.insert(entry.group.clone(), entry.role.clone());
+    }
+    EffectiveSso {
+        issuer: text("issuer"),
+        issuer_source: Source::Console,
+        client_id: text("clientId"),
+        client_id_source: Source::Console,
+        client_secret: SecretValue::new(""),
+        client_secret_set: false,
+        client_secret_source: Source::Default,
+        provider_name: text("providerName").unwrap_or_else(|| "default".to_owned()),
+        provider_name_source: Source::Console,
+        groups_claim: text("groupsClaim").unwrap_or_else(|| "groups".to_owned()),
+        groups_claim_source: Source::Console,
+        role_map,
+        role_map_rows,
+        role_map_source: Source::Console,
+        jit_provisioning: draft
+            .get("jitProvisioning")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        jit_provisioning_source: Source::Console,
+        authorize_url: None,
+        authorize_url_source: Source::Default,
+        token_url: None,
+        token_url_source: Source::Default,
+        jwks_url: None,
+        jwks_url_source: Source::Default,
+        redirect_uri: config.oidc_redirect_uri.clone(),
+        redirect_uri_source: if config.oidc_redirect_uri.is_some() {
+            Source::Server
+        } else {
+            Source::Default
+        },
+        clock_skew_seconds: config.oidc_clock_skew_seconds,
+    }
+}
+
+/// `sso_runtime_or_fail` with the store failure logged and the
 /// environment's values used instead — the shape every request path needs,
 /// because a database blip must not take sign-in settings down with it.
 pub async fn sso_runtime(state: &AppState) -> SwappableOidc {

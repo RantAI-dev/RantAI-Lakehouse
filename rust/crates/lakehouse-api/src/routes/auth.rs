@@ -905,6 +905,41 @@ struct TokenResponse {
     id_token: String,
 }
 
+/// The one member a failed token response is read for, so a refusal is told
+/// apart from an unreachable provider without ever carrying the provider's
+/// text (`ADM-12` review round 1, S1; principle 4).
+#[derive(Debug, Deserialize)]
+struct TokenErrorResponse {
+    error: String,
+}
+
+/// Why a code exchange did not produce an `id_token` (`ADM-12` review round
+/// 1, S1). The provider's status and body are classified here and never
+/// carried further.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeFailure {
+    /// The provider refused the client ID or secret: a 401/403, or its own
+    /// `error` member saying `invalid_client`.
+    Refused,
+    /// The provider could not be reached at all.
+    Unreachable,
+    /// A status this deployment does not classify, or an answer that is not
+    /// the expected shape.
+    Other,
+}
+
+impl ExchangeFailure {
+    /// The fixed sentence the test sign-in stores for this failure. Nothing
+    /// the provider said is appended.
+    const fn sentence(self) -> &'static str {
+        match self {
+            Self::Refused => "The provider refused the client ID or secret.",
+            Self::Unreachable => "The identity provider could not be reached.",
+            Self::Other => "The provider's answer to the sign-in was not usable.",
+        }
+    }
+}
+
 /// `GET /api/auth/oidc/callback?code=&state=` — the second half of the
 /// login flow [`oidc_start`] began: exchange the authorization code for an
 /// id token, verify it (signature, `iss`, `aud`, `exp`/`nbf`, algorithm
@@ -1035,7 +1070,7 @@ pub async fn oidc_callback(
     } else {
         state.config.oidc_client_secret.as_deref()
     };
-    let Some(id_token) = exchange_code_for_id_token(
+    let Ok(id_token) = exchange_code_for_id_token(
         &runtime.http,
         token_url,
         redirect_uri,
@@ -1162,11 +1197,16 @@ fn decode_flow_cookie(headers: &HeaderMap) -> Option<OidcFlow> {
 /// POST the authorization code (and PKCE `code_verifier`) to `token_url`
 /// through `http` — the client the connection was built with, so the
 /// address that passed the allowlist check is the one dialled (`ADM-12`
-/// D10) — and return the `id_token` from a successful response, or `None` on
-/// any failure: a non-2xx status, a network error, or a response body that
-/// isn't `{"id_token": "..."}`. Never surfaces the `IdP`'s own status/body
-/// to the caller or into anything but a `tracing::warn!` line (AGENTS.md
-/// principle 4; see [`oidc_callback`]'s `# Errors` doc comment).
+/// D10) — and return the `id_token` from a successful response.
+///
+/// # Errors
+///
+/// Returns a classified [`ExchangeFailure`] (`ADM-12` review round 1, S1):
+/// [`ExchangeFailure::Refused`] for a client-ID/secret refusal,
+/// [`ExchangeFailure::Unreachable`] for a request that never completed, and
+/// [`ExchangeFailure::Other`] otherwise. Never surfaces the `IdP`'s own
+/// status/body to the caller or into anything but a `tracing::warn!` line
+/// (AGENTS.md principle 4).
 async fn exchange_code_for_id_token(
     http: &reqwest::Client,
     token_url: &str,
@@ -1175,7 +1215,7 @@ async fn exchange_code_for_id_token(
     client_secret: Option<&str>,
     code: &str,
     code_verifier: &str,
-) -> Option<String> {
+) -> Result<String, ExchangeFailure> {
     let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -1186,21 +1226,39 @@ async fn exchange_code_for_id_token(
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret));
     }
-    let token_response = http
-        .post(token_url)
-        .form(&form)
-        .send()
+    let response = http.post(token_url).form(&form).send().await.map_err(|_| {
+        tracing::warn!("oidc: token exchange request failed");
+        ExchangeFailure::Unreachable
+    })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        // Only the `error` member is read, and only to tell a refusal from a
+        // status this deployment does not classify. The member's value is
+        // compared, never logged or returned.
+        let invalid_client = response
+            .json::<TokenErrorResponse>()
+            .await
+            .is_ok_and(|body| body.error == "invalid_client");
+        tracing::warn!("oidc: the token endpoint did not accept the code exchange");
+        return Err(
+            if invalid_client
+                || status == StatusCode::UNAUTHORIZED
+                || status == StatusCode::FORBIDDEN
+            {
+                ExchangeFailure::Refused
+            } else {
+                ExchangeFailure::Other
+            },
+        );
+    }
+    response
+        .json::<TokenResponse>()
         .await
-        .and_then(reqwest::Response::error_for_status);
-    let Ok(token_response) = token_response else {
-        tracing::warn!("oidc callback: token exchange request failed");
-        return None;
-    };
-    let Ok(TokenResponse { id_token }) = token_response.json::<TokenResponse>().await else {
-        tracing::warn!("oidc callback: token endpoint response was not the expected shape");
-        return None;
-    };
-    Some(id_token)
+        .map(|response| response.id_token)
+        .map_err(|_| {
+            tracing::warn!("oidc: token endpoint response was not the expected shape");
+            ExchangeFailure::Other
+        })
 }
 
 /// Read the `lh_oidc_flow` cookie's raw (still base64url-encoded) value
@@ -1239,9 +1297,45 @@ fn oidc_login_audit_event(principal: &Principal, user_id: Uuid) -> NewAuditEvent
     }
 }
 
+/// Store a test run's result and record the audit row (`ADM-12` D8): one
+/// place, so every failure path stores the same shape and none can forget
+/// the audit. The sentence in `result.error` is fixed by the caller; nothing
+/// the provider said is in it.
+async fn store_sso_test_result(
+    pool: &PgPool,
+    test_run_id: Uuid,
+    created_by: Uuid,
+    result: serde_json::Value,
+) {
+    let _ = lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
+    let outcome = if result.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        "executed"
+    } else {
+        "failed"
+    };
+    audit_sso_test(pool, created_by, outcome, &result).await;
+}
+
+/// The second half of a test sign-in (`ADM-12` D8): exchange the code and
+/// verify the ID token against the **draft's own** settings, store what the
+/// provider sent, and create no user, no identity and no session.
+///
+/// `ADM-12` review round 1, B2: every address and every setting comes from
+/// the run's stored draft, through the same builder the live path uses — the
+/// token endpoint, the key set and the authenticate address never come from
+/// the live connection, so a draft's secret is never sent to a provider the
+/// draft did not name. S4: the client secret is the one sealed into the run,
+/// never `OIDC_CLIENT_SECRET`.
+///
+/// # Errors
+///
+/// Returns 401 for a missing/expired run, a missing `code`/`state`, or a
+/// `state` mismatch, and 503 without a Postgres pool. Every provider-side
+/// failure is stored as a fixed sentence and answered with the redirect back
+/// to the Settings page (D8).
 #[allow(
     clippy::too_many_lines,
-    reason = "orchestrates complete OIDC test verification flow from token exchange through claims extraction and audit"
+    reason = "one linear test-sign-in flow: every failure stores one fixed sentence and returns the same redirect (ADM-12 D8)"
 )]
 async fn handle_oidc_test_callback(
     state: AppState,
@@ -1274,6 +1368,9 @@ async fn handle_oidc_test_callback(
         Ok(Some(r)) if r.expires_at > time::OffsetDateTime::now_utc() => r,
         _ => return Ok(unauthorized()),
     };
+    let created_by = run.created_by;
+    let draft = run.draft;
+    let sealed_secret = run.draft_secret;
 
     let landing_target = format!("/admin/settings?section=sign-in&ssoTest={test_run_id}");
     let mut redirect_resp = (StatusCode::FOUND, ()).into_response();
@@ -1286,13 +1383,16 @@ async fn handle_oidc_test_callback(
 
     let (Some(code), Some(returned_state)) = (query.code, query.state) else {
         tracing::warn!("oidc test callback: missing code or state");
-        let result = serde_json::json!({
-            "ok": false,
-            "error": "The identity provider returned no authorization code or state.",
-        });
-        let _ =
-            lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
-        audit_sso_test(pool, run.created_by, "failed", &result).await;
+        store_sso_test_result(
+            pool,
+            test_run_id,
+            created_by,
+            serde_json::json!({
+                "ok": false,
+                "error": "The provider returned no authorization code or state.",
+            }),
+        )
+        .await;
         return Ok(redirect_resp);
     };
 
@@ -1300,71 +1400,90 @@ async fn handle_oidc_test_callback(
         Secret::new(returned_state).constant_time_eq(&Secret::new(flow.state.clone()));
     if !state_matches {
         tracing::warn!("oidc test callback: state mismatch");
-        let result = serde_json::json!({
-            "ok": false,
-            "error": "State parameter mismatch in identity provider response.",
-        });
-        let _ =
-            lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
-        audit_sso_test(pool, run.created_by, "failed", &result).await;
+        store_sso_test_result(
+            pool,
+            test_run_id,
+            created_by,
+            serde_json::json!({
+                "ok": false,
+                "error": "The sign-in answer did not match the request this deployment started.",
+            }),
+        )
+        .await;
         return Ok(redirect_resp);
     }
 
-    let draft = run.draft;
-    let issuer = draft
-        .get("issuer")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let client_id = draft
-        .get("clientId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let provider_name = draft
-        .get("providerName")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("default");
-    let groups_claim = draft
-        .get("groupsClaim")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("groups");
-    let role_map = draft
-        .get("roleMap")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            crate::runtime_settings::parse_role_map_json_entries(&serde_json::Value::Array(
-                arr.clone(),
-            ))
-        })
-        .unwrap_or_default();
-
-    let client_secret = if let Some(ref sealed) = run.draft_secret {
-        state
-            .connector_secret_store
-            .keyring()
-            .ok()
-            .and_then(|r| {
-                r.open(crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME, sealed)
-                    .ok()
-            })
-            .and_then(|o| String::from_utf8(o.plaintext).ok())
-    } else {
-        state.config.oidc_client_secret.clone()
+    // B2: the draft's own settings, and the draft's own discovery document.
+    let runtime = crate::runtime_settings::sso_runtime_for_settings(
+        &state,
+        crate::runtime_settings::draft_sso_settings(&state.config, &draft),
+    )
+    .await;
+    let Some(authenticator) = runtime.authenticator.clone() else {
+        let reason = runtime
+            .not_ready_reason()
+            .unwrap_or("The draft connection cannot be used to test a sign-in.");
+        store_sso_test_result(
+            pool,
+            test_run_id,
+            created_by,
+            serde_json::json!({ "ok": false, "error": reason }),
+        )
+        .await;
+        return Ok(redirect_resp);
+    };
+    let (Some(token_url), Some(redirect_uri), Some(client_id)) = (
+        runtime.settings.token_url.as_deref(),
+        runtime.settings.redirect_uri.as_deref(),
+        runtime.settings.client_id.as_deref(),
+    ) else {
+        store_sso_test_result(
+            pool,
+            test_run_id,
+            created_by,
+            serde_json::json!({
+                "ok": false,
+                "error": "The draft is missing an address a sign-in needs.",
+            }),
+        )
+        .await;
+        return Ok(redirect_resp);
     };
 
-    let sso = crate::runtime_settings::sso(&state).await;
-    let token_url = sso
-        .token_url
-        .as_deref()
-        .or(state.config.oidc_token_url.as_deref())
-        .unwrap_or("");
-    let redirect_uri = sso
-        .redirect_uri
-        .as_deref()
-        .or(state.config.oidc_redirect_uri.as_deref())
-        .unwrap_or("/api/auth/oidc/callback");
+    // S4: this run uses ONLY the secret sealed into it when it was created.
+    // No `OIDC_CLIENT_SECRET`, and no live connection's secret.
+    let client_secret = match sealed_secret.as_deref() {
+        None => None,
+        Some(sealed) => {
+            let opened = state
+                .connector_secret_store
+                .keyring()
+                .ok()
+                .and_then(|ring| {
+                    ring.open(crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME, sealed)
+                        .ok()
+                })
+                .and_then(|opened| String::from_utf8(opened.plaintext).ok());
+            let Some(opened) = opened else {
+                tracing::warn!("oidc test callback: the run's sealed secret could not be opened");
+                store_sso_test_result(
+                    pool,
+                    test_run_id,
+                    created_by,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "The secret saved with this test sign-in could not be opened.",
+                    }),
+                )
+                .await;
+                return Ok(redirect_resp);
+            };
+            Some(opened)
+        }
+    };
 
-    let Some(id_token) = exchange_code_for_id_token(
-        &reqwest::Client::new(),
+    let id_token = match exchange_code_for_id_token(
+        &runtime.http,
         token_url,
         redirect_uri,
         client_id,
@@ -1373,90 +1492,55 @@ async fn handle_oidc_test_callback(
         &flow.code_verifier,
     )
     .await
-    else {
-        tracing::warn!("oidc test callback: token exchange failed");
-        let result = serde_json::json!({
-            "ok": false,
-            "error": "The provider refused the client ID or secret.",
-        });
-        let _ =
-            lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result).await;
-        audit_sso_test(pool, run.created_by, "failed", &result).await;
-        return Ok(redirect_resp);
-    };
-
-    let mut oidc_config = match sso.jwks_url.clone() {
-        Some(jwks_url) => lakehouse_auth::oidc::OidcConfig::new(
-            issuer.to_owned(),
-            client_id.to_owned(),
-            provider_name.to_owned(),
-            jwks_url,
-        ),
-        None => lakehouse_auth::oidc::OidcConfig::with_discovery(
-            issuer.to_owned(),
-            client_id.to_owned(),
-            provider_name.to_owned(),
-        ),
-    };
-    for entry in role_map {
-        oidc_config.role_map.insert(entry.group, entry.role);
-    }
-    oidc_config.groups_claim = groups_claim.to_owned();
-    oidc_config.clock_skew_seconds = state.config.oidc_clock_skew_seconds;
-
-    let internal_hosts = state.config.connector_internal_hosts();
-    let mut http_client = None;
-    if let Some((host, port)) = crate::connector_probe::parse_endpoint_host_port(issuer)
-        && let Ok(approved) =
-            crate::connector_probe::resolve_checked(host, port, &internal_hosts).await
     {
-        let mut builder = reqwest::Client::builder().resolve_to_addrs(host, approved.all());
-        if let Some(ref jwks_url) = sso.jwks_url
-            && let Some((j_host, j_port)) =
-                crate::connector_probe::parse_endpoint_host_port(jwks_url)
-            && let Ok(j_appr) =
-                crate::connector_probe::resolve_checked(j_host, j_port, &internal_hosts).await
-        {
-            builder = builder.resolve_to_addrs(j_host, j_appr.all());
+        Ok(id_token) => id_token,
+        Err(failure) => {
+            store_sso_test_result(
+                pool,
+                test_run_id,
+                created_by,
+                serde_json::json!({ "ok": false, "error": failure.sentence() }),
+            )
+            .await;
+            return Ok(redirect_resp);
         }
-        if let Ok(client) = builder.build() {
-            http_client = Some(client);
-        }
-    }
+    };
 
-    let draft_auth = lakehouse_auth::oidc::OidcAuthenticator::new_with_http_client(
-        oidc_config,
-        http_client,
-        pool.clone(),
-    );
-
-    match draft_auth
+    match authenticator
         .validate_for_test(&Secret::new(id_token), &flow.nonce)
         .await
     {
-        Ok(test_claims) => {
-            let result = serde_json::json!({
-                "ok": true,
-                "subject": test_claims.subject,
-                "email": test_claims.email,
-                "groups": test_claims.groups,
-                "mappedRoles": test_claims.mapped_roles,
-            });
-            let _ =
-                lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result)
-                    .await;
-            audit_sso_test(pool, run.created_by, "executed", &result).await;
+        Ok(claims) => {
+            // S2: `emailVerified` and `overage` are part of what an
+            // administrator sees (`SEC-65` will need the former).
+            store_sso_test_result(
+                pool,
+                test_run_id,
+                created_by,
+                serde_json::json!({
+                    "ok": true,
+                    "subject": claims.subject,
+                    "email": claims.email,
+                    "emailVerified": claims.email_verified,
+                    "groups": claims.groups,
+                    "mappedRoles": claims.mapped_roles,
+                    "overage": claims.overage,
+                }),
+            )
+            .await;
         }
         Err(err) => {
             tracing::warn!(error = %err, "oidc test callback: id token validation failed");
-            let result = serde_json::json!({
-                "ok": false,
-                "error": "ID token verification failed.",
-            });
-            let _ =
-                lakehouse_store::sso_settings::update_test_run_result(pool, test_run_id, &result)
-                    .await;
-            audit_sso_test(pool, run.created_by, "failed", &result).await;
+            store_sso_test_result(
+                pool,
+                test_run_id,
+                created_by,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "The ID token could not be verified.",
+                }),
+            )
+            .await;
         }
     }
 
@@ -1856,6 +1940,15 @@ mod tests {
         aud: &'a str,
         exp: i64,
         nonce: &'a str,
+        /// The email claim, when the test sign-in result is about it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<&'a str>,
+        /// The provider's `email_verified` claim (`ADM-12` D8/S2).
+        #[serde(rename = "email_verified", skip_serializing_if = "Option::is_none")]
+        email_verified: Option<bool>,
+        /// The groups claim the configured `groupsClaim` names.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<&'a str>>,
         /// Entra ID's overage marker (`SEC-39`): names each claim whose
         /// values did not fit in the token, so the claim itself is absent.
         /// `None` for every ordinary test token.
@@ -2053,6 +2146,9 @@ mod tests {
                 aud: "lakehouse-console",
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
                 claim_names: None,
             },
             &key,
@@ -2104,6 +2200,542 @@ mod tests {
         .await?;
         assert_eq!(identities, 1, "the sign-in provisions the new subject");
         Ok(())
+    }
+
+    // ── `ADM-12` review round 1, B2/S1/S2/S4: the test sign-in uses the
+    // draft's own provider, says what failed, and creates nothing ─────────
+
+    /// A test sign-in against a draft is verified with the draft's own
+    /// provider, reports `emailVerified` and `overage`, and creates no user,
+    /// identity or session (D8; review round 1, S2).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_test_sign_in_reports_the_draft_providers_claims_and_creates_nothing(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let users_before: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user")
+            .fetch_one(&pool)
+            .await?;
+        let identities_before: i64 = sqlx::query_scalar("SELECT count(*) FROM auth_identity")
+            .fetch_one(&pool)
+            .await?;
+        let sessions_before: i64 = sqlx::query_scalar("SELECT count(*) FROM session")
+            .fetch_one(&pool)
+            .await?;
+
+        let (flow_cookie, run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": issuer,
+                "clientId": "draft-client",
+                "clientSecret": "draft-secret",
+                "providerName": "draft-provider",
+                "groupsClaim": "groups",
+                "roleMap": [{"group": "admins", "role": "Platform Admin"}],
+                "jitProvisioning": true,
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "draft-subject-1",
+                iss: &issuer,
+                aud: "draft-client",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: Some("draft@example.com"),
+                email_verified: Some(true),
+                groups: Some(vec!["admins"]),
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-1").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        let run = lakehouse_store::sso_settings::get_test_run(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        let result = run.result.expect("the callback stored a result");
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["subject"], "draft-subject-1");
+        assert_eq!(result["email"], "draft@example.com");
+        assert_eq!(result["emailVerified"], true);
+        assert_eq!(result["groups"], serde_json::json!(["admins"]));
+        assert_eq!(result["mappedRoles"], serde_json::json!(["Platform Admin"]));
+        assert_eq!(result["overage"], false);
+
+        let users_after: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user")
+            .fetch_one(&pool)
+            .await?;
+        let identities_after: i64 = sqlx::query_scalar("SELECT count(*) FROM auth_identity")
+            .fetch_one(&pool)
+            .await?;
+        let sessions_after: i64 = sqlx::query_scalar("SELECT count(*) FROM session")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(users_before, users_after, "no app_user created");
+        assert_eq!(
+            identities_before, identities_after,
+            "no auth_identity created"
+        );
+        assert_eq!(sessions_before, sessions_after, "no session created");
+        Ok(())
+    }
+
+    /// `ADM-12` review round 1, B2: a draft whose provider differs from the
+    /// saved one never sends anything to the saved provider — the token
+    /// exchange goes to the draft's own discovery document.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_draft_whose_provider_differs_sends_nothing_to_the_saved_one(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        // The saved connection's provider, reachable but never used here.
+        let (saved_server, _saved_front, saved_issuer, _saved_http) = https_mock_provider().await;
+        // The draft's own provider.
+        let (draft_server, _draft_front, draft_issuer, draft_http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&draft_server, &key).await;
+
+        lakehouse_store::sso_settings::upsert(
+            &pool,
+            &lakehouse_store::sso_settings::SsoSettings {
+                oidc_issuer: Some(saved_issuer),
+                oidc_client_id: Some("saved-client".to_owned()),
+                oidc_client_secret: None,
+                oidc_provider_name: Some("saved-provider".to_owned()),
+                oidc_groups_claim: None,
+                oidc_role_map: None,
+                oidc_jit_provisioning: None,
+            },
+            "test-user",
+        )
+        .await
+        .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        // One client that trusts both mocks' CAs: the saved provider's CA
+        // is only trusted, never dialled, by this test.
+        state.sso_http_override = Some(draft_http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let (flow_cookie, _run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": draft_issuer,
+                "clientId": "draft-client",
+                "clientSecret": "draft-secret",
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "draft-subject-2",
+                iss: &draft_issuer,
+                aud: "draft-client",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&draft_server, &id_token).await;
+
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-2").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        // The saved provider saw no request at all: not the discovery
+        // document, and above all not its token endpoint.
+        let saved_requests = saved_server.received_requests().await.unwrap();
+        assert!(
+            saved_requests.is_empty(),
+            "the draft's test sign-in must not reach the saved provider: {saved_requests:?}"
+        );
+        // The draft's provider is where the code was exchanged.
+        let draft_requests = draft_server.received_requests().await.unwrap();
+        assert!(
+            draft_requests
+                .iter()
+                .any(|request| request.method.as_str() == "POST" && request.url.path() == "/token"),
+            "the exchange goes to the draft's token endpoint: {draft_requests:?}"
+        );
+        Ok(())
+    }
+
+    /// `ADM-12` review round 1, S1: a provider that cannot be reached is
+    /// told apart from one that refused the client, with a fixed sentence.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_test_sign_in_that_cannot_reach_the_provider_says_so(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        // A port nothing listens on: bound, then released.
+        let closed_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let server = wiremock::MockServer::start().await;
+        let plain_port: u16 = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+        let front = crate::tls_proxy::HttpsFront::start("127.0.0.1", plain_port, "127.0.0.1").await;
+        let issuer = format!("https://127.0.0.1:{}", front.port());
+        // The discovery document is readable; only the token endpoint is
+        // unreachable.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("https://127.0.0.1:{closed_port}/token"),
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                })),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(front.ca_pem().as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let (flow_cookie, run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": issuer,
+                "clientId": "draft-client",
+                "clientSecret": "draft-secret",
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-3").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        let run = lakehouse_store::sso_settings::get_test_run(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        let result = run.result.expect("the callback stored a result");
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(
+            result["error"],
+            "The identity provider could not be reached."
+        );
+        Ok(())
+    }
+
+    /// `ADM-12` review round 1, S4: a run with no secret of its own sends
+    /// none — never the deployment's `OIDC_CLIENT_SECRET`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_test_run_with_no_secret_sends_no_client_secret(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        env.insert("CONNECTOR_SECRETS_KEY".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+        });
+        // The deployment's own secret, which this run must not use.
+        env.insert("OIDC_CLIENT_SECRET".to_owned(), "env-secret".to_owned());
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let (flow_cookie, run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": issuer,
+                "clientId": "draft-client",
+                // An explicit null: this run carries no secret at all.
+                "clientSecret": null,
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "draft-subject-4",
+                iss: &issuer,
+                aud: "draft-client",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: None,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-4").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        let token_requests: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "POST" && request.url.path() == "/token")
+            .collect();
+        assert_eq!(token_requests.len(), 1, "the code was exchanged once");
+        let body = String::from_utf8_lossy(&token_requests[0].body);
+        assert!(
+            !body.contains("client_secret"),
+            "a run with no secret sends none, not OIDC_CLIENT_SECRET: {body}"
+        );
+        let run = lakehouse_store::sso_settings::get_test_run(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        assert_eq!(
+            run.result.expect("the callback stored a result")["ok"],
+            true,
+            "the public-client exchange still verifies the token"
+        );
+        Ok(())
+    }
+
+    /// `ADM-12` review round 1, S2: a token carrying an overage marker
+    /// reports `overage: true` and maps no group-based role (`SEC-39`).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_test_sign_in_with_a_group_overage_says_so(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let (server, _front, issuer, http) = https_mock_provider().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert(
+            "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+            "true".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_PUBLIC_URL".to_owned(),
+            "https://lakehouse.test".to_owned(),
+        );
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.sso_http_override = Some(http);
+        let admin = seeded_admin_id(&pool).await?;
+
+        let (flow_cookie, run_id) = start_sso_test(
+            &state,
+            admin,
+            serde_json::json!({
+                "issuer": issuer,
+                "clientId": "draft-client",
+                "roleMap": [{"group": "lakehouse-admins", "role": "Platform Admin"}],
+            }),
+        )
+        .await;
+        let flow = decode_flow_cookie(&flow_cookie);
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "draft-subject-5",
+                iss: &issuer,
+                aud: "draft-client",
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
+                claim_names: Some(serde_json::json!({ "groups": "src1" })),
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let response = finish_sso_test(&state, &flow_cookie, &flow, "code-5").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let run = lakehouse_store::sso_settings::get_test_run(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        let result = run.result.expect("the callback stored a result");
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["overage"], true, "{result}");
+        assert_eq!(result["mappedRoles"], serde_json::json!([]), "{result}");
+        Ok(())
+    }
+
+    /// The seeded Platform Admin as the route handlers see it: unrestricted
+    /// (`*:*`), which is what `PUT`/`POST`/`GET` of SSO settings require (D5).
+    fn admin_principal(id: Uuid) -> Principal {
+        Principal {
+            id: PrincipalId::User(id),
+            tenant_ids: Vec::new(),
+            display_name: "fajar".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("*:*"),
+            provider: "local".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    async fn seeded_admin_id(pool: &sqlx::PgPool) -> sqlx::Result<Uuid> {
+        let (admin_id,): (Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+            .bind("fajar@meridian.example")
+            .fetch_one(pool)
+            .await?;
+        Ok(admin_id)
+    }
+
+    /// Start a test sign-in by calling the route handler (`ADM-12` D8): the
+    /// response's flow cookie and the run's id.
+    async fn start_sso_test(
+        state: &AppState,
+        admin: Uuid,
+        draft: serde_json::Value,
+    ) -> (String, Uuid) {
+        let response = crate::routes::settings::post_sso_test(
+            axum::extract::State(state.clone()),
+            axum::Extension(admin_principal(admin)),
+            axum::body::Bytes::from(draft.to_string().into_bytes()),
+        )
+        .await
+        .expect("a usable draft starts a test sign-in");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the draft must be usable: {:?}",
+            response.status()
+        );
+        let flow_cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let text = value.to_str().ok()?;
+                text.starts_with("lh_oidc_flow=").then(|| text.to_owned())
+            })
+            .expect("the test flow cookie");
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let run_id: Uuid = body["id"]
+            .as_str()
+            .expect("the run id")
+            .parse()
+            .expect("a UUID");
+        (flow_cookie, run_id)
+    }
+
+    /// Finish a test sign-in by calling the callback handler with the flow
+    /// cookie `start_sso_test` returned.
+    async fn finish_sso_test(
+        state: &AppState,
+        flow_cookie: &str,
+        flow: &OidcFlow,
+        code: &str,
+    ) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(flow_cookie.split(';').next().unwrap_or_default())
+                .expect("an ASCII cookie"),
+        );
+        oidc_callback(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(OidcCallbackQuery {
+                code: Some(code.to_owned()),
+                state: Some(flow.state.clone()),
+            }),
+            headers,
+        )
+        .await
+        .expect("the callback answers")
     }
 
     fn sign_id_token(claims: &IdTokenClaims<'_>, key: &TestKey) -> String {
@@ -2200,6 +2832,9 @@ mod tests {
                 // always well under `i32::MAX` seconds past the epoch.
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
                 claim_names: None,
             },
             &key,
@@ -2325,6 +2960,9 @@ mod tests {
                 aud: client_id,
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
                 claim_names: Some(serde_json::json!({ "groups": "src1" })),
             },
             &key,
@@ -2422,6 +3060,9 @@ mod tests {
                 aud: client_id,
                 exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 nonce: &flow.nonce,
+                email: None,
+                email_verified: None,
+                groups: None,
                 claim_names: None,
             },
             &key,

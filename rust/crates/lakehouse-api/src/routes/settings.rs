@@ -2433,7 +2433,11 @@ pub async fn post_sso_test(
         }
     };
 
-    let test_run_id = Uuid::new_v4();
+    // `ADM-12` review round 1, B2: the authorize address comes from the
+    // DRAFT's own discovery document, through the same builder the live path
+    // uses — never from the live connection, and never a guessed
+    // `<issuer>/authorize`. A draft that cannot be used is a 400 with the
+    // builder's fixed sentence, before a run is created.
     let draft = json!({
         "issuer": validated_issuer,
         "clientId": client_id_str,
@@ -2442,6 +2446,25 @@ pub async fn post_sso_test(
         "roleMap": role_map_json,
         "jitProvisioning": jit_provisioning,
     });
+    let draft_runtime = crate::runtime_settings::sso_runtime_for_settings(
+        &state,
+        crate::runtime_settings::draft_sso_settings(&state.config, &draft),
+    )
+    .await;
+    let (Some(authorize_base), Some(redirect_uri)) = (
+        draft_runtime.settings.authorize_url.as_deref(),
+        draft_runtime.settings.redirect_uri.as_deref(),
+    ) else {
+        return Err(ApiError::BadRequest(
+            draft_runtime
+                .not_ready_reason()
+                .unwrap_or("The draft connection cannot be used to test a sign-in.")
+                .to_owned(),
+        )
+        .into());
+    };
+
+    let test_run_id = Uuid::new_v4();
 
     let new_run = lakehouse_store::sso_settings::NewSsoTestRun {
         id: test_run_id,
@@ -2454,19 +2477,6 @@ pub async fn post_sso_test(
     lakehouse_store::sso_settings::create_test_run(pool, &new_run)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
-
-    // Build authorize URL for the test run using the draft's settings
-    let sso = crate::runtime_settings::sso(&state).await;
-    let authorize_base = sso
-        .authorize_url
-        .as_deref()
-        .or(state.config.oidc_authorize_url.as_deref())
-        .map_or_else(|| format!("{validated_issuer}/authorize"), String::from);
-    let redirect_uri = sso
-        .redirect_uri
-        .as_deref()
-        .or(state.config.oidc_redirect_uri.as_deref())
-        .unwrap_or("/api/auth/oidc/callback");
 
     let state_token = lakehouse_auth::generate_opaque_token();
     let nonce = lakehouse_auth::generate_opaque_token();
@@ -2482,7 +2492,7 @@ pub async fn post_sso_test(
         test_run_id: Some(test_run_id),
     };
 
-    let mut redirect = url::Url::parse(&authorize_base)
+    let mut redirect = url::Url::parse(authorize_base)
         .map_err(|_| ApiError::Unavailable("OIDC authorize URL is not a valid URL".to_owned()))?;
     redirect
         .query_pairs_mut()
