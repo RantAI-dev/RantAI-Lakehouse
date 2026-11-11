@@ -216,7 +216,8 @@ Base `e606e2c3`. Branch `feat/adm-12-oidc-in-settings`, pushed after every commi
 | `d3449193` | Role names from `lakehouse_store::identity::list_roles` (S3). |
 | `7dc10317` | Console: `ready`/`notReadyReason` in the contract and the reason on the form (S6). |
 | `8c74fbd7` | `docs/OPERATIONS.md`: `CONSOLE_PUBLIC_URL`, and the addresses from the discovery document (T5/D10). |
-| this commit | This handoff. |
+| `58eeb91f` | This handoff. |
+| `c319f194` | Refinement of B3: pin only the issuer and the discovery document's three addresses (the ones that were checked), not an environment value D10 says is used as it is. |
 
 **Each finding**
 
