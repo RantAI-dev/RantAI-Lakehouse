@@ -741,3 +741,21 @@ sign-in.
 `origin/main` (`01d507c8`: WEB-7 S1 #461 and two docs PRs) is merged in the commit that
 carries this note; no conflict.
 
+### Round 4 (planner, 2026-11-11) — branch at `a7ce98e9`
+
+Read the fix (`70069879..a9fa2722`, `runtime_settings.rs`).
+
+- **R3-S1: closed.** `is_fresh` keeps a server-owned runtime for as long as its `base` is the
+  same, ready or not; a console-set one keeps the round 2 rule. The round 2 test that
+  expected a server-owned not-ready runtime to be retried after 30 seconds asserted the bug
+  and was replaced, with the reason in the commit. `now` is a parameter so the ten-minute
+  case needs no sleep.
+
+**No open BLOCKER and no open SHOULD-FIX.** The console (`sso-page.tsx`) was read in round 2
+for the security-relevant parts (the secret is never in a GET payload, server-owned fields
+are read-only, `noopener` on the test tab), not line by line. I ran no check locally; merged
+only when #455 is green on its last commit.
+
+Numbers still marked *(proposed)*, for the owner: the 10-minute life of a ready console-set
+runtime (R2-S1) and the 10-minute life of a test sign-in (D8).
+
