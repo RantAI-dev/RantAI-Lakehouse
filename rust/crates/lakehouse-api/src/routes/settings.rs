@@ -2228,10 +2228,15 @@ pub async fn put_sso(
         },
     )?;
 
-    let known_roles: Vec<String> = sqlx::query_scalar("SELECT name FROM role")
-        .fetch_all(pool)
+    // `ADM-12` review round 1, S3: the store already lists roles
+    // (`lakehouse_store::identity::list_roles`, rule 4) — the role map is
+    // validated against its names, not a second query.
+    let known_roles: Vec<String> = lakehouse_store::identity::list_roles(pool)
         .await
-        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?
+        .into_iter()
+        .map(|role| role.name)
+        .collect();
 
     let (role_map, role_map_changed) =
         role_map_field(parsed.get("roleMap"), old_role_map, &known_roles)?;
@@ -2354,10 +2359,13 @@ pub async fn post_sso_test(
         "groups".to_owned()
     };
 
-    let known_roles: Vec<String> = sqlx::query_scalar("SELECT name FROM role")
-        .fetch_all(pool)
+    // `ADM-12` review round 1, S3: one store call, the same one `PUT` uses.
+    let known_roles: Vec<String> = lakehouse_store::identity::list_roles(pool)
         .await
-        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?
+        .into_iter()
+        .map(|role| role.name)
+        .collect();
 
     let role_map_json = if let Some(v) = parsed.get("roleMap") {
         if v.is_null() {
