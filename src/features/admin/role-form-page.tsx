@@ -184,7 +184,9 @@ function RoleEditForm({ role }: { role: Role }) {
   const renamed = name.trim() !== role.name
   // The API refuses to narrow a role that holds `*:*` (GOV-7 D4), so the
   // section is disabled with the server's own sentence and no table-access
-  // write is sent for such a role.
+  // write is sent for such a role. Whatever grants it already stores stay:
+  // the API refuses to replace them, and they apply again if the role ever
+  // loses `*:*`.
   const fullAccess = grantsUnrestricted(permissions)
   const loadingAccess = accessState.status === "loading"
 

@@ -186,6 +186,9 @@ export function RoleTableAccessSection({
   }
 
   function toggleWholeSchema(schema: string, checked: boolean) {
+    // The schema's single-table grants are kept, not cleared: turning the
+    // whole schema off again must not silently drop tables the person had
+    // picked, and the engine reads `*` as covering them anyway.
     const rest = grants.filter(
       (grant) => !(sameName(grant.schema, schema) && grant.table === "*")
     )
