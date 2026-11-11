@@ -341,3 +341,51 @@ $ git ls-remote --heads origin fix/sec-65-verified-email-linking
 ```
 
 ## 6. Review (planner)
+
+### Round 1 (planner, 2026-11-11) — branch at `791b4940`
+
+Read in full: the change to `provision_user` and `audit_link_refused`
+(`lakehouse-auth/src/oidc.rs`), `AuthError::EmailNotVerified` and its mapping (`error.rs`),
+the callback's refusal (`routes/auth.rs`), the migration, and how `trust_email` travels
+through `resolve_sso`, `to_oidc_config`, the draft and `GET`/`PUT /api/settings/sso`. Not
+read line by line: the console change and the tests. I ran no check locally; #467 runs the
+suite.
+
+- **D1, D2, D4, D5 are built as written.** The row is read whenever the token carries an
+  email, and used as the account to join only when the email is confirmed or trusted. A
+  deactivated account still answers `InvalidCredentials` first, confirmed or not. The refused
+  path rolls the read-only transaction back before it writes the audit row, so the row
+  cannot vanish with it. An unconfirmed address is neither stored nor used as the name.
+- **The audit row holds the provider and the subject, not the email.** The error carries no
+  claim text; the callback answers with a fixed address, `/login?ssoNotice=email_not_verified`,
+  sets no session cookie and clears the flow cookie.
+- **D3:** `.env` owns the switch when the variable is set; a saved value is used otherwise;
+  the default is off; `NULL` in an existing row is off.
+- **The developer's finding on the sign-in page is right and worth keeping:** a refused
+  callback used to be a bare JSON 401 in the browser, and `SsoNotice` was only rendered
+  after sign-in. The sign-in page renders it now.
+- `ops/g10`'s Keycloak realm marks its users' emails as verified, so that gate still joins
+  accounts; `ops/g4`'s mock sends no `email_verified`, so its account is now created without
+  an email, which that gate does not assert on. Read by the developer, not run.
+
+**No BLOCKER and no SHOULD-FIX.**
+
+**The plan's own mistake (planner).** T1's *Accept* line `cargo test -p lakehouse-auth oidc`
+filters by test name and runs one test; the developer ran `--test oidc` (35 tests) and
+`--lib` instead, which is what was meant.
+
+**For the product owner**
+
+- **D1 to D4 are still proposals.** The one with a cost on upgrade is D3's default: with the
+  switch off, a person whose provider does not send `email_verified` and who has a local
+  account is refused at their first sign-in through that provider until an administrator
+  turns the switch on. The test sign-in shows what the provider sends. Flipping the default
+  is one constant and one sentence.
+- **The refusal tells a signed-in-at-the-provider person that an account with that address
+  exists** (they are refused instead of getting a new account). That is the price of not
+  creating a second account silently; it is reached only after the provider authenticated
+  them.
+- **On the bearer-token path the refusal is audited on every request** that carries such a
+  token. That is the same as any refused credential here; it is noted in case the audit log
+  shows a run of them.
+
