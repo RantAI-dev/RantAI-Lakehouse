@@ -276,6 +276,167 @@ Review 1 findings (B1, B2, S1, S2) addressed and verified.
 #### Anything Not Verified
 Full repository-wide checks (`cargo test --workspace` and `bun test`) were not run in this remediation turn; scoped checks for the touched packages (`src/features/admin` and `lakehouse-api`) were run in the foreground and verified green.
 
+### Handoff (developer, 2026-11-11, S2 T4 to T7)
+
+Slice S2, tasks T4–T7, is implemented, verified and pushed to
+`origin/feat/web-8-s2-pickers`, branched from `origin/main` at `ba2d8f0c`
+(the `WEB-7` merge, #463). T8 is **not** done: it is built separately.
+
+#### Commits
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T4 | `39b057f7` | `feat(console): SQL and Oracle connection forms pick their SSL mode (WEB-8 T4, D8)` |
+| T5 | `7418254b` | `feat(console): pipeline form picks its zones and columns (WEB-8 T5, D8)` |
+| T6 | `8bbeaedf` | `feat(console): quality, freshness and alert forms pick their tables (WEB-8 T6, D8)` |
+| T7 | `8f64b346` | `feat(console): subscription time zone list and access-rule role checkboxes (WEB-8 T7, D8)` |
+
+#### Where each anchor is now
+
+The plan's anchors were verified at `dcaae8a5`; `WEB-7` (#461, #463) then moved
+the side panels and dialogs onto pages. Re-found by name on this branch:
+
+| Plan anchor | Now |
+| --- | --- |
+| `cdc-dial-form.tsx:25-38` `CDC_SSL_MODES`, `ORACLE_SSL_MODES` | `src/features/connectors/dial-forms/ssl-modes.ts:15` and `:25` (moved); `DEFAULT_CDC_SSL_MODE` stays `cdc-dial-form.tsx:22` |
+| `sql-dial-form.tsx:112-121` SSL mode input | `sql-dial-form.tsx:123` (now the ui `Select`, choices built at `:56`) |
+| `oracle-dial-form.tsx:87-94` SSL mode input | `oracle-dial-form.tsx:98` (now the ui `Select`, choices built at `:49`) |
+| `pipeline-create-page.tsx:223` `namespaces` | `pipeline-create-page.tsx:229` (unchanged call) |
+| `:211-221` source table datalist | `pipeline-create-page.tsx:585-601` — unchanged, still a `datalist` (`DATA-19` D4) |
+| `:432` incremental column | `pipeline-create-page.tsx:465` — `ColumnField` |
+| `:449-454` source zone | `pipeline-create-page.tsx:492` — `ZoneField` (the connector-fixed Bronze case stays a read-only input, `:486`) |
+| `:663-729` key / column / value / from / to | `pipeline-create-page.tsx:710, 720, 759, 766, 777` — `ColumnField` for key, column, from and to; the filter's `value` stays free text (see Mismatches) |
+| `:759` columns list | `pipeline-create-page.tsx:805` — `ColumnsField` (`Faceted multiple`) |
+| `:815` target zone | `pipeline-create-page.tsx:862` — `ZoneField`; the target table stays free text at `:870-876` |
+| `data-quality-page.tsx:382` Asset field | `quality-rule-create-page.tsx:101` (moved by `WEB-7`); `data-quality-page.tsx` no longer holds the form |
+| `quality-check-fields.tsx:86-104` column picker | `quality-check-fields.tsx:86-105`; the held-but-unknown option is at `:99` |
+| `quality-rule-edit-dialog.tsx:105` Table field | `quality-rule-edit-dialog.tsx:108` — `TablePicker` |
+| `freshness-target-dialog.tsx:113` Table field | `freshness-target-dialog.tsx:115` — `TablePicker` |
+| `alerts-page.tsx:644,659` two table fields | `alert-rule-page.tsx:653` (quality incident, `*` allowed) and `:665` (dataset freshness) — moved by `WEB-7` |
+| `subscriptions-dialog.tsx:319` time zone | `subscriptions-dialog.tsx:327-339` — input + `datalist` |
+| `asset-access.tsx:149-155` roles field | `asset-access.tsx:166-201` — checkboxes |
+
+#### Each picker: options, and what happens when they cannot be loaded
+
+- **SSL mode, SQL form** (`sql-dial-form.tsx`): `CDC_SSL_MODES` from
+  `ssl-modes.ts`, plus a "Default (no mode sent)" entry. On load there is
+  nothing remote, so no failure state; a stored value that is not in the list is
+  added as `<value> (not one of the listed modes)` and kept. The SQL form offers
+  the four Debezium modes because the spec (`web-8.md`, target row "SSL mode (SQL,
+  Oracle)") names `CDC_SSL_MODES` for it; the batch adapter passes the string
+  through (`SqlDial::ssl_mode` doc, `rust/crates/lakehouse-store/src/ingest_spec.rs:72-74`).
+- **SSL mode, Oracle form** (`oracle-dial-form.tsx`): `ORACLE_SSL_MODES`, plus
+  the same "Default" entry.
+- **Pipeline zones** (`ZoneField`, `src/features/pipelines/pipeline-pickers.tsx`):
+  `lakehouseService.listNamespaces` — the call the page already made
+  (`pipeline-create-page.tsx:229`). While loading or after a failed read there
+  is no list, so the field is the text input it was; on failure a sentence says
+  "Could not read the lakehouse's namespaces; type the zone name instead." A
+  stored zone not in the list is an extra entry marked "(not a namespace this
+  lakehouse lists)".
+- **Pipeline columns** (`ColumnField`, `ColumnsField`): the source table's schema
+  from `lakehouseService.getTableDetail(zone, table)` (called at
+  `pipeline-create-page.tsx:246`, only for a zone `listNamespaces` listed —
+  `getTableDetail` answers for Iceberg namespaces). When the table does not
+  exist or the detail read fails, the fields stay free text and the page shows
+  "Columns appear here once the table exists" (`:474`, `:658`). A stored column
+  not in the schema is an extra entry marked "(not in this table)"; in the
+  multi-select it is a chip that can be taken out.
+- **Governance and alert tables** (`TablePicker`,
+  `src/features/governance/table-picker.tsx`): `assetService.listAssets`, shown
+  as `namespace.table` by `tableKey`. Loaded through `useTableCatalog`. A failed
+  read falls back to the text input with "Could not read the catalog's tables;
+  type the table as namespace.table." A table the record holds that the catalog
+  does not list is an extra entry marked "(not in the catalog)". The quality
+  alert's field keeps `*` as "Every table" (`allowEveryTable`).
+- **Quality rule columns** (`useTableColumns`): `assetService.getAsset(id).schema`
+  for the asset behind the picked key; `null` (free text in `CheckFields`) when
+  the table has no catalog id or its detail cannot be read.
+- **Subscription time zone** (`subscriptions-dialog.tsx:286`): `listTimeZones()`
+  from `src/lib/time-zones.ts` — the browser's IANA list plus `UTC` and the zone
+  already held — offered as a `datalist`, the control
+  `reporting-settings-page.tsx:201-217` uses for the same list. It is a local
+  list, so there is no failure state; the saved zone is always one of the names.
+- **Access-rule roles** (`asset-access.tsx:166`): `identityService.listRoles`,
+  the checkbox list `invite-user-page.tsx:122-150` uses. A failed read falls back
+  to the comma text field with "Could not read the roles; type them as a
+  comma-separated list."; a successful but empty answer says "No roles defined".
+  The field writes the same comma `subjects` string `policyCondition` already
+  took, through `roleNames()` (`asset-policy.ts`), so the two cannot disagree.
+
+#### The SQL dial form's "Default" entry
+
+What the server does with a missing SSL mode, read on this branch:
+
+- `SqlDial::ssl_mode` is `Option<String>`
+  (`rust/crates/lakehouse-store/src/ingest_spec.rs:74`) with no
+  `#[serde(default)]` needed: serde reads an absent `Option` field as `None`, so
+  a request that omits `sslMode` is the blank the field has always had, not an
+  error (`Dial::parse` at `:662`).
+- The post-parse rules are in `validate_sql_dial_post_parse` (`:1543`). The only
+  TLS-dependent one is Oracle's "`sslServerCertDn` is required when `sslMode`
+  requires TLS", and `tls_required` (`:1572-1574`) is false when `sslMode` is
+  `None`; postgres/mysql/mssql have no TLS rule there at all.
+
+So "Default" sends no `sslMode`, exactly as the empty text field did, and the
+form relies on nothing the server does not already accept.
+
+The Oracle form offers the same "Default" entry. The plan names it only for the
+SQL form, but `null` is a valid, stored Oracle value ("plaintext, no DN check" —
+`dagster/dispar_orchestrate/adapters/oracle.py:145`), and a Select with no entry
+for it would show an empty trigger and could not put it back; D8's rule ("a
+value the record already holds is still shown and kept") requires the entry.
+
+#### Mismatch between the plan and the code (T5, reported rather than improvised)
+
+The plan lists the filter transform's **`value`** among the fields that become
+column pickers (`:663-729`). It is not a column: `renderTransformDraft` writes
+the filter as `filter(${draft.column} ${draft.operator} '${draft.value}')`
+(`src/lib/transform-draft.ts:55`), i.e. `value` is the quoted literal the column
+is compared to. A picker there would change what the grammar means, so `Value`
+stays a text input (`pipeline-create-page.tsx:745-757`, with a comment saying
+why); `key`, `column`, `from` and `to` are the column pickers.
+
+#### Tests changed, and why
+
+- `pipeline-create-page.test.tsx`: the BLD-10 dedupe helper now picks `id` from
+  the key-column picker instead of typing it (the field is a picker once the
+  table exists); the BLD-9 assertion "the source zone is editable again" now
+  looks for the zone combobox instead of a text box.
+- `quality-rule-create-page.test.tsx`: the Asset field is picked, as a user
+  does, and the stub answers `/api/catalog` and `/api/catalog/{id}`.
+- No assertion was weakened or removed; new tests cover each picker.
+
+#### Verification commands and counts (all foreground, on this branch)
+
+- `bun install --frozen-lockfile`: "Checked 779 installs across 753 packages (no changes)".
+- T4, `bun test src/features/connectors/dial-forms`: **38 pass, 0 fail, 145 expect() calls** across 2 files.
+- T4 accept, `bun test src/features/connectors`: **448 pass, 0 fail** across 23 files. (A first run had 1 failure in `uploads-panel.test.tsx`, "refreshes while a row is loading and stops when none is"; it passes alone and the folder passes on re-run — a timing-sensitive test this branch does not touch.)
+- T5 accept, `bun test src/features/pipelines`: **127 pass, 0 fail** across 12 files.
+- T6 accept, `bun test src/features/governance`: **76 pass, 0 fail** across 12 files; `bun test src/features/alerts`: **40 pass, 0 fail** across 3 files.
+- T7 accept, `bun test src/features/dashboards`: **629 pass, 0 fail** across 79 files; `bun test src/features/catalog`: **363 pass, 0 fail** across 14 files.
+- `bun run typecheck`: clean, exit 0 (after every task).
+- `bun run lint`: **0 errors, 10 warnings**, the same ten pre-existing warnings `main` has (after every task).
+- No cargo command was run: this slice changes no Rust.
+
+*Not verified locally: the rest, left to CI* — the whole-suite `bun run test`
+(needs more memory than this machine gives an agent), the Rust workspace
+checks (nothing Rust changed), and the pickers in a real browser (Bun DOM tests
+only).
+
+#### T8 not done
+
+T8 — the row filter grammar route and its hint — is built separately: it needs a
+Rust route. `asset-access.tsx`'s row filter field and help line are untouched by
+this slice; only its roles field changed (T7).
+
+#### Git state
+
+- `git status --short`: clean.
+- `git log --oneline origin/main..HEAD`: the four commits above.
+- `git ls-remote --heads origin feat/web-8-s2-pickers`: the T7 commit,
+  `8f64b346` (later, after this plan commit, the plan commit).
+
 
 ## 6. Review (planner)
 
