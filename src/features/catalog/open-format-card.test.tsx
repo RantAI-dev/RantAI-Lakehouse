@@ -309,7 +309,8 @@ describe("OpenFormatCard", () => {
     await waitFor(() =>
       expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
     )
-    expect(screen.getByText("Last published")).toBeDefined()
+    // PR #456 CI: the history is read only after the publication loads (plan D7), so wait for it.
+    expect(await screen.findByText("Last published")).toBeDefined()
     expect(screen.getByText("Publishing is off; this copy is no longer updated.")).toBeDefined()
   })
 
