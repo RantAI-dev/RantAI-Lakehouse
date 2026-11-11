@@ -24,3 +24,11 @@ export type Session = {
   createdIp: string | null;
   userAgent: string | null;
 };
+/**
+ * `GET /api/auth/password-rules` (`ADM-11` D4): the lengths the server
+ * actually enforces, so the invite form states them instead of a guess.
+ */
+export type PasswordRulesResponse = {
+  minLength: number;
+  maxLength: number;
+};

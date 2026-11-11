@@ -94,6 +94,39 @@ async fn statements(ch: &MockServer) -> Vec<String> {
         .collect()
 }
 
+/// Posts `body` to `/api/ai/chat` with the switch and returns the status and
+/// the raw response bytes.
+async fn post_chat(
+    llm: &MockServer,
+    ch: &MockServer,
+    switch: &str,
+    body: &Value,
+) -> (StatusCode, bytes::Bytes) {
+    let mut env = std::collections::HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    env.insert("AI_SQL_HELP".to_owned(), switch.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/chat")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes)
+}
+
 /// Sends one chat turn with the given allowlist (`None` for no allowlist)
 /// and the switch, and returns the status and the body.
 async fn chat(
@@ -103,32 +136,11 @@ async fn chat(
     tools: Option<Value>,
     question: &str,
 ) -> (StatusCode, Value) {
-    let mut env = std::collections::HashMap::new();
-    env.insert("LLM_URL".to_owned(), llm.uri());
-    env.insert("CH_URL".to_owned(), ch.uri());
-    env.insert("AI_SQL_HELP".to_owned(), switch.to_owned());
-    let TestApp { router, pool } = spin_up_with_env(&env).await;
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
     let mut body = json!({ "messages": [{ "role": "user", "content": question }] });
     if let Some(tools) = tools {
         body["tools"] = tools;
     }
-    let resp = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/ai/chat")
-                .header("content-type", "application/json")
-                .header("cookie", &cookie)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let (status, bytes) = post_chat(llm, ch, switch, &body).await;
     (
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
@@ -747,4 +759,313 @@ async fn a_user_with_catalog_read_is_not_refused_the_data_map_for_a_missing_perm
     let (system, _) = system_prompt_for_user_holding("catalog:read").await;
 
     assert!(!system.contains(MAP_NEEDS_CATALOG_READ), "{system}");
+}
+
+// ── `AI-17` (plan 80): the server-side script gate ─────────────────────
+//
+// On staging the model answered the Latin-script question "Berapa total
+// kunjungan?" with text holding 吸引力, ignoring the prompt's "never in
+// Chinese" line, so the server now asks once — with no tools — for a
+// rewrite when the latest user message is in Latin script and the answer
+// holds a CJK character. These tests count the model's requests, so the
+// mock answers carry no digits: a bare figure would trip the citation
+// repair (WS7), which adds its own round and would mask the rewrite under
+// test.
+
+#[tokio::test]
+async fn an_answer_with_a_cjk_character_to_a_latin_question_is_asked_once_for_a_rewrite_and_the_clean_rewrite_is_the_reply()
+ {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["answer"], "Total kunjungan tercatat.",
+        "the clean rewrite is the reply: {body}"
+    );
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 2,
+        "exactly one rewrite round was added: {model_calls}"
+    );
+}
+
+#[tokio::test]
+async fn a_rewrite_that_still_holds_a_cjk_character_is_discarded_and_the_first_answer_is_the_reply()
+{
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(Some("Jawabannya tetap 吸引力."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["answer"], "Total kunjungan adalah 吸引力.",
+        "the first answer is kept when the rewrite is not clean: {body}"
+    );
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 2,
+        "no round runs after the discarded rewrite: {model_calls}"
+    );
+}
+
+#[tokio::test]
+async fn a_latin_answer_to_a_latin_question_sends_no_rewrite_round() {
+    let llm = mock_model(vec![model_round(Some("Total kunjungan tercatat."), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["answer"], "Total kunjungan tercatat.", "{body}");
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 1,
+        "a clean Latin answer is not rewritten: {model_calls}"
+    );
+}
+
+#[tokio::test]
+async fn a_chinese_answer_to_a_chinese_question_sends_no_rewrite_round() {
+    let llm = mock_model(vec![model_round(Some("总共四次。"), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "总共多少?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["answer"], "总共四次。", "{body}");
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 1,
+        "a question in another script is not checked: {model_calls}"
+    );
+}
+
+/// The `messages` array of the model's `n`th request (0-based), without the
+/// system prompt, as roles and contents, so a test can see what the model was
+/// shown in a later round.
+async fn model_request_messages(llm: &MockServer, n: usize) -> Vec<(String, String)> {
+    let requests = llm.received_requests().await.expect("recording is on");
+    let request: Value = serde_json::from_slice(&requests[n].body).expect("a JSON request");
+    request["messages"]
+        .as_array()
+        .expect("a messages array")
+        .iter()
+        .skip(1)
+        .map(|m| {
+            (
+                m["role"].as_str().unwrap_or_default().to_owned(),
+                m["content"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// `AI-17` review fix (BLOCKER 1): a clean rewrite that then trips the
+/// citation repair (the figure is in no tool result) must reach the repair
+/// round as the model's own assistant message. Before the fix the rewrite's
+/// reply was never pushed, so the repair request followed the rewrite
+/// request, the model repaired its CJK answer, and the repaired answer was
+/// returned with no CJK check.
+#[tokio::test]
+async fn a_clean_rewrite_the_citation_check_flags_is_shown_to_the_model_as_its_own_message_in_the_repair_round()
+ {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(Some("Total kunjungan adalah 48213."), &[]),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["answer"], "Total kunjungan tercatat.",
+        "the repaired answer is the reply: {body}"
+    );
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 3,
+        "the answer, one rewrite, one repair: {model_calls}"
+    );
+    let repair = model_request_messages(&llm, 2).await;
+    let roles: Vec<&str> = repair.iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        ["user", "assistant", "user", "assistant", "user"],
+        "question, answer, rewrite request, rewrite, repair request: {repair:?}"
+    );
+    assert!(
+        repair[3].1.contains("Total kunjungan adalah 48213."),
+        "the repair round shows the model its rewrite: {repair:?}"
+    );
+}
+
+/// `AI-17` review fix (BLOCKER 1): a rewrite that is discarded leaves the
+/// conversation as it was before the rewrite request, so a later repair
+/// round does not see two user messages in a row.
+#[tokio::test]
+async fn a_discarded_rewrite_leaves_no_trace_in_the_conversation_the_repair_round_sees() {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 48213 吸引力."), &[]),
+        model_round(Some("Jawabannya tetap 吸引力."), &[]),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["answer"], "Total kunjungan tercatat.", "{body}");
+    let repair = model_request_messages(&llm, 2).await;
+    let roles: Vec<&str> = repair.iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        ["user", "assistant", "user"],
+        "question, answer, repair request: {repair:?}"
+    );
+}
+
+/// `AI-17` review fix (BLOCKER 2): the iteration-budget path runs the same
+/// check. `MAX_ITER` (8) rounds that call a tool, then a final answer with a
+/// CJK character, then the rewrite: ten requests in all.
+#[tokio::test]
+async fn a_final_answer_after_the_tool_call_limit_with_a_cjk_character_is_replaced_by_its_clean_rewrite()
+ {
+    let mut rounds: Vec<Value> = (1..=8)
+        .map(|n| model_round(None, &[(&format!("call_{n}"), "no_such_tool", "{}")]))
+        .collect();
+    rounds.push(model_round(Some("Total kunjungan adalah 吸引力."), &[]));
+    rounds.push(model_round(Some("Total kunjungan tercatat."), &[]));
+    let llm = mock_model(rounds).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["answer"], "Total kunjungan tercatat.",
+        "the clean rewrite is the reply: {body}"
+    );
+    assert_eq!(body["note"], "tool-call limit reached", "{body}");
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 10,
+        "eight tool rounds, the final answer, one rewrite: {model_calls}"
+    );
+    // `AI-17` review fix round 2 (BLOCKER): the rewrite request follows the
+    // answer it asks about. Before the fix the answer was never pushed, so
+    // the request came right after "Give your final answer now" and the model
+    // was asked to rewrite an answer it had not seen.
+    let rewrite_round = model_request_messages(&llm, 9).await;
+    let tail: Vec<(&str, &str)> = rewrite_round[rewrite_round.len() - 3..]
+        .iter()
+        .map(|(role, content)| (role.as_str(), content.as_str()))
+        .collect();
+    assert_eq!(
+        tail.iter().map(|(role, _)| *role).collect::<Vec<_>>(),
+        ["user", "assistant", "user"],
+        "final-answer request, the CJK answer, the rewrite request: {tail:?}"
+    );
+    assert_eq!(tail[1].1, "Total kunjungan adalah 吸引力.", "{tail:?}");
+}
+
+/// `AI-17` review fix round 2 (optional item): the rewrite round offers no
+/// tools, so a structured tool call in its reply has no tool result to
+/// follow it. The message kept for the repair round carries none.
+#[tokio::test]
+async fn a_clean_rewrite_that_carries_a_tool_call_is_kept_for_the_repair_round_without_it() {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(
+            Some("Total kunjungan adalah 48213."),
+            &[("call_x", "no_such_tool", "{}")],
+        ),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["answer"], "Total kunjungan tercatat.", "{body}");
+    let requests = llm.received_requests().await.expect("recording is on");
+    assert_eq!(requests.len(), 3, "answer, rewrite, repair");
+    let repair: Value = serde_json::from_slice(&requests[2].body).expect("a JSON request");
+    let kept = repair["messages"]
+        .as_array()
+        .expect("a messages array")
+        .iter()
+        .find(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("Total kunjungan adalah 48213."))
+        })
+        .expect("the rewrite is in the repair round");
+    assert!(
+        kept.get("tool_calls").is_none_or(Value::is_null),
+        "the kept rewrite has no tool call: {kept}"
+    );
+}
+
+/// `AI-17` review fix (SHOULD-FIX 2): a streaming client clears its draft
+/// only on a `status` or `tool` event, so the rewrite round sends a status
+/// before the model writes, or its deltas would be appended to the CJK
+/// answer's text.
+#[tokio::test]
+async fn a_streamed_rewrite_round_announces_itself_with_a_status_event_before_its_deltas() {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+    let body = json!({
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Berapa total kunjungan?" }],
+    });
+
+    let (status, bytes) = post_chat(&llm, &ch, "true", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let events: Vec<Value> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("every line is one JSON event"))
+        .collect();
+    let rewrite_delta = events
+        .iter()
+        .position(|e| e["type"] == "delta" && e["text"] == "Total kunjungan tercatat.")
+        .unwrap_or_else(|| panic!("the rewrite streams as a delta: {events:?}"));
+    let status_before = events[..rewrite_delta]
+        .iter()
+        .rposition(|e| e["type"] == "status");
+    let first_answer_delta = events
+        .iter()
+        .position(|e| e["type"] == "delta")
+        .expect("the first answer streams");
+    assert!(
+        status_before.is_some_and(|s| s > first_answer_delta),
+        "a status event sits between the first answer's text and the rewrite's: {events:?}"
+    );
+    assert_eq!(
+        events.last().expect("events")["body"]["answer"],
+        "Total kunjungan tercatat.",
+        "{events:?}"
+    );
 }
