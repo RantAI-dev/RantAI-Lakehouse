@@ -231,26 +231,80 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
-/// One cached discovery read: the `jwks_uri` a provider's discovery
-/// document named, with the time it was read (`SEC-38`). Cached for the
-/// same [`JwksClient::ttl`] as the key set itself, per the plan's decision
-/// 2 — a discovery document is no more trustworthy for longer than the
-/// keys it points at.
+/// The addresses an `OpenID Connect` Discovery 1.0 document names that a
+/// caller needs: where a person is sent to sign in, where an authorization
+/// code is exchanged, and where the signing keys live (`SEC-38`; `ADM-12`
+/// D10 extends the read this module already had to all three).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcEndpoints {
+    /// The provider's authorization endpoint (`authorization_endpoint`).
+    pub authorization_endpoint: String,
+    /// The provider's token endpoint (`token_endpoint`).
+    pub token_endpoint: String,
+    /// The key set's absolute URL (`jwks_uri`).
+    pub jwks_uri: String,
+}
+
+/// One cached discovery read: the document a provider served, with the
+/// time it was read (`SEC-38`). Cached for the same [`JwksClient::ttl`] as
+/// the key set itself, per the plan's decision 2 — a discovery document is
+/// no more trustworthy for longer than the keys it points at.
 struct CachedDiscovery {
-    url: String,
+    document: DiscoveryDocument,
     fetched_at: Instant,
 }
 
 /// The subset of an `OpenID Connect` Discovery 1.0 document this module
-/// reads (`SEC-38`, section 4). Unknown members are ignored, as the
+/// reads (`SEC-38`, section 4; `ADM-12` D10 adds the two endpoints a
+/// browser sign-in needs). Unknown members are ignored, as the
 /// specification allows a provider to add its own.
-#[derive(Debug, Deserialize)]
+///
+/// The two endpoints are optional in the parse, not because a document may
+/// omit them in practice, but so a document that does is refused only by
+/// the caller that needs them ([`Self::endpoints`]): the bearer-token path
+/// needs nothing but `jwks_uri` and must not start failing because a
+/// provider's document is thin.
+#[derive(Debug, Clone, Deserialize)]
 struct DiscoveryDocument {
     /// The issuer identifier the provider claims. Trusted only when it
     /// equals the configured issuer exactly (discovery section 4.3).
     issuer: String,
+    /// The authorization endpoint's absolute URL.
+    #[serde(default)]
+    authorization_endpoint: Option<String>,
+    /// The token endpoint's absolute URL.
+    #[serde(default)]
+    token_endpoint: Option<String>,
     /// The key set's absolute URL.
     jwks_uri: String,
+}
+
+impl DiscoveryDocument {
+    /// The three addresses a browser sign-in needs, in one value. The
+    /// issuer check has already passed by the time this is called; a
+    /// document that names fewer than all three cannot send a person
+    /// anywhere, so it is refused here rather than half-filled.
+    fn endpoints(&self) -> Result<OidcEndpoints, AuthError> {
+        let Some(authorization_endpoint) = self.authorization_endpoint.clone() else {
+            tracing::warn!(
+                reason = "discovery document names no authorization_endpoint",
+                "OIDC discovery refused"
+            );
+            return Err(AuthError::InvalidCredentials);
+        };
+        let Some(token_endpoint) = self.token_endpoint.clone() else {
+            tracing::warn!(
+                reason = "discovery document names no token_endpoint",
+                "OIDC discovery refused"
+            );
+            return Err(AuthError::InvalidCredentials);
+        };
+        Ok(OidcEndpoints {
+            authorization_endpoint,
+            token_endpoint,
+            jwks_uri: self.jwks_uri.clone(),
+        })
+    }
 }
 
 /// Where a [`JwksClient`] learns the key set's address from.
@@ -366,32 +420,41 @@ impl JwksClient {
             .map_err(|_| AuthError::InvalidCredentials)
     }
 
-    /// The `jwks_uri` from the cached discovery document, but only if it is
-    /// still within [`Self::ttl`] — the mirror of [`Self::cached_key`].
-    fn cached_discovery_url(&self) -> Option<String> {
+    /// The document from the cache, but only if it is still within
+    /// [`Self::ttl`] — the mirror of [`Self::cached_key`].
+    fn cached_document(&self) -> Option<DiscoveryDocument> {
         let guard = self.discovery.read().ok()?;
         let cached = guard.as_ref()?;
         if cached.fetched_at.elapsed() >= self.ttl {
             return None;
         }
-        Some(cached.url.clone())
+        Some(cached.document.clone())
     }
 
-    /// Read `issuer`'s discovery document and return its `jwks_uri`.
+    /// Read `issuer`'s discovery document.
     ///
     /// The document is trusted only when its own `issuer` equals `issuer`
-    /// exactly (Discovery 1.0 section 4.3) and `jwks_uri` is an absolute
-    /// `https` URL (`http` only when the issuer itself is `http`, i.e. a
-    /// local test provider such as `ops/oidc-mock`). Each refusal logs
-    /// which check failed, by name only — the provider's text never
+    /// exactly (Discovery 1.0 section 4.3) and each endpoint it names is an
+    /// absolute `https` URL (`http` only when the issuer itself is `http`,
+    /// i.e. a local test provider such as `ops/oidc-mock`). Each refusal
+    /// logs which check failed, by name only — the provider's text never
     /// becomes a response, and its document is never echoed into a log
     /// line.
     ///
     /// The issuer and the document are administrator configuration, never
     /// request input, so the connector address allowlist does not apply
     /// here — the same reasoning `crate::openfga`'s module doc gives for
-    /// its own dialer.
-    async fn discover(&self, issuer: &str) -> Result<String, AuthError> {
+    /// its own dialer. A console-set issuer's addresses are checked
+    /// against that allowlist by the caller (`lakehouse-api`'s
+    /// `runtime_settings`), which is the layer that knows the deployment's
+    /// internal networks (`ADM-12` D10).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::InvalidCredentials`] when the document cannot
+    /// be read or parsed, names a different issuer, or names an endpoint
+    /// that is not an absolute URL this module may use.
+    async fn discover(&self, issuer: &str) -> Result<DiscoveryDocument, AuthError> {
         let document_url = format!("{}{DISCOVERY_PATH}", issuer.trim_end_matches('/'));
         let document: DiscoveryDocument = self.get_json(&document_url).await.inspect_err(|_| {
             tracing::warn!(
@@ -408,21 +471,55 @@ impl JwksClient {
             );
             return Err(AuthError::InvalidCredentials);
         }
-        if !jwks_uri_is_allowed(&document.jwks_uri, issuer) {
-            tracing::warn!(
-                issuer = %issuer,
-                reason = "discovery jwks_uri is not an absolute https URL",
-                "OIDC discovery refused"
-            );
-            return Err(AuthError::InvalidCredentials);
+        let mut endpoints = vec![("jwks_uri", document.jwks_uri.as_str())];
+        if let Some(ref url) = document.authorization_endpoint {
+            endpoints.push(("authorization_endpoint", url.as_str()));
+        }
+        if let Some(ref url) = document.token_endpoint {
+            endpoints.push(("token_endpoint", url.as_str()));
+        }
+        for (name, url) in endpoints {
+            if !endpoint_is_allowed(url, issuer) {
+                tracing::warn!(
+                    issuer = %issuer,
+                    endpoint = name,
+                    reason = "discovery endpoint is not an absolute https URL",
+                    "OIDC discovery refused"
+                );
+                return Err(AuthError::InvalidCredentials);
+            }
         }
         if let Ok(mut guard) = self.discovery.write() {
             *guard = Some(CachedDiscovery {
-                url: document.jwks_uri.clone(),
+                document: document.clone(),
                 fetched_at: Instant::now(),
             });
         }
-        Ok(document.jwks_uri)
+        Ok(document)
+    }
+
+    /// `issuer`'s discovery document, from the cache when it is still
+    /// within [`Self::ttl`]. `refresh_discovery` forces a fresh read — the
+    /// unknown-`kid` path in [`Self::key_for`].
+    async fn document(
+        &self,
+        issuer: &str,
+        refresh_discovery: bool,
+    ) -> Result<DiscoveryDocument, AuthError> {
+        if !refresh_discovery && let Some(document) = self.cached_document() {
+            return Ok(document);
+        }
+        self.discover(issuer).await
+    }
+
+    /// `issuer`'s three endpoints (`ADM-12` D10), refused when the
+    /// document names fewer than all three.
+    async fn endpoints(
+        &self,
+        issuer: &str,
+        refresh_discovery: bool,
+    ) -> Result<OidcEndpoints, AuthError> {
+        self.document(issuer, refresh_discovery).await?.endpoints()
     }
 
     /// The address this client reads the key set from. `refresh_discovery`
@@ -432,12 +529,10 @@ impl JwksClient {
     async fn jwks_url(&self, refresh_discovery: bool) -> Result<String, AuthError> {
         match &self.source {
             JwksSource::Fixed(url) => Ok(url.clone()),
-            JwksSource::Discovery { issuer } => {
-                if !refresh_discovery && let Some(url) = self.cached_discovery_url() {
-                    return Ok(url);
-                }
-                self.discover(issuer).await
-            }
+            JwksSource::Discovery { issuer } => self
+                .document(issuer, refresh_discovery)
+                .await
+                .map(|document| document.jwks_uri),
         }
     }
 
@@ -519,15 +614,16 @@ impl JwksClient {
     }
 }
 
-/// Whether a discovery document's `jwks_uri` may be used (`SEC-38`,
-/// decision 3): it must be an absolute URL with a host, served over
+/// Whether a discovery document's endpoint may be used (`SEC-38`,
+/// decision 3; `ADM-12` D10 applies the same rule to the authorization and
+/// token endpoints): it must be an absolute URL with a host, served over
 /// `https` — or over `http` only when the configured issuer is itself
 /// `http`, which is how this repository's local test providers
 /// (`ops/oidc-mock`, Keycloak on the compose network) are reached. A
-/// document that arrived over `https` therefore never downgrades its key
-/// set to plaintext.
-fn jwks_uri_is_allowed(jwks_uri: &str, issuer: &str) -> bool {
-    let Ok(parsed) = Url::parse(jwks_uri) else {
+/// document that arrived over `https` therefore never downgrades any
+/// endpoint to plaintext.
+fn endpoint_is_allowed(url: &str, issuer: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
         return false;
     };
     if parsed.host_str().is_none() {
@@ -724,6 +820,27 @@ impl OidcAuthenticator {
     #[must_use]
     pub fn config(&self) -> &OidcConfig {
         &self.config
+    }
+
+    /// The provider's discovery document's three endpoints (`SEC-38`;
+    /// `ADM-12` D10): where a person signs in, where a code is exchanged,
+    /// and where the signing keys live.
+    ///
+    /// Reads through the same cached discovery read the key set uses — one
+    /// HTTP client, one cache, one parser (rule 4), whichever key-set
+    /// address the config names. The addresses are returned as the
+    /// document names them; the caller that must enforce a deployment's
+    /// own address policy does so on the returned values, before sending
+    /// anything to them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::InvalidCredentials`] for the reasons
+    /// [`JwksClient`]'s discovery read documents: the document cannot be
+    /// read, names another issuer, or names an endpoint this module may
+    /// not use.
+    pub async fn discovery_endpoints(&self) -> Result<OidcEndpoints, AuthError> {
+        self.jwks.endpoints(&self.config.issuer, false).await
     }
 
     /// Build an authenticator with an explicit [`JwksClient`] — the seam
@@ -1169,28 +1286,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_discovery_jwks_uri_must_be_absolute_and_not_downgrade_https() {
-        // `SEC-38`, decision 3. A wiremock server can only serve over
-        // plaintext `http`, so the `http`-under-`https` refusal is checked
-        // here, on the pure rule, rather than through a discovered
+    fn a_discovery_endpoint_must_be_absolute_and_not_downgrade_https() {
+        // `SEC-38`, decision 3; `ADM-12` D10 extends the rule to every
+        // endpoint the document names. A wiremock server can only serve
+        // over plaintext `http`, so the `http`-under-`https` refusal is
+        // checked here, on the pure rule, rather than through a discovered
         // document.
-        assert!(jwks_uri_is_allowed(
+        assert!(endpoint_is_allowed(
             "https://keys.example/jwks",
             "https://issuer.example"
         ));
-        assert!(jwks_uri_is_allowed(
+        assert!(endpoint_is_allowed(
             "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/certs",
             "http://keycloak:8080/realms/lakehouse"
         ));
-        assert!(!jwks_uri_is_allowed(
+        assert!(!endpoint_is_allowed(
             "http://keys.example/jwks",
             "https://issuer.example"
         ));
-        assert!(!jwks_uri_is_allowed("/jwks", "https://issuer.example"));
-        assert!(!jwks_uri_is_allowed(
+        assert!(!endpoint_is_allowed("/jwks", "https://issuer.example"));
+        assert!(!endpoint_is_allowed(
             "file:///etc/passwd",
             "https://issuer.example"
         ));
+    }
+
+    /// `ADM-12` D10: the discovery document's three addresses are read
+    /// into one value, and an unknown member is ignored as Discovery 1.0
+    /// allows (`SEC-38`). A document that names fewer than all three is
+    /// refused when the endpoints are asked for.
+    #[test]
+    fn a_discovery_document_yields_all_three_endpoints() {
+        let document: DiscoveryDocument = serde_json::from_value(serde_json::json!({
+            "issuer": "https://issuer.example",
+            "authorization_endpoint": "https://issuer.example/authorize",
+            "token_endpoint": "https://issuer.example/token",
+            "jwks_uri": "https://issuer.example/jwks",
+            "one_the_provider_added": "ignored",
+        }))
+        .expect("a discovery document naming all three endpoints");
+        assert_eq!(
+            document.endpoints().expect("all three endpoints"),
+            OidcEndpoints {
+                authorization_endpoint: "https://issuer.example/authorize".to_owned(),
+                token_endpoint: "https://issuer.example/token".to_owned(),
+                jwks_uri: "https://issuer.example/jwks".to_owned(),
+            }
+        );
+
+        let thin: DiscoveryDocument = serde_json::from_value(serde_json::json!({
+            "issuer": "https://issuer.example",
+            "jwks_uri": "https://issuer.example/jwks",
+        }))
+        .expect("a document that names only the key set");
+        assert!(
+            thin.endpoints().is_err(),
+            "a document with no sign-in endpoints cannot send anyone anywhere"
+        );
     }
 
     /// `SEC-39`, decision 1: `_claim_names` naming the configured groups
