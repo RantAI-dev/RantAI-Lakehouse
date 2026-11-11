@@ -345,6 +345,57 @@ Audited `ops/` and `dagster/` and confirmed no automated background callers are 
 
 not verified locally: remaining `lakehouse-api` `--test <name>` binaries and workspace bun test suite, left to CI per planner instruction.
 
+### Handoff (developer, 2026-11-11, round 2 fixes)
+
+#### Commits
+- `50843d09` — `fix(home): status line names only the checks that were made (ADM-13 review round 2, R2-B1)`
+- `0d08d978` — `docs(operations): the Roles page is the way, custom roles that already held one (ADM-13 review round 2, R2-S1)`
+- (this commit) — `docs(plan): developer handoff for ADM-13 round 2 fixes (ADM-13 review round 2, R2-S2)`
+
+#### What changed
+- **R2-B1** — `src/lib/home-status.ts`: `HomeStatusInput`'s four checks are optional;
+  `homeStatus` builds `NamedCheck` entries only for the checks passed in and returns
+  `null` when there are none. A check that was not passed is named nowhere and does not
+  hold the line in `loading`. `src/features/home/home-page.tsx`: `HomePage` passes a
+  check only when `canPipelines`, `canAlerts`, `canConnectors` or `canCatalog` allows the
+  page (the `state: … : "ok"` branches are gone), `StatusLine` takes `HomeStatus | null`
+  and returns `null` for it, and the catalog `useService` resolves to `null` when the
+  read is not made (the `as unknown as OverviewSummary` cast is gone). Tests:
+  `src/lib/home-status.test.ts` covers no checks → `null`, alerts alone → alerts only,
+  and loading only among the checks made; `src/features/home/home-page.test.tsx` covers
+  an `assistant:ask,dashboard:read` user (no status line, none of the four sentences)
+  and the same user with `alert:read` (a line whose tooltip is `no open alerts`).
+- **R2-S1** — `docs/OPERATIONS.md`, "How to take the assistant away from a role": the
+  "Via SQL" option and its `UPDATE role …` block are removed; the section now points at
+  **Administration → Roles**. The custom-roles sentence reads "unless they held `*:*`
+  or already held one of the four".
+
+#### Files in `git diff --stat 30b735e1..HEAD`
+```
+ docs/OPERATIONS.md                   |  21 ++-----
+ src/features/home/home-page.test.tsx | 113 +++++++++++++++++++++++++----------
+ src/features/home/home-page.tsx      |  36 +++++++----
+ src/lib/home-status.test.ts          |  53 +++++++++++++---
+ src/lib/home-status.ts               |  57 ++++++++++++++----
+ 5 files changed, 202 insertions(+), 78 deletions(-)
+```
+
+#### Exact commands and counts verified (foreground)
+- `bun install --frozen-lockfile`: 678 packages installed (exit 0).
+- `bun run typecheck`: passed (exit 0, no diagnostics).
+- `bun run lint`: passed (0 errors, 10 warnings; none of the warnings is in the four
+  TypeScript files this slice touched — they are in `data-table.tsx`, `sidebar.tsx`,
+  `alerts-page.tsx`, `login-page.tsx`, `use-copilot.ts`, `use-data-table.ts`,
+  `dashboard-specs.ts`, `uploads.test.ts` and `http.ts`).
+- `bun test src/lib/home-status.test.ts src/features/home`: 12 passed, 0 failed,
+  21 `expect()` calls, 2 files (1.28 s).
+
+No Rust, Python, Dagster or compose file changed, so no such check was run. The
+documentation commit changed only Markdown and ran no check.
+
+not verified locally: the rest, left to CI (`bun run test` in full, `cargo` workspace
+and the compose config check).
+
 ## 6. Review (planner)
 
 ### Round 1 (planner, 2026-11-11) — branch at `3497f25e`
