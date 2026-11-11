@@ -472,6 +472,11 @@ about non-assistant surfaces, where `assistant:use` is not what the person means
   (`list_boards`, `create_alert_rule` digest, the four chart tools, `list_charts`,
   the calculated-field tools) hold `assistant:use` besides their
   `dashboard:read`/`dashboard:write`/`query:read`/`alert:write` permissions.
+  Four of them were red in the run; the fifth,
+  `the_assistant_does_not_resolve_a_hidden_sql_source_either`, was green for
+  the wrong reason — both its calls were refused with the same 403, so the
+  hidden answer equalled the unknown one and its "no `SELECT 1`" assertion
+  passed vacuously. It is meaningful again with the route floor satisfied.
 - `ops_workloads` — `the_workloads_route_answers_200_with_the_documented_fields`
   reads `GET /api/ops/workloads` as a person holding `ops:read` only (was a
   zero-permission principal); the route's stale "RequiresAuth" comment is
