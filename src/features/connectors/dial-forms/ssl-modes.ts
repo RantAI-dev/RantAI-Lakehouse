@@ -1,13 +1,18 @@
 /**
- * The TLS modes a connection form offers (`WEB-8` D8, spec `web-8.md`):
+ * The TLS modes connection forms offer (`WEB-8` D8, spec `web-8.md`):
  * a closed list per adapter instead of a free-text field, because the mode
  * string is the adapter's own vocabulary and a typo in it is silently
  * ignored by the driver.
  *
- * They were private to `cdc-dial-form.tsx`; the batch SQL and Oracle forms
- * offer the same lists now, so one module owns them (rule 4). `disable` is
- * always labelled as not encrypted: it is a deliberate choice, never
- * something a person can pick by accident (`SEC-14`).
+ * They were private to `cdc-dial-form.tsx`; the Oracle form offers
+ * `ORACLE_SSL_MODES` too, so one module owns them (rule 4). The batch SQL
+ * form does **not** offer a list: `WEB-8 S2 review round 1, B1` found that
+ * no loader for the drivers it serves (PostgreSQL, MySQL/MariaDB, SQL
+ * Server) reads `sslMode`, so a list there would claim a guarantee the
+ * load does not make — that form's field is free text with a help line
+ * saying so. `disable` is always labelled as not encrypted: it is a
+ * deliberate choice, never something a person can pick by accident
+ * (`SEC-14`).
  */
 export type SslModeOption = { value: string; label: string }
 

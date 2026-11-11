@@ -344,16 +344,6 @@ describe("dial forms", () => {
   })
 })
 
-// WEB-8 D8: the SSL mode is the adapter's own closed list, not free text.
-/** base-ui's Select commits on the pointer sequence, not on a bare click. */
-function pickOption(option: HTMLElement) {
-  fireEvent.pointerDown(option, { button: 0, pointerType: "mouse" })
-  fireEvent.mouseDown(option, { button: 0 })
-  fireEvent.pointerUp(option, { button: 0, pointerType: "mouse" })
-  fireEvent.mouseUp(option, { button: 0 })
-  fireEvent.click(option)
-}
-
 const sqlDial = (over: { sslMode?: string | null } = {}) => ({
   driver: "postgres" as const,
   host: "h",
@@ -364,45 +354,32 @@ const sqlDial = (over: { sslMode?: string | null } = {}) => ({
   ...over,
 })
 
-describe("the SSL mode pickers (WEB-8 D8)", () => {
-  it("SqlDialForm offers the adapter's modes and a Default that sends nothing", async () => {
-    const onChange = mock()
-    render(<SqlDialForm value={sqlDial()} onChange={onChange} driver="postgres" />)
-    const trigger = screen.getByRole("combobox", { name: "SSL mode (optional)" })
-    // The blank has always meant "no mode": the field says so, it does not guess one.
-    expect(trigger.textContent).toContain("Default (no mode sent)")
-    fireEvent.click(trigger)
-    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
-      "Default (no mode sent)",
-      "Require (encrypted, certificate not checked)",
-      "Verify CA",
-      "Verify CA and host name",
-      "Disable (not encrypted)",
-    ])
+describe("the SSL mode fields (WEB-8 D8; S2 review round 1, B1)", () => {
+  it("SqlDialForm's SSL mode stays free text because no batch loader for its drivers reads it", () => {
+    render(<SqlDialForm value={sqlDial()} onChange={mock()} driver="postgres" />)
+    const field = screen.getByLabelText("SSL mode (optional)") as HTMLInputElement
+    // WEB-8 S2 review round 1, B1: the change-capture modes were offered here
+    // with labels the batch loaders do not honour, so the field is the text
+    // input the API's `SqlDial::ssl_mode: Option<String>` takes.
+    expect(field.tagName).toBe("INPUT")
+    expect(field.value).toBe("")
+    expect(screen.getByText(/do not\s+read this value/)).toBeDefined()
   })
 
-  it("SqlDialForm sends the picked mode, and no mode at all when Default is picked", async () => {
+  it("SqlDialForm sends the mode as typed, and null when the field is cleared", () => {
     const onChange = mock()
     const { rerender } = render(<SqlDialForm value={sqlDial()} onChange={onChange} driver="postgres" />)
-    fireEvent.click(screen.getByRole("combobox", { name: "SSL mode (optional)" }))
-    pickOption(await screen.findByRole("option", { name: "Disable (not encrypted)" }))
-    expect(onChange.mock.calls.at(-1)?.[0]).toMatchObject({ sslMode: "disable" })
+    fireEvent.change(screen.getByLabelText("SSL mode (optional)"), { target: { value: "verify-full" } })
+    expect(onChange.mock.calls.at(-1)?.[0]).toMatchObject({ sslMode: "verify-full" })
 
-    rerender(<SqlDialForm value={sqlDial({ sslMode: "disable" })} onChange={onChange} driver="postgres" />)
-    fireEvent.click(screen.getByRole("combobox", { name: "SSL mode (optional)" }))
-    pickOption(await screen.findByRole("option", { name: "Default (no mode sent)" }))
+    rerender(<SqlDialForm value={sqlDial({ sslMode: "require" })} onChange={onChange} driver="postgres" />)
+    fireEvent.change(screen.getByLabelText("SSL mode (optional)"), { target: { value: "" } })
     expect(onChange.mock.calls.at(-1)?.[0]).toMatchObject({ sslMode: null })
   })
 
-  it("SqlDialForm shows a stored value that is not one of the modes and keeps it", () => {
+  it("SqlDialForm shows the stored mode and keeps it untouched", () => {
     render(<SqlDialForm value={sqlDial({ sslMode: "prefer" })} onChange={mock()} driver="postgres" />)
-    const trigger = screen.getByRole("combobox", { name: "SSL mode (optional)" })
-    expect(trigger.textContent).toContain("prefer (not one of the listed modes)")
-    // It is offered back, so opening and closing the list cannot drop it.
-    fireEvent.click(trigger)
-    expect(screen.getAllByRole("option").map((o) => o.textContent)).toContain(
-      "prefer (not one of the listed modes)"
-    )
+    expect((screen.getByLabelText("SSL mode (optional)") as HTMLInputElement).value).toBe("prefer")
   })
 
   it("OracleDialForm offers only the two modes its driver can honour, plus Default", async () => {
