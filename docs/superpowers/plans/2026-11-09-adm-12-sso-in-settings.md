@@ -374,6 +374,128 @@ was read.
 integration binaries, and the console's other suites were not run (AGENTS.md:
 scoped checks per commit; CI runs the full suite on the PR).
 
+### Handoff (developer, 2026-11-11, round 2 fixes)
+
+Base `01b38fde` (the round 2 review), plus `origin/main` at `49781423` (which
+brings `ADM-13`, #454, to `4189c0b1`). Branch `feat/adm-12-oidc-in-settings`,
+pushed after every commit.
+
+| Commit | What |
+| --- | --- |
+| `1c7ecbd8` | Merge `origin/main` into the branch (R2-S4). |
+| `31af6c4d` | The authenticator and sign-in readiness are two facts (R2-B1). |
+| `312d4796` | The Deployment page names the SSO connection as the console does (R2-B2). |
+| `beea6246` | The runtime is built outside the lock; a ready one is kept 10 minutes (R2-S1). |
+| `6022c9f8` | Console: `noopener,noreferrer`, `emailVerified`/`overage`, `useService` (R2-S2, R2-S3). |
+| this commit | This handoff. |
+
+**Each finding**
+
+- **R2-B1 — closed.** `SwappableOidc` now documents and keeps two facts
+  apart. `authenticator` is `Some` whenever the issuer and the client ID are
+  set — for a server-owned connection (`.env`) without the three sign-in
+  addresses too, which is `main`'s behaviour — and
+  `runtime_settings::oidc` (the bearer path in
+  `auth::AuthenticatedPrincipal`, and `get_deployment`) reads that one. New
+  `SwappableOidc::sign_in_authenticator` is the second fact (ready *and* an
+  authenticator) and is what `providers`, `oidc_start`, `oidc_callback` and
+  `handle_oidc_test_callback` take; `get_sso` keeps reading
+  `not_ready_reason`. A server-owned connection missing an address reports
+  `SsoNotReady::ServerAddressesMissing` while keeping its authenticator.
+  Tests: `routes::auth::tests::an_issuer_and_a_client_id_alone_report_no_sign_in_but_keep_the_authenticator`
+  (`oidc()` is `Some`, `providers` answers `oidc: false`) and
+  `routes::auth::tests::a_bearer_token_is_accepted_with_only_an_issuer_and_a_client_id`
+  (`#[sqlx::test]`; only `OIDC_ISSUER` and `OIDC_CLIENT_ID` set, a mock
+  provider's token, `GET /api/auth/me` → 200). The Deployment-page half is
+  `deployment_settings_route::every_feature_is_on_when_its_settings_are_in_place`,
+  which passes **unchanged**.
+  One interpretation to review: a *console-set* connection with no return
+  address still builds nothing, because the redirect gate stays ahead of the
+  discovery read in `build_sso_runtime` (round 1 behaviour, and what
+  `sso_settings_route::without_a_public_address_the_connection_is_not_ready_and_no_button_shows`
+  asserts: it must name `CONSOLE_PUBLIC_URL` before a provider is reached).
+  "The address checks passed" in the finding is read as "they were reached
+  and passed", which this shape satisfies; the finding's own tests are the
+  server-owned ones, which are the ones fixed.
+- **R2-B2 — closed.** `every_feature_is_off_and_names_what_is_missing` now
+  expects `missing: ["issuer", "clientId"], where: "console"` for
+  `singleSignOn`, with the why in the test and the commit (the connection is
+  saveable in Settings now, the same shape `consoleAddress` has). Only that
+  value changed.
+- **R2-S1 — closed.** `cached_or_build` reads the slot under the read lock
+  (`cached_runtime`), builds outside any lock, and stores under a short write
+  lock; when two requests build at once the newer runtime is kept.
+  `is_fresh` keeps a ready runtime for `READY_SSO_RUNTIME_TTL` (10 minutes; a
+  named constant whose comment records that the number is proposed in review
+  round 2) and a not-ready one for `SETTINGS_CACHE_TTL` (30 s). `put_sso`'s
+  clearing is unchanged. Tests, one per behaviour:
+  `runtime_settings::tests::a_ready_runtime_is_kept_for_ten_minutes` (aged
+  past 30 s: the same authenticator `Arc` and the same `built_at` come back),
+  `a_not_ready_runtime_is_retried_after_the_settings_ttl` (rebuilt, still not
+  ready, authenticator still present) and `a_save_clears_a_ready_runtime_at_once`
+  (the save's two invalidation lines, a different authenticator afterwards).
+- **R2-S2 — closed.** `window.open(url, "_blank", "noopener,noreferrer")` in
+  `sso-page.tsx`; test
+  `sso-page.test.tsx::opens the provider's page without an opener and without a referrer`.
+- **R2-S3 — closed.** The card shows `Email verified` and `Group overage`
+  (the second says "no group-based roles were applied" when true) and
+  "Not reported" for a claim the provider did not send; `SsoTestResult` in
+  `src/services/contracts/settings.ts` carries both. The result is read with
+  `useService` on `[ssoTestId]`, not an effect. Tests:
+  `the test result card shows emailVerified and overage` and
+  `the test result card says a claim the provider did not send was not reported`.
+- **R2-S4 — closed.** See the merge below.
+
+**The merge (R2-S4).** `git merge origin/main` was hunk-clean: no conflict
+markers, no `--ours`/`--theirs`. Both sides only add in the two files
+`ADM-13` touched, so every hunk kept both: `policy.rs` has the eight SSO
+rows and the ten `/api/ai/*` `RequiresAnyPermission` rows side by side, and
+`tests/route_auth.rs` keeps the ADM-13 assistant/pages tests beside the
+ADM-12 SSO test (87 tests). The merge commit's message records this. Migration
+`0134_sso_settings.sql` is unchanged; `main` ends at `0133_pages_per_role.sql`.
+The merged tree compiled (`check --all-targets`) and
+`--lib route_policy_tests` passed before the fix commits.
+
+**Commands run, with counts** (scoped; `cargo-locked`, from `rust/`,
+`sg docker` for the ones that need containers).
+
+- `cargo fmt --check`: clean (after every Rust commit).
+- `cargo-locked check -p lakehouse-api --all-targets`: clean, after the merge
+  and after the R2-B1 and R2-S1 edits.
+- `cargo-locked clippy -p lakehouse-auth -p lakehouse-api --all-targets -- -D warnings`:
+  clean (two runs; the first caught a `doc_markdown` backtick and an
+  `unchecked_time_subtraction` in the new tests, both fixed in place).
+- `--test route_auth`: 87 passed (after the merge; re-run after R2-B1/S1: 87).
+- `--test sso_settings_route`: 5 passed (after the merge, after R2-B1, after
+  R2-S1).
+- `--lib route_policy_tests`: 2 passed (after the merge).
+- `--test deployment_settings_route`: 6 passed + 1 failed (the R2-B2
+  expectation, before it was changed), then 7 passed.
+- `--lib routes::auth`: 88 passed (after R2-B1); `--lib routes::auth::tests`:
+  29 passed (after R2-S1).
+- `--lib routes::settings::`: 23 passed; `--lib auth::tests`: 56 passed;
+  `--lib runtime_settings`: 27 passed, then 30 passed with the three R2-S1
+  tests.
+- `--test sec11_guard`: 4 passed.
+- `bun install --frozen-lockfile`: 678 packages, lockfile unchanged.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 11 warnings (all
+  pre-existing, elsewhere).
+- `bun test src/features/admin`: 106 passed (was 103);
+  `bun test src/features/admin/sso-page.test.tsx`: 10 passed.
+
+**Compose.** Not changed this round (it was in round 1), so no `up` was run
+for it. Nothing this round touches `docker-compose.yml`.
+
+**Not verified locally: the rest, left to CI.** The full workspace
+`cargo test --workspace`, `cargo test --doc`, the other `lakehouse-api`
+integration binaries, the console's other suites, and `docker compose config`
+were not run: no compose edit this round and AGENTS.md scopes checks to what
+a commit touched.
+
+`git status --short`: empty. `git ls-remote --heads origin
+feat/adm-12-oidc-in-settings`:
+`6022c9f8918653c218cef1abfd03e51f29acce8b	refs/heads/feat/adm-12-oidc-in-settings`.
+
 
 ## 6. Review (planner)
 
