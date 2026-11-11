@@ -542,7 +542,7 @@ pub async fn namespaces(
     })
     .await
     .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
-    let mut names: Vec<String> = idents.iter().map(NamespaceIdent::to_url_string).collect();
+    let names: Vec<String> = idents.iter().map(NamespaceIdent::to_url_string).collect();
     // GOV-7 D6: which tables a role may read is Postgres's answer, asked once.
     let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
 

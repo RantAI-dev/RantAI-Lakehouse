@@ -971,21 +971,23 @@ impl Respond for CatalogFake {
             .lock()
             .expect("the statement log")
             .push(sql.clone());
+        // The catalog's own reads alias the columns (`database db`), so the
+        // fake answers with the names the real engine would send back.
         if sql.contains("FROM system.tables") {
             return rows(
-                &["database", "name", "engine"],
+                &["db", "name", "engine"],
                 &[
-                    json!({"database": "silver", "name": "visible_x", "engine": "MergeTree"}),
-                    json!({"database": "silver", "name": "hidden_x", "engine": "MergeTree"}),
+                    json!({"db": "silver", "name": "visible_x", "engine": "MergeTree"}),
+                    json!({"db": "silver", "name": "hidden_x", "engine": "MergeTree"}),
                 ],
             );
         }
         if sql.contains("FROM system.columns") {
             return rows(
-                &["database", "table", "n"],
+                &["db", "table", "n"],
                 &[
-                    json!({"database": "silver", "table": "visible_x", "n": "2"}),
-                    json!({"database": "silver", "table": "hidden_x", "n": "2"}),
+                    json!({"db": "silver", "table": "visible_x", "n": "2"}),
+                    json!({"db": "silver", "table": "hidden_x", "n": "2"}),
                 ],
             );
         }

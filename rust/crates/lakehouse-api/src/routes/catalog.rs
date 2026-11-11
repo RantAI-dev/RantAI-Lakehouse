@@ -309,8 +309,15 @@ pub async fn list(
                 });
                 // `DATA-41` D3: the count of every match, so a caller that
                 // asked for a few of them still knows how many there are.
+                // An unrestricted caller's count is the search's own (the
+                // index applied the limit after ranking); a narrowed one's is
+                // the visible matches it filtered above.
                 if let Some(limit) = limit {
-                    let total = assets.len();
+                    let total = if access.is_all() {
+                        outcome.total
+                    } else {
+                        assets.len()
+                    };
                     assets.truncate(limit);
                     body["assets"] = json!(assets);
                     body["total"] = json!(total);

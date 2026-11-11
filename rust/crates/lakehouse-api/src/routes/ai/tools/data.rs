@@ -497,7 +497,7 @@ pub(super) async fn list_datasets_with(
         .iter()
         .filter(|r| {
             let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
-            if !dataset_visible(&access, table) {
+            if !dataset_visible(access, table) {
                 return false;
             }
             let row_tier = r.get("tier").and_then(Value::as_str).unwrap_or("");
