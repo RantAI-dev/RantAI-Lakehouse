@@ -113,8 +113,12 @@ export const clickhouseAssetService: AssetService = {
   },
   async getAsset(id, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}`, { signal });
-    const json = await res.json();
-    if (!res.ok) throw new ServiceError("not_found", json?.error ?? "Asset not found");
+    // QA LH-DATA-13-03 / LH-DATA-15-03 F4 (plan D8): every failure used to
+    // be "not_found", so a down engine or a missing permission read as
+    // "Not found". The status picks the kind, and a body that is not JSON
+    // must not hide it.
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Asset not found");
     return json as AssetDetail;
   },
   async getAssetProfile(id, signal) {
