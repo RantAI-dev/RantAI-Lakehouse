@@ -63,6 +63,7 @@ use crate::routes::catalog_source::{self, ReadSource, SourceKind};
 use crate::routes::schema_versions;
 use crate::routes::support::{js_string, num_or_zero, prettify, str_col, upstream_message};
 use crate::state::AppState;
+use crate::upstream_error;
 
 use crate::tenant::{
     NAMESPACE_META, NAMESPACE_PRIMER, NAMESPACE_SEKUNDER, TENANT_DOMAIN, TENANT_OWNER,
@@ -1708,8 +1709,9 @@ fn build_namespaces(assets: &[Value]) -> Vec<Value> {
 ///
 /// Whatever `catalog_tenant_refusal` returns (a Postgres failure while
 /// counting tenants), or whatever `clickhouse_asset_detail`/
-/// `bronze_asset_detail` return: 404 for an unknown asset, otherwise the
-/// `ClickHouse` failure mapped through `ApiError`.
+/// `bronze_asset_detail` return: 404 for an unknown asset; for a Silver or
+/// Gold table the engine could not read, a `503` with a fixed message and a
+/// reference (QA LH-DATA-13-03, plan D8) rather than a 404.
 pub async fn detail(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2455,6 +2457,14 @@ async fn mark_schema_versions(ch: &ChClient, body: &mut Value, table_key: &str) 
     }
 }
 
+/// What a failed table read says on an asset page (QA LH-DATA-13-03, plan
+/// D8): fixed words, so no engine text reaches the response.
+const ASSET_DETAIL: upstream_error::Context = upstream_error::Context::new(
+    "asset detail",
+    "This table's details could not be read right now.",
+    "This table's details could not be read right now: the database is unavailable.",
+);
+
 async fn clickhouse_asset_detail(
     state: &AppState,
     principal: &Principal,
@@ -2468,9 +2478,22 @@ async fn clickhouse_asset_detail(
     }
 
     // No such table is the same 404 the old unguarded `SELECT *` failing
-    // used to produce.
-    let Ok(Some(source)) = catalog_source::clickhouse_source(ch, &db, &table).await else {
-        return Err(not_found());
+    // used to produce. QA LH-DATA-13-03 / LH-DATA-15-03 F4 (plan D8): an
+    // engine that cannot answer is not "no such table". It used to fold into
+    // the same 404, so an outage or a refusal read as "Not found"; it is now
+    // a `503` with a fixed message and a reference, and the engine's text
+    // goes to the log only (SEC-11).
+    let source = match catalog_source::clickhouse_source(ch, &db, &table).await {
+        Ok(Some(source)) => source,
+        Ok(None) => return Err(not_found()),
+        Err(e) => {
+            return Err(upstream_error::ch_error_as(
+                &ASSET_DETAIL,
+                &e,
+                upstream_error::FailedAs::ServiceUnavailable,
+            )
+            .into());
+        }
     };
     let (sample, masked) =
         governed_sample(state, principal, headers, Some(&source), DETAIL_SAMPLE_ROWS).await;
@@ -5292,6 +5315,63 @@ mod tests {
             let (status, body) = response_json(resp).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["supported"], json!(false));
+        }
+
+        /// QA LH-DATA-13-03 / LH-DATA-15-03 F4 (plan D8): an engine that
+        /// answers with a failure is "unavailable" (503, fixed message and a
+        /// reference), never the 404 of a table that does not exist, and the
+        /// engine's own text stays out of the body.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn detail_of_a_silver_table_says_unavailable_when_the_engine_fails(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(500)
+                        .set_body_string("Code: 999. DB::Exception: engine-internal-text"),
+                )
+                .mount(&ch)
+                .await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:read");
+
+            let resp = detail(
+                State(state),
+                Extension(member),
+                HeaderMap::new(),
+                Path("silver.some_table".to_owned()),
+            )
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+            let (status, body) = response_json(resp).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            let message = body["error"].as_str().unwrap_or_default();
+            assert!(message.contains("could not be read right now"), "{body}");
+            assert!(message.contains("Reference:"), "{body}");
+            assert!(!message.contains("engine-internal-text"), "{body}");
+        }
+
+        /// The other half of the same rule: a table the engine says it does
+        /// not have is still the plain 404.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn detail_of_a_silver_table_the_engine_does_not_have_is_still_404(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:read");
+
+            let resp = detail(
+                State(state),
+                Extension(member),
+                HeaderMap::new(),
+                Path("silver.no_such_table".to_owned()),
+            )
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+            let (status, _) = response_json(resp).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
         }
 
         async fn annotation_rows(pool: &lakehouse_store::PgPool, asset_id: &str) -> i64 {
