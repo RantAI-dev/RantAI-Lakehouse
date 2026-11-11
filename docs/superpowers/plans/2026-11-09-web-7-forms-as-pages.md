@@ -234,6 +234,49 @@ editor round trip is S2, not measured here.
 `git ls-remote --heads origin feat/web-7-s1-admin-forms`: the branch exists and points at the
 pushed head.
 
+### Handoff (developer, 2026-11-11, S1 round 1 fix)
+
+**Commits.** `a88b7237` (S2, the merge of `origin/main`, already on the branch) and `99ad77b1`
+(this fix). One commit for S1: the store change, its two callers, the new store test and the
+two page tests are one atomic change — the signature and both call sites cannot land apart.
+
+**Found in the checkout after the restart.** The earlier session's S1 work was uncommitted on
+`feat/web-7-s1-admin-forms` and touched only the files this task owns: `invite-password.ts`
+(modified), `invite-user-page.tsx`, `users-page.tsx` and the two `*.test.tsx` (modified), plus a
+new untracked `invite-password.test.ts`. Nothing else was dirty, the branch matched
+`origin/feat/web-7-s1-admin-forms` at `a88b7237`, and no pull was needed. I kept that work,
+checked it against the finding, and committed it. No stash, reset or deletion was performed.
+
+**What the fix does.** `rememberInvitePassword(value, userId, now = Date.now())` stores the
+value with the `/api/auth/me` id of the signed-in administrator and the clock reading;
+`takeInvitePassword(userId, now = Date.now())` hands it back only to that id and only when
+`now - rememberedAt <= INVITE_PASSWORD_TTL_MS`, and clears the module variable in every branch
+(other user, expired, nothing stored). `INVITE_PASSWORD_TTL_MS = 2 * 60_000` is a named
+constant documented as a proposed number from review round 1. The invite page takes the id from
+`useAuth()` and drops an unattributed password rather than leaving it for the next sign-in; the
+Users list asks for `user.id` in its mount effect, so a value left in the tab is cleared and not
+shown. Both clocks are defaulted parameters, so `invite-password.test.ts` moves time by
+injection and sleeps nowhere. The URL, `localStorage` and `sessionStorage` assertions are
+unchanged. The existing tests changed only by passing the reader's id (`"u1"`); no assertion was
+dropped or weakened — `invite-user-page.test.tsx` keeps its 32 invite assertions and
+`users-page.test.tsx` gains one test for the other-user case.
+
+**Commands run (foreground, this machine, `99ad77b1`)**
+
+- `bun install --frozen-lockfile` → `Checked 779 installs across 753 packages (no changes)`.
+- `bun run typecheck` → `$ bun --bun tsc --noEmit`, no output, exit 0.
+- `bun run lint` → exit 0, 10 problems (0 errors, 10 warnings), the same pre-existing set the
+  S1 handoff listed; a `grep` of the output for `features/admin` found none.
+- `bun test src/features/admin` → 117 pass, 0 fail, 1555 expect() calls, 20 files.
+- `bun test src/features/admin/invite-password.test.ts` → 4 pass, 0 fail, 6 expect() calls,
+  1 file.
+- `bun test src/components/app-shell` → 27 pass, 0 fail, 111 expect() calls, 4 files.
+
+**Not verified locally: the rest, left to CI.** `bun run test` (the whole suite) was not run on
+this machine; no cargo command was run (no Rust change); no compose check (no compose change).
+`git status --short` before the commit: exactly the six S1 files, the new test untracked; after
+it, clean apart from this handoff and then clean.
+
 
 ## 6. Review (planner)
 
