@@ -371,13 +371,10 @@ pub enum AssistantAccess {
 
 impl AssistantAccess {
     /// Decide assistant access from a principal.
+    // ADM-13 review round 1, S2: delegates to from_perms (one match helper).
     #[must_use]
     pub fn from_principal(principal: Option<&Principal>) -> Self {
-        match principal {
-            Some(p) if p.has("assistant:use") => Self::Full,
-            Some(p) if p.has("assistant:ask") => Self::AskOnly,
-            _ => Self::Full,
-        }
+        Self::from_perms(principal.map(|p| &p.permissions))
     }
 
     /// Decide assistant access from a permission set.
@@ -386,6 +383,10 @@ impl AssistantAccess {
         match perms {
             Some(p) if p.has("assistant:use") => Self::Full,
             Some(p) if p.has("assistant:ask") => Self::AskOnly,
+            // ADM-13 review round 1, S2: A caller with neither permission
+            // defaults to Full because the route gate already refused
+            // unauthenticated/unauthorized callers (RequiresAnyPermission(["assistant:use", "assistant:ask"]));
+            // headless runs (e.g. agents.rs) pass through here unchanged.
             _ => Self::Full,
         }
     }
@@ -397,10 +398,12 @@ impl AssistantAccess {
     }
 }
 
-/// ADM-13 (D6): Checks whether `principal` has read permission `perm` directly,
-/// or — for `query:read` and `catalog:read` — via `assistant:ask`.
-pub fn assistant_reads(principal: Option<&Principal>, perm: &str) -> bool {
-    let Some(p) = principal else {
+/// ADM-13 (D6), ADM-13 review round 1, S2: Checks whether `perms` has read permission
+/// `perm` directly, or — for `query:read` and `catalog:read` — via `assistant:ask`.
+/// Single helper used across gate.rs, registry.rs, and `data_map_access` in ai/mod.rs.
+#[must_use]
+pub fn assistant_reads(perms: Option<&lakehouse_auth::PermissionSet>, perm: &str) -> bool {
+    let Some(p) = perms else {
         return false;
     };
     if p.has(perm) {
@@ -429,9 +432,10 @@ enum MapAccess {
 /// `Principal::has` honours wildcards, so a `*:*` holder gets the full map.
 /// ADM-13 (D6): `assistant:ask` counts as `catalog:read` + `query:read` here.
 fn data_map_access(principal: Option<&Principal>) -> MapAccess {
-    if assistant_reads(principal, "catalog:read") && assistant_reads(principal, "query:read") {
+    let perms = principal.map(|p| &p.permissions);
+    if assistant_reads(perms, "catalog:read") && assistant_reads(perms, "query:read") {
         MapAccess::Full
-    } else if assistant_reads(principal, "catalog:read") {
+    } else if assistant_reads(perms, "catalog:read") {
         MapAccess::WithoutSamples
     } else {
         MapAccess::None

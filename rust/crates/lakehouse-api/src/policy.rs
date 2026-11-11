@@ -431,7 +431,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // own chart alert. `/api/alerts/run` below is the scheduler's door and is
     // unchanged — `check_run_token` still guards it (D4 not weakened).
     ("POST",   "/api/alerts/test",  Policy::RequiresAuth),
-    ("GET",    "/api/alerts/run",  Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
+    // ADM-13 review round 1, S3: GET /api/alerts/run is the scheduler's door
+    // (the same handler as POST /api/alerts/run, guarded by check_run_token),
+    // not a list; route policy is RequiresAuth as the floor.
+    ("GET",    "/api/alerts/run",   Policy::RequiresAuth),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
     // ── Gold export (ADR 0010, Rust/Phase-P6-only — no TypeScript route to

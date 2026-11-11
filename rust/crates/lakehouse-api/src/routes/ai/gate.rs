@@ -715,15 +715,12 @@ pub fn permission_granted(
     if spec.permission.is_empty() {
         return true;
     }
-    if perms.is_some_and(|p| p.has(spec.permission)) {
+    // ADM-13 (D6), ADM-13 review round 1, S2: use shared assistant_reads helper
+    // for query:read / catalog:read stand-in when holding assistant:ask.
+    if spec.risk == Risk::Read && super::assistant_reads(perms, spec.permission) {
         return true;
     }
-    // ADM-13 (D6): for a Risk::Read tool whose permission is query:read or catalog:read,
-    // holding assistant:ask also grants it.
-    if spec.risk == Risk::Read
-        && (spec.permission == "query:read" || spec.permission == "catalog:read")
-        && perms.is_some_and(|p| p.has("assistant:ask"))
-    {
+    if perms.is_some_and(|p| p.has(spec.permission)) {
         return true;
     }
     super::registry::reach_offers(spec.name, spec.permission, reach)
@@ -1359,13 +1356,13 @@ mod tests {
         assert_eq!(refused["required"], json!("dashboard:read"));
     }
 
-    /// A tool with an empty `permission` (`get_quality`: no narrower route
+    /// A tool with an empty `permission` (`get_query_limits`: no narrower route
     /// permission than `RequiresAuth`) is allowed for any authenticated
     /// principal, even one with no grants at all.
     #[test]
     fn empty_permission_tool_is_allowed_for_any_authenticated_principal() {
         let perms = PermissionSet::default();
-        let empty_perm_spec = spec("get_quality");
+        let empty_perm_spec = spec("get_query_limits");
         assert_eq!(empty_perm_spec.permission, "");
         assert_eq!(
             decide(true, Some(&perms), empty_perm_spec, &no_args()),
@@ -1514,7 +1511,10 @@ mod tests {
     /// behaves like "authenticated, no grants", not like Ask mode.
     #[test]
     fn absent_principal_is_allowed_empty_permission_tool() {
-        assert_eq!(decide(true, None, spec("get_quality"), &no_args()), None);
+        assert_eq!(
+            decide(true, None, spec("get_query_limits"), &no_args()),
+            None
+        );
     }
 
     /// [`strip_confirmed`] removes only the `confirmed` key, leaving every
