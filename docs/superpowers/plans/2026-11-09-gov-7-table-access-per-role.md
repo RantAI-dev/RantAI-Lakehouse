@@ -1106,3 +1106,22 @@ Read the fix (`0d21aaad`). Run by me at `9b6143d1`: `bun run typecheck` (pass),
 **No open BLOCKER and no open SHOULD-FIX.** The Rust suite and the whole `bun run test`
 were not run by me; #468 runs them. Merged only when #468 is green on its last commit, after
 #467.
+
+### S2, CI fix (planner, 2026-11-11) — branch at `d4ee9500`
+
+"Repo lints" was red on #468 at `34131e21`: the R11 guard matches text, and T8's new
+`bronze.` literal sat within its window of `PART_STATS_COLUMNS`, whose `count()` reads
+`system.parts`. A false positive, and mine to have prevented: the round 1 brief did not ask
+for the two repo lints.
+
+Read the fix (`749a8cfe`). Run by me at `d4ee9500`:
+`python3 ops/lint/check_bare_iceberg_count.py` and
+`python3 ops/lint/check_intra_package_imports.py` (both pass). Cargo: not run by me; #468
+runs it.
+
+- The guard and `PART_STATS_COLUMNS` are untouched (rule 2).
+- `bronze_table_key` is the one definition of the key, used by the list row, the detail body
+  and `ensure_asset_readable` (rule 4). An empty registry name keeps the outcome it had at
+  each site.
+
+**No open BLOCKER and no open SHOULD-FIX.**
