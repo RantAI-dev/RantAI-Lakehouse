@@ -442,3 +442,69 @@ owed (S7).
 - **S7. The next handoff owes** the D4 reader list, the compose `up` evidence (rule 8) and
   every command with its counts.
 
+### Round 2 (planner, 2026-11-11) — branch at `237aca35`
+
+Read the round 1 fixes on the server side (`runtime_settings.rs` `build_sso_runtime`,
+`cached_or_build`, `draft_sso_settings`, `pinned_client`; `routes/auth.rs`
+`handle_oidc_test_callback`; `state.rs`), skimmed the console (`sso-page.tsx`, its tests, the
+client), and read CI on #455. I ran no check locally.
+
+**Round 1, as the code stands**
+
+| Finding | State | Where |
+| --- | --- | --- |
+| B1 | Closed for a connection set in Settings; it broke a connection set in `.env` (R2-B1) | `build_sso_runtime` reads the three addresses from discovery, the redirect from `CONSOLE_PUBLIC_URL`; `ready`/`notReadyReason` |
+| B2 | Closed | `sso_runtime_for_settings(draft_sso_settings(..))`, never the cache |
+| B3 | Closed | Issuer and each discovery address pass `https://` and `resolve_checked` before an authenticator exists; a refusal builds none |
+| S1, S2, S4, S5 | Closed | Fixed sentences per cause; the run's own sealed secret; one builder |
+| S3, S6, S7 | Closed | Store role list; the form shows the reason; handoff with the reader list and the compose `up` |
+
+The developer's reported mismatch is accepted: a console issuer must be `https://`, the mock
+provider is plain, so the end-to-end tests are unit tests in `routes::auth` behind
+`tls_proxy::HttpsFront`, with `AppState::sso_http_override` behind `#[cfg(test)]`. The address
+checks still run; a service build cannot set the override.
+
+**BLOCKER**
+
+- **R2-B1. A connection set in `.env` lost its authenticator** (CI:
+  `deployment_settings_route::every_feature_is_on_when_its_settings_are_in_place`). On `main`
+  the authenticator exists whenever `OIDC_ISSUER` and `OIDC_CLIENT_ID` are set. Now
+  `build_sso_runtime` returns none for a server-owned connection that lacks
+  `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL` or `OIDC_REDIRECT_URI`. Two things read it:
+  - `src/auth.rs:98`, the bearer-token path: a deployment that sets only the issuer and the
+    client ID to accept bearer tokens now refuses every one of them;
+  - `routes/settings.rs:1167`, the Deployment page: it reports single sign-on off and names
+    `OIDC_ISSUER` and `OIDC_CLIENT_ID` as missing while both are set.
+
+  Two facts, kept apart:
+  - **the authenticator** exists whenever the issuer and the client ID are set (and, for a
+    console-set connection, the address checks passed), as on `main`;
+  - **ready for sign-in** additionally needs the authorize, token and redirect addresses.
+    `providers`, `oidc_start` and `GET /api/settings/sso` use this one.
+
+  The Deployment page keeps its meaning ("its settings are in place": issuer and client ID).
+  Tests: with only `OIDC_ISSUER` and `OIDC_CLIENT_ID` set, a bearer token is still accepted,
+  the Deployment page says on, and `providers` reports no OIDC.
+- **R2-B2. CI is red on two tests** of `tests/deployment_settings_route.rs`.
+  - `every_feature_is_on_when_its_settings_are_in_place`: R2-B1. The test does not change.
+  - `every_feature_is_off_and_names_what_is_missing` expects `missing: ["OIDC_ISSUER",
+    "OIDC_CLIENT_ID"], where: "server"` and gets `["issuer", "clientId"], "console"`. The new
+    answer is the right one now that the connection can be set in Settings (the same shape
+    `consoleAddress` has). Change the expectation and say why in the commit.
+
+**SHOULD-FIX**
+
+- **R2-S1. A working connection is rebuilt every 30 seconds, under the write lock.**
+  `cached_or_build` drops a ready runtime after `SETTINGS_CACHE_TTL` and rebuilds it while
+  holding `state.oidc`'s write lock: a discovery request (10 s timeout), four address
+  look-ups and a new key-set cache. The bearer-token path waits on that lock. Do the network
+  work outside the lock, and keep a ready runtime for 10 minutes *(proposed)*; a not-ready one
+  is still retried after 30 seconds.
+- **R2-S2. `window.open(res.authorizeUrl, "_blank")`** (`sso-page.tsx:199`) gives the page
+  being tested a handle on the console's tab. Pass `"noopener,noreferrer"`.
+- **R2-S3. The result card** shows `emailVerified` and `overage`, and the result is loaded
+  with `useService` like the rest of the form, not a bare call in an effect
+  (`sso-page.tsx:113`).
+- **R2-S4. Merge `origin/main`.** `ADM-13` (#454) changed `policy.rs` and
+  `tests/route_auth.rs`; resolve hunk by hunk. The migration stays `0134`.
+
