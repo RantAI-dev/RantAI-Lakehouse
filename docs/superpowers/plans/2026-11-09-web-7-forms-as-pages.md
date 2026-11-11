@@ -236,3 +236,35 @@ pushed head.
 
 
 ## 6. Review (planner)
+
+### S1, round 1 (planner, 2026-11-11) — branch at `5771aa14`
+
+Read: the access map entries (`nav-config.ts`), `form-page.tsx`, `invite-password.ts`, the
+service registration (`services/index.ts`, `clients/auth.ts`), and every new page's service
+calls and navigation. The form bodies are moved code; I checked that their tests moved with
+them (the seven invite tests are in `invite-user-page.test.tsx`, 32 assertions against 27
+removed from `users-page.test.tsx`; the other four forms likewise) rather than reading each
+field. I ran no check locally; the pull request (#461) runs the suite.
+
+- D1 to D4 are built as planned. Eight pages, each with a `ROUTE_ACCESS` entry that matches
+  the submit route in `policy.rs`; edit pages load by id; no feature imports a client.
+- T4 (D8) is rightly left for S2: `CreateSheet` still has the two Query Studio users.
+- The invite page reads the password rules through `authService`, which is the registry
+  doing its job, not a bypass.
+
+**No BLOCKER.**
+
+**SHOULD-FIX**
+
+- **S1. The shown-once password can outlive the person who made it.** `invite-password.ts`
+  keeps it in a module variable until the Users list takes it. Signing out is a
+  `router.push("/login")` (`auth-provider.tsx`), not a reload, so the variable survives it:
+  an administrator who invites, does not land on the list (a failed navigation, a quick click
+  elsewhere) and signs out leaves the password for whoever signs in next in that tab and
+  opens Users.
+  - `rememberInvitePassword` records who made it (the signed-in user's id) and when;
+    `takeInvitePassword(userId)` returns it only to the same user and only within two minutes
+    *(proposed)*, and clears it in every other case.
+  - Tests: another user gets nothing and the value is gone; an old value gets nothing.
+- **S2. Merge `origin/main`** (the branch is behind).
+
