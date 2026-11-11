@@ -630,3 +630,38 @@ checks still run; a service build cannot set the override.
 - **R2-S4. Merge `origin/main`.** `ADM-13` (#454) changed `policy.rs` and
   `tests/route_auth.rs`; resolve hunk by hunk. The migration stays `0134`.
 
+### Round 3 (planner, 2026-11-11) — branch at `0744cc34`
+
+Read the round 2 fixes (`1c7ecbd8..0744cc34`): `runtime_settings.rs` (`SwappableOidc`,
+`sign_in_authenticator`, `cached_or_build`, `is_fresh`, `build_sso_runtime`), the three call
+sites in `routes/auth.rs`, and the test change in `deployment_settings_route.rs`. I ran no
+check locally; #455 runs the suite.
+
+| Finding | State | Where |
+| --- | --- | --- |
+| R2-B1 | Closed | The authenticator exists for issuer and client ID; `sign_in_authenticator()` is the ready fact. Tests: bearer token accepted with only the two variables; `providers` reports no OIDC; the Deployment test passes unchanged |
+| R2-B2 | Closed | Only the expected `singleSignOn` value changed, with the reason |
+| R2-S1 | Closed for a connection that can sign in; see R3-S1 | Build outside the lock; ready kept ten minutes *(proposed)*; not ready retried after 30 seconds |
+| R2-S2, R2-S3 | Closed | `noopener,noreferrer`; `emailVerified` and `overage` on the card; `useService` |
+| R2-S4 | Closed | `main` merged; migration stays `0134` |
+
+The developer's flagged reading is accepted: a connection set in Settings with no
+`CONSOLE_PUBLIC_URL` builds nothing, and says so in `notReadyReason`. Its only use is
+sign-in.
+
+**No open BLOCKER.**
+
+**SHOULD-FIX**
+
+- **R3-S1. A bearer-only `.env` connection is rebuilt every 30 seconds.** `is_fresh` gives ten
+  minutes only to a runtime that is ready for sign-in. A server-owned connection with an
+  issuer and a client ID but no sign-in addresses has an authenticator and `is_ready()` false,
+  so it gets `SETTINGS_CACHE_TTL` and a new authenticator, with an empty key-set cache, every
+  30 seconds. On `main` that authenticator is built once at start-up. A server-owned
+  connection cannot change while the process runs: keep its runtime for the life of the
+  process (or until a save clears the slot), ready or not. A test: an aged server-owned
+  runtime without sign-in addresses is reused, same authenticator.
+
+`origin/main` (`01d507c8`: WEB-7 S1 #461 and two docs PRs) is merged in the commit that
+carries this note; no conflict.
+
