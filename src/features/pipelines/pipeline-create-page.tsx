@@ -32,6 +32,12 @@ import { cn } from "@/lib/utils"
 import { connectorService, lakehouseService, pipelineService } from "@/services"
 import type { Pipeline, PipelineDetail, PipelineKind } from "@/services/contracts/pipelines"
 import {
+  COLUMNS_APPEAR_LATER,
+  ColumnField,
+  ColumnsField,
+  ZoneField,
+} from "./pipeline-pickers"
+import {
   connectorLoadTriggerOn,
   withConnectorLoadTrigger,
 } from "./pipeline-connector-trigger"
@@ -231,6 +237,32 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
         : Promise.resolve([]),
     [sourceZoneForLookup, zoneIsIceberg]
   )
+  // WEB-8 D8: the source table's own columns, from the same read the table
+  // page uses. `getTableDetail` answers for an Iceberg namespace only, so a
+  // zone it does not list (a ClickHouse database) keeps the free-text fields
+  // instead of asking a question with no answer. `null` means "no list":
+  // either the table is not known yet, or the detail could not be read.
+  const sourceTableForLookup = sourceTableShown.trim()
+  const tableDetail = useService(
+    (signal) =>
+      zoneIsIceberg && sourceTableForLookup
+        ? lakehouseService.getTableDetail(sourceZoneForLookup, sourceTableForLookup, signal)
+        : Promise.resolve(null),
+    [sourceZoneForLookup, sourceTableForLookup, zoneIsIceberg]
+  )
+  const sourceColumns = React.useMemo(() => {
+    if (tableDetail.status !== "success" || !Array.isArray(tableDetail.data?.schema)) return null
+    const names = tableDetail.data.schema.map((field) => field.name)
+    return names.length > 0 ? names : null
+  }, [tableDetail.status, tableDetail.data])
+  // The namespaces, as a picker's options: `null` while they are being read
+  // or when the read failed, because neither is "there are no zones".
+  const zoneNames =
+    namespaces.status === "success" ? namespaces.data.map((namespace) => namespace.name) : null
+  const zoneNote =
+    namespaces.status === "error"
+      ? "Could not read the lakehouse's namespaces; type the zone name instead."
+      : undefined
   const [description, setDescription] = React.useState(existing?.description ?? "")
   // The chain both entry points send: DATA-19's upload job and BLD-7's
   // connector load, each switch owning exactly one entry. One helper so a
@@ -429,31 +461,43 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 </SelectContent>
               </Select>
             </Field>
-            <Field label="Incremental column">
-              <Input
+            <div className="space-y-1.5">
+              <ColumnField
+                id="pipeline-incremental-column"
+                label="Incremental column"
                 value={incrementalColumn}
-                onChange={(e) => setIncrementalColumn(e.target.value)}
+                onChange={setIncrementalColumn}
+                columns={sourceColumns}
+                placeholder="updated_at"
               />
-            </Field>
-            <Field label="Source zone">
-              {hasConnector ? (
-                // BLD-7 decision 5: shown, not editable. The connector's
-                // objects are loaded into Bronze, so that is the only zone
-                // this pipeline can read (`DEC-15`: no direct source read).
+              {sourceColumns === null ? (
+                <p className="text-xs text-muted-foreground">{COLUMNS_APPEAR_LATER}</p>
+              ) : null}
+            </div>
+            {hasConnector ? (
+              // BLD-7 decision 5: shown, not editable. The connector's
+              // objects are loaded into Bronze, so that is the only zone
+              // this pipeline can read (`DEC-15`: no direct source read).
+              <Field label="Source zone">
                 <Input
                   value={BRONZE_ZONE}
                   readOnly
                   disabled
                   aria-label="Source zone, fixed to bronze by the connector"
                 />
-              ) : (
-                <Input
-                  value={sourceZone}
-                  onChange={(e) => setSourceZone(e.target.value)}
-                  aria-label="Source zone"
-                />
-              )}
-            </Field>
+              </Field>
+            ) : (
+              // WEB-8 D8: the zones the lakehouse lists, never a typed one
+              // that no namespace has — free text only when there is no list.
+              <ZoneField
+                id="pipeline-source-zone"
+                label="Source zone"
+                value={sourceZone}
+                onChange={setSourceZone}
+                zones={zoneNames}
+                note={zoneNote}
+              />
+            )}
             <Field label="Connector" className="sm:col-span-2">
               {!existing && connectorIdFromUrl ? (
                 // The connector page's own entry: the connector is the
@@ -610,6 +654,9 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 Only the verbs and operators the server&apos;s transform grammar accepts are offered
                 here — the request is still re-validated server-side on submit.
               </p>
+              {sourceColumns === null ? (
+                <p className="mb-2 text-xs text-muted-foreground">{COLUMNS_APPEAR_LATER}</p>
+              ) : null}
               {transformDrafts.length > 0 ? (
                 <ul className="mb-3 space-y-1">
                   {transformDrafts.map((draft, index) => (
@@ -660,25 +707,23 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   </select>
                 </Field>
                 {pendingDraft.verb === "dedupe" ? (
-                  <Field label="Key column">
-                    <Input
-                      value={pendingDraft.key}
-                      onChange={(e) => setPendingDraft({ verb: "dedupe", key: e.target.value })}
-                      placeholder="order_id"
-                    />
-                  </Field>
+                  <ColumnField
+                    label="Key column"
+                    value={pendingDraft.key}
+                    onChange={(key) => setPendingDraft({ verb: "dedupe", key })}
+                    columns={sourceColumns}
+                    placeholder="order_id"
+                  />
                 ) : null}
                 {pendingDraft.verb === "filter" ? (
                   <>
-                    <Field label="Column">
-                      <Input
-                        value={pendingDraft.column}
-                        onChange={(e) =>
-                          setPendingDraft({ ...pendingDraft, column: e.target.value })
-                        }
-                        placeholder="status"
-                      />
-                    </Field>
+                    <ColumnField
+                      label="Column"
+                      value={pendingDraft.column}
+                      onChange={(column) => setPendingDraft({ ...pendingDraft, column })}
+                      columns={sourceColumns}
+                      placeholder="status"
+                    />
                     <Field label="Operator">
                       <select
                         className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
@@ -697,6 +742,9 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                         ))}
                       </select>
                     </Field>
+                    {/* The value is the literal the column is compared to
+                        (`filter(column op 'value')`, `renderTransformDraft`),
+                        so it stays typed: it is not a column of the table. */}
                     <Field label="Value">
                       <Input
                         value={pendingDraft.value}
@@ -708,33 +756,31 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 ) : null}
                 {pendingDraft.verb === "rename" ? (
                   <>
-                    <Field label="From column">
-                      <Input
-                        value={pendingDraft.from}
-                        onChange={(e) => setPendingDraft({ ...pendingDraft, from: e.target.value })}
-                        placeholder="old_col"
-                      />
-                    </Field>
-                    <Field label="To column">
-                      <Input
-                        value={pendingDraft.to}
-                        onChange={(e) => setPendingDraft({ ...pendingDraft, to: e.target.value })}
-                        placeholder="new_col"
-                      />
-                    </Field>
+                    <ColumnField
+                      label="From column"
+                      value={pendingDraft.from}
+                      onChange={(from) => setPendingDraft({ ...pendingDraft, from })}
+                      columns={sourceColumns}
+                      placeholder="old_col"
+                    />
+                    <ColumnField
+                      label="To column"
+                      value={pendingDraft.to}
+                      onChange={(to) => setPendingDraft({ ...pendingDraft, to })}
+                      columns={sourceColumns}
+                      placeholder="new_col"
+                    />
                   </>
                 ) : null}
                 {pendingDraft.verb === "cast" ? (
                   <>
-                    <Field label="Column">
-                      <Input
-                        value={pendingDraft.column}
-                        onChange={(e) =>
-                          setPendingDraft({ ...pendingDraft, column: e.target.value })
-                        }
-                        placeholder="amount"
-                      />
-                    </Field>
+                    <ColumnField
+                      label="Column"
+                      value={pendingDraft.column}
+                      onChange={(column) => setPendingDraft({ ...pendingDraft, column })}
+                      columns={sourceColumns}
+                      placeholder="amount"
+                    />
                     <Field label="Type">
                       <select
                         className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
@@ -756,13 +802,12 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   </>
                 ) : null}
                 {pendingDraft.verb === "select" ? (
-                  <Field label="Columns (comma-separated)">
-                    <Input
-                      value={pendingDraft.columns}
-                      onChange={(e) => setPendingDraft({ verb: "select", columns: e.target.value })}
-                      placeholder="id,name,amount"
-                    />
-                  </Field>
+                  <ColumnsField
+                    label="Columns"
+                    value={pendingDraft.columns}
+                    onChange={(columns) => setPendingDraft({ verb: "select", columns })}
+                    columns={sourceColumns}
+                  />
                 ) : null}
                 <Button
                   type="button"
@@ -812,9 +857,16 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
 
         {step === 2 ? (
           <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Target zone">
-              <Input value={targetZone} onChange={(e) => setTargetZone(e.target.value)} />
-            </Field>
+            {/* WEB-8 D8: the target zone is one the lakehouse lists too. The
+                target TABLE stays free text: this pipeline creates it. */}
+            <ZoneField
+              id="pipeline-target-zone"
+              label="Target zone"
+              value={targetZone}
+              onChange={setTargetZone}
+              zones={zoneNames}
+              note={zoneNote}
+            />
             <Field label="Target table">
               <Input
                 value={targetTable}
