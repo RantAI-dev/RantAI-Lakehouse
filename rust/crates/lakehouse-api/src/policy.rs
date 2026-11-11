@@ -912,6 +912,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // token (AGENTS.md rule 4).
     ("PUT",  "/api/identity/roles/{id}",             Policy::RequiresPermission("identity:write")),
     ("DELETE", "/api/identity/roles/{id}",           Policy::RequiresPermission("identity:write")),
+    // GOV-7 D7: a role's read access per schema and table. Reading it is the
+    // role form's own read (`identity:read`); changing it takes access away
+    // from everybody who holds the role, so it is the same privilege bundle
+    // write as `PUT` above — no new permission token (rule 4).
+    ("GET",  "/api/identity/roles/{id}/table-access", Policy::RequiresPermission("identity:read")),
+    ("PUT",  "/api/identity/roles/{id}/table-access", Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),

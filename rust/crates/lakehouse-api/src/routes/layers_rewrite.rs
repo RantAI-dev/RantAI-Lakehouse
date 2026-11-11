@@ -114,7 +114,7 @@ impl LayerRunner for Engine {
             &NoViews,
         )
         .map_err(|err: RewriteError| {
-            SpecRunFailure::Refused(crate::policy_engine::refusal_message(&err))
+            SpecRunFailure::Refused(crate::policy_engine::refusal_message(&err).to_owned())
         })?;
         eprintln!(
             "RAW      {}\nREWRITTEN {}",
@@ -638,7 +638,9 @@ impl Stub {
             ));
         }
         if sql.contains("REFUSED") {
-            return Err(SpecRunFailure::Refused("refused by the role rewrite"));
+            return Err(SpecRunFailure::Refused(
+                "refused by the role rewrite".to_owned(),
+            ));
         }
         if sql.contains("MANYROWS") {
             // One row more than a layer may return, as the statement's over-fetch gives.

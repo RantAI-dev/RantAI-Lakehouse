@@ -209,6 +209,9 @@ pub async fn status(
         return Ok(ApiJson(json!({ "supported": false, "reason": reason })));
     }
     validate_annotation_id(&id)?;
+    // GOV-7 D6: a hidden asset's restore status answers the same 404 as an
+    // unknown id.
+    crate::routes::catalog::ensure_asset_readable(&state, &principal, &id).await?;
     let (admin, table) = match target(&state, &id).await? {
         Target::Ready { admin, table } => (admin, table),
         Target::Unsupported(reason) => {
