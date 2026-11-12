@@ -23,7 +23,8 @@ use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
 };
 
 async fn app() -> (axum::Router, PgPool, MockServer) {
@@ -120,6 +121,35 @@ async fn admin(pool: &PgPool) -> String {
     // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
     let user = create_principal_with_permissions(pool, "*:*,query:read,governance:write").await;
     session_cookie_for_user(pool, user).await
+}
+
+/// Narrows a person's only role to `silver.orders` — the three statements
+/// `tests/table_access.rs` writes inline. Both the form's test and the
+/// assistant's use it, so the narrowing is one thing (`AGENTS.md` rule 4).
+async fn narrow_to_orders(pool: &PgPool, user: uuid::Uuid) {
+    let role: uuid::Uuid =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, 'silver', 'orders')",
+    )
+    .bind(role)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn incidents(router: &axum::Router, cookie: &str, status: &str) -> Vec<Value> {
@@ -516,29 +546,7 @@ async fn a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored()
 async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sentence() {
     let (router, pool, _ch) = app().await;
     let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
-    let role: uuid::Uuid =
-        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
-            .bind(user)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
-        .bind(role)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
-        .bind(role)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, 'silver', 'orders')",
-    )
-    .bind(role)
-    .execute(&pool)
-    .await
-    .unwrap();
+    narrow_to_orders(&pool, user).await;
     // The person is a member of the tenant that owns the catalog, so the
     // catalog's tenant rule lets them through to the role's own table access
     // (PR review round 1 R3).
@@ -588,6 +596,75 @@ async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sente
     )
     .await;
     assert_eq!(code, StatusCode::CREATED, "{created}");
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`), review round 1 R1: the assistant drafts a
+/// rule as the person behind the chat, so a table their role hides is refused
+/// with the very sentence the form gives that person, and nothing is stored.
+#[tokio::test]
+async fn the_assistant_cannot_draft_a_rule_on_a_table_the_person_may_not_read() {
+    let (router, pool, _ch) = app().await;
+    let user = create_assistant_principal(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let draft = |name: &str, asset: &str| {
+        json!({
+            "tool": "draft_quality_rule",
+            "args": {
+                "name": name, "asset": asset, "dimension": "volume",
+                "threshold": "rows >= 1", "severity": "high", "confirmed": true,
+            },
+            "mode": "build",
+        })
+    };
+
+    let (code, tool) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(draft("r1_hidden", "silver.customers")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{tool}");
+    assert_eq!(tool["outcome"], "failed", "{tool}");
+
+    // The sentence the form gives the same person, for the same table.
+    let (code, form) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "r1_hidden_form", "asset": "silver.customers", "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{form}");
+    assert_eq!(
+        tool["result"]["error"], form["error"],
+        "the assistant refuses a hidden table as the form does"
+    );
+
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name LIKE 'r1_hidden%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a refused draft stores nothing");
+
+    let (_, tool) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(draft("r1_orders", "silver.orders")),
+    )
+    .await;
+    assert_eq!(tool["outcome"], "executed", "{tool}");
 }
 
 /// A caller outside the tenant that owns the shared catalog is refused before
