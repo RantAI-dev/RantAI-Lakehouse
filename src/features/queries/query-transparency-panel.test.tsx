@@ -75,3 +75,48 @@ describe("QueryTransparencyPanel sources", () => {
     expect(screen.getByText("pii")).toBeTruthy()
   })
 })
+
+// Plan 73 D3 and D6 (QS-5-AC14, LH-QS-4-08): what the panel says when there is
+// no estimate to show.
+describe("QueryTransparencyPanel without an estimate", () => {
+  const IDLE: ActionState<QueryEstimate> = { status: "idle", data: null, error: null }
+
+  it("names the first parameter the estimate waits for, spelled as the run's sentence spells it", () => {
+    render(<QueryTransparencyPanel state={IDLE} estimatable={false} waitingFor="region" onRetry={() => {}} />)
+    expect(screen.getByText("Fill in {{region}} for a pre-run estimate.")).toBeTruthy()
+    expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
+  })
+
+  it("keeps the empty-editor sentence for an empty editor", () => {
+    render(<QueryTransparencyPanel state={IDLE} estimatable={false} waitingFor={null} onRetry={() => {}} />)
+    expect(screen.getByText("Type SQL for a pre-run estimate.")).toBeTruthy()
+    expect(screen.queryByText(/Fill in/)).toBeNull()
+  })
+
+  it("says there is no estimate for Trino, and nothing else, whatever state the action holds", () => {
+    const refused: ActionState<QueryEstimate> = {
+      status: "success",
+      data: { ...BASE, error: "Unknown table" },
+      error: null,
+    }
+    const { rerender } = render(
+      <QueryTransparencyPanel state={refused} estimatable estimateSupported={false} onRetry={() => {}} />
+    )
+    expect(screen.getByText("No pre-run estimate for Trino queries.")).toBeTruthy()
+    expect(screen.queryByText("This query cannot be planned")).toBeNull()
+    expect(screen.queryByText("Unknown table")).toBeNull()
+
+    const failed: ActionState<QueryEstimate> = {
+      status: "error",
+      data: null,
+      error: { code: "unavailable", message: "down" } as never,
+    }
+    rerender(<QueryTransparencyPanel state={failed} estimatable estimateSupported={false} onRetry={() => {}} />)
+    expect(screen.getByText("No pre-run estimate for Trino queries.")).toBeTruthy()
+    expect(screen.queryByText(/Estimate unavailable/)).toBeNull()
+
+    rerender(<QueryTransparencyPanel state={IDLE} estimatable={false} estimateSupported={false} onRetry={() => {}} />)
+    expect(screen.getByText("No pre-run estimate for Trino queries.")).toBeTruthy()
+    expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
+  })
+})

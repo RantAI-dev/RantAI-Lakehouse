@@ -292,6 +292,52 @@ function references(tokens: SqlToken[], tables: CompletionTable[]): Reference[] 
   return found
 }
 
+/**
+ * The aliases the statement gives to a table the catalog does not know,
+ * lower-cased: `x` in `FROM x q` and `JOIN a.b AS q` is not in the list, so
+ * `q` is declared but names no table in it (`references` records nothing for
+ * such a table). Plan 73 D5, QS-4-AC8.
+ *
+ * Only a table position can declare one, as in `references`. The word after
+ * an alias is not read again as a table name, so `AS` and the alias itself
+ * are never taken for tables.
+ */
+function unknownTableAliases(tokens: SqlToken[], tables: CompletionTable[]): Set<string> {
+  const aliases = new Set<string>()
+  let inTableClause = false
+  let i = 0
+  while (i < tokens.length) {
+    const token = tokens[i]
+    if (token.kind !== "word") {
+      i += 1
+      continue
+    }
+    const word = token.text.toUpperCase()
+    if (word === "FROM" || word === "JOIN") {
+      inTableClause = true
+      i += 1
+      continue
+    }
+    if (ENDS_FROM.has(word)) {
+      inTableClause = false
+      i += 1
+      continue
+    }
+    const last = chainEnd(tokens, i)
+    let written = token.text
+    for (let k = i + 2; k <= last; k += 2) written += `.${tokens[k]?.text ?? ""}`
+    i = last + 1
+    if (!inTableClause || resolveTable(written, tables)) continue
+    const alias = aliasAfter(tokens, last)
+    if (alias === null) continue
+    aliases.add(alias.toLowerCase())
+    // Past `AS` and the alias: neither is a table.
+    if (tokens[i]?.text.toUpperCase() === "AS") i += 1
+    i += 1
+  }
+  return aliases
+}
+
 /** Where the word the cursor is in starts. */
 function wordStart(sql: string, cursor: number): number {
   let from = cursor
@@ -333,6 +379,18 @@ function resolveQualifier(
     if (reference.alias?.toLowerCase() === wanted) return reference.table
   }
   return resolveTable(qualifier, tables)
+}
+
+/** Whether `qualifier` is an alias the statement gives to a table of the list. */
+function resolvesToAlias(
+  qualifier: string,
+  tokens: SqlToken[],
+  tables: CompletionTable[]
+): boolean {
+  const wanted = qualifier.toLowerCase()
+  return references(tokens, tables).some(
+    (reference) => reference.alias?.toLowerCase() === wanted
+  )
 }
 
 /** The columns of one table, or the note that says they are not there yet. */
@@ -490,6 +548,18 @@ export function sqlCompletionOptions({
 
   const qualifier = qualifierBefore(sql, from)
   if (qualifier) {
+    // An alias for a table the list does not hold: the statement does name a
+    // table there, so another table's columns, or the table list, would be
+    // a wrong answer for it (plan 73 D5). An alias of a listed table, and a
+    // qualifier that is a schema or catalog name, are answered below. The
+    // alias is one word: a dotted qualifier is never one.
+    if (
+      !qualifier.includes(".") &&
+      !resolvesToAlias(qualifier, tokens, tables) &&
+      unknownTableAliases(tokens, tables).has(qualifier.toLowerCase())
+    ) {
+      return { from, options: [] }
+    }
     const table = resolveQualifier(qualifier, tokens, tables)
     if (table) {
       // The table behind the qualifier is known: its columns are the only

@@ -126,13 +126,39 @@ export function QueryPlanPanel({ plan }: { plan: QueryPlanStage[] | null }) {
 export function QueryTransparencyPanel({
   state,
   estimatable,
+  estimateSupported = true,
+  waitingFor = null,
   onRetry,
 }: {
   state: ActionState<QueryEstimate>
   /** Whether the editor holds a statement worth estimating. */
   estimatable?: boolean
+  /**
+   * Whether the open tab's engine has an estimate at all. Only ClickHouse
+   * does: the server's `EXPLAIN ESTIMATE` has no Trino counterpart, so a Trino
+   * tab never asks and the panel says so (plan 73 D3, LH-QS-4-08).
+   */
+  estimateSupported?: boolean
+  /**
+   * The first parameter the estimate waits for, or `null`. The panel names it
+   * in the spelling of the run's refusal (plan 73 D6, QS-5-AC14).
+   */
+  waitingFor?: string | null
   onRetry: () => void
 }) {
+  if (!estimateSupported) {
+    // Every other state is about an estimate this tab cannot have, so none
+    // of them is shown: a leftover refusal or error would blame the query
+    // for something the engine simply does not do.
+    return (
+      <SectionCard
+        title="Execution transparency"
+        description="Pre-run estimate. Engine categories stay product-neutral."
+      >
+        <p className="text-sm text-muted-foreground">No pre-run estimate for Trino queries.</p>
+      </SectionCard>
+    )
+  }
   return (
     <SectionCard
       title="Execution transparency"
@@ -140,8 +166,12 @@ export function QueryTransparencyPanel({
     >
       {/* An empty editor gets no estimate and says so, rather than
           reporting a confident "0 B · 1.00 cu · Fresh · 0 s" about
-          nothing. */}
-      {state.status === "idle" || estimatable === false ? (
+          nothing. A statement that waits for a parameter names it. */}
+      {waitingFor !== null ? (
+        <p className="text-sm text-muted-foreground">
+          {`Fill in {{${waitingFor}}} for a pre-run estimate.`}
+        </p>
+      ) : state.status === "idle" || estimatable === false ? (
         <p className="text-sm text-muted-foreground">
           Type SQL for a pre-run estimate.
         </p>

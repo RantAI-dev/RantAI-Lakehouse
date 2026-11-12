@@ -5,6 +5,7 @@ import {
   activeParameters,
   fieldsNamedBy,
   findParamNames,
+  firstMissingValueName,
   missingRequiredValue,
   paramInputs,
   reconcileDefinitions,
@@ -272,4 +273,17 @@ test("missingRequiredValue counts a date range with one end and a multi-select w
   )
   assert.equal(missingRequiredValue([{ name: "m", type: "multiSelect" }], { m: [] }), true)
   assert.equal(missingRequiredValue([{ name: "m", type: "multiSelect" }], { m: ["a"] }), false)
+})
+
+// QS-5-AC14 / plan 73 D6: the estimate says which name it waits for.
+test("firstMissingValueName is the first name in parameter order with nothing to run with", () => {
+  const definitions: QueryParamDef[] = [
+    { name: "region", type: "text" },
+    { name: "since", type: "date" },
+    { name: "limit", type: "number", default: 10 },
+  ]
+  assert.equal(firstMissingValueName(definitions, {}), "region")
+  assert.equal(firstMissingValueName(definitions, { region: "EU" }), "since")
+  assert.equal(firstMissingValueName(definitions, { region: "EU", since: "2026-11-01" }), null)
+  assert.equal(firstMissingValueName([], {}), null)
 })

@@ -184,10 +184,24 @@ export function missingRequiredValue(
   definitions: readonly QueryParamDef[],
   values: Readonly<Record<string, QueryParamValue>>
 ): boolean {
-  return definitions.some((def) => {
+  return firstMissingValueName(definitions, values) !== null
+}
+
+/**
+ * The first name in `definitions` (parameter order) that has nothing to run
+ * with, or `null` when every name has a value. The estimate panel quotes it
+ * as `{{name}}`, the spelling of the server's run sentence (QS-5-AC14, plan
+ * 73 D6).
+ */
+export function firstMissingValueName(
+  definitions: readonly QueryParamDef[],
+  values: Readonly<Record<string, QueryParamValue>>
+): string | null {
+  const missing = definitions.find((def) => {
     const value = Object.hasOwn(values, def.name) ? values[def.name] : def.default
     return value === undefined || !valueFitsType(def.type, value)
   })
+  return missing?.name ?? null
 }
 
 /**
