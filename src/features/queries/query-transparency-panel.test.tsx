@@ -76,6 +76,62 @@ describe("QueryTransparencyPanel sources", () => {
   })
 })
 
+// `QS-6` (`LH-QS-4-08`, `LH-QS-2-10`), decisions 7 and 13: the panel names
+// the engine that answered, and a Trino statement says there is no estimate
+// instead of showing a ClickHouse answer about Trino SQL.
+describe("QueryTransparencyPanel engine", () => {
+  it("says a Trino query has no pre-run estimate, names Trino, and shows no source and no error", () => {
+    panel({
+      ...BASE,
+      supported: false,
+      reason: "A Trino query has no pre-run estimate.",
+      queryEngine: "trino",
+      estimatedBytes: null,
+      estimatedCostMin: null,
+      estimatedCostMax: null,
+      error: null,
+      workloadClass: null,
+      engine: null,
+      sources: [],
+    })
+
+    expect(screen.getByText("No pre-run estimate")).toBeTruthy()
+    expect(screen.getByText("A Trino query has no pre-run estimate.")).toBeTruthy()
+    expect(screen.getByText("Trino")).toBeTruthy()
+    // Nothing was read, so no table is named and no failure is reported.
+    expect(screen.queryByText("Sources")).toBeNull()
+    expect(screen.queryByText("This query cannot be planned")).toBeNull()
+  })
+
+  it("names ClickHouse as the engine of an estimate", () => {
+    panel({ ...BASE, supported: true, queryEngine: "clickhouse" })
+
+    expect(screen.queryByText("No pre-run estimate")).toBeNull()
+    expect(screen.getByText("ClickHouse")).toBeTruthy()
+    expect(screen.getByText("Hot analytics")).toBeTruthy()
+  })
+
+  it("shows the server's `error` text when a query cannot be planned", () => {
+    panel({
+      ...BASE,
+      supported: true,
+      queryEngine: "clickhouse",
+      estimatedBytes: null,
+      estimatedCostMin: null,
+      estimatedCostMax: null,
+      error: "Code: 47. DB::Exception: Missing columns: 'revenue' while processing query: 'SELECT revenue FROM bronze.orders'",
+      sources: [],
+    })
+
+    expect(screen.getByText("This query cannot be planned")).toBeTruthy()
+    expect(
+      screen.getByText(
+        "Code: 47. DB::Exception: Missing columns: 'revenue' while processing query: 'SELECT revenue FROM bronze.orders'"
+      )
+    ).toBeTruthy()
+  })
+})
+
 // LH-QS-4-08 and QS-5-AC14: what the panel says when there is
 // no estimate to show.
 describe("QueryTransparencyPanel without an estimate", () => {

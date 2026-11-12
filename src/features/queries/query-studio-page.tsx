@@ -18,6 +18,7 @@ import { QueryTransparencyPanel } from "./query-transparency-panel"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import { summarizeQuery } from "@/lib/page-context-summary"
+import { queryDraftKey } from "@/lib/query-draft"
 import { SchemaBrowser } from "./schema-browser"
 import { QueryTabBar } from "./query-tab-bar"
 import { SqlPanel } from "./sql-panel"
@@ -25,8 +26,27 @@ import { useQueryStudio } from "./use-query-studio"
 
 /** Query Studio: natural-language ↔ SQL workspace with execution transparency. */
 export function QueryStudioPage() {
+  const { user, activeTenantId } = useAuth()
+  // QA LH-QS-1-04 (QS-8): the draft belongs to one person in one tenant.
+  const draftKey = user ? queryDraftKey(user.id, activeTenantId) : null
+  // A different owner gets a new workspace. The first key is not a change:
+  // the session may answer after the page has mounted.
+  const [generation, setGeneration] = React.useState(0)
+  const ownerRef = React.useRef<string | null>(null)
+  React.useEffect(() => {
+    if (draftKey === null) return
+    if (ownerRef.current !== null && ownerRef.current !== draftKey) setGeneration((g) => g + 1)
+    ownerRef.current = draftKey
+  }, [draftKey])
+  // `key` remounts the workspace, so the old one flushes its tabs under its
+  // own key as it unmounts and the new one starts from its owner's entry.
+  return <QueryStudioWorkspace key={generation} draftKey={draftKey} />
+}
+
+/** One owner's workspace: the layout below, over one draft key. */
+function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
   // All the state lives in the hook; this file is the layout.
-  const studio = useQueryStudio()
+  const studio = useQueryStudio(draftKey)
   const router = useRouter()
   const [schemaOpen, setSchemaOpen] = React.useState(false)
   const { hasPermission } = useAuth()

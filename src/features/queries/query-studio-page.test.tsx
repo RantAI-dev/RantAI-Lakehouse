@@ -25,11 +25,11 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
-import { AuthProvider } from "@/features/auth/auth-provider"
+import { AuthProvider, useAuth } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
-import { QUERY_DRAFT_KEY } from "@/lib/query-draft"
+import { queryDraftKey } from "@/lib/query-draft"
 import { SQL_FORMAT_SETTINGS_KEY } from "@/lib/sql-format-settings"
 import { QueryStudioPage } from "./query-studio-page"
 import { readSaveQueryDraft, readSaveSourceDraft } from "./save-draft"
@@ -71,7 +71,7 @@ function stubNetwork(permissions: string[] = []) {
 
 /** Seeds the editor with a statement and opens the SQL tab, the way a saved draft would. */
 function seedDraft(sql: string) {
-  window.localStorage.setItem(QUERY_DRAFT_KEY, JSON.stringify({ sql, question: "", tab: "sql" }))
+  window.localStorage.setItem(queryDraftKey("u1", null), JSON.stringify({ sql, question: "", tab: "sql" }))
 }
 
 function renderPage() {
@@ -229,8 +229,11 @@ describe("QueryStudioPage saved-query link", () => {
     renderPage()
 
     await screen.findByText("This query is not available to you.")
-    // No tab was opened for it: the tab bar still holds the draft's one.
-    expect(screen.getAllByRole("button", { name: /^Query \d+$/ }).length).toBe(1)
+    // No tab was opened for it: the tab bar still holds the draft's one. The
+    // wait is for the draft, which is read once the session has answered.
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: /^Query \d+$/ }).length).toBe(1)
+    )
   })
 })
 
@@ -397,7 +400,7 @@ describe("QueryStudioPage parameters", () => {
   it("restores the fields of a reload at the values the tab held", async () => {
     stubNetwork()
     window.localStorage.setItem(
-      QUERY_DRAFT_KEY,
+      queryDraftKey("u1", null),
       JSON.stringify({
         tabs: [
           {
@@ -463,7 +466,7 @@ describe("QueryStudioPage parameters", () => {
     stubNetwork()
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT)
     window.localStorage.setItem(
-      QUERY_DRAFT_KEY,
+      queryDraftKey("u1", null),
       JSON.stringify({
         tabs: [
           {
@@ -546,5 +549,99 @@ describe("QueryStudioPage save handoff ('WEB-7' D5)", () => {
 
     await screen.findByRole("button", { name: "Save as new" })
     expect(screen.queryByRole("button", { name: "Save as SQL source" })).toBeNull()
+  })
+})
+
+// `QS-8` (`LH-QS-1-04` F1): the draft belongs to one person in one tenant.
+// The session fixture here belongs to two tenants, and switching the active
+// one mounts a new workspace over the other tenant's key.
+describe("QueryStudioPage draft owner", () => {
+  /** The session of a person who belongs to two tenants, `t1` and `t2`. */
+  function stubTwoTenants() {
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return json({
+          id: "u1",
+          name: "Analyst",
+          email: null,
+          roles: ["Analyst"],
+          permissions: [],
+          tenants: [
+            { id: "t1", name: "One", slug: "one" },
+            { id: "t2", name: "Two", slug: "two" },
+          ],
+        })
+      }
+      if (path.includes("/api/ai/sessions")) return json({ sessions: [] })
+      return json({})
+    }) as unknown as typeof fetch)
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    spyOn(lakehouseService, "listNamespaces").mockResolvedValue([])
+  }
+
+  /** One stored tab under a tenant's key, with the placeholder it holds. */
+  function seedTenantTab(tenantId: string, name: string) {
+    window.localStorage.setItem(
+      queryDraftKey("u1", tenantId),
+      JSON.stringify({
+        tabs: [
+          {
+            id: "tab-1",
+            name: "Query 1",
+            sql: `SELECT {{${name}}}`,
+            engine: "clickhouse",
+            parameters: [],
+            values: {},
+          },
+        ],
+        activeId: "tab-1",
+        question: "",
+        tab: "sql",
+      })
+    )
+  }
+
+  /** The navbar's tenant switch, rendered beside the page under one provider. */
+  function TenantSwitch() {
+    const { setActiveTenant } = useAuth()
+    return (
+      <button type="button" onClick={() => setActiveTenant("t2")}>
+        Switch to Two
+      </button>
+    )
+  }
+
+  it("shows the other tenant's tabs, and none of the first, when the active tenant changes", async () => {
+    stubTwoTenants()
+    seedTenantTab("t1", "first")
+    seedTenantTab("t2", "second")
+    render(
+      <AuthProvider>
+        <TableProviders>
+          <CopilotProvider>
+            <QueryStudioPage />
+            <TenantSwitch />
+          </CopilotProvider>
+        </TableProviders>
+      </AuthProvider>,
+    )
+
+    // The first tenant's tab is open before the switch, and the second's is not.
+    await screen.findByLabelText("first")
+    expect(screen.queryByLabelText("second")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch to Two" }))
+
+    // The new workspace reads the second tenant's key: its tab replaces the
+    // first tenant's in the editor, not beside it.
+    await screen.findByLabelText("second")
+    expect(screen.queryByLabelText("first")).toBeNull()
+    // The first tenant's tabs are still theirs to find on the next switch.
+    const firstKey = window.localStorage.getItem(queryDraftKey("u1", "t1"))
+    expect(JSON.parse(firstKey ?? "{}").tabs?.[0]?.sql).toBe("SELECT {{first}}")
   })
 })

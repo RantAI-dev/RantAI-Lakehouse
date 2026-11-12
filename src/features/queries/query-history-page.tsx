@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input"
 import { useService } from "@/hooks/use-service"
 import { formatDateTime, formatDuration } from "@/lib/format"
 import { HISTORY_PAGE_LIMIT, historyQueryString } from "@/lib/history-query-params"
+import { queryEngineLabel } from "@/lib/status"
 import { cn } from "@/lib/utils"
 import { queryService } from "@/services"
 import type { QueryHistoryFilter, QueryHistoryItem } from "@/services/contracts/queries"
@@ -163,7 +164,7 @@ export function QueryHistoryPage() {
           </Pill>
           {ENGINES.map((e) => (
             <Pill key={e} pressed={engine === e} onClick={() => setEngine(e)}>
-              {e === "trino" ? "Trino" : "ClickHouse"}
+              {queryEngineLabel(e)}
             </Pill>
           ))}
         </div>
