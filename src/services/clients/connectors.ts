@@ -3,7 +3,6 @@ import type {
   ApproveSchemaChangeResponse,
   Connector,
   ConnectorDetail,
-  ConnectorRun,
   ConnectorRunList,
   ConnectorRunLog,
   ConnectorService,
