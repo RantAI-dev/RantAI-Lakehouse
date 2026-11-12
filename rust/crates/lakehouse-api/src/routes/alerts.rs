@@ -49,6 +49,10 @@ use crate::upstream_error;
 /// separate route, [`status`], so this body stays what the parity corpus
 /// recorded (`SRC-7` review SHOULD-FIX 3).
 ///
+/// `DEC-16` (QA `LH-SRC-7-04`, `SRC-42`): a rule's `target` is returned only
+/// to a caller who may manage the rule; everyone else gets the rule with
+/// `"targetHidden": true` ([`rule_json_for`]).
+///
 /// The `TypeScript` handler's `catch` returns a 500 with `e.message`
 /// (`alerts/route.ts`'s `GET`), unlike `POST`/`PUT` which return 400 for
 /// the same kind of failure — the status code here depends on which route
@@ -86,6 +90,34 @@ struct ChartTitle {
     board_title: String,
 }
 
+/// A rule as the list's JSON, with its `target` only for a caller who may
+/// manage it (`DEC-16`, QA `LH-SRC-7-04`, `SRC-42`).
+///
+/// A webhook address can carry a token and an e-mail address is personal, so a
+/// caller with `alert:read` and nothing more sees `channel` (Webhook or
+/// E-mail) but not where the rule sends: the key is left out and
+/// `"targetHidden": true` says so. This is the one place — `GET /api/alerts`
+/// and the assistant's `list_alert_rules` both go through [`listed_rules`]
+/// (D15) — and the test of who may manage a rule is
+/// [`chart_alerts::may_manage`], the same one the write routes use.
+///
+/// # Errors
+///
+/// The serializer's error, which the caller turns into a fixed 500.
+fn rule_json_for(
+    principal: Option<&Principal>,
+    rule: &AlertRule,
+) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(rule)?;
+    if !crate::routes::chart_alerts::may_manage(principal, Some(rule))
+        && let Some(map) = value.as_object_mut()
+    {
+        map.remove("target");
+        map.insert("targetHidden".to_owned(), json!(true));
+    }
+    Ok(value)
+}
+
 /// The rules of `rules` the caller may see, each as the list's JSON
 /// (`GET /api/alerts` and the assistant's `list_alert_rules`, one helper so the
 /// two cannot drift — rule 4).
@@ -95,6 +127,9 @@ struct ChartTitle {
 /// they cannot see carries none of the three, and the console keeps
 /// "Dashboard chart". The caller's charts and boards are read once for the whole
 /// list, never once per rule.
+///
+/// `DEC-16` (`SRC-42`): a rule's target is included only for a caller who may
+/// manage that rule ([`rule_json_for`]).
 ///
 /// # Errors
 ///
@@ -113,7 +148,7 @@ pub(crate) async fn listed_rules(
     };
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
-        let mut value = serde_json::to_value(&rule).map_err(|err| {
+        let mut value = rule_json_for(principal, &rule).map_err(|err| {
             tracing::warn!(%err, rule_id = %rule.id, "an alert rule could not be serialized");
             ApiError::Internal("the alert rules could not be listed".to_owned())
         })?;
@@ -4036,5 +4071,106 @@ mod run_events_configured {
             reported(Some("")).await,
             json!({ "runEventsConfigured": false })
         );
+    }
+}
+
+/// `DEC-16` (QA `LH-SRC-7-04`, `SRC-42`): a rule's target is returned only to
+/// a caller who may manage the rule. Plain `#[test]`: no database.
+#[cfg(test)]
+mod hidden_targets {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_alerts::{AlertChannel, AlertKind, AlertOp, AlertRule};
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::rule_json_for;
+
+    const ADDRESS: &str = "https://hooks.example.com/secret-token";
+
+    fn principal(permissions: &str, id: u128) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(id)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    fn rule(chart: Option<&str>, owner: Option<&str>) -> AlertRule {
+        AlertRule {
+            id: "al_1".to_owned(),
+            name: "orders".to_owned(),
+            kind: AlertKind::Alert,
+            mart: Some("mart_orders".to_owned()),
+            measure: Some("orders".to_owned()),
+            agg: "sum".to_owned(),
+            op: AlertOp::Gt,
+            threshold: 10.0,
+            board: None,
+            channel: AlertChannel::Webhook,
+            target: ADDRESS.to_owned(),
+            enabled: true,
+            created_at: None,
+            severity: None,
+            pipeline: None,
+            metric: None,
+            connector: None,
+            asset: None,
+            chart: chart.map(str::to_owned),
+            series: None,
+            filters: Vec::new(),
+            condition: None,
+            owner_id: owner.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_caller_with_alert_read_only_gets_the_rule_without_its_target() {
+        let value = rule_json_for(Some(&principal("alert:read", 1)), &rule(None, None)).unwrap();
+        assert!(value.get("target").is_none(), "{value}");
+        assert_eq!(value["targetHidden"], json!(true));
+        assert_eq!(value["channel"], json!("webhook"));
+        assert!(!value.to_string().contains(ADDRESS), "{value}");
+    }
+
+    #[test]
+    fn a_caller_with_alert_write_gets_the_target() {
+        let value = rule_json_for(
+            Some(&principal("alert:read, alert:write", 1)),
+            &rule(None, None),
+        )
+        .unwrap();
+        assert_eq!(value["target"], json!(ADDRESS));
+        assert!(value.get("targetHidden").is_none(), "{value}");
+    }
+
+    #[test]
+    fn the_owner_of_a_chart_alert_gets_their_own_target_without_alert_write() {
+        let owner = principal("alert:read", 7);
+        let owner_id = owner.id.uuid().to_string();
+        let value = rule_json_for(Some(&owner), &rule(Some("chart-1"), Some(&owner_id))).unwrap();
+        assert_eq!(value["target"], json!(ADDRESS));
+        assert!(value.get("targetHidden").is_none(), "{value}");
+
+        // Another person's chart rule, and a mart rule of their own, stay
+        // hidden: only a chart alert they own carries their own address.
+        let someone_else = Uuid::from_u128(9).to_string();
+        let other =
+            rule_json_for(Some(&owner), &rule(Some("chart-1"), Some(&someone_else))).unwrap();
+        assert!(other.get("target").is_none(), "{other}");
+        let mart = rule_json_for(Some(&owner), &rule(None, Some(&owner_id))).unwrap();
+        assert!(mart.get("target").is_none(), "{mart}");
+    }
+
+    #[test]
+    fn a_caller_with_no_principal_gets_no_target() {
+        let value = rule_json_for(None, &rule(None, None)).unwrap();
+        assert!(value.get("target").is_none(), "{value}");
+        assert_eq!(value["targetHidden"], json!(true));
     }
 }

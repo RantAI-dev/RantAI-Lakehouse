@@ -994,8 +994,8 @@ export type RunTrigger = "schedule" | "user" | "refresh" | "clear" | "other" | s
 /** Where a run stands in the product's own record; `running` is also what a killed run keeps, see the Runs card. Widened. */
 export type RunStatus = "running" | "succeeded" | "failed" | "paused" | string
 
-/** Why a run ended (`SRC-11` decision 5). Widened. */
-export type RunEndReason = "completed" | "table_failed" | "connector_paused" | "other" | string
+/** Why a run ended (`SRC-11` decision 5). `timed_out`: it outlived the run limit and was stopped (`SRC-39`, QA `TC-1702`). Widened. */
+export type RunEndReason = "completed" | "table_failed" | "connector_paused" | "timed_out" | "other" | string
 
 /**
  * One run of a connector, from `GET /api/connectors/{id}/runs` (newest 50 first). Mirrors the API's run record
@@ -1019,6 +1019,21 @@ export type ConnectorRun = {
   /** All attempts at all tables. */
   attempts: number
   endReason: RunEndReason | null
+}
+
+/**
+ * `GET /api/connectors/{id}/runs`: the connector's newest 50 runs, and the run limit the API judges
+ * them by (`SRC-39`, QA `TC-1702`).
+ */
+export type ConnectorRunList = {
+  runs: ConnectorRun[]
+  /**
+   * How long a run may run before the API stops holding the connector for it, in seconds
+   * (`INGEST_RUN_MAX_RUNTIME_SECONDS`). The Runs card shows a run whose record still says `running`
+   * as going until this limit, so the number is never copied here: raising the setting keeps the page
+   * and the API in step. Absent in an older API's answer; the page then falls back to six hours.
+   */
+  maxRuntimeSeconds?: number
 }
 
 /** The closed list of why an attempt failed (`SRC-11` decision 2); a success carries none. Widened. */
@@ -1175,8 +1190,11 @@ export interface ConnectorService {
   getDiscovery(id: string, kind: DiscoveryReadKind, signal?: AbortSignal): Promise<DiscoveryAnswer>
   /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
   runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
-  /** `GET /api/connectors/{id}/runs` (`SRC-11`): the newest 50 runs from the product's own run record. */
-  listConnectorRuns(connectorId: string, signal?: AbortSignal): Promise<ConnectorRun[]>
+  /**
+   * `GET /api/connectors/{id}/runs` (`SRC-11`): the newest 50 runs from the product's own run record,
+   * and the run limit the API judges them by (`SRC-39`).
+   */
+  listConnectorRuns(connectorId: string, signal?: AbortSignal): Promise<ConnectorRunList>
   /** `GET /api/connectors/{id}/runs/{runId}/log` (`SRC-11`): the attempts and lines of one run. */
   getConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<ConnectorRunLog>
   /** The same log as text (`?format=text`), for the Download log button. */
