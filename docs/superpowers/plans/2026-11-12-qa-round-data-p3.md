@@ -1327,4 +1327,242 @@ None of these blocks the plan.
 
 ## 5. Handoff
 
+Developer: `opencode-go/deepseek-v4.1-flash` (not Opus). Branch
+`fix/qa-round-data-p3`, base `04715976` (`docs(plan): QA round, data-p3: the
+plan`, which is `origin/fix/qa-round-data-p3` at the start). One commit per
+task, in plan order; every commit pushed to
+`origin/fix/qa-round-data-p3`; no force-push; no pull request opened.
+
+### Commits
+
+| Task | Commit | Title |
+| --- | --- | --- |
+| T1 | `ccea9dc1` | fix(search): a word with no letter or digit finds nothing (DATA-54) |
+| T2 | `90007c0c` | fix(search): search the table's physical name, not its internal id (DATA-54) |
+| T3 | `25db366b` | fix(search): a description match carries the text around the word (DATA-54) |
+| T4 | `a6243564` | fix(catalog): saving the same mark again writes nothing (DATA-54) |
+| T5 | `e0bd2fc5` | fix(catalog): the mark's refusals are sentences (DATA-54) |
+| T6 | `92ecd875` | fix(catalog): tag refusals say what is allowed, in words (DATA-54) |
+| T7 | `dc549cb9` | fix(governance): a tag key in use names the tables that hold it (DATA-54) |
+| T8 | `8c3bf5b2` | fix(governance): a rule's table must exist and be readable (DATA-54) |
+| T9 | `c7067d4a` | fix(governance): the table picker offers the tables' real keys (DATA-54) |
+| T10 | `0f8fe0a5` | fix(search): the box says when more tables matched than it shows (DATA-54) |
+| T11 | `600d13c6` | fix(search): the reason names the table, not "id" (DATA-54) |
+| T12 | `edf92042` | fix(search): a result shows its physical name and the matched text (DATA-54) |
+| T13 | `af15bdf7` | fix(search): pages and actions are listed only for words they contain (DATA-54) |
+| T14 | `6f277ee7` | fix(search): the box takes 100 characters and says so (DATA-54) |
+| T15 | `21eac55e` | fix(catalog): a deprecated table with no replacement says so (DATA-54) |
+| T16 | `fddfa55a` | fix(dashboards): the chosen mart keeps its Certified mark (DATA-54) |
+| T17 | `7fe68ac9` | fix(catalog): change history shows the date and time on hover (DATA-54) |
+| T18 | `9106a0da` | fix(governance): the incidents panel is read again after a run (DATA-54) |
+| T19 | `f31219ac` | fix(governance): "stale" is explained in words (DATA-54) |
+| T20 | `5f3c34f9` | fix(connectors): the upload's result says when on-load checks run (DATA-54) |
+| T21 | `41f4691d` | fix(catalog): no row count for a table that is not there (DATA-54) |
+| T22 | `6768273c` | docs(features): the documents say what is now true (DATA-54) |
+
+### Tests added or changed, with the failure before the fix
+
+Each was run against the code before its fix (the fix stashed or the wrong
+change the task names applied), and the failure text is the one printed.
+
+- T1 `routes::catalog_search::tests::a_word_with_no_letter_or_digit_is_dropped_and_alone_finds_nothing`.
+  Without `.filter(|w| !w.parts.is_empty())`:
+  `assertion left == right failed: _` — left `silver.dim_customer`,
+  `silver.rev_month` with `matchedOn.field = "id"`, right `[]`.
+- T2 `…a_table_is_found_by_its_physical_name_and_a_bronze_slug_is_not_searched`.
+  Reading `asset.get("id")` for the table candidate: left
+  `[{… "matchedOn": {"field": "table", "value": "zq-registry-slug"}}]`, right `[]`.
+- T3 `…a_description_match_carries_the_text_around_the_word` and
+  `…the_snippet_never_cuts_inside_a_character`. Answering `String::new()` for the
+  value: the test panics at the first value assertion (empty value). The second
+  test passes on the good code and would panic on a byte slice (it asserts
+  `contains("Übersee")` on a multi-byte description).
+- T4 `…saving_the_same_mark_again_writes_no_history_entry_and_keeps_who_set_it`.
+  Without the early return: `left: 2, right: 1` (`an unchanged save is no history`).
+- T5 `…no_certification_refusal_names_an_api_field_and_each_is_a_sentence`.
+  Leaving `a table cannot be its own replacement` as it was: the message
+  `a table cannot be its own replacement` fails the uppercase assertion.
+- T6 `governed_tag::tests::no_tag_refusal_prints_a_pattern_or_an_api_field`.
+  Leaving the key sentence as it was: `key must be 1-64 characters matching
+  ^[a-z0-9][a-z0-9_-]*$` fails the `^` assertion.
+- T7 `catalog::tests::only_tables_the_caller_may_read_are_named` (dropping the
+  `asset_visible` condition: left `["Orders", "Customers"]`, right `["Orders"]`);
+  `governance::tests::the_refusal_names_up_to_three_tables_and_counts_the_rest`;
+  `tag_key_handlers::deleting_a_key_in_use_names_the_tables_that_hold_it`
+  (answering `counted` always: `{"error":"\"data_domain\" is still given to 2
+  tables. Remove it from those tables first."}` — no names);
+  `governed_tag::the_tables_holding_a_key_are_listed_in_order`.
+- T8 `quality_incidents::a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored`
+  (skipping the existence check: `left: 201, right: 400`);
+  `…a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sentence`
+  (skipping the access check: `left: 201, right: 400`);
+  `…changing_a_rule_to_a_table_that_is_not_there_is_refused_and_the_rule_keeps_its_table`
+  (checking only in create: `left: 200, right: 400`).
+- T9 `src/lib/table-key.test.ts` (new), `table-picker.test.tsx`
+  `offers each row's table key, never its display name`. On the code before the
+  change it fails with the options `["Every table"-less]
+  ["primer.Northwind Orders","primer.No Table","silver.Orders Clean"]` — the
+  three existing picker tests fail the same way (`primer.Raw Orders`,
+  `silver.Orders`). The four files' fixtures were reshaped to the API's rows.
+- T10 `command-palette.test.tsx`
+  `says how many tables matched when it shows only eight of them` (reading
+  `assets.length` as the total: the "Showing 8 of 23" line is absent);
+  `says nothing about more when every match is shown`;
+  `assets.test.ts searchAssets asks for the limit and answers the total`
+  (`expect(found.total).toBe(23)` fails, `1` instead).
+- T11 `palette-search.test.ts`
+  `names the table that matched, and calls an old server's id a table id`
+  (removing the `"id"` case: `id · approximate match` instead of
+  `table id · approximate match`).
+- T12 `palette-search.test.ts the lines of a result are its table key and why it
+  matched`, `quotes the piece of the description the server sent`;
+  `command-palette.test.tsx shows the physical name under the friendly name, and
+  the matched text as text` (not passing `path`: the row holds no `silver.t1`).
+- T13 `palette-search.test.ts a page is listed only when every typed word is in
+  its text` (returning the score alone: `Received: 0.16200530530950422` for
+  `gic`); `command-palette.test.tsx does not list a page for letters scattered
+  through its name`.
+- T14 `palette-search.test.ts the box's limit is the dashboard search's` (reads
+  `rust/crates/lakehouse-bi/src/search.rs`); `command-palette.test.tsx says to
+  shorten the search when the dashboard search refuses the text` (treating
+  `invalid_request` as an outage: the old sentence shows);
+  `the search box takes at most 100 characters`.
+- T15 `asset-detail-page.test.tsx says no replacement is named for a deprecated
+  table without one`; `does not say so when a replacement is named, or when the
+  page is opened with a table grant` (ignoring `replacementHidden`: the grant
+  case shows the sentence).
+- T16 `chart-builder.test.tsx shows Certified under the picker once a certified
+  mart is chosen` (line removed: `findByTestId("chosen-mart-mark")` finds
+  nothing); `shows no mark line for a mart without one`.
+- T17 `asset-detail-tabs.test.tsx shows a change's date and time on hover`
+  (title removed: `getByTitle(formatDateTime(...))` finds nothing).
+- T18 `asset-detail-tabs.test.tsx reads the incidents again after the checks
+  ran`; `data-quality-page.test.tsx reads the incidents again after Run check`
+  (leaving `reloadKey` out of the dependency list: both fail; the first times
+  out waiting for the incident, the second's count stays).
+- T19 `data-quality-page.test.tsx says what stale means on a stale incident, and
+  nothing on an open one` (showing the note for every incident:
+  `Expected: 1, Received: 2`).
+- T20 `upload-file-page.test.tsx says when on-load checks run once the load has
+  finished` (line removed: the text is absent); the failed-load test now also
+  asserts the line is absent there.
+- T21 `asset-detail-page.test.tsx shows no row count when the Iceberg table is
+  not there`; `keeps the row count of a table that is not an Iceberg table`;
+  `keeps the row count when the table read fails for another reason` (hiding the
+  count on every error: `Expected to not contain: "—"`, `Received: "Rows—"`).
+- T22 no test.
+
+Existing tests changed, with the reason (rule 2 — the rule changed, not the
+test's purpose):
+
+- T3 `one_edit_finds_a_word_by_deletion_swap_substitution_and_insertion`: the
+  expected value is now `revenue by month` (D5).
+- T5 `each_certification_refusal_has_its_sentence_and_writes_nothing` and
+  `a_replacement_is_refused_with_503_when_the_catalog_cannot_be_read`: the
+  expected pieces are the new sentences.
+- T6 `validate_annotation_body_rejects_a_tag_over_64_chars` (the old assertion
+  read the word "tags" in the sentence; it now reads
+  `not accepted: a tag`), `validate_annotation_body_bounds_governed_tags`,
+  `an_undefined_governed_key_and_a_malformed_pair_are_refused`,
+  `a_governed_value_outside_the_list_is_refused_naming_the_key_and_saves_nothing`,
+  `governance::tag_key_refusals_name_the_field_and_store_nothing`,
+  `lakehouse-store/tests/governed_tag.rs` (two assertions).
+- T12 `CommandPalette catalog order`: the row's text now ends with its table
+  key, so the test strips that instead of trailing punctuation; the order it
+  asserts is unchanged.
+- T15 two tests look the replacement field up by its new label (the label
+  changed on purpose).
+
+### Commands run (final commit `6768273c`, foreground)
+
+Rust, from `rust/`, with
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2 CARGO_BUILD_JOBS=6`:
+
+```text
+cargo fmt --check                                     # ok, no diff
+cargo clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings
+                                                      # ok
+cargo test -p lakehouse-store --lib governed_tag      # 2 passed; 0 failed; 318 filtered out
+cargo test -p lakehouse-store --test governed_tag     # 16 passed; 0 failed
+cargo test -p lakehouse-api --lib routes::catalog_search
+                                                      # 35 passed; 0 failed; 3501 filtered out
+cargo test -p lakehouse-api --lib routes::catalog     # 247 passed; 0 failed; 3289 filtered out
+cargo test -p lakehouse-api --lib routes::governance  # 69 passed; 0 failed; 3467 filtered out
+cargo test -p lakehouse-api --lib routes::quality     # 46 passed; 0 failed; 3490 filtered out
+cargo test -p lakehouse-api --test quality_incidents  # 11 passed; 0 failed
+```
+
+TypeScript, from the repository root (`bun install --frozen-lockfile` once,
+before the first check):
+
+```text
+bun run typecheck                                     # ok, no output
+bun run lint                                          # 0 errors, 11 warnings, none in a file this slice touched (data-table, sidebar, sso-page, alerts-page, login-page, use-copilot, use-data-table, dashboard-specs, uploads.test, http)
+bun run test                                          # 4079 passed, 1 skipped, 0 failed, 12303 expect() calls, 381 files, 98.05s
+```
+
+Lints and hygiene:
+
+```text
+python3 ops/lint/check_bare_iceberg_count.py          # R11 guard: no bare count() against a Bronze Iceberg table found.
+python3 ops/lint/check_intra_package_imports.py       # OK: all intra-package dispar_orchestrate imports resolve
+git status                                            # clean (nothing generated staged) on the final commit
+```
+
+Per-commit checks: for every Rust commit `cargo fmt --check`, `cargo clippy -p
+<the crates the commit touched> --all-targets -- -D warnings`, and the tests
+the plan's section 3 table names for that task; for every console commit
+`bun run typecheck`, `bun run lint` and `bun test` on the test files the plan
+names, plus the two Python lints. Each of those runs is the one whose counts
+appear above under "Tests added or changed" (the per-commit run and the final
+run agree).
+
+Not verified locally:
+
+- `cargo test --workspace` — *not verified locally, CI*. The plan leaves it to
+  CI on the pull request; the scoped commands above are what was run.
+- The container list: `docker ps -a` before the first database test showed 32
+  `clickhouse/clickhouse-server:26.8` containers and one `postgres:16-alpine`
+  (`ca1ffac89342`); after the last one it showed 31 and the same postgres. I
+  started no container directly and removed none (`docker rm -f` was never
+  run); one clickhouse container that was there before is no longer listed and
+  is not mine to explain.
+- Nothing under `dagster/` changed, so no Python test and no compose check ran,
+  as the plan says.
+- `cargo clippy` with `--all-features`: *not run* — the plan's handoff block
+  names `--all-targets` only.
+
+### MISMATCH
+
+None. Every anchor was found by its text at this base and every task's code
+matched the plan. The planner's unverified readings all held:
+
+- D16/T9: the picker's fixtures really were not shaped like the API's rows;
+  with the API's shape the old code read `primer.Northwind Orders`,
+  `primer.No Table`, `silver.Orders Clean` (the new test fails on it), so D16 is
+  confirmed, not wrong.
+- T2: every existing `catalog_search` test passed unchanged; their ids hold a
+  dot or are never searched for.
+- T8: the `quality_incidents` mock's `system.columns` answer reads as "the table
+  exists", and `with_priority(1)` lets one test answer "no such table" — both
+  existing `PUT`s and the new 201 cases pass.
+- T7/T8: a principal with `*:*` and no narrowed role reads every table through
+  `table_access_for`.
+- T13/T10: `cmdk` passes the item's `value` to the filter intact and a `div`
+  inside `Command.Group` is drawn.
+- T4: the let-chain compiles as written.
+
+Two things the plan did not name, reported here rather than improvised:
+
+- T8: `create_quality_rule` has a third caller, the assistant's
+  `draft_quality_rule` tool (`rust/crates/lakehouse-api/src/routes/ai/tools/
+  governance.rs`). It has no person behind it, so it passes `None` as the actor:
+  access is not narrowed, a missing table is still refused. No tool schema
+  changed; `tests/fixtures/tool_schemas.json` was not regenerated.
+- T14: the module comment of `palette-search.ts` named `listAssets`; it names
+  `searchAssets` now (T10's instruction), and T14's `PALETTE_SEARCH_MAX_CHARS`
+  lives beside it.
+- T9 removed the only use of the `Asset` type import in `table-picker.tsx`; the
+  import is `AssetDetail` only now (no unused import left).
+
 ## 6. Review
