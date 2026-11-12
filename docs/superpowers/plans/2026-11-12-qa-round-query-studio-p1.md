@@ -1138,3 +1138,51 @@ handoff's 27 was a real count; the line now reads 28 with the test R4 added.
 
 No open BLOCKER. T1 and T2 stay held (section 0) and are not part of this pull request: the
 first half of `QS-6` is still open in the backlog. Merge when CI on #483 is green.
+
+### Round 3 (planner, 2026-11-12): merge with `main` after #482
+
+`main` gained #482 (`177d6f218`, another engineer) while this branch waited for CI. #482 fixes
+`LH-QS-4-08` on the console side: a Trino tab does not call the estimate and says "No pre-run
+estimate for Trino queries."; a Bronze row is proven when the list loads (at most four reads
+at a time), so it inserts without expanding; completion after an alias of an unlisted table
+offers nothing. That is the same ground as this branch's T7 (`QS-7`) and the console half of
+T6. Two implementations of one fix must not both ship. The planner's rulings:
+
+- **M1. The Bronze proof: `main` wins, this branch's T7 goes.** After the merge, remove
+  everything commit `353595020` added that `main`'s code does not use: `listedBronzeTable` in
+  `src/lib/asset-query.ts` and its tests in `asset-query.test.ts`; in
+  `src/features/queries/use-query-studio.ts` the `trinoSeen` state, `wantsBronzeListing`, the
+  `bronzeListing` read of `listTables`, `listedBronzeNames` and the `tableProofs` merge (the
+  hook returns `main`'s proofs); the tests T7 and review R3 added for that listing in
+  `use-query-studio.test.ts` and `schema-browser.test.tsx`. Keep every test #482 brought.
+  A deleted test of ours is not a weakened test here: it tested code that no longer exists;
+  say so in the commit body.
+- **M2. The estimate on a Trino tab: `main`'s console wins.** In both conflict hunks of
+  `use-query-studio.ts` take `main`'s side (`estimateSupported`, no call for a non-ClickHouse
+  tab, the reset on switch). Drop this branch's `estimateEngineRef` (review R2): `main`'s
+  reset covers it. The console no longer sends `engine` to the estimate: remove the `engine`
+  argument from the hook's `runEstimate`/`estimateDebounced` and from
+  `queriesService.estimate` and its client test ("posts the engine to estimate for a Trino tab
+  …", "asks for the estimate again, with the engine …"), with the reason in the commit body.
+- **M3. What stays from this branch.** The server side of T3 (`POST /api/query/estimate`
+  accepts `engine`, answers `supported: false` with a fixed reason for Trino and asks no
+  engine; a Trino run result states no ClickHouse tier and no workload class) and its tests:
+  it is the honest answer for any caller. T4 and T8 (`canDownload`, Download and Copy as TSV
+  off). T5 (the draft per person and tenant). From T6: the result summary and the panel name
+  the engine that ran ("ClickHouse" or "Trino"; `LH-QS-2-10`), and the panel's branch for an
+  answer with `supported: false` (now reached only if a caller asks anyway). Where the panel's
+  sentence for "no estimate on Trino" exists twice, keep `main`'s words ("No pre-run estimate
+  for Trino queries.") as the one sentence.
+- **M4. Documents.** In `docs/core/features/query-studio-editor.md` and
+  `docs/core/features/query-history.md`: `main`'s text for the Bronze proof and for the Trino
+  estimate; this branch's text for the tab storage (`QS-8`), the download switch (`QS-9`) and
+  the engine name. `CHANGELOG.md`: keep both sides' entries, `main`'s first; drop this
+  branch's `QS-7` entry (the fix is #482's) and reword its Trino-estimate entry to what is
+  left (the estimate route's typed answer and the engine name on the summary).
+- **M5. How.** `git merge origin/main` on the branch (a merge commit, never a rebase or a
+  force-push). Resolve hunk by hunk by the rulings above; never `--ours` or `--theirs` on a
+  file both sides changed (rule 9). Then M1's removals as their own commit. Run the checks,
+  and report anything where the two sides' behaviour differs and no ruling covers it as
+  "MISMATCH", without choosing.
+
+After this round `QS-7` is closed by #482, not by this pull request.
