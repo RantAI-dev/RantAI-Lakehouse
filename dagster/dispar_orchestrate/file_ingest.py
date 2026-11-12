@@ -114,7 +114,7 @@ import re
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, BinaryIO
 
@@ -142,7 +142,9 @@ MAX_LOAD_FILES = 10
 # `ingest_run.connector_id` of an upload's run: what the API asks for.
 CONNECTOR_PREFIX = "upload:"
 
-# What the shared catalog shows as the table's author.
+# What the shared catalog shows as the table's author. `DATA-52`: the person who
+# started an upload is on the table's own versions (`SinkConfig.author`), not in this
+# catalog, which is shared across tenants.
 AUTHOR = "upload"
 
 # The API stores every upload under this prefix of the warehouse bucket, and
@@ -325,6 +327,9 @@ class FileIngestParams:
     columns: tuple[ColumnSpec, ...]
     #: `null` (load a value that does not fit as empty) or `stop` (fail the load).
     on_bad_value: str
+    #: Who the load is recorded as on the table's versions (`DATA-52`), e.g.
+    #: `Rina Wijaya (file upload)`; the empty string records no author.
+    author: str
 
     @classmethod
     def from_op_config(cls, config: Mapping[str, Any]) -> FileIngestParams:
@@ -359,6 +364,10 @@ CONFIG_SCHEMA = {
         description="The column list, one entry per column; empty for every column text.",
     ),
     "on_bad_value": Field(str, description="`null` or `stop`: what to do with a value that does not fit its column."),
+    "author": Field(
+        str,
+        description="Who started the load, e.g. `Rina Wijaya (file upload)`; an empty string records no author.",
+    ),
 }
 
 
@@ -1303,6 +1312,9 @@ def _load(
         sink_config = load_config()
     except Exception as exc:  # noqa: BLE001 -- e.g. an unreadable token file; nothing was read or written
         raise LoadFailure(LOAD_FAILED) from exc
+    # `DATA-52`: the API sends who started the load; every write of this load records it
+    # on the table's versions, so a version written by an upload is not "unknown".
+    sink_config = replace(sink_config, author=params.author)
     with _unbounded_csv_fields(), ExitStack() as opened:
         handles: list[BinaryIO] = []
         for each in keys:

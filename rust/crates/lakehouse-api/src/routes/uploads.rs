@@ -2731,17 +2731,41 @@ async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
     }
 }
 
+/// Who a load is recorded as in the table's own history (`DATA-52`, QA
+/// `LH-DATA-15-08`): the display name of the person who pressed Load, and
+/// ` (file upload)` after it, so a version written by an upload says how it was
+/// written. A name with nothing usable in it is `file upload` alone rather than a
+/// bare suffix. Control characters go (a name is shown in a table's history) and
+/// the name is cut at [`MAX_STORED_TEXT_CHARS`], like every other stored text of
+/// an upload.
+fn load_author(display_name: &str) -> String {
+    let name: String = display_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_STORED_TEXT_CHARS)
+        .collect();
+    let name = name.trim();
+    if name.is_empty() {
+        "file upload".to_owned()
+    } else {
+        format!("{name} (file upload)")
+    }
+}
+
 /// The run config `file_ingest_job` takes: `ops.ingest_uploaded_file.config`
 /// (plan T7). `load_key` is the object the job reads: the upload's own, or the
 /// converted sheet of a workbook ([`converted_key`]). The config schema is
 /// closed, so nothing about the sheet can be added here. `load_keys` lists every
 /// file of the load, the primary first (`DATA-17` slice 5, plan AD5); the
-/// `bronze_table_name` path the `DATA-19` sensor reads does not move.
+/// `bronze_table_name` path the `DATA-19` sensor reads does not move. `author` is
+/// [`load_author`]'s answer for the person who started the load (`DATA-52`); the
+/// job takes it from this change on, so the schema stays closed.
 fn run_config(
     upload_id: &str,
     request: &IngestRequest,
     load_keys: &[String],
     (format, compression): (&str, &str),
+    author: &str,
 ) -> Value {
     let (columns, on_bad_value) = columns::run_config_columns(request.columns.as_ref());
     json!({
@@ -2760,6 +2784,7 @@ fn run_config(
                     "header_row": request.header_row,
                     "columns": columns,
                     "on_bad_value": on_bad_value,
+                    "author": author,
                 }
             }
         }
@@ -2851,12 +2876,13 @@ async fn launch(
     request: &IngestRequest,
     load_keys: &[String],
     kind: (&str, &str),
+    author: &str,
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
         .launch_run_with_config(
             FILE_INGEST_JOB,
-            &run_config(&claimed.id, request, load_keys, kind),
+            &run_config(&claimed.id, request, load_keys, kind, author),
         )
         .await
     {
@@ -3321,7 +3347,10 @@ pub async fn ingest(
 
     let claimed = claim_load(pool, &row, &request, folder, converted.as_ref(), limits).await?;
 
-    let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind).await?;
+    // `DATA-52`: the author is the person who pressed Load, taken from the
+    // authenticated principal rather than from anything the request sent.
+    let author = load_author(&principal.display_name);
+    let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind, &author).await?;
     let attached = finish_launch_and_audit(
         pool,
         &principal,
@@ -4217,7 +4246,13 @@ mod tests {
             "uploads/t/up-3.csv",
         ]
         .map(str::to_owned);
-        let config = run_config("up-1", &request, &keys, ("delimited", "none"));
+        let config = run_config(
+            "up-1",
+            &request,
+            &keys,
+            ("delimited", "none"),
+            "a person (file upload)",
+        );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["storage_keys"], json!(keys));
         assert_eq!(job["upload_id"], "up-1");
@@ -4248,6 +4283,7 @@ mod tests {
             &request,
             &["uploads/t/up-1.xlsx.converted.csv".to_owned()],
             ("delimited", "none"),
+            "a person (file upload)",
         );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["upload_id"], "up-1");
@@ -4262,6 +4298,40 @@ mod tests {
         assert!(
             job.get("sheet").is_none(),
             "the job's config schema is closed"
+        );
+    }
+
+    /// `DATA-52`: the job is told who started the load, as the API stores it.
+    #[test]
+    fn the_run_config_names_who_started_the_load() {
+        let request = parse_ingest_request(&body(&valid()), None, None).unwrap();
+        let config = run_config(
+            "up-1",
+            &request,
+            &["uploads/t/up-1.csv".to_owned()],
+            ("delimited", "none"),
+            "Rina Wijaya (file upload)",
+        );
+        let job = &config["ops"]["ingest_uploaded_file"]["config"];
+        assert_eq!(job["author"], "Rina Wijaya (file upload)");
+    }
+
+    /// `DATA-52` (QA `LH-DATA-15-08`): a name is shown in a table's history, so it
+    /// carries no control character and no more than a stored text does; and an
+    /// upload with no usable name says how it was written, not " (file upload)".
+    #[test]
+    fn the_author_of_a_load_is_the_name_without_control_characters_or_file_upload_alone() {
+        assert_eq!(load_author("Rina Wijaya"), "Rina Wijaya (file upload)");
+        assert_eq!(load_author("Rina\nWijaya\u{7}"), "RinaWijaya (file upload)");
+        assert_eq!(load_author("  Rina Wijaya  "), "Rina Wijaya (file upload)");
+        for nothing in ["", "   ", "\n\u{7}"] {
+            assert_eq!(load_author(nothing), "file upload", "{nothing:?}");
+        }
+        let long = "x".repeat(300);
+        let author = load_author(&long);
+        assert_eq!(
+            author,
+            format!("{} (file upload)", "x".repeat(MAX_STORED_TEXT_CHARS))
         );
     }
 

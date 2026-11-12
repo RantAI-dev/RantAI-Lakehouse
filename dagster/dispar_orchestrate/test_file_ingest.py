@@ -120,6 +120,7 @@ def _params(**overrides) -> FileIngestParams:
         header_row=0,
         columns=(),
         on_bad_value="stop",
+        author="Rina Wijaya (file upload)",
     )
     return dataclasses.replace(base, **overrides)
 
@@ -211,6 +212,7 @@ class _Harness:
                 "table": table,
                 "plan": plan,
                 "column_types": kwargs.get("column_types"),
+                "author": config.author,
                 "columns": dict(resource.columns),
                 "rows": [row for batch in resource for row in batch.to_pylist()],
             }
@@ -1086,6 +1088,17 @@ def test_the_table_is_registered_for_the_shared_catalog_without_the_tenant_or_th
     assert ".csv" not in registered["description"]
 
 
+def test_the_sink_is_told_the_author_the_run_was_launched_with():
+    # `DATA-52` (QA `LH-DATA-15-08`): who started the load is recorded on the table's own
+    # versions, through `SinkConfig.author`; the shared catalog's author stays "upload",
+    # because that catalog is shared across tenants.
+    harness = _Harness()
+    harness.run(_params(author="Rina Wijaya (file upload)"))
+    [loaded] = harness.loads
+    assert loaded["author"] == "Rina Wijaya (file upload)"
+    assert harness.registered[0]["author"] == "upload"
+
+
 def test_a_table_registered_by_an_upload_reaches_the_catalog_through_the_shared_helper():
     from dispar_orchestrate import connector_catalog
 
@@ -1305,6 +1318,7 @@ RUN_CONFIG = {
                 "header_row": 4,
                 "columns": [],
                 "on_bad_value": "stop",
+                "author": "Rina Wijaya (file upload)",
             }
         }
     }
@@ -1343,6 +1357,7 @@ def test_the_run_config_the_api_sends_reaches_the_load_as_the_same_settings(monk
             header_row=4,
             columns=(),
             on_bad_value="stop",
+            author="Rina Wijaya (file upload)",
         )
     ]
     assert result.output_for_node("ingest_uploaded_file") == {

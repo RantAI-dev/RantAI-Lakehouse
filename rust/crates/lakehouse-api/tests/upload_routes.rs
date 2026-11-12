@@ -84,6 +84,11 @@ const SESSION_CAP: usize = 2 * 1024 * 1024 * 1024;
 /// 50 MiB unpacked) and the most a gzip, a zip or a grouped load may add up to.
 const UNPACKED_CAP: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The display name of Bayu, one of the seeded users of `0002_seed_identity.sql`
+/// (`uploadedBy` of an upload he makes). `DATA-52`: the job's `author` is that name
+/// and ` (file upload)` after it, built from this one text rather than typed again.
+const BAYU_DISPLAY_NAME: &str = "Bayu Pratama";
+
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
         "{}/../../../ops/fixtures/uploads/{name}",
@@ -1156,7 +1161,7 @@ async fn an_upload_is_stored_under_a_server_made_key_and_answered_without_intern
     );
     assert_eq!(upload["sizeBytes"], bytes.len());
     assert_eq!(upload["status"], "uploaded");
-    assert_eq!(upload["uploadedBy"], "Bayu Pratama");
+    assert_eq!(upload["uploadedBy"], BAYU_DISPLAY_NAME);
     assert!(upload["createdAt"].as_str().unwrap().ends_with('Z'));
     for hidden in [
         "storageKey",
@@ -2032,6 +2037,7 @@ async fn an_ingest_launches_the_job_with_the_confirmed_options_and_records_the_r
             "header_row": 4,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } })
     );
     let row = stack.status_of(&id).await;
@@ -4569,6 +4575,7 @@ async fn a_workbook_ingest_stores_the_converted_sheet_beside_the_original_and_la
             "header_row": 0,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } }),
         "the job's own configuration, the converted object and the fixed dialect"
     );
@@ -5014,6 +5021,7 @@ async fn a_parquet_ingest_converts_nothing_and_launches_the_job_on_the_original_
             "header_row": 0,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } }),
         "the job's own configuration: the original object, read as Parquet"
     );

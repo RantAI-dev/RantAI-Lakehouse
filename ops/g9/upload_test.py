@@ -123,7 +123,8 @@ is `DATA-19`
     `bronze_ingest_<table>` and refuses a schema name past 64 characters,
     which is a table name past 50. The count is read through
     `POST /api/query/run`, under a `WHERE` (R11), so the catalog server and the
-    query engine are proven to take the name too.
+    query engine are proven to take the name too. Every version of the table
+    names the person who started the loads (`DATA-52`).
 
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
@@ -1232,8 +1233,22 @@ def step_long_table_name(api, state: dict) -> None:
             _wait_for(f"{QUERY_DB}.`bronze.{table}` holds {total} rows", holds, VISIBLE_TIMEOUT_S, retry_failures=True)
         except G9Failure as exc:
             raise G9Failure(f"{exc}; the last count was {counted[-1] if counted else 'never read'}") from exc
+
+    # `DATA-52` (`LH-DATA-15-08`): a version written by an upload names the person who
+    # started it, so no snapshot of this table says "unknown".
+    detail = _expect(
+        api.get(f"{API_URL}/api/lakehouse/tables/bronze/{table}", timeout=60),
+        200,
+        "GET /api/lakehouse/tables/bronze/{table}",
+    ).json()
+    snapshots = detail.get("snapshots") or []
+    if not snapshots:
+        raise G9Failure(f"the table {table} should have snapshots after two loads, it has none: {detail}")
+    unnamed = [s for s in snapshots if not str(s.get("author") or "").endswith(" (file upload)")]
+    if unnamed:
+        raise G9Failure(f"every version of {table} should name who started the load, these do not: {unnamed}")
     _delete_upload(api, upload_id, state)
-    print(f"[g9] long name: {table} holds 4 rows after a replace and an append")
+    print(f"[g9] long name: {table} holds 4 rows after a replace and an append, its versions name the uploader")
 
 
 def step_create_pipeline_over_uploaded_table(api, requests, table: str, silver_table: str) -> str:
