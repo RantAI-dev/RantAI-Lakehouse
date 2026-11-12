@@ -948,7 +948,16 @@ export function useQueryStudio(draftKey: string | null) {
   // says for an empty editor. SQL with no placeholder is never held back.
   const estimateWaits = missingRequiredValue(estimateDefinitions, parameterValues)
   const estimatable = targetStatement !== null && !estimateWaits
+  // Review round 1, R2 (QS-6): the estimate on screen belongs to the engine
+  // that was asked for. Until the new answer arrives the panel would draw
+  // the other engine's sources under this tab's engine label
+  // (`LH-QS-4-08`), so a changed engine drops it and shows the skeleton.
+  const estimateEngineRef = React.useRef<QueryEngine | null>(null)
   React.useEffect(() => {
+    if (estimateEngineRef.current !== null && estimateEngineRef.current !== engine) {
+      resetEstimate()
+    }
+    estimateEngineRef.current = engine
     // A buffer holding only the starter comment has nothing to estimate,
     // and asking anyway put an EXPLAIN ESTIMATE on ClickHouse for every
     // keystroke, including the ones that typed the comment.
@@ -957,7 +966,7 @@ export function useQueryStudio(draftKey: string | null) {
     }
     // `engine` is a dependency: the same statement on another engine has a
     // different answer (`QS-6`, decision 7), so switching the tab asks again.
-  }, [targetText, estimateWaits, estimateInputs, engine, estimateDebounced])
+  }, [targetText, estimateWaits, estimateInputs, engine, estimateDebounced, resetEstimate])
 
   // ── Actions ──────────────────────────────────────────────────────────
   /**
