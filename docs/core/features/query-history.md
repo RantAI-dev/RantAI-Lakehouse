@@ -65,7 +65,7 @@ recorded the same way; the chat's `run_sql` is not recorded, as today.
 - A failed Trino run recorded before the classification keeps its old message, which can hold the engine's first line. Failed ClickHouse runs from before it show the same default sentence, not their cause. Both age out of the 14-day window.
 - History covers 14 days. Runs from before this release have no table list, so the table filter misses them.
 - A `DESCRIBE` or `SHOW COLUMNS FROM` statement records the table it names. A `SHOW TABLES` statement records no table.
-- On a Trino tab, an alias on `iceberg.bronze.<table>` offers the table's columns one request after the statement first names the table; until then, the list says it is loading them.
+- On a Trino tab, an alias on `iceberg.bronze.<table>` offers no columns until the table's detail loads, when the table's registry id differs from its table name.
 - An alias on a quoted Bronze table name, one whose table name is not a plain identifier (for example
   `iceberg.bronze."order lines" b`), does not resolve its columns. The name is still inserted.
 - History is per user, not per tenant: a user who changes tenant still sees their own earlier runs from the
@@ -88,7 +88,7 @@ Run on a running console by the product owner. A step not performed is never a p
 | `QS-4-AC5` | (operator) Have a run recorded 15 days ago | It is not listed | Not run |
 | `QS-4-AC6` | Filter on engine Trino and a minimum of 5 seconds | Only Trino runs of 5 seconds or more | Not run |
 | `QS-4-AC7` | Click a run | Its SQL opens in a new Query Studio tab with its engine | Not run |
-| `QS-4-AC8` | In the editor on a Trino tab, click a Bronze table in the schema browser without expanding it; type its alias and a dot | The name is inserted and its columns are suggested | Not run |
+| `QS-4-AC8` | In the editor, expand a Bronze table in the schema browser and click it; type its alias and a dot | The name is inserted and its columns are suggested | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 
