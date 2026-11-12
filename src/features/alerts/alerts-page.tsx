@@ -155,7 +155,7 @@ export function AlertsPage() {
         rules as unknown as Rule[],
         {
           search: tableUrlState.search,
-          searchFields: [(r) => r.name, (r) => r.mart, (r) => r.measure, (r) => r.target],
+          searchFields: [(r) => r.name, (r) => r.mart, (r) => r.measure, (r) => r.target ?? ""],
           filters: tableUrlState.filters,
           joinOperator: tableUrlState.joinOperator,
         }

@@ -3,7 +3,7 @@ import type {
   ApproveSchemaChangeResponse,
   Connector,
   ConnectorDetail,
-  ConnectorRun,
+  ConnectorRunList,
   ConnectorRunLog,
   ConnectorService,
   ConnectorTestResult,
@@ -155,12 +155,8 @@ export const postgresConnectorService: ConnectorService = {
   runIngest(id, signal, table) {
     return postJson<IngestRunResult>(`/api/connectors/${encodeURIComponent(id)}/ingest/run`, table, signal);
   },
-  async listConnectorRuns(connectorId, signal) {
-    const body = await getJson<{ runs: ConnectorRun[] }>(
-      `/api/connectors/${encodeURIComponent(connectorId)}/runs`,
-      { signal }
-    );
-    return body.runs;
+  listConnectorRuns(connectorId, signal) {
+    return getJson<ConnectorRunList>(`/api/connectors/${encodeURIComponent(connectorId)}/runs`, { signal });
   },
   getConnectorRunLog(connectorId, runId, signal) {
     return getJson<ConnectorRunLog>(

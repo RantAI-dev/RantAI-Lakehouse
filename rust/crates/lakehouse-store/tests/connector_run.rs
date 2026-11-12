@@ -8,8 +8,8 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::connector_run::{
     AttemptReport, EndReason, ErrorClass, LogEvent, RUN_HISTORY_LIMIT, RunStatus, RunTrigger,
-    add_log_line, end_run, get_run_log, list_runs, purge_older_than, record_attempt, run_status,
-    settle_run, start_run,
+    add_log_line, end_run, end_timed_out_run, get_run_log, list_runs, purge_older_than,
+    record_attempt, run_status, settle_run, start_run,
 };
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
@@ -454,6 +454,73 @@ async fn the_sensor_settles_only_a_run_still_running(pool: PgPool) -> sqlx::Resu
         Some("paused")
     );
     assert_eq!(run_status(&pool, PG, "run-unknown").await.unwrap(), None);
+    Ok(())
+}
+
+/// QA `TC-1702` (`SRC-39`): a run that outlived its limit ends as failed
+/// with its own word (`timed_out`), not "a table failed", and its last log
+/// line says the limit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_past_its_limit_ends_as_failed_with_the_limit_in_its_last_log_line(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let t0 = OffsetDateTime::now_utc() - Duration::hours(6);
+    assert!(
+        start_run(&pool, PG, "run-long", RunTrigger::Schedule, None, t0)
+            .await
+            .unwrap()
+    );
+    assert!(
+        end_timed_out_run(&pool, PG, "run-long", 21_600, t0 + Duration::hours(6))
+            .await
+            .unwrap()
+    );
+
+    let runs = list_runs(&pool, PG, RUN_HISTORY_LIMIT).await.unwrap();
+    assert_eq!(runs[0].status, "failed");
+    assert_eq!(runs[0].end_reason.as_deref(), Some("timed_out"));
+    let log = get_run_log(&pool, PG, "run-long").await.unwrap().unwrap();
+    assert_eq!(
+        log.lines.last().unwrap().text,
+        "run ended: failed, the run did not finish in 6 h and was stopped"
+    );
+    Ok(())
+}
+
+/// A run that already ended keeps its own end, and a run with no record is
+/// left alone: nothing is invented for either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_that_already_ended_or_has_no_record_is_left_alone_by_the_time_limit(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let t0 = OffsetDateTime::now_utc() - Duration::minutes(10);
+    start_run(&pool, PG, "run-done", RunTrigger::Schedule, None, t0)
+        .await
+        .unwrap();
+    end_run(
+        &pool,
+        PG,
+        "run-done",
+        RunStatus::Succeeded,
+        EndReason::Completed,
+        t0 + Duration::seconds(30),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !end_timed_out_run(&pool, PG, "run-done", 21_600, t0 + Duration::hours(7))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !end_timed_out_run(&pool, PG, "run-unknown", 21_600, t0)
+            .await
+            .unwrap()
+    );
+    let runs = list_runs(&pool, PG, RUN_HISTORY_LIMIT).await.unwrap();
+    assert_eq!(runs[0].status, "succeeded");
+    assert_eq!(runs[0].end_reason.as_deref(), Some("completed"));
     Ok(())
 }
 
