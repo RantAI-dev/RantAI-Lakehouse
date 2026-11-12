@@ -3025,12 +3025,25 @@ pub(super) fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result
 pub struct CreatePipelineBody {
     name: String,
     kind: String,
-    source_zone: String,
-    source_table: String,
+    /// BLD-1 part 1 / D3: the legacy form's first field. Absent when the body
+    /// sent `inputs` and `steps`, which is the other form of the same thing.
+    #[serde(default)]
+    source_zone: Option<String>,
+    /// See [`Self::source_zone`].
+    #[serde(default)]
+    source_table: Option<String>,
     #[serde(default)]
     incremental_column: Option<String>,
+    /// The legacy form's transforms. Absent is the same as empty for the
+    /// legacy form, and is not allowed together with `inputs`/`steps`.
     #[serde(default)]
-    transforms: Vec<String>,
+    transforms: Option<Vec<String>>,
+    /// BLD-1 part 1 / D1: the definition's inputs, the new form.
+    #[serde(default)]
+    inputs: Option<Vec<lakehouse_store::pipelines::PipelineInput>>,
+    /// BLD-1 part 1 / D1: the definition's steps, the new form.
+    #[serde(default)]
+    steps: Option<Vec<lakehouse_store::pipelines::PipelineStep>>,
     #[serde(default)]
     fbic_enabled: bool,
     #[serde(default)]
@@ -3112,20 +3125,42 @@ pub async fn create(
     // `create_pipeline` tool lands here too, so it is refused with the
     // same wording its schema enum no longer offers.
     crate::routes::authored_pipelines::validate_target_zone(&body.target_zone)?;
+    // BLD-1 part 1 / D3: whichever of the two body forms this is, one
+    // function turns it into D1's shape. A body that sends both is refused
+    // here, before anything else reads them.
+    let form = crate::routes::authored_pipelines::definition_form(
+        body.inputs,
+        body.steps,
+        body.source_zone.as_deref(),
+        body.source_table.as_deref(),
+        body.transforms.as_deref(),
+    )?;
+    // The legacy form's transforms keep the `transforms[<i>]` message the
+    // console already parses (D7); the compiler checks the same strings
+    // again inside their step, as `steps[0].transforms[<j>]`.
+    if let Some(legacy) = &form.legacy_transforms {
+        for (index, transform) in legacy.iter().enumerate() {
+            crate::transform_grammar::parse_transform(transform).map_err(|err| {
+                ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
+            })?;
+        }
+    }
+    // The first input is the one the per-table upstreams and the connector
+    // watch (D12); the compiler has already refused a definition with none.
+    let first = form
+        .inputs
+        .first()
+        .ok_or_else(|| ApiError::BadRequest("a pipeline needs at least one input".to_owned()))?
+        .clone();
     // DATA-19 / D2 + BLD-4 / D2: `file_ingest_job` and `ingest_job` are
     // only upstreams of a pipeline that reads a Bronze table, so the create
     // route applies the same guard `authored_pipelines::update` and
     // `restore_version` run — one rule, one message per job, three call
-    // sites.
+    // sites. D12: the FIRST input is the one such a job loads.
     crate::routes::authored_pipelines::validate_per_table_upstream(
-        &body.source_zone,
+        &first.zone,
         Some(&body.depends_on),
     )?;
-    for (index, transform) in body.transforms.iter().enumerate() {
-        crate::transform_grammar::parse_transform(transform).map_err(|err| {
-            ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
-        })?;
-    }
     // Plan 1c: validate `max_retries` against the same `0..=5` the
     // column CHECK enforces (migration 0051). Catching it here means a
     // bad value returns a 400 with the field name, not a 500 from the
@@ -3175,6 +3210,17 @@ pub async fn create(
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty());
     if let Some(connector_id) = connector_id.as_deref() {
+        // BLD-1 part 1 / D12: a connector names the one Bronze table its
+        // ingest job writes, so a pipeline with a connector reads exactly
+        // one input. Refused here rather than silently watching only the
+        // first, which would make the other inputs look wired and never
+        // refresh the pipeline.
+        if form.inputs.len() != 1 {
+            return Err(ApiError::BadRequest(
+                "a pipeline with a connector has exactly one input".to_owned(),
+            )
+            .into());
+        }
         require_connector_in_tenant(pool(&state)?, connector_id, tenant_id).await?;
         // BLD-7 / decision 2 + DEC-15: a pipeline that names a connector
         // reads one of that connector's Bronze tables, never the source
@@ -3184,20 +3230,44 @@ pub async fn create(
         crate::routes::authored_pipelines::validate_connector_source(
             pool(&state)?,
             connector_id,
-            &body.source_zone,
-            &body.source_table,
+            &first.zone,
+            &first.table,
         )
         .await?;
     }
+    // BLD-1 part 1 / D2, D4, D5, D6: the definition is checked and compiled
+    // before it is stored, so a step outside the rules is refused at the item
+    // at fault rather than failing its first run (D7). The same compile is
+    // what D9 then gates and rewrites, and what the orchestrator later runs.
+    let compiled = crate::pipeline_compile::validate_and_compile(
+        &form.inputs,
+        &form.steps,
+        Some((&body.target_zone, &body.target_table)),
+        crate::routes::authored_pipelines::catalog_db(&state),
+    )
+    .map_err(crate::routes::authored_pipelines::definition_rejection)?;
+    // BLD-1 part 1 / D9 (F1): what the author may read is checked when the
+    // pipeline is saved, not only when it runs — the same gate and rewrite
+    // the run route applies, as the person the pipeline will read as.
+    let run_as = author_id(&principal);
+    crate::routes::authored_pipelines::save_check_compiled(
+        &state,
+        tenant_id,
+        run_as,
+        &form.inputs,
+        &form.steps,
+        &compiled,
+    )
+    .await?;
     let input = CreatePipelineInput {
-        inputs: Vec::new(),
-        steps: Vec::new(),
         name: body.name,
         kind: body.kind,
-        source_zone: body.source_zone,
-        source_table: body.source_table,
+        source_zone: first.zone.clone(),
+        source_table: first.table.clone(),
         incremental_column: body.incremental_column,
-        transforms: body.transforms,
+        transforms: form.legacy_transforms.unwrap_or_default(),
+        inputs: form.inputs,
+        steps: form.steps,
         fbic_enabled: body.fbic_enabled,
         target_zone: body.target_zone,
         target_table: body.target_table,
@@ -3217,7 +3287,7 @@ pub async fn create(
         // exactly what this column exists to stop. Such a row stays
         // `run_as = NULL` and does not run until an admin assigns an
         // author (D2).
-        run_as: author_id(&principal),
+        run_as,
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -4485,6 +4555,10 @@ mod dagster_half_tenant_gate {
     fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+        // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+        // database, so a state that builds bronze pipelines names it the way
+        // compose does (`ICEBERG_QUERY_DB`).
+        env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
         env.insert(
             "DAGSTER_URL".to_owned(),
             "http://127.0.0.1:1/graphql".to_owned(),
@@ -4598,6 +4672,20 @@ mod tests {
             provider: "service".to_owned(),
             must_change_password: false,
             role_names: Vec::new(),
+        }
+    }
+
+    /// [`fixture_member_principal`] with the unrestricted (`*:*`) grant.
+    ///
+    /// BLD-1 part 1 / D9 runs the tenant gate and the policy rewrite when a
+    /// pipeline is saved, as the person it will read as. A test whose setup
+    /// builds a pipeline through that check needs an author the gate lets
+    /// through — a `*:*` member of the seeded tenant — and a real `app_user`
+    /// for the `run_as` foreign key the create path now writes.
+    pub(super) fn fixture_admin_member_principal() -> Principal {
+        Principal {
+            permissions: PermissionSet::parse("*:*"),
+            ..fixture_member_principal()
         }
     }
 
@@ -5457,7 +5545,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = detail(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_admin_member_principal())),
                 HeaderMap::new(),
                 Path("bronze_maintenance_job".to_owned()),
             )
@@ -5517,7 +5605,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = detail(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_admin_member_principal())),
                 HeaderMap::new(),
                 Path("no_such_job".to_owned()),
             )
@@ -5543,6 +5631,10 @@ mod tests {
         fn pg_state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -5581,7 +5673,7 @@ mod tests {
             let state = pg_state_for(&pool);
             let (_, ApiJson(created)) = create(
                 State(state.clone()),
-                Extension(fixture_member_principal()),
+                Extension(fixture_admin_member_principal()),
                 HeaderMap::new(),
                 create_body(&json!({
                     "connectorId": "conn-pg-lakehouse",
@@ -5624,7 +5716,7 @@ mod tests {
             let state = pg_state_for(&pool);
             let (status, ApiJson(created)) = create(
                 State(state),
-                Extension(fixture_member_principal()),
+                Extension(fixture_admin_member_principal()),
                 HeaderMap::new(),
                 create_body(&json!({
                     "connectorId": "conn-pg-lakehouse",
@@ -5796,7 +5888,7 @@ mod tests {
             );
             let (_, ApiJson(created)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_admin_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -5836,7 +5928,7 @@ mod tests {
             let state = AppState::new(config);
             let response = detail(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_admin_member_principal())),
                 HeaderMap::new(),
                 Path("pl-does-not-exist".to_owned()),
             )
@@ -6173,7 +6265,7 @@ mod tests {
             let tenant_principal = |tenant_id: uuid::Uuid| -> Principal {
                 Principal {
                     tenant_ids: vec![tenant_id],
-                    ..fixture_user_principal()
+                    ..fixture_admin_member_principal()
                 }
             };
 
@@ -6364,7 +6456,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_admin_member_principal())),
                 Path("pl-authored".to_owned()),
             )
             .await;
@@ -6400,7 +6492,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_admin_member_principal())),
                 Path("ingest_job".to_owned()),
             )
             .await;
@@ -6439,7 +6531,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_admin_member_principal())),
                 Path("not_a_job".to_owned()),
             )
             .await;
@@ -6479,7 +6571,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_admin_member_principal())),
                 Path("ingest_job".to_owned()),
             )
             .await;
@@ -7726,6 +7818,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = std::collections::HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -7756,7 +7852,7 @@ mod tests {
 
             let err = create(
                 State(state),
-                Extension(fixture_user_principal()),
+                Extension(fixture_admin_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -7825,6 +7921,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -7848,7 +7948,7 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_admin_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -7981,6 +8081,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -8022,7 +8126,7 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_admin_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -9355,6 +9459,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool, dagster_uri: &str) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             env.insert("DAGSTER_URL".to_owned(), format!("{dagster_uri}/graphql"));
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
@@ -9512,7 +9620,7 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_admin_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -9716,6 +9824,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             // DAGSTER_URL is irrelevant for the routes under walk (none of
             // them dial Dagster when the scope check fails first); the
             // default localhost address is fine.
@@ -9726,7 +9838,7 @@ mod tests {
         fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
             Principal {
                 tenant_ids: vec![tenant_id],
-                ..fixture_user_principal()
+                ..fixture_admin_member_principal()
             }
         }
 
@@ -10796,6 +10908,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -10849,7 +10965,7 @@ mod tests {
         fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
             Principal {
                 tenant_ids: vec![tenant_id],
-                ..fixture_user_principal()
+                ..fixture_admin_member_principal()
             }
         }
 

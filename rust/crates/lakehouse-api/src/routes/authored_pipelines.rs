@@ -65,6 +65,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
+use lakehouse_core::ident::Ident;
 use lakehouse_store::PgPool;
 use lakehouse_store::pipelines::{self, ConnectorChange, UpdatePipelineInput};
 use serde::Deserialize;
@@ -1018,6 +1019,293 @@ pub fn validate_pipeline_input(
     Ok(())
 }
 
+// ── BLD-1 part 1: the definition's shape and the save-time check ───────
+
+/// What a create or an update body said the pipeline IS (D1), whichever of
+/// the two body forms it used (D3).
+#[derive(Debug, Clone)]
+pub(crate) struct DefinitionForm {
+    /// The inputs, in the order the person listed them.
+    pub inputs: Vec<lakehouse_store::pipelines::PipelineInput>,
+    /// The steps, in the order they run.
+    pub steps: Vec<lakehouse_store::pipelines::PipelineStep>,
+    /// The legacy `transforms` the body sent, when it sent the legacy form.
+    /// Kept so a bad transform is still refused as `transforms[<i>]`, the
+    /// shape the console already parses (D7).
+    pub legacy_transforms: Option<Vec<String>>,
+}
+
+/// The refusal when a body sends both forms at once.
+const BOTH_FORMS: &str =
+    "send either inputs and steps, or sourceZone, sourceTable and transforms, not both";
+/// The refusal when a body sends neither.
+const NO_SOURCE: &str = "sourceZone and sourceTable are required, or inputs and steps";
+
+/// BLD-1 part 1 / D3: the ONE function that turns either body form into
+/// D1's shape.
+///
+/// Today's three fields become one input and, when there are transforms, one
+/// `transform` step ([`pipelines::legacy_definition`]); the new fields are
+/// used as given. A body that sends both is a 400, because "which one wins"
+/// is not a question a caller should have to guess.
+///
+/// # Errors
+///
+/// [`ApiRejection`] (400) when the body sends both forms, or neither.
+pub(crate) fn definition_form(
+    inputs: Option<Vec<lakehouse_store::pipelines::PipelineInput>>,
+    steps: Option<Vec<lakehouse_store::pipelines::PipelineStep>>,
+    source_zone: Option<&str>,
+    source_table: Option<&str>,
+    transforms: Option<&[String]>,
+) -> Result<DefinitionForm, ApiRejection> {
+    let has_new = inputs.is_some() || steps.is_some();
+    let has_old = source_zone.is_some() || source_table.is_some() || transforms.is_some();
+    if has_new && has_old {
+        return Err(ApiError::BadRequest(BOTH_FORMS.to_owned()).into());
+    }
+    if has_new {
+        return Ok(DefinitionForm {
+            inputs: inputs.unwrap_or_default(),
+            steps: steps.unwrap_or_default(),
+            legacy_transforms: None,
+        });
+    }
+    let (Some(zone), Some(table)) = (source_zone, source_table) else {
+        return Err(ApiError::BadRequest(NO_SOURCE.to_owned()).into());
+    };
+    let transforms = transforms.unwrap_or(&[]);
+    let (inputs, steps) = pipelines::legacy_definition(zone, table, transforms);
+    Ok(DefinitionForm {
+        inputs,
+        steps,
+        legacy_transforms: Some(transforms.to_vec()),
+    })
+}
+
+/// BLD-1 part 1 / D2–D6: the compiler's refusal as the route answers it (400).
+pub(crate) fn definition_rejection(err: crate::pipeline_compile::DefinitionError) -> ApiRejection {
+    ApiError::BadRequest(err.to_string()).into()
+}
+
+/// The catalog database a Bronze input is read through, when configured
+/// (`Config::iceberg_query_db`, the same name the orchestrator is told).
+pub(crate) fn catalog_db(state: &AppState) -> Option<&str> {
+    state.config.iceberg_query_db.as_ref().map(Ident::as_str)
+}
+
+/// Who a pipeline reads as, resolved once for both the save-time check (D9)
+/// and the run route (D8).
+pub(crate) enum PipelineActor {
+    /// A real, active person, with the principal their roles and tenant list
+    /// resolve to right now.
+    Author(Box<Principal>),
+    /// No author, or an author who is no longer active. The save path runs
+    /// every check except the rewrite and stores nothing new about who the
+    /// pipeline is (D9); the run path refuses with [`NO_AUTHOR_REASON`].
+    NoAuthor,
+}
+
+/// Load the principal a pipeline reads as — the body of what
+/// [`enforce_pipeline_sql`] did inline before BLD-1 part 1 (D9 asks the save
+/// path and the run route to share it rather than keep two copies).
+///
+/// # Errors
+///
+/// [`ApiError`] for a database failure, through `upstream_error` so no driver
+/// text reaches the response.
+pub(crate) async fn pipeline_actor(
+    pool: &PgPool,
+    run_as: Option<Uuid>,
+) -> Result<PipelineActor, ApiError> {
+    let Some(run_as) = run_as else {
+        return Ok(PipelineActor::NoAuthor);
+    };
+    match lakehouse_store::identity::user_status(pool, run_as).await? {
+        // `ON DELETE SET NULL` means a deleted author is `None` above; this
+        // covers the row that is still there but is not active.
+        Some(status) if status == "active" => {}
+        _ => return Ok(PipelineActor::NoAuthor),
+    }
+    match lakehouse_auth::repository::load_principal_for_user(
+        pool,
+        run_as,
+        "local".to_owned(),
+        false,
+    )
+    .await
+    {
+        Ok(principal) => Ok(PipelineActor::Author(Box::new(principal))),
+        // Raced with a delete: it now IS no author.
+        Err(lakehouse_auth::AuthError::NotFound) => Ok(PipelineActor::NoAuthor),
+        // BLD-1 review BLOCKER 1: a database failure goes through
+        // `upstream_error` — fixed message plus a reference id to the caller,
+        // the driver's own text to the log only (AGENTS.md principle 4).
+        Err(lakehouse_auth::AuthError::Database(source)) => {
+            Err(upstream_error::report_sqlx(&upstream_error::STORE, &source)
+                .into_api_error(upstream_error::FailedAs::Internal))
+        }
+        Err(other) => Err(upstream_error::internal_error(
+            &upstream_error::STORE,
+            &other,
+        )),
+    }
+}
+
+/// Why the gate or the rewrite refused a statement.
+///
+/// The two callers answer it differently on purpose: the run route (D8) keeps
+/// each one's own status, and the save path (D9) answers both as a 422 naming
+/// the step, because a person is editing a pipeline and no retry is involved.
+pub(crate) enum EnforcementRefusal {
+    /// The tenant gate refused — a fixed sentence from the gate.
+    Gate(ApiError),
+    /// The policy rewrite refused.
+    Rewrite(Box<crate::policy_engine::EnforcementError>),
+}
+
+/// The gate and the rewrite for one statement, as `author` in `tenant_id` —
+/// the one path Query Studio, the run route and the save path share.
+///
+/// # Errors
+///
+/// [`EnforcementRefusal`] when the tenant gate or the rewrite refuses.
+pub(crate) async fn check_and_rewrite(
+    state: &AppState,
+    author: &Principal,
+    tenant_id: Option<Uuid>,
+    sql: &str,
+) -> Result<String, EnforcementRefusal> {
+    crate::routes::query::gate_statement(
+        state,
+        sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        crate::routes::query::GateActor::AsTenant {
+            principal: author,
+            tenant_id,
+        },
+    )
+    .await
+    .map_err(EnforcementRefusal::Gate)?;
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(author.id.uuid().to_string()),
+        principal_tenant_ids: author.tenant_ids.iter().map(ToString::to_string).collect(),
+    };
+    let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(state);
+    crate::policy_engine::rewrite_sql_for_roles(
+        sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        crate::sql_rewrite::Engine::ClickHouse,
+        &author.role_names,
+        &placeholders,
+        &obligations_source,
+    )
+    .await
+    .map_err(|err| EnforcementRefusal::Rewrite(Box::new(err)))
+}
+
+/// The tables one step introduces, when it is a SQL step. A `transform` step
+/// reads a CTE, so it can never introduce a table of its own.
+fn step_tables(step: &lakehouse_store::pipelines::PipelineStep) -> Option<Vec<String>> {
+    let lakehouse_store::pipelines::PipelineStep::Sql { sql, .. } = step else {
+        return None;
+    };
+    crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::ClickHouseDialect {})
+}
+
+/// Which input or step a gate or rewrite refusal belongs to (D7).
+///
+/// The table the engine refused is the honest answer when the refusal names
+/// one; otherwise the first item whose own text mentions a table the message
+/// names; otherwise the last step, which is the item a person would look at.
+fn refusal_path(
+    inputs: &[lakehouse_store::pipelines::PipelineInput],
+    steps: &[lakehouse_store::pipelines::PipelineStep],
+    table: Option<&str>,
+    message: &str,
+) -> String {
+    if let Some(table) = table {
+        if let Some(index) = inputs.iter().position(|i| i.location() == table) {
+            return format!("inputs[{index}]");
+        }
+        if let Some(index) = steps.iter().position(|step| {
+            step_tables(step).is_some_and(|tables| tables.iter().any(|t| t == table))
+        }) {
+            return format!("steps[{index}]");
+        }
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        if message.contains(&input.location()) {
+            return format!("inputs[{index}]");
+        }
+    }
+    for (index, step) in steps.iter().enumerate() {
+        if step_tables(step).is_some_and(|tables| tables.iter().any(|t| message.contains(t))) {
+            return format!("steps[{index}]");
+        }
+    }
+    steps
+        .len()
+        .checked_sub(1)
+        .map_or_else(|| "inputs[0]".to_owned(), |index| format!("steps[{index}]"))
+}
+
+/// The fixed sentence inside a gate refusal, whichever status it carried.
+fn gate_message(err: &ApiError) -> String {
+    match err {
+        ApiError::NotFound(message) | ApiError::Unprocessable(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// BLD-1 part 1 / D9: the gate and the rewrite for the whole compiled
+/// statement, as the person the pipeline will read as, answered as a 422 that
+/// names the input or step at fault (D7).
+///
+/// No author is not a refusal here: a pipeline created by a service identity
+/// has nobody to read as, and D9 stores it compiled-but-unchecked until an
+/// administrator assigns an author. It does not run in the meantime (D2, the
+/// run route's 409).
+///
+/// # Errors
+///
+/// [`ApiRejection`] (422) with `<inputs[i]|steps[i]>: <fixed sentence>` when
+/// the gate or the rewrite refuses.
+pub(crate) async fn save_check_compiled(
+    state: &AppState,
+    tenant_id: Option<Uuid>,
+    run_as: Option<Uuid>,
+    inputs: &[lakehouse_store::pipelines::PipelineInput],
+    steps: &[lakehouse_store::pipelines::PipelineStep],
+    compiled: &str,
+) -> Result<(), ApiRejection> {
+    let actor = pipeline_actor(crate::routes::pipelines::pool(state)?, run_as).await?;
+    let PipelineActor::Author(author) = actor else {
+        return Ok(());
+    };
+    let refusal = match check_and_rewrite(state, &author, tenant_id, compiled).await {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    let (table, message) = match &refusal {
+        EnforcementRefusal::Gate(err) => (None, gate_message(err)),
+        EnforcementRefusal::Rewrite(err) => {
+            let table = match err.as_ref() {
+                crate::policy_engine::EnforcementError::TableNotReadable(table) => {
+                    Some(table.as_str())
+                }
+                _ => None,
+            };
+            (
+                table,
+                crate::policy_engine::enforcement_error_message(err.as_ref()),
+            )
+        }
+    };
+    let path = refusal_path(inputs, steps, table, &message);
+    Err(ApiError::Unprocessable(format!("{path}: {message}")).into())
+}
+
 /// Ask the orchestrator to rebuild its authored jobs. Best effort: the
 /// write that called this has already succeeded, and a failed reload is
 /// reported as `false`, never as the write failing. The reason is logged,
@@ -1481,44 +1769,12 @@ pub async fn enforce_pipeline_sql(
     // Both refuse rather than run the query unrewritten, and neither is
     // retryable from the orchestrator's side -- what changes the answer is
     // an administrator assigning an author, not another attempt.
-    let Some(run_as) = pipeline.run_as else {
+    //
+    // BLD-1 part 1 / D9: this is the same resolution the save path runs
+    // (`pipeline_actor`), so "who reads" has one implementation.
+    let PipelineActor::Author(author) = pipeline_actor(pool, pipeline.run_as).await? else {
         return Err(ApiError::Conflict(NO_AUTHOR_REASON.to_owned()).into());
     };
-    match lakehouse_store::identity::user_status(pool, run_as).await? {
-        // `ON DELETE SET NULL` means a deleted author reads as NULL above;
-        // this covers the row that is still there but is not active.
-        Some(status) if status == "active" => {}
-        _ => return Err(ApiError::Conflict(NO_AUTHOR_REASON.to_owned()).into()),
-    }
-    let author = lakehouse_auth::repository::load_principal_for_user(
-        pool,
-        run_as,
-        "local".to_owned(),
-        false,
-    )
-    .await
-    .map_err(|err| match err {
-        // Raced with a delete between the two reads above. The same
-        // refusal as "no author", because it now IS no author.
-        lakehouse_auth::AuthError::NotFound => ApiError::Conflict(NO_AUTHOR_REASON.to_owned()),
-        // BLD-1 review BLOCKER 1: a failure here is an upstream database
-        // error, so it goes through `upstream_error` -- a fixed message
-        // plus a reference to the caller, the driver's own text to the log
-        // only (AGENTS.md principle 4). The reported value is the `sqlx`
-        // source, NOT this enum: `AuthError::Database`'s `Display` is the
-        // fixed "database error" (`lakehouse_auth::error`'s module doc), so
-        // reporting the enum would log that string and throw the cause
-        // away, and `report_sqlx` is also what tells an unreachable pool
-        // (`503`, retryable) from a statement the database refused (`500`).
-        lakehouse_auth::AuthError::Database(source) => {
-            upstream_error::report_sqlx(&upstream_error::STORE, &source)
-                .into_api_error(upstream_error::FailedAs::Internal)
-        }
-        // Every other variant this loader can return is this code base's
-        // own text, but none of it is a reason to answer the caller with an
-        // error string built here: log it under a reference, answer fixed.
-        other => upstream_error::internal_error(&upstream_error::STORE, &other),
-    })?;
 
     // SEC-50 R3: a pipeline that belongs to NO tenant is refused with its
     // own sentence, BEFORE the gate. The gate's table sentence would
@@ -1534,51 +1790,26 @@ pub async fn enforce_pipeline_sql(
         return Err(ApiError::Conflict(NO_TENANT_REASON.to_owned()).into());
     }
 
-    // The placeholders are the AUTHOR's, exactly as Query Studio builds
-    // them for a session principal (`routes::query::
-    // rewrite_sql_for_principal_inner`): a row filter or a mask that names
-    // `{principal_id}` or `{tenant_ids}` resolves to whoever the pipeline
-    // reads as.
-    let placeholders = crate::sql_rewrite::PlaceholderValues {
-        principal_id: Some(author.id.uuid().to_string()),
-        principal_tenant_ids: author.tenant_ids.iter().map(ToString::to_string).collect(),
-    };
-    let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(&state);
     // SEC-50: the tenant gate runs BEFORE the policy rewrite, so a
-    // statement that reads a table the pipeline's own tenant may not
-    // read is refused before the policy's own prefetch asks the engine
-    // about that table, and before the statement reaches the engine at
-    // all. The pipeline acts as its OWN tenant (`pipeline_definition
-    // .tenant_id`), applied as if the author had sent it in `X-Tenant`:
-    // the caller is the orchestrator, which has no tenant of its own.
+    // statement that reads a table the pipeline's own tenant may not read
+    // is refused before the policy's own prefetch asks the engine about
+    // that table, and before the statement reaches the engine at all. The
+    // pipeline acts as its OWN tenant (`pipeline_definition.tenant_id`),
+    // applied as if the author had sent it in `X-Tenant`: the caller is the
+    // orchestrator, which has no tenant of its own.
     //
-    // R2: a refusal here answers 422, not 404 — see
-    // `gate_refusal_as_unprocessable` for why this route's status
-    // differs from Query Studio's.
-    crate::routes::query::gate_statement(
-        &state,
-        &sql,
-        &sqlparser::dialect::ClickHouseDialect {},
-        crate::routes::query::GateActor::AsTenant {
-            principal: &author,
-            tenant_id: pipeline.tenant_id,
-        },
-    )
-    .await
-    .map_err(gate_refusal_as_unprocessable)?;
-    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
-        &sql,
-        &sqlparser::dialect::ClickHouseDialect {},
-        crate::sql_rewrite::Engine::ClickHouse,
-        &author.role_names,
-        &placeholders,
-        &obligations_source,
-    )
-    .await
-    // GOV-7 D5: a table the author's roles do not include answers the tenant
-    // gate's own 404 here too (the gate's OWN refusal stays the 422 this
-    // route documents above — that is `gate_refusal_as_unprocessable`).
-    .map_err(|err| crate::routes::support::enforcement_refusal(&sql, &err))?;
+    // R2: a gate refusal here answers 422, not 404 — see
+    // `gate_refusal_as_unprocessable` for why this route's status differs
+    // from Query Studio's. GOV-7 D5: a table the author's roles do not
+    // include answers the tenant gate's own 404 here too.
+    let rewritten = check_and_rewrite(&state, &author, pipeline.tenant_id, &sql)
+        .await
+        .map_err(|refusal| match refusal {
+            EnforcementRefusal::Gate(err) => gate_refusal_as_unprocessable(err),
+            EnforcementRefusal::Rewrite(err) => {
+                crate::routes::support::enforcement_refusal(&sql, &err)
+            }
+        })?;
     // DATA-13 (F2): the API sees the run's real SELECT only here. Keep the SQL
     // as the orchestrator submitted it, not `rewritten` (masking wraps the
     // source in subqueries, which would make every column partial); the
@@ -1592,12 +1823,24 @@ pub async fn enforce_pipeline_sql(
 #[serde(rename_all = "camelCase")]
 pub struct UpdateBody {
     kind: String,
-    source_zone: String,
-    source_table: String,
+    /// BLD-1 part 1 / D3: the legacy form's first field; absent when the body
+    /// sent `inputs` and `steps`.
+    #[serde(default)]
+    source_zone: Option<String>,
+    /// See [`Self::source_zone`].
+    #[serde(default)]
+    source_table: Option<String>,
     #[serde(default)]
     incremental_column: Option<String>,
+    /// The legacy form's transforms (absent is the same as empty).
     #[serde(default)]
-    transforms: Vec<String>,
+    transforms: Option<Vec<String>>,
+    /// BLD-1 part 1 / D1: the definition's inputs, the new form.
+    #[serde(default)]
+    inputs: Option<Vec<lakehouse_store::pipelines::PipelineInput>>,
+    /// BLD-1 part 1 / D1: the definition's steps, the new form.
+    #[serde(default)]
+    steps: Option<Vec<lakehouse_store::pipelines::PipelineStep>>,
     #[serde(default)]
     fbic_enabled: bool,
     target_zone: String,
@@ -1694,11 +1937,38 @@ pub async fn update(
     // (PR #59 review) moved them into the shared `validate_pipeline_input`
     // that this route and `restore_version` both call below.
     validate_target_zone(&body.target_zone)?;
+    // BLD-1 part 1 / D3: one function turns either body form into D1's shape.
+    let form = definition_form(
+        body.inputs,
+        body.steps,
+        body.source_zone.as_deref(),
+        body.source_table.as_deref(),
+        body.transforms.as_deref(),
+    )?;
+    // The legacy form keeps the `transforms[<i>]` message the console already
+    // parses (D7); the compiler checks the same strings again inside their
+    // step.
+    if let Some(legacy) = &form.legacy_transforms {
+        for (index, transform) in legacy.iter().enumerate() {
+            crate::transform_grammar::parse_transform(transform).map_err(|err| {
+                ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
+            })?;
+        }
+    }
+    let first = form
+        .inputs
+        .first()
+        .ok_or_else(|| ApiError::BadRequest("a pipeline needs at least one input".to_owned()))?
+        .clone();
     // DATA-19 / D2 + BLD-4 / D2: the same shape as the guard above, on the
     // upstream side. `None` here means the body omitted `dependsOn` and the
-    // stored chain is kept, so there is nothing new to check.
-    validate_per_table_upstream(&body.source_zone, body.depends_on.as_deref())?;
+    // stored chain is kept, so there is nothing new to check. D12: the FIRST
+    // input is the table one of those jobs loads.
+    validate_per_table_upstream(&first.zone, body.depends_on.as_deref())?;
     let pool = crate::routes::pipelines::pool(&state)?;
+    let current = pipelines::get_pipeline(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     // BLD-9 / decision 7: `connectorId` is optional on this route, and the
     // three cases differ. Absent (`None`) leaves the stored connector
     // alone, exactly like `owner`/`max_retries`; `null` or an empty string
@@ -1718,31 +1988,45 @@ pub async fn update(
     // rule is checked against the connector the row will END with, not
     // only a newly submitted one. Otherwise an edit could point a
     // connector's pipeline at a table that connector never loads.
-    match &connector_change {
-        ConnectorChange::Set(connector_id) => {
-            let current = pipelines::get_pipeline(pool, &id)
-                .await?
-                .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-            crate::routes::pipelines::require_connector_in_tenant(
-                pool,
-                connector_id,
-                current.tenant_id,
+    //
+    // BLD-1 part 1 / D12: a connector means the pipeline reads exactly one
+    // Bronze input, the table that connector's ingest writes.
+    let ends_with_connector = match &connector_change {
+        ConnectorChange::Clear => None,
+        ConnectorChange::Set(connector_id) => Some(connector_id.clone()),
+        ConnectorChange::Keep => current.connector_id.clone(),
+    };
+    if let Some(connector_id) = ends_with_connector.as_deref() {
+        if form.inputs.len() != 1 {
+            return Err(ApiError::BadRequest(
+                "a pipeline with a connector has exactly one input".to_owned(),
             )
-            .await?;
-            validate_connector_source(pool, connector_id, &body.source_zone, &body.source_table)
+            .into());
+        }
+        match &connector_change {
+            ConnectorChange::Set(connector_id) => {
+                crate::routes::pipelines::require_connector_in_tenant(
+                    pool,
+                    connector_id,
+                    current.tenant_id,
+                )
                 .await?;
-        }
-        ConnectorChange::Clear => {}
-        ConnectorChange::Keep => {
-            let current = pipelines::get_pipeline(pool, &id)
-                .await?
-                .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-            if let Some(kept) = current.connector_id.as_deref() {
-                validate_connector_source(pool, kept, &body.source_zone, &body.source_table)
-                    .await?;
             }
+            // Kept: the tenant check ran when it was set, and `in_scope`
+            // has already vouched for the row.
+            ConnectorChange::Keep | ConnectorChange::Clear => {}
         }
+        validate_connector_source(pool, connector_id, &first.zone, &first.table).await?;
     }
+    // BLD-1 part 1 / D2, D4, D5, D6: checked and compiled before anything is
+    // written, exactly as `create` does.
+    let compiled = crate::pipeline_compile::validate_and_compile(
+        &form.inputs,
+        &form.steps,
+        Some((&body.target_zone, &body.target_table)),
+        catalog_db(&state),
+    )
+    .map_err(definition_rejection)?;
     // Dagster unreachable degrades to "no Dagster upstreams accepted"
     // (empty list) rather than 500ing the update — see
     // `routes::pipelines::create`'s identical treatment. The rule
@@ -1775,21 +2059,47 @@ pub async fn update(
     // the stored chain), `Some(vec)` replaces it.
     validate_pipeline_input(
         &id,
-        &body.transforms,
+        form.legacy_transforms.as_deref().unwrap_or(&[]),
         body.max_retries,
         body.depends_on.as_deref(),
         &others,
         &dagster_jobs,
     )?;
+    // BLD-1 part 1 / D10 (`SEC-71`): when a person other than the current
+    // author changes what the pipeline READS, the pipeline reads as them from
+    // then on -- reading as someone else after their edit is how an editor
+    // would see rows they may not see. An edit that changes neither the
+    // inputs nor the steps (the schedule, the description, the retries)
+    // leaves the author alone.
+    let stored = pipelines::get_definition(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    let inputs_changed = stored.inputs != form.inputs || stored.steps != form.steps;
+    let caller = match principal.id {
+        PrincipalId::User(user_id) => Some(user_id),
+        PrincipalId::Service(_) => None,
+    };
+    let new_run_as = caller.filter(|user_id| Some(*user_id) != current.run_as && inputs_changed);
+    let effective_run_as = new_run_as.or(current.run_as);
+    // BLD-1 part 1 / D9: the gate and the rewrite for the definition as it
+    // will be stored, as the person it will read as.
+    save_check_compiled(
+        &state,
+        current.tenant_id,
+        effective_run_as,
+        &form.inputs,
+        &form.steps,
+        &compiled,
+    )
+    .await?;
     let input = UpdatePipelineInput {
-        inputs: Vec::new(),
-        steps: Vec::new(),
-        run_as: None,
         kind: body.kind,
-        source_zone: body.source_zone,
-        source_table: body.source_table,
+        source_zone: first.zone.clone(),
+        source_table: first.table.clone(),
         incremental_column: body.incremental_column.filter(|c| !c.trim().is_empty()),
-        transforms: body.transforms,
+        transforms: form.legacy_transforms.clone().unwrap_or_default(),
+        inputs: form.inputs,
+        steps: form.steps,
         fbic_enabled: body.fbic_enabled,
         target_zone: body.target_zone,
         target_table: body.target_table,
@@ -1799,11 +2109,22 @@ pub async fn update(
         max_retries: body.max_retries,
         depends_on: body.depends_on,
         connector_id: connector_change,
+        run_as: new_run_as,
     };
     let updated = pipelines::update_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-    record_pipeline_audit(&state, &principal, "pipeline.update", &id, Value::Null).await;
+    // D10: the audit entry of an edit records the author it moved from and
+    // to, because that is a change of who the output is written as.
+    let audit_args = if new_run_as.is_some() {
+        json!({
+            "runAsBefore": current.run_as,
+            "runAsAfter": updated.run_as,
+        })
+    } else {
+        Value::Null
+    };
+    record_pipeline_audit(&state, &principal, "pipeline.update", &id, audit_args).await;
     // A draft has no job; only a runnable pipeline's job has to be rebuilt.
     let reloaded = if updated.status == "draft" {
         false
@@ -1960,20 +2281,35 @@ pub async fn restore_version(
     // the shared `validate_pipeline_input` this route calls below,
     // which also takes the tenant-scoped `others`.
     validate_target_zone(&snapshot.target_zone)?;
+    // BLD-1 part 1 / D13: the inputs and steps this version held. A snapshot
+    // written before the shape existed is turned into it by D3's rule, so a
+    // restore of an old version reproduces what that version's pipeline was.
+    let (restored_inputs, restored_steps) = pipelines::snapshot_definition(&snapshot);
+    let first = restored_inputs
+        .first()
+        .ok_or_else(|| ApiError::BadRequest("a pipeline needs at least one input".to_owned()))?
+        .clone();
     // DATA-19 / D2 + BLD-4 / D2: the snapshot is replayed whole, so its
-    // `depends_on` is checked against its own `source_zone` on every restore
+    // `depends_on` is checked against its own source zone on every restore
     // (a stored version can predate the rule, the same reason the
     // Bronze-target refusal above is re-applied here). Always `Some(...)`: a
-    // restore always carries the snapshot's chain.
-    validate_per_table_upstream(&snapshot.source_zone, Some(&snapshot.depends_on))?;
+    // restore always carries the snapshot's chain. D12: the FIRST input is
+    // the table a per-table upstream loads.
+    validate_per_table_upstream(&first.zone, Some(&snapshot.depends_on))?;
+    let current = pipelines::get_pipeline(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     // PR review (BLD-7, SHOULD-FIX 1): a restore keeps the row's current
     // connector (`ConnectorChange::Keep` below) but replays the snapshot's
     // source, which may predate the connector. Hold it to the same rule.
-    if let Some(current) = pipelines::get_pipeline(pool, &id).await?
-        && let Some(kept) = current.connector_id.as_deref()
-    {
-        validate_connector_source(pool, kept, &snapshot.source_zone, &snapshot.source_table)
-            .await?;
+    if let Some(kept) = current.connector_id.as_deref() {
+        if restored_inputs.len() != 1 {
+            return Err(ApiError::BadRequest(
+                "a pipeline with a connector has exactly one input".to_owned(),
+            )
+            .into());
+        }
+        validate_connector_source(pool, kept, &first.zone, &first.table).await?;
     }
     let dagster_jobs = match state.dagster.list_jobs().await {
         Ok(j) => j,
@@ -1993,18 +2329,50 @@ pub async fn restore_version(
         &others,
         &dagster_jobs,
     )?;
+    // BLD-1 part 1 / D2, D4, D5, D6: a stored definition can predate every
+    // rule this branch added, and a restore writes it straight back into the
+    // row, so it is compiled and checked exactly as `create` and `update`
+    // check theirs.
+    let compiled = crate::pipeline_compile::validate_and_compile(
+        &restored_inputs,
+        &restored_steps,
+        Some((&snapshot.target_zone, &snapshot.target_table)),
+        catalog_db(&state),
+    )
+    .map_err(definition_rejection)?;
+    // BLD-1 part 1 / D10 (`SEC-71`): a version that reads differently from
+    // the current definition, restored by someone other than the current
+    // author, makes that person the author -- the same rule an edit follows.
+    let stored = pipelines::get_definition(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    let inputs_changed = stored.inputs != restored_inputs || stored.steps != restored_steps;
+    let caller = match principal.id {
+        PrincipalId::User(user_id) => Some(user_id),
+        PrincipalId::Service(_) => None,
+    };
+    let new_run_as = caller.filter(|user_id| Some(*user_id) != current.run_as && inputs_changed);
+    // BLD-1 part 1 / D9: the same save-time check `create` and `update` run.
+    save_check_compiled(
+        &state,
+        current.tenant_id,
+        new_run_as.or(current.run_as),
+        &restored_inputs,
+        &restored_steps,
+        &compiled,
+    )
+    .await?;
     // Rebuild an `UpdatePipelineInput` from the snapshot. `name` and
     // `status` are deliberately excluded: a restore is a replay of the
     // editable fields, not a rename/re-promotion (Plan R4 2b).
     let input = UpdatePipelineInput {
-        inputs: Vec::new(),
-        steps: Vec::new(),
-        run_as: None,
         kind: snapshot.kind,
-        source_zone: snapshot.source_zone,
-        source_table: snapshot.source_table,
+        source_zone: first.zone.clone(),
+        source_table: first.table.clone(),
         incremental_column: snapshot.incremental_column,
         transforms: snapshot.transforms,
+        inputs: restored_inputs,
+        steps: restored_steps,
         fbic_enabled: snapshot.fbic_enabled,
         target_zone: snapshot.target_zone,
         target_table: snapshot.target_table,
@@ -2024,6 +2392,7 @@ pub async fn restore_version(
         // `name`/`status` above. Clearing it here would silently break
         // a pipeline the restore never touched.
         connector_id: ConnectorChange::Keep,
+        run_as: new_run_as,
     };
     let updated = pipelines::restore_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
@@ -2202,7 +2571,13 @@ mod tests {
     /// helper keeps their pre-F2.1 assertions intact.
     fn unrestricted_principal() -> Principal {
         Principal {
-            id: PrincipalId::User(Uuid::from_u128(1)),
+            // BLD-1 part 1 / D9 and D10: a save may now store `run_as`, which
+            // has a foreign key to `app_user`. A made-up uuid would make every
+            // update in these tests fail on that key, so this fixture is the
+            // seeded `rina@meridian.example` (`0002_seed_identity.sql`) — still
+            // `*:*` through `permissions` below, which is the part the tests
+            // are about.
+            id: PrincipalId::User(Uuid::parse_str("33333333-3333-4333-8333-000000000001").unwrap()),
             tenant_ids: Vec::new(),
             display_name: "fixture".to_owned(),
             permissions: PermissionSet::parse("*:*"),
@@ -2765,6 +3140,10 @@ mod tests {
         pub(super) fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -2791,6 +3170,10 @@ mod tests {
                 .await;
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             // Build the AppState against the wiremock, not the
             // production DAGSTER_URL.
             let mut env_with_dagster = env.clone();
@@ -3196,6 +3579,10 @@ mod tests {
         pub(super) fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -3553,6 +3940,10 @@ mod tests {
         pub(super) fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -4029,6 +4420,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -4312,6 +4707,10 @@ mod tests {
                 .await;
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             env.insert(
                 "DAGSTER_URL".to_owned(),
                 format!("{}/graphql", server.uri()),
@@ -4515,6 +4914,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -4649,6 +5052,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -5056,6 +5463,10 @@ mod tests {
                 .await;
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             env.insert(
                 "DAGSTER_URL".to_owned(),
                 format!("{}/graphql", server.uri()),
