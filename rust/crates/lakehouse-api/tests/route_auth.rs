@@ -4325,3 +4325,56 @@ async fn overview_alerts_refuses_dashboard_read_principal() {
     assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
     assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+/// `SEC-72` decision `DEC-19`: a signed-in caller gets the same 405 and 404
+/// answers an anonymous one does. Both used to be 500 — the gate answered
+/// `route_policy_unclassified` for a method no route had, and the router
+/// answered "No matched path found" for an address no route matched — so
+/// neither status depended on who was asking. A fresh session per request,
+/// because one of the paths is a logout in other tests' sweeps.
+#[tokio::test]
+async fn a_signed_in_person_gets_405_for_a_method_no_route_has_and_404_for_an_unknown_address() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = platform_admin_user_id(&pool).await;
+
+    let method_not_allowed =
+        serde_json::json!({ "error": "This method is not allowed on this address." });
+    for (method, path) in [
+        ("DELETE", "/health"),
+        ("POST", "/api/dashboard"),
+        ("GET", "/api/pipelines/x/target-lag"),
+        ("DELETE", "/api/pipelines/x/target-lag"),
+        ("POST", "/api/governance/quality/incidents"),
+        ("PATCH", "/api/reports/subscriptions/x"),
+    ] {
+        let cookie = session_cookie_for_user(&pool, admin).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} has no handler"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+        assert_eq!(body, method_not_allowed, "{method} {path}");
+    }
+
+    let no_such_address = serde_json::json!({ "error": "No such address." });
+    for (method, path) in [
+        ("GET", "/api/never-existed"),
+        ("PATCH", "/api/governance/quality/incidents/x"),
+        ("PUT", "/api/governance/quality/incidents/x"),
+    ] {
+        let cookie = session_cookie_for_user(&pool, admin).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+        assert_eq!(body, no_such_address, "{method} {path}");
+    }
+}
