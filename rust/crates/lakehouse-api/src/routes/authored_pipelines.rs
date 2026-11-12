@@ -1304,10 +1304,25 @@ pub(crate) async fn pipeline_actor(
 /// each one's own status, and the save path (D9) answers both as a 422 naming
 /// the step, because a person is editing a pipeline and no retry is involved.
 pub(crate) enum EnforcementRefusal {
-    /// The tenant gate refused — a fixed sentence from the gate.
+    /// The tenant gate refused — a fixed sentence from the gate, or an outage
+    /// that must keep its own status (R1-S1).
     Gate(ApiError),
     /// The policy rewrite refused.
     Rewrite(Box<crate::policy_engine::EnforcementError>),
+}
+
+impl EnforcementRefusal {
+    /// The refusal as the error the caller must answer with, unchanged — the
+    /// path an outage takes on the save route (R1-S1), and the gate's own
+    /// status on the run route.
+    fn into_api_error(self) -> ApiError {
+        match self {
+            Self::Gate(err) => err,
+            Self::Rewrite(err) => ApiError::Unprocessable(
+                crate::policy_engine::enforcement_error_message(err.as_ref()),
+            ),
+        }
+    }
 }
 
 /// The gate and the rewrite for one statement, as `author` in `tenant_id` —
@@ -1396,11 +1411,19 @@ fn refusal_path(
         .map_or_else(|| "inputs[0]".to_owned(), |index| format!("steps[{index}]"))
 }
 
-/// The fixed sentence inside a gate refusal, whichever status it carried.
-fn gate_message(err: &ApiError) -> String {
+/// The fixed sentence inside a gate refusal — or `None` when the gate did not
+/// refuse at all.
+///
+/// BLD-1 part 1 review R1-S1: only the gate's own refusals (the `SEC-20` table
+/// sentence, the listing sentence, a tenant the author may not act as) are a
+/// 422 at save. An outage — an unreachable database, a failed count — keeps its
+/// own status, exactly as it does on the run route
+/// (`gate_refusal_as_unprocessable`): an outage must not read as a bad
+/// request.
+fn gate_message(err: &ApiError) -> Option<String> {
     match err {
-        ApiError::NotFound(message) | ApiError::Unprocessable(message) => message.clone(),
-        other => other.to_string(),
+        ApiError::NotFound(message) | ApiError::Unprocessable(message) => Some(message.clone()),
+        _ => None,
     }
 }
 
@@ -1433,7 +1456,13 @@ pub(crate) async fn save_check_compiled(
         return Ok(());
     };
     let (table, message) = match &refusal {
-        EnforcementRefusal::Gate(err) => (None, gate_message(err)),
+        EnforcementRefusal::Gate(err) => {
+            let Some(message) = gate_message(err) else {
+                // Not a refusal: an outage keeps its own status (R1-S1).
+                return Err(refusal.into_api_error().into());
+            };
+            (None, message)
+        }
         EnforcementRefusal::Rewrite(err) => {
             let table = match err.as_ref() {
                 crate::policy_engine::EnforcementError::TableNotReadable(table) => {
