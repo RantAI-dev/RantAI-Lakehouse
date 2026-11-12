@@ -944,6 +944,86 @@ async fn a_table_the_connector_does_not_load_is_a_404_and_stops_no_run() {
     );
 }
 
+/// `review round 1, R10` (QA `TC-1702`): the assistant's `run_ingest` has no
+/// signed-in person, and stopping a run is a person's decision (its own
+/// `cancel_pipeline_run` is a `WriteHigh` tool). An overdue run is the 409 for
+/// the tool — no `terminateRun` is sent — and its sentence says "Run now" on
+/// the connector's page, where a person decides.
+#[tokio::test]
+async fn the_assistants_run_ingest_answers_409_for_an_overdue_run_and_stops_nothing() {
+    let server = MockServer::start().await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    let started = now - 7.0 * 3600.0;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_created_at(
+            "conn-ingest-tool",
+            "run-tool",
+            "STARTED",
+            started,
+            Some(started)
+        )]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("terminateRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                "run": { "runId": "run-tool" } } }
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "never" } } }
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-tool").await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/tool")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(
+                    json!({
+                        "tool": "run_ingest",
+                        "args": { "id": "conn-ingest-tool", "confirmed": true },
+                        "mode": "build"
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    // The tool answer wraps the route's body: `{"tool", "outcome", "result"}`.
+    let error = body["result"]["error"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .unwrap_or_default();
+    assert!(error.contains("run too long"), "{body}");
+    assert!(error.contains("Run now"), "{body}");
+    assert_eq!(cancel_requests(&server).await, [] as [String; 0]);
+}
+
 /// Another connector's run does not block this one.
 #[tokio::test]
 async fn ingest_run_is_not_blocked_by_another_connectors_run() {

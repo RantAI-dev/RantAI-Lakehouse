@@ -3843,6 +3843,12 @@ pub async fn ingest_run(
 /// run; it holds the connector until it has waited longer than a run may run.
 /// A `STARTING` run holds the connector and is left to the monitoring.
 ///
+/// `may_stop` says whether this caller may stop an overdue run. It is false
+/// for the assistant's `run_ingest`, which has no signed-in person
+/// (`review round 1, R10`): stopping a run is a person's decision (the
+/// assistant's own `cancel_pipeline_run` needs approval), so an overdue run is
+/// the 409 there and nothing is cancelled.
+///
 /// # Errors
 ///
 /// 409 naming the run that is still going, 503 when the orchestrator cannot
@@ -3855,6 +3861,7 @@ pub async fn ingest_run(
 async fn runs_holding_the_lock(
     state: &AppState,
     connector_id: &str,
+    may_stop: bool,
 ) -> Result<Vec<ConnectorIngestRun>, ApiError> {
     let recent = state
         .dagster
@@ -3875,6 +3882,9 @@ async fn runs_holding_the_lock(
             blocking.status,
             blocking.run_id.get(..8).unwrap_or(&blocking.run_id),
         )));
+    }
+    if !may_stop && !active.is_empty() {
+        return Err(ApiError::Conflict(OVERDUE_RUN_FOR_THE_ASSISTANT.to_owned()));
     }
     Ok(active)
 }
@@ -3983,7 +3993,9 @@ async fn launch_ingest(
     // (`SRC-39`, QA `TC-1702`). This decides only: the 409 for a run that is
     // still going, or the overdue runs to stop later (`review round 1, R3`).
     // The 409 comes before the body is judged, as it always did.
-    let overdue = runs_holding_the_lock(&state, &id).await?;
+    // A person's route may stop a run; the assistant's `run_ingest` (no
+    // principal) may not (`review round 1, R10`).
+    let overdue = runs_holding_the_lock(&state, &id, principal.is_some()).await?;
 
     // The request's own refusals come next, and they have no side effect: a
     // body naming a table the connector does not load, or a table waiting for
@@ -4111,6 +4123,12 @@ const INGEST_RUN_NEEDS_BOTH: &str =
 /// Fixed 404 text: the connector does not load the table asked for. No name from
 /// the request is repeated.
 const INGEST_OBJECT_NOT_SELECTED: &str = "This connector does not load that table.";
+
+/// Fixed 409 text for a caller that may not stop a run (the assistant's
+/// `run_ingest`, which has no signed-in person): `review round 1, R10`.
+const OVERDUE_RUN_FOR_THE_ASSISTANT: &str = "The earlier run for this connector has run too long \
+     to wait for, and starting another one from here would load the same tables twice. It can be \
+     replaced with \"Run now\" on the connector's page.";
 
 /// Fixed 409 text: the table waits for a schema decision (`SRC-8`).
 const INGEST_OBJECT_WAITS: &str = "This table is waiting for a schema decision, so it cannot be \
