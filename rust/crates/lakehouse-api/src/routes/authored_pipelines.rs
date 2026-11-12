@@ -1937,7 +1937,15 @@ pub async fn compile_pipeline(
     // COMPILED SQL (not `rewritten`: masking wraps the source in subqueries,
     // which would make every column partial); the mapping is written when the
     // run is reported successful.
-    super::lineage::columns::note_pipeline_sql(pool, &id, &compiled).await;
+    //
+    // BLD-1 part 1 review R1-B1 / D4b: only a definition of today's shape
+    // (D4a) is noted. Any other compiles to a `WITH`, which the lineage
+    // mapper cannot read — it would record a target column with no
+    // provenance, so no row is recorded instead (a `WITH`-aware mapper is a
+    // backlog item). Table lineage (D11) is unaffected.
+    if crate::pipeline_compile::is_legacy_shape(&definition.inputs, &definition.steps) {
+        super::lineage::columns::note_pipeline_sql(pool, &id, &compiled).await;
+    }
     Ok(ApiJson(json!({
         "sql": rewritten,
         // D8: whether any input is Bronze decides `allow_database_iceberg` on

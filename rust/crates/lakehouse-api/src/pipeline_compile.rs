@@ -162,6 +162,21 @@ pub fn compile(
     catalog_db: Option<&str>,
 ) -> Result<String, DefinitionError> {
     let (limit, last) = validate(inputs, steps, up_to)?;
+    // BLD-1 part 1 review R1-B1 / D4a: a definition of today's shape compiles
+    // to today's statement, with no `WITH`. That is what `DATA-13`'s lineage
+    // reads, and a `WITH` made every existing pipeline's mapping partial.
+    if is_legacy_shape(inputs, steps) {
+        let source = input_source(&inputs[0], 0, catalog_db)?;
+        if limit == 0 {
+            return Ok(format!("SELECT * FROM {source}"));
+        }
+        let PipelineStep::Transform { transforms, .. } = &steps[0] else {
+            // `is_legacy_shape` accepted only that kind.
+            return Ok(format!("SELECT * FROM {source}"));
+        };
+        let parsed = parse_transforms(transforms, 0)?;
+        return Ok(render_transform_step(&source, &parsed));
+    }
     let mut ctes: Vec<String> = Vec::with_capacity(inputs.len() + limit);
     for (index, input) in inputs.iter().enumerate() {
         ctes.push(format!(
@@ -178,6 +193,37 @@ pub fn compile(
         ctes.join(",\n"),
         last
     ))
+}
+
+/// Parse a `transform` step's strings, naming the position at fault.
+fn parse_transforms(
+    transforms: &[String],
+    index: usize,
+) -> Result<Vec<Transform>, DefinitionError> {
+    transforms
+        .iter()
+        .map(|text| {
+            parse_transform(text).map_err(|_| {
+                DefinitionError::at(format!("steps[{index}].transforms"), TRANSFORM_REFUSED)
+            })
+        })
+        .collect()
+}
+
+/// D4a: whether this definition is today's shape — one input and either no
+/// step or exactly one `transform` step reading it — which is what compiles
+/// to today's statement (no `WITH`), and the only shape whose statement is
+/// noted for column lineage (D4b).
+#[must_use]
+pub fn is_legacy_shape(inputs: &[PipelineInput], steps: &[PipelineStep]) -> bool {
+    let [input] = inputs else {
+        return false;
+    };
+    match steps {
+        [] => true,
+        [PipelineStep::Transform { reads, .. }] => reads == &input.name,
+        _ => false,
+    }
 }
 
 /// Check the whole definition and compile all of it, refusing an output
@@ -398,17 +444,10 @@ fn render_step(step: &PipelineStep, index: usize) -> Result<String, DefinitionEr
             reads,
             transforms,
         } => {
-            let parsed = transforms
-                .iter()
-                .map(|text| {
-                    parse_transform(text).map_err(|_| {
-                        DefinitionError::at(format!("steps[{index}].transforms"), TRANSFORM_REFUSED)
-                    })
-                })
-                .collect::<Result<Vec<Transform>, DefinitionError>>()?;
+            let parsed = parse_transforms(transforms, index)?;
             Ok(format!(
                 "  `{name}` AS ({})",
-                render_transform_step(reads, &parsed)
+                render_transform_step(&format!("`{reads}`"), &parsed)
             ))
         }
         PipelineStep::Sql { name, sql } => Ok(format!("  `{name}` AS (\n{sql}\n)")),
@@ -424,7 +463,7 @@ fn render_step(step: &PipelineStep, index: usize) -> Result<String, DefinitionEr
 /// `ORDER BY k LIMIT 1 BY k`. Every dynamic piece is rendered through
 /// [`Transform::render_clickhouse`], never string-interpolated here.
 #[must_use]
-pub fn render_transform_step(reads: &str, transforms: &[Transform]) -> String {
+pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
     let mut columns: Option<Vec<String>> = None;
     let mut renames: Vec<(String, String)> = Vec::new();
     let mut casts: Vec<(String, String)> = Vec::new();
@@ -466,7 +505,7 @@ pub fn render_transform_step(reads: &str, transforms: &[Transform]) -> String {
         },
     );
 
-    let mut sql = format!("SELECT {select_columns} FROM `{reads}`");
+    let mut sql = format!("SELECT {select_columns} FROM {from}");
     if !filters.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&filters.join(" AND "));
@@ -522,11 +561,14 @@ mod tests {
         compile(inputs, steps, None, Some("icecat_api")).expect_err("the definition is refused")
     }
 
+    /// D4a: today's shape compiles to today's statement — the text
+    /// `_build_select_sql` gave on `main` for the same pipeline. `DATA-13`'s
+    /// lineage reads it, and a `WITH` made every mapping partial (R1-B1).
     #[test]
     fn one_input_and_no_steps_is_a_plain_copy() {
         assert_eq!(
             compile(&one_input(), &[], None, Some("icecat_api")).unwrap(),
-            "WITH\n  `orders` AS (SELECT * FROM silver.`orders`)\nSELECT * FROM `orders`"
+            "SELECT * FROM silver.`orders`"
         );
     }
 
@@ -535,8 +577,7 @@ mod tests {
         let inputs = vec![input("g3a_orders", "bronze", "g3a_orders")];
         assert_eq!(
             compile(&inputs, &[], None, Some("icecat_api")).unwrap(),
-            "WITH\n  `g3a_orders` AS (SELECT * FROM icecat_api.`bronze.g3a_orders`)\n\
-             SELECT * FROM `g3a_orders`"
+            "SELECT * FROM icecat_api.`bronze.g3a_orders`"
         );
     }
 
@@ -566,9 +607,8 @@ mod tests {
         )];
         assert_eq!(
             compile(&one_input(), &steps, None, Some("icecat_api")).unwrap(),
-            "WITH\n  `orders` AS (SELECT * FROM silver.`orders`),\n  `transformed` AS \
-             (SELECT id, CAST(amount AS Float64) AS amount_usd FROM `orders` WHERE status = \
-             'active' ORDER BY id LIMIT 1 BY id)\nSELECT * FROM `transformed`"
+            "SELECT id, CAST(amount AS Float64) AS amount_usd FROM silver.`orders` \
+             WHERE status = 'active' ORDER BY id LIMIT 1 BY id"
         );
     }
 
@@ -804,6 +844,51 @@ mod tests {
         let inputs = vec![input("orders", "silver", "orders")];
         let err = compile(&inputs, &[], Some("Orders"), Some("icecat_api")).unwrap_err();
         assert_eq!(err.path(), "upTo");
+    }
+
+    /// D4a: `up_to` follows the same rule — up to the input of a today's-shape
+    /// definition is the plain read of its table, with no `WITH`.
+    #[test]
+    fn up_to_the_input_of_todays_shape_is_the_plain_read() {
+        let steps = vec![transform_step("transformed", "orders", &["select(id)"])];
+        assert_eq!(
+            compile(&one_input(), &steps, Some("orders"), Some("icecat_api")).unwrap(),
+            "SELECT * FROM silver.`orders`"
+        );
+        assert_eq!(
+            compile(
+                &one_input(),
+                &steps,
+                Some("transformed"),
+                Some("icecat_api")
+            )
+            .unwrap(),
+            "SELECT id FROM silver.`orders`"
+        );
+    }
+
+    #[test]
+    fn the_legacy_predicate_is_exactly_one_input_and_one_step_reading_it() {
+        let inputs = vec![input("orders", "silver", "orders")];
+        assert!(super::is_legacy_shape(&inputs, &[]));
+        assert!(super::is_legacy_shape(
+            &inputs,
+            &[transform_step("transformed", "orders", &["select(id)"])]
+        ));
+        // A step reading something else, a SQL step and a second input are
+        // not today's shape.
+        assert!(!super::is_legacy_shape(
+            &inputs,
+            &[transform_step("transformed", "other", &["select(id)"])]
+        ));
+        assert!(!super::is_legacy_shape(
+            &inputs,
+            &[sql_step("copied", "SELECT id FROM orders")]
+        ));
+        assert!(!super::is_legacy_shape(
+            &[input("a", "silver", "a"), input("b", "silver", "b")],
+            &[]
+        ));
     }
 
     /// Decision 12: window functions are allowed, and so is every other
