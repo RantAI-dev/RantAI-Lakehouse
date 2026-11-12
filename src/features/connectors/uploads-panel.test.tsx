@@ -419,6 +419,8 @@ describe("UploadsPanel folders", () => {
     fireEvent.click(folderNav().getByRole("button", { name: /^Ops/ }))
     expect((screen.getByRole("button", { name: "Delete folder Ops" }) as HTMLButtonElement).disabled).toBe(false)
     expect(screen.queryByTestId("folder-delete-reason")).toBeNull()
+    // Ops can take a subfolder, so no reason is shown for that button either.
+    expect(screen.queryByTestId("folder-nest-reason")).toBeNull()
   })
 
   it("deletes an empty folder after a confirmation and goes back to every file", async () => {
@@ -487,7 +489,41 @@ describe("UploadsPanel folders", () => {
     fireEvent.click(folderNav().getByRole("button", { name: /^C/ }))
     const button = screen.getByRole("button", { name: "New subfolder" }) as HTMLButtonElement
     expect(button.disabled).toBe(true)
+    // `DATA-51` (QA `LH-DATA-35-07`): the reason is text under the button too, not
+    // only a `title` a touch screen never shows.
     expect(button.getAttribute("title")).toBe("Folders can be nested at most 3 levels deep.")
+    expect(screen.getByTestId("folder-nest-reason").textContent).toBe("Folders can be nested at most 3 levels deep.")
+  })
+
+  it("says the list is cut when a hundred files came back, and not for ninety-nine", async () => {
+    // `DATA-51` (QA `LH-DATA-35-10`): `GET /api/uploads` has no paging, so a full answer
+    // is a cut one and the page says so.
+    const many = (count: number) =>
+      Array.from({ length: count }, (_, i) => upload({ id: `up-${i}`, originalFilename: `file-${i}.csv` }))
+    stubFetch(() => many(100))
+    render(<UploadsPanel />)
+    await screen.findByText("file-0.csv")
+    expect(screen.getByTestId("upload-list-cut").textContent).toBe(
+      "Showing the newest 100 files; search to find older ones."
+    )
+    cleanup()
+
+    stubFetch(() => many(99))
+    render(<UploadsPanel />)
+    await screen.findByText("file-0.csv")
+    expect(screen.queryByTestId("upload-list-cut")).toBeNull()
+    cleanup()
+
+    // While a search is on, the sentence says so.
+    stubFetch(() => many(100))
+    render(<UploadsPanel />)
+    await screen.findByText("file-0.csv")
+    fireEvent.change(screen.getByLabelText("Search uploaded files"), { target: { value: "file" } })
+    await waitFor(() =>
+      expect(screen.getByTestId("upload-list-cut").textContent).toBe(
+        "Showing the newest 100 files that match; narrow the search to find older ones."
+      )
+    )
   })
 
   it("renames the open folder", async () => {

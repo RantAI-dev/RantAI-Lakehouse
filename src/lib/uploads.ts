@@ -49,6 +49,13 @@ const WORKBOOK_NAME = /\.xlsx?$/i
 /** The most files one upload takes (decision 5 of `docs/core/features/upload-big-files-and-more-formats.md`). */
 export const MAX_FILES = 10
 
+/**
+ * The most files `GET /api/uploads` returns (the API's `LIST_LIMIT`,
+ * `routes/uploads.rs`): the list has no paging, so a full answer is a cut one
+ * (`DATA-51`, QA `LH-DATA-35-10`).
+ */
+export const UPLOAD_LIST_LIMIT = 100
+
 /** The longest raw table name the API accepts (its `MAX_TABLE_NAME_CHARS`). */
 export const MAX_TABLE_NAME_CHARS = 128
 
