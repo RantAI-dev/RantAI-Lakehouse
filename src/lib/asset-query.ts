@@ -1,6 +1,6 @@
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { pinSnapshot } from "./snapshot-picker"
-import type { AssetDetail } from "@/services/contracts/assets"
+import type { Asset, AssetDetail } from "@/services/contracts/assets"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import type { QueryEngine } from "@/services/contracts/queries"
 
@@ -34,6 +34,32 @@ export const BRONZE_NAMESPACE = "bronze"
  */
 export function trinoBronzeName(tableName: string): string {
   return `iceberg.bronze.${quoteIdent(tableName)}`
+}
+
+/**
+ * The registry table name a Bronze list row carries, or `null` when the row
+ * names no Bronze table.
+ *
+ * The list row of a Bronze asset carries `tableKey: "bronze.<table>"`
+ * (`routes/catalog.rs`, `bronze_catalog_row`), so Query Studio knows the
+ * table's Trino name before the asset's detail was ever opened (`QS-7`,
+ * `LH-QS-4-08`). It says a Bronze table *might* exist, not that it does:
+ * the proof is the `bronze` namespace's table list, or the table's own read.
+ * Every other row answers `null`: a Silver or Gold row's id already is its
+ * key, and a row whose key is not a Bronze one names no Bronze table.
+ */
+export function listedBronzeTable(
+  asset: Pick<Asset, "layer" | "type" | "tableKey">
+): string | null {
+  const key = asset.tableKey
+  if (typeof key !== "string") return null
+  const prefix = `${BRONZE_NAMESPACE}.`
+  if (!key.startsWith(prefix)) return null
+  const tableName = key.slice(prefix.length)
+  if (tableName.length === 0) return null
+  return isIcebergCandidate({ layer: asset.layer, type: asset.type, tableName })
+    ? tableName
+    : null
 }
 
 /**
