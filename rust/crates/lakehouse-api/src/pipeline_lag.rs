@@ -2640,6 +2640,26 @@ mod tests {
         );
     }
 
+    /// BLD-1 part 1 / D11 and review R1-S4: `inputs_of` returns EVERY input
+    /// of a pipeline with two of them, not only the first.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn inputs_of_returns_both_inputs_of_a_two_input_pipeline(pool: PgPool) {
+        let tenant_id = seed_tenant(&pool).await;
+        let mut pipeline = pipeline("pl-two-inputs", 10);
+        pipeline.tenant_id = Some(tenant_id);
+        pipeline.source = "bronze.first".to_owned();
+        pipeline.input_tables = vec!["bronze.first".to_owned(), "silver.second".to_owned()];
+
+        let inputs = inputs_of(&pool, &pipeline)
+            .await
+            .expect("resolve the inputs")
+            .expect("inputs parseable");
+        assert_eq!(
+            inputs,
+            vec![input_of("bronze", "first"), input_of("silver", "second")]
+        );
+    }
+
     /// The budget is the MEDIAN of the last five successful runs measured
     /// from the run REQUEST to its landing, plus two check intervals — and
     /// the assumed 60 s plus the same two intervals when there is nothing to

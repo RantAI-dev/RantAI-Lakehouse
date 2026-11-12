@@ -798,3 +798,84 @@ async fn an_editors_change_is_refused_when_they_may_not_read_an_input() {
         "the refusal must name the input they may not read: {message}"
     );
 }
+
+/// R1-S4 / D13: a version written before `inputs`/`steps` existed restores
+/// through the route into D3's shape — one input named after the table, one
+/// `transform` step — and runs the same checks as a save.
+#[tokio::test]
+async fn an_old_snapshot_restores_through_the_route_into_todays_shape() {
+    let (router, pool, _ch) = app().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let (status, created) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &admin,
+            Some(GROUP_TENANT),
+            Some(legacy_body("save-old-snapshot")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    // A snapshot in the pre-BLD-1 shape: no `inputs`, no `steps`.
+    let old = json!({
+        "kind": "batch",
+        "sourceZone": "silver",
+        "sourceTable": "orders",
+        "incrementalColumn": null,
+        "transforms": ["dedupe(id)"],
+        "fbicEnabled": false,
+        "targetZone": "silver",
+        "targetTable": "save_old_snapshot_out",
+        "schedule": "manual",
+        "owner": "Current user",
+        "description": null,
+        "maxRetries": 2,
+        "dependsOn": [],
+        "name": "save-old-snapshot",
+        "status": "draft"
+    });
+    sqlx::query(
+        "UPDATE pipeline_definition_version SET snapshot = $2 \
+         WHERE pipeline_id = $1 AND version = 1",
+    )
+    .bind(&id)
+    .bind(&old)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, restored) = send(
+        &router,
+        request(
+            "POST",
+            &format!("/api/pipelines/{id}/versions/1/restore"),
+            &admin,
+            Some(GROUP_TENANT),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+
+    let (_, detail) = send(
+        &router,
+        request(
+            "GET",
+            &format!("/api/pipelines/{id}"),
+            &admin,
+            Some(GROUP_TENANT),
+            None,
+        ),
+    )
+    .await;
+    let definition = &detail["definition"];
+    assert_eq!(definition["inputs"][0]["name"], "orders", "{detail}");
+    assert_eq!(definition["inputs"][0]["table"], "orders", "{detail}");
+    assert_eq!(definition["steps"][0]["name"], "transformed", "{detail}");
+    assert_eq!(definition["steps"][0]["reads"], "orders", "{detail}");
+    assert_eq!(definition["steps"][0]["kind"], "transform", "{detail}");
+}

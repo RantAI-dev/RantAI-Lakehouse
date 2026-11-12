@@ -633,13 +633,15 @@ mod tests {
 
     /// D4: the SQL goes in between line breaks, so a comment at its end
     /// cannot swallow the closing bracket.
+    /// R1-S4: the whole text, not a suffix — the SQL goes in between line
+    /// breaks so the comment cannot swallow the closing bracket.
     #[test]
     fn a_sql_step_ending_in_a_line_comment_keeps_its_closing_bracket() {
         let steps = vec![sql_step("selected", "SELECT id FROM orders -- keep this")];
-        let compiled = compile(&one_input(), &steps, None, Some("icecat_api")).unwrap();
-        assert!(
-            compiled.ends_with("\n)\nSELECT * FROM `selected`"),
-            "{compiled}"
+        assert_eq!(
+            compile(&one_input(), &steps, None, Some("icecat_api")).unwrap(),
+            "WITH\n  `orders` AS (SELECT * FROM silver.`orders`),\n  `selected` AS (\n\
+             SELECT id FROM orders -- keep this\n)\nSELECT * FROM `selected`"
         );
     }
 
@@ -655,6 +657,7 @@ mod tests {
         assert!(!compiled.contains("`joined`"), "{compiled}");
     }
 
+    /// R1-S4: pinned whole — the prefix of the steps, then the one named.
     #[test]
     fn up_to_a_middle_step_stops_there() {
         let inputs = vec![input("orders", "silver", "orders")];
@@ -663,9 +666,12 @@ mod tests {
             sql_step("second", "SELECT id FROM first"),
             sql_step("third", "SELECT id FROM second"),
         ];
-        let compiled = compile(&inputs, &steps, Some("second"), Some("icecat_api")).unwrap();
-        assert!(compiled.ends_with("SELECT * FROM `second`"), "{compiled}");
-        assert!(!compiled.contains("`third`"), "{compiled}");
+        assert_eq!(
+            compile(&inputs, &steps, Some("second"), Some("icecat_api")).unwrap(),
+            "WITH\n  `orders` AS (SELECT * FROM silver.`orders`),\n  `first` AS (\n\
+             SELECT id FROM orders\n),\n  `second` AS (\nSELECT id FROM first\n)\n\
+             SELECT * FROM `second`"
+        );
     }
 
     #[test]
@@ -778,6 +784,14 @@ mod tests {
         let err = refusal(&one_input(), &steps);
         assert_eq!(err.path(), "steps[0]");
         assert_eq!(err.message(), super::READS_NOT_INPUT);
+    }
+
+    #[test]
+    fn an_unsafe_zone_is_refused_at_its_input() {
+        let inputs = vec![input("orders", "sil ver", "orders")];
+        let err = refusal(&inputs, &[]);
+        assert_eq!(err.path(), "inputs[0]");
+        assert_eq!(err.message(), super::INVALID_TABLE);
     }
 
     #[test]

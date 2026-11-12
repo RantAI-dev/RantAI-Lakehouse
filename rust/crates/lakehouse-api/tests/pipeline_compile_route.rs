@@ -1048,3 +1048,62 @@ async fn a_masked_column_inside_a_sql_step_comes_back_masked() {
     );
     assert!(sql.contains("FROM serving.`enforced_x`"), "{sql}");
 }
+
+/// R1-S4: a `transform`-step pipeline (today's shape) through the compile
+/// route — the exact statement, and the mask where the column is read.
+#[tokio::test]
+async fn a_transform_step_pipeline_compiles_to_todays_statement() {
+    let (router, pool, cookie, _engine) = app().await;
+    seed_mask(&pool, "Analyst").await;
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        Some(first_tenant_of(&pool, "rina@meridian.example").await),
+        READS,
+        FixtureStep::SelectEmail,
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sql = body["sql"].as_str().expect("a sql string");
+    // The rewrite wraps the source in a masked subquery and projects the
+    // column from it, so the mask sits where the column is read and the
+    // unmasked projection is gone.
+    assert!(
+        sql.contains("SELECT replaceRegexpOne(toString(`email`)"),
+        "a transform step's column is masked where it is read: {sql}"
+    );
+    assert!(sql.contains("FROM serving.`enforced_x`"), "{sql}");
+    assert!(
+        !sql.contains("SELECT email FROM serving.`enforced_x`"),
+        "the unmasked statement survived the rewrite: {sql}"
+    );
+}
+
+/// R1-S4: a stored definition that does not compile answers the route's 422
+/// with the item at fault named — never a parser's text (D7).
+#[tokio::test]
+async fn a_stored_definition_that_does_not_compile_is_422() {
+    let (router, pool, cookie, _engine) = app().await;
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "fajar@meridian.example").await),
+        Some(first_tenant_of(&pool, "fajar@meridian.example").await),
+        READS,
+        // A qualified name in a step is refused by D6a, so this cannot be
+        // stored through the API — which is the point: a row that an older
+        // API (or a direct write) left behind is refused at run time.
+        FixtureStep::Sql("SELECT * FROM silver.enforced_x"),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["error"].as_str().expect("an error string");
+    assert!(message.starts_with("steps[0]: "), "{message}");
+    assert!(
+        !message.contains("silver.enforced_x"),
+        "the refusal must not echo the statement: {message}"
+    );
+}
