@@ -462,3 +462,41 @@ handoff (3981 pass, 1 skip, 0 fail) and CI runs it on #472.
 
 Not verified by anyone: how the control looks in a browser, in either theme. The owner
 looks at Add Quality Rule after the merge.
+
+### S2, round 1 (planner, 2026-11-12) — branch at `112191e3`, pull request #474
+
+No `BLOCKER`, no `SHOULD-FIX`. R1-S1 is closed.
+
+Read: every converted site under `src/features/connectors` (11 files, 19 selects), the
+fix in `quality-check-fields.tsx`, and the lines the tests lost.
+
+- **R1-S1 closed** in `c776f922`: the Column list on Add Quality Rule has
+  `placeholder="Pick a column"`, with a test that reads it before a column is chosen.
+- **D2, D2a.** Prompts became placeholders (`Pick a column…`, `Day first or month
+  first?`, `Detected by the service`); real empty choices stayed options (`Unassigned`,
+  the schedule's manual preset). Three sites whose stored value can be outside the list
+  got a placeholder (`Pick a tenant`, `Pick a driver`, `Pick how it signs in`).
+- **D3.** Options, order, disabled states and effects are unchanged. A stored TLS mode
+  the adapter no longer lists is still appended and shown as it is. `SELECT_CLASS` and
+  `fieldClass` are gone; the compact rows of the ingest panel use `size="sm"`.
+- **D5.** The tests read the trigger's label and the opened list where they read
+  `HTMLSelectElement.value` and `.options`. One assertion was narrowed, with the reason at
+  the site: `connector-ingest-panel.test.tsx` looked for no `max-w-` on the Schedule
+  control and now looks for no `max-w-xs`, because the design system's trigger always
+  carries `max-w-full`. `max-w-xs` is the page layout's cap, which is what the test is
+  about, so the test still fails if the cap leaks into the panel layout.
+
+Re-run by the planner at `112191e3`, in the foreground:
+
+| Command | Result |
+| --- | --- |
+| `bun test src/features/connectors src/features/governance/quality-rule-create-page.test.tsx` | 457 pass, 0 fail, 24 files |
+| `bun run typecheck` | clean |
+| `bun run lint` | 0 errors, 11 warnings (the same 11 as `main`) |
+| S2's acceptance grep | prints nothing |
+
+The handoff reports one failing test in the first of three whole-suite runs, whose name
+the developer did not capture, and none in the next two. Not identified; `REL-24` is the
+known flaky test, and CI runs the suite on #474. A failure there is read before merging.
+
+Not verified by anyone: how the control looks in a browser.
