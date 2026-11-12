@@ -3850,7 +3850,7 @@ fn validate_certification(
         Value::String(s) if s == "deprecated" => Some("deprecated"),
         _ => {
             return Err(ApiError::BadRequest(
-                "status must be \"certified\", \"deprecated\" or null".to_owned(),
+                "The mark must be \"certified\", \"deprecated\" or null.".to_owned(),
             ));
         }
     };
@@ -3858,7 +3858,7 @@ fn validate_certification(
     let replacement = trimmed_or_none(body.replacement_asset_id.as_ref());
     if status != Some("deprecated") && (note.is_some() || replacement.is_some()) {
         return Err(ApiError::BadRequest(
-            "a note or a replacement is allowed only with the deprecated mark".to_owned(),
+            "A note or a replacement can be given only with the deprecated mark.".to_owned(),
         ));
     }
     if note
@@ -3866,7 +3866,7 @@ fn validate_certification(
         .is_some_and(|n| n.chars().count() > CERTIFICATION_NOTE_MAX_LEN)
     {
         return Err(ApiError::BadRequest(format!(
-            "note must be at most {CERTIFICATION_NOTE_MAX_LEN} characters"
+            "The note can be at most {CERTIFICATION_NOTE_MAX_LEN} characters."
         )));
     }
     if replacement
@@ -3874,12 +3874,12 @@ fn validate_certification(
         .is_some_and(|r| r.chars().count() > ANNOTATION_ID_MAX_LEN)
     {
         return Err(ApiError::BadRequest(format!(
-            "replacementAssetId must be at most {ANNOTATION_ID_MAX_LEN} characters"
+            "The replacement's id can be at most {ANNOTATION_ID_MAX_LEN} characters."
         )));
     }
     if replacement.as_deref() == Some(id) {
         return Err(ApiError::BadRequest(
-            "a table cannot be its own replacement".to_owned(),
+            "A table cannot be its own replacement.".to_owned(),
         ));
     }
     Ok(CertificationChange {
@@ -3901,7 +3901,7 @@ fn validate_certification(
 /// when the catalog holds no asset of that id and `503` when it cannot be asked
 /// ([`ensure_asset_exists`]); then `400` with a fixed
 /// sentence for each refusal of [`validate_certification`], for a
-/// replacement that is not an asset in the catalog, and for a replacement
+/// replacement that is not a table in the catalog, and for a replacement
 /// that is itself deprecated. [`ApiError::Unavailable`] without a Postgres
 /// pool, or when the catalog cannot be read to check a replacement (fail
 /// closed: an unchecked replacement is not stored). A classified
@@ -3934,7 +3934,7 @@ pub async fn put_certification(
         let snapshot = search_snapshot(&state).await.map_err(|err| {
             tracing::warn!(%err, "catalog read failed while checking a replacement");
             ApiError::Unavailable(
-                "the catalog could not be read to check the replacement".to_owned(),
+                "The catalog could not be read to check the replacement. Try again.".to_owned(),
             )
         })?;
         let exists = snapshot
@@ -3943,16 +3943,18 @@ pub async fn put_certification(
             .any(|a| a.get("id").and_then(Value::as_str) == Some(replacement));
         if !exists {
             return Err(ApiError::BadRequest(
-                "the replacement is not an asset in the catalog".to_owned(),
+                "The replacement is not a table in the catalog.".to_owned(),
             )
             .into());
         }
         let replacement_row =
             lakehouse_store::annotation::get_annotation(pool, replacement).await?;
         if replacement_row.is_some_and(|r| r.certification.as_deref() == Some("deprecated")) {
-            return Err(
-                ApiError::BadRequest("the replacement is itself deprecated".to_owned()).into(),
-            );
+            return Err(ApiError::BadRequest(
+                "The replacement is itself deprecated. Name a table that is still in use."
+                    .to_owned(),
+            )
+            .into());
         }
     }
     let before_row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
@@ -5270,6 +5272,47 @@ mod tests {
         assert!(matches!(err, ApiError::BadRequest(msg) if msg == "body must be JSON"));
     }
 
+    // QA `LH-DATA-12-05` F3 (`DATA-54`): a refusal of the mark is a sentence
+    // a person reads: a capital, a full stop, no API field name and no
+    // pattern.
+    #[test]
+    fn no_certification_refusal_names_an_api_field_and_each_is_a_sentence() {
+        let id = "serving.mart_x";
+        let long_note = format!(
+            r#"{{"status":"deprecated","note":"{}"}}"#,
+            "a".repeat(CERTIFICATION_NOTE_MAX_LEN + 1)
+        );
+        let long_replacement = format!(
+            r#"{{"status":"deprecated","replacementAssetId":"{}"}}"#,
+            "a".repeat(ANNOTATION_ID_MAX_LEN + 1)
+        );
+        let bodies = [
+            r#"{"status":"trusted"}"#.to_owned(),
+            r#"{"status":"certified","note":"x"}"#.to_owned(),
+            long_note,
+            long_replacement,
+            format!(r#"{{"status":"deprecated","replacementAssetId":"{id}"}}"#),
+        ];
+        let mut seen = 0;
+        for body in bodies {
+            let parsed: CertificationBody = serde_json::from_str(&body).expect("a JSON body");
+            let err = validate_certification(id, &parsed).expect_err("must refuse");
+            let ApiError::BadRequest(message) = err else {
+                panic!("a shape refusal is a 400: {body}");
+            };
+            seen += 1;
+            let first = message
+                .chars()
+                .next()
+                .expect("a message has a first character");
+            assert!(first.is_uppercase(), "{message}");
+            assert!(message.ends_with('.'), "{message}");
+            assert!(!message.contains("replacementAssetId"), "{message}");
+            assert!(!message.contains("status must"), "{message}");
+        }
+        assert_eq!(seen, 5, "every refusal shape is checked");
+    }
+
     // ── CATALOG_TENANT_ID
     // gates GET /api/catalog and GET /api/catalog/{id} to the shared
     // catalog's owning tenant. Six cases covering each branch of
@@ -5807,7 +5850,7 @@ mod tests {
                 .await;
             let long_note = format!(r#"{{"status":"deprecated","note":"{}"}}"#, "a".repeat(1001));
             let cases: [(&str, &str); 7] = [
-                (r#"{"status":"trusted"}"#, "status must be"),
+                (r#"{"status":"trusted"}"#, "The mark must be"),
                 (
                     r#"{"status":"certified","note":"x"}"#,
                     "only with the deprecated mark",
@@ -5816,14 +5859,17 @@ mod tests {
                     r#"{"status":null,"replacementAssetId":"serving.mart_y"}"#,
                     "only with the deprecated mark",
                 ),
-                (long_note.as_str(), "note must be at most 1000 characters"),
+                (
+                    long_note.as_str(),
+                    "The note can be at most 1000 characters.",
+                ),
                 (
                     r#"{"status":"deprecated","replacementAssetId":"serving.mart_x"}"#,
                     "its own replacement",
                 ),
                 (
                     r#"{"status":"deprecated","replacementAssetId":"serving.nope"}"#,
-                    "not an asset in the catalog",
+                    "not a table in the catalog",
                 ),
                 (
                     r#"{"status":"deprecated","replacementAssetId":"serving.old"}"#,
@@ -5904,7 +5950,7 @@ mod tests {
             assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
             assert!(
                 err.1
-                    .contains("the catalog could not be read to check the replacement"),
+                    .contains("The catalog could not be read to check the replacement"),
                 "{}",
                 err.1
             );
