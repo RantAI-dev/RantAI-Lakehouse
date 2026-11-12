@@ -361,7 +361,13 @@ export function ConnectorCreatePage() {
                 type="button"
                 size="sm"
                 variant="outline"
-                disabled={test.status === "pending" || settingsPending}
+                // Review round 1, R1 (QA LH-SRC-6-39, D11): a failed save leaves
+                // the sentence above as the only statement that the settings were
+                // not stored (the ingest panel stays unmounted without a save),
+                // and this button is what would clear it. A test of a connector
+                // with no settings says nothing useful either, so it is disabled
+                // and the Edit link is the way forward.
+                disabled={test.status === "pending" || settingsPending || saveSpec.status === "error"}
                 onClick={() => {
                   setTestSkipped(false)
                   test.run(createdId)

@@ -661,6 +661,86 @@ describe("the created screen waits for the save (LH-SRC-6-39)", () => {
   })
 })
 
+// Review round 1, R1 (QA LH-SRC-6-39, D11): the create answers 201 and the
+// `PUT .../ingest-spec` fails for another reason. The screen must keep saying
+// the settings were never saved — it is the only place that says it, because the
+// ingest panel stays unmounted without a successful save. "Run test again" would
+// hide that sentence, so it is disabled: there are no settings to test.
+describe("the created screen when the connection settings could not be saved (LH-SRC-6-39)", () => {
+  it("keeps the failed-save sentence and its Edit link, and offers no test", async () => {
+    const calls = stubFetch((url, method) => {
+      if (url.endsWith("/api/connectors") && method === "POST") {
+        return json(
+          {
+            id: "conn-orders-k3x9",
+            name: "orders",
+            type: "PostgreSQL",
+            direction: "source",
+            health: "unknown",
+            environment: "production",
+            tenant: "Acme Co",
+            lastTestAt: null,
+            lastActivityAt: null,
+            lastRunSuccessAt: null,
+            lastRunFailureAt: null,
+            failureStreak: 0,
+            schemaChangePolicy: "apply_non_breaking",
+            pausedReason: null,
+            pausedAt: null,
+            capabilities: [],
+            owner: "Current user",
+            credential: { primary: "file:/run/secrets/x_password", secondary: null },
+            credentialStored: true,
+          },
+          201
+        )
+      }
+      if (url.includes("/ingest-spec") && method === "PUT") {
+        return json({ error: "invalid_request: the connection settings could not be stored." }, 500)
+      }
+      // Everything below must stay unreached; the assertions say so.
+      if (url.includes("/ingest-spec") && method === "GET") {
+        return json({ adapter: "sql", ingestMode: "batch", dial: {}, sourceObjects: [], scheduleCron: null })
+      }
+      if (url.includes("/test")) {
+        return json({ ok: true, supported: true, latencyMs: 12, message: "ok", testedAt: "2026-01-01T00:00:00.000Z" })
+      }
+      if (url.endsWith("/runs")) return json({ runs: [] })
+      return null
+    })
+    const page = renderPage()
+    await waitFor(() =>
+      expect(page.getByRole("radio", { name: /PostgreSQL/ }).getAttribute("aria-checked")).toBe("true")
+    )
+    fireEvent.change(page.getByLabelText("Name"), { target: { value: "orders" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "s3cret-pass" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Residency"))
+    fireEvent.change(page.getByLabelText("Residency"), { target: { value: "in-region" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.click(page.getByRole("button", { name: "Create connector" }))
+
+    await waitFor(() =>
+      expect(page.getByText(/The connection test was not run: the connection settings could not be saved/)).toBeDefined()
+    )
+    const edit = page.getByRole("link", { name: "Edit" })
+    expect(edit.getAttribute("href")).toBe("/connectors/conn-orders-k3x9/edit")
+    const again = page.getByRole("button", { name: "Run test again" }) as HTMLButtonElement
+    expect(again.disabled).toBe(true)
+
+    // Nothing reads settings that were never stored, and nothing dials.
+    expect(calls.filter((c) => c.url.includes("/ingest-spec") && c.method === "GET")).toEqual([])
+    expect(calls.filter((c) => c.url.includes("/test"))).toEqual([])
+
+    // And the sentence survives a press on the (disabled) button.
+    fireEvent.click(again)
+    expect(page.getByText(/the connection settings could not be saved/)).toBeDefined()
+    expect(page.getByRole("link", { name: "Edit" }).getAttribute("href")).toBe("/connectors/conn-orders-k3x9/edit")
+    expect(calls.filter((c) => c.url.includes("/test"))).toEqual([])
+  })
+})
+
 // QA LH-SRC-3-08 (SRC-41 D20): when the list of types cannot be read there is
 // nothing to create from, so the page shows a state instead of the wizard.
 describe("the New Connector page when the types cannot be read (LH-SRC-3-08)", () => {
