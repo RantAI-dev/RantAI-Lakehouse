@@ -264,6 +264,162 @@ native select with `fireEvent.change`, now calling `chooseOption`:
 - No visual finding about list length to report: the converted lists are the
   same lengths they were (longest is the quality check list, unchanged).
 
+### Handoff (developer, 2026-11-12, S2)
+
+Branch `feat/web-9-select-s2`, cut from `origin/feat/web-9-select-s2` at
+`273d89e6b` (S1 merged). Only `src/` and this plan changed; no `rust/`,
+`dagster/`, `ops/`, migration, `docker-compose.yml` or `design-system/` file,
+and no cargo command was run. Nothing under `src/features/dashboards`,
+`src/features/pipelines`, `src/features/queries` or `eslint.config.mjs` was
+touched (S3 owns those).
+
+**Commits**
+
+| Hash | Subject |
+| --- | --- |
+| `c776f922a` | `fix(web-9): name the column choice on Add Quality Rule` |
+| `326e26798` | `refactor(web-9): replace the dial forms' native selects with SelectField` |
+| `d525a6659` | `refactor(web-9): replace the upload step's native selects with SelectField` |
+| `4b6da0933` | `refactor(web-9): replace the ingest panel's native selects with SelectField` |
+
+Each commit was pushed to `origin/feat/web-9-select-s2` immediately after it
+was made. T5 was split into three commits by group of files, as the task
+allows.
+
+**T0 — `WEB-9 S1 review R1-S1` (D2a).** `quality-check-fields.tsx`'s Column
+list gets `placeholder="Pick a column"`, with the finding cited at the site.
+`quality-rule-create-page.test.tsx` gains a test that the trigger reads
+"Pick a column" before a column is chosen, and the chosen column's name after.
+
+**Files converted (`SelectField`), with the number of selects in each — 11
+files, 19 selects**
+
+- T5a, dial forms — 7 files, 9 selects: `sftp-dial-form.tsx` (1),
+  `files-dial-form.tsx` (1), `sql-dial-form.tsx` (1), `rest-dial-form.tsx`
+  (2: auth type, pagination), `saas-dial-form.tsx` (1), `cdc-dial-form.tsx`
+  (2: driver, TLS mode), `kafka-dial-form.tsx` (1).
+- T5b, upload step — 2 files, 6 selects: `upload-columns.tsx` (3: type, date
+  reading, time zone), `upload-check-step.tsx` (3: sheet, encoding,
+  delimiter). Both private `SELECT_CLASS` constants are deleted.
+- T5c, ingest — 2 files, 4 selects: `connector-form-parts.tsx` (1: the tenant
+  picker, `TenantField`), `connector-ingest-panel.tsx` (3: schedule, load
+  mode, new-row column). `fieldClass` is deleted.
+
+The compact in-row controls use `size="sm"` plus `px-2 text-xs` (and
+`font-mono` where the old class had it) to keep their height and tone.
+
+**Placeholders added under D2a (a value that can be outside the list)**
+
+- `quality-check-fields.tsx`, Column — `"Pick a column"` (R1-S1).
+- `sql-dial-form.tsx`, Driver — `"Pick a driver"`: the options are the three
+  drivers that form serves, and a stored dial can name another (`oracle` has
+  its own form).
+- `saas-dial-form.tsx`, How it signs in — `"Pick how it signs in"`: a stored
+  dial can say `integration` where the vendor lists no integration option.
+- `connector-form-parts.tsx`, Tenant — `"Pick a tenant"`: a stored tenant the
+  person's own list lacks.
+
+**Prompts turned into placeholders under D2 (not real choices)**
+
+- `upload-check-step.tsx`, Encoding and Delimiter —
+  `"Detected by the service"` (was a disabled option with value `""`).
+- `upload-columns.tsx`, date reading — `"Day first or month first?"` (was a
+  disabled prompt option).
+- `connector-ingest-panel.tsx`, new-row column — `"Pick a column…"` (was a
+  prompt option with value `""`).
+
+Real choices keep their option and value `""`: "Unassigned" (tenant), "Manual
+only" (schedule), and the existing "None" options.
+
+**Commands run, with real counts (all in the foreground)**
+
+- `bun install --frozen-lockfile` once (this checkout had no `node_modules`):
+  678 packages installed.
+- T0: `bun test src/features/governance/quality-rule-create-page.test.tsx` →
+  9 pass, 0 fail, 25 `expect()` calls.
+- T5a: `bun test src/features/connectors/connector-create-page.test.tsx
+  src/features/connectors/connector-edit-page.test.tsx
+  src/features/connectors/dial-forms
+  src/features/connectors/saas-connectors.test.tsx` → 79 pass, 0 fail, 347
+  `expect()` calls, 5 files.
+- T5b: `bun test src/features/connectors/upload-file-page.test.tsx` → 88 pass,
+  0 fail, 1 file.
+- T5c: `bun test src/features/connectors/connector-ingest-panel.test.tsx` → 89
+  pass, 0 fail; then `bun test src/features/connectors` → 448 pass, 0 fail,
+  23 files.
+- `bun run typecheck` before every commit → no errors.
+- `bun run lint` before every commit → 0 errors, 11 warnings; the same 11
+  warnings exist on the base and none is in an S2 file.
+- Final commit, once: `bun run typecheck` → no errors; `bun run lint` → 0
+  errors, 11 warnings; `bun run test` → first run 3992 pass, 1 skip, **1
+  fail**, 11975 `expect()` calls, 380 files, 149.35s; the failing test's name
+  was not captured (the console output was truncated before it), so I cannot
+  say which test it was. Two further full runs were green: the second printed
+  no failing-test line (its counts were not captured), the third 3993 pass, 1
+  skip, 0 fail, 11975 `expect()` calls, 380 files, 150.07s. The single
+  failure did not recur; the known flaky `AssistantSettingsForm (ADM-9)`
+  (`REL-24`) was not confirmed as its cause.
+- `python3 ops/lint/check_bare_iceberg_count.py` → "R11 guard: no bare
+  count() against a Bronze Iceberg table found."
+- `python3 ops/lint/check_intra_package_imports.py` → "OK: all intra-package
+  dispar_orchestrate imports resolve".
+- S2 acceptance: `grep -rnE '<select\b' src/features/connectors
+  --include=*.tsx | grep -v '\.test\.'` prints nothing (exit 1).
+- `git status` before each commit: only the intended files; nothing generated
+  was staged.
+
+**Tests that had to change, and why**
+
+No test was deleted. Seven test files changed, all mechanism changes under
+D5 unless noted:
+
+- `src/features/governance/quality-rule-create-page.test.tsx` — one new test
+  for T0; no existing assertion changed.
+- `src/features/connectors/dial-forms/dial-forms.test.tsx` — driver and TLS
+  mode values read as the trigger's shown label; the TLS and auth-type option
+  lists read from the opened list; two `fireEvent.change` steps became
+  `chooseOption`.
+- `src/features/connectors/dial-forms/tier2-dial-forms.test.tsx` — Kafka and
+  SFTP option lists read from the opened list, which is portalled onto
+  `document.body`, outside the container that file scopes its queries to.
+- `src/features/connectors/saas-connectors.test.tsx` — the sign-in steps call
+  `chooseOption`, and the "integration credential only where the vendor has
+  one" test opens the list before asking what it offers (a closed combobox
+  has no options, so the old query would have passed for the wrong reason).
+- `src/features/connectors/connector-create-page.test.tsx` and
+  `connector-edit-page.test.tsx` — one auth-type step each became
+  `chooseOption`.
+- `src/features/connectors/upload-file-page.test.tsx` — delimiter, sheet,
+  column type and date-reading values read as the trigger's label; option
+  lists read from the opened list (the hidden sheet's "Notes (hidden)" label
+  among them); six `fireEvent.change` steps became `chooseOption`.
+- `src/features/connectors/connector-ingest-panel.test.tsx` — schedule, load
+  mode and the column list read as labels / opened lists; the mode and
+  schedule steps call `chooseOption`. Two things are worth naming:
+  - Three new-row-column steps still use `fireEvent.change`: when the source
+    cannot list a table's columns the cursor is a text `Input`, not a
+    `SelectField`, and those tests exercise that path.
+  - "stops its inputs stretching across the page" now looks for the page's
+    own `max-w-xs` on the Schedule trigger instead of the absence of any
+    `max-w-`, because the design system's trigger always carries
+    `max-w-full`. The fact asserted (the page layout caps it, the embedded
+    one does not) is the same.
+
+**Skipped / not verified**
+
+- No browser check. I cannot see the page in a browser here, so how the new
+  dropdowns look in either theme, and whether the compact `size="sm"`
+  triggers keep the old row height visually, are *not verified* beyond the
+  DOM-level tests.
+- D6 (a light dashboard's popup) does not apply to S2: no dashboard site is
+  in this slice.
+- `TenantField` has no caller in this tree (it is exported but unused); it was
+  converted like any other site, and its behaviour is not covered by a test
+  either before or after this slice.
+- No list is long enough to raise the "too long to scan" finding: the longest
+  converted list is the tenant list.
+- No Rust/Python/compose change, so none of those checks were run.
+
 ## 6. Review (planner)
 
 ### S1, round 1 (planner, 2026-11-12) — branch at `a192fe75`, pull request #472
