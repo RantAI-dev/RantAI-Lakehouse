@@ -76,6 +76,7 @@
 
 use super::{Measure, QueryBuilder, Ready};
 use crate::specs::Aggregate;
+use lakehouse_core::ident::Ident;
 
 /// What the groups are ranked by.
 enum Target<'a> {
@@ -83,6 +84,23 @@ enum Target<'a> {
     Dimension,
     /// A measure, by position.
     Measure(usize, &'a Measure),
+}
+
+/// The comparison key of the breakdown cap, on both sides of `IN` (`QA
+/// LH-BI-6-01` review round 1, R1): whether the value is NULL and its text, so
+/// a NULL breakdown value is its own key (a bare `NULL IN (<set>)` is false in
+/// `ClickHouse` unless `transform_null_in` is set) and an empty string is not
+/// merged with it.
+fn cap_key(breakdown: &Ident) -> String {
+    format!("(isNull({breakdown}), ifNull(toString({breakdown}), ''))")
+}
+
+/// What a built statement's breakdown cap starts with, on the left of `IN`
+/// (`QA LH-BI-6-01` review round 1, R4). [`super::statement_caps_breakdown`]
+/// reads it out of a statement, so the recognizer and the clause share one
+/// spelling.
+pub(super) fn cap_clause_start(breakdown: &Ident) -> String {
+    format!("{} IN (SELECT", cap_key(breakdown))
 }
 
 impl QueryBuilder<Ready> {
@@ -220,12 +238,12 @@ impl QueryBuilder<Ready> {
     /// "Largest" is always the largest: the subquery orders descending even on
     /// a chart sorted ascending, because the limit counts the biggest values.
     ///
-    /// The comparison key is `(isNull(b), ifNull(toString(b), ''))` on both
-    /// sides rather than the bare column (`QA LH-BI-6-01` review round 1, R1):
-    /// `ClickHouse` answers `NULL IN (<set>)` with false unless
-    /// `transform_null_in` is set, so a bare `b IN (…)` dropped every row whose
-    /// breakdown value is NULL, on every bar, hbar, line and area chart. The
-    /// module comment names the measurement.
+    /// The comparison key is [`cap_key`] on both sides rather than the bare
+    /// column (`QA LH-BI-6-01` review round 1, R1): `ClickHouse` answers
+    /// `NULL IN (<set>)` with false unless `transform_null_in` is set, so a
+    /// bare `b IN (…)` dropped every row whose breakdown value is NULL, on
+    /// every bar, hbar, line and area chart. The module comment names the
+    /// measurement.
     pub(super) fn breakdown_cap(&self) -> Option<String> {
         let breakdown = self.breakdown.as_ref()?;
         if self.steps.is_some() || !self.groupings.is_empty() {
@@ -237,10 +255,10 @@ impl QueryBuilder<Ready> {
         }
         let rank = self.rank_expr(measure);
         Some(format!(
-            "(isNull({breakdown}), ifNull(toString({breakdown}), '')) IN \
-             (SELECT isNull({breakdown}), ifNull(toString({breakdown}), '') \
+            "{} IN (SELECT isNull({breakdown}), ifNull(toString({breakdown}), '') \
              FROM {from}{where_sql} \
              GROUP BY {breakdown} ORDER BY {rank} DESC, {breakdown} LIMIT {limit})",
+            cap_key(breakdown),
             from = self.from.render(),
             where_sql = self.where_sql(),
             limit = self.limit,

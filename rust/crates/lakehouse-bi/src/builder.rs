@@ -194,6 +194,23 @@ pub fn trailing_limit(statement: &str) -> Option<u32> {
     statement[start..start + len].parse().ok()
 }
 
+/// Whether a built statement carries [`QueryBuilder::with_breakdown_cap`]'s
+/// clause for `breakdown` (`BI-46`; QA `LH-BI-6-01` review round 1, R4).
+///
+/// The assistant's digest is written from a chart's definition, which does not
+/// say whether its measure is a table calculation — that is resolved from the
+/// deployment's calculated fields while the statement is built, and such a
+/// chart gets no cap. The saved statement is the fact, so the digest reads it
+/// here rather than repeating the builder's resolution rules. `false` for a
+/// name that is not an identifier: no such statement can have been built.
+#[must_use]
+pub fn statement_caps_breakdown(statement: &str, breakdown: &str) -> bool {
+    let Ok(breakdown) = Ident::new(breakdown.to_owned()) else {
+        return false;
+    };
+    statement.contains(&ranked::cap_clause_start(&breakdown))
+}
+
 /// Where a chart's rows come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Relation {
@@ -4548,6 +4565,64 @@ mod tests {
             !got.sql.contains("cat IN (SELECT cat"),
             "no bare `IN` over a nullable column: {}",
             got.sql
+        );
+    }
+
+    /// `BI-46` review round 1, R4: the assistant's digest asks a built
+    /// statement whether it caps the breakdown (`statement_caps_breakdown`). A
+    /// bar chart's capped statement says yes; a chart whose measure is a table
+    /// calculation has no cap in its statement — its windows run over the whole
+    /// grouped result — so the digest is not told to promise one.
+    #[test]
+    fn a_table_calculations_statement_carries_no_breakdown_cap() {
+        let capped = bi6_sql(r#"{"breakdown":"cat","limit":3}"#, &[]);
+        assert!(statement_caps_breakdown(&capped, "cat"), "{capped}");
+        assert!(
+            !statement_caps_breakdown(&capped, "kab"),
+            "another column's cap is not this one's: {capped}"
+        );
+        assert!(
+            !statement_caps_breakdown(&capped, "not a name"),
+            "a name that is not an identifier has no clause"
+        );
+
+        let catalog = FieldCatalog::from_fields(vec![crate::fields::FieldDef {
+            id: "f_1".to_owned(),
+            source_kind: crate::fields::SourceKind::Mart,
+            source_id: "mart_x".to_owned(),
+            name: "running".to_owned(),
+            formula: "RunningTotal(Sum(visitors))".to_owned(),
+            level: "table".to_owned(),
+            ty: "number".to_owned(),
+            created_by: "ui".to_owned(),
+            updated_at: None,
+        }]);
+        let read = ReadContext {
+            time: &DEFAULT_TIME,
+            grain: None,
+            fields: &catalog,
+        };
+        let mut plain = stored_spec(ChartKind::Bar, "mart_x", "kab", &["running"]);
+        plain.def.breakdown = Some("cat".to_owned());
+        plain.def.limit = Some(10.into());
+        let sql = super::sql_with_filters_report(&plain, &[], &[], &bi6_cols(), &read).sql;
+        assert!(
+            sql.contains("cat"),
+            "the breakdown is still a series: {sql}"
+        );
+        assert!(
+            !statement_caps_breakdown(&sql, "cat"),
+            "a table calculation gets no cap: {sql}"
+        );
+
+        let mut grained = stored_spec(ChartKind::Line, "mart_x", "d", &["running"]);
+        grained.def.grain = Some("month".to_owned());
+        grained.def.breakdown = Some("cat".to_owned());
+        grained.def.limit = Some(10.into());
+        let sql = super::sql_with_filters_report(&grained, &[], &[], &bi6_cols(), &read).sql;
+        assert!(
+            !statement_caps_breakdown(&sql, "cat"),
+            "a grained table calculation gets no cap: {sql}"
         );
     }
 

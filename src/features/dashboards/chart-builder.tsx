@@ -616,7 +616,12 @@ export function ChartBuilder({
   // limit keeps the N breakdown values with the largest total.
   const breakdownKind = breakdown ? fields?.kinds?.[breakdown] : undefined;
   const breakdownGrainOptions = React.useMemo(() => breakdownGrainChoices(kind, breakdownKind), [kind, breakdownKind]);
-  const capsBreakdown = !!breakdown && takesBreakdownGrain(kind);
+  // `BI-46` review round 1, R4: a chart whose measure is a table calculation
+  // gets no breakdown cap on the server — its windows run over the whole
+  // grouped result — so the limit keeps the label such a chart always had, and
+  // does not promise a cut that does not happen.
+  const measureIsTableCalc = (fields?.calculated ?? []).some((f) => f.level === "table" && f.name === measure);
+  const capsBreakdown = !!breakdown && takesBreakdownGrain(kind) && !measureIsTableCalc;
   // BI-10: a number column can be the dimension or the breakdown when it is put in bins; a table does
   // that per grouping, a pivot on its first number row or column field.
   const onSqlSource = choice?.kind === "sql" || source === NEW_SQL_CHOICE;

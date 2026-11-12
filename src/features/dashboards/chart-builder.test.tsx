@@ -685,4 +685,37 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
     expect(await screen.findByText("Breakdown values (Top N)")).toBeTruthy()
   })
+
+  /** Adds a table-calculation measure the base stub does not have. */
+  function withTableCalc() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const res = await inner(input, init)
+      if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
+        const body = (await res.json()) as Record<string, unknown>
+        return new Response(JSON.stringify({
+          ...body,
+          measures: [...(body.measures as string[]), "running"],
+          calculated: [{
+            id: "f_1", sourceKind: "mart", sourceId: "mart_visits", name: "running",
+            formula: "RunningTotal(Sum(visitors))", level: "table", type: "number", createdBy: "u",
+          }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return res
+    }) as unknown as typeof fetch
+  }
+
+  // `BI-46` review round 1, R4: the server builds no breakdown cap for a table
+  // calculation, so the field must not be labelled as one.
+  it("a table-calculation measure keeps the limit label the chart always had", async () => {
+    withTableCalc()
+    renderBuilder({ ...barDef, measures: ["running"], breakdown: "category" })
+    await screen.findByLabelText("Aggregation of running")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Limit (Top N)")).toBeTruthy()
+    expect(screen.queryByText("Limit (Top N, dimension and breakdown)")).toBeNull()
+    expect(screen.queryByText("Breakdown values (Top N)")).toBeNull()
+  })
 })

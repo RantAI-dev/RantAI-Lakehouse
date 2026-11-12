@@ -85,16 +85,22 @@ const DIGEST_MAX: usize = 300;
 /// 2026-11-07), and it was the wrong reading until `BI-46` — the rule then was
 /// "the breakdown is not limited".
 ///
-/// The rules are `ChartInput::caps_breakdown`,
-/// `ChartInput::keeps_latest_buckets` and `grain::effective_limit`, fed the
-/// order the query builder feeds them — the builder's own methods, so the
-/// sentence and the statement cannot disagree. A pivot has no dimension (its
-/// grain applies to its first date field) and the builder never cuts it to its
-/// latest buckets, so a chart without a dimension makes no claim about what
-/// its limit counts. One gap stays: the builder resolves the grain against the
-/// column type (`grain::resolve`), which a synchronous digest cannot do, so
-/// this reads only the grain the chart names.
-fn limit_digest(def: &ChartInput, breakdown: Option<&str>) -> Option<String> {
+/// `caps_built` is whether the statement that was built for the chart holds
+/// the breakdown cap (`BI-46` review round 1, R4). It is read from the saved
+/// statement, not from `ChartInput::caps_breakdown` alone: a measure that is a
+/// table calculation is resolved from the deployment's calculated fields while
+/// the statement is built and gets no cap, so the kind-and-breakdown rule
+/// alone would promise a cut the chart does not make.
+///
+/// The other rules are `ChartInput::keeps_latest_buckets` and
+/// `grain::effective_limit`, fed the order the query builder feeds them — the
+/// builder's own methods, so the sentence and the statement cannot disagree. A
+/// pivot has no dimension (its grain applies to its first date field) and the
+/// builder never cuts it to its latest buckets, so a chart without a dimension
+/// makes no claim about what its limit counts. One gap stays: the builder
+/// resolves the grain against the column type (`grain::resolve`), which a
+/// synchronous digest cannot do, so this reads only the grain the chart names.
+fn limit_digest(def: &ChartInput, breakdown: Option<&str>, caps_built: bool) -> Option<String> {
     let counted = match &def.limit {
         Some(lakehouse_bi::params::Limit::Fixed(n)) => Some((n.to_string(), Some(*n))),
         Some(lakehouse_bi::params::Limit::Param(p)) => {
@@ -110,7 +116,7 @@ fn limit_digest(def: &ChartInput, breakdown: Option<&str>) -> Option<String> {
             .as_deref()
             .and_then(Grain::parse)
             .filter(|_| !def.dimension.is_empty());
-        if let Some(breakdown) = breakdown.filter(|_| def.caps_breakdown()) {
+        if let Some(breakdown) = breakdown.filter(|_| caps_built) {
             // `BI-46` (plan D12, D15): the limit counts the breakdown's
             // values, the N with the largest total; every bucket of a time
             // grain on the dimension is kept. A parameter names the N in the
@@ -175,13 +181,18 @@ fn limit_digest(def: &ChartInput, breakdown: Option<&str>) -> Option<String> {
 /// is [`limit_digest`]'s own sentence. The line is cut to [`DIGEST_MAX`]
 /// characters, the last one `…`.
 ///
+/// `caps_built` says whether the statement built for this definition carries
+/// the breakdown cap (`BI-46` review round 1, R4): [`caps_in_statement`] reads
+/// it from the saved statement, so a chart whose measure is a table
+/// calculation — no cap is built for one — is not described as cut to N.
+///
 /// It reads the definition the save is built from, not the one it stores: the
 /// store fills every chart's `limit` with the one it built with, which would
 /// hide whether the call set one. A create draft and its saved reply pass the
 /// same `ChartInput`, so one chart gives one line. An update gets its line
 /// only in its saved reply, where the input is the stored chart merged with
 /// the call, read as the caller; its draft carries none.
-pub(super) fn definition_digest(def: &ChartInput) -> String {
+pub(super) fn definition_digest(def: &ChartInput, caps_built: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !def.dimension.is_empty() {
         parts.push(format!("dimension: {}", def.dimension));
@@ -213,7 +224,7 @@ pub(super) fn definition_digest(def: &ChartInput) -> String {
     // One gap stays: the builder resolves the grain against the column type
     // (`grain::resolve`), which a synchronous digest cannot do, so this reads
     // only the grain the chart names.
-    if let Some(limit) = limit_digest(def, breakdown) {
+    if let Some(limit) = limit_digest(def, breakdown, caps_built) {
         parts.push(limit);
     }
     if let Some(bin) = &def.shape.bin {
@@ -251,6 +262,20 @@ pub(super) fn definition_digest(def: &ChartInput) -> String {
     let mut cut: String = digest.chars().take(DIGEST_MAX - 1).collect();
     cut.push('…');
     cut
+}
+
+/// Whether the statement built for `def` caps its breakdown (`BI-46` review
+/// round 1, R4), for [`definition_digest`].
+///
+/// The builder is the only place that knows whether a cap was made: a measure
+/// that is a table calculation gets none, and that is resolved from the
+/// deployment's calculated fields, which the definition does not carry. The
+/// saved statement is the fact, so it is asked ([`statement_caps_breakdown`]).
+fn caps_in_statement(def: &ChartInput, statement: &str) -> bool {
+    def.breakdown
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .is_some_and(|b| lakehouse_bi::builder::statement_caps_breakdown(statement, b))
 }
 
 /// The call's args with the formatting the call does not name filled in from
@@ -666,7 +691,7 @@ pub(super) async fn create_chart(
                 "kind": spec.spec.kind,
                 "mart": spec.spec.mart,
                 "board": spec.board,
-                "definition": definition_digest(&input),
+                "definition": definition_digest(&input, caps_in_statement(&input, &spec.spec.sql)),
                 "url": "/dashboards",
                 "note": "Chart tersimpan & langsung tampil di halaman Dashboards.",
                 })
@@ -839,7 +864,10 @@ pub(super) async fn check_chart_draft(
 ) -> Result<String, Value> {
     let PreparedChart { input, .. } = prepare_chart(ch, viewer, id.as_deref(), args, time).await?;
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
-        Ok(_) => Ok(definition_digest(&input)),
+        Ok(spec) => Ok(definition_digest(
+            &input,
+            caps_in_statement(&input, &spec.spec.sql),
+        )),
         Err(err) => Err(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
     }
 }
@@ -890,7 +918,10 @@ pub(super) async fn update_chart(
                         "kind": spec.spec.kind,
                         "mart": spec.spec.mart,
                         "board": spec.board,
-                        "definition": definition_digest(&input),
+                        "definition": definition_digest(
+                            &input,
+                            caps_in_statement(&input, &spec.spec.sql),
+                        ),
                         "formattingKept": formatting_kept,
                     });
                     if source_kept {
@@ -3136,33 +3167,39 @@ mod tests {
     /// digest cannot take it for something that was made.
     #[test]
     fn a_definition_digest_leaves_out_what_the_chart_does_not_hold() {
-        let digest = definition_digest(&input(json!({
-            "title": "Visitors",
-            "kind": "bar",
-            "mart": "mart_x",
-            "dimension": "province",
-            "measures": ["visitors"],
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "Visitors",
+                "kind": "bar",
+                "mart": "mart_x",
+                "dimension": "province",
+                "measures": ["visitors"],
+            })),
+            false,
+        );
         assert_eq!(digest, "dimension: province; measures: visitors");
     }
 
     #[test]
     fn a_definition_digest_lists_every_field_it_covers_when_the_chart_holds_them_all() {
-        let digest = definition_digest(&input(json!({
-            "title": "Visitors",
-            "kind": "bar",
-            "mart": "mart_x",
-            "dimension": "arrival",
-            "breakdown": "province",
-            "measures": ["visitors", { "column": "spend", "aggregate": "avg" }],
-            "sort": { "by": "visitors", "dir": "desc" },
-            "limit": 10,
-            "grain": "month",
-            "filters": [
-                { "column": "province", "values": ["a"] },
-                { "column": "region", "values": ["b"] },
-            ],
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "Visitors",
+                "kind": "bar",
+                "mart": "mart_x",
+                "dimension": "arrival",
+                "breakdown": "province",
+                "measures": ["visitors", { "column": "spend", "aggregate": "avg" }],
+                "sort": { "by": "visitors", "dir": "desc" },
+                "limit": 10,
+                "grain": "month",
+                "filters": [
+                    { "column": "province", "values": ["a"] },
+                    { "column": "region", "values": ["b"] },
+                ],
+            })),
+            true,
+        );
         // `BI-46` (plan D12, D15): with a breakdown the limit counts the
         // breakdown's values, so the line says so instead of "the breakdown is
         // not limited" (QA `LH-BI-6-06`).
@@ -3184,22 +3221,28 @@ mod tests {
     /// pins that.
     #[test]
     fn a_definition_digest_says_a_limit_beside_a_grain_keeps_the_latest_buckets() {
-        let by_bucket = definition_digest(&input(json!({
-            "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
-            "measures": ["visitors"],
-            "grain": "month", "limit": 10,
-        })));
+        let by_bucket = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+                "measures": ["visitors"],
+                "grain": "month", "limit": 10,
+            })),
+            false,
+        );
         assert!(
             by_bucket.contains("limit: 10 (the latest 10 month buckets of tanggal)"),
             "{by_bucket}"
         );
         // A sort by the dimension itself is the bucket order too.
-        let by_dimension = definition_digest(&input(json!({
-            "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
-            "measures": ["visitors"],
-            "sort": { "by": "tanggal", "dir": "asc" },
-            "grain": "month", "limit": 10,
-        })));
+        let by_dimension = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+                "measures": ["visitors"],
+                "sort": { "by": "tanggal", "dir": "asc" },
+                "grain": "month", "limit": 10,
+            })),
+            false,
+        );
         assert!(
             by_dimension.contains("limit: 10 (the latest 10 month buckets of tanggal)"),
             "{by_dimension}"
@@ -3213,11 +3256,14 @@ mod tests {
     /// is not capped and keeps the old words, and a breakdown grain is listed.
     #[test]
     fn a_definition_digest_says_a_limit_beside_a_breakdown_counts_the_breakdown() {
-        let grained = definition_digest(&input(json!({
-            "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
-            "breakdown": "provinsi", "measures": ["visitors"],
-            "grain": "month", "limit": 10,
-        })));
+        let grained = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+                "breakdown": "provinsi", "measures": ["visitors"],
+                "grain": "month", "limit": 10,
+            })),
+            true,
+        );
         assert!(
             grained.contains(
                 "limit: 10 (the 10 provinsi values with the largest total; every month bucket \
@@ -3226,42 +3272,81 @@ mod tests {
             "{grained}"
         );
         assert!(!grained.contains("latest"), "{grained}");
-        let plain = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
-            "breakdown": "kawasan", "measures": ["visitors"], "limit": 10,
-        })));
+        let plain = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+                "breakdown": "kawasan", "measures": ["visitors"], "limit": 10,
+            })),
+            true,
+        );
         assert!(
             plain
                 .contains("limit: 10 kab values, and the 10 kawasan values with the largest total"),
             "{plain}"
         );
         // A heatmap's second column is an axis, not a series: still uncapped.
-        let heatmap = definition_digest(&input(json!({
-            "title": "T", "kind": "heatmap", "mart": "mart_x", "dimension": "kab",
-            "breakdown": "kawasan", "measures": ["visitors"], "limit": 10,
-        })));
+        let heatmap = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "heatmap", "mart": "mart_x", "dimension": "kab",
+                "breakdown": "kawasan", "measures": ["visitors"], "limit": 10,
+            })),
+            false,
+        );
         assert!(
             heatmap.contains("limit: 10 kab values; the breakdown is not limited"),
             "{heatmap}"
         );
-        let with_grain = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
-            "breakdown": "tanggal", "breakdownGrain": "month",
-            "measures": ["visitors"], "limit": 10,
-        })));
+        let with_grain = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+                "breakdown": "tanggal", "breakdownGrain": "month",
+                "measures": ["visitors"], "limit": 10,
+            })),
+            true,
+        );
         assert!(
             with_grain.contains("breakdown grain: month"),
             "{with_grain}"
         );
     }
 
+    /// `BI-46` review round 1, R4: a chart whose measure is a table
+    /// calculation gets no breakdown cap — its windows run over the whole
+    /// grouped result — so the digest must not promise a cut. `caps_in_statement`
+    /// reads the built statement, and the builder test
+    /// `a_table_calculations_statement_carries_no_breakdown_cap` pins that such
+    /// a statement has none.
+    #[test]
+    fn a_definition_digest_says_a_breakdown_is_not_limited_when_the_statement_has_no_cap() {
+        let plain = input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+            "breakdown": "kawasan", "measures": ["running"], "limit": 10,
+        }));
+        let digest = definition_digest(&plain, false);
+        assert!(
+            digest.contains("limit: 10 kab values; the breakdown is not limited"),
+            "{digest}"
+        );
+        let grained = input(json!({
+            "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+            "breakdown": "provinsi", "measures": ["running"],
+            "grain": "month", "limit": 10,
+        }));
+        let digest = definition_digest(&grained, false);
+        assert!(digest.contains("the breakdown is not limited"), "{digest}");
+        assert!(!digest.contains("largest total"), "{digest}");
+    }
+
     #[test]
     fn a_definition_digest_says_a_limit_beside_a_sort_counts_dimension_values() {
-        let top_n = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "provinsi",
-            "measures": ["visitors"],
-            "sort": { "by": "visitors", "dir": "desc" }, "limit": 10,
-        })));
+        let top_n = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "provinsi",
+                "measures": ["visitors"],
+                "sort": { "by": "visitors", "dir": "desc" }, "limit": 10,
+            })),
+            false,
+        );
         assert!(top_n.contains("limit: 10 provinsi values"), "{top_n}");
         assert!(!top_n.contains("latest"), "{top_n}");
         // No breakdown, so nothing to say about one.
@@ -3273,20 +3358,26 @@ mod tests {
     /// count dimension values, neither keeps "the latest".
     #[test]
     fn a_definition_digest_reads_a_limit_on_a_date_part_or_a_value_order_as_dimension_values() {
-        let part = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
-            "measures": ["visitors"],
-            "sort": { "by": "visitors", "dir": "desc" },
-            "grain": "day_of_week", "limit": 3,
-        })));
+        let part = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+                "measures": ["visitors"],
+                "sort": { "by": "visitors", "dir": "desc" },
+                "grain": "day_of_week", "limit": 3,
+            })),
+            false,
+        );
         assert!(part.contains("limit: 3 arrival values"), "{part}");
         assert!(!part.contains("latest"), "{part}");
-        let by_value = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
-            "measures": ["visitors"],
-            "sort": { "by": "visitors", "dir": "desc" },
-            "grain": "month", "limit": 3,
-        })));
+        let by_value = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+                "measures": ["visitors"],
+                "sort": { "by": "visitors", "dir": "desc" },
+                "grain": "month", "limit": 3,
+            })),
+            false,
+        );
         assert!(by_value.contains("limit: 3 arrival values"), "{by_value}");
         assert!(!by_value.contains("latest"), "{by_value}");
     }
@@ -3297,10 +3388,13 @@ mod tests {
     /// not claim a count of values the chart does not cut to.
     #[test]
     fn a_definition_digest_says_a_limit_on_a_date_part_in_its_own_order_cuts_nothing() {
-        let digest = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
-            "measures": ["visitors"], "grain": "day_of_week", "limit": 3,
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+                "measures": ["visitors"], "grain": "day_of_week", "limit": 3,
+            })),
+            false,
+        );
         assert!(
             digest.contains("limit: 3 (not applied: day_of_week returns its whole range)"),
             "{digest}"
@@ -3314,12 +3408,15 @@ mod tests {
     /// makes no claim about what the limit counts and names no empty column.
     #[test]
     fn a_definition_digest_makes_no_latest_claim_for_a_pivot_with_a_grain_and_a_limit() {
-        let digest = definition_digest(&input(json!({
-            "title": "T", "kind": "pivot", "mart": "mart_x",
-            "rows": ["place"], "columns": ["day"],
-            "values": [{ "column": "visitors", "aggregate": "sum" }],
-            "grain": "month", "limit": 10,
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "pivot", "mart": "mart_x",
+                "rows": ["place"], "columns": ["day"],
+                "values": [{ "column": "visitors", "aggregate": "sum" }],
+                "grain": "month", "limit": 10,
+            })),
+            false,
+        );
         assert!(digest.contains("limit: 10; grain: month"), "{digest}");
         assert!(!digest.contains("latest"), "{digest}");
         assert!(!digest.contains("buckets"), "{digest}");
@@ -3330,11 +3427,14 @@ mod tests {
     /// parameter in the number's place and stays true either way.
     #[test]
     fn a_definition_digest_names_a_limit_parameter_in_place_of_the_number() {
-        let latest = definition_digest(&input(json!({
-            "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
-            "breakdown": "provinsi", "measures": ["visitors"],
-            "grain": "month", "limit": { "param": "top_n" },
-        })));
+        let latest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+                "breakdown": "provinsi", "measures": ["visitors"],
+                "grain": "month", "limit": { "param": "top_n" },
+            })),
+            true,
+        );
         // `BI-46` (plan D15): with a breakdown the parameter names the N of
         // the breakdown's values, so no number is invented.
         assert!(
@@ -3344,11 +3444,14 @@ mod tests {
             ),
             "{latest}"
         );
-        let values = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "provinsi",
-            "measures": ["visitors"],
-            "sort": { "by": "visitors", "dir": "desc" }, "limit": { "param": "top_n" },
-        })));
+        let values = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "provinsi",
+                "measures": ["visitors"],
+                "sort": { "by": "visitors", "dir": "desc" }, "limit": { "param": "top_n" },
+            })),
+            false,
+        );
         assert!(
             values.contains("limit: parameter top_n provinsi values"),
             "{values}"
@@ -3359,35 +3462,44 @@ mod tests {
     /// the cut mark.
     #[test]
     fn a_definition_digest_with_a_limit_text_stays_within_three_hundred_characters() {
-        let digest = definition_digest(&input(json!({
-            "title": "T", "kind": "line", "mart": "mart_x",
-            "dimension": "a_dimension_with_a_rather_long_column_name_that_keeps_going_on",
-            "breakdown": "a_breakdown_with_a_rather_long_column_name_that_keeps_going_on",
-            "measures": ["visitors", { "column": "spend", "aggregate": "avg" }],
-            "sort": { "by": "visitors", "dir": "desc" },
-            "limit": 10, "grain": "month",
-            "filters": [
-                { "column": "province", "values": ["a"] },
-                { "column": "region", "values": ["b"] },
-            ],
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x",
+                "dimension": "a_dimension_with_a_rather_long_column_name_that_keeps_going_on",
+                "breakdown": "a_breakdown_with_a_rather_long_column_name_that_keeps_going_on",
+                "measures": ["visitors", { "column": "spend", "aggregate": "avg" }],
+                "sort": { "by": "visitors", "dir": "desc" },
+                "limit": 10, "grain": "month",
+                "filters": [
+                    { "column": "province", "values": ["a"] },
+                    { "column": "region", "values": ["b"] },
+                ],
+            })),
+            true,
+        );
         assert!(digest.chars().count() <= 300, "{digest}");
         assert!(digest.ends_with('…'), "{digest}");
     }
 
     #[test]
     fn a_definition_digest_names_a_bin_by_its_width_or_count() {
-        let wide = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
-            "measures": ["spend"],
-            "bin": { "mode": "width", "width": 500 },
-        })));
+        let wide = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+                "measures": ["spend"],
+                "bin": { "mode": "width", "width": 500 },
+            })),
+            false,
+        );
         assert!(wide.contains("bin: width 500"), "{wide}");
-        let counted = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
-            "measures": ["spend"],
-            "bin": { "mode": "count", "count": 10 },
-        })));
+        let counted = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+                "measures": ["spend"],
+                "bin": { "mode": "count", "count": 10 },
+            })),
+            false,
+        );
         assert!(counted.contains("bin: 10 bins"), "{counted}");
     }
 
@@ -3395,15 +3507,21 @@ mod tests {
     /// digest says so, because that is what "top N" is not.
     #[test]
     fn a_definition_digest_reads_limit_none_beside_a_breakdown_or_a_sort() {
-        let with_breakdown = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
-            "breakdown": "province", "measures": ["visitors"],
-        })));
+        let with_breakdown = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+                "breakdown": "province", "measures": ["visitors"],
+            })),
+            false,
+        );
         assert!(with_breakdown.contains("limit: none"), "{with_breakdown}");
-        let with_sort = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "province",
-            "measures": ["visitors"], "sort": { "by": "visitors", "dir": "asc" },
-        })));
+        let with_sort = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "province",
+                "measures": ["visitors"], "sort": { "by": "visitors", "dir": "asc" },
+            })),
+            false,
+        );
         assert!(with_sort.contains("limit: none"), "{with_sort}");
     }
 
@@ -3412,10 +3530,13 @@ mod tests {
         let names: Vec<String> = (0..12)
             .map(|i| format!("{i:02}_{}", "x".repeat(37)))
             .collect();
-        let digest = definition_digest(&input(json!({
-            "title": "T", "kind": "stacked", "mart": "mart_x", "dimension": "province",
-            "measures": names,
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "stacked", "mart": "mart_x", "dimension": "province",
+                "measures": names,
+            })),
+            false,
+        );
         assert_eq!(digest.chars().count(), 300, "{digest}");
         assert!(digest.ends_with('…'), "{digest}");
         assert!(
