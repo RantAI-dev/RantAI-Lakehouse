@@ -95,6 +95,29 @@ impl ReexecutionStrategy {
     }
 }
 
+/// The `terminatePolicy` a `terminateRun` mutation asks for. A closed enum
+/// with a `graphql()` word, like [`ReexecutionStrategy`], so the policy word
+/// is a constant of this crate and never caller text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminatePolicy {
+    /// `Dagster` shuts the run down cleanly; what an operator's own cancel
+    /// asks for.
+    Safe,
+    /// Stop the worker if it is still there, then mark the run cancelled at
+    /// once. The only policy `Dagster` honours for a run that never started
+    /// or whose worker is gone (`QA TC-1702`, `SRC-39`).
+    MarkCanceledNow,
+}
+
+impl TerminatePolicy {
+    const fn graphql(self) -> &'static str {
+        match self {
+            Self::Safe => "SAFE_TERMINATE",
+            Self::MarkCanceledNow => "MARK_AS_CANCELED_IMMEDIATELY",
+        }
+    }
+}
+
 /// A `Dagster` run together with the run config it was launched with, as
 /// returned by `runsOrError { results { runConfig } }` — for a caller that
 /// needs to tell apart runs of one shared job by their config (every
@@ -113,6 +136,10 @@ pub struct DgConfiguredRun {
     /// Unix seconds the run ended, or `None` if it hasn't finished yet.
     #[serde(default)]
     pub end_time: Option<f64>,
+    /// Unix seconds the run was created (queued). The only time a run that
+    /// never started has (`QA TC-1702`, `SRC-39`).
+    #[serde(default)]
+    pub creation_time: Option<f64>,
     /// The run config, as `Dagster` returns it (a JSON object).
     #[serde(default)]
     pub run_config: Value,
@@ -1193,7 +1220,7 @@ impl DgClient {
         // same caller contract, as `list_runs_for_job` above.
         let query = format!(
             "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
-             __typename ... on Runs {{ results {{ runId status startTime endTime runConfig }} }} \
+             __typename ... on Runs {{ results {{ runId status startTime endTime creationTime runConfig }} }} \
              }} }}"
         );
         let data: ConfiguredRunsOrErrorData = self.execute(&query, None).await?;
@@ -1694,15 +1721,47 @@ impl DgClient {
     ///
     /// See [`DgClient::launch_run`].
     pub async fn terminate_run(&self, run_id: &str) -> Result<LaunchOutcome, DgError> {
-        let query = "mutation($runId: String!) { \
-                      terminateRun(runId: $runId, terminatePolicy: SAFE_TERMINATE) { \
-                      __typename \
-                      ... on TerminateRunSuccess { run { runId } } \
-                      ... on TerminateRunFailure { message } \
-                      ... on PythonError { message } \
-                      } }";
+        self.terminate_with(run_id, TerminatePolicy::Safe).await
+    }
+
+    /// Cancel a run that is past its limit for good: stop its worker if it
+    /// is still there, then mark the run cancelled at once
+    /// (`MARK_AS_CANCELED_IMMEDIATELY`). Right for a run whose connector is
+    /// locked by it — a run that never started, or whose worker died
+    /// (`QA TC-1702`, `SRC-39`, decision D10). `SAFE_TERMINATE` is refused
+    /// by `Dagster` for exactly those runs.
+    ///
+    /// Like [`DgClient::terminate_run`], a typed `Dagster`-side failure is
+    /// reported through `Ok(LaunchOutcome { failure: Some(..), .. })`, and
+    /// the upstream message is logged here, never put in the outcome.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn cancel_run_now(&self, run_id: &str) -> Result<LaunchOutcome, DgError> {
+        self.terminate_with(run_id, TerminatePolicy::MarkCanceledNow)
+            .await
+    }
+
+    /// The one body of `terminateRun`: the policy word is the only thing the
+    /// two callers change.
+    async fn terminate_with(
+        &self,
+        run_id: &str,
+        policy: TerminatePolicy,
+    ) -> Result<LaunchOutcome, DgError> {
+        let query = format!(
+            "mutation($runId: String!) {{ \
+             terminateRun(runId: $runId, terminatePolicy: {}) {{ \
+             __typename \
+             ... on TerminateRunSuccess {{ run {{ runId }} }} \
+             ... on TerminateRunFailure {{ message }} \
+             ... on PythonError {{ message }} \
+             }} }}",
+            policy.graphql()
+        );
         let data: TerminateRunData = self
-            .execute(query, Some(json!({ "runId": run_id })))
+            .execute(&query, Some(json!({ "runId": run_id })))
             .await?;
         let r = data.terminate_run;
         if r.typename == "TerminateRunSuccess"
@@ -3971,6 +4030,40 @@ mod tests {
         );
     }
 
+    /// QA `TC-1702` (`SRC-39`): a run that never started has no start time,
+    /// so `creationTime` is the only time the route can judge it by.
+    #[tokio::test]
+    async fn list_runs_for_job_with_config_returns_when_each_run_was_created() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            // `review round 1, R5`: the field is pinned on the QUERY, not on
+            // the answer. Without this the fixtures still carried
+            // `creationTime` while the query no longer asked for it, and the
+            // never-started path of the run route would switch itself off
+            // unnoticed.
+            .and(body_string_contains("creationTime"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "status": "STARTED", "startTime": null,
+                      "creationTime": 4.0, "runConfig": {} },
+                    { "runId": "r0", "status": "QUEUED", "runConfig": {} }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let runs = client
+            .list_runs_for_job_with_config("ingest_job", 50)
+            .await
+            .unwrap();
+        assert_eq!(runs[0].creation_time, Some(4.0));
+        assert_eq!(runs[1].creation_time, None);
+    }
+
     #[tokio::test]
     async fn list_jobs_with_schedules_attaches_matching_schedule_only() {
         let server = MockServer::start().await;
@@ -4200,6 +4293,51 @@ mod tests {
         // F2.7: "already finished" upstream text is logged, not
         // surfaced — `TerminateRunFailure` is `LaunchFailure::Refused`.
         assert_eq!(outcome.failure, Some(LaunchFailure::Refused));
+    }
+
+    /// QA `TC-1702` (`SRC-39`): the forced policy is what the run route uses
+    /// for a run past its limit — `SAFE_TERMINATE` is refused for a run that
+    /// never started or whose worker is gone.
+    #[tokio::test]
+    async fn cancel_run_now_asks_for_the_run_to_be_marked_cancelled_at_once() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("MARK_AS_CANCELED_IMMEDIATELY"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                    "run": { "runId": "r1" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.cancel_run_now("r1").await.unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("r1"));
+        assert!(outcome.failure.is_none());
+    }
+
+    /// The existing operator-facing cancel keeps the clean shutdown.
+    #[tokio::test]
+    async fn terminate_run_still_asks_for_a_safe_termination() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SAFE_TERMINATE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                    "run": { "runId": "r1" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.terminate_run("r1").await.unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("r1"));
     }
 
     #[tokio::test]
