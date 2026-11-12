@@ -52,9 +52,15 @@ def test_a_run_limit_that_cannot_be_read_falls_back_to_six_hours(monkeypatch, ca
     assert settings.max_runtime_seconds == SIX_HOURS
     if bad.strip():  # a blank value is the same as unset: nothing to complain about
         assert any(f.RUN_LIMIT_ENV in r.getMessage() and "default" in r.getMessage() for r in caplog.records)
-        # The value itself is never echoed. The default happens to contain the
-        # digit `0`, so the bad value is looked for with the default removed.
-        assert bad.strip() not in caplog.text.replace(str(SIX_HOURS), "")
+        # The value itself is never echoed (`review round 1, R6`): asserted on
+        # the records, never on `caplog.text`, whose default formatter puts
+        # the file name and the line number into the line — a warning that
+        # moved to line 280 or 300 would fail the `"0"` case with no change of
+        # behaviour. The default happens to contain the digit `0`, so the bad
+        # value is looked for with the default removed.
+        for record in caplog.records:
+            assert bad.strip() not in record.getMessage().replace(str(SIX_HOURS), ""), record.getMessage()
+            assert bad.strip() not in [str(arg) for arg in record.args], record.args
 
 
 def test_the_ingest_job_and_its_runs_carry_the_limit_tag() -> None:
