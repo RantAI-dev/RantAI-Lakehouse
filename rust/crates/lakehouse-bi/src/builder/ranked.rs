@@ -42,7 +42,8 @@
 //! limit keeps the N breakdown values with the largest total of the chart's
 //! measure over the chart's filtered rows; every other breakdown value is left
 //! out (plan D12). [`QueryBuilder::with_breakdown_cap`] adds that as one more
-//! `WHERE` clause — `{b} IN (SELECT {b} FROM <relation> [WHERE the same rows]
+//! `WHERE` clause — `(isNull({b}), ifNull(toString({b}), '')) IN (SELECT
+//! isNull({b}), ifNull(toString({b}), '') FROM <relation> [WHERE the same rows]
 //! GROUP BY {b} ORDER BY <the measure> DESC, {b} LIMIT N)` — so the cap ranks
 //! over the same filtered rows as the statement it sits in, and the
 //! dimension's own top N is untouched when the dimension has no grain. With a
@@ -51,6 +52,20 @@
 //! gets no cap (its windows run over the whole grouped result); heatmap,
 //! sankey and sunburst keep their statements, because there the second column
 //! is an axis, a target or a ring, not a series.
+//!
+//! The key is a `(isNull, toString)` pair rather than the bare column
+//! (`QA LH-BI-6-01` review round 1, R1): `ClickHouse` answers `NULL IN (<set>)`
+//! with false unless `transform_null_in` is set, and nothing in this
+//! repository sets it, so a bare `{b} IN (…)` silently dropped every row
+//! whose breakdown value is NULL — a nullable mart column, a left-joined
+//! column (`Relation::Joined` reads with `join_use_nulls = 1`) or a bucket of a
+//! NULL date. The pair keeps the NULL series and cannot merge it with an empty
+//! string. Measured on `clickhouse/clickhouse-server:26.8` (the version
+//! `docker-compose.yml` pins) by `lakehouse-api`'s
+//! `tests/breakdown_cap.rs`: with rows `(NULL, 100), (x, 50), (y, 30), ('',
+//! 7)`, the bare form returned three of four series at `LIMIT 20` and none at
+//! `LIMIT 1` when NULL was the largest; the pair returned all four, and only
+//! the NULL series at `LIMIT 1`.
 //!
 //! # Safety of the SQL
 //!
@@ -204,6 +219,13 @@ impl QueryBuilder<Ready> {
     ///
     /// "Largest" is always the largest: the subquery orders descending even on
     /// a chart sorted ascending, because the limit counts the biggest values.
+    ///
+    /// The comparison key is `(isNull(b), ifNull(toString(b), ''))` on both
+    /// sides rather than the bare column (`QA LH-BI-6-01` review round 1, R1):
+    /// `ClickHouse` answers `NULL IN (<set>)` with false unless
+    /// `transform_null_in` is set, so a bare `b IN (…)` dropped every row whose
+    /// breakdown value is NULL, on every bar, hbar, line and area chart. The
+    /// module comment names the measurement.
     pub(super) fn breakdown_cap(&self) -> Option<String> {
         let breakdown = self.breakdown.as_ref()?;
         if self.steps.is_some() || !self.groupings.is_empty() {
@@ -215,7 +237,9 @@ impl QueryBuilder<Ready> {
         }
         let rank = self.rank_expr(measure);
         Some(format!(
-            "{breakdown} IN (SELECT {breakdown} FROM {from}{where_sql} \
+            "(isNull({breakdown}), ifNull(toString({breakdown}), '')) IN \
+             (SELECT isNull({breakdown}), ifNull(toString({breakdown}), '') \
+             FROM {from}{where_sql} \
              GROUP BY {breakdown} ORDER BY {rank} DESC, {breakdown} LIMIT {limit})",
             from = self.from.render(),
             where_sql = self.where_sql(),

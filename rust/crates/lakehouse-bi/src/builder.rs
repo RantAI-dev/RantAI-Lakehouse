@@ -4445,7 +4445,7 @@ mod tests {
             got.sql,
             "SELECT d, g, round(sum(v)) AS v FROM \
              (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
-             WHERE g IN (SELECT g FROM (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
+             WHERE (isNull(g), ifNull(toString(g), '')) IN (SELECT isNull(g), ifNull(toString(g), '') FROM (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
              GROUP BY g ORDER BY sum(v) DESC, g LIMIT 8) GROUP BY d, g ORDER BY d, g"
         );
         assert_eq!(got.latest_limit, None);
@@ -4468,7 +4468,7 @@ mod tests {
         );
         assert!(
             got.sql.contains(&format!(
-                "d2 IN (SELECT d2 FROM {bucket} GROUP BY d2 ORDER BY sum(v) DESC, d2 LIMIT 20)"
+                "(isNull(d2), ifNull(toString(d2), '')) IN (SELECT isNull(d2), ifNull(toString(d2), '') FROM {bucket} GROUP BY d2 ORDER BY sum(v) DESC, d2 LIMIT 20)"
             )),
             "the cap ranks the buckets: {}",
             got.sql
@@ -4514,7 +4514,7 @@ mod tests {
         let got = sql_with_filters_report(&spec, &[], &[], &bi6_cols());
         assert!(
             got.sql.contains(
-                "cat IN (SELECT cat FROM serving.mart_x GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 3)"
+                "(isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 3)"
             ),
             "{}",
             got.sql
@@ -4522,6 +4522,34 @@ mod tests {
         assert!(
             got.sql.contains("kab IN (SELECT kab FROM serving.mart_x"),
             "the dimension's own top N is still there: {}",
+            got.sql
+        );
+    }
+
+    /// `BI-46` (plan D12; QA `LH-BI-6-01` review round 1, R1): `ClickHouse`
+    /// answers `NULL IN (<set>)` with false unless `transform_null_in` is set,
+    /// so the cap compares `(isNull, toString)` on both sides and a NULL
+    /// breakdown value keeps its own series. `lakehouse-api`'s
+    /// `tests/breakdown_cap.rs` runs the same clause on a real engine with a
+    /// `Nullable(String)` breakdown.
+    #[test]
+    fn a_breakdown_cap_keeps_a_null_breakdown_value_and_does_not_compare_the_bare_column() {
+        let mut spec = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        spec.def.breakdown = Some("cat".to_owned());
+        spec.def.order = Some("desc".to_owned());
+        let got = sql_with_filters_report(&spec, &[], &[], &bi6_cols());
+        assert!(
+            got.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN \
+                 (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x \
+                 GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 20)"
+            ),
+            "the cap keeps a NULL breakdown value: {}",
+            got.sql
+        );
+        assert!(
+            !got.sql.contains("cat IN (SELECT cat"),
+            "no bare `IN` over a nullable column: {}",
             got.sql
         );
     }
@@ -4541,8 +4569,9 @@ mod tests {
             &bi6_cols(),
         );
         assert!(
-            got.sql
-                .contains("cat IN (SELECT cat FROM serving.mart_x WHERE cat NOT IN ('x')"),
+            got.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x WHERE cat NOT IN ('x')"
+            ),
             "the cap ranks over the filtered rows: {}",
             got.sql
         );
@@ -4571,8 +4600,9 @@ mod tests {
         spec.def.limit = Some(5.into());
         let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
         assert!(
-            got.sql
-                .contains("WHERE g IN (SELECT g FROM (SELECT toDayOfWeek(d) AS d, g, v"),
+            got.sql.contains(
+                "WHERE (isNull(g), ifNull(toString(g), '')) IN (SELECT isNull(g), ifNull(toString(g), '') FROM (SELECT toDayOfWeek(d) AS d, g, v"
+            ),
             "the cap ranks the breakdown: {}",
             got.sql
         );
@@ -5036,9 +5066,9 @@ mod tests {
         assert_eq!(
             got.sql,
             "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
-             WHERE cat IN ('a') AND cat IN (SELECT cat FROM serving.mart_x WHERE cat IN ('a') \
+             WHERE cat IN ('a') AND (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x WHERE cat IN ('a') \
              GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 20) AND kab IN (SELECT kab FROM \
-             serving.mart_x WHERE cat IN ('a') AND cat IN (SELECT cat FROM serving.mart_x WHERE \
+             serving.mart_x WHERE cat IN ('a') AND (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x WHERE \
              cat IN ('a') GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 20) GROUP BY kab \
              ORDER BY sum(visitors) DESC LIMIT 20) GROUP BY kab, cat ORDER BY kab, cat"
         );
@@ -5239,9 +5269,9 @@ mod tests {
             sql,
             "SELECT kab, cat, __m0 AS visitors FROM (SELECT kab, cat, round(sum(visitors)) AS __m0, \
              sum(sum(visitors)) OVER (PARTITION BY kab) AS __t FROM serving.mart_x \
-             WHERE cat IN (SELECT cat FROM serving.mart_x GROUP BY cat \
+             WHERE (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x GROUP BY cat \
              ORDER BY sum(visitors) DESC, cat LIMIT 5) AND kab IN (SELECT kab FROM serving.mart_x \
-             WHERE cat IN (SELECT cat FROM serving.mart_x GROUP BY cat \
+             WHERE (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x GROUP BY cat \
              ORDER BY sum(visitors) DESC, cat LIMIT 5) GROUP BY kab \
              ORDER BY sum(visitors) DESC, kab LIMIT 5) GROUP BY kab, cat) \
              ORDER BY __t DESC, kab, cat"

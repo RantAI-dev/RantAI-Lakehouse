@@ -7996,7 +7996,10 @@ mod tests {
         assert!(spec.def.caps_breakdown());
         assert!(spec.def.uses_shaping(), "rebuilt on every read (D14)");
         assert!(
-            spec.spec.sql.contains("cat IN (SELECT cat FROM ("),
+            spec.spec.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN \
+                 (SELECT isNull(cat), ifNull(toString(cat), '') FROM ("
+            ),
             "{}",
             spec.spec.sql
         );
