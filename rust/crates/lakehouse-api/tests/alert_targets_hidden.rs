@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
-use lakehouse_store::overview::{FiredRule, insert_from_fired_rule};
+use lakehouse_store::overview::{DeliveryRecord, FiredRule, insert_from_fired_rule};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -179,6 +179,53 @@ async fn the_assistants_rule_list_returns_the_target_to_a_caller_with_alert_writ
     let f = fixture().await;
     let result = list_alert_rules(&f, f.writer).await;
     assert_eq!(result["rules"][0]["target"], json!(ADDRESS));
+}
+
+/// `SRC-40` D6 (`TC-1695`): a rule's latest delivery — when it last sent, or
+/// that it did not and why — is listed for every caller who may list the rule,
+/// here and in the assistant's `list_alert_rules`; and the body of a caller
+/// without `alert:write` still holds no target. Fails if the `lastDelivery`
+/// insert in `listed_rules` is removed.
+#[tokio::test]
+async fn the_rule_list_and_the_assistants_list_carry_a_rules_last_delivery() {
+    const REASON: &str = "the webhook server answered with an error";
+    let f = fixture().await;
+    lakehouse_store::alert_delivery::record(
+        &f.app.pool,
+        RULE,
+        DeliveryRecord::NotDelivered(REASON),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .expect("a delivery row");
+
+    for who in [f.read_only, f.writer] {
+        let (status, body) = get(&f, who, "/api/alerts").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let delivery = &body["rules"][0]["lastDelivery"];
+        assert_eq!(delivery["delivered"], json!(false), "{body}");
+        assert_eq!(delivery["reason"], json!(REASON), "{body}");
+        assert!(delivery["at"].is_string(), "{body}");
+        if who == f.read_only {
+            assert!(!body.to_string().contains(ADDRESS), "{body}");
+        }
+    }
+
+    let result = list_alert_rules(&f, f.read_only).await;
+    let delivery = &result["rules"][0]["lastDelivery"];
+    assert_eq!(delivery["delivered"], json!(false), "{result}");
+    assert_eq!(delivery["reason"], json!(REASON), "{result}");
+    assert!(delivery["at"].is_string(), "{result}");
+}
+
+/// `SRC-40` D6: a rule nothing was ever delivered to carries no
+/// `lastDelivery` key, not an empty one (principle 2: no invented outcome).
+#[tokio::test]
+async fn a_rule_never_delivered_to_has_no_last_delivery_key() {
+    let f = fixture().await;
+    let (status, body) = get(&f, f.writer, "/api/alerts").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["rules"][0].get("lastDelivery").is_none(), "{body}");
 }
 
 /// A pin: the incidents list is built from names and ids and has no target
