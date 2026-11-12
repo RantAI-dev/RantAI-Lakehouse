@@ -530,6 +530,17 @@ services:
       # gate sets a small number so it need not run 30 failures
       # (`ops/g6/src11_connector_operations_test.py`). Not a credential.
       CONNECTOR_AUTO_DISABLE_AFTER: ${CONNECTOR_AUTO_DISABLE_AFTER:-}
+      # SRC-39 (QA TC-1702): how long one connector run may run before the
+      # API stops holding the connector for it, in seconds. Unset or empty
+      # keeps the code's default, 21600 (six hours); zero, negative or
+      # garbage does too. The run's `dagster/max_runtime` tag is the same
+      # number, read by the code location below. Not a credential.
+      INGEST_RUN_MAX_RUNTIME_SECONDS: ${INGEST_RUN_MAX_RUNTIME_SECONDS:-}
+      # SRC-39 (QA TC-1702): how long a queued connector run may take to start
+      # before the API stops holding the connector, in seconds. Unset or empty
+      # keeps the code's default, 600 (ten minutes); it must equal
+      # `start_timeout_seconds` in `dagster/dagster.yaml`. Not a credential.
+      INGEST_RUN_START_TIMEOUT_SECONDS: ${INGEST_RUN_START_TIMEOUT_SECONDS:-}
       # SRC-12 decision 4 (ADR 0002 addendum 5): the key managed connector
       # credentials are sealed with (AES-256-GCM). Required, no default
       # anywhere: compose refuses to start without it, and so does the API.
@@ -2297,6 +2308,13 @@ services:
       # process, which this service launches, so the daemon needs none. A
       # gate shortens it (`ops/g6/src11_connector_operations_test.py`).
       INGEST_RETRY_DELAYS_SECONDS: ${INGEST_RETRY_DELAYS_SECONDS:-}
+      # SRC-39 (QA TC-1702): the `dagster/max_runtime` tag every ingest run
+      # carries, in seconds, which the orchestrator's run monitoring enforces.
+      # Unset or empty keeps the code's default, 21600 (six hours); zero,
+      # negative or garbage does too (`RunLimitSettings.from_env`). Read by
+      # the code location, which builds the tag; the API's own copy of the
+      # number is above. Not a credential.
+      INGEST_RUN_MAX_RUNTIME_SECONDS: ${INGEST_RUN_MAX_RUNTIME_SECONDS:-}
       # SRC-12 decision 4: opens the sealed `connector_managed_*` files on the
       # read-only volume above (`secret_resolver.open_managed_credential`).
       # Same required key as `lakehouse-api`, same single value, no default;

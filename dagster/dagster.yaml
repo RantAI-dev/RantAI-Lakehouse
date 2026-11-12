@@ -16,3 +16,31 @@ storage:
         env: DAGSTER_PG_PASSWORD
       db_name:
         env: DAGSTER_PG_DB
+
+# Run monitoring is ON, so the orchestrator ends a run that never finishes
+# (SRC-39, QA TC-1702 / LH-SRC-11-11). Off by default in dagster 1.13.20, and
+# without it a run whose worker died, or one that was never launched, stays
+# queued or running for good: the API refuses the connector's next run with
+# 409 and the schedule sensor skips it, for days.
+#
+#   start_timeout_seconds  a run still NOT_STARTED or STARTING after this is
+#                          failed. 600 (ten minutes) is the same number the
+#                          API reads as INGEST_RUN_START_TIMEOUT_SECONDS
+#                          (`lakehouse-api/src/config.rs`): whoever changes one
+#                          changes both.
+#   cancel_timeout_seconds how long a cancelled run's worker is given to stop.
+#   max_resume_run_attempts 0: a run is not resumed by itself.
+#   poll_interval_seconds  how often the daemon looks.
+#
+# No `max_runtime_seconds` here on purpose: it would cap every job of the
+# instance. The running limit is the `dagster/max_runtime` tag `ingest_job`
+# carries (INGEST_RUN_MAX_RUNTIME_SECONDS, default 21600 = six hours), set in
+# `dagster/dispar_orchestrate/ingest_factory.py`. These fields cannot be read
+# from the environment (the instance schema takes plain integers), which is
+# why they are written here.
+run_monitoring:
+  enabled: true
+  start_timeout_seconds: 600
+  cancel_timeout_seconds: 300
+  max_resume_run_attempts: 0
+  poll_interval_seconds: 60
