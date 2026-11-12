@@ -1068,3 +1068,136 @@ migration's `UPDATE` and leaving its header), then restoring.
 - `pytest` / `dispar_orchestrate` — *not run, not needed*: no Python changed.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `80ac6b05`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#487) runs the suites. No BLOCKER, 4 SHOULD-FIX. No defect found in the 405/404
+router order, the 500 for an unclassified handler, the grant check's code paths, migration
+`0138`, the audit actor mapping or the sessions change; no assertion in
+`tests/route_auth.rs` was removed or loosened.
+
+**Planner's ruling on R2 (changes D20): option (b), and wider.** A person admitted by a table
+grant, without `catalog:read`, is shown that table and nothing about other tables or other
+people. `ensure_may_open_asset` returns which of the two admitted the caller; for a caller
+admitted by the grant, the body leaves out `upstream`, `downstream`, `usage.joinedTables`,
+`usage.frequentUsers`, `usage.frequentQueries`, `dependents`, `replacementAssetId` and
+`replacementName` (empty lists or absent keys, as each field's type allows, and one typed
+flag so the console can say "Shown with a table grant: related tables and usage are hidden"
+instead of drawing empty panels as if nothing existed). The table's own description, columns,
+sample (under the caller's masks and row filters), freshness, marks, policy summary and
+history stay. A caller with `catalog:read` gets the body unchanged. The two sentences T12
+added then stay as written; add the one sentence about what is hidden to
+`asset-page-depth.md` (Signed: *(proposed, not yet signed)*).
+
+R1, R3 and R4: as the findings say.
+
+### R1. SHOULD-FIX: the revoked, expired and other-permission tests of T7 pass without ever reaching the SQL they are named for, and the approved-request origin has no test at all
+
+- Where: `rust/crates/lakehouse-api/tests/catalog_grants.rs:412-423` (`catalog_tenant_harness`,
+  the grantee is `create_zero_permission_principal`), `:493`
+  (`a_revoked_or_expired_grant_no_longer_opens_the_page`), `:540`
+  (`a_grant_of_another_permission_does_not_open_the_page`);
+  `rust/crates/lakehouse-api/src/routes/catalog.rs:3311-3320`;
+  `rust/crates/lakehouse-store/src/agents.rs:1879-1900`.
+- What happens: the grantee holds no role permission, so the grant under test is also the
+  only thing that gives them `query:read`. Once it is revoked or expired,
+  `load_user_permissions` (`lakehouse-auth/src/repository.rs:199-204`) drops it, so
+  `principal.has(SAMPLE_PERMISSION)` is false and `ensure_may_open_asset` answers 403 before
+  `holds_asset_grant` is called. The same holds for the `lineage:read` grant: the person never
+  has `query:read`. Delete `g.revoked_at IS NULL AND g.expires_at > now()` or
+  `g.permission = $3` from `holds_asset_grant` and all three assertions still pass. Those
+  predicates are the only guard in the real cases: (a) a grant from table A is revoked or
+  expires and the person then gets a `query:read` grant from table B (the route allows it,
+  `rust/crates/lakehouse-api/src/routes/catalog_grants.rs:168-181`, because they no longer
+  hold the permission): A's page must stay
+  closed; (b) a person whose role holds `query:read` without `catalog:read` (the seeded Data
+  Scientist) is given a `lineage:read` or `catalog:write` grant from a table: its page must
+  stay closed. The unit test in `sample_masking` covers only the `user_id` and `catalog_id`
+  predicates. The second origin (`a.resource = $2`, the grant of an approved request) is
+  exercised by no test in either crate; `holds_asset_grant` has no store test
+  (`grep holds_asset_grant lakehouse-store/tests` is empty).
+- Fix: no production change. In `catalog_grants.rs` make the grantee of these two tests a
+  principal that holds `query:read` by role (`create_principal_with_permissions(&pool,
+  "query:read")`, put `in_the_catalog_tenant`), and insert the `query:read` grant rows with
+  `lakehouse_store::agents::create_direct_grant` (the route answers 409 for a person who
+  already holds the permission); revoke through the route's `DELETE`, expire with the existing
+  `UPDATE`. Assert 200-or-503 before and 403 `permission_denied: catalog:read` after. For the
+  other-permission test, grant `lineage:read` through the route to that same role-holder. Add
+  a store test file case for `holds_asset_grant` (in `lakehouse-store/tests/agents.rs`):
+  direct grant true; other asset, other user, other permission, revoked, expired false; and a
+  grant row with `approval_id` whose `approval_item.resource` is the asset true, another
+  resource false.
+- Check: each new assertion must fail when the matching line of the `holds_asset_grant` SQL
+  is removed (`revoked_at`, `expires_at`, `permission`, `a.resource`); say so per assertion in
+  the handoff.
+
+### R2. SHOULD-FIX: the body a grantee without `catalog:read` receives names other tables, while the backlog row and the new documents say the grant shows "only that table"
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog.rs:1774-1805` (nothing after the
+  admission distinguishes the two kinds of reader), `:2634-2639` (`upstream`), `:2830`
+  (`downstream`), `:2124-2134` (`replacementAssetId`, `replacementName`), `:2305-2327`
+  (`mark_governance`); `rust/crates/lakehouse-api/src/routes/catalog_governance.rs:409-420`
+  and `:658-679` (`usage.joinedTables` with each table's `assetId`), `:548-549`
+  (`frequentUsers`, `frequentQueries`), `:197-246` (`dependents`);
+  `docs/core/features/asset-page-depth.md:73`; `CHANGELOG.md:44`; `docs/core/BACKLOG.md:355`.
+- What happens: a person with a `query:read` grant from `silver.orders` and no `catalog:read`
+  or `lineage:read` calls `GET /api/catalog/silver.orders` and gets, besides that table: the
+  Bronze dataset it is built from (`upstream`: slug and `bronze.<table>`), up to ten other
+  tables people joined with it in the last 30 days, each with its catalog id
+  (`usage.joinedTables`), the names of the people who query it most and the shapes of their
+  statements (`frequentUsers`, `frequentQueries`), the saved queries and dashboards that read
+  it (`dependents`), the replacement asset's id and name when it is deprecated, and its policy
+  summary and change history. For a Bronze id it is `downstream` (`silver.<table>`). This is
+  exactly what plan D20 decides ("the same body a `catalog:read` reader gets"), so the code
+  matches the plan. But `GOV-11` in the backlog says "The page shows such a person only that
+  table", and the two sentences T12 added ("It opens that table only: not the catalog list,
+  not search, not another table's page") read as if nothing of another table is shown. The
+  lineage neighbours reach a person who was never given `lineage:read`.
+- Fix: a decision for the planner and the owner, not an improvisation for the developer.
+  Either (a) keep D20 and add one sentence to `asset-page-depth.md` under the new bullet:
+  the page still names the tables it is built from and joined with, the people who query it
+  and what reads it; or (b) for a caller admitted by the grant (not by `catalog:read`), leave
+  out `upstream`, `downstream`, `usage.joinedTables`, `replacementAssetId` and
+  `replacementName`: have `ensure_may_open_asset` return which of the two admitted the
+  caller, and strip those keys from the body at the end of `detail`.
+- Check: for (b), extend
+  `detail_admits_a_person_granted_query_read_on_that_table_and_masks_what_they_read`: the
+  grantee's body has no `upstream`, and `usage.joinedTables` is empty, while the same call as
+  `analyst("catalog:read, query:read")` still has them. For (a), no test; the sentence.
+
+### R3. SHOULD-FIX: no test proves the `GOV-7` half of D20 for a grant-holder, though three documents now state it
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog.rs:1784-1797`;
+  `docs/core/features/table-access-per-role.md:57`, `docs/core/features/asset-page-depth.md:73`,
+  `CHANGELOG.md:44`; no case in `tests/catalog_grants.rs` or in `mod sample_masking`.
+- What happens: the code is right today: `table_access_for` runs after the admission for
+  every reader, so a grantee whose roles hide the table gets the 404 an unknown id gets. But
+  the only thing keeping it right is statement order in `detail`. A later change that returns
+  early for an admitted grantee, or moves the grant check below the access check, would open
+  a hidden table to a grant-holder and no test would fail. The plan's T7 checks did not ask
+  for one; the claim was then written into two feature pages and the changelog.
+- Fix: one test, no production change.
+- Check: in `tests/catalog_grants.rs`,
+  `a_grant_does_not_open_a_table_the_persons_roles_hide`: a grantee whose role is narrowed by
+  `GOV-7` to a schema that does not contain `silver.orders` (set up the role's table access the
+  way the `GOV-7` tests of `/api/catalog/{id}` do), with a `query:read` grant from
+  `silver.orders`; `GET /api/catalog/silver.orders` answers 404 `Asset not found`, not 403 and
+  not 200/503.
+
+### R4. SHOULD-FIX: T5 deleted the first line of an unrelated test's doc comment in `tests/route_auth.rs`
+
+- Where: `rust/crates/lakehouse-api/tests/route_auth.rs:2655-2658` (base `75010df81`:
+  `:2592-2595`).
+- What happens: the two new tests were inserted between the first and second lines of the doc
+  comment of `quality_schedule_routes_are_gated_in_both_directions`. The line
+  ``/// `DATA-14` (F3): any login may read the schedules, and setting one needs`` and the
+  blank line before it are gone, so the comment now starts mid-sentence
+  (``/// `governance:write`. A principal without it is refused (403) and nothing is stored;``)
+  directly under the closing brace of the test above. This is the one removed line in the
+  file (`git diff 75010df81 HEAD -- tests/route_auth.rs` has exactly one `-` line); no
+  assertion was removed or loosened.
+- Fix: restore the deleted line and the blank line above it, unchanged.
+- Check: `git diff 75010df81 HEAD -- rust/crates/lakehouse-api/tests/route_auth.rs | grep -c '^-[^-]'`
+  prints `0`.
+
