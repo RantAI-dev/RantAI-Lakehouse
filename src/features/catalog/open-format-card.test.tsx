@@ -281,24 +281,33 @@ describe("OpenFormatCard", () => {
 
   // QA LH-DATA-1-01 (DATA-49): a mart never published answers `published: false`,
   // and the card shows no last-published rows for it — there is nothing to name.
-  it("shows no last-published rows for a mart the API reports as not published", async () => {
+  //
+  // Review round 1 R5: the publication here HAS a last export on record, so
+  // `hasHistory` is true and the `published` read-back is the only thing that
+  // closes the two rows. With `lastExportedAt: null` the test passed even with the
+  // `published` check removed, which proved nothing.
+  it("shows no last-published rows when the read-back says the table is not there", async () => {
+    let readBacks = 0
     mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
-          lastExportedAt: null,
-          changedSinceExport: null,
+          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: false,
         })
       }
       if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        readBacks += 1
+        // The catalog no longer has the table, so the read-back names no copy —
+        // a stray snapshot in the body is still not a published one.
         return jsonResponse({
           namespace: "gold",
           table: "mart_a",
           published: false,
           formatVersion: null,
           rowsInIceberg: null,
-          snapshotId: null,
-          exportedAt: null,
+          snapshotId: { value: 999, measured: true },
+          exportedAt: "2026-10-02T04:00:00Z",
         })
       }
       if (url.includes("/api/gold/exports")) {
@@ -308,9 +317,14 @@ describe("OpenFormatCard", () => {
     })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
-    await waitFor(() => expect(screen.getByText("Never published")).toBeDefined())
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
+    )
+    await waitFor(() => expect(readBacks).toBe(1))
     expect(screen.queryByText("Last published")).toBeNull()
+    expect(screen.queryByText("999")).toBeNull()
     expect(screen.queryByText("Snapshot")).toBeNull()
+    expect(screen.queryByText("Could not be read")).toBeNull()
   })
 
   // A failed read-back is a failure, not "never published": the row says the copy

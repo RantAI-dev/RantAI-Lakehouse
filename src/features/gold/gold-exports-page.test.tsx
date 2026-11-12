@@ -102,10 +102,50 @@ describe("GoldExportsPage", () => {
 
   // QA LH-DATA-1-01 (DATA-49): the route answers 200 with `published: false` for
   // a mart never published, and that is what the cell reads.
-  it("says Never exported for a mart the API reports as not published", async () => {
-    mockApi()
+  //
+  // Review round 1 R5: the body carries a stray `snapshotId`, so the snapshot cell
+  // is the assertion — with `published` dropped from its condition, the stray value
+  // is printed and this test fails.
+  it("says Never exported, and no snapshot, for a mart the API reports as not published", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/api/dashboard/fields")) {
+        return jsonResponse({ marts: [{ name: "sales", rows: 42 }] })
+      }
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          mart: "sales",
+          enabled: false,
+          updatedAt: null,
+          lastChangedAt: "2026-10-02T03:30:00Z",
+          lastExportedAt: null,
+          changedSinceExport: null,
+          lastFailure: null,
+          canEdit: true,
+        })
+      }
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/api/gold/exports")) return jsonResponse({ mart: "sales", runs: [] })
+      if (url.includes("/api/gold/export/sales")) {
+        return jsonResponse({
+          namespace: "gold",
+          table: "sales",
+          published: false,
+          formatVersion: null,
+          rowsInIceberg: null,
+          snapshotId: { value: 999, measured: true },
+          exportedAt: "2026-10-02T04:00:00Z",
+        })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+
     render(<GoldExportsPage />)
-    await waitFor(() => expect(screen.getByText("Never exported")).toBeDefined())
+    const row = (await screen.findByText("sales")).closest("tr") as HTMLTableRowElement
+    const cells = row.querySelectorAll("td")
+    // Column order: mart, rows, enabled, last export, snapshot, history, consumers, actions.
+    await waitFor(() => expect(cells[3]?.textContent).toBe("Never exported"))
+    expect(cells[4]?.textContent).toBe("—")
   })
 
   it("shows a dash, not Never exported, when the read-back fails", async () => {
