@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -18,8 +19,6 @@ import { notifyError, notifySuccess } from "@/lib/notify"
 import { governanceService } from "@/services"
 import type { DatasetSla } from "@/services/contracts/governance"
 import { TablePicker, useTableCatalog } from "./table-picker"
-
-const selectClassName = "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 const UNIT_MINUTES = { minutes: 1, hours: 60, days: 1440 } as const
 type Unit = keyof typeof UNIT_MINUTES
@@ -137,18 +136,15 @@ export function FreshnessTargetDialog({
               onChange={(e) => setAmount(e.target.value)}
               aria-invalid={minutes === null}
             />
-            <select
+            <SelectField
               aria-label="Unit"
-              className={selectClassName}
               value={unit}
-              onChange={(e) => setUnit(e.target.value as Unit)}
-            >
-              {(Object.keys(UNIT_MINUTES) as Unit[]).map((u) => (
-                <option key={u} value={u}>
-                  {u}
-                </option>
-              ))}
-            </select>
+              options={(Object.keys(UNIT_MINUTES) as Unit[]).map((u) => ({
+                value: u,
+                label: u,
+              }))}
+              onValueChange={(next) => setUnit(next as Unit)}
+            />
           </div>
           {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
         </div>

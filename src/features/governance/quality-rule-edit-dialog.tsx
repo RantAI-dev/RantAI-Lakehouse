@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -20,8 +21,6 @@ import { governanceService } from "@/services"
 import type { QualityRule, UpdateQualityRuleInput } from "@/services/contracts/governance"
 import { ThresholdForms } from "./quality-check-fields"
 import { TablePicker, useTableCatalog } from "./table-picker"
-
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 /** What the dialog needs of a rule — a list row and an asset's check both have it. */
 export type EditableRule = {
@@ -128,18 +127,16 @@ export function EditRuleDialog({
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="edit-rule-severity">Severity</Label>
-            <select
+            <SelectField
               id="edit-rule-severity"
-              className={selectClassName}
+              className="w-full"
               value={severity}
-              onChange={(e) => setSeverity(e.target.value as Severity)}
-            >
-              {(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => (
-                <option key={s} value={s}>
-                  {SEVERITY_LABEL[s]}
-                </option>
-              ))}
-            </select>
+              options={(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => ({
+                value: s,
+                label: SEVERITY_LABEL[s],
+              }))}
+              onValueChange={(next) => setSeverity(next as Severity)}
+            />
           </div>
           {clearsResults ? (
             <p className="text-xs text-muted-foreground">

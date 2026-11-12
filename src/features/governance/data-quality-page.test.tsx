@@ -20,6 +20,7 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { DataQualityPage } from "./data-quality-page"
 
@@ -314,7 +315,7 @@ describe("DataQualityPage: Schedules tab (WEB-3 S3-D5)", () => {
     stubApi(["governance:write"], { schedules: [schedule({})] })
     renderPage()
     fireEvent.click(await screen.findByRole("button", { name: "Edit the schedule of silver.orders" }))
-    fireEvent.change(screen.getByLabelText("Run the checks"), { target: { value: "on_load" } })
+    chooseOption(screen.getByRole("combobox", { name: "Run the checks" }), "On every load")
     fireEvent.click(screen.getByRole("button", { name: "Save schedule" }))
     await waitFor(() => expect(writesSeen.length).toBe(1))
     expect(writesSeen[0]).toEqual([
@@ -387,7 +388,7 @@ describe("DataQualityPage: Freshness targets tab (WEB-3 S3-D5)", () => {
     expect((save as HTMLButtonElement).disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Table"), { target: { value: "silver.customers" } })
     fireEvent.change(screen.getByLabelText("New data at least every"), { target: { value: "6" } })
-    fireEvent.change(screen.getByLabelText("Unit"), { target: { value: "hours" } })
+    chooseOption(screen.getByRole("combobox", { name: "Unit" }), "hours")
     fireEvent.click(save)
     await waitFor(() => expect(writesSeen.length).toBe(1))
     expect(writesSeen[0]).toEqual(["PUT", "/api/governance/sla", { tableName: "silver.customers", expectedIntervalMinutes: 360 }])
@@ -399,7 +400,11 @@ describe("DataQualityPage: Freshness targets tab (WEB-3 S3-D5)", () => {
     renderPage()
     fireEvent.click(await screen.findByRole("button", { name: "Edit the target of silver.orders" }))
     expect((screen.getByLabelText("New data at least every") as HTMLInputElement).value).toBe("1")
-    expect((screen.getByLabelText("Unit") as HTMLSelectElement).value).toBe("days")
+    // WEB-9 D2: the trigger shows the chosen option's label.
+    expect(
+      screen.getByRole("combobox", { name: "Unit" }).querySelector('[data-slot="select-value"]')
+        ?.textContent
+    ).toBe("days")
     expect(screen.getByRole("button", { name: "Remove target" })).toBeTruthy()
   })
 
@@ -423,7 +428,7 @@ describe("DataQualityPage: Freshness targets tab (WEB-3 S3-D5)", () => {
     ])
     fireEvent.click(within(list).getByText("silver.orders"))
     fireEvent.change(screen.getByLabelText("New data at least every"), { target: { value: "6" } })
-    fireEvent.change(screen.getByLabelText("Unit"), { target: { value: "hours" } })
+    chooseOption(screen.getByRole("combobox", { name: "Unit" }), "hours")
     fireEvent.click(screen.getByRole("button", { name: "Save target" }))
     await waitFor(() => expect(writesSeen.length).toBe(1))
     expect(writesSeen[0]).toEqual([

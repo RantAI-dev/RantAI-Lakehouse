@@ -1,5 +1,6 @@
 "use client"
 
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
@@ -14,7 +15,27 @@ import {
   type Stat,
 } from "./quality-checks"
 
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+const KIND_OPTIONS = (Object.keys(KINDS) as Kind[]).map((k) => ({
+  value: k,
+  label: KINDS[k].label,
+}))
+
+const NULL_UNIT_OPTIONS = [
+  { value: "percent", label: "% of rows" },
+  { value: "count", label: "rows" },
+]
+
+const DURATION_UNIT_OPTIONS = [
+  { value: "m", label: "minutes" },
+  { value: "h", label: "hours" },
+  { value: "d", label: "days" },
+]
+
+const STAT_OPTIONS = [
+  { value: "min", label: "Minimum" },
+  { value: "max", label: "Maximum" },
+  { value: "avg", label: "Average" },
+]
 
 /**
  * The picker for one quality check: which check, the column it reads, and
@@ -69,41 +90,33 @@ export function CheckFields({
     <>
       <div className="grid gap-1.5">
         <Label htmlFor={id("kind")}>Check</Label>
-        <select
+        <SelectField
           id={id("kind")}
-          className={selectClassName}
+          className="w-full"
           value={form.kind}
-          onChange={(e) => onChange({ kind: e.target.value as Kind })}
-        >
-          {(Object.keys(KINDS) as Kind[]).map((k) => (
-            <option key={k} value={k}>
-              {KINDS[k].label}
-            </option>
-          ))}
-        </select>
+          options={KIND_OPTIONS}
+          onValueChange={(next) => onChange({ kind: next as Kind })}
+        />
       </div>
       {KINDS[form.kind].column ? (
         <div className="grid gap-1.5">
           <Label htmlFor={id("column")}>Column</Label>
           {columns ? (
-            <select
+            <SelectField
               id={id("column")}
-              className={selectClassName}
+              className="w-full"
               value={form.column}
-              onChange={(e) => onChange({ column: e.target.value })}
-            >
-              {/* WEB-8 D8: a column the rule already names that this table
-                  does not have is still shown, so opening the picker cannot
-                  replace it with whatever sorts first. */}
-              {form.column !== "" && !columns.includes(form.column) ? (
-                <option value={form.column}>{form.column} (not in this table)</option>
-              ) : null}
-              {columns.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
+              options={[
+                /* WEB-8 D8: a column the rule already names that this table
+                   does not have is still shown, so opening the picker cannot
+                   replace it with whatever sorts first. */
+                ...(form.column !== "" && !columns.includes(form.column)
+                  ? [{ value: form.column, label: `${form.column} (not in this table)` }]
+                  : []),
+                ...columns.map((c) => ({ value: c, label: c })),
+              ]}
+              onValueChange={(next) => onChange({ column: next })}
+            />
           ) : (
             <Input
               id={id("column")}
@@ -151,15 +164,13 @@ export function CheckFields({
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor={id("null-unit")}>Counted as</Label>
-            <select
+            <SelectField
               id={id("null-unit")}
-              className={selectClassName}
+              className="w-full"
               value={form.nullUnit}
-              onChange={(e) => onChange({ nullUnit: e.target.value as NullUnit })}
-            >
-              <option value="percent">% of rows</option>
-              <option value="count">rows</option>
-            </select>
+              options={NULL_UNIT_OPTIONS}
+              onValueChange={(next) => onChange({ nullUnit: next as NullUnit })}
+            />
           </div>
         </div>
       ) : null}
@@ -189,16 +200,13 @@ export function CheckFields({
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor={id("duration-unit")}>Unit</Label>
-            <select
+            <SelectField
               id={id("duration-unit")}
-              className={selectClassName}
+              className="w-full"
               value={form.durationUnit}
-              onChange={(e) => onChange({ durationUnit: e.target.value as DurationUnit })}
-            >
-              <option value="m">minutes</option>
-              <option value="h">hours</option>
-              <option value="d">days</option>
-            </select>
+              options={DURATION_UNIT_OPTIONS}
+              onValueChange={(next) => onChange({ durationUnit: next as DurationUnit })}
+            />
           </div>
         </div>
       ) : null}
@@ -222,16 +230,13 @@ export function CheckFields({
         <>
           <div className="grid gap-1.5">
             <Label htmlFor={id("stat")}>Statistic</Label>
-            <select
+            <SelectField
               id={id("stat")}
-              className={selectClassName}
+              className="w-full"
               value={form.stat}
-              onChange={(e) => onChange({ stat: e.target.value as Stat })}
-            >
-              <option value="min">Minimum</option>
-              <option value="max">Maximum</option>
-              <option value="avg">Average</option>
-            </select>
+              options={STAT_OPTIONS}
+              onValueChange={(next) => onChange({ stat: next as Stat })}
+            />
           </div>
           {bounds}
         </>

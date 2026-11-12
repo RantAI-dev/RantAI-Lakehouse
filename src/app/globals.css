@@ -16,6 +16,21 @@
 @custom-variant dark (&:is(.dark *):not(:is(.theme-light *)));
 
 /*
+ * WEB-9 D1: tell the browser which theme it is in. Without this, a native
+ * control it draws itself — the list of a `<select>`, a date picker, a
+ * scrollbar — comes out in the browser's light colours while the page's text
+ * is light, so only the highlighted row of a dropdown can be read. A
+ * dashboard fixed to the light theme (BI-17 D6) is light in its own subtree.
+ */
+.dark {
+  color-scheme: dark;
+}
+
+.theme-light {
+  color-scheme: light;
+}
+
+/*
  * Tailwind v4 wraps every `hover:` (and so `group-hover:`) in
  * `@media (hover: hover)`, so browsers that report no hover capability,
  * such as touchscreen laptops and some Linux or remote-desktop setups, get

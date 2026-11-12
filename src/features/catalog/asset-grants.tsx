@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Trash2 } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
+import { SelectField } from "@/components/patterns/select-field"
 import { ErrorState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
@@ -19,8 +20,6 @@ import type { AssetDetail, AssetGrant } from "@/services/contracts/assets"
 
 /** The permissions a grant from this page may carry: the three a user can request. */
 const GRANTABLE = ["catalog:write", "lineage:read", "query:read"] as const
-
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 /** The server's sentence, without the `permission_denied: ` its 403 body carries. */
 function sentence(message: string): string {
@@ -133,18 +132,13 @@ export function AssetGrants({ asset: a }: { asset: AssetDetail }) {
           <Label htmlFor="grant-permission" className="mb-1 block text-xs">
             Permission
           </Label>
-          <select
+          <SelectField
             id="grant-permission"
-            className={selectClassName}
+            className="w-full"
             value={permission}
-            onChange={(e) => setPermission(e.target.value)}
-          >
-            {GRANTABLE.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
+            options={GRANTABLE.map((p) => ({ value: p, label: p }))}
+            onValueChange={setPermission}
+          />
         </div>
         <Button type="submit" size="sm" disabled={email.trim() === "" || grant.status === "pending"}>
           Grant
