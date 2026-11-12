@@ -123,6 +123,15 @@ function ResolveDialog({
   )
 }
 
+/**
+ * What "stale" means, in words (QA `LH-DATA-14-03`, `DATA-54`): a later run of
+ * the rule passed, and the incident stays open until a person resolves it
+ * (signed decision 3). The server marks it stale (`routes/quality.rs`); it
+ * never resolves one by itself.
+ */
+export const STALE_INCIDENT_NOTE =
+  "The check has passed since this incident opened. It stays open until someone resolves it."
+
 function IncidentRow({
   incident,
   onResolve,
@@ -138,12 +147,21 @@ function IncidentRow({
             {INCIDENT_KIND_LABEL[incident.kind] ?? incident.kind}
           </Pill>
           {/* PR #106 review R1 SHOULD-FIX DATA-14 3 / D2: show stale badge on incidents page */}
-          {incident.status === "stale" ? <Pill tone="neutral">stale</Pill> : null}
+          {incident.status === "stale" ? (
+            <Pill tone="neutral" title={STALE_INCIDENT_NOTE}>
+              stale
+            </Pill>
+          ) : null}
           {incident.ruleName ? (
             <span className="font-mono text-xs text-muted-foreground">{incident.ruleName}</span>
           ) : null}
         </div>
         <p className="mt-1 text-sm">{incident.detail}</p>
+        {/* QA `LH-DATA-14-03` (`DATA-54`): what "stale" means, where the
+            incident is read. */}
+        {incident.status === "stale" ? (
+          <p className="mt-0.5 text-xs text-muted-foreground">{STALE_INCIDENT_NOTE}</p>
+        ) : null}
         <p className="mt-0.5 text-xs text-muted-foreground">
           Opened {formatRelativeTime(incident.openedAt)} · last seen{" "}
           {formatRelativeTime(incident.lastSeenAt)}
@@ -172,13 +190,25 @@ function IncidentRow({
  * resolved ones as history. On an asset's Quality tab pass `asset` to list
  * that table's alone.
  */
-export function QualityIncidents({ asset }: { asset?: string }) {
+export function QualityIncidents({
+  asset,
+  reloadKey,
+}: {
+  asset?: string
+  /**
+   * Raise it to read the incidents again — after a rule ran or changed. The
+   * page keeps its content mounted while it reloads
+   * (`keepDataOnReload`), so a change of the view or the table is not the only
+   * thing that must bring a new read (`QA LH-DATA-14-01` F1, `DATA-54`).
+   */
+  reloadKey?: number
+}) {
   const { hasPermission } = useAuth()
   const [view, setView] = React.useState<"open" | "resolved">("open")
   const [resolving, setResolving] = React.useState<QualityIncident | null>(null)
   const state = useService(
     (signal) => governanceService.listQualityIncidents({ status: view, asset }, signal),
-    [view, asset]
+    [view, asset, reloadKey]
   )
   const canResolve = hasPermission("governance:write")
   const groups = state.status === "success" ? groupByTable(state.data) : []

@@ -102,10 +102,12 @@ export type Asset = {
    * of a search with a term, and absent when every word matched the name.
    * With several words it explains the first word, in typed order, that the
    * name does not (`DATA-11` review `SHOULD-FIX 8`).
-   * `field` is `"id"`, `"namespace"`, `"tag"`, `"column"`, `"owner"`,
-   * `"description"` or `"columnDescription"`; `value` is the tag or column
-   * name and `""` for the rest; `approximate` is true when the match
-   * forgave a typo.
+   * `field` is `"table"`, `"namespace"`, `"tag"`, `"column"`, `"owner"`,
+   * `"description"` or `"columnDescription"`; `value` is the tag, the
+   * column, the table key or a piece of the description, and `""` for the
+   * rest; `approximate` is true when the match forgave a typo. `"table"`
+   * names the physical name a person types (QA `LH-DATA-11-05`,
+   * `DATA-54`); an API build older than that sends `"id"` instead.
    * `"name"` is the one field outside that list (`DATA-32` D1): the server
    * reports it when the name forgave a typo and no other field explains the
    * hit, so `value` is `""` and `approximate` is true.
@@ -523,8 +525,22 @@ export type AssetRestoreStatus =
       expiresAt?: string
     }
 
+/**
+ * A catalog search's answer: the best matches and how many matched in all
+ * (`DATA-41` D3, `DATA-54`). The palette shows a few of them and says how
+ * many more there are.
+ */
+export type AssetSearchResult = { assets: Asset[]; total: number }
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
+  /**
+   * The best matches for `term` and how many matched in all (`DATA-41` D3).
+   *
+   * `limit` is how many assets to return; the server ranks every match and
+   * counts them, so a caller that shows eight still knows there are more.
+   */
+  searchAssets(term: string, limit: number, signal?: AbortSignal): Promise<AssetSearchResult>
   /**
    * One page of assets, with search/filter/sort/grouping applied on the
    * server (`GET /api/catalog/query`).

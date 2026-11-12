@@ -36,6 +36,8 @@ const json = (body: unknown, status = 200) =>
 
 /** The `[method, path, body]` of every write the page sent to the stub. */
 let writesSeen: unknown[][] = []
+/** How many times the stub was asked for the quality incidents (`DATA-54`). */
+let incidentReads = 0
 /** How the stub answers a schedule reset; a test may swap it for a failure. */
 let resetAnswer: () => Response = () => new Response(null, { status: 204 })
 
@@ -60,6 +62,7 @@ function stubApi(
   } = {}
 ) {
   writesSeen = []
+  incidentReads = 0
   let sessionRead: () => void = () => {}
   const done = new Promise<void>((resolve) => {
     sessionRead = resolve
@@ -79,9 +82,14 @@ function stubApi(
         writesSeen.push(["POST", path, JSON.parse(String(init?.body))])
         return json({ ...(incidents[0] as object), status: "resolved", resolution: JSON.parse(String(init?.body)).resolution })
       }
+      incidentReads += 1
       return json({ incidents })
     }
     if (path.includes("/api/governance/quality/") && path.endsWith("/runs")) return json({ runs })
+    // QA `LH-DATA-14-01` F1 (`DATA-54`): a run answers its verdict.
+    if ((init?.method ?? "GET") === "POST" && path.endsWith("/run")) {
+      return json({ id: "r1", status: "failed", value: "70.0% not null" })
+    }
     // WEB-8 D8: the catalog the freshness dialog's table picker reads. When
     // the test gives none the read fails, which is the free-text fallback.
     if (catalog !== undefined && path.startsWith("/api/catalog")) {
@@ -180,6 +188,22 @@ describe("DataQualityPage: incidents (DATA-14)", () => {
     expect(screen.getByText("Volume anomaly")).toBeTruthy()
     expect(screen.getByText(/The latest load added 100 rows, 10% of the usual/)).toBeTruthy()
     expect(screen.getByText(/2 open · oldest opened/)).toBeTruthy()
+  })
+
+  // QA `LH-DATA-14-03` (`DATA-54`): "stale" is explained where the incident
+  // is read, and only on a stale one.
+  it("says what stale means on a stale incident, and nothing on an open one", async () => {
+    stubApi(["governance:write"], {
+      incidents: [
+        incident({ id: "i1", status: "stale" }),
+        incident({ id: "i2", ruleName: "id_unique", detail: "id_unique — 3 repeated values" }),
+      ],
+    })
+    renderPage()
+    const note =
+      "The check has passed since this incident opened. It stays open until someone resolves it."
+    expect((await screen.findAllByText(note)).length).toBe(1)
+    expect(screen.getByText("stale").getAttribute("title")).toBe(note)
   })
 
   it("says nothing is wrong when no incident is open", async () => {
@@ -316,6 +340,19 @@ describe("DataQualityPage: running a rule by hand (GOV-10)", () => {
     fireEvent.click(await screen.findByText("email_filled"))
     expect(await screen.findByRole("button", { name: "Run check" })).toBeTruthy()
   })
+
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the incidents panel does not read
+  // again by itself after a run, so the page raises a key for it.
+  it("reads the incidents again after Run check", async () => {
+    stubApi(["governance:write"], { quality: [rule] })
+    renderPage()
+    fireEvent.click(await screen.findByText("email_filled"))
+    await screen.findByRole("button", { name: "Run check" })
+    await waitFor(() => expect(incidentReads).toBeGreaterThan(0))
+    const before = incidentReads
+    fireEvent.click(screen.getByRole("button", { name: "Run check" }))
+    await waitFor(() => expect(incidentReads).toBe(before + 1))
+  })
 })
 
 const schedule = (over: Record<string, unknown>) => ({
@@ -446,8 +483,16 @@ describe("DataQualityPage: Freshness targets tab (WEB-3 S3-D5)", () => {
     search = new URLSearchParams("tab=freshness")
     stubApi(["governance:write"], {
       catalog: [
-        { id: "a-orders", name: "orders", namespace: "silver" },
-        { id: "a-raw", name: "raw_orders", namespace: "bronze" },
+        // Shaped like the API's list rows (`DATA-54`): a Silver row's `id`
+        // is its table key; a Bronze row's `id` is a registry slug and its
+        // table is named by `tableKey`.
+        { id: "silver.orders", name: "Orders", namespace: "silver" },
+        {
+          id: "raw-orders",
+          name: "Raw Orders",
+          namespace: "primer",
+          tableKey: "bronze.raw_orders",
+        },
       ],
     })
     renderPage()

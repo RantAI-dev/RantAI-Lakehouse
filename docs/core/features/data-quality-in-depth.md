@@ -56,6 +56,13 @@ reported, not quietly lowered.
   load itself stays committed.
 - Alerts need SRC-7's channels configured; without them an incident still
   opens, only nothing is sent.
+- A rule is written for a table that exists and that its author may read; any
+  other table is refused (`DATA-54`).
+- On-load checks start when the orchestrator reports the finished load, not
+  when the load ends: QA saw about 36 seconds on staging (`LH-DATA-14-05`). The
+  upload's result page says so.
+- A stale incident is one whose check has passed since it opened. It stays
+  open until a person resolves it.
 
 ## Spec rows
 

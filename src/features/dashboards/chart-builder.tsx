@@ -1351,6 +1351,18 @@ export function ChartBuilder({
                 ) : null}
               </SelectContent>
             </Select>
+            {/* QA LH-DATA-12-17 F1 (DATA-54): the trigger shows the mart's name
+                only, so the mark of the list row was lost once a mart was
+                chosen. A deprecated mart has the notice below. */}
+            {chosenMart?.certification === "certified" ? (
+              <p
+                data-testid="chosen-mart-mark"
+                className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              >
+                <CertificationBadge certification="certified" />
+                This mart is certified.
+              </p>
+            ) : null}
             {/* DATA-12 part 3: a deprecated mart still works; it warns, with the
                 note and a link to its replacement, and never blocks. */}
             {chosenMart ? <DeprecationNotice asset={chosenMart} /> : null}

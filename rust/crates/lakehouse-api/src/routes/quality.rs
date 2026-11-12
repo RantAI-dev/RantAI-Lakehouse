@@ -946,6 +946,100 @@ async fn resolve(state: &AppState, asset: &str) -> Option<ReadSource> {
     }
 }
 
+/// Refuses a quality rule written for a table that is not there, or that the
+/// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`).
+///
+/// The form offers only tables the person may read; what the form hides the
+/// server refuses. "Not there" and "not yours" are one sentence on purpose:
+/// the answer must not say which tables exist. The catalog's tenant rule runs
+/// first and the role's table access second, so a table the caller may not
+/// reach at all is never asked about.
+///
+/// A rule that already exists may keep a table that has since been dropped
+/// (`update_rule` checks only a rewrite that changes the table), so a rule
+/// can still be edited or loosened when its table is gone.
+///
+/// # Errors
+///
+/// [`ApiError::PermissionDenied`] (`403`) when the caller is outside the
+/// tenant that owns the shared catalog ([`crate::routes::catalog::
+/// catalog_tenant_refusal`]) — that answer is the same for every table, so it
+/// says nothing about one (PR review round 1 R3, `DATA-54`).
+/// [`ApiError::BadRequest`] with one sentence when `asset` is not a
+/// `silver.<table>`, `serving.<table>` or `bronze.<table>` key, when the
+/// caller's table access hides it, or when the table does not exist.
+/// [`ApiError::Unavailable`] (`503`) when the table cannot be checked because
+/// the engine or the catalog did not answer: a check that cannot be made is
+/// not a refusal.
+pub(crate) async fn ensure_rule_table(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+    asset: &str,
+) -> Result<(), ApiError> {
+    let asset = asset.trim();
+    let refused = || {
+        ApiError::BadRequest(format!(
+            "\"{asset}\" is not a table you can read. Pick the table as \
+             silver.<table>, serving.<table> or bronze.<table>."
+        ))
+    };
+    let Some((zone, table)) = asset.split_once('.') else {
+        return Err(refused());
+    };
+    let zone = zone.to_lowercase();
+    if !matches!(zone.as_str(), "silver" | "serving" | "bronze") {
+        return Err(refused());
+    }
+    // Review round 1 R7: a name that is not a plain identifier can never be a
+    // table the rule reads (both `resolve` and `catalog_source`'s readers
+    // need an `Ident` too), so it is refused here. Left to the checks below, a
+    // `bronze.` name no catalog can even be asked about read "Try again." for
+    // ever, where the same name under `silver.` was refused.
+    if Ident::new(table).is_err() {
+        return Err(refused());
+    }
+    // The catalog's tenant rule first (PR review round 1 R3, `DATA-54`): a
+    // caller the catalog refuses is answered the same way for every table,
+    // so the table check below cannot say which tables exist through it.
+    // Access second, so a hidden table is never asked about either. No
+    // principal (a system call) is not narrowed, as `TableAccess` documents.
+    if let Some(principal) = principal {
+        if let Some(reason) =
+            crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await?
+        {
+            return Err(ApiError::PermissionDenied(reason.to_owned()));
+        }
+        let access = crate::routes::catalog::table_access_for(state, principal).await?;
+        if !access.allows(&zone, table) {
+            return Err(refused());
+        }
+    }
+    match zone.as_str() {
+        "silver" | "serving" => {
+            match catalog_source::clickhouse_source(&state.clickhouse, &zone, table).await {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(refused()),
+                Err(err) => {
+                    tracing::warn!(%err, "could not check that a quality rule's table exists");
+                    Err(ApiError::Unavailable(
+                        "The table could not be checked. Try again.".to_owned(),
+                    ))
+                }
+            }
+        }
+        _ => match catalog_source::iceberg_table_presence(state, table).await {
+            // `NoQueryDatabase` means such a rule could never run in this
+            // deployment, so it is refused like a missing table.
+            Ok(true) => Ok(()),
+            Ok(false) | Err(catalog_source::PresenceUnknown::NoQueryDatabase) => Err(refused()),
+            Err(catalog_source::PresenceUnknown::Unanswered) => Err(ApiError::Unavailable(
+                "The table could not be checked. Try again.".to_owned(),
+            )),
+        },
+    }
+}
+
 /// Why a rule could not be run.
 #[derive(Debug)]
 enum RunError {
@@ -1098,12 +1192,15 @@ pub struct UpdateRuleBody {
 ///
 /// # Errors
 ///
-/// `400` when the body is malformed or leaves the table, the threshold or
-/// the severity empty; `404` when no rule has that id; `503`/`500` on a
-/// store failure.
+/// `400` when the body is malformed, leaves the table, the threshold or the
+/// severity empty, or names a table that is not there or that the caller may
+/// not read (QA `LH-DATA-14-01` F2, `DATA-54`); `403` when the caller is
+/// outside the tenant that owns the shared catalog; `404` when no rule has
+/// that id; `503` when the table cannot be checked; `500` on a store failure.
 pub async fn update_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
@@ -1130,6 +1227,13 @@ pub async fn update_rule(
         .into_iter()
         .find(|r| r.id == id)
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // A rewrite that keeps the table is not checked, so a rule whose table
+    // has since been dropped can still be edited or loosened (QA
+    // `LH-DATA-14-01` F2, `DATA-54`). A rewrite that changes it gets the same
+    // tenant and access gate a new rule does (PR review round 1 R3).
+    if !before.asset.eq_ignore_ascii_case(&input.asset) {
+        ensure_rule_table(&state, Some(&principal), &headers, &input.asset).await?;
+    }
     let rule = lakehouse_store::governance::update_quality_rule(pool, &id, &input)
         .await?
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;

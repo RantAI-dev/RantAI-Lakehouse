@@ -84,6 +84,12 @@ Signed by the product owner on 2026-10-09.
 - A deprecated table still works. It warns; it does not block.
 - Tags do not pass from a namespace to its tables.
 - A dashboard SQL source does not show the marks of the tables it reads.
+- A deprecated table needs no replacement; its page then says "No replacement
+  is named." (`DATA-54`).
+- Saving a mark that is already set changes nothing: who set it and when stay,
+  and the change history gets no new entry (`DATA-54`).
+- A tag key in use cannot be deleted. The refusal names up to three of the
+  tables that hold it, and only tables the person may read (`DATA-54`).
 
 ## Acceptance checklist
 

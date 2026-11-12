@@ -37,9 +37,11 @@ const json = (body: unknown, status = 200) =>
 
 // WEB-8 D8: the table is picked from the catalog, and its columns come from
 // the asset's own detail.
+// Shaped like the API's list rows: a Silver row's `id` is its table key and
+// its `name` is the display name.
 const CATALOG = [
-  { id: "a-orders", name: "orders", namespace: "silver" },
-  { id: "a-customers", name: "customers", namespace: "silver" },
+  { id: "silver.orders", name: "Orders", namespace: "silver" },
+  { id: "silver.customers", name: "Customers", namespace: "silver" },
 ]
 const ORDERS_DETAIL = {
   ...CATALOG[0],
@@ -68,7 +70,7 @@ function stubApi(permissions: string[] = ["governance:write", "query:read"]) {
     // Reads the form makes before it can be filled: the catalog's tables and
     // the picked table's columns. Not writes, so they stay out of `writes`.
     if (path.startsWith("/api/catalog/")) {
-      return path.endsWith("/a-orders")
+      return path.endsWith("/silver.orders")
         ? json(ORDERS_DETAIL)
         : json({ error: "asset not found" }, 404)
     }
@@ -221,7 +223,7 @@ describe("QualityRuleCreatePage (WEB-7 D2/T3)", () => {
         return json({ id: "u1", name: "Admin", email: null, roles: [], permissions: ["governance:write"], tenants: [] })
       }
       if (path.startsWith("/api/catalog/")) {
-        return path.endsWith("/a-orders")
+        return path.endsWith("/silver.orders")
           ? json(ORDERS_DETAIL)
           : json({ error: "asset not found" }, 404)
       }
