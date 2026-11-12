@@ -1394,15 +1394,31 @@ def _pipeline_target(p: dict[str, Any]) -> str:
     return ""
 
 
-def _pipeline_source(p: dict[str, Any]) -> str:
-    if p.get("source"):
-        return str(p["source"])
+def _pipeline_sources(p: dict[str, Any]) -> list[str]:
+    """Every table a pipeline reads (BLD-1 part 1 / D11, review R1-B7).
+
+    `definition.inputs` is the shape; a payload that predates it (or a stored
+    row the backfill never reached) falls back to `source`, then to
+    `sourceZone`/`sourceTable` — the same fallback the store's own
+    `input_tables_of` makes. A pipeline with two inputs must be watched at
+    both: the lag sensor below attaches a downstream pipeline that produces
+    the SECOND one too, or that pipeline never runs.
+    """
     defn = p.get("definition") or {}
+    tables = [
+        f"{i.get('zone')}.{i.get('table')}"
+        for i in (defn.get("inputs") or [])
+        if isinstance(i, dict) and i.get("zone") and i.get("table")
+    ]
+    if tables:
+        return tables
+    if p.get("source"):
+        return [str(p["source"])]
     zone = defn.get("sourceZone") or p.get("sourceZone") or p.get("source_zone") or ""
     table = defn.get("sourceTable") or p.get("sourceTable") or p.get("source_table") or ""
     if zone and table:
-        return f"{zone}.{table}"
-    return ""
+        return [f"{zone}.{table}"]
+    return []
 
 
 def _pipeline_tenant(p: dict[str, Any]) -> str | None:
@@ -1453,7 +1469,7 @@ def build_authored_lag_sensors(
             # two unassigned pipelines never share a lag sensor.
             if curr_tenant is None:
                 continue
-            curr_source = _pipeline_source(curr)
+            curr_sources = _pipeline_sources(curr)
             curr_deps = set(_pipeline_depends_on(curr))
             for other_p, other_j in pipeline_jobs:
                 other_id = other_p.get("id", "")
@@ -1465,7 +1481,9 @@ def build_authored_lag_sensors(
                 if _pipeline_tenant(other_p) != curr_tenant:
                     continue
                 other_target = _pipeline_target(other_p)
-                if (other_target and other_target == curr_source) or (other_id in curr_deps):
+                if (other_target and other_target in curr_sources) or (
+                    other_id in curr_deps
+                ):
                     visited_ids.add(other_id)
                     queue.append(other_p)
 

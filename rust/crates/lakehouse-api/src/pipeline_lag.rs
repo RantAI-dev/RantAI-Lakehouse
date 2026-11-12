@@ -411,14 +411,9 @@ pub async fn inputs_of_conn(
     conn: &mut sqlx::PgConnection,
     pipeline: &Pipeline,
 ) -> Result<Option<Vec<InputTable>>, StoreError> {
-    // BLD-1 part 1 / D11: every input, not only the first. `source` is the
-    // fallback for a row that predates migration `0137` and was never
-    // backfilled, which is the answer such a row always gave.
-    let tables = if pipeline.input_tables.is_empty() {
-        vec![pipeline.source.clone()]
-    } else {
-        pipeline.input_tables.clone()
-    };
+    // BLD-1 part 1 / D11: every input, not only the first, through the store's
+    // one rule for a row that predates migration `0137` (D11a).
+    let tables = pipelines::input_tables_of(pipeline);
     let mut inputs = Vec::with_capacity(tables.len());
     for table in &tables {
         let Some(input) = InputTable::parse(table) else {

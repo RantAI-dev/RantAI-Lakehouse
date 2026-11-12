@@ -295,6 +295,29 @@ impl PipelineStep {
     }
 }
 
+/// The tables a pipeline reads (BLD-1 part 1 / D11, D11a): its
+/// `input_tables`, or — for a row that predates migration `0137` and was never
+/// backfilled — its `source`, which is the answer every reader gave before.
+///
+/// One rule, called by every reader, so "a pipeline with no `input_tables`"
+/// cannot mean two different things in two places.
+#[must_use]
+pub fn input_tables_of(pipeline: &Pipeline) -> Vec<String> {
+    input_tables_or_source(&pipeline.input_tables, &pipeline.source)
+}
+
+/// [`input_tables_of`] for a row read as columns rather than as a
+/// [`Pipeline`] (the cycle walk reads `input_tables` and `source` in one
+/// query).
+#[must_use]
+pub fn input_tables_or_source(input_tables: &[String], source: &str) -> Vec<String> {
+    if input_tables.is_empty() {
+        vec![source.to_owned()]
+    } else {
+        input_tables.to_vec()
+    }
+}
+
 /// What one definition writes into the three legacy columns (D3, D13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefinitionColumns {
@@ -2697,14 +2720,8 @@ pub async fn upstream_downstream_pipelines_conn(
         return Ok(Vec::new());
     };
     // BLD-1 part 1 / D11: every input this pipeline reads, not just the
-    // first. `source` is the fallback for a row that predates migration
-    // `0137` and was never backfilled — the same answer such a row always
-    // gave.
-    let mut input_tables = if pipeline.input_tables.is_empty() {
-        vec![pipeline.source.clone()]
-    } else {
-        pipeline.input_tables.clone()
-    };
+    // first.
+    let mut input_tables = input_tables_of(pipeline);
     for target in targets_for_conn(conn, Some(tenant_id), &pipeline.depends_on)
         .await?
         .into_values()
@@ -2886,11 +2903,7 @@ pub async fn find_target_lag_cycle_conn(
         else {
             return Vec::new();
         };
-        let mut inputs = if input_tables.is_empty() {
-            vec![source.clone()]
-        } else {
-            input_tables.clone()
-        };
+        let mut inputs = input_tables_or_source(input_tables, source);
         for up in depends_on {
             if let Some(target) = target_of.get(up) {
                 inputs.push(target.clone());

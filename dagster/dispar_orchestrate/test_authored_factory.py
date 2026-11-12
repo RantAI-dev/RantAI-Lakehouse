@@ -2650,6 +2650,70 @@ class TestLagSensor:
         assert "authored__pl_u3" not in attached_job_names, "Unrelated downstream must NOT be attached"
         assert "authored__pl_u4" not in attached_job_names, "Different tenant downstream must NOT be attached"
 
+    def test_a_lag_pipeline_is_watched_at_every_input(self) -> None:
+        """BLD-1 part 1 / D11, review R1-B7: a pipeline with a time lag that
+        reads TWO tables must attach the downstream pipeline producing the
+        SECOND one too — it used to see only `sourceZone`/`sourceTable`, so
+        that producer never ran for it."""
+        p_pipe = {
+            "id": "pl-multi",
+            "status": "ready",
+            "tenantId": "t1",
+            "definition": {
+                "inputs": [
+                    {"name": "left_t", "zone": "silver", "table": "first"},
+                    {"name": "right_t", "zone": "silver", "table": "second"},
+                ],
+                "steps": [],
+                "sourceZone": "silver",
+                "sourceTable": "first",
+            },
+            "target": "gold.multi",
+            "targetLag": {"kind": "lag", "minutes": 10},
+        }
+        second_producer = {
+            "id": "pl-second",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "bronze.raw",
+            "target": "silver.second",
+            "targetLag": {"kind": "downstream"},
+        }
+        unrelated = {
+            "id": "pl-unrelated",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "bronze.other",
+            "target": "silver.elsewhere",
+            "targetLag": {"kind": "downstream"},
+        }
+
+        @job(name="authored__pl_multi")
+        def j_multi() -> None:
+            pass
+
+        @job(name="authored__pl_second")
+        def j_second() -> None:
+            pass
+
+        @job(name="authored__pl_unrelated")
+        def j_unrelated() -> None:
+            pass
+
+        sensors = authored_factory.build_authored_lag_sensors(
+            [
+                (p_pipe, j_multi),
+                (second_producer, j_second),
+                (unrelated, j_unrelated),
+            ]
+        )
+        assert len(sensors) == 1
+        attached = {j.name for j in sensors[0].jobs}
+        assert "authored__pl_second" in attached, (
+            "the producer of the pipeline's SECOND input must be attached"
+        )
+        assert "authored__pl_unrelated" not in attached
+
     def test_an_unassigned_lag_pipeline_links_no_downstream_even_to_another_unassigned_pipeline(
         self,
     ) -> None:
