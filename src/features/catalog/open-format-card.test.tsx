@@ -54,6 +54,7 @@ const publicationBody: Record<string, unknown> = {
   lastChangedAt: "2026-10-02T03:30:00Z",
   lastExportedAt: "2026-10-02T04:00:00Z",
   changedSinceExport: false,
+  lastFailure: null,
   canEdit: true,
 }
 
@@ -105,6 +106,66 @@ describe("OpenFormatCard", () => {
     await waitFor(() =>
       expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
     )
+  })
+
+  // QA LH-DATA-1-01 (DATA-49): a failed newest run outranks the fingerprint
+  // comparison, and the card says what failed, when, and where the last good copy is.
+  it("shows Last publish failed with the time, the reason and the last successful publish", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          changedSinceExport: false,
+          lastFailure: { failedAt: "2026-10-02T05:00:00Z", reason: "The catalog request failed. Reference: abc123" },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Last publish failed"),
+    )
+    expect(screen.getByTestId("publication-status").className).toContain("text-destructive")
+    const failure = screen.getByTestId("publication-failure").textContent ?? ""
+    expect(failure).toContain("Failed ")
+    expect(failure).toContain("The catalog request failed. Reference: abc123")
+    expect(screen.getByText(/Last successful publish: /)).toBeDefined()
+  })
+
+  it("says nothing has been published yet when the only run failed", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          lastExportedAt: null,
+          changedSinceExport: null,
+          lastFailure: { failedAt: null, reason: "A value in this table could not be written in open format." },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Last publish failed"),
+    )
+    expect(screen.getByTestId("publication-failure").textContent).toBe(
+      "Failed: A value in this table could not be written in open format.",
+    )
+    expect(screen.getByText("Nothing has been published yet.")).toBeDefined()
   })
 
   it("shows Out of date when changedSinceExport is true", async () => {

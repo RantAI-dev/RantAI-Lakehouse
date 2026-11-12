@@ -77,6 +77,9 @@ function LastFiveRuns({ mart }: { mart: string }) {
 const stateLabelClass = (label: string): string => {
   if (label === "Up to date") return "font-medium text-green-600 dark:text-green-400"
   if (label === "Out of date") return "font-medium text-amber-600 dark:text-amber-400"
+  // QA LH-DATA-1-01 (DATA-49): a failed newest run is the state that needs a
+  // person, so it reads in the destructive tone, not the muted one.
+  if (label === "Last publish failed") return "font-medium text-destructive"
   return "font-medium text-muted-foreground"
 }
 
@@ -222,6 +225,23 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             {line}
           </span>
         </div>
+        {/* QA LH-DATA-1-01 (DATA-49): what failed, when, and where the last good
+            copy stands — so "Last publish failed" is actionable without opening
+            the history. The failure's own sentence is the API's. */}
+        {p.lastFailure && (
+          <>
+            <p className="text-xs text-destructive" data-testid="publication-failure">
+              {p.lastFailure.failedAt
+                ? `Failed ${formatDateTime(p.lastFailure.failedAt)}: ${p.lastFailure.reason}`
+                : `Failed: ${p.lastFailure.reason}`}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {p.lastExportedAt
+                ? `Last successful publish: ${formatDateTime(p.lastExportedAt)}.`
+                : "Nothing has been published yet."}
+            </p>
+          </>
+        )}
         {!enabled && hasHistory && (
           <p className="text-xs text-muted-foreground">
             Publishing is off; this copy is no longer updated.

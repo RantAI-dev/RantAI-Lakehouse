@@ -117,6 +117,16 @@ export type GoldTrimSummary = {
   reason: string | null
 }
 
+/**
+ * The mart's newest export run, when it FAILED (`DATA-49`). `failedAt` is when
+ * that run started, RFC 3339, or `null` when it cannot be read; `reason` is the
+ * sentence the API stored for it — the same one the failed response carried.
+ */
+export type GoldPublicationFailure = {
+  failedAt: string | null
+  reason: string
+}
+
 export type GoldPublication = {
   mart: string
   enabled: boolean
@@ -124,6 +134,11 @@ export type GoldPublication = {
   lastChangedAt: string | null
   lastExportedAt: string | null
   changedSinceExport: boolean | null
+  /**
+   * `null` unless the mart's newest run failed, whatever the last successful
+   * publish says (`DATA-49`, `publication_body` in `routes/gold.rs`).
+   */
+  lastFailure: GoldPublicationFailure | null
   canEdit: boolean
   trim?: GoldTrimSummary | null
 }
