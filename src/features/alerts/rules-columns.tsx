@@ -320,14 +320,24 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Status",
       cell: ({ row }) => {
         const r = row.original
+        // DEC-16 (QA LH-SRC-7-04, SRC-42): `targetHidden` is the API's own
+        // per-rule answer that this caller may not manage the rule, so the
+        // switch is not offered at all — only the state, as text (`SRC-40`
+        // D9, which replaces #485's D19 "shown but disabled"). Keying it on
+        // `alert:write` alone would take the switch from the owner of a chart
+        // alert, whom the API lets switch their own rule.
+        if (r.targetHidden === true) {
+          return (
+            <span className="text-xs text-muted-foreground">
+              {r.enabled ? "Active" : "Disabled"}
+            </span>
+          )
+        }
         return (
           <div className="flex items-center gap-2">
             <Switch
               checked={r.enabled}
               onCheckedChange={() => onToggle(r)}
-              // DEC-16 (QA LH-SRC-7-04, SRC-42): the API refuses the change for
-              // this caller, so the switch says so instead of offering it.
-              disabled={r.targetHidden === true}
               aria-label={`Toggle rule ${r.name}`}
             />
             <span className="text-xs text-muted-foreground">

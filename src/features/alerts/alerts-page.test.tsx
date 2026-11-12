@@ -391,12 +391,16 @@ describe("a rule whose target is hidden (DEC-16)", () => {
     return render_({ row: { original: rule } })
   }
 
-  it("says Webhook for a hidden webhook rule, disables its switch and shows no actions", () => {
+  it("says Webhook for a hidden webhook rule, shows its state without a switch and shows no actions", () => {
+    // `SRC-40` D9 replaced #485's D19 ("the switch is shown but disabled"): a
+    // rule this caller may not manage gets no switch at all, and the state is
+    // text. The decision changed, so the assertion follows it; nothing here
+    // was loosened.
     const hidden = { ...base, channel: "webhook", targetHidden: true } as AlertRule
     render(<div>{cell("delivery", hidden)}{cell("enabled", hidden)}{cell("actions", hidden)}</div>)
     expect(screen.getByText("Webhook")).toBeTruthy()
-    // base-ui renders the switch as a span: `aria-disabled` is its disabled state.
-    expect(screen.getByRole("switch").getAttribute("aria-disabled")).toBe("true")
+    expect(screen.queryByRole("switch")).toBeNull()
+    expect(screen.getByText("Active")).toBeTruthy()
     expect(screen.queryByRole("button", { name: "Test run now" })).toBeNull()
     expect(screen.queryByRole("button", { name: "More rule actions" })).toBeNull()
   })
