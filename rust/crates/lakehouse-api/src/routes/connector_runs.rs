@@ -673,7 +673,8 @@ pub struct EndBody {
 ///
 /// # Errors
 ///
-/// 403 as [`report_start`]; 400 for an invalid body or `status: running`;
+/// 403 as [`report_start`]; 400 for an invalid body, `status: running`, or
+/// `reason: timed_out` (D11: that word has two writers, and this is not one);
 /// 404 for an unknown connector or a run that is not this connector's;
 /// 503/500 as the store reports.
 pub async fn report_end(
@@ -686,6 +687,18 @@ pub async fn report_end(
     let req: EndBody = parse_body(&body)?;
     if req.status == RunStatus::Running {
         return Err(ApiError::BadRequest("a run cannot end as running".to_owned()).into());
+    }
+    // D11: `timed_out` is written in two places and nowhere else — the
+    // orchestrator's failure report (`load_alerts`) and the run route — so this
+    // report, whose vocabulary stays the four words of `SRC-11`, may not set
+    // it (`review round 1, R11`). The orchestrator's own list (`END_REASONS`,
+    // `dagster/dispar_orchestrate/run_reports.py`) does not know the word
+    // either, so nothing sends it today.
+    if req.reason == EndReason::TimedOut {
+        return Err(ApiError::BadRequest(
+            "a run's end report cannot end it as timed_out".to_owned(),
+        )
+        .into());
     }
     let ended_at = report_time("endedAt", req.ended_at.as_deref())?;
     require_connector(&state, &id).await?;
@@ -1135,6 +1148,40 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "an end before the start");
+    }
+
+    /// D11 (`review round 1, R11`): the orchestrator's end report may not end a
+    /// run as `timed_out`. That word is written in two places and nowhere else
+    /// — the failure report of `load_alerts` and the run route — so this body
+    /// is a 400 and the record is untouched.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_end_report_cannot_write_the_timed_out_reason(pool: sqlx::PgPool) {
+        let h = harness(&pool).await;
+        let id = connector(&h, "runs six").await;
+        let me = user(&[h.tenant]);
+        report(
+            &h,
+            &id,
+            "",
+            json!({ "runId": "run-1", "trigger": "schedule" }),
+        )
+        .await;
+
+        let (status, answer) = report(
+            &h,
+            &id,
+            "/run-1/end",
+            json!({ "status": "succeeded", "reason": "timed_out" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+
+        let (_, listed) = call(&h, &me, "GET", &format!("/api/connectors/{id}/runs"), None).await;
+        assert_eq!(
+            listed["runs"][0]["status"], "running",
+            "the refused end wrote nothing: {listed}"
+        );
+        assert_eq!(listed["runs"][0]["endReason"], Value::Null);
     }
 
     /// D8: history, log and resume answer another tenant's user as an
