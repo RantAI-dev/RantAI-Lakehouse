@@ -1,0 +1,7 @@
+# The site is its own package (WEB-5 D1); the root .gitignore anchors its
+# patterns at the repository root, so the site's build output needs its own.
+/node_modules
+/.next/
+/out/
+*.tsbuildinfo
+next-env.d.ts

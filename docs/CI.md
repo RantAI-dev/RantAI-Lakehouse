@@ -29,13 +29,14 @@ This repo's CI is split into workflows under `.github/workflows/`:
 ## Change Scopes and the Single Gate (`ci-required`)
 
 To reduce CI feedback latency on targeted changes (such as docs-only or frontend-only PRs),
-`ci.yml` classifies changes in the `changes` job into six scopes:
+`ci.yml` classifies changes in the `changes` job into seven scopes:
 
 | Scope | Triggered By |
 |---|---|
 | `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml` |
 | `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
 | `dagster` | `dagster/**` |
+| `site` | `site/**`, the Lakehouse site, its own package (`WEB-5` D12) |
 | `stack` | `docker-compose.yml`, `ops/**` (except `ops/fixtures/**`), `scripts/**` (except `scripts/ci/**`), `.env.example` |
 | `docs_only` | True when every changed file is under `docs/**`, `GTM/**`, or is a root `*.md`, `LICENSE` or `NOTICE` |
 | `all` | `.github/**`, `ops/fixtures/**`, `scripts/ci/**`, an unreadable base SHA, or any file unclassified by the rules above (fails safe) |
@@ -45,6 +46,7 @@ On a `push` to `main`, all jobs run unconditionally.
 Downstream jobs execute according to scope:
 - **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
 - **`verify`**: Runs if `frontend` or `all` is true.
+- **`site`** (`WEB-5` D12, "Site · lint, typecheck, test, build, size"): Runs if `site` or `all` is true, in `site/`: `bun install --frozen-lockfile`, lint, typecheck, unit tests, the static export built with `NEXT_PUBLIC_SITE_URL=https://example.invalid`, and a check that `out/index.html` is `lang="en"`, `out/id/index.html` is `lang="id"` and `out/en` does not exist. Required by `ci-required` (`SITE_RESULT`) exactly as `verify` is, on its own scope.
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
 - **`dagster-loader-tests`**: Same condition. Runs the tests marked `loader` (`-m loader`): a real `dlt` pipeline against a local Iceberg table. Split from the job above because together they took 13m52s of a 15-minute limit (PR #115).
 - **`g6-credentials`** (`SRC-12` part A, `ops/g6/src12_credentials_test.py`): checks that `docker compose config` refuses an empty `CONNECTOR_SECRETS_KEY` and names it; starts the `g6-ops` stack with `ops/g6/docker-compose.src12.override.yml` (the writable credentials volume the other g6 gates replace); types a MySQL credential through the API and checks the stored file is a seal (version byte, not the plain value, owner-only) and that the connector tests and loads; runs `lakehouse-api rotate-secrets-key` with a new key (old key as `CONNECTOR_SECRETS_KEY_PREVIOUS`), drops the old key, recreates the API and the code location, and checks the file changed and the connector still tests and loads. Its own job so the slowest connector gate stays under 20 minutes; the first CI runs are its measurement. Not run against a real stack before it reached CI.

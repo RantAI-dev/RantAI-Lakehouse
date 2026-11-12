@@ -81,8 +81,8 @@ And two more since WEB-2, from the product owner's decision of
 page:
 
   - the console image's build context (`.dockerignore`) keeps the
-    landing page's two folders out, so no console image carries the
-    route; and
+    landing page's source out (since WEB-5 the Lakehouse site, `site/`),
+    so no console image carries it; and
   - the install proof asks for `/landing`'s status and fails the job
     unless it is 404.
 
@@ -314,11 +314,11 @@ REGISTRIES = (
 # ROOT (WEB-2).
 DOCKERIGNORE_PATH = REPO_ROOT / ".dockerignore"
 
-# The landing page's two folders. The product owner decided on
-# 2026-11-02 that the page is a separate product page and that an
-# installed Lakehouse must not serve it, so no console image carries
-# them (WEB-2).
-LANDING_PATHS = ("src/app/landing", "src/features/landing")
+# The landing page's source. The product owner decided on 2026-11-02 that
+# the page is a separate product page and that an installed Lakehouse must
+# not serve it, so no console image carries it (WEB-2). WEB-5 moved it out
+# of the console into its own package, the Lakehouse site in `site/` (D11).
+LANDING_PATHS = ("site",)
 
 # The step of the proof job that asks the console what it answers.
 CONSOLE_STEP = "The stack is ready and the console answers"
@@ -1458,7 +1458,7 @@ def dockerignore_excludes(text: str, path: str) -> bool:
 
     Docker's rule is that the LAST matching pattern wins, and a pattern
     that starts with `!` re-includes what an earlier one excluded. So a
-    later `!src/app/landing` would undo the exclusion, and this answers
+    later `!site` would undo the exclusion, and this answers
     the question the build actually asks.
     """
     excluded = False
@@ -2361,10 +2361,10 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
         The product owner decided on 2026-11-02 that the landing page is a
         separate product page and that an install must not offer it. The
-        console image is built from the repository ROOT, so the two
-        folders that hold the page have to be out of its build context —
+        console image is built from the repository ROOT, so the site that
+        holds the page (`site/`, WEB-5) has to be out of its build context —
         otherwise every console image (the release's, the staging
-        deploy's, compose's) carries the route.
+        deploy's, compose's) carries it.
         """
         text = DOCKERIGNORE_PATH.read_text(encoding="utf-8")
         for path in LANDING_PATHS:
@@ -2381,8 +2381,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def test_a_later_negation_would_undo_the_exclusion(self) -> None:
         """Docker's last match wins, and `!` re-includes."""
-        text = "src/app/landing\n!src/app/landing\n"
-        self.assertFalse(dockerignore_excludes(text, "src/app/landing"))
+        text = "site/\n!site\n"
+        self.assertFalse(dockerignore_excludes(text, "site"))
 
     def test_a_change_to_the_build_context_runs_the_dry_run(self) -> None:
         """`.dockerignore` decides what the console image is made of.

@@ -30,6 +30,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // WEB-5 D11: the Lakehouse site is its own package with its own lint
+    // run (`cd site && bun run lint`); the console's run never reads it.
+    "site/**",
   ]),
 ]);
 

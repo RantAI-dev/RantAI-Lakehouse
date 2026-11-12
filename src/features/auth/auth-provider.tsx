@@ -18,22 +18,11 @@ import { clearActiveTenantId, readActiveTenantId, writeActiveTenantId } from "@/
  * be shared with people who never sign in (Metabase-style public dashboard
  * links and embeds) — gating them would silently break that feature.
  *
- * `/landing` is the marketing page (WEB-1, `docs/superpowers/plans/
- * 2026-10-11-landing-page.md`). It is static, calls no API and must render
- * for a visitor who has no session, without the console chrome.
- *
- * The prefix stays here for the dev server (`bun run dev`), which serves
- * the page from the source tree. An INSTALLED Lakehouse does not contain it
- * at all: the console image excludes `src/app/landing` and
- * `src/features/landing` (WEB-2, product owner 2026-11-02), so there
- * `/landing` answers with the console's page-not-found — without the
- * chrome, because the path is under this public prefix.
- *
  * `/render` is the PDF print view (`BI-1`): the Gotenberg container that makes
  * the PDF has no session, so the page reads its data with a render token in
  * the address (`POST /api/render/data`) and renders without the console chrome.
  */
-const PUBLIC_PREFIXES = ["/login", "/public", "/embed", "/landing", "/render"];
+const PUBLIC_PREFIXES = ["/login", "/public", "/embed", "/render"];
 
 export function isPublicPath(pathname: string): boolean {
   return PUBLIC_PREFIXES.some((p) => pathname === p || pathname.startsWith(`${p}/`));

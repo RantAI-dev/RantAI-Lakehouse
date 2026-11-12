@@ -1,0 +1,5 @@
+# The site's own test settings (WEB-5 D9). Kept separate from the console's
+# root bunfig.toml, whose DOM preload the site's pure-module tests do not need,
+# so `bun test` in site/ never loads the console's setup files.
+[test]
+root = "src"

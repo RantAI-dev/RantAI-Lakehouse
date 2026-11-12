@@ -35,8 +35,8 @@ expect() {
 
   (
     # Clean subshell environment
-    unset EVENT_NAME SCOPE_RUST SCOPE_FRONTEND SCOPE_DAGSTER SCOPE_STACK SCOPE_DOCS_ONLY SCOPE_ALL \
-          CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
+    unset EVENT_NAME SCOPE_RUST SCOPE_FRONTEND SCOPE_DAGSTER SCOPE_STACK SCOPE_SITE SCOPE_DOCS_ONLY SCOPE_ALL \
+          CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT SITE_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
           RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT DAGSTER_LOADER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
           G4_CDC_RESULT G4_MYSQL_RESULT G4_MSSQL_RESULT G4_MONGO_RESULT G4_ORACLE_RESULT G10_SSO_RESULT G6_INGEST_RESULT G6_INGEST_OTHER_RESULT G6_ORACLE_RESULT G9_UPLOAD_RESULT G6_ALERTS_RESULT G6_OPS_RESULT G6_CREDENTIALS_RESULT G6_SECRET_MANAGERS_RESULT G6_OAUTH_RESULT G6_DISCOVERY_SCALE_RESULT G6_SAAS_A_RESULT G6_SAAS_B_RESULT GOLD_EXPORT_RESULT G8_GOVERNANCE_RESULT G8_TIME_TRAVEL_RESULT \
@@ -64,6 +64,7 @@ base_docs_green=(
   G3A_DAGSTER_RESULT=skipped G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G4_MYSQL_RESULT=skipped G4_MSSQL_RESULT=skipped G4_MONGO_RESULT=skipped G4_ORACLE_RESULT=skipped G10_SSO_RESULT=skipped
   G6_INGEST_RESULT=skipped G6_INGEST_OTHER_RESULT=skipped G6_ORACLE_RESULT=skipped G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped G6_OPS_RESULT=skipped G6_CREDENTIALS_RESULT=skipped G6_SECRET_MANAGERS_RESULT=skipped G6_OAUTH_RESULT=skipped G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
   IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
+  SITE_RESULT=skipped
 )
 
 base_frontend_green=(
@@ -75,6 +76,7 @@ base_frontend_green=(
   G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G4_MYSQL_RESULT=skipped G4_MSSQL_RESULT=skipped G4_MONGO_RESULT=skipped G4_ORACLE_RESULT=skipped G10_SSO_RESULT=skipped G6_INGEST_RESULT=skipped G6_INGEST_OTHER_RESULT=skipped G6_ORACLE_RESULT=skipped G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped G6_OPS_RESULT=skipped G6_CREDENTIALS_RESULT=skipped G6_SECRET_MANAGERS_RESULT=skipped G6_OAUTH_RESULT=skipped G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped
   GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
   IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
+  SITE_RESULT=skipped
 )
 
 base_rust_green=(
@@ -86,6 +88,7 @@ base_rust_green=(
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
   IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+  SITE_RESULT=skipped
 )
 
 base_dagster_green=(
@@ -97,6 +100,7 @@ base_dagster_green=(
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
   IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+  SITE_RESULT=skipped
 )
 
 base_stack_green=(
@@ -108,6 +112,7 @@ base_stack_green=(
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
   IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+  SITE_RESULT=skipped
 )
 
 base_all_green=(
@@ -119,6 +124,7 @@ base_all_green=(
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
   IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+  SITE_RESULT=success
 )
 
 base_push_green=(
@@ -130,6 +136,12 @@ base_push_green=(
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
   GOLD_EXPORT_RESULT=success G8_GOVERNANCE_RESULT=success G8_TIME_TRAVEL_RESULT=success
   IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+  SITE_RESULT=success
+)
+
+# WEB-5 D12: a PR that touches only site/.
+base_site_green=(
+  "${base_docs_green[@]}" SCOPE_DOCS_ONLY=false SCOPE_SITE=true SITE_RESULT=success
 )
 
 # 1. Happy path cases
@@ -140,12 +152,18 @@ expect 0 "Dagster green PR passes gate" "${base_dagster_green[@]}"
 expect 0 "Stack green PR passes gate" "${base_stack_green[@]}"
 expect 0 "Scope-all green PR passes gate" "${base_all_green[@]}"
 expect 0 "Push to main green passes gate" "${base_push_green[@]}"
+expect 0 "Site-only green PR passes gate" "${base_site_green[@]}"
 
 # 2. Failure scenarios
 expect 1 "Failing changes job blocks gate" "${base_docs_green[@]}" CHANGES_RESULT=failure
 expect 1 "Failing repo-lints blocks docs-only PR" "${base_docs_green[@]}" REPO_LINTS_RESULT=failure
 expect 1 "Failing frontend blocks frontend PR" "${base_frontend_green[@]}" FRONTEND_RESULT=failure
 expect 1 "Skipped frontend blocks frontend PR" "${base_frontend_green[@]}" FRONTEND_RESULT=skipped
+expect 1 "Failing site blocks site PR" "${base_site_green[@]}" SITE_RESULT=failure
+expect 1 "Skipped site blocks site PR" "${base_site_green[@]}" SITE_RESULT=skipped
+expect 1 "Skipped site blocks scope-all PR" "${base_all_green[@]}" SITE_RESULT=skipped
+expect 1 "Skipped site on push blocks gate" "${base_push_green[@]}" SITE_RESULT=skipped
+expect 1 "Failing site blocks a frontend PR even when not required" "${base_frontend_green[@]}" SITE_RESULT=failure
 expect 1 "Failing rust test blocks rust PR" "${base_rust_green[@]}" RUST_TEST_RESULT=failure
 expect 1 "Skipped rust test blocks rust PR" "${base_rust_green[@]}" RUST_TEST_RESULT=skipped
 expect 1 "Failing MSRV check blocks rust PR" "${base_rust_green[@]}" RUST_MSRV_RESULT=failure

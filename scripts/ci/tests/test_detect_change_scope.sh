@@ -36,7 +36,7 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   git config user.email "ci-test@example.com"
   git config user.name "CI Test"
 
-  mkdir -p docs GTM src/lib src/components public rust/crates dagster ops/g6 ops/g9 ops/fixtures scripts .github/workflows
+  mkdir -p docs GTM src/lib src/components public rust/crates dagster ops/g6 ops/g9 ops/fixtures scripts .github/workflows site/src/app
 
   : > docs/test.md
   : > GTM/test.md
@@ -66,6 +66,8 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   : > scripts/compose.sh
   : > .env.example
   : > .github/workflows/ci.yml
+  : > site/src/app/page.tsx
+  : > site/package.json
 
   git add .
   git commit -q -m "initial base commit"
@@ -134,6 +136,26 @@ assert_case() {
   fi
 }
 
+# WEB-5 D12: the `site` output is checked on its own, so the six-scope
+# assertions above stay as they were.
+assert_site() {
+  local label="$1"
+  local expected_site="$2"
+  shift 2
+  local files=("$@")
+
+  local output
+  output="$(run_case "${files[@]}")"
+
+  local st
+  st="$(grep "^site=" <<< "$output" | cut -d= -f2)"
+  if [ "$st" = "$expected_site" ]; then
+    log_pass "$label"
+  else
+    log_fail "$label (got site=$st)"
+  fi
+}
+
 echo "=== Change-scope test suite ==="
 
 # Docs-only tests
@@ -186,6 +208,15 @@ assert_case ".github/workflows/ci.yml forces all" "true" "true" "true" "true" "f
 # Unclassified file tests
 assert_case "unclassified file forces all" "true" "true" "true" "true" "false" "true" "some_random_file.xyz"
 
+# Site tests (WEB-5 D12): site/** selects the site job and nothing else.
+assert_case "site/src/app/page.tsx sets no other scope" "false" "false" "false" "false" "false" "false" "site/src/app/page.tsx"
+assert_site "site/src/app/page.tsx sets site" "true" "site/src/app/page.tsx"
+assert_site "site/package.json sets site" "true" "site/package.json"
+assert_site "src/components/button.tsx does not set site" "false" "src/components/button.tsx"
+assert_site "docs/test.md does not set site" "false" "docs/test.md"
+assert_site ".github/workflows/ci.yml forces site through all" "true" ".github/workflows/ci.yml"
+assert_site "unclassified file forces site through all" "true" "some_random_file.xyz"
+
 # Multi-file tests
 assert_case "docs + rust sets rust and clears docs_only" "true" "false" "false" "false" "false" "false" "docs/test.md" "rust/crates/lib.rs"
 assert_case "frontend + dagster sets both" "false" "true" "true" "false" "false" "false" "src/components/button.tsx" "dagster/pipeline.py"
@@ -201,7 +232,8 @@ assert_case "frontend + dagster sets both" "false" "true" "true" "false" "false"
   bash "$SCRIPT" >/dev/null
   a="$(grep "^all=" "$output" | cut -d= -f2)"
   r="$(grep "^rust=" "$output" | cut -d= -f2)"
-  if [ "$a" = "true" ] && [ "$r" = "true" ]; then
+  st="$(grep "^site=" "$output" | cut -d= -f2)"
+  if [ "$a" = "true" ] && [ "$r" = "true" ] && [ "$st" = "true" ]; then
     log_pass "push event forces all=true"
   else
     log_fail "push event did not force all=true"

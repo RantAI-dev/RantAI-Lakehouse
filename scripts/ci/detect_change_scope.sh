@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Detect change scope for CI pipeline.
 # Classifies changed files into scope categories:
-#   rust, frontend, dagster, stack, docs_only, all
+#   rust, frontend, dagster, stack, site, docs_only, all
 # and writes results to $GITHUB_OUTPUT.
 #
 # Required environment variables:
@@ -25,6 +25,7 @@ if [ "$EVENT" = "push" ]; then
       echo "frontend=true"
       echo "dagster=true"
       echo "stack=true"
+      echo "site=true"
       echo "docs_only=false"
       echo "all=true"
     } >> "$GITHUB_OUTPUT"
@@ -41,6 +42,7 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
       echo "frontend=true"
       echo "dagster=true"
       echo "stack=true"
+      echo "site=true"
       echo "docs_only=false"
       echo "all=true"
     } >> "$GITHUB_OUTPUT"
@@ -56,6 +58,7 @@ if ! CHANGED="$(git diff --no-renames --name-only "$BASE" HEAD)"; then
       echo "frontend=true"
       echo "dagster=true"
       echo "stack=true"
+      echo "site=true"
       echo "docs_only=false"
       echo "all=true"
     } >> "$GITHUB_OUTPUT"
@@ -71,6 +74,7 @@ if [ -z "$CHANGED" ]; then
       echo "frontend=true"
       echo "dagster=true"
       echo "stack=true"
+      echo "site=true"
       echo "docs_only=false"
       echo "all=true"
     } >> "$GITHUB_OUTPUT"
@@ -82,6 +86,7 @@ rust=false
 frontend=false
 dagster=false
 stack=false
+site=false
 docs_only=true
 all=false
 
@@ -128,6 +133,14 @@ while IFS= read -r file; do
     classified=true
   fi
 
+  # Site: site/** (WEB-5 D12). The Lakehouse site is its own package with its
+  # own job (`site`); it shares no code with the console, so it selects only
+  # that job.
+  if [[ "$file" == site/* ]]; then
+    site=true
+    classified=true
+  fi
+
   # Test fixtures: ops/fixtures/** is read across scopes by Rust tests (lakehouse-api
   # upload_parse.rs, routes/uploads.rs, tests/upload_routes.rs), frontend test
   # (src/lib/uploads.test.ts) and Dagster test (test_file_ingest.py). Must force all=true.
@@ -169,6 +182,7 @@ if [ "$all" = true ]; then
   frontend=true
   dagster=true
   stack=true
+  site=true
   docs_only=false
 fi
 
@@ -177,6 +191,7 @@ echo "  rust=$rust"
 echo "  frontend=$frontend"
 echo "  dagster=$dagster"
 echo "  stack=$stack"
+echo "  site=$site"
 echo "  docs_only=$docs_only"
 echo "  all=$all"
 
@@ -186,6 +201,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "frontend=$frontend"
     echo "dagster=$dagster"
     echo "stack=$stack"
+    echo "site=$site"
     echo "docs_only=$docs_only"
     echo "all=$all"
   } >> "$GITHUB_OUTPUT"

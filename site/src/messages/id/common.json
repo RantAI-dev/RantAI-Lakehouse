@@ -1,0 +1,57 @@
+{
+  "skipToContent": "Langsung ke konten",
+  "nav": {
+    "label": "Bagian halaman",
+    "product": "Produk",
+    "howItWorks": "Cara kerja",
+    "governance": "Tata kelola",
+    "openSource": "Open source"
+  },
+  "cta": {
+    "install": "Instal",
+    "talk": "Hubungi kami",
+    "source": "Lihat source code"
+  },
+  "footer": {
+    "tagline": "RantAI Lakehouse. Satu lakehouse dengan dashboard bawaan.",
+    "columns": {
+      "product": "Produk",
+      "rantai": "RantAI",
+      "connect": "Kontak"
+    },
+    "sections": {
+      "sources": "Semua mengalir masuk",
+      "depths": "Tiga kedalaman",
+      "assistant": "Cukup tanya",
+      "dashboards": "Dashboard",
+      "governance": "Aman sejak awal",
+      "open": "Milik Anda"
+    },
+    "userGuide": "Panduan pengguna",
+    "legal": "© 2026 RantAI. Depok, Jawa Barat, Indonesia."
+  },
+  "language": {
+    "label": "Bahasa",
+    "en": "English",
+    "id": "Bahasa Indonesia",
+    "short": {
+      "en": "EN",
+      "id": "ID"
+    },
+    "switchTo": "Ganti ke {language}"
+  },
+  "suggestion": {
+    "label": "Pilihan bahasa",
+    "text": "Tersedia dalam Bahasa Indonesia",
+    "view": "Lihat",
+    "dismiss": "Tutup, tetap dalam bahasa Inggris"
+  },
+  "notFound": {
+    "title": "Halaman ini tidak ada.",
+    "body": "Tautannya mungkin usang, atau halamannya sudah pindah.",
+    "home": "Kembali ke beranda"
+  },
+  "gauge": {
+    "surface": "Permukaan"
+  }
+}

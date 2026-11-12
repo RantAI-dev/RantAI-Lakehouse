@@ -1,0 +1,163 @@
+{
+  "hero": {
+    "eyebrow": "RANTAI LAKEHOUSE",
+    "headline": "Your data has a home now.",
+    "sub": "One lakehouse with dashboards built in. Bring every source in, keep it in open tables, and ask for answers in plain language.",
+    "scrollCue": "Scroll to dive"
+  },
+  "sources": {
+    "headline": "Everything flows in.",
+    "sub": "Databases, files, streams, APIs and business apps land in one place, on a schedule or as they change.",
+    "items": [
+      "PostgreSQL",
+      "MySQL",
+      "SQL Server",
+      "MongoDB",
+      "REST APIs",
+      "Kafka",
+      "CSV and TSV files",
+      "Excel workbooks",
+      "Parquet files",
+      "Salesforce",
+      "ServiceNow",
+      "Google Analytics 4",
+      "HubSpot",
+      "Zendesk",
+      "Confluence",
+      "Dynamics 365",
+      "SharePoint",
+      "JSON, JSON Lines and Avro",
+      "gzip and zip archives"
+    ],
+    "caption": "Live change capture for PostgreSQL. Dedupe or keep history on load, discover tables in any source, and upload 10 files at once, in folders."
+  },
+  "depths": {
+    "eyebrow": "Three depths",
+    "headline": "Three depths.",
+    "layers": {
+      "bronze": {
+        "title": "Raw, kept as it came.",
+        "body": "Every source lands untouched in open Apache Iceberg tables, so nothing is lost and nothing is locked in."
+      },
+      "silver": {
+        "title": "Cleaned and joined.",
+        "body": "Pipelines with schedules, dependencies, retries and version history clean the raw data into tables you can trust, and quality checks with anomaly detection watch them."
+      },
+      "gold": {
+        "title": "Ready for answers.",
+        "body": "Curated tables built for the questions your business asks. They refresh themselves within the lag you set, and publish as open tables when you switch it on."
+      }
+    }
+  },
+  "assistant": {
+    "headline": "Ask, don't dig.",
+    "sub": "The assistant works with the same tools as the console. It answers questions, builds charts and dashboards, and runs pipelines. Anything risky waits for a person to approve it. Prefer SQL? Query Studio has autocomplete, tabs and a query history.",
+    "caption": "Illustration",
+    "userOne": "Which region had the most visitors last quarter?",
+    "answerOne": "Region North had the most visitors last quarter.",
+    "userTwo": "Pause the nightly sales pipeline.",
+    "approvalLabel": "Waiting for approval",
+    "approvalAction": "Pause pipeline",
+    "approve": "Approve",
+    "decline": "Decline",
+    "regions": {
+      "north": "North",
+      "south": "South",
+      "east": "East",
+      "west": "West"
+    },
+    "srDescription": "An illustration of the assistant. A person asks which region had the most visitors last quarter and the assistant answers with a small bar chart. The person then asks to pause the nightly sales pipeline, and the assistant shows a card that waits for a person to approve or decline the change. The region names and numbers are illustrative."
+  },
+  "dashboards": {
+    "headline": "Answers come back up as dashboards.",
+    "sub": "About two dozen chart types, maps on your own boundaries included, with calculated fields, parameters, reusable metrics and results that are remembered and refreshed. Comment with @mentions, set alerts on a chart, export PNG, PDF or Excel, schedule reports, and share by a public link with an expiry and a password, or as an embed.",
+    "caption": "Illustrations, not customer data.",
+    "tiles": {
+      "line": {
+        "title": "Visits over time",
+        "kind": "Line chart",
+        "aria": "Illustrative line chart"
+      },
+      "map": {
+        "title": "Visits by region",
+        "kind": "Map",
+        "aria": "Illustrative map of dots"
+      },
+      "sankey": {
+        "title": "Where visits come from",
+        "kind": "Sankey",
+        "aria": "Illustrative Sankey diagram"
+      },
+      "kpi": {
+        "title": "Visits this week",
+        "kind": "KPI",
+        "aria": "Illustrative KPI tile",
+        "delta": "+8.4% vs last week"
+      },
+      "calendar": {
+        "title": "Busy days",
+        "kind": "Calendar heatmap",
+        "aria": "Illustrative calendar heatmap"
+      }
+    }
+  },
+  "governance": {
+    "headline": "Guarded by default.",
+    "sub": "Roles decide who sees what. Sensitive columns are classified and masked for everyone who should not see them, and column-level lineage shows where every column comes from.",
+    "illustration": "Illustration · fictional people",
+    "viewAs": "View as",
+    "roles": {
+      "analyst": "Analyst",
+      "admin": "Admin"
+    },
+    "columns": {
+      "name": "Name",
+      "email": "Email",
+      "city": "City",
+      "amount": "Amount"
+    },
+    "tableCaption": "Five fictional customers. As an analyst the name and email columns are masked; as an admin they are shown in full.",
+    "facts": [
+      {
+        "label": "Proof",
+        "text": "Masking proven end to end in an acceptance gate"
+      },
+      {
+        "label": "Audit",
+        "text": "Assistant actions logged; risky ones wait for approval"
+      },
+      {
+        "label": "Lineage",
+        "text": "Column-level lineage, from raw table to curated table"
+      },
+      {
+        "label": "Catalog",
+        "text": "Catalog search with certified and deprecated marks and governed tags"
+      },
+      {
+        "label": "Access",
+        "text": "Permissions per dashboard and per folder"
+      }
+    ]
+  },
+  "open": {
+    "headline": "Yours to keep.",
+    "cards": [
+      {
+        "title": "Open source.",
+        "body": "AGPL-3.0. Read every line, run it yourself."
+      },
+      {
+        "title": "Open tables.",
+        "body": "Raw data in Apache Iceberg. Any engine that reads Iceberg can read it."
+      },
+      {
+        "title": "Your servers or ours.",
+        "body": "Install it on your own infrastructure, or talk to us about running it for you."
+      }
+    ]
+  },
+  "final": {
+    "headline": "Come on in. The data's fine."
+  }
+}

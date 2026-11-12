@@ -1,0 +1,450 @@
+/*
+ * The Lakehouse site's styles (WEB-5). Tailwind, the few console rules the
+ * landing page was drawn against, and the landing's own CSS (moved from
+ * `src/features/landing/landing.css`): custom properties, keyframes and the
+ * text-stroke numerals.
+ *
+ * Palette is sampled from the logo; `lib/palette.ts` holds the same values
+ * for the 3D scene. The accents (bronze, silver, gold) belong to the three
+ * depths only (WEB-1 plan §2.3).
+ *
+ * Motion that loops forever lives here as CSS, and every one of those loops is
+ * switched off under `prefers-reduced-motion: reduce` at the bottom of this
+ * file (plan §2.8: "no autoplay loops"). Scroll-driven motion is done in the
+ * components with `motion`, which checks the same media query itself.
+ */
+
+@import "tailwindcss";
+
+/*
+ * Hover applies whenever the element is actually hovered: the console's
+ * rule, kept so the page behaves as it did. Tailwind v4 otherwise wraps
+ * every `hover:` in `@media (hover: hover)`.
+ */
+@custom-variant hover (&:hover);
+/* WEB-5 review fix R12: a phone screen too short for the hero's creature
+   and its full-size copy: up to 832 px tall, so 360×800 and 375×812 are,
+   and 390×844, where nothing may change, is not. */
+@custom-variant short (@media (max-width: 47.99rem) and (max-height: 52rem));
+
+/*
+ * WEB-5 D6 (the design stays): the landing was drawn inside the console, so
+ * it inherited the console design system's radius scale and base type
+ * rules. They are restated here, with the console's values, so the moved
+ * page measures the same: `rounded-3xl` is 2.2 x 0.45rem there, not
+ * Tailwind's 1.5rem.
+ */
+@theme {
+  --radius-sm: calc(0.45rem * 0.6);
+  --radius-md: calc(0.45rem * 0.8);
+  --radius-lg: 0.45rem;
+  --radius-xl: calc(0.45rem * 1.4);
+  --radius-2xl: calc(0.45rem * 1.8);
+  --radius-3xl: calc(0.45rem * 2.2);
+  --radius-4xl: calc(0.45rem * 2.6);
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    background: #020514;
+    color: #e8f4ff;
+  }
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  summary,
+  label[for] {
+    cursor: pointer;
+  }
+  h1 {
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 48px;
+    line-height: 48px;
+    letter-spacing: -0.02em;
+  }
+  h2 {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 30px;
+    line-height: 36px;
+    letter-spacing: -0.01em;
+  }
+  h3 {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 24px;
+    line-height: 32px;
+  }
+  p,
+  li {
+    font-size: 16px;
+    line-height: 24px;
+  }
+  th {
+    font-weight: 500;
+    font-size: 14px;
+    line-height: 24px;
+  }
+  td {
+    font-size: 14px;
+    line-height: 24px;
+  }
+  /* WEB-5 review fix R7 (owner): monospace only for code. The one code
+     identifier on the page (the pipeline name in the approval card) uses
+     the system's monospace stack, as the RantAI site's `.code-frame pre
+     code` does; every label, pill and caption is the sans face. */
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 14px;
+    line-height: 20px;
+  }
+}
+
+/* ---- The landing ------------------------------------------------------ */
+
+.lk-root {
+  --lk-abyss: #020514;
+  --lk-navy: #050a30;
+  --lk-dusk: #0b1a4a;
+  --lk-lake: #44a6fa;
+  --lk-foam: #e8f4ff;
+  --lk-bronze: #c8834a;
+  --lk-silver: #b9c6d3;
+  --lk-gold: #f2c14e;
+  color-scheme: dark;
+  background: var(--lk-abyss);
+  color: var(--lk-foam);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* The overscroll area and the area behind a rubber-banding page match the
+   page instead of flashing a light background. */
+html:has(.lk-root) {
+  background: #020514;
+  scroll-behavior: smooth;
+}
+
+.lk-display {
+  font-family: var(--font-display), "Instrument Serif", ui-serif, Georgia, serif;
+  font-style: italic;
+  font-weight: 400;
+}
+
+
+/* WEB-5 D5: content is visible without JavaScript. Every reveal starts
+   hidden through inline styles (opacity, travel, blur) that the server HTML
+   already carries. Until motion's animation features have loaded and
+   `motion-features.tsx` has put `motion-ready` on <html>, those starting
+   states are overridden, so a visitor without JavaScript, or whose features
+   chunk failed, reads the page in full (WEB-5 review fix R1). This replaces
+   the `<noscript>` patch. */
+html:not(.motion-ready) [data-reveal] {
+  opacity: 1 !important;
+  transform: none !important;
+  filter: none !important;
+}
+
+/* WEB-5 D14 S1, the slow dive: while the live lake runs the hero is 220 vh
+   (DIVE.heroVh in lib/scroll-timeline.ts), so the camera has room to linger
+   at the waterline. The DOM hero (no fast WebGL, reduced motion, no JS)
+   keeps its 150 vh, because a long pinned screen without the dive would
+   only be a pause. The mode is set after the page is usable, below the
+   fold, so the change shifts nothing on screen. */
+html[data-scene="full"] #hero {
+  height: 220vh;
+}
+
+/* WEB-5 D14 S1: the waterline the lake engine moves up the screen as the
+   camera crosses the surface (lake-engine.ts sets the two variables). Above
+   the line the scene shows as it is; at the line a pale meniscus; below it
+   the lake-blue tint of the water at the lens. */
+.lk-waterline {
+  --lk-wl-pos: 105%;
+  --lk-wl-a: 0;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    transparent calc(var(--lk-wl-pos) - 0.6%),
+    rgba(190, 228, 255, calc(var(--lk-wl-a) * 1.2)) var(--lk-wl-pos),
+    rgba(18, 70, 140, var(--lk-wl-a)) calc(var(--lk-wl-pos) + 1.2%),
+    rgba(7, 31, 82, var(--lk-wl-a)) 100%
+  );
+}
+
+/* WEB-5 D14 S2: the page-wide water (components/home/depth-backdrop.tsx).
+   Its two colours are written by the page as it scrolls; the defaults are
+   the deepest water, where the assistant starts. Once the page has
+   hydrated (`data-scene` is set), the sections from the assistant to the
+   final call drop their own backgrounds and sit in it. Without
+   JavaScript the attribute never appears, and they keep them. */
+.lk-water {
+  --lk-water-top: #020514;
+  --lk-water-bottom: #040a2a;
+  background: linear-gradient(180deg, var(--lk-water-top), var(--lk-water-bottom));
+}
+html[data-scene] .lk-fallback-bg {
+  background: none;
+}
+/* S5, the ascent: caustics and bubbles, scaled by the page (0 outside the climb). */
+.lk-water {
+  --lk-ascent: 0;
+  --lk-caustic: 0;
+}
+.lk-water-caustics {
+  opacity: calc(var(--lk-caustic) * 0.9);
+}
+.lk-bubbles {
+  opacity: var(--lk-ascent);
+}
+.lk-bubble {
+  animation-name: lk-bubble;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+@keyframes lk-bubble {
+  0% {
+    transform: translate3d(0, 10vh, 0);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.9;
+  }
+  50% {
+    transform: translate3d(6px, -50vh, 0);
+  }
+  85% {
+    opacity: 0.7;
+  }
+  100% {
+    transform: translate3d(-4px, -105vh, 0);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lk-bubbles {
+    display: none;
+  }
+}
+
+/* WEB-5 D14 S3: the depth gauge (components/home/depth-gauge.tsx). The page
+   writes --lk-gauge-f, the depth as a fraction of the deepest point. The
+   desktop marker moves down the scale and the phone hairline fills with it.
+   The desktop scale hides inside the depths section, whose own gauge
+   stands there. Without JavaScript there is no reading, so no gauge. */
+.lk-gauge {
+  --lk-gauge-f: 0;
+}
+.lk-gauge-marker {
+  top: calc(var(--lk-gauge-f) * 100%);
+}
+.lk-gauge-fill {
+  transform: scaleX(var(--lk-gauge-f));
+}
+.lk-gauge-scale {
+  transition: opacity 0.4s ease;
+}
+.lk-gauge[data-in-depths] .lk-gauge-scale {
+  opacity: 0;
+}
+html:not([data-scene]) .lk-gauge {
+  display: none;
+}
+
+/* Visible focus ring on the dark page (plan §2.8, keyboard). */
+.lk-root :focus-visible {
+  outline: 2px solid var(--lk-lake);
+  outline-offset: 3px;
+}
+.lk-root #main:focus {
+  outline: none;
+}
+
+.lk-root ::selection {
+  background: rgba(68, 166, 250, 0.35);
+  color: #fff;
+}
+
+/* Outlined numerals for the "Yours to keep" cards. */
+.lk-outline-text {
+  color: transparent;
+  -webkit-text-stroke: 1px rgba(232, 244, 255, 0.38);
+}
+
+/* Film grain: a 160px tile of fractal noise, very faint. It breaks up the
+   banding that long dark gradients show on 8-bit displays. */
+.lk-grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.07;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.9 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  /* WEB-5 D14 S2/S5: the grain fades in over the final's first quarter, so
+     it does not draw an edge on the page-wide water where the section starts. */
+  mask-image: linear-gradient(to bottom, transparent, #000 25%);
+}
+
+/* ---- Keyframes -------------------------------------------------------- */
+
+@keyframes lk-bob {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-0.6deg);
+  }
+  50% {
+    transform: translateY(-2.2%) rotate(0.6deg);
+  }
+}
+
+@keyframes lk-drop {
+  0% {
+    transform: translateY(-6px);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(40px);
+    opacity: 0;
+  }
+}
+
+@keyframes lk-caustic-a {
+  0% {
+    transform: translate3d(-6%, -4%, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(6%, 5%, 0) scale(1.15);
+  }
+  100% {
+    transform: translate3d(-6%, -4%, 0) scale(1);
+  }
+}
+
+@keyframes lk-caustic-b {
+  0% {
+    transform: translate3d(7%, 3%, 0) scale(1.1);
+  }
+  50% {
+    transform: translate3d(-5%, -6%, 0) scale(0.95);
+  }
+  100% {
+    transform: translate3d(7%, 3%, 0) scale(1.1);
+  }
+}
+
+@keyframes lk-wave {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes lk-ring {
+  0% {
+    transform: translate(-50%, -50%) scale(0.5);
+    opacity: 0.55;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.1);
+    opacity: 0;
+  }
+}
+
+@keyframes lk-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes lk-twinkle {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+@keyframes lk-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(68, 166, 250, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 7px rgba(68, 166, 250, 0);
+  }
+}
+
+.lk-bob {
+  animation: lk-bob 4s ease-in-out infinite;
+}
+.lk-drop {
+  animation: lk-drop 2.4s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+}
+.lk-caustic-a {
+  animation: lk-caustic-a 22s ease-in-out infinite;
+}
+.lk-caustic-b {
+  animation: lk-caustic-b 28s ease-in-out infinite;
+}
+.lk-wave-slow {
+  animation: lk-wave 18s linear infinite;
+}
+.lk-wave-fast {
+  animation: lk-wave 11s linear infinite;
+}
+.lk-ring {
+  animation: lk-ring 4s ease-out infinite;
+}
+.lk-twinkle {
+  animation: lk-twinkle 3.2s ease-in-out infinite;
+}
+.lk-pulse {
+  animation: lk-pulse 2s ease-in-out infinite;
+}
+.lk-shimmer {
+  background-size: 200% 100%;
+  animation: lk-shimmer 1.6s linear infinite;
+}
+
+/* ---- Reduced motion --------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  html:has(.lk-root) {
+    scroll-behavior: auto;
+  }
+  .lk-root .lk-bob,
+  .lk-root .lk-drop,
+  .lk-root .lk-caustic-a,
+  .lk-root .lk-caustic-b,
+  .lk-root .lk-wave-slow,
+  .lk-root .lk-wave-fast,
+  .lk-root .lk-ring,
+  .lk-root .lk-twinkle,
+  .lk-root .lk-pulse,
+  .lk-root .lk-shimmer {
+    animation: none;
+  }
+}

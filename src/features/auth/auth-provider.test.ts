@@ -2,9 +2,11 @@ import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import { isPublicPath } from "./auth-provider"
 
-test("isPublicPath lets the landing page render without a session", () => {
-  assert.equal(isPublicPath("/landing"), true)
-  assert.equal(isPublicPath("/landing/"), true)
+// WEB-5 D11: the landing page moved to its own site (`site/`); the console
+// has no `/landing` route, so the path is no longer public.
+test("isPublicPath no longer treats the moved landing page as public", () => {
+  assert.equal(isPublicPath("/landing"), false)
+  assert.equal(isPublicPath("/landing/"), false)
 })
 
 test("isPublicPath does not treat a lookalike prefix as public", () => {

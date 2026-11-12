@@ -1553,11 +1553,11 @@ jobs:
           curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/
           # WEB-2: an installed Lakehouse does not serve the landing page.
           # The product owner decided on 2026-11-02 that the page is a
-          # separate product page and must not be available on an install;
-          # the console image excludes `src/app/landing` and
-          # `src/features/landing`, so the route is not in the image and
-          # the path answers with the console's page-not-found. A 200 here
-          # means the page is back in the install, and the job fails.
+          # separate product page and must not be available on an install.
+          # Since WEB-5 the page is the Lakehouse site in `site/`, which the
+          # console image excludes and the console has no route for, so the
+          # path answers with the console's page-not-found. A 200 here
+          # means a landing route is back in the install, and the job fails.
           landing_status="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/landing)"
           echo "the landing page: $landing_status"
           if [ "$landing_status" != "404" ]; then
