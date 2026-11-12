@@ -17,6 +17,7 @@ import type { FormulaFunction } from "@/services/contracts/calc-fields"
 import type { Metric, MetricCheck, MetricSource, Segment } from "@/services/contracts/metrics"
 import type { FilterDef } from "@/services/clients/bi-store"
 import { ChartFilters } from "./chart-shape-section"
+import { ownSourceOf } from "./filters/use-filter-values"
 import { SourceChoiceLabel, sourceChoiceItems } from "./source-choice-label"
 import { useSourceChoices, useSourceColumns } from "./use-source-columns"
 
@@ -207,6 +208,7 @@ export function MetricDialog({ open, onOpenChange, existing, onChanged }: {
             onChange={(next) => set({ filters: next as unknown as typeof form.filters })}
             columns={columns}
             disabled={!source}
+            source={ownSourceOf(source)}
           />
           {mine.length ? (
             <div className="grid gap-1.5">

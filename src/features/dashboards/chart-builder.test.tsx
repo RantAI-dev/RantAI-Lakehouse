@@ -594,3 +594,39 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
     expect(screen.getByText("Size metric")).toBeTruthy()
   })
 })
+
+// `BI-47` (QA `LH-BI-6-01`): a dashboard parameter slot (`{ukuran}`) is a
+// dimension, a breakdown and a measure, never a filter column — the server has
+// no column to list its values from.
+describe("ChartBuilder and a parameter slot (QA LH-BI-6-01)", () => {
+  /** The board's parameters: one list whose values are columns, so the builder offers it as a dimension. */
+  function withListParam() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/api/dashboard/params")) {
+        const params = [{
+          id: "p1", name: "ukuran", label: "Ukuran", type: "list", default: "provinsi",
+          values: [{ value: "provinsi", label: "provinsi" }, { value: "category", label: "category" }],
+        }]
+        return new Response(JSON.stringify({ params }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return inner(input, init)
+    }) as unknown as typeof fetch
+  }
+
+  it("a parameter slot is offered as a dimension and not as a filter column", async () => {
+    withListParam()
+    renderBuilder(barDef)
+    await screen.findByLabelText("Aggregation of visitors")
+    // The slot is a dimension of the picker.
+    const dimensionField = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    fireEvent.click(dimensionField.querySelector('[role="combobox"]') as HTMLElement)
+    expect(await screen.findByRole("option", { name: /\{ukuran\}/ })).toBeTruthy()
+    // Close that list, open the filter section, and ask for a filter column.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" })
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    fireEvent.click(await screen.findByLabelText("Add a filter"))
+    expect(await screen.findByRole("option", { name: "provinsi" })).toBeTruthy()
+    expect(screen.queryByRole("option", { name: /\{ukuran\}/ })).toBeNull()
+  })
+})

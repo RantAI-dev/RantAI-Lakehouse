@@ -78,6 +78,7 @@ import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
 import { displayColumnFull, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
+import type { OwnSource } from "./filters/use-filter-values";
 import { AccordionSection, ColumnLabel, FoldSection, columnItems, focusFirstEmpty } from "./builder-sections";
 import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
 import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
@@ -923,10 +924,23 @@ export function ChartBuilder({
     ...(takesMetrics ? (fields?.metrics ?? []).map((m) => metricColumn(m.name)) : []),
   ];
   // Columns a filter or a grouping may name: the source's, with its per-row calculated fields.
+  // `BI-47` (plan D11): a dashboard parameter slot (`{ukuran}`) is a dimension,
+  // a breakdown and a measure, never a filter or grouping column — the server
+  // has no column to list its values from.
   const columnChoices = React.useMemo<ColumnChoice[]>(() => {
-    const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])].filter((n) => !wholeMeasure.has(n));
+    const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])]
+      .filter((n) => !wholeMeasure.has(n) && !slotParam(n));
     return names.map((name) => ({ name, kind: fields?.kinds?.[name] ?? "text" }));
   }, [fields, wholeMeasure]);
+  // `BI-47` (QA `LH-BI-6-01`): a filter's value list reads the chart's OWN
+  // relation, not every mart that has the column. SQL that is new or edited and
+  // not saved has no list (the saved text would show the old values), and a
+  // chart with no source chosen has none either.
+  const filterSource: OwnSource = heldPreview || !choice
+    ? { unsaved: true }
+    : choice.kind === "sql"
+      ? { sqlSource: choice.id }
+      : { mart: choice.name, joins: joinsPayload(shape.joins).joins };
   // The chart's grouped result, and (BI-6 part 2) what is left after its steps: the sort names the last one's columns.
   const baseResult: ResultColumns = {
     groups: (isGroupedTable ? shape.groupings : [{ column: dimension } as { column: string; grain?: string }]).filter((g) => g.column).map((g) => {
@@ -1613,7 +1627,7 @@ export function ChartBuilder({
               </div>
             ) : null}
 
-            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} /> : null}
+            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} source={filterSource} /> : null}
           </AccordionSection>
 
           <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen} panelRef={(n) => { panelRefs.current[4] = n; }}>
