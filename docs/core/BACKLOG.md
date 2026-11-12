@@ -139,6 +139,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-66` | Task | Gold exports and agent runs have no read permission: `GET /api/gold/*` and `GET /api/agents/runs*` are `RequiresAuth`, so their pages (`/gold-exports`, `/agents/runs/[runId]`) stay open by address to any signed-in user, a Dashboard Viewer included. Add a read permission for each, give it on upgrade to the roles that could read them, and put it in the console's access map | Administration & Security | P2 | Todo |  | `ADM-13` review round 1, S4; `policy.rs` |
 | `SEC-67` | Task | Acknowledging, resolving and silencing an alert need only a login: `POST /api/overview/alerts/{id}/acknowledge`, `/resolve` and `/silence` are `RequiresAuth`, while reading the same list needs `alert:read` or `alert:write` since `ADM-13`. Put `alert:write` (or a narrower action permission) on the three | Administration & Security | P2 | Todo |  | `ADM-13` review round 1; `policy.rs` |
 | `GOV-7` | Feature | Access per schema and table: an administrator lets a role read only chosen schemas or tables (for example Finance reads only `finance`), and the server enforces it everywhere data is read: Query Studio, dashboards, embeds, alerts, reports, pipelines, the assistant, and the catalog and search (with `DATA-20`). Today `query:read` reads every table (`routes/catalog_grants.rs`); masks and row filters per role exist but cannot hide a table. Decided by the product owner 2026-11-09: existing and new roles keep reading every table until an administrator narrows them, so an upgrade changes nobody's access | Governance | P1 | In Acceptance | #459, #468 | Owner notes 2026-11-09; **Waits for `ADM-13`**. spec `specs/gov-7.md`, plan `superpowers/plans/2026-11-09-gov-7-table-access-per-role.md` |
+| `WEB-9` | Task | One dropdown in the console, readable in the dark theme: 61 native `<select>` elements in 34 files open a white list with near-white text in the dark theme (the page sets no `color-scheme`) and look like the browser's default, while 45 other files use the design system's `Select`. Set `color-scheme` per theme, replace every native select with one `SelectField` built on the design system's `Select`, and add a lint rule that refuses a new native select | Platform | P1 | In Progress |  | Owner, 2026-11-12 (screenshot of Add Quality Rule). plan `superpowers/plans/2026-11-12-web-9-one-dropdown.md` |
 | `OPS-19` | Task | `/api/ops/workloads` answers 503: the alias `elapsed` shadows `system.processes.elapsed` (`routes/ops.rs`), so the assistant's `list_workloads` fails (QA `QS-2-07`, `BI-5-02`). Shipped in #448 (2026-11-10). | Operations | P1 | Done | #448 | `routes/ops.rs` |
 
 ## Next (P2)
@@ -424,6 +425,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `WEB-9` | 2026-11-12 | | |
 | `SEC-65` | 2026-11-11 | 2026-11-11 (#467) | |
 | `SEC-62` | 2026-11-10 | 2026-11-10 (#446); 2026-11-11 (#452) | |
 | `OPS-19` | 2026-11-10 | 2026-11-10 (#448) | |
