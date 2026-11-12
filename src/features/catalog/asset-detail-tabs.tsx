@@ -33,7 +33,7 @@ import { AssetOverview, type AssetTab } from "./asset-overview"
 import { AssetQuality } from "./asset-quality"
 import { AssetSample } from "./asset-sample"
 import { AssetSchema } from "./asset-schema"
-import { useIcebergTable } from "./asset-storage"
+import { useIcebergTable, type IcebergTableState } from "./asset-storage"
 
 /** The seven tabs, in order. `?tab=` names any but the first. */
 const TABS: { value: AssetTab; label: string; icon: LucideIcon }[] = [
@@ -84,13 +84,20 @@ function tabCount(
 /**
  * Tab strip for the asset detail page. The open tab lives in `?tab=`, so a
  * refresh or a shared link lands on it.
+ *
+ * The Iceberg table is a prop: the page reads it once and its header needs
+ * the same answer (`DATA-54`). [`AssetDetailTabs`] is the wrapper that reads
+ * it itself, for a caller that has not.
  */
-export function AssetDetailTabs({
+export function AssetDetailTabsView({
   asset: a,
+  iceberg,
   onAssetChanged,
   meanings,
 }: {
   asset: AssetDetail
+  /** The asset's Iceberg table, read once by the page (or the wrapper). */
+  iceberg: IcebergTableState
   /** Reloads the asset after something on a tab changed it. */
   onAssetChanged: () => void
   /** The page's meanings, read once by the page for its header and this tab. */
@@ -108,7 +115,6 @@ export function AssetDetailTabs({
     setTab(urlTab)
   }
   const rootRef = React.useRef<HTMLDivElement>(null)
-  const iceberg = useIcebergTable(a)
   const lineage = useAssetLineage(a)
 
   const selectTab = React.useCallback(
@@ -170,4 +176,16 @@ export function AssetDetailTabs({
       </Tabs>
     </div>
   )
+}
+
+/**
+ * [`AssetDetailTabsView`] for a caller that has not read the asset's Iceberg
+ * table: it reads it itself. The page reads it once and passes it in, so its
+ * header and the tabs share one read (`DATA-54`).
+ */
+export function AssetDetailTabs(
+  props: Omit<React.ComponentProps<typeof AssetDetailTabsView>, "iceberg">
+) {
+  const iceberg = useIcebergTable(props.asset)
+  return <AssetDetailTabsView {...props} iceberg={iceberg} />
 }
