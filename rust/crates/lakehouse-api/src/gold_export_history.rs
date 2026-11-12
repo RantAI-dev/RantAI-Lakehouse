@@ -16,12 +16,13 @@
 //! kind of single owner `lakehouse-bi::store` uses for its own
 //! `console.*` tables: an idempotent Rust-side `ensure_*` function.
 //!
-//! One row per call to `POST /api/gold/export/{mart}`, success or failure,
-//! written by `routes::gold::export` itself right after
-//! `gold_export::export_mart` returns — this captures BOTH trigger sources
-//! (the console's "Export now" button and the Dagster schedule) through
-//! the one HTTP handler both call, rather than recording only
-//! Dagster-triggered runs.
+//! One row per call to `POST /api/gold/export/{mart}` that gets past the mart's
+//! existence — success or failure, written by `routes::gold::export` itself
+//! right after `gold_export::export_mart` returns, or as soon as a step before
+//! the export fails (`DATA-56`, #484 review R4). That captures BOTH trigger
+//! sources (the console's "Export now" button and the Dagster schedule)
+//! through the one HTTP handler both call, and it captures the publishes that
+//! fail before the copy starts, which used to leave no trace at all.
 //!
 //! # Copy retention and trim history (DATA-2)
 //!
@@ -248,9 +249,10 @@ pub async fn rewrite_raw_errors(ch: &ChClient) -> Result<u64, ChError> {
 }
 
 /// One export attempt to record — always both an id (the caller mints a
-/// UUID) and the outcome, never a partial row: `routes::gold::export`
-/// calls this exactly once per call, after `export_mart` has already
-/// returned `Ok` or `Err`.
+/// UUID) and the outcome, never a partial row: `routes::gold::export` calls
+/// this at most once per call, either after `export_mart` has already
+/// returned `Ok` or `Err`, or when a step before the export failed on a mart
+/// known to exist (`DATA-56`, #484 review R4).
 pub struct NewGoldExportRun<'a> {
     /// The Gold mart's identifier (already validated by the caller's
     /// `Ident`), unquoted.
