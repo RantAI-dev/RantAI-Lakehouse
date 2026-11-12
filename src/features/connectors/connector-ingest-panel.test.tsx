@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import {
   ConnectorIngestPanel,
   cronProblem,
@@ -194,7 +195,7 @@ describe("ConnectorIngestPanel", () => {
     const target = screen.getByLabelText("Bronze table for public.orders") as HTMLInputElement
     expect(target.value).toBe("northwind_orders")
 
-    fireEvent.change(screen.getByLabelText("Schedule"), { target: { value: "0 2 * * *" } })
+    chooseOption(screen.getByLabelText("Schedule"), "Every day at 02:00 UTC")
     // A saved schedule applies on its own, with no orchestrator reload.
     expect(screen.getByText("Runs on this schedule within a minute of saving.")).toBeDefined()
     // Unsaved changes block a run.
@@ -240,14 +241,16 @@ describe("ConnectorIngestPanel", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
 
-    const mode = screen.getByLabelText("Load mode for public.orders") as HTMLSelectElement
-    expect(mode.value).toBe("replace")
-    fireEvent.change(mode, { target: { value: "incremental" } })
+    const mode = screen.getByLabelText("Load mode for public.orders")
+    // WEB-9 D5: the trigger shows the mode's label, where the select held its value.
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows")
+    chooseOption(mode, "Add only new rows")
     // No column yet: the reason is shown and the save is off.
     expect(screen.getByText(/Pick the column that marks new rows/)).toBeDefined()
     const save = screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
 
+    // The source cannot list this table's columns here, so the cursor is typed.
     fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "order_id" } })
     expect(screen.getByText(/later runs add rows whose order_id is higher/)).toBeDefined()
     expect(save.disabled).toBe(false)
@@ -266,15 +269,17 @@ describe("ConnectorIngestPanel", () => {
   it("shows a table saved without a mode as replace, and offers incremental to SQL only", async () => {
     stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
     const sql = render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
-    expect(mode.value).toBe("replace")
-    expect([...mode.options].map((o) => o.value)).toEqual([
-      "replace",
-      "incremental",
-      "append",
-      "replace_dedup",
-      "incremental_dedup",
-      "history",
+    const mode = await screen.findByLabelText("Load mode for public.orders")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows")
+    // WEB-9 D5: the modes are read from the opened list, by the words a person reads.
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add only new rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Add only new rows, one per key",
+      "Keep history",
     ])
     expect((screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement).disabled).toBe(true)
     sql.unmount()
@@ -286,8 +291,14 @@ describe("ConnectorIngestPanel", () => {
       sourceObjects: [{ name: "orders", target: "api_orders" }],
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
-    const restMode = (await screen.findByLabelText("Load mode for orders")) as HTMLSelectElement
-    expect([...restMode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
+    const restMode = await screen.findByLabelText("Load mode for orders")
+    fireEvent.click(restMode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Keep history",
+    ])
   })
 
   it("does not save a Bronze name that is not an identifier", async () => {
@@ -360,7 +371,7 @@ describe("ConnectorIngestPanel layout", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Find tables" }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
     expect((screen.getByLabelText("Bronze table for public.orders") as HTMLInputElement).value).toBe("northwind_orders")
-    fireEvent.change(screen.getByLabelText("Schedule"), { target: { value: "0 2 * * *" } })
+    chooseOption(screen.getByLabelText("Schedule"), "Every day at 02:00 UTC")
     fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
     expect((calls.find((c) => c.method === "PUT")?.body as { scheduleCron: string }).scheduleCron).toBe("0 2 * * *")
@@ -377,7 +388,9 @@ describe("ConnectorIngestPanel layout", () => {
 
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     expect((await screen.findByLabelText("Bronze table for public.orders")).className).not.toContain("max-w-")
-    expect(screen.getByLabelText("Schedule").className).not.toContain("max-w-")
+    // WEB-9 D3: the trigger always carries the design system's `max-w-full`, so
+    // the page's own cap is the one to look for (absent here).
+    expect(screen.getByLabelText("Schedule").className).not.toContain("max-w-xs")
   })
 
   /**
@@ -509,13 +522,14 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     sourceObjects: [{ name: "public.orders", target: "northwind_orders", ...extra }],
   })
   const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
-  const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
+  const modeOf = async (name: string) => await screen.findByLabelText(`Load mode for ${name}`)
 
   it("offers six modes to a SQL source, labelled in plain words", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect([...mode.options].map((o) => o.textContent)).toEqual([
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
       "Replace all rows",
       "Add only new rows",
       "Add all rows again",
@@ -536,7 +550,13 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     const mode = await modeOf("orders")
-    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Keep history",
+    ])
     expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only/)).toBeDefined()
   })
 
@@ -549,7 +569,14 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     })
     render(<ConnectorIngestPanel connectorId="conn-saas" connectorName="acme" />)
     const mode = await modeOf("tickets")
-    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "incremental_dedup", "history"])
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Add only new rows, one per key",
+      "Keep history",
+    ])
     expect(screen.queryByText(/offered for SQL sources and business apps only/)).toBeNull()
   })
 
@@ -564,8 +591,16 @@ describe("ConnectorIngestPanel load modes and keys", () => {
       incremental: /keep the rows already there/,
       incremental_dedup: /merge .* into the rows already there/,
     }
+    // WEB-9 D5: each mode is chosen by the label the trigger shows for it.
+    const labels: Record<string, string> = {
+      replace: "Replace all rows",
+      append: "Add all rows again",
+      replace_dedup: "Replace all rows, one per key",
+      incremental: "Add only new rows",
+      incremental_dedup: "Add only new rows, one per key",
+    }
     for (const [value, hint] of Object.entries(hints)) {
-      fireEvent.change(mode, { target: { value } })
+      chooseOption(mode, labels[value])
       if (value.startsWith("incremental")) {
         fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "order_id" } })
       }
@@ -581,16 +616,17 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
 
-    fireEvent.change(mode, { target: { value: "replace_dedup" } })
+    chooseOption(mode, "Replace all rows, one per key")
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
     expect(screen.queryByText(/cannot be saved without a key/)).toBeNull()
     expect(saveButton().disabled).toBe(false)
 
-    fireEvent.change(mode, { target: { value: "incremental_dedup" } })
+    chooseOption(mode, "Add only new rows, one per key")
     expect(screen.getByText(/Pick the column that marks new rows/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
+    // No column list from this source, so the cursor is typed.
     fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "updated_at" } })
     expect(saveButton().disabled).toBe(false)
 
@@ -605,7 +641,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     fireEvent.change(await screen.findByLabelText("Add by name"), { target: { value: "orders" } })
     fireEvent.click(screen.getByRole("button", { name: "Add" }))
-    fireEvent.change(await modeOf("orders"), { target: { value: "replace_dedup" } })
+    chooseOption(await modeOf("orders"), "Replace all rows, one per key")
     fireEvent.change(screen.getByLabelText("Key columns for orders"), { target: { value: "id, region" } })
     fireEvent.click(saveButton())
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
@@ -632,8 +668,8 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "incremental_dedup" } })
-    fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "updated_at" } })
+    chooseOption(await modeOf("public.orders"), "Add only new rows, one per key")
+    chooseOption(screen.getByLabelText("New-row column for public.orders"), "updated_at")
 
     const ticked = (name: string) =>
       (screen.getByLabelText(`${name} is part of the key of public.orders`) as HTMLInputElement).checked
@@ -661,7 +697,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.customers/))
-    fireEvent.change(await modeOf("public.customers"), { target: { value: "replace_dedup" } })
+    chooseOption(await modeOf("public.customers"), "Replace all rows, one per key")
     // Declares no key: nothing is ticked, and Save says why it is off.
     expect((screen.getByLabelText("customer_id is part of the key of public.customers") as HTMLInputElement).checked).toBe(false)
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
@@ -672,7 +708,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     stubFetch(saved({ loadMode: "replace_dedup", primaryKey: ["id"] }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect(mode.value).toBe("replace_dedup")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows, one per key")
     expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
     expect(saveButton().disabled).toBe(true)
   })
@@ -688,13 +724,13 @@ describe("ConnectorIngestPanel history mode", () => {
     sourceObjects: [{ name: "public.orders", target: "northwind_orders", ...extra }],
   })
   const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
-  const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
+  const modeOf = async (name: string) => await screen.findByLabelText(`Load mode for ${name}`)
   const BOUNDARY = "After saving, use Refresh, removing rows on this table: its rows must be rebuilt for the new mode."
 
   it("says in one line what is kept and that each run reads the whole table", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
     expect(
       screen.getByText(
@@ -706,7 +742,7 @@ describe("ConnectorIngestPanel history mode", () => {
   it("asks for a key like the deduplicating modes, and shows no cursor field", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
     expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
@@ -718,7 +754,7 @@ describe("ConnectorIngestPanel history mode", () => {
   it("saves the key and no cursor, even if the table had a cursor before", async () => {
     const calls = stubFetch(saved({ loadMode: "incremental", incrementalKey: "updated_at" }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id, region" } })
     fireEvent.click(saveButton())
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
@@ -740,7 +776,7 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect((screen.getByLabelText("order_id is part of the key of public.orders") as HTMLInputElement).checked).toBe(true)
     expect(saveButton().disabled).toBe(false)
   })
@@ -750,11 +786,11 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "append" } })
+    chooseOption(mode, "Add all rows again")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "history" } })
+    chooseOption(mode, "Keep history")
     expect(screen.getByText(BOUNDARY)).toBeDefined()
-    fireEvent.change(mode, { target: { value: "replace" } })
+    chooseOption(mode, "Replace all rows")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
   })
 
@@ -762,9 +798,9 @@ describe("ConnectorIngestPanel history mode", () => {
     stubFetch(saved({ loadMode: "history", primaryKey: ["id"] }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect(mode.value).toBe("history")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Keep history")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "replace_dedup" } })
+    chooseOption(mode, "Replace all rows, one per key")
     expect(screen.getByText(BOUNDARY)).toBeDefined()
   })
 
@@ -775,7 +811,7 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
   })
 
@@ -957,9 +993,10 @@ describe("ConnectorIngestPanel refresh and clear", () => {
       sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "incremental_dedup", primaryKey: ["id"] }],
     })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
-    const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
-    expect([...mode.options].map((o) => o.text)).toEqual(["Current row per key", "Keep history"])
-    expect(mode.value).toBe("incremental_dedup")
+    const mode = await screen.findByLabelText("Load mode for public.orders")
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["Current row per key", "Keep history"])
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Current row per key")
     expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
     expect(screen.getByText(/The table holds the current row of each key/)).toBeDefined()
   })
@@ -1467,7 +1504,7 @@ describe("ConnectorIngestPanel table discovery", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Find tables" }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
     await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/discovery/preview")).length).toBe(1))
-    fireEvent.change(await screen.findByLabelText("Load mode for public.orders"), { target: { value: "history" } })
+    chooseOption(await screen.findByLabelText("Load mode for public.orders"), "Keep history")
     await screen.findByLabelText("order_id is part of the key of public.orders")
     expect(calls.filter((c) => c.url.endsWith("/discovery/preview")).length).toBe(1)
   })
