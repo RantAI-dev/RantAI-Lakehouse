@@ -70,6 +70,7 @@ reported, not quietly lowered.
 - Usage counts what the product's own query history records; reads from
   dashboards and from outside tools are not counted.
 - A grant expires after 30 days, like a decided request.
+- A `query:read` grant made from a table's page also opens that table's page for the grantee, without `catalog:read` (product owner 2026-11-12, `DEC-20`). It opens that table only: not the catalog list, not search, not another table's page. Masks, row filters and the role's table access apply as everywhere.
 - Restore works only for Iceberg tables, only within the retention window.
 - A version's author is shown only where the committer was recorded.
 
