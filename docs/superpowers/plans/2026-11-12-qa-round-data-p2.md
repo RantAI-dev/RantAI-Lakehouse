@@ -977,4 +977,246 @@ None of these blocks the plan.
 
 ## 5. Handoff
 
+Branch `fix/qa-round-data-p2`, based on `51fb4833` (the plan) whose parent is
+`94d86f39` (the head of `fix/qa-round-data-p1`, PR #484). Every commit was pushed
+with `git push origin HEAD:fix/qa-round-data-p2`; nothing was force-pushed, `main`
+is untouched, no pull request was opened.
+
+### Commits (one per task, in plan order, plus one follow-up)
+
+| Task | Commit | Title |
+| --- | --- | --- |
+| T1 | `4583c971` | test(dagster): reproduce the long table name failure (DATA-50, LH-DATA-9-37) |
+| T2 | `692de2b6` | fix(dagster): a table with no schema is not there, without asking dlt (DATA-50, LH-DATA-9-37) |
+| T3 | `154ac151` | test(g9): load into a table name of the full 128 characters (DATA-50, LH-DATA-9-37) |
+| T4 | `01937b25` | fix(uploads): a damaged file of an accepted format says it could not be opened (DATA-51, LH-DATA-17-05) |
+| T5 | `073c5eef` | fix(uploads): the unpacked refusal names the 2 GB limit (DATA-51, LH-DATA-17-13) |
+| T6 | `61d8e22f` | fix(catalog): usage shows people by name, never by their id (DATA-52, LH-DATA-12-01 F3, LH-DATA-15-02, TC-1730) |
+| T7 | `e5e2fe46` | fix(dagster): a replace and an append record the load's author (DATA-52, LH-DATA-15-08) |
+| T8 | `cd3d5b87` | feat(uploads): the API tells the job who started the load (DATA-52, LH-DATA-15-08) |
+| T9 | `bf0f031e` | fix(upload-types): a uint64 starts as Decimal and a timestamp takes nine digits (DATA-53, LH-DATA-9-32) |
+| T10 | `0002b45c` | fix(query): the query route keeps a decimal's digits (DATA-53, LH-DATA-9-32) |
+| T11 | `d5bb463a` | fix(upload): a selection over the 2 GB limit sends nothing (DATA-51, LH-DATA-17-04) |
+| T12 | `73836763` | fix(uploads-panel): the cut list says so, and New subfolder says why it is off (DATA-51, LH-DATA-35-10, LH-DATA-35-07) |
+| T13 | `4f89dc50` | fix(console): one list of formats for the upload (DATA-51, LH-DATA-9-02) |
+| T14 | `c34a8173` | fix(catalog): two people with one name are two rows (DATA-52, LH-DATA-12-01 F3) |
+| T15 | `87d031cc` | feat(console): the Check step says what a type keeps, and the page gives the name to query (DATA-53, LH-DATA-9-32, LH-DATA-9-07) |
+| T16 | `d031121e` | docs(features): what the data round changed on the pages (DATA-50, DATA-51, DATA-52, DATA-53) |
+| T8 (follow-up) | `5621b13e` | test(dagster): the loader and job tests' run configs carry the author (DATA-52, LH-DATA-15-08) |
+
+`5621b13e` is not a task of its own: three Python tests outside the ones T8 names
+build the job's config or its params and broke once `author` became required
+(below, "Deviations").
+
+### Tests added, and what they said before the fix
+
+Each of these was run once against the code as it was before its commit (the
+product change reverted in place, then restored), in the foreground.
+
+- T1 `dagster/dispar_orchestrate/test_sink_long_table_name.py`, four functions,
+  five tests with the parameters.
+  Before any product change: `2 passed, 3 xfailed in 1.62s`, the three xfails being
+  `InvalidSchemaName` (`test_a_first_typed_replace_into_a_long_table_name_loads[52]`
+  and `[128]`, `test_clearing_a_long_named_table_that_was_never_loaded_says_there_is_nothing_to_empty`).
+  `test_a_first_load_without_a_column_list_into_a_128_character_name_loads` passed
+  before the fix too, as D4/D5 read it. (The first draft of test 1 called `.name` on
+  what `make_schema_with_default_name` returns, a `str`; fixed before the commit.)
+- T2: no new test; the two xfail marks removed, the same file `5 passed in 5.91s`.
+- T4 `routes::uploads::tests::a_binary_file_named_like_an_accepted_format_is_told_it_could_not_be_opened`.
+  Before: `panicked ... assertion left == right failed: a.parquet`
+  `left: "This is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files."`
+  `right: "This file could not be opened as a Parquet file."`
+  Plus the integration test
+  `a_damaged_parquet_file_is_refused_at_completion_as_a_file_that_could_not_be_opened`
+  in `tests/upload_routes.rs` (the unit test is the one run before the fix; the
+  integration one passes at 176 passed in the same file's run).
+- T5 `routes::uploads::tests::the_unpacked_sentences_name_the_unpacked_cap`. Before:
+  `left: "The file is larger than the 2 GB limit once unpacked."`
+  `right: "The file is larger than the upload limit once unpacked."` (the fixture had
+  the new sentence, the code the old one).
+  `the_reasons_the_api_knows_are_the_reasons_in_the_shared_fixture` and
+  `test_there_are_twelve_different_failure_reasons_among_them_the_header_row_with_no_columns`
+  changed their expected count from eleven to twelve (a rule change, said in the
+  commit body), and
+  `test_the_old_unpacked_sentence_stays_in_the_list_and_is_no_longer_the_one_raised`
+  is new in `test_file_ingest.py`.
+- T6 `frequent_users_are_named_from_the_user_table_and_ranked_by_their_queries`. Before:
+  `left: Array [Object {"name": String("busy.old-handle"), "queries": Number(2)}, Object {"name": String("quiet.old-handle"), "queries": Number(1)}]`
+  `right: Array [Object {"name": String("Busy"), "queries": Number(2)}, Object {"name": String("Quiet"), "queries": Number(1)}]`.
+  New too: `a_person_who_no_longer_exists_is_unknown_user_and_never_an_id`,
+  `a_row_without_an_owner_is_named_by_the_id_in_its_user_name_or_shown_as_stored`, and
+  the caller's name asserted in `usage_counts_everyone_but_lists_only_the_callers_queries`.
+- T7 `test_snapshot_author.py::test_a_replace_and_an_append_record_the_author_of_the_load`.
+  Before: `assert [None, None] == ['a person (file upload)', 'a person (file upload)']`
+  (`At index 0 diff: None != 'a person (file upload)'`). New too:
+  `test_a_load_without_an_author_records_none_and_nothing_stays_registered`; and
+  `test_typed_load.py`'s type-changing-replace test gained the author assertion.
+- T8 `routes::uploads::tests::the_run_config_names_who_started_the_load`. Before:
+  `left: Null right: "Rina Wijaya (file upload)"`. New too:
+  `the_author_of_a_load_is_the_name_without_control_characters_or_file_upload_alone` and
+  `test_file_ingest.py::test_the_sink_is_told_the_author_the_run_was_launched_with`.
+- T9 `upload_types::tests::a_files_and_a_tables_own_types_become_the_starting_types`.
+  Before: `assertion left == right failed: uint64` `left: (Integer, None)`
+  `right: (Decimal, None)`. New too:
+  `a_uint64_s_largest_value_fits_the_type_its_column_starts_with` and
+  `the_guess_keeps_six_digits_of_a_fraction_and_a_chosen_timestamp_takes_nine`; the
+  fixture's seven-digit case changed (a rule change, D17, said in the commit body),
+  three cases added to `cast.json`, `guess.json` untouched.
+- T10 `lakehouse-clickhouse` `query_with_options_asks_for_quoted_decimals_only_when_told`.
+  Before: `panicked ... cancel_http_readonly_queries_on_client_close=1` (the query
+  string the assert printed had no `output_format_json_quote_decimals`). Integration
+  test `a_decimal_keeps_every_digit_the_engine_holds` in `tests/query_result_cap.rs`.
+- T11 `planPick refuses every file of a selection that takes the upload over 2 GB, and a
+  refused file does not count`. Before: `actual: ""` against
+  `/^The 3 files chosen would bring the upload to .* over the 2 GB limit for one upload/`;
+  and `planPick refuses both files of LH-DATA-17-04 before either is sent` failed the
+  same way.
+- T12 `says the list is cut when a hundred files came back, and not for ninety-nine`.
+  Before: `Unable to find an element by: [data-testid="upload-list-cut"]`; the extended
+  third-level folder test failed with `Unable to find an element by:
+  [data-testid="folder-nest-reason"]`.
+- T13 `ConnectorCreatePage > offers a link to upload a file ...`. Before:
+  `Unable to find role="link" and name "Have a file instead? Upload CSV, TSV, JSON, JSON
+  Lines, Avro, Excel or Parquet files"`. New too:
+  `uploads-panel.test.tsx`'s empty state (title and sentence changed) and
+  `src/lib/uploads.test.ts::the formats phrase names every format the Accepted fact lists`.
+- T14 `lists two frequent users who share a name as two rows`. Before: the console
+  logged `Encountered two children with the same key, "Rina Wijaya"` twice and the
+  test failed on `Expected to not contain: "same key"`.
+- T15 `says under a decimal column what is stored, and under a nanosecond timestamp that
+  it is cut`. Before: `Unable to find an element with the text: Stored exactly, with up
+  to 38 digits, 9 of them after the point.`; the table-step test failed with
+  `Unable to find an element by: [data-testid="upload-query-name"]`; the review test's
+  label list and the loaded-view test failed on the new label and sentence. New too:
+  `src/lib/uploads.test.ts::keepsNanoseconds is true only for a nanosecond timestamp label`.
+- T16: documents only.
+
+### Commands run, with their real counts
+
+Rust, from `rust/` with `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-1
+CARGO_BUILD_JOBS=6` — the "before handoff" block of section 3, on `d031121e`
+(`5621b13e` after it touches only three Python test files, so `fmt`, `clippy`,
+`typecheck` and `lint` were re-run on it and the Rust/TS test binaries are the same):
+
+- `cargo fmt --check` → clean.
+- `cargo clippy -p lakehouse-clickhouse -p lakehouse-iceberg -p lakehouse-api --all-targets -- -D warnings` → `Finished` with no warning (`50.13s`; re-run on `5621b13e` in `0.34s`, cached).
+- `cargo test -p lakehouse-clickhouse --lib query_with_options` → `2 passed; 0 failed`.
+- `cargo test -p lakehouse-api --lib routes::uploads` → `61 passed; 0 failed`.
+- `cargo test -p lakehouse-api --lib routes::catalog_governance` → `34 passed; 0 failed`.
+- `cargo test -p lakehouse-api --lib upload_types` → `9 passed; 0 failed`.
+- `cargo test -p lakehouse-api --lib upload_formats` → `16 passed; 0 failed`.
+- `cargo test -p lakehouse-api --test upload_routes` → `176 passed; 0 failed` (`133.23s`; the same file also ran at `01937b25` and `073c5eef`, 176 passed each time).
+- `cargo test -p lakehouse-api --test query_result_cap` → `10 passed; 0 failed` (`13.44s`).
+
+Per commit, the scoped runs the table of section 3 names, all in the foreground:
+T4 `--lib a_binary_file_named_like_an_accepted_format_is_told_it_could_not_be_opened`
+(1 passed after the fix, the failure above before it) and
+`--lib a_parquet_file_needs_both_its_first_bytes_and_a_parquet_name` (1 passed);
+T5 the two `--lib` tests above (1 passed each) and `--lib upload_formats` (16 passed);
+T6 `--lib routes::catalog_governance` (34 passed);
+T8 the four `--lib` tests of the table (1 passed each);
+T9 `--lib upload_types` (9 passed);
+T10 `--lib query_with_options` (2 passed) and
+`--lib a_null_cell_is_null_and_every_other_cell_keeps_its_text` (1 passed);
+T14 no Rust test (a comment only), `cargo clippy -p lakehouse-iceberg --all-targets -- -D warnings` ran.
+
+TypeScript, from the checkout:
+
+- `bun install --frozen-lockfile` → `Checked 779 installs across 753 packages (no changes)`.
+- `bun run typecheck` → no output (clean).
+- `bun run lint` → `✖ 11 problems (0 errors, 11 warnings)`; none is in a file this slice
+  changed the logic of (`src/lib/uploads.test.ts`'s two unused imports are in the base
+  commit too, and the rest are untouched files: `data-table`, `sidebar`, `sso-page`,
+  `alerts-page`, `login-page`, `use-copilot`, `use-data-table`, `dashboard-specs`,
+  `http.ts`).
+- `bun run test` → `4050 pass, 1 skip, 0 fail, 12246 expect() calls; Ran 4051 tests
+  across 380 files` (`90.53s`).
+
+Python, in `/home/rismana/rantai/venv-agents-1` (`uv venv`, then
+`uv pip install ./dagster pytest==8.3.4`; `dlt 1.30.0`, `pyiceberg 0.12.0`):
+
+- `(cd dagster && python -m pytest dispar_orchestrate -q -m "not loader")` →
+  `2 failed, 2222 passed, 1 skipped, 313 deselected, 38 warnings in 16.98s`.
+- `(cd dagster && python -m pytest dispar_orchestrate -q -m loader)` →
+  `313 passed, 2225 deselected, 263 warnings in 815.92s (0:13:35)`.
+- The two failures are not this branch's: both fail at `94d86f39` in a scratch
+  worktree with the same venv —
+  `test_adapters_oracle.py::test_a_tls_dial_really_encrypts_and_checks_the_certificate_dn`
+  and `test_parquet_ingest.py::test_floats_are_written_in_the_shortest_form_that_reads_back[3.4028234663852886e+38-True-3.4028235e38]`
+  (`2 failed, 16 passed` there when run alone).
+- Per task, one file per call: T1 `test_sink_long_table_name.py` `2 passed, 3 xfailed`
+  before T2 and `5 passed` after it; T2 also `test_sink_empty_table.py` 25 passed,
+  `test_sink_history.py` 23 passed, `test_sink_history_guard.py` 43 passed,
+  `test_typed_load.py` 20 passed, `test_snapshot_author.py` 5 passed;
+  T5 `test_file_ingest.py` 209 passed, 1 skipped (211 passed after T8);
+  T7 `test_snapshot_author.py` 7 passed, `test_typed_load.py` 20 passed,
+  `test_iceberg_stream.py` 8 passed, `test_iceberg_snapshot.py` 7 passed;
+  T8 `test_file_ingest.py` 211 passed, 1 skipped; T9 `test_upload_types.py` 94 passed.
+
+Lints, always: `python3 ops/lint/check_bare_iceberg_count.py` →
+`R11 guard: no bare count() against a Bronze Iceberg table found.`;
+`python3 ops/lint/check_intra_package_imports.py` →
+`OK: all intra-package dispar_orchestrate imports resolve`.
+
+`git status` on the final commit → clean (nothing generated staged; no
+`__pycache__/`, `*.pyc`, `rust/target/`).
+
+Containers (section 3a): `docker ps -a` listed 32 containers before the first
+`cargo test --test …` and 32 after the last, the same ids. The test harness reused
+the running Postgres (`sleepy_pike`) and its own ClickHouse; my runs left nothing
+behind, so nothing was removed.
+
+### Not verified locally, CI
+
+- `cargo test --workspace` (and CI's `cargo nextest run --workspace` partitions plus
+  `cargo test --doc`): the plan makes it CI's, and this slice runs the files it names.
+- The G9 gate, including T3's `step_long_table_name` and T8's author check in it: CI job
+  "Rust · G9 file upload" on the pull request. Its docker commands were not run on this
+  machine (the plan allows them only when that job fails without saying why). So that
+  the **catalog server and the query engine take a 128-character table name** (D6/T3)
+  and that **a real table's versions carry `<name> (file upload)` end to end** are
+  *not verified locally, CI*.
+- That `table.name()[-1]` is the table's name for a table of the real catalog (section 3's
+  list of what the planner did not run): T7's tests use a local catalog. T8's G9 check in
+  `step_long_table_name` reads a real table's versions, so CI is its proof.
+- The CI run itself is on x86_64; everything above ran on this ARM64 machine.
+- No compose file changed, so no `docker compose config`/`up` check was run (section 3).
+
+### MISMATCH
+
+None: every anchor was found by its text, the T1 reproduction failed with exactly
+`InvalidSchemaName` (D4), and no decision had to be worked around. Two notes, not
+mismatches:
+
+- Some anchors had moved from the line the plan names (the plan read them at
+  `d6d22a2c5`, this branch starts at `51fb4833` on `94d86f39`): `classify_head`'s
+  `OtherBinary` arm is at `routes/uploads.rs:1045` now, the reasons and their fixture
+  test further down the same file, `run_config` at `:2763`. Found by the quoted text.
+- D9 says the job's sentence is "pinned to the API's built sentence" by a test. Here it
+  is pinned by `the_unpacked_sentences_name_the_unpacked_cap` (API: `JOB_TOO_LARGE_UNPACKED
+  == Refusal::TooLargeUnpacked.to_string()`, and the sentence names the cap) plus the
+  shared fixture that both sides' count tests compare (twelve reasons). The job does not
+  read the Rust source; the fixture is the join.
+
+### Deviations worth a reviewer's look
+
+- **T8 (`5621b13e`).** Making `author` a required field of `CONFIG_SCHEMA` broke three
+  tests outside T8's list, all of which build that config or `FileIngestParams`:
+  `test_several_files.py::test_the_op_config_takes_a_list_of_keys_and_the_params_keep_their_order`
+  (`KeyError: 'author'`; it also asserts the config holds exactly the schema's fields),
+  `test_authored_factory.py::TestFileIngestRunConfigReader::test_a_real_runs_config_resolves_to_the_table_the_load_wrote`
+  (`DagsterInvalidConfigError: Missing required config entry "author"`) and
+  `test_load_memory.py`'s probe (`TypeError: FileIngestParams.__init__() missing 1
+  required positional argument: 'author'`). Each gained the field with the reason; no
+  assertion was weakened. T8's own commit had been pushed already, so this is its own
+  commit rather than an amend.
+- **T5, the two names.** As the plan's items 3 and 5 say, the Rust constant of the old
+  sentence is `JOB_TOO_LARGE_UNPACKED_UNNAMED` and the Python one is
+  `TOO_LARGE_UNPACKED_UNNAMED`, while each side's `...UNPACKED` without the suffix is the
+  new sentence; the Python raise sites therefore needed no edit. Each constant's comment
+  says which sentence it holds and why the old one is kept.
+- **T6, the caller's own name.** `people_names` inserts `caller.display_name` only when
+  it is not blank, so a caller with no name is "Unknown user" like anyone else (D14's
+  blank-name rule) rather than shown as an empty name.
+
 ## 6. Review
