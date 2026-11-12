@@ -19,6 +19,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { QualityRuleCreatePage } from "./quality-rule-create-page"
 
@@ -126,7 +127,7 @@ describe("QualityRuleCreatePage (WEB-7 D2/T3)", () => {
     fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "email_filled" } })
     await pickTable()
     // WEB-8 D8: the column is a list of that table's own columns now.
-    fireEvent.change(screen.getByLabelText("Column"), { target: { value: "email" } })
+    chooseOption(await screen.findByRole("combobox", { name: "Column" }), "email")
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }))
 
     await waitFor(() =>
@@ -203,7 +204,7 @@ describe("QualityRuleCreatePage (WEB-7 D2/T3)", () => {
     fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "email_filled" } })
     await pickTable()
     // WEB-8 D8: the column is a list of that table's own columns now.
-    fireEvent.change(screen.getByLabelText("Column"), { target: { value: "email" } })
+    chooseOption(await screen.findByRole("combobox", { name: "Column" }), "email")
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }))
 
     expect(await screen.findByRole("alert")).toBeTruthy()
@@ -248,18 +249,20 @@ describe("QualityRuleCreatePage table and column pickers (WEB-8 D8)", () => {
     // value kept and marked (it is not one of them).
     await pickTable("silver.orders")
     await waitFor(() =>
-      expect(screen.getByLabelText("Column")).toHaveProperty("tagName", "SELECT")
+      expect(screen.getByRole("combobox", { name: "Column" })).toBeTruthy()
     )
-    const column = screen.getByLabelText("Column") as HTMLSelectElement
-    expect(column.value).toBe("typed_by_hand")
-    expect(Array.from(column.options).map((o) => o.value)).toEqual([
-      "typed_by_hand",
+    const column = screen.getByRole("combobox", { name: "Column" })
+    // WEB-9 D2: the trigger shows the option's label; the stored value is
+    // still the typed column, kept and marked because this table lacks it.
+    expect(column.querySelector('[data-slot="select-value"]')?.textContent).toBe(
+      "typed_by_hand (not in this table)"
+    )
+    fireEvent.click(column)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "typed_by_hand (not in this table)",
       "email",
       "amount",
     ])
-    expect(Array.from(column.options).map((o) => o.textContent)).toContain(
-      "typed_by_hand (not in this table)"
-    )
   })
 
   it("keeps a typed column that the table does not have, marked, instead of dropping it", async () => {
@@ -269,11 +272,14 @@ describe("QualityRuleCreatePage table and column pickers (WEB-8 D8)", () => {
     fireEvent.change(screen.getByLabelText("Column"), { target: { value: "old_name" } })
     await pickTable("silver.orders")
     await waitFor(() =>
-      expect(screen.getByLabelText("Column")).toHaveProperty("tagName", "SELECT")
+      expect(screen.getByRole("combobox", { name: "Column" })).toBeTruthy()
     )
-    const column = screen.getByLabelText("Column") as HTMLSelectElement
-    expect(column.value).toBe("old_name")
-    expect(Array.from(column.options).map((o) => o.textContent)).toContain("old_name (not in this table)")
+    const column = screen.getByRole("combobox", { name: "Column" })
+    expect(column.querySelector('[data-slot="select-value"]')?.textContent).toBe(
+      "old_name (not in this table)"
+    )
+    fireEvent.click(column)
+    expect(screen.getByRole("option", { name: "old_name (not in this table)" })).toBeTruthy()
   })
 
   it("is free text when the catalog cannot be read, and says why", async () => {
