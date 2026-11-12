@@ -30,7 +30,7 @@ import {
 import {
   activeParameters,
   fieldsNamedBy,
-  missingRequiredValue,
+  firstMissingValueName,
   paramInputs,
   reconcileDefinitions,
   replaceDefinition,
@@ -207,6 +207,12 @@ type Batch = {
   runId: string | null
   engine: QueryEngine
 }
+
+/**
+ * How many Bronze tables are proven at once when the list loads (LH-QS-4-08).
+ * Four keeps a long list moving without a burst of requests from one page.
+ */
+const MAX_PROOF_READS = 4
 
 /**
  * The name a new tab gets: the first "Query N" nobody is using, so a name
@@ -616,17 +622,38 @@ export function useQueryStudio(draftKey: string | null) {
     setColumns((previous) => ({ ...previous, [id]: state }))
   }, [])
 
-  // Fetches one table's columns and keeps what came back.
+  // The Iceberg table itself: a Bronze table's Trino name is offered only
+  // once the table is proven to be there, and only a read that answered
+  // "not found" proves it is not (QS-4 D3). Any other rejection failed, and
+  // is held as failed so the entry offers a retry instead of a false "not
+  // there" (#448 review SHOULD-FIX). The promise settles when the proof is
+  // kept, which is what the list-load queue below waits for.
+  const readProof = React.useCallback(
+    (id: string, bronzeTable: string): Promise<void> =>
+      lakehouseService.getTableDetail(BRONZE_NAMESPACE, bronzeTable).then(
+        () => rememberProof(id, { status: "there" }),
+        (error: unknown) =>
+          rememberProof(
+            id,
+            toServiceError(error).code === "not_found" ? { status: "missing" } : { status: "failed" }
+          )
+      ),
+    [rememberProof]
+  )
+
+  // Fetches one table's columns and keeps what came back. The promise
+  // settles once the columns, and for a Bronze table its proof, are kept; it
+  // never rejects.
   //
   // The tenant gate answers a refusal with `200` and a body that has no
   // `schema`, so a refusal is read before the schema is. Without that, the
   // `.map` below threw inside the handler and the table stayed "loading"
   // for good.
   const fetchColumns = React.useCallback(
-    (id: string) => {
+    (id: string): Promise<void> => {
       rememberColumns(id, { status: "loading" })
-      void assetService.getAsset(id).then(
-        (detail) => {
+      return assetService.getAsset(id).then(
+        (detail): Promise<void> | void => {
           const refusal = catalogRefusal(detail)
           if (refusal) {
             rememberColumns(id, { status: "failed", reason: refusal.reason })
@@ -635,32 +662,14 @@ export function useQueryStudio(draftKey: string | null) {
           // A slug id names no table, so the answer is asked for the SQL
           // form; an id that already reads as one keeps being the
           // reference and the answer is not read for names.
+          let proving: Promise<void> | undefined
           if (!SQL_TABLE_NAME.test(id)) {
             const bronzeTable = isIcebergCandidate(detail) ? (detail.tableName ?? null) : null
             setTargets((previous) => ({
               ...previous,
               [id]: { target: assetQueryTarget(detail), bronzeTable },
             }))
-            // The Iceberg table itself: a Bronze table's Trino name is
-            // offered only once the table is proven to be there, and only
-            // a read that answered "not found" proves it is not (QS-4 D3).
-            // Any other rejection failed, and is held as failed so the
-            // entry offers a retry instead of a false "not there" (#448
-            // review SHOULD-FIX).
-            if (bronzeTable) {
-              void lakehouseService
-                .getTableDetail(BRONZE_NAMESPACE, bronzeTable)
-                .then(
-                  () => rememberProof(id, { status: "there" }),
-                  (error: unknown) =>
-                    rememberProof(
-                      id,
-                      toServiceError(error).code === "not_found"
-                        ? { status: "missing" }
-                        : { status: "failed" }
-                    )
-                )
-            }
+            if (bronzeTable) proving = readProof(id, bronzeTable)
           }
           rememberColumns(id, {
             status: "ready",
@@ -669,13 +678,14 @@ export function useQueryStudio(draftKey: string | null) {
               dataType: column.dataType,
             })),
           })
+          return proving
         },
         // The request failed: the table is kept as a failure, and the
         // editor says so instead of asking again.
         () => rememberColumns(id, { status: "failed" })
       )
     },
-    [rememberColumns, rememberProof]
+    [rememberColumns, readProof]
   )
 
   React.useEffect(() => {
@@ -685,9 +695,57 @@ export function useQueryStudio(draftKey: string | null) {
       // named twice is fetched once, and a table that failed is not asked
       // for again on a keystroke.
       if (named.id in columnsRef.current) continue
-      fetchColumns(named.id)
+      void fetchColumns(named.id)
     }
   }, [sql, tables, assetsState.status, fetchColumns])
+
+  // Bronze rows are proven when the list loads (LH-QS-4-08), so a
+  // Bronze row is insertable on a Trino tab without being expanded. It is
+  // the read `fetchColumns` makes for a table a statement names, through the
+  // same caches, so a table is read once however it was asked for. A
+  // ClickHouse tab offers no Bronze name, so it reads nothing here, and a
+  // keystroke reads nothing beyond the statement's own tables.
+  //
+  // At most `MAX_PROOF_READS` rows are read at a time, taken in list order
+  // from a queue: a catalog with hundreds of Bronze tables would otherwise
+  // open hundreds of requests at once from one page, and a row waiting its
+  // turn is simply not insertable yet, which is what a row being proven
+  // already is. The queue and the counter live in refs because they outlive
+  // any one run of the effect; leaving the Trino tab stops the pump, and
+  // coming back starts it again.
+  const proofQueueRef = React.useRef<string[]>([])
+  const proofReadsRef = React.useRef(0)
+  const onTrinoTabRef = React.useRef(false)
+  const pumpProofReads = React.useCallback(() => {
+    while (
+      onTrinoTabRef.current &&
+      mountedRef.current &&
+      proofReadsRef.current < MAX_PROOF_READS
+    ) {
+      const id = proofQueueRef.current.shift()
+      if (id === undefined) return
+      // A statement or an expand may have asked for it while it waited.
+      if (id in columnsRef.current) continue
+      proofReadsRef.current += 1
+      void fetchColumns(id).finally(() => {
+        proofReadsRef.current -= 1
+        pumpProofReads()
+      })
+    }
+  }, [fetchColumns])
+  React.useEffect(() => {
+    onTrinoTabRef.current = engine === "trino"
+    if (engine !== "trino" || assetsState.status !== "success") return
+    for (const asset of assetsState.data) {
+      // A SQL-named id is its own reference, and only a Bronze layer has a
+      // table to prove; the same test the rows use before their detail loads.
+      if (SQL_TABLE_NAME.test(asset.id)) continue
+      if (asset.layer !== "raw" && asset.layer !== "bronze") continue
+      if (asset.id in columnsRef.current || proofQueueRef.current.includes(asset.id)) continue
+      proofQueueRef.current.push(asset.id)
+    }
+    pumpProofReads()
+  }, [engine, assetsState.status, assetsState.data, pumpProofReads])
 
   // The schema browser asks for a table's columns when a person expands it.
   // It shares the cache above, so a table the statement already named is not
@@ -705,7 +763,7 @@ export function useQueryStudio(draftKey: string | null) {
       ) {
         return
       }
-      fetchColumns(id)
+      void fetchColumns(id)
     },
     [fetchColumns, proofs]
   )
@@ -944,29 +1002,41 @@ export function useQueryStudio(draftKey: string | null) {
     [estimateDefinitions, parameterValues]
   )
   // A name with no value and no default would only be refused ("Fill in
-  // ..."). The estimate waits for it instead, and the panel says what it
-  // says for an empty editor. SQL with no placeholder is never held back.
-  const estimateWaits = missingRequiredValue(estimateDefinitions, parameterValues)
+  // ..."). The estimate waits for it instead, and the panel names it
+  // (QS-5-AC14). SQL with no placeholder is never held back.
+  const estimateWaitsFor = firstMissingValueName(estimateDefinitions, parameterValues)
+  const estimateWaits = estimateWaitsFor !== null
   const estimatable = targetStatement !== null && !estimateWaits
-  // Review round 1, R2 (QS-6): the estimate on screen belongs to the engine
-  // that was asked for. Until the new answer arrives the panel would draw
-  // the other engine's sources under this tab's engine label
-  // (`LH-QS-4-08`), so a changed engine drops it and shows the skeleton.
-  const estimateEngineRef = React.useRef<QueryEngine | null>(null)
+  // Only ClickHouse has an estimate: the server runs `EXPLAIN ESTIMATE`,
+  // which a Trino statement is not valid in, so asking for one on a Trino
+  // tab got a refusal that read as the query's fault (`LH-QS-4-08`).
+  // The merge with `main` (#482) kept this gate over this branch's engine
+  // bookkeeping: a Trino tab asks nothing and drops what an earlier
+  // ClickHouse statement left, so no answer for another engine shows.
+  const estimateSupported = engine === "clickhouse"
   React.useEffect(() => {
-    if (estimateEngineRef.current !== null && estimateEngineRef.current !== engine) {
+    if (!estimateSupported) {
+      // Drop what an earlier ClickHouse statement left: an ask in flight, a
+      // pending debounced ask, and the estimate on screen. The skip input
+      // replaces the pending debounced ask; the reset acts now, so no
+      // answer for another engine shows after the switch.
+      estimateDebounced("", null, engine)
       resetEstimate()
+      return
     }
-    estimateEngineRef.current = engine
     // A buffer holding only the starter comment has nothing to estimate,
     // and asking anyway put an EXPLAIN ESTIMATE on ClickHouse for every
     // keystroke, including the ones that typed the comment.
-    if (targetText !== null) {
-      estimateDebounced(targetText, estimateWaits ? null : estimateInputs, engine)
-    }
-    // `engine` is a dependency: the same statement on another engine has a
-    // different answer (`QS-6`, decision 7), so switching the tab asks again.
-  }, [targetText, estimateWaits, estimateInputs, engine, estimateDebounced, resetEstimate])
+    if (targetText !== null) estimateDebounced(targetText, estimateWaits ? null : estimateInputs, engine)
+  }, [
+    estimateSupported,
+    engine,
+    targetText,
+    estimateWaits,
+    estimateInputs,
+    estimateDebounced,
+    resetEstimate,
+  ])
 
   // ── Actions ──────────────────────────────────────────────────────────
   /**
@@ -1571,6 +1641,8 @@ export function useQueryStudio(draftKey: string | null) {
     completionSource,
     editorExtensions,
     estimatable,
+    estimateWaitsFor,
+    estimateSupported,
     generateAct,
     estimateAct,
     savedState,
@@ -1596,7 +1668,7 @@ export function useQueryStudio(draftKey: string | null) {
     runQuery,
     runSelectionOrAll,
     reEstimate: () => {
-      if (targetText !== null && !estimateWaits) {
+      if (estimateSupported && targetText !== null && !estimateWaits) {
         void runEstimate(targetText, estimateInputs, engine)
       }
     },

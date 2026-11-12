@@ -237,6 +237,33 @@ describe("QueryStudioPage saved-query link", () => {
   })
 })
 
+describe("QueryStudioPage estimate panel", () => {
+  it("says there is no estimate for a Trino tab and leaves the Estimate button with nothing to do (LH-QS-4-08)", async () => {
+    stubNetwork()
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const estimateSpy = queryService.estimate as unknown as { mock: { calls: unknown[] } }
+    renderPage()
+
+    expect(await screen.findByText("No pre-run estimate for Trino queries.")).toBeTruthy()
+    expect(screen.queryByText("This query cannot be planned")).toBeNull()
+    expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
+    const estimate = screen.getByRole("button", { name: "Estimate" })
+    expect((estimate as HTMLButtonElement).disabled).toBe(true)
+    expect(estimate.getAttribute("title")).toBe("No pre-run estimate for Trino queries.")
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    expect(estimateSpy.mock.calls.length).toBe(0)
+  })
+
+  it("names the parameter the estimate waits for (QS-5-AC14)", async () => {
+    stubNetwork()
+    seedDraft("SELECT {{region}}")
+    renderPage()
+
+    expect(await screen.findByText("Fill in {{region}} for a pre-run estimate.")).toBeTruthy()
+    expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
+  })
+})
+
 describe("QueryStudioPage statements", () => {
   it("disables the actions that work on one statement when the tab holds several", async () => {
     stubNetwork()

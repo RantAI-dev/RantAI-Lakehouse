@@ -235,6 +235,8 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
           <QueryTransparencyPanel
             state={studio.estimateAct}
             estimatable={studio.estimatable}
+            estimateSupported={studio.estimateSupported}
+            waitingFor={studio.estimateWaitsFor}
             onRetry={studio.reEstimate}
           />
           <SavedQuickList state={studio.savedState} onLoadSql={studio.loadSql} />
