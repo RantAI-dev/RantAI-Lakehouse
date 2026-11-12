@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { KafkaAuth, KafkaDial } from "@/services/contracts/connectors"
@@ -120,18 +121,15 @@ export function KafkaDialForm({
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="kafka-dial-auth-type">Auth type</Label>
-          <select
+          {/* WEB-9 D3: exactly the two auth variants, labelled with the API's
+              own words, as the option text was. */}
+          <SelectField
             id="kafka-dial-auth-type"
-            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+            className="w-full"
             value={dial.auth.type}
-            onChange={(e) => set("auth", defaultAuth(e.target.value as KafkaAuth["type"]))}
-          >
-            {AUTH_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
+            options={AUTH_TYPES.map((t) => ({ value: t, label: t }))}
+            onValueChange={(next) => set("auth", defaultAuth(next as KafkaAuth["type"]))}
+          />
         </div>
         {dial.auth.type === "sasl_plain" ? (
           <div className="space-y-1.5 sm:col-span-2">

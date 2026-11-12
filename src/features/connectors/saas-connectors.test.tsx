@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import type { ConnectorType, SaasDial } from "@/services/contracts/connectors"
 import { SAAS_VENDORS } from "@/lib/connectors/saas-vendors"
 import { targetChanged } from "@/lib/connectors/target-identity"
@@ -37,16 +38,20 @@ describe("SaasDialForm", () => {
 
   it("offers the integration credential only where the vendor has one (not Salesforce)", () => {
     render(<SaasDialForm typeName="Salesforce" value={null} onChange={mock()} />)
+    // WEB-9 D5: the choices live in the opened list now, so it is opened
+    // before asking what it offers.
+    fireEvent.click(screen.getByLabelText("How it signs in"))
     expect(screen.queryByRole("option", { name: "An integration credential" })).toBeNull()
     cleanup()
     render(<SaasDialForm typeName="Zendesk" value={null} onChange={mock()} />)
+    fireEvent.click(screen.getByLabelText("How it signs in"))
     expect(screen.getByRole("option", { name: "An integration credential" })).toBeDefined()
   })
 
   it("switches to an integration credential and back, keeping the account", () => {
     const onChange = mock()
     render(<SaasDialForm typeName="Zendesk" value={oauth("zendesk")} onChange={onChange} />)
-    fireEvent.change(screen.getByLabelText("How it signs in"), { target: { value: "integration" } })
+    chooseOption(screen.getByLabelText("How it signs in"), "An integration credential")
     expect(onChange.mock.calls[0][0]).toEqual(integration("zendesk"))
   })
 
@@ -58,7 +63,8 @@ describe("SaasDialForm", () => {
     cleanup()
     const switched = mock()
     render(<SaasDialForm typeName="NetSuite" value={{ ...integration("netsuite"), certificateId: "cert-1" }} onChange={switched} />)
-    fireEvent.change(screen.getByLabelText("How it signs in"), { target: { value: "browser" } })
+    // WEB-9 D5: the browser sign-in is chosen by the label a person reads.
+    chooseOption(screen.getByLabelText("How it signs in"), /browser window/)
     expect(switched.mock.calls[0][0]).not.toHaveProperty("certificateId")
     cleanup()
     render(<SaasDialForm typeName="Zendesk" value={integration("zendesk")} onChange={mock()} />)
