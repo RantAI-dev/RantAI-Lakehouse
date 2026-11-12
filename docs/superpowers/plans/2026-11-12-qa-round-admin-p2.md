@@ -884,4 +884,187 @@ None of these blocks the plan.
 
 ## 5. Handoff
 
+Branch `fix/qa-round-admin-p2`, pushed after every commit. Twelve commits, one
+per task, in the plan's order:
+
+| Task | Commit | Title |
+| --- | --- | --- |
+| T1 | `e73f546a` | fix(audit): an event nobody signed in caused names what caused it (T1) |
+| T2 | `fb31cb86` | fix(audit): the list never gives an event nobody signed in to the assistant (T2) |
+| T3 | `6ad87107` | fix(routes): a method no route has answers 405, an unknown address 404 (T3) |
+| T4 | `efd5bc7b` | fix(sessions): a sign-in records the browser; session times are RFC 3339 (T4) |
+| T5 | `b0a3a1c8` | fix(quality): running a rule by hand needs governance:write (T5) |
+| T6 | `8f888a54` | feat(identity): Data Engineer holds catalog:read (T6) |
+| T7 | `e6f0ec55` | feat(catalog): a query:read grant on a table opens that table's page (T7) |
+| T8 | `a413b9b6` | fix(sessions): the page shows the expiry and the browser (T8) |
+| T9 | `25603c52` | fix(login): the lock message is one sentence (T9) |
+| T10 | `f9853b7a` | fix(quality): Run is shown only with governance:write (T10) |
+| T11 | `3360599a` | feat(nav): the console opens a table's page for query:read too (T11) |
+| T12 | `ec3fc3e5` | docs: what is now true for the audit actor, 405/404, sessions, Run, a grant (T12) |
+
+### Migration number
+
+`rust/migrations/0138_data_engineer_catalog_read.sql`. On `main`
+(`git ls-tree --name-only origin/main rust/migrations/ | tail -3`) the highest is
+`0136_sso_trust_email.sql`; `0137` is planned by the unmerged sibling branch
+`fix/qa-round-connectors-p1`, so this slice took `0138` and left `0137` free,
+as the plan's T6 and the task brief both say.
+
+### Commands run, with counts
+
+Final commit (`ec3fc3e5`), in the foreground, from `rust/` with
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2 CARGO_BUILD_JOBS=6`:
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | no diff |
+| `cargo clippy -p lakehouse-store -p lakehouse-auth -p lakehouse-api --all-targets -- -D warnings` | `Finished` on all three crates |
+| `cargo test -p lakehouse-api --lib route_policy_tests` | `5 passed; 0 failed; 3492 filtered out` |
+| `cargo test -p lakehouse-api --lib sample_masking` | `11 passed; 0 failed; 3486 filtered out` |
+| `cargo test -p lakehouse-api --test route_auth` | `93 passed; 0 failed` |
+| `cargo test -p lakehouse-api --test login_throttle` | `10 passed; 0 failed` |
+| `cargo test -p lakehouse-api --test catalog_grants` | `13 passed; 0 failed` |
+| `cargo test -p lakehouse-api --test public_links` | `16 passed; 0 failed` |
+| `cargo test -p lakehouse-api --test quality_incidents` | `8 passed; 0 failed` |
+| `cargo test -p lakehouse-api --test permission_catalog` | `2 passed; 0 failed; 1 ignored` |
+| `cargo test -p lakehouse-store --test sessions` | `10 passed; 0 failed` |
+| `cargo test -p lakehouse-store --test identity` | `32 passed; 0 failed` |
+| `cargo test -p lakehouse-auth --test oidc` | `35 passed; 0 failed` |
+| `bun run typecheck` | no errors |
+| `bun run lint` | `0 errors`, `11 warnings` (all pre-existing) |
+| `bun run test` | `4001 pass; 1 skip; 0 fail; 11988 expect() calls; 4002 tests across 380 files` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `git status` | nothing untracked or generated |
+
+Per commit, only what the commit touched:
+
+- T1: `cargo test -p lakehouse-api --test login_throttle` (8 passed),
+  `--test public_links` (16), `cargo test -p lakehouse-auth --test oidc` (35);
+  `cargo clippy` on `lakehouse-store`, `lakehouse-auth`, `lakehouse-api`.
+- T2: `--lib actor_kind_of_narrows_copilot_principal_kinds_to_agent`,
+  `--lib source_of_follows_the_principal_kind`,
+  `--lib actor_of_names_the_label_then_the_id_then_the_assistant_only_for_a_copilot_event`
+  (1 passed each); `--test login_throttle` (9 passed); clippy `lakehouse-api`.
+- T3: `--lib route_policy_tests` (5 passed, 339 s),
+  `--lib removed_agent_endpoints_answer_like_an_unknown_path` (1);
+  `--test route_auth` (90 at this commit), later 91/92/93 as T5–T7 added theirs.
+- T4: `--lib the_session_user_agent` (2 passed),
+  `--lib oidc_callback_with_a_matching_state_and_nonce_creates_a_session_and_redirects`
+  (1); `--test login_throttle` (10); `lakehouse-store --test sessions` (10);
+  clippy `lakehouse-store`, `lakehouse-api`.
+- T5: `--lib running_a_quality_rule_by_hand_needs_governance_write` (1);
+  `--test route_auth` (91); `--test quality_incidents` (8).
+- T6: `lakehouse-store --test identity` (32); `--test route_auth` (92).
+- T7: `--lib sample_masking` (11); `--test catalog_grants` (13);
+  `--test route_auth` (93); `--test permission_catalog` (2 passed, 1 ignored).
+- T8: `bun test src/features/admin/sessions-page.test.tsx` (5 pass).
+- T9: `bun test src/features/auth/login-page.test.tsx` (5 pass).
+- T10: `bun test` on `data-quality-page.test.tsx`, `asset-detail-tabs.test.tsx`,
+  `quality-rule-create-page.test.tsx` (191 pass).
+- T11: `bun test src/components/app-shell/nav-config.test.ts` (11 pass).
+- T12: documents only; the two lint scripts above.
+
+The `405` carries axum's `Allow` header. Observed with a temporary print in
+`a_method_no_handler_serves_answers_405_with_the_fixed_sentence`:
+`GET,HEAD` for `DELETE /health` and `POST /api/dashboard`, `PUT` for both
+target-lag requests, `GET,HEAD` for `POST /api/governance/quality/incidents`
+and `GET,HEAD,PUT,DELETE` for `PATCH /api/reports/subscriptions/x`. Nothing
+asserts it and nothing sets it by hand (the fallback's own body is the fixed
+sentence), as the plan says.
+
+### Tests added, and how each failed before its fix
+
+Each failure was produced by stashing the source files of that task and
+running the test against the previous code (or, for T6, by removing the
+migration's `UPDATE` and leaving its header), then restoring.
+
+- T1, `the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_password`
+  (extended): `assertion left == right failed: the lock names the sign-in form
+  as its cause; left: None; right: Some("Sign-in form")`.
+- T1, `five_wrong_passwords_lock_the_link_and_a_locked_link_says_so`
+  (extended): `left: None; right: Some("Public link")`.
+- T1, `an_unconfirmed_email_is_refused_for_an_existing_account` (extended):
+  `left: None; right: Some("Single sign-on")`.
+- T2, `a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assistants`:
+  `left: String("agent"); right: "service"`.
+- T2, `actor_of_names_the_label_then_the_id_then_the_assistant_only_for_a_copilot_event`
+  (new); `actor_kind_of_narrows_copilot_principal_kinds_to_agent` and
+  `source_of_follows_the_principal_kind` changed their last line from the old
+  fallback (`"agent"`, `"copilot"`) to the new exact value — rule 2, said in
+  the test comments and the commit body.
+- T3, `a_signed_in_person_gets_405_for_a_method_no_route_has_and_404_for_an_unknown_address`:
+  `assertion left == right failed: DELETE /health has no handler; left: 500;
+  right: 405`.
+- T3, `a_handler_that_is_not_in_the_policy_table_answers_500_and_is_never_served`
+  replaces `an_unregistered_route_denies_by_default_instead_of_serving_public`
+  (rule 2: the old one proved it with `DELETE /health`, which is now a 405).
+  New: `a_method_no_handler_serves_answers_405_with_the_fixed_sentence`,
+  `an_address_no_route_matches_answers_404_with_the_fixed_sentence`,
+  `a_route_registered_for_any_method_stays_behind_the_gate`.
+- T4, `a_sign_in_records_the_browser_and_creates_exactly_one_session`:
+  `left: None; right: Some("QA-Browser/1.0")`.
+- T4, `session_times_travel_as_rfc_3339_in_utc`: `left:
+  "2026-11-12 09:42:13.123+00"; right: "2026-11-12T09:42:13.123Z"`.
+- T4, `the_session_user_agent_is_the_header_trimmed_and_cut_to_512_characters`
+  and `the_session_user_agent_is_nothing_for_an_absent_empty_or_non_ascii_header`
+  (new); the single sign-on round-trip test now sends `user-agent:
+  QA-Browser/1.0` and asserts the session row.
+- T5, `running_a_quality_rule_by_hand_is_gated_in_both_directions`:
+  `assertion left == right failed: a viewer may not run a rule by hand;
+  left: 404; right: 403`. Also `running_a_quality_rule_by_hand_needs_governance_write`.
+- T6, `the_data_engineer_role_holds_catalog_read_exactly_once_even_when_the_migration_runs_again`:
+  `left: 0; right: 1`, with Data Engineer's permissions printed as
+  `pipeline:*, catalog:write, connector:manage, workload:cancel, alert:write,
+  ingest:read,assistant:use,ops:read,alert:read,governance:read`. Also
+  `a_seeded_data_engineer_may_read_the_catalog`.
+- T7, `a_query_read_grant_on_a_table_opens_that_tables_page_and_no_other`:
+  `a query:read grant from silver.orders must open it, got 403 Forbidden:
+  {"error":"permission_denied: catalog:read"}`. Also
+  `detail_admits_a_person_granted_query_read_on_that_table_and_masks_what_they_read`,
+  `a_revoked_or_expired_grant_no_longer_opens_the_page`,
+  `a_grant_of_another_permission_does_not_open_the_page` and
+  `the_asset_page_route_is_gated_in_both_directions`.
+- T8, `shows when a session expires as a time and as the time left` and
+  `shows the browser a session was created from and says when nothing was
+  recorded`: both fail on the reverted page (the first on `in 12h`, the second
+  on `QA-Browser/1.0` and the three "Not recorded" cells).
+- T9, `shows one sentence with the wait in whole minutes on a 429` (renamed and
+  rewritten, rule 2) and `says about one minute for a wait of 60 seconds` fail
+  on the reverted page; `shows the server's sentence when a 429 carries no wait`
+  is new and passes both ways.
+- T10, `hides Run check for a person who may only read governance`,
+  `does not try the first run for a person without governance:write` (new) and
+  the two rewritten tests (`asset-detail-tabs`' Add rule test and
+  `quality-rule-create-page`'s threshold test) fail with the four source files
+  reverted.
+- T11, `opens a table's page for query:read, and not the catalog`: fails on the
+  reverted `nav-config.ts`.
+
+### Notes for the reviewer
+
+- `cargo fmt` also rewrapped one existing `if let (Some(detail), Some(o)) = …`
+  line in `routes/governance.rs` (T2's commit). It is a formatting change in a
+  file T2 touched, not a behaviour change.
+- `sqlx::migrate!` embeds the migration set at compile time of
+  `lakehouse-store`, so after adding `0138` the api integration harness kept
+  its old set until that crate was recompiled (`touch
+  crates/lakehouse-store/src/lib.rs`, no content change). Worth knowing for the
+  reviewer's own run.
+- The Postgres testcontainer (`org.rantai.lakehouse-test-support`, id
+  `ca1ffac89342`) was already running when this slice started (`docker ps -a`
+  said "Up 2 hours") and is left in place, as section 3a says.
+- No `MISMATCH`: every anchor in the plan was found, by its text where a line
+  number had moved.
+
+### Not verified
+
+- `cargo test --workspace` — *not verified locally, CI* (the plan's section 3
+  puts the full run on the pull request). The per-crate and per-test runs above
+  are what ran here.
+- `cargo test --doc` — *not verified*: not in section 3's block.
+- x86_64 CI — *not verified*: this machine is ARM64.
+- `docker compose` — *not run, not needed*: no compose file changed.
+- `pytest` / `dispar_orchestrate` — *not run, not needed*: no Python changed.
+
 ## 6. Review
