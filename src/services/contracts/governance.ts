@@ -271,6 +271,12 @@ export type AuditEvent = {
   estimatedCost?: number
   actualCost?: number
   approvalId?: string
+  /**
+   * One sentence on what the action did, set by `routes::governance` for a
+   * catalog grant or revoke ("Granted query:read to Name <email> until
+   * 2026-12-06"); absent for other actions (QA LH-DATA-15-03 F1, plan D9).
+   */
+  detail?: string
 }
 
 export type CreatePolicyInput = {

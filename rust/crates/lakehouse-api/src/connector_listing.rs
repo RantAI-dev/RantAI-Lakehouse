@@ -1030,6 +1030,25 @@ async fn list_s3(
     Ok(Listing { objects, truncated })
 }
 
+/// The format a preview reads `key` as: what the object's extension says,
+/// case-insensitively, and the connector's configured format only when the
+/// extension says nothing (QA LH-SRC-13-01 F1, plan D10). A `.parquet` object
+/// on a connector set to CSV used to be read as text, so its binary footer
+/// came back as column names. `.json`, `.jsonl` and `.ndjson` map to
+/// [`FilesFormat::Json`], which the preview answers as not supported. Only
+/// the preview chooses this way; the load path reads the configured format.
+fn format_for(key: &str, configured: FilesFormat) -> FilesFormat {
+    let extension = key
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("parquet") => FilesFormat::Parquet,
+        Some("csv") => FilesFormat::Csv,
+        Some("json" | "jsonl" | "ndjson") => FilesFormat::Json,
+        _ => configured,
+    }
+}
+
 /// The columns of one file (D6): a CSV from its head, a Parquet from its
 /// footer — and the footer is read by the child, from the file's tail
 /// (`SEC-55` D1, `SEC-22` P1).
@@ -1049,6 +1068,8 @@ async fn preview_s3(
     let path = ObjectPath::parse(key).map_err(|_| ErrorClass::Failed)?;
     let fail = |err: object_store::Error| logged("an S3 read", class_of_object_store(&err));
     let size = client.head(&path).await.map_err(fail)?.size;
+    // QA LH-SRC-13-01 F1 (plan D10): the object's own extension wins.
+    let format = format_for(key, format);
     match format {
         FilesFormat::Csv => {
             let end = size.min(CSV_HEAD_BYTES);
@@ -1248,6 +1269,27 @@ mod tests {
     /// a conversion would start (`SEC-55` D5 passes the runner through).
     fn unused_runner() -> ConversionRunner {
         ConversionRunner::new(std::path::PathBuf::from("unused"), 1, 64)
+    }
+
+    /// QA LH-SRC-13-01 F1 (plan D10): a preview reads an object by its
+    /// extension, in any case, and falls back to the configured format.
+    #[test]
+    fn a_preview_reads_an_object_by_its_extension_and_falls_back_to_the_configured_format() {
+        let cases = [
+            ("sales/a.parquet", FilesFormat::Csv, FilesFormat::Parquet),
+            ("sales/A.PARQUET", FilesFormat::Csv, FilesFormat::Parquet),
+            ("sales/a.csv", FilesFormat::Parquet, FilesFormat::Csv),
+            ("sales/a.CSV", FilesFormat::Json, FilesFormat::Csv),
+            ("sales/a.json", FilesFormat::Csv, FilesFormat::Json),
+            ("sales/a.jsonl", FilesFormat::Csv, FilesFormat::Json),
+            ("sales/a.NDJSON", FilesFormat::Csv, FilesFormat::Json),
+            ("sales/a.txt", FilesFormat::Parquet, FilesFormat::Parquet),
+            ("sales/noextension", FilesFormat::Csv, FilesFormat::Csv),
+            ("sales.parquet/data", FilesFormat::Csv, FilesFormat::Csv),
+        ];
+        for (key, configured, expected) in cases {
+            assert_eq!(format_for(key, configured), expected, "{key}");
+        }
     }
 
     fn globs(pattern: &str) -> Glob {

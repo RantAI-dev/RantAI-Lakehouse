@@ -196,6 +196,35 @@ describe("OpenFormatCard", () => {
     expect(switchEl.hasAttribute("data-disabled")).toBe(true)
   })
 
+  it("makes no request for the publish history when the person may not edit", async () => {
+    // QA LH-DATA-1-02 (plan D7): those routes need gold:export, and a 401
+    // from them signed the person out. A read-only publication asks for the
+    // publication and the readers only.
+    const urls: string[] = []
+    mockApi((url) => {
+      urls.push(url)
+      if (url.includes("/publication")) {
+        return jsonResponse({ ...publicationBody, canEdit: false })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText(/gold:export/)).toBeDefined())
+    // Let any request the card would still send go out before looking.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(urls.some((u) => u.includes("/api/gold/exports"))).toBe(false)
+    expect(
+      urls.some(
+        (u) =>
+          u.includes("/api/gold/export/mart_a") &&
+          !u.includes("/publication") &&
+          !u.includes("/exports"),
+      ),
+    ).toBe(false)
+    expect(screen.queryByText("Last 5 publish runs")).toBeNull()
+  })
+
   it("leaves the switch off after a failed PUT and shows the server's error", async () => {
     // PR slice D review D-S2: render from toggle.status === "error",
     // not from a stale closure capture of toggle.error. The returned
@@ -280,7 +309,8 @@ describe("OpenFormatCard", () => {
     await waitFor(() =>
       expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
     )
-    expect(screen.getByText("Last published")).toBeDefined()
+    // PR #456 CI: the history is read only after the publication loads (plan D7), so wait for it.
+    expect(await screen.findByText("Last published")).toBeDefined()
     expect(screen.getByText("Publishing is off; this copy is no longer updated.")).toBeDefined()
   })
 

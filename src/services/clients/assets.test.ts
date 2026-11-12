@@ -63,3 +63,33 @@ describe("clickhouseAssetService.setCertification", () => {
     expect(err.code).toBe("permission_denied")
   })
 })
+
+describe("clickhouseAssetService.getAsset", () => {
+  // QA LH-DATA-13-03 / LH-DATA-15-03 F4 (plan D8): the status picks the kind
+  // the asset page shows; it used to be "not_found" for every failure.
+  it("throws permission_denied on a 403", async () => {
+    stubFetch(() => json({ error: "permission_denied: catalog:read" }, 403))
+    const err = await clickhouseAssetService.getAsset("silver.orders").catch((e) => e)
+    expect(err).toBeInstanceOf(ServiceError)
+    expect(err.code).toBe("permission_denied")
+  })
+
+  it("throws unavailable on a 503 and keeps the API's sentence", async () => {
+    stubFetch(() => json({ error: "This table's details could not be read right now. Reference: abc" }, 503))
+    const err = await clickhouseAssetService.getAsset("silver.orders").catch((e) => e)
+    expect(err.code).toBe("unavailable")
+    expect(err.message).toContain("could not be read right now")
+  })
+
+  it("throws not_found on a 404", async () => {
+    stubFetch(() => json({ error: "Asset not found" }, 404))
+    const err = await clickhouseAssetService.getAsset("silver.orders").catch((e) => e)
+    expect(err.code).toBe("not_found")
+  })
+
+  it("still names the failure when the body is not JSON", async () => {
+    stubFetch(() => new Response("bad gateway", { status: 502 }))
+    const err = await clickhouseAssetService.getAsset("silver.orders").catch((e) => e)
+    expect(err.code).toBe("unavailable")
+  })
+})

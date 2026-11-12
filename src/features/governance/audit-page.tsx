@@ -22,7 +22,7 @@ import { governanceService } from "@/services"
 import type { AuditEvent } from "@/services/contracts/governance"
 import { getAuditColumns } from "./audit-columns"
 
-function EventDetail({ event }: { readonly event: AuditEvent }) {
+export function EventDetail({ event }: { readonly event: AuditEvent }) {
   return (
     <>
       <div className="flex flex-wrap items-center gap-2">
@@ -48,6 +48,9 @@ function EventDetail({ event }: { readonly event: AuditEvent }) {
           { label: "Action", value: event.action },
           { label: "Resource", value: event.resource },
           { label: "Policy decision", value: event.policyDecision },
+          // QA LH-DATA-15-03 F1 (plan D9): a grant's entry says who got
+          // which permission; only the rows that carry a detail show it.
+          ...(event.detail ? [{ label: "Detail", value: event.detail }] : []),
           ...(event.engineCategory
             ? [
                 {

@@ -383,3 +383,201 @@ both extended tests fail. The ones that pass on the base are the controls the pl
 No BLOCKER. R1–R4 go back to the developer (rule 13: cite `QA fails part A review R<n>` at each
 fix site and in the commit body). R1 and R2 should land before the owner's browser QA of
 LH-DATA-18-08, since R1 is on that case's own path.
+
+## 7. Slice 2: the API side (Rust, with the console change each one needs)
+
+Same branch (`fix/qa-fails-part-a`, draft PR #453), on top of `b06fe132`. Anchors verified on
+that commit (the Rust files are unchanged since `46b1cc05`). Four QA findings, all
+"still broken in code" in the triage of 2026-11-10. Developer: another agent (not Opus); the
+planner reviews as in slice 1.
+
+### 7.1 Decisions
+
+- **D6. A signed-in person without `gold:export` is forbidden, not signed out (LH-DATA-1-02).**
+  Today `check_export_token` (`rust/crates/lakehouse-api/src/routes/gold.rs:202`) answers `401`
+  whenever `GOLD_EXPORT_RUN_TOKEN` is set and the caller presents no matching token, and the
+  console reads every `401` as an expired session (`src/services/http.ts:105-106`), so the Gold
+  asset page of an Analyst loops between the page and `/login`. New rule, in the configured-token
+  branch only: when the caller presented **no** token (header and query both `None`) and the
+  principal is a `PrincipalId::User` (`rust/crates/lakehouse-auth/src/principal.rs:24`) without
+  `gold:export`, answer `ApiError::Forbidden` (403). Unchanged: a token that is presented and
+  wrong is still `401` (the unit test
+  `configured_token_rejects_an_unpermissioned_session_presenting_the_wrong_token`,
+  `gold.rs:1250`, stays as it is); a service principal and the no-token-configured branch
+  (`503`) are unchanged. Fail closed still holds: nobody gets in who did not before.
+- **D7. The console stops asking for what it may not read (LH-DATA-1-02).** In
+  `src/features/catalog/open-format-card.tsx`, `LastFiveRuns` (`:35`, `listExportRuns`) and
+  the `getLastExport` call (`:138`) run only when the publication says `canEdit`; for anyone
+  else the card shows the publication state and the existing read-only note (`:200`) and no
+  publish history. `http.ts` is not changed.
+- **D8. A ClickHouse failure on an asset page is "unavailable", not "not found" (LH-DATA-13-03,
+  LH-DATA-15-03 F4).** `clickhouse_asset_detail` (`rust/crates/lakehouse-api/src/routes/catalog.rs:2472`)
+  turns every `clickhouse_source` error into `not_found()`. Keep `Ok(None)` → `not_found()`;
+  map `Err(e)` through `upstream_error::ch_error_as(&CTX, &e, FailedAs::ServiceUnavailable)`
+  (`rust/crates/lakehouse-api/src/upstream_error.rs:386`, `FailedAs` at `:57`, `Context::new`
+  at `:85`) with a `const` context whose messages say the table's details could not be read
+  right now. No engine text reaches the body (SEC-11; `tests/sec11_guard.rs` must stay green).
+  Console: `getAsset` (`src/services/clients/assets.ts:117`) uses the file's own
+  `errorFor(res.status, …)` (`:25`) instead of always `"not_found"`, so `ErrorState`
+  (`src/features/catalog/asset-detail-page.tsx:109-110`) shows the right kind (permission,
+  unavailable with retry, not found).
+- **D9. The grant's audit entry says who got what (LH-DATA-15-03 F1, F3).**
+  `routes::governance` builds each audit row (`rust/crates/lakehouse-api/src/routes/governance.rs:400-422`)
+  without `args`, and writes `"source": "copilot"` for every row.
+  - Add `"detail"`: a short sentence made from `args` for `catalog.grant` (and `catalog.revoke`
+    if `catalog_grants.rs` records one; check), e.g.
+    `query:read to QA Approver <qa-approver@…>, until 2026-12-06`. Other actions: no `detail`
+    key. Build it from the stored fields only (`permission`, `grantee`, `expiresAt`,
+    `catalog_grants.rs:206-215`); never echo an unknown `args` blob.
+  - `"source"` follows `principal_kind`: `user` → `console`, `copilot` → `copilot`,
+    `schedule` → `schedule`, `service` → `service`, none → `copilot` (the same fallback the
+    actor label uses at `:412`). Grep for any reader of `source: "copilot"` first.
+  - Console: `AuditEvent` (`src/services/contracts/governance.ts:258`) gains
+    `detail?: string`; the audit drawer (`src/features/governance/audit-page.tsx:34-60`) shows a
+    "Detail" row when it is present. `source` stays out of the console type (it is not shown).
+- **D10. An S3 preview reads a file by what it is (LH-SRC-13-01 F1).** `preview_s3` takes the
+  connector's configured format (`rust/crates/lakehouse-api/src/connector_listing.rs:1125`), so
+  a `.parquet` object on a connector set to CSV is read as text. Choose the reader from the
+  object key's extension, case-insensitive: `.parquet` → `FilesFormat::Parquet`, `.csv` →
+  `Csv`, `.json` / `.jsonl` / `.ndjson` → `Json` (which already answers `NotSupported`
+  honestly, `:1097`); anything else falls back to `dial.format`. Only the preview changes;
+  the load path is out of scope.
+
+### 7.2 Tasks (Rust first, in one sitting, then the console)
+
+- **T9. D6.** Change `check_export_token`, update its doc comment (`gold.rs:179-201`) to the
+  new third rule, and add unit tests next to the existing ones (`gold.rs:1185-1265`): user
+  without the permission and no token → `Forbidden`; same user with a wrong token → still
+  `Unauthorized`. `tests/gold_publication.rs:236` asserts `401 || 503` for a session without
+  the permission and no token: if that test configures a token it will now see `403`. That
+  assertion was written for the old status, not for a property; change it to the exact status
+  the new rule gives and say why in the commit (rule 2: corrected, not weakened). Check
+  `tests/gold_export_auth.rs` and `tests/route_auth.rs` the same way.
+- **T10. D8, server side.** `catalog.rs:2472` as above; a test (unit or `tests/`, whichever the
+  file's neighbours use) that an unreachable ClickHouse gives `503` with a fixed message and a
+  reference, and a missing table still gives `404`. Update the `detail` doc comment
+  (`catalog.rs:1708-1712`) if it no longer matches.
+- **T11. D9, server side.** `governance.rs`; unit tests for the detail sentence (grant with and
+  without `expiresAt`, an action with no detail) and for the source mapping, beside
+  `actor_kind_of_narrows_copilot_principal_kinds_to_agent` (`:2768`).
+- **T12. D10.** A small pure function for the choice (`format_for(key, configured)`), used at
+  `:1125`, with unit tests for each extension, upper case, and the fallback.
+- **T13. D7, console.** `open-format-card.tsx`, with a test that a read-only publication makes
+  no request to `/api/gold/exports` or `/api/gold/export/{mart}` (GET).
+- **T14. D8, console.** `assets.ts` `getAsset`, with tests for 403 → `permission_denied`, 503 →
+  `unavailable`, 404 → `not_found`.
+- **T15. D9, console.** Contract field and the drawer row, with a test.
+
+### 7.3 Verification
+
+Per commit: Rust → `cd rust && cargo fmt --check && cargo clippy -p lakehouse-api --all-targets -- -D warnings`
+and `cargo test -p lakehouse-api <filter>` for the tests touched; TypeScript → `bun run typecheck`
+and the touched test files. This VM: `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-qa-target`,
+`CARGO_BUILD_JOBS=4` (11 GB RAM; never `cargo clean`). Integration tests under
+`rust/crates/lakehouse-api/tests/` need a Postgres (`sqlx::test`); if none is reachable, say
+*not verified locally* and name them; CI runs them on the PR. The checkout's `.env` leaks
+`CONNECTOR_*` into one `state::tests` test; a failure of exactly that test is known, not
+yours (run it from a copy of `rust/` outside the checkout if you need a clean count).
+
+Before handoff, once, in the foreground:
+
+```bash
+cd rust && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test -p lakehouse-api
+bun run typecheck && bun run lint && bun run test
+git status
+```
+
+A full `cargo test --workspace` is CI's job on this VM; quote what ran and what did not.
+
+### 7.3a Change of verification, 2026-11-11 (owner's decision)
+
+The first local build of `lakehouse-api` in test mode did not finish: one `rustc` held 5.2 GB
+for 1 h 40 min on this 11 GB VM, swap was full, and the owner stopped it. From here on, slice 2
+runs **no cargo command on this VM except `cargo fmt`** (`cargo fmt --check` per Rust commit;
+rustfmt is cheap). Clippy and every Rust test run on the PR in CI (the `test` job is
+`cargo nextest run --workspace`, REL-20). The handoff lists every Rust check as *not verified
+locally, CI* (rule 7); the reviewer reads the Rust diff by hand and merges only on a green CI.
+TypeScript checks run locally as in 7.3. Slice 2 moves to branch `fix/qa-fails-part-a-s2`
+(from `fix/qa-fails-part-a` at `608ced3b` plus this plan) and gets its own PR, because PR #453
+(slice 1) merges on its own.
+
+### 7.4 Out of scope for slice 2
+
+DATA-12-07 F2 (Data Engineer `catalog:read`) and BI-11-07 stay out (owner / AI team).
+DATA-15-03 F2 (`catalog:read` cannot be granted) is a product decision. SRC-13-01 F2 (Kafka,
+REST timeouts) is environment.
+
+## 8. Slice 2 handoff
+
+Branch `fix/qa-fails-part-a-s2`, built on `9843e17e`. Per 7.3a no cargo command ran on this VM
+except `cargo fmt`; every Rust check below is *not verified locally, CI*.
+
+### Commits
+
+- `0f7f6103` fix(gold): a signed-in person without gold:export gets 403, not a login loop (LH-DATA-1-02) (T9)
+- `282cea46` fix(catalog): an asset page says "unavailable", not "Not found", when the engine fails (DATA-13, DATA-15) (T10)
+- `81cefc3d` fix(governance): the audit entry of a catalog grant says who got which permission (DATA-15) (T11)
+- `982a9e9f` fix(connectors): an S3 preview reads a file by what it is (SRC-13) (T12)
+- `6f0a6166` fix(catalog): the Gold page stops asking for publish history a person may not read (LH-DATA-1-02) (T13)
+- `a6c44668` fix(catalog): the asset page shows permission, unavailable or not found by the status (DATA-13, DATA-15) (T14)
+- `da55f14c` fix(governance): the audit drawer shows who got which permission (DATA-15) (T15)
+
+### Commands run and counts
+
+- `cd rust && cargo fmt --check`: clean (exit 0) on the final commit; `cargo fmt` applied to the files I touched (it only changed my hunks).
+- `bun run typecheck`: clean.
+- `bun run lint`: 0 errors, 10 warnings (none in files I touched; they pre-exist, e.g. `http.ts:84`).
+- `bun run test`: 3805 pass, 1 skip, 0 fail (3806 tests, 360 files).
+- Per task: `bun test src/features/catalog/open-format-card.test.tsx` 17 pass; `bun test src/services/clients/assets.test.ts` 8 pass; `bun test src/features/governance/audit-page.test.tsx` 2 pass.
+- `git status`: only `AGENTS.md` (modified by `next dev`) and the untracked files that are not mine (`.claude/`, `docs/plans/FEAT-CONNECTORS-REPORT.md`, `lark-import/`, `ops/g3/bronze_catalog.py`) remain; none staged.
+
+### Not verified locally, CI
+
+`cargo clippy` (workspace and `-p lakehouse-api`), `cargo test` / `cargo nextest`, and the `sqlx::test`
+integration tests: all of it. Rust tests I added or changed, to find in the CI log:
+
+- `routes::gold::tests::configured_token_forbids_a_signed_in_user_without_the_permission_who_sent_no_token`, `configured_token_still_401s_a_user_without_the_permission_who_sent_a_wrong_token`, `configured_token_still_401s_when_there_is_no_principal_and_no_token` (new).
+- `routes::catalog::...::detail_of_a_silver_table_says_unavailable_when_the_engine_fails`, `detail_of_a_silver_table_the_engine_does_not_have_is_still_404` (new, `sqlx::test`, wiremock engine). The first relies on a `500` answer from the mock becoming a `ChError` out of `clickhouse_source`; if CI shows it returning another status, that is where to look.
+- `routes::governance::tests::source_of_follows_the_principal_kind`, `detail_of_a_grant_names_the_permission_the_grantee_and_the_day_it_ends`, `detail_of_a_grant_without_an_expiry_does_not_invent_a_date`, `detail_of_a_revoke_names_the_permission_and_the_grantee`, `detail_of_any_other_action_is_none` (new).
+- `connector_listing::tests::a_preview_reads_an_object_by_its_extension_and_falls_back_to_the_configured_format` (new).
+- `tests/sec11_guard.rs` must stay green: the new call in `clickhouse_asset_detail` passes `&e` to `upstream_error::ch_error_as` like `routes/alerts.rs` does.
+
+### Answers the plan asks for
+
+- **T9, changed expectations:** none. `tests/gold_publication.rs:236` does not configure `GOLD_EXPORT_RUN_TOKEN`, so it stays on the `503` path; `tests/gold_export_auth.rs` sends service credentials only (its 401 is at `auth_gate`, before `check_export_token`); `tests/route_auth.rs` has no Gold export entry. The unit test `configured_token_rejects_an_unpermissioned_session_presenting_the_wrong_token` is unchanged and still expects 401.
+- **Plan mismatch (D6):** the plan says `ApiError::Forbidden`, but its fixed body is `embedding_disabled` (`lakehouse-core/src/error.rs:46`), which would mislabel the 403. I used `ApiError::PermissionDenied("gold:export")` (also 403, body `permission_denied: gold:export`). Same status, so the console fix holds either way.
+- **T11, `catalog.revoke`:** it exists (`catalog_grants.rs:254`, args `permission` and `grantee`), so it gets a detail too ("Revoked P from G"). I reused `catalog_governance::grant_summary` (made `pub(super)`) rather than a second copy of the wording (rule 4); the sentence therefore reads "Granted query:read to Name <email> until 2026-12-06", and "until its expiry" when no `expiresAt` is stored (existing wording).
+- **Readers of source `"copilot"`:** none found in `src/`, `ops/` or the Rust tests (the console `AuditEvent` has no `source`; `ops/g3a/g3a_test.py` reads only `resource`).
+- **T13:** the history reads wait for `pub.data.canEdit` (deps `[mart, mayReadHistory]`), so there is no request before the publication answers and none for a read-only person; the "Last 5 publish runs" block is also hidden for them. `getConsumers` (readers) is unchanged and out of this plan.
+
+## 9. Slice 2 review
+
+Reviewer: Claude Opus, 2026-11-11, on `140087c0` (commits `0f7f6103`..`da55f14c`). Read every
+line of the Rust and TypeScript diff against D6–D10 and AGENTS.md. **No BLOCKER, no SHOULD-FIX.**
+
+- **D6, the plan was wrong and the developer was right.** `ApiError::Forbidden` renders the
+  fixed body `embedding_disabled` (`lakehouse-core/src/error.rs:46-57`, test at `:232`), so
+  `PermissionDenied("gold:export")` (also `403`, `:174`) is the correct variant. The new branch
+  fires only for a `PrincipalId::User` that presented no token; a wrong token and no principal
+  still give `401` (three new unit tests). No existing expectation changed:
+  `tests/gold_publication.rs:236` configures no token, so it stays on the `503` path.
+- **D8.** `Err(e)` goes through `upstream_error::ch_error_as(.., FailedAs::ServiceUnavailable)`
+  with fixed words; `Ok(None)` stays `404`. The two new `sqlx::test`s sit in `tenant_scoping`
+  and use its own helpers (`state_for`, `principal`, `response_json`, `mock_clickhouse`), the
+  same calling pattern as the existing `serving.mart_x` tests. `"Reference:"` comes from the
+  `Display` of the upstream failure (`upstream_error.rs:297`).
+- **D9.** `detail_of` reuses `catalog_governance::grant_summary` (now `pub(super)`) instead of
+  a second copy (rule 4) and reads only `permission`, `grantee`, `expiresAt`. `source_of` keeps
+  `"copilot"` as the fallback, matching the actor label. The developer found no reader of
+  `source` in `src/`, `ops/` or the tests.
+- **D10.** `format_for` takes only the last extension (`sales.parquet/data` stays on the
+  configured format, tested) and is applied after `head`, so a missing object still fails the
+  same way.
+- **Console.** `open-format-card` requests the read-back only after the publication says
+  `canEdit` and hides "Last 5 publish runs" otherwise; `getAsset` uses the file's `errorFor`
+  and tolerates a non-JSON body; the drawer shows "Detail" only when present.
+
+**Not verified by the reviewer:** no Rust check ran on this VM (7.3a). Merge only when CI on the
+PR is green, including `cargo clippy` and the nextest partitions that hold the 11 new Rust
+tests. If CI is red, the first suspect is the D8 outage test (it assumes the mock's `500`
+becomes an `Err` from `clickhouse_source`).

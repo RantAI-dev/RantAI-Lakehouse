@@ -200,6 +200,14 @@ async fn unchanged_since_last_export_reason(
 ///    missing token here is always `401`, whether or not the caller holds
 ///    any permission at all.
 ///
+/// 3. **QA LH-DATA-1-02 (plan D6): a signed-in person who presented no
+///    token is `403`, not `401`.** In the configured-token branch, a
+///    `PrincipalId::User` without `gold:export` that sent no token (header
+///    and query both absent) is forbidden: they are signed in, and the
+///    console reads every `401` as an expired session, which sent an Analyst
+///    opening a Gold table page into a `/login` loop. A token that is
+///    presented and wrong stays `401`. Nobody gets in who did not before.
+///
 /// With neither set, only a `PrincipalId::Service` principal is let
 /// through (`503` otherwise) — unchanged from before this task.
 fn check_export_token(
@@ -214,8 +222,16 @@ fn check_export_token(
         return Ok(());
     }
     if let Some(need) = configured {
-        return if header_token.or(query_token) == Some(need) {
+        let presented = header_token.or(query_token);
+        return if presented == Some(need) {
             Ok(())
+        } else if presented.is_none()
+            && matches!(principal, Some(p) if matches!(p.id, PrincipalId::User(_)))
+        {
+            // QA LH-DATA-1-02 (plan D6): signed in, no token, no gold:export.
+            // `PermissionDenied`, not `Forbidden`: the latter's fixed body is
+            // `embedding_disabled`, which would mislabel this 403.
+            Err(ApiError::PermissionDenied("gold:export".to_owned()))
         } else {
             Err(ApiError::unauthorized())
         };
@@ -1262,6 +1278,39 @@ mod tests {
         assert!(
             matches!(err, ApiError::Unauthorized(_)) || err.to_string().contains("unauthorized")
         );
+    }
+
+    #[test]
+    fn configured_token_forbids_a_signed_in_user_without_the_permission_who_sent_no_token() {
+        // QA LH-DATA-1-02 (plan D6): 403 so the console does not read it as
+        // an expired session.
+        let err = check_export_token(
+            Some("secret"),
+            None,
+            None,
+            Some(&human_principal_with("catalog:read")),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::PermissionDenied(_)));
+        assert_eq!(err.status(), 403);
+    }
+
+    #[test]
+    fn configured_token_still_401s_a_user_without_the_permission_who_sent_a_wrong_token() {
+        let err = check_export_token(
+            Some("secret"),
+            Some("wrong"),
+            None,
+            Some(&human_principal_with("catalog:read")),
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), 401);
+    }
+
+    #[test]
+    fn configured_token_still_401s_when_there_is_no_principal_and_no_token() {
+        let err = check_export_token(Some("secret"), None, None, None).unwrap_err();
+        assert_eq!(err.status(), 401);
     }
 
     // ── compute_changed_since_export (DATA-10 T3 / D4) ──────────────────
