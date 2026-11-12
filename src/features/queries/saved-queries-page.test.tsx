@@ -25,6 +25,7 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { queryService } from "@/services"
 import type {
@@ -619,9 +620,7 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "" },
-    })
+    chooseOption(await screen.findByRole("combobox", { name: "Target folder" }), "Shared")
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     await waitFor(() => {
@@ -641,9 +640,7 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "team" },
-    })
+    chooseOption(await screen.findByRole("combobox", { name: "Target folder" }), "Team")
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     await waitFor(() => {
@@ -664,9 +661,10 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "personal-1" },
-    })
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Personal space (only you)",
+    )
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     // The console does not guess the rule and does not block the move
@@ -688,9 +686,10 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "personal-1" },
-    })
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Personal space (only you)",
+    )
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
     expect((await screen.findByRole("alert")).textContent).toBe(
       "Only someone who manages this can move it.",
@@ -713,9 +712,10 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "quarterly" },
-    })
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Team / Quarterly",
+    )
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     await waitFor(() => {
@@ -731,9 +731,10 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Revenue" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "quarterly" },
-    })
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Team / Quarterly",
+    )
 
     // `u1` is the signed-in person (the session read in `renderPage`).
     expect(await screen.findByText("Shared with 1 person or role: Dewi Lestari.")).toBeDefined()
@@ -746,9 +747,10 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "quarterly" },
-    })
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Team / Quarterly",
+    )
 
     expect(await screen.findByText("Shared with 1 person or role: Dewi Lestari.")).toBeDefined()
   })
@@ -760,9 +762,7 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "" },
-    })
+    chooseOption(await screen.findByRole("combobox", { name: "Target folder" }), "Shared")
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     await waitFor(() => {

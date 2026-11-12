@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -136,29 +137,32 @@ export function SavedQueryMoveDialog({
           <label htmlFor={pickerId} className="text-sm font-medium">
             Target folder
           </label>
-          <select
+          {/* WEB-9 D3: the two `<optgroup>`s are SelectOptionGroups. D2: the
+              shared space is a real target, so it keeps the empty value. */}
+          <SelectField
             id={pickerId}
+            className="w-full"
             value={target}
-            onChange={(event) => setTarget(event.target.value)}
-            className="h-8 w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {targets.personal.length > 0 ? (
-              <optgroup label={PERSONAL_SPACE_LABEL}>
-                {targets.personal.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </optgroup>
-            ) : null}
-            <optgroup label={SHARED_SPACE_LABEL}>
-              {targets.shared.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </optgroup>
-          </select>
+            options={[
+              ...(targets.personal.length > 0
+                ? [{
+                    label: PERSONAL_SPACE_LABEL,
+                    options: targets.personal.map((option) => ({
+                      value: option.value,
+                      label: option.label,
+                    })),
+                  }]
+                : []),
+              {
+                label: SHARED_SPACE_LABEL,
+                options: targets.shared.map((option) => ({
+                  value: option.value,
+                  label: option.label,
+                })),
+              },
+            ]}
+            onValueChange={setTarget}
+          />
           {/* The key drops the previous folder's names at once; the hook
               keeps them until its effect resets (QS-3 review). */}
           <FolderSharingNote

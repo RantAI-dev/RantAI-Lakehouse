@@ -18,6 +18,7 @@ import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -425,22 +426,25 @@ export function PipelineDetailPage() {
           <label className="text-xs text-muted-foreground" htmlFor="pipeline-reads-as">
             Reads as
           </label>
-          <select
+          <SelectField
             id="pipeline-reads-as"
-            className="min-w-52 rounded-md border border-border bg-background px-2 py-1 text-sm"
+            className="min-w-52"
             value={readsAsChoice ?? ""}
             disabled={authorChoicesState.options.length === 0}
-            onChange={(event) => setReadsAsChoice(event.target.value || null)}
-          >
-            <option value="">
-              {readsAsState.kind === "unset" ? "Nobody — this pipeline cannot run" : "Choose a user…"}
-            </option>
-            {authorChoicesState.options.map((option) => (
-              <option key={option.id} value={option.id}>
-                {option.name}
-              </option>
-            ))}
-          </select>
+            /* WEB-9 D2: the empty value is a real choice ("nobody"), so it
+               stays an option; its label is the same sentence as before. */
+            options={[
+              {
+                value: "",
+                label:
+                  readsAsState.kind === "unset"
+                    ? "Nobody — this pipeline cannot run"
+                    : "Choose a user…",
+              },
+              ...authorChoicesState.options.map((option) => ({ value: option.id, label: option.name })),
+            ]}
+            onValueChange={(next) => setReadsAsChoice(next || null)}
+          />
           <Button
             size="sm"
             variant="secondary"

@@ -2,6 +2,7 @@
 
 import * as React from "react"
 
+import { SelectField } from "@/components/patterns/select-field"
 import { formatNumber } from "@/lib/format"
 import {
   columnStatistics,
@@ -64,18 +65,12 @@ export function QueryColumnStatistics({
         <label htmlFor={id} className="text-xs text-muted-foreground">
           Column
         </label>
-        <select
+        <SelectField
           id={id}
           value={column}
-          onChange={(event) => setChosen(event.target.value)}
-          className="h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
-        >
-          {columns.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
+          options={columns.map((name) => ({ value: name, label: name }))}
+          onValueChange={setChosen}
+        />
       </div>
 
       <p className="text-xs text-muted-foreground">

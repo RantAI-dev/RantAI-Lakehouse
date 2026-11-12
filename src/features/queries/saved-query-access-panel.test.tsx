@@ -12,6 +12,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { queryService } from "@/services"
 import type { GranteeList, SavedQueryAccessList } from "@/services/contracts/queries"
 import { ServiceError } from "@/services/errors"
@@ -258,16 +259,12 @@ describe("the share panel", () => {
     fireEvent.change(await screen.findByLabelText("Add a person or role"), {
       target: { value: "re" },
     })
-    fireEvent.change(screen.getByLabelText("Level to give"), {
-      target: { value: "edit" },
-    })
+    chooseOption(screen.getByRole("combobox", { name: "Level to give" }), "Can edit")
     fireEvent.click(await screen.findByRole("button", { name: /Reza Hakim/ }))
     fireEvent.change(screen.getByLabelText("Add a person or role"), {
       target: { value: "ana" },
     })
-    fireEvent.change(screen.getByLabelText("Level to give"), {
-      target: { value: "view" },
-    })
+    chooseOption(screen.getByRole("combobox", { name: "Level to give" }), "Can view")
     fireEvent.click(await screen.findByRole("button", { name: /Analyst/ }))
     fireEvent.click(screen.getByRole("button", { name: "Save access" }))
 
@@ -301,9 +298,7 @@ describe("the share panel", () => {
     await screen.findByText("Dewi Lestari")
 
     fireEvent.click(screen.getByRole("button", { name: "Remove Dewi Lestari" }))
-    fireEvent.change(screen.getByLabelText("Level of Finance (role)"), {
-      target: { value: "manage" },
-    })
+    chooseOption(screen.getByRole("combobox", { name: "Level of Finance (role)" }), "Can manage")
     fireEvent.click(screen.getByRole("button", { name: "Save access" }))
 
     await waitFor(() => {
