@@ -897,4 +897,106 @@ None of these blocks the build; each names what the plan does meanwhile.
 
 ## 5. Handoff
 
+Branch `fix/qa-round-query-studio-p1`, base `208b0572`.
+T1 and T2 not built: held by section 0. T5's follow-up commit `11024dd7` is
+a test-timing fix found during the handoff run, not a new task.
+
+### Commits
+
+- `180b0008` fix(query): the estimate knows its engine; a Trino run states no ClickHouse tier (T3)
+- `3d3b2644` fix(query): the run result says whether the person may download (T4)
+- `cbec0b86` fix(query): keep the Query Studio draft per person and tenant (T5)
+- `8642d5e0` fix(query): the estimate carries the tab's engine; the panel and summary name it (T6)
+- `35359502` fix(query): insert a Bronze table on a Trino tab without expanding it (T7)
+- `903140c6` fix(query): turn Download and Copy as TSV off when the role may not download (T8)
+- `1259b960` docs(features): the QS-8 tab storage, the QS-7 Bronze proof and the QS-9 switch (T9, section 0's subset)
+- `11024dd7` test(query): wait for the draft before counting the tabs (T5 follow-up)
+
+No migration, no route added or changed, `POLICY_TABLE` and
+`route_auth.rs` untouched.
+
+### Commands run (section 3 as changed by 3a)
+
+Every cargo shell had `export CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2 CARGO_BUILD_JOBS=6`.
+
+- `cargo fmt --check` — passes, run before every Rust commit.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — passes (last run on the final commit: `Finished dev profile`, 0 warnings).
+- `cargo test -p lakehouse-api --lib -- a_trino_run_result_states_no_storage_tier a_clickhouse_estimate_says_it_is_supported an_estimate_of_a_trino a_run_result_says_the_caller_may_download` — 5 passed, 0 failed, 3489 filtered out (final commit).
+- `cargo test -p lakehouse-api --test query_history` — 27 passed, 0 failed (final commit; includes `a_run_by_a_person_whose_every_role_is_switched_off_carries_can_download_false`).
+- `cargo check -p lakehouse-trino -p lakehouse-api` — passes (final commit, handoff block).
+- `bun install --frozen-lockfile` — 678 packages installed, once before the first TypeScript check.
+- `bun run typecheck` — passes, no output (final commit).
+- `bun run lint` — 0 errors, 11 warnings, all pre-existing in files this slice did not touch (verified by reading the list: none is in `src/lib/query-draft.ts`, `src/lib/asset-query.ts`, `src/lib/status.ts`, `src/services/*queries*`, `src/features/queries/*`, `src/features/admin/reporting-settings-page*`).
+- `bun run test` (it runs `bun test src`) — 4019 passed, 1 skipped, 0 failed across 380 files, exit 0 (final commit). An earlier run of the same command on `1259b960` had 4018 passed, 1 failed (`QueryStudioPage saved-query link > says the query is not available…`, a wait race this slice introduced); `11024dd7` fixes the wait and the assertion is unchanged. The same test file was run 3 more times afterwards: 20 passed each.
+- `python3 ops/lint/check_bare_iceberg_count.py` — "R11 guard: no bare count() against a Bronze Iceberg table found."
+- `python3 ops/lint/check_intra_package_imports.py` — "OK: all intra-package dispar_orchestrate imports resolve".
+- `git status` — clean before the handoff commit.
+
+Not run: `docker compose` (no compose change) and Python tests (no Python
+change). `cargo clippy`/`cargo test` for `lakehouse-trino` were not run: T2
+was not built, so that crate is untouched.
+
+### Tests added, and the failure each was checked against
+
+Before-the-fix evidence was taken by stashing the product change, running
+the test, and restoring it.
+
+Rust (T3, T4):
+- `a_clickhouse_estimate_says_it_is_supported_and_names_its_engine` — failed before: `left: Null, right: Bool(true)`.
+- `a_trino_run_result_states_no_storage_tier_and_no_workload_class` — failed before: `a Trino run must not claim a ClickHouse storage tier, got "hot-store"`.
+- `an_estimate_of_a_trino_statement_says_there_is_none_and_asks_no_engine` — failed before: `NotFound("Table not found or not available to your organisation: bronze.t")`.
+- `an_estimate_of_a_trino_write_is_refused_with_the_runs_sentence` — a guard, already green before (the read-only sentence was already the run's).
+- `a_run_result_says_the_caller_may_download_when_no_role_is_switched_off` — failed before: `left: Null, right: Bool(true)`.
+- `a_run_by_a_person_whose_every_role_is_switched_off_carries_can_download_false` (integration, `tests/query_history.rs`) — failed before: `left: Null, right: Bool(false)`; body quoted in the run.
+
+Console (T5 to T8):
+- `queryDraftKey gives each person and each tenant a key of their own, never the old shared key`;
+  `readTabs reads only the tabs stored under the key it is given`;
+  `dropLegacyDraft removes the entry under the old shared key and leaves a person's own draft` — the whole file fails against the old module (no `queryDraftKey`/`dropLegacyDraft` export).
+- `does not show the draft stored under the old shared key, and removes it` (replaces the test that pinned the opposite; run against the old module: `SyntaxError: Export named 'LEGACY_QUERY_DRAFT_KEY' not found`).
+- `does not show a draft stored under another person's key`;
+  `writes the draft under its owner's key and nothing under the old shared key`;
+  `reads and writes nothing while the owner is not known`;
+  `keeps writing under its first owner when the key it is given changes` — same old-module import failure.
+- `shows the other tenant's tabs, and none of the first, when the active tenant changes` — same old-module import failure.
+- `posts the engine to estimate for a Trino tab and leaves it out for ClickHouse` — failed before: the body had no `engine` key (`- "engine": "trino"`).
+- `asks for the estimate again, with the engine, when the tab's engine changes to Trino` — no pre-fix run (it needs `queryDraftKey`); it fails on the old hook by construction (the effect does not list `engine`).
+- `says a Trino query has no pre-run estimate, names Trino, and shows no source and no error`;
+  `names ClickHouse as the engine of an estimate`;
+  `shows the server's fixed sentence when a query cannot be planned` — no pre-fix run recorded; the first reads `supported`, which the old panel does not know.
+- `names Trino as the engine of a Trino run and shows no workload class for it`;
+  `names ClickHouse as the engine of a ClickHouse run` — no pre-fix run recorded; the first reads `result.engine`, which the old summary did not.
+- `listedBronzeTable reads the table name of a Bronze list row and nothing from any other row` — import failure against the old module.
+- `offers a Bronze table's Trino name on a Trino tab once the Bronze listing names it, without reading its detail`;
+  `holds a Bronze table the listing does not name as missing and offers no name`;
+  `does not ask for the Bronze listing on a ClickHouse tab`;
+  `falls back to the entry's own read when the Bronze listing fails`;
+  `loads the columns of a Bronze table the statement names by its Trino name, and offers them after its alias` — no pre-fix run recorded; they need `listedBronzeTable`.
+- `inserts a Bronze table's Trino name on a Trino tab without expanding it` — failed before: `findByRole("Insert iceberg.bronze.orders")` timed out (the entry was not insertable before its detail).
+- `turns Copy as TSV and Download off and says why when the person's roles may not download` — failed before: `Expected: true, Received: false` (the copy button was enabled).
+- `leaves both on when the result carries no flag`;
+  `is closed when downloads are switched off for the person, and says why`;
+  `says the download switch covers Query Studio's download and Copy as TSV` — no pre-fix run recorded (the first two assert today's behaviour plus the new prop; the third fails on the old paragraph).
+
+### Not verified, and why
+
+- Every Rust test runs in CI on the PR; `cargo clippy` and the integration
+  tests above were run locally, but the full `cargo test --workspace` was
+  not (section 3 leaves it to CI).
+- The other integration tests the plan lists (`sec11_guard.rs`,
+  `query_statement_errors.rs`, `upstream_errors.rs`, `ai_sql_help.rs`) are
+  T1/T2 files; not built and not run.
+- The schema browser's per-entry retry path and the catalog link paths were
+  not re-run beyond the existing tests, which stayed green.
+- No browser was opened; the T9 acceptance rows are left "Not run".
+
+### MISMATCH
+
+- None. Every anchor matched the code at `208b0572`; line numbers moved only
+  where this slice's own edits shifted them.
+- Note, not a mismatch: the branch had no git identity configured in the
+  checkout, so `git config user.name/user.email` was set repository-locally
+  (to the identity the repository's existing commits carry) before the
+  first commit.
+
 ## 6. Review
