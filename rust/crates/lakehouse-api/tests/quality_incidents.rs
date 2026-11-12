@@ -541,10 +541,23 @@ async fn a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored()
 
 /// QA `LH-DATA-14-01` F2 (`DATA-54`): a table the author's roles hide is
 /// refused with the same sentence as a missing one, so the answer is not an
-/// oracle.
+/// oracle. The two refusals come from different branches: the narrowed
+/// caller's hidden table is refused by the role's access, and an unrestricted
+/// caller's missing one by the existence check (review round 1 R6 — comparing
+/// two access refusals proved nothing).
 #[tokio::test]
 async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sentence() {
-    let (router, pool, _ch) = app().await;
+    let (router, pool, ch) = app().await;
+    // The stand-in answers no columns for the table that is not there.
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
     let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
     narrow_to_orders(&pool, user).await;
     // The person is a member of the tenant that owns the catalog, so the
@@ -568,12 +581,18 @@ async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sente
     )
     .await;
     assert_eq!(code, StatusCode::BAD_REQUEST, "{hidden}");
+    // A caller whose role hides nothing asks for a table that is not there:
+    // the existence check's refusal, not the access check's.
+    let admin_cookie = admin(&pool).await;
     let (code, missing) = call(
         &router,
-        &cookie,
+        &admin_cookie,
         "POST",
         "/api/governance/quality",
-        Some(body("silver.no_such_table")),
+        Some(json!({
+            "name": "t8_admin_missing", "asset": "silver.no_such_table",
+            "dimension": "volume", "threshold": "rows >= 1", "severity": "high",
+        })),
     )
     .await;
     assert_eq!(code, StatusCode::BAD_REQUEST, "{missing}");
