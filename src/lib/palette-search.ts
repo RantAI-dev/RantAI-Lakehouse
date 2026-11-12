@@ -48,12 +48,22 @@ export function matchedOnLabel(matchedOn: Asset["matchedOn"]): string | null {
     case "tag":
       what = value ? `${field} ${value}` : field
       break
+    case "table":
+      // QA `LH-DATA-11-05` (`DATA-54`): the server reports the physical name
+      // the search read; the reader sees which table matched.
+      what = value ? `table ${value}` : "table"
+      break
+    case "id":
+      // An API build older than `DATA-54` still sends `"id"`; it read as a
+      // column named id, which is not what it is.
+      what = "table id"
+      break
     case "columnDescription":
       what = "column description"
       break
     default:
-      // id, namespace, owner, description; a field a newer server adds is
-      // shown as it came rather than hidden.
+      // namespace, owner, description; a field a newer server adds is shown
+      // as it came rather than hidden.
       what = field
   }
   return approximate ? `${what} · approximate match` : what

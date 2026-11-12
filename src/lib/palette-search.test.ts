@@ -35,6 +35,20 @@ describe("matchedOnLabel", () => {
     )
   })
 
+  // QA `LH-DATA-11-05`, `LH-DATA-11-14` (`DATA-54`): the server names the
+  // table it read, which is the physical name, not an internal id.
+  it("names the table that matched, and calls an old server's id a table id", () => {
+    expect(
+      matchedOnLabel({ field: "table", value: "silver.dim_negara", approximate: false }),
+    ).toBe("table silver.dim_negara")
+    expect(matchedOnLabel({ field: "table", value: "silver.dim_negara", approximate: true })).toBe(
+      "table silver.dim_negara · approximate match",
+    )
+    expect(matchedOnLabel({ field: "id", value: "", approximate: true })).toBe(
+      "table id · approximate match",
+    )
+  })
+
   it("says so when a typo was forgiven", () => {
     expect(matchedOnLabel({ field: "column", value: "revenue", approximate: true })).toBe(
       "column revenue · approximate match",
