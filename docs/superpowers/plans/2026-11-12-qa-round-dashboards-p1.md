@@ -93,11 +93,14 @@ What QA saw:
   statement.
 - **D7. The route deadline follows the limit** for `/api/dashboard/specs`,
   `/api/dashboard/specs/preview` (the longest configured limit + 15 seconds, the rule of
-  `/api/query/run`) and `/api/dashboard/sources/preview` (twice the longest limit + 15 seconds,
-  because with a chart it runs the source twice: the row read, then the chart). Without this
-  the default limit (60 seconds) can never be reported by these routes: the 60-second
-  deadline fires first. `GET` and `DELETE` on `/api/dashboard/specs` share the path and so the
-  bound; they send no long statement, so the longer bound changes nothing for them.
+  `/api/query/run`), `/api/dashboard/sources/preview` (twice the longest limit + 15 seconds,
+  because with a chart it runs the source twice: the row read, then the chart) and — review
+  round 1, R3 — `/api/ai/tool` (the longest configured limit + 15 seconds: the assistant's
+  four confirmed saves run there, so at the default 60-second limit the fixed deadline fired
+  before the limit's sentence could be returned). Without this the default limit (60 seconds)
+  can never be reported by these routes: the 60-second deadline fires first. `GET` and
+  `DELETE` on `/api/dashboard/specs` share the path and so the bound; they send no long
+  statement, so the longer bound changes nothing for them.
 
 ### BI-47: the value list of a chart filter
 

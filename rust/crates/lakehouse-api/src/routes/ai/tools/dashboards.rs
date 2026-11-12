@@ -1594,6 +1594,53 @@ mod tests {
         );
     }
 
+    /// `BI-45` review round 1 R3 (QA `LH-BI-5-01`): the assistant's save runs
+    /// its statement under the caller's limit, and a statement the engine stops
+    /// at the limit is the tile's answer — the sentence plus its limit — not an
+    /// upstream error. This is the reply the Confirm button posts through
+    /// `POST /api/ai/tool`, which now waits for the limit before its own
+    /// deadline (`routes::limit_bearing`).
+    #[tokio::test]
+    async fn a_create_chart_tool_call_whose_statement_hits_the_limit_answers_with_the_sentence() {
+        let server = mart_server().await;
+        // The chart's own statement (it names the mart in a FROM), not the
+        // mart's metadata (system.tables/system.columns): a higher priority
+        // than the catch-all, which would answer 200 with no row.
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM serving.mart_x"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 159. DB::Exception: planted-marker Timeout exceeded (TIMEOUT_EXCEEDED)",
+            ))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = create_chart(
+            &ch,
+            &as_viewer(None),
+            None,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(
+            reply["error"], "This chart stopped after 60 seconds, the limit for this install.",
+            "{reply}"
+        );
+        assert_eq!(reply["limit"]["kind"], json!("time"), "{reply}");
+        assert!(
+            !reply.to_string().contains("planted-marker"),
+            "the engine's text reached the reply: {reply}"
+        );
+        // Nothing was written: the statement ran under the limit before the row.
+        let all = sent(&server).await;
+        assert!(writes(&all).is_empty(), "{all:#?}");
+    }
+
     /// `PR #199 review O BLOCKER 2`: a kind that takes no colours must not be
     /// given the company palette — the style check refuses colours on a
     /// table, a KPI or a static tile, so the assistant could create none of
