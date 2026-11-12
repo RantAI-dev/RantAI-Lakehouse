@@ -35,6 +35,11 @@ const GROUP_CONNECTOR: &str = "conn-pg-lakehouse";
 
 struct FakeCh {
     value: Arc<Mutex<f64>>,
+    /// The connector [`CONNECTOR`] watches, and what an insert makes it watch
+    /// next: `save_rule` re-reads the row it just wrote (`get_rule`), so an
+    /// edit only reads as a change of connector when this fake applies it.
+    connector: Arc<Mutex<String>>,
+    after_insert: Arc<Mutex<Option<String>>>,
 }
 
 fn plain_rule() -> Value {
@@ -59,13 +64,13 @@ fn late_rule() -> Value {
     })
 }
 
-fn connector_rule() -> Value {
+fn connector_rule(connector: &str) -> Value {
     json!({
         "id": CONNECTOR, "name": "Source keeps failing", "type": "connector_failure",
         "mart": "", "measure": "", "agg": "sum", "op": ">", "threshold": "0", "board": "",
         "channel": "email", "target": "bayu@meridian.example", "enabled": "1",
         "created_at": "2026-11-02 00:00:00", "severity": "", "pipeline": "", "metric": "",
-        "connector": GROUP_CONNECTOR, "asset": "", "chart": "", "series": "",
+        "connector": connector, "asset": "", "chart": "", "series": "",
         "condition": "", "owner_id": "", "filters_json": "[]",
     })
 }
@@ -77,6 +82,13 @@ impl Respond for FakeCh {
             let n = data.len();
             ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
         };
+        if sql.contains("INSERT INTO console.alert_rule") {
+            let mut held = self.after_insert.lock().unwrap();
+            if let Some(next) = held.take() {
+                *self.connector.lock().unwrap() = next;
+            }
+            return ResponseTemplate::new(200).set_body_string("Ok.\n");
+        }
         if sql.contains("FROM console.alert_rule") {
             // `get_rule` names one id; `list_rules` names none.
             let data = if sql.contains(&format!("id='{PLAIN}'")) {
@@ -84,11 +96,15 @@ impl Respond for FakeCh {
             } else if sql.contains(&format!("id='{LATE}'")) {
                 vec![late_rule()]
             } else if sql.contains(&format!("id='{CONNECTOR}'")) {
-                vec![connector_rule()]
+                vec![connector_rule(&self.connector.lock().unwrap())]
             } else if sql.contains("id=") {
                 Vec::new()
             } else {
-                vec![plain_rule(), late_rule(), connector_rule()]
+                vec![
+                    plain_rule(),
+                    late_rule(),
+                    connector_rule(&self.connector.lock().unwrap()),
+                ]
             };
             return rows(data);
         }
@@ -118,10 +134,19 @@ impl Respond for FakeCh {
 /// is added here, where the app is built, so every test in this file has the
 /// same shape (`common::in_the_catalog_tenant`, as the other gated tests do).
 async fn app() -> TestApp {
+    app_with_connector_edits().await.0
+}
+
+/// [`app`], with the handle that makes the fake apply a saved rule's new
+/// connector on the read `save_rule` does right after its insert.
+async fn app_with_connector_edits() -> (TestApp, Arc<Mutex<Option<String>>>) {
     let ch = MockServer::start().await;
+    let after_insert = Arc::new(Mutex::new(None));
     Mock::given(method("POST"))
         .respond_with(FakeCh {
             value: Arc::new(Mutex::new(150.0)),
+            connector: Arc::new(Mutex::new(GROUP_CONNECTOR.to_owned())),
+            after_insert: Arc::clone(&after_insert),
         })
         .mount(&ch)
         .await;
@@ -143,7 +168,7 @@ async fn app() -> TestApp {
         .await
         .expect("a seeded user");
     common::in_the_catalog_tenant(&app.pool, user).await;
-    app
+    (app, after_insert)
 }
 
 async fn test_run(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) {
@@ -306,5 +331,114 @@ async fn the_assistant_refuses_another_tenants_rule_with_the_same_sentence() {
         body["result"]["error"],
         json!("alert rule not found."),
         "{body}"
+    );
+}
+
+/// `PUT /api/alerts` with `body` as `bayu`; the answer's status and JSON body.
+async fn put_rule(app: &TestApp, cookie: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/alerts")
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// A `connector_failure` rule watching `connector`, named `name`, to
+/// `bayu@meridian.example`: the stored rule [`CONNECTOR`], edited.
+fn connector_rule_body(name: &str, connector: &str) -> Value {
+    json!({
+        "id": CONNECTOR, "name": name, "type": "connector_failure", "connector": connector,
+        "channel": "email", "target": "bayu@meridian.example",
+    })
+}
+
+/// Whether [`CONNECTOR`] has a latest-delivery row.
+async fn has_delivery(app: &TestApp) -> bool {
+    lakehouse_store::alert_delivery::last_for(&app.pool, &[CONNECTOR.to_owned()])
+        .await
+        .expect("the delivery rows")
+        .contains_key(CONNECTOR)
+}
+
+/// Record one delivery attempt of [`CONNECTOR`], as a success event would.
+async fn record_delivery(app: &TestApp) {
+    lakehouse_store::alert_delivery::record(
+        &app.pool,
+        CONNECTOR,
+        lakehouse_store::overview::DeliveryRecord::NotDelivered(
+            "the webhook server answered with an error",
+        ),
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .expect("a delivery row");
+}
+
+/// `SRC-40` D5 (review round 1, R2): an edit that changes what a rule watches
+/// drops its latest delivery — here a `connector_failure` rule moved to
+/// another connector, whose "Last sent" would otherwise describe the old one.
+/// Fails if the `alert_delivery::delete` call in
+/// `routes::alerts::forget_state` is removed.
+#[tokio::test]
+async fn an_edit_that_changes_the_connector_drops_the_rules_last_delivery() {
+    let (app, after_insert) = app_with_connector_edits().await;
+    let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    record_delivery(&app).await;
+
+    // `conn-s3-warehouse` is another seeded connector of the same tenant, so
+    // the edit is one the caller may make; the fake serves it after the insert,
+    // the way `ClickHouse` would.
+    *after_insert.lock().unwrap() = Some("conn-s3-warehouse".to_owned());
+    let (status, body) = put_rule(
+        &app,
+        &bayu,
+        connector_rule_body("Source keeps failing", "conn-s3-warehouse"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rule"]["connector"],
+        json!("conn-s3-warehouse"),
+        "{body}"
+    );
+    assert!(
+        !has_delivery(&app).await,
+        "a rule that watches another connector starts with no last delivery"
+    );
+}
+
+/// `SRC-40` D5 (review round 1, R2): an edit of the name alone keeps it — the
+/// rule still watches the same connector, and its "Last sent" still holds.
+#[tokio::test]
+async fn an_edit_of_the_name_alone_keeps_the_rules_last_delivery() {
+    let app = app().await;
+    let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    record_delivery(&app).await;
+
+    let (status, body) = put_rule(
+        &app,
+        &bayu,
+        connector_rule_body("Source keeps failing today", GROUP_CONNECTOR),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        has_delivery(&app).await,
+        "the same connector keeps the rule's last delivery"
     );
 }

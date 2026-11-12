@@ -60,7 +60,10 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 /** Every fetch the page issues; `testStatus` answers `POST /api/alerts/test`. */
-function setupFetch(testStatus: number): void {
+function setupFetch(
+  testStatus: number,
+  permissions: string[] = ["dashboard:read", "alert:write"]
+): void {
   fetchCalls = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
@@ -73,7 +76,7 @@ function setupFetch(testStatus: number): void {
         name: "Sari",
         email: "sari@meridian.example",
         roles: ["Analyst"],
-        permissions: ["dashboard:read", "alert:write"],
+        permissions,
         tenants: [{ id: "t1", name: "Acme", slug: "acme" }],
       })
     }
@@ -168,5 +171,23 @@ describe("the alerts page tests one rule", () => {
     } finally {
       restore()
     }
+  })
+})
+
+// QA TC-1696 (SRC-40 D9): "New rule" is offered only to a person who may
+// create a rule. The page it opens takes `alert:write`, and the API refuses
+// the save for anyone else.
+describe("New rule needs alert:write", () => {
+  it("offers New rule only to a person with alert:write", async () => {
+    setupFetch(200, ["dashboard:read", "alert:read"])
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Visitors in Bali")).toBeDefined())
+    expect(screen.queryByRole("button", { name: "New rule" })).toBeNull()
+
+    cleanup()
+    setupFetch(200)
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Visitors in Bali")).toBeDefined())
+    expect(screen.getByRole("button", { name: "New rule" })).toBeDefined()
   })
 })

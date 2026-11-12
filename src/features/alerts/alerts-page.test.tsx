@@ -15,9 +15,11 @@ import {
 import {
   chartAlertHref,
   getRuleColumns,
+  lastDeliveryLabel,
   ruleKindLabel,
   ruleScope,
 } from "./rules-columns"
+import { formatDateTime } from "@/lib/format"
 
 afterEach(cleanup)
 
@@ -389,12 +391,16 @@ describe("a rule whose target is hidden (DEC-16)", () => {
     return render_({ row: { original: rule } })
   }
 
-  it("says Webhook for a hidden webhook rule, disables its switch and shows no actions", () => {
+  it("says Webhook for a hidden webhook rule, shows its state without a switch and shows no actions", () => {
+    // `SRC-40` D9 replaced #485's D19 ("the switch is shown but disabled"): a
+    // rule this caller may not manage gets no switch at all, and the state is
+    // text. The decision changed, so the assertion follows it; nothing here
+    // was loosened.
     const hidden = { ...base, channel: "webhook", targetHidden: true } as AlertRule
     render(<div>{cell("delivery", hidden)}{cell("enabled", hidden)}{cell("actions", hidden)}</div>)
     expect(screen.getByText("Webhook")).toBeTruthy()
-    // base-ui renders the switch as a span: `aria-disabled` is its disabled state.
-    expect(screen.getByRole("switch").getAttribute("aria-disabled")).toBe("true")
+    expect(screen.queryByRole("switch")).toBeNull()
+    expect(screen.getByText("Active")).toBeTruthy()
     expect(screen.queryByRole("button", { name: "Test run now" })).toBeNull()
     expect(screen.queryByRole("button", { name: "More rule actions" })).toBeNull()
   })
@@ -403,6 +409,43 @@ describe("a rule whose target is hidden (DEC-16)", () => {
     const hidden = { ...base, channel: "email", targetHidden: true } as AlertRule
     render(<div>{cell("delivery", hidden)}</div>)
     expect(screen.getByText("E-mail")).toBeTruthy()
+  })
+
+  it("shows when a success rule last sent, under its delivery", () => {
+    // QA TC-1695 (SRC-40): a "run succeeded" alert opens no incident, so its
+    // latest delivery is shown here. The expected text is built with
+    // `formatDateTime` and never a typed date: the zone differs by machine.
+    const at = "2026-11-12T03:04:05.000Z"
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+      lastDelivery: { at, delivered: true },
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(screen.getByText(`Last sent ${formatDateTime(at)}`)).toBeTruthy()
+  })
+
+  it("says a success alert was not delivered, with the reason", () => {
+    const at = "2026-11-12T03:04:05.000Z"
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+      lastDelivery: { at, delivered: false, reason: "the webhook server answered with an error" },
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(
+      screen.getByText(
+        `Last attempt ${formatDateTime(at)} · Not delivered: the webhook server answered with an error`
+      )
+    ).toBeTruthy()
+  })
+
+  it("shows no second line for a rule with no recorded delivery", () => {
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(lastDeliveryLabel(rule)).toBeNull()
+    expect(screen.queryByText(/Last sent/)).toBeNull()
+    expect(screen.queryByText(/Last attempt/)).toBeNull()
   })
 
   it("shows the address, an enabled switch and the actions when the target is returned", () => {

@@ -351,7 +351,12 @@ async fn a_restricted_dashboard_refuses_another_target() {
 }
 
 /// T1's state reset through the tool: a rule that now watches another chart
-/// starts over.
+/// starts over. `SRC-40` D5 (review round 1, R2) is the same moment for the
+/// rule's latest delivery: the assistant's save path goes through
+/// `routes::alerts::forget_state`, so its row goes too. Fails if the
+/// `alert_delivery::delete` call there is removed. (`delete_alert_rule` cannot
+/// cover this here: it is `WriteHigh` and returns a pending approval, never the
+/// delete itself — `tests/tier1_writehigh_approval.rs`.)
 #[tokio::test]
 async fn update_alert_rule_changing_the_chart_resets_the_state() {
     let (f, person) = fixture("dashboard:read, alert:write", true).await;
@@ -366,6 +371,16 @@ async fn update_alert_rule_changing_the_chart_resets_the_state() {
     )
     .bind(RULE)
     .execute(&f.app.pool)
+    .await
+    .unwrap();
+    lakehouse_store::alert_delivery::record(
+        &f.app.pool,
+        RULE,
+        lakehouse_store::overview::DeliveryRecord::NotDelivered(
+            "the webhook server answered with an error",
+        ),
+        time::OffsetDateTime::now_utc(),
+    )
     .await
     .unwrap();
 
@@ -391,6 +406,16 @@ async fn update_alert_rule_changing_the_chart_resets_the_state() {
         .await
         .unwrap();
     assert_eq!(left, 0, "a rule watching a new line starts from ok");
+    let deliveries: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM alert_rule_delivery WHERE rule_id = $1")
+            .bind(RULE)
+            .fetch_one(&f.app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        deliveries, 0,
+        "a rule watching a new line starts with no last delivery"
+    );
 }
 
 /// D2/D5: Ask mode still refuses both tools, and an unconfirmed call returns a

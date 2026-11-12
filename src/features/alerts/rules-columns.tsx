@@ -23,6 +23,8 @@ import {
 import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
 import { displayColumn } from "@/lib/chart-joins"
+import { formatDateTime } from "@/lib/format"
+import { deliverySummary } from "@/features/overview/alert-delivery"
 import { LOAD_ALERT_KINDS, QUALITY_ALERT_KIND, type AlertRule } from "@/services/contracts/alerts"
 
 /**
@@ -63,6 +65,21 @@ export function ruleKindLabel(type: string): string {
 export function deliveryLabel(rule: AlertRule): string {
   if (rule.targetHidden === true) return rule.channel === "email" ? "E-mail" : "Webhook"
   return rule.target ?? ""
+}
+
+/**
+ * The second line of the Delivery cell for a "run succeeded" rule (`SRC-40` D7,
+ * QA `TC-1695`): when it last sent, or when it last tried and that the message
+ * did not arrive, with `deliverySummary`'s words — the same the incident list
+ * uses. `null` when no delivery was recorded, so a rule that never sent shows
+ * no line at all.
+ */
+export function lastDeliveryLabel(rule: Pick<AlertRule, "lastDelivery">): string | null {
+  const delivery = rule.lastDelivery
+  if (!delivery) return null
+  if (delivery.delivered) return `Last sent ${formatDateTime(delivery.at)}`
+  const summary = deliverySummary({ delivered: false, deliveryReason: delivery.reason })
+  return `Last attempt ${formatDateTime(delivery.at)} · ${summary.text}`
 }
 
 /**
@@ -270,15 +287,30 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Delivery",
       cell: ({ row }) => {
         const r = row.original
+        const last = lastDeliveryLabel(r)
         return (
-          <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-            {r.channel === "email" ? (
-              <Mail className="size-3.5 text-muted-foreground" />
-            ) : (
-              <Webhook className="size-3.5 text-muted-foreground" />
+          <div className="flex flex-col gap-0.5">
+            <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+              {r.channel === "email" ? (
+                <Mail className="size-3.5 text-muted-foreground" />
+              ) : (
+                <Webhook className="size-3.5 text-muted-foreground" />
+              )}
+              <span className="max-w-50 truncate">{deliveryLabel(r)}</span>
+            </span>
+            {last === null ? null : (
+              <span
+                className={cn(
+                  "block text-xs",
+                  r.lastDelivery?.delivered === false
+                    ? "text-destructive"
+                    : "text-muted-foreground"
+                )}
+              >
+                {last}
+              </span>
             )}
-            <span className="max-w-50 truncate">{deliveryLabel(r)}</span>
-          </span>
+          </div>
         )
       },
     },
@@ -288,14 +320,24 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Status",
       cell: ({ row }) => {
         const r = row.original
+        // DEC-16 (QA LH-SRC-7-04, SRC-42): `targetHidden` is the API's own
+        // per-rule answer that this caller may not manage the rule, so the
+        // switch is not offered at all — only the state, as text (`SRC-40`
+        // D9, which replaces #485's D19 "shown but disabled"). Keying it on
+        // `alert:write` alone would take the switch from the owner of a chart
+        // alert, whom the API lets switch their own rule.
+        if (r.targetHidden === true) {
+          return (
+            <span className="text-xs text-muted-foreground">
+              {r.enabled ? "Active" : "Disabled"}
+            </span>
+          )
+        }
         return (
           <div className="flex items-center gap-2">
             <Switch
               checked={r.enabled}
               onCheckedChange={() => onToggle(r)}
-              // DEC-16 (QA LH-SRC-7-04, SRC-42): the API refuses the change for
-              // this caller, so the switch says so instead of offering it.
-              disabled={r.targetHidden === true}
               aria-label={`Toggle rule ${r.name}`}
             />
             <span className="text-xs text-muted-foreground">
