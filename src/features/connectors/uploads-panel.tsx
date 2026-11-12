@@ -389,10 +389,12 @@ export function UploadsPanel({
           </Table>
         </div>
         {uploads.length >= UPLOAD_LIST_LIMIT ? (
+          // Review round 1 R7: the number is the constant the condition reads, so the
+          // sentence and the cut cannot drift apart.
           <p className="text-xs text-muted-foreground" data-testid="upload-list-cut">
             {searching
-              ? "Showing the newest 100 files that match; narrow the search to find older ones."
-              : "Showing the newest 100 files; search to find older ones."}
+              ? `Showing the newest ${UPLOAD_LIST_LIMIT} files that match; narrow the search to find older ones.`
+              : `Showing the newest ${UPLOAD_LIST_LIMIT} files; search to find older ones.`}
           </p>
         ) : null}
         </div>

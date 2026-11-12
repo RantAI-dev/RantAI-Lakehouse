@@ -6,6 +6,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import type { Upload, UploadFolder } from "@/services/contracts/uploads"
+import { UPLOAD_LIST_LIMIT } from "@/lib/uploads"
 import { UploadsPanel } from "./uploads-panel"
 
 const originalFetch = global.fetch
@@ -500,33 +501,31 @@ describe("UploadsPanel folders", () => {
 
   it("says the list is cut when a hundred files came back, and not for ninety-nine", async () => {
     // `DATA-51` (QA `LH-DATA-35-10`): `GET /api/uploads` has no paging, so a full answer
-    // is a cut one and the page says so.
+    // is a cut one and the page says so. Review round 1 R7: the counts and both sentences
+    // are built from `UPLOAD_LIST_LIMIT`, so a page that typed the number would fail here
+    // the moment the constant moved.
     const many = (count: number) =>
       Array.from({ length: count }, (_, i) => upload({ id: `up-${i}`, originalFilename: `file-${i}.csv` }))
-    stubFetch(() => many(100))
+    const cut = `Showing the newest ${UPLOAD_LIST_LIMIT} files; search to find older ones.`
+    const cutMatching = `Showing the newest ${UPLOAD_LIST_LIMIT} files that match; narrow the search to find older ones.`
+    stubFetch(() => many(UPLOAD_LIST_LIMIT))
     render(<UploadsPanel />)
     await screen.findByText("file-0.csv")
-    expect(screen.getByTestId("upload-list-cut").textContent).toBe(
-      "Showing the newest 100 files; search to find older ones."
-    )
+    expect(screen.getByTestId("upload-list-cut").textContent).toBe(cut)
     cleanup()
 
-    stubFetch(() => many(99))
+    stubFetch(() => many(UPLOAD_LIST_LIMIT - 1))
     render(<UploadsPanel />)
     await screen.findByText("file-0.csv")
     expect(screen.queryByTestId("upload-list-cut")).toBeNull()
     cleanup()
 
     // While a search is on, the sentence says so.
-    stubFetch(() => many(100))
+    stubFetch(() => many(UPLOAD_LIST_LIMIT))
     render(<UploadsPanel />)
     await screen.findByText("file-0.csv")
     fireEvent.change(screen.getByLabelText("Search uploaded files"), { target: { value: "file" } })
-    await waitFor(() =>
-      expect(screen.getByTestId("upload-list-cut").textContent).toBe(
-        "Showing the newest 100 files that match; narrow the search to find older ones."
-      )
-    )
+    await waitFor(() => expect(screen.getByTestId("upload-list-cut").textContent).toBe(cutMatching))
   })
 
   it("renames the open folder", async () => {
