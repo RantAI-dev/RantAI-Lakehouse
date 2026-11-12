@@ -229,8 +229,8 @@ async fn a_revoked_session_is_never_returned(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// The honest-`null` shape for `created_ip`/`user_agent`: every session
-/// minted today passes `None` for both columns, and the JSON the handler
+/// The honest-`null` shape for `created_ip`/`user_agent`: a session minted
+/// before `ADM-14` recorded the browser has neither, and the JSON the handler
 /// returns carries an explicit `null` (not absent, not a guessed default).
 ///
 /// This test runs against the JSON wire shape — the bytes that go to the
@@ -260,6 +260,32 @@ async fn created_ip_and_user_agent_round_trip_as_null_on_the_wire(
         Some(&serde_json::Value::Null),
         "userAgent must be explicit null, not omitted"
     );
+    Ok(())
+}
+
+/// `QA LH-SEC-5-01` (`ADM-14` D11): the two times travel as RFC 3339 in UTC
+/// with milliseconds, which every browser's `Date` parses. The listing used
+/// to cast the columns with `::text`, giving
+/// `2026-11-12 09:42:13.123456+00` — a shape only a browser's own leniency
+/// reads, and the console's tests already assume the RFC 3339 one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn session_times_travel_as_rfc_3339_in_utc(pool: PgPool) -> sqlx::Result<()> {
+    let caller = seed_user(&pool, "a@x.invalid").await;
+    sqlx::query(
+        "INSERT INTO session (app_user_id, token_hash, created_at, expires_at) \
+         VALUES ($1, $2, '2026-11-12 09:42:13.123+00', '2999-01-02 03:04:05.678+00')",
+    )
+    .bind(caller)
+    .bind("t".repeat(64))
+    .execute(&pool)
+    .await?;
+
+    let rows = list_sessions_for_caller(&pool, caller, false)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].created_at, "2026-11-12T09:42:13.123Z");
+    assert_eq!(rows[0].expires_at, "2999-01-02T03:04:05.678Z");
     Ok(())
 }
 

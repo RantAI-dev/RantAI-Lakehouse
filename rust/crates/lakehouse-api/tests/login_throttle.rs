@@ -46,12 +46,27 @@ fn env_with(max_failures: &str, lockout_secs: &str) -> HashMap<String, String> {
 }
 
 async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::Response<Body> {
+    login_with_user_agent(app, email, password, None).await
+}
+
+/// [`login`] with the browser the sign-in claims to come from (`ADM-14`):
+/// the header the session records, or none when the request carries none.
+async fn login_with_user_agent(
+    app: &axum::Router,
+    email: &str,
+    password: &str,
+    user_agent: Option<&str>,
+) -> axum::http::Response<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json");
+    if let Some(user_agent) = user_agent {
+        request = request.header("user-agent", user_agent);
+    }
     app.clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header("content-type", "application/json")
+            request
                 .body(Body::from(format!(
                     r#"{{"email": "{email}", "password": "{password}"}}"#
                 )))
@@ -277,6 +292,40 @@ async fn a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assi
     assert_eq!(entry["actor"], "Sign-in form");
     assert_eq!(entry["actorKind"], "service");
     assert_eq!(entry["source"], "system");
+}
+
+/// QA LH-SEC-5-01 (`ADM-14` decisions D9 and D14): a sign-in records the
+/// browser it came from, records no network address (the API has no trusted
+/// source for one), and creates exactly one session — the six rows QA saw for
+/// one administrator are six sign-ins, not one sign-in that repeats.
+#[tokio::test]
+async fn a_sign_in_records_the_browser_and_creates_exactly_one_session() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    let resp = login_with_user_agent(
+        &router,
+        THROTTLED_EMAIL,
+        REAL_PASSWORD,
+        Some("QA-Browser/1.0"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT count(*), max(s.user_agent), max(s.created_ip) FROM session s \
+         JOIN app_user u ON u.id = s.app_user_id WHERE u.email = $1",
+    )
+    .bind(THROTTLED_EMAIL)
+    .fetch_one(&pool)
+    .await
+    .expect("query session");
+    assert_eq!(count, 1, "one sign-in, one session");
+    assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
+    assert_eq!(
+        created_ip, None,
+        "the network address is not recorded (ADM-14 D10)"
+    );
 }
 
 #[tokio::test]
