@@ -934,12 +934,35 @@ mod tests {
 
     // QA `LH-DATA-11-04` (`DATA-54`): the piece is cut by character, never by
     // byte, and a word that is not found (or no word) starts at the beginning.
+    // Review round 1 R5: the first case never cut (it is shorter than the
+    // piece), so the cases below cut inside multi-byte text on both sides —
+    // a byte slice would panic on either of them.
     #[test]
     fn the_snippet_never_cuts_inside_a_character() {
         assert!(
             description_snippet("Umsatz nach Übersee für Österreich", "übersee")
                 .contains("Übersee")
         );
+
+        let d = format!("{} Übersee {}", "é".repeat(60), "ö".repeat(60));
+        let piece = description_snippet(&d, "übersee");
+        assert!(piece.contains("Übersee"), "{piece}");
+        assert!(piece.starts_with('…'), "{piece}");
+        assert!(piece.ends_with('…'), "{piece}");
+        assert!(piece.chars().count() <= 82, "{piece}");
+
+        // A word in a script without spaces is a word: the CJK description
+        // holds `収益` at character 100 and the piece is built around it.
+        let cjk = format!("{}収益{}", "表".repeat(100), "表".repeat(100));
+        let assets = vec![json!({ "id": "silver.cjk", "name": "Cjk", "description": cjk })];
+        let hit = &find(&assets, "収益")[0];
+        assert_eq!(hit["matchedOn"]["field"], "description", "{hit}");
+        let value = hit["matchedOn"]["value"].as_str().unwrap();
+        assert!(value.contains("収益"), "{value}");
+        assert!(value.starts_with('…'), "{value}");
+        assert!(value.ends_with('…'), "{value}");
+        assert!(value.chars().count() <= 82, "{value}");
+
         assert_eq!(description_snippet("", "x"), "");
         assert_eq!(description_snippet("abc", ""), "abc");
     }
