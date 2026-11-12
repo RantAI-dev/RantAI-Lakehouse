@@ -6578,8 +6578,21 @@ mod tests {
             assert_eq!(v["queryEngine"], json!("trino"));
             assert!(v["error"].is_null(), "no engine error: {}", v["error"]);
             assert_eq!(v["sources"], json!([]));
-            assert_eq!(received(&ch).await, Vec::<String>::new());
-            assert_eq!(received(&trino).await, Vec::<String>::new());
+            // Review round 1, R6: D7 says nothing reaches any engine, and
+            // `received` hides `system.*` lookups — the one kind a policy
+            // rewrite would send — so these two read every request.
+            assert!(
+                ch.received_requests().await.expect("recorded").is_empty(),
+                "ClickHouse was asked nothing"
+            );
+            assert!(
+                trino
+                    .received_requests()
+                    .await
+                    .expect("recorded")
+                    .is_empty(),
+                "Trino was asked nothing"
+            );
         }
 
         /// The run's read-only sentence, read with Trino's rules, still comes
@@ -6605,8 +6618,20 @@ mod tests {
 
             assert_eq!(status, 422);
             assert!(message.starts_with("Only read queries"), "{message}");
-            assert_eq!(received(&ch).await, Vec::<String>::new());
-            assert_eq!(received(&trino).await, Vec::<String>::new());
+            // Review round 1, R6: unfiltered, for the same reason as the
+            // test above — a rewritten `system.*` lookup would count.
+            assert!(
+                ch.received_requests().await.expect("recorded").is_empty(),
+                "ClickHouse was asked nothing"
+            );
+            assert!(
+                trino
+                    .received_requests()
+                    .await
+                    .expect("recorded")
+                    .is_empty(),
+                "Trino was asked nothing"
+            );
         }
 
         /// A policy that masks `email` and filters rows, seeded for the
