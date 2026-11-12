@@ -476,3 +476,49 @@ handoff (3981 pass, 1 skip, 0 fail) and CI runs it on #472.
 
 Not verified by anyone: how the control looks in a browser, in either theme. The owner
 looks at Add Quality Rule after the merge.
+
+### S3, round 1 (planner, 2026-11-12) — branch at `faafbd7c`, pull request #475
+
+No `BLOCKER`, no `SHOULD-FIX`. One finding goes to the backlog (`WEB-10`).
+
+Read: every converted site under `src/features/dashboards` (7 files, 16 selects),
+`src/features/pipelines` (2 files, 6) and `src/features/queries` (4 files, 5), the lint
+rule, and the lines the tests lost.
+
+- **D2, D2a.** `Choose a chart…` and `Choose one of the connector's tables` became
+  placeholders; `All` and `No connector (read a ClickHouse table directly)` stayed real
+  choices. Sites whose value can fall outside the list got a placeholder (`Pick a series`,
+  `Pick a mode`, `Pick a level`).
+- **D3.** Options, order, disabled states and effects are unchanged. `PlainSelect` in
+  `filter-editors.tsx` is gone with its comment that the repo had no select fitting a
+  narrow popover. The filter mode's hint moved from the select's `title` to a wrapping
+  `span`, because `SelectField` takes data. The two `<optgroup>` sites use groups.
+- **A `Select` inside a popover.** `filter-editors.tsx` renders inside a Radix `Popover`
+  (`filter-bar.tsx:140`) while `SelectField` is Base UI. Radix decides "outside" through
+  the React tree, which a portal keeps, so choosing an option does not close the popover;
+  four files already put the design system's `Select` in a popover
+  (`query-parameter-menu.tsx`, `sql-panel.tsx`, `data-table-filter-controls.tsx`,
+  `data-table-sort-chip.tsx`). Read, not seen in a browser.
+- **D4.** `eslint.config.mjs` refuses `JSXOpeningElement[name.name='select']` under
+  `src/**/*.{ts,tsx}` with the plan's message. On this branch `bun run lint` reports 19
+  errors, all that rule, all in the 11 connector files S2 converts; nothing else.
+- **D6, the finding.** The list of a `SelectField` is portalled to `<body>`, so inside a
+  dashboard fixed to the light theme within a dark console (`.theme-light`, `BI-17` D6)
+  the list takes the console's dark tokens. It is readable, and it is what every other
+  design-system popup on that surface already does (menus, popovers, the existing
+  `Select`s), so it is not fixed here. For the embed filter bar it is a change: the native
+  list there used to come out light. Filed as `WEB-10`.
+
+Re-run by the planner at `faafbd7c`, in the foreground:
+
+| Command | Result |
+| --- | --- |
+| `bun test src/features/dashboards src/features/pipelines src/features/queries` | 1128 pass, 0 fail, 119 files |
+| `bun run typecheck` | clean |
+| `bun run lint` | 19 errors, all `no-restricted-syntax` in `src/features/connectors` (11 files); 11 warnings as on `main` |
+| S3's acceptance grep (connectors excluded) | prints nothing |
+
+`bun run lint` is run again, and must be clean, after S2 (#474) is merged and `main` is
+merged into this branch. The PR is not merged before that.
+
+Not verified by anyone: how the control looks in a browser, in either theme.
