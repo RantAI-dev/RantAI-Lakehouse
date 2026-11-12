@@ -511,9 +511,11 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
   // (`permission_denied: connector:manage`). That one gets a sentence that says
   // what the person can do; every other error goes through the shared
   // translation, so no text that starts with one of the API's codes is shown.
+  // The refusal is `code` or `status`: `getJson` maps a 403 to `invalid_request`
+  // and keeps the status (`home-cards.ts`'s `cardRead` reads it the same way).
   const connectorsError =
     connectorList.status === "error"
-      ? connectorList.error.code === "permission_denied"
+      ? connectorList.error.code === "permission_denied" || connectorList.error.status === 403
         ? "You do not have permission to choose a connector for this rule."
         : readableErrorMessage(connectorList.error.message)
       : null
