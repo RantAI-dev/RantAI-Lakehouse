@@ -1000,3 +1000,79 @@ Console (T5 to T8):
   first commit.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `2d277521c`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#483) runs the suites. 1 BLOCKER, 7 SHOULD-FIX. No part of the held T1 and T2 was
+built, no existing test was weakened, and the documents stay within section 0.
+
+### R1. BLOCKER: The contract, a panel comment and a new test state the held fixed-sentence rule (T1) as fact, and it is false on this branch.
+
+- Where:
+  - `src/services/contracts/queries.ts:362-365` (doc of `QueryEstimate.error`: "the server's fixed sentence by cause with a reference id (`QS-6`), never the engine's own text")
+  - `src/features/queries/query-transparency-panel.tsx:181-184` ("its reason (a fixed sentence by cause since `QS-6`, with a reference id)")
+  - `src/features/queries/query-transparency-panel.test.tsx:114` (`shows the server's fixed sentence when a query cannot be planned`)
+  - what the server really does: `rust/crates/lakehouse-api/src/routes/query.rs:2707` (`estimate_body` still maps the failure with `upstream_error::ch_message_for_author`), and the route's own doc at `query.rs:2450-2452` ("the `ClickHouse` message is carried in `error`")
+- What happens: T1 is held (section 0), so a failed `EXPLAIN ESTIMATE` still puts the engine's trimmed diagnosis in `error`. The TypeScript contract now says the opposite, in the same branch where the Rust doc says the engine's message is carried. Section 0 says to leave T1's ground as it is today; T6 steps 2 and 5 were written for a build that has T1, and were applied literally. Rule 1 (a claim checked against the code before it is written in a comment) is broken, and if the owner keeps the author exception the comment stays false. The new test also passes on the code before the change (the panel already printed `error` under "This query cannot be planned"), so it proves nothing and its name claims the held behaviour. No behaviour is affected.
+- Fix: restore the old meaning in both comments (for example "Why there is no estimate, as the server sends it: today the engine's trimmed diagnosis, `SEC-11` decision 4"), with no mention of a fixed sentence. Rename the test to what it checks ("shows the server's `error` text when a query cannot be planned") and give it an engine-style string, or delete it. `reason` at `queries.ts:351` is correct and stays. Leave the T1 wording for the T1 commit.
+- Check: `grep -n "fixed sentence" src/services/contracts/queries.ts src/features/queries/query-transparency-panel.tsx src/features/queries/query-transparency-panel.test.tsx` returns only the `reason` line (`queries.ts:351`) and the Trino branch comment (`query-transparency-panel.tsx:169`).
+
+### R2. SHOULD-FIX: After a tab's engine changes, the panel keeps showing the other engine's estimate until the next answer arrives.
+
+- Where: `src/features/queries/use-query-studio.ts:951-960` (the effect only schedules `estimateDebounced`), `src/hooks/use-service.ts:112` (`run` keeps `prev.data` while pending), `src/features/queries/query-transparency-panel.tsx:172` and `:191` (both branches draw `state.data` whatever the open tab's engine is).
+- What happens: a ClickHouse tab shows an estimate with sources; the person sets the engine to Trino (or opens a Trino tab). For the 500 ms debounce the panel still shows the ClickHouse estimate, undimmed, with "Engine: ClickHouse" and the ClickHouse sources, then the same dimmed until the server answers. That is the screen of `LH-QS-4-08`, now for a short time instead of for good. The other way round, a ClickHouse tab shows "No pre-run estimate / Engine: Trino" for the same interval. The estimate state belongs to the hook, not to the tab or the engine.
+- Fix: when `engine` differs from the engine of the estimate on screen, call `resetEstimate()` before scheduling the new one (in the effect at `:951`), so the panel shows the skeleton. Simplest form: keep the last engine in a ref and reset when it changes.
+- Check: in `use-query-studio.test.ts`, extend "asks for the estimate again, with the engine, when the tab's engine changes to Trino": the first estimate resolves `{ supported: true, queryEngine: "clickhouse", sources: ["x"] }`; right after `setEngine("trino")`, before the second call resolves, `hook.result.current.estimate.data` is `null`.
+
+### R3. SHOULD-FIX: The test "falls back to the entry's own read when the Bronze listing fails" passes when a failed listing is wrongly read as "every table is missing".
+
+- Where: `src/features/queries/use-query-studio.test.ts:472-490`; the rule it should pin is `src/features/queries/use-query-studio.ts:526-529` (`listedBronzeNames` is `null` unless the listing succeeded).
+- What happens: the test checks `reference: ""` right after the tables load (true before the listing has even rejected, and true for a "missing" proof as well), then calls `loadColumns` and waits for the name. The entry's own read always wins (`:536`), so the name appears in both cases. A change that turned a failed listing into an empty set would show "No readable table for this asset yet." on every Bronze row and this test would stay green. It also never checks that the listing was asked for.
+- Fix: before `loadColumns`, wait for `listTables` to have been called once and flush (`await act(async () => {})`), then assert `hook.result.current.proofs["demo_orders"]` is `undefined`.
+- Check: temporarily make `listedBronzeNames` return `new Set()` when `bronzeListing.status === "error"`; the corrected test must fail.
+
+### R4. SHOULD-FIX: No test covers the branch where `canDownload` is `false` because the settings cannot be read.
+
+- Where: `rust/crates/lakehouse-api/src/routes/query.rs:2030-2034` (`format_settings(state).await.is_ok_and(..)`); the two tests are `query.rs:6364` (no pool, so the defaults: `true`) and `tests/query_history.rs:1094` (a readable row: `false`).
+- What happens: the code fails closed today (D9). Nothing pins it: replacing `is_ok_and` by `map_or(true, ..)` keeps both tests green, and the console would then offer Download and Copy as TSV whenever `reporting_settings` cannot be read.
+- Fix: add a test in `tests/query_history.rs`, `mod recording`, that makes the settings read fail after the session exists (for example `ALTER TABLE reporting_settings RENAME TO reporting_settings_gone` on the test pool, then `post_sql`), and asserts status 200 and `body["canDownload"] == false`.
+- Check: that test, which must fail with `map_or(true, ..)` in place of `is_ok_and`.
+
+### R5. SHOULD-FIX: "reads and writes nothing while the owner is not known" proves the writes only.
+
+- Where: `src/features/queries/use-query-studio.test.ts:1132-1142`.
+- What happens: storage is empty when the hook mounts, so there is nothing a read could find. A hook that read the old shared entry, or removed it, while `draftKey` is `null` would pass. The "nothing is read" half of D12 is not tested anywhere with an unknown owner.
+- Fix: seed `LEGACY_QUERY_DRAFT_KEY` with a tab holding `SELECT 'shared'` before `renderHook(() => useQueryStudio(null))`; assert `hook.result.current.sql` is not that text, the legacy entry is still present after the 600 ms, and `localStorage.length` is 1.
+- Check: move `dropLegacyDraft()` above the `ownKey === null` return in the restore effect (`use-query-studio.ts:830`); the corrected test must fail.
+
+### R6. SHOULD-FIX: The Trino estimate test asserts "no request" through a helper that hides every request containing `system.`.
+
+- Where: `rust/crates/lakehouse-api/src/routes/query.rs:6581-6582` and `:6608-6609`, using `received()` at `:6218-6228` (`.filter(|b| !b.contains("system."))`).
+- What happens: D7 says nothing is sent to any engine and the policy rewrite is skipped. The helper was written to ignore the rewrite's own `system.*` lookups, so these assertions cannot see the one kind of request D7 rules out. The first test would still fail today if the rewrite ran (it answers `NotFound` for `bronze.t` without a pool), but the "asks no engine" claim itself is not what is asserted.
+- Fix: in both tests assert the unfiltered count: `assert!(ch.received_requests().await.expect("recorded").is_empty())`, and the same for `trino`.
+- Check: the two tests with that assertion.
+
+### R7. SHOULD-FIX: The handoff reports 27 passed for `--test query_history`; the file holds 26 tests.
+
+- Where: plan section 5, line 925; `rust/crates/lakehouse-api/tests/query_history.rs` has 26 `#[tokio::test]` functions at `2d277521c` (25 at the base `208b0572c`, plus the new one), and `tests/common/mod.rs` adds none.
+- What happens: the quoted count cannot come from this file on the final commit, so the line does not meet rule 7 (a count you can quote from the run). The other counts in the handoff add up (5 unit tests for the four filters; 4019 + 1 skipped = the 4020 of the earlier run).
+- Fix: re-run `cargo test -p lakehouse-api --test query_history` on the final commit and correct the line with the real count, or mark it *not verified*.
+- Check: the reviewer's own run of that command before merge.
+
+### R8. SHOULD-FIX: Four decision rows say the owner signed wording the owner has not seen.
+
+- Where: `docs/core/features/query-studio-editor.md` decisions 5 and 9, `docs/core/features/query-studio-results.md` decision 8, `docs/core/features/query-history.md` decision 8: the Signed cell now ends "changed: Owner, 2026-11-12".
+- What happens: T9 told the developer to write that, and it was the planner's mistake: the owner asked for the fixes and has not yet read the new wording (open question 2 in 4a). A Signed cell that names the owner is a claim (principle 2).
+- Fix: in those four cells replace "changed: Owner, 2026-11-12" by "changed 2026-11-12 (`QS-7`, `QS-8` or `QS-9` as fits the row), *(proposed, not yet signed)*". The planner asks the owner and corrects the cells when the answer comes.
+- Check: `grep -n "changed: Owner, 2026-11-12" docs/core/features/query-*.md` returns nothing.
+
+**Checked, no defect found:** `canDownload` uses `settings::may_download` as the dashboard
+does and fails closed; the download routes are unchanged; the draft key always holds the user
+id and a late write goes to its first owner; a Trino estimate returns before the policy
+rewrite and before any engine call; the Bronze listing goes through the `GOV-7` gate.
+
+**Noted for the backlog, not for this branch:** the active tenant kept in the browser
+(`lh_active_tenant`) is not cleared on sign-out and not checked against the next person's
+tenants (`auth-provider.tsx:178`), so the next person can start in a tenant that is not
+theirs until they pick one.
