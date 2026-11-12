@@ -157,4 +157,105 @@ No Rust changes, so no cargo command. CI runs the rest on the draft PR.
 
 ## 5. Handoff (developer appends below, one entry per slice)
 
+### Handoff (developer, 2026-11-12, S1)
+
+Branch `feat/web-9-select-s1`, off `feat/web-9-select-s1` at `be14f8cc6` (the plan commit).
+Only `src/` and this plan changed; no `rust/`, `dagster/`, `ops/`, migration,
+`docker-compose.yml` or `design-system/` file, and no cargo command was run.
+
+**Commits**
+
+| Hash | Subject |
+| --- | --- |
+| `1d1a2e447` | `fix(web-9): set color-scheme so native controls follow the theme` |
+| `c55a0ebcc` | `feat(web-9): add SelectField, the console's one dropdown` |
+| `599ea5d29` | `refactor(web-9): replace governance's native selects with SelectField` |
+| `c0a4995f5` | `refactor(web-9): replace catalog's native selects with SelectField` |
+
+Each commit was pushed to `origin/feat/web-9-select-s1` immediately after it was made.
+
+**Files converted (`SelectField`), with the number of selects in each**
+
+- T3, `src/features/governance` — 5 files, 10 selects:
+  `quality-check-fields.tsx` (5), `quality-schedule.tsx` (2),
+  `quality-rule-create-page.tsx` (1), `quality-rule-edit-dialog.tsx` (1),
+  `freshness-target-dialog.tsx` (1). `selectClassName` deleted in every file
+  that had one.
+- T4, `src/features/catalog` — 5 files, 5 selects: `asset-about.tsx`,
+  `asset-grants.tsx`, `asset-quality.tsx`, `column-lineage.tsx`,
+  `column-sensitivity.tsx`.
+
+Plan/code mismatch, reported not improvised: section 2 says governance has 6
+files and 11 selects, but at this branch's base the acceptance grep named
+5 files and 10 selects. T3 converted exactly what the grep names, as the task
+text allows. No file under either area has a native `<select>` left.
+
+Per D2: the empty option that was only a prompt became `placeholder` at
+`column-lineage.tsx` ("Pick a column"); `asset-about.tsx`'s "None" is a real
+choice and stays an option with `value: ""`, held behind `SelectField`'s
+private sentinel (Base UI treats `""` as nothing selected). `quality-schedule`
+keeps its minute values as strings at the boundary and converts back in
+`onValueChange`; no stored value changed.
+
+**Commands run, with real counts (all in the foreground)**
+
+- `bun install --frozen-lockfile` once (this checkout had no `node_modules`):
+  678 packages installed.
+- T2: `bun test src/components/patterns/select-field.test.tsx` → 7 pass, 0 fail.
+  The seven tests are the ones T2 lists; names are full sentences.
+- T3: `bun test src/features/governance` → 78 pass, 0 fail, across 13 files.
+- T4: `bun test src/features/catalog` → 369 pass, 0 fail, across 14 files.
+- `bun run typecheck` before every commit → no errors.
+- `bun run lint` before every commit → 0 errors, 11 warnings; the same 11
+  warnings (unused vars, hook deps, `window.location.assign`) exist on the
+  base and none is in an S1 file.
+- Final commit, once: `bun run typecheck && bun run lint && bun run test` →
+  typecheck no errors; lint 0 errors, 11 warnings; test 3981 pass, 1 skip,
+  0 fail, 11945 `expect()` calls, 380 files, 140.47s. The known flaky
+  `AssistantSettingsForm (ADM-9)` test (`REL-24`) did not fail, so the suite
+  was run once.
+- `python3 ops/lint/check_bare_iceberg_count.py` → "R11 guard: no bare
+  count() against a Bronze Iceberg table found."
+- `python3 ops/lint/check_intra_package_imports.py` → "OK: all intra-package
+  dispar_orchestrate imports resolve".
+- S1 acceptance:
+  `grep -rnE '<select\b' src/features/governance src/features/catalog --include=*.tsx | grep -v '\.test\.'`
+  prints nothing (exit 1).
+- `git status` before each commit: only the intended files; nothing generated
+  was staged.
+
+**Tests that had to change, and why**
+
+No test was deleted or loosened. Four files were rewritten where they set a
+native select with `fireEvent.change`, now calling `chooseOption`:
+
+- `src/features/governance/quality-rule-create-page.test.tsx` — the two
+  WEB-8 column tests asserted `tagName === "SELECT"`, `.value` and
+  `select.options`. The control is a button now, so they assert the same
+  facts through the combobox: it is a combobox (not the free-text `INPUT`),
+  its trigger shows the kept value's label (including "(not in this table)"),
+  and the open list holds the same options in the same order.
+- `src/features/catalog/asset-detail-tabs.test.tsx` — the lineage test also
+  asserted "Pick a column" as a `<select>` option; D2 makes it the
+  placeholder, so it asserts the placeholder in the trigger and the two
+  column options in the open list. The other changed steps only swap
+  `fireEvent.change` for `chooseOption`; where the old test read
+  `select.value` it now reads the trigger's label ("days", "High"), which is
+  what a person sees.
+- `src/features/catalog/column-lineage.test.tsx` — same mechanism change and
+  the same "Pick a column" placeholder change as above.
+- `src/features/governance/data-quality-page.test.tsx` — mechanism only; the
+  Unit assertion reads the trigger label.
+
+**Skipped / not verified**
+
+- No browser check. I cannot see the page in a browser here, so D1's
+  `color-scheme` on a native control, and the look of the new popup in the
+  dark theme, are *not verified* beyond the DOM-level tests above.
+- D6 (a light dashboard's popup) belongs to S3's dashboard sites and was not
+  exercised in this slice.
+- No Rust/Python/compose change, so none of those checks were run.
+- No visual finding about list length to report: the converted lists are the
+  same lengths they were (longest is the quality check list, unchanged).
+
 ## 6. Review (planner)
