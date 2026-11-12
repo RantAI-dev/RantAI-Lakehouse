@@ -3296,6 +3296,13 @@ pub(crate) async fn readable_asset_names(
     principal: &Principal,
     ids: &[String],
 ) -> Option<Vec<String>> {
+    // Review round 1 R8: a caller who may not open the catalog is not told
+    // which tables hold a key — the same rule [`ensure_may_open_asset`]
+    // applies (`catalog:read`, or a grant for the table's page). The
+    // sentence then counts them and names nobody.
+    if !principal.has("catalog:read") {
+        return Some(Vec::new());
+    }
     let access = match table_access_for(state, principal).await {
         Ok(access) => access,
         Err(err) => {

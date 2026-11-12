@@ -3505,6 +3505,71 @@ mod tests {
             );
         }
 
+        // Review round 1 R8 (`DATA-54`): a caller who may not open the catalog
+        // is told how many tables hold the key, and named none of them.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_caller_without_catalog_read_is_told_the_count_and_no_name(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            // A deployment with no tenant of the seeded ones: the catalog's
+            // tenant rule then changes nothing, and the permissions are what
+            // is under test.
+            sqlx::query("DELETE FROM app_user_tenant")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM tenant")
+                .execute(&pool)
+                .await
+                .unwrap();
+            create(
+                &state,
+                r#"{"key":"data_domain","allowedValues":["finance","ops"]}"#,
+            )
+            .await;
+            for asset in ["silver.a", "silver.b"] {
+                lakehouse_store::governed_tag::set_asset_tags(
+                    &pool,
+                    asset,
+                    &[("data_domain".to_owned(), "ops".to_owned())],
+                    "Rina",
+                )
+                .await
+                .unwrap();
+            }
+            crate::routes::catalog::prime_search_copy_for_test(
+                &state,
+                vec![
+                    json!({ "id": "silver.a", "name": "Orders" }),
+                    json!({ "id": "silver.b", "name": "Customers" }),
+                ],
+            )
+            .await;
+
+            // Governance Admin without `catalog:read`: it may delete a key, but
+            // it may not list the tables the sentence would name.
+            let writer = Principal {
+                permissions: PermissionSet::parse("governance:write"),
+                ..admin()
+            };
+            let (status, refused) = answer(
+                delete_tag_key(
+                    State(state.clone()),
+                    Extension(writer),
+                    Path("data_domain".to_owned()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let message = refused["error"].as_str().unwrap();
+            assert!(message.contains("2 tables."), "{refused}");
+            assert!(!message.contains("Orders"), "{refused}");
+            assert!(!message.contains("Customers"), "{refused}");
+        }
+
         // PR #106 review R1 BLOCKER 1
         #[sqlx::test(migrations = "../../migrations")]
         async fn a_caller_outside_the_catalog_tenant_is_refused_every_tag_key_write(
