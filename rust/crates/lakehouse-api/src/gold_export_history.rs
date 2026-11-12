@@ -16,10 +16,13 @@
 //! kind of single owner `lakehouse-bi::store` uses for its own
 //! `console.*` tables: an idempotent Rust-side `ensure_*` function.
 //!
-//! One row per call to `POST /api/gold/export/{mart}` that gets past the mart's
-//! existence — success or failure, written by `routes::gold::export` itself
-//! right after `gold_export::export_mart` returns, or as soon as a step before
-//! the export fails (`DATA-56`, #484 review R4). That captures BOTH trigger
+//! At most one row per call to `POST /api/gold/export/{mart}`: none for a
+//! refusal, a skip under `?ifChanged=true` or a `409`; one for the export's
+//! outcome; one for a failure before the export on a mart `system.tables` lists
+//! (written by `routes::gold::export` itself right after
+//! `gold_export::export_mart` returns, or as soon as such a step fails —
+//! `DATA-56`, #484 review R4; the exact list is that route's "What is
+//! recorded" section). That captures BOTH trigger
 //! sources (the console's "Export now" button and the Dagster schedule)
 //! through the one HTTP handler both call, and it captures the publishes that
 //! fail before the copy starts, which used to leave no trace at all.

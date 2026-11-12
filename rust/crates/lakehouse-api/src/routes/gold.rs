@@ -595,9 +595,11 @@ pub async fn export(
     })))
 }
 
-/// Best-effort history write for one finished export attempt: every
-/// `POST` that gets past the mart's existence records exactly one row, success
-/// or failure (the acceptance test counts on it), but a failed write is
+/// Best-effort history write for one finished export attempt: at most one row
+/// per call — none for a refusal, a skip under `?ifChanged=true`, or a `409`;
+/// one for the export's outcome; one for a failure before the export on a mart
+/// `system.tables` lists (the exact list is this module's "What is recorded"
+/// section on `export`). The acceptance test counts on it. A failed write is
 /// logged, never propagated — this table is a history view, not a correctness
 /// dependency of the export itself (`gold_export_history::record_export_run`'s
 /// doc comment).
@@ -778,8 +780,9 @@ async fn read_content_fingerprint(
 /// the token check, the mart name, and the tenant gate all refuse the request
 /// rather than fail it. `attempt.exists` is `false` for a name `system.tables`
 /// does not list (D23): such a name goes on as before and no early failure is
-/// recorded for it. A failed read of `system.tables` never gets here
-/// (`Attempt::open` returns it unrecorded).
+/// recorded for it. A failed read of `system.tables` never gets here:
+/// `Attempt::open` returns it unrecorded, so it never builds an `Attempt`
+/// (review round 1, R5).
 ///
 /// This is the PRE-LOCK helper, used for the content fingerprint and the
 /// `?ifChanged=true` history read (review round 1, R3): the row is written only
