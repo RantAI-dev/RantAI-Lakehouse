@@ -193,8 +193,9 @@ const CORPUS: &[(&str, Expect)] = &[
         Expect::SelectGuardRefused,
     ),
     // The review shape (2026-11-12, same image): the engine refuses the
-    // statement, and before the lexer followed the quotes the guard let it
-    // pass, because it read a string around the `DROP`.
+    // statement. The lexer does not follow the quotes: it marks them
+    // uncertain, so the guard refuses the statement. A lexer that read a
+    // string around the `DROP` let it pass.
     (
         "SELECT \u{2018} ' \u{2019}; DROP TABLE t; SELECT \u{2018} ' \u{2019}",
         Expect::RefusedBoth,

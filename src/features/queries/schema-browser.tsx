@@ -166,7 +166,7 @@ function TableRow({
         : proof?.status === "failed"
           ? TABLE_PROOF_FAILED
           : NO_SQL_NAME
-  // Plan 73 D4 (QS-13-AC12): on a Trino tab a Bronze table's columns follow
+  // LH-QS-4-08: on a Trino tab a Bronze table's columns follow
   // its row. A row that is not insertable (proving, failed) has columns that
   // are not either, and a row whose Iceberg table is not there has none to
   // show. A ClickHouse tab reads a Bronze table with Trino anyway, so its

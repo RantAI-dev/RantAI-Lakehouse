@@ -360,7 +360,7 @@ describe("SchemaBrowser", () => {
     expect(row.getAttribute("title") ?? "").toContain("SQL name")
   })
 
-  // Plan 73 D4 (QS-4-AC14, QS-13-AC12): a Bronze row is proven when the list
+  // LH-QS-4-08: a Bronze row is proven when the list
   // loads, and its columns follow the row.
   it("offers a Bronze table's Trino name on a Trino tab without expanding it", async () => {
     visitTrinoTab()

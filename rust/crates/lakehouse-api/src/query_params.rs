@@ -376,12 +376,13 @@ struct Found {
 /// The placeholders the author wrote, in order. Comments are skipped, a
 /// well-formed placeholder inside quotes or inside a `ClickHouse` heredoc is
 /// refused, a `{{` that is not a placeholder outside both is refused, and a
-/// placeholder in a statement that holds a `$`-run no measured rule reads,
-/// or a Unicode quote on `ClickHouse` ([`SpanKind::Uncertain`]), is refused
-/// with the inside-quotes sentence too: the engine refuses every such `$`
-/// shape the measurements cover and reads `‘ … ’` as a literal this lexer
-/// does not follow, so the value would be printed into text no measured rule
-/// reads. A statement that holds the run and no placeholder comes back as it
+/// placeholder in a statement that holds an [`SpanKind::Uncertain`] span is
+/// refused with the inside-quotes sentence too. That span is a `$`-run no
+/// measured rule reads, or on `ClickHouse` a Unicode quote (U+2018, U+2019,
+/// U+201C or U+201D) outside a quoted run, a comment or a heredoc: the engine
+/// reads `‘ … ’` as a literal this lexer does not follow, so the value would
+/// be printed into text no measured rule reads. A statement that holds the
+/// span and no placeholder comes back as it
 /// stands — the guard refuses it at run.
 ///
 /// The text is read the way the engine reads it, by the one lexer in
@@ -429,13 +430,14 @@ fn scan(engine: Engine, sql: &str) -> Result<Vec<Found>, ParamError> {
             }
             // A comment, and text the engine cannot run: nothing to fill.
             SpanKind::Comment | SpanKind::NotCode => {}
-            // A `$`-run no measured rule reads: recorded, and refused
-            // with the statement's first placeholder below.
+            // A `$`-run no measured rule reads, or a Unicode quote on
+            // `ClickHouse`: recorded, and refused with the statement's
+            // first placeholder below.
             SpanKind::Uncertain => uncertain = true,
         }
     }
     // A placeholder in a statement that holds an uncertain
-    // `$`-run is refused, not filled. Without a placeholder the statement
+    // span is refused, not filled. Without a placeholder the statement
     // comes back as it stands; the guard refuses it at run.
     if uncertain && !found.is_empty() {
         let first = &found[0];

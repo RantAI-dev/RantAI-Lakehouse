@@ -136,12 +136,12 @@ export function QueryTransparencyPanel({
   /**
    * Whether the open tab's engine has an estimate at all. Only ClickHouse
    * does: the server's `EXPLAIN ESTIMATE` has no Trino counterpart, so a Trino
-   * tab never asks and the panel says so (plan 73 D3, LH-QS-4-08).
+   * tab never asks and the panel says so (LH-QS-4-08).
    */
   estimateSupported?: boolean
   /**
    * The first parameter the estimate waits for, or `null`. The panel names it
-   * in the spelling of the run's refusal (plan 73 D6, QS-5-AC14).
+   * in the spelling of the run's refusal (QS-5-AC14).
    */
   waitingFor?: string | null
   onRetry: () => void

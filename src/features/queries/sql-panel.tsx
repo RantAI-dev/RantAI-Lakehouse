@@ -286,7 +286,7 @@ export function SqlPanel({
           disabled={estimateAct.status === "pending" || !oneStatement || !estimateSupported}
           title={
             !estimateSupported
-              ? // Plan 73 D3 (LH-QS-4-08): the same sentence the panel says.
+              ? // LH-QS-4-08: the same sentence the panel says.
                 "No pre-run estimate for Trino queries."
               : oneStatement
                 ? undefined

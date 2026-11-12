@@ -108,8 +108,10 @@ pub fn is_read_only(sql: &str, engine: Engine) -> bool {
 /// cannot run. And the tail of a heredoc that is never closed: the engine
 /// reads that tail as code (`ClickHouse` opens a heredoc only when the
 /// closing delimiter is found again in the text), so a denied keyword in
-/// it is a keyword the engine would run. And a `$`-run no measured rule
-/// reads ([`SpanKind::Uncertain`]): [`is_read_only`] refuses the whole
+/// it is a keyword the engine would run. And an uncertain span
+/// ([`SpanKind::Uncertain`]): a `$`-run no measured rule reads, or on
+/// `ClickHouse` a Unicode quote outside a quoted run, a comment or a heredoc.
+/// [`is_read_only`] refuses the whole
 /// statement when one is present, so keeping it as it stands here cannot
 /// make a statement pass. The guard reads all three as they stand.
 #[must_use]

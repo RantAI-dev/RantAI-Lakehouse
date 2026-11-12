@@ -392,7 +392,7 @@ describe("useQueryStudio Bronze tables", () => {
   })
 })
 
-// Plan 73 D3 (LH-QS-4-08): the server's estimate is ClickHouse's `EXPLAIN
+// LH-QS-4-08: the server's estimate is ClickHouse's `EXPLAIN
 // ESTIMATE` and a Trino statement is not valid there, so a Trino tab never asks.
 describe("useQueryStudio estimate by engine", () => {
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -470,7 +470,7 @@ describe("useQueryStudio estimate by engine", () => {
   })
 })
 
-// Plan 73 D4 (QS-4-AC14, QS-13-AC12): the Bronze rows of the list are proven
+// LH-QS-4-08: the Bronze rows of the list are proven
 // when it loads on a Trino tab, a bounded number at a time.
 describe("useQueryStudio Bronze proof on list load", () => {
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -533,7 +533,7 @@ describe("useQueryStudio Bronze proof on list load", () => {
     expect(getTableDetail).toHaveBeenCalledTimes(2)
   })
 
-  it("completes the columns after an alias on a Bronze table written by its Trino name, once the row is proven (plan 73 D5)", async () => {
+  it("completes the columns after an alias on a Bronze table written by its Trino name, once the row is proven (QS-4-AC8)", async () => {
     visit("/query-studio?sql=SELECT%201&engine=trino")
     const { hook } = mountList([bronze(1)])
     const sql = "SELECT b. FROM iceberg.bronze.t1 b"
@@ -1039,7 +1039,7 @@ describe("useQueryStudio parameter requests", () => {
     expect(result.current.estimatable).toBe(true)
   })
 
-  it("names the first parameter the estimate waits for (QS-5-AC14, plan 73 D6)", async () => {
+  it("names the first parameter the estimate waits for (QS-5-AC14)", async () => {
     spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
     const { result } = mountWith("SELECT {{region}}, {{since}}")
     expect(result.current.estimateWaitsFor).toBe("region")

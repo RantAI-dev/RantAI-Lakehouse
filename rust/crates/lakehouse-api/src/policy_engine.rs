@@ -823,7 +823,7 @@ mod tests {
 
     #[test]
     fn engine_error_messages_are_distinct_english_sentences() {
-        // QS-13 (D7): the three user-facing texts are English, and each
+        // The three user-facing texts are English, and each
         // variant keeps its own sentence so a reader can tell a syntax
         // problem from a database fault or an unenforceable policy.
         let unparseable = engine_error_message(&PolicyEngineError::Unparseable);

@@ -445,7 +445,7 @@ test("inPlaceholder reads the braces before the name, and inCommentOrString the 
   assert.equal(inCommentOrString("SELECT 1", 8), false)
 })
 
-// Plan 73 D5 (QS-4-AC8): after `q.`, an alias the statement declares for a
+// QS-4-AC8: after `q.`, an alias the statement declares for a
 // table the list does not hold has no columns to offer, and the table list
 // is no answer to it either.
 test("sqlCompletionOptions offers nothing after an alias declared for a table that is not in the list", () => {

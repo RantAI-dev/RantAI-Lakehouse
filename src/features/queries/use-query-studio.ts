@@ -203,7 +203,7 @@ type Batch = {
 }
 
 /**
- * How many Bronze tables are proven at once when the list loads (plan 73 D4).
+ * How many Bronze tables are proven at once when the list loads (LH-QS-4-08).
  * Four keeps a long list moving without a burst of requests from one page.
  */
 const MAX_PROOF_READS = 4
@@ -614,11 +614,11 @@ export function useQueryStudio() {
       // named twice is fetched once, and a table that failed is not asked
       // for again on a keystroke.
       if (named.id in columnsRef.current) continue
-      fetchColumns(named.id)
+      void fetchColumns(named.id)
     }
   }, [sql, tables, assetsState.status, fetchColumns])
 
-  // Bronze rows are proven when the list loads (plan 73 D4, QS-4-AC14), so a
+  // Bronze rows are proven when the list loads (LH-QS-4-08), so a
   // Bronze row is insertable on a Trino tab without being expanded. It is
   // the read `fetchColumns` makes for a table a statement names, through the
   // same caches, so a table is read once however it was asked for. A
@@ -682,7 +682,7 @@ export function useQueryStudio() {
       ) {
         return
       }
-      fetchColumns(id)
+      void fetchColumns(id)
     },
     [fetchColumns, proofs]
   )
@@ -910,13 +910,13 @@ export function useQueryStudio() {
   )
   // A name with no value and no default would only be refused ("Fill in
   // ..."). The estimate waits for it instead, and the panel names it
-  // (plan 73 D6, QS-5-AC14). SQL with no placeholder is never held back.
+  // (QS-5-AC14). SQL with no placeholder is never held back.
   const estimateWaitsFor = firstMissingValueName(estimateDefinitions, parameterValues)
   const estimateWaits = estimateWaitsFor !== null
   const estimatable = targetStatement !== null && !estimateWaits
   // Only ClickHouse has an estimate: the server runs `EXPLAIN ESTIMATE`,
   // which a Trino statement is not valid in, so asking for one on a Trino
-  // tab got a refusal that read as the query's fault (plan 73 D3, LH-QS-4-08).
+  // tab got a refusal that read as the query's fault (LH-QS-4-08).
   const estimateSupported = engine === "clickhouse"
   React.useEffect(() => {
     if (!estimateSupported) {

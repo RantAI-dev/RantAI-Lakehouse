@@ -76,7 +76,7 @@ describe("QueryTransparencyPanel sources", () => {
   })
 })
 
-// Plan 73 D3 and D6 (QS-5-AC14, LH-QS-4-08): what the panel says when there is
+// LH-QS-4-08 and QS-5-AC14: what the panel says when there is
 // no estimate to show.
 describe("QueryTransparencyPanel without an estimate", () => {
   const IDLE: ActionState<QueryEstimate> = { status: "idle", data: null, error: null }
