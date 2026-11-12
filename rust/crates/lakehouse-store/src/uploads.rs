@@ -633,7 +633,8 @@ pub enum FolderFilter<'a> {
 }
 
 /// What narrows a listing before the newest-first window is cut, so that a
-/// folder's files and a search are not hidden by newer files elsewhere.
+/// folder's files, a search and one table's uploads are not hidden by newer
+/// files elsewhere.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ListFilter<'a> {
     /// The folder to show.
@@ -641,11 +642,17 @@ pub struct ListFilter<'a> {
     /// Text a file name or a table name must contain, case-insensitively.
     /// The text is bound as a value; `%`, `_` and `\` in it match themselves.
     pub text: Option<&'a str>,
+    /// Exactly this raw table name. Bound as a value and compared with `=`, so
+    /// `%` and `_` are ordinary characters and the case must match.
+    pub table: Option<&'a str>,
 }
 
 /// `tenant_id`'s uploads that match `filter`, newest first. `limit` is clamped to
 /// `1..=500`. A folder of another tenant matches nothing: the tenant is bound
-/// in the same statement.
+/// in the same statement. A table filter is an exact match on the raw
+/// `bronze_table`, not the contains-match [`ListFilter::text`] is: `stock` does
+/// not bring `stock_2026`, which is how the Table step asks which uploads of
+/// this tenant loaded into one table (`DATA-47`, QA `LH-DATA-35-03`).
 ///
 /// # Errors
 ///
@@ -674,6 +681,7 @@ pub async fn list_filtered(
         "SELECT {COLS} FROM file_upload WHERE tenant_id = $1 \
            AND (NOT $3 OR folder_id IS NOT DISTINCT FROM $4) \
            AND ($5::text IS NULL OR original_filename ILIKE $5 OR bronze_table ILIKE $5) \
+           AND ($6::text IS NULL OR bronze_table = $6) \
          ORDER BY created_at DESC, id DESC LIMIT $2"
     );
     // safe: only the constant `COLS` is formatted in; values are bound.
@@ -683,6 +691,7 @@ pub async fn list_filtered(
         .bind(by_folder)
         .bind(folder_id)
         .bind(pattern)
+        .bind(filter.table)
         .fetch_all(pool)
         .await?)
 }

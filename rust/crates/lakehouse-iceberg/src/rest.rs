@@ -867,5 +867,49 @@ mod tests {
             assert_eq!(warehouses.len(), 1);
             assert!(warehouses[0].reachable);
         }
+        /// `DATA-49` (QA `LH-DATA-1-01`): a Gold table the catalog does not have
+        /// is `None`, not an error — "never published" is a state the console
+        /// shows, and a 404 must not read as a failed request.
+        #[tokio::test]
+        async fn a_gold_table_the_catalog_does_not_have_loads_as_none() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces/gold/tables/never"))
+                .respond_with(ResponseTemplate::new(404).set_body_string(
+                    r#"{"error":{"message":"not found","type":"NoSuchTableException","code":404}}"#,
+                ))
+                .mount(&server)
+                .await;
+            let client = connect(&server).await;
+
+            let table = client
+                .load_gold_table_if_exists("never")
+                .await
+                .expect("a missing table is not an error");
+
+            assert!(table.is_none());
+        }
+
+        /// The other direction: a catalog that refuses the caller (401) is still
+        /// an error, so a broken credential never reads as "never published".
+        #[tokio::test]
+        async fn a_catalog_that_refuses_the_caller_is_still_an_error_for_a_gold_table() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces/gold/tables/never"))
+                .respond_with(ResponseTemplate::new(401).set_body_string(
+                    r#"{"error":{"message":"unauthorized","type":"NotAuthorizedException","code":401}}"#,
+                ))
+                .mount(&server)
+                .await;
+            let client = connect(&server).await;
+
+            let err = client
+                .load_gold_table_if_exists("never")
+                .await
+                .expect_err("a refusal must stay an error");
+
+            assert!(matches!(err, IcebergError::Catalog(_)), "{err}");
+        }
     }
 }
