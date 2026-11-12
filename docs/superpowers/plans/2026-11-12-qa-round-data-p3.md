@@ -1566,3 +1566,276 @@ Two things the plan did not name, reported here rather than improvised:
   import is `AssetDetail` only now (no unused import left).
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `80fa69ff`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#493) runs the suites. 4 BLOCKERs (R1 to R4) and 8 SHOULD-FIX. No existing test was
+weakened, every QA case id cited exists in the backlog row, and the documents stay in scope.
+
+**Planner's rulings** (where a ruling and a finding's "Fix" differ, the ruling holds).
+
+- **R1, R2.** As the findings say. The assistant's rule draft is checked as the person behind
+  the chat is; the existing `tier2_governance_drafts` test gets a `ClickHouse` stand-in and
+  keeps every assertion.
+- **R3 (a gap in T8).** As the finding says: the catalog's tenant gate runs before the table
+  is asked about, on create and on an update that changes the table. `run_rule`'s missing
+  tenant gate is older than this branch: it is NOT fixed here and gets its own backlog row,
+  filed by the planner.
+- **R4 is the planner's error in D20 and T20.** The sentence must not name a time. Use the
+  finding's wording, correct the changelog entry, and correct D20 and T20 in this plan.
+- **R5 to R12.** As the findings say (R9: the comparison moves into the write; R10: the piece
+  is taken around the first part of the word that is found).
+
+### R1. BLOCKER: The assistant's `draft_quality_rule` passes `None` as the actor although the dispatcher holds the signed-in person, so it skips the per-role table check and is an existence oracle.
+
+- Where: `rust/crates/lakehouse-api/src/routes/ai/tools/governance.rs:151-172` (the `None` at `:167`,
+  and the comment `:164-166` "The drafting tool has no person behind it");
+  `rust/crates/lakehouse-api/src/routes/ai/tools/mod.rs:135-140` (`run_tool(state, principal:
+  Option<&Principal>, …)`) and `:258` (`"draft_quality_rule" => governance::draft_quality_rule(state,
+  args)` — the principal is in scope and is passed to most other arms, not to this one);
+  `rust/crates/lakehouse-api/src/routes/quality.rs:988-995` (the access check runs only for `Some`).
+- What happens: a person whose role is narrowed to `silver.orders` (`read_scope = 'listed'`) and who
+  holds `governance:write` asks the assistant to draft a rule on `silver.customers`. `POST
+  /api/governance/quality` by the same person answers 400 "is not a table you can read"; the tool
+  call reaches `ensure_rule_table(state, None, …)`, the access check is skipped, the table exists,
+  and the rule is stored. The same call for `silver.no_such_table` answers the refusal: so through
+  the assistant a hidden table reads "created" and a missing one reads "refused", which is the
+  oracle D17 forbids. The comment is also false against the signature (rule 1): in a chat the
+  principal is the person; it is `None` only for a headless run.
+- Fix: give `draft_quality_rule` the dispatcher's principal (`governance::draft_quality_rule(state,
+  principal, args)`) and pass it on to `create_quality_rule(State(..), principal, bytes)`. Replace
+  the comment: the person behind the chat is checked exactly as the form checks them; only a run
+  with no principal is not narrowed (`TableAccess`'s documented rule).
+- Check: in `tests/quality_incidents.rs` (it has the ClickHouse stand-in and the narrowed-role
+  setup), `the_assistant_cannot_draft_a_rule_on_a_table_the_person_may_not_read`: the narrowed user
+  of the T8 test posts `/api/ai/tool` `{tool: "draft_quality_rule", args: {… "asset":
+  "silver.customers", "confirmed": true}, mode: "build"}`; `outcome` is `failed`, the result's
+  `error` equals the sentence `POST /api/governance/quality` gives for the same table, and
+  `quality_rule` holds no such row; with `silver.orders` the outcome is `executed`. Wrong change
+  that must make it fail: passing `None` again (the hidden table's rule is stored).
+
+### R2. BLOCKER: An existing integration test now fails: `draft_quality_rule_is_never_passed_or_failed` drafts a rule with no ClickHouse behind it, which T8 turns into a 503.
+
+- Where: `rust/crates/lakehouse-api/tests/tier2_governance_drafts.rs:141-168` (not in the diff);
+  `rust/crates/lakehouse-api/tests/common/mod.rs:57`, `:317` (`CH_URL` is `http://127.0.0.1:1` under
+  `spin_up()`); `rust/crates/lakehouse-api/src/routes/governance.rs:1691`;
+  `rust/crates/lakehouse-api/src/routes/quality.rs:996-1007`;
+  `rust/crates/lakehouse-api/src/routes/ai/mod.rs:1659-1660`.
+- What happens: the test calls the tool with `"asset": "serving.mart_wisman"` on `spin_up()`.
+  `create_quality_rule` now calls `ensure_rule_table` first; `clickhouse_source` cannot reach
+  ClickHouse and answers `Err`, so the handler answers 503 "The table could not be checked. Try
+  again."; the tool result is `{"error": …}`, `outcome` becomes `"failed"`, and the helper's
+  `assert_eq!(body["outcome"], "executed")` (`:74`) fails (the later `fetch_one(...).expect("row
+  must exist")` would fail too). The handoff ran only `--test quality_incidents` and `--lib`
+  filters, so this was never run; it passes on `main`, so the pull request adds a red check
+  (AGENTS.md step 6).
+- Fix: give that test a ClickHouse stand-in that answers `system.columns` for `serving.mart_wisman`
+  (`spin_up_with_env` with `CH_URL`, as `tests/quality_incidents.rs::app()` does). Do not loosen its
+  assertions (rule 2). Add the handoff line for `cargo test -p lakehouse-api --test
+  tier2_governance_drafts` with its count.
+- Check: `cargo test -p lakehouse-api --test tier2_governance_drafts` passes; add beside it
+  `a_drafted_rule_for_a_table_that_is_not_there_is_refused` (the stand-in answers no columns for
+  `no_such_table`: `outcome == "failed"`, no row). Wrong change that must make the existing test
+  fail again: removing the stand-in.
+
+### R3. BLOCKER: The new table check is not behind the catalog's tenant gate, so a caller outside the catalog's tenant learns whether a table exists (400 against 201). (Plan gap: T8 names no tenant check.)
+
+- Where: `rust/crates/lakehouse-api/src/routes/quality.rs:969-1018` (`ensure_rule_table`: role access
+  and existence, no tenant); `rust/crates/lakehouse-api/src/routes/governance.rs:1053-1075`,
+  `:1685-1701` (`create_rule`, `create_quality_rule`: no `catalog_tenant_refusal`);
+  `rust/crates/lakehouse-api/src/routes/quality.rs:1177-1211` (`update_rule`: none either). The
+  catalog's rule is `catalog_tenant_refusal` (`routes/catalog.rs:210-236`), which the list
+  (`:269`), the quality reads (`routes/quality.rs:865`, `routes/quality_incidents.rs:189`,
+  `routes/quality_schedules.rs:61`) and every tag-key write (`routes/governance.rs:2127`, "PR #106
+  review R1 BLOCKER 1") already apply.
+- What happens: two tenants, `CATALOG_TENANT_ID` names tenant A, a member of tenant B holds
+  `governance:write`. `GET /api/catalog` answers them `supported: false`. `POST
+  /api/governance/quality` with `"asset": "silver.dim_customer"` now answers 201 when the table
+  exists and 400 "is not a table you can read" when it does not; before this branch it answered 201
+  for any text. The same holds for a `PUT` that changes the table. This is new with T8. (Not new and
+  not in this diff, named so it gets a backlog row: `run_rule`, `routes/quality.rs:1100`, has no
+  tenant gate and no table-access check either, so a rule that exists can be run by such a caller
+  and answers a measured value.)
+- Fix: in `create_rule`'s quality arm and in `update_rule`, run `catalog_tenant_refusal(&state,
+  principal, &headers)` before `ensure_rule_table` and answer `ApiError::PermissionDenied(reason)`,
+  as `delete_tag_key` does (both handlers need `headers: HeaderMap`); or do it inside
+  `ensure_rule_table` by passing the headers. The assistant's path gets the same gate once it passes
+  its principal (R1). The planner decides whether `run_rule` is fixed here or gets its own row.
+- Check: in `tests/quality_incidents.rs`,
+  `a_caller_outside_the_catalog_tenant_is_refused_before_the_table_is_asked_about`: two tenants and
+  `CATALOG_TENANT_ID` as in `routes/quality.rs:2390-2430`
+  (`quality_read_routes_refuse_caller_outside_catalog_tenant`); the outside caller's `POST` answers
+  403 with the same body for `silver.orders` and for `silver.no_such_table`, and stores nothing.
+  Wrong change that must make it fail: removing the gate (201 and 400).
+
+### R4. BLOCKER: The upload's result promises a time the code does not control: "Quality checks … start within about a minute". (The sentence is the plan's, D20/T20.)
+
+- Where: `src/features/connectors/upload-run-view.tsx:163-169`; the same promise in
+  `CHANGELOG.md:11` ("on-load checks start within about a minute"). Cause, unchanged:
+  `dagster/dispar_orchestrate/pipeline_events.py:254-259` (the success sensor has no interval of its
+  own), `:211-236` (with `PIPELINE_RUN_TOKEN` unset it does not post at all; after a network error
+  "the report for it is lost" and Dagster does not ask again);
+  `rust/crates/lakehouse-api/src/routes/quality_load.rs:1-24` (the rules run only after that report).
+- What happens: the page states a bound for every finished load. Nothing in this repository bounds
+  it: the wait is the orchestrator daemon's tick plus its backlog; when the sensor is off, the token
+  is unset or the report is lost, the checks never start, and the page still says "within about a
+  minute". The only measurement is one QA observation of 36 seconds; the plan itself lists the 30
+  second tick as read, not verified (section 3). That is a latency the product does not guarantee,
+  printed as one (principle 2, principle 5).
+- Fix: say what the code does and drop the bound, for example: "Quality checks set to run on every
+  load start after the orchestrator reports this load, not when the load ends. Their results are on
+  the table's Quality tab." Change the CHANGELOG entry to match ("says when on-load checks start").
+  `docs/core/features/data-quality-in-depth.md:61-63` already says only what was seen ("QA saw about
+  36 seconds on staging") and can stay. The plan's D20/T20 text needs the same correction by the
+  planner.
+- Check: `upload-file-page.test.tsx` "says when on-load checks run once the load has finished"
+  additionally asserts the paragraph's text does not match `/minute|second/`. Wrong change that must
+  make it fail: the present sentence.
+
+---
+
+### R5. SHOULD-FIX: `the_snippet_never_cuts_inside_a_character` cannot fail on the wrong change it is named for, and no other test cuts multi-byte text; the handoff's "would panic on a byte slice" is not true.
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog_search.rs:936-946` (the test), `:389-420`
+  (`description_snippet`); handoff, plan file `:1375-1379`.
+- What happens: the test's only multi-byte input is `"Umsatz nach Übersee für Österreich"`: 34
+  characters (37 bytes), shorter than `SNIPPET_MAX_CHARS`, so nothing is ever cut. With the plan's
+  named wrong change (slice the `str` by the same indices) `start = 0` and `end = 34`; byte 34 is
+  inside the ASCII tail "reich", a character boundary, so there is no panic and the piece
+  "Umsatz nach Übersee für Österre" still contains "Übersee": the test passes. The other snippet
+  test is ASCII only. So the property the brief and D5 care most about (no panic on multi-byte
+  text) is held by the code today — it slices a `Vec<char>` — but by no test. The plan specified
+  this input, so the weakness starts there; the handoff's claim was not run.
+- Fix: add a case that really cuts inside multi-byte text on both sides, in the same test.
+- Check: `let d = format!("{} Übersee {}", "é".repeat(60), "ö".repeat(60));` then
+  `description_snippet(&d, "übersee")`: contains `Übersee`, starts and ends with `…`, and has at most
+  82 characters; and the same through `find` with a CJK description of 200 characters (`"表".repeat(100)
+  + "収益" + &"表".repeat(100)`, term `収益`), which also proves a word in a script without spaces
+  is a word. Wrong change that must make it fail: `line[start..end]` on the `String` (byte 41 is
+  inside an `é`: panic).
+
+### R6. SHOULD-FIX: The "same sentence" test compares two refusals of the same branch, so it does not prove "not there" and "not yours" read alike.
+
+- Where: `rust/crates/lakehouse-api/tests/quality_incidents.rs:509-580` (the `assert_eq!` at
+  `:565-569`).
+- What happens: both requests are made by the narrowed user. `silver.customers` is refused by the
+  access check; `silver.no_such_table` is not in the role's grants either, so it is refused by the
+  access check too and never reaches the existence check (the test mounts no "no such table" answer;
+  it does not need one). The equality therefore holds for any existence sentence. A change of
+  `Ok(None) => Err(refused())` to a sentence of its own that still contains "is not a table you can
+  read" (for example with ": no such table." appended) passes all three T8 tests and is the oracle.
+- Fix: compare the narrowed user's refusal for `silver.customers` with the refusal an unrestricted
+  caller (`admin`) gets for `silver.no_such_table` behind the `with_priority(1)` stand-in the first
+  test mounts; keep the name replacement.
+- Check: that assertion. Wrong change that must make it fail: a different sentence in the
+  `Ok(None)` or `Ok(false)` arm of `ensure_rule_table`.
+
+### R7. SHOULD-FIX: A `bronze.` name that is not a plain identifier answers 503 "Try again." for ever; the same name under `silver.` answers 400.
+
+- Where: `rust/crates/lakehouse-api/src/routes/quality.rs:1009-1017`;
+  `rust/crates/lakehouse-api/src/routes/catalog_source.rs:182-184` (`Ident::new(table)` failing is
+  `PresenceUnknown::Unanswered`); `:107-109` (`clickhouse_source` answers `Ok(None)` for the same
+  input).
+- What happens: `POST /api/governance/quality` with `"asset": "bronze.orders-2024"`, `"bronze.my
+  table"`, `"bronze."` or `"bronze.2024_orders"` (`Ident` refuses a leading digit) answers 503 "The
+  table could not be checked. Try again.", although the engine was never asked and no retry can
+  succeed. D17 keeps 503 for "the engine did not answer". `silver.orders-2024` answers the 400
+  refusal.
+- Fix: in `ensure_rule_table`, before the zone match, `let Ok(_) = Ident::new(table) else { return
+  Err(refused()) }` (import `lakehouse_core::ident::Ident`); do not change
+  `iceberg_table_presence`, which other callers use. Comment: such a name can never be a table the
+  rule reads (`resolve` needs an `Ident` too).
+- Check: in `a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored`, add
+  `bronze.orders-2024` and `bronze.` to the loop over `["orders", "lake.orders"]` (400 and the same
+  piece). Add one test for D17's other half, which has none today:
+  `a_table_that_cannot_be_checked_is_a_503_not_a_refusal` (the stand-in answers 500 for
+  `system.columns` and `broken_table`: 503, the fixed sentence, nothing stored). Wrong changes:
+  dropping the guard (503 for the bad name); mapping `Err` to `refused()` (400 in the new test).
+
+### R8. SHOULD-FIX: The tag-key refusal names tables to a caller who holds `governance:write` without `catalog:read`.
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog.rs:3294-3314` (`readable_asset_names`: role
+  table access only); `rust/crates/lakehouse-api/src/policy.rs:378` (`DELETE
+  /api/governance/tag-keys/{key}` needs `governance:write` only); the catalog's own admission is
+  `principal.has("catalog:read")` or a grant (`routes/catalog.rs:3394-3413`), and `GET /api/catalog`
+  needs `catalog:read` (`policy.rs:239`).
+- What happens: a custom role with `governance:write` and no `catalog:read` (the seeded Governance
+  Admin holds both since migration `0031`) deletes a key in use and is told the display names of up
+  to three catalog tables it cannot list. D13 as written ("`asset_visible`") is met; the question is
+  whether "may read" includes being able to open the catalog. Before this branch the refusal carried
+  a count only.
+- Fix: in `readable_asset_names`, answer `Some(Vec::new())` when `!principal.has("catalog:read")`
+  (the sentence then counts and names nobody), with a comment naming `ensure_may_open_asset` as the
+  rule it mirrors.
+- Check: `tag_key_handlers::a_caller_without_catalog_read_is_told_the_count_and_no_name`: as
+  `deleting_a_key_in_use_names_the_tables_that_hold_it`, with a principal holding
+  `governance:write` only; the sentence contains `2 tables.` and neither `Orders` nor `Customers`.
+  Wrong change: dropping the permission check.
+
+### R9. SHOULD-FIX: "Writes nothing" is decided by a read followed by a separate write, so two saves of the same mark at the same time still write two history entries and move who set it.
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog.rs:4043-4053` (read, compare, return) and
+  `:4054-4068` (the write); `rust/crates/lakehouse-store/src/annotation.rs:201-226`
+  (`set_certification`: an unconditional upsert).
+- What happens: two requests with the same body (a retried request, two governors) both read the
+  row before either writes; both pass the comparison, both upsert, both add `catalog.deprecate`, and
+  `certified_by` / `certified_at` are the second one's. The console's Save is disabled while a save
+  is pending (`asset-certification.tsx:206`), so a double click does not reach this; an API client
+  or two people do. "Same" itself is compared correctly (status, trimmed note, trimmed replacement),
+  and a real change is written and audited (the test's step 4).
+- Fix: move the comparison into the write: `ON CONFLICT (asset_id) DO UPDATE SET … WHERE
+  (asset_annotation.certification, asset_annotation.certification_note,
+  asset_annotation.replacement_asset_id) IS DISTINCT FROM (EXCLUDED.certification,
+  EXCLUDED.certification_note, EXCLUDED.replacement_asset_id)`, have `set_certification` return
+  whether a row was written (`rows_affected() == 1`), and audit / drop the search copy only then.
+  The handler's early return can stay as the cheap path.
+- Check: store test `setting_the_mark_that_is_already_set_writes_no_row`: the second
+  `set_certification` with the same three values answers `false` and `certified_by`, `certified_at`
+  and `updated_at` are unchanged; a different note answers `true`. Wrong change: removing the
+  `WHERE` (the second call answers `true`).
+
+### R10. SHOULD-FIX: For a forgiven typo, or a word matched in parts, the description piece is the first 80 characters, which need not hold the match. (Plan decision: T3 step 2, "no position is position 0".)
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog_search.rs:406-413`.
+- What happens: a description of 200 characters with `revenue` at character 120, searched as
+  `revnue` (or `rev-enue`, which matches by its parts with `approximate: false`): `matchedOn.value`
+  is `"<the first 80 characters>…"`, and the box prints `description: "…" · approximate match` over
+  text that does not contain the word. The existing typo assertion uses a 25-character description,
+  where the whole line is the piece, so it does not show this.
+- Fix: when the word is not found as typed, take the first position where one of the word's parts
+  is found, and failing that the first token within one edit of a part (`within_one_edit` and
+  `tokens` are in the module); position 0 only when neither exists.
+- Check: in `a_description_match_carries_the_text_around_the_word`, `find(.., "revnue")` on the
+  200-character asset: the value contains `revenue` and starts with `…`. Wrong change: position 0
+  for every unfound word.
+
+### R11. SHOULD-FIX: The picker's fallback sentence still tells a person to type `namespace.table`, which T9 says names no table and T8 now refuses.
+
+- Where: `src/features/governance/table-picker.tsx:69`; the stale test title at
+  `src/features/governance/table-picker.test.tsx:92` ("offers the catalog's tables as
+  namespace.table").
+- What happens: the catalog read fails, the field becomes free text and says "type the table as
+  namespace.table". A Bronze row's namespace is `primer`; `primer.orders` is answered 400 "Pick the
+  table as silver.<table>, serving.<table> or bronze.<table>." The module comment of the same file
+  was corrected by T9; this sentence, which a person reads, was not.
+- Fix: "Could not read the catalog's tables; type the table as silver.<table>, serving.<table> or
+  bronze.<table>." and rename the test.
+- Check: the existing fallback test of `table-picker.test.tsx` (catalog read rejects) asserts the
+  new sentence. Wrong change: the old text.
+
+### R12. SHOULD-FIX: The handoff quotes a "printed" failure for T9 that the old code cannot print.
+
+- Where: plan file `:1401-1406`; old code at `c7067d4a3~1:src/features/governance/table-picker.tsx:55`
+  (`Array.from(new Set(assets.map(tableKey))).sort()`).
+- What happens: the handoff says each failure text "is the one printed" and gives the old options as
+  `["primer.Northwind Orders","primer.No Table","silver.Orders Clean"]`. The old code sorts its
+  options, and `"primer.No Table"` sorts before `"primer.Northwind Orders"` (a space is below `r`),
+  so the printed list was `["primer.No Table", "primer.Northwind Orders", "silver.Orders Clean"]`.
+  The quoted order is the order of the plan's own sentence (T9, "the options read …"). With R5's
+  "would panic on a byte slice", two of the handoff's "failed before" claims are not what the code
+  does (rule 7).
+- Fix: re-run the two, quote what is printed, or write *not verified*.
+- Check: the reviewer's own run of `bun test src/features/governance/table-picker.test.tsx` on
+  `c7067d4a3~1` with the new test applied.
+
