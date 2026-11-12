@@ -4649,18 +4649,33 @@ mod tests {
         );
     }
 
-    /// `BI-46` (plan D12): a heatmap's second column is an axis, not a series,
-    /// so its statement is unchanged and nothing caps it.
+    /// `BI-46` (plan D12) review round 1, R5: a heatmap's, sankey's and
+    /// sunburst's second column is an axis, a target or a ring, not a series,
+    /// so the whole statement is the one `main` builds. A dashboard filter is
+    /// passed so the builder really rebuilds it: without one, such a chart
+    /// returns its stored statement (`"SELECT 1"` in these tests) and an
+    /// assertion about what the builder did would pass whatever it did.
     #[test]
-    fn a_heatmap_keeps_its_statement_and_its_second_column_is_not_capped() {
-        let mut spec = stored_spec(ChartKind::Heatmap, "mart_x", "kab", &["visitors"]);
-        spec.def.breakdown = Some("cat".to_owned());
-        let got = sql_with_filters_report(&spec, &[], &[], &bi6_cols());
-        assert!(
-            !got.sql.contains("IN (SELECT cat"),
-            "a heatmap's second column is not capped: {}",
-            got.sql
-        );
+    fn a_heatmap_a_sankey_and_a_sunburst_keep_their_statements_and_their_second_column_is_not_capped()
+     {
+        let expected = "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
+             WHERE cat IN ('a') AND kab IN (SELECT kab FROM serving.mart_x WHERE cat IN ('a') \
+             GROUP BY kab ORDER BY sum(visitors) DESC LIMIT 20) GROUP BY kab, cat ORDER BY kab, cat";
+        for kind in [ChartKind::Heatmap, ChartKind::Sankey, ChartKind::Sunburst] {
+            let mut spec = stored_spec(kind, "mart_x", "kab", &["visitors"]);
+            spec.def.breakdown = Some("cat".to_owned());
+            let got = sql_with_filters_report(
+                &spec,
+                &[],
+                &[filter(r#"{"column":"cat","values":["a"]}"#)],
+                &bi6_cols(),
+            );
+            assert_eq!(got.sql, expected, "{kind:?}");
+            assert!(
+                !got.sql.contains("isNull(cat)"),
+                "{kind:?}: the breakdown is not capped"
+            );
+        }
     }
 
     /// `BI-46` (plan D12): with a breakdown the limit is the chart's own, so a

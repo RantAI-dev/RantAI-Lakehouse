@@ -8012,8 +8012,9 @@ mod tests {
         );
     }
 
-    /// `BI-46` (plan D12): a chart with no breakdown is not capped, and its
-    /// statement is the one it always had.
+    /// `BI-46` (plan D12) review round 1, R5: the exact statement a chart with
+    /// no breakdown is saved with — today's one, byte for byte, not just a
+    /// statement that happens to lack a cap.
     #[test]
     fn a_chart_without_a_breakdown_is_saved_with_the_statement_it_always_had() {
         let spec = bi6_save(&serde_json::json!({
@@ -8021,10 +8022,12 @@ mod tests {
         }))
         .unwrap();
         assert!(!spec.def.caps_breakdown());
-        assert!(
-            !spec.spec.sql.contains("IN (SELECT cat"),
-            "{}",
-            spec.spec.sql
+        assert_eq!(
+            spec.spec.sql,
+            "SELECT place, round(sum(visitors)) AS visitors FROM (\n\
+             SELECT place, cat, d, visitors, stay FROM serving.mart_x\n\
+             ) AS src GROUP BY place ORDER BY visitors DESC LIMIT 3 SETTINGS \
+             max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
         );
     }
 
