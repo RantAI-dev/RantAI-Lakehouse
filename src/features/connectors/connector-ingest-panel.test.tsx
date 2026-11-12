@@ -1315,7 +1315,9 @@ describe("ConnectorIngestPanel column choice", () => {
 
   async function openColumns() {
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
-    await screen.findByText("1 tables found")
+    // QA LH-SRC-6-50 (SRC-41 D18): a count of one is singular; the line used
+    // to read "1 tables found".
+    await screen.findByText("1 table found")
     fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
     // The columns are read through the preview route when the section opens (SRC-13), so they arrive after the click.
     await screen.findAllByLabelText(/^Load column /)
