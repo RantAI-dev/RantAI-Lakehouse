@@ -45,6 +45,7 @@ import { FreshnessTargetDialog } from "@/features/governance/freshness-target-di
 import { lineageKey } from "./asset-lineage"
 import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ALL, CountToggle } from "./count-toggle"
+import { TableGrantNote } from "./table-grant-note"
 
 /** How many snapshots, or changes, are listed before the reader asks for more. */
 const PAGE_SIZES = [10, 25, 50] as const
@@ -212,7 +213,10 @@ function IcebergSnapshots({
                   ) : null}
                 </TableCell>
                 <TableCell className="py-1.5 text-xs">{s.operation}</TableCell>
-                {/* DATA-15 F5: only the author a commit recorded; a load through dlt records none. */}
+                {/* DATA-15 F5, DATA-52: only the author a commit recorded. An upload records
+                    `<name> (file upload)`, a connector's replace or append its run; a merge
+                    load, which dlt writes itself, and a version written before 2026-11-12
+                    record none. */}
                 <TableCell className={cn("py-1.5 text-xs", s.author ? undefined : "text-muted-foreground")}>
                   {s.author ?? "unknown"}
                 </TableCell>
@@ -384,6 +388,9 @@ export function AssetActivity({
 
   return (
     <div className="flex flex-col gap-2">
+      {/* GOV-11 (review round 1 R2): usage is withheld from a caller
+          admitted by a table grant, so its lists are empty on purpose. */}
+      <TableGrantNote asset={a} />
       <FreshnessCard asset={a} onChanged={onChanged} />
       <SectionCard
         size="sm"
@@ -450,7 +457,12 @@ export function AssetActivity({
                 <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
                   <span className="font-medium">{c.actor}</span>
                   <span className="text-muted-foreground">{c.summary}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
+                  {/* QA `LH-DATA-12-01` F2 (`DATA-54`): the date and time on
+                      hover, as the Snapshots table of this file does. */}
+                  <span
+                    className="ml-auto text-xs text-muted-foreground"
+                    title={formatDateTime(c.at)}
+                  >
                     {formatRelativeTime(c.at)}
                   </span>
                 </li>
@@ -492,8 +504,14 @@ export function AssetActivity({
                 </p>
               ) : null}
               <UsageList title="Frequent users" empty="No one yet.">
-                {a.usage.frequentUsers.map((u) => (
-                  <UsageRow key={u.name} count={`${formatNumber(u.queries)} quer${u.queries === 1 ? "y" : "ies"}`}>
+                {/* `DATA-52` (QA `LH-DATA-12-01` F3): names are not unique -- two people
+                    may share one, and the API sends display names now -- so the rows are
+                    keyed by position and name. */}
+                {a.usage.frequentUsers.map((u, index) => (
+                  <UsageRow
+                    key={`${index}:${u.name}`}
+                    count={`${formatNumber(u.queries)} quer${u.queries === 1 ? "y" : "ies"}`}
+                  >
                     {u.name}
                   </UsageRow>
                 ))}

@@ -255,7 +255,7 @@ pub(in crate::routes) async fn run_tool(
         "get_gold_export" => gold::get_gold_export(state, args).await,
         "draft_policy" => governance::draft_policy(state, args).await,
         "draft_classification_rule" => governance::draft_classification_rule(state, args).await,
-        "draft_quality_rule" => governance::draft_quality_rule(state, args).await,
+        "draft_quality_rule" => governance::draft_quality_rule(state, principal, args).await,
         "get_ingest_spec" => ingest::get_ingest_spec(state, args).await,
         "set_ingest_spec" => ingest::set_ingest_spec(state, args).await,
         "discover_source" => ingest::discover_source(state, args).await,

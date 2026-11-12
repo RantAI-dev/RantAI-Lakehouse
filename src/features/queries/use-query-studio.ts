@@ -15,6 +15,7 @@ import { notifyInfo } from "@/lib/notify"
 import { readableErrorMessage } from "@/lib/notify-message"
 import { newRunId } from "@/lib/run-id"
 import {
+  dropLegacyDraft,
   MAX_QUERY_TABS,
   readTabs,
   writeTabs,
@@ -248,8 +249,21 @@ function newTabId(): string {
  * of mixed concerns, and because the rules that matter here — don't
  * estimate on every keystroke, don't estimate a buffer that holds only a
  * comment — are easy to lose sight of inside JSX.
+ *
+ * `draftKey` is the storage key of the person whose tabs these are
+ * (`queryDraftKey`), or `null` while the signed-in person is not known. One
+ * hook instance has one owner for its whole life (`QS-8`, decision 12): a
+ * later, different key is ignored here because the page mounts a new
+ * workspace for it — the old one flushes its tabs under its own key as it
+ * unmounts. `null` reads and writes nothing (fail closed).
  */
-export function useQueryStudio() {
+export function useQueryStudio(draftKey: string | null) {
+  // The owner is latched: the session may answer after this hook has mounted,
+  // so the first non-null key is taken and every later one is not.
+  const [ownKey, setOwnKey] = React.useState<string | null>(draftKey)
+  React.useEffect(() => {
+    if (ownKey === null && draftKey !== null) setOwnKey(draftKey)
+  }, [ownKey, draftKey])
   const [tab, setTab] = React.useState<StudioTab>("nl")
   const [question, setQuestion] = React.useState("")
   const [tabs, setTabs] = React.useState<QueryTab[]>(() => [
@@ -419,7 +433,9 @@ export function useQueryStudio() {
     queryService.generateSql(q, signal)
   )
   const estimateAct = useServiceAction((signal, s: string, inputs: QueryParamInputs) =>
-    // SQL with no placeholder asks as it did before `QS-5`: no options at all.
+    // Only a ClickHouse tab gets this far (M2 of the round-3 rulings, after
+    // #482): the console names no engine, so the request is the one sent
+    // before `QS-6` — no options, or the inputs alone.
     queryService.estimate(s, inputs.definitions ? inputs : undefined, signal)
   )
   // The fields to mark: the ones the last run's refusal named, and the ones
@@ -792,13 +808,25 @@ export function useQueryStudio() {
   // exist on the server, and reading it in render would make the first
   // paint differ from the markup Next sent.
   const hydratedRef = React.useRef(false)
+  // Mirrors `hydratedRef` into state: the effects that must wait for the
+  // owner's tabs to be in place (the `?saved=` link, below) read this one, so
+  // they run in the same render the restored tabs land in.
+  const [hydrated, setHydrated] = React.useState(false)
   // Whether the tab bar still holds the empty tab that was there before
   // anything was read. A link that arrives while it does takes its place
   // instead of leaving a blank tab next to the query it opened.
   const placeholderRef = React.useRef(true)
   React.useEffect(() => {
     if (hydratedRef.current) return
+    // Nothing is read while the owner is not known (`QS-8`, `LH-QS-1-04` F1):
+    // a key invented here would be somebody else's draft.
+    if (ownKey === null) return
     hydratedRef.current = true
+    // Same render as the restored tabs: the `?saved=` effect waits on this.
+    setHydrated(true)
+    // The entry every person shared before `QS-8` holds tabs whose owner
+    // cannot be known: it is removed, not handed to this person.
+    dropLegacyDraft()
     // A `?sql=` link (e.g. an asset's "Open in Query Studio") names the
     // query the user came here to run, so it opens in a tab of its own and
     // the draft it finds stays where it was.
@@ -811,7 +839,7 @@ export function useQueryStudio() {
     const linkedEngine = params.get("engine")
     const engine: QueryEngine = linkedEngine === "trino" ? "trino" : "clickhouse"
     const hasLink = Boolean(linkedSql && hasStatement(linkedSql))
-    const stored = readTabs()
+    const stored = readTabs(ownKey)
 
     if (stored) {
       placeholderRef.current = false
@@ -850,15 +878,15 @@ export function useQueryStudio() {
       setActiveTabId(linked.id)
       setTab("sql")
     }
-  }, [])
+  }, [ownKey])
 
-  const persistDraft = useDebouncedCallback((next: QueryTabs) => {
-    writeTabs(next)
+  const persistDraft = useDebouncedCallback((key: string, next: QueryTabs) => {
+    writeTabs(key, next)
   }, DRAFT_DEBOUNCE_MS)
   React.useEffect(() => {
-    if (!hydratedRef.current) return
-    persistDraft({ tabs, activeId: activeTabId, question, tab })
-  }, [tabs, activeTabId, question, tab, persistDraft])
+    if (!hydratedRef.current || ownKey === null) return
+    persistDraft(ownKey, { tabs, activeId: activeTabId, question, tab })
+  }, [tabs, activeTabId, question, tab, ownKey, persistDraft])
 
   // ── Statements ───────────────────────────────────────────────────────
   // The statements of the open tab. The server runs one statement per
@@ -916,7 +944,9 @@ export function useQueryStudio() {
   const estimatable = targetStatement !== null && !estimateWaits
   // Only ClickHouse has an estimate: the server runs `EXPLAIN ESTIMATE`,
   // which a Trino statement is not valid in, so asking for one on a Trino
-  // tab got a refusal that read as the query's fault (LH-QS-4-08).
+  // tab got a refusal that read as the query's fault (`LH-QS-4-08`). A
+  // Trino tab asks nothing and drops what an earlier ClickHouse statement
+  // left, so no answer for another engine shows.
   const estimateSupported = engine === "clickhouse"
   React.useEffect(() => {
     if (!estimateSupported) {
@@ -1415,7 +1445,9 @@ export function useQueryStudio() {
   }, [])
 
   React.useEffect(() => {
-    if (!linkedSaved) return
+    // `QS-8` (`LH-QS-1-04` F1): a restored draft must not replace a tab the
+    // link opened, so this waits until the owner's tabs are in place.
+    if (!hydrated || !linkedSaved) return
     const openedId = newTabId()
     // The empty tab that was there before anything was read takes the saved
     // query's place instead of sitting next to it.
@@ -1441,7 +1473,7 @@ export function useQueryStudio() {
     })
     setActiveTabId(openedId)
     setTab("sql")
-  }, [linkedSaved])
+  }, [hydrated, linkedSaved])
 
   // The rows on screen for each tab: the result of the statement that is
   // open on it. The per-statement state behind it is `runs`.

@@ -322,7 +322,10 @@ describe("UploadFilePage, first step", () => {
     stubFetch()
     render(<UploadFilePage lookupDelayMs={0} />)
     expect(screen.getByText("Drop files here, or choose some")).toBeDefined()
-    expect(screen.getByText(/CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables/)).toBeDefined()
+    // `DATA-51` (QA `LH-DATA-9-02`): JSON Lines is named too, as decision 12 of the page says.
+    expect(
+      screen.getByText(/CSV, TSV, JSON, JSON Lines, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables/)
+    ).toBeDefined()
     const input = screen.getByLabelText("Choose files")
     const button = screen.getByText("Choose files", { selector: "label" })
     expect(button.getAttribute("for")).toBe(input.id)
@@ -886,6 +889,59 @@ describe("UploadFilePage, Check step for a Parquet file", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
   })
 
+  it("says under a decimal column what is stored, and under a nanosecond timestamp that it is cut", async () => {
+    // `DATA-53` (QA `LH-DATA-9-32`): one Decimal, and a nanosecond column cut to microseconds;
+    // a microsecond column says nothing, because nothing of it is cut.
+    url.search = "?id=up-1"
+    stubFetch({
+      get: () => upload({ originalFilename: "orders.parquet" }),
+      preview: () =>
+        preview({
+          columns: ["sku", "price", "seen_at", "made_at"],
+          columnSpecs: [
+            { source: "sku", name: "sku", type: "text", guessedType: "text", askDateOrder: false },
+            { source: "price", name: "price", type: "decimal", guessedType: "decimal", askDateOrder: false },
+            {
+              source: "seen_at",
+              name: "seen_at",
+              type: "timestamp",
+              guessedType: "timestamp",
+              askDateOrder: false,
+              dateFormat: "iso",
+              timezone: true,
+            },
+            {
+              source: "made_at",
+              name: "made_at",
+              type: "timestamp",
+              guessedType: "timestamp",
+              askDateOrder: false,
+              dateFormat: "iso",
+              timezone: true,
+            },
+          ],
+          rows: [["a1", "1.50", "2026-10-16T13:30:05.123456789Z", "2026-10-16T13:30:05.123456Z"]],
+          parquet: {
+            columns: [
+              { name: "sku", type: "string" },
+              { name: "price", type: "decimal(10,2)" },
+              { name: "seen_at", type: "timestamp (ns, UTC)" },
+              { name: "made_at", type: "timestamp (us, UTC)" },
+            ],
+            rows: 1,
+          },
+        }),
+    })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByRole("columnheader", { name: /sku/ })
+    expect(screen.getByText("Stored exactly, with up to 38 digits, 9 of them after the point.")).toBeDefined()
+    expect(
+      screen.getByText("The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.")
+    ).toBeDefined()
+    // One note, for the nanosecond column only.
+    expect(screen.getAllByText(/The file keeps nanoseconds/)).toHaveLength(1)
+  })
+
   it("sends the settings the preview used when Load is pressed (the API ignores them for Parquet), and the review names the format", async () => {
     const started = upload({ status: "ingesting", bronzeTable: "orders", loadMode: "replace" })
     const calls = await openParquet({ ingest: json({ upload: started, runId: "run-1" }) })
@@ -1018,13 +1074,17 @@ describe("UploadFilePage, Table step", () => {
     expect(screen.getByText("Spaces are not allowed: use an underscore.")).toBeDefined()
   })
 
-  it("shows where the data will land, as the Catalog names it, only for a name that passes", async () => {
+  it("shows where the data will land, as the Catalog names it and as Query Studio reads it, only for a name that passes", async () => {
     await openTable([])
     expect(screen.getByText("bronze.stock")).toBeDefined()
+    // `DATA-53` (QA `LH-DATA-9-07`): the name Query Studio reads on the Trino engine.
+    expect(screen.getByTestId("upload-query-name").textContent).toBe("iceberg.bronze.stock")
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
     expect(screen.getByText("bronze.stock_b")).toBeDefined()
+    expect(screen.getByTestId("upload-query-name").textContent).toBe("iceberg.bronze.stock_b")
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "Stock B" } })
     expect(screen.queryByText(/^bronze\./)).toBeNull()
+    expect(screen.queryByTestId("upload-query-name")).toBeNull()
     expect(screen.getByText("Enter a valid name to see it.")).toBeDefined()
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "" } })
     expect(screen.getByText("Enter a valid name to see it.")).toBeDefined()
@@ -1452,10 +1512,24 @@ describe("UploadFilePage, after Load", () => {
   it("summarises the file, how it is read and the table by its full name, with one sentence saying what Load does", async () => {
     await review({ get: () => upload(), ingest: json({ upload: started, runId: "run-1" }) })
     const labels = screen.getAllByRole("term").map((term) => term.textContent)
-    expect(labels).toEqual(["Name", "Size", "Uploaded", "Encoding", "Delimiter", "Header row", "Columns", "Table", "sku", "qty", "A value that does not fit"])
+    expect(labels).toEqual([
+      "Name",
+      "Size",
+      "Uploaded",
+      "Encoding",
+      "Delimiter",
+      "Header row",
+      "Columns",
+      "Table",
+      "In Query Studio (Trino)",
+      "sku",
+      "qty",
+      "A value that does not fit",
+    ])
     const value = (label: string) =>
       screen.getAllByRole("term").find((term) => term.textContent === label)?.nextElementSibling?.textContent
     expect(value("Table")).toBe("bronze.stock")
+    expect(value("In Query Studio (Trino)")).toBe("iceberg.bronze.stock")
     expect(value("Columns")).toBe("2")
     const sentence = screen.getByText(/^Load reads/)
     expect(sentence.textContent).toContain("stock.csv")
@@ -1487,12 +1561,34 @@ describe("UploadFilePage, after Load", () => {
     await screen.findByText("Loaded", { selector: "span" })
     expect(screen.getByText("Load finished")).toBeDefined()
     expect(screen.getByText("bronze.stock")).toBeDefined()
+    expect(
+      screen.getByText(/In Query Studio, on the Trino engine, the table is/).textContent
+    ).toBe("In Query Studio, on the Trino engine, the table is iceberg.bronze.stock.")
     expect(screen.getByText("1,234")).toBeDefined()
     expect(screen.getByText("Replace its rows")).toBeDefined()
     expect(screen.getByText("stock.csv")).toBeDefined()
     expect(document.querySelector("[data-file-mark=delimited]")?.textContent).toBe("CSV")
     const open = screen.getByText("Open in Catalog").closest("a")
     expect(open?.getAttribute("href")).toBe("/data/assets/stock")
+  })
+
+  // QA `LH-DATA-14-05` (`DATA-54`): the on-load checks start when the
+  // orchestrator reports the finished run, not when the load ends.
+  it("says when on-load checks run once the load has finished", async () => {
+    await review({
+      get: (n) => (n === 1 ? upload() : { ...started, status: "ingested", rows: 1234, assetId: "stock" }),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await screen.findByText("Load finished")
+    const paragraph = screen.getByText(/^Quality checks set to run on every load/)
+    expect(paragraph.textContent).toContain(
+      "Their results are on the table's Quality tab."
+    )
+    // Review round 1 R4: the sentence names no time. Nothing in this
+    // repository bounds when the orchestrator reports a load, so a promise
+    // here would be one the code does not keep.
+    expect(paragraph.textContent).not.toMatch(/minute|second/)
   })
 
   it("offers no action while loading, and Upload another file after a failure goes back to an empty first step", async () => {
@@ -1506,6 +1602,9 @@ describe("UploadFilePage, after Load", () => {
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull()
 
     await screen.findByText("Load failed")
+    // QA `LH-DATA-14-05` (`DATA-54`): a load that did not finish says nothing
+    // about the checks that would follow it.
+    expect(screen.queryByText(/^Quality checks set to run/)).toBeNull()
     expect(screen.getByText("The load into bronze.stock failed.")).toBeDefined()
     expect(screen.getByText("The load into the table failed.")).toBeDefined()
     expect(screen.getByRole("button", { name: "Try again" })).toBeDefined()
@@ -1790,6 +1889,36 @@ describe("UploadFilePage, column types", () => {
       "Timestamp",
     ])
     await waitFor(() => expect(next().disabled).toBe(false))
+  })
+
+  it("says under a CSV column set to Timestamp that a seven-digit fraction loses its last digits", async () => {
+    // `DATA-53` decision 17, review round 1 R5: this column is guessed Text and the person
+    // chooses Timestamp, so the value used to be stored as `…05.123456` with nothing on the
+    // Check step saying so, while the feature page promised the step says it.
+    url.search = "?id=up-1"
+    stubFetch({
+      get: () => upload(),
+      preview: () =>
+        preview({
+          columns: ["SKU", "Qty", "Seen"],
+          columnSpecs: [
+            { source: "SKU", name: "sku", type: "text", guessedType: "text", askDateOrder: false },
+            { source: "Qty", name: "qty", type: "integer", guessedType: "integer", askDateOrder: false },
+            { source: "Seen", name: "seen", type: "text", guessedType: "text", askDateOrder: false },
+          ],
+          rows: [["a1", "3", "2026-10-16T13:30:05.1234567"]],
+          sampledRows: 1,
+        }),
+      check: () => ({ sampledRows: 1, count: 0, byColumn: [], rows: [] }),
+    })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByLabelText("Type of seen")
+
+    expect(screen.queryByText(/The file keeps nanoseconds/)).toBeNull()
+    chooseOption(screen.getByLabelText("Type of seen"), "Timestamp")
+    expect(
+      screen.getByText("The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.")
+    ).toBeDefined()
   })
 
   it("lists up to 100 failing values after a change of type, with stop pre-selected, and sends the choice with Load", async () => {

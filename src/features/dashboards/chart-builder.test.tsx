@@ -595,6 +595,39 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
   })
 })
 
+describe("ChartBuilder chosen mart mark (QA LH-DATA-12-17)", () => {
+  /** The `beforeEach` stub, with the marts answer replaced. */
+  function stubMarts(marts: unknown[]) {
+    const base = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/api/dashboard/fields") && !url.includes("mart=")) {
+        return new Response(JSON.stringify({ marts }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      return (base as typeof fetch)(input, init)
+    }) as unknown as typeof fetch
+  }
+
+  // QA `LH-DATA-12-17` F1 (`DATA-54`): the picker's trigger shows the mart's
+  // name only, so the mark of the list row was lost once a mart was chosen.
+  it("shows Certified under the picker once a certified mart is chosen", async () => {
+    stubMarts([{ name: "mart_visits", rows: 10, certification: "certified" }])
+    renderBuilder(barDef)
+    const mark = await screen.findByTestId("chosen-mart-mark")
+    expect(mark.textContent).toContain("Certified")
+  })
+
+  it("shows no mark line for a mart without one", async () => {
+    renderBuilder(barDef)
+    // The form has loaded its marts once the chosen mart is on screen.
+    expect((await screen.findAllByText(/mart_visits/)).length).toBeGreaterThan(0)
+    expect(screen.queryByTestId("chosen-mart-mark")).toBeNull()
+  })
+})
+
 // `BI-47` (QA `LH-BI-6-01`): a dashboard parameter slot (`{ukuran}`) is a
 // dimension, a breakdown and a measure, never a filter column — the server has
 // no column to list its values from.

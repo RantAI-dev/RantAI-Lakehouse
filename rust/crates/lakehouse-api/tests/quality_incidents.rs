@@ -23,7 +23,8 @@ use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
 };
 
 async fn app() -> (axum::Router, PgPool, MockServer) {
@@ -59,6 +60,17 @@ async fn app() -> (axum::Router, PgPool, MockServer) {
         .await;
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
+    // The deployment names the tenant that owns the shared catalog: the
+    // seeded identity migration creates four tenants, so without it every
+    // caller but an unrestricted one is refused (PR review round 1 R3).
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    // A Bronze rule's table is asked of the Iceberg query database, so the
+    // deployment has one here; the stand-in's empty answer reads as "no such
+    // table" (review round 1 R7).
+    overrides.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     (router, pool, ch)
 }
@@ -113,6 +125,35 @@ async fn admin(pool: &PgPool) -> String {
     // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
     let user = create_principal_with_permissions(pool, "*:*,query:read,governance:write").await;
     session_cookie_for_user(pool, user).await
+}
+
+/// Narrows a person's only role to `silver.orders` — the three statements
+/// `tests/table_access.rs` writes inline. Both the form's test and the
+/// assistant's use it, so the narrowing is one thing (`AGENTS.md` rule 4).
+async fn narrow_to_orders(pool: &PgPool, user: uuid::Uuid) {
+    let role: uuid::Uuid =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, 'silver', 'orders')",
+    )
+    .bind(role)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn incidents(router: &axum::Router, cookie: &str, status: &str) -> Vec<Value> {
@@ -424,6 +465,384 @@ async fn deleting_a_rule_resolves_its_open_incidents() {
             .any(|b| b.contains("ALTER TABLE console.quality_run DELETE")),
         "deleting a rule still forgets its runs"
     );
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a rule is written for a table that is
+/// there, and one that does not exist is refused and stores nothing. "Not
+/// there" and "not yours" are one sentence, so the answer says neither.
+#[tokio::test]
+async fn a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let body = |name: &str, asset: &str| {
+        json!({
+            "name": name, "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+    let (code, refused) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("t8_missing", "silver.no_such_table")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("is not a table you can read"),
+        "{refused}"
+    );
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name = 't8_missing'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a refused rule is not stored");
+
+    let (code, created) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("t8_present", "silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{created}");
+
+    // Review round 1 R7: a name that is not a plain identifier is refused like
+    // any other not-table, and not left as a 503 that no retry can fix.
+    for asset in ["orders", "lake.orders", "bronze.orders-2024", "bronze."] {
+        let (code, refused) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/governance/quality",
+            Some(body("t8_other", asset)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{asset}: {refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("is not a table you can read"),
+            "{asset}: {refused}"
+        );
+    }
+}
+
+/// `DATA-54`, D17's other half (review round 1 R7): a table the engine did not
+/// answer about is a 503 that says so — a check that cannot be made is not a
+/// refusal — and nothing is stored.
+#[tokio::test]
+async fn a_table_that_cannot_be_checked_is_a_503_not_a_refusal() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("broken_table"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Code: 999. DB::Exception"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "d17_unchecked", "asset": "silver.broken_table", "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"], "The table could not be checked. Try again.",
+        "a check that could not be made says so, in a fixed sentence"
+    );
+    let (stored,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM quality_rule WHERE name = 'd17_unchecked'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a rule that could not be checked is not stored");
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a table the author's roles hide is
+/// refused with the same sentence as a missing one, so the answer is not an
+/// oracle. The two refusals come from different branches: the narrowed
+/// caller's hidden table is refused by the role's access, and an unrestricted
+/// caller's missing one by the existence check (review round 1 R6 — comparing
+/// two access refusals proved nothing).
+#[tokio::test]
+async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sentence() {
+    let (router, pool, ch) = app().await;
+    // The stand-in answers no columns for the table that is not there.
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    // The person is a member of the tenant that owns the catalog, so the
+    // catalog's tenant rule lets them through to the role's own table access
+    // (PR review round 1 R3).
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let body = |asset: &str| {
+        json!({
+            "name": "t8_narrowed", "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+    let (code, hidden) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.customers")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{hidden}");
+    // A caller whose role hides nothing asks for a table that is not there:
+    // the existence check's refusal, not the access check's.
+    let admin_cookie = admin(&pool).await;
+    let (code, missing) = call(
+        &router,
+        &admin_cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "t8_admin_missing", "asset": "silver.no_such_table",
+            "dimension": "volume", "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{missing}");
+    let (hidden, missing) = (
+        hidden["error"].as_str().unwrap(),
+        missing["error"].as_str().unwrap(),
+    );
+    assert_eq!(
+        hidden.replace("silver.customers", "T"),
+        missing.replace("silver.no_such_table", "T"),
+        "a hidden table and a missing one read alike"
+    );
+
+    let (code, created) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{created}");
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`), review round 1 R1: the assistant drafts a
+/// rule as the person behind the chat, so a table their role hides is refused
+/// with the very sentence the form gives that person, and nothing is stored.
+#[tokio::test]
+async fn the_assistant_cannot_draft_a_rule_on_a_table_the_person_may_not_read() {
+    let (router, pool, _ch) = app().await;
+    let user = create_assistant_principal(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let draft = |name: &str, asset: &str| {
+        json!({
+            "tool": "draft_quality_rule",
+            "args": {
+                "name": name, "asset": asset, "dimension": "volume",
+                "threshold": "rows >= 1", "severity": "high", "confirmed": true,
+            },
+            "mode": "build",
+        })
+    };
+
+    let (code, tool) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(draft("r1_hidden", "silver.customers")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{tool}");
+    assert_eq!(tool["outcome"], "failed", "{tool}");
+
+    // The sentence the form gives the same person, for the same table.
+    let (code, form) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "r1_hidden_form", "asset": "silver.customers", "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{form}");
+    assert_eq!(
+        tool["result"]["error"], form["error"],
+        "the assistant refuses a hidden table as the form does"
+    );
+
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name LIKE 'r1_hidden%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a refused draft stores nothing");
+
+    let (_, tool) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(draft("r1_orders", "silver.orders")),
+    )
+    .await;
+    assert_eq!(tool["outcome"], "executed", "{tool}");
+}
+
+/// A caller outside the tenant that owns the shared catalog is refused before
+/// the table is asked about (PR review round 1 R3, plan gap in T8): the
+/// answer is the catalog's own refusal, the same for a table that is there
+/// and one that is not, so it says neither.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_is_refused_before_the_table_is_asked_about() {
+    let (router, pool, _ch) = app().await;
+    let outsider =
+        create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    // Seeded tenant 2, not the one the catalog names.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(
+            "11111111-1111-4111-8111-000000000002"
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    let body = |asset: &str| {
+        json!({
+            "name": "r3_outside", "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+
+    let (code, present) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{present}");
+    let (code, missing) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.no_such_table")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{missing}");
+    assert_eq!(
+        present, missing,
+        "the tenant refusal is the same for every table, so it names none"
+    );
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name = 'r3_outside'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored, 0,
+        "a caller outside the catalog tenant stores nothing"
+    );
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a rewrite that changes the table is
+/// checked, and a refusal leaves the rule on its old table. A rewrite that
+/// keeps the table is not checked, so a rule on a dropped table can still be
+/// edited.
+#[tokio::test]
+async fn changing_a_rule_to_a_table_that_is_not_there_is_refused_and_the_rule_keeps_its_table() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    let id = rule(&pool, "email_filled", "email not null >= 90%").await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let (code, refused) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.no_such_table",
+            "threshold": "email not null >= 90%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused}");
+    let asset: String = sqlx::query_scalar("SELECT asset FROM quality_rule WHERE name = $1")
+        .bind("email_filled")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(asset, "silver.orders", "a refused rewrite changes nothing");
+
+    // The threshold change with the table kept is not checked.
+    let (code, edited) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.orders",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{edited}");
 }
 
 /// `DATA-14` (F2): editing a rule keeps the runs it has (each now records

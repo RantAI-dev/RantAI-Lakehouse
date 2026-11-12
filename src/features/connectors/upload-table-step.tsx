@@ -1,6 +1,7 @@
 "use client"
 
 import { DatabaseIcon } from "lucide-react"
+import { trinoBronzeName } from "@/lib/asset-query"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { TABLE_NAME_RULE, rawTableFullName, tableNameFault } from "@/lib/uploads"
@@ -72,6 +73,16 @@ export function UploadTableStep({
           ) : (
             <p className="text-sm text-muted-foreground">Enter a valid name to see it.</p>
           )}
+          {/* `DATA-53` (QA `LH-DATA-9-07`): the Catalog's name is not the one Query Studio
+              reads on Trino, so both are given. */}
+          {valid ? (
+            <p className="text-xs text-muted-foreground">
+              In Query Studio, on the Trino engine:{" "}
+              <span className="break-all font-mono" data-testid="upload-query-name">
+                {trinoBronzeName(tableName)}
+              </span>
+            </p>
+          ) : null}
         </div>
       </div>
 

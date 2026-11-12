@@ -65,8 +65,10 @@ export type LakehouseSnapshot = {
   operation: "append" | "replace" | "overwrite" | "delete" | string
   /**
    * Who made the commit, where the product recorded it (the snapshot summary
-   * key `rantai.author`, `DATA-15`); `null` where it did not — a load written
-   * through `dlt` records none — and the page then says "unknown".
+   * key `rantai.author`, `DATA-15`); `null` where it did not, and the page then
+   * says "unknown". A file upload records `<name> (file upload)` (`DATA-52`) and
+   * a connector's replace or append its run; a merge load, which `dlt` writes
+   * itself, and a version written before 2026-11-12 record none.
    */
   author: string | null
   summary: LakehouseSnapshotSummary

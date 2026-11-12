@@ -95,7 +95,9 @@ function AddRuleDialog({
     notifySuccess("Quality rule added")
     // DATA-14 (AC1): run it once now, so a check that already fails opens its
     // incident at once instead of at the next scheduled pass.
-    if (hasPermission("query:read") && created.evaluable !== false) {
+    // QA LH-DATA-14-04 (GOV-10): running a rule by hand needs
+    // `governance:write`, the same permission the Run button follows.
+    if (hasPermission("governance:write") && created.evaluable !== false) {
       try {
         await governanceService.runQualityRule(created.id)
       } catch (err) {
@@ -281,6 +283,14 @@ export function AssetQuality({
   const [running, setRunning] = React.useState(false)
   const [deleting, setDeleting] = React.useState<Check | null>(null)
   const [editing, setEditing] = React.useState<Check | null>(null)
+  const [incidentsKey, setIncidentsKey] = React.useState(0)
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the page keeps this tab mounted while
+  // the asset reloads (`keepDataOnReload`), so the incidents panel has to be
+  // told to read again, not only the asset.
+  const changed = () => {
+    setIncidentsKey((k) => k + 1)
+    onChanged()
+  }
   const remove = useServiceAction((signal, id: string) =>
     governanceService.deleteQualityRule(id, signal)
   )
@@ -295,7 +305,7 @@ export function AssetQuality({
     }
     notifySuccess(`Deleted rule ${deleting.name}`)
     setDeleting(null)
-    onChanged()
+    changed()
   }
   const summary = qualitySummary(a.qualityChecks)
   const runnable = a.qualityChecks.filter((q) => q.origin === "rule" && q.evaluable !== false)
@@ -325,20 +335,23 @@ export function AssetQuality({
     } else {
       notifySuccess(`Ran ${runnable.length} check${runnable.length === 1 ? "" : "s"}`)
     }
-    onChanged()
+    changed()
   }
 
   return (
     <div className="flex flex-col gap-4">
       {/* DATA-14 (F7): what is wrong now on this table, above the checks. */}
-      <QualityIncidents asset={lineageKey(a)} />
+      <QualityIncidents asset={lineageKey(a)} reloadKey={incidentsKey} />
       <SectionCard
         size="sm"
         title="Quality checks"
         description={parts.length > 0 ? parts.join(" · ") : "Rules and recorded results for this asset."}
         action={
           <div className="flex flex-wrap justify-end gap-1.5">
-            {hasPermission("query:read") && runnable.length > 0 ? (
+            {/* QA LH-DATA-14-04 (GOV-10, DEC-17): running a rule by hand is a
+                governance action — the API takes `governance:write`, so the
+                button follows. */}
+            {canWrite && runnable.length > 0 ? (
               <Button size="sm" variant="outline" onClick={() => void runAll()} disabled={running}>
                 <Play />
                 {running ? "Running…" : "Run checks"}
@@ -415,7 +428,7 @@ export function AssetQuality({
             onClose={() => setEditing(null)}
             onSaved={() => {
               setEditing(null)
-              onChanged()
+              changed()
             }}
           />
         ) : null}
@@ -425,7 +438,7 @@ export function AssetQuality({
             onClose={() => setAdding(false)}
             onCreated={() => {
               setAdding(false)
-              onChanged()
+              changed()
             }}
           />
         ) : null}

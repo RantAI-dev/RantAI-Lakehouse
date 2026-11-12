@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Button } from "@/components/ui/button"
 import { MetadataList, type MetadataItem } from "@/components/patterns/metadata-list"
+import { trinoBronzeName } from "@/lib/asset-query"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
 import {
   columnTypeLabel,
@@ -164,6 +165,8 @@ export function UploadReviewStep({
           title="Table"
           items={[
             { label: "Table", value: <Wrapped mono>{full}</Wrapped> },
+            // `DATA-53`: the Catalog's name and the one Query Studio reads on the Trino engine.
+            { label: "In Query Studio (Trino)", value: <Wrapped mono>{trinoBronzeName(tableName)}</Wrapped> },
             ...(offersMode
               ? [{ label: "Rows already in it", value: mode === "append" ? "Add to its rows" : "Replace its rows" }]
               : []),

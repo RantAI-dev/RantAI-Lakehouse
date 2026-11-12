@@ -245,6 +245,8 @@ measurements. The preview decodes at most the first 2,000 rows and shows 20.
   100 are listed, and the load either stops or writes them as empty, as the
   person chose (`DATA-18`, #186, merged 2026-10-26; `upload-column-types.md`).
   A load that sends no column list stores every column as text.
+- The Upload file page shows a table's name twice: `bronze.<table>` as the Catalog lists it, and `iceberg.bronze.<table>`, the name Query Studio reads on the Trino engine (`DATA-53`).
+- A file named like a format the upload reads that does not open as one is refused as a file that could not be opened, not as a format that is not read (`DATA-51`).
 - Adding a file to a table that exists keeps that table's names and types.
   Replacing a table may change its types, and a pipeline that reads the table
   fails on its next run and says why.

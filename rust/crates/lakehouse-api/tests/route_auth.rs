@@ -2589,6 +2589,71 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `GOV-11` (`DEC-20`; QA `LH-DATA-12-07` F2): after
+/// `0138_data_engineer_catalog_read.sql` the seeded Data Engineer — the role
+/// that edits catalog entries — can open the Catalog and a table's page. It
+/// still cannot create roles.
+#[tokio::test]
+async fn a_seeded_data_engineer_may_read_the_catalog() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    for path in ["/api/catalog", "/api/lakehouse/tables"] {
+        let resp = request_with_cookie(&router, "GET", path, &cookie).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+
+    let denied = request_with_cookie(&router, "POST", "/api/identity/roles", &cookie).await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read does not make the role an identity administrator"
+    );
+}
+
+/// `GOV-10` (`DEC-17`; QA `LH-DATA-14-04`, `TC-1728`): running an authored
+/// rule by hand needs `governance:write`. A principal holding `query:read`
+/// and `governance:read` is refused (403); one holding `governance:write`
+/// alone is past the gate and the unknown rule answers 404; no cookie at all
+/// answers 401.
+#[tokio::test]
+async fn running_a_quality_rule_by_hand_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let run = "/api/governance/quality/00000000-0000-4000-8000-000000000000/run";
+
+    let viewer = create_principal_with_permissions(&pool, "query:read,governance:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+    let refused = request_with_cookie(&router, "POST", run, &cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "a viewer may not run a rule by hand"
+    );
+
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let allowed = request_with_cookie(&router, "POST", run, &cookie).await;
+    assert_eq!(
+        allowed.status(),
+        StatusCode::NOT_FOUND,
+        "past the gate, the rule does not exist"
+    );
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(run)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// `DATA-14` (F3): any login may read the schedules, and setting one needs
 /// `governance:write`. A principal without it is refused (403) and nothing is
 /// stored; one with it is past the gate (an empty body then answers 400).
@@ -4287,6 +4352,57 @@ async fn permissions_route_is_gated_in_both_directions() {
     assert_eq!(allowed.status(), StatusCode::OK);
 }
 
+/// `GOV-11` (`DEC-20`; QA `LH-DATA-15-03` F2): the table's page takes
+/// `catalog:read`, or a `query:read` grant made from exactly that asset. On
+/// its own, `query:read` is not enough — a role permission is not a grant on
+/// a table — and neither is no session at all.
+#[tokio::test]
+async fn the_asset_page_route_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let asset = "/api/catalog/silver.orders";
+
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
+
+    let nobody = create_zero_permission_principal(&pool).await;
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    let refused = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let querier = create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, querier).await;
+    let refused = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "query:read without a grant on the table is not enough"
+    );
+    let bytes = to_bytes(refused.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+    assert_eq!(
+        body["error"],
+        serde_json::json!("permission_denied: catalog:read")
+    );
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(asset)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// ADM-13 (D10.2), ADM-13 review round 1, B3:
 /// `GET /api/notifications` is `RequiresAuth`, but a `dashboard:read`-only principal
 /// gets empty `openAlerts` and `pendingApprovals` without error.
@@ -4324,4 +4440,57 @@ async fn overview_alerts_refuses_dashboard_read_principal() {
     let allowed = request_with_cookie(&router, "GET", "/api/overview/alerts", &cookie).await;
     assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
     assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+/// `SEC-72` decision `DEC-19`: a signed-in caller gets the same 405 and 404
+/// answers an anonymous one does. Both used to be 500 — the gate answered
+/// `route_policy_unclassified` for a method no route had, and the router
+/// answered "No matched path found" for an address no route matched — so
+/// neither status depended on who was asking. A fresh session per request,
+/// because one of the paths is a logout in other tests' sweeps.
+#[tokio::test]
+async fn a_signed_in_person_gets_405_for_a_method_no_route_has_and_404_for_an_unknown_address() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = platform_admin_user_id(&pool).await;
+
+    let method_not_allowed =
+        serde_json::json!({ "error": "This method is not allowed on this address." });
+    for (method, path) in [
+        ("DELETE", "/health"),
+        ("POST", "/api/dashboard"),
+        ("GET", "/api/pipelines/x/target-lag"),
+        ("DELETE", "/api/pipelines/x/target-lag"),
+        ("POST", "/api/governance/quality/incidents"),
+        ("PATCH", "/api/reports/subscriptions/x"),
+    ] {
+        let cookie = session_cookie_for_user(&pool, admin).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} has no handler"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+        assert_eq!(body, method_not_allowed, "{method} {path}");
+    }
+
+    let no_such_address = serde_json::json!({ "error": "No such address." });
+    for (method, path) in [
+        ("GET", "/api/never-existed"),
+        ("PATCH", "/api/governance/quality/incidents/x"),
+        ("PUT", "/api/governance/quality/incidents/x"),
+    ] {
+        let cookie = session_cookie_for_user(&pool, admin).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+        assert_eq!(body, no_such_address, "{method} {path}");
+    }
 }

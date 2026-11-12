@@ -25,6 +25,7 @@ import {
   type SaveAlertRuleInput,
 } from "@/services/contracts/alerts"
 import { isLoadAlertKind, isQualityAlertKind, ruleKindLabel } from "./rules-columns"
+import { readableErrorMessage } from "@/lib/notify-message"
 import { TablePicker, useTableCatalog } from "@/features/governance/table-picker"
 import type { Metric } from "@/services/contracts/metrics"
 
@@ -141,7 +142,7 @@ export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
       name: f.name.trim(),
       type: f.type,
       channel: f.channel,
-      target: f.target.trim(),
+      target: (f.target ?? "").trim(),
       enabled: f.enabled,
       ...(f.severity ? { severity: f.severity } : {}),
       asset: (f.asset ?? "").trim(),
@@ -152,7 +153,7 @@ export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
       name: f.name.trim(),
       type: f.type,
       channel: f.channel,
-      target: f.target.trim(),
+      target: (f.target ?? "").trim(),
       enabled: f.enabled,
       pipeline: f.pipeline?.trim() || "*",
       ...(f.severity ? { severity: f.severity } : {}),
@@ -163,7 +164,7 @@ export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
     name: f.name.trim(),
     type: f.type,
     channel: f.channel,
-    target: f.target.trim(),
+    target: (f.target ?? "").trim(),
     enabled: f.enabled,
     ...(f.severity ? { severity: f.severity } : {}),
     ...(f.type === "upload_failure" ? {} : { connector: f.connector ?? "" }),
@@ -434,7 +435,11 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
     try {
       setFields(await dashboardService.listMartMeasures(mart))
     } catch (e) {
-      setFieldsError(e instanceof Error ? e.message : "Fields could not be loaded")
+      // QA LH-SRC-7-10 (SRC-40 D8): the measures' error is a sentence, never
+      // the API's code-first text.
+      setFieldsError(
+        e instanceof Error ? readableErrorMessage(e.message) : "Fields could not be loaded"
+      )
       setFields([])
     }
   }
@@ -477,6 +482,22 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
         />
       )
     }
+    // DEC-16 (QA LH-SRC-7-04, SRC-42): the API sends a rule without its target
+    // to a caller who may not manage it, and refuses every change from that
+    // caller; the form would offer a Save that cannot work.
+    if (rule.targetHidden === true) {
+      return (
+        <EmptyState
+          title="You cannot change this rule"
+          description="Seeing where a rule sends, or changing it, needs the alert:write permission."
+          action={
+            <Button variant="outline" size="sm" render={<Link href={backHref} />}>
+              Back to Alerts
+            </Button>
+          }
+        />
+      )
+    }
   }
 
   const targetPlaceholder =
@@ -487,23 +508,36 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
     connectorList.status === "success"
       ? connectorList.data.map((c) => ({ id: c.id, name: c.name }))
       : []
+  // QA LH-SRC-7-10 (SRC-40): `GET /api/connectors` takes `connector:manage`, so
+  // a person with `alert:write` and without it saw the API's raw refusal
+  // (`permission_denied: connector:manage`). That one gets a sentence that says
+  // what the person can do; every other error goes through the shared
+  // translation, so no text that starts with one of the API's codes is shown.
+  // The refusal is `code` or `status`: `getJson` maps a 403 to `invalid_request`
+  // and keeps the status (`home-cards.ts`'s `cardRead` reads it the same way).
   const connectorsError =
-    connectorList.status === "error" ? connectorList.error.message : null
+    connectorList.status === "error"
+      ? connectorList.error.code === "permission_denied" || connectorList.error.status === 403
+        ? "You do not have permission to choose a connector for this rule."
+        : readableErrorMessage(connectorList.error.message)
+      : null
   const marts = martsState.status === "success" ? martsState.data.map((m) => m.name) : []
-  const martsError = martsState.status === "error" ? martsState.error.message : null
+  const martsError =
+    martsState.status === "error" ? readableErrorMessage(martsState.error.message) : null
   const boards =
     boardsState.status === "success"
       ? boardsState.data
           .filter((b) => b.id !== "default")
           .map((b) => ({ id: b.id, name: b.name }))
       : []
-  const boardsError = boardsState.status === "error" ? boardsState.error.message : null
+  const boardsError =
+    boardsState.status === "error" ? readableErrorMessage(boardsState.error.message) : null
   const metrics = metricsState.status === "success" ? metricsState.data : []
 
   async function save() {
     setFormErr(null)
     if (!f.name.trim()) { setFormErr("Name required."); return }
-    if (!f.target.trim()) { setFormErr("Webhook URL / email required."); return }
+    if (!(f.target ?? "").trim()) { setFormErr("Webhook URL / email required."); return }
     if (f.type === "alert" && isMetricRule(f) && !f.metric) { setFormErr("Pick a metric."); return }
     if (alertRuleFormFields(f.type, canSeeAllTenants).connector && !f.connector) {
       setFormErr("Choose a connector.")
@@ -529,7 +563,11 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
       // field to fill in.
       canSubmit
       submitting={saveAction.status === "pending"}
-      error={formErr ?? saveAction.error?.message ?? null}
+      // QA LH-SRC-7-10 (SRC-40 D8): a refused save says the shared sentence, not
+      // the API's code-first text; `formErr` is the form's own sentence.
+      error={
+        formErr ?? (saveAction.error ? readableErrorMessage(saveAction.error.message) : null)
+      }
       onSubmit={() => void save()}
       onCancel={() => router.push(backHref)}
       className="max-w-xl"
@@ -687,7 +725,7 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
               {f.channel === "email" ? "Recipient email" : "Webhook URL"}
             </Label>
             <Input
-              value={f.target}
+              value={f.target ?? ""}
               onChange={(e) => setF((prev) => ({ ...prev, target: e.target.value }))}
               placeholder={targetPlaceholder}
             />

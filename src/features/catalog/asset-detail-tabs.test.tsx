@@ -25,7 +25,7 @@ import { toast } from "sonner"
 import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { NO_READABLE_TABLE } from "@/lib/asset-query"
-import { formatDate } from "@/lib/format"
+import { formatDate, formatDateTime } from "@/lib/format"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
@@ -215,6 +215,9 @@ const INCIDENT = {
 /** What the sample route answers for a `limit`: the rows, or a response of its own (a failure). */
 type SampleAnswer = (limit: number) => Record<string, string | null>[] | Response
 
+/** How many times the incidents read was asked (`DATA-54`). */
+let incidentReads = 0
+
 function stubApi({
   permissions = ["*:*"],
   lineage = GRAPH,
@@ -231,6 +234,7 @@ function stubApi({
   revokeRefusal,
   restore = { restorable: false, reason: "no dropped copy of this table is kept" },
   incidents = [],
+  incidentsAfterRun,
   schedules = [],
   learning = LEARNING,
   roles,
@@ -262,6 +266,8 @@ function stubApi({
   restore?: unknown
   /** The quality incidents `GET /api/governance/quality/incidents` answers. */
   incidents?: unknown[]
+  /** What it answers from the second read on (`DATA-54`): after a run. */
+  incidentsAfterRun?: unknown[]
   /** The quality schedules `GET /api/governance/quality/schedules` answers. */
   schedules?: unknown[]
   /** What `GET /api/governance/quality/learning/{asset}` answers. */
@@ -272,6 +278,7 @@ function stubApi({
   /** The row filter grammar `GET /api/governance/row-filter-grammar` answers; absent means it fails. */
   grammar?: unknown
 } = {}) {
+  incidentReads = 0
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     const method = init?.method ?? "GET"
@@ -304,7 +311,11 @@ function stubApi({
     }
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     // DATA-14: the Quality tab's incidents, schedule and learning state.
-    if (method === "GET" && path.includes("/api/governance/quality/incidents")) return json({ incidents })
+    if (method === "GET" && path.includes("/api/governance/quality/incidents")) {
+      incidentReads += 1
+      const answer = incidentReads > 1 && incidentsAfterRun ? incidentsAfterRun : incidents
+      return json({ incidents: answer })
+    }
     if (method === "GET" && path.endsWith("/api/governance/quality/schedules")) {
       return json({ schedules, defaultIntervalMinutes: 60 })
     }
@@ -710,6 +721,25 @@ describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
     )
   })
 
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the page keeps the tab mounted while
+  // the asset reloads, so the panel has to be told to read again.
+  it("reads the incidents again after the checks ran", async () => {
+    stubApi({ incidents: [], incidentsAfterRun: [INCIDENT] })
+    url.search = "tab=quality"
+    renderTabs({
+      ...BRONZE,
+      qualityChecks: [
+        { id: "q2", name: "orders_uniqueness", dimension: "uniqueness", status: null, lastRun: null, threshold: "id unique", severity: "high", origin: "rule" },
+      ],
+    })
+
+    fireEvent.click(await screen.findByText("Run checks"))
+    expect(
+      await screen.findByText(/3 repeated values in 50 rows \(threshold: id unique\)/)
+    ).toBeTruthy()
+    expect(incidentReads).toBeGreaterThanOrEqual(2)
+  })
+
   it("offers no Resolve without governance:write", async () => {
     stubApi({ permissions: ["catalog:read", "query:read"], incidents: [INCIDENT] })
     url.search = "tab=quality"
@@ -857,6 +887,22 @@ describe("Activity tab: usage and history", () => {
     expect(within(history).getByText("Edited description, owner")).toBeTruthy()
   })
 
+  // QA `LH-DATA-12-01` F2 (`DATA-54`): "just now" alone says nothing; the
+  // date and time are on hover.
+  it("shows a change's date and time on hover", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      changeHistory: [
+        { id: "audit-1", at: "2026-06-12T09:41:00Z", actor: "Rina", summary: "Edited description" },
+      ],
+    })
+    const history = (await screen.findByText("Change history")).closest("[data-slot=card]") as HTMLElement
+    const at = within(history).getByTitle(formatDateTime("2026-06-12T09:41:00Z"))
+    expect(at.className).toContain("ml-auto")
+  })
+
   it("lists frequent users, frequent queries without values, joined tables and column popularity over 30 days", () => {
     stubApi()
     url.search = "tab=activity"
@@ -894,6 +940,31 @@ describe("Activity tab: usage and history", () => {
     expect(within(usage).getByText(/4 queries that read several tables are not counted/)).toBeTruthy()
   })
 
+  it("lists two frequent users who share a name as two rows", async () => {
+    // `DATA-52` (QA `LH-DATA-12-01` F3): the API sends display names, which are not
+    // unique, so the rows must be keyed by more than the name.
+    const errors = spyOn(console, "error")
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      usage: usageOf({
+        queries: 5,
+        users: 2,
+        frequentUsers: [
+          { name: "Rina Wijaya", queries: 3 },
+          { name: "Rina Wijaya", queries: 2 },
+        ],
+      }),
+    })
+
+    const usage = screen.getByText("Usage (30d)").closest("[data-slot=card]") as HTMLElement
+    expect(within(usage).getAllByText("Rina Wijaya")).toHaveLength(2)
+    expect(within(usage).getByText("3 queries")).toBeTruthy()
+    expect(within(usage).getByText("2 queries")).toBeTruthy()
+    expect(errors.mock.calls.flat().join(" ")).not.toContain("same key")
+  })
+
   it("says nobody queried the table, rather than that usage is unknown", () => {
     stubApi()
     url.search = "tab=activity"
@@ -915,6 +986,39 @@ describe("Activity tab: usage and history", () => {
       ],
     })
     expect(screen.getByText("Not counted: reads by the 2 dashboards that use this asset.")).toBeTruthy()
+  })
+})
+
+describe("A page opened with a table grant (GOV-11, review round 1 R2)", () => {
+  const NOTE = "Shown with a table grant: related tables and usage are hidden"
+
+  it("says the connections are hidden on the overview instead of reading them as zero", () => {
+    stubApi()
+    renderTabs({ ...BRONZE, shownWithTableGrant: true })
+    expect(screen.getByText(NOTE)).toBeTruthy()
+  })
+
+  it("says it on the Lineage tab, where the related panels are drawn", async () => {
+    stubApi({ lineage: NO_LINEAGE })
+    url.search = "tab=lineage"
+    renderTabs({ ...BRONZE, shownWithTableGrant: true })
+    expect(screen.getByText(NOTE)).toBeTruthy()
+    expect(await screen.findByText("Dependents")).toBeTruthy()
+  })
+
+  it("says it on the Activity tab, above the usage it was withheld from", () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({ ...BRONZE, shownWithTableGrant: true, usage: usageOf({ queries: 0 }) })
+    expect(screen.getByText(NOTE)).toBeTruthy()
+  })
+
+  // The server decides: a `catalog:read` body carries no flag, so the page
+  // draws the panels it was given and says nothing about hiding.
+  it("says nothing for a catalog reader", () => {
+    stubApi()
+    renderTabs(BRONZE)
+    expect(screen.queryByText(NOTE)).toBeNull()
   })
 })
 
@@ -1298,19 +1402,30 @@ describe("Quality tab: adding a rule needs governance:write", () => {
   ]
 
   it("hides Add rule on the Quality tab without governance:write, and shows it with", async () => {
-    stubApi({ permissions: without })
+    const fetchSpy = stubApi({ permissions: without })
     url.search = "tab=quality"
     renderTabs({ ...BRONZE, qualityChecks: runnableRule })
 
-    // Run checks needs query:read, so it appearing proves the session loaded.
-    await screen.findByRole("button", { name: "Run checks" })
+    // QA LH-DATA-14-04 (GOV-10, DEC-17): "Run checks" takes
+    // `governance:write` now, so it no longer appears for this person and
+    // cannot be the proof that the session loaded. Wait for the stub to
+    // answer /api/auth/me, then one tick for React to apply it —
+    // `sessionSettled`'s idiom in data-quality-page.test.tsx.
+    await waitFor(() =>
+      expect(
+        fetchSpy.mock.calls.some(([input]) => String(input).includes("/api/auth/me"))
+      ).toBe(true)
+    )
+    await new Promise((resolve) => setTimeout(resolve, 50))
     expect(screen.queryByRole("button", { name: "Add rule" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Run checks" })).toBeNull()
     cleanup()
     mock.restore()
 
     stubApi({ permissions: [...without, "governance:write"] })
     renderTabs({ ...BRONZE, qualityChecks: runnableRule })
     expect(await screen.findByRole("button", { name: "Add rule" })).toBeTruthy()
+    expect(await screen.findByRole("button", { name: "Run checks" })).toBeTruthy()
   })
 
 })

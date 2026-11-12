@@ -54,6 +54,16 @@ from dispar_orchestrate.ssrf_guard_sftp import PinnedHostKeyPolicy
 
 _SUPPORTED_FILE_FORMATS = ("csv",)
 
+# QA TC-1712 (SRC-41 D16): `paramiko`'s `connect` has no timeout of its own
+# (its default is `None`), so a silent host was waited for until the operating
+# system gave up -- about two minutes on Linux. 30 seconds is the number the
+# code already uses for one request to a source (the REST adapter's own
+# listing, Kafka's request timeout). `paramiko` re-raises a connect timeout as
+# Python's `TimeoutError`, which `ingest_errors` classifies as `timeout` and
+# retries; the same function opens a load's session, so a load is bounded the
+# same way. `banner_timeout` and `auth_timeout` keep `paramiko`'s defaults.
+CONNECT_TIMEOUT_SECONDS = 30
+
 
 @dataclass(frozen=True)
 class AdapterBuildResult:
@@ -81,6 +91,7 @@ def _connect_kwargs(spec: dict, secrets: dict[str, str]) -> dict[str, Any]:
         "hostname": spec["host"],
         "port": spec["port"],
         "username": spec.get("user", ""),
+        "timeout": CONNECT_TIMEOUT_SECONDS,
     }
     if auth_type == "password":
         kwargs["password"] = secrets["password"]

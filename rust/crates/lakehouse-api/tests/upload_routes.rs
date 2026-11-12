@@ -84,6 +84,11 @@ const SESSION_CAP: usize = 2 * 1024 * 1024 * 1024;
 /// 50 MiB unpacked) and the most a gzip, a zip or a grouped load may add up to.
 const UNPACKED_CAP: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The display name of Bayu, one of the seeded users of `0002_seed_identity.sql`
+/// (`uploadedBy` of an upload he makes). `DATA-52`: the job's `author` is that name
+/// and ` (file upload)` after it, built from this one text rather than typed again.
+const BAYU_DISPLAY_NAME: &str = "Bayu Pratama";
+
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
         "{}/../../../ops/fixtures/uploads/{name}",
@@ -1156,7 +1161,7 @@ async fn an_upload_is_stored_under_a_server_made_key_and_answered_without_intern
     );
     assert_eq!(upload["sizeBytes"], bytes.len());
     assert_eq!(upload["status"], "uploaded");
-    assert_eq!(upload["uploadedBy"], "Bayu Pratama");
+    assert_eq!(upload["uploadedBy"], BAYU_DISPLAY_NAME);
     assert!(upload["createdAt"].as_str().unwrap().ends_with('Z'));
     for hidden in [
         "storageKey",
@@ -2032,6 +2037,7 @@ async fn an_ingest_launches_the_job_with_the_confirmed_options_and_records_the_r
             "header_row": 4,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } })
     );
     let row = stack.status_of(&id).await;
@@ -4569,6 +4575,7 @@ async fn a_workbook_ingest_stores_the_converted_sheet_beside_the_original_and_la
             "header_row": 0,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } }),
         "the job's own configuration, the converted object and the fixed dialect"
     );
@@ -5014,6 +5021,7 @@ async fn a_parquet_ingest_converts_nothing_and_launches_the_job_on_the_original_
             "header_row": 0,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } }),
         "the job's own configuration: the original object, read as Parquet"
     );
@@ -5610,6 +5618,39 @@ async fn a_binary_that_is_not_a_supported_file_is_refused_at_completion_and_remo
     let reply = stack.complete(&bayu, &id).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
     assert_eq!(reply.json["error"], OTHER_BINARY);
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "the refused file was removed"
+    );
+    assert_eq!(stack.row_count(&id).await, 0);
+}
+
+/// A file named like a format this upload reads, whose bytes do not open as that format,
+/// is refused as a file that could not be opened -- not as a format this upload does not
+/// read (QA `LH-DATA-17-05`, `DATA-51`). A damaged Parquet file is the case QA sent.
+#[tokio::test]
+async fn a_damaged_parquet_file_is_refused_at_completion_as_a_file_that_could_not_be_opened() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    // The bytes of the "not text" case above: a NUL byte, so no reader takes it.
+    let bytes: Vec<u8> = (0..3000_u32)
+        .map(|n| u8::try_from(n % 251).unwrap())
+        .collect();
+    let id = stack.session(&bayu, "data.parquet", bytes.len()).await;
+    stack.put_part(&bayu, &id, "1", &bytes).await;
+
+    let reply = stack.complete(&bayu, &id).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    let expected = lakehouse_api::upload_parquet::ParquetFileError::Unreadable.to_string();
+    assert_eq!(reply.json["error"], expected.as_str(), "{}", reply.text);
+    assert!(
+        !reply.json["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a file this upload reads"),
+        "{}",
+        reply.text
+    );
     assert!(
         stack.bucket.keys().is_empty(),
         "the refused file was removed"
@@ -6798,7 +6839,8 @@ async fn a_gzip_bomb_is_refused_when_it_arrives_and_nothing_is_stored() {
     std::io::Write::write_all(&mut encoder, b"a").unwrap();
     let bomb = encoder.finish().unwrap();
     assert!(bomb.len() < 8 * MIB, "the setup: a small file");
-    let unpacked = "The file is larger than the upload limit once unpacked.";
+    // `DATA-51` (`LH-DATA-17-13`): the sentence names the cap.
+    let unpacked = "The file is larger than the 2 GB limit once unpacked.";
 
     assert_eq!(
         refusal_of(&stack, &bayu, "bomb.csv.gz", bomb.clone()).await,

@@ -35,6 +35,46 @@ use lakehouse_store::identity::{
 };
 use sqlx::PgPool;
 
+/// `0138_data_engineer_catalog_read.sql` (`GOV-11`, `DEC-20`; QA
+/// `LH-DATA-12-07` F2): the role that edits catalog entries holds
+/// `catalog:read` exactly once, keeps `catalog:write`, and a second run of
+/// the migration adds nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_data_engineer_role_holds_catalog_read_exactly_once_even_when_the_migration_runs_again(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (perms,): (String,) =
+        sqlx::query_as("SELECT permissions FROM role WHERE name = 'Data Engineer'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        perms.matches("catalog:read").count(),
+        1,
+        "expected catalog:read exactly once in Data Engineer's permissions, got: {perms}"
+    );
+    assert!(
+        perms.contains("catalog:write"),
+        "the role still edits catalog entries, got: {perms}"
+    );
+
+    sqlx::raw_sql(sqlx::AssertSqlSafe(include_str!(
+        "../../../migrations/0138_data_engineer_catalog_read.sql"
+    )))
+    .execute(&pool)
+    .await?;
+
+    let (again,): (String,) =
+        sqlx::query_as("SELECT permissions FROM role WHERE name = 'Data Engineer'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        again.matches("catalog:read").count(),
+        1,
+        "a second run adds nothing, got: {again}"
+    );
+    Ok(())
+}
+
 /// The seed lands the full `mock/identity.ts` fixture set, and list queries
 /// return it in the fixture's own order (newest `created_at` first, which
 /// the staggered seed timestamps reproduce).

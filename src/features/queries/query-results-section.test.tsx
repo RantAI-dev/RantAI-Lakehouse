@@ -363,6 +363,36 @@ describe("copy as TSV", () => {
   })
 })
 
+// QA LH-QS-2-06 (QS-9), decision 10: a role whose downloads are switched off
+// may not copy the rows out either, and the reason is on the screen, not only
+// in a tooltip.
+describe("the result's export actions and the download switch", () => {
+  it("turns Copy as TSV and Download off and says why when the person's roles may not download", async () => {
+    renderSection(result({ canDownload: false }))
+
+    const copy = screen.getByRole("button", { name: "Copy as TSV" }) as HTMLButtonElement
+    const download = screen.getByRole("button", { name: /Download/ }) as HTMLButtonElement
+    expect(copy.disabled).toBe(true)
+    expect(download.disabled).toBe(true)
+    expect(screen.getByText("Downloads are switched off for your role.")).toBeTruthy()
+
+    // A click on a disabled button copies nothing.
+    fireEvent.click(copy)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(copied).toEqual([])
+  })
+
+  it("leaves both on when the result carries no flag", async () => {
+    renderSection(result())
+
+    const copy = screen.getByRole("button", { name: "Copy as TSV" }) as HTMLButtonElement
+    const download = screen.getByRole("button", { name: /Download/ }) as HTMLButtonElement
+    expect(copy.disabled).toBe(false)
+    expect(download.disabled).toBe(false)
+    expect(screen.queryByText("Downloads are switched off for your role.")).toBeNull()
+  })
+})
+
 describe("the banner of a cut result", () => {
   it("names the row limit that cut the result", () => {
     render(<QueryResultBanner rowCount={10} rowLimit={64000} cutBy="rows" />)
@@ -395,5 +425,39 @@ describe("the banner of a cut result", () => {
   it("does not claim a result is cut when it is not", () => {
     renderSection(result())
     expect(screen.queryAllByText(/Showing the first/)).toHaveLength(0)
+  })
+})
+
+// `QS-6` (`LH-QS-2-10`), decision 8 and 13: the summary names the engine that
+// really ran, as the tab's picker spells it, and a Trino run states no
+// ClickHouse workload class.
+describe("the result summary engine", () => {
+  /** The value beside a metadata label, as the person reads it. */
+  function summaryValue(label: string): string {
+    const term = screen.getByText(label)
+    return term.parentElement?.querySelector("dd")?.textContent ?? ""
+  }
+
+  it("names Trino as the engine of a Trino run and shows no workload class for it", () => {
+    renderSection(
+      result({
+        engine: "trino",
+        metrics: {
+          ...result().metrics,
+          engine: null,
+          workloadClass: null,
+        },
+      })
+    )
+
+    expect(summaryValue("Engine")).toBe("Trino")
+    expect(summaryValue("Workload")).toBe("—")
+  })
+
+  it("names ClickHouse as the engine of a ClickHouse run", () => {
+    renderSection(result())
+
+    expect(summaryValue("Engine")).toBe("ClickHouse")
+    expect(summaryValue("Workload")).toBe("Hot analytics")
   })
 })

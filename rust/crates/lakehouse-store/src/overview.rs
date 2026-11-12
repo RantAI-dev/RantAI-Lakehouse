@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 
 use crate::{PgPool, StoreError};
 
-fn iso_millis(at: OffsetDateTime) -> String {
+pub(crate) fn iso_millis(at: OffsetDateTime) -> String {
     let at = at.to_offset(time::UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
@@ -143,9 +143,9 @@ const ALERT_COLUMNS: &str = "id, title, severity, source, affected, status, assi
     delivery_reason";
 
 /// `alert_instance.delivery_status` of an instance whose delivery arrived.
-const DELIVERED: &str = "delivered";
+pub(crate) const DELIVERED: &str = "delivered";
 /// `alert_instance.delivery_status` of an instance whose delivery failed.
-const NOT_DELIVERED: &str = "not_delivered";
+pub(crate) const NOT_DELIVERED: &str = "not_delivered";
 
 /// How a delivery ended, as [`insert_from_fired_rule_with_delivery`] records
 /// it (`SRC-17` F1).

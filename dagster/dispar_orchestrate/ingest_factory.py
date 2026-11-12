@@ -240,6 +240,61 @@ def _headers(cfg: IngestFactoryConfig) -> dict[str, str]:
     return {} if not cfg.service_token else {"Authorization": f"Bearer {cfg.service_token}"}
 
 
+# How long one `ingest_job` run may run, in seconds (`SRC-39`, QA `TC-1702`).
+# Six hours is the bound the console already uses to treat a run with no end
+# as stopped (`STALE_RUN_MS`, `connector-ingest-panel.tsx`), and the retry
+# policy alone holds a failing table's run open for about 21 minutes (`SRC-11`
+# decision 1); the longest measured loads are minutes
+# (`docs/plans/DATA-17-RESULT.md`, `docs/plans/SRC-11-RESULT.md`).
+RUN_LIMIT_ENV = "INGEST_RUN_MAX_RUNTIME_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 21_600
+# The largest value the API can read (`u32::MAX`): both services must read the
+# setting by the same rule, or one lets a run go for a day while the other
+# cancels it at six hours (`review round 1, R9`).
+MAX_RUN_LIMIT_SECONDS = 4_294_967_295
+
+
+@dataclass(frozen=True)
+class RunLimitSettings:
+    """How long one `ingest_job` run may run, in seconds (`SRC-39`).
+
+    `_ingest_job_tags` reads it into the `dagster/max_runtime` tag of every
+    run. The tag is a tag on `ingest_job` alone, not
+    `run_monitoring.max_runtime_seconds`, which would cap every job of the
+    instance (D9), and the orchestrator enforces it only while run monitoring
+    is on (`dagster/dagster.yaml`, T10).
+    """
+
+    max_runtime_seconds: int = DEFAULT_RUN_LIMIT_SECONDS
+
+    @classmethod
+    def from_env(cls) -> "RunLimitSettings":
+        raw = _env(RUN_LIMIT_ENV, "")
+        if not raw:
+            return cls()
+        # `review round 1, R9`: the API's rule (`parse_run_limit`,
+        # `lakehouse-api/src/config.rs`), so both services read one setting the
+        # same way: surrounding spaces trimmed (`_env` does it), ASCII digits
+        # only, a value from 1 to `u32::MAX`. `int()` alone would take
+        # "86_400" and 4294967296, which the API rejects.
+        seconds = int(raw) if raw.isascii() and raw.isdigit() else 0
+        if not 1 <= seconds <= MAX_RUN_LIMIT_SECONDS:
+            # The value is the operator's own setting, but a malformed one is
+            # not worth echoing into a log line the whole team reads.
+            logger.warning(
+                "%s cannot be used (expected a whole number of seconds, 1 or more); using the default %d",
+                RUN_LIMIT_ENV,
+                DEFAULT_RUN_LIMIT_SECONDS,
+            )
+            return cls()
+        return cls(max_runtime_seconds=seconds)
+
+
+def _ingest_job_tags() -> dict[str, str]:
+    """The tags every `ingest_job` run carries (`SRC-39`, QA `TC-1702`)."""
+    return {"dagster/max_runtime": str(RunLimitSettings.from_env().max_runtime_seconds)}
+
+
 def _fetch_one_connector(cfg: IngestFactoryConfig, connector_id: str) -> dict[str, Any]:
     """Used at RUN time by `run_ingest` (below) -- a connector launched
     directly (a future `POST .../ingest/run`) may not have existed at this
@@ -779,6 +834,10 @@ def _run_one_object(
                 dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj]),
                 plan,
                 gate=gate,
+                # `DATA-52`, review round 1 R2: this load is a connector's replace,
+                # append or incremental, and it records the run's label like the
+                # Clear, Oracle and generic paths below do.
+                author=_run_author(connector_id, run_id),
             )
             if outcome.get("waiting"):
                 _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
@@ -1061,7 +1120,11 @@ def run_kafka_stream_batch(
             batch = consume_one_batch(consumer, topic=topic, max_seconds=spec.get("microBatchSeconds", 60))
             if not batch.rows:
                 return 0
-            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
+            # `DATA-52`, review round 1 R2: a micro-batch is a load like any other,
+            # and its commits record the run's label (`_run_author`).
+            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(
+                dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+            )
             outcome = load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
             # Committed ONLY after the sink write above returned
             # successfully (an exception there propagates out of this
@@ -1547,7 +1610,14 @@ A failure is classified by `ingest_errors.classify` and either retried or
     return rows
 
 
-@job(name="ingest_job")
+# The `dagster/max_runtime` tag is what run monitoring enforces (`SRC-39`,
+# QA `TC-1702`): a run still going after the limit is cancelled and failed by
+# the daemon, which then frees the connector. It is only enforced while run
+# monitoring is on (`dagster/dagster.yaml`, T10), and it sits on `ingest_job`
+# alone: `run_monitoring.max_runtime_seconds` would cap every job of the
+# instance. `tags` and not `run_tags`: both launch paths (the GraphQL launch
+# and the sensor) copy a job's `tags` onto the run when `run_tags` is unset.
+@job(name="ingest_job", tags=_ingest_job_tags())
 def ingest_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `ingest_job` -- the SAME
     static job for every ingestible connector, launched with run config

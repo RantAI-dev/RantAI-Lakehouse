@@ -46,9 +46,10 @@ struct SqlBody {
     #[serde(default)]
     sql: Option<String>,
     /// Which engine should run this statement: `"clickhouse"` (the
-    /// default, when absent) or `"trino"` (WS2 §4). Only [`run`] reads
-    /// this — `estimate` always runs `EXPLAIN ESTIMATE` against
-    /// `ClickHouse`, unaffected.
+    /// default, when absent) or `"trino"` (WS2 §4). Both [`run`] and
+    /// [`estimate`] read it: the estimate fills `{{name}}` and judges the
+    /// statement with this engine's rules, and answers a `Trino` statement
+    /// without asking any engine (`QS-6`, `LH-QS-4-08`).
     #[serde(default)]
     engine: Option<String>,
     /// `QS-5`: the value each `{{name}}` in `sql` takes, name to value.
@@ -1523,7 +1524,13 @@ async fn execute_query_against_engine(
         // named so Stop can end it (`QueryRun::options`). A query the limit
         // or a Stop ended gets a fixed sentence (plan D6), not the engine's
         // text.
-        let options = run.options(limits, limits.studio_rows);
+        // QA `LH-DATA-9-32` (`DATA-53`): every cell of this route is text already, so a
+        // decimal written as text changes no cell's type and keeps its digits, where a
+        // number read into a 64-bit float keeps about fifteen of them.
+        let options = lakehouse_clickhouse::QueryOptions {
+            quote_decimals: true,
+            ..run.options(limits, limits.studio_rows)
+        };
         let result = state
             .clickhouse
             .query_with_options(sql, &options, None)
@@ -1769,6 +1776,12 @@ pub async fn run(
 /// The order of the guards, the history records and the errors are those of
 /// [`run`].
 ///
+/// The completed body is [`run_result_json`] plus `canDownload`: whether this
+/// principal may download a result at all (`QS-9`, `LH-QS-2-06`). It is
+/// `false` when the settings cannot be read, and the console uses it to turn
+/// Download and "Copy as TSV" off; `GET /api/query/run/{id}/download`
+/// refuses on its own either way.
+///
 /// # Errors
 ///
 /// The same as [`run`], less the 400s for the request body and the
@@ -2002,7 +2015,7 @@ pub(crate) async fn run_statement(
         }
     }
 
-    Ok(ApiJson(run_result_json(
+    let mut body = run_result_json(
         &id,
         &json!(columns),
         &json!(rows),
@@ -2012,7 +2025,23 @@ pub(crate) async fn run_statement(
         scanned_bytes,
         cost_units,
         engine,
-    )))
+    );
+    // QA `LH-QS-2-06` (`QS-9`): the console turns its own export actions off
+    // with this flag, so a role whose downloads are blocked cannot copy the
+    // rows out of a result. The download route refuses on its own (unchanged);
+    // the flag only spares the person the refused click. `false` when the
+    // settings cannot be read: an unreadable switch denies, it does not allow
+    // (AGENTS.md principle 3), and `format_settings` has already logged the
+    // cause under a reference.
+    let can_download = crate::routes::settings::format_settings(state)
+        .await
+        .is_ok_and(|settings| {
+            crate::routes::settings::may_download(p, &settings.download_denied_roles)
+        });
+    if let Some(map) = body.as_object_mut() {
+        map.insert("canDownload".to_owned(), Value::Bool(can_download));
+    }
+    Ok(ApiJson(body))
 }
 
 /// `QS-4` (the history page, decision 3): the one place records a run
@@ -2266,9 +2295,12 @@ fn cut_rows_by_bytes(rows: Vec<Value>, cap: usize) -> (Vec<Value>, bool) {
 ///
 /// `engine` is the top-level field naming which engine actually ran this
 /// statement (`"clickhouse"`/`"trino"`, WS2 §4) — a DIFFERENT thing from
-/// `metrics.engine`, which stays the fixed string `"hot-store"` describing
-/// `ClickHouse`'s storage tier regardless of which top-level engine ran.
-/// Neither renames nor removes the other.
+/// `metrics.engine`, which describes `ClickHouse`'s storage tier. Since
+/// `QS-6` (decision 8) `metrics.engine` and `metrics.workloadClass` are
+/// stated for a `ClickHouse` run only and are `null` for a `Trino` run: a
+/// Trino result does not live in a `ClickHouse` storage tier at all, so naming
+/// one would be a fabricated measurement (the convention `cacheHit` already
+/// uses). Neither field is renamed or removed.
 ///
 /// `cut_by` names the limit that cut the result (`"rows"` for the Query
 /// Studio row limit, `"bytes"` for the 10 MB cap) and is absent when
@@ -2301,8 +2333,12 @@ fn run_result_json(
             "durationMs": duration_ms,
             "scannedBytes": scanned_bytes,
             "costUnits": cost_units,
-            "engine": "hot-store",
-            "workloadClass": "hot-analytics",
+            // QA `LH-QS-2-10` (`QS-6`), decision 8: the tier and the class are
+            // ClickHouse's own, so a Trino run states neither — `null` reads
+            // "not measured", where "hot-store"/"hot-analytics" would claim
+            // the run happened in a store it never touched.
+            "engine": if is_trino_engine(engine) { Value::Null } else { json!("hot-store") },
+            "workloadClass": if is_trino_engine(engine) { Value::Null } else { json!("hot-analytics") },
             // WS1 task 1.6: `ClickHouse`'s response carries no cache-hit flag
             // and no pushdown list, and there is no policy engine to produce
             // obligations (`WS7` builds one). Null says "not measured"; the
@@ -2414,13 +2450,16 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// missing/blank `sql`, and with the same sentences as [`run`] when
 /// `parameters` or `definitions` has the wrong shape or a `{{name}}` cannot
 /// be filled (`QS-5`), and 422 [`ApiError::Unprocessable`] when `sql` fails
-/// [`is_read_only`], the rewrite refuses it, or it names a setting other than
-/// `iceberg_snapshot_id` (`SEC-21`), as [`run`] does. An `EXPLAIN
+/// [`is_read_only`] read with the request's engine, the rewrite refuses it,
+/// or it names a setting other than `iceberg_snapshot_id` (`SEC-21`), as
+/// [`run`] does. An `EXPLAIN
 /// ESTIMATE` failure (e.g. an unknown column) still answers 200 — the
 /// console shows the estimate panel either way — but `estimatedBytes`/costs
 /// are `null` and the `ClickHouse` message is carried in `error`, rather
 /// than a zeroed estimate that looked identical to "this query reads
-/// nothing".
+/// nothing". A `Trino` statement is not estimated at all: it answers 200
+/// with `supported: false` and nothing sent to any engine (`QS-6`,
+/// `LH-QS-4-08`, decision 7).
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2433,23 +2472,37 @@ pub async fn estimate(
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
     let (parameters, definitions) = parameter_inputs(parsed.parameters, parsed.definitions)?;
+    // `QS-6` (`LH-QS-4-08`): the estimate reads the engine the request names,
+    // exactly as `run` does, so a Trino tab's placeholders are filled and its
+    // statement is judged by Trino's rules rather than ClickHouse's.
+    let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
     // `query-parameters.md`, decision 13: the estimate explains the statement the run would send, so
     // it fills the placeholders first, with the run's function and before
-    // every guard below. It always asks `ClickHouse`. A refusal is the run's
-    // 400 sentence; the estimate keeps no history.
-    let sql = substitute_parameters("clickhouse", &sql, &parameters, &definitions)?;
+    // every guard below. A refusal is the run's 400 sentence; the estimate
+    // keeps no history.
+    let sql = substitute_parameters(&engine, &sql, &parameters, &definitions)?;
     // SEC-19: the estimate refuses what the run refuses, with the run's
     // status and message, and does so before the rewrite below, whose policy
     // prefetch already queries the engine. `EXPLAIN ESTIMATE` is the only
     // statement this route may send, so a non-read never reaches it.
-    // The estimate always asks `ClickHouse`, so the guard reads the
-    // statement with the `ClickHouse` rules.
-    if !is_read_only(&sql, crate::sql_rewrite::Engine::ClickHouse) {
+    // The guard reads the statement with the request's engine rules, as the
+    // run does: a Trino statement that ClickHouse's dialect would misread is
+    // refused by Trino's rule, not ClickHouse's.
+    if !is_read_only(&sql, crate::sql_rewrite::Engine::from_name(&engine)) {
         return Err(ApiError::Unprocessable(
             "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
         )
         .into());
+    }
+    // QA `LH-QS-4-08` (`QS-6`), decision 7: estimating a Trino statement would
+    // mean asking ClickHouse about Trino SQL — the bug this answers — and
+    // `lakehouse-trino` has no `EXPLAIN` path and no byte figure to offer. So
+    // nothing is sent to any engine and the honest answer is "there is none":
+    // typed, 200, not an error. The policy rewrite is skipped with it: no
+    // table is read, so nothing about a table is answered.
+    if is_trino_engine(&engine) {
+        return Ok(ApiJson(trino_estimate_json()));
     }
 
     // A failed EXPLAIN is reported, not swallowed. It used to come back as
@@ -2516,8 +2569,43 @@ pub async fn estimate(
     Ok(ApiJson(result))
 }
 
+/// The reason a `Trino` estimate carries (`QS-6`, decision 7): a fixed
+/// sentence, not a `ClickHouse` error and not an empty estimate.
+const NO_TRINO_ESTIMATE: &str = "A Trino query has no pre-run estimate.";
+
+/// The `/api/query/estimate` body for a `Trino` statement (`QS-6`,
+/// `LH-QS-4-08`, decision 7).
+///
+/// Nothing was sent to any engine, so every number is `null` and there are no
+/// sources: `supported: false` plus the reason is the whole honest answer, and
+/// `queryEngine` lets the panel name the engine it is talking about. Typed, so
+/// the console can tell "no estimate for this engine" from a failed estimate.
+fn trino_estimate_json() -> Value {
+    json!({
+        "supported": false,
+        "reason": NO_TRINO_ESTIMATE,
+        "queryEngine": "trino",
+        "estimatedBytes": Value::Null,
+        "estimatedCostMin": Value::Null,
+        "estimatedCostMax": Value::Null,
+        "error": Value::Null,
+        "workloadClass": Value::Null,
+        "engine": Value::Null,
+        "cacheEligible": Value::Null,
+        "freshnessLagSeconds": Value::Null,
+        "policyObligations": Value::Null,
+        "sources": [],
+        "plan": Value::Null,
+    })
+}
+
 /// Build the `/api/query/estimate` response body from already-computed
 /// values. See [`run_result_json`] for why this is extracted.
+///
+/// Only a `ClickHouse` estimate reaches this function: a `Trino` statement
+/// answers [`trino_estimate_json`] and never runs `EXPLAIN ESTIMATE`, so the
+/// storage tier and workload class stated here are true by construction
+/// (`QS-6`, decision 8).
 #[allow(
     clippy::too_many_arguments,
     reason = "one flat result row, no natural grouping"
@@ -2531,12 +2619,18 @@ fn estimate_result_json(
     error: Option<&str>,
 ) -> Value {
     json!({
+        // `QS-6` (decision 7): a ClickHouse estimate is supported by
+        // definition; the fields are here so the console reads one shape for
+        // both engines.
+        "supported": true,
+        "reason": Value::Null,
+        "queryEngine": "clickhouse",
         "estimatedBytes": estimated_bytes,
         "estimatedCostMin": cost_min,
         "estimatedCostMax": cost_max,
         "error": error,
-        // True by construction: Query Studio runs everything through
-        // ClickHouse, the hot analytical store.
+        // True by construction: this body is built for a ClickHouse
+        // estimate only, which runs through the hot analytical store.
         "workloadClass": "hot-analytics",
         "engine": "hot-store",
         // Nothing in this deployment configures ClickHouse's query cache,
@@ -3461,6 +3555,8 @@ pub async fn download(
         // No row cap: the download holds the whole result.
         max_result_rows: None,
         query_id: Some(download_query_id(caller.id.uuid(), run_id)),
+        // A download keeps the engine's own formatting (out of scope of `DATA-53`).
+        quote_decimals: false,
     };
     let statement = download_statement(&rewritten);
 
@@ -4272,6 +4368,35 @@ mod tests {
     }
 
     #[test]
+    fn a_trino_run_result_states_no_storage_tier_and_no_workload_class() {
+        let v = run_result_json(
+            "q-2",
+            &json!([]),
+            &json!([]),
+            (0, 2_000),
+            None,
+            12,
+            34,
+            1,
+            "trino",
+        );
+
+        // QA LH-QS-2-10 (QS-6), decision 8: a Trino run never touched
+        // ClickHouse's storage tier or workload class, so neither is stated.
+        assert_eq!(v["engine"], json!("trino"));
+        assert!(
+            v["metrics"]["engine"].is_null(),
+            "a Trino run must not claim a ClickHouse storage tier, got {}",
+            v["metrics"]["engine"]
+        );
+        assert!(
+            v["metrics"]["workloadClass"].is_null(),
+            "a Trino run must not claim a ClickHouse workload class, got {}",
+            v["metrics"]["workloadClass"]
+        );
+    }
+
+    #[test]
     fn run_result_emits_null_for_unmeasured_transparency_fields() {
         let v = run_result_json(
             "q-1",
@@ -4450,6 +4575,18 @@ mod tests {
         );
         assert_eq!(by_bytes["cutBy"], json!("bytes"));
         assert_eq!(by_bytes["truncated"], json!(true));
+    }
+
+    #[test]
+    fn a_clickhouse_estimate_says_it_is_supported_and_names_its_engine() {
+        let v = estimate_result_json(Some(100), Some(1.0), Some(2.0), &json!([]), None, None);
+
+        // QA LH-QS-4-08 (QS-6), decision 7: the console reads one shape for
+        // both engines, and a ClickHouse estimate is supported by definition.
+        assert_eq!(v["supported"], json!(true));
+        assert!(v["reason"].is_null());
+        assert_eq!(v["queryEngine"], json!("clickhouse"));
+        assert_eq!(v["engine"], json!("hot-store"));
     }
 
     #[test]
@@ -6228,6 +6365,22 @@ mod tests {
             assert!(sent[0].contains("SELECT '{{x}}' AS v"), "{}", sent[0]);
         }
 
+        /// QA `LH-QS-2-06` (`QS-9`): the run tells the console whether this
+        /// person may download the result, so it can turn its export actions
+        /// off. With no role switched off, everything is allowed.
+        #[tokio::test]
+        async fn a_run_result_says_the_caller_may_download_when_no_role_is_switched_off() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            let answer = run_on_clickhouse(state, json!({ "sql": "SELECT 1" }))
+                .await
+                .expect("a plain read runs");
+            let v = answer.0;
+
+            assert_eq!(v["canDownload"], json!(true));
+        }
+
         /// What the assistant's tools call after their own substitution:
         /// the filled statement runs without a second scan, so a literal
         /// that reads `'{{x}}'` is not refused as a placeholder in quotes.
@@ -6408,6 +6561,85 @@ mod tests {
             assert_eq!(status, 400);
             assert_eq!(message, "Fill in {{n}} to run this query.");
             assert_eq!(received(&ch).await, Vec::<String>::new());
+        }
+
+        /// QA `LH-QS-4-08` (`QS-6`), decision 7: a Trino tab's estimate is
+        /// answered here, by this product, and no engine is asked anything.
+        #[tokio::test]
+        async fn an_estimate_of_a_trino_statement_says_there_is_none_and_asks_no_engine() {
+            let ch = clickhouse_answering_one_row().await;
+            let trino = trino_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), &trino.uri());
+
+            let answer = estimate(
+                State(state),
+                analyst_principal(),
+                HeaderMap::new(),
+                body(&json!({ "sql": "SELECT * FROM iceberg.bronze.t", "engine": "trino" })),
+            )
+            .await
+            .expect("a Trino estimate is typed, not an error");
+            let v = answer.0;
+
+            assert_eq!(v["supported"], json!(false));
+            assert_eq!(v["reason"], json!("A Trino query has no pre-run estimate."));
+            assert_eq!(v["queryEngine"], json!("trino"));
+            assert!(v["error"].is_null(), "no engine error: {}", v["error"]);
+            assert_eq!(v["sources"], json!([]));
+            // Review round 1, R6: D7 says nothing reaches any engine, and
+            // `received` hides `system.*` lookups — the one kind a policy
+            // rewrite would send — so these two read every request.
+            assert!(
+                ch.received_requests().await.expect("recorded").is_empty(),
+                "ClickHouse was asked nothing"
+            );
+            assert!(
+                trino
+                    .received_requests()
+                    .await
+                    .expect("recorded")
+                    .is_empty(),
+                "Trino was asked nothing"
+            );
+        }
+
+        /// The run's read-only sentence, read with Trino's rules, still comes
+        /// before the "no estimate" answer: a write is refused, not shrugged at.
+        #[tokio::test]
+        async fn an_estimate_of_a_trino_write_is_refused_with_the_runs_sentence() {
+            let ch = clickhouse_answering_one_row().await;
+            let trino = trino_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), &trino.uri());
+
+            let (status, message) = refusal(
+                estimate(
+                    State(state),
+                    analyst_principal(),
+                    HeaderMap::new(),
+                    body(&json!({
+                        "sql": "INSERT INTO iceberg.bronze.t VALUES (1)",
+                        "engine": "trino",
+                    })),
+                )
+                .await,
+            );
+
+            assert_eq!(status, 422);
+            assert!(message.starts_with("Only read queries"), "{message}");
+            // Review round 1, R6: unfiltered, for the same reason as the
+            // test above — a rewritten `system.*` lookup would count.
+            assert!(
+                ch.received_requests().await.expect("recorded").is_empty(),
+                "ClickHouse was asked nothing"
+            );
+            assert!(
+                trino
+                    .received_requests()
+                    .await
+                    .expect("recorded")
+                    .is_empty(),
+                "Trino was asked nothing"
+            );
         }
 
         /// A policy that masks `email` and filters rows, seeded for the

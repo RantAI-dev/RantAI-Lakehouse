@@ -1,6 +1,6 @@
 /**
  * Command-palette catalog search bounds (WS2 §13). The palette calls
- * `assetService.listAssets` (through `@/services`,
+ * `assetService.searchAssets` (through `@/services`,
  * never a raw URL) after a debounce and abort wiring that lives in
  * `command-palette.tsx` itself — plain `setTimeout`/`AbortController`
  * plumbing, not logic worth hiding behind an interface. The one rule that
@@ -13,9 +13,19 @@
 import { defaultFilter } from "cmdk"
 
 import type { Asset } from "@/services/contracts/assets"
+import { tableKeyOf } from "@/lib/table-key"
 
 /** The palette shows at most this many catalog-asset results per search. */
 export const PALETTE_ASSET_RESULT_LIMIT = 8
+
+/**
+ * The longest text the box takes: the dashboard search's own limit
+ * (`lakehouse_bi::search::MAX_QUERY_CHARS`). The server refuses a longer text
+ * with 400, so the box stops the typing at the same number and says what to do
+ * when an older answer is still refused (`QA LH-DATA-11-15` F2, `DATA-54`).
+ * `palette-search.test.ts` fails when the two numbers differ.
+ */
+export const PALETTE_SEARCH_MAX_CHARS = 100
 
 /**
  * Truncates `results` to at most `PALETTE_ASSET_RESULT_LIMIT` entries,
@@ -48,19 +58,65 @@ export function matchedOnLabel(matchedOn: Asset["matchedOn"]): string | null {
     case "tag":
       what = value ? `${field} ${value}` : field
       break
+    case "table":
+      // QA `LH-DATA-11-05` (`DATA-54`): the server reports the physical name
+      // the search read; the reader sees which table matched.
+      what = value ? `table ${value}` : "table"
+      break
+    case "id":
+      // An API build older than `DATA-54` still sends `"id"`; it read as a
+      // column named id, which is not what it is.
+      what = "table id"
+      break
+    case "description":
+      // QA `LH-DATA-11-04` (`DATA-54`): the server sends a piece of the
+      // description around the matched word; it is shown as text, never as
+      // HTML.
+      what = value ? `description: "${value}"` : "description"
+      break
     case "columnDescription":
       what = "column description"
       break
     default:
-      // id, namespace, owner, description; a field a newer server adds is
-      // shown as it came rather than hidden.
+      // namespace, owner; a field a newer server adds is shown as it came
+      // rather than hidden.
       what = field
   }
   return approximate ? `${what} · approximate match` : what
 }
 
+/**
+ * The two lines of a catalog-asset result (`LH-DATA-11-01` F1, `DATA-54`):
+ * the table's physical name (`bronze.orders`, `serving.mart_sales`), and why
+ * it matched. When the reason is the table key itself the key is not printed
+ * twice — the reason is then only "approximate match" when a typo was
+ * forgiven, and nothing otherwise.
+ */
+export function paletteAssetLines(
+  asset: Pick<Asset, "id" | "tableKey" | "matchedOn">,
+): { path: string | null; reason: string | null } {
+  const path = tableKeyOf(asset)
+  if (path !== null && asset.matchedOn?.field === "table") {
+    return { path, reason: asset.matchedOn.approximate ? "approximate match" : null }
+  }
+  return { path, reason: matchedOnLabel(asset.matchedOn) }
+}
+
 /** The `value` prefix of a catalog-asset row in the palette (`command-palette.tsx`). */
 export const ASSET_VALUE_PREFIX = "asset "
+
+/**
+ * Whether every word of `search` is a substring, in any case, of `value` and
+ * the `keywords` (QA `LH-DATA-11-14`, `DATA-54`).
+ */
+function everyWordIn(value: string, search: string, keywords?: string[]): boolean {
+  const haystack = `${value} ${(keywords ?? []).join(" ")}`.toLowerCase()
+  return search
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((word) => word !== "")
+    .every((word) => haystack.includes(word))
+}
 
 /**
  * cmdk's `filter` for the palette. QA LH-DATA-11-06: cmdk scores every item
@@ -70,12 +126,21 @@ export const ASSET_VALUE_PREFIX = "asset "
  * one cmdk would have given any asset row, so the asset group keeps the
  * position among the other groups that it has today (cmdk orders groups by
  * their best item). Every other item keeps cmdk's own score.
+ *
+ * QA `LH-DATA-11-14` (`DATA-54`): `cmdk` accepts the letters in order
+ * anywhere, so `gic` was found in "Governance Access rules
+ * /governance/policies". A page or an action is listed only when every typed
+ * word is in its text; `cmdk`'s score still decides the order and nothing
+ * new is listed. Asset rows are not affected: the server decided them.
  */
 export function makePaletteFilter(assetValues: string[]) {
   return (value: string, search: string, keywords?: string[]): number => {
-    if (!value.startsWith(ASSET_VALUE_PREFIX)) return defaultFilter(value, search, keywords)
-    let best = 0
-    for (const v of assetValues) best = Math.max(best, defaultFilter(v, search, keywords))
-    return best
+    const score = defaultFilter(value, search, keywords)
+    if (value.startsWith(ASSET_VALUE_PREFIX)) {
+      let best = 0
+      for (const v of assetValues) best = Math.max(best, defaultFilter(v, search, keywords))
+      return best
+    }
+    return score > 0 && everyWordIn(value, search, keywords) ? score : 0
   }
 }

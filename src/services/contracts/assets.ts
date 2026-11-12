@@ -102,10 +102,12 @@ export type Asset = {
    * of a search with a term, and absent when every word matched the name.
    * With several words it explains the first word, in typed order, that the
    * name does not (`DATA-11` review `SHOULD-FIX 8`).
-   * `field` is `"id"`, `"namespace"`, `"tag"`, `"column"`, `"owner"`,
-   * `"description"` or `"columnDescription"`; `value` is the tag or column
-   * name and `""` for the rest; `approximate` is true when the match
-   * forgave a typo.
+   * `field` is `"table"`, `"namespace"`, `"tag"`, `"column"`, `"owner"`,
+   * `"description"` or `"columnDescription"`; `value` is the tag, the
+   * column, the table key or a piece of the description, and `""` for the
+   * rest; `approximate` is true when the match forgave a typo. `"table"`
+   * names the physical name a person types (QA `LH-DATA-11-05`,
+   * `DATA-54`); an API build older than that sends `"id"` instead.
    * `"name"` is the one field outside that list (`DATA-32` D1): the server
    * reports it when the name forgave a typo and no other field explains the
    * hit, so `value` is `""` and `approximate` is true.
@@ -180,6 +182,7 @@ export type AssetUsage = {
   basedOn: number
   /** True when that read was full, so the oldest queries of the window are not in the figures. */
   truncated: boolean
+  /** `name` is the person's display name, or "Unknown user" (`DATA-52`); the id is never sent. */
   frequentUsers: { name: string; queries: number }[]
   /** `sql` has every literal replaced by `?`; queries are grouped by that form. */
   frequentQueries: { sql: string; runs: number; lastAt: string }[]
@@ -259,6 +262,7 @@ export type AssetDetail = Asset & {
   recentQueries: {
     id: string
     sql: string
+    /** The caller's display name, or "Unknown user" (`DATA-52`); the id is never sent. */
     user: string
     at: string
     status?: string
@@ -336,6 +340,19 @@ export type AssetDetail = Asset & {
     /** Every column of the table, system columns included. */
     tableColumns: number
   }
+  /**
+   * `true` when the API admitted the caller by a `query:read` grant made
+   * from this table rather than by `catalog:read` (`GOV-11`, `DEC-20`;
+   * review round 1 R2). The body then holds the table's own facts only:
+   * `upstream`, `downstream`, `dependents` and the usage lists
+   * (`joinedTables`, `frequentUsers`, `frequentQueries`) are empty because
+   * they are withheld, not because nothing exists, and a deprecation's
+   * `replacementAssetId`/`replacementName` are absent. The server decides
+   * this from how the caller was admitted; the console must not infer it
+   * from a permission. Absent for a `catalog:read` caller, and from an
+   * older API build, which sent the whole body.
+   */
+  shownWithTableGrant?: boolean
   /**
    * `true` when `sample` is empty because the caller lacks `query:read`
    * (the API withholds rows from `catalog:read`-only callers), not
@@ -508,8 +525,22 @@ export type AssetRestoreStatus =
       expiresAt?: string
     }
 
+/**
+ * A catalog search's answer: the best matches and how many matched in all
+ * (`DATA-41` D3, `DATA-54`). The palette shows a few of them and says how
+ * many more there are.
+ */
+export type AssetSearchResult = { assets: Asset[]; total: number }
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
+  /**
+   * The best matches for `term` and how many matched in all (`DATA-41` D3).
+   *
+   * `limit` is how many assets to return; the server ranks every match and
+   * counts them, so a caller that shows eight still knows there are more.
+   */
+  searchAssets(term: string, limit: number, signal?: AbortSignal): Promise<AssetSearchResult>
   /**
    * One page of assets, with search/filter/sort/grouping applied on the
    * server (`GET /api/catalog/query`).

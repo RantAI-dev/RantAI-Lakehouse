@@ -38,6 +38,7 @@ mock.module("@/features/auth/auth-provider", () => ({
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { alertRuleService, assetService, connectorService, dashboardService, metricService } from "@/services"
+import { ServiceError } from "@/services/errors"
 import type { AlertRule } from "@/services/contracts/alerts"
 import { AlertRulePage } from "./alert-rule-page"
 
@@ -80,9 +81,12 @@ function stubReads(rules: AlertRule[] = []) {
   spyOn(connectorService, "listConnectors").mockResolvedValue([])
   spyOn(metricService, "list").mockResolvedValue([])
   // WEB-8 D8: the table pickers read the catalog.
+  // Shaped like the API's list rows (`DATA-54`): a Silver row's `id` is its
+  // table key; a Bronze row's `id` is a registry slug and its table is named
+  // by `tableKey`.
   spyOn(assetService, "listAssets").mockResolvedValue([
-    { id: "a-orders", name: "orders", namespace: "silver" },
-    { id: "a-raw", name: "raw_orders", namespace: "bronze" },
+    { id: "silver.orders", name: "Orders", namespace: "silver" },
+    { id: "raw-orders", name: "Raw Orders", namespace: "primer", tableKey: "bronze.raw_orders" },
   ] as never)
 }
 
@@ -156,6 +160,31 @@ describe("the alert rule page (WEB-7 T7)", () => {
 
     expect(await screen.findByText("Rule not found")).toBeDefined()
     expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts")
+  })
+
+  // DEC-16 (QA LH-SRC-7-04, SRC-42): the API sends a rule without its target to
+  // a caller who may not manage it, and the page says so instead of rendering a
+  // form whose Save the API would refuse.
+  it("says a rule whose target is hidden cannot be changed", async () => {
+    stubReads([{ ...RULE, target: undefined, targetHidden: true }])
+    render(<AlertRulePage ruleId="al_1234" />)
+
+    expect(await screen.findByText("You cannot change this rule")).toBeDefined()
+    expect(
+      screen.getByText(
+        "Seeing where a rule sends, or changing it, needs the alert:write permission."
+      )
+    ).toBeDefined()
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
+    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts")
+  })
+
+  it("still renders the form for a rule whose target is returned", async () => {
+    stubReads([RULE])
+    render(<AlertRulePage ruleId="al_1234" />)
+
+    expect(await screen.findByRole("button", { name: "Save" })).toBeDefined()
+    expect(screen.queryByText("You cannot change this rule")).toBeNull()
   })
 
   it("says which field is missing instead of saving", async () => {
@@ -264,5 +293,55 @@ describe("the table pickers on the alert rule page (WEB-8 D8)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }))
     await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
     expect(create.mock.calls[0]?.[0]).toMatchObject({ type: "freshness", mart: "bronze.raw_orders" })
+  })
+})
+
+// QA LH-SRC-7-10 (SRC-40 D8): the form and its reads say a refusal in words,
+// never the API's own `permission_denied: connector:manage` text.
+describe("a refusal on the alert rule page (LH-SRC-7-10)", () => {
+  async function chooseType(label: string) {
+    fireEvent.click(screen.getByRole("combobox", { name: "Type" }))
+    pickOption(await screen.findByRole("option", { name: label }))
+  }
+
+  it("says in words that the connector cannot be chosen, not the API's code", async () => {
+    stubReads()
+    // `GET /api/connectors` takes `connector:manage`; the form only needs
+    // `alert:write`.
+    // The shape the connector client really produces for a 403: `getJson`
+    // maps it to `invalid_request` and keeps the status.
+    spyOn(connectorService, "listConnectors").mockRejectedValue(
+      new ServiceError("invalid_request", "permission_denied: connector:manage", 403)
+    )
+    render(<AlertRulePage />)
+    fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), {
+      target: { value: "Load" },
+    })
+    await chooseType("Connector run failed")
+
+    expect(
+      await screen.findByText("You do not have permission to choose a connector for this rule.")
+    ).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/permission_denied/)
+  })
+
+  it("shows the shared sentence when the save is refused", async () => {
+    stubReads()
+    spyOn(alertRuleService, "createRule").mockRejectedValue(
+      new ServiceError("permission_denied", "permission_denied: alert:write", 403)
+    )
+    render(<AlertRulePage />)
+    fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), {
+      target: { value: "Visitors in Bali" },
+    })
+    fireEvent.change(screen.getByPlaceholderText("https://hooks.slack.com/services/…"), {
+      target: { value: "https://hooks.example.com/x" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+
+    expect(
+      await screen.findByText("This account does not have permission. Ask a workspace admin.")
+    ).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/permission_denied/)
   })
 })

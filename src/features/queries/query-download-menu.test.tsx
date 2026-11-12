@@ -14,6 +14,7 @@ function renderMenu(over: Partial<React.ComponentProps<typeof QueryDownloadMenu>
     resultId: "q-1",
     engine: "clickhouse",
     busy: null,
+    canDownload: true,
     onDownload: () => {},
     ...over,
   }
@@ -42,6 +43,15 @@ describe("the download menu of a result", () => {
     const trigger = renderMenu({ engine: "trino" })
     expect((trigger as HTMLButtonElement).disabled).toBe(true)
     expect(trigger.getAttribute("title")).toBe("Downloads run on ClickHouse only.")
+  })
+
+  // QA LH-QS-2-06 (QS-9), decision 10: the person's roles decide first.
+  it("is closed when downloads are switched off for the person, and says why", () => {
+    const trigger = renderMenu({ canDownload: false })
+    expect((trigger as HTMLButtonElement).disabled).toBe(true)
+    expect(trigger.getAttribute("title")).toBe(
+      "Downloads are switched off for your role."
+    )
   })
 
   it("is closed when there is no result to download", () => {

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_state,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -93,6 +93,9 @@ impl Respond for FakeCh {
 
 struct F {
     app: TestApp,
+    /// The state the router was built from, so a test can drive the runner
+    /// (`RPT-1`'s `tick`) the way the scheduler does.
+    state: lakehouse_api::state::AppState,
     owner: Uuid,
     owner_cookie: String,
     _ch: MockServer,
@@ -119,11 +122,12 @@ async fn fixture(extra_env: &[(&str, &str)]) -> F {
     for (k, v) in extra_env {
         env.insert((*k).to_owned(), (*v).to_owned());
     }
-    let app = spin_up_with_env(&env).await;
+    let (app, state) = spin_up_with_state(&env, |_| {}).await;
     let owner = create_principal_with_permissions(&app.pool, "dashboard:read").await;
     let owner_cookie = session_cookie_for_user(&app.pool, owner).await;
     F {
         app,
+        state,
         owner,
         owner_cookie,
         _ch: ch,
@@ -885,4 +889,133 @@ async fn a_non_owner_administrator_may_only_pause_delete_and_remove_recipients()
     assert_eq!(got["recipients"].as_array().unwrap().len(), 1);
     let (status, _) = call(&f, "DELETE", &one, &cookie, None).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// QA `LH-RPT-1-06` (`RPT-2`, `DEC-18`): with e-mail not set up, the list says
+/// on the subscription that it is not being sent, and names the last attempt
+/// once there is one — while nothing is counted towards the pause.
+///
+/// The delivery that must not be counted is a SCHEDULED one (review round 1,
+/// R7): `run_subscription` returns before counting for a "Send now" whatever its
+/// reason, so assertions made after only a manual send hold with the
+/// e-mail-not-set-up half of the rule deleted. The scheduled run is driven here
+/// the way the runner loop drives it, with an `EmailSender` built from the
+/// deployment's saved settings.
+#[tokio::test]
+async fn the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted()
+{
+    let f = fixture(&[]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": colleague.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let one = format!("{SUBS}/{}", made["id"].as_str().unwrap());
+
+    let (_, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(list["emailSetUp"], json!(false), "no SMTP_HOST here");
+    let before = &list["items"][0]["notSent"];
+    assert_eq!(
+        *before,
+        json!({ "cause": "email_not_set_up", "lastAttemptAt": null }),
+        "nothing has been attempted yet: {list}"
+    );
+
+    let (status, delivery) = call(&f, "POST", &format!("{one}/send"), &f.owner_cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{delivery}");
+    assert_eq!(
+        delivery["reason"],
+        "Email is not set up on this deployment."
+    );
+
+    // R7: the scheduled delivery the counting rule is about. Make the one
+    // subscription due and run the runner once, with the mailer the loop builds.
+    sqlx::query(
+        "UPDATE report_subscription SET next_run_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(made["id"].as_str().unwrap()).unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let mailer = lakehouse_notify::EmailSender::new(
+        lakehouse_api::runtime_settings::email(&f.state)
+            .await
+            .smtp(),
+    );
+    let taken = lakehouse_api::routes::report_runner::tick(&f.state, &mailer).await;
+    assert_eq!(taken, 1, "the due subscription is claimed and run");
+
+    let (_, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    let item = &list["items"][0];
+    assert_eq!(
+        item["notSent"]["cause"],
+        json!("email_not_set_up"),
+        "{list}"
+    );
+    let at = item["notSent"]["lastAttemptAt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the failed attempt names its time: {list}"));
+    time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+        .expect("the time is RFC 3339 as written");
+    assert_eq!(item["lastDelivery"]["status"], "failed", "{list}");
+    assert_eq!(
+        item["consecutiveFailures"],
+        json!(0),
+        "DEC-18: a scheduled delivery that fails for this reason is not counted"
+    );
+    assert_eq!(item["paused"], json!(false), "DEC-18: nothing is paused");
+}
+
+/// The other side of the same rule (`RPT-2`): with e-mail set up the list says
+/// nothing of the kind. The mail server is named on a closed local port, so the
+/// send itself still fails — the point is that the LIST does not claim e-mail is
+/// missing.
+#[tokio::test]
+async fn the_list_says_nothing_of_the_kind_while_email_is_set_up() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let f = fixture(&[("SMTP_HOST", "127.0.0.1"), ("SMTP_PORT", &port.to_string())]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": colleague.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+
+    let (status, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["emailSetUp"], json!(true), "{list}");
+    assert_eq!(list["items"][0]["notSent"], Value::Null, "{list}");
 }
