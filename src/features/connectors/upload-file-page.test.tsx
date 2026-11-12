@@ -110,6 +110,8 @@ type Answer<Args extends unknown[] = []> = Response | ((...args: Args) => Respon
 
 type Routes = {
   list?: Upload[] | Response
+  /** `GET /api/uploads?table=<name>` (`DATA-47`): the named table's own uploads; the default narrows `list`. */
+  tableUploads?: (table: string) => Upload[] | Response | Promise<Upload[] | Response>
   /** `POST /api/uploads/sessions`; the default opens `up-N` with 8 MiB pieces. */
   session?: Answer<[{ filename: string; sizeBytes: number }]>
   /** `PUT /api/uploads/{id}/parts/{n}`; the default stores the piece. */
@@ -158,7 +160,18 @@ function stubFetch(routes: Routes = {}): Call[] {
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : init?.body
     calls.push({ url: `${target.pathname}${target.search}`, method, body })
     const reply = (value: unknown) => (value instanceof Response ? value : json(value))
-    if (target.pathname === "/api/uploads" && method === "GET") return reply(routes.list ?? [])
+    if (target.pathname === "/api/uploads" && method === "GET") {
+      // `DATA-47`: the Table step asks about one table by its exact name. Without a
+      // `tableUploads` route the answer is the unfiltered list narrowed the way the
+      // API narrows it, so a test that gives `list` keeps its meaning.
+      const table = target.searchParams.get("table")
+      if (table !== null) {
+        if (routes.tableUploads) return reply(await routes.tableUploads(table))
+        const list = routes.list ?? []
+        return reply(Array.isArray(list) ? list.filter((u) => u.bronzeTable === table) : list)
+      }
+      return reply(routes.list ?? [])
+    }
     // Before the per-upload routes below: `folders` is not an upload id.
     if (target.pathname === "/api/uploads/folders" && method === "GET") return reply(routes.folders ?? [])
     if (target.pathname === "/api/uploads/folders" && method === "POST") {
@@ -234,7 +247,7 @@ const CSV = () => new File(["sku,qty\na1,3\nb2,5\n"], "stock.csv", { type: "text
 describe("UploadFilePage, first step", () => {
   it("has a labelled file control and refuses a file over 2 GB, sending nothing", async () => {
     const calls = stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const big = new File(["x"], "big.csv")
     Object.defineProperty(big, "size", { value: MAX_SESSION_BYTES + 1 })
     chooseFile(big)
@@ -250,7 +263,7 @@ describe("UploadFilePage, first step", () => {
   it("shows the API's refusal of a file in its row, word for word, and stays on the first step", async () => {
     const sentence = "This looks like a workbook. Save it as CSV and upload that."
     stubFetch({ complete: () => json({ error: sentence }, 400) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     // A name the console does not refuse by itself (it refuses .xlsm before any
     // request, see below), so the API's own refusal by content is what shows.
     chooseFile(new File(["x"], "stock.dat"))
@@ -265,7 +278,7 @@ describe("UploadFilePage, first step", () => {
 
   it("refuses a workbook the API does not read by its name before any request, saying what to save it as", async () => {
     const calls = stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(new File(["x"], "stock.XLSM"))
 
     const alert = await screen.findByRole("alert")
@@ -279,7 +292,7 @@ describe("UploadFilePage, first step", () => {
 
   it("states the limits as short facts up front, and suggests text and Excel files in the picker", () => {
     stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const facts = new Map(
       screen.getAllByRole("term").map((term) => [term.textContent, term.nextElementSibling?.textContent])
     )
@@ -307,7 +320,7 @@ describe("UploadFilePage, first step", () => {
 
   it("is a drop area with one line, a button labelling the real file input, and the page's subtitle names Excel", () => {
     stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     expect(screen.getByText("Drop files here, or choose some")).toBeDefined()
     expect(screen.getByText(/CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables/)).toBeDefined()
     const input = screen.getByLabelText("Choose files")
@@ -317,7 +330,7 @@ describe("UploadFilePage, first step", () => {
 
   it("highlights the area while files are dragged over it, and takes the dropped files as rows that start to be sent", async () => {
     const calls = stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const area = screen.getByText("Drop files here, or choose some").closest("[data-dragging]") as HTMLElement
     expect(area.dataset.dragging).toBe("false")
 
@@ -343,7 +356,7 @@ describe("UploadFilePage, first step", () => {
 
   it("marks the chosen files by their format: green spreadsheet and XLS/XLSX, text and CSV/TSV, neutral otherwise, in any case", () => {
     stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const cases: [string, string | null, string, string][] = [
       ["stock.xls", "XLS", "workbook", "text-emerald-700"],
       ["Stock.XLSX", "XLSX", "workbook", "text-emerald-700"],
@@ -370,7 +383,7 @@ describe("UploadFilePage, first step", () => {
 
   it("refuses a dropped file by the same checks as a chosen one, and a drop with no file changes nothing", async () => {
     stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const area = screen.getByText("Drop files here, or choose some").closest("[data-dragging]") as HTMLElement
     fireEvent.drop(area, { dataTransfer: { files: [new File(["x"], "stock.XLSM")] } })
     const alert = await screen.findByRole("alert")
@@ -384,7 +397,7 @@ describe("UploadFilePage, first step", () => {
 
   it("takes up to ten files at once, sends each, and says how many were left out of a larger pick", async () => {
     const calls = stubFetch()
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const picked = Array.from({ length: 11 }, (_, i) => new File([`a,b\n${i},1\n`], `part-${i}.csv`))
     chooseFiles(picked)
 
@@ -416,7 +429,7 @@ describe("UploadFilePage, first step", () => {
         return json({ partNumber: n, sizeBytes: 4 })
       },
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(new File(["12345678"], "bars.csv"))
 
     const bar = await screen.findByRole("progressbar", { name: "bars.csv sent" })
@@ -435,7 +448,7 @@ describe("UploadFilePage, first step", () => {
       complete: (id) => json({ ...upload({ id, originalFilename: "stock.xlsx" }), workbook: WORKBOOK }),
       preview: (q) => workbookPreview(q.get("sheet") ?? WORKBOOK.defaultSheet),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(new File(["x"], "stock.xlsx"))
     expect(screen.queryByRole("alert")).toBeNull()
     await waitFor(() => expect(next().disabled).toBe(false))
@@ -450,7 +463,7 @@ describe("UploadFilePage, first step", () => {
       complete: (id) => json({ ...upload({ id, originalFilename: "orders.parquet" }), parquet: PARQUET }),
       preview: () => parquetPreview(),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(new File(["x"], "orders.parquet"))
     expect(screen.queryByRole("alert")).toBeNull()
     await waitFor(() => expect(next().disabled).toBe(false))
@@ -461,7 +474,7 @@ describe("UploadFilePage, first step", () => {
 
   it("does not show a proxy's plain-text 413 as such: it says the upload did not reach the service and names the limit", async () => {
     stubFetch({ session: () => new Response("Request Entity Too Large", { status: 413 }) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
 
     const alert = await screen.findByRole("alert")
@@ -473,7 +486,7 @@ describe("UploadFilePage, first step", () => {
 
   it("keeps trying when a proxy answers 500: the file waits for the connection, with no alert, and is not refused", async () => {
     stubFetch({ part: () => new Response("Internal Server Error", { status: 500 }) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
 
     expect(await screen.findByText(/Waiting for the connection/)).toBeDefined()
@@ -496,7 +509,7 @@ describe("UploadFilePage, first step", () => {
         return json({ partNumber: n, sizeBytes: 1 })
       },
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
 
     await screen.findByText(/Received/)
@@ -510,7 +523,7 @@ describe("UploadFilePage, first step", () => {
         json({ ...upload({ id }), duplicateOf: upload({ id: "up-0", originalFilename: "stock_old.csv", bronzeTable: "stock" }) }),
       preview: () => preview(),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -542,7 +555,7 @@ describe("UploadFilePage, first step", () => {
       },
       preview: () => preview(),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFiles([CSV(), new File(["qty,sku\n1,a\n"], "second.csv")])
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -575,7 +588,7 @@ describe("UploadFilePage, first step", () => {
         return json({ partNumber: n, sizeBytes: 1 })
       },
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
     await screen.findByRole("progressbar", { name: "stock.csv sent" })
     await waitFor(() => expect(sent(calls, "PUT", /parts\/1$/).length).toBe(1))
@@ -588,7 +601,7 @@ describe("UploadFilePage, first step", () => {
 
   it("shows a refusal for a missing permission in the file's row, in the API's sentence", async () => {
     stubFetch({ session: () => json({ error: "You do not have permission to do this." }, 403) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     chooseFile(CSV())
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe("You do not have permission to do this.")
@@ -600,7 +613,7 @@ describe("UploadFilePage, Check step", () => {
   async function openCheck(routes: Routes) {
     url.search = "?id=up-1"
     const calls = stubFetch({ get: () => upload(), ...routes })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     return calls
   }
@@ -716,7 +729,7 @@ describe("UploadFilePage, Check step", () => {
     url.search = "?id=up-1"
     const sentence = "Upload storage is unavailable (timeout)."
     stubFetch({ get: () => upload(), preview: () => json({ error: sentence }, 503) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(sentence)
     expect(screen.getByRole("button", { name: "Retry" })).toBeDefined()
@@ -749,7 +762,7 @@ describe("UploadFilePage, Check step for a workbook", () => {
       preview: (q) => workbookPreview(q.get("sheet") ?? WORKBOOK.defaultSheet),
       ...routes,
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Sheet")
     return calls
   }
@@ -792,6 +805,8 @@ describe("UploadFilePage, Check step for a workbook", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
     expect(screen.getByText("Sheet")).toBeDefined()
@@ -847,7 +862,7 @@ describe("UploadFilePage, Check step for a Parquet file", () => {
       preview: () => parquetPreview(),
       ...routes,
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByRole("columnheader", { name: /sku/ })
     return calls
   }
@@ -877,6 +892,8 @@ describe("UploadFilePage, Check step for a Parquet file", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
     expect(screen.getByText("Format")).toBeDefined()
@@ -907,7 +924,7 @@ describe("UploadFilePage, Check step for JSON, Avro, gzip and zip (DATA-17 slice
       get: () => upload({ originalFilename: name }),
       preview: () => preview({ columns: ["id", "name", "meta"], rows: [["1", "Anna", '{"x":1}']], ...over }),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByRole("columnheader", { name: /id/ })
   }
 
@@ -960,6 +977,8 @@ describe("UploadFilePage, Check step for JSON, Avro, gzip and zip (DATA-17 slice
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
     expect(screen.getByText("CSV or TSV in a zip archive")).toBeDefined()
@@ -971,7 +990,7 @@ describe("UploadFilePage, Table step", () => {
   async function openTable(list: Upload[]) {
     url.search = "?id=up-1"
     const calls = stubFetch({ get: () => upload(), list, preview: () => preview() })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -1029,6 +1048,123 @@ describe("UploadFilePage, Table step", () => {
     expect(screen.queryByRole("radio", { name: "Add to its rows" })).toBeNull()
   })
 
+  /** The same page opened with routes of the test's choosing (the lookup's answer, a folder list). */
+  async function openTableWith(routes: Routes) {
+    url.search = "?id=up-1"
+    const calls = stubFetch({ get: () => upload(), preview: () => preview(), ...routes })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    return calls
+  }
+
+  // QA LH-DATA-35-03 (DATA-47): the choice comes from the named table's own
+  // uploads, asked by the name, not from the newest hundred uploads of the tenant.
+  it("offers Replace or Add and the table's folder for a table whose upload is not in the newest list", async () => {
+    const calls = await openTableWith({
+      list: [],
+      folders: [folder({ id: "uf-q1", name: "Q1" })],
+      tableUploads: (table) =>
+        table === "stock"
+          ? [upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock", folderId: "uf-q1" })]
+          : [],
+    })
+
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(screen.getByRole("radio", { name: "Add to its rows" })).toBeDefined()
+    expect(screen.getByRole("combobox", { name: "Folder (optional)" }).textContent).toContain("Q1")
+    expect(calls.filter((c) => c.url === "/api/uploads?table=stock").length).toBe(1)
+  })
+
+  it("says the check failed, keeps Next off, and asks again on Check again", async () => {
+    let attempts = 0
+    await openTableWith({
+      tableUploads: () => {
+        attempts += 1
+        return attempts === 1
+          ? json({ error: "The service is unavailable." }, 503)
+          : [upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]
+      },
+    })
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("Could not check whether an earlier upload created stock")
+    expect(alert.textContent).toContain("The service is unavailable.")
+    expect(next().disabled).toBe(true)
+    expect(screen.queryByRole("radio", { name: "Replace its rows" })).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }))
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(next().disabled).toBe(false)
+  })
+
+  it("keeps Next off and says it is checking until the table check answers", async () => {
+    const pending: Array<() => void> = []
+    await openTableWith({
+      tableUploads: () =>
+        new Promise<Upload[]>((resolve) => pending.push(() => resolve([upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]))),
+    })
+
+    expect(screen.getByText(/Checking whether an earlier upload created stock/)).toBeDefined()
+    expect(next().disabled).toBe(true)
+    await waitFor(() => expect(pending.length).toBe(1))
+    pending[0]!()
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(next().disabled).toBe(false)
+  })
+
+  it("keeps Load off on the Review step while the table check has not answered", async () => {
+    const pending: Array<() => void> = []
+    await openTableWith({
+      tableUploads: (table) =>
+        table === "stock"
+          ? [upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]
+          : new Promise<Upload[]>((resolve) => pending.push(() => resolve([]))),
+    })
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    fireEvent.click(next())
+    await screen.findByRole("button", { name: "Load" })
+
+    // Back to the Table step, a new name, then straight on through the stepper —
+    // the step buttons are how a person reaches Review with a check still running.
+    fireEvent.click(screen.getByRole("button", { name: /Table Name the raw table/ }))
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_new" } })
+    fireEvent.click(screen.getByRole("button", { name: /Review Load the files/ }))
+
+    const load = (await screen.findByRole("button", { name: "Load" })) as HTMLButtonElement
+    expect(load.disabled).toBe(true)
+    expect(screen.getByText(/Checking whether an earlier upload created stock_new/)).toBeDefined()
+    await waitFor(() => expect(pending.length).toBe(1))
+    pending[0]!()
+    await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  it("asks about a typed name once, after the pause, and uses only the answer for the name in the field", async () => {
+    url.search = "?id=up-1"
+    const calls = stubFetch({ get: () => upload(), preview: () => preview() })
+    render(<UploadFilePage lookupDelayMs={30} />)
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    const field = await screen.findByLabelText("Table name")
+    const asked = () => calls.filter((c) => c.url.startsWith("/api/uploads?table="))
+
+    // The page's own suggestion is asked at once, so the answer is there before
+    // the person reaches this step.
+    await waitFor(() => expect(asked().length).toBe(1))
+    expect(asked()[0]!.url).toBe("/api/uploads?table=stock")
+
+    fireEvent.change(field, { target: { value: "sto" } })
+    fireEvent.change(field, { target: { value: "stoc" } })
+    fireEvent.change(field, { target: { value: "stock_a" } })
+    await waitFor(() => expect(asked().some((c) => c.url === "/api/uploads?table=stock_a")).toBe(true))
+    expect(asked().filter((c) => c.url === "/api/uploads?table=stock_a").length).toBe(1)
+    expect(asked().filter((c) => c.url === "/api/uploads?table=sto")).toEqual([])
+    expect(asked().filter((c) => c.url === "/api/uploads?table=stoc")).toEqual([])
+  })
+
   it("carries the choice to the review, and sends nothing before Load", async () => {
     const calls = await openTable([upload({ id: "up-0", status: "ingested", bronzeTable: "stock", assetId: "stock" })])
     fireEvent.click(screen.getByRole("radio", { name: "Add to its rows" }))
@@ -1046,7 +1182,7 @@ describe("UploadFilePage, Table step, folders (DATA-35)", () => {
   async function openTable(routes: Routes) {
     url.search = "?id=up-1"
     const calls = stubFetch({ get: () => upload(), preview: () => preview(), ...routes })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -1146,11 +1282,13 @@ describe("UploadFilePage, after Load", () => {
   async function review(routes: Routes) {
     url.search = "?id=up-1"
     const calls = stubFetch({ preview: () => preview(), ...routes })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
     return calls
@@ -1274,6 +1412,8 @@ describe("UploadFilePage, after Load", () => {
     fireEvent.click(screen.getByRole("button", { name: "Previous" }))
     fireEvent.click(await screen.findByRole("radio", { name: "Add to its rows" }))
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
+    // The table check answers for the new name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
@@ -1378,7 +1518,7 @@ describe("UploadFilePage, with ?id=", () => {
   it("skips the file step and shows the page's own error state for an upload that is not there", async () => {
     url.search = "?id=gone"
     stubFetch({ get: () => json({ error: "Upload not found." }, 404) })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     expect(await screen.findByText("Not found")).toBeDefined()
     expect(screen.getByText(/Upload not found\./)).toBeDefined()
     expect(screen.queryByLabelText("Choose files")).toBeNull()
@@ -1389,7 +1529,7 @@ describe("UploadFilePage, with ?id=", () => {
     stubFetch({
       get: () => upload({ status: "ingesting", bronzeTable: "stock" }),
     })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
     expect(await screen.findByText("Loading", { selector: "span" })).toBeDefined()
     expect(screen.getByText(/Loading stock\.csv into stock/)).toBeDefined()
   })
@@ -1409,7 +1549,7 @@ describe("UploadFilePage, limits", () => {
           ? preview({ using: { ...OPTIONS, delimiter: ";" }, columns: ["sku;qty"], rows: [["a1;3"]] })
           : json({ error: TOO_MANY_COLUMNS }, 400),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(TOO_MANY_COLUMNS)
@@ -1434,7 +1574,7 @@ describe("UploadFilePage, limits", () => {
       get: () => upload(),
       preview: (q) => (q.get("delimiter") === "|" ? json({ error: TOO_MANY_COLUMNS }, 400) : preview()),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByRole("columnheader", { name: "sku" })
 
     chooseOption(screen.getByLabelText("Delimiter"), "Pipe")
@@ -1452,11 +1592,13 @@ describe("UploadFilePage, limits", () => {
       preview: () => preview(),
       ingest: json({ error: TOO_MANY_UPLOADS }, 429),
     })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
     await screen.findByLabelText("Encoding")
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
 
@@ -1490,7 +1632,7 @@ describe("UploadFilePage, column types", () => {
       check: () => ({ sampledRows: 3, count: 0, byColumn: [], rows: [] }),
       ...routes,
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Type of qty")
     return calls
   }
@@ -1547,6 +1689,8 @@ describe("UploadFilePage, column types", () => {
     fireEvent.click(screen.getByLabelText(/Load them as empty/))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/ingest"))).toBe(true))
@@ -1586,6 +1730,8 @@ describe("UploadFilePage, column types", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByText(/^Load reads/)
   }
@@ -1645,7 +1791,7 @@ describe("UploadFilePage, column types", () => {
       // test lets it come, so the check is still running when the Review step opens.
       check: (body) => (body.columns[0].type === "integer" ? held : NONE),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Type of qty")
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
@@ -1699,6 +1845,8 @@ describe("UploadFilePage, column types", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     // The load waits for the check's answer (review R1); the check re-runs after the change.
     await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
@@ -1722,7 +1870,7 @@ describe("UploadFilePage, column types", () => {
         }),
       check: () => ({ sampledRows: 3, count: 0, byColumn: [], rows: [] }),
     })
-    render(<UploadFilePage />)
+    render(<UploadFilePage lookupDelayMs={0} />)
     await screen.findByLabelText("Type of qty")
     fireEvent.click(next())
     const name = await screen.findByLabelText("Table name")
@@ -1748,11 +1896,12 @@ describe("UploadFilePage, column types", () => {
         check: () => ({ sampledRows: 2, count: 0, byColumn: [], rows: [] }),
         ingest: json({ upload: started, runId: "run-1" }),
       })
-      render(<UploadFilePage pollMs={20} />)
+      render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
       await screen.findByLabelText("Encoding")
       await waitFor(() => expect(next().disabled).toBe(false))
       fireEvent.click(next())
       await screen.findByLabelText("Table name")
+      await waitFor(() => expect(next().disabled).toBe(false))
       fireEvent.click(next())
       fireEvent.click(await screen.findByRole("button", { name: "Load" }))
       const report = await screen.findByLabelText("Values that did not fit")
@@ -1772,7 +1921,7 @@ describe("UploadFilePage, several files into one table", () => {
   /** Picks the files, goes to Check and waits for the comparison the API answers with `compare`. */
   async function openCheck(files: File[], routes: Routes = {}) {
     const calls = stubFetch({ preview: () => preview(), ...routes })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
     chooseFiles(files)
     await waitFor(() => expect(sent(calls, "POST", /complete$/).length).toBe(files.length))
     await waitFor(() => expect(next().disabled).toBe(false))
@@ -1866,6 +2015,8 @@ describe("UploadFilePage, several files into one table", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByRole("button", { name: "Load" })
 
@@ -1896,6 +2047,8 @@ describe("UploadFilePage, several files into one table", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Table name")
+    // The table check answers for the suggested name before the step may go on (`DATA-47`).
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     fireEvent.click(await screen.findByRole("button", { name: "Load" }))
     fireEvent.click(await screen.findByRole("button", { name: "Try again" }))
@@ -1920,7 +2073,7 @@ describe("UploadFilePage, several files into one table", () => {
       get: (n) => (n === 1 ? second : { ...second, status: "failed", error: "The load into the table failed." }),
       list: [upload({ id: "up-1", originalFilename: "stock.csv" }), second],
     })
-    render(<UploadFilePage pollMs={20} />)
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
 
     await screen.findByText("Load failed")
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull()
