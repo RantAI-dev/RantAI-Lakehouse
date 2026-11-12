@@ -238,7 +238,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // ── Catalog: seeded Analyst permission `catalog:read`. ───────────────
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/query", Policy::RequiresPermission("catalog:read")),
-    ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
+    // The handler admits `catalog:read`, or a person's `query:read` grant made
+    // from exactly this asset (the grant opens that table and nothing else),
+    // and refuses everyone else with the same 403 the gate used to answer
+    // (`catalog::ensure_may_open_asset`; `GOV-11`, `DEC-20`). The table cannot
+    // express "this permission, or a grant on this id": `RequiresAnyPermission`
+    // with both would be untrue, because `query:read` alone is not enough
+    // (`tests/route_auth.rs` asserts each permission of such a row passes
+    // alone). `RequiresAuth` with the level resolved in the handler is the
+    // pattern the dashboard read routes already use.
+    ("GET", "/api/catalog/{id}",  Policy::RequiresAuth),
     // Column profile: aggregates over the asset's rows (a `max` IS a value),
     // so it needs the same `query:read` as running that SELECT yourself —
     // and goes through the same policy rewrite (`routes::catalog_profile`).

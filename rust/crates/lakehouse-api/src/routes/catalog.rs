@@ -1758,8 +1758,10 @@ fn build_namespaces(assets: &[Value]) -> Vec<Value> {
 ///
 /// # Errors
 ///
-/// Whatever `catalog_tenant_refusal` returns (a Postgres failure while
-/// counting tenants), or whatever `clickhouse_asset_detail`/
+/// 403 without `catalog:read` and without a `query:read` grant made from this
+/// asset ([`ensure_may_open_asset`]; `GOV-11`, `DEC-20`), whatever
+/// `catalog_tenant_refusal` returns (a Postgres failure while counting
+/// tenants), or whatever `clickhouse_asset_detail`/
 /// `bronze_asset_detail` return: 404 for an unknown asset; for a Silver or
 /// Gold table the engine could not read, a `503` with a fixed message and a
 /// reference (QA LH-DATA-13-03, plan D8) rather than a 404.
@@ -1769,6 +1771,7 @@ pub async fn detail(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
+    ensure_may_open_asset(&state, &principal, &id).await?;
     if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
         return Ok((
             StatusCode::OK,
@@ -3273,6 +3276,51 @@ pub(crate) async fn ensure_asset_readable(
         }
     };
     ensure_key_readable_with(&access, &key)
+}
+
+/// Admits a caller to a table's page (`GOV-11`, `DEC-20`; QA
+/// `LH-DATA-15-03` F2): `GET /api/catalog/{id}` takes `catalog:read`, as it
+/// always did, **or** a person who holds `query:read` and a `query:read`
+/// grant that is in force and was made from exactly this asset
+/// ([`lakehouse_store::agents::holds_asset_grant`] — the same two origins
+/// the asset's Grants card lists).
+///
+/// Everyone else is refused with the same `permission_denied: catalog:read`
+/// the policy gate answers, before the asset is looked up, so the refusal
+/// says nothing about whether the id exists. A grant on table A opens A and
+/// nothing else.
+///
+/// What the admitted person then sees is what a `catalog:read` reader sees,
+/// built by the same code: the tenant gate, the role's table access (`GOV-7`
+/// — a grant gives a permission, not a table), and masks and row filters on
+/// the sample. `query:read` itself stays global, as
+/// [`super::catalog_grants`] says.
+///
+/// # Errors
+///
+/// 403 [`ApiError::PermissionDenied`] when neither applies; a classified
+/// store failure from the grant lookup (fail closed).
+async fn ensure_may_open_asset(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<(), ApiError> {
+    if principal.has("catalog:read") {
+        return Ok(());
+    }
+    if principal.has(SAMPLE_PERMISSION)
+        && let Some(user_id) = principal.user_id()
+        && lakehouse_store::agents::holds_asset_grant(
+            annotation_pool(state)?,
+            user_id,
+            id,
+            SAMPLE_PERMISSION,
+        )
+        .await?
+    {
+        return Ok(());
+    }
+    Err(ApiError::PermissionDenied("catalog:read".to_owned()))
 }
 
 /// [`ensure_asset_readable`] over an already canonical `"schema.table"` key
@@ -6907,6 +6955,93 @@ mod tests {
                     .all(|b| b.contains("replaceRegexpOne")),
                 "the sample must never reach ClickHouse unmasked"
             );
+            Ok(())
+        }
+
+        /// An Analyst in the catalog tenant, as [`analyst`] builds one, but
+        /// with a real `app_user.id` — what `ensure_may_open_asset` asks a
+        /// grant about (`GOV-11`).
+        fn analyst_with_id(id: Uuid, permissions: &str) -> Principal {
+            Principal {
+                id: PrincipalId::User(id),
+                ..analyst(permissions)
+            }
+        }
+
+        /// `detail` for `id` as `principal` over the mock engine `server`,
+        /// without seeding a policy — the negative half of a detail test.
+        /// An error answer is rendered, not panicked on: the 403 this asks
+        /// about comes back as `Err`.
+        async fn detail_for(
+            pool: &lakehouse_store::PgPool,
+            server: &MockServer,
+            principal: Principal,
+            id: &str,
+        ) -> (StatusCode, Value) {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+            match detail(
+                State(state),
+                Extension(principal),
+                HeaderMap::new(),
+                Path(id.to_owned()),
+            )
+            .await
+            {
+                Ok(resp) => response_json(resp).await,
+                Err(rejection) => response_json(rejection.into_response()).await,
+            }
+        }
+
+        /// `GOV-11` (`DEC-20`; QA `LH-DATA-15-03` F2): a person who holds
+        /// `query:read` and a `query:read` grant made from `serving.mart_x`
+        /// opens that table's page without `catalog:read`, and sees what a
+        /// `catalog:read` reader sees — the mask still applies. The same
+        /// person is refused another table, and a person with no grant row is
+        /// refused even this one.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn detail_admits_a_person_granted_query_read_on_that_table_and_masks_what_they_read(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            const GRANTEE: &str = "33333333-3333-4333-8333-000000000005";
+            const GRANTOR: &str = "33333333-3333-4333-8333-000000000006";
+            let server = MockServer::start().await;
+            let grantee = analyst_with_id(GRANTEE.parse().unwrap(), "query:read");
+            lakehouse_store::agents::create_direct_grant(
+                &pool,
+                grantee.user_id().expect("a person, not a service"),
+                "query:read",
+                "serving.mart_x",
+                GRANTOR.parse().unwrap(),
+                30,
+            )
+            .await
+            .expect("granting query:read from serving.mart_x");
+
+            let (status, body) = detail_as(&pool, &server, grantee.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["schema"][1]["masked"], json!(true));
+            assert_eq!(body["sample"], json!([{"id": "1", "email": "***"}]));
+
+            // A grant made from one asset opens that asset, not every table.
+            let (status, body) = detail_for(&pool, &server, grantee, "serving.mart_y").await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "another table stays closed: {body}"
+            );
+            assert_eq!(body["error"], json!("permission_denied: catalog:read"));
+
+            // No grant row at all: `query:read` alone is not enough.
+            let ungranted = analyst_with_id(
+                "33333333-3333-4333-8333-000000000001".parse().unwrap(),
+                "query:read",
+            );
+            let (status, body) = detail_for(&pool, &server, ungranted, "serving.mart_x").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "no grant: {body}");
             Ok(())
         }
 

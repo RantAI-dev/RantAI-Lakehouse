@@ -405,3 +405,156 @@ async fn a_grant_cannot_go_to_a_user_outside_the_catalog_tenant() {
         json!("permission_denied: grantee must be a member of the catalog tenant")
     );
 }
+
+/// The harness for `GOV-11` (`DEC-20`) below: a catalog-tenant deployment,
+/// an unrestricted caller that may grant, and a grantee with no permissions
+/// of their own who is a member of the catalog tenant.
+async fn catalog_tenant_harness() -> (axum::Router, PgPool, String, Uuid) {
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    let TestApp { router, pool } = common::spin_up_with_env(&overrides).await;
+    let admin = create_principal_with_permissions(&pool, "*:*").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let grantee = create_zero_permission_principal(&pool).await;
+    common::in_the_catalog_tenant(&pool, grantee).await;
+    (router, pool, cookie, grantee)
+}
+
+/// `GET /api/catalog/{id}` for `id` as `cookie`, parsed.
+async fn read_asset(router: &axum::Router, id: &str, cookie: &str) -> (StatusCode, Value) {
+    call(router, "GET", &format!("/api/catalog/{id}"), cookie, "").await
+}
+
+/// Grant `permission` from `asset` to `grantee` through the page's own grant
+/// route, so the row is the one a person makes there.
+async fn grant_from_asset(
+    router: &axum::Router,
+    pool: &PgPool,
+    admin_cookie: &str,
+    asset: &str,
+    grantee: Uuid,
+    permission: &str,
+) -> Value {
+    let email = email_of(pool, grantee).await;
+    let (status, body) = call(
+        router,
+        "POST",
+        &format!("/api/catalog/{asset}/grants"),
+        admin_cookie,
+        &json!({"email": email, "permission": permission}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// `GOV-11` (`DEC-20`; QA `LH-DATA-15-03` F2): a `query:read` grant made from
+/// a table's page opens that table's page for the grantee, who holds no
+/// `catalog:read` — and only that table: another table and the catalog list
+/// stay closed.
+///
+/// No engine is reachable in this harness, so an admitted read ends at 503;
+/// the assertion is "neither 401 nor 403", with the status in the message.
+#[tokio::test]
+async fn a_query_read_grant_on_a_table_opens_that_tables_page_and_no_other() {
+    let (router, pool, admin_cookie, grantee) = catalog_tenant_harness().await;
+    grant_from_asset(&router, &pool, &admin_cookie, ASSET, grantee, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, grantee).await;
+
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a query:read grant from {ASSET} must open it, got {status}: {body}"
+    );
+
+    let (status, body) = read_asset(&router, "silver.customers", &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the grant opens one table, not another: {body}"
+    );
+
+    let (status, body) = call(&router, "GET", "/api/catalog", &cookie, "").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the catalog list is unchanged: {body}"
+    );
+}
+
+/// `GOV-11` (`DEC-20`): the grant must be in force. A revoked grant and an
+/// expired one both leave the page closed, with the same 403.
+#[tokio::test]
+async fn a_revoked_or_expired_grant_no_longer_opens_the_page() {
+    let (router, pool, admin_cookie, grantee) = catalog_tenant_harness().await;
+    let cookie = session_cookie_for_user(&pool, grantee).await;
+
+    let made = grant_from_asset(&router, &pool, &admin_cookie, ASSET, grantee, "query:read").await;
+    let grant_id = made["id"].as_str().expect("the grant id").to_owned();
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "before the revoke: {body}");
+
+    let (status, body) = call(
+        &router,
+        "DELETE",
+        &format!("/api/catalog/{ASSET}/grants/{grant_id}"),
+        &admin_cookie,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a revoked grant opens nothing: {body}"
+    );
+
+    grant_from_asset(&router, &pool, &admin_cookie, ASSET, grantee, "query:read").await;
+    sqlx::query(
+        "UPDATE access_grant SET expires_at = now() - interval '1 second' \
+         WHERE user_id = $1 AND catalog_id = $2",
+    )
+    .bind(grantee)
+    .bind(ASSET)
+    .execute(&pool)
+    .await
+    .expect("expire the grant");
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an expired grant opens nothing: {body}"
+    );
+}
+
+/// `GOV-11` (`DEC-20`): a grant of another permission from the same table
+/// does not open its page. The asset page takes `query:read`, not "any
+/// grant from this asset".
+#[tokio::test]
+async fn a_grant_of_another_permission_does_not_open_the_page() {
+    let (router, pool, admin_cookie, grantee) = catalog_tenant_harness().await;
+    grant_from_asset(
+        &router,
+        &pool,
+        &admin_cookie,
+        ASSET,
+        grantee,
+        "lineage:read",
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, grantee).await;
+
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a lineage:read grant does not open the page: {body}"
+    );
+    assert_eq!(body["error"], json!("permission_denied: catalog:read"));
+}

@@ -4350,6 +4350,57 @@ async fn permissions_route_is_gated_in_both_directions() {
     assert_eq!(allowed.status(), StatusCode::OK);
 }
 
+/// `GOV-11` (`DEC-20`; QA `LH-DATA-15-03` F2): the table's page takes
+/// `catalog:read`, or a `query:read` grant made from exactly that asset. On
+/// its own, `query:read` is not enough — a role permission is not a grant on
+/// a table — and neither is no session at all.
+#[tokio::test]
+async fn the_asset_page_route_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let asset = "/api/catalog/silver.orders";
+
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
+
+    let nobody = create_zero_permission_principal(&pool).await;
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    let refused = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let querier = create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, querier).await;
+    let refused = request_with_cookie(&router, "GET", asset, &cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "query:read without a grant on the table is not enough"
+    );
+    let bytes = to_bytes(refused.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+    assert_eq!(
+        body["error"],
+        serde_json::json!("permission_denied: catalog:read")
+    );
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(asset)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// ADM-13 (D10.2), ADM-13 review round 1, B3:
 /// `GET /api/notifications` is `RequiresAuth`, but a `dashboard:read`-only principal
 /// gets empty `openAlerts` and `pendingApprovals` without error.
