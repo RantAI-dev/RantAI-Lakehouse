@@ -61,7 +61,7 @@ pub struct Pipeline {
     /// BLD-1 part 1 / D3: kept for every caller that predates `inputs`; the
     /// target-lag readers use [`Self::input_tables`], which holds all of them.
     pub source: String,
-    /// BLD-1 part 1 / D11: every input's `<zone>.<table>` (migration `0137`),
+    /// BLD-1 part 1 / D11: every input's `<zone>.<table>` (migration `0140`),
     /// written by [`definition_columns`]. This is what the target-lag readers
     /// ask "which tables does this pipeline read?" — an old single-source row
     /// is one entry here, and a pipeline with two inputs is two.
@@ -296,7 +296,7 @@ impl PipelineStep {
 }
 
 /// The tables a pipeline reads (BLD-1 part 1 / D11, D11a): its
-/// `input_tables`, or — for a row that predates migration `0137` and was never
+/// `input_tables`, or — for a row that predates migration `0140` and was never
 /// backfilled — its `source`, which is the answer every reader gave before.
 ///
 /// One rule, called by every reader, so "a pipeline with no `input_tables`"
@@ -362,7 +362,7 @@ pub fn definition_columns(inputs: &[PipelineInput], steps: &[PipelineStep]) -> D
 /// there are transforms, one `transform` step named `transformed`
 /// (`transformed_1` when the input took that name).
 ///
-/// This is the same rule migration `0137` backfills every existing row with;
+/// This is the same rule migration `0140` backfills every existing row with;
 /// the migration's two SQL functions exist so the two answers can be compared
 /// rather than merely claimed to agree.
 #[must_use]
@@ -387,7 +387,7 @@ pub fn legacy_definition(
     // BLD-1 part 1 review R1-B4: D2's names are unique without regard to
     // case, so an input called `Transformed` would collide with a step named
     // `transformed` and the compiler would refuse a pipeline that used to
-    // run. The suffix is chosen the way migration `0137` chooses it.
+    // run. The suffix is chosen the way migration `0140` chooses it.
     let step_name = if name.eq_ignore_ascii_case("transformed") {
         "transformed_1"
     } else {
@@ -523,7 +523,7 @@ struct DefinitionRow {
     target: String,
     incremental_column: Option<String>,
     transforms: serde_json::Value,
-    /// BLD-1 part 1 / D1: the stored shape (migration `0137`). Decoded by
+    /// BLD-1 part 1 / D1: the stored shape (migration `0140`). Decoded by
     /// [`get_definition`], which falls back to [`legacy_definition`] for a
     /// row that predates the columns and was not backfilled for some reason.
     inputs: serde_json::Value,
@@ -614,7 +614,7 @@ pub struct PipelineDefinitionSnapshot {
     /// `pipeline_definition.kind`.
     pub kind: String,
     /// BLD-1 part 1 / D1: the definition's inputs. `#[serde(default)]` so a
-    /// snapshot written before migration `0137` still reads; D3's rule turns
+    /// snapshot written before migration `0140` still reads; D3's rule turns
     /// the empty list back into one input when it is restored
     /// ([`snapshot_definition`]).
     #[serde(default)]
@@ -834,7 +834,7 @@ struct FullPipelineRow {
     /// the same pair.
     target_lag_seconds: Option<i32>,
     target_lag_downstream: bool,
-    /// BLD-1 part 1 / D11: every input's location (migration `0137`).
+    /// BLD-1 part 1 / D11: every input's location (migration `0140`).
     input_tables: Vec<String>,
     /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
     /// here so the create path can return the author it actually stored
@@ -1090,7 +1090,7 @@ pub async fn get_definition(
         // would compile to a plain copy and overwrite the output.
         let transforms: Vec<String> =
             serde_json::from_value(row.transforms).map_err(|_| StoreError::CorruptDefinition)?;
-        // A row written before migration `0137` (or one its backfill missed)
+        // A row written before migration `0140` (or one its backfill missed)
         // has `[]`, and D3's rule is what turns it back into one input, so
         // `inputs` is never empty on a readable pipeline.
         let inputs: Vec<PipelineInput> =

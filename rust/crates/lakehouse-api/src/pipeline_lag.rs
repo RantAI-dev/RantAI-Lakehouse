@@ -412,7 +412,7 @@ pub async fn inputs_of_conn(
     pipeline: &Pipeline,
 ) -> Result<Option<Vec<InputTable>>, StoreError> {
     // BLD-1 part 1 / D11: every input, not only the first, through the store's
-    // one rule for a row that predates migration `0137` (D11a).
+    // one rule for a row that predates migration `0140` (D11a).
     let tables = pipelines::input_tables_of(pipeline);
     let mut inputs = Vec::with_capacity(tables.len());
     for table in &tables {

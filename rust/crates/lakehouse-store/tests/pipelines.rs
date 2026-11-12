@@ -3540,7 +3540,7 @@ async fn a_table_name_that_is_not_a_usable_name_becomes_input_1(pool: PgPool) ->
 }
 
 /// R1-B4: the migration's backfill itself, run over rows inserted in the
-/// legacy shape (the state every row was in when `0137` ran), equals D3's
+/// legacy shape (the state every row was in when `0140` ran), equals D3's
 /// rule — and a row that already has a definition is left alone, which is the
 /// "running it again is a no-op" claim the comment makes.
 #[sqlx::test(migrations = "../../migrations")]
