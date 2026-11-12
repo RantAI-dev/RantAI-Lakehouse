@@ -158,6 +158,12 @@ pub struct QueryOptions {
     pub max_result_rows: Option<u64>,
     /// `query_id`: lets `KILL QUERY WHERE query_id ...` find this query.
     pub query_id: Option<String>,
+    /// `output_format_json_quote_decimals = 1`: the engine writes a decimal as JSON
+    /// TEXT, with every digit, instead of a number, which this client reads as a 64-bit
+    /// float and so keeps about fifteen digits of (`DATA-53`, QA `LH-DATA-9-32`). Read by
+    /// [`ChClient::query_with_options`] only: a caller whose cells are text anyway asks
+    /// for it; a chart's numbers are not changed. Default `false`.
+    pub quote_decimals: bool,
 }
 
 /// Most progress headers one limited request may receive; hyper's client
@@ -366,6 +372,9 @@ impl ChClient {
         }
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
+        }
+        if options.quote_decimals {
+            settings.push(("output_format_json_quote_decimals", "1".to_owned()));
         }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
@@ -579,6 +588,9 @@ impl ChClient {
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
         }
+        if options.quote_decimals {
+            settings.push(("output_format_json_quote_decimals", "1".to_owned()));
+        }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
             "1".to_owned(),
@@ -661,6 +673,9 @@ impl ChClient {
         }
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
+        }
+        if options.quote_decimals {
+            settings.push(("output_format_json_quote_decimals", "1".to_owned()));
         }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
@@ -1407,6 +1422,7 @@ mod tests {
             max_execution_time: Some(std::time::Duration::from_secs(45)),
             max_result_rows: Some(2001),
             query_id: Some("u:r:1".to_owned()),
+            quote_decimals: false,
         };
         let result = client(&server.uri())
             .query_with_options("SELECT n FROM t", &options, None)
@@ -1418,6 +1434,52 @@ mod tests {
         assert!(
             !body.contains("SETTINGS"),
             "the SQL text stays as written: {body}"
+        );
+    }
+
+    /// `DATA-53` (QA `LH-DATA-9-32`): the setting goes on the request only when the
+    /// caller asks for it, so no other reader of this client changes.
+    #[tokio::test]
+    async fn query_with_options_asks_for_quoted_decimals_only_when_told() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"d","type":"Decimal(38, 9)"}],"data":[{"d":"1.5"}],"rows":1}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = client(&server.uri());
+
+        let quoted = QueryOptions {
+            quote_decimals: true,
+            ..QueryOptions::default()
+        };
+        let result = client
+            .query_with_options("SELECT toDecimal64(1.5, 9) AS d", &quoted, None)
+            .await
+            .unwrap();
+        assert_eq!(result.rows, 1);
+
+        let plain = QueryOptions::default();
+        client
+            .query_with_options("SELECT 1 AS d", &plain, None)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let queries: Vec<String> = requests
+            .iter()
+            .map(|request| request.url.query().unwrap_or_default().to_owned())
+            .collect();
+        assert!(
+            queries[0].contains("output_format_json_quote_decimals=1"),
+            "{}",
+            queries[0]
+        );
+        assert!(
+            !queries[1].contains("output_format_json_quote_decimals"),
+            "{}",
+            queries[1]
         );
     }
 
