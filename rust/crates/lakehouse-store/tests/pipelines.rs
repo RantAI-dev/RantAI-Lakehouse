@@ -3479,17 +3479,26 @@ async fn a_legacy_create_without_transforms_has_one_input_and_no_steps(
 /// the Rust function sees.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_migration_backfill_matches_the_store_rule(pool: PgPool) -> sqlx::Result<()> {
+    // R1-B4's fixtures: a plain location; one with no dot (an empty zone, the
+    // table as the whole location); one with two (the table keeps the rest);
+    // a name that is not a usable identifier; and a table named `Transformed`,
+    // whose step must avoid it without regard to case.
     let fixtures = [
         ("bronze.orders", vec!["dedupe(id)".to_owned()]),
         ("silver.orders_clean", Vec::new()),
+        ("orders", vec!["select(id)".to_owned()]),
+        ("serving.sales.orders", vec!["select(id)".to_owned()]),
         ("__reserved.table", vec!["select(id)".to_owned()]),
         ("2024.orders", Vec::new()),
         ("bronze.transformed", vec!["select(id)".to_owned()]),
+        ("bronze.Transformed", vec!["select(id)".to_owned()]),
     ];
     for (location, transforms) in fixtures {
+        // The same split the store uses (`split_zone_table`): at the first
+        // dot, an empty zone for a location with none.
         let (zone, table) = location
             .split_once('.')
-            .expect("fixture locations are <zone>.<table>");
+            .map_or(("", location), |(zone, table)| (zone, table));
         let expected = pipelines::legacy_definition(zone, table, &transforms);
 
         let (input_json, steps_json): (serde_json::Value, serde_json::Value) = sqlx::query_as(
@@ -3527,6 +3536,61 @@ async fn a_table_name_that_is_not_a_usable_name_becomes_input_1(pool: PgPool) ->
         .expect("definition should exist");
     assert_eq!(definition.inputs[0].name, "input_1");
     assert_eq!(definition.inputs[0].table, "__reserved");
+    Ok(())
+}
+
+/// R1-B4: the migration's backfill itself, run over rows inserted in the
+/// legacy shape (the state every row was in when `0137` ran), equals D3's
+/// rule — and a row that already has a definition is left alone, which is the
+/// "running it again is a no-op" claim the comment makes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_migration_backfill_fills_legacy_rows_and_skips_defined_ones(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO pipeline_definition \
+            (id, name, kind, status, owner, source, target, schedule, transforms) \
+         VALUES ('pl-b4-dotted', 'b4-dotted', 'batch', 'draft', 'o', \
+                 'serving.sales.orders', 'silver.t', 'manual', '[]'::jsonb), \
+                ('pl-b4-transformed', 'b4-transformed', 'batch', 'draft', 'o', \
+                 'bronze.Transformed', 'silver.t', 'manual', '[\"select(id)\"]'::jsonb), \
+                ('pl-b4-nodot', 'b4-nodot', 'batch', 'draft', 'o', \
+                 'orders', 'silver.t', 'manual', '[]'::jsonb)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("SELECT pipeline_backfill_legacy_definition()")
+        .execute(&pool)
+        .await?;
+
+    for (id, location, transforms) in [
+        ("pl-b4-dotted", "serving.sales.orders", Vec::<String>::new()),
+        (
+            "pl-b4-transformed",
+            "bronze.Transformed",
+            vec!["select(id)".to_owned()],
+        ),
+        ("pl-b4-nodot", "orders", Vec::new()),
+    ] {
+        let (zone, table) = location
+            .split_once('.')
+            .map_or(("", location), |(zone, table)| (zone, table));
+        let definition = pipelines::get_definition(&pool, id)
+            .await
+            .expect("get_definition")
+            .expect("the row exists");
+        assert_eq!(
+            (definition.inputs, definition.steps),
+            pipelines::legacy_definition(zone, table, &transforms),
+            "the migration and the store disagree for {location}"
+        );
+        assert_eq!(
+            input_tables_of(&pool, id).await,
+            vec![location.to_owned()],
+            "input_tables is the whole location, not its two split parts"
+        );
+    }
     Ok(())
 }
 

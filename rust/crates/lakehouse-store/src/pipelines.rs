@@ -361,7 +361,11 @@ pub fn legacy_definition(
     if transforms.is_empty() {
         return (vec![input], Vec::new());
     }
-    let step_name = if name == "transformed" {
+    // BLD-1 part 1 review R1-B4: D2's names are unique without regard to
+    // case, so an input called `Transformed` would collide with a step named
+    // `transformed` and the compiler would refuse a pipeline that used to
+    // run. The suffix is chosen the way migration `0137` chooses it.
+    let step_name = if name.eq_ignore_ascii_case("transformed") {
         "transformed_1"
     } else {
         "transformed"
