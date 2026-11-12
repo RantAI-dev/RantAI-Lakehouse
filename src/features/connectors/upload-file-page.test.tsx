@@ -1044,6 +1044,11 @@ describe("UploadFilePage, Table step", () => {
     expect(add.checked).toBe(false)
 
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
+    // The check for the new name has to answer first (`DATA-47`): while it is
+    // `checking` the radios are hidden whatever the answer will be, so the two
+    // assertions below only prove something once the step may go on (review round
+    // 1 R6).
+    await waitFor(() => expect(next().disabled).toBe(false))
     expect(screen.queryByRole("radio", { name: "Replace its rows" })).toBeNull()
     expect(screen.queryByRole("radio", { name: "Add to its rows" })).toBeNull()
   })
