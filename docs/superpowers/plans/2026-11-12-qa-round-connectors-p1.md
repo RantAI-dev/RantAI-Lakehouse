@@ -925,3 +925,123 @@ line numbers, and the plan's `:4103` `dg_run` fixture needed the `creation_time`
 field the same task adds, as it says.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `90ff6cb7`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#485) runs the suites and the `g6-ops` gate. 1 BLOCKER (R1) and 10 SHOULD-FIX. No
+existing test was weakened and no route returns an alert target to a caller without
+`alert:write`.
+
+**Planner's rulings** (they replace "planner decision" in the findings below; where a ruling
+and a finding's "Fix" differ, the ruling holds).
+
+- **R1 (changes D10 and D13).** The plan was wrong about a queued run: the orchestrator queues
+  every run, and its monitoring never ends a queued one. New rule for `overdue`:
+  - `QUEUED`: overdue only when it was created longer ago than the **running** limit plus the
+    grace (a run that waited in the queue longer than a run may run). Until then the route
+    answers 409 as before this branch.
+  - `NOT_STARTED`: the start limit plus the grace, by `creationTime`, as built.
+  - `STARTING`: never overdue here; the route answers 409 and leaves it to the orchestrator's
+    monitoring, which fails it after the start limit.
+  - `STARTED`: the running limit plus the grace, by `startTime`, as built.
+  Correct the comments and the document lines R1 names so they say this, and reword D13 and
+  decision 15 of `connector-operations.md` for the queued case (Signed cell: *(proposed, not
+  yet signed)*).
+- **R2.** As the finding says: an orchestrator that cannot be reached for the cancel answers
+  503 and writes nothing; a typed refusal lets the launch go on but claims no stop; the record
+  is closed before the cancel is asked for.
+- **R3.** As the finding says: decide first, refuse what the request itself gets wrong, and
+  stop the overdue run only immediately before the launch.
+- **R7.** Row 10 of `load-failure-alerts.md` keeps only the words of `DEC-16` with its date;
+  the chart-owner exception (D16) moves to its own row with the Signed cell *(proposed, not
+  yet signed)*; fix the section's opening line to the number of rows it now has.
+- **R8.** The API returns the running limit with the connector's run list (one number, in
+  seconds, camelCase, read from the same setting), and the console uses it in place of
+  `STALE_RUN_MS`; when the field is absent the console falls back to six hours.
+- **R9.** Both services accept the same thing: surrounding spaces trimmed, then ASCII digits
+  only, a value from 1 to 4 294 967 295; anything else falls back to six hours, and the API
+  logs a warning that names the variable and not the value, as the orchestrator does.
+- **R10.** The assistant does not stop a run. `ingest_run` called without a signed-in person
+  (the assistant's `run_ingest`) answers the 409 for an overdue run, with a sentence that
+  says the earlier run has run too long and can be replaced with "Run now" on the connector's
+  page; it sends no `terminateRun`. No tool description or schema changes.
+- **R11.** As the finding says.
+
+### R1. BLOCKER: A healthy run that is only waiting in the orchestrator's queue is force-cancelled by "Run now" after 15 minutes, because the route applies the start limit to `QUEUED`, a state run monitoring never ends.
+
+- Where: `rust/crates/lakehouse-api/src/routes/connectors.rs:4180-4192` (`overdue`), `:4140-4145` (`OVERDUE_GRACE_SECONDS` doc), `:3868-3870`; the statements that say otherwise: `docker-compose.yml:539-543`, `docs/CONFIGURATION.md:243`, `rust/crates/lakehouse-api/src/config.rs:1141-1147`, `dagster/dagster.yaml:19-23`, `docs/core/features/connector-operations.md:86`.
+- What happens: `dagster/dagster.yaml` sets no `run_coordinator`, and in `dagster` 1.13.20 the default is `QueuedRunCoordinator` (`dagster/_core/instance/ref.py`, the defaults dict) with `max_concurrent_runs` 10 for the whole instance (`queued_run_coordinator.py`). So every run, from the API and from the schedule sensor, is `QUEUED` until the daemon takes it, and waits there whenever ten runs of any job are going. Run monitoring reads only `STARTING`, `STARTED`, `CANCELING` and `NOT_STARTED` (`run_monitoring.py`, `execute_run_monitoring_iteration`); `start_timeout_seconds` is never applied to `QUEUED`. The route, as T8.2 says, calls `QUEUED` with a `creationTime` older than 600 + 300 s `NeverStarted`. State: connector X's scheduled run (or a person's "clear"/"refresh" of one table) has been queued for 16 minutes behind ten running loads. Someone presses "Run now" on X (the page shows no run: the record starts with the start report). Before: 409 "already queued". Now: `terminateRun(MARK_AS_CANCELED_IMMEDIATELY)` on the healthy queued run, no row in the history (D13), no count, no alert, and a new run at the back of the queue. Pressing again 15 minutes later does it again. A queued table action is replaced by a plain run without a word. Three plan statements do not hold for `QUEUED`: D10 "the five minutes let D8 act first ... the route only acts when the orchestrator's monitoring did not" (monitoring never acts on it), D13 "it is counted as a failed run and alerted by D8's path" (nothing reports it), and D8 as the answer to "a queued run never started" for a scheduled connector (the sensor's `_busy_connector_ids` counts `QUEUED`, `ingest_factory.py:1631-1636`, and nothing but a person's "Run now" ends it). `STARTING` has a smaller version of the same fault: the route measures it from `creationTime`, the orchestrator from the launch time (`monitor_starting_run`), so a run that waited 20 minutes in the queue and was taken a second ago is already `NeverStarted` for the route. The handoff says "MISMATCH: None"; this is one (plan against the pinned library), and the developer built T8.2 as written.
+- Fix: planner decision first, then code. In `overdue`, take `QUEUED` out of the start-limit arm: either keep the 409 for `QUEUED`, or give it its own, explicitly decided limit (for example the run limit: queued longer than a run may run). Keep the start limit for `NOT_STARTED`. For `STARTING`, do not judge by `creationTime` (keep the 409 and leave it to the orchestrator, which fails it 600 s after launch). Correct the five comments and document lines above so they say the start limit covers a run that was created or launched and did not start, not a queued one, and reword D13 and decision 15 of the feature page for the queued case.
+- Check: unit `a_queued_run_is_not_overdue_after_the_start_limit` (status `QUEUED`, `creation_time = now - start_seconds - 1` gives `None`) and `a_starting_run_is_not_judged_by_when_it_was_created`; integration in `tests/ingest_run.rs`: a `QUEUED` run created 20 minutes ago answers 409 and the mock received no `terminateRun`.
+
+### R2. SHOULD-FIX: When the forced cancel fails, the route still writes "was stopped" into the run record, logs "stopped an overdue run", and launches; an orchestrator that could not be reached is treated like a refusal.
+
+- Where: `rust/crates/lakehouse-api/src/routes/connectors.rs:3893-3923` (`stop_overdue_run`).
+- What happens: (a) `cancel_run_now` returns `Err` (time-out, connection reset) for a `STARTED` run 7 hours old whose worker is alive (monitoring is down, or the run predates the tag). The route warns, then closes the record as `failed` / `timed_out` with the line "run ended: failed, the run did not finish in 6 h and was stopped", logs "stopped an overdue run so the connector can run again", and goes on to launch. If the launch call gets through, a second run loads on top of a live one (Bronze is append-only, the reason the guard exists). If the old run then finishes, its own end report is refused (`end_run` updates only `status = 'running'`) and the history keeps "failed, was stopped" for a run that loaded its rows (principle 2). (b) The opposite order: the cancel succeeds and `end_timed_out_run` fails once; the request is a 5xx, the next request finds the run `CANCELED` (not active), so nothing ever closes the record and it stays `running`. T8.5 asked for the unconditional close, so this is the plan's text built literally; the transport case is not "the connector locked for good", it is retryable.
+- Fix: on `Err` from `cancel_run_now` return `orchestrator_unreachable(&err)` (503, nothing written). On a typed refusal keep D10 (launch goes on) but do not claim a stop: skip the `info!` line, and either leave the record to the sensor or close it with a line that does not say "was stopped". Close the record before asking for the cancel, so a store error cannot leave a cancelled run `running`.
+- Check: integration `an_orchestrator_that_cannot_be_reached_for_the_cancel_answers_503_and_starts_nothing` (the `terminateRun` mock answers 500: status 503, no `launchRun` received, the old record is still `running`).
+
+### R3. SHOULD-FIX: A request that is then refused has already cancelled the overdue run and closed its record.
+
+- Where: `rust/crates/lakehouse-api/src/routes/connectors.rs:3965-3986` (the guard runs before the two refusals of a run of one table), `:4003-4040`.
+- What happens: `POST /api/connectors/{id}/ingest/run` with `{"object": "not_a_table", "action": "clear"}` on a connector with an overdue run: `guard_one_run_at_a_time` cancels the run and writes `timed_out`, then the request answers 404 "This connector does not load that table." (or 409 for a table that waits for a schema decision). The same when the launch itself is refused (422, 503 job not loaded). Before this branch the guard had no side effect, so its place did not matter.
+- Fix: split the guard: decide first (409 or a list of overdue runs), run the request's own refusals, and call `stop_overdue_run` only immediately before `launch_run_with_config_and_tags`.
+- Check: integration: an overdue `STARTED` run plus a body naming a table the connector does not load answers 404 and the mock received no `terminateRun`; the record is still `running`.
+
+### R4. SHOULD-FIX: No test fails if the five-minute grace of D10 is removed.
+
+- Where: `rust/crates/lakehouse-api/src/routes/connectors.rs:4255-4322` (the unit tests build their times from `limits.running_seconds` / `limits.start_seconds`, which already hold the grace), `rust/crates/lakehouse-api/tests/ingest_run.rs:637`, `:705` (7 hours, 20 minutes: far past either bound).
+- What happens: set `OVERDUE_GRACE_SECONDS` to `0.0`, or drop the `+ OVERDUE_GRACE_SECONDS` in `RunAgeLimits::from_config`: every test still passes. The decision "each plus a fixed five minutes, so the orchestrator's monitoring acts first" is not pinned, and without it the route races the daemon at exactly the limit.
+- Fix: add a unit test on absolute numbers from the default config.
+- Check: `a_run_inside_the_grace_after_its_limit_still_holds_the_connector`: with the default config, a `STARTED` run with `start_time = now - 21_600 - 299` is `None` and `now - 21_600 - 301` is `RanTooLong`; a `NOT_STARTED` run at `now - 600 - 299` is `None` and at `now - 600 - 301` is `NeverStarted`.
+
+### R5. SHOULD-FIX: No test fails if the run-list query stops asking for `creationTime`, which would silently switch the never-started path off.
+
+- Where: `rust/crates/lakehouse-dagster/src/lib.rs:4036-4057` (the mock answers any POST), `rust/crates/lakehouse-api/tests/ingest_run.rs:50-58` (`mount_recent_runs` matches `runsOrError` only).
+- What happens: remove `creationTime` from the query at `lakehouse-dagster/src/lib.rs:1223`: the wiremock fixtures still return the field, so all tests pass, while the real orchestrator returns none, `creation_time` is `None`, and `overdue` answers `None` for every queued or unstarted run (fail closed, so the QA case comes back unnoticed).
+- Fix: add `.and(body_string_contains("creationTime"))` to the mock in `list_runs_for_job_with_config_returns_when_each_run_was_created` (as the two `terminateRun` tests do for their policy word).
+- Check: that test fails when the field is taken out of the query string.
+
+### R6. SHOULD-FIX: The "warning never echoes the value" test passes for `"0"` only because the warning sits on line 278.
+
+- Where: `dagster/dispar_orchestrate/test_ingest_run_limit.py:57`.
+- What happens: `caplog.text` is formatted with pytest's default `%(levelname)-8s %(name)s:%(filename)s:%(lineno)d %(message)s`, so it holds `ingest_factory.py:278`. The assertion `"0" not in caplog.text.replace("21600", "")` holds today because 278 has no zero. Any edit that moves `logger.warning(` in `RunLimitSettings.from_env` to a line with a `0` in its number (280, 290, 300 to 309, ...) fails the `bad="0"` case with no change of behaviour.
+- Fix: assert on the records, not on the formatted text: for each record, `bad.strip()` is not in `record.getMessage().replace(str(SIX_HOURS), "")` and is not among `record.args`.
+- Check: the test still passes after ten blank lines are inserted above `RunLimitSettings` (not to be committed).
+
+### R7. SHOULD-FIX: A "Signed" cell dated 2026-11-12 cites `DEC-16` for wording the owner's decision does not contain.
+
+- Where: `docs/core/features/load-failure-alerts.md:69` (Decisions row 10; the table's last column is "Signed"), against `docs/core/BACKLOG.md:711` (`DEC-16`) and `:161` (`SRC-42`).
+- What happens: `DEC-16` reads "shown only to people with `alert:write`; `alert:read` shows the rule without them". Row 10 says "Only a person with `alert:write`, and the owner of a chart alert for their own rule", and carries the signed date. The chart-owner exception is plan decision D16, not the owner's. The developer copied T13 as written, so the correction is the planner's. (The section's opening line also still says "All nine defaults signed ... on 2026-10-09" above a table of ten.) Row 15 of `connector-operations.md` leaves its Signed cell empty, as it should.
+- Fix: either cut row 10's Default to the words of `DEC-16` and move the chart-owner exception to its own unsigned row, or leave the Signed cell empty until the owner has seen the sentence.
+- Check: none (document); the reviewer reads the row against `DEC-16`.
+
+### R8. SHOULD-FIX: The run limit is a setting, but the console's six hours are fixed, so raising the limit brings the QA symptom back.
+
+- Where: `src/features/connectors/connector-ingest-panel.tsx:1275` (`STALE_RUN_MS`), `docs/core/features/connector-operations.md:98` ("unless `INGEST_RUN_MAX_RUNTIME_SECONDS` is raised").
+- What happens: an operator sets `INGEST_RUN_MAX_RUNTIME_SECONDS=43200` for a long first load. At hour 7 the console calls the run "no end reported" and enables "Run now" (its bound is six hours); the API answers 409 until hour 12 and five minutes, which is the case D9 itself names as the QA finding (`TC-1702`). T11 says `STALE_RUN_MS` is not changed, so this is a gap of the plan, not of the build.
+- Fix: planner decision: return the limit to the console (for example beside the run list) and use it in place of the constant, or say in the feature page's limit that the page stops showing a run as going after six hours whatever the setting.
+- Check: `connector-ingest-panel.test.tsx`: with a limit of 12 hours a run that started 7 hours ago is still shown as going and "Run now" is disabled.
+
+### R9. SHOULD-FIX: The two services do not read `INGEST_RUN_MAX_RUNTIME_SECONDS` by the same rule, and the API falls back without a word.
+
+- Where: `dagster/dispar_orchestrate/ingest_factory.py:210-214`, `:268-284` (`_env` strips, then `int()`); `rust/crates/lakehouse-api/src/config.rs:1492-1498` (`parse_positive_u32_or_default`: no trim, `i64` then `u32`).
+- What happens: `"86_400"`, a value quoted with a space, or any number above 4 294 967 295 is accepted by Python (`int("86_400") == 86400`) and rejected by Rust. The orchestrator then lets a run go for a day, the API believes six hours, and "Run now" force-cancels a healthy run at 6 h 5 min (R8 makes the button available). Python warns about a value it cannot read; the API logs nothing.
+- Fix: make `RunLimitSettings.from_env` as strict as the API (ASCII digits only after the strip, at most `u32::MAX`), and trim in the API before parsing; or name the accepted form in both comments and in `docs/CONFIGURATION.md`.
+- Check: add `"86_400"` and `"4294967296"` to the parametrised cases of `test_a_run_limit_that_cannot_be_read_falls_back_to_six_hours`, and `" 900 "` (taken as 900) to `the_run_limits_default_to_six_hours_and_ten_minutes_and_ignore_garbage`.
+
+### R10. SHOULD-FIX: The assistant's `run_ingest` tool can now cancel a run without approval, and the plan does not name it.
+
+- Where: `rust/crates/lakehouse-api/src/routes/ai/tools/ingest.rs:101-108` (calls `connectors::ingest_run`, so `guard_one_run_at_a_time`), `rust/crates/lakehouse-api/src/routes/ai/registry.rs:2593-2596` (`run_ingest`: `Risk::WriteLow`), `:2448-2451` (`cancel_pipeline_run`: `Risk::WriteHigh`, "Needs human approval").
+- What happens: "run the orders connector" through the assistant, with an overdue run listed, sends `terminateRun(MARK_AS_CANCELED_IMMEDIATELY)`. Stopping a run is an approval-gated action everywhere else in the assistant; here it happens inside a low-risk tool, and the tool's description says nothing of it. D20 speaks of the alert tools only.
+- Fix: planner decision: accept it and say so in the plan and in `run_ingest`'s description (then `tests/fixtures/tool_schemas.json` is regenerated), or have `ingest_run` (the entry with no principal) answer the 409 for an overdue run and leave the stop to the person's route.
+- Check: a tool test in `routes/ai/tools/ingest.rs` or `tests/ingest_run.rs` for whichever is decided (either "the mock received no `terminateRun`", or the description names the stop).
+
+### R11. SHOULD-FIX: `timed_out` can now be written through the orchestrator's end report too, which D11 rules out.
+
+- Where: `rust/crates/lakehouse-store/src/connector_run.rs:112-125` (`EndReason` derives `Deserialize`), `rust/crates/lakehouse-api/src/routes/connector_runs.rs:646-690` (`EndBody.reason: EndReason`, `report_end`).
+- What happens: D11: "written in two places and nowhere else". `POST /api/connectors/{id}/run-reports/{runId}/end` with `{"status": "succeeded", "reason": "timed_out"}` is now accepted and stored (with the generic phrase, no limit in the line). The orchestrator's own list (`dagster/dispar_orchestrate/run_reports.py:51`, `END_REASONS`) does not know the word, so nothing sends it today.
+- Fix: refuse `EndReason::TimedOut` in `report_end` with a 400 (the route's own vocabulary stays the four words), with a comment citing D11.
+- Check: a test beside `connector_runs.rs:1093`: the end report with `reason: "timed_out"` answers 400 and the record stays `running`.
+
