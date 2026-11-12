@@ -360,8 +360,8 @@ export type QueryEstimate = {
   estimatedCostMin: number | null
   estimatedCostMax: number | null
   /**
-   * Why there is no estimate: the server's fixed sentence by cause with a
-   * reference id (`QS-6`), never the engine's own text.
+   * Why there is no estimate, as the server sends it: today the engine's
+   * trimmed diagnosis (`SEC-11`, decision 4).
    */
   error?: string | null
   /** Null for a Trino statement, which has no ClickHouse workload class. */
