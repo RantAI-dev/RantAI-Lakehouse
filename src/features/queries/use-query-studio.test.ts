@@ -471,11 +471,18 @@ describe("useQueryStudio Bronze tables", () => {
 
   it("falls back to the entry's own read when the Bronze listing fails", async () => {
     visit("/query-studio?sql=SELECT%201&engine=trino")
-    const { hook, getTableDetail } = mountListedBronze(() =>
+    const { hook, getTableDetail, listTables } = mountListedBronze(() =>
       Promise.reject(new ServiceError("unavailable", "warehouse down", 503))
     )
 
     await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+    // Review round 1, R3: a failed listing must leave the asset unproved —
+    // not "missing" — and the read below is what proves it. Waiting for the
+    // rejection to settle is the point: an empty set here would make every
+    // Bronze row say it has no readable table.
+    await waitFor(() => expect(listTables).toHaveBeenCalledTimes(1))
+    await act(async () => {})
+    expect(hook.result.current.proofs["demo_orders"]).toBeUndefined()
     expect(hook.result.current.tables[0]).toMatchObject({ reference: "" })
 
     act(() => hook.result.current.loadColumns("demo_orders"))
