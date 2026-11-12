@@ -95,7 +95,9 @@ function AddRuleDialog({
     notifySuccess("Quality rule added")
     // DATA-14 (AC1): run it once now, so a check that already fails opens its
     // incident at once instead of at the next scheduled pass.
-    if (hasPermission("query:read") && created.evaluable !== false) {
+    // QA LH-DATA-14-04 (GOV-10): running a rule by hand needs
+    // `governance:write`, the same permission the Run button follows.
+    if (hasPermission("governance:write") && created.evaluable !== false) {
       try {
         await governanceService.runQualityRule(created.id)
       } catch (err) {
@@ -338,7 +340,10 @@ export function AssetQuality({
         description={parts.length > 0 ? parts.join(" · ") : "Rules and recorded results for this asset."}
         action={
           <div className="flex flex-wrap justify-end gap-1.5">
-            {hasPermission("query:read") && runnable.length > 0 ? (
+            {/* QA LH-DATA-14-04 (GOV-10, DEC-17): running a rule by hand is a
+                governance action — the API takes `governance:write`, so the
+                button follows. */}
+            {canWrite && runnable.length > 0 ? (
               <Button size="sm" variant="outline" onClick={() => void runAll()} disabled={running}>
                 <Play />
                 {running ? "Running…" : "Run checks"}

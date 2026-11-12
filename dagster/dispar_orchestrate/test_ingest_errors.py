@@ -175,6 +175,89 @@ def test_a_cycle_in_the_cause_chain_ends_the_walk() -> None:
     assert e.classify(cyclic).error_class == e.OTHER
 
 
+def _cause_chain(outer: BaseException, inner: BaseException, links: int) -> BaseException:
+    """`links` `RuntimeError`s above `inner`, each wrapping the next by
+    `__cause__` (what `raise ... from` records)."""
+    current = inner
+    for _ in range(links):
+        wrapper = RuntimeError("pipeline step failed")
+        wrapper.__cause__ = current
+        current = wrapper
+    return current
+
+
+def test_a_failure_five_wrappers_deep_is_still_found() -> None:
+    # QA LH-SRC-6-53 (SRC-38): the object-storage error arrives under `dlt`'s
+    # wrappers, four exceptions below the outermost one.
+    chained = _cause_chain(RuntimeError("outer"), ConnectionRefusedError(), links=4)
+    assert e.classify(chained) == e.Classified(e.UNREACHABLE, retried=True)
+
+
+def test_a_failure_under_implicit_context_is_found_three_links_deep() -> None:
+    # `__context__` only: no `raise ... from`, so no explicit cause at all.
+    inner = ConnectionRefusedError()
+    middle = RuntimeError("pipeline step failed")
+    middle.__context__ = inner
+    outer = RuntimeError("outer")
+    outer.__context__ = middle
+    assert e.classify(outer).error_class == e.UNREACHABLE
+
+
+def test_the_walk_stops_after_sixteen_exceptions() -> None:
+    sixteenth = _cause_chain(RuntimeError("outer"), ConnectionRefusedError(), links=15)
+    assert e.classify(sixteenth).error_class == e.UNREACHABLE
+    # One more wrapper puts the connection failure past the bound.
+    seventeenth = _cause_chain(RuntimeError("outer"), ConnectionRefusedError(), links=16)
+    assert e.classify(seventeenth).error_class == e.OTHER
+
+
+# --- object storage that is down (`s3fs` -> `botocore`), QA LH-SRC-6-53 (SRC-38) ---
+
+
+def _object_store_chain(storage_error: BaseException) -> BaseException:
+    """What `dlt` raises around a failing `s3fs` read: `PipelineStepFailed`
+    (with `.exception`) over `ResourceExtractionError`, over the `botocore`
+    error itself. Stand-in classes, so this file imports no `dlt`."""
+    inner = _driver_error("dlt", "ResourceExtractionError")("pipeline step failed")
+    inner.__cause__ = storage_error
+    outer = _driver_error("dlt", "PipelineStepFailed")("pipeline step failed")
+    outer.exception = inner
+    outer.__cause__ = inner
+    return outer
+
+
+def test_an_object_storage_endpoint_that_is_down_is_unreachable_and_retried() -> None:
+    from botocore.exceptions import EndpointConnectionError
+
+    storage = EndpointConnectionError(endpoint_url="http://storage.invalid:9000/b")
+    assert e.classify(_object_store_chain(storage)) == e.Classified(e.UNREACHABLE, retried=True)
+
+
+def test_each_object_storage_connection_error_gets_its_class() -> None:
+    from botocore.exceptions import ConnectTimeoutError, ConnectionClosedError, ReadTimeoutError
+
+    address = "http://storage.invalid:9000/b"
+    for error, expected in (
+        (ConnectionClosedError(endpoint_url=address), e.UNREACHABLE),
+        (ConnectTimeoutError(endpoint_url=address), e.TIMEOUT),
+        (ReadTimeoutError(endpoint_url=address), e.TIMEOUT),
+    ):
+        assert e.classify(error) == e.Classified(expected, retried=True), type(error).__name__
+
+
+def test_a_certificate_failure_at_the_object_store_is_not_called_unreachable() -> None:
+    from botocore.exceptions import SSLError
+
+    verdict = e.classify(
+        SSLError(endpoint_url="http://storage.invalid:9000/b", error="certificate verify failed")
+    )
+    assert verdict == e.Classified(e.OTHER, retried=False)
+
+
+def test_the_classifier_imports_no_object_storage_library() -> None:
+    assert not {"botocore", "s3fs", "aiohttp"} & set(vars(e))
+
+
 def test_nothing_of_a_message_is_in_the_verdict() -> None:
     verdict = e.classify(_driver_error("pymysql")(1045, "Access denied for user 'secret_user'@'10.1.2.3'"))
     assert "secret_user" not in repr(verdict) and "10.1.2.3" not in repr(verdict)

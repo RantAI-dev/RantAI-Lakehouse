@@ -296,7 +296,11 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
 
   // Data & Catalog
   { pattern: "/catalog", requires: ["catalog:read"] },
-  { pattern: "/data/assets/[assetId]", requires: ["catalog:read"] },
+  // QA LH-DATA-15-03 F2 (GOV-11, DEC-20): a `query:read` grant made from a
+  // table opens that table's page, so the route needs `catalog:read` OR
+  // `query:read`; the API decides which table (a grant on A opens A and not
+  // B). The sidebar entry and `/catalog` stay `catalog:read`.
+  { pattern: "/data/assets/[assetId]", requires: ["catalog:read", "query:read"] },
   { pattern: "/lakehouse/tables/[namespace]/[table]", requires: ["catalog:read"] },
   // ADM-13 review round 1, S4: gold-exports requires [] (any signed-in user, RequiresAuth on GET)
   { pattern: "/gold-exports", requires: [] },

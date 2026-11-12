@@ -35,6 +35,7 @@ import {
   type AssetLineageState,
 } from "./asset-lineage"
 import { OpenFormatCard } from "./open-format-card"
+import { TableGrantNote } from "./table-grant-note"
 import {
   AssetStorage,
   ClickHouseStorage,
@@ -334,6 +335,9 @@ export function AssetOverview({
               </li>
             ))}
           </ul>
+          {/* GOV-11 (review round 1 R2): the counts are zero because the
+              API withheld them, not because the asset is unconnected. */}
+          <TableGrantNote asset={a} className="mt-2" />
         </SectionCard>
 
         {/* ── What changed lately? ──────────────────────────────────── */}

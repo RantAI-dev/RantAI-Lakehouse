@@ -56,7 +56,8 @@ function found(options: { discovered?: unknown[] }): Found[] {
 function stubFetch(
   spec: typeof SPEC = SPEC,
   // SRC-11: the run record (`GET .../runs`) and the log of each run by id (`GET .../runs/{id}/log`).
-  history: { runs: unknown[]; logs?: Record<string, unknown> } = { runs: [] },
+  // SRC-39: `maxRuntimeSeconds` is the run limit the API judges runs by (absent in an older answer).
+  history: { runs: unknown[]; logs?: Record<string, unknown>; maxRuntimeSeconds?: number } = { runs: [] },
   // SRC-10: what discovery finds, and how a run of the connector is answered (the default launches run 0123456789abcdef).
   // SRC-11: how Resume is answered (the default lifts the pause).
   options: {
@@ -78,7 +79,7 @@ function stubFetch(
       const scheduleCron = body.scheduleCron ?? null
       return json({ ...spec, ...body, scheduleCron, nextRunAt: scheduleCron ? "2026-10-01T02:00:00Z" : null })
     }
-    if (url.endsWith("/runs")) return json({ runs: history.runs })
+    if (url.endsWith("/runs")) return json({ runs: history.runs, maxRuntimeSeconds: history.maxRuntimeSeconds })
     const log = /\/runs\/([^/]+)\/log(\?format=text)?$/.exec(url)
     if (log) {
       if (log[2]) return new Response("run 0123 (schedule), succeeded\n", { status: 200, headers: { "Content-Type": "text/plain" } })
@@ -1074,6 +1075,17 @@ describe("ConnectorIngestPanel runs from the run record", () => {
     expect(screen.getByText("The connector was paused, so nothing was loaded.")).toBeDefined()
   })
 
+  // SRC-39 (QA TC-1702): a run the time limit stopped says so, in plain words.
+  it("says a run that outlived its limit was stopped", async () => {
+    stubFetch(SPEC, {
+      runs: [record({ runId: "run-timed-0001", status: "failed", endReason: "timed_out" })],
+    })
+    panel()
+    expect(
+      await screen.findByText("The run did not finish within the time limit and was stopped."),
+    ).toBeDefined()
+  })
+
   it("says there are no runs yet when the record is empty", async () => {
     stubFetch(SPEC)
     panel()
@@ -1089,6 +1101,20 @@ describe("ConnectorIngestPanel runs from the run record", () => {
     expect(screen.getByText("This run never reported its end. It may have been stopped before it finished.")).toBeDefined()
     expect(screen.queryByText(/is running/)).toBeNull()
     await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  // SRC-39 (review round 1, R8): the limit is the API's setting, not a copy of six hours here. A
+  // raised limit must keep the page and the API in step, or "Run now" is offered for a run the API
+  // still refuses (that is QA TC-1702 itself).
+  it("keeps a run going for the limit the API sends, not for six hours", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] }, {
+      maxRuntimeSeconds: 12 * 60 * 60,
+      runs: [record({ runId: "run-long-0001", status: "running", startedAt: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(), endedAt: null, durationSeconds: null, endReason: null })],
+    })
+    panel()
+    expect(await screen.findByText(/Run run-long is running/)).toBeDefined()
+    expect(screen.queryByText("No end reported")).toBeNull()
+    await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true))
   })
 
   it("shows a run recorded as running a moment ago as active, with Run now disabled", async () => {
@@ -1289,7 +1315,9 @@ describe("ConnectorIngestPanel column choice", () => {
 
   async function openColumns() {
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
-    await screen.findByText("1 tables found")
+    // QA LH-SRC-6-50 (SRC-41 D18): a count of one is singular; the line used
+    // to read "1 tables found".
+    await screen.findByText("1 table found")
     fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
     // The columns are read through the preview route when the section opens (SRC-13), so they arrive after the click.
     await screen.findAllByLabelText(/^Load column /)
@@ -1557,5 +1585,39 @@ describe("ConnectorIngestPanel table discovery", () => {
     expect(await screen.findByLabelText("Add by name")).toBeDefined()
     expect(screen.getByText("This connector type cannot list its objects, so type each one as the source names it.")).toBeDefined()
     expect(screen.queryByRole("button", { name: /^Find / })).toBeNull()
+  })
+})
+
+// QA LH-SRC-6-16 (SRC-41 D17): a run's status is closed by the orchestrator's
+// run-status sensor, which can report minutes after the last table's rows are
+// counted. The card says so once an attempt has ended; nothing is retimed.
+describe("the Runs card says the status follows the orchestrator's report (LH-SRC-6-16)", () => {
+  const SENTENCE = /The status changes when the orchestrator reports the end of the run/
+  const live = (attempts: number, status = "running") =>
+    record({
+      runId: "run-live-0001",
+      status,
+      startedAt: new Date().toISOString(),
+      endedAt: status === "running" ? null : new Date().toISOString(),
+      attempts,
+    })
+
+  it("says the status follows the orchestrator's report once an attempt has ended", async () => {
+    stubFetch(SPEC, { runs: [live(1)] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.getByText(SENTENCE)).toBeDefined()
+
+    cleanup()
+    stubFetch(SPEC, { runs: [live(0)] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.queryByText(SENTENCE)).toBeNull()
+
+    cleanup()
+    stubFetch(SPEC, { runs: [live(1, "succeeded")] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText("Succeeded")
+    expect(screen.queryByText(SENTENCE)).toBeNull()
   })
 })

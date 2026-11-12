@@ -45,6 +45,7 @@ import { FreshnessTargetDialog } from "@/features/governance/freshness-target-di
 import { lineageKey } from "./asset-lineage"
 import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ALL, CountToggle } from "./count-toggle"
+import { TableGrantNote } from "./table-grant-note"
 
 /** How many snapshots, or changes, are listed before the reader asks for more. */
 const PAGE_SIZES = [10, 25, 50] as const
@@ -387,6 +388,9 @@ export function AssetActivity({
 
   return (
     <div className="flex flex-col gap-2">
+      {/* GOV-11 (review round 1 R2): usage is withheld from a caller
+          admitted by a table grant, so its lists are empty on purpose. */}
+      <TableGrantNote asset={a} />
       <FreshnessCard asset={a} onChanged={onChanged} />
       <SectionCard
         size="sm"

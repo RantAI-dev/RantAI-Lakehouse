@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { KeyRoundIcon, NetworkIcon } from "lucide-react"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -31,6 +31,8 @@ import {
   usesNoCredential as needsNoCredential,
 } from "./connector-form-parts"
 import { DIRECTION_LABEL } from "./connectors-columns"
+import { saasAccountProblem, saasVendorForType } from "@/lib/connectors/saas-vendors"
+import { readableErrorMessage } from "@/lib/notify-message"
 import { connectionReviewItems } from "./connector-review"
 import { ScopeFields } from "./connector-scope-fields"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
@@ -195,9 +197,19 @@ export function ConnectorCreatePage() {
     referenceManager: referenceMode ? credentialSettings?.secretManager : null,
   })
 
+  // QA LH-SRC-3-11 (SRC-41 D13): for a business app the form knows the
+  // vendor's account rule, so Next waits until the account fits it. The server
+  // checks the same dial and refuses it before anything is created (D11).
+  const saasVendor = adapter === "saas" ? saasVendorForType(selectedType?.name) : undefined
+  const saasAccount = typeof dial?.account === "string" ? dial.account : ""
+  const saasAccountIssue = saasVendor ? saasAccountProblem(saasVendor, saasAccount) : null
+
   const canProceed =
     (step === 0 && Boolean(name.trim() && selectedType?.supported)) ||
-    (step === 1 && problems.primary === null && problems.secondary === null) ||
+    (step === 1 &&
+      problems.primary === null &&
+      problems.secondary === null &&
+      saasAccountIssue === null) ||
     (step === 2 && Boolean(environment.trim() && tenantId && residency.trim())) ||
     step === 3
 
@@ -235,6 +247,9 @@ export function ConnectorCreatePage() {
       tenantId,
       residency: residency.trim(),
       capabilities: [],
+      // Checked before the row exists (`SRC-41` D11); the same settings are
+      // stored by the `saveSpec` call that follows.
+      connection: { adapter, dial: dial ?? {} },
     })
     // Never keep a credential in memory longer than the request needs it.
     setPrimaryValue("")
@@ -271,6 +286,18 @@ export function ConnectorCreatePage() {
   // the tables to ingest and run them, instead of redirecting past any of
   // it.
   if (createdId) {
+    // QA LH-SRC-6-39/LH-SRC-6-54 (SRC-41 D14): the created screen mounted the
+    // ingest panel at once, and that panel reads `GET .../ingest-spec` once and
+    // never again. When the read answered before the `PUT` that stores the
+    // settings landed, the card said "This connector has no connection
+    // settings saved yet" and stayed that way — a race, which is why it was
+    // intermittent. So the panels mount only once the save has answered, and
+    // the card says what it is waiting for until then.
+    const settingsSaved = saveSpec.status === "success"
+    const settingsPending =
+      saveSpec.status === "idle" ||
+      saveSpec.status === "pending" ||
+      setCredentialAfterCreate.status === "pending"
     return (
       <div className="flex flex-col gap-4">
         <PageHeader
@@ -291,7 +318,7 @@ export function ConnectorCreatePage() {
               <div className="space-y-1.5">
                 <p className="text-sm text-destructive">
                   The connection test was not run: the connection settings could not be saved.
-                  {saveSpec.status === "error" ? ` ${saveSpec.error.message}` : ""}
+                  {saveSpec.status === "error" ? ` ${readableErrorMessage(saveSpec.error.message)}` : ""}
                 </p>
                 <p className="text-xs text-muted-foreground">
                   Correct them from{" "}
@@ -301,6 +328,8 @@ export function ConnectorCreatePage() {
                   , then run the test again.
                 </p>
               </div>
+            ) : settingsPending ? (
+              <p className="text-sm text-muted-foreground">Saving the connection settings…</p>
             ) : test.status === "pending" ? (
               <p className="text-sm text-muted-foreground">Testing connection…</p>
             ) : test.status === "error" ? (
@@ -333,7 +362,13 @@ export function ConnectorCreatePage() {
                 type="button"
                 size="sm"
                 variant="outline"
-                disabled={test.status === "pending"}
+                // Review round 1, R1 (QA LH-SRC-6-39, D11): a failed save leaves
+                // the sentence above as the only statement that the settings were
+                // not stored (the ingest panel stays unmounted without a save),
+                // and this button is what would clear it. A test of a connector
+                // with no settings says nothing useful either, so it is disabled
+                // and the Edit link is the way forward.
+                disabled={test.status === "pending" || settingsPending || saveSpec.status === "error"}
                 onClick={() => {
                   setTestSkipped(false)
                   test.run(createdId)
@@ -345,13 +380,47 @@ export function ConnectorCreatePage() {
           </div>
         </SectionCard>
 
-        {signInConnector && !testSkipped ? <ConnectorOAuthPanel connectorId={createdId} /> : null}
+        {signInConnector && !testSkipped && settingsSaved ? (
+          <ConnectorOAuthPanel connectorId={createdId} />
+        ) : null}
 
-        {!testSkipped ? (
+        {!testSkipped && settingsSaved ? (
           <SectionCard title="What to ingest" description="Pick the tables this connector copies into Bronze, then run it.">
             <ConnectorIngestPanel connectorId={createdId} connectorName={name.trim()} />
           </SectionCard>
         ) : null}
+      </div>
+    )
+  }
+
+  // QA LH-SRC-3-08 (SRC-41 D20): when the list of types cannot be read there is
+  // nothing to create from, so the page shows the header and the state alone —
+  // no Name, Direction, Previous or Next. A refusal says what the person can do;
+  // anything else offers Retry. The server refuses the create for the same
+  // person already (`POST /api/connectors` is `connector:manage`). The signal
+  // is the `ServiceError` this client really produces: `getJson` maps a 403 to
+  // `invalid_request` and keeps the status, so a refusal is `code` or `status`
+  // (`home-cards.ts`'s `cardRead` reads it the same way).
+  if (types.status === "error") {
+    return (
+      <div className="flex flex-col gap-4">
+        <PageHeader
+          title="New Connector"
+          description="Configure a source or sink with discovery and residency scope, then verify connectivity."
+          actions={
+            <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
+              Cancel
+            </Button>
+          }
+        />
+        {types.error.code === "permission_denied" || types.error.status === 403 ? (
+          <EmptyState
+            title="You cannot create a connector"
+            description="Creating a connector needs the connector:manage permission. Ask a workspace administrator."
+          />
+        ) : (
+          <ErrorState error={types.error} onRetry={types.reload} />
+        )}
       </div>
     )
   }
@@ -387,9 +456,8 @@ export function ConnectorCreatePage() {
             </p>
             {types.status === "loading" ? (
               <LoadingSkeleton rows={4} />
-            ) : types.status === "error" ? (
-              <ErrorState error={types.error} onRetry={types.reload} />
             ) : (
+              // The `error` state is answered above, before the form exists.
               <ConnectorTypePicker types={types.data} value={selectedTypeName} onChange={setSelectedTypeName} />
             )}
             <div className="grid gap-4 border-t border-border pt-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
@@ -425,6 +493,13 @@ export function ConnectorCreatePage() {
                 onChange={setDial}
                 oauthCallbackUrl={credentialSettings?.oauthCallbackUrl}
               />
+              {/* Nothing red before something is typed, as for the credential
+                  fields: the refusal follows what the form holds. */}
+              {saasAccountIssue !== null && saasAccount !== "" ? (
+                <p role="alert" className="text-xs text-destructive">
+                  {saasAccountIssue}
+                </p>
+              ) : null}
             </section>
             <section className="space-y-3 border-t border-border pt-5">
               <StepSectionHeading

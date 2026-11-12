@@ -1017,6 +1017,7 @@ async fn evaluate(state: &AppState, rule: &QualityRule, run_by: &str) -> Result<
 ///
 /// # Errors
 ///
+/// - `403` without `governance:write` (`GOV-10`, `DEC-17`; the policy gate).
 /// - `404` when no rule has that id.
 /// - `400` when the rule cannot be evaluated as written: a threshold
 ///   outside the grammar (the message is [`GRAMMAR_HINT`]), an `asset`
