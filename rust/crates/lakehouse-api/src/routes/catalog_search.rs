@@ -35,7 +35,10 @@
 //! `SHOULD-FIX 8`): `northwind customer` finds `Northwind Orders` through
 //! its column `customer_id`, and the first word alone (the name) would leave
 //! the reader with no reason. When every word's best field is the name there
-//! is no `matchedOn`: the name is already on screen.
+//! is no `matchedOn`: the name is already on screen. The value of
+//! `matchedOn` is the tag, the column, the table key or — for a description
+//! — a piece of the description around the matched word
+//! (`LH-DATA-11-04`, `DATA-54`).
 //!
 //! A typed word with no letter or digit (`_`, `%`, `--`) names nothing: it
 //! is not a filter but punctuation, so it is dropped before the matching. A
@@ -76,6 +79,16 @@ const MAX_WORDS: usize = 8;
 /// A word shorter than this never matches approximately (`DATA-11` D3):
 /// one edit on three letters reaches too many unrelated words.
 const MIN_APPROX_CHARS: usize = 4;
+
+/// How many characters of a description a `matchedOn` value carries
+/// (`LH-DATA-11-04`, `DATA-54`). A description can be a paragraph; the
+/// reader needs the words around the match, not the paragraph.
+const SNIPPET_MAX_CHARS: usize = 80;
+
+/// How many of those characters may precede the matched word, when the
+/// description is long enough to cut (`LH-DATA-11-04`, `DATA-54`). The word
+/// stays in view rather than at the very start of the piece.
+const SNIPPET_LEAD_CHARS: usize = 20;
 
 /// Weight of a word that equals the whole name.
 const SCORE_NAME_WHOLE: u32 = 120;
@@ -165,8 +178,9 @@ struct Candidate {
     field: Field,
     /// The text, prepared: lower-cased and tokenised (`DATA-41` D2).
     text: Arc<PreparedText>,
-    /// What `matchedOn.value` shows: the tag or the column name, empty for
-    /// the rest.
+    /// What `matchedOn.value` shows: the tag, the column name or the table
+    /// key. A description's value is built from the asset when the answer is
+    /// written (`LH-DATA-11-04`), so it is empty here.
     shown: String,
 }
 
@@ -333,10 +347,12 @@ struct Hit {
 }
 
 /// Why an asset matched, as the caller is told.
-enum Reason {
+enum Reason<'a> {
     /// A field that explains the hit (`DATA-11`): the reader sees which
-    /// field matched and whether a typo was forgiven.
-    Field(Hit),
+    /// field matched and whether a typo was forgiven. The typed word is kept
+    /// for a description match, whose reason carries a piece of the
+    /// description (`LH-DATA-11-04`).
+    Field(Hit, &'a str),
     /// The name forgave a typo and no field explains the hit (`DATA-32` D1):
     /// the name is on screen already, so the reader is told only that the
     /// match was approximate.
@@ -359,6 +375,53 @@ pub fn governed_pairs(asset: &Value) -> Vec<(&str, &str)> {
 
 fn text_of<'a>(asset: &'a Value, key: &str) -> &'a str {
     asset.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// A printable piece of `description` around the first occurrence of `word`
+/// (`LH-DATA-11-04`, `DATA-54`): at most [`SNIPPET_MAX_CHARS`] characters on
+/// one line, with `…` where it is cut.
+///
+/// The text is made one line first, because a description may hold line
+/// breaks and tabs that a one-line result row would show as a broken line.
+/// The search is by `char`, never by byte, so a multi-byte letter is never
+/// cut in half. A word that is not found (a typo the approximate match
+/// forgave, or no word at all) starts the piece at the beginning.
+fn description_snippet(description: &str, word: &str) -> String {
+    let line: String = description
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = line.chars().collect();
+    // One lower-case character per character, so an index in `lower` is the
+    // same index in `chars` (`char::to_lowercase` can expand, so its first
+    // character is taken).
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|&c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    let needle: Vec<char> = word.chars().collect();
+    let position = if needle.is_empty() {
+        0
+    } else {
+        lower
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .unwrap_or(0)
+    };
+    let start = position.saturating_sub(SNIPPET_LEAD_CHARS);
+    let end = (start + SNIPPET_MAX_CHARS).min(chars.len());
+    let mut snippet = String::new();
+    if start > 0 {
+        snippet.push('…');
+    }
+    snippet.extend(&chars[start..end]);
+    if end < chars.len() {
+        snippet.push('…');
+    }
+    snippet
 }
 
 /// The field's tokens: runs of letters and digits.
@@ -514,8 +577,9 @@ pub struct SearchOutcome {
 /// ordered by score descending, then use descending, then `id` ascending,
 /// each with `matchedOn` set for the best field of the first word, in typed
 /// order, whose best field is not the name (omitted when every word's best
-/// field is the name; `DATA-11` review `SHOULD-FIX 8`). `usage` is
-/// `DATA-11` D4.
+/// field is the name; `DATA-11` review `SHOULD-FIX 8`). `matchedOn.value` is
+/// the tag, the column, the table key, or a piece of the description around
+/// the matched word (`LH-DATA-11-04`, `DATA-54`). `usage` is `DATA-11` D4.
 ///
 /// `DATA-32` D1: when no field explains the hit and a word matched the name
 /// only approximately, `matchedOn` is the name with `approximate: true`.
@@ -563,7 +627,7 @@ pub fn search(
 
     // `(score, use, id, position in the index, reason)`: the id is the
     // tie-break of the ranking, the position is where the asset is.
-    let mut ranked: Vec<(u32, u32, &str, usize, Option<Reason>)> = Vec::new();
+    let mut ranked: Vec<(u32, u32, &str, usize, Option<Reason<'_>>)> = Vec::new();
     for (position, entry) in index.entries.iter().enumerate() {
         let mut total = 0_u32;
         let mut reason = None;
@@ -578,7 +642,7 @@ pub fn search(
             // `DATA-11` review `SHOULD-FIX 8`: not the first word as such but
             // the first one the name does not already explain.
             if reason.is_none() && hit.field.reported().is_some() {
-                reason = Some(Reason::Field(hit));
+                reason = Some(Reason::Field(hit, word.text));
             } else if !name_typo && hit.field == Field::Name && hit.approximate {
                 // `DATA-32` D1: the name forgave a typo. It is the reason
                 // only when no field explains the hit, so it is kept aside;
@@ -602,11 +666,19 @@ pub fn search(
         .take(limit.unwrap_or(usize::MAX))
         .map(|(_, _, _, position, reason)| {
             let mut asset = index.assets[position].clone();
+            // QA `LH-DATA-11-04` (`DATA-54`): a description reason carries a
+            // piece of the description, so the reader sees the words that
+            // matched, not only that something did. The value is built from
+            // the asset before it is borrowed mutably below.
             let reported = reason.and_then(|r| match r {
-                Reason::Field(hit) => hit
-                    .field
-                    .reported()
-                    .map(|f| (f, hit.shown, hit.approximate)),
+                Reason::Field(hit, word) => hit.field.reported().map(|f| {
+                    let value = if hit.field == Field::Description {
+                        description_snippet(text_of(&asset, "description"), word)
+                    } else {
+                        hit.shown
+                    };
+                    (f, value, hit.approximate)
+                }),
                 // `DATA-32` D1: the name forgave a typo and nothing else
                 // explains the hit, so the name is the reason.
                 Reason::NameTypo => Some(("name", String::new(), true)),
@@ -826,8 +898,50 @@ mod tests {
         let hit = &find(&assets, "revnue")[0];
         assert_eq!(
             hit["matchedOn"],
-            json!({ "field": "description", "value": "", "approximate": true })
+            json!({ "field": "description", "value": "revenue by month", "approximate": true })
         );
+    }
+
+    // QA `LH-DATA-11-04` (`DATA-54`): a description match carries the words
+    // around the matched word, on one line, with `…` where it is cut.
+    #[test]
+    fn a_description_match_carries_the_text_around_the_word() {
+        let mut long = "a".repeat(200);
+        long.replace_range(117..127, "  revenue  ");
+        let assets = vec![json!({ "id": "silver.long", "name": "Long", "description": long })];
+        let hit = &find(&assets, "revenue")[0];
+        let value = hit["matchedOn"]["value"].as_str().unwrap();
+        assert_eq!(hit["matchedOn"]["field"], "description");
+        assert!(value.contains("revenue"), "{value}");
+        assert!(value.starts_with('…'), "{value}");
+        assert!(value.ends_with('…'), "{value}");
+        assert!(value.chars().count() <= 82, "{value}");
+
+        let assets = vec![json!({
+            "id": "silver.monthly", "name": "Monthly",
+            "description": "Monthly\n  revenue\tby region"
+        })];
+        assert_eq!(
+            find(&assets, "revenue")[0]["matchedOn"],
+            json!({ "field": "description", "value": "Monthly revenue by region", "approximate": false })
+        );
+        // The typo was forgiven, so there is no position: the piece starts at
+        // the beginning and is the whole line.
+        let typo = &find(&assets, "revnue")[0];
+        assert_eq!(typo["matchedOn"]["approximate"], true);
+        assert_eq!(typo["matchedOn"]["value"], "Monthly revenue by region");
+    }
+
+    // QA `LH-DATA-11-04` (`DATA-54`): the piece is cut by character, never by
+    // byte, and a word that is not found (or no word) starts at the beginning.
+    #[test]
+    fn the_snippet_never_cuts_inside_a_character() {
+        assert!(
+            description_snippet("Umsatz nach Übersee für Österreich", "übersee")
+                .contains("Übersee")
+        );
+        assert_eq!(description_snippet("", "x"), "");
+        assert_eq!(description_snippet("abc", ""), "abc");
     }
 
     #[test]
