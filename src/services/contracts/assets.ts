@@ -182,6 +182,7 @@ export type AssetUsage = {
   basedOn: number
   /** True when that read was full, so the oldest queries of the window are not in the figures. */
   truncated: boolean
+  /** `name` is the person's display name, or "Unknown user" (`DATA-52`); the id is never sent. */
   frequentUsers: { name: string; queries: number }[]
   /** `sql` has every literal replaced by `?`; queries are grouped by that form. */
   frequentQueries: { sql: string; runs: number; lastAt: string }[]
@@ -261,6 +262,7 @@ export type AssetDetail = Asset & {
   recentQueries: {
     id: string
     sql: string
+    /** The caller's display name, or "Unknown user" (`DATA-52`); the id is never sent. */
     user: string
     at: string
     status?: string

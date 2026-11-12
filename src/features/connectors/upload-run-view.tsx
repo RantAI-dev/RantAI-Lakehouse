@@ -7,6 +7,7 @@ import { HealthTile } from "@/components/patterns/health-tile"
 import { SectionCard } from "@/components/patterns/section-card"
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useServiceAction } from "@/hooks/use-service"
+import { trinoBronzeName } from "@/lib/asset-query"
 import { formatBytes, formatNumber } from "@/lib/format"
 import { rawTableFullName, retryInput } from "@/lib/uploads"
 import { uploadService } from "@/services"
@@ -159,6 +160,14 @@ export function UploadRunView({
                 </HealthTile>
               ) : null}
             </div>
+            {/* `DATA-53` (QA `LH-DATA-9-07`): the Catalog lists `bronze.<table>`; Query
+                Studio reads the table on its Trino engine under another name. */}
+            {upload.bronzeTable !== undefined ? (
+              <p className="text-sm text-muted-foreground">
+                In Query Studio, on the Trino engine, the table is{" "}
+                <span className="break-all font-mono">{trinoBronzeName(upload.bronzeTable)}</span>.
+              </p>
+            ) : null}
             {upload.badValues !== undefined ? <BadValuesReport upload={upload} /> : null}
             {/* QA LH-DATA-14-05 (DATA-54), review round 1 R4: the sentence names
                 no time. The checks start after the orchestrator reports the

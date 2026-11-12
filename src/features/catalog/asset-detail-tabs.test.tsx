@@ -940,6 +940,31 @@ describe("Activity tab: usage and history", () => {
     expect(within(usage).getByText(/4 queries that read several tables are not counted/)).toBeTruthy()
   })
 
+  it("lists two frequent users who share a name as two rows", async () => {
+    // `DATA-52` (QA `LH-DATA-12-01` F3): the API sends display names, which are not
+    // unique, so the rows must be keyed by more than the name.
+    const errors = spyOn(console, "error")
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      usage: usageOf({
+        queries: 5,
+        users: 2,
+        frequentUsers: [
+          { name: "Rina Wijaya", queries: 3 },
+          { name: "Rina Wijaya", queries: 2 },
+        ],
+      }),
+    })
+
+    const usage = screen.getByText("Usage (30d)").closest("[data-slot=card]") as HTMLElement
+    expect(within(usage).getAllByText("Rina Wijaya")).toHaveLength(2)
+    expect(within(usage).getByText("3 queries")).toBeTruthy()
+    expect(within(usage).getByText("2 queries")).toBeTruthy()
+    expect(errors.mock.calls.flat().join(" ")).not.toContain("same key")
+  })
+
   it("says nobody queried the table, rather than that usage is unknown", () => {
     stubApi()
     url.search = "tab=activity"

@@ -1514,7 +1514,20 @@ function IngestRuns({
           <LoaderIcon className="size-3.5 animate-spin" />
           Run {activeRun.runId.slice(0, 8)} is running. Its log shows each attempt as it ends.
         </p>
-      ) : awaitingLaunch ? (
+      ) : null}
+      {activeRun && activeRun.attempts > 0 ? (
+        // QA LH-SRC-6-16 (SRC-41 D17): the run record is closed by the
+        // orchestrator's run-status sensor, which is evaluated every 30 s (at
+        // most 5 ended runs of all jobs per tick, one sensor after another),
+        // so the status can lag minutes behind the last table's rows. Nothing
+        // here is retimed; the limits to tell a customer say so, with the
+        // three settings, on the feature page.
+        <p className="text-xs text-muted-foreground">
+          The status changes when the orchestrator reports the end of the run. That can be a few
+          minutes after the last table&apos;s rows are counted.
+        </p>
+      ) : null}
+      {!activeRun && awaitingLaunch ? (
         <p className="flex items-center gap-1.5 text-xs text-primary">
           <LoaderIcon className="size-3.5 animate-spin" />
           Starting run {launchedRunId?.slice(0, 8)}…

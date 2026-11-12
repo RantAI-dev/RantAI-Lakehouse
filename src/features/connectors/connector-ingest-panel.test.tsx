@@ -1315,7 +1315,9 @@ describe("ConnectorIngestPanel column choice", () => {
 
   async function openColumns() {
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
-    await screen.findByText("1 tables found")
+    // QA LH-SRC-6-50 (SRC-41 D18): a count of one is singular; the line used
+    // to read "1 tables found".
+    await screen.findByText("1 table found")
     fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
     // The columns are read through the preview route when the section opens (SRC-13), so they arrive after the click.
     await screen.findAllByLabelText(/^Load column /)
@@ -1583,5 +1585,39 @@ describe("ConnectorIngestPanel table discovery", () => {
     expect(await screen.findByLabelText("Add by name")).toBeDefined()
     expect(screen.getByText("This connector type cannot list its objects, so type each one as the source names it.")).toBeDefined()
     expect(screen.queryByRole("button", { name: /^Find / })).toBeNull()
+  })
+})
+
+// QA LH-SRC-6-16 (SRC-41 D17): a run's status is closed by the orchestrator's
+// run-status sensor, which can report minutes after the last table's rows are
+// counted. The card says so once an attempt has ended; nothing is retimed.
+describe("the Runs card says the status follows the orchestrator's report (LH-SRC-6-16)", () => {
+  const SENTENCE = /The status changes when the orchestrator reports the end of the run/
+  const live = (attempts: number, status = "running") =>
+    record({
+      runId: "run-live-0001",
+      status,
+      startedAt: new Date().toISOString(),
+      endedAt: status === "running" ? null : new Date().toISOString(),
+      attempts,
+    })
+
+  it("says the status follows the orchestrator's report once an attempt has ended", async () => {
+    stubFetch(SPEC, { runs: [live(1)] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.getByText(SENTENCE)).toBeDefined()
+
+    cleanup()
+    stubFetch(SPEC, { runs: [live(0)] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.queryByText(SENTENCE)).toBeNull()
+
+    cleanup()
+    stubFetch(SPEC, { runs: [live(1, "succeeded")] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText("Succeeded")
+    expect(screen.queryByText(SENTENCE)).toBeNull()
   })
 })

@@ -834,6 +834,10 @@ def _run_one_object(
                 dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj]),
                 plan,
                 gate=gate,
+                # `DATA-52`, review round 1 R2: this load is a connector's replace,
+                # append or incremental, and it records the run's label like the
+                # Clear, Oracle and generic paths below do.
+                author=_run_author(connector_id, run_id),
             )
             if outcome.get("waiting"):
                 _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
@@ -1116,7 +1120,11 @@ def run_kafka_stream_batch(
             batch = consume_one_batch(consumer, topic=topic, max_seconds=spec.get("microBatchSeconds", 60))
             if not batch.rows:
                 return 0
-            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
+            # `DATA-52`, review round 1 R2: a micro-batch is a load like any other,
+            # and its commits record the run's label (`_run_author`).
+            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(
+                dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+            )
             outcome = load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
             # Committed ONLY after the sink write above returned
             # successfully (an exception there propagates out of this

@@ -19,6 +19,7 @@ import {
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useServiceAction } from "@/hooks/use-service"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
+import { ACCEPTED_FORMATS, UPLOAD_LIST_LIMIT } from "@/lib/uploads"
 import {
   ALL_FILES,
   NO_FOLDER,
@@ -127,7 +128,7 @@ export function UploadsPanel({
     return (
       <EmptyState
         title="No uploaded files"
-        description="Upload CSV, TSV, Excel or Parquet files to bring them in as raw tables."
+        description={`Upload ${ACCEPTED_FORMATS} files to bring them in as raw tables.`}
         action={
           <Button size="sm" render={<Link href="/connectors/upload" />}>
             <UploadIcon data-icon="inline-start" />
@@ -143,6 +144,10 @@ export function UploadsPanel({
   const chosen = uploads.filter((u) => selected.has(u.id))
   const allChosen = uploads.length > 0 && chosen.length === uploads.length
   const deleteReason = openFolder ? deleteFolderReason(openFolder) : null
+  // `DATA-51` (QA `LH-DATA-35-07`): why the button is off is a sentence under it, not
+  // only a `title` a person on a touch screen never sees.
+  const nestReason =
+    openFolder && !canNestIn(folders, openFolder.id) ? "Folders can be nested at most 3 levels deep." : null
   const toggle = (id: string, on: boolean) =>
     setSelected((prev) => {
       const next = new Set(prev)
@@ -206,8 +211,8 @@ export function UploadsPanel({
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={!canNestIn(folders, openFolder.id)}
-                  title={canNestIn(folders, openFolder.id) ? undefined : "Folders can be nested at most 3 levels deep."}
+                  disabled={nestReason !== null}
+                  title={nestReason ?? undefined}
                   onClick={() => setFolderDialog("subfolder")}
                 >
                   New subfolder
@@ -239,10 +244,16 @@ export function UploadsPanel({
                   {deleteReason}
                 </p>
               ) : null}
+              {nestReason !== null ? (
+                <p className="text-xs text-muted-foreground" data-testid="folder-nest-reason">
+                  {nestReason}
+                </p>
+              ) : null}
             </div>
           ) : null}
         </aside>
 
+        <div className="min-w-0 space-y-2">
         <div className="min-w-0 rounded-md border">
           <Table>
             <TableHeader>
@@ -376,6 +387,16 @@ export function UploadsPanel({
               ))}
             </TableBody>
           </Table>
+        </div>
+        {uploads.length >= UPLOAD_LIST_LIMIT ? (
+          // Review round 1 R7: the number is the constant the condition reads, so the
+          // sentence and the cut cannot drift apart.
+          <p className="text-xs text-muted-foreground" data-testid="upload-list-cut">
+            {searching
+              ? `Showing the newest ${UPLOAD_LIST_LIMIT} files that match; narrow the search to find older ones.`
+              : `Showing the newest ${UPLOAD_LIST_LIMIT} files; search to find older ones.`}
+          </p>
+        ) : null}
         </div>
       </div>
 
