@@ -2528,6 +2528,46 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
         let relation = binned::binned(from, where_clauses, &bins, &needed);
         return rebuild_chart_over(spec, &relation, Vec::new(), &[], (read, cols), None);
     }
+    // `BI-46` (plan D13; QA `LH-BI-6-01`): a date or timestamp breakdown can be
+    // grouped by a day, week, month, quarter or year. Its bucket is put in the
+    // relation under the breakdown's own name, with the predicates under it on
+    // the raw rows, so everything after this — the cap of T8 included — reads
+    // buckets. The dimension's own grain, when it has one, nests its bucket on
+    // top, as a grouped table's grains do.
+    if let (Some(raw), Some(breakdown)) = (
+        def.shape.breakdown_grain.as_deref(),
+        def.breakdown.as_deref().filter(|b| !b.is_empty()),
+    ) {
+        let grain = crate::grain::Grain::parse(raw)?;
+        let measures = shape::resolve_measures(&def.measures, from)?;
+        let groups: Vec<String> = [Some(def.dimension.as_str()), Some(breakdown)]
+            .into_iter()
+            .flatten()
+            .filter(|g| !g.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let needed = binned::needed_columns(from, &groups, &measures)?;
+        let column = Ident::new(breakdown.to_owned()).ok()?;
+        let expr = grain.bucket_expr(&column, cols.get(breakdown).copied()?, read.time)?;
+        let base = if where_clauses.is_empty() {
+            from.clone()
+        } else {
+            Relation::Filtered {
+                base: Box::new(from.clone()),
+                predicates: where_clauses,
+            }
+        };
+        let relation = Relation::Bucketed {
+            base: Box::new(base),
+            dimension: breakdown.to_owned(),
+            expr,
+            carried: needed
+                .into_iter()
+                .filter(|name| name != breakdown)
+                .collect(),
+        };
+        return rebuild_chart_over(spec, &relation, Vec::new(), &[], (read, cols), grained);
+    }
     rebuild_chart_over(
         spec,
         from,
@@ -4293,9 +4333,13 @@ mod tests {
         spec
     }
 
+    /// `mart_x`'s columns for a grained chart: the date dimension `d`, the
+    /// measure `v`, the text breakdown `g`, and — `BI-46` — a second date
+    /// column `d2` to be a grained breakdown.
     fn dated(kind: ColumnKind) -> HashMap<String, RelationColumns> {
         let mut cols: RelationColumns = RelationColumns::default();
         cols.insert("d".to_owned(), kind);
+        cols.insert("d2".to_owned(), kind);
         cols.insert("v".to_owned(), ColumnKind::Number);
         cols.insert("g".to_owned(), ColumnKind::Text);
         HashMap::from([("mart_x".to_owned(), cols)])
@@ -4405,6 +4449,58 @@ mod tests {
              GROUP BY g ORDER BY sum(v) DESC, g LIMIT 8) GROUP BY d, g ORDER BY d, g"
         );
         assert_eq!(got.latest_limit, None);
+    }
+
+    /// `BI-46` (plan D13; QA `LH-BI-6-01`): a date breakdown grouped by month
+    /// is bucketed under the chart under the breakdown's own name, and the
+    /// breakdown cap ranks the buckets.
+    #[test]
+    fn a_date_breakdown_grouped_by_month_is_bucketed_under_the_chart_and_capped_by_bucket() {
+        let mut spec = stored_spec(ChartKind::Bar, "mart_x", "g", &["v"]);
+        spec.def.breakdown = Some("d2".to_owned());
+        spec.def.shape.breakdown_grain = Some("month".to_owned());
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
+        let bucket = "(SELECT date_trunc('month', d2) AS d2, g, v FROM serving.mart_x) AS bkt";
+        assert!(
+            got.sql.contains(bucket),
+            "the month bucket is under the chart: {}",
+            got.sql
+        );
+        assert!(
+            got.sql.contains(&format!(
+                "d2 IN (SELECT d2 FROM {bucket} GROUP BY d2 ORDER BY sum(v) DESC, d2 LIMIT 20)"
+            )),
+            "the cap ranks the buckets: {}",
+            got.sql
+        );
+        assert!(
+            got.sql.contains("GROUP BY g, d2 ORDER BY g, d2"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.latest_limit, None);
+    }
+
+    /// `BI-46` (plan D13): the dimension's own grain nests its bucket on top of
+    /// the breakdown's, one each.
+    #[test]
+    fn a_grain_on_the_dimension_and_on_the_breakdown_nest_one_bucket_each() {
+        let mut spec = grained_spec(ChartKind::Line, "month", "none");
+        spec.def.breakdown = Some("d2".to_owned());
+        spec.def.shape.breakdown_grain = Some("month".to_owned());
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
+        assert!(
+            got.sql
+                .contains("SELECT date_trunc('month', d2) AS d2, d, v FROM serving.mart_x"),
+            "the breakdown's bucket is the inner one: {}",
+            got.sql
+        );
+        assert!(
+            got.sql
+                .contains("SELECT date_trunc('month', d) AS d, d2, v FROM"),
+            "the dimension's bucket nests on top: {}",
+            got.sql
+        );
     }
 
     /// `BI-46` (plan D12): without a time grain the dimension keeps its own
