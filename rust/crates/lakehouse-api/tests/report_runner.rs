@@ -1028,6 +1028,32 @@ fn a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread(
     assert!(!log.contains("logged by another thread"), "{log}");
 }
 
+/// The call site this test shares with another thread: `tracing-core` takes a
+/// call site's interest from the DEFAULT of the first thread to reach it and
+/// keeps that answer for the process (`D9`, `REL-25`). With a subscriber only
+/// on one thread, a site another thread reached first is recorded "never" and
+/// this thread's record is dropped.
+fn shared_site() {
+    tracing::error!("from the shared call site");
+}
+
+/// `REL-25` (review round 1, R2): a capture sees a call site another thread
+/// reached first — the case a per-thread `set_default` cannot serve. The other
+/// thread is joined before this one logs, so its registration of the site comes
+/// first on any machine, under `cargo test` and `nextest`.
+#[test]
+fn a_log_capture_sees_a_call_site_another_thread_reached_first() {
+    let capture = LogCapture::start();
+    std::thread::spawn(shared_site).join().unwrap();
+    shared_site();
+    let log = capture.text();
+    assert_eq!(
+        log.matches("from the shared call site").count(),
+        1,
+        "the site registered on the other thread must still reach this capture: {log}"
+    );
+}
+
 /// RPT-1 review fix (SHOULD-FIX) R7: a PDF failure leaves a trace for the
 /// operator (the cause under a reference), while the stored reason stays fixed.
 #[tokio::test]
