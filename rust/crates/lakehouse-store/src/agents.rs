@@ -1864,6 +1864,41 @@ pub async fn list_asset_grants(
     Ok(rows.into_iter().map(AssetGrant::from).collect())
 }
 
+/// `true` when `user_id` holds `permission` through a grant that is still in
+/// force and was made from the asset `catalog_id` — the predicate of
+/// [`list_asset_grants`], narrowed to one person and one permission
+/// (`GOV-11`, `DEC-20`; QA `LH-DATA-15-03` F2).
+///
+/// Both origins count, exactly as they do on the asset's Grants card: a
+/// direct grant by its `catalog_id`, and the grant of an approved request by
+/// its approval's `resource`. Revoked and expired grants do not.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any query failure.
+pub async fn holds_asset_grant(
+    pool: &PgPool,
+    user_id: Uuid,
+    catalog_id: &str,
+    permission: &str,
+) -> Result<bool, StoreError> {
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM access_grant g \
+             LEFT JOIN approval_item a ON a.id = g.approval_id \
+             WHERE g.user_id = $1 AND g.permission = $3 \
+               AND g.revoked_at IS NULL AND g.expires_at > now() \
+               AND (g.catalog_id = $2 OR a.resource = $2) \
+         )",
+    )
+    .bind(user_id)
+    .bind(catalog_id)
+    .bind(permission)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
 /// A direct grant just made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectGrant {

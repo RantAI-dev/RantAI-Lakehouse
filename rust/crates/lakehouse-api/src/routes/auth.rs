@@ -131,6 +131,27 @@ fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
     }
 }
 
+/// The longest `User-Agent` a session records, in characters. A browser's
+/// header is short; the cap keeps a caller from storing a kilobyte of text
+/// under the column the Sessions page renders.
+const SESSION_USER_AGENT_MAX_CHARS: usize = 512;
+
+/// The `User-Agent` a sign-in records on its session, or `None`
+/// (`QA LH-SEC-5-01`, `ADM-14` decision D9).
+///
+/// It is what the client says about itself: shown on the Sessions page,
+/// never trusted for anything. Trimmed, cut to
+/// [`SESSION_USER_AGENT_MAX_CHARS`], and nothing when the header is absent,
+/// empty, or carries bytes that are not plain ASCII (`to_str` refuses
+/// those, and a lossy conversion would invent text).
+fn session_user_agent(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::USER_AGENT)?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.chars().take(SESSION_USER_AGENT_MAX_CHARS).collect())
+}
+
 /// `POST /api/auth/login` — verify `{ email, password }`, and on success,
 /// create a server-side session and set its cookie.
 ///
@@ -155,7 +176,11 @@ fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
 /// 400 on an unparseable body; 401 on bad credentials (same status for
 /// "no such email" and "wrong password" — see the module doc comment);
 /// 429 when the key is locked; 503 if no Postgres pool is configured.
-pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Response> {
+pub async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
     let pool = pool(&state)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         ApiError::Unavailable(
@@ -213,8 +238,10 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
                 pool,
                 user_id,
                 session::DEFAULT_SESSION_TTL,
+                // ADM-14 D10: no address — the API sits behind the console's
+                // own server and has no trusted source for the client's.
                 None,
-                None,
+                session_user_agent(&headers).as_deref(),
                 &[],
             )
             .await?;
@@ -250,6 +277,10 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
                     outcome: "refused".to_owned(),
                     resource_kind: Some("login_key".to_owned()),
                     resource_id: Some(key[..12].to_owned()),
+                    // QA LH-SEC-2-06 (SEC-70, decision D3): nobody signed in
+                    // yet, so the event has no principal and names the form
+                    // that produced it.
+                    actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
                     ..Default::default()
                 };
                 if let Err(err) = store_audit::insert(pool, event).await {
@@ -438,14 +469,15 @@ fn sessions_decision_for(principal: &Principal) -> SessionsDecision {
 /// (every authenticated caller may hit it — the admin-vs-own split lives
 /// here in the handler, see [`SessionsDecision`]).
 ///
-/// # A documented gap
+/// # What each row records
 ///
-/// `created_ip` and `user_agent` are returned as `null` for every session
-/// minted today: both [`login`] and [`oidc_callback`] call
-/// `session::create_session(..., None, None)`. The columns themselves are
-/// `TEXT NULL` (`0019_auth.sql`), so the listing reflects that honestly
-/// rather than inventing an IP or UA — see
-/// `lakehouse_store::sessions::SessionRow`'s own doc comment.
+/// `user_agent` is the browser as it named itself at sign-in (`ADM-14`
+/// decision D9), and `null` for a session older than that change.
+/// `created_ip` is always `null`: the API sits behind the console's own
+/// server and has no trusted source for the client's address, so the page
+/// says "Not recorded" rather than showing a wrong address as a fact
+/// (decision D10) — see `lakehouse_store::sessions::SessionRow`'s own doc
+/// comment.
 ///
 /// # Errors
 ///
@@ -1166,8 +1198,10 @@ pub async fn oidc_callback(
         pool,
         user_id,
         session::DEFAULT_SESSION_TTL,
+        // ADM-14 D10: no address — the API sits behind the console's own
+        // server and has no trusted source for the client's.
         None,
-        None,
+        session_user_agent(&headers).as_deref(),
         &login.mapped_role_names,
     )
     .await?;
@@ -1721,6 +1755,68 @@ mod tests {
             .decode(value)
             .expect("valid base64url");
         serde_json::from_slice(&json).expect("valid OidcFlow JSON")
+    }
+
+    /// `QA LH-SEC-5-01` (`ADM-14` D9): the browser is recorded as it named
+    /// itself — trimmed, and cut to a length the column and the page can
+    /// carry.
+    #[test]
+    fn the_session_user_agent_is_the_header_trimmed_and_cut_to_512_characters() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("QA-Browser/1.0"),
+        );
+        assert_eq!(
+            session_user_agent(&headers).as_deref(),
+            Some("QA-Browser/1.0")
+        );
+
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("   QA-Browser/1.0   "),
+        );
+        assert_eq!(
+            session_user_agent(&headers).as_deref(),
+            Some("QA-Browser/1.0"),
+            "surrounding whitespace is trimmed"
+        );
+
+        let long = "A".repeat(700);
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(&long).expect("a 700-character header value"),
+        );
+        let recorded = session_user_agent(&headers).expect("a long header is recorded, cut short");
+        assert_eq!(recorded.chars().count(), 512);
+        assert!(recorded.chars().all(|c| c == 'A'));
+    }
+
+    /// `QA LH-SEC-5-01` (`ADM-14` D9): nothing is recorded for a header that
+    /// is absent, empty, or not plain ASCII — a value the page would show as
+    /// fact has to be the client's own text, not a lossy conversion.
+    #[test]
+    fn the_session_user_agent_is_nothing_for_an_absent_empty_or_non_ascii_header() {
+        assert_eq!(session_user_agent(&HeaderMap::new()), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("   "));
+        assert_eq!(
+            session_user_agent(&headers),
+            None,
+            "whitespace only is empty"
+        );
+
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_bytes("QA-Browser/1.0 é".as_bytes())
+                .expect("obs-text is a legal header value"),
+        );
+        assert_eq!(
+            session_user_agent(&headers),
+            None,
+            "not plain ASCII is not recorded"
+        );
     }
 
     #[tokio::test]
@@ -2924,6 +3020,7 @@ mod tests {
                         flow.state
                     ))
                     .header(header::COOKIE, cookie.to_str().unwrap())
+                    .header(header::USER_AGENT, "QA-Browser/1.0")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2957,6 +3054,19 @@ mod tests {
                 .any(|c| c.starts_with(&format!("{OIDC_FLOW_COOKIE_NAME}="))
                     && c.contains("Max-Age=0")),
             "expected the flow cookie to be cleared even on success: {set_cookies:?}"
+        );
+
+        // QA LH-SEC-5-01 (ADM-14 D9/D10): the single sign-on callback records
+        // the browser it came from, and records no network address.
+        let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT count(*), max(user_agent), max(created_ip) FROM session")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(count, 1, "one callback, one session");
+        assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
+        assert_eq!(
+            created_ip, None,
+            "the network address is not recorded (ADM-14 D10)"
         );
         Ok(())
     }

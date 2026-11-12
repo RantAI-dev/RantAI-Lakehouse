@@ -1272,7 +1272,9 @@ fn agents_router() -> Router<AppState> {
               `storage_router`/etc. already serve for the larger groups"
 )]
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // Every route and merged sub-router above `gated` below; the layers that
+    // gate and bound them live in one place there (Task 3.2, `SEC-72`).
+    let routes = Router::new()
         .route("/health", get(health))
         .route("/health/ready", get(ready))
         .route("/api/catalog", get(catalog::list))
@@ -1755,7 +1757,35 @@ pub fn router(state: AppState) -> Router {
         // and approvals.
         .merge(agents_router())
         // Task 3.2: login/logout/me/change-password.
-        .merge(auth_router())
+        .merge(auth_router());
+
+    gated(routes, state)
+}
+
+/// Puts `auth_gate` and the timeout around every registered route, and
+/// answers what no route serves (QA `LH-BI-13-02`, `LH-BLD-2-03`,
+/// `LH-DATA-14-04`, `LH-RPT-1-11`; `SEC-72`, decision `DEC-19`).
+///
+/// # Why the order of these six calls is the fix
+///
+/// `.layer(auth_gate)` wraps every method handler of a path *and* the path's
+/// own "no handler for this method" fallback, which is why a request for a
+/// method no route has reached the gate and answered
+/// `500 route_policy_unclassified` before this change. The two fallbacks
+/// below are set **after** that layer, so they are not wrapped by it:
+///
+/// - a path that exists with no handler for the method answers 405 — nothing
+///   runs, so nothing is opened;
+/// - a path no route matches answers 404 — the gate's `MatchedPath` extractor
+///   used to fail there, and axum answered `500 No matched path found`.
+///
+/// A handler still runs behind the gate: one missing from `POLICY_TABLE`
+/// still answers `500 route_policy_unclassified` (principle 3, unchanged). A
+/// path registered with `axum::routing::any` (the `Iceberg` door) has a
+/// fallback of its own, which is not the default one, so it is not replaced
+/// and stays behind the gate. Do not reorder these calls.
+fn gated(routes: Router<AppState>, state: AppState) -> Router {
+    routes
         // Task 3.2: the one authorization gate every route (bar the four
         // `Policy::Public` entries in `crate::policy::POLICY_TABLE`) passes
         // through, driven entirely by that table rather than per-handler
@@ -1771,8 +1801,46 @@ pub fn router(state: AppState) -> Router {
             crate::query_limits::scope_middleware,
         ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
+        .method_not_allowed_fallback(method_not_allowed)
+        .fallback(no_such_address)
         .layer(from_fn_with_state(state.clone(), timeout_middleware))
         .with_state(state)
+}
+
+/// The sentence a request for a method no route serves is told (`SEC-72`,
+/// decision `DEC-19`; QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`,
+/// `LH-RPT-1-11`). One sentence for every path, like every other error.
+const METHOD_NOT_ALLOWED: &str = "This method is not allowed on this address.";
+
+/// The sentence a request for an address no route matches is told
+/// (`SEC-72`, decision `DEC-19`).
+const NO_SUCH_ADDRESS: &str = "No such address.";
+
+/// Answers 405 for a path that exists with no handler for the method asked
+/// for (QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+/// `SEC-72`, decision `DEC-19`).
+///
+/// It runs outside `auth_gate` on purpose: it serves nothing, so there is
+/// nothing to authorize, and no request the gate would refuse is answered
+/// any differently by it.
+async fn method_not_allowed() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        ApiJson(FixedErrorBody {
+            error: METHOD_NOT_ALLOWED.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+/// Answers 404 for an address no route matches (QA `LH-BI-13-02`,
+/// `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`; `SEC-72`, decision
+/// `DEC-19`).
+///
+/// It runs outside `auth_gate` on purpose: it serves nothing, so there is
+/// nothing to authorize, and it says nothing about what exists.
+async fn no_such_address() -> crate::error::ApiRejection {
+    ApiError::NotFound(NO_SUCH_ADDRESS.to_owned()).into()
 }
 
 /// `GET /health` — liveness, plus whether the application database is
@@ -1839,13 +1907,17 @@ async fn ready(State(state): State<AppState>) -> Response {
     (status, ApiJson(body)).into_response()
 }
 
-/// The JSON body shape a request-timeout response takes — same
+/// The JSON body shape a fixed error response takes — same
 /// `{"error": "<message>"}` envelope every other error response in this
 /// crate uses (see [`crate::error::ApiRejection`]), rather than the bare,
 /// content-type-less body `tower_http::timeout::TimeoutLayer` produces on
 /// its own.
+///
+/// Two responses have no route of their own to render this through: the
+/// request timeout ([`timeout_middleware`]) and the 405 for a method no
+/// handler serves ([`method_not_allowed`]).
 #[derive(Debug, Serialize)]
-struct TimeoutBody {
+struct FixedErrorBody {
     error: String,
 }
 
@@ -1873,7 +1945,7 @@ async fn timeout_middleware(State(state): State<AppState>, req: Request, next: N
         Ok(response) => response,
         Err(_elapsed) => (
             StatusCode::REQUEST_TIMEOUT,
-            ApiJson(TimeoutBody {
+            ApiJson(FixedErrorBody {
                 error: "request timeout".to_owned(),
             }),
         )
@@ -2164,18 +2236,30 @@ mod tests {
 /// to failing on `entries_not_reachable`... no — it does not touch this
 /// test (which only walks entries that already exist in the table); the
 /// route that actually goes RED is a direct request to the throwaway path
-/// itself, which this module also exercises
-/// (`an_unregistered_route_denies_by_default_instead_of_serving_public`),
+/// itself, which this module also exercises through
+/// `a_handler_that_is_not_in_the_policy_table_answers_500_and_is_never_served`,
 /// asserting exactly the 500 `route_policy_unclassified` body deny-by-default
-/// produces for ANY unclassified path — a throwaway route hits that same
+/// produces for a handler with no entry — a throwaway route hits that same
 /// code path the moment it's requested, with no separate wiring needed to
 /// prove it.
+///
+/// # What an unclassified request is NOT
+///
+/// `SEC-72` (decision `DEC-19`) split this apart: only a handler that exists
+/// and has no entry answers this 500. A method no path's handler serves
+/// answers 405, and an address no route matches answers 404 — neither
+/// reaches `auth_gate`, so neither is a policy question at all.
+/// `HEAD` on a path that serves `GET` still answers 500 (`DEC-19` D8): axum
+/// answers `HEAD` with the `GET` handler, so a handler exists and
+/// `("HEAD", path)` is not in the table.
 #[cfg(test)]
 mod route_policy_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use axum::Router;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
+    use axum::routing::get;
     use tower::ServiceExt;
 
     use crate::config::Config;
@@ -2194,12 +2278,18 @@ mod route_policy_tests {
     /// throwaway address this test never dials, since the no-credential
     /// path never reaches it.
     fn test_router() -> axum::Router {
+        super::router(test_state())
+    }
+
+    /// The state [`test_router`] builds, for a test that assembles a router
+    /// of its own through [`super::gated`].
+    fn test_state() -> AppState {
         let env = std::collections::HashMap::from([(
             "DATABASE_URL".to_owned(),
             "postgres://test:test@127.0.0.1:5432/test".to_owned(),
         )]);
         let cfg = Config::from_map(&env).unwrap();
-        super::router(AppState::new(cfg))
+        AppState::new(cfg)
     }
 
     /// `{id}`/`{token}`/`{kind}`/`{runId}` — any `{...}` capture segment —
@@ -2294,28 +2384,97 @@ mod route_policy_tests {
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
-    /// The deny-by-default regression itself: a `(method, path)` with NO
+    /// The deny-by-default regression itself: a handler with NO
     /// `POLICY_TABLE` entry is refused (500, `route_policy_unclassified`)
-    /// rather than silently served. This is precisely what goes RED (as a
-    /// live 200/404-vs-500 behavior change, not just this assertion) the
-    /// moment a route is registered in `router()` without a matching
-    /// table entry — see the task's final report for the throwaway-route
-    /// demonstration.
+    /// rather than silently served.
+    ///
+    /// This used to prove the same property with `DELETE /health`, a method
+    /// no handler serves. `DEC-19` (`SEC-72`) turns that request into a 405
+    /// before the gate, which is the answer it should always have been, so
+    /// the proof now needs a real handler: `GET` on a path nobody
+    /// classified. The throwaway path deliberately does not start with
+    /// `/api/`, so `every_registered_route_has_a_policy_entry`
+    /// (`tests/route_auth.rs`) — which reads this file's `.route(` calls —
+    /// does not report it, and it is the last `.route` of that chain.
     #[tokio::test]
-    async fn an_unregistered_route_denies_by_default_instead_of_serving_public() {
-        // `/health` is mounted and IS in the table (Public) — this proves
-        // the negative instead by asking for a method the health route
-        // never registers a policy entry for. `MatchedPath` still
-        // resolves to `/health` (axum matches the path regardless of
-        // method before yielding 405), so `auth_gate` still runs and still
-        // finds no `("DELETE", "/health", _)` entry.
-        let resp = request(test_router(), "DELETE", "/health").await;
+    async fn a_handler_that_is_not_in_the_policy_table_answers_500_and_is_never_served() {
+        let app = super::gated(
+            Router::new()
+                .route("/health", get(super::health))
+                .route("/__sec72_unclassified", get(super::health)),
+            test_state(),
+        );
+        let resp = request(app, "GET", "/__sec72_unclassified").await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(
             text.contains("route_policy_unclassified"),
             "expected the deny-by-default body, got: {text}"
+        );
+    }
+
+    /// QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+    /// `SEC-72` decision `DEC-19`: a path that exists with no handler for
+    /// the method asked for answers 405 with one fixed sentence, with no
+    /// credentials and never a 500.
+    #[tokio::test]
+    async fn a_method_no_handler_serves_answers_405_with_the_fixed_sentence() {
+        let expected =
+            serde_json::json!({ "error": "This method is not allowed on this address." });
+        for (method, path) in [
+            ("DELETE", "/health"),
+            ("POST", "/api/dashboard"),
+            ("GET", "/api/pipelines/x/target-lag"),
+            ("DELETE", "/api/pipelines/x/target-lag"),
+            ("POST", "/api/governance/quality/incidents"),
+            ("PATCH", "/api/reports/subscriptions/x"),
+        ] {
+            let resp = request(test_router(), method, path).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path} has no handler"
+            );
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, expected, "{method} {path}");
+        }
+    }
+
+    /// QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+    /// `SEC-72` decision `DEC-19`: an address no route matches answers 404
+    /// with one fixed sentence. These three used to answer
+    /// `500 No matched path found`, because `auth_gate`'s `MatchedPath`
+    /// extractor failed before the router could say "no such address".
+    #[tokio::test]
+    async fn an_address_no_route_matches_answers_404_with_the_fixed_sentence() {
+        let expected = serde_json::json!({ "error": "No such address." });
+        for (method, path) in [
+            ("GET", "/api/never-existed"),
+            ("PATCH", "/api/governance/quality/incidents/x"),
+            ("PUT", "/api/governance/quality/incidents/x"),
+        ] {
+            let resp = request(test_router(), method, path).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, expected, "{method} {path}");
+        }
+    }
+
+    /// `SEC-72` decision `DEC-19`: a path registered with
+    /// `axum::routing::any` (the `Iceberg` door) has its own fallback, which
+    /// is not the default one, so [`super::gated`] does not replace it. It
+    /// stays behind the gate: no credentials is 401, never a 405 that would
+    /// have reached it before the gate.
+    #[tokio::test]
+    async fn a_route_registered_for_any_method_stays_behind_the_gate() {
+        let resp = request(test_router(), "POST", "/api/iceberg/v1/config").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an any() route keeps its own gated fallback"
         );
     }
 }

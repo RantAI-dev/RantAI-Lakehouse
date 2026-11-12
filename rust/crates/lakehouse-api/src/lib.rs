@@ -1676,11 +1676,11 @@ mod tests {
     /// The three old agent endpoints ran a model's SQL straight on
     /// `ClickHouse` with no masking or row filter (`SEC-9`, `SEC-11`). They
     /// are gone: the console's natural-language box asks `/api/ai/chat`
-    /// instead. `auth_gate` fails closed on a path no route matched (it has
-    /// no `MatchedPath`, so the answer is a 500, not a 404, for every
-    /// caller, signed in or not), so "no longer mounted" is asserted as
-    /// "answers exactly like a path that never existed". A still-mounted
-    /// route would answer 401 here (`RequiresAuth`, no credentials).
+    /// instead. Since `SEC-72` (`DEC-19`), a path no route matched answers
+    /// 404 `No such address.` for every caller, signed in or not, so "no
+    /// longer mounted" is asserted as "answers exactly like a path that
+    /// never existed". A still-mounted route would answer 401 here
+    /// (`RequiresAuth`, no credentials).
     #[tokio::test]
     async fn removed_agent_endpoints_answer_like_an_unknown_path() {
         let unknown = post(test_router(), "/api/never-existed").await.status();

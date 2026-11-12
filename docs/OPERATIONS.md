@@ -1370,6 +1370,8 @@ Migration `0133_pages_per_role.sql` introduces four new read permissions (`assis
 
 Any custom roles created before the upgrade similarly have `assistant:use,ops:read,alert:read,governance:read` appended unless they held `*:*` or already held one of the four.
 
+Migration `0138_data_engineer_catalog_read.sql` adds `catalog:read` to the role named `Data Engineer` when it does not already hold it (or a wildcard that covers it), so the role that edits catalog entries can open the Catalog and a table's page (`GOV-11`). A renamed or custom role is not changed, and re-running the migration adds nothing.
+
 ### How to take the assistant away from a role
 
 To revoke the AI Copilot assistant from any role, use **Administration → Roles**: edit the
