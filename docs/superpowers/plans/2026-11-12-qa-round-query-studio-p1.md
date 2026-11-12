@@ -922,7 +922,7 @@ Every cargo shell had `export CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target
 - `cargo fmt --check` — passes, run before every Rust commit.
 - `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — passes (last run on the final commit: `Finished dev profile`, 0 warnings).
 - `cargo test -p lakehouse-api --lib -- a_trino_run_result_states_no_storage_tier a_clickhouse_estimate_says_it_is_supported an_estimate_of_a_trino a_run_result_says_the_caller_may_download` — 5 passed, 0 failed, 3489 filtered out (final commit).
-- `cargo test -p lakehouse-api --test query_history` — 27 passed, 0 failed (final commit; includes `a_run_by_a_person_whose_every_role_is_switched_off_carries_can_download_false`).
+- `cargo test -p lakehouse-api --test query_history` — 28 passed, 0 failed (round 1, R7: the binary also runs `common::tls_proxy::tests::the_proxy_terminates_tls_with_the_certificate_it_advertises`, so 26 tests in `tests/query_history.rs`, that one and round 1's new `canDownload` test make 28; includes `a_run_by_a_person_whose_every_role_is_switched_off_carries_can_download_false`).
 - `cargo check -p lakehouse-trino -p lakehouse-api` — passes (final commit, handoff block).
 - `bun install --frozen-lockfile` — 678 packages installed, once before the first TypeScript check.
 - `bun run typecheck` — passes, no output (final commit).
