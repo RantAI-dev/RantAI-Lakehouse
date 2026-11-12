@@ -316,9 +316,6 @@ async fn build_state_and_pool(
     env.insert("DATABASE_URL".to_owned(), db_url);
     env.insert("CH_URL".to_owned(), DEAD_UPSTREAM.to_owned());
     env.insert("DAGSTER_URL".to_owned(), DEAD_UPSTREAM.to_owned());
-    // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
-    // database, so the harness names it the way compose does.
-    env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     if dead_llm_url {
         env.insert("LLM_URL".to_owned(), DEAD_UPSTREAM.to_owned());
     }

@@ -141,6 +141,10 @@ async fn app_with_engine() -> (axum::Router, PgPool, String, MockServer) {
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
     overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    // BLD-1 part 1 / D4: a Bronze input is compiled through the catalog
+    // database (R1-CI2: named here, not in the shared harness, so a test that
+    // asserts the "not configured" answer keeps its premise).
+    overrides.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     // A Platform Admin: `runnable`'s rule allows a service identity OR an
     // unrestricted principal, and a test cannot mint the orchestrator's

@@ -104,6 +104,9 @@ async fn app(run_status: &str) -> (axum::Router, PgPool, String, (MockServer, Mo
     // these tests read (`bronze.orders`) is a table no upload claimed, so
     // only that tenant may read it.
     overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    // BLD-1 part 1 / D4: the pipeline reads Bronze, so the compiler names the
+    // catalog database (R1-CI2: not in the shared harness).
+    overrides.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
     (router, pool, cookie, (ch, dagster))
