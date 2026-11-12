@@ -109,6 +109,51 @@ describe("OpenFormatCard", () => {
     )
   })
 
+  // QA LH-DATA-1-01 (DATA-49), review round 1 R1: the answer to a failed publish
+  // is `lastFailure` on the publication route and a new run in the history, so the
+  // card reads both again the moment the action settles. Before, it kept the status
+  // it had — "Up to date" — until the person loaded the page again.
+  it("reads the publication again after a failed Publish now and says Last publish failed", async () => {
+    const reason = "This mart has 12000000 rows, exceeding GOLD_EXPORT_MAX_ROWS."
+    let publications = 0
+    let posts = 0
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/publication")) {
+        publications += 1
+        return jsonResponse(
+          publications === 1
+            ? publicationBody
+            : { ...publicationBody, lastFailure: { failedAt: "2026-10-02T05:00:00Z", reason } },
+        )
+      }
+      if (init?.method === "POST" && url.includes("/api/gold/export/mart_a")) {
+        posts += 1
+        return jsonResponse({ error: reason }, 422)
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${init?.method} ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Publish now" }))
+    await waitFor(() => expect(posts).toBe(1))
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Last publish failed"),
+    )
+    expect(screen.getByTestId("publication-failure").textContent).toContain(reason)
+  })
+
   // QA LH-DATA-1-01 (DATA-49): a failed newest run outranks the fingerprint
   // comparison, and the card says what failed, when, and where the last good copy is.
   it("shows Last publish failed with the time, the reason and the last successful publish", async () => {

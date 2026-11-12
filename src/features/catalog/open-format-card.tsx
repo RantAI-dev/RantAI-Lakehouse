@@ -33,10 +33,10 @@ function trimmedMart(assetId: string): string {
   return assetId.startsWith("serving.") ? assetId.slice("serving.".length) : assetId
 }
 
-function LastFiveRuns({ mart }: { mart: string }) {
+function LastFiveRuns({ mart, runsKey }: { mart: string; runsKey: number }) {
   const state = useService<GoldExportRun[]>(
     (signal) => goldService.listExportRuns(mart, signal),
-    [mart]
+    [mart, runsKey]
   )
   if (state.status === "loading") return <LoadingSkeleton rows={3} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
@@ -177,6 +177,9 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
     (signal, enabled: boolean) => goldService.setPublication(mart, enabled, signal)
   )
   const exportNow = useServiceAction((signal) => goldService.triggerExport(mart, signal))
+  // Bumped after a publish so `LastFiveRuns` reads again: its `useService` is keyed
+  // on the mart alone, so a new run would otherwise stay unseen.
+  const [runsKey, setRunsKey] = React.useState(0)
 
   async function handleToggle(checked: boolean) {
     const result = await toggle.run(checked)
@@ -321,11 +324,14 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
                   variant="outline"
                   disabled={exportNow.status === "pending"}
                   onClick={() => {
+                    // QA LH-DATA-1-01 (DATA-49), review round 1 R1: a failed publish
+                    // answers `lastFailure` and records a run, so the state and the run
+                    // list are read again whatever the result — the card kept saying
+                    // "Up to date" until the page was loaded again.
                     void exportNow.run().then((result) => {
-                      if (result) {
-                        lastExport.reload()
-                        pub.reload()
-                      }
+                      pub.reload()
+                      setRunsKey((key) => key + 1)
+                      if (result) lastExport.reload()
                     })
                   }}
                 >
@@ -343,7 +349,7 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             {canEdit && (
               <div>
                 <h4 className="mb-1 text-sm font-medium">Last 5 publish runs</h4>
-                <LastFiveRuns mart={mart} />
+                <LastFiveRuns mart={mart} runsKey={runsKey} />
               </div>
             )}
             <Link

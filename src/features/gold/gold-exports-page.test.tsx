@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { GoldExportsPage } from "./gold-exports-page"
 
@@ -189,5 +189,85 @@ describe("GoldExportsPage", () => {
     // Column order: mart, rows, enabled, last export, snapshot,
     // history, consumers, actions.
     expect(cells[6]?.textContent).toBe("No reads in 7 days")
+  })
+
+  // QA LH-DATA-1-01 (DATA-49), review round 1 R1: the page's own "Export now" left
+  // the label and the run count where they were after a failed publish, so the row
+  // read "On · Up to date" and 0 runs until the page was loaded again.
+  it("reads the publication and the run count again after a failed Export now", async () => {
+    const reason = "This mart has 12000000 rows, exceeding GOLD_EXPORT_MAX_ROWS."
+    let publications = 0
+    let histories = 0
+    let posts = 0
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/api/dashboard/fields")) {
+        return jsonResponse({ marts: [{ name: "sales", rows: 42 }] })
+      }
+      if (url.includes("/publication")) {
+        publications += 1
+        return jsonResponse({
+          mart: "sales",
+          enabled: true,
+          updatedAt: null,
+          lastChangedAt: "2026-10-02T03:30:00Z",
+          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: false,
+          lastFailure: publications === 1 ? null : { failedAt: "2026-10-02T05:00:00Z", reason },
+          canEdit: true,
+        })
+      }
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/api/gold/exports")) {
+        histories += 1
+        return jsonResponse({
+          mart: "sales",
+          runs:
+            histories === 1
+              ? []
+              : [
+                  {
+                    id: "run-1",
+                    status: "failed",
+                    rowsExported: null,
+                    formatVersion: null,
+                    snapshotId: null,
+                    error: reason,
+                    triggeredBy: "manual",
+                    startedAt: "2026-10-02T05:00:00Z",
+                    finishedAt: "2026-10-02T05:00:02Z",
+                  },
+                ],
+        })
+      }
+      if (init?.method === "POST" && url.includes("/api/gold/export/sales")) {
+        posts += 1
+        return jsonResponse({ error: reason }, 422)
+      }
+      if (url.includes("/api/gold/export/sales")) {
+        return jsonResponse({
+          namespace: "gold",
+          table: "sales",
+          published: true,
+          formatVersion: 2,
+          rowsInIceberg: 42,
+          snapshotId: { value: 12345, measured: true },
+          exportedAt: "2026-10-02T04:00:00Z",
+        })
+      }
+      throw new Error(`unexpected fetch: ${init?.method} ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<GoldExportsPage />)
+    const row = (await screen.findByText("sales")).closest("tr") as HTMLTableRowElement
+    const cells = () => row.querySelectorAll("td")
+    // Column order: mart, rows, enabled, last export, snapshot, history, consumers, actions.
+    await waitFor(() => expect(cells()[2]?.textContent).toBe("On · Up to date"))
+    expect(cells()[5]?.textContent).toBe("0")
+
+    fireEvent.click(screen.getByRole("button", { name: "Export now" }))
+    await waitFor(() => expect(posts).toBe(1))
+    await waitFor(() => expect(cells()[2]?.textContent).toBe("On · Last publish failed"))
+    expect(cells()[5]?.textContent).toBe("1")
   })
 })
