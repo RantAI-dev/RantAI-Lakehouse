@@ -1298,19 +1298,30 @@ describe("Quality tab: adding a rule needs governance:write", () => {
   ]
 
   it("hides Add rule on the Quality tab without governance:write, and shows it with", async () => {
-    stubApi({ permissions: without })
+    const fetchSpy = stubApi({ permissions: without })
     url.search = "tab=quality"
     renderTabs({ ...BRONZE, qualityChecks: runnableRule })
 
-    // Run checks needs query:read, so it appearing proves the session loaded.
-    await screen.findByRole("button", { name: "Run checks" })
+    // QA LH-DATA-14-04 (GOV-10, DEC-17): "Run checks" takes
+    // `governance:write` now, so it no longer appears for this person and
+    // cannot be the proof that the session loaded. Wait for the stub to
+    // answer /api/auth/me, then one tick for React to apply it —
+    // `sessionSettled`'s idiom in data-quality-page.test.tsx.
+    await waitFor(() =>
+      expect(
+        fetchSpy.mock.calls.some(([input]) => String(input).includes("/api/auth/me"))
+      ).toBe(true)
+    )
+    await new Promise((resolve) => setTimeout(resolve, 50))
     expect(screen.queryByRole("button", { name: "Add rule" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Run checks" })).toBeNull()
     cleanup()
     mock.restore()
 
     stubApi({ permissions: [...without, "governance:write"] })
     renderTabs({ ...BRONZE, qualityChecks: runnableRule })
     expect(await screen.findByRole("button", { name: "Add rule" })).toBeTruthy()
+    expect(await screen.findByRole("button", { name: "Run checks" })).toBeTruthy()
   })
 
 })
