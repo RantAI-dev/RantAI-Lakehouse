@@ -6,6 +6,7 @@ import { Pencil, Play, Plus, Trash2 } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
+import { SelectField } from "@/components/patterns/select-field"
 import { CheckBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -52,8 +53,6 @@ import { qualitySummary } from "./asset-overview"
 type Check = AssetDetail["qualityChecks"][number]
 
 const SEVERITY_TONE = { critical: "destructive", high: "destructive", medium: "warning" } as const
-
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 // DATA-14 (F1/F7): the checks and their threshold text live in
 // `quality-checks.ts`, shared with the Data Quality page.
@@ -139,18 +138,16 @@ function AddRuleDialog({
             </div>
             <div className="grid gap-1.5">
               <Label htmlFor="rule-severity">Severity if it fails</Label>
-              <select
+              <SelectField
                 id="rule-severity"
-                className={selectClassName}
+                className="w-full"
                 value={severity}
-                onChange={(e) => setSeverity(e.target.value as Severity)}
-              >
-                {(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => (
-                  <option key={s} value={s}>
-                    {SEVERITY_LABEL[s]}
-                  </option>
-                ))}
-              </select>
+                options={(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => ({
+                  value: s,
+                  label: SEVERITY_LABEL[s],
+                }))}
+                onValueChange={(next) => setSeverity(next as Severity)}
+              />
             </div>
           </div>
           <p className="text-xs text-muted-foreground">
