@@ -74,6 +74,92 @@ fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
 /// The longest digest, in characters.
 const DIGEST_MAX: usize = 300;
 
+/// The `limit: …` part of [`definition_digest`] (`BI-46`, plan D15), or `None`
+/// when the chart has no limit and nothing to say about one.
+///
+/// What the limit counts is not what a reader assumes: on a bar, hbar, line or
+/// area chart with a breakdown it keeps the N breakdown values with the
+/// largest total, and with a truncation grain ordered by bucket on the
+/// dimension it keeps the latest buckets. A bare `limit: 10` beside a
+/// breakdown was read as "10 of the breakdown" (`BI-6-06` of the QA of
+/// 2026-11-07), and it was the wrong reading until `BI-46` — the rule then was
+/// "the breakdown is not limited".
+///
+/// The rules are `ChartInput::caps_breakdown`,
+/// `ChartInput::keeps_latest_buckets` and `grain::effective_limit`, fed the
+/// order the query builder feeds them — the builder's own methods, so the
+/// sentence and the statement cannot disagree. A pivot has no dimension (its
+/// grain applies to its first date field) and the builder never cuts it to its
+/// latest buckets, so a chart without a dimension makes no claim about what
+/// its limit counts. One gap stays: the builder resolves the grain against the
+/// column type (`grain::resolve`), which a synchronous digest cannot do, so
+/// this reads only the grain the chart names.
+fn limit_digest(def: &ChartInput, breakdown: Option<&str>) -> Option<String> {
+    let counted = match &def.limit {
+        Some(lakehouse_bi::params::Limit::Fixed(n)) => Some((n.to_string(), Some(*n))),
+        Some(lakehouse_bi::params::Limit::Param(p)) => {
+            Some((format!("parameter {}", p.param), None))
+        }
+        None => None,
+    };
+    if let Some((limit, number)) = counted {
+        use lakehouse_bi::grain::{Grain, effective_limit};
+        let order = def.effective_order();
+        let grain = def
+            .grain
+            .as_deref()
+            .and_then(Grain::parse)
+            .filter(|_| !def.dimension.is_empty());
+        if let Some(breakdown) = breakdown.filter(|_| def.caps_breakdown()) {
+            // `BI-46` (plan D12, D15): the limit counts the breakdown's
+            // values, the N with the largest total; every bucket of a time
+            // grain on the dimension is kept. A parameter names the N in the
+            // number's place, so the sentence never invents one.
+            let top = number.map_or_else(
+                || format!("{breakdown} values"),
+                |n| format!("{n} {breakdown} values"),
+            );
+            return Some(match grain {
+                Some(grain) => format!(
+                    "limit: {limit} (the {top} with the largest total; every {} bucket of {} is \
+                     kept)",
+                    grain.as_str(),
+                    def.dimension
+                ),
+                None => format!(
+                    "limit: {limit} {} values, and the {top} with the largest total",
+                    def.dimension
+                ),
+            });
+        }
+        let mut part = match grain {
+            Some(grain) if def.keeps_latest_buckets(grain) => format!(
+                "limit: {limit} (the latest {}{} buckets of {})",
+                number.map(|n| format!("{n} ")).unwrap_or_default(),
+                grain.as_str(),
+                def.dimension
+            ),
+            // A date part in its own order returns its whole range: the
+            // builder swaps the limit for the range, so asking what it
+            // would do with the largest limit tells whether this one is
+            // dropped.
+            Some(grain) if effective_limit(grain, &order, u32::MAX) != u32::MAX => format!(
+                "limit: {limit} (not applied: {} returns its whole range)",
+                grain.as_str()
+            ),
+            _ if def.dimension.is_empty() => format!("limit: {limit}"),
+            _ => format!("limit: {limit} {} values", def.dimension),
+        };
+        if breakdown.is_some() {
+            part.push_str("; the breakdown is not limited");
+        }
+        return Some(part);
+    } else if def.shape.sort.is_some() || breakdown.is_some() {
+        return Some("limit: none (default applies)".to_owned());
+    }
+    None
+}
+
 /// What a chart holds, in one line the model can read back: the fields that
 /// decide what the chart shows, and only those that are set. A model told
 /// "saved" and nothing else describes the arguments it meant to send; this
@@ -85,13 +171,9 @@ const DIGEST_MAX: usize = 300;
 /// `limit` is the exception to "set only": beside a sort or a breakdown it
 /// reads `none (default applies)` when the chart sets none, because a missing
 /// limit there is the difference between a top N and the builder's own cap,
-/// and the cap depends on the kind, so no number is named. A limit that is
-/// set also says what it counts: the latest buckets of a truncation grain
-/// ordered by bucket, otherwise the dimension's values, and that a breakdown
-/// is not limited; a date part in its own order and a chart without a
-/// dimension (a pivot) say less, because there the limit counts nothing the
-/// digest can name. The line is cut to [`DIGEST_MAX`] characters, the last one
-/// `…`.
+/// and the cap depends on the kind, so no number is named. What a limit counts
+/// is [`limit_digest`]'s own sentence. The line is cut to [`DIGEST_MAX`]
+/// characters, the last one `…`.
 ///
 /// It reads the definition the save is built from, not the one it stores: the
 /// store fills every chart's `limit` with the one it built with, which would
@@ -114,57 +196,25 @@ pub(super) fn definition_digest(def: &ChartInput) -> String {
     if let Some(sort) = &def.shape.sort {
         parts.push(format!("sort: {} {}", sort.by, sort.dir));
     }
-    // What the limit counts is not what a reader assumes: the server applies
-    // it to the dimension's values and never to a breakdown, and with a
-    // truncation grain ordered by bucket it keeps the latest buckets. A bare
-    // `limit: 10` beside a breakdown was read as "10 of the breakdown"
-    // (BI-6-06 of the QA of 2026-11-07).
+    // What the limit counts is not what a reader assumes: on a bar, hbar, line
+    // or area chart with a breakdown it keeps the N breakdown values with the
+    // largest total, and with a truncation grain ordered by bucket on the
+    // dimension it keeps the latest buckets. A bare `limit: 10` beside a
+    // breakdown was read as "10 of the breakdown" (BI-6-06 of the QA of
+    // 2026-11-07), and it was the wrong reading until `BI-46`: the rule then
+    // was "the breakdown is not limited".
     //
-    // The rules are `grain::cuts_to_latest` and `grain::effective_limit`, fed
-    // the order the query builder feeds them. The builder also leaves a pivot
-    // out of "the latest buckets" (it has no dimension, and its grain applies
-    // to its first date field), so a chart without a dimension makes no claim
-    // about what its limit counts. One gap stays: the builder resolves the
-    // grain against the column type (`grain::resolve`), which a synchronous
-    // digest cannot do, so this reads only the grain the chart names.
-    let counted = match &def.limit {
-        Some(lakehouse_bi::params::Limit::Fixed(n)) => Some((n.to_string(), Some(*n))),
-        Some(lakehouse_bi::params::Limit::Param(p)) => {
-            Some((format!("parameter {}", p.param), None))
-        }
-        None => None,
-    };
-    if let Some((limit, number)) = counted {
-        use lakehouse_bi::grain::{Grain, cuts_to_latest, effective_limit};
-        let order = def.effective_order();
-        let grain = def
-            .grain
-            .as_deref()
-            .and_then(Grain::parse)
-            .filter(|_| !def.dimension.is_empty());
-        let mut part = match grain {
-            Some(grain) if cuts_to_latest(grain, &order) => format!(
-                "limit: {limit} (the latest {}{} buckets of {})",
-                number.map(|n| format!("{n} ")).unwrap_or_default(),
-                grain.as_str(),
-                def.dimension
-            ),
-            // A date part in its own order returns its whole range: the
-            // builder swaps the limit for the range, so asking what it would
-            // do with the largest limit tells whether this one is dropped.
-            Some(grain) if effective_limit(grain, &order, u32::MAX) != u32::MAX => format!(
-                "limit: {limit} (not applied: {} returns its whole range)",
-                grain.as_str()
-            ),
-            _ if def.dimension.is_empty() => format!("limit: {limit}"),
-            _ => format!("limit: {limit} {} values", def.dimension),
-        };
-        if breakdown.is_some() {
-            part.push_str("; the breakdown is not limited");
-        }
-        parts.push(part);
-    } else if def.shape.sort.is_some() || breakdown.is_some() {
-        parts.push("limit: none (default applies)".to_owned());
+    // The rules are `ChartInput::caps_breakdown`, `ChartInput::keeps_latest_buckets`
+    // and `grain::effective_limit`, fed the order the query builder feeds them
+    // — the builder's own methods, so the sentence and the statement cannot
+    // disagree. The builder also leaves a pivot out of "the latest buckets"
+    // (it has no dimension, and its grain applies to its first date field), so
+    // a chart without a dimension makes no claim about what its limit counts.
+    // One gap stays: the builder resolves the grain against the column type
+    // (`grain::resolve`), which a synchronous digest cannot do, so this reads
+    // only the grain the chart names.
+    if let Some(limit) = limit_digest(def, breakdown) {
+        parts.push(limit);
     }
     if let Some(bin) = &def.shape.bin {
         parts.push(match (bin.mode.as_str(), bin.width, bin.count) {
@@ -175,6 +225,16 @@ pub(super) fn definition_digest(def: &ChartInput) -> String {
     }
     if let Some(grain) = def.grain.as_deref().filter(|g| !g.is_empty()) {
         parts.push(format!("grain: {grain}"));
+    }
+    // `BI-46` (plan D13, D15): the breakdown can be grouped by a period, and
+    // the sentence says so right after the dimension's own grain.
+    if let Some(grain) = def
+        .shape
+        .breakdown_grain
+        .as_deref()
+        .filter(|g| !g.is_empty())
+    {
+        parts.push(format!("breakdown grain: {grain}"));
     }
     let filters = def.shape.filters.as_deref().map_or(0, <[_]>::len);
     if filters > 0 {
@@ -3056,41 +3116,95 @@ mod tests {
                 { "column": "region", "values": ["b"] },
             ],
         })));
+        // `BI-46` (plan D12, D15): with a breakdown the limit counts the
+        // breakdown's values, so the line says so instead of "the breakdown is
+        // not limited" (QA `LH-BI-6-06`).
         assert_eq!(
             digest,
             "dimension: arrival; breakdown: province; measures: visitors, spend; \
-             sort: visitors desc; limit: 10 arrival values; \
-             the breakdown is not limited; grain: month; filters: 2"
+             sort: visitors desc; limit: 10 (the 10 province values with the largest total; \
+             every month bucket of arrival is kept); grain: month; filters: 2"
         );
     }
 
-    /// A limit counts the values of the dimension, never the breakdown: with
-    /// a time grain ordered by bucket it keeps the latest buckets. The digest
-    /// says which, so a model cannot read "limit: 10" as "10 provinces"
-    /// (BI-6-06 of the QA of 2026-11-07).
+    /// A limit with a time grain ordered by bucket keeps the latest buckets
+    /// of the dimension. The digest says which, so a model cannot read
+    /// "limit: 10" as "10 periods" (BI-6-06 of the QA of 2026-11-07).
+    ///
+    /// `BI-46` (plan D12): this rule is the one a chart WITHOUT a breakdown
+    /// follows; with a breakdown the limit counts the breakdown, and
+    /// `a_definition_digest_says_a_limit_beside_a_breakdown_counts_the_breakdown`
+    /// pins that.
     #[test]
     fn a_definition_digest_says_a_limit_beside_a_grain_keeps_the_latest_buckets() {
         let by_bucket = definition_digest(&input(json!({
             "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
-            "breakdown": "provinsi", "measures": ["visitors"],
+            "measures": ["visitors"],
             "grain": "month", "limit": 10,
         })));
         assert!(
-            by_bucket.contains(
-                "limit: 10 (the latest 10 month buckets of tanggal); the breakdown is not limited"
-            ),
+            by_bucket.contains("limit: 10 (the latest 10 month buckets of tanggal)"),
             "{by_bucket}"
         );
         // A sort by the dimension itself is the bucket order too.
         let by_dimension = definition_digest(&input(json!({
             "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
-            "breakdown": "provinsi", "measures": ["visitors"],
+            "measures": ["visitors"],
             "sort": { "by": "tanggal", "dir": "asc" },
             "grain": "month", "limit": 10,
         })));
         assert!(
             by_dimension.contains("limit: 10 (the latest 10 month buckets of tanggal)"),
             "{by_dimension}"
+        );
+    }
+
+    /// QA `LH-BI-6-06` (`BI-46`, plan D12, D15): on a bar, hbar, line or
+    /// area chart with a breakdown the limit keeps the N breakdown values with
+    /// the largest total. With a time grain on the dimension every bucket is
+    /// kept; without one the dimension keeps its own top N as well. A heatmap
+    /// is not capped and keeps the old words, and a breakdown grain is listed.
+    #[test]
+    fn a_definition_digest_says_a_limit_beside_a_breakdown_counts_the_breakdown() {
+        let grained = definition_digest(&input(json!({
+            "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+            "breakdown": "provinsi", "measures": ["visitors"],
+            "grain": "month", "limit": 10,
+        })));
+        assert!(
+            grained.contains(
+                "limit: 10 (the 10 provinsi values with the largest total; every month bucket \
+                 of tanggal is kept)"
+            ),
+            "{grained}"
+        );
+        assert!(!grained.contains("latest"), "{grained}");
+        let plain = definition_digest(&input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+            "breakdown": "kawasan", "measures": ["visitors"], "limit": 10,
+        })));
+        assert!(
+            plain
+                .contains("limit: 10 kab values, and the 10 kawasan values with the largest total"),
+            "{plain}"
+        );
+        // A heatmap's second column is an axis, not a series: still uncapped.
+        let heatmap = definition_digest(&input(json!({
+            "title": "T", "kind": "heatmap", "mart": "mart_x", "dimension": "kab",
+            "breakdown": "kawasan", "measures": ["visitors"], "limit": 10,
+        })));
+        assert!(
+            heatmap.contains("limit: 10 kab values; the breakdown is not limited"),
+            "{heatmap}"
+        );
+        let with_grain = definition_digest(&input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+            "breakdown": "tanggal", "breakdownGrain": "month",
+            "measures": ["visitors"], "limit": 10,
+        })));
+        assert!(
+            with_grain.contains("breakdown grain: month"),
+            "{with_grain}"
         );
     }
 
@@ -3174,9 +3288,12 @@ mod tests {
             "breakdown": "provinsi", "measures": ["visitors"],
             "grain": "month", "limit": { "param": "top_n" },
         })));
+        // `BI-46` (plan D15): with a breakdown the parameter names the N of
+        // the breakdown's values, so no number is invented.
         assert!(
             latest.contains(
-                "limit: parameter top_n (the latest month buckets of tanggal); the breakdown is not limited"
+                "limit: parameter top_n (the provinsi values with the largest total; every month \
+                 bucket of tanggal is kept)"
             ),
             "{latest}"
         );

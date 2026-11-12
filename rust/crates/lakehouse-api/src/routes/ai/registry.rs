@@ -332,6 +332,8 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension" },
         "bin": bin_schema("group the number `dimension` (or a pivot's first number row or column field) in ranges, for example visitors in bins of 500; the result value is each bin's lower edge. bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall, grouped table, pivot; not with a grain"),
         "breakdownBin": bin_schema("the same for a number `breakdown`"),
+        "breakdownGrain": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"],
+            "description": "group a date or timestamp `breakdown` by this period; bar, hbar, line and area only; not with a bin" },
         "grid": { "type": "object", "properties": {
             "size": { "type": ["string", "number"], "description": "auto, or the cell size in degrees: 0.01, 0.1, 1 or 10" } },
             "required": ["size"],
@@ -639,7 +641,7 @@ const KEPT_CHART_DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "/function/parameters/properties/limit",
-        "the number of groups to show; with `sort` it keeps the first N in that order",
+        "the number of groups to show; with `sort` it keeps the first N in that order; on a bar, hbar, line or area chart with a breakdown it keeps that many breakdown values, the ones with the largest total",
     ),
 ];
 
@@ -3335,6 +3337,7 @@ mod tests {
             "joins",
             "bin",
             "breakdownBin",
+            "breakdownGrain",
             "grid",
         ] {
             assert!(
@@ -3365,6 +3368,7 @@ mod tests {
             "joins",
             "bin",
             "breakdownBin",
+            "breakdownGrain",
             "grid",
         ] {
             assert!(

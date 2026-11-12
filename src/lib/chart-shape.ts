@@ -80,6 +80,12 @@ export type ShapeDefFields = {
   /** How the number dimension (or a pivot's first number field) is binned, and the number breakdown (BI-10). */
   bin?: BinDef
   breakdownBin?: BinDef
+  /**
+   * The period a date or timestamp `breakdown` is grouped by (`BI-46`): day,
+   * week, month, quarter or year, for bar, hbar, line and area; never with a
+   * bin. The builder offers it in T13; the assistant's draft carries it now.
+   */
+  breakdownGrain?: string
   /** A point map grouped by grid cell (BI-10). */
   grid?: GridDef
   /** More questions drawn on the same chart (BI-13), and how its own series is drawn. */

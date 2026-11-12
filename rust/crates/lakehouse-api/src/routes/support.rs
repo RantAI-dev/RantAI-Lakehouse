@@ -930,14 +930,18 @@ pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartS
     else {
         return;
     };
-    let order = chart.def.order.as_deref().unwrap_or("none");
     let filtered = FilteredSql {
         sql: String::new(),
         skipped: Vec::new(),
         grain_skipped: None,
         grain: Some(grain),
         grain_column: None,
-        latest_limit: lakehouse_bi::grain::cuts_to_latest(grain, order)
+        // `BI-46` (plan D12): a chart with a breakdown keeps every bucket, so
+        // the surplus-bucket annotation is the builder's own rule — one place,
+        // never a second copy that could disagree with it.
+        latest_limit: chart
+            .def
+            .keeps_latest_buckets(grain)
             .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit_value())),
         table: None,
         bins: Vec::new(),
