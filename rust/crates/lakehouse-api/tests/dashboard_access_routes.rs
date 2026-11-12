@@ -675,6 +675,38 @@ async fn a_rule_only_person_cannot_read_any_mart_through_records_or_values() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// QA `LH-BI-6-01` (`BI-47`, plan D9): a value list that names a mart or a
+/// SQL source reads that relation, so it needs `dashboard:read` — refused for
+/// a person who holds only a rule, even beside a board they were given, which
+/// alone would be answered.
+#[tokio::test]
+async fn a_person_without_dashboard_read_cannot_name_a_mart_for_a_value_list() {
+    let (router, pool, _ch) = app().await;
+    let guest = create_principal_with_permissions(&pool, "query:read").await;
+    replace_item(&pool, "board", "b1", &[view_for(guest)], false, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, guest).await;
+    for uri in [
+        "/api/dashboard/values?column=province&mart=mart_x&board=b1",
+        "/api/dashboard/values?column=province&source=s_1&board=b1",
+    ] {
+        let (status, body) = send(&router, &cookie, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+    // The board the person was given still answers on its own: the new check
+    // comes before the board one and does not replace it.
+    let (status, body) = send(
+        &router,
+        &cookie,
+        "GET",
+        "/api/dashboard/values?column=province&board=b1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// R2: a drill of a chart the caller cannot see is the unknown-chart answer,
 /// and any other preview still needs `dashboard:read`.
 #[tokio::test]
