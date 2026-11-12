@@ -229,8 +229,11 @@ describe("QueryStudioPage saved-query link", () => {
     renderPage()
 
     await screen.findByText("This query is not available to you.")
-    // No tab was opened for it: the tab bar still holds the draft's one.
-    expect(screen.getAllByRole("button", { name: /^Query \d+$/ }).length).toBe(1)
+    // No tab was opened for it: the tab bar still holds the draft's one. The
+    // wait is for the draft, which is read once the session has answered.
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: /^Query \d+$/ }).length).toBe(1)
+    )
   })
 })
 
