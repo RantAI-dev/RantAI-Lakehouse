@@ -213,7 +213,8 @@ Findings on `main`, each handled below or in the backlog:
   `validate_connector_source` (`authored_pipelines.rs:549`) as today.
   `ingest_job` and `file_ingest_job` in `dependsOn` are accepted when the
   first input is Bronze (`validate_per_table_upstream`, `:594`), and watch
-  the first input, as today.
+  the first input, as today. `DEC-22` (whether a re-upload also runs the
+  pipelines further down) is open and is not changed here.
 
 - **D13. Storage.** Migration `0137_pipeline_inputs_and_steps.sql` (the next
   free number when the PR is opened; check every open branch first). Adds
