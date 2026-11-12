@@ -819,3 +819,136 @@ async fn a_failed_publish_stores_the_sentence_the_response_carried_and_no_catalo
         "the stored sentence is the response's own: {body}"
     );
 }
+
+/// The row-cap sentence this repository wrote, which the rewrite must leave
+/// alone.
+const ROW_CAP_SENTENCE: &str = "mart \"raw_history_mart\" has 5000001 rows, exceeding \
+                                GOLD_EXPORT_MAX_ROWS (5000000); refusing to export a partial mart silently";
+
+/// Seeds one history row per raw shape this code used to store, plus a failed
+/// row with this repository's own sentence and one success — each a different
+/// second, so the newest-first order is fixed.
+async fn seed_history_rows_with_raw_text(ch: &ChClient, mart: &str) {
+    for (offset, status, error) in [
+        (
+            -50,
+            "failed",
+            Some(
+                "reading Gold mart from ClickHouse failed: Code: 60. DB::Exception: \
+                 Unknown table (version 26.8.1.1)",
+            ),
+        ),
+        (
+            -40,
+            "failed",
+            Some(
+                "Iceberg export failed: iceberg catalog operation failed: \
+                 status: 401 Unauthorized, headers: {www-authenticate: Bearer}",
+            ),
+        ),
+        (
+            -30,
+            "failed",
+            Some("failed to build export batch: amount: \"12,5\" is not a valid decimal"),
+        ),
+        (-20, "failed", Some(ROW_CAP_SENTENCE)),
+        (-10, "success", None),
+    ] {
+        gold_export_history::record_export_run(
+            ch,
+            &gold_export_history::NewGoldExportRun {
+                mart,
+                status,
+                rows_exported: if status == "success" { Some(5) } else { None },
+                format_version: None,
+                snapshot_id: None,
+                error,
+                triggered_by: "user:test",
+                content_fingerprint: "",
+                started_at_ms: unix_ms(offset),
+                finished_at_ms: unix_ms(offset),
+            },
+        )
+        .await
+        .expect("seed a history row");
+    }
+}
+
+/// QA `LH-DATA-1-01` (`DATA-49`): the rows written before a failed publish was
+/// classified hold the engine's or the catalog's own text. The list route never
+/// shows it, and `rewrite_raw_errors` replaces it at rest — once, then never
+/// again — while a sentence this repository wrote stays as it is.
+#[tokio::test]
+async fn stored_upstream_text_is_rewritten_at_rest_and_never_listed() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "raw_history_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+    seed_history_rows_with_raw_text(&ch, "raw_history_mart").await;
+
+    // The read path maps the raw shapes before a row leaves the API.
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/exports?mart=raw_history_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Vec<&str> = body["runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .map(|run| run["error"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            "",
+            ROW_CAP_SENTENCE,
+            "A value in this table could not be written in open format.",
+            "The catalog request failed.",
+            "The database request failed.",
+        ],
+        "newest first: the success, the row cap, and one fixed sentence per raw shape: {body}"
+    );
+
+    // The rewrite replaces exactly the three raw shapes, at rest.
+    let rewritten = gold_export_history::rewrite_raw_errors(&ch)
+        .await
+        .expect("the rewrite runs");
+    assert_eq!(rewritten, 3, "three rows held a raw shape");
+
+    let stored = ch
+        .rows(
+            "SELECT status, error FROM console.gold_export_run \
+             WHERE mart = 'raw_history_mart' ORDER BY started_at ASC FORMAT JSON",
+            None,
+        )
+        .await
+        .expect("read the stored rows");
+    let stored_errors: Vec<Option<&str>> = stored
+        .iter()
+        .map(|row| row.get("error").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        stored_errors,
+        [
+            Some("The database request failed."),
+            Some("The catalog request failed."),
+            Some("A value in this table could not be written in open format."),
+            Some(ROW_CAP_SENTENCE),
+            None,
+        ],
+        "the row cap is this repository's own sentence and stays"
+    );
+
+    assert_eq!(
+        gold_export_history::rewrite_raw_errors(&ch)
+            .await
+            .expect("the second run reads the count"),
+        0,
+        "nothing matches after the rewrite"
+    );
+}

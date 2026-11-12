@@ -126,7 +126,125 @@ async fn ensure_gold_export_run_table_uncached(ch: &ChClient) -> Result<(), ChEr
         None,
     )
     .await?;
+    // QA LH-DATA-1-01 (DATA-49): rows written before this fix hold the
+    // `Display` of `GoldExportError`, which carries the engine's or the
+    // catalog's own words. The read path already hides them
+    // (`public_error`), so a failed clean-up must not take the whole history
+    // down: it is logged, and the next start tries again.
+    match rewrite_raw_errors(ch).await {
+        Ok(0) => {}
+        Ok(rewritten) => {
+            tracing::info!(
+                rewritten,
+                "gold export history: raw error text was replaced"
+            );
+        }
+        Err(err) => {
+            tracing::error!(%err, "gold export history: raw error text was not replaced; the next start retries");
+        }
+    }
     Ok(())
+}
+
+/// The three prefixes this code wrote in front of upstream text, and the one
+/// fixed text it wrote for an unreachable engine, before `DATA-49` classified a
+/// failed publish before storing it (QA `LH-DATA-1-01`).
+const CLICKHOUSE_RAW_PREFIX: &str = "reading Gold mart from ClickHouse failed: ";
+const ICEBERG_RAW_PREFIX: &str = "Iceberg export failed: ";
+const BATCH_RAW_PREFIX: &str = "failed to build export batch: ";
+/// `ChError::Transport`'s own fixed `Display`, this code's word for an engine
+/// that could not be reached — a different sentence from a failed statement,
+/// which is why it is matched before the prefix.
+const UNREACHABLE_RAW: &str = "reading Gold mart from ClickHouse failed: fetch failed";
+
+/// The sentence the API shows for a stored `error` text.
+///
+/// The old raw shapes map to the same fixed sentences the rewrite writes, so a
+/// row never shows upstream text even before (or without) the rewrite
+/// (`DATA-49`, QA `LH-DATA-1-01`). Every other text was written in this
+/// repository and is returned as it is.
+fn public_error(stored: &str) -> &str {
+    if stored == UNREACHABLE_RAW {
+        return crate::upstream_error::DATABASE.unavailable;
+    }
+    if stored.starts_with(CLICKHOUSE_RAW_PREFIX) {
+        return crate::upstream_error::DATABASE.failed;
+    }
+    if stored.starts_with(ICEBERG_RAW_PREFIX) {
+        return crate::upstream_error::CATALOG.failed;
+    }
+    if stored.starts_with(BATCH_RAW_PREFIX) {
+        return crate::upstream_error::PUBLISH_BATCH.failed;
+    }
+    stored
+}
+
+/// The `WHERE` clause that selects the rows whose stored `error` is one of the
+/// raw shapes above. One owner, so the count and the rewrite cannot drift.
+fn raw_error_predicate() -> String {
+    let prefix = |text: &str| format!("startsWith(error, {})", SqlLiteral::from(text));
+    format!(
+        "{} OR {} OR {}",
+        prefix(CLICKHOUSE_RAW_PREFIX),
+        prefix(ICEBERG_RAW_PREFIX),
+        prefix(BATCH_RAW_PREFIX),
+    )
+}
+
+fn raw_error_count_sql() -> String {
+    format!(
+        "SELECT toString(count()) AS n FROM console.gold_export_run \
+         WHERE status = 'failed' AND ({})",
+        raw_error_predicate()
+    )
+}
+
+fn raw_error_rewrite_sql() -> String {
+    format!(
+        "ALTER TABLE console.gold_export_run UPDATE error = CAST(multiIf(\
+           error = {unreachable}, {unavailable}, \
+           startsWith(error, {clickhouse}), {database}, \
+           startsWith(error, {iceberg}), {catalog}, \
+           {batch}\
+         ) AS Nullable(String)) WHERE status = 'failed' AND ({predicate}) \
+         SETTINGS mutations_sync = 1",
+        unreachable = SqlLiteral::from(UNREACHABLE_RAW),
+        unavailable = SqlLiteral::from(crate::upstream_error::DATABASE.unavailable),
+        clickhouse = SqlLiteral::from(CLICKHOUSE_RAW_PREFIX),
+        database = SqlLiteral::from(crate::upstream_error::DATABASE.failed),
+        iceberg = SqlLiteral::from(ICEBERG_RAW_PREFIX),
+        catalog = SqlLiteral::from(crate::upstream_error::CATALOG.failed),
+        batch = SqlLiteral::from(crate::upstream_error::PUBLISH_BATCH.failed),
+        predicate = raw_error_predicate(),
+    )
+}
+
+/// Replace the raw error text of rows written before `DATA-49` classified a
+/// failed publish before storing it (QA `LH-DATA-1-01`).
+///
+/// Written to be run again: after it has run no row matches the predicate, so
+/// a second call issues no mutation and answers `0`. A row that holds a
+/// sentence this repository wrote (the row cap, an unsupported column, a policy
+/// or gate refusal) is not touched. No reference id is invented for these rows:
+/// they never had one, and a made-up one would be a fabricated fact.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the count or the rewrite fails. The caller decides
+/// whether that is fatal; the start-up path logs it and carries on.
+pub async fn rewrite_raw_errors(ch: &ChClient) -> Result<u64, ChError> {
+    let rows = ch.rows(&raw_error_count_sql(), None).await?;
+    let matching = rows
+        .first()
+        .and_then(|row| row.get("n"))
+        .and_then(Value::as_str)
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if matching == 0 {
+        return Ok(0);
+    }
+    ch.exec(&raw_error_rewrite_sql(), None).await?;
+    Ok(matching)
 }
 
 /// One export attempt to record — always both an id (the caller mints a
@@ -293,6 +411,7 @@ fn row_to_export_run(row: &serde_json::Map<String, Value>) -> GoldExportRunRow {
             .get("error")
             .filter(|v| !v.is_null())
             .and_then(Value::as_str)
+            .map(public_error)
             .map(str::to_owned),
         triggered_by: str_field("triggered_by"),
         content_fingerprint: str_field("content_fingerprint"),
@@ -774,5 +893,86 @@ mod tests {
         }))
         .unwrap();
         assert!(parse_content_fingerprint_row(&row).is_none());
+    }
+    // ── Raw text already stored (DATA-49, QA LH-DATA-1-01) ───────────────
+
+    /// Every raw shape this code used to store maps to the fixed sentence of
+    /// its context, and a sentence this repository wrote comes back unchanged.
+    #[test]
+    fn public_error_replaces_each_raw_shape_and_keeps_this_repositorys_own_sentences() {
+        assert_eq!(
+            public_error("reading Gold mart from ClickHouse failed: fetch failed"),
+            "The database is unavailable."
+        );
+        assert_eq!(
+            public_error(
+                "reading Gold mart from ClickHouse failed: Code: 60. DB::Exception: Unknown table"
+            ),
+            "The database request failed."
+        );
+        assert_eq!(
+            public_error("Iceberg export failed: catalog returned 401 Unauthorized"),
+            "The catalog request failed."
+        );
+        assert_eq!(
+            public_error("failed to build export batch: amount: \"12,5\""),
+            "A value in this table could not be written in open format."
+        );
+
+        // This repository's own sentences stay as they are.
+        let row_cap = "mart \"orders\" has 5000001 rows, exceeding GOLD_EXPORT_MAX_ROWS (5000000)";
+        assert_eq!(public_error(row_cap), row_cap);
+        let classified = "The catalog request failed. Reference: abc";
+        assert_eq!(public_error(classified), classified);
+    }
+
+    /// A row read back through the list route never carries the catalog's own
+    /// answer, headers and all.
+    #[test]
+    fn row_to_export_run_never_returns_a_stored_upstream_text() {
+        let row: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "id": "r1", "status": "failed", "rows_exported": null,
+            "format_version": null, "snapshot_id": null,
+            "error": "Iceberg export failed: iceberg catalog operation failed: \
+                      status: 401 Unauthorized, headers: {www-authenticate: Bearer}",
+            "triggered_by": "t", "started_at": "s", "finished_at": "f"
+        }))
+        .unwrap();
+        let run = row_to_export_run(&row);
+        assert_eq!(run.error.as_deref(), Some("The catalog request failed."));
+    }
+
+    /// The rewrite touches only failed rows in the three raw shapes, waits for
+    /// the mutation, and writes one fixed sentence per shape.
+    #[test]
+    fn the_rewrite_statement_touches_only_failed_rows_in_the_three_raw_shapes() {
+        let sql = raw_error_rewrite_sql();
+        assert!(
+            sql.contains("ALTER TABLE console.gold_export_run UPDATE error"),
+            "{sql}"
+        );
+        assert!(sql.contains("status = 'failed'"), "{sql}");
+        assert!(
+            sql.contains("startsWith(error, 'reading Gold mart from ClickHouse failed: ')"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("startsWith(error, 'Iceberg export failed: ')"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("startsWith(error, 'failed to build export batch: ')"),
+            "{sql}"
+        );
+        assert!(sql.contains("mutations_sync = 1"), "{sql}");
+        assert!(sql.contains("'The database request failed.'"), "{sql}");
+        assert!(sql.contains("'The catalog request failed.'"), "{sql}");
+        assert!(
+            sql.contains("'A value in this table could not be written in open format.'"),
+            "{sql}"
+        );
+        // The count and the rewrite share one predicate, so they cannot drift.
+        assert!(raw_error_count_sql().contains(&raw_error_predicate()));
+        assert!(sql.contains(&raw_error_predicate()));
     }
 }
