@@ -1504,9 +1504,14 @@ describe("UploadFilePage, after Load", () => {
     })
     fireEvent.click(screen.getByRole("button", { name: "Load" }))
     await screen.findByText("Load finished")
-    expect(screen.getByText(/^Quality checks set to run on every load/).textContent).toContain(
+    const paragraph = screen.getByText(/^Quality checks set to run on every load/)
+    expect(paragraph.textContent).toContain(
       "Their results are on the table's Quality tab."
     )
+    // Review round 1 R4: the sentence names no time. Nothing in this
+    // repository bounds when the orchestrator reports a load, so a promise
+    // here would be one the code does not keep.
+    expect(paragraph.textContent).not.toMatch(/minute|second/)
   })
 
   it("offers no action while loading, and Upload another file after a failure goes back to an empty first step", async () => {

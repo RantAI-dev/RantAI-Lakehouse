@@ -160,12 +160,14 @@ export function UploadRunView({
               ) : null}
             </div>
             {upload.badValues !== undefined ? <BadValuesReport upload={upload} /> : null}
-            {/* QA LH-DATA-14-05 (DATA-54): the checks start when the orchestrator
-                reports the finished run, on its next tick, not when the load
-                ends. */}
+            {/* QA LH-DATA-14-05 (DATA-54), review round 1 R4: the sentence names
+                no time. The checks start after the orchestrator reports the
+                finished run — `pipeline_events.py`'s sensor has no interval of
+                its own and posts nothing while `PIPELINE_RUN_TOKEN` is unset —
+                so any bound here would be one the code does not keep. */}
             <p className="text-xs text-muted-foreground">
-              {"Quality checks set to run on every load start within about a minute. Their results "}
-              {"are on the table's Quality tab."}
+              {"Quality checks set to run on every load start after the orchestrator reports "}
+              {"this load, not when the load ends. Their results are on the table's Quality tab."}
             </p>
             <div className="flex flex-wrap gap-2">
               {upload.assetId !== undefined ? (

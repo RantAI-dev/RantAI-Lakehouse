@@ -204,12 +204,15 @@ What QA saw, and what the planner found by reading the code:
   "The check has passed since this incident opened. It stays open until someone resolves
   it."
 - **D20. The upload's result says when checks run; the timing is not changed**
-  (`LH-DATA-14-05`). Cause of the wait: the orchestrator's sensor for finished runs has no
-  interval of its own (`dagster/dispar_orchestrate/pipeline_events.py:254-259`), so it
-  reports on the orchestrator's default tick, and the API runs the on-load rules after that
-  report (`routes/quality_load.rs:1-24`). The page says, for every finished load: "Quality
-  checks set to run on every load start within about a minute. Their results are on the
-  table's Quality tab." It does not read the table's schedule, so it says "set to".
+  (`LH-DATA-14-05`; corrected on review round 1, R4). Cause of the wait: the orchestrator's
+  sensor for finished runs has no interval of its own
+  (`dagster/dispar_orchestrate/pipeline_events.py:254-259`), it posts nothing while
+  `PIPELINE_RUN_TOKEN` is unset (`:211-236`), and the API runs the on-load rules only after
+  that report (`routes/quality_load.rs:1-24`). Nothing in this repository bounds the wait,
+  so the page promises no time. It says, for every finished load: "Quality checks set to
+  run on every load start after the orchestrator reports this load, not when the load ends.
+  Their results are on the table's Quality tab." It does not read the table's schedule, so
+  it says "set to".
 - **D21. No row count for a table that is not there** (`LH-DATA-15-07` F2). The header's
   count is the registry's (`a.rows`); the page already knows the Iceberg table is gone when
   the table read answers 404 (`asset-storage.tsx:246`). Then the header shows "—". Any other
@@ -1016,13 +1019,17 @@ anchors by their text after it merges.
   buttons, add
   ```tsx
   {/* QA LH-DATA-14-05 (DATA-54): the checks start when the orchestrator reports the
-      finished run, on its next tick, not when the load ends. */}
+      finished run, not when the load ends. No time is named: nothing here bounds
+      that wait (review round 1 R4). */}
   <p className="text-xs text-muted-foreground">
-    Quality checks set to run on every load start within about a minute. Their results
-    are on the table's Quality tab.
+    Quality checks set to run on every load start after the orchestrator reports this
+    load, not when the load ends. Their results are on the table's Quality tab.
   </p>
   ```
-  No Python and no Rust change; the timing stays.
+  No Python and no Rust change; the timing stays. The sentence names no time: the sensor
+  has no interval of its own, posts nothing while `PIPELINE_RUN_TOKEN` is unset, and a
+  lost report is not asked for again, so "within about a minute" was a bound the code does
+  not keep (principle 2, principle 5).
 - Check, in `upload-file-page.test.tsx`, beside the test at `:1185`:
   `says when on-load checks run once the load has finished`: after "Load finished" the
   text starting "Quality checks set to run on every load" is on screen; and in a test that
@@ -1234,8 +1241,8 @@ the assertion.
 - That the chart builder's `Select` does not keep its list rows in the document while it is
   closed. T16's test does not depend on it (it looks for `data-testid`).
 - That the orchestrator's default sensor tick is 30 seconds. Nothing in the plan depends on
-  the number; the page says "within about a minute" and the documents quote QA's 36
-  seconds.
+  the number (review round 1 R4 dropped the page's "within about a minute"); the feature
+  page quotes QA's 36 seconds as what was seen.
 - That the let-chain in T4 compiles as written (the form is used at
   `routes/catalog.rs:3481-3483`).
 
