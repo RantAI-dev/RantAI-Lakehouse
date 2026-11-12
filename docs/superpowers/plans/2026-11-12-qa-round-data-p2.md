@@ -1220,3 +1220,200 @@ mismatches:
   blank-name rule) rather than shown as an empty name.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `59f8a39e`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#489) runs the suites and the upload gate. 2 BLOCKERs (R1, R2) and 7 SHOULD-FIX. The
+long-name fix, the required `author` field and the quoted decimals showed no defect, and no
+existing test was weakened.
+
+**Planner's rulings** (where a ruling and a finding's "Fix" differ, the ruling holds).
+
+- **R1 (adds to D14).** As the finding says: a name is resolved only for a person who shares a
+  tenant with the caller; every other id reads "Unknown user". Say the rule in D14 and on the
+  feature page.
+- **R2: option (a), carry the author.** A PostgreSQL connector's load, a Kafka batch and the
+  schema commit of a history load record the run's label, so what the documents say becomes
+  true. Keep the label's form the other connector paths use.
+- **R3 (adds to D14).** A service identity is shown by its own name (one more read for the ids
+  `app_user` did not answer, in the caller's tenant like R1), never merged with deleted people.
+- **R5 (changes D17).** The Check step shows the sentence under any Timestamp column whose
+  sampled values hold a fraction longer than six digits, whatever the file kind; the bullet in
+  `upload-column-types.md` says exactly when it appears.
+- **R4, R6, R7, R8, R9.** As the findings say.
+
+### R1. BLOCKER: The Usage panel can name a person of another tenant, because the name lookup has no tenant filter.
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog_governance.rs:677-710` (`people_names`),
+  `rust/crates/lakehouse-store/src/dashboard_access.rs:257-269` (`user_names`:
+  `SELECT id, name … FROM app_user WHERE id = ANY($1)`),
+  `rust/crates/lakehouse-store/src/queries.rs:472-502` (`history_mentioning`: `query_history` has no
+  tenant column and the read has no tenant condition; "by anyone").
+- What happens: person P belongs to tenant B only and types a statement that names tenant A's table.
+  The tenant gate refuses it, and the refusal is recorded with `owner_id = P`
+  (`routes/query.rs:1857-1880`, status `blocked`). `summarize_usage` counts every status
+  (`catalog_governance.rs:515-531`), so P's row is in `reads`. `people_names` then asks `user_names`
+  for P's id and gets P's display name, and a member of tenant A who opens the asset sees
+  "<P's display name> · 1 query" under Frequent users. Before this branch that row showed P's id
+  (what `query_history.user_name` holds). So a display name now crosses tenants. Other name reads in
+  the store are tenant scoped (`report_subscriptions.rs:726-731`, `saved_query_access.rs:1460-1468`);
+  this one is not. The plan (D14) does not decide it.
+- Fix: resolve names only for ids that share a tenant with the caller. Add a store read next to
+  `user_names` (for example `user_names_in_tenants(pool, ids, tenant_ids)`, the same select with
+  `AND EXISTS (SELECT 1 FROM app_user_tenant ut WHERE ut.user_id = app_user.id AND ut.tenant_id = ANY($2))`),
+  call it from `people_names` with `caller.tenant_ids`, and leave every other id out of the map so it
+  is "Unknown user". Keep the caller's own insertion. Say the rule in D14 and on the feature page.
+- Check: a database test (`lakehouse-store/tests/dashboard_access.rs` for the read, and one for
+  `people_names`): two users, one in the caller's tenant and one in another tenant only; the map holds
+  the first and not the second, and `frequentUsers` from it shows "Unknown user" for the second and
+  never the second's name. Temporary wrong change that must make it fail: drop the `EXISTS` condition
+  (or call `user_names` again).
+
+### R2. BLOCKER: The documents and five comments say a connector's replace or append names its run; a PostgreSQL connector and a Kafka batch still record no author.
+
+- Where: `docs/core/features/asset-page-depth.md:75` and `:86`, `CHANGELOG.md:53`,
+  `src/services/contracts/lakehouse.ts:68-71`, `src/features/catalog/asset-activity.tsx:215-218`,
+  `rust/crates/lakehouse-iceberg/src/rest.rs:158-163`; the code that contradicts them:
+  `dagster/dispar_orchestrate/ingest_factory.py:774-782` (PostgreSQL goes through
+  `dlt_pipeline.run_bronze_ingest`), `dagster/dispar_orchestrate/dlt_pipeline.py:346`
+  (`SinkConfig.from_bronze_ingest_config(cfg)`, no `author`), `ingest_factory.py:1064-1065`
+  (Kafka batch, no `author`), `dagster/dispar_orchestrate/adapters/history.py:504-518`
+  (`ensure_columns` runs `pipeline.run` outside `snapshot_properties_for`).
+- What happens: T7 records the author only when `SinkConfig.author` is set. `_run_author` is passed
+  at three sites (`ingest_factory.py:738`, `:815`, `:893`): Clear, Oracle and the generic adapters.
+  A PostgreSQL connector's load (replace, append, incremental, and its history mode) and every Kafka
+  micro-batch build their `SinkConfig` with the default `author=""`, so `snapshot_properties("")` is
+  `{}` and the version still says "unknown" after 2026-11-12. The zero-row commit a history load makes
+  to create the table or add a column (`ensure_columns`) carries none either (the existing test only
+  asserts the author is `in` the list). The feature page's spec row ("a merge load, and versions
+  written before 2026-11-12, say unknown"), its new bullet, the changelog entry and open question 5 to
+  the owner all state a behaviour the most common connector does not have (principle 2, rule 1). D15's
+  "so a connector's replace and append versions now name their run" is not met for these paths.
+- Fix: one of the two, the planner decides. (a) Carry the author: `run_bronze_ingest` gains
+  `author: str = ""` and passes it to `SinkConfig.from_bronze_ingest_config(cfg, author=author)`;
+  `ingest_factory.py:778` passes `_run_author(connector_id, run_id)`; the Kafka batch passes its
+  connector's label; `history.load_history` wraps its `ensure_columns` call in
+  `iceberg_stream.snapshot_properties_for(table, snapshot_properties(author))`. (b) Or correct the six
+  texts to name what records an author (uploads; Oracle and the generic adapters) and what does not
+  (PostgreSQL connectors, Kafka batches, merge loads, the schema commit of a history load).
+- Check: for (a), a unit test that `ingest_factory`'s PostgreSQL branch hands `run_bronze_ingest` the
+  run's label and that `run_bronze_ingest` builds a `SinkConfig` whose `author` is that label (capture
+  the `load_via_sink` call, no network), and in `test_snapshot_author.py` assert every snapshot of a
+  first history load has the author (`set(_authors(lab, "h")) == {"connector conn-x, run 9z8y"}`).
+  Temporary wrong change: drop the `author=` argument at `dlt_pipeline.py:346`.
+
+### R3. SHOULD-FIX: A live service identity is shown as "Unknown user" and merged into the row of deleted people.
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog_governance.rs:370-378` (`person`), `:688-701`
+  (`people_names` reads `app_user` only); `rust/crates/lakehouse-auth/src/service_token.rs:216-220`
+  (`PrincipalId::Service(service_identity_id)`); `routes/query.rs:1995` and `:2073`
+  (`owner_id: Some(p.id.uuid())` for any principal).
+- What happens: a service token that runs queries is recorded with its `service_identity.id` as
+  `owner_id`. That id is not in `app_user`, so `person` answers "Unknown user" and the token's queries
+  are added to the same row as people who were deleted. The page then says an existing, named caller
+  no longer exists, and one "Unknown user" row can be mostly a service's queries. Before, the row
+  showed the id. D14 covers "an id with no user (deleted)" only.
+- Fix: in `people_names`, also read the names of the ids found in `service_identity`
+  (`SELECT id, name FROM service_identity WHERE id = ANY($1)`, one more read for the ids `app_user`
+  did not answer) and put them in the map; or decide a second label for them. Say which in D14.
+- Check: unit test on `summarize_usage` with a map that holds a service's id and name: its row shows
+  the name and is not merged with a deleted person's; plus the database test of R4 with a
+  `service_identity` row. Temporary wrong change: remove the second read.
+
+### R4. SHOULD-FIX: No test reaches `people_names` or its wiring in `usage`; every new test hands `summarize_usage` a hand-made map.
+
+- Where: `rust/crates/lakehouse-api/src/routes/catalog_governance.rs:677-710`, `:729`; tests
+  `:1663-1669` (`named`) and the tests that use it. `grep -rn "frequentUsers\|people_names" tests src`
+  finds no other test.
+- What happens: the read, the blank-name filter, the "lookup failed, everyone but the caller is
+  Unknown user" branch and the insertion of the caller are specified in T6 item 6 and D14 and have no
+  test. If `usage` passed `&HashMap::new()`, or the filter kept blank names, every test of this branch
+  would still pass while the page showed "Unknown user" for everyone (or an empty name). The QA case
+  (names instead of ids on the page) is therefore not proven by a test.
+- Fix: add a database test for `people_names` (the crate's tests already get a Postgres through
+  `lakehouse_test_support`): three `app_user` rows, one with a blank name, mentions that name all
+  three plus an id with no row.
+- Check: the map holds the two named users and the caller, not the blank one and not the missing id;
+  with the pool closed (or a dropped table) the map holds the caller only. Temporary wrong change:
+  remove the `.filter(|(_, name, _)| !name.trim().is_empty())` line, and separately pass an empty map
+  at `:729`.
+
+### R5. SHOULD-FIX: A Timestamp a person chose (or a table's own Timestamp column on "add to its rows") now loses digits 7 to 9 of a CSV, JSON, Excel or Avro value with nothing on the Check step, where the value was listed as not fitting before.
+
+- Where: `rust/crates/lakehouse-api/src/upload_types.rs:484` (`fits` takes `MAX_FRACTION_DIGITS`),
+  `:750-775` (`check_rows` lists what does not fit, for every file kind);
+  `dagster/dispar_orchestrate/upload_types.py:152-155`, `:212-216` (the cut);
+  `src/features/connectors/upload-columns.tsx:108-112` (the note needs a Parquet file label);
+  `docs/core/features/upload-column-types.md:75` ("… and the Check step says so").
+- What happens: a CSV column with `2026-10-16T13:30:05.1234567` is guessed Text. If the person sets it
+  to Timestamp, or adds the file to a table whose column is a timestamp (types fixed), the Check step
+  used to list the value under "values that do not fit" and the person chose stop or empty. Now
+  `fits` is true, nothing is listed, and the job stores `…05.123456`. The note is shown only when
+  `fileTypes[index]` starts with `timestamp (ns`, which only a Parquet preview has. This is what D17
+  says, so the developer followed the plan; but it is a silent loss the feature page denies, and rule
+  14 prefers the earlier honest refusal. The plan lists only Avro as out of scope.
+- Fix (planner decides): show the nanosecond sentence under any Timestamp column whose sampled values
+  hold a fraction longer than six digits (the preview has the rows), or keep six digits as the fit for
+  every file but Parquet nanosecond columns; and make the bullet at `upload-column-types.md:75` say
+  exactly when the note appears.
+- Check: console test: a CSV preview whose column is set to Timestamp and whose row holds a 7-digit
+  fraction shows the sentence (or, with the other fix, the API's check lists the value). Temporary
+  wrong change: restrict the condition to `keepsNanoseconds(...)` again.
+
+### R6. SHOULD-FIX: `quote_decimals` was wired into two client functions the plan did not name, and two new comments say things the code does not do.
+
+- Where: `rust/crates/lakehouse-clickhouse/src/lib.rs:161-166` (the field's comment: "Read by
+  `ChClient::query_with_options` only"), `:591-593` (`query_stream_with_options`), `:677-679`
+  (`byte_stream`); `dagster/dispar_orchestrate/adapters/iceberg_snapshot.py:123-127`.
+- What happens: T10 item 1 says the option is read by `query_with_options` only. The branch also sends
+  `output_format_json_quote_decimals=1` from the row stream and the byte stream when the flag is set.
+  No caller sets it there today, so nothing changes now, but the comment is false (rule 1), the two
+  sites have no test, and a later caller that copies the query route's options into a stream would
+  change what a tile or a download receives, which D20 excludes. Second comment: the docstring of
+  `write_one_snapshot` lists "the history mode, emptying a table" among the paths "that write through
+  here"; its only callers are `sink.py:977` and `iceberg_stream.py:214`. History writes through
+  `history.write_versions` and emptying through `iceberg_table.delete`.
+- Fix: remove the two extra `if options.quote_decimals` blocks (or, if they are wanted, say so in the
+  plan, correct the field comment and test them); reword the `write_one_snapshot` docstring to name
+  its two callers and say the other paths carry the author through their own calls.
+- Check: extend `query_with_options_asks_for_quoted_decimals_only_when_told` with a
+  `query_stream_with_options` and a `byte_stream` call made with `quote_decimals: true` and assert the
+  request's query string does not hold the setting. Temporary wrong change: put one block back.
+
+### R7. SHOULD-FIX: The "newest 100 files" sentences hold a typed 100, not the constant, so the sentence and the condition can drift.
+
+- Where: `src/features/connectors/uploads-panel.tsx:391-396`; the plan, T12 item 2 ("the number from
+  the constant").
+- What happens: the condition reads `UPLOAD_LIST_LIMIT`, the two sentences say "100" as text. With
+  the constant at 200 the page would say "Showing the newest 100 files" under 200 rows, and no test
+  would fail (the test compares the full sentence for 100 rows only).
+- Fix: build both sentences with `${UPLOAD_LIST_LIMIT}`.
+- Check: in `uploads-panel.test.tsx`, build the expected sentences from the imported
+  `UPLOAD_LIST_LIMIT` and the row counts from it (`many(UPLOAD_LIST_LIMIT)`, `many(UPLOAD_LIST_LIMIT - 1)`).
+  Temporary wrong change: set the constant to 99 with "100" still typed in the component; the test
+  must fail on the sentence.
+
+### R8. SHOULD-FIX: T1's first test does not make the schema at the limit, so "a table name of 50 is accepted" is not pinned.
+
+- Where: `dagster/dispar_orchestrate/test_sink_long_table_name.py:37-43`; the plan, T1 test 1
+  ("`dlt.Schema("bronze_ingest_" + "a" * 50)` is made").
+- What happens: the test asserts `make_schema_with_default_name(prefix + "a" * 50)` returns its input
+  (a string function, `dlt/extract/utils.py:329-335`) and that 51, 52 and 128 raise. It never calls
+  `Schema(...)` with the 64-character name, so if a later `dlt` lowered the limit the test would still
+  pass while 50-character names started to fail. No other test loads a name of 50 or 51.
+- Fix: add `Schema(PIPELINE_PREFIX + "a" * 50)` (no exception) before the loop, as T1 says; keep the
+  existing assertion.
+- Check: the test itself. Temporary wrong change: make the accepted call use `"a" * 51`; it must
+  raise `InvalidSchemaName` and fail the test.
+
+### R9. SHOULD-FIX: Two decision cells of `upload-column-types.md` run two sentences together.
+
+- Where: `docs/core/features/upload-column-types.md:58` ("… a mix stays text A fraction of a second
+  …") and `:63` ("… to Decimal or Text A Parquet `uint64` …").
+- What happens: the appended sentence follows a cell that ended without a full stop (the plan's text
+  was appended literally), so the signed table reads as one broken sentence in both rows.
+- Fix: put a full stop before the appended sentence in both cells. The "Signed" cells are correct
+  (they say *proposed, not yet signed*).
+- Check: read the two rows; no test.
+
