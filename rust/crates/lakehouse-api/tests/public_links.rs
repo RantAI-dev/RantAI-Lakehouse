@@ -561,6 +561,25 @@ async fn five_wrong_passwords_lock_the_link_and_a_locked_link_says_so() {
     .await
     .unwrap();
     assert_eq!(locks, 1);
+    // QA LH-SEC-2-06 (SEC-70): a visitor locking a public link is nobody the
+    // product signed in, so the row has no principal and names the link.
+    let (actor_label, principal_kind, principal_id): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT actor_label, principal_kind, principal_id FROM audit_event \
+         WHERE action = 'dashboard.public_link_locked'",
+    )
+    .fetch_one(&f.app.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        actor_label.as_deref(),
+        Some(lakehouse_store::audit::ACTOR_PUBLIC_LINK)
+    );
+    assert_eq!(principal_kind, None);
+    assert_eq!(principal_id, None);
 }
 
 #[tokio::test]

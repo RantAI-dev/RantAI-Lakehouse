@@ -250,6 +250,10 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
                     outcome: "refused".to_owned(),
                     resource_kind: Some("login_key".to_owned()),
                     resource_id: Some(key[..12].to_owned()),
+                    // QA LH-SEC-2-06 (SEC-70, decision D3): nobody signed in
+                    // yet, so the event has no principal and names the form
+                    // that produced it.
+                    actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
                     ..Default::default()
                 };
                 if let Err(err) = store_audit::insert(pool, event).await {

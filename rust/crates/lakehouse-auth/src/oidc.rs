@@ -1338,6 +1338,10 @@ impl OidcAuthenticator {
                 "subject": subject,
             })),
             outcome: "refused".to_owned(),
+            // QA LH-SEC-2-06 (SEC-70, decision D3): the refused link is
+            // nobody the product signed in, so the row has no principal and
+            // names what refused it.
+            actor_label: Some(lakehouse_store::audit::ACTOR_SINGLE_SIGN_ON.to_owned()),
             ..Default::default()
         };
         if let Err(err) = lakehouse_store::audit::insert(&self.pool, event).await {
