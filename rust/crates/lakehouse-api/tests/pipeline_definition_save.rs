@@ -584,3 +584,141 @@ async fn a_pipeline_in_another_tenant_answers_the_same_404_as_an_unknown_one() {
         "an out-of-tenant id must be indistinguishable from one that does not exist"
     );
 }
+
+/// R1-B3 / D3a: until S3 ships, the console sends today's form on every
+/// save. Over a pipeline with its own inputs and steps that form cannot hold
+/// them, so it is refused (409) and nothing changes — rather than storing one
+/// input and no step, which the next run would use to overwrite the output
+/// with a copy of the first input.
+#[tokio::test]
+async fn a_today_s_form_edit_of_a_two_input_pipeline_is_409_and_changes_nothing() {
+    let (router, pool, _ch) = app().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let (status, created) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &admin,
+            Some(GROUP_TENANT),
+            Some(new_body("save-d3a")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, refused) = send(
+        &router,
+        request(
+            "PUT",
+            &format!("/api/pipelines/{id}"),
+            &admin,
+            Some(GROUP_TENANT),
+            Some(legacy_body("save-d3a")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(
+        refused["error"].as_str(),
+        Some(
+            "This pipeline has inputs and steps this form cannot hold; edit it in the pipeline \
+             editor, which sends inputs and steps."
+        ),
+        "{refused}"
+    );
+
+    let (_, detail) = send(
+        &router,
+        request(
+            "GET",
+            &format!("/api/pipelines/{id}"),
+            &admin,
+            Some(GROUP_TENANT),
+            None,
+        ),
+    )
+    .await;
+    let definition = &detail["definition"];
+    assert_eq!(definition["inputs"].as_array().unwrap().len(), 2);
+    assert_eq!(definition["steps"][0]["kind"], "sql");
+}
+
+/// R1-B3 / D3a: on a pipeline today's form CAN hold, a save in that form
+/// keeps the input's and the step's own names and changes only the zone, the
+/// table and the transforms — so it neither renames the pipeline's definition
+/// nor moves who it reads as.
+#[tokio::test]
+async fn a_today_s_form_edit_keeps_the_stored_names_and_the_author() {
+    let (router, pool, _ch) = app().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let create = json!({
+        "name": "save-d3a-names",
+        "kind": "batch",
+        "inputs": [{"name": "orders_named", "zone": "silver", "table": "orders"}],
+        "steps": [{"name": "my_step", "kind": "transform", "reads": "orders_named",
+                   "transforms": ["select(id)"]}],
+        "targetZone": "silver",
+        "targetTable": "save_d3a_names_out",
+        "schedule": "manual",
+    });
+    let (status, created) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &admin,
+            Some(GROUP_TENANT),
+            Some(create),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    let author = created["runAs"].as_str().unwrap_or_default().to_owned();
+
+    // The same transforms, sent in today's form, by someone else.
+    let engineer = session_cookie_for_seeded_user(&pool, "yoga@meridian.example").await;
+    let body = json!({
+        "kind": "batch",
+        "sourceZone": "silver",
+        "sourceTable": "orders",
+        "transforms": ["select(id)"],
+        "targetZone": "silver",
+        "targetTable": "save_d3a_names_out",
+        "schedule": "manual",
+    });
+    let (status, edited) = send(
+        &router,
+        request(
+            "PUT",
+            &format!("/api/pipelines/{id}"),
+            &engineer,
+            Some(GROUP_TENANT),
+            Some(body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+
+    let (_, detail) = send(
+        &router,
+        request(
+            "GET",
+            &format!("/api/pipelines/{id}"),
+            &engineer,
+            Some(GROUP_TENANT),
+            None,
+        ),
+    )
+    .await;
+    let definition = &detail["definition"];
+    assert_eq!(definition["inputs"][0]["name"], "orders_named", "{detail}");
+    assert_eq!(definition["steps"][0]["name"], "my_step", "{detail}");
+    assert_eq!(
+        edited["runAs"].as_str().unwrap_or_default(),
+        author,
+        "the definition did not change, so the author must not move"
+    );
+}

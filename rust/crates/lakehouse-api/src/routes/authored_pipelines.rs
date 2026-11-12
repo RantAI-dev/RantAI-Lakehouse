@@ -1041,6 +1041,13 @@ const BOTH_FORMS: &str =
 /// The refusal when a body sends neither.
 const NO_SOURCE: &str = "sourceZone and sourceTable are required, or inputs and steps";
 
+/// BLD-1 part 1 review R1-B3 / D3a: today's form cannot describe a pipeline
+/// with its own inputs and steps, so an edit that sends it is refused rather
+/// than flattening that pipeline to one input and no step — which the next run
+/// would use to overwrite the output with a copy of the first input.
+pub const LEGACY_FORM_CANNOT_EDIT: &str = "This pipeline has inputs and steps this form cannot hold; edit it in the pipeline editor, \
+     which sends inputs and steps.";
+
 /// BLD-1 part 1 / D3: the ONE function that turns either body form into
 /// D1's shape.
 ///
@@ -1088,6 +1095,98 @@ pub(crate) fn definition_form(
         inputs,
         steps,
         legacy_transforms: Some(transforms.to_vec()),
+    })
+}
+
+/// The editable row an `update` writes, from the body it read and the shape
+/// it validated. One place, so a field cannot be forgotten between the two.
+fn update_input_from_body(
+    form: &DefinitionForm,
+    first: &lakehouse_store::pipelines::PipelineInput,
+    body: &UpdateBody,
+    connector_change: ConnectorChange,
+    run_as: Option<Uuid>,
+) -> UpdatePipelineInput {
+    UpdatePipelineInput {
+        kind: body.kind.clone(),
+        source_zone: first.zone.clone(),
+        source_table: first.table.clone(),
+        incremental_column: body
+            .incremental_column
+            .clone()
+            .filter(|c| !c.trim().is_empty()),
+        transforms: form.legacy_transforms.clone().unwrap_or_default(),
+        inputs: form.inputs.clone(),
+        steps: form.steps.clone(),
+        fbic_enabled: body.fbic_enabled,
+        target_zone: body.target_zone.clone(),
+        target_table: body.target_table.clone(),
+        schedule: body.schedule.clone(),
+        owner: body.owner.clone().filter(|o| !o.trim().is_empty()),
+        description: body.description.clone().filter(|d| !d.trim().is_empty()),
+        max_retries: body.max_retries,
+        depends_on: body.depends_on.clone(),
+        connector_id: connector_change,
+        run_as,
+    }
+}
+
+/// R1-B3 / D3a: a body in today's form, applied to the definition it may
+/// edit — or the 409 that says it cannot hold this pipeline.
+///
+/// Today's form describes one input and at most one `transform` step. On a
+/// pipeline of exactly that shape it keeps the stored names and changes only
+/// the zone, the table and the transforms; on any other it is refused, because
+/// storing one input and no step over (say) the assistant's SQL steps would
+/// make the next run overwrite the output with a copy of the first input.
+///
+/// # Errors
+///
+/// [`ApiRejection`] 409 with [`LEGACY_FORM_CANNOT_EDIT`], or 400 when the
+/// legacy body has no source (which [`definition_form`] has already refused).
+fn legacy_form_over_stored(
+    form: &DefinitionForm,
+    stored: &lakehouse_store::pipelines::AuthoredDefinition,
+    source_zone: Option<&str>,
+    source_table: Option<&str>,
+) -> Result<DefinitionForm, ApiRejection> {
+    let (Some(zone), Some(table)) = (source_zone, source_table) else {
+        return Err(ApiError::BadRequest(NO_SOURCE.to_owned()).into());
+    };
+    let Some(input) = stored.inputs.first() else {
+        return Err(ApiError::Conflict(LEGACY_FORM_CANNOT_EDIT.to_owned()).into());
+    };
+    if !crate::pipeline_compile::is_legacy_shape(&stored.inputs, &stored.steps) {
+        return Err(ApiError::Conflict(LEGACY_FORM_CANNOT_EDIT.to_owned()).into());
+    }
+    let input_name = input.name.clone();
+    let step_name = stored.steps.first().map_or_else(
+        || {
+            if input_name.eq_ignore_ascii_case("transformed") {
+                "transformed_1".to_owned()
+            } else {
+                "transformed".to_owned()
+            }
+        },
+        |step| step.name().to_owned(),
+    );
+    let transforms = form.legacy_transforms.clone().unwrap_or_default();
+    Ok(DefinitionForm {
+        inputs: vec![lakehouse_store::pipelines::PipelineInput {
+            name: input_name.clone(),
+            zone: zone.to_owned(),
+            table: table.to_owned(),
+        }],
+        steps: if transforms.is_empty() {
+            Vec::new()
+        } else {
+            vec![lakehouse_store::pipelines::PipelineStep::Transform {
+                name: step_name,
+                reads: input_name,
+                transforms,
+            }]
+        },
+        legacy_transforms: form.legacy_transforms.clone(),
     })
 }
 
@@ -2074,13 +2173,27 @@ pub async fn update(
     // that this route and `restore_version` both call below.
     validate_target_zone(&body.target_zone)?;
     // BLD-1 part 1 / D3: one function turns either body form into D1's shape.
-    let form = definition_form(
-        body.inputs,
-        body.steps,
+    let mut form = definition_form(
+        body.inputs.clone(),
+        body.steps.clone(),
         body.source_zone.as_deref(),
         body.source_table.as_deref(),
         body.transforms.as_deref(),
     )?;
+    let pool = crate::routes::pipelines::pool(&state)?;
+    let stored = pipelines::get_definition(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    // BLD-1 part 1 review R1-B3 / D3a: today's form cannot hold a pipeline
+    // with its own inputs and steps (see `legacy_form_over_stored`).
+    if form.legacy_transforms.is_some() {
+        form = legacy_form_over_stored(
+            &form,
+            &stored,
+            body.source_zone.as_deref(),
+            body.source_table.as_deref(),
+        )?;
+    }
     // The first input is the one the per-table upstreams and the connector
     // watch (D12).
     let first = first_input(&form)?;
@@ -2089,7 +2202,6 @@ pub async fn update(
     // stored chain is kept, so there is nothing new to check. D12: the FIRST
     // input is the table one of those jobs loads.
     validate_per_table_upstream(&first.zone, body.depends_on.as_deref())?;
-    let pool = crate::routes::pipelines::pool(&state)?;
     let current = pipelines::get_pipeline(pool, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
@@ -2099,7 +2211,7 @@ pub async fn update(
     // `in_scope` already vouched for). Whichever it is, a pipeline that ends
     // with a connector reads exactly one input, the Bronze table that
     // connector's ingest writes.
-    let connector_change = body.connector_id;
+    let connector_change = body.connector_id.clone();
     check_connector_for_definition(
         pool,
         &connector_change,
@@ -2133,9 +2245,6 @@ pub async fn update(
     // BLD-1 part 1 / D10 (`SEC-71`): an edit that changes what the pipeline
     // reads moves the author to the editor; one that changes neither the
     // inputs nor the steps leaves the author alone.
-    let stored = pipelines::get_definition(pool, &id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     let inputs_changed = stored.inputs != form.inputs || stored.steps != form.steps;
     let caller = caller_user_id(&principal);
     let new_run_as = author_after_edit(current.run_as, caller, inputs_changed);
@@ -2150,25 +2259,7 @@ pub async fn update(
         (&body.target_zone, &body.target_table),
     )
     .await?;
-    let input = UpdatePipelineInput {
-        kind: body.kind,
-        source_zone: first.zone.clone(),
-        source_table: first.table.clone(),
-        incremental_column: body.incremental_column.filter(|c| !c.trim().is_empty()),
-        transforms: form.legacy_transforms.clone().unwrap_or_default(),
-        inputs: form.inputs,
-        steps: form.steps,
-        fbic_enabled: body.fbic_enabled,
-        target_zone: body.target_zone,
-        target_table: body.target_table,
-        schedule: body.schedule,
-        owner: body.owner.filter(|o| !o.trim().is_empty()),
-        description: body.description.filter(|d| !d.trim().is_empty()),
-        max_retries: body.max_retries,
-        depends_on: body.depends_on,
-        connector_id: connector_change,
-        run_as: new_run_as,
-    };
+    let input = update_input_from_body(&form, &first, &body, connector_change, new_run_as);
     let updated = pipelines::update_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
