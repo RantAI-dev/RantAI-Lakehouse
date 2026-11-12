@@ -100,6 +100,7 @@ export const uploadService: UploadService = {
     const query = new URLSearchParams()
     if (filter?.folderId !== undefined && filter.folderId !== "") query.set("folderId", filter.folderId)
     if (filter?.q !== undefined && filter.q.trim() !== "") query.set("q", filter.q.trim())
+    if (filter?.table !== undefined && filter.table.trim() !== "") query.set("table", filter.table.trim())
     const text = query.toString()
     return readJson<Upload[]>(await apiFetch(text === "" ? base : `${base}?${text}`, { signal }))
   },

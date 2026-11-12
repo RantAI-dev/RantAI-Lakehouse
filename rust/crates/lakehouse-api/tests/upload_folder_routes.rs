@@ -633,3 +633,56 @@ async fn the_upload_list_can_be_narrowed_by_folder_and_text() {
         .await;
     assert_eq!(ids(&foreign), Vec::<String>::new());
 }
+
+/// QA `LH-DATA-35-03` (`DATA-47`): the Table step asks which uploads loaded into
+/// the named table. `table=<name>` is an exact match on the raw table name, not
+/// the contains-match `q` is, and it is scoped to the caller's tenant.
+#[tokio::test]
+async fn the_upload_list_can_be_narrowed_to_one_table_by_its_exact_name() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    stack
+        .seed(GROUP, "up-1", "stock_raw.csv", Some("stock_raw"))
+        .await;
+    stack
+        .seed(GROUP, "up-2", "stock_raw_2026.csv", Some("stock_raw_2026"))
+        .await;
+    stack.seed(GROUP, "up-3", "orders.csv", None).await;
+    stack
+        .seed(RETAIL, "up-r", "stock_raw.csv", Some("stock_raw"))
+        .await;
+
+    let ids = |reply: &Reply| -> Vec<String> {
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+        reply
+            .json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let mine = stack
+        .send(&bayu, "GET", "/api/uploads?table=stock_raw", None)
+        .await;
+    assert_eq!(ids(&mine), ["up-1"], "the exact name, not its prefix");
+    let theirs = stack
+        .send(&andi, "GET", "/api/uploads?table=stock_raw", None)
+        .await;
+    assert_eq!(ids(&theirs), ["up-r"], "the tenant still bounds the list");
+    let prefix = stack
+        .send(&bayu, "GET", "/api/uploads?table=stock", None)
+        .await;
+    assert!(
+        ids(&prefix).is_empty(),
+        "`stock` must not bring `stock_raw`: that is what `q` does"
+    );
+    let empty = stack.send(&bayu, "GET", "/api/uploads?table=", None).await;
+    assert_eq!(
+        ids(&empty),
+        ["up-3", "up-2", "up-1"],
+        "an empty value is no filter"
+    );
+}

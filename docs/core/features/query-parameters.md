@@ -81,7 +81,7 @@ To set a field's type, default or options, press the small menu button on the fi
 
 The tab keeps its definitions and its values across a reload, in this browser. A name that leaves the SQL drops its field, but the tab keeps what the person set for that name until the tab is closed, so a cut and paste does not lose it. A definition that nobody has edited and that has no value is dropped as its name leaves, so typing `{{re` on the way to `{{region}}` leaves no field behind.
 
-Run, Run all and Estimate send the values and the definitions of the names the SQL uses. When the SQL has no placeholder, they send the same request as before. The estimate waits while a value is missing: it sends no request and the panel shows no estimate until every field has a value.
+Run, Run all and Estimate send the values and the definitions of the names the SQL uses. When the SQL has no placeholder, they send the same request as before. The estimate waits while a value is missing: it sends no request, and the panel shows no estimate until every field has a value. While it waits, the panel says "Fill in {{name}} for a pre-run estimate." with the first missing name in parameter order.
 
 When the server refuses a run or an estimate, its sentence shows where a run's error shows, and the field the sentence names is marked. The mark goes when that field's value or definition changes.
 
@@ -110,6 +110,7 @@ After `{{`, the editor offers the names that the tab defines.
 | 15 | A dashboard's SQL source whose SQL holds a placeholder is refused with "Parameters in a dashboard's SQL source come later: give the value in the SQL for now." The SQL help check is the variables part of `AI-12`: it fills in the tab's values when the request carries them, and otherwise refuses with the missing-value sentence | none | Planner's choice, 2026-11-07 |
 | 16 | On ClickHouse a heredoc (`$$ … $$` and `$tag$ … $tag$`) is read like a quoted string, so a placeholder inside it is refused with the same inside-quotes sentence a placeholder inside a string gets, and an unclosed heredoc runs to the end of the statement. A heredoc opens where its `$` starts a token: a run of `[A-Za-z0-9_$]` before the `$` is a name when it starts with a letter, `_` or `$`, and a number otherwise, so `SELECT 1$$ … $$` opens a heredoc and `a$$b` stays one identifier. Trino has no heredoc, so nothing changes there | none | Planner's choice, 2026-11-08 |
 | 17 | After `{{` the list holds the tab's defined parameter names and nothing else (no SQL keyword), and a `{{` inside a comment or inside a quoted run offers no name at all | none | Planner's choice, 2026-11-08 |
+| 18 | On ClickHouse the Unicode quotes U+2018 (`‘`), U+2019 (`’`), U+201C (`“`) and U+201D (`”`) outside an ASCII string, comment, heredoc or quoted identifier make the statement uncertain. The read-only guard refuses the whole statement, and the parameter scanner refuses any placeholder in it. Inside those spans they are plain text. Measured on 2026-11-12 on `clickhouse/clickhouse-server:26.8`: the engine reads `‘ … ’` as a string literal and `“ … ”` as a quoted identifier. Trino is unchanged, because its parser already fails these characters | none | Planner's choice, 2026-11-12 |
 
 ## Limits to tell a customer
 
@@ -145,6 +146,10 @@ After `{{`, the editor offers the names that the tab defines.
   Trino run. The result is a refusal, never a bypass.
 - A ClickHouse heredoc (`$$ ... $$`) reads like a quoted string; a placeholder
   in it is refused with the inside-quotes sentence. Do not put one in it.
+- On ClickHouse a Unicode quote (U+2018, U+2019, U+201C, U+201D) outside an
+  ASCII string, comment, heredoc or quoted identifier makes the whole statement
+  refused by the read-only guard, even when it holds no write. Do not use
+  curly quotes as SQL quotes on ClickHouse.
 - A query takes at most 20 parameters, a text value 200 characters, a
   dropdown 200 options and a multi-select 200 values.
 
@@ -171,7 +176,7 @@ ids on this page otherwise number part 1 only.
 | `QS-5-AC11` | (console) On ClickHouse, write one statement that uses a text, a number, a date, a date range, a dropdown and a multi-select parameter; set each type in its field's menu, give each field a value, and run | Rows come back filtered by the six values, and History shows the statement with the values printed in it | Not run |
 | `QS-5-AC12` | (console) The same as `QS-5-AC11`, on Trino | The same result as on ClickHouse | Not run |
 | `QS-5-AC13` | (console) Type `x' OR '1'='1` in a text field, run it on ClickHouse, then run it on Trino | The field keeps the text as typed, and each run gives what `QS-5-AC2` expects, with nothing else run | Not run |
-| `QS-5-AC14` | (console) Write `{{region}}` with no default and no value, then run; type `EU` in the field and run again | The estimate shows nothing and asks for none while the field is empty; the first run is refused with "Fill in {{region}} to run this query.", and the field is marked; the second run goes, and the mark goes with the value | Not run |
+| `QS-5-AC14` | (console) Write `{{region}}` with no default and no value, then run; type `EU` in the field and run again | The estimate sends no request while the field is empty, and the panel says "Fill in {{region}} for a pre-run estimate."; the first run is refused with "Fill in {{region}} to run this query.", and the field is marked; the second run goes, and the mark goes with the value | Not run |
 | `QS-5-AC15` | (console) Save a query with a text field whose default is `EU` and a dropdown with two options and no default; change the text field to `US` in the tab; save; reopen the saved query | The reopened fields show `EU` and no choice in the dropdown; `US` is not kept | Not run |
 | `QS-5-AC16` | (console) Open a saved query, change only the default of one field, save, and open its version history | The new version shows "Parameters changed" and lists the names of every parameter it holds, including that field; the oldest version shows no such line | Not run |
 

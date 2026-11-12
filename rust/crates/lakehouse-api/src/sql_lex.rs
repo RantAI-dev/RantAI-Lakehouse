@@ -114,17 +114,22 @@
 //!
 //! ## What this module does not implement
 //!
-//! `ClickHouse`'s lexer reads one form this module does not, and reading
-//! it as ordinary code is the safe direction for both readers — the guard
-//! sees more text than the engine runs, and a value the scanner fills into
-//! what the engine reads as a quoted run is printed as a quoted literal,
-//! so it cannot escape the quoted run:
+//! `ClickHouse`'s lexer reads one form this module does not follow: the
+//! Unicode quotes. Measured on `clickhouse/clickhouse-server:26.8`
+//! (2026-11-12, the `#452` review SHOULD-FIX), `‘ … ’` is a string literal
+//! and `“ … ”` a quoted identifier there. Reading them as ordinary code is
+//! not the safe direction, as an earlier version of this doc claimed. The
+//! `'` inside `‘ ' ’` opens no string on the engine, but this lexer opens
+//! one, so `SELECT ‘ ' ’; DROP TABLE t; SELECT ‘ ' ’` showed the guard a
+//! string around the `DROP` that the engine did not see. A placeholder
+//! between the two quotes would be filled into a literal in the same way.
 //!
-//! - The Unicode quotes `‘ … ’` are a string literal and `“ … ”` a quoted
-//!   identifier there; this module reads them as ordinary code.
-//!   `sqlparser` has no such rule either, so a statement that uses them
-//!   does not parse in the rewrite and is refused before it reaches the
-//!   engine.
+//! The lexer cannot follow them, so on `ClickHouse` each of `‘` (U+2018),
+//! `’` (U+2019), `“` (U+201C) and `”` (U+201D) outside a quoted run, a
+//! comment or a heredoc is a one-character [`SpanKind::Uncertain`] span:
+//! the guard refuses the statement and the scanner refuses a placeholder in
+//! it. Inside an ASCII quoted run, a comment or a heredoc they are data and
+//! open nothing. `Trino` has no such quotes, so the text stays code there.
 //!
 //! # What the spans say
 //!
@@ -144,11 +149,13 @@
 //! - [`SpanKind::UnclosedHeredoc`]: the tail of a heredoc that is never
 //!   closed. It is the one text the two readers read differently, and it
 //!   has a kind of its own so that neither reader has to guess.
-//! - [`SpanKind::Uncertain`]: a `$`-run no measured rule reads. The
-//!   engine refuses every shape of this kind the measurements cover, and
-//!   its reading of the rest is unknown, so both readers refuse: the
-//!   guard refuses the whole statement when one is present, and the
-//!   scanner refuses a placeholder in a statement that holds one.
+//! - [`SpanKind::Uncertain`]: a `$`-run no measured rule reads, or, on
+//!   `ClickHouse`, one of the four Unicode quotes the lexer does not
+//!   follow. The engine refuses every `$` shape of this kind the
+//!   measurements cover, and its reading of the rest is unknown, so both
+//!   readers refuse: the guard refuses the whole statement when one is
+//!   present, and the scanner refuses a placeholder in a statement that
+//!   holds one.
 //!
 //! An unclosed literal or comment runs to the end of the text, and so does
 //! an unclosed heredoc — but the engine reads that tail as code, and the
@@ -200,8 +207,18 @@ pub(crate) enum SpanKind {
     /// engine does: a denied keyword in it is a keyword the engine would
     /// run.
     UnclosedHeredoc,
-    /// A `$` run in code that no measured rule reads: it neither continues
-    /// an identifier nor opens a heredoc the engine measurements claim.
+    /// A `$` run in code that no measured rule reads (it neither continues
+    /// an identifier nor opens a heredoc the engine measurements claim), or,
+    /// on `ClickHouse`, one of the Unicode quotes `‘ ’ “ ”` outside a
+    /// quoted run, a comment or a heredoc.
+    ///
+    /// The Unicode quotes: measured on `clickhouse/clickhouse-server:26.8`
+    /// (2026-11-12, `#452` review SHOULD-FIX), `‘ … ’` is a string literal
+    /// and `“ … ”` a quoted identifier there. The lexer does not follow
+    /// either, so it cannot say where such a run ends, and the span is the
+    /// single quote character. Both readers refuse, as for a `$` run below.
+    ///
+    /// The `$` run:
     ///
     /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10, image
     /// digest
@@ -279,6 +296,13 @@ pub(crate) fn lex(engine: Engine, sql: &str) -> Vec<Span> {
                     skip_quoted(&chars, i, c, backslash_escapes(engine)),
                     SpanKind::Literal,
                 )),
+                // The Unicode quotes open a literal or a quoted identifier
+                // on `ClickHouse` that this lexer does not follow, so the
+                // run behind one is unknown (`#452` review SHOULD-FIX).
+                // `Trino` has no such quotes: the text stays code there.
+                c if engine == Engine::ClickHouse && is_unicode_quote(c) => {
+                    Some((i + 1, SpanKind::Uncertain))
+                }
                 _ => None,
             }
         };
@@ -317,6 +341,13 @@ pub(crate) fn lex(engine: Engine, sql: &str) -> Vec<Span> {
         });
     }
     spans
+}
+
+/// Whether `c` is one of the four Unicode quotes `ClickHouse` reads as a
+/// quote: U+2018 and U+2019 around a string literal, U+201C and U+201D
+/// around a quoted identifier.
+fn is_unicode_quote(c: char) -> bool {
+    matches!(c, '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}')
 }
 
 /// What a `#` and the rest of its line are on `engine`.
@@ -828,6 +859,75 @@ mod tests {
                 (SpanKind::UnclosedHeredoc, "$x$é$".to_owned()),
             ]
         );
+    }
+
+    /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-12, `#452`
+    /// review SHOULD-FIX): `‘ … ’` is a string literal and `“ … ”` a quoted
+    /// identifier there, and this lexer follows neither, so each of the four
+    /// characters is an uncertain span of its own on `ClickHouse`.
+    #[test]
+    fn a_unicode_quote_outside_a_span_is_uncertain_on_clickhouse() {
+        for quote in ['\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}'] {
+            assert_eq!(
+                spans(Engine::ClickHouse, &format!("SELECT {quote} 1")),
+                vec![
+                    (SpanKind::Code, "SELECT ".to_owned()),
+                    (SpanKind::Uncertain, quote.to_string()),
+                    (SpanKind::Code, " 1".to_owned()),
+                ],
+                "{quote}"
+            );
+        }
+    }
+
+    /// The span is one character, and the ordinary rules keep spanning the
+    /// text around it: the `'` between the two quotes still opens a string.
+    #[test]
+    fn a_unicode_quote_span_is_one_character_and_the_rules_go_on_behind_it() {
+        assert_eq!(
+            spans(Engine::ClickHouse, "SELECT \u{2018} ' \u{2019}"),
+            vec![
+                (SpanKind::Code, "SELECT ".to_owned()),
+                (SpanKind::Uncertain, "\u{2018}".to_owned()),
+                (SpanKind::Code, " ".to_owned()),
+                (SpanKind::Literal, "' \u{2019}".to_owned()),
+            ]
+        );
+    }
+
+    /// `Trino` has no such quotes: the text stays code there, byte for byte
+    /// as before the rule existed.
+    #[test]
+    fn a_unicode_quote_is_plain_code_on_trino() {
+        for quote in ['\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}'] {
+            assert_eq!(
+                spans(Engine::Trino, &format!("SELECT {quote} 1")),
+                vec![(SpanKind::Code, format!("SELECT {quote} 1"))],
+                "{quote}"
+            );
+        }
+    }
+
+    /// Inside an ASCII literal, a quoted identifier, a comment or a heredoc
+    /// the four characters are data, so they open no uncertain span there.
+    #[test]
+    fn a_unicode_quote_inside_another_span_stays_plain_text() {
+        for sql in [
+            "'\u{2018}'",
+            "\"\u{2019}\"",
+            "`\u{201C}`",
+            "-- \u{2018}",
+            "/* \u{201D} */",
+            "# \u{2018}",
+            "$$\u{2019}$$",
+        ] {
+            assert!(
+                spans(Engine::ClickHouse, sql)
+                    .iter()
+                    .all(|(kind, _)| *kind != SpanKind::Uncertain),
+                "{sql}"
+            );
+        }
     }
 
     /// Measured on `clickhouse/clickhouse-server:26.8` (2026-11-10):
