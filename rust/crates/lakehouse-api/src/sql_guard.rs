@@ -258,9 +258,14 @@ fn contains_trino_denied_keyword(sql: &str) -> bool {
 /// bound only keeps a pasted dump from being stored and re-sent per tile.
 const SQL_SOURCE_MAX_CHARS: usize = 20_000;
 
-/// Why a statement cannot become a dashboard SQL source. Every message is
-/// fixed text written here, never parser or engine output, so it is safe to
-/// return to the caller as-is.
+/// Why a piece of SQL text cannot become a dashboard SQL source or a
+/// pipeline step. Every message is fixed text written here, never parser or
+/// engine output, so it is safe to return to the caller as-is.
+///
+/// BLD-1 part 1 / D5 splits the lexical rules into [`SqlTextRefusal`], which
+/// this enum shares with the pipeline step's [`check_pipeline_step_sql`]:
+/// the two surfaces must not drift, and AGENTS.md rule 4 says a duplicated
+/// guard is a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SqlSourceRefusal {
     /// Blank after trimming.
@@ -283,6 +288,43 @@ pub(crate) enum SqlSourceRefusal {
     /// take parameters until part 2, and the engine would answer with a
     /// message about `{`.
     ParametersLater,
+}
+
+/// The lexical half of [`check_sql_source`], shared with the pipeline step's
+/// [`check_pipeline_step_sql`] (BLD-1 part 1 / D5): blank, too long, a
+/// placeholder, not a `SELECT`/`WITH`, more than one statement, or a
+/// `SETTINGS`/`FORMAT` clause.
+///
+/// Returns the trimmed text a caller goes on to parse. Splitting this out is
+/// the only change `check_sql_source` got — its verdicts and its tests are
+/// the same, which is the point: two callers, one core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlTextRefusal {
+    /// Blank after trimming.
+    Empty,
+    /// Over [`SQL_SOURCE_MAX_CHARS`].
+    TooLong,
+    /// Not a `SELECT`/`WITH` query, or [`is_read_only`] refused it.
+    NotASelect,
+    /// More than one statement.
+    MultipleStatements,
+    /// A `SETTINGS`/`FORMAT` clause.
+    SettingsOrFormat,
+    /// A well-formed `{{name}}` placeholder.
+    ParametersLater,
+}
+
+impl From<SqlTextRefusal> for SqlSourceRefusal {
+    fn from(refusal: SqlTextRefusal) -> Self {
+        match refusal {
+            SqlTextRefusal::Empty => Self::Empty,
+            SqlTextRefusal::TooLong => Self::TooLong,
+            SqlTextRefusal::NotASelect => Self::NotASelect,
+            SqlTextRefusal::MultipleStatements => Self::MultipleStatements,
+            SqlTextRefusal::SettingsOrFormat => Self::SettingsOrFormat,
+            SqlTextRefusal::ParametersLater => Self::ParametersLater,
+        }
+    }
 }
 
 impl SqlSourceRefusal {
@@ -327,40 +369,7 @@ impl SqlSourceRefusal {
 ///
 /// The [`SqlSourceRefusal`] naming the first rule `sql` breaks.
 pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
-    let trimmed = sql.trim();
-    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
-    if trimmed.is_empty() {
-        return Err(SqlSourceRefusal::Empty);
-    }
-    if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
-        return Err(SqlSourceRefusal::TooLong);
-    }
-    // `query-parameters.md` decision 15: before anything reads the statement as ClickHouse SQL. The
-    // scanner is the one that knows comments and quotes, so a `{{` in a
-    // comment, or text that is not a well-formed placeholder, changes
-    // nothing here.
-    if crate::query_params::holds_placeholder(trimmed) {
-        return Err(SqlSourceRefusal::ParametersLater);
-    }
-    let code = strip_sql_noise(trimmed, Engine::ClickHouse);
-    let lower = code.trim_start().to_ascii_lowercase();
-    let starts_select = ["select", "with"].iter().any(|kw| {
-        lower
-            .strip_prefix(kw)
-            .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
-    });
-    // `is_read_only` also admits SHOW/DESCRIBE/EXPLAIN, which cannot be a
-    // derived table, hence the narrower first-word check.
-    if !starts_select || !is_read_only(trimmed, Engine::ClickHouse) {
-        return Err(SqlSourceRefusal::NotASelect);
-    }
-    if code.contains(';') {
-        return Err(SqlSourceRefusal::MultipleStatements);
-    }
-    let chars: Vec<char> = lower.chars().collect();
-    if word_occurs(&chars, "settings") || word_occurs(&chars, "format") {
-        return Err(SqlSourceRefusal::SettingsOrFormat);
-    }
+    let trimmed = check_sql_text(sql)?;
     let tables =
         crate::sql_rewrite::referenced_tables(trimmed, &sqlparser::dialect::ClickHouseDialect {})
             .ok_or(SqlSourceRefusal::Unparseable)?;
@@ -372,6 +381,124 @@ pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
         return Err(SqlSourceRefusal::OutsideServing);
     }
     Ok(trimmed.to_owned())
+}
+
+/// The shared lexical core: trimmed text (one trailing `;` dropped) that is
+/// non-blank, within [`SQL_SOURCE_MAX_CHARS`], free of `{{placeholder}}`s,
+/// one read-only `SELECT`/`WITH` statement with no `;` in its code and no
+/// `SETTINGS`/`FORMAT` clause.
+///
+/// Returns the trimmed text on the way through, because the two callers that
+/// share this need exactly that text to parse next.
+fn check_sql_text(sql: &str) -> Result<&str, SqlTextRefusal> {
+    let trimmed = sql.trim();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    if trimmed.is_empty() {
+        return Err(SqlTextRefusal::Empty);
+    }
+    if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
+        return Err(SqlTextRefusal::TooLong);
+    }
+    // `query-parameters.md` decision 15: before anything reads the statement as ClickHouse SQL. The
+    // scanner is the one that knows comments and quotes, so a `{{` in a
+    // comment, or text that is not a well-formed placeholder, changes
+    // nothing here.
+    if crate::query_params::holds_placeholder(trimmed) {
+        return Err(SqlTextRefusal::ParametersLater);
+    }
+    let code = strip_sql_noise(trimmed, Engine::ClickHouse);
+    let lower = code.trim_start().to_ascii_lowercase();
+    let starts_select = ["select", "with"].iter().any(|kw| {
+        lower
+            .strip_prefix(kw)
+            .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
+    });
+    // `is_read_only` also admits SHOW/DESCRIBE/EXPLAIN, which cannot be a
+    // derived table, hence the narrower first-word check.
+    if !starts_select || !is_read_only(trimmed, Engine::ClickHouse) {
+        return Err(SqlTextRefusal::NotASelect);
+    }
+    if code.contains(';') {
+        return Err(SqlTextRefusal::MultipleStatements);
+    }
+    let chars: Vec<char> = lower.chars().collect();
+    if word_occurs(&chars, "settings") || word_occurs(&chars, "format") {
+        return Err(SqlTextRefusal::SettingsOrFormat);
+    }
+    Ok(trimmed)
+}
+
+/// Why a pipeline step's SQL is refused (BLD-1 part 1 / D5). Fixed text, for
+/// the same reason as [`SqlSourceRefusal`]: it reaches the person who wrote
+/// the step, never the parser's own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineStepRefusal {
+    /// Blank after trimming.
+    Empty,
+    /// Over [`SQL_SOURCE_MAX_CHARS`] (decision 16: the dashboard source's own
+    /// limit, shared rather than copied).
+    TooLong,
+    /// Not a read-only `SELECT`/`WITH`.
+    NotASelect,
+    /// More than one statement, after the engine's own parse.
+    MultipleStatements,
+    /// A `SETTINGS`/`FORMAT` clause.
+    SettingsOrFormat,
+    /// A `{{name}}` placeholder.
+    ParametersLater,
+}
+
+impl PipelineStepRefusal {
+    /// The caller-facing message. Each one names what to change, never the
+    /// text that was refused.
+    #[must_use]
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "a step needs SQL",
+            Self::TooLong => "this step's SQL is too long (max 20000 characters)",
+            Self::NotASelect => "a step must be a read-only SELECT or WITH query",
+            Self::MultipleStatements => "a step must be a single statement",
+            Self::SettingsOrFormat => "remove the SETTINGS/FORMAT clause; a step cannot set them",
+            Self::ParametersLater => "parameters are not supported in a step yet",
+        }
+    }
+}
+
+impl From<SqlTextRefusal> for PipelineStepRefusal {
+    fn from(refusal: SqlTextRefusal) -> Self {
+        match refusal {
+            SqlTextRefusal::Empty => Self::Empty,
+            SqlTextRefusal::TooLong => Self::TooLong,
+            SqlTextRefusal::NotASelect => Self::NotASelect,
+            SqlTextRefusal::MultipleStatements => Self::MultipleStatements,
+            SqlTextRefusal::SettingsOrFormat => Self::SettingsOrFormat,
+            SqlTextRefusal::ParametersLater => Self::ParametersLater,
+        }
+    }
+}
+
+/// Decide whether `sql` may be a pipeline step's SQL (BLD-1 part 1 / D5).
+///
+/// The same lexical rules as [`check_sql_source`] (one shared core), and on
+/// top of them the spec's rule 1: the text parses, under `ClickHouse`'s
+/// dialect, to exactly one statement, and that statement is a query. Window
+/// functions are not refused (decision 12); table functions, `system.*` and
+/// dictionary functions are refused later by the policy rewrite, as they are
+/// for every other surface.
+///
+/// # Errors
+///
+/// [`PipelineStepRefusal`] naming the first rule `sql` breaks.
+pub(crate) fn check_pipeline_step_sql(sql: &str) -> Result<String, PipelineStepRefusal> {
+    let trimmed = check_sql_text(sql)?;
+    let statements =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::ClickHouseDialect {}, trimmed)
+            .map_err(|_| PipelineStepRefusal::NotASelect)?;
+    match statements.as_slice() {
+        [sqlparser::ast::Statement::Query(_)] => Ok(trimmed.to_owned()),
+        [_single] => Err(PipelineStepRefusal::NotASelect),
+        _ => Err(PipelineStepRefusal::MultipleStatements),
+    }
 }
 
 #[cfg(test)]

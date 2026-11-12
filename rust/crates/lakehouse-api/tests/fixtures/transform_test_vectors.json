@@ -1,0 +1,18 @@
+[
+  {"input": "dedupe(order_id)", "accepted": true, "verb": "dedupe"},
+  {"input": "filter(status = 'active')", "accepted": true, "verb": "filter"},
+  {"input": "rename(old_col,new_col)", "accepted": true, "verb": "rename"},
+  {"input": "cast(amount,Int64)", "accepted": true, "verb": "cast"},
+  {"input": "select(id,name,amount)", "accepted": true, "verb": "select"},
+  {"input": "filter(1=1; DROP TABLE x)", "accepted": false, "class": "stacked_statement"},
+  {"input": "filter(id IN (SELECT id FROM other_table))", "accepted": false, "class": "subquery"},
+  {"input": "filter(sleep(status))", "accepted": false, "class": "function_call"},
+  {"input": "filter(status = 'a' -- ')", "accepted": false, "class": "comment_dash"},
+  {"input": "filter(status = 'a' /* */)", "accepted": false, "class": "comment_block"},
+  {"input": "filter(status <> 'x')", "accepted": false, "class": "disallowed_operator"},
+  {"input": "cast(col,UDF_EVIL_TYPE)", "accepted": false, "class": "disallowed_cast_type"},
+  {"input": "dedupe(order_id; DROP TABLE x)", "accepted": false, "class": "invalid_identifier"},
+  {"input": "exec(rm -rf /)", "accepted": false, "class": "unknown_verb"},
+  {"input": "filter(name = '\\' OR '1'='1')", "accepted": false, "class": "backslash_quote_bypass"},
+  {"input": "filter(path = 'C:\\data')", "accepted": true, "verb": "filter", "note": "bare backslash, no embedded quote — must be accepted and rendered with the backslash escaped by whichever safe encoding the implementation uses"}
+]
