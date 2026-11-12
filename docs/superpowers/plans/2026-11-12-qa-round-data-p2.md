@@ -180,6 +180,12 @@ What QA saw:
     from has no tenant column, so it can hold a person of another tenant — a refused statement
     is recorded with `owner_id` — and every id of such a person is "Unknown user" in this
     tenant's usage, never their name.
+  - Review round 1 R3: a service identity is shown by its own name. A service token's
+    queries are recorded with its `service_identity.id`, which no `app_user` row holds, so
+    `people_names` makes one more read (`dashboard_access::service_names`) for the ids the
+    people read left out, and a live service identity is never merged into the row of
+    deleted people. `service_identity` has no tenant column (`0001_init.sql`), so there is
+    no tenant to narrow that read by: a service credential belongs to the deployment.
 - **D15. An upload's versions name who started the load.** The API sends the load's author
   in the run configuration as `author`: the display name of the person who pressed Load (not
   of who sent the file, if they differ), followed by ` (file upload)`. The job puts it in

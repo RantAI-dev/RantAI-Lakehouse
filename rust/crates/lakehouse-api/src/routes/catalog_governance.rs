@@ -678,6 +678,14 @@ async fn asset_ids_of(state: &AppState, keys: &[String]) -> HashMap<String, Stri
 /// recorded with `owner_id`, `routes/query.rs`), and a member of this tenant
 /// must not be shown that person's name.
 ///
+/// Review round 1 R3: a service token's queries are recorded with its
+/// `service_identity.id`, which is in no `app_user` row, so a second read
+/// (`dashboard_access::service_names`) answers for the ids the first one left
+/// out: a live service identity is shown by its own name, never merged into the
+/// row of deleted people. `service_identity` has no tenant column, so there is
+/// no tenant to narrow that read by; a service credential belongs to the
+/// deployment, not to a tenant.
+///
 /// No `Result`: a failed lookup logs a warning and answers names for the caller
 /// only. The names are decoration, and a lookup that fails must not turn the page's
 /// usage into "not measured".
@@ -709,6 +717,23 @@ async fn people_names(
             }
         }
     };
+    let rest: Vec<uuid::Uuid> = ids
+        .iter()
+        .filter(|id| !names.contains_key(id))
+        .copied()
+        .collect();
+    if !rest.is_empty() {
+        match lakehouse_store::dashboard_access::service_names(pg, &rest).await {
+            Ok(rows) => {
+                for (id, name) in rows {
+                    if !name.trim().is_empty() {
+                        names.insert(id, name);
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(?err, "catalog usage: service names unavailable"),
+        }
+    }
     // The caller is always named: their own name is the one this server holds without
     // a read, and it keeps their own row readable when the lookup above failed. A blank
     // name is not inserted, so that person is "Unknown user" like anyone else with none.
@@ -1919,6 +1944,42 @@ mod tests {
         assert!(!json!(recent).to_string().contains(&me.to_string()));
     }
 
+    /// `DATA-52`, review round 1 R3: a service identity's id has a name of its own, so
+    /// its queries get its own row and never the "Unknown user" row of deleted people.
+    #[test]
+    fn a_service_identity_is_named_and_not_merged_with_deleted_people() {
+        let (me, service, gone) = (
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        );
+        let mentions = [
+            mention("q1", "SELECT * FROM silver.orders", me, "completed", 1),
+            mention("q2", "SELECT * FROM silver.orders", service, "completed", 1),
+            mention("q3", "SELECT * FROM silver.orders", service, "completed", 1),
+            mention("q4", "SELECT * FROM silver.orders", gone, "completed", 1),
+        ];
+        // What `people_names` answers: the person, the service identity and not the
+        // deleted id.
+        let names = named(&[(me, "Rina Wijaya"), (service, "svc-reporting")]);
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            false,
+            &names,
+        );
+        assert_eq!(
+            usage["frequentUsers"],
+            json!([
+                {"name": "svc-reporting", "queries": 2},
+                {"name": "Rina Wijaya", "queries": 1},
+                {"name": "Unknown user", "queries": 1}
+            ])
+        );
+    }
+
     /// `DATA-52`: a row with no owner id is named by the id its `user_name` holds (a row
     /// from before the ids) when that id has a name, and as stored when it is not an id.
     #[test]
@@ -2539,6 +2600,50 @@ mod tests {
                 ])
             );
             assert!(!usage.to_string().contains("bob theirs"));
+        }
+
+        /// Review round 1 R3: a service identity's id is in no `app_user` row, and the
+        /// second read names it, so an existing caller is not reported as a person who
+        /// no longer exists nor merged into their row.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_service_identity_is_shown_by_its_own_name(pool: PgPool) {
+            let here = tenant(&pool, "acme").await;
+            let me = person(&pool, "rina").await;
+            in_tenant(&pool, me, here).await;
+            let service: Uuid = sqlx::query_scalar(
+                "INSERT INTO service_identity (name, environment, expires_at) \
+                 VALUES ('svc-reporting', 'test', now() + interval '1 day') RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            // A person whose row is gone: only an id is left in the history.
+            let gone = Uuid::new_v4();
+
+            let mentions = [mentioned("q1", service), mentioned("q2", gone)];
+            let caller = principal(me, &[here], "rina");
+            let names = people_names(&pool, &mentions, &caller).await;
+            assert_eq!(
+                names.get(&service).map(String::as_str),
+                Some("svc-reporting")
+            );
+            assert!(!names.contains_key(&gone));
+
+            let (usage, _) = summarize_usage(
+                &mentions,
+                &tables(&["silver.orders"]),
+                &[],
+                me,
+                false,
+                &names,
+            );
+            assert_eq!(
+                usage["frequentUsers"],
+                json!([
+                    {"name": "Unknown user", "queries": 1},
+                    {"name": "svc-reporting", "queries": 1}
+                ])
+            );
         }
     }
 }

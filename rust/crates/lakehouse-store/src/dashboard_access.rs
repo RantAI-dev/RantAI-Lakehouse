@@ -305,6 +305,26 @@ pub async fn user_names_in_tenants(
     .await?)
 }
 
+/// `(id, name)` for each of these service identities that still exists.
+///
+/// Review round 1 R3 (`DATA-52`): a service token that runs a query is recorded
+/// with its `service_identity.id` as `owner_id` (`routes/query.rs`), so a
+/// history the usage is built from can hold one. Without this read such a row
+/// reads "Unknown user", telling the page an existing, named caller no longer
+/// exists and merging the service into the row of deleted people.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn service_names(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, String)>, StoreError> {
+    Ok(
+        sqlx::query_as("SELECT id, name FROM service_identity WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
 /// `(id, name)` for each of these roles that still exists.
 ///
 /// # Errors
