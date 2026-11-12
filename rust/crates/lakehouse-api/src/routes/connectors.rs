@@ -36,6 +36,7 @@ use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
+use lakehouse_store::connector_run;
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use lakehouse_store::ingest_spec::{Dial, RestAuth, SqlDriver};
@@ -3820,6 +3821,108 @@ pub async fn ingest_run(
     launch_ingest(&state, &id, None, None).await
 }
 
+/// One run at a time per connector. Bronze is append-only, so a second run
+/// started while the first is still going copies every table into Bronze a
+/// second time — a double click was enough to do it. Checked against
+/// `Dagster`'s own run list, so a run started by the schedule counts too. Not
+/// a lock: two requests in the same instant can both pass, which the
+/// console's disabled button covers.
+///
+/// QA `TC-1702` (`SRC-39`): a run that never finishes used to hold this 409
+/// for days. A run past its start or run limit plus a grace no longer holds
+/// the connector: it is cancelled in the orchestrator (or recorded as
+/// `timed_out` for a run that was going) and the launch goes on (D10). The
+/// grace lets the orchestrator's own run monitoring act first.
+///
+/// # Errors
+///
+/// 409 naming the run that is still going, 503 when the orchestrator cannot
+/// be asked for the run list, and the store's classified error when an
+/// overdue run's record cannot be closed.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Unix seconds to f64 to match DgConfiguredRun's wire shape; \
+              a timestamp this size loses no meaningful precision"
+)]
+async fn guard_one_run_at_a_time(state: &AppState, connector_id: &str) -> Result<(), ApiError> {
+    let recent = state
+        .dagster
+        .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
+        .await
+        .map_err(|err| orchestrator_unreachable(&err))?;
+    let now = time::OffsetDateTime::now_utc();
+    let limits = RunAgeLimits::from_config(&state.config);
+    let active: Vec<ConnectorIngestRun> =
+        connector_runs(&recent, connector_id, now.unix_timestamp() as f64, &limits)
+            .into_iter()
+            .filter(ConnectorIngestRun::is_active)
+            .collect();
+    if let Some(blocking) = active.iter().find(|run| run.overdue.is_none()) {
+        return Err(ApiError::Conflict(format!(
+            "a run for this connector is already {} (run {}); wait for it to finish before \
+             starting another",
+            blocking.status,
+            blocking.run_id.get(..8).unwrap_or(&blocking.run_id),
+        )));
+    }
+    for run in &active {
+        stop_overdue_run(state, connector_id, run, now).await?;
+    }
+    Ok(())
+}
+
+/// Stop one run that is past its limit, so its connector can run again
+/// (`SRC-39`, QA `TC-1702`, D10).
+///
+/// The route asks the orchestrator to cancel the run for good
+/// (`MARK_AS_CANCELED_IMMEDIATELY`): a run that never started, and a running
+/// run whose worker is gone, cannot be stopped cleanly. A cancel that fails,
+/// by transport or by a refusal, is logged and is not an error of the request
+/// — the alternative is the connector locked for good. A running run's record
+/// is then closed as `timed_out` (D11).
+///
+/// # Errors
+///
+/// The store's classified error when the run record cannot be closed.
+async fn stop_overdue_run(
+    state: &AppState,
+    connector_id: &str,
+    run: &ConnectorIngestRun,
+    now: time::OffsetDateTime,
+) -> Result<(), ApiError> {
+    match state.dagster.cancel_run_now(&run.run_id).await {
+        Ok(outcome) if outcome.failure.is_none() => {}
+        Ok(outcome) => tracing::warn!(
+            run_id = %run.run_id,
+            failure = ?outcome.failure,
+            "Dagster refused to cancel an overdue run"
+        ),
+        // The error's text goes to the log only, never into an `ApiError`
+        // (SEC-11).
+        Err(err) => tracing::warn!(
+            %err,
+            run_id = %run.run_id,
+            "Dagster could not be asked to cancel an overdue run"
+        ),
+    }
+    if run.overdue == Some(Overdue::RanTooLong) {
+        connector_run::end_timed_out_run(
+            pool(state)?,
+            connector_id,
+            &run.run_id,
+            i64::from(state.config.ingest_run_max_runtime_seconds),
+            now,
+        )
+        .await?;
+    }
+    tracing::info!(
+        connector_id,
+        run_id = %run.run_id,
+        "stopped an overdue run so the connector can run again"
+    );
+    Ok(())
+}
+
 /// The run itself; see [`ingest_run_request`] for the order of the answers.
 /// `principal` is the caller, for the audit event of a run of one table.
 async fn launch_ingest(
@@ -3859,29 +3962,9 @@ async fn launch_ingest(
         })));
     }
 
-    // One run at a time per connector. Bronze is append-only, so a second
-    // run started while the first is still going copies every table into
-    // Bronze a second time — a double click was enough to do it. Checked
-    // against Dagster's own run list, so a run started by the schedule
-    // counts too. Not a lock: two requests in the same instant can both
-    // pass, which the console's disabled button covers.
-    let recent = state
-        .dagster
-        .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
-        .await
-        .map_err(|err| orchestrator_unreachable(&err))?;
-    if let Some(active) = connector_runs(&recent, &id)
-        .into_iter()
-        .find(ConnectorIngestRun::is_active)
-    {
-        return Err(ApiError::Conflict(format!(
-            "a run for this connector is already {} (run {}); wait for it to finish before \
-             starting another",
-            active.status,
-            active.run_id.get(..8).unwrap_or(&active.run_id),
-        ))
-        .into());
-    }
+    // One run at a time per connector, unless a run is past its limit
+    // (`SRC-39`, QA `TC-1702`).
+    guard_one_run_at_a_time(&state, &id).await?;
 
     // The two refusals of a run of one table come after the 409s above, which
     // are the existing, stated answers for "not now".
@@ -4054,6 +4137,60 @@ const RECENT_INGEST_RUNS: u32 = 100;
 /// How many of one connector's runs [`connector_runs`] keeps.
 const CONNECTOR_RUN_HISTORY: usize = 20;
 
+/// How long past its limit a run may be before the route stops holding the
+/// connector for it (`SRC-39`, QA `TC-1702`, D10). The orchestrator's run
+/// monitoring polls every 60 seconds, so five minutes is its turn to end the
+/// run first; the route only steps in when that did not happen, because a
+/// cancel from here is the less clean of the two.
+const OVERDUE_GRACE_SECONDS: f64 = 300.0;
+
+/// Why a run no longer holds its connector's lock (`SRC-39`, QA `TC-1702`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overdue {
+    /// A queued or starting run that never started, past the start limit.
+    NeverStarted,
+    /// A running run past the run limit.
+    RanTooLong,
+}
+
+/// How old a run may be before [`overdue`] calls it so: the two API settings
+/// of `SRC-39` (D9), each plus [`OVERDUE_GRACE_SECONDS`].
+#[derive(Debug, Clone, Copy)]
+struct RunAgeLimits {
+    start_seconds: f64,
+    running_seconds: f64,
+}
+
+impl RunAgeLimits {
+    /// The limits the route judges a run by.
+    fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            start_seconds: f64::from(config.ingest_run_start_timeout_seconds)
+                + OVERDUE_GRACE_SECONDS,
+            running_seconds: f64::from(config.ingest_run_max_runtime_seconds)
+                + OVERDUE_GRACE_SECONDS,
+        }
+    }
+}
+
+/// Whether `run` is past the limit that applies to its `Dagster` status
+/// (`SRC-39`, QA `TC-1702`, D10), judged by the orchestrator's own status
+/// word and its own times. A missing time, and every other status, is `None`:
+/// a run nobody measured keeps the 409 (fail closed).
+fn overdue(run: &DgConfiguredRun, now_unix: f64, limits: &RunAgeLimits) -> Option<Overdue> {
+    match run.status.as_str() {
+        "QUEUED" | "NOT_STARTED" | "STARTING" => run
+            .creation_time
+            .filter(|created| now_unix - created > limits.start_seconds)
+            .map(|_| Overdue::NeverStarted),
+        "STARTED" | "MANAGED" => run
+            .start_time
+            .filter(|started| now_unix - started > limits.running_seconds)
+            .map(|_| Overdue::RanTooLong),
+        _ => None,
+    }
+}
+
 /// One `ingest_job` run of one connector, as far as the one-run-at-a-time
 /// guard in [`ingest_run_request`] needs it. The run list the console shows
 /// is the product's own record (`SRC-11`, `routes::connector_runs`); the old
@@ -4066,6 +4203,9 @@ pub struct ConnectorIngestRun {
     /// `queued | running | completed | failed | cancelled | unknown`
     /// ([`map_run_status`], the vocabulary the pipelines pages use).
     pub status: &'static str,
+    /// Why this run no longer holds the connector, `None` while it still
+    /// does (`SRC-39`, QA `TC-1702`).
+    overdue: Option<Overdue>,
 }
 
 impl ConnectorIngestRun {
@@ -4077,8 +4217,14 @@ impl ConnectorIngestRun {
 
 /// `connector_id`'s runs among `runs`, keeping `Dagster`'s newest-first
 /// order. Every connector runs the same `ingest_job`; only the run config
-/// (`ops.run_ingest.config.connector_id`) tells whose run it is.
-fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<ConnectorIngestRun> {
+/// (`ops.run_ingest.config.connector_id`) tells whose run it is. Each run is
+/// judged against `limits` at `now_unix` (`SRC-39`, QA `TC-1702`).
+fn connector_runs(
+    runs: &[DgConfiguredRun],
+    connector_id: &str,
+    now_unix: f64,
+    limits: &RunAgeLimits,
+) -> Vec<ConnectorIngestRun> {
     runs.iter()
         .filter(|run| {
             run.run_config
@@ -4090,6 +4236,7 @@ fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<Connector
         .map(|run| ConnectorIngestRun {
             run_id: run.run_id.clone(),
             status: map_run_status(&run.status),
+            overdue: overdue(run, now_unix, limits),
         })
         .collect()
 }
@@ -4097,17 +4244,94 @@ fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<Connector
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(
+        clippy::cast_precision_loss,
+        reason = "test fixture times are real-world Unix seconds, cast to f64 to match \
+                  DgConfiguredRun's wire shape; no meaningful precision is lost"
+    )]
 
     use std::collections::HashMap;
 
+    fn limits() -> RunAgeLimits {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        RunAgeLimits::from_config(&Config::from_map(&env).unwrap())
+    }
+
+    /// A run that is "going" started 60 seconds ago, not at a fixed time in
+    /// September 2026: QA `TC-1702` (`SRC-39`) makes a run older than the
+    /// limit overdue, so a fixed old start would say something else than the
+    /// test's name. This does not weaken those tests: it makes the fixture
+    /// say what they assert.
     fn dg_run(id: &str, status: &str, connector: &str) -> DgConfiguredRun {
+        let started = time::OffsetDateTime::now_utc().unix_timestamp() as f64 - 60.0;
         DgConfiguredRun {
             run_id: id.to_owned(),
             status: status.to_owned(),
-            start_time: Some(1_790_670_111.0),
-            end_time: (status == "SUCCESS").then_some(1_790_670_153.0),
-            creation_time: Some(1_790_670_111.0),
+            start_time: Some(started),
+            end_time: (status == "SUCCESS").then_some(started + 42.0),
+            creation_time: Some(started),
             run_config: json!({ "ops": { "run_ingest": { "config": { "connector_id": connector } } } }),
+        }
+    }
+
+    /// QA `TC-1702` (`SRC-39`, D10): a run that started longer ago than the
+    /// run limit plus its grace is overdue; a younger one is not.
+    #[test]
+    fn a_run_started_longer_ago_than_the_limit_is_overdue_and_a_younger_one_is_not() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut old = dg_run("run-old", "STARTED", "conn-a");
+        old.start_time = Some(now - limits.running_seconds - 1.0);
+        assert_eq!(overdue(&old, now, &limits), Some(Overdue::RanTooLong));
+        let mut managed = dg_run("run-managed", "MANAGED", "conn-a");
+        managed.start_time = Some(now - limits.running_seconds - 1.0);
+        assert_eq!(overdue(&managed, now, &limits), Some(Overdue::RanTooLong));
+        let mut young = dg_run("run-young", "STARTED", "conn-a");
+        young.start_time = Some(now - 60.0);
+        assert_eq!(overdue(&young, now, &limits), None);
+    }
+
+    /// A queued or starting run past the start limit is overdue even though
+    /// it never started; one inside the limit is not.
+    #[test]
+    fn a_run_that_never_started_is_overdue_after_the_start_limit() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        for status in ["QUEUED", "NOT_STARTED", "STARTING"] {
+            let mut run = dg_run("run-q", status, "conn-a");
+            run.start_time = None;
+            run.creation_time = Some(now - limits.start_seconds - 1.0);
+            assert_eq!(overdue(&run, now, &limits), Some(Overdue::NeverStarted));
+            run.creation_time = Some(now - 60.0);
+            assert_eq!(overdue(&run, now, &limits), None, "{status}");
+        }
+    }
+
+    /// Fail closed: a run whose time the orchestrator did not give is never
+    /// overdue, so the 409 stays.
+    #[test]
+    fn a_run_with_no_time_recorded_is_never_overdue() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut queued = dg_run("run-q", "QUEUED", "conn-a");
+        queued.creation_time = None;
+        assert_eq!(overdue(&queued, now, &limits), None);
+        let mut started = dg_run("run-s", "STARTED", "conn-a");
+        started.start_time = None;
+        assert_eq!(overdue(&started, now, &limits), None);
+    }
+
+    /// A finished run never holds the connector, however old it is.
+    #[test]
+    fn a_finished_run_is_never_overdue() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        for status in ["SUCCESS", "FAILURE", "CANCELED", "CANCELING"] {
+            let mut run = dg_run("run-done", status, "conn-a");
+            run.start_time = Some(now - limits.running_seconds - 10_000.0);
+            run.creation_time = Some(now - limits.start_seconds - 10_000.0);
+            assert_eq!(overdue(&run, now, &limits), None, "{status}");
         }
     }
 
@@ -4118,13 +4342,19 @@ mod tests {
             dg_run("run-2", "SUCCESS", "conn-b"),
             dg_run("run-1", "SUCCESS", "conn-a"),
         ];
-        let mine = connector_runs(&runs, "conn-a");
+        let mine = connector_runs(
+            &runs,
+            "conn-a",
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64,
+            &limits(),
+        );
         assert_eq!(
             mine.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
             ["run-3", "run-1"]
         );
         assert_eq!(mine[0].status, "running");
         assert!(mine[0].is_active());
+        assert_eq!(mine[0].overdue, None, "a run 60 s old is not overdue");
         assert_eq!(mine[1].status, "completed");
         assert!(!mine[1].is_active());
     }
@@ -4134,7 +4364,7 @@ mod tests {
         let mut run = dg_run("run-1", "SUCCESS", "conn-a");
         run.run_config = json!({});
         assert_eq!(
-            connector_runs(&[run], "conn-a"),
+            connector_runs(&[run], "conn-a", 1_800_000_000.0, &limits()),
             [] as [crate::routes::connectors::ConnectorIngestRun; 0]
         );
     }

@@ -16,6 +16,11 @@
 //! default dead upstream and fail loudly instead of silently passing).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::cast_precision_loss,
+    reason = "test fixture times are real-world Unix seconds, cast to f64 to match the \
+              orchestrator's wire shape; no meaningful precision is lost"
+)]
 
 mod common;
 
@@ -54,8 +59,31 @@ async fn mount_recent_runs(server: &MockServer, results: Value) {
 }
 
 fn ingest_run_for(connector_id: &str, run_id: &str, status: &str) -> Value {
+    // QA `TC-1702` (SRC-39): "a run is going" now means it started recently —
+    // a run older than the limit plus its grace is cancelled by the route
+    // instead of answering 409. The fixed September 2026 time was older than
+    // the limit, so this fixture now says what the 409 tests assert; no
+    // assertion is weakened.
+    let started = time::OffsetDateTime::now_utc().unix_timestamp() as f64 - 60.0;
     json!({
-        "runId": run_id, "status": status, "startTime": 1_790_670_111.0, "endTime": null,
+        "runId": run_id, "status": status, "startTime": started, "endTime": null,
+        "creationTime": started,
+        "runConfig": { "ops": { "run_ingest": { "config": { "connector_id": connector_id } } } }
+    })
+}
+
+/// A run that `Dagster` says was created at `created` and, when it started,
+/// at `started` — for the overdue tests (`SRC-39`, QA `TC-1702`).
+fn ingest_run_created_at(
+    connector_id: &str,
+    run_id: &str,
+    status: &str,
+    created: f64,
+    started: Option<f64>,
+) -> Value {
+    json!({
+        "runId": run_id, "status": status, "startTime": started, "endTime": null,
+        "creationTime": created,
         "runConfig": { "ops": { "run_ingest": { "config": { "connector_id": connector_id } } } }
     })
 }
@@ -530,6 +558,209 @@ async fn ingest_run_refuses_a_second_run_while_one_is_going() {
     let error = body["error"].as_str().expect("error is a string");
     assert!(error.contains("already running"), "{error}");
     assert!(error.contains("7bd3a0c4"), "{error}");
+}
+
+/// The `terminateRun` requests the mock received, as their JSON bodies.
+async fn cancel_requests(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("request log")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .filter(|body| body.contains("terminateRun"))
+        .collect()
+}
+
+/// The runs of `connector_id` in the product's own record.
+async fn recorded_runs(
+    pool: &sqlx::PgPool,
+    connector_id: &str,
+) -> Vec<lakehouse_store::connector_run::RunSummary> {
+    lakehouse_store::connector_run::list_runs(pool, connector_id, 50)
+        .await
+        .expect("the run history")
+}
+
+/// QA `TC-1702`, `LH-SRC-11-11` (`SRC-39`, D10): a run going for seven hours
+/// no longer holds the connector. The route asks for it to be cancelled for
+/// good, records it as failed with `timed_out`, and starts the next run.
+#[tokio::test]
+async fn a_run_older_than_the_limit_is_cancelled_and_the_next_run_starts() {
+    let server = MockServer::start().await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    let started = now - 7.0 * 3600.0;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_created_at(
+            "conn-ingest-old",
+            "run-old",
+            "STARTED",
+            started,
+            Some(started)
+        )]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("terminateRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                "run": { "runId": "run-old" } } }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-new" } } }
+        })))
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-old").await;
+    lakehouse_store::connector_run::start_run(
+        &app.pool,
+        "conn-ingest-old",
+        "run-old",
+        lakehouse_store::connector_run::RunTrigger::Schedule,
+        None,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(7),
+    )
+    .await
+    .expect("a record of the old run");
+
+    let (status, answer) = post_run(&app, &cookie, "conn-ingest-old", None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["runId"], "run-new");
+
+    let cancels = cancel_requests(&server).await;
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert!(
+        cancels[0].contains("MARK_AS_CANCELED_IMMEDIATELY"),
+        "{cancels:?}"
+    );
+    assert!(cancels[0].contains("run-old"), "{cancels:?}");
+
+    let runs = recorded_runs(&app.pool, "conn-ingest-old").await;
+    assert_eq!(runs[0].status, "failed");
+    assert_eq!(runs[0].end_reason.as_deref(), Some("timed_out"));
+}
+
+/// A run that never started stops holding the connector after the start
+/// limit: it is cancelled, no record is invented for it (D13), and the launch
+/// goes on.
+#[tokio::test]
+async fn a_run_that_never_started_stops_locking_the_connector_after_the_start_limit() {
+    let server = MockServer::start().await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_created_at(
+            "conn-ingest-queued",
+            "run-queued",
+            "NOT_STARTED",
+            now - 20.0 * 60.0,
+            None
+        )]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("terminateRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                "run": { "runId": "run-queued" } } }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-new" } } }
+        })))
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-queued").await;
+
+    let (status, answer) = post_run(&app, &cookie, "conn-ingest-queued", None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["runId"], "run-new");
+    let cancels = cancel_requests(&server).await;
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert!(
+        cancels[0].contains("MARK_AS_CANCELED_IMMEDIATELY"),
+        "{cancels:?}"
+    );
+
+    let (records,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM connector_run WHERE connector_id = $1")
+            .bind("conn-ingest-queued")
+            .fetch_one(&app.pool)
+            .await
+            .expect("count the records");
+    assert_eq!(
+        records, 0,
+        "nothing is invented for a run that never started"
+    );
+}
+
+/// An orchestrator that refuses the cancel does not keep the connector
+/// locked, and its own text never reaches the response (SEC-11).
+#[tokio::test]
+async fn an_orchestrator_that_refuses_the_cancel_does_not_keep_the_connector_locked() {
+    let server = MockServer::start().await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    let started = now - 7.0 * 3600.0;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_created_at(
+            "conn-ingest-stuck",
+            "run-stuck",
+            "STARTED",
+            started,
+            Some(started)
+        )]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("terminateRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "terminateRun": { "__typename": "TerminateRunFailure",
+                "message": "the run is already gone from the worker" } }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-new" } } }
+        })))
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-stuck").await;
+
+    let (status, answer) = post_run(&app, &cookie, "conn-ingest-stuck", None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["runId"], "run-new");
+    assert!(
+        !answer
+            .to_string()
+            .contains("the run is already gone from the worker"),
+        "{answer}"
+    );
 }
 
 /// Another connector's run does not block this one.
