@@ -29,7 +29,7 @@ import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-cha
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeCopyBelow, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
@@ -665,6 +665,22 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     }, 600);
   }, [board]);
 
+  // `BI-48` (QA `LH-BI-6-40`): a chart's copy is a new chart on the same
+  // dashboard from the stored definition, titled "<title> (copy)", placed
+  // directly below the original on its tab and the same size. The save is the
+  // console's own create (`POST /api/dashboard/specs`, `D17`), so the server
+  // applies every check of a new chart; the layout save is awaited, not the
+  // debounced `persistLayout`, because the copy must land where the page drew
+  // it before the reload.
+  async function duplicateChart(spec: ChartCard) {
+    try {
+      const { id } = await dashboardService.saveChart({ ...spec.def, title: `${spec.title} (copy)`, board }, false);
+      if (id) await dashboardService.saveBoardLayout(board, placeCopyBelow(tabs, shownLayout, chartIds, spec.id, id));
+      await load();
+    } catch (e) {
+      notifyFailure("The chart was not duplicated", writeError(e));
+    }
+  }
   async function removeChart(id: string) {
     setRemoveBusy(true);
     try {
@@ -1063,6 +1079,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       // `WEB-7` D6: editing a chart is its own page, carrying the parameter
       // values the dashboard shows so its preview matches this one.
       onEdit: () => router.push(chartEditHref(board, spec.id, data?.appliedParams)),
+      onDuplicate: () => void duplicateChart(spec),
       onDelete: () => setRemoving({ id: spec.id, title: spec.title }),
     });
     const menu: TileMenuItem[] = [

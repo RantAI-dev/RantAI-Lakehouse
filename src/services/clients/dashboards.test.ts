@@ -286,6 +286,14 @@ describe("the chart builder's write and read (WEB-7 D6)", () => {
     expect(sent(calls[1])).toEqual({ id: "c1", title: "Visitors" })
   })
 
+  /** `BI-48`: the tile's Duplicate places the copy by the id the create answers. */
+  it("returns the new chart's id, and an empty id when the answer carries none", async () => {
+    stubFetch(() => json({ ok: true, chart: { id: "c_new" } }))
+    expect(await clickhouseDashboardService.saveChart({ title: "T", kind: "bar" }, false)).toEqual({ id: "c_new" })
+    stubFetch(() => json({ ok: true }))
+    expect(await clickhouseDashboardService.saveChart({ title: "T", kind: "bar" }, false)).toEqual({ id: "" })
+  })
+
   it("throws the server's own sentence when the save is refused", async () => {
     stubFetch(() => json({ error: "invalid or missing measure column" }, 400))
     await expect(

@@ -11,7 +11,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
@@ -81,5 +81,66 @@ describe("DashboardPage per-role rendering without CopilotProvider (ADM-13 revie
 
     // Assert that the page rendered in view mode without errors
     expect(screen.queryByRole("alert")).toBeNull()
+  })
+})
+
+// `BI-48` (QA `LH-BI-6-40`): a chart tile's menu copies the chart — a new chart
+// on the same dashboard from the stored definition, titled "<title> (copy)",
+// placed directly below the original.
+describe("DashboardPage tile menu: Duplicate (QA LH-BI-6-40)", () => {
+  const chart = {
+    id: "c_1", title: "Visitors", kind: "bar", mart: "mart_x", x: "provinsi", y: "visitors",
+    source: "ui", span: 1,
+    def: { title: "Visitors", kind: "bar", mart: "mart_x", dimension: "provinsi", measures: ["visitors"] },
+  }
+
+  it("posts the chart's definition with a (copy) title and the board, then saves a layout that holds the new id", async () => {
+    const writes: { url: string; method: string; body: Record<string, unknown> }[] = []
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      const method = init?.method ?? "GET"
+      const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {}
+      if (path.includes("/api/auth/me")) {
+        return Promise.resolve(json({ id: "u_editor", name: "Editor", email: null, roles: ["Editor"], permissions: ["dashboard:read", "dashboard:write"], tenants: [] }))
+      }
+      if (path.startsWith("/api/dashboard?") && method === "GET") {
+        return Promise.resolve(json({
+          board: "b_1", boardName: "Quarterly Sales", boards: [{ id: "b_1", name: "Quarterly Sales" }],
+          charts: [chart], kpis: [], filterColumns: [], results: {},
+          layout: { c_1: { x: 0, y: 0, w: 6, h: 4 } }, canDownload: true,
+        }))
+      }
+      if (path.startsWith("/api/dashboard/specs") && method === "POST") {
+        writes.push({ url: path, method, body })
+        return Promise.resolve(json({ ok: true, chart: { id: "c_copy" } }))
+      }
+      if (path.startsWith("/api/dashboard/boards") && method === "PUT") {
+        writes.push({ url: path, method, body })
+        return Promise.resolve(json({ ok: true }))
+      }
+      if (path.includes("/api/dashboard/folders")) return Promise.resolve(json([]))
+      if (path.includes("/api/dashboard/shortcuts")) return Promise.resolve(json({ favourites: [], recent: [] }))
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+
+    render(
+      <AuthProvider>
+        <TableProviders>
+          <DashboardPage boardId="b_1" />
+        </TableProviders>
+      </AuthProvider>,
+    )
+
+    fireEvent.click(await screen.findByLabelText("Actions for Visitors"))
+    fireEvent.click(await screen.findByText("Duplicate"))
+    await waitFor(() => expect(writes.map((w) => w.method)).toEqual(["POST", "PUT"]))
+
+    expect(writes[0].body).toMatchObject({
+      kind: "bar", mart: "mart_x", dimension: "provinsi", measures: ["visitors"],
+      title: "Visitors (copy)", board: "b_1",
+    })
+    expect((writes[0].body as { id?: string }).id).toBeUndefined()
+    const layout = writes[1].body.layout as Record<string, { x: number; y: number; w: number; h: number }>
+    expect(layout.c_copy).toEqual({ x: 0, y: 4, w: 6, h: 4 })
   })
 })
