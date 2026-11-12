@@ -136,7 +136,7 @@ from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
 from pyiceberg.expressions import And, EqualTo, In, IsNull, NotNull
 
-from dispar_orchestrate.adapters import dedup
+from dispar_orchestrate.adapters import dedup, iceberg_stream
 
 HISTORY_COLUMNS = ("_valid_from", "_valid_to", "_is_current", "_row_hash")
 # The columns the sink and `dlt` own: never taken from the source, never hashed.
@@ -401,9 +401,16 @@ def open_table(pipeline: Any, table: str, *, sync: bool = True) -> Any | None:
     owns it (in production Lakekeeper's REST catalog, as the sink installs it), or
     `None` when `dlt` does not know the table. Syncs the pipeline from the bucket
     first: a recreated container has no local copy of its schema (`sync=False` when
-    the caller already did)."""
+    the caller already did). A pipeline that knows no schema knows no table, and is
+    answered `None` before a client is asked for."""
     if sync:
         pipeline.sync_destination()
+    if not pipeline.default_schema_name:
+        # QA LH-DATA-9-37 (DATA-50): a pipeline with no schema knows no table, so the
+        # client `dlt` would build answers "not there" anyway; asking for it makes
+        # `dlt` build a schema named after the pipeline, which it refuses past 64
+        # characters -- that is a table name past 50 (`bronze_ingest_<table>`).
+        return None
     try:
         with pipeline.destination_client() as client:
             return client.load_open_table("iceberg", table)
@@ -499,16 +506,24 @@ def ensure_columns(
     table: str,
     schema: pa.Schema,
     adapt: Callable[[DltResource], Any],
+    *,
+    author: str = "",
 ) -> None:
     """Let `dlt` create the table, or add the columns of `schema` it lacks, by running
     the pipeline on a ZERO-row Arrow table of that schema. `adapt` puts the sink's
     table hints (day partition on `_ingested_at`, format version 2) on the resource,
     the one definition `sink.load_via_sink` uses too. A `dlt` run with nothing to add
     still costs one empty commit, so the caller runs it only when a column is missing
-    (`test_an_ensure_step_with_nothing_to_add_...`)."""
+    (`test_an_ensure_step_with_nothing_to_add_...`).
+
+    `author` is the run's label (`DATA-52`, review round 1 R2): this commit is one a
+    history load makes, so it records the run as `rantai.author` like the load's data
+    commit does, carried by `iceberg_stream.snapshot_properties_for` because `dlt`
+    calls that write from its own thread with no argument of ours."""
     resource = dlt.resource(pa.Table.from_pylist([], schema=schema), name=table, columns=HISTORY_HINTS)
     adapt(resource)
-    pipeline.run(resource, table_name=table, table_format="iceberg", write_disposition="append")
+    with iceberg_stream.snapshot_properties_for(table, snapshot_properties(author)):
+        pipeline.run(resource, table_name=table, table_format="iceberg", write_disposition="append")
 
 
 AUTHOR_PROPERTY = "rantai.author"
@@ -638,7 +653,7 @@ def load_history(
             pa.field("_dlt_load_id", pa.string(), nullable=False),
             pa.field("_dlt_id", pa.string(), nullable=False),
         ]
-        ensure_columns(pipeline, table, pa.schema(fields), adapt)
+        ensure_columns(pipeline, table, pa.schema(fields), adapt, author=author)
         iceberg_table = open_table(pipeline, table)
     if iceberg_table is None:
         raise HistoryRefused(f"table {table!r}: the table could not be created")

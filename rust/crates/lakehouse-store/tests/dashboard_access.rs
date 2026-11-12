@@ -39,6 +39,26 @@ async fn role(pool: &PgPool, name: &str) -> Uuid {
         .unwrap()
 }
 
+async fn tenant(pool: &PgPool, slug: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO tenant (name, slug, plan, residency) \
+         VALUES ($1, $1, 'team', 'eu') RETURNING id",
+    )
+    .bind(slug)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn in_tenant(pool: &PgPool, user_id: Uuid, tenant_id: Uuid) {
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 fn for_user(id: Uuid, level: &str) -> NewRule {
     NewRule {
         user_id: Some(id),
@@ -354,6 +374,37 @@ async fn names_are_found_for_the_people_and_roles_that_exist(pool: PgPool) -> sq
     // `%` and `_` in the needle are literal.
     assert_eq!(search_roles(&pool, "report", 10).await.unwrap().len(), 1);
     assert_eq!(search_roles(&pool, "%", 10).await.unwrap().len(), 0);
+    Ok(())
+}
+
+/// Review round 1 R1 (`DATA-52`): a name is only answered for a person who
+/// shares a tenant with the caller; an id of another tenant's person reads
+/// nothing, so the call site shows "Unknown user" rather than that name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_name_is_only_found_for_a_person_who_shares_a_tenant_with_the_caller(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    use lakehouse_store::dashboard_access::user_names_in_tenants;
+    let here = tenant(&pool, "acme").await;
+    let elsewhere = tenant(&pool, "globex").await;
+    let ours = user(&pool, "ann ours").await;
+    let theirs = user(&pool, "bob theirs").await;
+    in_tenant(&pool, ours, here).await;
+    in_tenant(&pool, theirs, elsewhere).await;
+
+    let names = user_names_in_tenants(&pool, &[ours, theirs], &[here])
+        .await
+        .unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0].0, ours);
+    assert_eq!(names[0].1, "ann ours");
+
+    // An empty list of tenants narrows nothing: a deployment that does not use
+    // tenants answers both, as `search_active_users` does.
+    let both = user_names_in_tenants(&pool, &[ours, theirs], &[])
+        .await
+        .unwrap();
+    assert_eq!(both.len(), 2);
     Ok(())
 }
 

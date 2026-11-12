@@ -158,7 +158,9 @@ pub fn stats_from_summary(summary: &Summary) -> TableStats {
 /// The snapshot summary key the product's own `pyiceberg` commits write the
 /// author under (`dagster/dispar_orchestrate/adapters/history.py`
 /// `AUTHOR_PROPERTY`): the run that made the commit, e.g.
-/// `connector conn-x, run 1a2b`.
+/// `connector conn-x, run 1a2b`, or who started a file upload, e.g.
+/// `Rina Wijaya (file upload)` (`DATA-52`). A merge load is `dlt`'s own write
+/// and records none.
 pub const AUTHOR_SUMMARY_KEY: &str = "rantai.author";
 
 /// The recorded author of a snapshot, if it has one. An empty value is no

@@ -324,7 +324,12 @@ export function UploadCheckStep({
           <UploadPreviewGrid preview={shown} stale={settled === null} />
           {settled !== null && choices.columns.length > 0 ? (
             <>
-              <UploadColumnsEditor choices={choices} sampledRows={settled.sampledRows} />
+              <UploadColumnsEditor
+                choices={choices}
+                sampledRows={settled.sampledRows}
+                rows={settled.rows}
+                fileTypes={parquet?.columns.map((c) => c.type)}
+              />
               <UploadBadValuesPanel choices={choices} sampledRows={settled.sampledRows} />
             </>
           ) : null}
