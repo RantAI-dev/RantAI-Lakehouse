@@ -438,6 +438,14 @@ export type CreateConnectorInput = {
   residency: string
   capabilities: string[]
   owner?: string
+  /**
+   * The connection settings, sent with the create so the API checks them
+   * BEFORE the connector exists (`SRC-41` D11, QA `LH-SRC-3-11`): a refused
+   * dial is a 400 and nothing is created. They are still stored by the
+   * `PUT .../ingest-spec` call that follows. Absent for the assistant, whose
+   * tool offers no such field.
+   */
+  connection?: { adapter: string; dial: Record<string, unknown> }
 }
 
 /**

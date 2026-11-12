@@ -96,6 +96,7 @@ others are beyond the spec. The planner's recommendation is the Default.
   rows stay empty in it.
 - Logs older than 30 days are gone.
 - A load that needs more than 6 hours is stopped unless `INGEST_RUN_MAX_RUNTIME_SECONDS` is raised.
+- A run's status changes when the orchestrator reports the end of the run, which can be minutes after the last table's rows are counted. The report is the run-status sensor's: it is evaluated at most every 30 seconds (`minimum_interval_seconds` of `pipeline_run_finished_sensor`), handles at most 5 ended runs of all jobs per evaluation (`DAGSTER_RUN_STATUS_SENSOR_PROCESS_LIMIT`), and waits its turn behind the other sensors (`sensors.use_threads` in `dagster/dagster.yaml` is off). Which of these made the five to six minutes QA saw (`LH-SRC-6-16`) was not measured.
 
 ## Acceptance checklist
 

@@ -131,6 +131,13 @@ fn rule_json_for(
 /// `DEC-16` (`SRC-42`): a rule's target is included only for a caller who may
 /// manage that rule ([`rule_json_for`]).
 ///
+/// `SRC-40` D6: a rule that has a latest delivery row (`alert_rule_delivery`)
+/// also carries `lastDelivery` — when it last sent, or that it did not and
+/// why. That is the same two facts the incident list shows to `alert:read`, so
+/// every caller who may list the rule sees it. A rule with no row has no key;
+/// a store that cannot be read is logged and leaves the key out (the list
+/// still answers).
+///
 /// # Errors
 ///
 /// As [`visible_rules`]; a rule that cannot be serialized is a 500 with a fixed
@@ -147,11 +154,17 @@ pub(crate) async fn listed_rules(
         HashMap::new()
     };
     let mut out = Vec::with_capacity(rules.len());
+    let last_deliveries = last_deliveries_for(state, &rules).await;
     for rule in rules {
         let mut value = rule_json_for(principal, &rule).map_err(|err| {
             tracing::warn!(%err, rule_id = %rule.id, "an alert rule could not be serialized");
             ApiError::Internal("the alert rules could not be listed".to_owned())
         })?;
+        if let Some(delivery) = last_deliveries.get(&rule.id)
+            && let Some(map) = value.as_object_mut()
+        {
+            map.insert("lastDelivery".to_owned(), json!(delivery));
+        }
         let found = rule.chart.as_deref().and_then(|id| titles.get(id));
         if let Some(found) = found
             && let Some(map) = value.as_object_mut()
@@ -163,6 +176,29 @@ pub(crate) async fn listed_rules(
         out.push(value);
     }
     Ok(out)
+}
+
+/// The latest delivery of each of `rules` (`SRC-40` D6), from
+/// `alert_rule_delivery`. One read for the whole list. No pool, or a read that
+/// fails, is logged and answers an empty map: the list then carries no
+/// `lastDelivery` key instead of failing.
+async fn last_deliveries_for(
+    state: &AppState,
+    rules: &[AlertRule],
+) -> HashMap<String, lakehouse_store::alert_delivery::LastDelivery> {
+    let Some(pg) = state.pg.as_deref() else {
+        return HashMap::new();
+    };
+    let ids: Vec<String> = rules.iter().map(|rule| rule.id.clone()).collect();
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    lakehouse_store::alert_delivery::last_for(pg, &ids)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "the alert rules' last deliveries could not be read");
+            HashMap::new()
+        })
 }
 
 /// Chart id → its title and its dashboard's id and name, for the charts
@@ -808,11 +844,18 @@ pub async fn delete(
 /// route and for the assistant's `delete_alert_rule` (`BI-19` C review SF-7).
 /// Best effort: a state that cannot be removed is logged, not an error to the
 /// caller, because the rule itself is already changed.
+///
+/// `SRC-40` D5: the rule's latest delivery row (`alert_rule_delivery`) goes
+/// with it, for the same two moments, so a new rule that reuses neither the id
+/// nor the thing it watches starts with no "Last sent".
 pub(crate) async fn forget_state(state: &AppState, id: &str) {
-    if let Some(pg) = state.pg.as_deref()
-        && let Err(err) = lakehouse_store::alert_state::delete(pg, id).await
-    {
-        tracing::warn!(%err, rule_id = %id, "an alert's state could not be removed");
+    if let Some(pg) = state.pg.as_deref() {
+        if let Err(err) = lakehouse_store::alert_state::delete(pg, id).await {
+            tracing::warn!(%err, rule_id = %id, "an alert's state could not be removed");
+        }
+        if let Err(err) = lakehouse_store::alert_delivery::delete(pg, id).await {
+            tracing::warn!(%err, rule_id = %id, "an alert's last delivery could not be removed");
+        }
     }
 }
 

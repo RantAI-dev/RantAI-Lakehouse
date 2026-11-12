@@ -450,7 +450,10 @@ describe("ConnectorDetailPage", () => {
     expect(fact("Tenant")).toBe("Acme Co")
     expect(fact("Residency")).toBe("id-jakarta")
     expect(fact("Owner")).toBe("admin")
-    expect(fact("Credential")).toBe("Stored by lakehouse, encrypted")
+    // QA LH-SRC-6-39 (SRC-41 D15): the fact is "—" until the ingest spec has
+    // answered, so this one expectation waits for it (the expected text is
+    // unchanged; the page gained a loading state).
+    await waitFor(() => expect(fact("Credential")).toBe("Stored by lakehouse, encrypted"))
     expect(fact("Last test")).toBe("Never tested")
     // The type (the description) and the environment (a pill by the name) are
     // in the header already, so the row does not say them a second time.
@@ -817,5 +820,22 @@ describe("ConnectorDetailPage change capture", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
     await screen.findByText("Connection test passed")
     expect(screen.queryByRole("region", { name: "Source setup" })).toBeNull()
+  })
+})
+
+// QA LH-SRC-6-39 (SRC-41 D15): a connection that reads no credential says so,
+// instead of repeating where an absent credential would be stored.
+describe("a connector that authenticates with none (LH-SRC-6-39)", () => {
+  it("says None for a connector that authenticates with none", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () =>
+        json({ ...SPEC, adapter: "kafka", dial: { bootstrapServers: ["broker:9092"], auth: { type: "none" } } }),
+    })
+    const { container } = render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    const facts = within(container.querySelector("dl") as HTMLElement)
+    const fact = (label: string) => facts.getByText(label).nextElementSibling?.textContent
+    await waitFor(() => expect(fact("Credential")).toBe("None: this connection authenticates with none"))
+    expect(facts.queryByText("Stored by lakehouse, encrypted")).toBeNull()
   })
 })

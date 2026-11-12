@@ -91,6 +91,7 @@ beyond the spec. The planner's recommendation is the Default.
   (`SRC-8`).
 - For MongoDB, Kafka, SFTP and Oracle the listing runs as a short job and
   takes some seconds longer than for the other sources.
+- A source that does not answer is given up on after 30 seconds (object storage, SFTP, a REST preview) and the listing says it took too long. For the sources the orchestrator reads, the time to start its short job comes on top; that time was not measured (`TC-1712`).
 - A file listing stops at 10,000 files; a narrower glob finds the rest.
 - Business-app connectors (`SRC-3`) list the vendor's objects through the
   same short job (the vendor's own list where it has one, a suggested list

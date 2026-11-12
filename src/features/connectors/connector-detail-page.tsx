@@ -40,6 +40,7 @@ import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { ConnectorSchemaChangesPanel } from "./connector-schema-changes-panel"
 import { ConnectorSetupChecks } from "./connector-setup-checks"
 import { DIRECTION_LABEL } from "./connectors-columns"
+import { usesNoCredential } from "./connector-form-parts"
 
 type ConnectorTab = "overview" | "ingest" | "capture" | "schema" | "tests"
 
@@ -80,18 +81,41 @@ function credentialFact(source: ConnectorDetail["credentialSource"]): string {
 }
 
 /**
+ * What the connector's credential fact can say (`SRC-41` D15, QA
+ * `LH-SRC-6-39`): `none` when the connection reads no credential at all
+ * (Kafka with auth `none` is created with `source: "managed"` and no value, so
+ * `credentialSource` alone read "Stored by lakehouse, encrypted" while the
+ * review step said "No credential is stored"), `unknown` while the ingest spec
+ * is still loading (a dash, not a claim it may have to take back), and
+ * `stored` otherwise — a read that failed included, which keeps today's fact.
+ */
+type CredentialState = "none" | "unknown" | "stored"
+
+/**
  * The row of facts under the title, the asset page's `MetadataList` with the
  * connector's own: who it belongs to, how its credential is held and when it
  * was last tested. The type (the description) and the environment (a pill by
  * the name) are already in the header and are not repeated here (reviewer
  * SHOULD-FIX R1).
  */
-function connectorFacts(c: ConnectorDetail, secretManager: SecretManager | null): MetadataItem[] {
+function connectorFacts(
+  c: ConnectorDetail,
+  secretManager: SecretManager | null,
+  credential: CredentialState
+): MetadataItem[] {
   return [
     { label: "Tenant", value: c.tenant || "Unassigned" },
     { label: "Residency", value: c.residency || "—" },
     { label: "Owner", value: c.owner || "—" },
-    { label: "Credential", value: credentialFact(c.credentialSource) },
+    {
+      label: "Credential",
+      value:
+        credential === "none"
+          ? "None: this connection authenticates with none"
+          : credential === "unknown"
+            ? "—"
+            : credentialFact(c.credentialSource),
+    },
     // `SRC-12` part B: which secret manager this installation reads from, when
     // the operator set one up.
     ...(secretManager ? [{ label: "Secret manager", value: SECRET_MANAGER_LABEL[secretManager] }] : []),
@@ -384,7 +408,22 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
           </>
         }
       />
-      <MetadataList density="compact" columns={3} items={connectorFacts(c, credentialSettings.status === "success" ? credentialSettings.data.secretManager : null)} />
+      <MetadataList
+        density="compact"
+        columns={3}
+        items={connectorFacts(
+          c,
+          credentialSettings.status === "success" ? credentialSettings.data.secretManager : null,
+          // The spec says whether the connection reads a credential; until it
+          // has answered, the fact makes no claim (D15).
+          ingestSpec.status === "loading"
+            ? "unknown"
+            : ingestSpec.status === "success" &&
+                usesNoCredential(ingestSpec.data.adapter ?? null, ingestSpec.data.dial)
+              ? "none"
+              : "stored"
+        )}
+      />
       <ConnectorDeleteDialog
         connector={c}
         dependents={c.dependentPipelines}
