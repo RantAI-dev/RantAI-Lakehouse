@@ -160,6 +160,13 @@ export function UploadRunView({
               ) : null}
             </div>
             {upload.badValues !== undefined ? <BadValuesReport upload={upload} /> : null}
+            {/* QA LH-DATA-14-05 (DATA-54): the checks start when the orchestrator
+                reports the finished run, on its next tick, not when the load
+                ends. */}
+            <p className="text-xs text-muted-foreground">
+              {"Quality checks set to run on every load start within about a minute. Their results "}
+              {"are on the table's Quality tab."}
+            </p>
             <div className="flex flex-wrap gap-2">
               {upload.assetId !== undefined ? (
                 <Button size="sm" render={<Link href={`/data/assets/${encodeURIComponent(upload.assetId)}`} />}>

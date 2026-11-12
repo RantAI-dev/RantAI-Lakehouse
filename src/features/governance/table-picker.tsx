@@ -19,7 +19,7 @@ import { Label } from "@/components/ui/label"
 import { useService } from "@/hooks/use-service"
 import { tableKeyOf } from "@/lib/table-key"
 import { assetService } from "@/services"
-import type { Asset, AssetDetail } from "@/services/contracts/assets"
+import type { AssetDetail } from "@/services/contracts/assets"
 
 /**
  * The table picker the governance forms share (`WEB-8` D8, spec
