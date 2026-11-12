@@ -951,8 +951,9 @@ async fn resolve(state: &AppState, asset: &str) -> Option<ReadSource> {
 ///
 /// The form offers only tables the person may read; what the form hides the
 /// server refuses. "Not there" and "not yours" are one sentence on purpose:
-/// the answer must not say which tables exist. The access check runs first,
-/// so a hidden table is never asked about.
+/// the answer must not say which tables exist. The catalog's tenant rule runs
+/// first and the role's table access second, so a table the caller may not
+/// reach at all is never asked about.
 ///
 /// A rule that already exists may keep a table that has since been dropped
 /// (`update_rule` checks only a rewrite that changes the table), so a rule
@@ -960,6 +961,10 @@ async fn resolve(state: &AppState, asset: &str) -> Option<ReadSource> {
 ///
 /// # Errors
 ///
+/// [`ApiError::PermissionDenied`] (`403`) when the caller is outside the
+/// tenant that owns the shared catalog ([`crate::routes::catalog::
+/// catalog_tenant_refusal`]) — that answer is the same for every table, so it
+/// says nothing about one (PR review round 1 R3, `DATA-54`).
 /// [`ApiError::BadRequest`] with one sentence when `asset` is not a
 /// `silver.<table>`, `serving.<table>` or `bronze.<table>` key, when the
 /// caller's table access hides it, or when the table does not exist.
@@ -969,6 +974,7 @@ async fn resolve(state: &AppState, asset: &str) -> Option<ReadSource> {
 pub(crate) async fn ensure_rule_table(
     state: &AppState,
     principal: Option<&Principal>,
+    headers: &HeaderMap,
     asset: &str,
 ) -> Result<(), ApiError> {
     let asset = asset.trim();
@@ -985,9 +991,17 @@ pub(crate) async fn ensure_rule_table(
     if !matches!(zone.as_str(), "silver" | "serving" | "bronze") {
         return Err(refused());
     }
-    // Access first, so a hidden table is never asked about. No principal (a
-    // system call) is not narrowed, as `TableAccess` documents.
+    // The catalog's tenant rule first (PR review round 1 R3, `DATA-54`): a
+    // caller the catalog refuses is answered the same way for every table,
+    // so the table check below cannot say which tables exist through it.
+    // Access second, so a hidden table is never asked about either. No
+    // principal (a system call) is not narrowed, as `TableAccess` documents.
     if let Some(principal) = principal {
+        if let Some(reason) =
+            crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await?
+        {
+            return Err(ApiError::PermissionDenied(reason.to_owned()));
+        }
         let access = crate::routes::catalog::table_access_for(state, principal).await?;
         if !access.allows(&zone, table) {
             return Err(refused());
@@ -1172,11 +1186,13 @@ pub struct UpdateRuleBody {
 ///
 /// `400` when the body is malformed, leaves the table, the threshold or the
 /// severity empty, or names a table that is not there or that the caller may
-/// not read (QA `LH-DATA-14-01` F2, `DATA-54`); `404` when no rule has that
-/// id; `503` when the table cannot be checked; `500` on a store failure.
+/// not read (QA `LH-DATA-14-01` F2, `DATA-54`); `403` when the caller is
+/// outside the tenant that owns the shared catalog; `404` when no rule has
+/// that id; `503` when the table cannot be checked; `500` on a store failure.
 pub async fn update_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
@@ -1205,9 +1221,10 @@ pub async fn update_rule(
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
     // A rewrite that keeps the table is not checked, so a rule whose table
     // has since been dropped can still be edited or loosened (QA
-    // `LH-DATA-14-01` F2, `DATA-54`).
+    // `LH-DATA-14-01` F2, `DATA-54`). A rewrite that changes it gets the same
+    // tenant and access gate a new rule does (PR review round 1 R3).
     if !before.asset.eq_ignore_ascii_case(&input.asset) {
-        ensure_rule_table(&state, Some(&principal), &input.asset).await?;
+        ensure_rule_table(&state, Some(&principal), &headers, &input.asset).await?;
     }
     let rule = lakehouse_store::governance::update_quality_rule(pool, &id, &input)
         .await?

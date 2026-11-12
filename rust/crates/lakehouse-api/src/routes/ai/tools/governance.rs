@@ -165,6 +165,9 @@ pub(super) async fn draft_quality_rule(state: &AppState, args: &Map<String, Valu
             // narrowed, but a table that is not there is still refused
             // (QA `LH-DATA-14-01` F2, `DATA-54`).
             None,
+            // The tool has no request headers of its own, so the tenant rule
+            // reads the person's own tenant (`tenant_scope::resolve`).
+            &axum::http::HeaderMap::new(),
             axum::body::Bytes::from(bytes),
         )
         .await,

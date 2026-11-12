@@ -1049,30 +1049,35 @@ pub(crate) async fn audit_table_change(
 ///
 /// # Errors
 ///
-/// 400 for an unrecognized `kind` or a malformed body; 503/500 as above.
+/// 400 for an unrecognized `kind` or a malformed body; 403 for the quality
+/// kind when the caller is outside the tenant that owns the shared catalog
+/// (PR review round 1 R3); 503/500 as above.
 pub async fn create_rule(
     State(state): State<AppState>,
     Path(kind): Path<String>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let actor = principal.as_ref().map(|Extension(p)| p);
     match Kind::parse(&kind) {
-        Kind::Quality => match create_quality_rule(State(state.clone()), actor, body).await {
-            Ok(resp) => {
-                let rule = &resp.1.0;
-                audit_table_change(
-                    &state,
-                    actor,
-                    &rule.asset,
-                    "quality.rule_create",
-                    json!({ "name": rule.name, "threshold": rule.threshold }),
-                )
-                .await;
-                resp.into_response()
+        Kind::Quality => {
+            match create_quality_rule(State(state.clone()), actor, &headers, body).await {
+                Ok(resp) => {
+                    let rule = &resp.1.0;
+                    audit_table_change(
+                        &state,
+                        actor,
+                        &rule.asset,
+                        "quality.rule_create",
+                        json!({ "name": rule.name, "threshold": rule.threshold }),
+                    )
+                    .await;
+                    resp.into_response()
+                }
+                Err(err) => err.into_response(),
             }
-            Err(err) => err.into_response(),
-        },
+        }
         Kind::Classification => {
             match create_classification_rule(State(state.clone()), body).await {
                 Ok(resp) => {
@@ -1680,15 +1685,17 @@ pub struct CreateQualityRuleBody {
 ///
 /// 400 on a malformed body, or for a table that is not there or that the
 /// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`);
-/// 409 if the name is taken; 503 when the table cannot be checked; 500 on a
-/// store failure.
+/// 403 when the caller is outside the tenant that owns the shared catalog
+/// (PR review round 1 R3); 409 if the name is taken; 503 when the table
+/// cannot be checked; 500 on a store failure.
 pub async fn create_quality_rule(
     State(state): State<AppState>,
     actor: Option<&Principal>,
+    headers: &HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<QualityRule>)> {
     let body: CreateQualityRuleBody = parse_body(&body)?;
-    crate::routes::quality::ensure_rule_table(&state, actor, &body.asset).await?;
+    crate::routes::quality::ensure_rule_table(&state, actor, headers, &body.asset).await?;
     let input = CreateQualityRuleInput {
         name: body.name,
         asset: body.asset,

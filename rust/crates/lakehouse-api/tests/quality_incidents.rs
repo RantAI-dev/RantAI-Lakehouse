@@ -59,6 +59,13 @@ async fn app() -> (axum::Router, PgPool, MockServer) {
         .await;
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
+    // The deployment names the tenant that owns the shared catalog: the
+    // seeded identity migration creates four tenants, so without it every
+    // caller but an unrestricted one is refused (PR review round 1 R3).
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     (router, pool, ch)
 }
@@ -532,6 +539,10 @@ async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sente
     .execute(&pool)
     .await
     .unwrap();
+    // The person is a member of the tenant that owns the catalog, so the
+    // catalog's tenant rule lets them through to the role's own table access
+    // (PR review round 1 R3).
+    common::in_the_catalog_tenant(&pool, user).await;
     let cookie = session_cookie_for_user(&pool, user).await;
 
     let body = |asset: &str| {
@@ -577,6 +588,67 @@ async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sente
     )
     .await;
     assert_eq!(code, StatusCode::CREATED, "{created}");
+}
+
+/// A caller outside the tenant that owns the shared catalog is refused before
+/// the table is asked about (PR review round 1 R3, plan gap in T8): the
+/// answer is the catalog's own refusal, the same for a table that is there
+/// and one that is not, so it says neither.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_is_refused_before_the_table_is_asked_about() {
+    let (router, pool, _ch) = app().await;
+    let outsider =
+        create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    // Seeded tenant 2, not the one the catalog names.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(
+            "11111111-1111-4111-8111-000000000002"
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    let body = |asset: &str| {
+        json!({
+            "name": "r3_outside", "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+
+    let (code, present) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{present}");
+    let (code, missing) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.no_such_table")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{missing}");
+    assert_eq!(
+        present, missing,
+        "the tenant refusal is the same for every table, so it names none"
+    );
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name = 'r3_outside'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored, 0,
+        "a caller outside the catalog tenant stores nothing"
+    );
 }
 
 /// QA `LH-DATA-14-01` F2 (`DATA-54`): a rewrite that changes the table is
