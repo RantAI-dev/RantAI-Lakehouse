@@ -49,7 +49,10 @@ export function recentProblems(probes: ConnectorProbeResult[] | null, runs: Conn
       message:
         run.endReason === "table_failed"
           ? "The last ingest run did not load every table. Its log under Runs says which."
-          : "The last ingest run failed.",
+          : run.endReason === "timed_out"
+            ? // SRC-39 (QA TC-1702): the time limit stopped it, which is not "another reason".
+              "The last ingest run did not finish within the time limit and was stopped."
+            : "The last ingest run failed.",
       at: run.startedAt,
     })
   }

@@ -1337,6 +1337,7 @@ const END_REASON_LABEL: Record<string, string> = {
   completed: "Every table was loaded.",
   table_failed: "At least one table could not be loaded.",
   connector_paused: "The connector was paused, so nothing was loaded.",
+  timed_out: "The run did not finish within the time limit and was stopped.",
   other: "The run ended for another reason.",
 }
 

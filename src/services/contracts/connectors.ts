@@ -994,8 +994,8 @@ export type RunTrigger = "schedule" | "user" | "refresh" | "clear" | "other" | s
 /** Where a run stands in the product's own record; `running` is also what a killed run keeps, see the Runs card. Widened. */
 export type RunStatus = "running" | "succeeded" | "failed" | "paused" | string
 
-/** Why a run ended (`SRC-11` decision 5). Widened. */
-export type RunEndReason = "completed" | "table_failed" | "connector_paused" | "other" | string
+/** Why a run ended (`SRC-11` decision 5). `timed_out`: it outlived the run limit and was stopped (`SRC-39`, QA `TC-1702`). Widened. */
+export type RunEndReason = "completed" | "table_failed" | "connector_paused" | "timed_out" | "other" | string
 
 /**
  * One run of a connector, from `GET /api/connectors/{id}/runs` (newest 50 first). Mirrors the API's run record

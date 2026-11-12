@@ -1074,6 +1074,17 @@ describe("ConnectorIngestPanel runs from the run record", () => {
     expect(screen.getByText("The connector was paused, so nothing was loaded.")).toBeDefined()
   })
 
+  // SRC-39 (QA TC-1702): a run the time limit stopped says so, in plain words.
+  it("says a run that outlived its limit was stopped", async () => {
+    stubFetch(SPEC, {
+      runs: [record({ runId: "run-timed-0001", status: "failed", endReason: "timed_out" })],
+    })
+    panel()
+    expect(
+      await screen.findByText("The run did not finish within the time limit and was stopped."),
+    ).toBeDefined()
+  })
+
   it("says there are no runs yet when the record is empty", async () => {
     stubFetch(SPEC)
     panel()
