@@ -1245,3 +1245,65 @@ The developer's handled MISMATCH (a 403 reaches this client as `invalid_request`
   `// QA LH-SRC-7-10 (SRC-40 D8): never the API's code-first text.`
 - Check: none (comments).
 
+### Round 1 fixes (developer)
+
+Base: `ddf38bf0`, the merge of `origin/fix/qa-round-connectors-p1` into this branch (no conflicts;
+`CHANGELOG.md` needed nothing this time). After it, `ls rust/migrations | tail -4` →
+`0136_sso_trust_email.sql`, `0137_connector_run_timed_out.sql`,
+`0138_data_engineer_catalog_read.sql`, `0139_alert_rule_delivery.sql`: no number is used twice.
+
+One finding per commit, in order, each pushed to `fix/qa-round-connectors-p2`.
+
+| # | Commit | What changed | Proof |
+| --- | --- | --- | --- |
+| R1 | `5444a18a` | "Run test again" is disabled while `saveSpec.status === "error"`, so a failed settings save keeps its sentence and its Edit link | New test `the created screen when the connection settings could not be saved (LH-SRC-6-39) > keeps the failed-save sentence and its Edit link, and offers no test`; with the new `saveSpec.status === "error"` condition removed from `disabled`, it fails at `Expected: true / Received: false` (13 pass, 1 fail). The screen already rendered the sentence (`setTestSkipped(true)` on a failed save), which is why the fix is the button and not the branch. |
+| R2 | `b4a88d39` | The delivery-row cleanup is held by three route-level tests: the delete (refused keeps it, successful removes it), the assistant's chart-change update, and a `connector_failure` edit moved to another connector (name-only keeps it) | With `alert_delivery::delete` removed from `forget_state`: `a_caller_without_alert_write_cannot_delete_a_rule` fails at "a deleted rule keeps no last delivery"; `update_alert_rule_changing_the_chart_resets_the_state` fails at `left: 1, right: 0` ("a rule watching a new line starts with no last delivery"); `an_edit_that_changes_the_connector_drops_the_rules_last_delivery` fails at "a rule that watches another connector starts with no last delivery". `an_edit_of_the_name_alone_keeps_the_rules_last_delivery` passes in both states, as it should. |
+| R3 | `ef1e6fc6` | The seven names and where the seven comes from, measured | See below: **85 pass, 7 fail** with the helper's old text back on `ddf38bf0`. |
+| R4 | `936cab70` | `asciiLower` lower-cases `[A-Z]` only, in the two places the account rule lower-cased | Both U+212A accounts added to `refuses each vendor's near misses`; with `toLowerCase()` put back the test fails (`Received: null`, i.e. `saasAccountProblem` returned `null` for an account the server refuses): 5 pass, 1 fail. |
+| R5 | `6bb6941e` | One comment naming `LH-SRC-7-10 (SRC-40 D8)` at `alerts-page.tsx:213` (the list's banner), `alert-rule-page.tsx:437` (the measures' error) and `:567` (the save's error) | Comments only; `typecheck` clean, `lint` 0 errors, and `bun test alerts-page.test.tsx alert-rule-page.test.tsx` → 48 pass. |
+
+**R3, measured (rule 7).** On `ddf38bf0` I put the helper's old text back
+(`await screen.findByText("1 tables found")` in `openColumns`) and ran
+`bun test src/features/connectors/connector-ingest-panel.test.tsx`: **85 pass, 7 fail, 92 tests**.
+The seven: "lists the columns discovery found, ticked, and saves an unticked one as excluded";
+"shows a saved exclusion unticked, lets it be ticked again, and then saves none"; "locks the key
+columns of a deduplicating table and the cursor column, ticked, with the reason"; "never sends a
+key or cursor column as excluded, even if it was unticked before the mode needed it"; "is offered
+for the mysql driver too"; "is offered for the mssql driver too"; "is offered for the oracle
+driver too". Five `openColumns()` call sites are seven tests because the fifth is
+`it.each(["mysql", "mssql", "oracle"])`. The handoff's "seven" was right; the review's "five" is
+the call sites. Section 5 now carries this, so the count is visible where the reader looks.
+
+**R2, deviation (MISMATCH: R2(b)).** The finding asks for the assistant's `delete_alert_rule`,
+"beside the `alert_rule_state` assertion at `:388`". `delete_alert_rule` is `WriteHigh`
+(`tests/tier1_writehigh_approval.rs:124`): a call returns a pending approval and never reaches
+`routes::ai::tools::alerts::delete_alert_rule`, so a delete test in `tests/ai_alert_tools.rs`
+cannot reach `forget_state` at all. (And `:388` is the chart-change update's state assertion, not
+a delete.) I covered the same `forget_state` call through the assistant's `update_alert_rule`
+instead, in that existing test, and the delete itself at its reachable entry point,
+`DELETE /api/alerts`, with R2(a). The approved path that would execute the tool was not
+exercised.
+
+**Commands run on `6bb6941e`, in the foreground.**
+
+- `cd rust && cargo fmt --check` → clean.
+- `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings` → `Finished`;
+  no warning. `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-4`, `CARGO_BUILD_JOBS=6`.
+- `cargo test -p lakehouse-api --test alert_targets_hidden` → **10 passed**;
+  `--test ai_alert_tools` → **8 passed**; `--test alert_test_route` → **8 passed**.
+- `bun run typecheck` → clean. `bun run lint` → **0 errors, 11 warnings**, all pre-existing.
+- `bun run test` → first run **4080 pass, 1 skip, 1 fail**; I kept only the tail of that run and
+  did not capture the failing test's name, so it is *not verified* which one it was. Two reruns
+  after it: **4081 pass, 1 skip, 0 fail, 4082 tests across 380 files** each. All of my own tests
+  pass in every run.
+- `(cd dagster && /home/rismana/rantai/venv-agents-4/bin/python -m pytest dispar_orchestrate -q -m
+  loader)` → **306 passed, 2239 deselected** in 811.70s.
+- `python3 ops/lint/check_bare_iceberg_count.py` → `R11 guard: no bare count() against a Bronze
+  Iceberg table found.`
+- `python3 ops/lint/check_intra_package_imports.py` → `OK: all intra-package dispar_orchestrate
+  imports resolve`.
+- `git status` → clean before this doc commit; nothing generated staged.
+
+**Not verified.** `cargo test --workspace` (CI runs it, and rule "Keep build time down" scopes the
+developer's run). The `WriteHigh` approval flow that would execute `delete_alert_rule` after
+approval. The name of the one test that failed in the first full `bun run test` (above).
