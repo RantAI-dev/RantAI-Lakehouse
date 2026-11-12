@@ -401,9 +401,16 @@ def open_table(pipeline: Any, table: str, *, sync: bool = True) -> Any | None:
     owns it (in production Lakekeeper's REST catalog, as the sink installs it), or
     `None` when `dlt` does not know the table. Syncs the pipeline from the bucket
     first: a recreated container has no local copy of its schema (`sync=False` when
-    the caller already did)."""
+    the caller already did). A pipeline that knows no schema knows no table, and is
+    answered `None` before a client is asked for."""
     if sync:
         pipeline.sync_destination()
+    if not pipeline.default_schema_name:
+        # QA LH-DATA-9-37 (DATA-50): a pipeline with no schema knows no table, so the
+        # client `dlt` would build answers "not there" anyway; asking for it makes
+        # `dlt` build a schema named after the pipeline, which it refuses past 64
+        # characters -- that is a table name past 50 (`bronze_ingest_<table>`).
+        return None
     try:
         with pipeline.destination_client() as client:
             return client.load_open_table("iceberg", table)

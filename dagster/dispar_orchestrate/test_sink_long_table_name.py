@@ -50,11 +50,6 @@ def test_dlt_refuses_a_schema_named_after_a_pipeline_of_more_than_64_characters(
     assert first != second
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=InvalidSchemaName,
-    reason="QA LH-DATA-9-37 (DATA-50): fixed in the next commit",
-)
 @pytest.mark.parametrize("length", [52, 128])
 def test_a_first_typed_replace_into_a_long_table_name_loads(lab: Lab, length: int) -> None:
     name = _table_name(length)
@@ -72,11 +67,6 @@ def test_a_first_typed_replace_into_a_long_table_name_loads(lab: Lab, length: in
     assert sorted(row["id"] for row in lab.rows(name)) == [1, 2]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=InvalidSchemaName,
-    reason="QA LH-DATA-9-37 (DATA-50): fixed in the next commit",
-)
 def test_clearing_a_long_named_table_that_was_never_loaded_says_there_is_nothing_to_empty(lab: Lab) -> None:
     assert clear_table(_table_name(128), lab.config).load_info_str == "table not loaded; nothing to empty"
 
