@@ -878,6 +878,72 @@ async fn an_orchestrator_that_cannot_be_reached_for_the_cancel_answers_503_and_s
     assert_eq!(runs[0].end_reason, None);
 }
 
+/// `review round 1, R3` (QA `TC-1702`): the request's own refusals come before
+/// any run is touched. A body naming a table the connector does not load is a
+/// 404, and the overdue run is neither cancelled nor closed for it. Before the
+/// fix the guard ran first and lost the run for a typo.
+#[tokio::test]
+async fn a_table_the_connector_does_not_load_is_a_404_and_stops_no_run() {
+    let server = MockServer::start().await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    let started = now - 7.0 * 3600.0;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_created_at(
+            "conn-ingest-typo",
+            "run-typo",
+            "STARTED",
+            started,
+            Some(started)
+        )]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("terminateRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                "run": { "runId": "run-typo" } } }
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "never" } } }
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-typo").await;
+    select_two_tables(&app.pool, "conn-ingest-typo").await;
+    lakehouse_store::connector_run::start_run(
+        &app.pool,
+        "conn-ingest-typo",
+        "run-typo",
+        lakehouse_store::connector_run::RunTrigger::Schedule,
+        None,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(7),
+    )
+    .await
+    .expect("a record of the old run");
+
+    let body = json!({"object": "public.not_a_table", "action": "clear"}).to_string();
+    let (status, answer) = post_run(&app, &cookie, "conn-ingest-typo", Some(&body)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_eq!(cancel_requests(&server).await, [] as [String; 0]);
+    let runs = recorded_runs(&app.pool, "conn-ingest-typo").await;
+    assert_eq!(
+        runs[0].status, "running",
+        "the refused request wrote nothing"
+    );
+}
+
 /// Another connector's run does not block this one.
 #[tokio::test]
 async fn ingest_run_is_not_blocked_by_another_connectors_run() {

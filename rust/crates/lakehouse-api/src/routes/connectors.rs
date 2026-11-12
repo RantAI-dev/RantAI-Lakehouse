@@ -3821,12 +3821,15 @@ pub async fn ingest_run(
     launch_ingest(&state, &id, None, None).await
 }
 
-/// One run at a time per connector. Bronze is append-only, so a second run
-/// started while the first is still going copies every table into Bronze a
-/// second time — a double click was enough to do it. Checked against
-/// `Dagster`'s own run list, so a run started by the schedule counts too. Not
-/// a lock: two requests in the same instant can both pass, which the
-/// console's disabled button covers.
+/// The runs of this connector that stand between it and a launch, decided
+/// only: every refusal is an error, and the overdue runs that may be stopped
+/// are returned for the caller to stop immediately before the launch
+/// (`review round 1, R3`). One run at a time per connector. Bronze is
+/// append-only, so a second run started while the first is still going copies
+/// every table into Bronze a second time — a double click was enough to do it.
+/// Checked against `Dagster`'s own run list, so a run started by the schedule
+/// counts too. Not a lock: two requests in the same instant can both pass,
+/// which the console's disabled button covers.
 ///
 /// QA `TC-1702` (`SRC-39`): a run that never finishes used to hold this 409
 /// for days. A run the orchestrator launched and did not start, past the
@@ -3843,14 +3846,16 @@ pub async fn ingest_run(
 /// # Errors
 ///
 /// 409 naming the run that is still going, 503 when the orchestrator cannot
-/// be asked for the run list, and the store's classified error when an
-/// overdue run's record cannot be closed.
+/// be asked for the run list.
 #[allow(
     clippy::cast_precision_loss,
     reason = "Unix seconds to f64 to match DgConfiguredRun's wire shape; \
               a timestamp this size loses no meaningful precision"
 )]
-async fn guard_one_run_at_a_time(state: &AppState, connector_id: &str) -> Result<(), ApiError> {
+async fn runs_holding_the_lock(
+    state: &AppState,
+    connector_id: &str,
+) -> Result<Vec<ConnectorIngestRun>, ApiError> {
     let recent = state
         .dagster
         .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
@@ -3871,10 +3876,7 @@ async fn guard_one_run_at_a_time(state: &AppState, connector_id: &str) -> Result
             blocking.run_id.get(..8).unwrap_or(&blocking.run_id),
         )));
     }
-    for run in &active {
-        stop_overdue_run(state, connector_id, run, now).await?;
-    }
-    Ok(())
+    Ok(active)
 }
 
 /// Stop one run that is past its limit, so its connector can run again
@@ -3978,11 +3980,16 @@ async fn launch_ingest(
     }
 
     // One run at a time per connector, unless a run is past its limit
-    // (`SRC-39`, QA `TC-1702`).
-    guard_one_run_at_a_time(&state, &id).await?;
+    // (`SRC-39`, QA `TC-1702`). This decides only: the 409 for a run that is
+    // still going, or the overdue runs to stop later (`review round 1, R3`).
+    // The 409 comes before the body is judged, as it always did.
+    let overdue = runs_holding_the_lock(&state, &id).await?;
 
-    // The two refusals of a run of one table come after the 409s above, which
-    // are the existing, stated answers for "not now".
+    // The request's own refusals come next, and they have no side effect: a
+    // body naming a table the connector does not load, or a table waiting for
+    // a schema decision, is refused before any run is stopped. The guard used
+    // to stop an overdue run for a request it then refused, which lost a run
+    // for a typo (`review round 1, R3`).
     if let Some((object, _)) = &request {
         let selected = spec
             .source_objects
@@ -4012,6 +4019,12 @@ async fn launch_ingest(
         op_config["action"] = json!(action.as_str());
     }
     let run_config = json!({"ops": {"run_ingest": {"config": op_config}}});
+    // The stop is the last thing before the launch, so every answer above is
+    // free of side effects (`review round 1, R3`).
+    let now = time::OffsetDateTime::now_utc();
+    for run in &overdue {
+        stop_overdue_run(&state, &id, run, now).await?;
+    }
     // `SRC-11` review 1 SHOULD-FIX 1: a launch through this route is a
     // person's ("Run now", refresh, clear); the orchestrator's start report
     // reads this tag, and a run with no tag is recorded as `other`.
