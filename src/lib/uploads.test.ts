@@ -4,6 +4,8 @@ import { join } from "node:path"
 import { test } from "node:test"
 import type { Upload } from "@/services/contracts/uploads"
 import {
+  ACCEPTED_FILES,
+  ACCEPTED_FORMATS,
   COLUMN_NAME_RULE,
   COLUMN_TYPES,
   MAX_FILES,
@@ -30,6 +32,8 @@ import {
   headerRowFromDisplay,
   groupProblem,
   isUploadedTable,
+  cutsNanosecondDigits,
+  keepsNanoseconds,
   mismatchLines,
   planPick,
   rawTableFullName,
@@ -408,15 +412,99 @@ test("planPick gives a file its own problem: a kind the API does not read, or on
   assert.equal(candidates[2].problem, null)
 })
 
-test("planPick counts the 2 GB of one upload over all its files, and a refused file does not count", () => {
+test("planPick refuses every file of a selection that takes the upload over 2 GB, and a refused file does not count", () => {
+  // QA LH-DATA-17-04 (DATA-51): the first file of the pick used to pass and be sent,
+  // and the second was refused -- after the first had already gone. Now the total of
+  // the selection is checked first, so none of it is handed to the queue.
   const half = MAX_SESSION_BYTES / 2
   const { candidates } = planPick(
     [{ size: half, state: "received" }, { size: MAX_SESSION_BYTES, state: "refused" }],
     [fileOfSize("a.csv", half), fileOfSize("b.csv", 1), fileOfSize("c.csv", 1)]
   )
-  assert.equal(candidates[0].problem, null, "exactly the limit in all")
-  assert.match(candidates[1].problem ?? "", /b\.csv would bring the files to .*over the 2 GB limit for one upload/)
-  assert.match(candidates[2].problem ?? "", /c\.csv would bring the files/)
+  assert.equal(candidates.length, 3)
+  for (const candidate of candidates) {
+    assert.match(
+      candidate.problem ?? "",
+      /^The 3 files chosen would bring the upload to .* over the 2 GB limit for one upload/
+    )
+    assert.match(candidate.problem ?? "", /None of them was sent/)
+  }
+})
+
+test("planPick refuses both files of LH-DATA-17-04 before either is sent", () => {
+  // The QA case: two files of 1,127,500,000 bytes each.
+  const { candidates } = planPick([], [fileOfSize("a.csv", 1_127_500_000), fileOfSize("b.csv", 1_127_500_000)])
+  assert.equal(candidates.length, 2)
+  for (const candidate of candidates) {
+    assert.match(candidate.problem ?? "", /^The 2 files chosen would bring the upload to 2\.1 GB,/)
+    assert.match(candidate.problem ?? "", /None of them was sent/)
+  }
+})
+
+test("planPick keeps a selection that fits, and today's sentence for one file too many", () => {
+  const half = MAX_SESSION_BYTES / 2
+  const fits = planPick([], [fileOfSize("a.csv", half), fileOfSize("b.csv", half)])
+  assert.deepEqual(
+    fits.candidates.map((c) => c.problem),
+    [null, null]
+  )
+  // One file too many keeps the sentence it always had, with the total it would make.
+  const one = planPick(
+    [
+      { size: half, state: "received" },
+      { size: half, state: "received" },
+    ],
+    [fileOfSize("c.csv", 1)]
+  )
+  assert.match(one.candidates[0].problem ?? "", /c\.csv would bring the files to .*over the 2 GB limit for one upload/)
+})
+
+test("planPick does not count a file refused for its own reason toward the total", () => {
+  // The 3 GiB workbook is refused by its name, so it adds nothing; the two CSVs fit.
+  const { candidates } = planPick([], [
+    fileOfSize("book.xlsm", 3 * 1024 * 1024 * 1024),
+    fileOfSize("a.csv", 10),
+    fileOfSize("b.csv", 10),
+  ])
+  assert.match(candidates[0].problem ?? "", /looks like a workbook or an archive/)
+  assert.equal(candidates[1].problem, null)
+  assert.equal(candidates[2].problem, null)
+})
+
+test("keepsNanoseconds is true only for a nanosecond timestamp label", () => {
+  // `DATA-53`: the label the API gives a Parquet column (`upload_parquet::type_label`).
+  assert.equal(keepsNanoseconds("timestamp (ns)"), true)
+  assert.equal(keepsNanoseconds("timestamp (ns, UTC)"), true)
+  assert.equal(keepsNanoseconds("timestamp (us, UTC)"), false)
+  assert.equal(keepsNanoseconds("int64"), false)
+  assert.equal(keepsNanoseconds(undefined), false)
+})
+
+test("cutsNanosecondDigits is true for a nanosecond file type or a fraction of seven to nine digits", () => {
+  // `DATA-53` decision 17, review round 1 R5: a CSV column someone chose Timestamp for lost
+  // digits 7 to 9 with nothing on the Check step; the previewed rows decide it now.
+  const rows = [["a", "1.50", "2026-10-16T13:30:05.1234567"], ["b", "2", "2026-10-16T13:30:05.123456"]]
+  assert.equal(cutsNanosecondDigits(rows, 2), true)
+  assert.equal(cutsNanosecondDigits(rows, 1), false, "a decimal's own digits are not a timestamp fraction")
+  // Nine digits fit a Timestamp column and are cut; ten or more do not fit, and the Check
+  // step lists that value instead.
+  assert.equal(cutsNanosecondDigits([["2026-10-16T13:30:05.123456789"]], 0), true)
+  assert.equal(cutsNanosecondDigits([["2026-10-16T13:30:05.1234567890"]], 0), false)
+  assert.equal(cutsNanosecondDigits([["2026-10-16T13:30:05Z"]], 0), false)
+  // The file's own type still says it, whatever the previewed rows hold.
+  assert.equal(cutsNanosecondDigits([["2026-10-16T13:30:05.123456"]], 0, "timestamp (ns, UTC)"), true)
+})
+
+test("the formats phrase names every format the Accepted fact lists", () => {
+  // `DATA-51` (QA `LH-DATA-9-02`): one phrase for the link, the empty state and the page.
+  for (const format of ["CSV", "TSV", "JSON", "JSON Lines", "Avro"]) {
+    assert.ok(ACCEPTED_FORMATS.includes(format), format)
+    assert.ok(ACCEPTED_FILES.includes(format), format)
+  }
+  assert.ok(ACCEPTED_FORMATS.includes("Excel"))
+  assert.ok(ACCEPTED_FORMATS.includes("Parquet"))
+  assert.ok(ACCEPTED_FILES.includes(".xlsx"))
+  assert.ok(ACCEPTED_FILES.includes(".parquet"))
 })
 
 // ── column types (DATA-18) ────────────────────────────────────────────────

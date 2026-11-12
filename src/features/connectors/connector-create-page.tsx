@@ -15,6 +15,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
 import { SECRET_MANAGER_LABEL } from "@/lib/connectors/secret-reference"
+import { ACCEPTED_FORMATS } from "@/lib/uploads"
 import type { Connector, CredentialSpec } from "@/services/contracts/connectors"
 import {
   CredentialFields,
@@ -450,7 +451,7 @@ export function ConnectorCreatePage() {
                 (DATA-9, `docs/core/features/upload-file.md`). */}
             <p className="text-sm text-muted-foreground">
               <Link href="/connectors/upload" className="text-primary underline-offset-4 hover:underline">
-                Have a file instead? Upload CSV, TSV, Excel or Parquet files
+                Have a file instead? Upload {ACCEPTED_FORMATS} files
               </Link>
             </p>
             {types.status === "loading" ? (

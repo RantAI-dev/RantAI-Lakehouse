@@ -9,7 +9,7 @@ import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { folderOfTable } from "@/lib/upload-folders"
-import { isUploadedTable, suggestTableName, tableNameProblem } from "@/lib/uploads"
+import { ACCEPTED_FORMATS, columnSpecOf, isUploadedTable, suggestTableName, tableNameProblem } from "@/lib/uploads"
 import { uploadService } from "@/services"
 import type { IngestUploadInput, Upload, UploadFolder, UploadLoadMode } from "@/services/contracts/uploads"
 import { UploadCheckStep, useUploadPreview } from "./upload-check-step"
@@ -23,10 +23,9 @@ import { useColumnChoices } from "./use-column-choices"
 import { TABLE_LOOKUP_DELAY_MS, useTableUploads } from "./use-table-uploads"
 import { useUploadGroup } from "./use-upload-group"
 import { useUploadQueue } from "./use-upload-queue"
-import { columnSpecOf } from "@/lib/uploads"
 
 const STEPS: FormStep[] = [
-  { id: "file", label: "File", description: "Choose CSV, TSV, JSON, Avro, Excel or Parquet files" },
+  { id: "file", label: "File", description: `Choose ${ACCEPTED_FORMATS} files` },
   { id: "check", label: "Check", description: "How the file is read" },
   { id: "table", label: "Table", description: "Name the raw table" },
   { id: "review", label: "Review", description: "Load the files" },
@@ -401,7 +400,7 @@ export function UploadFilePage({
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Upload file"
-        description="Bring CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables. Files with the same columns can load into one table together. Check how the first one is read, name the table, then load."
+        description={`Bring ${ACCEPTED_FORMATS} files, or a gzip or zip of them, in as raw tables. Files with the same columns can load into one table together. Check how the first one is read, name the table, then load.`}
         actions={
           <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
             Cancel

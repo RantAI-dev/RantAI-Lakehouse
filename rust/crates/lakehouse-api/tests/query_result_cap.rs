@@ -322,6 +322,27 @@ async fn a_result_under_both_caps_carries_no_cut_by() {
     assert!(body.get("cutBy").is_none(), "no cut means no cutBy");
 }
 
+/// `DATA-53` (QA `LH-DATA-9-32`): the route asks the engine for decimals as text, so a
+/// value the engine holds exactly reaches the caller with every digit instead of the
+/// fifteen or so a 64-bit float keeps.
+#[tokio::test]
+async fn a_decimal_keeps_every_digit_the_engine_holds() {
+    let (app, _ch) = spin_up_with_clickhouse().await;
+
+    let (status, body) = run_as_reader(
+        &app,
+        "SELECT toDecimal128('123456789012345.678901234', 9) AS d",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"][0]["d"],
+        json!("123456789012345.678901234"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn a_result_of_exactly_the_cap_is_not_reported_as_truncated() {
     let (app, _ch) = spin_up_with_clickhouse().await;

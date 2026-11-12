@@ -2319,6 +2319,8 @@ class TestFileIngestRunConfigReader:
                         "header_row": 0,
                         "columns": [],
                         "on_bad_value": "stop",
+                        # `DATA-52`: who started the load.
+                        "author": "Rina Wijaya (file upload)",
                     }
                 }
             }
