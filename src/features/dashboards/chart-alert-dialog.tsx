@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Loader2 } from "lucide-react";
+import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -15,7 +16,11 @@ import { displayColumn } from "@/lib/chart-joins";
 import { OTHER_FLAG } from "@/lib/chart-shape";
 import { alertNumberShape } from "./chart-alert";
 
-const selectClass = "h-8 rounded-md border border-input bg-background px-2 text-sm";
+const CONDITION_LABELS: Record<AlertCondition, string> = {
+  above: "the value goes above",
+  below: "the value goes below",
+  any_rows: "the chart returns any rows",
+};
 
 /** What the dialog says about who an alert is read as (feature decision C4). */
 export const READ_AS_YOU_SENTENCE =
@@ -117,14 +122,12 @@ export function ChartAlertDialog({
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="chart-alert-condition">When</Label>
-            <select id="chart-alert-condition" className={selectClass} value={condition}
-              onChange={(e) => setCondition(e.target.value as AlertCondition)}>
-              {conditions.map((c) => (
-                <option key={c} value={c}>
-                  {c === "above" ? "the value goes above" : c === "below" ? "the value goes below" : "the chart returns any rows"}
-                </option>
-              ))}
-            </select>
+            <SelectField
+              id="chart-alert-condition"
+              value={condition}
+              options={conditions.map((c) => ({ value: c, label: CONDITION_LABELS[c] }))}
+              onValueChange={(next) => setCondition(next as AlertCondition)}
+            />
             {shape === "none" ? (
               <p className="text-xs text-muted-foreground">This chart has no single number, so an alert on it can only ask whether it returns any rows.</p>
             ) : null}
@@ -139,9 +142,13 @@ export function ChartAlertDialog({
           {shape === "series" && needsLine ? (
             <div className="grid gap-1.5">
               <Label htmlFor="chart-alert-series">Series (its latest point is read)</Label>
-              <select id="chart-alert-series" className={selectClass} value={series} onChange={(e) => setSeries(e.target.value)}>
-                {seriesChoices.map((m) => <option key={m} value={m}>{chart.labels?.[m] ?? displayColumn(m)}</option>)}
-              </select>
+              <SelectField
+                id="chart-alert-series"
+                value={series}
+                placeholder="Pick a series"
+                options={seriesChoices.map((m) => ({ value: m, label: chart.labels?.[m] ?? displayColumn(m) }))}
+                onValueChange={setSeries}
+              />
             </div>
           ) : null}
           <p className="text-xs text-muted-foreground">

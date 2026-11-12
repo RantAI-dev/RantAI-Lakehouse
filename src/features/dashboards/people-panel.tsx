@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Shield, UserPlus, Users, X } from "lucide-react";
+import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -165,14 +166,19 @@ export function PeoplePanel({ kind, id }: { readonly kind: AccessKind; readonly 
             {/* BI-19 B2: edit and manage are enforced now. A person cannot give a
                 level above their own (feature B6), so the choices stop at yours;
                 a row already above it keeps its word and is shown as it is. */}
-            <select aria-label={`Level of ${r.name || r.id}`} value={r.level} disabled={busy}
-              onChange={(e) => setRows((cur) => cur.map((x) => (rowKey(x) === rowKey(r) ? { ...x, level: e.target.value } : x)))}
-              className="h-7 rounded-md border border-input bg-background px-1 text-xs">
-              {LEVELS.filter((l) => levelAtLeast(access.yourLevel, l) || l === r.level).map((l) => (
-                <option key={l} value={l}>{levelLabel(l)}</option>
-              ))}
-              {LEVELS.includes(r.level as DashboardLevel) ? null : <option value={r.level}>{levelLabel(r.level)}</option>}
-            </select>
+            {/* WEB-9 D2a: a row's level can sit above the viewer's own, so it
+                is left out of the offered list and the trigger would be empty;
+                the placeholder says what the control is for. */}
+            <SelectField aria-label={`Level of ${r.name || r.id}`} value={r.level} disabled={busy} size="sm"
+              placeholder="Pick a level"
+              options={[
+                ...LEVELS.filter((l) => levelAtLeast(access.yourLevel, l) || l === r.level)
+                  .map((l) => ({ value: l, label: levelLabel(l) })),
+                ...(LEVELS.includes(r.level as DashboardLevel)
+                  ? []
+                  : [{ value: r.level, label: levelLabel(r.level) }]),
+              ]}
+              onValueChange={(next) => setRows((cur) => cur.map((x) => (rowKey(x) === rowKey(r) ? { ...x, level: next } : x)))} />
             <Button variant="ghost" size="icon-sm" aria-label={`Remove ${r.name || r.id}`} disabled={busy}
               onClick={() => setRows((cur) => cur.filter((x) => rowKey(x) !== rowKey(r)))}>
               <X className="size-3.5" />

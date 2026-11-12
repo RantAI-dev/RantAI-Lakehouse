@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -41,22 +42,6 @@ function ApplyRow({ disabled, onApply }: { disabled: boolean; onApply: () => voi
 const TEXT_OPS = [
   ["contains", "contains"], ["not_contains", "does not contain"], ["starts_with", "starts with"], ["ends_with", "ends with"],
 ] as const;
-
-/** A native select styled like the inputs; the repo has no select primitive that fits a popover this narrow. */
-function PlainSelect({ label, value, onChange, children, className }: {
-  label: string; value: string; onChange: (v: string) => void; children: React.ReactNode; className?: string;
-}) {
-  return (
-    <select
-      aria-label={label}
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className={cn("h-8 w-full rounded-lg border border-input bg-transparent px-2 text-sm dark:bg-input/30", className)}
-    >
-      {children}
-    </select>
-  );
-}
 
 export function TextEditor({ board, column, others, initial, onApply }: EditorProps) {
   const isText = ["contains", "not_contains", "starts_with", "ends_with"].includes(opOf(initial));
@@ -128,9 +113,9 @@ export function NumberEditor({ board, column, others, initial, onApply }: Editor
       </TabsList>
       <TabsContent value="compare">
         <div className="flex flex-col gap-2">
-          <PlainSelect label="Comparison" value={mode} onChange={(v) => setMode(v as NumberPick["mode"])}>
-            {NUMBER_MODES.map(([m, label]) => <option key={m} value={m}>{label}</option>)}
-          </PlainSelect>
+          <SelectField aria-label="Comparison" value={mode} className="w-full"
+            options={NUMBER_MODES.map(([value, label]) => ({ value, label }))}
+            onValueChange={(next) => setMode(next as NumberPick["mode"])} />
           {mode === "between" ? (
             <div className="flex gap-2">{field(min, setMin, "From", "From")}{field(max, setMax, "To", "To")}</div>
           ) : (
@@ -210,35 +195,34 @@ export function DateEditor({ column, initial, onApply }: EditorProps) {
             ))}
           </div>
           <div className="flex items-end gap-2 border-t border-border pt-2">
-            <PlainSelect label="Direction" value={dir} onChange={(v) => setDir(v as "last" | "next")} className="w-20">
-              <option value="last">Last</option>
-              <option value="next">Next</option>
-            </PlainSelect>
+            <SelectField aria-label="Direction" value={dir} className="w-20"
+              options={[{ value: "last", label: "Last" }, { value: "next", label: "Next" }]}
+              onValueChange={(next) => setDir(next as "last" | "next")} />
             <Input type="number" min={1} max={3650} value={n} onChange={(e) => setN(e.target.value)} aria-label="How many" className="w-16" />
-            <PlainSelect label="Unit" value={unit} onChange={(v) => setUnit(v as RelativeUnit)}>
-              {UNITS.map((u) => <option key={u} value={u}>{u}s</option>)}
-            </PlainSelect>
+            <SelectField aria-label="Unit" value={unit}
+              options={UNITS.map((u) => ({ value: u, label: `${u}s` }))}
+              onValueChange={(next) => setUnit(next as RelativeUnit)} />
             <Button size="sm" disabled={datePickToFilter(column, relativePick) === null} onClick={() => apply(relativePick)}>Apply</Button>
           </div>
         </div>
       </TabsContent>
       <TabsContent value="date">
         <div className="flex flex-col gap-2">
-          <PlainSelect label="Date filter" value={mode} onChange={(v) => setMode(v as DateMode)}>
-            {DATE_MODES.map(([m, label]) => <option key={m} value={m}>{label}</option>)}
-          </PlainSelect>
+          <SelectField aria-label="Date filter" value={mode} className="w-full"
+            options={DATE_MODES.map(([value, label]) => ({ value, label }))}
+            onValueChange={(next) => setMode(next as DateMode)} />
           {mode === "range" ? (
             <div className="flex gap-2">{input(from, setFrom, "From")}{input(to, setTo, "To")}</div>
           ) : mode === "month" || mode === "quarter" ? (
             <div className="flex gap-2">
               {mode === "month" ? (
-                <PlainSelect label="Month" value={String(month)} onChange={(v) => setMonth(Number(v))}>
-                  {MONTH_NAMES.map((name, i) => <option key={name} value={i + 1}>{name}</option>)}
-                </PlainSelect>
+                <SelectField aria-label="Month" value={String(month)} className="w-full"
+                  options={MONTH_NAMES.map((name, i) => ({ value: String(i + 1), label: name }))}
+                  onValueChange={(next) => setMonth(Number(next))} />
               ) : (
-                <PlainSelect label="Quarter" value={String(quarter)} onChange={(v) => setQuarter(Number(v))}>
-                  {[1, 2, 3, 4].map((q) => <option key={q} value={q}>Q{q}</option>)}
-                </PlainSelect>
+                <SelectField aria-label="Quarter" value={String(quarter)} className="w-full"
+                  options={[1, 2, 3, 4].map((q) => ({ value: String(q), label: `Q${q}` }))}
+                  onValueChange={(next) => setQuarter(Number(next))} />
               )}
               <Input type="number" min={1900} max={2299} value={year} onChange={(e) => setYear(e.target.value)} placeholder="Year" aria-label="Year" className="w-24" />
             </div>

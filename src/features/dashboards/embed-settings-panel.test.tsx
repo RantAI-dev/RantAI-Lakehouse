@@ -1,5 +1,6 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import type { EmbedInfo } from "@/services"
 import { EmbedSettingsPanel } from "./embed-settings-panel"
 
@@ -42,8 +43,8 @@ describe("EmbedSettingsPanel (BI-26 D9)", () => {
   it("lists the dashboard's filters with their saved mode, hidden when none was chosen", async () => {
     stub()
     open()
-    expect((screen.getByLabelText("Mode of region") as HTMLSelectElement).value).toBe("locked")
-    expect((screen.getByLabelText("Mode of year") as HTMLSelectElement).value).toBe("hidden")
+    expect(screen.getByRole("combobox", { name: "Mode of region" }).textContent).toContain("Locked")
+    expect(screen.getByRole("combobox", { name: "Mode of year" }).textContent).toContain("Hidden")
   })
 
   it("saves the modes and says unsaved changes until then", async () => {
@@ -52,7 +53,7 @@ describe("EmbedSettingsPanel (BI-26 D9)", () => {
     open((i) => infos.push(i))
     const save = screen.getByRole("button", { name: "Save filter modes" }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
-    fireEvent.change(screen.getByLabelText("Mode of year"), { target: { value: "editable" } })
+    chooseOption(screen.getByRole("combobox", { name: "Mode of year" }), "Editable")
     expect(screen.getByText("Unsaved changes")).toBeDefined()
     fireEvent.click(save)
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
@@ -65,7 +66,7 @@ describe("EmbedSettingsPanel (BI-26 D9)", () => {
   it("shows the server's sentence when saving is refused", async () => {
     stub(() => json({ error: "A mode can only be set for a filter the dashboard has." }, 400))
     open()
-    fireEvent.change(screen.getByLabelText("Mode of year"), { target: { value: "locked" } })
+    chooseOption(screen.getByRole("combobox", { name: "Mode of year" }), "Locked")
     fireEvent.click(screen.getByRole("button", { name: "Save filter modes" }))
     await screen.findByText(/A mode can only be set/)
   })
@@ -83,10 +84,12 @@ describe("EmbedSettingsPanel (BI-26 D9)", () => {
     const calls = stub()
     open()
     fireEvent.click(screen.getByLabelText("One chart"))
-    const picker = (await screen.findByLabelText("Chart")) as HTMLSelectElement
-    await waitFor(() => expect(picker.options.length).toBe(2))
-    expect(Array.from(picker.options).map((o) => o.text)).toEqual(["Choose a chart…", "Visits"])
-    fireEvent.change(picker, { target: { value: "u_1" } })
+    const picker = await screen.findByRole("combobox", { name: "Chart" })
+    expect(picker.textContent).toContain("Choose a chart…")
+    // The chart list arrives from `/api/dashboard/specs`; let the effect settle
+    // before the list is opened, or it would open empty (same reason as S1).
+    await act(async () => {})
+    chooseOption(picker, "Visits")
     fireEvent.click(screen.getByText("How to sign a token"))
     expect(signText()).toContain('resource: { chart: "u_1" }')
     await waitFor(() => expect(calls.some((c) => c.url === "/api/dashboard/embed-info?board=b_1&chart=u_1")).toBe(true))
@@ -100,7 +103,7 @@ describe("EmbedSettingsPanel (BI-26 D9)", () => {
   it("the look options go into the preview address and the snippets", async () => {
     stub()
     open()
-    fireEvent.change(screen.getByLabelText("Theme"), { target: { value: "dark" } })
+    chooseOption(screen.getByRole("combobox", { name: "Theme" }), "Dark")
     fireEvent.click(screen.getByLabelText("Hide the Rantai Lake name"))
     fireEvent.click(screen.getByLabelText("Let the page behind show through"))
     fireEvent.click(screen.getByRole("button", { name: "Show preview" }))
@@ -115,16 +118,22 @@ describe("EmbedSettingsPanel (BI-26 D9)", () => {
   it("offers only Hidden for a filter that does not pick values (BI-26 review fix R3)", async () => {
     stub()
     render(<EmbedSettingsPanel board="b_1" info={{ ...INFO, hiddenOnlyColumns: ["year"] }} origin="https://lake.example" onInfo={() => {}} />)
-    const year = screen.getByLabelText("Mode of year") as HTMLSelectElement
-    expect(Array.from(year.options).map((o) => o.value)).toEqual(["hidden"])
-    const region = screen.getByLabelText("Mode of region") as HTMLSelectElement
-    expect(Array.from(region.options).map((o) => o.value)).toEqual(["locked", "editable", "hidden"])
+    const year = screen.getByRole("combobox", { name: "Mode of year" })
+    fireEvent.click(year)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["Hidden"])
+    // A list opened by a bare click stays open, so the second control is read
+    // in a fresh render rather than beside the first one's options.
+    cleanup()
+    render(<EmbedSettingsPanel board="b_1" info={{ ...INFO, hiddenOnlyColumns: ["year"] }} origin="https://lake.example" onInfo={() => {}} />)
+    const region = screen.getByRole("combobox", { name: "Mode of region" })
+    fireEvent.click(region)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["Locked", "Editable", "Hidden"])
     expect(screen.getByText("not a list of values")).toBeDefined()
   })
 
   it("cannot save modes without the write right", async () => {
     stub()
     render(<EmbedSettingsPanel board="b_1" info={INFO} origin="https://lake.example" canWrite={false} onInfo={() => {}} />)
-    expect((screen.getByLabelText("Mode of year") as HTMLSelectElement).disabled).toBe(true)
+    expect((screen.getByRole("combobox", { name: "Mode of year" }) as HTMLButtonElement).disabled).toBe(true)
   })
 })

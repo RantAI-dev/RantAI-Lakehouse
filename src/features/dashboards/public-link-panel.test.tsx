@@ -56,8 +56,8 @@ describe("PublicLinkPanel", () => {
   it("offers 30 days preselected and sends the expiry and the password when making a link", async () => {
     const calls = stub({ enabled: true, link: null }, () => json({ ok: true, link: LINK }))
     render(<PublicLinkPanel board="b_1" />)
-    const select = (await screen.findByLabelText("Link expires in")) as HTMLSelectElement
-    expect(select.value).toBe("30")
+    const select = await screen.findByRole("combobox", { name: "Link expires in" })
+    expect(select.textContent).toContain("30 days")
     fireEvent.change(screen.getByLabelText("Password (optional)"), { target: { value: "correct horse" } })
     fireEvent.click(screen.getByRole("button", { name: "Make a public link" }))
     await screen.findByText(/A password is needed/)

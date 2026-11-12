@@ -1,5 +1,6 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import * as realThemes from "next-themes"
 import * as realTileBody from "./tile-body"
 import * as realGrid from "./dashboard-grid"
@@ -164,17 +165,16 @@ describe("editable filters in a signed embed (BI-26 D4, D5)", () => {
   it("lists the allowed values, starts at the saved value, and asks again with the viewer's choice", async () => {
     const calls = serve({ data: payload({ embedFilters: filters }), values: ["Bali", "Java"] })
     render(<EmbedView jwt="the.jwt" />)
-    const select = (await screen.findByLabelText("region")) as HTMLSelectElement
-    await waitFor(() => expect(select.options.length).toBe(3))
-    expect(select.value).toBe("Bali")
+    const select = await screen.findByRole("combobox", { name: "region" })
+    await waitFor(() => expect(select.textContent).toContain("Bali"))
     expect(calls.some((c) => c.url === "/api/embed/values" && c.body.column === "region" && c.body.jwt === "the.jwt")).toBe(true)
 
-    fireEvent.change(select, { target: { value: "Java" } })
+    chooseOption(select, "Java")
     await waitFor(() =>
       expect(calls.some((c) => c.url === "/api/embed/data" && JSON.stringify(c.body.filters) === JSON.stringify([{ column: "region", op: "in", values: ["Java"] }]))).toBe(true),
     )
     // "All" clears it: an inactive filter replaces the saved one.
-    fireEvent.change(select, { target: { value: "" } })
+    chooseOption(select, "All")
     await waitFor(() =>
       expect(calls.some((c) => c.url === "/api/embed/data" && JSON.stringify(c.body.filters) === JSON.stringify([{ column: "region", op: "in", values: [] }]))).toBe(true),
     )
@@ -191,7 +191,7 @@ describe("editable filters in a signed embed (BI-26 D4, D5)", () => {
     const calls = serve({ data: payload({ embedFilters: filters }) })
     render(<EmbedView token="p_tok" />)
     await screen.findByTestId("tile")
-    expect(screen.queryByLabelText("region")).toBeNull()
+    expect(screen.queryByRole("combobox", { name: "region" })).toBeNull()
     expect(calls.some((c) => c.url === "/api/embed/values")).toBe(false)
   })
 })

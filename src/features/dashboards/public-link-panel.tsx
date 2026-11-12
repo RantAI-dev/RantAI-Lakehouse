@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Check, Code2, Copy, Globe, Link2 } from "lucide-react";
+import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { copyText as copyToClipboard } from "@/lib/copy-text";
@@ -58,18 +59,18 @@ function ExpiryPicker({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <select
+      <SelectField
         aria-label="Link expires in"
         value={choice}
-        onChange={(e) => onChoice(e.target.value as ExpiryChoice)}
-        className="h-8 rounded-md border border-border bg-background px-2 text-xs"
-      >
-        <option value="1">1 day</option>
-        <option value="7">7 days</option>
-        <option value="30">30 days</option>
-        <option value="90">90 days</option>
-        <option value="date">A date…</option>
-      </select>
+        options={[
+          { value: "1", label: "1 day" },
+          { value: "7", label: "7 days" },
+          { value: "30", label: "30 days" },
+          { value: "90", label: "90 days" },
+          { value: "date", label: "A date…" },
+        ]}
+        onValueChange={(next) => onChoice(next as ExpiryChoice)}
+      />
       {choice === "date" ? (
         <Input type="date" aria-label="Link expires on" value={date} onChange={(e) => onDate(e.target.value)} className="h-8 w-40 text-xs" />
       ) : null}
