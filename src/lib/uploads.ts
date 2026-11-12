@@ -50,6 +50,18 @@ const WORKBOOK_NAME = /\.xlsx?$/i
 export const MAX_FILES = 10
 
 /**
+ * The formats the upload reads, in one phrase (decision 12 of
+ * `docs/core/features/upload-file.md`, `DATA-51`, QA `LH-DATA-9-02`): the link
+ * on New Connector, the empty state of Uploaded files and the Upload file page
+ * all read it, so they cannot name different lists. A format added to the API
+ * is added here and nowhere else in the console.
+ */
+export const ACCEPTED_FORMATS = "CSV, TSV, JSON, JSON Lines, Avro, Excel or Parquet"
+
+/** The same formats with the file names a person picks, for the Accepted fact: decision 12 again. */
+export const ACCEPTED_FILES = "CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip"
+
+/**
  * The most files `GET /api/uploads` returns (the API's `LIST_LIMIT`,
  * `routes/uploads.rs`): the list has no paging, so a full answer is a cut one
  * (`DATA-51`, QA `LH-DATA-35-10`).

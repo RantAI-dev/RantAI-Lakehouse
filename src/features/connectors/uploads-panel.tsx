@@ -19,7 +19,7 @@ import {
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useServiceAction } from "@/hooks/use-service"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
-import { UPLOAD_LIST_LIMIT } from "@/lib/uploads"
+import { ACCEPTED_FORMATS, UPLOAD_LIST_LIMIT } from "@/lib/uploads"
 import {
   ALL_FILES,
   NO_FOLDER,
@@ -128,7 +128,7 @@ export function UploadsPanel({
     return (
       <EmptyState
         title="No uploaded files"
-        description="Upload CSV, TSV, Excel or Parquet files to bring them in as raw tables."
+        description={`Upload ${ACCEPTED_FORMATS} files to bring them in as raw tables.`}
         action={
           <Button size="sm" render={<Link href="/connectors/upload" />}>
             <UploadIcon data-icon="inline-start" />

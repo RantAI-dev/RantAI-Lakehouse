@@ -154,11 +154,14 @@ describe("UploadsPanel", () => {
     expect((row.getByRole("button", { name: "Delete big.csv" }) as HTMLButtonElement).disabled).toBe(false)
   })
 
-  it("says in the empty state that CSV, TSV, Excel and Parquet files can be uploaded", async () => {
+  it("says in the empty state every format this upload reads can be uploaded", async () => {
     stubFetch(() => [])
     render(<UploadsPanel />)
     expect(await screen.findByText("No uploaded files")).toBeDefined()
-    expect(screen.getByText("Upload CSV, TSV, Excel or Parquet files to bring them in as raw tables.")).toBeDefined()
+    // `DATA-51` (QA `LH-DATA-9-02`): one list of formats, the same as the New Connector link's.
+    expect(
+      screen.getByText("Upload CSV, TSV, JSON, JSON Lines, Avro, Excel or Parquet files to bring them in as raw tables.")
+    ).toBeDefined()
   })
 
   it("offers Load for an uploaded or failed file, opening the upload page on it, and for no other", async () => {

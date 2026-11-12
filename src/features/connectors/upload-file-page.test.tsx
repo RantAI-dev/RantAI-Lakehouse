@@ -322,7 +322,10 @@ describe("UploadFilePage, first step", () => {
     stubFetch()
     render(<UploadFilePage lookupDelayMs={0} />)
     expect(screen.getByText("Drop files here, or choose some")).toBeDefined()
-    expect(screen.getByText(/CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables/)).toBeDefined()
+    // `DATA-51` (QA `LH-DATA-9-02`): JSON Lines is named too, as decision 12 of the page says.
+    expect(
+      screen.getByText(/CSV, TSV, JSON, JSON Lines, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables/)
+    ).toBeDefined()
     const input = screen.getByLabelText("Choose files")
     const button = screen.getByText("Choose files", { selector: "label" })
     expect(button.getAttribute("for")).toBe(input.id)

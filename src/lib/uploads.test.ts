@@ -4,6 +4,8 @@ import { join } from "node:path"
 import { test } from "node:test"
 import type { Upload } from "@/services/contracts/uploads"
 import {
+  ACCEPTED_FILES,
+  ACCEPTED_FORMATS,
   COLUMN_NAME_RULE,
   COLUMN_TYPES,
   MAX_FILES,
@@ -465,6 +467,18 @@ test("planPick does not count a file refused for its own reason toward the total
   assert.match(candidates[0].problem ?? "", /looks like a workbook or an archive/)
   assert.equal(candidates[1].problem, null)
   assert.equal(candidates[2].problem, null)
+})
+
+test("the formats phrase names every format the Accepted fact lists", () => {
+  // `DATA-51` (QA `LH-DATA-9-02`): one phrase for the link, the empty state and the page.
+  for (const format of ["CSV", "TSV", "JSON", "JSON Lines", "Avro"]) {
+    assert.ok(ACCEPTED_FORMATS.includes(format), format)
+    assert.ok(ACCEPTED_FILES.includes(format), format)
+  }
+  assert.ok(ACCEPTED_FORMATS.includes("Excel"))
+  assert.ok(ACCEPTED_FORMATS.includes("Parquet"))
+  assert.ok(ACCEPTED_FILES.includes(".xlsx"))
+  assert.ok(ACCEPTED_FILES.includes(".parquet"))
 })
 
 // ── column types (DATA-18) ────────────────────────────────────────────────
