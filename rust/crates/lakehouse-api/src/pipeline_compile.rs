@@ -361,42 +361,108 @@ fn validate(
     Ok((limit, last))
 }
 
-/// D6: the tables one SQL step names, each resolved against the inputs and
-/// the steps before it.
+/// The names one step declares as `WITH` aliases, and the tables it reads —
+/// both AS WRITTEN, at any depth.
 ///
-/// A fully qualified name must be an input's `<zone>.<table>`; a bare name
-/// must be an input or an earlier step. Anything else is refused, naming this
-/// step — `sql_rewrite::referenced_tables` leaves CTE names out of the
-/// compiled text, so a bare name that names a LATER step would otherwise
-/// pass unnoticed and fail in `ClickHouse` at run time.
+/// BLD-1 part 1 review R2-B1 / D6a: this walks the parsed step with
+/// `sqlparser`'s visitor instead of `sql_rewrite::referenced_tables`, because
+/// that collector lowercases every name and drops a bare name that equals one
+/// of the statement's own `WITH` names — so `FROM ORDERS` was accepted as the
+/// input `orders`, `WITH T AS … SELECT * FROM t` was never checked, and an
+/// input `Orders` could never be read at all. `ClickHouse` matches a `WITH`
+/// name by exact case, so these comparisons must keep it.
+///
+/// A table function (`args.is_some()`) is skipped: the rewrite classifies and
+/// refuses it, as it does for every other surface.
+#[derive(Default)]
+struct StepReads {
+    /// Every `WITH` name the step declares, anywhere in it.
+    with_names: Vec<String>,
+    /// Every ordinary table relation, at any depth, as written.
+    tables: Vec<sqlparser::ast::ObjectName>,
+}
+
+impl sqlparser::ast::Visitor for StepReads {
+    type Break = std::convert::Infallible;
+
+    fn pre_visit_query(
+        &mut self,
+        query: &sqlparser::ast::Query,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.with_names.push(cte.alias.name.value.clone());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(
+        &mut self,
+        factor: &sqlparser::ast::TableFactor,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if let sqlparser::ast::TableFactor::Table { name, args, .. } = factor
+            && args.is_none()
+        {
+            self.tables.push(name.clone());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Every identifier part of a name, as written. A part that is a function
+/// (`FUNCTION(...)`) is not an identifier, so the name is refused rather than
+/// guessed at.
+fn name_parts(name: &sqlparser::ast::ObjectName) -> Option<Vec<String>> {
+    name.0
+        .iter()
+        .map(|part| part.as_ident().map(|ident| ident.value.clone()))
+        .collect()
+}
+
+/// D6: the names one SQL step reads, each resolved against the inputs and the
+/// steps before it.
+///
+/// D6a, and review R2-B1: a reference matches by its name EXACTLY, case
+/// included, against an input, an earlier step, or a `WITH` name the step
+/// itself declares (also as written). A name with more than one part
+/// (`zone.table`) is refused even when it names an input, and a bare name that
+/// names a LATER step is refused with its own sentence. Anything else is not a
+/// table the pipeline reads.
 fn check_step_tables(
     sql: &str,
     index: usize,
     inputs: &[PipelineInput],
     steps: &[PipelineStep],
 ) -> Result<(), DefinitionError> {
-    let Some(tables) =
-        crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::ClickHouseDialect {})
-    else {
-        // `check_pipeline_step_sql` already proved it parses; this is the
-        // defence-in-depth branch, refused rather than assumed.
+    use sqlparser::ast::Statement::Query as QueryStatement;
+
+    let dialect = sqlparser::dialect::ClickHouseDialect {};
+    let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+        .map_err(|_| DefinitionError::step(index, READS_NOT_INPUT))?;
+    // `check_pipeline_step_sql` already proved one query; this is the
+    // defence-in-depth branch, refused rather than assumed.
+    let [QueryStatement(query)] = statements.as_slice() else {
         return Err(DefinitionError::step(index, READS_NOT_INPUT));
     };
-    for table in tables {
-        // R1-B6 / D6a: a step reads an input by its NAME in the pipeline, so
-        // a qualified `zone.table` is refused even when it names an input —
-        // `ClickHouse` would resolve it as a table in the connection's own
-        // database, which neither the gate nor the rewrite sees.
-        if table.contains('.') {
+    let mut reads = StepReads::default();
+    let _: std::ops::ControlFlow<_> = sqlparser::ast::Visit::visit(query, &mut reads);
+
+    for name in &reads.tables {
+        let Some(parts) = name_parts(name) else {
             return Err(DefinitionError::step(index, READS_NOT_INPUT));
-        }
-        // Exact, case included: the same reason as `reads` above.
-        if inputs.iter().any(|i| i.name == table)
-            || steps[..index].iter().any(|s| s.name() == table)
+        };
+        let [table] = parts.as_slice() else {
+            // D6a: a step reads an input by its name in the pipeline.
+            return Err(DefinitionError::step(index, READS_NOT_INPUT));
+        };
+        if inputs.iter().any(|input| &input.name == table)
+            || steps[..index].iter().any(|step| step.name() == table)
+            || reads.with_names.iter().any(|with| with == table)
         {
             continue;
         }
-        let later = steps[index + 1..].iter().any(|s| s.name() == table);
+        let later = steps[index + 1..].iter().any(|step| step.name() == table);
         return Err(DefinitionError::step(
             index,
             if later {
@@ -837,6 +903,66 @@ mod tests {
         let err = refusal(&inputs, &steps);
         assert_eq!(err.path(), "steps[0]");
         assert_eq!(err.message(), super::READS_NOT_INPUT);
+    }
+
+    /// R2-B1: the reference is read AS WRITTEN. `ClickHouse` matches a `WITH`
+    /// name by exact case, so `FROM ORDERS` is not the input `orders` — it is a
+    /// table in the connection's own database, which neither the gate nor the
+    /// rewrite sees.
+    #[test]
+    fn a_read_that_differs_only_in_case_is_refused_the_other_way_round() {
+        let inputs = vec![input("orders", "silver", "orders")];
+        let steps = vec![sql_step("copied", "SELECT * FROM ORDERS")];
+        let err = refusal(&inputs, &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::READS_NOT_INPUT);
+    }
+
+    /// R2-B1: an input whose name has a capital letter can be read, exactly.
+    #[test]
+    fn an_input_with_a_capital_letter_is_read_exactly() {
+        let inputs = vec![input("Orders", "silver", "orders")];
+        let steps = vec![sql_step("copied", "SELECT * FROM Orders")];
+        assert_eq!(
+            compile(&inputs, &steps, None, Some("icecat_api")).unwrap(),
+            "WITH\n  `Orders` AS (SELECT * FROM silver.`orders`),\n  `copied` AS (\n\
+             SELECT * FROM Orders\n)\nSELECT * FROM `copied`"
+        );
+    }
+
+    /// R2-B1: the step's OWN `WITH` names are read as written too — `t` is the
+    /// alias, `T` is a table nobody declared.
+    #[test]
+    fn a_steps_own_with_name_is_matched_as_written() {
+        let inputs = vec![input("orders", "silver", "orders")];
+        let accepted = vec![sql_step(
+            "aggregated",
+            "WITH t AS (SELECT id FROM orders) SELECT * FROM t",
+        )];
+        assert!(compile(&inputs, &accepted, None, Some("icecat_api")).is_ok());
+
+        let refused_steps = vec![sql_step(
+            "aggregated",
+            "WITH t AS (SELECT id FROM orders) SELECT * FROM T",
+        )];
+        let err = refusal(&inputs, &refused_steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::READS_NOT_INPUT);
+    }
+
+    /// R2-B1: a name inside a subquery or a join is checked the same way.
+    #[test]
+    fn a_name_inside_a_subquery_or_a_join_is_checked_too() {
+        let inputs = vec![input("orders", "silver", "orders")];
+        for sql in [
+            "SELECT * FROM orders WHERE id IN (SELECT id FROM ORDERS)",
+            "SELECT * FROM orders AS o JOIN ORDERS AS x ON o.id = x.id",
+        ] {
+            let steps = vec![sql_step("copied", sql)];
+            let err = refusal(&inputs, &steps);
+            assert_eq!(err.path(), "steps[0]", "{sql}");
+            assert_eq!(err.message(), super::READS_NOT_INPUT, "{sql}");
+        }
     }
 
     #[test]
