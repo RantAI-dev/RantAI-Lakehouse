@@ -64,9 +64,12 @@ export function useTableCatalog(): TableCatalog {
           ).sort(),
     [assets]
   )
+  // Review round 1 R11: the fallback names the shape the server accepts. A
+  // Bronze row's namespace is the registry's, so `namespace.table` named no
+  // table and is answered 400 (QA `LH-DATA-14-01` F2, `DATA-54`).
   const note =
     state.status === "error"
-      ? "Could not read the catalog's tables; type the table as namespace.table."
+      ? "Could not read the catalog's tables; type the table as silver.<table>, serving.<table> or bronze.<table>."
       : null
   const idOf = React.useCallback(
     (table: string) => assets?.find((asset) => tableKeyOf(asset) === table)?.id ?? null,

@@ -89,7 +89,7 @@ describe("TablePicker", () => {
     ])
   })
 
-  it("offers the catalog's tables as namespace.table and picks one", async () => {
+  it("offers the catalog's tables as their table keys and picks one", async () => {
     spyOn(assetService, "listAssets").mockResolvedValue(ASSETS)
     const onChange = mock<(next: string) => void>(() => {})
     render(<CatalogPicker onChange={onChange} />)
@@ -131,7 +131,12 @@ describe("TablePicker", () => {
     render(<CatalogPicker />)
     const input = (await screen.findByRole("textbox", { name: "Table" })) as HTMLInputElement
     expect(input.value).toBe("")
-    expect(screen.getByText(/Could not read the catalog's tables/)).toBeTruthy()
+    // Review round 1 R11: the sentence names the shape the server accepts.
+    expect(
+      screen.getByText(
+        "Could not read the catalog's tables; type the table as silver.<table>, serving.<table> or bronze.<table>."
+      )
+    ).toBeTruthy()
     expect(screen.queryByRole("button", { name: "Table" })).toBeNull()
   })
 })
