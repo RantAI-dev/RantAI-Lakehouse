@@ -158,6 +158,31 @@ describe("the alert rule page (WEB-7 T7)", () => {
     expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts")
   })
 
+  // DEC-16 (QA LH-SRC-7-04, SRC-42): the API sends a rule without its target to
+  // a caller who may not manage it, and the page says so instead of rendering a
+  // form whose Save the API would refuse.
+  it("says a rule whose target is hidden cannot be changed", async () => {
+    stubReads([{ ...RULE, target: undefined, targetHidden: true }])
+    render(<AlertRulePage ruleId="al_1234" />)
+
+    expect(await screen.findByText("You cannot change this rule")).toBeDefined()
+    expect(
+      screen.getByText(
+        "Seeing where a rule sends, or changing it, needs the alert:write permission."
+      )
+    ).toBeDefined()
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
+    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts")
+  })
+
+  it("still renders the form for a rule whose target is returned", async () => {
+    stubReads([RULE])
+    render(<AlertRulePage ruleId="al_1234" />)
+
+    expect(await screen.findByRole("button", { name: "Save" })).toBeDefined()
+    expect(screen.queryByText("You cannot change this rule")).toBeNull()
+  })
+
   it("says which field is missing instead of saving", async () => {
     stubReads()
     const create = spyOn(alertRuleService, "createRule").mockResolvedValue(RULE)

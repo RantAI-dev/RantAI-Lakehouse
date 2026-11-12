@@ -1264,13 +1264,13 @@ const POLL_MS = 3_000
 const LAUNCH_GRACE_MS = 60_000
 
 /**
- * How long a run whose record still says `running` is believed. A table holds
- * a run open for at most about 21 minutes of waiting between its three retries
- * (`SRC-11` decision 1) plus the load itself, so a run with no end reported
- * after six hours was stopped without reporting one: a worker killed or a run
- * cancelled in the orchestrator fires neither of the reports that close a
- * record (the Rust handoff of tasks 1 to 4 says so). It is shown as "no end
- * reported", not as active forever, and it no longer disables Run now.
+ * The fallback for how long a run whose record still says `running` is believed, used only when the
+ * API's run list does not carry its limit (`ConnectorRunList.maxRuntimeSeconds`). A table holds a run
+ * open for at most about 21 minutes of waiting between its three retries (`SRC-11` decision 1) plus
+ * the load itself, so a run with no end reported after six hours was stopped without reporting one: a
+ * worker killed or a run cancelled in the orchestrator fires neither of the reports that close a
+ * record (the Rust handoff of tasks 1 to 4 says so). It is shown as "no end reported", not as active
+ * forever, and it no longer disables Run now.
  */
 export const STALE_RUN_MS = 6 * 60 * 60 * 1000
 
@@ -1278,20 +1278,29 @@ function startedMillis(run: ConnectorRun): number {
   return parseTimestamp(run.startedAt).getTime()
 }
 
-/** Whether the run's record says it is going and the bound above has not passed. */
-export function isActive(run: ConnectorRun, now = Date.now()): boolean {
+/**
+ * The bound a run is believed for, from the API's own setting (`SRC-39`, QA `TC-1702`; `review round
+ * 1, R8`). The API refuses the next run while the previous one is inside this limit, so the page must
+ * not use a smaller number of its own: it would offer "Run now" for a run the API still holds.
+ */
+export function runLimitMillis(maxRuntimeSeconds: number | undefined): number {
+  return typeof maxRuntimeSeconds === "number" && maxRuntimeSeconds > 0 ? maxRuntimeSeconds * 1000 : STALE_RUN_MS
+}
+
+/** Whether the run's record says it is going and the bound has not passed. */
+export function isActive(run: ConnectorRun, limitMs = STALE_RUN_MS, now = Date.now()): boolean {
   if (run.status !== "running") return false
   const started = startedMillis(run)
-  return Number.isNaN(started) || now - started < STALE_RUN_MS
+  return Number.isNaN(started) || now - started < limitMs
 }
 
-/** A record that says `running` for longer than `STALE_RUN_MS`: its end was never reported. */
-export function isNoEndReported(run: ConnectorRun, now = Date.now()): boolean {
-  return run.status === "running" && !isActive(run, now)
+/** A record that says `running` for longer than the run limit: its end was never reported. */
+export function isNoEndReported(run: ConnectorRun, limitMs = STALE_RUN_MS, now = Date.now()): boolean {
+  return run.status === "running" && !isActive(run, limitMs, now)
 }
 
-export function runStatusLabel(run: ConnectorRun, now = Date.now()): string {
-  if (isNoEndReported(run, now)) return "No end reported"
+export function runStatusLabel(run: ConnectorRun, limitMs = STALE_RUN_MS, now = Date.now()): string {
+  if (isNoEndReported(run, limitMs, now)) return "No end reported"
   switch (run.status) {
     case "running":
       return "Running"
@@ -1308,9 +1317,10 @@ export function runStatusLabel(run: ConnectorRun, now = Date.now()): string {
 
 export function runStatusTone(
   run: ConnectorRun,
+  limitMs = STALE_RUN_MS,
   now = Date.now()
 ): "success" | "destructive" | "warning" | "neutral" | "info" {
-  if (isNoEndReported(run, now)) return "neutral"
+  if (isNoEndReported(run, limitMs, now)) return "neutral"
   switch (run.status) {
     case "running":
       return "info"
@@ -1337,6 +1347,7 @@ const END_REASON_LABEL: Record<string, string> = {
   completed: "Every table was loaded.",
   table_failed: "At least one table could not be loaded.",
   connector_paused: "The connector was paused, so nothing was loaded.",
+  timed_out: "The run did not finish within the time limit and was stopped.",
   other: "The run ended for another reason.",
 }
 
@@ -1380,8 +1391,11 @@ function useIngestRunState(connectorId: string) {
   // A run just launched, until the record lists it.
   const [launchedRunId, setLaunchedRunId] = React.useState<string | null>(null)
 
-  const runs = list.data ?? []
-  const activeRun = runs.find((r) => isActive(r)) ?? null
+  const runs = list.data?.runs ?? []
+  // `SRC-39` (`review round 1, R8`): the limit the API judges a run by travels
+  // with the list, so raising the setting cannot bring the QA symptom back.
+  const limitMs = runLimitMillis(list.data?.maxRuntimeSeconds)
+  const activeRun = runs.find((r) => isActive(r, limitMs)) ?? null
   const awaitingLaunch = launchedRunId !== null && !runs.some((r) => r.runId === launchedRunId)
   const watching = activeRun !== null || awaitingLaunch
   const { refresh: refreshRuns } = list
@@ -1413,6 +1427,7 @@ function useIngestRunState(connectorId: string) {
     awaitingLaunch,
     launchedRunId,
     watching,
+    limitMs,
     launch: setLaunchedRunId,
     refreshRuns,
   }
@@ -1462,7 +1477,7 @@ function IngestRuns({
   /** A change-capture connector is paused and resumed on the Change capture tab (`SRC-4` S4-g), not here. */
   resumeOnCaptureTab?: boolean
 }) {
-  const { list, runs, activeRun, awaitingLaunch, launchedRunId, watching, refreshRuns } = state
+  const { list, runs, activeRun, awaitingLaunch, launchedRunId, watching, limitMs, refreshRuns } = state
   const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
 
   const runNowButton = (
@@ -1524,6 +1539,7 @@ function IngestRuns({
               layout={layout}
               connectorId={connectorId}
               run={run}
+              limitMs={limitMs}
               defaultOpen={index === 0}
             />
           ))}
@@ -1609,21 +1625,24 @@ function RunCard({
   layout,
   connectorId,
   run,
+  limitMs,
   defaultOpen,
 }: {
   layout: "page" | "embedded"
   connectorId: string
   run: ConnectorRun
+  /** The API's run limit (`review round 1, R8`), so a run is "going" for as long as the API holds it. */
+  limitMs: number
   defaultOpen: boolean
 }) {
   const [logOpen, setLogOpen] = React.useState(false)
-  const noEnd = isNoEndReported(run)
+  const noEnd = isNoEndReported(run, limitMs)
   const attempts = `${run.attempts} ${run.attempts === 1 ? "attempt" : "attempts"}`
   const summary = noEnd
     ? "No end reported"
     : `${run.rowsLoaded.toLocaleString()} rows · ${attempts}`
 
-  const status = <Pill tone={runStatusTone(run)}>{runStatusLabel(run)}</Pill>
+  const status = <Pill tone={runStatusTone(run, limitMs)}>{runStatusLabel(run, limitMs)}</Pill>
   const runId = (
     <>
       <span className="font-mono text-xs">{run.runId.slice(0, 8)}</span>

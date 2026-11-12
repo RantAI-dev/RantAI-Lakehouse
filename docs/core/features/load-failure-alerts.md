@@ -51,8 +51,9 @@ its new run fields, so the AI team reviews the tool schema snapshot.
 
 ## Decisions
 
-All nine defaults signed by the product owner on 2026-10-09 ("do as recommended"). Rows 1 and 2 are the spec's *(proposed)*
-numbers. Rows 3 to 5 settle how a spec row is met. Rows 6 to 9 are beyond
+Nine defaults were signed by the product owner on 2026-10-09 ("do as recommended") and row 10 on
+2026-11-12 (`DEC-16`); row 11 is *(proposed, not yet signed)*. Rows 1 and 2 are the spec's *(proposed)*
+numbers. Rows 3 to 5 settle how a spec row is met. Rows 6 to 11 are beyond
 the spec.
 
 | # | Decision | Default | Signed |
@@ -66,6 +67,8 @@ the spec.
 | 7 | Beyond the spec: who may create a rule for all connectors, or for uploads. Rules are one list for the installation, so such a rule carries every tenant's connector names. | Only an administrator who sees every tenant. Others with `alert:write` may create a rule for one connector in their own tenant. | 2026-10-09 |
 | 8 | Beyond the spec: what an alert says (principle 4). | The connector's or file's name, the run, a link into the console. Never the error text from the source system. | 2026-10-09 |
 | 9 | Beyond the spec: the orchestrator reports runs only when `PIPELINE_RUN_TOKEN` is set, and it is optional in compose. | Keep it optional; the Alerts page says plainly when it is not set, so "no alerts" is never silent (principle 2). | 2026-10-09 |
+| 10 | Beyond the spec: who sees where a rule sends (`DEC-16`, QA `LH-SRC-7-04`). | Only a person with `alert:write`. A person with `alert:read` sees the rule, its state and whether it sends to a webhook or an e-mail address, not the address. | 2026-11-12 |
+| 11 | Beyond the spec: the owner of a chart alert sees where their own rule sends, without `alert:write` (plan decision D16, `BI-19` part C). | The owner of a chart alert sees the target of their own rule, because it is their own address. Everyone else without `alert:write` sees it hidden, as row 10 says. | *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
@@ -103,6 +106,7 @@ Target row works as written" checkable and cover the decisions above.
 | 10 | Read an alert from row 2 | It names the connector and the run and links to the console; no database error text | Pass 2026-10-23 (product owner) |
 | 11 | As a user who is not an administrator: create a rule for all connectors, then for another tenant's connector | Both refused with a plain message | Pass 2026-10-23 (product owner) |
 | 12 | (operator) Unset `PIPELINE_RUN_TOKEN`, restart, open the Alerts page | The page says run alerts are not being reported | Pass 2026-10-23 (product owner) |
+| 13 | As a user with `alert:read` and without `alert:write`, open the Alerts page and read `GET /api/alerts` | Each rule shows "Webhook" or "E-mail" and no address; the answer holds no webhook address and no e-mail address | Not run |
 
 Pre-merge check, 2026-10-12, product owner, on a separate instance built from PR #101 at `f9d488f`: the Alerts page, the six rule kinds and the Sources list were reported as conforming ("QA sudah sesuai"). No rule of a new kind was left saved on that instance. No run could be started there (it uses the shared orchestrator) and SMTP is not configured, so rows 2 to 8 and 12's restart were not exercised; the g6 gate proved a failed run reaching the connector's row in 21 to 26 seconds on PR #101. This is not the acceptance run.
 

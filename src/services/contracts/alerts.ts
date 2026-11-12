@@ -71,7 +71,15 @@ export type AlertRule = {
   threshold: number
   board?: string
   channel: AlertChannel
-  target: string
+  /**
+   * Where the rule sends: a webhook URL or an e-mail address. Left out of the
+   * wire body, with `targetHidden: true`, when the caller may not manage the
+   * rule (`DEC-16`, QA `LH-SRC-7-04`, `SRC-42`); the list then says "Webhook"
+   * or "E-mail" instead.
+   */
+  target?: string
+  /** `true` when the API withheld `target` from this caller (`DEC-16`); never present otherwise. */
+  targetHidden?: boolean
   enabled: boolean
   createdAt?: string
   /**
