@@ -49,7 +49,7 @@ from dagster import (
     op,
 )
 
-from dispar_orchestrate import authored_factory, authored_transforms
+from dispar_orchestrate import authored_factory
 from dispar_orchestrate.authored_factory import (
     DAGSTER_LOCATION,
     DAGSTER_REPO,
@@ -66,25 +66,21 @@ def _cfg(run_token: str = "a-real-token") -> authored_factory.AuthoredPipelineCo
 
 
 @contextlib.contextmanager
-def _enforce_passthrough():
-    """Make the op's BLD-1 / D4 enforcement call answer with the SQL it was
-    given, unchanged.
+def _compile_passthrough(reads_iceberg: bool = False):
+    """Make the op's compile call answer with a fixed statement and flag.
 
-    Every test below that exercises the op's happy path needs this: the op
-    now POSTs its `SELECT` to the API and runs whatever comes back, so
-    without it each of them would make a real request to
-    `http://lakehouse-api.invalid:8080` (a host that does not resolve) and
-    fail on a connection error rather than on the thing it is testing.
-    Returning the input verbatim is the neutral stand-in — it leaves every
-    assertion about the SQL the op builds and writes exactly as valid as
-    before D4. The tests that care about enforcement itself
-    (`EnforceSqlTest`) mock the transport instead of this seam, so they
-    exercise the real `_enforced_sql`.
+    BLD-1 part 1 / D14: this module builds no SQL, so there is nothing to
+    return "unchanged". The stand-in answers the shape the API documents,
+    which is all the op itself needs; the tests that care about the call
+    (`CompileSqlTest`) mock the transport instead of this seam.
     """
+    compiled = "SELECT id, name FROM silver.`orders`"
     with mock.patch.object(
-        authored_factory, "_enforced_sql", side_effect=lambda cfg, pid, sql: sql,
-    ) as enforced:
-        yield enforced
+        authored_factory,
+        "_compiled_sql",
+        side_effect=lambda cfg, pid: (compiled, reads_iceberg),
+    ) as compiled_call:
+        yield compiled_call
 
 
 class HeadersTest(unittest.TestCase):
@@ -196,27 +192,6 @@ class BuildAuthoredJobsTest(unittest.TestCase):
         )
 
 
-class BuildSelectSqlTest(unittest.TestCase):
-    def test_select_rename_cast_filter_dedupe_compose_into_one_statement(self) -> None:
-        transforms = [
-            authored_transforms.parse_transform("select(id,amount)"),
-            authored_transforms.parse_transform("rename(amount,amount_usd)"),
-            authored_transforms.parse_transform("cast(amount,Float64)"),
-            authored_transforms.parse_transform("filter(status = 'active')"),
-            authored_transforms.parse_transform("dedupe(id)"),
-        ]
-        sql = authored_factory._build_select_sql("silver.`orders`", transforms)
-        self.assertEqual(
-            sql,
-            "SELECT id, CAST(amount AS Float64) AS amount_usd FROM silver.`orders` "
-            "WHERE status = 'active' ORDER BY id LIMIT 1 BY id",
-        )
-
-    def test_no_transforms_selects_star_with_no_where_or_order(self) -> None:
-        sql = authored_factory._build_select_sql("silver.`orders`", [])
-        self.assertEqual(sql, "SELECT * FROM silver.`orders`")
-
-
 class BronzeSourceTest(unittest.TestCase):
     """BLD-1 / D5 (was BLD-3 / D1 + D2): a `bronze` source is Iceberg in
     Lakekeeper, not a ClickHouse database, so it is read through a
@@ -257,7 +232,7 @@ class BronzeSourceTest(unittest.TestCase):
             return_value=ClickHouseTarget("http://ch", "default", ""),
         ), mock.patch.dict(
             os.environ, {"ICEBERG_QUERY_DB": "icecat_api"}, clear=False,
-        ), _enforce_passthrough():
+        ), _compile_passthrough():
             result = run_fn(build_op_context())
         return result, calls
 
@@ -279,53 +254,35 @@ class BronzeSourceTest(unittest.TestCase):
             **overrides,
         }
 
-    def test_a_bronze_source_is_read_through_the_api_iceberg_query_database(self) -> None:
-        """D5: the source is ``icecat_api.`bronze.g3a_orders` `` -- the API's
-        OWN `ICEBERG_QUERY_DB` plus the catalog's own flat `bronze.<table>`
-        name -- never the ClickHouse database `bronze` that does not exist
-        on this stack, and never a database private to this module (which
-        is the change D5 makes, and the reason: the API's policy rewriter
-        resolves a governed table by its name under this database, so
-        reading through any other one left the query unenforced)."""
-        _, calls = self._run_op(**self._bronze_pipeline())
-        selects = [s for s in self._statements(calls) if "icecat_api" in s]
-        self.assertTrue(selects, f"no statement read the catalog database: {calls}")
-        for statement in selects:
-            self.assertIn(
-                "FROM icecat_api.`bronze.g3a_orders`",
-                statement,
-                f"bronze source not read through the catalog database: {statement}",
-            )
-        # The Bronze source is never spelled as a ClickHouse database.
-        self.assertFalse(
-            [s for s in self._statements(calls) if "`g3a_orders`" in s and "icecat_api" not in s]
-        )
-
-    def test_this_module_creates_no_catalog_database_of_its_own(self) -> None:
-        """D5: `clickhouse-iceberg-init` creates the API's `ICEBERG_QUERY_DB`
-        on every `up`, so a `CREATE DATABASE ... DataLakeCatalog` here would
-        be a second copy of a statement that already exists -- and the one
-        that exists is the one the rewriter must see."""
-        _, calls = self._run_op(**self._bronze_pipeline())
-        self.assertFalse(
-            [s for s in self._statements(calls) if "CREATE DATABASE" in s and "icecat_api" in s],
-            f"this module created the API's catalog database itself: {calls}",
-        )
-        self.assertFalse(
-            hasattr(authored_factory, "CATALOG_DB"),
-            "the private catalog-database name is gone in D5; the source is "
-            "named from the API's ICEBERG_QUERY_DB instead",
-        )
-
-    def test_every_statement_reading_the_catalog_database_carries_allow_database_iceberg(self) -> None:
-        """D2: ClickHouse refuses an Iceberg read without the setting, so it
-        rides on the `CREATE TABLE ... AS SELECT ... LIMIT 0`, on the
-        staging table's own `CREATE`, and on the staging `INSERT ... SELECT`
-        -- the three statements that read the source. It rides LAST in each
-        statement (ClickHouse parses `SETTINGS` as the SELECT's final
-        clause), which is why `_reading` appends it rather than building it
-        into `_build_select_sql`'s `FROM` clause."""
-        _, calls = self._run_op(**self._bronze_pipeline())
+    def test_the_op_attaches_the_read_setting_when_the_api_says_bronze(self) -> None:
+        """D14: the API answers `readsIceberg`, and this module turns it into
+        `allow_database_iceberg = 1` on every statement it runs for that
+        pipeline -- the three that read the source, and none of the writes."""
+        pipeline = _ready_pipeline(**self._bronze_pipeline())
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        calls: list[tuple[str, str]] = []
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        with mock.patch.object(
+            authored_factory,
+            "_ch_exec",
+            side_effect=lambda target, statement: calls.append(("sql", statement)),
+        ), mock.patch.object(
+            authored_factory,
+            "_ch_query_json",
+            side_effect=lambda target, statement: next(counts),
+        ), mock.patch.object(
+            authored_factory.ClickHouseTarget,
+            "from_env",
+            return_value=ClickHouseTarget("http://ch", "default", ""),
+        ), mock.patch.object(
+            authored_factory,
+            "_compiled_sql",
+            side_effect=lambda cfg, pid: (
+                "SELECT id, name FROM icecat_api.`bronze.g3a_orders`",
+                True,
+            ),
+        ):
+            run_fn(build_op_context())
         reads = [s for s in self._statements(calls) if "icecat_api" in s]
         self.assertEqual(len(reads), 3, f"expected CREATE, staging CREATE and INSERT: {reads}")
         for statement in reads:
@@ -333,52 +290,6 @@ class BronzeSourceTest(unittest.TestCase):
                 statement.endswith("SETTINGS allow_database_iceberg = 1"),
                 f"statement does not carry the Iceberg read setting: {statement}",
             )
-        kinds = [
-            "staging CREATE" if statement.startswith("CREATE TABLE silver.`__staging") else
-            "INSERT" if statement.startswith("INSERT INTO") else "target CREATE"
-            for statement in reads
-        ]
-        self.assertEqual(
-            sorted(kinds),
-            ["INSERT", "staging CREATE", "target CREATE"],
-        )
-
-    def test_a_silver_source_is_read_exactly_as_before(self) -> None:
-        """D3: a `silver` (or `gold`, or any ClickHouse zone) source is still
-        ``silver.`orders` ``, no Iceberg read setting appears, and no
-        statement grows anything it did not have before."""
-        result, calls = self._run_op()
-        self.assertEqual(result["rows"], 3)
-        statements = self._statements(calls)
-        self.assertFalse([s for s in statements if "icecat_api" in s])
-        self.assertFalse([s for s in statements if "allow_database_iceberg" in s])
-        self.assertTrue(
-            any(
-                "ENGINE = MergeTree ORDER BY tuple() AS SELECT id, name FROM silver.`orders` LIMIT 0" in s
-                for s in statements
-            ),
-            statements,
-        )
-        self.assertTrue(
-            any("INSERT INTO serving.`__staging_orders_clean` SELECT id, name FROM silver.`orders`" == s for s in statements),
-            statements,
-        )
-
-    def test_resolve_source_marks_only_bronze_as_an_iceberg_read(self) -> None:
-        """`_PipelineSource.reads_iceberg` is what makes `_reading` attach the
-        setting, so it must be true for `bronze` alone. The catalog database
-        is a PARAMETER (D5: the caller's `ICEBERG_QUERY_DB`, not a constant
-        of this module's), so a different value is a different source name
-        rather than an ignored argument."""
-        bronze = authored_factory._resolve_source("bronze", "orders", "icecat_api")
-        self.assertEqual(bronze.clickhouse_name, "icecat_api.`bronze.orders`")
-        self.assertTrue(bronze.reads_iceberg)
-        other = authored_factory._resolve_source("bronze", "orders", "some_other_db")
-        self.assertEqual(other.clickhouse_name, "some_other_db.`bronze.orders`")
-        for zone in ("silver", "gold", "serving"):
-            source = authored_factory._resolve_source(zone, "orders", "icecat_api")
-            self.assertEqual(source.clickhouse_name, f"{zone}.`orders`")
-            self.assertFalse(source.reads_iceberg)
 
     def test_a_bronze_source_with_a_silver_target_is_still_executed(self) -> None:
         """The refusal is on the TARGET only: `bronze` -> `silver` is the
@@ -390,7 +301,7 @@ class BronzeSourceTest(unittest.TestCase):
         self.assertTrue([s for s in self._statements(calls) if "silver.`orders_clean`" in s])
 
 
-class EnforceSqlTest(unittest.TestCase):
+class CompileSqlTest(unittest.TestCase):
     """BLD-1 / D4: the SQL the op RUNS is the API's rewrite of the SQL it
     BUILT, never the SQL it built.
 
@@ -431,18 +342,17 @@ class EnforceSqlTest(unittest.TestCase):
         return result, statements, mocked_post
 
     def test_the_op_runs_the_sql_the_api_returned_and_never_its_own(self) -> None:
-        """The whole point of D4: the `SELECT` this module builds is a
-        REQUEST, not a command. Every statement that reads the source --
-        the target `CREATE TABLE ... AS`, the staging `CREATE` and the
-        staging `INSERT` -- must carry the API's text, and the unmasked
-        original must appear in none of them."""
+        """The whole point of D4/D14: this module builds no SQL. Every
+        statement that reads the source -- the target `CREATE TABLE ... AS`,
+        the staging `CREATE` and the staging `INSERT` -- carries the API's
+        compiled text, and the unmasked original appears in none of them."""
         result, statements, mocked_post = self._run_op_with(
-            self._post_returning(200, {"sql": self.ENFORCED})
+            self._post_returning(200, {"sql": self.ENFORCED, "readsIceberg": False})
         )
         self.assertEqual(result["rows"], 3)
         self.assertEqual(mocked_post.call_count, 1, "exactly one enforcement call per run")
-        sent = mocked_post.call_args.kwargs["json"]
-        self.assertEqual(sent["sql"], "SELECT id, name FROM silver.`orders`")
+        # D8: no body -- the API compiles the stored definition.
+        self.assertIsNone(mocked_post.call_args.kwargs.get("json"))
         reads = [s for s in statements if "silver.`orders`" in s]
         self.assertEqual(len(reads), 3, f"expected CREATE, staging CREATE and INSERT: {reads}")
         for statement in reads:
@@ -453,13 +363,12 @@ class EnforceSqlTest(unittest.TestCase):
         """The route is the orchestrator-only one, so the run token goes
         with it, and the pipeline id in the URL is the row being run --
         URL-quoted, so an id could never inject a path segment."""
-        _, _, mocked_post = self._run_op_with(self._post_returning(200, {"sql": self.ENFORCED}))
+        _, _, mocked_post = self._run_op_with(self._post_returning(200, {"sql": self.ENFORCED, "readsIceberg": False}))
         url = mocked_post.call_args.args[0]
         headers = mocked_post.call_args.kwargs["headers"]
-        self.assertEqual(url, "http://api.invalid:8080/api/pipelines/runnable/pl-dedupe-select-abc123/enforce")
+        self.assertEqual(url, "http://api.invalid:8080/api/pipelines/runnable/pl-dedupe-select-abc123/compile")
         self.assertEqual(headers["Authorization"], "Bearer run-tok")
         self.assertEqual(headers["x-run-token"], "run-tok")
-        self.assertEqual(headers["content-type"], "application/json")
 
     def _assert_refused_without_retry(self, post: Any) -> str:
         """A refusal fails the op on the first attempt, with the API's own
@@ -521,7 +430,9 @@ class EnforceSqlTest(unittest.TestCase):
     def test_a_2xx_without_a_sql_is_refused_rather_than_run(self) -> None:
         """A response the op cannot read is never treated as "nothing to
         enforce", which would silently run the unmasked SQL."""
-        self._assert_refused_without_retry(self._post_returning(200, {"sql": None}))
+        self._assert_refused_without_retry(
+            self._post_returning(200, {"sql": None, "readsIceberg": False})
+        )
 
 
 class OpForPipelineTest(unittest.TestCase):
@@ -558,7 +469,7 @@ class OpForPipelineTest(unittest.TestCase):
         with mock.patch.object(authored_factory, "_ch_exec", side_effect=lambda t, s: exec_calls.append(s)), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
              mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
-             _enforce_passthrough():
+             _compile_passthrough():
             result = run_fn(build_op_context())
 
         self.assertEqual(result["rows"], 3)
@@ -590,7 +501,7 @@ class OpForPipelineTest(unittest.TestCase):
         with mock.patch.object(authored_factory, "_ch_exec"), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
              mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
-             _enforce_passthrough():
+             _compile_passthrough():
             result = run_fn(build_op_context())
 
         self.assertEqual(result["rows"], 3)
@@ -628,7 +539,7 @@ class OpForPipelineTest(unittest.TestCase):
         with mock.patch.object(authored_factory, "_ch_exec"), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts_1)), \
              mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
-             _enforce_passthrough():
+             _compile_passthrough():
             first = run_fn(build_op_context())
         self.assertEqual(first["rows"], 3)
 
@@ -638,7 +549,7 @@ class OpForPipelineTest(unittest.TestCase):
         with mock.patch.object(authored_factory, "_ch_exec"), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts_2)), \
              mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
-             _enforce_passthrough():
+             _compile_passthrough():
             second = run_fn(build_op_context())
         self.assertEqual(second["rows"], 3)
 
@@ -650,29 +561,10 @@ class OpForPipelineTest(unittest.TestCase):
         with mock.patch.object(authored_factory, "_ch_exec"), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
              mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
-             _enforce_passthrough():
+             _compile_passthrough():
             result = run_fn(build_op_context())
 
         self.assertEqual(result["skipped_verbs"], [authored_factory.FBIC_UNSUPPORTED_REASON])
-
-    def test_a_rejected_transform_raises_a_non_retryable_failure_wrapping_transform_error(
-        self,
-    ) -> None:
-        """PART D: `TransformError` from `parse_transform` is a config
-        rejection -- the transform string is wrong, retrying with the
-        same string gets the same answer. The `_run` op body wraps it
-        in `Failure(allow_retries=False)`, the original `TransformError`
-        is preserved as `__cause__` (the message names the offending
-        field), and the run fails on the first attempt without burning
-        60s on retries that cannot succeed."""
-        from dagster import Failure
-
-        pipeline = _ready_pipeline(transforms=["exec(rm -rf /)"])
-        run_fn = authored_factory._op_for_pipeline(pipeline)
-        with self.assertRaises(Failure) as ctx:
-            run_fn(build_op_context())
-        self.assertFalse(ctx.exception.allow_retries)
-        self.assertIsInstance(ctx.exception.__cause__, authored_transforms.TransformError)
 
     def test_a_bronze_target_is_refused_before_any_sql_is_sent(self) -> None:
         """BLD-3 / D4: Bronze is written by ingestion, so a pipeline with a
@@ -712,26 +604,22 @@ class OpForPipelineTest(unittest.TestCase):
             connectorId="conn-1", sourceZone="bronze", sourceTable="orders",
         )
         run_fn = authored_factory._op_for_pipeline(pipeline)
-        selects: list[str] = []
-
-        def record_select(
-            _cfg: authored_factory.AuthoredPipelineConfig, _pipeline_id: str, sql: str,
-        ) -> str:
-            selects.append(sql)
-            return sql
+        compiled = "SELECT id, name FROM icecat_api.`bronze.orders`"
 
         counts = iter([[{"n": "0"}], [{"n": "3"}]])
         exec_calls: list[str] = []
-        with mock.patch.object(authored_factory, "_enforced_sql", side_effect=record_select), \
-             mock.patch.object(authored_factory, "_ch_exec", side_effect=lambda t, s: exec_calls.append(s)), \
+        with mock.patch.object(
+            authored_factory,
+            "_compiled_sql",
+            side_effect=lambda _cfg, _pipeline_id: (compiled, True),
+        ), mock.patch.object(authored_factory, "_ch_exec", side_effect=lambda t, s: exec_calls.append(s)), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
              mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
             result = run_fn(build_op_context())
 
-        self.assertEqual(
-            selects,
-            ["SELECT id, name FROM icecat_api.`bronze.orders`"],
-            "a connector pipeline reads its Bronze table through the catalog database",
+        self.assertTrue(
+            exec_calls and all(compiled in s for s in exec_calls if "SELECT" in s or "INSERT" in s),
+            f"the API's compiled text is what runs: {exec_calls}",
         )
         self.assertEqual(result["rows"], 3)
         self.assertTrue(
