@@ -64,7 +64,7 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   eleven the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   twelve the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
 //!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
@@ -196,7 +196,7 @@ pub(super) const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 /// session path already took (found in the measurement of
 /// `docs/plans/DATA-17-RESULT.md`). A bomb is decoded by range and counted,
 /// never held, so the size costs time and not memory. Plan T6.2, item 2.
-pub(super) const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// What `DefaultBodyLimit` allows the `POST /api/uploads` request as a whole:
 /// the cap plus 1 MiB for the multipart framing around the file. Applied to
@@ -340,10 +340,10 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these eleven (review finding
+// shows a recorded reason only when it is one of these twelve (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same eleven as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same twelve as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
@@ -362,14 +362,20 @@ const JOB_TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
 // `DATA-18`: a load told to stop at a value that does not fit its column's type.
 const JOB_BAD_VALUES: &str = "Some values do not fit their column's type.";
 // `DATA-17` slice 4 (decision 2): the decoded bytes of a gzip or zip file passed the cap.
-const JOB_TOO_LARGE_UNPACKED: &str = "The file is larger than the upload limit once unpacked.";
+// No longer raised (`DATA-51` named the number): kept so a load an older job recorded
+// keeps its message, as `JOB_TOO_MANY_ROWS` did.
+const JOB_TOO_LARGE_UNPACKED_UNNAMED: &str =
+    "The file is larger than the upload limit once unpacked.";
 // PR #186 review SHOULD-FIX 1: the column list sent with the load is not the file's (a JSON key that
 // first appears after the rows the preview sampled), so the person is told to look at the preview again.
 const JOB_COLUMNS_NOT_PREVIEWED: &str = "The file's columns are not the ones the preview showed.";
+// `DATA-51` (`LH-DATA-17-13`): the same sentence as the API's own refusal once unpacked,
+// whose number comes from [`MAX_UNPACKED_BYTES`] (`Refusal::TooLargeUnpacked`).
+const JOB_TOO_LARGE_UNPACKED: &str = "The file is larger than the 2 GB limit once unpacked.";
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 11] = [
+const JOB_FAILURE_REASONS: [&str; 12] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
     JOB_HEADER_NO_COLUMNS,
@@ -379,8 +385,9 @@ const JOB_FAILURE_REASONS: [&str; 11] = [
     JOB_NOT_REGISTERED,
     JOB_TOO_MANY_COLUMNS,
     JOB_BAD_VALUES,
-    JOB_TOO_LARGE_UNPACKED,
+    JOB_TOO_LARGE_UNPACKED_UNNAMED,
     JOB_COLUMNS_NOT_PREVIEWED,
+    JOB_TOO_LARGE_UNPACKED,
 ];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
@@ -3847,6 +3854,30 @@ mod tests {
         assert_ne!(MAX_UNPACKED_BYTES, u64::try_from(MAX_UPLOAD_BYTES).unwrap());
     }
 
+    /// `DATA-51` (QA `LH-DATA-17-13`): the refusal once unpacked names the cap, and the
+    /// job's recorded reason for it is that same sentence -- the API shows a recorded
+    /// reason only when it is one of [`JOB_FAILURE_REASONS`], so the two must not drift.
+    #[test]
+    fn the_unpacked_sentences_name_the_unpacked_cap() {
+        assert_eq!(
+            MAX_UNPACKED_BYTES % (1024 * 1024 * 1024),
+            0,
+            "the sentence says a whole number of GB"
+        );
+        let gigabytes = MAX_UNPACKED_BYTES / (1024 * 1024 * 1024);
+        assert_eq!(
+            JOB_TOO_LARGE_UNPACKED,
+            Refusal::TooLargeUnpacked.to_string()
+        );
+        let cap = format!("the {gigabytes} GB limit");
+        for sentence in [
+            JOB_TOO_LARGE_UNPACKED,
+            Refusal::TooLargeUnpacked.to_string().as_str(),
+        ] {
+            assert!(sentence.contains(&cap), "{sentence} must name {cap}");
+        }
+    }
+
     #[test]
     fn the_request_body_limit_leaves_room_for_the_form_around_the_file() {
         assert_eq!(MAX_REQUEST_BODY_BYTES - MAX_UPLOAD_BYTES, 1024 * 1024);
@@ -4396,8 +4427,8 @@ mod tests {
     }
 
     /// Review finding B6: a recorded reason reaches a response only when it is
-    /// one of the eleven the API knows (six before finding C2). Each of the
-    /// eleven is kept; text that is near one of them, text with detail added,
+    /// one of the twelve the API knows (six before finding C2). Each of the
+    /// twelve is kept; text that is near one of them, text with detail added,
     /// and exception text are all the fixed `The load failed.`.
     #[test]
     fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
@@ -4432,9 +4463,10 @@ mod tests {
         }
     }
 
-    /// Review findings B6 and C2: the eleven reasons the API knows are the
-    /// eleven in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
-    /// `DATA-17` slice 4 the tenth; PR #186 review SHOULD-FIX 1 the eleventh) the job's own tests assert its constants against
+    /// Review findings B6 and C2: the twelve reasons the API knows are the
+    /// twelve in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
+    /// `DATA-17` slice 4 the tenth; PR #186 review SHOULD-FIX 1 the eleventh;
+    /// `DATA-51` the twelfth) the job's own tests assert its constants against
     /// too, in the same order, so the two sides cannot drift apart
     /// unnoticed. Read here from test code only, with `include_str!`, so the
     /// release build of the API depends on nothing outside `rust/`.
@@ -4450,7 +4482,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 11, "eleven different reasons");
+        assert_eq!(distinct.len(), 12, "twelve different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"

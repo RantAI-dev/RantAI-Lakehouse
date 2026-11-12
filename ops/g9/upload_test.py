@@ -990,7 +990,8 @@ NEW_FORMATS = [
     ("orders.csv.gz", {"format": "delimited", "compression": "gzip"}, "dialect"),
     ("three.zip", {"format": "delimited", "compression": "zip"}, "dialect"),
 ]
-UNPACKED_SENTENCE = "The file is larger than the upload limit once unpacked."
+# `DATA-51` (`LH-DATA-17-13`): the sentence names the cap the file passed.
+UNPACKED_SENTENCE = "The file is larger than the 2 GB limit once unpacked."
 
 
 def step_new_formats(api, base_table: str, state: dict) -> None:

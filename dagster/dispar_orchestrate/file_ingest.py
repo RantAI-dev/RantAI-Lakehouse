@@ -227,14 +227,21 @@ TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
 BAD_VALUES = "Some values do not fit their column's type."
 
 # `DATA-17` slice 4 (decision 2): the decoded bytes of a gzip or zip file passed the cap.
-# Appended last, so the fixture's order of the first nine is kept.
-TOO_LARGE_UNPACKED = "The file is larger than the upload limit once unpacked."
+# No longer raised (`DATA-51` named the number in the sentence): it stays in this list, and in
+# the fixture shared with the API, so a load an older job recorded keeps its message.
+TOO_LARGE_UNPACKED_UNNAMED = "The file is larger than the upload limit once unpacked."
 
 # PR #186 review SHOULD-FIX 1: the column list the console sent has another number of columns
 # than the file the job read. A JSON file whose key first appears after the sampled rows is the
 # case: the preview did not show that column, so the list is one short. Appended last, so the
 # fixture's order of the first ten is kept.
 COLUMNS_NOT_PREVIEWED = "The file's columns are not the ones the preview showed."
+
+# `DATA-51` (QA `LH-DATA-17-13`): the same sentence as the API's own refusal once unpacked,
+# whose number comes from `MAX_UNPACKED_BYTES`. A fixed sentence like every other reason here:
+# the API shows a recorded reason only when it equals one of them. Appended last, so the
+# fixture's order of the first eleven is kept.
+TOO_LARGE_UNPACKED = "The file is larger than the 2 GB limit once unpacked."
 
 FAILURE_REASONS = (
     UNREADABLE,
@@ -246,8 +253,9 @@ FAILURE_REASONS = (
     NOT_REGISTERED,
     TOO_MANY_COLUMNS,
     BAD_VALUES,
-    TOO_LARGE_UNPACKED,
+    TOO_LARGE_UNPACKED_UNNAMED,
     COLUMNS_NOT_PREVIEWED,
+    TOO_LARGE_UNPACKED,
 )
 
 

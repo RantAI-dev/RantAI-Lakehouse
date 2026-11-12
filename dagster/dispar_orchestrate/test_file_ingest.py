@@ -50,6 +50,8 @@ from dispar_orchestrate.file_ingest import (
     NOT_REGISTERED,
     COLUMNS_NOT_PREVIEWED,
     TABLE_NAME,
+    TOO_LARGE_UNPACKED,
+    TOO_LARGE_UNPACKED_UNNAMED,
     TOO_MANY_COLUMNS,
     TOO_MANY_ROWS,
     UNREADABLE,
@@ -263,16 +265,27 @@ def test_the_failure_reasons_equal_the_shared_fixture_file_the_api_is_tested_aga
     assert list(FAILURE_REASONS) == json.loads(REASONS_FILE.read_text(encoding="utf-8"))
 
 
-def test_there_are_eleven_different_failure_reasons_among_them_the_header_row_with_no_columns():
+def test_there_are_twelve_different_failure_reasons_among_them_the_header_row_with_no_columns():
     # Review finding C2 made it seven: a header row with no columns has a
     # sentence of its own. SEC-17 made it eight with the column cap, DATA-18 nine,
     # DATA-17 slice 4 ten, and PR #186 review SHOULD-FIX 1 eleven (a column list that is
-    # not the file's). The API counts the same eleven against the same file.
+    # not the file's). DATA-51 made it twelve: the unpacked sentence names the cap, and the
+    # old one stays in the list for loads an older job recorded. The API counts the same
+    # twelve against the same file.
     in_file = json.loads(REASONS_FILE.read_text(encoding="utf-8"))
-    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 11
+    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 12
     assert HEADER_NO_COLUMNS == "The header row has no columns."
     assert HEADER_NO_COLUMNS != HEADER_PAST_END
     assert COLUMNS_NOT_PREVIEWED == "The file's columns are not the ones the preview showed."
+
+
+def test_the_old_unpacked_sentence_stays_in_the_list_and_is_no_longer_the_one_raised():
+    # DATA-51 (QA LH-DATA-17-13): a load that fails past the cap is recorded with the sentence
+    # that names it; the old one is kept only so an upload an older job failed keeps its message
+    # in the list the API shows recorded reasons from.
+    assert TOO_LARGE_UNPACKED_UNNAMED in FAILURE_REASONS
+    assert TOO_LARGE_UNPACKED_UNNAMED != TOO_LARGE_UNPACKED
+    assert "2 GB" in TOO_LARGE_UNPACKED
 
 
 def test_the_job_has_no_row_cap_and_keeps_the_old_sentence_only_so_recorded_failures_still_show():

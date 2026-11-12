@@ -6831,7 +6831,8 @@ async fn a_gzip_bomb_is_refused_when_it_arrives_and_nothing_is_stored() {
     std::io::Write::write_all(&mut encoder, b"a").unwrap();
     let bomb = encoder.finish().unwrap();
     assert!(bomb.len() < 8 * MIB, "the setup: a small file");
-    let unpacked = "The file is larger than the upload limit once unpacked.";
+    // `DATA-51` (`LH-DATA-17-13`): the sentence names the cap.
+    let unpacked = "The file is larger than the 2 GB limit once unpacked.";
 
     assert_eq!(
         refusal_of(&stack, &bayu, "bomb.csv.gz", bomb.clone()).await,
