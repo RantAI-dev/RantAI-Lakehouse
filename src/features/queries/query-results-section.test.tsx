@@ -22,6 +22,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import * as notify from "@/lib/notify"
 import type { QueryResult } from "@/services/contracts/queries"
@@ -231,9 +232,7 @@ describe("the statistics panel", () => {
 
   it("follows the column the reader picks", () => {
     renderSection(result())
-    fireEvent.change(screen.getByLabelText("Column"), {
-      target: { value: "amount" },
-    })
+    chooseOption(screen.getByRole("combobox", { name: "Column" }), "amount")
     // The smallest amount is 10 and the largest is 30.
     expect(panel().getByText("Minimum").parentElement?.textContent).toContain(
       "10"
@@ -252,9 +251,7 @@ describe("the statistics panel", () => {
 
   it("says the histogram of a numeric column shows value ranges", () => {
     renderSection(result())
-    fireEvent.change(screen.getByLabelText("Column"), {
-      target: { value: "amount" },
-    })
+    chooseOption(screen.getByRole("combobox", { name: "Column" }), "amount")
     expect(panel().getByText("Value range")).toBeTruthy()
     expect(panel().queryAllByText("Most frequent values")).toHaveLength(0)
   })

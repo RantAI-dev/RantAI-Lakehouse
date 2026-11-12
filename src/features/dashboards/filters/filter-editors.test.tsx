@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import type { FilterDef } from "@/services/clients/bi-store"
 import { DateEditor, NumberEditor, blankFilter } from "./filter-editors"
 
@@ -18,7 +19,7 @@ describe("the date and number editors", () => {
       <DateEditor board="b" column="d" others={[]} initial={initial} onApply={onApply} />
     ))
     expect((screen.getByLabelText("Before") as HTMLInputElement).value).toBe("2026-10-03")
-    expect((screen.getByLabelText("Date filter") as HTMLSelectElement).value).toBe("before")
+    expect(screen.getByRole("combobox", { name: "Date filter" }).textContent).toContain("Before")
     fireEvent.click(screen.getByText("Apply"))
     expect(out).toEqual([initial])
   })
@@ -27,7 +28,7 @@ describe("the date and number editors", () => {
     const out = applied((onApply) => (
       <DateEditor board="b" column="d" others={[]} initial={blankFilter("d", "date")} onApply={onApply} />
     ))
-    fireEvent.change(screen.getByLabelText("Direction"), { target: { value: "next" } })
+    chooseOption(screen.getByRole("combobox", { name: "Direction" }), "Next")
     fireEvent.change(screen.getByLabelText("How many"), { target: { value: "7" } })
     fireEvent.click(screen.getAllByText("Apply")[0])
     expect(out).toEqual([{ column: "d", values: [], op: "relative", anchor: "next", n: 7, unit: "day" }])
@@ -39,7 +40,7 @@ describe("the date and number editors", () => {
     ))
     const apply = screen.getByText("Apply") as HTMLButtonElement
     expect(apply.disabled).toBe(true)
-    fireEvent.change(screen.getByLabelText("Comparison"), { target: { value: "gt" } })
+    chooseOption(screen.getByRole("combobox", { name: "Comparison" }), "greater than")
     fireEvent.change(screen.getByLabelText("Number"), { target: { value: "5" } })
     expect(apply.disabled).toBe(false)
     fireEvent.click(apply)

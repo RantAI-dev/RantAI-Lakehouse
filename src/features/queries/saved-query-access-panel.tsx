@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { Share2Icon, UserPlusIcon, XIcon } from "lucide-react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -335,19 +336,17 @@ export function SavedQueryAccessPanel({
             {rows.map((row) => (
               <li key={ruleKey(row)} className="flex items-center gap-2 text-sm">
                 <GranteeText rule={row} />
-                <select
+                <SelectField
                   aria-label={`Level of ${ruleLabel(row)}`}
                   value={row.level}
                   disabled={busy}
-                  onChange={(event) => changeLevel(row, event.target.value)}
-                  className="h-7 rounded-md border border-input bg-background px-1 text-xs"
-                >
-                  {levelChoices(yourLevel, row.level).map((level) => (
-                    <option key={level} value={level}>
-                      {savedQueryLevelLabel(level)}
-                    </option>
-                  ))}
-                </select>
+                  size="sm"
+                  options={levelChoices(yourLevel, row.level).map((level) => ({
+                    value: level,
+                    label: savedQueryLevelLabel(level),
+                  }))}
+                  onValueChange={(next) => changeLevel(row, next)}
+                />
                 <Button
                   variant="ghost"
                   size="icon-sm"
@@ -389,19 +388,17 @@ export function SavedQueryAccessPanel({
               onChange={(event) => setQuery(event.target.value)}
               className="h-8 text-xs"
             />
-            <select
+            <SelectField
               aria-label="Level to give"
               value={givenLevel}
               disabled={busy}
-              onChange={(event) => setGivenLevel(event.target.value as SavedQueryLevel)}
-              className="h-7 rounded-md border border-input bg-background px-1 text-xs"
-            >
-              {levelsFor(yourLevel).map((level) => (
-                <option key={level} value={level}>
-                  {savedQueryLevelLabel(level)}
-                </option>
-              ))}
-            </select>
+              size="sm"
+              options={levelsFor(yourLevel).map((level) => ({
+                value: level,
+                label: savedQueryLevelLabel(level),
+              }))}
+              onValueChange={(next) => setGivenLevel(next as SavedQueryLevel)}
+            />
           </div>
           {matches.people.length + matches.roles.length > 0 ? (
             <ul

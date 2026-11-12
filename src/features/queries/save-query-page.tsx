@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation"
 
 import { FormPage } from "@/components/patterns/form-page"
 import { EmptyState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -224,29 +225,30 @@ function SaveQueryForm({ draft }: { draft: SaveQueryDraft }) {
       {isChange ? null : (
         <div className="space-y-2">
           <Label htmlFor="saved-query-folder">Folder</Label>
-          <select
+          {/* WEB-9 D3: the two `<optgroup>`s are SelectOptionGroups, so the
+              picker still reads as "Personal space" then "Shared". */}
+          <SelectField
             id="saved-query-folder"
+            className="w-full"
             value={folder}
-            onChange={(event) => setFolder(event.target.value)}
-            className="h-9 w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <optgroup label={PERSONAL_SPACE_LABEL}>
-              <option value={PERSONAL_SPACE}>{PERSONAL_SPACE_LABEL}</option>
-              {personalFolders.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label={SHARED_SPACE_LABEL}>
-              <option value={SHARED_SPACE}>{SHARED_SPACE_LABEL}</option>
-              {sharedFolders.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </optgroup>
-          </select>
+            options={[
+              {
+                label: PERSONAL_SPACE_LABEL,
+                options: [
+                  { value: PERSONAL_SPACE, label: PERSONAL_SPACE_LABEL },
+                  ...personalFolders.map((option) => ({ value: option.value, label: option.label })),
+                ],
+              },
+              {
+                label: SHARED_SPACE_LABEL,
+                options: [
+                  { value: SHARED_SPACE, label: SHARED_SPACE_LABEL },
+                  ...sharedFolders.map((option) => ({ value: option.value, label: option.label })),
+                ],
+              },
+            ]}
+            onValueChange={setFolder}
+          />
           {/* Only a real folder can hold rules: the shared space and the
               caller's own space send `null` and `undefined`. The server
               refuses the access list to a caller below edit on the folder,

@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Check, Copy } from "lucide-react";
+import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
 import { copyText as copyToClipboard } from "@/lib/copy-text";
 import { readableErrorMessage } from "@/lib/notify-message";
@@ -117,11 +118,9 @@ export function EmbedSettingsPanel({
           One chart
         </label>
         {target === "chart" ? (
-          <select aria-label="Chart" value={chart} onChange={(e) => setChart(e.target.value)}
-            className="h-8 w-full rounded-md border border-border bg-background px-2 text-xs">
-            <option value="">Choose a chart…</option>
-            {charts.map((c) => <option key={c.id} value={c.id}>{c.title}</option>)}
-          </select>
+          <SelectField aria-label="Chart" value={chart} placeholder="Choose a chart…" className="w-full"
+            options={charts.map((c) => ({ value: c.id, label: c.title }))}
+            onValueChange={setChart} />
         ) : null}
         {target === "chart" ? (
           <p className="text-[11px] text-muted-foreground">A chart token reads that chart and nothing else; the address cannot turn it into the dashboard.</p>
@@ -130,12 +129,13 @@ export function EmbedSettingsPanel({
 
       <fieldset className="space-y-1.5">
         <legend className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Look (in the address, not the token)</legend>
-        <select aria-label="Theme" value={theme} onChange={(e) => setTheme(e.target.value as Theme)}
-          className="h-8 rounded-md border border-border bg-background px-2 text-xs">
-          <option value="dashboard">The dashboard&apos;s own look</option>
-          <option value="light">Light</option>
-          <option value="dark">Dark</option>
-        </select>
+        <SelectField aria-label="Theme" value={theme}
+          options={[
+            { value: "dashboard", label: "The dashboard's own look" },
+            { value: "light", label: "Light" },
+            { value: "dark", label: "Dark" },
+          ]}
+          onValueChange={(next) => setTheme(next as Theme)} />
         <label className="flex items-center gap-2 text-xs">
           <input type="checkbox" checked={hideName} onChange={(e) => setHideName(e.target.checked)} />
           Hide the Rantai Lake name
@@ -155,12 +155,18 @@ export function EmbedSettingsPanel({
             {columns.map((c) => (
               <li key={c} className="flex items-center gap-2 text-xs">
                 <span className="min-w-0 flex-1 truncate font-mono">{c}</span>
-                <select aria-label={`Mode of ${c}`} value={modeOf(c)} disabled={!canWrite}
-                  onChange={(e) => setDraft((cur) => ({ ...cur, [c]: e.target.value as FilterMode }))}
-                  title={MODES.find((m) => m.value === modeOf(c))?.hint}
-                  className="h-7 rounded-md border border-border bg-background px-2 text-xs">
-                  {MODES.filter((m) => !hiddenOnly.has(c) || m.value === "hidden").map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
-                </select>
+                {/* WEB-9 D6: the hint stays a `title`, kept on a wrapper because
+                    SelectField takes data, not markup (a title on an ancestor
+                    still shows on hovering the trigger). */}
+                <span title={MODES.find((m) => m.value === modeOf(c))?.hint}>
+                  <SelectField aria-label={`Mode of ${c}`} value={modeOf(c)} disabled={!canWrite} size="sm"
+                    placeholder="Pick a mode"
+                    options={MODES.filter((m) => !hiddenOnly.has(c) || m.value === "hidden").map((m) => ({
+                      value: m.value,
+                      label: m.label,
+                    }))}
+                    onValueChange={(next) => setDraft((cur) => ({ ...cur, [c]: next as FilterMode }))} />
+                </span>
                 {hiddenOnly.has(c) ? <span className="text-[10px] text-muted-foreground">not a list of values</span> : null}
               </li>
             ))}

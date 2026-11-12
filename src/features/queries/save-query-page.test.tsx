@@ -39,6 +39,7 @@ mock.module("@/features/auth/auth-provider", () => ({
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { readTabs, writeTabs } from "@/lib/query-draft"
 import { queryService } from "@/services"
 import type {
@@ -212,7 +213,17 @@ function renderPage(
 
 /** The folder the picker shows. */
 async function picker() {
-  return (await screen.findByLabelText("Folder")) as HTMLSelectElement
+  return await screen.findByRole("combobox", { name: "Folder" })
+}
+
+/**
+ * The folder picker once the folder list has been read and rendered: the
+ * combobox exists before `/folders` answers, and the options do not.
+ */
+async function foldersReady() {
+  const select = await picker()
+  await act(async () => {})
+  return select
 }
 
 describe("the save query page has no draft", () => {
@@ -407,14 +418,14 @@ describe("the save query page", () => {
     renderPage()
 
     const select = await picker()
-    await waitFor(() => expect(select.options.length).toBe(4))
-    expect(Array.from(select.options).map((option) => option.text)).toEqual([
+    expect(select.textContent).toContain("Personal space (only you)")
+    fireEvent.click(select)
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
       "Personal space (only you)",
       "Personal space (only you) / Reports",
       "Shared",
       "Team",
     ])
-    expect(select.value).toBe("personal")
   })
 
   it("sends no folder at all for the caller's own space", async () => {
@@ -435,7 +446,7 @@ describe("the save query page", () => {
     const { saveQuery } = renderPage()
 
     const select = await picker()
-    fireEvent.change(select, { target: { value: "shared" } })
+    chooseOption(select, "Shared")
     fireEvent.click(screen.getByRole("button", { name: "Save as new" }))
 
     await waitFor(() => expect(saveQuery).toHaveBeenCalledTimes(1))
@@ -449,7 +460,7 @@ describe("the save query page", () => {
     const { saveQuery } = renderPage()
 
     const select = await picker()
-    fireEvent.change(select, { target: { value: "team" } })
+    chooseOption(select, "Team")
     fireEvent.click(screen.getByRole("button", { name: "Save as new" }))
 
     await waitFor(() => expect(saveQuery).toHaveBeenCalledTimes(1))
@@ -462,7 +473,7 @@ describe("the save query page", () => {
     spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
     renderPage({ mode: "update", savedId: "q1" })
 
-    await waitFor(() => expect(screen.queryAllByLabelText("Folder").length).toBe(0))
+    await waitFor(() => expect(screen.queryAllByRole("combobox", { name: "Folder" }).length).toBe(0))
     expect(screen.queryAllByText(/shared with the team/i).length).toBe(0)
     expect(screen.getByRole("button", { name: "Save" })).toBeTruthy()
   })
@@ -483,9 +494,9 @@ describe("the save query page", () => {
     spyOn(queryService, "getFolderAccess").mockResolvedValue(accessList([]))
     renderPage()
 
-    const select = (await picker()) as HTMLSelectElement
-    fireEvent.change(select, { target: { value: "team" } })
-    expect(select.value).toBe("team")
+    const select = await foldersReady()
+    chooseOption(select, "Team")
+    expect(select.textContent).toContain("Team")
 
     // The page is left and opened again for the next query: the picker
     // starts in the caller's own space, not where the last visit left it.
@@ -494,9 +505,15 @@ describe("the save query page", () => {
     cleanup()
     renderPage()
 
-    const reopened = (await picker()) as HTMLSelectElement
-    await waitFor(() => expect(reopened.options.length).toBe(4))
-    expect(reopened.value).toBe("personal")
+    const reopened = await foldersReady()
+    expect(reopened.textContent).toContain("Personal space (only you)")
+    fireEvent.click(reopened)
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "Personal space (only you)",
+      "Personal space (only you) / Reports",
+      "Shared",
+      "Team",
+    ])
   })
 
   describe("who the chosen folder is shared with", () => {
@@ -520,7 +537,7 @@ describe("the save query page", () => {
       const access = spyOn(queryService, "getFolderAccess").mockResolvedValue(TEAM_ACCESS)
       renderPage()
 
-      fireEvent.change(await picker(), { target: { value: "team" } })
+      chooseOption(await foldersReady(), "Team")
 
       // Rina (the caller) is left out; Dewi is in the folder's own rules and
       // in an inherited one, and counts once.
@@ -537,7 +554,7 @@ describe("the save query page", () => {
       )
       renderPage()
 
-      fireEvent.change(await picker(), { target: { value: "team" } })
+      chooseOption(await foldersReady(), "Team")
 
       expect(
         await screen.findByText("Shared with 2 people or roles: Unknown person, Unknown role.")
@@ -551,7 +568,7 @@ describe("the save query page", () => {
       )
       renderPage()
 
-      fireEvent.change(await picker(), { target: { value: "team" } })
+      chooseOption(await foldersReady(), "Team")
 
       await loaded(access)
       expect(access).toHaveBeenCalledTimes(1)
@@ -563,7 +580,7 @@ describe("the save query page", () => {
       const access = spyOn(queryService, "getFolderAccess").mockResolvedValue(accessList([]))
       renderPage()
 
-      fireEvent.change(await picker(), { target: { value: "team" } })
+      chooseOption(await foldersReady(), "Team")
 
       await loaded(access)
       expect(access).toHaveBeenCalledTimes(1)
@@ -575,7 +592,7 @@ describe("the save query page", () => {
       spyOn(queryService, "getFolderAccess").mockResolvedValue(TEAM_ACCESS)
       renderPage({ noViewer: true })
 
-      fireEvent.change(await picker(), { target: { value: "team" } })
+      chooseOption(await foldersReady(), "Team")
 
       expect(
         await screen.findByText("Shared with 3 people or roles: Rina Wijaya, Dewi Lestari, Finance.")
@@ -587,12 +604,11 @@ describe("the save query page", () => {
       const access = spyOn(queryService, "getFolderAccess").mockResolvedValue(TEAM_ACCESS)
       renderPage()
 
-      const select = await picker()
-      await waitFor(() => expect(select.options.length).toBe(4))
+      const select = await foldersReady()
       // Own space is where the picker starts.
       expect(access).not.toHaveBeenCalled()
 
-      fireEvent.change(select, { target: { value: "shared" } })
+      chooseOption(select, "Shared")
       // Let any effect the change started run before the count is read.
       await new Promise((resolve) => setTimeout(resolve, 20))
 
@@ -607,9 +623,8 @@ describe("the save query page", () => {
       )
       renderPage()
 
-      const select = await picker()
-      await waitFor(() => expect(select.options.length).toBe(4))
-      fireEvent.change(select, { target: { value: "reports" } })
+      const select = await foldersReady()
+      chooseOption(select, "Personal space (only you) / Reports")
 
       expect(await screen.findByText("Shared with 1 person or role: Dewi Lestari.")).toBeDefined()
       expect(access.mock.calls.at(-1)?.[0]).toBe("reports")
@@ -620,7 +635,7 @@ describe("the save query page", () => {
       const access = spyOn(queryService, "getFolderAccess").mockReturnValue(new Promise(() => {}))
       const { saveQuery } = renderPage()
 
-      fireEvent.change(await picker(), { target: { value: "team" } })
+      chooseOption(await foldersReady(), "Team")
       await waitFor(() => expect(access).toHaveBeenCalledTimes(1))
 
       const save = screen.getByRole("button", { name: "Save as new" }) as HTMLButtonElement
@@ -636,7 +651,7 @@ describe("the save query page", () => {
       )
       const { saveQuery } = renderPage()
 
-      fireEvent.change(await picker(), { target: { value: "team" } })
+      chooseOption(await foldersReady(), "Team")
 
       expect(await screen.findByText("The folder list could not be read.")).toBeDefined()
       expect(sharedLine().length).toBe(0)
@@ -668,9 +683,8 @@ describe("the save query page", () => {
       )
       renderPage()
 
-      const select = await picker()
-      await waitFor(() => expect(select.options.length).toBe(5))
-      fireEvent.change(select, { target: { value: "read-only" } })
+      const select = await foldersReady()
+      chooseOption(select, "Read only")
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 20))
       })
@@ -694,13 +708,13 @@ describe("the save query page", () => {
       })
       renderPage()
 
-      const select = await picker()
-      fireEvent.change(select, { target: { value: "team" } })
+      const select = await foldersReady()
+      chooseOption(select, "Team")
       expect(
         await screen.findByText("Shared with 2 people or roles: Dewi Lestari, Finance.")
       ).toBeDefined()
 
-      fireEvent.change(select, { target: { value: "reports" } })
+      chooseOption(select, "Personal space (only you) / Reports")
 
       await waitFor(() => expect(asked.lines).not.toBeNull())
       expect(asked.lines).toBe(0)
@@ -713,7 +727,7 @@ describe("the save query page", () => {
       const access = spyOn(queryService, "getFolderAccess").mockResolvedValue(TEAM_ACCESS)
       renderPage({ mode: "update", savedId: "q1" })
 
-      await waitFor(() => expect(screen.queryAllByLabelText("Folder").length).toBe(0))
+      await waitFor(() => expect(screen.queryAllByRole("combobox", { name: "Folder" }).length).toBe(0))
       await new Promise((resolve) => setTimeout(resolve, 20))
 
       expect(access).not.toHaveBeenCalled()
