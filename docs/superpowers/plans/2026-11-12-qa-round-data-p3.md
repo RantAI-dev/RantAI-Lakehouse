@@ -1379,11 +1379,14 @@ change the task names applied), and the failure text is the one printed.
 - T2 `…a_table_is_found_by_its_physical_name_and_a_bronze_slug_is_not_searched`.
   Reading `asset.get("id")` for the table candidate: left
   `[{… "matchedOn": {"field": "table", "value": "zq-registry-slug"}}]`, right `[]`.
-- T3 `…a_description_match_carries_the_text_around_the_word` and
-  `…the_snippet_never_cuts_inside_a_character`. Answering `String::new()` for the
-  value: the test panics at the first value assertion (empty value). The second
-  test passes on the good code and would panic on a byte slice (it asserts
-  `contains("Übersee")` on a multi-byte description).
+- T3 `…a_description_match_carries_the_text_around_the_word`. Answering
+  `String::new()` for the value: the test panics at the first value assertion
+  (empty value). `…the_snippet_never_cuts_inside_a_character` passed on the code
+  before the fix as well: its only multi-byte input was shorter than the piece,
+  so nothing was cut and the sentence "would panic on a byte slice" was not
+  true (review round 1 R5, R12). Round 1's cases cut on both sides, and the
+  byte slice now panics with `start byte index 41 is not a char boundary; it is
+  inside 'é' (bytes 40..42 of string)`.
 - T4 `…saving_the_same_mark_again_writes_no_history_entry_and_keeps_who_set_it`.
   Without the early return: `left: 2, right: 1` (`an unchanged save is no history`).
 - T5 `…no_certification_refusal_names_an_api_field_and_each_is_a_sentence`.
@@ -1406,11 +1409,13 @@ change the task names applied), and the failure text is the one printed.
   `…changing_a_rule_to_a_table_that_is_not_there_is_refused_and_the_rule_keeps_its_table`
   (checking only in create: `left: 200, right: 400`).
 - T9 `src/lib/table-key.test.ts` (new), `table-picker.test.tsx`
-  `offers each row's table key, never its display name`. On the code before the
-  change it fails with the options `["Every table"-less]
-  ["primer.Northwind Orders","primer.No Table","silver.Orders Clean"]` — the
-  three existing picker tests fail the same way (`primer.Raw Orders`,
-  `silver.Orders`). The four files' fixtures were reshaped to the API's rows.
+  `offers each row's table key, never its display name`. Re-run on review round
+  1 (R12) with `c7067d4a~1`'s `table-picker.tsx` and this branch's test, it
+  fails printing `["primer.No Table", "primer.Northwind Orders",
+  "silver.Orders Clean"]` — the old code sorts its options and a space sorts
+  below `r`, so the order the plan's sentence quoted was not the printed one.
+  The test that picks a table prints `["primer.Raw Orders", "silver.Orders"]`.
+  The four files' fixtures were reshaped to the API's rows.
 - T10 `command-palette.test.tsx`
   `says how many tables matched when it shows only eight of them` (reading
   `assets.length` as the total: the "Showing 8 of 23" line is absent);
