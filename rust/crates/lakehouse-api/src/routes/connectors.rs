@@ -3882,34 +3882,43 @@ async fn guard_one_run_at_a_time(state: &AppState, connector_id: &str) -> Result
 ///
 /// The route asks the orchestrator to cancel the run for good
 /// (`MARK_AS_CANCELED_IMMEDIATELY`): a run that never started, and a running
-/// run whose worker is gone, cannot be stopped cleanly. A cancel that fails,
-/// by transport or by a refusal, is logged and is not an error of the request
-/// — the alternative is the connector locked for good. A running run's record
+/// run whose worker is gone, cannot be stopped cleanly. A running run's record
 /// is then closed as `timed_out` (D11).
+///
+/// `review round 1, R2`: the cancel is asked for first, and only a cancel that
+/// was accepted writes anything. An orchestrator that cannot be reached for it
+/// is a retryable `503` and nothing is written — the run may still be going,
+/// so launching now could load on top of a live run, which is the reason this
+/// guard exists. A typed refusal is different: the run is not stopping, the
+/// launch goes on as D10 decided (the alternative is a connector locked for
+/// good), and no stop is claimed — no `info!` line and no `timed_out` record;
+/// the record is left to the orchestrator's own report.
 ///
 /// # Errors
 ///
-/// The store's classified error when the run record cannot be closed.
+/// 503/502 when the orchestrator cannot be reached for the cancel (nothing is
+/// written), and the store's classified error when the run record cannot be
+/// closed.
 async fn stop_overdue_run(
     state: &AppState,
     connector_id: &str,
     run: &ConnectorIngestRun,
     now: time::OffsetDateTime,
 ) -> Result<(), ApiError> {
-    match state.dagster.cancel_run_now(&run.run_id).await {
-        Ok(outcome) if outcome.failure.is_none() => {}
-        Ok(outcome) => tracing::warn!(
+    // The error's text goes to the log only, never into an `ApiError`
+    // (SEC-11).
+    let outcome = state
+        .dagster
+        .cancel_run_now(&run.run_id)
+        .await
+        .map_err(|err| orchestrator_unreachable(&err))?;
+    if let Some(failure) = outcome.failure {
+        tracing::warn!(
             run_id = %run.run_id,
-            failure = ?outcome.failure,
-            "Dagster refused to cancel an overdue run"
-        ),
-        // The error's text goes to the log only, never into an `ApiError`
-        // (SEC-11).
-        Err(err) => tracing::warn!(
-            %err,
-            run_id = %run.run_id,
-            "Dagster could not be asked to cancel an overdue run"
-        ),
+            failure = ?failure,
+            "Dagster refused to cancel an overdue run; the launch goes on"
+        );
+        return Ok(());
     }
     if run.overdue == Some(Overdue::RanTooLong) {
         connector_run::end_timed_out_run(

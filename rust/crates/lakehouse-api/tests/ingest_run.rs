@@ -811,6 +811,73 @@ async fn a_queued_run_still_holds_the_connector_after_the_start_limit() {
     assert_eq!(cancel_requests(&server).await, [] as [String; 0]);
 }
 
+/// `review round 1, R2` (QA `TC-1702`): an orchestrator that cannot be reached
+/// for the cancel is a retryable 503, nothing is written and nothing is
+/// launched — the old run may still be loading, and Bronze is append-only.
+/// Before the fix the route closed the record as "stopped", logged a stop and
+/// launched on top of the live run.
+#[tokio::test]
+async fn an_orchestrator_that_cannot_be_reached_for_the_cancel_answers_503_and_starts_nothing() {
+    let server = MockServer::start().await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    let started = now - 7.0 * 3600.0;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_created_at(
+            "conn-ingest-cancel-down",
+            "run-down",
+            "STARTED",
+            started,
+            Some(started)
+        )]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("terminateRun"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream is down"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "never" } } }
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-cancel-down").await;
+    lakehouse_store::connector_run::start_run(
+        &app.pool,
+        "conn-ingest-cancel-down",
+        "run-down",
+        lakehouse_store::connector_run::RunTrigger::Schedule,
+        None,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(7),
+    )
+    .await
+    .expect("a record of the old run");
+
+    let (status, answer) = post_run(&app, &cookie, "conn-ingest-cancel-down", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert!(
+        !answer.to_string().contains("upstream is down"),
+        "the orchestrator's own text never reaches the response: {answer}"
+    );
+    assert_eq!(
+        launched_configs(&server).await,
+        [] as [Value; 0],
+        "nothing is launched while the old run may still be going"
+    );
+    let runs = recorded_runs(&app.pool, "conn-ingest-cancel-down").await;
+    assert_eq!(runs[0].status, "running", "nothing was written");
+    assert_eq!(runs[0].end_reason, None);
+}
+
 /// Another connector's run does not block this one.
 #[tokio::test]
 async fn ingest_run_is_not_blocked_by_another_connectors_run() {
