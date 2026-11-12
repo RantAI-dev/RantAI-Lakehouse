@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 
 use lakehouse_auth::Principal;
+use lakehouse_store::PgPool;
 use lakehouse_store::governance::{self as store, ClassificationRule, Policy, QualityRule};
 use lakehouse_store::queries::HistoryMention;
 use serde_json::{Map, Value, json};
@@ -326,6 +327,10 @@ const RECENT_QUERIES: usize = 5;
 const TOP_LIST: usize = 10;
 /// Rows in the column-popularity list.
 const TOP_COLUMNS: usize = 20;
+/// What a person is called when their row is gone or their name is blank (`DATA-52`,
+/// QA `LH-DATA-12-01` F3, `TC-1730`): one label, and one row, for every such person.
+/// The id is never shown: it is not a name.
+const UNKNOWN_USER: &str = "Unknown user";
 
 /// The `n` biggest entries of `counts`, biggest first; equal counts are
 /// ordered by `tie` so the list does not shuffle between requests.
@@ -343,22 +348,44 @@ fn top<K: Clone, T: Ord>(
 /// A history row that really reads the asset, with every table it reads.
 type Read<'a> = (&'a HistoryMention, Vec<String>);
 
-/// Who ran a query: the user id where the history has one, else the name.
+/// Who ran a query, for the `users` count: the user id where the history has one,
+/// else the name. A count of distinct ids, so a person is counted once over every
+/// spelling of their name.
 fn person_key(m: &HistoryMention) -> String {
     m.owner_id
         .map_or_else(|| m.user_name.clone(), |id| id.to_string())
 }
 
-/// Queries per person, most active first, named as the history recorded
-/// them (`DATA-15` F2).
-fn frequent_users(reads: &[Read<'_>]) -> Vec<Value> {
+/// The person a history row belongs to, if it names an id: `owner_id`, else a
+/// `user_name` that is one (`DATA-52`: rows older than the ids hold a name, and the
+/// id is what `X-Trino-User` is derived from, so it is what a row of a person is).
+fn person_id(m: &HistoryMention) -> Option<uuid::Uuid> {
+    m.owner_id
+        .or_else(|| uuid::Uuid::parse_str(m.user_name.trim()).ok())
+}
+
+/// The row key and the name shown for a person (`DATA-52`): an id with a name is
+/// shown by it; an id with no user, or with a blank name, is [`UNKNOWN_USER`] and all
+/// such people share one row; a `user_name` that is not an id is shown as stored.
+fn person(m: &HistoryMention, names: &HashMap<uuid::Uuid, String>) -> (String, String) {
+    match person_id(m) {
+        Some(id) => match names.get(&id) {
+            Some(name) => (id.to_string(), name.clone()),
+            None => (UNKNOWN_USER.to_owned(), UNKNOWN_USER.to_owned()),
+        },
+        None => (m.user_name.clone(), m.user_name.clone()),
+    }
+}
+
+/// Queries per person, most active first, by the names of the people who ran them
+/// (`DATA-15` F2, renamed `DATA-52`).
+fn frequent_users(reads: &[Read<'_>], names: &HashMap<uuid::Uuid, String>) -> Vec<Value> {
     let mut by_person: HashMap<String, u32> = HashMap::new();
     let mut name_of: HashMap<String, String> = HashMap::new();
     for (m, _) in reads {
-        let key = person_key(m);
+        let (key, name) = person(m, names);
         *by_person.entry(key.clone()).or_insert(0) += 1;
-        // Newest first, so the first name seen is the latest one.
-        name_of.entry(key).or_insert_with(|| m.user_name.clone());
+        name_of.entry(key).or_insert(name);
     }
     top(&by_person, TOP_LIST, |k| name_of[k].clone())
         .into_iter()
@@ -480,6 +507,7 @@ fn summarize_usage(
     columns: &[String],
     caller: uuid::Uuid,
     truncated: bool,
+    names: &HashMap<uuid::Uuid, String>,
 ) -> (Value, Vec<Value>) {
     // Each mention that really reads one of `tables`, with every table it
     // reads. The parse is the expensive part: skip it when no table's own
@@ -526,7 +554,7 @@ fn summarize_usage(
         known.insert(col.to_ascii_lowercase());
     }
 
-    let frequent_users = frequent_users(&reads);
+    let frequent_users = frequent_users(&reads, names);
     // PR #106 review R1 BLOCKER 6
     let (frequent_queries, unparsed) = frequent_queries(&reads, &known);
     let joined_tables = joined_tables(&reads, tables);
@@ -561,7 +589,7 @@ fn summarize_usage(
             json!({
                 "id": m.id,
                 "sql": m.sql,
-                "user": m.user_name,
+                "user": person(m, names).1,
                 "at": m.at,
                 "status": m.status,
                 "auditEventId": m.audit_event_id,
@@ -639,6 +667,48 @@ async fn asset_ids_of(state: &AppState, keys: &[String]) -> HashMap<String, Stri
     out
 }
 
+/// The display name of every person a history read mentions (`DATA-52`), one read
+/// for all of them (`lakehouse_store::dashboard_access::user_names`). Names that are
+/// blank are left out, so such a person is [`UNKNOWN_USER`].
+///
+/// No `Result`: a failed lookup logs a warning and answers names for the caller
+/// only. The names are decoration, and a lookup that fails must not turn the page's
+/// usage into "not measured".
+async fn people_names(
+    pg: &PgPool,
+    mentions: &[HistoryMention],
+    caller: &Principal,
+) -> HashMap<uuid::Uuid, String> {
+    let ids: Vec<uuid::Uuid> = mentions
+        .iter()
+        .filter_map(person_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut names: HashMap<uuid::Uuid, String> = if ids.is_empty() {
+        HashMap::new()
+    } else {
+        match lakehouse_store::dashboard_access::user_names(pg, &ids).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|(_, name, _)| !name.trim().is_empty())
+                .map(|(id, name, _)| (id, name))
+                .collect(),
+            Err(err) => {
+                tracing::warn!(?err, "catalog usage: user names unavailable");
+                HashMap::new()
+            }
+        }
+    };
+    // The caller is always named: their own name is the one this server holds without
+    // a read, and it keeps their own row readable when the lookup above failed. A blank
+    // name is not inserted, so that person is "Unknown user" like anyone else with none.
+    if !names.contains_key(&caller.id.uuid()) && !caller.display_name.trim().is_empty() {
+        names.insert(caller.id.uuid(), caller.display_name.clone());
+    }
+    names
+}
+
 /// [`summarize_usage`] over the query history. `usage` is `null` — "not
 /// measured" — only when the history cannot be read at all; a table nobody
 /// queried this month is a measured zero.
@@ -656,8 +726,15 @@ pub(crate) async fn usage(
         Ok(mentions) => {
             let truncated = i64::try_from(mentions.len())
                 .is_ok_and(|n| n >= lakehouse_store::queries::HISTORY_MENTION_LIMIT);
-            let (mut usage, recent) =
-                summarize_usage(&mentions, tables, columns, principal.id.uuid(), truncated);
+            let names = people_names(pg, &mentions, principal).await;
+            let (mut usage, recent) = summarize_usage(
+                &mentions,
+                tables,
+                columns,
+                principal.id.uuid(),
+                truncated,
+                &names,
+            );
             let keys: Vec<String> = usage["joinedTables"]
                 .as_array()
                 .into_iter()
@@ -1583,6 +1660,14 @@ mod tests {
         names.iter().map(|n| (*n).to_owned()).collect()
     }
 
+    /// What `people_names` would answer for these `(id, name)` pairs.
+    fn named(pairs: &[(uuid::Uuid, &str)]) -> HashMap<uuid::Uuid, String> {
+        pairs
+            .iter()
+            .map(|(id, name)| (*id, (*name).to_owned()))
+            .collect()
+    }
+
     /// Counts cover everyone who really read the table; the query text
     /// shown back is only the caller's own.
     #[test]
@@ -1607,8 +1692,17 @@ mod tests {
                 50,
             ),
         ];
-        let (usage, recent) =
-            summarize_usage(&mentions, &tables(&["silver.orders"]), &[], me, false);
+        // `DATA-52`: the caller's own row is shown by the name of the person, never by
+        // the id the history stores.
+        let names = named(&[(me, "Rina Wijaya")]);
+        let (usage, recent) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            false,
+            &names,
+        );
         // `DATA-15` F2: the keys were `queries7d` / `users7d`; the window is
         // 30 days now and the keys say no number of days.
         assert_eq!(usage["days"], 30);
@@ -1620,6 +1714,7 @@ mod tests {
         assert_eq!(usage["truncated"], false);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0]["id"], "q1");
+        assert_eq!(recent[0]["user"], "Rina Wijaya");
         assert_eq!(recent[0]["auditEventId"], "audit-q1");
     }
 
@@ -1632,6 +1727,7 @@ mod tests {
             &[],
             uuid::Uuid::from_u128(1),
             false,
+            &HashMap::new(),
         );
         assert_eq!(usage["queries"], 0);
         assert_eq!(usage["avgLatencyMs"], 0);
@@ -1668,7 +1764,14 @@ mod tests {
                 10,
             ),
         ];
-        let (usage, _) = summarize_usage(&mentions, &tables(&["silver.orders"]), &[], me, false);
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            false,
+            &HashMap::new(),
+        );
         let frequent = usage["frequentQueries"].as_array().expect("a list");
         assert_eq!(frequent.len(), 2);
         assert_eq!(
@@ -1718,6 +1821,7 @@ mod tests {
             &["id".to_owned(), "email".to_owned()],
             caller,
             false,
+            &HashMap::new(),
         );
         let frequent = usage["frequentQueries"].as_array().expect("a list");
         assert_eq!(frequent.len(), 1);
@@ -1730,26 +1834,120 @@ mod tests {
         assert!(!text.contains("failed@corp.example"));
     }
 
-    /// `DATA-15` F2: frequent users are counted per person, most active
-    /// first, named as the history recorded them.
+    /// `DATA-15` F2, `DATA-52`: frequent users are counted per person, most active
+    /// first, and shown by the name the user table holds for their id -- not by the
+    /// text the history recorded with the query.
     #[test]
-    fn frequent_users_rank_people_by_their_queries() {
+    fn frequent_users_are_named_from_the_user_table_and_ranked_by_their_queries() {
         let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
         let mut quiet = mention("q1", "SELECT * FROM silver.orders", a, "completed", 1);
-        quiet.user_name = "Quiet".to_owned();
+        quiet.user_name = "quiet.old-handle".to_owned();
         let mut busy_1 = mention("q2", "SELECT * FROM silver.orders", b, "completed", 1);
-        busy_1.user_name = "Busy".to_owned();
+        busy_1.user_name = "busy.old-handle".to_owned();
         let busy_2 = busy_1.clone();
+        let names = named(&[(a, "Quiet"), (b, "Busy")]);
         let (usage, _) = summarize_usage(
             &[quiet, busy_1, busy_2],
             &tables(&["silver.orders"]),
             &[],
             a,
             false,
+            &names,
         );
         assert_eq!(
             usage["frequentUsers"],
             json!([{"name": "Busy", "queries": 2}, {"name": "Quiet", "queries": 1}])
+        );
+    }
+
+    /// `DATA-52` (QA `LH-DATA-12-01` F3, `TC-1730`): a person whose row is gone is
+    /// "Unknown user", all such people share one row, and no id appears anywhere in
+    /// the answer.
+    #[test]
+    fn a_person_who_no_longer_exists_is_unknown_user_and_never_an_id() {
+        let (me, gone, also_gone) = (
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        );
+        let mut mine = mention("q1", "SELECT * FROM silver.orders", me, "completed", 1);
+        mine.user_name = me.to_string();
+        let mut theirs_1 = mention("q2", "SELECT * FROM silver.orders", gone, "completed", 1);
+        theirs_1.user_name = gone.to_string();
+        let mut theirs_2 = mention(
+            "q3",
+            "SELECT * FROM silver.orders",
+            also_gone,
+            "completed",
+            1,
+        );
+        theirs_2.user_name = also_gone.to_string();
+        let names = named(&[(me, "Rina Wijaya")]);
+        let (usage, recent) = summarize_usage(
+            &[mine, theirs_1, theirs_2],
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            false,
+            &names,
+        );
+        assert_eq!(
+            usage["frequentUsers"],
+            json!([
+                {"name": "Unknown user", "queries": 2},
+                {"name": "Rina Wijaya", "queries": 1}
+            ])
+        );
+        // Distinct ids, as before: the two deleted people are two people.
+        assert_eq!(usage["users"], 3);
+        let text = usage.to_string();
+        for id in [me, gone, also_gone] {
+            assert!(
+                !text.contains(&id.to_string()),
+                "the id {id} reached the answer"
+            );
+        }
+        assert!(!json!(recent).to_string().contains(&me.to_string()));
+    }
+
+    /// `DATA-52`: a row with no owner id is named by the id its `user_name` holds (a row
+    /// from before the ids) when that id has a name, and as stored when it is not an id.
+    #[test]
+    fn a_row_without_an_owner_is_named_by_the_id_in_its_user_name_or_shown_as_stored() {
+        let person_id = uuid::Uuid::from_u128(7);
+        let mut by_id = mention(
+            "q1",
+            "SELECT * FROM silver.orders",
+            person_id,
+            "completed",
+            1,
+        );
+        by_id.owner_id = None;
+        by_id.user_name = person_id.to_string();
+        let mut anonymous = mention(
+            "q2",
+            "SELECT * FROM silver.orders",
+            person_id,
+            "completed",
+            1,
+        );
+        anonymous.owner_id = None;
+        anonymous.user_name = "anonymous".to_owned();
+        let names = named(&[(person_id, "Rina Wijaya")]);
+        let (usage, _) = summarize_usage(
+            &[by_id, anonymous],
+            &tables(&["silver.orders"]),
+            &[],
+            person_id,
+            false,
+            &names,
+        );
+        assert_eq!(
+            usage["frequentUsers"],
+            json!([
+                {"name": "Rina Wijaya", "queries": 1},
+                {"name": "anonymous", "queries": 1}
+            ])
         );
     }
 
@@ -1772,6 +1970,7 @@ mod tests {
             &columns(&["amount", "cid"]),
             me,
             false,
+            &HashMap::new(),
         );
         assert_eq!(
             usage["joinedTables"],
@@ -1812,6 +2011,7 @@ mod tests {
             &columns(&["amount", "id", "city"]),
             me,
             false,
+            &HashMap::new(),
         );
         assert_eq!(
             usage["columns"],
@@ -1831,7 +2031,14 @@ mod tests {
             "completed",
             1,
         )];
-        let (usage, _) = summarize_usage(&mentions, &tables(&["silver.orders"]), &[], me, true);
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            true,
+            &HashMap::new(),
+        );
         assert_eq!(usage["truncated"], true);
         assert_eq!(usage["basedOn"], 1);
     }
