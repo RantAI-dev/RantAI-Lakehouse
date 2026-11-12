@@ -68,6 +68,10 @@ export function CommandPalette() {
   const [recents, setRecents] = React.useState<Recent[]>([]);
   const [search, setSearch] = React.useState("");
   const [assetResults, setAssetResults] = React.useState<Asset[]>([]);
+  // How many tables matched in all (`DATA-41` D3, `DATA-54`). 0 when there is
+  // no term, on a failed search and without `catalog:read`: there is nothing
+  // more to say then.
+  const [assetTotal, setAssetTotal] = React.useState(0);
   // A failed search is said out loud (principle 2); an empty list would
   // read as "nothing matches".
   // The line to show for it: a refusal, a `supported: false` reason, or the
@@ -109,6 +113,7 @@ export function CommandPalette() {
     const term = search.trim();
     if (!term || !hasPermission("catalog:read")) {
       setAssetResults([]);
+      setAssetTotal(0);
       setSearchFailed(null);
       setAssetsPending(false);
       return;
@@ -121,16 +126,18 @@ export function CommandPalette() {
         // `DATA-41` D3: the server is asked for what the box shows, so a
         // catalog of ten thousand tables is not sent to throw all but
         // eight away. `capPaletteAssetResults` stays as the second guard.
-        .listAssets({ search: term, limit: PALETTE_ASSET_RESULT_LIMIT }, controller.signal)
-        .then((assets) => {
+        .searchAssets(term, PALETTE_ASSET_RESULT_LIMIT, controller.signal)
+        .then(({ assets, total }) => {
           if (cancelled) return;
           setSearchFailed(null);
           setAssetResults(capPaletteAssetResults(assets));
+          setAssetTotal(total);
           setAssetsPending(false);
         })
         .catch((err: unknown) => {
           if (cancelled) return;
           setAssetResults([]);
+          setAssetTotal(0);
           setSearchFailed(failureLine(err));
           setAssetsPending(false);
         });
@@ -361,6 +368,13 @@ export function CommandPalette() {
                 onSelect={() => go(`/data/assets/${a.id}`)}
               />
             ))}
+            {/* QA `LH-DATA-11-02` (`DATA-54`): the box shows eight tables; when
+                more matched, it says so rather than looking complete. */}
+            {assetTotal > assetResults.length ? (
+              <div className="px-2.5 py-1.5 text-xs text-muted-foreground">
+                Showing {assetResults.length} of {assetTotal}: refine the search
+              </div>
+            ) : null}
             <PaletteItem
               forceMount
               icon={Search}

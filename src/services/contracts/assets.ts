@@ -521,8 +521,22 @@ export type AssetRestoreStatus =
       expiresAt?: string
     }
 
+/**
+ * A catalog search's answer: the best matches and how many matched in all
+ * (`DATA-41` D3, `DATA-54`). The palette shows a few of them and says how
+ * many more there are.
+ */
+export type AssetSearchResult = { assets: Asset[]; total: number }
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
+  /**
+   * The best matches for `term` and how many matched in all (`DATA-41` D3).
+   *
+   * `limit` is how many assets to return; the server ranks every match and
+   * counts them, so a caller that shows eight still knows there are more.
+   */
+  searchAssets(term: string, limit: number, signal?: AbortSignal): Promise<AssetSearchResult>
   /**
    * One page of assets, with search/filter/sort/grouping applied on the
    * server (`GET /api/catalog/query`).

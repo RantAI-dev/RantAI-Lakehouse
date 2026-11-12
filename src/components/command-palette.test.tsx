@@ -145,6 +145,35 @@ describe("CommandPalette catalog search", () => {
     expect(requested[0]).toContain("limit=8")
   })
 
+  // QA `LH-DATA-11-02` (`DATA-54`): the box shows eight tables; when more
+  // matched it says how many, so eight does not read as "that is all".
+  it("says how many tables matched when it shows only eight of them", async () => {
+    stubCatalog({
+      assets: Array.from({ length: 8 }, (_, i) => asset(i + 1)),
+      total: 23,
+    })
+    await search("table")
+    await screen.findByText("Table 1")
+    const text = document.body.textContent ?? ""
+    const line = text.indexOf("Showing 8 of 23: refine the search")
+    expect(line).toBeGreaterThan(-1)
+    expect(line).toBeLessThan(text.indexOf("See all results"))
+  })
+
+  it("says nothing about more when every match is shown", async () => {
+    stubCatalog({ assets: [asset(1), asset(2)], total: 2 })
+    await search("table")
+    await screen.findByText("Table 2")
+    expect(screen.queryByText(/^Showing /)).toBeNull()
+    cleanup()
+    requested.length = 0
+    // A server that sends no total: all of its answer is on screen.
+    stubCatalog({ assets: [asset(1), asset(2)] })
+    await search("table")
+    await screen.findByText("Table 2")
+    expect(screen.queryByText(/^Showing /)).toBeNull()
+  })
+
   it("opens the Catalog with the typed words from See all results", async () => {
     stubCatalog({ assets: [asset(1)] })
     await search("customer revenue")
