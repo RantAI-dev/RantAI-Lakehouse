@@ -1201,3 +1201,97 @@ R1, R3 and R4: as the findings say.
 - Check: `git diff 75010df81 HEAD -- rust/crates/lakehouse-api/tests/route_auth.rs | grep -c '^-[^-]'`
   prints `0`.
 
+### Round 1 fixes (developer)
+
+One commit per finding, in the order R2, R1, R3, R4. Every assertion below was
+run against the code with the wrong change its Check names, seen to fail with
+the message quoted, and then restored.
+
+**R2 — `8c62c4b2`** — `fix(catalog): a table grant shows that table, not other
+tables or people`. `ensure_may_open_asset` answers `Admission::CatalogRead` or
+`Admission::TableGrant` (never a client flag); `detail` strips the body once at
+the end for a grant-holder (`upstream`, `downstream`, `dependents`, the three
+usage lists emptied; `replacementAssetId`/`replacementName` removed;
+`shownWithTableGrant: true`). `Admission::shows_related` is true only for
+`catalog:read` (fail closed). The contract carries `shownWithTableGrant?`;
+the console shows "Shown with a table grant: related tables and usage are
+hidden" on the overview's Connections card, the Lineage tab and the Activity
+tab; `asset-page-depth.md` gains the sentence, `(proposed, not yet signed)`.
+
+- Proof: `detail_admits_a_person_granted_query_read_on_that_table_and_masks_what_they_read`
+  (extended) reads `silver.orders` as both callers — the grant-holder has no
+  `upstream`, empty `usage.joinedTables`/`frequentUsers`/`frequentQueries`,
+  empty `dependents` and no replacement, and the `catalog:read` caller still
+  has all of it and no flag — plus `only_a_catalog_reader_keeps_the_related_tables`
+  for the strip and the fail-closed direction.
+- Wrong changes, each restored after: strip disabled → `left: Null right:
+  Bool(true)` on `shownWithTableGrant`; top-level lists not emptied → `a grant
+  shows no table this one is built from: {…"upstream":[{"id":"orders_raw",
+  "name":"bronze.orders"}]…}`; usage lists not emptied → `left: Array [Object
+  {"name": String("Rina Wijaya"), "queries": Number(1)}] right: Array []`.
+- Not proved by a wrong change: `dependents` has no data in the pinned test
+  (the saved-query scope needs a person's own rows), so it is covered by the
+  unit test only; the four console assertions are not wrong-change proved
+  either (the Check named the Rust test).
+- The console flag/tests were run (`bun test
+  src/features/catalog/asset-detail-tabs.test.tsx`: 164 pass); what a browser
+  draws was not checked on a running deployment.
+
+**R1 — `21d0e6b4`** — `test(catalog): the grant tests reach the grant check,
+and the store has one`. The revoked/expired and other-permission tests use
+`query_reader_harness` (grantee holds `query:read` by role, in the catalog
+tenant), grant rows written with `create_direct_grant` (the route answers 409
+for a person who already holds the permission), the revoke through the route's
+DELETE and the expiry through the `UPDATE`; the other-permission test grants
+`lineage:read` through the route. `lakehouse-store/tests/agents.rs` gains
+`holds_asset_grant_counts_both_origins_and_only_while_in_force`.
+
+- Proof, one predicate at a time (removed from `holds_asset_grant`'s SQL):
+  `revoked_at` → `a revoked grant opens nothing` (store, `tests/agents.rs:1633`)
+  and the API's `a_revoked_or_expired_grant_no_longer_opens_the_page` with
+  `left: 403 right: …503 {"error":"This table's details could not be read
+  right now…"}`; `expires_at` → `an expired grant opens nothing` (both);
+  `permission` → `a grant of one permission is not another` (store) and `a
+  lineage:read grant does not open the page` (API); `a.resource` → `the grant
+  of an approved request admits the resource it was requested for`.
+
+**R3 — `ec5b00bd`** — `test(catalog): a grant does not open a table the
+person's roles hide`. New `a_grant_does_not_open_a_table_the_persons_roles_hide`,
+with `narrow_to` setting `role.read_scope = 'listed'` and `role_read_grant` as
+`tests/table_access.rs` does; no production change.
+
+- Proof: with the `access.allows_key` refusal in `detail` disabled the test
+  fails `a hidden table stays hidden from a grant-holder: {"error":"This
+  table's details could not be read right now…"} left: 503 right: 404`.
+
+**R4 — `6b04d7ee`** — `test(catalog): restore the doc comment line T5 cut in
+route_auth`. The line ``/// `DATA-14` (F3): any login may read the schedules,
+and setting one needs`` and the blank line above it are back, unchanged.
+`git diff 75010df81 -- rust/crates/lakehouse-api/tests/route_auth.rs | grep -c
+'^-[^-]'` prints `0`.
+
+**Commands run on the final commit (`6b04d7ee`)**
+
+```
+cd rust && cargo fmt --check                                # ok
+cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings  # finished
+cargo test -p lakehouse-api --test route_auth               # 93 passed; 0 failed
+cargo test -p lakehouse-api --test catalog_grants           # 14 passed; 0 failed
+cargo test -p lakehouse-store --test agents                 # 51 passed; 0 failed
+bun run typecheck                                           # ok
+bun run lint                                                # 0 errors, 11 warnings (all pre-existing)
+bun run test                                                # 4005 pass, 1 skip, 0 fail, 380 files
+python3 ops/lint/check_bare_iceberg_count.py                # R11 guard: OK
+python3 ops/lint/check_intra_package_imports.py             # OK
+```
+
+Per-commit runs were scoped: `cargo fmt --check` + `cargo clippy -p
+lakehouse-api --all-targets` + the touched unit tests (R2: `sample_masking`, 12
+passed) or integration file (R1: `catalog_grants` and `lakehouse-store`'s
+`agents`; R3: `catalog_grants`; R4: `route_auth`), and for R2 the console:
+`bun run typecheck`, `bun run lint`, `bun test
+src/features/catalog/asset-detail-tabs.test.tsx` (164 pass).
+
+*Not verified*: `cargo test --workspace` (CI runs it, and the scoped runs above
+do not cover crates this round did not touch); no `docker compose` run — no
+compose file changed; no browser check of the new sentence on a running page.
