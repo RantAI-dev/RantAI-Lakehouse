@@ -660,3 +660,47 @@ describe("the created screen waits for the save (LH-SRC-6-39)", () => {
     expect(page.queryByText(/has no connection settings saved yet/)).toBeNull()
   })
 })
+
+// QA LH-SRC-3-08 (SRC-41 D20): when the list of types cannot be read there is
+// nothing to create from, so the page shows a state instead of the wizard.
+describe("the New Connector page when the types cannot be read (LH-SRC-3-08)", () => {
+  function stubTypes(status: number, error: string) {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/api/auth/me")) return json(ME)
+      if (url.endsWith("/api/connectors/types")) return json({ error }, status)
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+  }
+
+  it("shows the missing permission and no form when the types are refused", async () => {
+    stubTypes(403, "permission_denied: connector:manage")
+    render(
+      <AuthProvider>
+        <ConnectorCreatePage />
+      </AuthProvider>
+    )
+    expect(await screen.findByText("You cannot create a connector")).toBeDefined()
+    expect(
+      screen.getByText(
+        "Creating a connector needs the connector:manage permission. Ask a workspace administrator."
+      )
+    ).toBeDefined()
+    expect(screen.queryByLabelText("Name")).toBeNull()
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Previous" })).toBeNull()
+    expect(document.body.textContent).not.toMatch(/permission_denied/)
+  })
+
+  it("offers Retry and no form when the types cannot be loaded", async () => {
+    stubTypes(503, "the connector types could not be read")
+    render(
+      <AuthProvider>
+        <ConnectorCreatePage />
+      </AuthProvider>
+    )
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeDefined()
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull()
+    expect(screen.queryByLabelText("Name")).toBeNull()
+  })
+})

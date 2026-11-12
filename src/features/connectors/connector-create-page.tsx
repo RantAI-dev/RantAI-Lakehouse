@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { KeyRoundIcon, NetworkIcon } from "lucide-react"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -386,6 +386,38 @@ export function ConnectorCreatePage() {
     )
   }
 
+  // QA LH-SRC-3-08 (SRC-41 D20): when the list of types cannot be read there is
+  // nothing to create from, so the page shows the header and the state alone —
+  // no Name, Direction, Previous or Next. A refusal says what the person can do;
+  // anything else offers Retry. The server refuses the create for the same
+  // person already (`POST /api/connectors` is `connector:manage`). The signal
+  // is the `ServiceError` this client really produces: `getJson` maps a 403 to
+  // `invalid_request` and keeps the status, so a refusal is `code` or `status`
+  // (`home-cards.ts`'s `cardRead` reads it the same way).
+  if (types.status === "error") {
+    return (
+      <div className="flex flex-col gap-4">
+        <PageHeader
+          title="New Connector"
+          description="Configure a source or sink with discovery and residency scope, then verify connectivity."
+          actions={
+            <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
+              Cancel
+            </Button>
+          }
+        />
+        {types.error.code === "permission_denied" || types.error.status === 403 ? (
+          <EmptyState
+            title="You cannot create a connector"
+            description="Creating a connector needs the connector:manage permission. Ask a workspace administrator."
+          />
+        ) : (
+          <ErrorState error={types.error} onRetry={types.reload} />
+        )}
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
@@ -417,9 +449,8 @@ export function ConnectorCreatePage() {
             </p>
             {types.status === "loading" ? (
               <LoadingSkeleton rows={4} />
-            ) : types.status === "error" ? (
-              <ErrorState error={types.error} onRetry={types.reload} />
             ) : (
+              // The `error` state is answered above, before the form exists.
               <ConnectorTypePicker types={types.data} value={selectedTypeName} onChange={setSelectedTypeName} />
             )}
             <div className="grid gap-4 border-t border-border pt-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
