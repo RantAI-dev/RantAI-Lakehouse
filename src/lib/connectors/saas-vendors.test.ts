@@ -85,6 +85,10 @@ describe("the account each vendor's form takes (SRC-41 D13)", () => {
       "a.b.c.d.workday.com/t",
       "wd2.workday.com.evil.invalid/t",
       "wd2.workday.org/t",
+      // U+212A (KELVIN SIGN) is `k` to JavaScript's `toLowerCase()` but not to
+      // the server's `to_ascii_lowercase`, so this copy must judge it the way
+      // the server does: not a Workday host (review round 1, R4).
+      "wd2.wor\u212Aday.com/t",
     ]) {
       expect(saasAccountProblem(workday, account)).not.toBeNull()
     }
@@ -96,6 +100,9 @@ describe("the account each vendor's form takes (SRC-41 D13)", () => {
       "acme.crm123.dynamics.com",
       "acme.crmx.dynamics.com",
       "a.b.crm.dynamics.com",
+      // The same U+212A, in the organisation label: the server refuses it, so
+      // the form says it first (review round 1, R4).
+      "a\u212A.crm4.dynamics.com",
     ]) {
       expect(saasAccountProblem(dynamics, `${host}${tenant}`)).not.toBeNull()
     }

@@ -370,6 +370,18 @@ export function saasAccountProblem(vendor: SaasVendor, account: string): string 
     : `This is not in the form ${vendor.label} uses.`
 }
 
+/**
+ * `text` with its ASCII letters lower-cased, and nothing else (`SRC-41` D13,
+ * review round 1, R4). `String.prototype.toLowerCase` follows Unicode, where
+ * U+212A (KELVIN SIGN) becomes `k`; Rust's `to_ascii_lowercase` in
+ * `SaasVendor::validate_account` leaves it as it is. Judging with the Unicode
+ * rule let the form pass an account (`wd2.worKday.com/t`) the server refuses,
+ * so this copy lowers exactly what the server lowers.
+ */
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (letter) => letter.toLowerCase())
+}
+
 /** 1 to 63 of `[A-Za-z0-9-]`, not starting or ending with `-`. */
 function isLabel(text: string): boolean {
   return text.length <= 63 && !text.startsWith("-") && !text.endsWith("-") && /^[A-Za-z0-9-]+$/.test(text)
@@ -402,7 +414,7 @@ function isEntraTenant(text: string): boolean {
 
 /** `<organisation>.<region>.dynamics.com`, the region `crm` plus at most two digits. */
 function isDataverseHost(account: string): boolean {
-  const lowered = account.toLowerCase()
+  const lowered = asciiLower(account)
   const suffix = ".dynamics.com"
   if (!lowered.endsWith(suffix)) return false
   const rest = lowered.slice(0, lowered.length - suffix.length)
@@ -423,7 +435,7 @@ function splitTenant(account: string): { inner: string; tenant: string } | null 
 function isHostTenant(account: string, suffixes: readonly string[]): boolean {
   const slash = account.indexOf("/")
   if (slash < 0) return false
-  const host = account.slice(0, slash).toLowerCase()
+  const host = asciiLower(account.slice(0, slash))
   const tenant = account.slice(slash + 1)
   if (!isTenantWord(tenant)) return false
   return suffixes.some((suffix) => {
