@@ -836,4 +836,25 @@ None blocks the build; the plan builds the answer named first.
 
 ## 5. Handoff
 
+### T1 cause
+
+`preview_for_roles` sends three statements to `ClickHouse`: the column probe
+(`probe_columns`, a `DESCRIBE`, which reads metadata and no row), the row read
+(`SELECT * FROM (<the source>) AS src LIMIT 50` with `SQL_SOURCE_SETTINGS`
+appended, through `ch.query(&sql, None)`), and — only with `chart` — the
+chart's own statement through `try_run_spec_sql`. Only the last one is under
+the caller's limits. The row read goes out with no URL settings at all
+(`query_with_settings(sql, &[], None, ..)`), so it carries only the fixed
+`max_execution_time = 60` the `SQL_SOURCE_SETTINGS` text has carried since the
+sources shipped, plus the client's own 60-second request timeout; the
+install's or the role's limit never reaches it, and
+`classify_ch_error` answers any failure with the fixed "The SQL source failed
+to run." A source that needs its whole result to produce its 50 rows (the
+aggregate-over-a-cross-join of the QA case) therefore ran to the fixed 60
+seconds and, on a slow source, to the request's own 60-second cut, never to
+the sentence. The reproduction test was run before the fix and failed as
+predicted: `Unprocessable("The SQL source failed to run. Reference:
+0bad014c25")` where the limit's sentence was expected, and the recorded
+row-read request had no `max_execution_time` URL setting.
+
 ## 6. Review

@@ -838,4 +838,53 @@ mod preview_tests {
             "{err:?}"
         );
     }
+
+    /// QA `LH-BI-5-01` (`BI-45`, plan D3): the row read of a SQL source
+    /// preview used to go out with no limit at all — `ch.query(&sql, None)` —
+    /// so a source the engine stopped for its time limit answered the fixed
+    /// "The SQL source failed to run." instead of the limit's sentence, and
+    /// the request carried no `max_execution_time`. This is the reproduction:
+    /// it is red until the row read runs through `run_statement_limited`.
+    #[tokio::test]
+    async fn the_row_read_of_a_sql_source_preview_carries_the_callers_time_limit_and_says_the_limit_sentence()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DESCRIBE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(describe_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("AS src LIMIT 50"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 159. DB::Exception: planted-marker Timeout exceeded (TIMEOUT_EXCEEDED)",
+            ))
+            .mount(&server)
+            .await;
+
+        let err = run(&server, json!({ "sql": SQL })).await.unwrap_err();
+
+        let ApiError::Unprocessable(message) = &err else {
+            panic!("a statement the limit ended is a 422, not {err:?}");
+        };
+        // A test runs outside a request, so the limits are the defaults.
+        assert_eq!(
+            message, "This chart stopped after 60 seconds, the limit for this install.",
+            "{err:?}"
+        );
+        assert!(!message.contains("planted-marker"), "{message}");
+        let requests = server.received_requests().await.unwrap();
+        let read = requests
+            .iter()
+            .find(|r| String::from_utf8_lossy(&r.body).contains("AS src LIMIT 50"))
+            .expect("the row read was sent");
+        let settings: std::collections::HashMap<_, _> =
+            read.url.query_pairs().into_owned().collect();
+        assert_eq!(
+            settings.get("max_execution_time").map(String::as_str),
+            Some("60"),
+            "the row read carried no time limit: {}",
+            read.url
+        );
+    }
 }
