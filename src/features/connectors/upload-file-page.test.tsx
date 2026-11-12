@@ -1141,6 +1141,127 @@ describe("UploadFilePage, Table step", () => {
     await waitFor(() => expect((screen.getByRole("button", { name: "Load" }) as HTMLButtonElement).disabled).toBe(false))
   })
 
+  // QA LH-DATA-35-03 (DATA-47), review round 1 R2: an answer belongs to one ask. After
+  // "Upload another file" the same name is a new ask, so the step says it is checking —
+  // the `[]` from before the load must not answer for it, or Load replaces rows without
+  // asking while the lookup is still running.
+  it("asks again about a name it answered before the load, and says it is checking until the new answer", async () => {
+    const held: Array<() => void> = []
+    let asks = 0
+    const started = upload({ status: "ingesting", bronzeTable: "stock", parseOptions: OPTIONS, loadMode: "replace" })
+    stubFetch({
+      preview: () => preview(),
+      tableUploads: (table) => {
+        asks += 1
+        return asks === 1
+          ? []
+          : new Promise<Upload[]>((resolve) =>
+              held.push(() =>
+                resolve([upload({ id: "up-old", status: "ingested", bronzeTable: table, assetId: table })]),
+              ),
+            )
+      },
+      get: () => ({ ...started, status: "ingested", rows: 3, assetId: "stock" }),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    render(<UploadFilePage pollMs={20} lookupDelayMs={0} />)
+    chooseFile(CSV())
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    // The first answer is `[]`: `stock` is a new table, so no choice is offered.
+    await waitFor(() => expect(next().disabled).toBe(false))
+    expect(screen.queryByRole("radio", { name: "Replace its rows" })).toBeNull()
+    fireEvent.click(next())
+    fireEvent.click(await screen.findByRole("button", { name: "Load" }))
+    await screen.findByText("Load finished")
+    expect(asks).toBe(1)
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload another file" }))
+    chooseFile(CSV())
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Encoding")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+
+    // The second ask for `stock` has not answered: `checking`, not the `[]` from before.
+    expect(screen.getByText(/Checking whether an earlier upload created stock/)).toBeDefined()
+    expect(next().disabled).toBe(true)
+    await waitFor(() => expect(held.length).toBe(1))
+    held[0]!()
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(screen.getByRole("radio", { name: "Add to its rows" })).toBeDefined()
+    expect(next().disabled).toBe(false)
+  })
+
+  // QA LH-DATA-35-03 (DATA-47), review round 1 R2: "Check again" must not answer from
+  // the successful check before the failed one. D4 says a failed lookup never falls
+  // back to Replace, so Next stays off until the retry answers.
+  it("keeps Next off after Check again until the retry answers, even with an earlier answer for the name", async () => {
+    const held: Array<() => void> = []
+    let stockAsks = 0
+    await openTableWith({
+      tableUploads: (table) => {
+        if (table !== "stock") return []
+        stockAsks += 1
+        if (stockAsks === 1) return []
+        if (stockAsks === 2) return json({ error: "The service is unavailable." }, 503)
+        return new Promise<Upload[]>((resolve) =>
+          held.push(() =>
+            resolve([upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]),
+          ),
+        )
+      },
+    })
+    // `stock` answered `[]` first, so the step may go on.
+    await waitFor(() => expect(next().disabled).toBe(false))
+
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stockx" } })
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock" } })
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("Could not check whether an earlier upload created stock")
+    expect(next().disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }))
+    await waitFor(() => expect(held.length).toBe(1))
+    expect(next().disabled).toBe(true)
+    expect(screen.getByText(/Checking whether an earlier upload created stock/)).toBeDefined()
+
+    held[0]!()
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(next().disabled).toBe(false)
+  })
+
+  // QA LH-DATA-35-03 (DATA-47), review round 1 R3: a failure belongs to the ask that
+  // failed, so a later answer for the same name replaces it — the page must not stay on
+  // "Could not check" with Load off after a successful check of that same name.
+  it("uses a successful check of a name it failed on before, without Check again", async () => {
+    let stockAsks = 0
+    await openTableWith({
+      tableUploads: (table) => {
+        if (table !== "stock") return []
+        stockAsks += 1
+        return stockAsks === 1
+          ? json({ error: "The service is unavailable." }, 503)
+          : [upload({ id: "up-old", status: "ingested", bronzeTable: "stock", assetId: "stock" })]
+      },
+    })
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("Could not check whether an earlier upload created stock")
+
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stockx" } })
+    fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock" } })
+
+    await screen.findByRole("radio", { name: "Replace its rows" })
+    expect(screen.queryByRole("alert")).toBeNull()
+    expect(next().disabled).toBe(false)
+  })
+
   it("asks about a typed name once, after the pause, and uses only the answer for the name in the field", async () => {
     url.search = "?id=up-1"
     const calls = stubFetch({ get: () => upload(), preview: () => preview() })

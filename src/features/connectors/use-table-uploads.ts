@@ -29,48 +29,72 @@ export type TableUploadsState =
  * `delayMs` is 0 for a name the page set itself (the suggestion from the file
  * name, or the table of an upload opened with `?id=`), so that answer is
  * normally there before the person reaches the Table step, and 400 for a name a
- * person typed. An answer is used only for the name it was asked for: while the
- * kept answer's name is not the current one, the state is `checking`, and the
- * page keeps Load off rather than guessing.
+ * person typed.
+ *
+ * An answer and a failure belong to ONE ask, not to a name (review round 1 R2,
+ * R3): the effect bumps a counter for every request it schedules, and only the
+ * ask of the moment may answer. So a name asked again — after "Upload another
+ * file", after "Check again", or a name typed back — is `checking` until its own
+ * answer arrives, and an answer or failure from before that ask can neither
+ * stand in for it (a slow lookup must not read as "a new table", which loads
+ * with Replace) nor outlive it (a check that succeeds after one that failed
+ * replaces the failure). The page keeps Load off while the state is `checking`.
  */
 export function useTableUploads(table: string | null, delayMs: number) {
-  const [answer, setAnswer] = React.useState<{ table: string; uploads: readonly Upload[] } | null>(null)
-  const [failure, setFailure] = React.useState<{ table: string; error: ServiceError } | null>(null)
-  const [asked, setAsked] = React.useState(0)
+  const [answer, setAnswer] = React.useState<{
+    ask: number
+    table: string
+    uploads: readonly Upload[]
+  } | null>(null)
+  const [failure, setFailure] = React.useState<{
+    ask: number
+    table: string
+    error: ServiceError
+  } | null>(null)
+  /** The ask of the moment: the last request this effect scheduled. */
+  const [ask, setAsk] = React.useState(0)
+  // A ref, so the id is known when the request is scheduled, before its answer.
+  const lastAsk = React.useRef(0)
+  const [retried, setRetried] = React.useState(0)
 
   React.useEffect(() => {
+    // Every scheduled request — the `table === null` gap between a reset and the
+    // next name included — makes what came before stale.
+    lastAsk.current += 1
+    const scheduled = lastAsk.current
+    setAsk(scheduled)
     if (table === null) return
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
       uploadService
         .list(controller.signal, { table })
-        .then((uploads) => setAnswer({ table, uploads }))
+        .then((uploads) => setAnswer({ ask: scheduled, table, uploads }))
         .catch((err: unknown) => {
           const error = toServiceError(err)
-          if (error.code !== "aborted") setFailure({ table, error })
+          if (error.code !== "aborted") setFailure({ ask: scheduled, table, error })
         })
     }, delayMs)
     return () => {
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [table, delayMs, asked])
+  }, [table, delayMs, retried])
 
   const state: TableUploadsState =
     table === null
       ? { status: "idle" }
-      : failure !== null && failure.table === table
+      : failure !== null && failure.ask === ask && failure.table === table
         ? { status: "error", error: failure.error }
-        : answer !== null && answer.table === table
+        : answer !== null && answer.ask === ask && answer.table === table
           ? { status: "known", uploads: answer.uploads }
           : { status: "checking" }
 
   return {
     state,
-    /** Ask again for the same name, after a failure (`Check again`). */
-    retry: () => {
-      setFailure(null)
-      setAsked((count) => count + 1)
-    },
+    /**
+     * Ask again for the same name, after a failure (`Check again`). It is
+     * `checking`, not the answer kept from before that failure, until it answers.
+     */
+    retry: () => setRetried((count) => count + 1),
   }
 }
