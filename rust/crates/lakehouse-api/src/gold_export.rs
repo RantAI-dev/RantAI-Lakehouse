@@ -89,6 +89,10 @@ use crate::state::AppState;
 #[derive(Debug, Error)]
 pub enum GoldExportError {
     /// Reading the source mart from `ClickHouse` failed.
+    ///
+    /// Its `Display` is for the log, never for a response or a stored row
+    /// (`DATA-49`, QA `LH-DATA-1-01`): `routes::gold`'s `From` impl classifies
+    /// it into fixed words and a reference first.
     #[error("reading Gold mart from ClickHouse failed: {0}")]
     ClickHouse(#[from] ChError),
     /// A `ClickHouse` column type has no supported Iceberg/Arrow mapping —
@@ -104,9 +108,18 @@ pub enum GoldExportError {
     },
     /// Building the Arrow batch from `ClickHouse` row data failed (a value
     /// did not parse as its declared column type).
+    ///
+    /// The text can hold a cell value and the Arrow or Iceberg library's own
+    /// words, so its `Display` is for the log, never for a response or a
+    /// stored row (`DATA-49`, QA `LH-DATA-1-01`): `routes::gold`'s `From` impl
+    /// classifies it into fixed words and a reference first.
     #[error("failed to build export batch: {0}")]
     Batch(String),
     /// The Iceberg catalog/write path failed.
+    ///
+    /// Its `Display` can hold catalog URLs and object keys, so it is for the
+    /// log, never for a response or a stored row (`DATA-49`, QA
+    /// `LH-DATA-1-01`): `routes::gold`'s `From` impl classifies it first.
     #[error("Iceberg export failed: {0}")]
     Iceberg(#[from] IcebergError),
     /// The source mart has more rows than `GOLD_EXPORT_MAX_ROWS` allows.

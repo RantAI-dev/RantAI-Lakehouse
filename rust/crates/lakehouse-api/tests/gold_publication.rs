@@ -103,6 +103,28 @@ async fn spin_up_with_clickhouse() -> (TestApp, ChClient) {
     (app, ch)
 }
 
+/// The app of [`spin_up_with_clickhouse`], with a Gold export token file that
+/// exists, so a `POST /api/gold/export/{mart}` gets past `read_catalog_token`
+/// and fails at the harness's dead catalog. The file's content is any text: the
+/// harness never presents it to anything. The returned file is kept alive by the
+/// caller for the test's duration.
+async fn spin_up_with_clickhouse_and_export_token() -> (TestApp, ChClient, tempfile::NamedTempFile)
+{
+    let (ch_url, _container) = shared_clickhouse().await;
+    let token = tempfile::NamedTempFile::new().expect("a temporary token file");
+    std::fs::write(token.path(), "test-token").expect("write the token file");
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), ch_url.clone());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    overrides.insert(
+        "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE".to_owned(),
+        token.path().display().to_string(),
+    );
+    let app = spin_up_with_env(&overrides).await;
+    let ch = ChClient::new(ch_url.clone(), "default".to_owned(), String::new());
+    (app, ch, token)
+}
+
 /// Seeds `serving.{mart}` as a real `MergeTree` with a few rows — the same
 /// schema-on-write shape `authored_factory.py` produces (`CREATE TABLE
 /// ... ENGINE = MergeTree` + a plain `INSERT`), so `system.tables` and
@@ -745,4 +767,55 @@ async fn publication_detail_reports_trim_failed() {
     assert!(body["trim"]["oldestKeptExportedAt"].is_null());
     assert!(body["trim"]["finishedAt"].is_string());
     assert_eq!(body["trim"]["reason"], "delete_failed");
+}
+
+/// QA `LH-DATA-1-01` (`DATA-49`): a failed publish stores the sentence the
+/// response carried. The catalog is unreachable in this harness, so the run
+/// fails there; the row must read the classified sentence with its reference,
+/// never the catalog client's own text (which names the HTTP answer and its
+/// headers), and the row and the response must agree word for word.
+#[tokio::test]
+async fn a_failed_publish_stores_the_sentence_the_response_carried_and_no_catalog_text() {
+    let (app, ch, _token) = spin_up_with_clickhouse_and_export_token().await;
+    seed_mart(&ch, "catalog_down_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/catalog_down_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let answered = body["error"]
+        .as_str()
+        .expect("a failed publish answers a sentence")
+        .to_owned();
+    assert!(
+        answered.starts_with("The catalog request failed. Reference: "),
+        "{answered}"
+    );
+    assert!(
+        !answered.contains("http://"),
+        "the catalog's address must not travel: {answered}"
+    );
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/exports?mart=catalog_down_mart",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let newest = &body["runs"][0];
+    assert_eq!(newest["status"], "failed", "{body}");
+    assert_eq!(
+        newest["error"], answered,
+        "the stored sentence is the response's own: {body}"
+    );
 }

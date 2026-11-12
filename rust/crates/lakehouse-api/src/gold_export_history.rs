@@ -150,9 +150,11 @@ pub struct NewGoldExportRun<'a> {
     /// The Iceberg table's snapshot id at export time, when the export
     /// succeeded and the source table has a current snapshot.
     pub snapshot_id: Option<i64>,
-    /// Classified error text (never raw upstream error bodies) — the
-    /// `Display` of `GoldExportError`, which is already a closed,
-    /// hand-written message per variant (see `gold_export.rs`).
+    /// The response's own sentence for a failed attempt, already classified by
+    /// `routes::gold` (`DATA-49`, QA `LH-DATA-1-01`): fixed words and a
+    /// `Reference:` for an upstream failure, this repository's own sentence for
+    /// a refusal. Never the `Display` of `GoldExportError`, which holds upstream
+    /// text and is for the log only.
     pub error: Option<&'a str>,
     /// `"user:<display name>"` or `"service:<display name>"` — see
     /// `routes::gold::export`'s call site for how this is built from a

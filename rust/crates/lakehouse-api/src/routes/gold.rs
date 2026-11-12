@@ -82,8 +82,17 @@ impl From<GoldExportError> for ApiError {
     fn from(err: GoldExportError) -> Self {
         match err {
             GoldExportError::ClickHouse(e) => upstream_error::ch_error(&upstream_error::DATABASE, &e),
+            // QA LH-DATA-1-01 (DATA-49): the batch text can hold a cell value
+            // and the Arrow or Iceberg library's words, so it is classified
+            // like an upstream failure — fixed sentence plus a reference —
+            // instead of being stored or answered verbatim.
+            GoldExportError::Batch(detail) => upstream_error::report(
+                &upstream_error::PUBLISH_BATCH,
+                upstream_error::Class::Failed,
+                &detail,
+            )
+            .into_api_error(upstream_error::FailedAs::Unprocessable),
             GoldExportError::UnsupportedColumn { .. }
-            | GoldExportError::Batch(_)
             // The mart is over `GOLD_EXPORT_MAX_ROWS` — a well-formed
             // request against real (too-large) data, same "caller's input,
             // not our outage" shape as the other `Unprocessable` variants,
@@ -506,6 +515,10 @@ pub async fn export(
     )
     .await;
     let finished_at = time::OffsetDateTime::now_utc();
+    // QA LH-DATA-1-01 (DATA-49): one conversion, before the row is stored, so
+    // the history row and the response carry the same classified sentence and
+    // the same reference. `GoldExportError`'s `Display` is the log's only.
+    let export_result = export_result.map_err(ApiError::from);
 
     let triggered_by = principal.as_ref().map_or_else(
         || "unknown".to_owned(),
@@ -525,7 +538,7 @@ pub async fn export(
     )
     .await;
 
-    let result = export_result.map_err(ApiError::from)?;
+    let result = export_result?;
 
     Ok(ApiJson(json!({
         "namespace": result.namespace,
@@ -542,6 +555,11 @@ pub async fn export(
 /// test counts on it), but a failed write is logged, never propagated —
 /// this table is a history view, not a correctness dependency of the
 /// export itself (`gold_export_history::record_export_run`'s doc comment).
+///
+/// `export_result` is the already-converted result, so the row's `error` is the
+/// sentence the response carries (`DATA-49`, QA `LH-DATA-1-01`) — the
+/// `ApiError`'s own text, never the `Display` of a `GoldExportError`, which
+/// holds upstream text for the log.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "rows_exported is a usize from an in-memory Vec of one ClickHouse batch, \
@@ -554,9 +572,9 @@ async fn record_export_history(
     started_at: time::OffsetDateTime,
     finished_at: time::OffsetDateTime,
     content_fingerprint: &str,
-    export_result: &Result<gold_export::GoldExportResult, GoldExportError>,
+    export_result: &Result<gold_export::GoldExportResult, ApiError>,
 ) {
-    let error_message = export_result.as_ref().err().map(ToString::to_string);
+    let error_message = stored_error(export_result);
     let history_row = gold_export_history::NewGoldExportRun {
         mart,
         status: if export_result.is_ok() {
@@ -577,6 +595,16 @@ async fn record_export_history(
     {
         tracing::error!(%err, mart, "failed to record gold export history");
     }
+}
+
+/// The sentence a failed publish stores, or `None` for a success.
+///
+/// Takes the converted result, not the `GoldExportError`, so this module cannot
+/// store an upstream text by accident (`DATA-49`, QA `LH-DATA-1-01`): the
+/// `ApiError` is what the response carries, and the row and the response are
+/// meant to read the same.
+fn stored_error(result: &Result<gold_export::GoldExportResult, ApiError>) -> Option<String> {
+    result.as_ref().err().map(ToString::to_string)
 }
 
 /// Renders an `Iceberg` snapshot's Unix-millisecond commit time as an RFC
@@ -1390,6 +1418,61 @@ mod tests {
             if_changed_skip_reason(None, Some("10:111:222"), Some(1_700_000_000_000),).is_none()
         );
         assert!(if_changed_skip_reason(None, None, None).is_none());
+    }
+
+    // ── The stored and answered sentence (DATA-49, QA LH-DATA-1-01) ──────
+
+    /// QA `LH-DATA-1-01` (`DATA-49`): the batch text can hold a cell value and
+    /// the Arrow or Iceberg library's words. It is classified — fixed sentence,
+    /// reference id — before it reaches a response or a stored row, and the
+    /// status stays `422` as it was.
+    #[test]
+    fn a_batch_failure_answers_a_fixed_sentence_with_a_reference_and_never_the_value() {
+        let err = ApiError::from(GoldExportError::Batch(
+            "amount: \"12,5\" is not a valid decimal".to_owned(),
+        ));
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = err.to_string();
+        assert!(
+            text.starts_with(
+                "A value in this table could not be written in open format. Reference: "
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("12,5"),
+            "the cell value must not travel: {text}"
+        );
+    }
+
+    /// QA `LH-DATA-1-01` (`DATA-49`): the history row stores the sentence the
+    /// response carried, so the card's reason and the answer read the same and
+    /// neither holds the engine's own text or its version.
+    #[test]
+    fn the_stored_error_of_a_failed_publish_is_the_classified_sentence() {
+        let result: Result<gold_export::GoldExportResult, ApiError> = Err(ApiError::from(
+            GoldExportError::ClickHouse(ChError::Server(
+                "Code: 60. DB::Exception: Unknown table (version 26.8.1.1)".to_owned(),
+            )),
+        ));
+        let stored = stored_error(&result).expect("a failed publish stores a sentence");
+        assert!(
+            stored.starts_with("The database request failed. Reference: "),
+            "{stored}"
+        );
+        assert!(!stored.contains("Code: 60"), "{stored}");
+        assert!(!stored.contains("26.8"), "{stored}");
+        assert!(
+            stored_error(&Ok(gold_export::GoldExportResult {
+                namespace: "gold".to_owned(),
+                table: "orders_rollup".to_owned(),
+                format_version: 2,
+                rows_exported: 1,
+                snapshot_id: Some(1),
+                exported_at_ms: Some(1_700_000_000_000),
+            }))
+            .is_none()
+        );
     }
 
     /// `SEC-50` slice 2 T8 (M12): the publication body reads the mart (its

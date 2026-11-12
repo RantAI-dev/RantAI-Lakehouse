@@ -119,6 +119,16 @@ pub const CATALOG: Context = Context::new(
     "The catalog is unavailable.",
 );
 
+/// Building the Arrow batch for a Gold publish (`DATA-49`, QA
+/// `LH-DATA-1-01`). The raw text of `GoldExportError::Batch` can hold a cell
+/// value and the Arrow or Iceberg library's own message, so it is logged under
+/// a reference and never stored or returned.
+pub const PUBLISH_BATCH: Context = Context::new(
+    "gold publish batch",
+    "A value in this table could not be written in open format.",
+    "A value in this table could not be written in open format.",
+);
+
 /// An LLM provider request.
 pub const MODEL: Context = Context::new(
     "model request",
