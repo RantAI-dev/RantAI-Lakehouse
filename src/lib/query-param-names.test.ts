@@ -5,7 +5,7 @@ import {
   activeParameters,
   fieldsNamedBy,
   findParamNames,
-  missingRequiredValue,
+  firstMissingValueName,
   paramInputs,
   reconcileDefinitions,
   replaceDefinition,
@@ -254,22 +254,35 @@ test("paramInputs sends an empty object of values when no definition has one", (
   })
 })
 
-test("missingRequiredValue is true for a name with no value and no default", () => {
-  assert.equal(missingRequiredValue([{ name: "a", type: "text" }], {}), true)
-  assert.equal(missingRequiredValue([{ name: "a", type: "text" }], { a: "x" }), false)
-  assert.equal(missingRequiredValue([{ name: "a", type: "text", default: "x" }], {}), false)
-  assert.equal(missingRequiredValue([], {}), false)
+test("firstMissingValueName names a text parameter with no value and no default", () => {
+  assert.equal(firstMissingValueName([{ name: "a", type: "text" }], {}), "a")
+  assert.equal(firstMissingValueName([{ name: "a", type: "text" }], { a: "x" }), null)
+  assert.equal(firstMissingValueName([{ name: "a", type: "text", default: "x" }], {}), null)
+  assert.equal(firstMissingValueName([], {}), null)
 })
 
-test("missingRequiredValue counts a date range with one end and a multi-select with no pick as missing", () => {
+test("firstMissingValueName names a date range with one end and a multi-select with no pick", () => {
   assert.equal(
-    missingRequiredValue([{ name: "d", type: "dateRange" }], { d: { start: "2026-11-01", end: "" } }),
-    true
+    firstMissingValueName([{ name: "d", type: "dateRange" }], { d: { start: "2026-11-01", end: "" } }),
+    "d"
   )
   assert.equal(
-    missingRequiredValue([{ name: "d", type: "dateRange" }], { d: { start: "2026-11-01", end: "2026-11-07" } }),
-    false
+    firstMissingValueName([{ name: "d", type: "dateRange" }], { d: { start: "2026-11-01", end: "2026-11-07" } }),
+    null
   )
-  assert.equal(missingRequiredValue([{ name: "m", type: "multiSelect" }], { m: [] }), true)
-  assert.equal(missingRequiredValue([{ name: "m", type: "multiSelect" }], { m: ["a"] }), false)
+  assert.equal(firstMissingValueName([{ name: "m", type: "multiSelect" }], { m: [] }), "m")
+  assert.equal(firstMissingValueName([{ name: "m", type: "multiSelect" }], { m: ["a"] }), null)
+})
+
+// QS-5-AC14: the estimate says which name it waits for.
+test("firstMissingValueName is the first name in parameter order with nothing to run with", () => {
+  const definitions: QueryParamDef[] = [
+    { name: "region", type: "text" },
+    { name: "since", type: "date" },
+    { name: "limit", type: "number", default: 10 },
+  ]
+  assert.equal(firstMissingValueName(definitions, {}), "region")
+  assert.equal(firstMissingValueName(definitions, { region: "EU" }), "since")
+  assert.equal(firstMissingValueName(definitions, { region: "EU", since: "2026-11-01" }), null)
+  assert.equal(firstMissingValueName([], {}), null)
 })

@@ -89,6 +89,7 @@ export function SqlPanel({
     elapsedMs,
     download,
     estimateAct,
+    estimateSupported,
     runnable,
     targetStatement,
     runQuery,
@@ -282,8 +283,15 @@ export function SqlPanel({
           size="sm"
           variant="ghost"
           onClick={reEstimate}
-          disabled={estimateAct.status === "pending" || !oneStatement}
-          title={oneStatement ? undefined : "Select one statement"}
+          disabled={estimateAct.status === "pending" || !oneStatement || !estimateSupported}
+          title={
+            !estimateSupported
+              ? // LH-QS-4-08: the same sentence the panel says.
+                "No pre-run estimate for Trino queries."
+              : oneStatement
+                ? undefined
+                : "Select one statement"
+          }
         >
           Estimate
         </Button>
