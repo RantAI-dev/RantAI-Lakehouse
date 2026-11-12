@@ -1295,3 +1295,23 @@ src/features/catalog/asset-detail-tabs.test.tsx` (164 pass).
 *Not verified*: `cargo test --workspace` (CI runs it, and the scoped runs above
 do not cover crates this round did not touch); no `docker compose` run — no
 compose file changed; no browser check of the new sentence on a running page.
+
+### Round 2 (planner, 2026-11-12), at `59ef2cc4`
+
+Read the round-1 fix commits. R1 to R4 are fixed, one commit each, each new test shown red on
+the wrong change before it was kept.
+
+- R2: a caller admitted by a table grant gets the table's own facts and a typed
+  `shownWithTableGrant` flag; `upstream`, `downstream`, `dependents`, the three usage lists and
+  the replacement are left out, decided on the server from how the caller was admitted, and an
+  unknown admission hides (fail closed). A caller with `catalog:read` gets the body it got
+  before, proven by the same test reading the table as both callers.
+- R1, R3: the grant tests now reach the predicates they are named for (revoked, expired, other
+  permission, approved-request origin, a table the roles hide).
+- R4: `tests/route_auth.rs` has no removed line against `main`.
+
+The planner merged `main` into the branch (`CHANGELOG.md` only: both sides' entries, `main`'s
+first).
+
+No open BLOCKER. Migration `0138` stays as numbered: `0137` is #485's. Merge when CI on #487
+is green.
