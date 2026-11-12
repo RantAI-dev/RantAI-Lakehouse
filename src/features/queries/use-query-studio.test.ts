@@ -1138,14 +1138,25 @@ describe("useQueryStudio draft owner", () => {
 
   it("reads and writes nothing while the owner is not known", async () => {
     stubLists()
+    // Review round 1, R5: an empty storage proves nothing about a read. The
+    // old shared entry is there, and an unknown owner must neither open it
+    // nor remove it.
+    window.localStorage.setItem(
+      LEGACY_QUERY_DRAFT_KEY,
+      JSON.stringify(storedTabs("SELECT 'shared'"))
+    )
     const hook = renderHook(() => useQueryStudio(null))
+
+    expect(hook.result.current.sql).not.toBe("SELECT 'shared'")
 
     act(() => hook.result.current.setSql("SELECT 1"))
 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 600))
     })
-    expect(window.localStorage.length).toBe(0)
+    expect(hook.result.current.sql).not.toBe("SELECT 'shared'")
+    expect(window.localStorage.getItem(LEGACY_QUERY_DRAFT_KEY)).not.toBeNull()
+    expect(window.localStorage.length).toBe(1)
   })
 
   it("keeps writing under its first owner when the key it is given changes", async () => {
