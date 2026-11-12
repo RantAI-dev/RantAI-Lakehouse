@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { SessionsPanel } from "./sessions-page"
+import { formatDateTime } from "@/lib/format"
 
 const originalFetch = global.fetch
 
@@ -124,5 +125,52 @@ describe("SessionsPanel (list + revoke)", () => {
     // what the test asserts on so it stays in sync with the shared
     // pattern rather than a one-off variant.
     await waitFor(() => expect(screen.getByRole("status")).toBeDefined())
+  })
+})
+
+/**
+ * `ADM-14` (QA `LH-SEC-5-01`): the two things the row could not say — when a
+ * session expires, and the browser it was created from.
+ */
+describe("SessionsPanel (expiry and browser)", () => {
+  const TWO_HOURS = 2 * 60 * 60 * 1000
+  const TWELVE_AND_A_HALF_HOURS = 12.5 * 60 * 60 * 1000
+
+  function session(overrides: Record<string, unknown>) {
+    return {
+      id: "s1",
+      userId: "u1",
+      userName: "Rina Wijaya",
+      createdAt: new Date(Date.now() - TWO_HOURS).toISOString(),
+      expiresAt: new Date(Date.now() + TWELVE_AND_A_HALF_HOURS).toISOString(),
+      createdIp: null,
+      userAgent: null,
+      ...overrides,
+    }
+  }
+
+  it("shows when a session expires as a time and as the time left", async () => {
+    const row = session({})
+    mockSessions([row])
+    render(<SessionsPanel />)
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    // `ADM-14` D12: the first line is the moment, the second is how long is
+    // left. Before this, the cell was a relative age and read "just now" for
+    // every session, because its expiry is in the future.
+    expect(screen.getByText(formatDateTime(row.expiresAt))).toBeDefined()
+    expect(screen.getByText("in 12h")).toBeDefined()
+    expect(screen.queryByText("just now")).toBeNull()
+  })
+
+  it("shows the browser a session was created from and says when nothing was recorded", async () => {
+    mockSessions([
+      session({ id: "s1", userAgent: "QA-Browser/1.0" }),
+      session({ id: "s2", userName: "Bayu Pratama" }),
+    ])
+    render(<SessionsPanel />)
+    await waitFor(() => expect(screen.getByText("QA-Browser/1.0")).toBeDefined())
+    // The address is never recorded (`ADM-14` D10) and the older session's
+    // browser is not either: two addresses and one browser.
+    expect(screen.getAllByText("Not recorded")).toHaveLength(3)
   })
 })

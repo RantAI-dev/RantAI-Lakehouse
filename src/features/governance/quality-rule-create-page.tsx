@@ -69,7 +69,9 @@ export function QualityRuleCreatePage() {
       severity,
     })
     if (!result) return
-    if (hasPermission("query:read") && result.evaluable !== false) {
+    // QA LH-DATA-14-04 (GOV-10): running a rule by hand needs
+    // `governance:write`, the same permission the Run button follows.
+    if (hasPermission("governance:write") && result.evaluable !== false) {
       try {
         await governanceService.runQualityRule(result.id)
       } catch (err) {
