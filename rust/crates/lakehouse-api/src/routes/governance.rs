@@ -1058,7 +1058,7 @@ pub async fn create_rule(
 ) -> Response {
     let actor = principal.as_ref().map(|Extension(p)| p);
     match Kind::parse(&kind) {
-        Kind::Quality => match create_quality_rule(State(state.clone()), body).await {
+        Kind::Quality => match create_quality_rule(State(state.clone()), actor, body).await {
             Ok(resp) => {
                 let rule = &resp.1.0;
                 audit_table_change(
@@ -1678,12 +1678,17 @@ pub struct CreateQualityRuleBody {
 ///
 /// # Errors
 ///
-/// 400 on a malformed body; 409 if the name is taken; 503/500 as above.
+/// 400 on a malformed body, or for a table that is not there or that the
+/// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`);
+/// 409 if the name is taken; 503 when the table cannot be checked; 500 on a
+/// store failure.
 pub async fn create_quality_rule(
     State(state): State<AppState>,
+    actor: Option<&Principal>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<QualityRule>)> {
     let body: CreateQualityRuleBody = parse_body(&body)?;
+    crate::routes::quality::ensure_rule_table(&state, actor, &body.asset).await?;
     let input = CreateQualityRuleInput {
         name: body.name,
         asset: body.asset,

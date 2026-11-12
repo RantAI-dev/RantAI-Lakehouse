@@ -161,6 +161,10 @@ pub(super) async fn draft_quality_rule(state: &AppState, args: &Map<String, Valu
     api_result_to_value(
         crate::routes::governance::create_quality_rule(
             State(state.clone()),
+            // The drafting tool has no person behind it: access is not
+            // narrowed, but a table that is not there is still refused
+            // (QA `LH-DATA-14-01` F2, `DATA-54`).
+            None,
             axum::body::Bytes::from(bytes),
         )
         .await,

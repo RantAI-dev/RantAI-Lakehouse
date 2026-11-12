@@ -426,6 +426,212 @@ async fn deleting_a_rule_resolves_its_open_incidents() {
     );
 }
 
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a rule is written for a table that is
+/// there, and one that does not exist is refused and stores nothing. "Not
+/// there" and "not yours" are one sentence, so the answer says neither.
+#[tokio::test]
+async fn a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let body = |name: &str, asset: &str| {
+        json!({
+            "name": name, "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+    let (code, refused) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("t8_missing", "silver.no_such_table")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("is not a table you can read"),
+        "{refused}"
+    );
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name = 't8_missing'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a refused rule is not stored");
+
+    let (code, created) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("t8_present", "silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{created}");
+
+    for asset in ["orders", "lake.orders"] {
+        let (code, refused) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/governance/quality",
+            Some(body("t8_other", asset)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{asset}: {refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("is not a table you can read"),
+            "{asset}: {refused}"
+        );
+    }
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a table the author's roles hide is
+/// refused with the same sentence as a missing one, so the answer is not an
+/// oracle.
+#[tokio::test]
+async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sentence() {
+    let (router, pool, _ch) = app().await;
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    let role: uuid::Uuid =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, 'silver', 'orders')",
+    )
+    .bind(role)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let body = |asset: &str| {
+        json!({
+            "name": "t8_narrowed", "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+    let (code, hidden) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.customers")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{hidden}");
+    let (code, missing) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.no_such_table")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{missing}");
+    let (hidden, missing) = (
+        hidden["error"].as_str().unwrap(),
+        missing["error"].as_str().unwrap(),
+    );
+    assert_eq!(
+        hidden.replace("silver.customers", "T"),
+        missing.replace("silver.no_such_table", "T"),
+        "a hidden table and a missing one read alike"
+    );
+
+    let (code, created) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{created}");
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a rewrite that changes the table is
+/// checked, and a refusal leaves the rule on its old table. A rewrite that
+/// keeps the table is not checked, so a rule on a dropped table can still be
+/// edited.
+#[tokio::test]
+async fn changing_a_rule_to_a_table_that_is_not_there_is_refused_and_the_rule_keeps_its_table() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    let id = rule(&pool, "email_filled", "email not null >= 90%").await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let (code, refused) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.no_such_table",
+            "threshold": "email not null >= 90%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused}");
+    let asset: String = sqlx::query_scalar("SELECT asset FROM quality_rule WHERE name = $1")
+        .bind("email_filled")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(asset, "silver.orders", "a refused rewrite changes nothing");
+
+    // The threshold change with the table kept is not checked.
+    let (code, edited) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.orders",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{edited}");
+}
+
 /// `DATA-14` (F2): editing a rule keeps the runs it has (each now records
 /// the threshold it ran with), and the old run is not the edited rule's
 /// verdict.
