@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Loader2 } from "lucide-react";
+import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -30,7 +31,41 @@ export const AS_CREATOR_SENTENCE =
 /** Shown while the deployment has no `SMTP_HOST` (feature decision 9). */
 export const EMAIL_NOT_SET_UP = "Email is not set up on this deployment.";
 
-const selectClass = "h-8 rounded-md border border-input bg-background px-2 text-sm";
+/** `WEB-9` D3: the schedule choices, in the order the form always offered them. */
+const REPEAT_OPTIONS = [
+  { value: "hourly", label: "Every hour" },
+  { value: "daily", label: "Every day" },
+  { value: "weekly", label: "Every week" },
+  { value: "monthly", label: "Every month" },
+];
+
+const WEEKDAY_OPTIONS = WEEKDAYS.map((d, i) => ({ value: String(i + 1), label: d }));
+
+const MONTH_DAY_OPTIONS = [
+  ...Array.from({ length: 28 }, (_, i) => ({ value: String(i + 1), label: String(i + 1) })),
+  { value: "last", label: "The last day" },
+];
+
+const PAPER_OPTIONS = [
+  { value: "a4", label: "A4" },
+  { value: "letter", label: "Letter" },
+];
+
+const ORIENTATION_OPTIONS = [
+  { value: "portrait", label: "Portrait" },
+  { value: "landscape", label: "Landscape" },
+];
+
+const FILE_OPTIONS = [
+  { value: "none", label: "Not attached" },
+  { value: "xlsx", label: "Excel" },
+  { value: "csv", label: "CSV" },
+];
+
+const VALUES_OPTIONS = [
+  { value: "formatted", label: "Values as on the chart" },
+  { value: "raw", label: "Raw values" },
+];
 
 /** `grouped`: the chart groups or lists rows, so "Skip when empty" can judge it (RPT-1 QA fix Q3). */
 type DashboardChart = { readonly id: string; readonly title: string; readonly grouped: boolean };
@@ -293,26 +328,19 @@ function SubscriptionForm({
         <legend className="mb-1 text-sm font-medium">When</legend>
         <div className="flex flex-wrap items-end gap-3">
           <Label className="flex flex-col gap-1 text-xs font-normal">Repeat
-            <select aria-label="Repeat" className={selectClass} value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
-              <option value="hourly">Every hour</option>
-              <option value="daily">Every day</option>
-              <option value="weekly">Every week</option>
-              <option value="monthly">Every month</option>
-            </select>
+            <SelectField aria-label="Repeat" value={kind} options={REPEAT_OPTIONS}
+              onValueChange={(next) => setKind(next as Kind)} />
           </Label>
           {kind === "weekly" ? (
             <Label className="flex flex-col gap-1 text-xs font-normal">On
-              <select aria-label="Weekday" className={selectClass} value={weekday} onChange={(e) => setWeekday(Number(e.target.value))}>
-                {WEEKDAYS.map((d, i) => <option key={d} value={i + 1}>{d}</option>)}
-              </select>
+              <SelectField aria-label="Weekday" value={String(weekday)} options={WEEKDAY_OPTIONS}
+                onValueChange={(next) => setWeekday(Number(next))} />
             </Label>
           ) : null}
           {kind === "monthly" ? (
             <Label className="flex flex-col gap-1 text-xs font-normal">On day
-              <select aria-label="Day of the month" className={selectClass} value={String(monthDay)} onChange={(e) => setMonthDay(e.target.value === "last" ? "last" : Number(e.target.value))}>
-                {Array.from({ length: 28 }, (_, i) => <option key={i + 1} value={String(i + 1)}>{i + 1}</option>)}
-                <option value="last">The last day</option>
-              </select>
+              <SelectField aria-label="Day of the month" value={String(monthDay)} options={MONTH_DAY_OPTIONS}
+                onValueChange={(next) => setMonthDay(next === "last" ? "last" : Number(next))} />
             </Label>
           ) : null}
           {kind === "hourly" ? (
@@ -351,27 +379,23 @@ function SubscriptionForm({
         {!pdfSupported ? <p className="text-xs text-muted-foreground">The PDF service is not set up on this deployment, so a PDF cannot be attached.</p> : null}
         {pdf ? (
           <div className="ml-6 flex gap-3">
-            <select aria-label="Paper" className={selectClass} value={paper} onChange={(e) => setPaper(e.target.value)}>
-              <option value="a4">A4</option><option value="letter">Letter</option>
-            </select>
-            <select aria-label="Orientation" className={selectClass} value={orientation} onChange={(e) => setOrientation(e.target.value)}>
-              <option value="portrait">Portrait</option><option value="landscape">Landscape</option>
-            </select>
+            <SelectField aria-label="Paper" value={paper} options={PAPER_OPTIONS}
+              onValueChange={setPaper} />
+            <SelectField aria-label="Orientation" value={orientation} options={ORIENTATION_OPTIONS}
+              onValueChange={setOrientation} />
           </div>
         ) : null}
         {charts.length ? <p className="pt-1 text-xs text-muted-foreground">Chart data (up to 10 files, 20 MB in all; a file that does not fit is left out and the email says so)</p> : null}
         {charts.map((c) => (
           <div key={c.id} className="flex items-center gap-2 text-sm">
             <span className="min-w-0 flex-1 truncate">{c.title}</span>
-            <select aria-label={`File for ${c.title}`} className={selectClass} value={files[c.id] ?? "none"} onChange={(e) => setFiles({ ...files, [c.id]: e.target.value as "none" | "xlsx" | "csv" })}>
-              <option value="none">Not attached</option><option value="xlsx">Excel</option><option value="csv">CSV</option>
-            </select>
+            <SelectField aria-label={`File for ${c.title}`} value={files[c.id] ?? "none"} options={FILE_OPTIONS}
+              onValueChange={(next) => setFiles({ ...files, [c.id]: next as "none" | "xlsx" | "csv" })} />
           </div>
         ))}
         {Object.values(files).some((f) => f !== "none") ? (
-          <select aria-label="Values" className={`${selectClass} w-fit`} value={values} onChange={(e) => setValues(e.target.value)}>
-            <option value="formatted">Values as on the chart</option><option value="raw">Raw values</option>
-          </select>
+          <SelectField aria-label="Values" value={values} options={VALUES_OPTIONS} className="w-fit"
+            onValueChange={setValues} />
         ) : null}
       </fieldset>
 
