@@ -1412,6 +1412,30 @@ role** → *Tables this role can read*:
 - The Roles list shows **All tables**, or how many schemas and single
   tables each role may read.
 
+**Create role** offers the same *Tables this role can read* section
+(`GOV-8`), so a role is narrowed as it is made instead of being opened a
+second time. A new role starts on **All tables**. **Create** sends the role
+first and its tables second, only when the section differs from All tables;
+a role whose permissions include `*:*` has the section disabled, as on Edit
+role, and sends no table-access request.
+
+If that second request fails, the role exists and reads every table, and the
+page opens the new role's Edit page with a notice saying the tables were not
+saved. The draft is not carried over: pick the tables again there and
+**Save**. The Create page offers no retry, because a second click would
+create another role or be refused for the name. A role that was just created
+is held by nobody, so nobody reads more than intended meanwhile.
+
+**Masks and row filters on a role.** Edit role lists the column masks and
+row filters that name the role, below the tables section, under *Masks and
+row filters on this role*. The list is read-only and names each rule's
+table (a link to its Access tab when the API resolved one), what it does and
+its status, so a draft rule does not read as enforced. The rules are still
+made, enforced, stopped and deleted on the table's **Access** tab; the list
+needs the permission `policy:read` and sends no request without it. A rule
+written as plain text is not listed: the engine skips it, so it names no
+role in a form the console can match.
+
 A **Bronze** table is listed by its registry table name under the schema
 `bronze` (`bronze.orders`), which is the key the rule compares. A dataset
 whose registry records no table name is not listed: nothing names a table
