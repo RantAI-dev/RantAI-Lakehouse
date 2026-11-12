@@ -327,6 +327,7 @@ export function UploadCheckStep({
               <UploadColumnsEditor
                 choices={choices}
                 sampledRows={settled.sampledRows}
+                rows={settled.rows}
                 fileTypes={parquet?.columns.map((c) => c.type)}
               />
               <UploadBadValuesPanel choices={choices} sampledRows={settled.sampledRows} />

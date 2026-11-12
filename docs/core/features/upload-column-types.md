@@ -72,7 +72,7 @@ Each default was the planner's recommendation.
 - Adding to an existing table keeps that table's names and types.
 - The size of a typed load is the same as for any upload: 2 GB, one load at a time measured (`docs/plans/DATA-17-RESULT.md`); the harness sends no column list, so no typed load was measured at full size.
 - A query through the console shows a NULL as an empty string (`DATA-29`); use `IS NULL` to tell them apart.
-- A timestamp keeps microseconds. A value with a longer fraction (a nanosecond Parquet column) is loaded with the digits after the sixth cut, not rounded, and the Check step says so.
+- A timestamp keeps microseconds. A value with a longer fraction is loaded with the digits after the sixth cut, not rounded. The Check step says so under a Timestamp column whose file type is `timestamp (ns…)` (a Parquet column) or whose previewed values hold a fraction of seven to nine digits — whatever the file kind. A fraction of ten digits or more does not fit a Timestamp column, so the Check step lists that value under "values that do not fit" instead of this sentence.
 
 ## Spec targets, row by row
 

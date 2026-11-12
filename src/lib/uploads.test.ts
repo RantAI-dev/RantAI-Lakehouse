@@ -32,6 +32,7 @@ import {
   headerRowFromDisplay,
   groupProblem,
   isUploadedTable,
+  cutsNanosecondDigits,
   keepsNanoseconds,
   mismatchLines,
   planPick,
@@ -477,6 +478,21 @@ test("keepsNanoseconds is true only for a nanosecond timestamp label", () => {
   assert.equal(keepsNanoseconds("timestamp (us, UTC)"), false)
   assert.equal(keepsNanoseconds("int64"), false)
   assert.equal(keepsNanoseconds(undefined), false)
+})
+
+test("cutsNanosecondDigits is true for a nanosecond file type or a fraction of seven to nine digits", () => {
+  // `DATA-53` decision 17, review round 1 R5: a CSV column someone chose Timestamp for lost
+  // digits 7 to 9 with nothing on the Check step; the previewed rows decide it now.
+  const rows = [["a", "1.50", "2026-10-16T13:30:05.1234567"], ["b", "2", "2026-10-16T13:30:05.123456"]]
+  assert.equal(cutsNanosecondDigits(rows, 2), true)
+  assert.equal(cutsNanosecondDigits(rows, 1), false, "a decimal's own digits are not a timestamp fraction")
+  // Nine digits fit a Timestamp column and are cut; ten or more do not fit, and the Check
+  // step lists that value instead.
+  assert.equal(cutsNanosecondDigits([["2026-10-16T13:30:05.123456789"]], 0), true)
+  assert.equal(cutsNanosecondDigits([["2026-10-16T13:30:05.1234567890"]], 0), false)
+  assert.equal(cutsNanosecondDigits([["2026-10-16T13:30:05Z"]], 0), false)
+  // The file's own type still says it, whatever the previewed rows hold.
+  assert.equal(cutsNanosecondDigits([["2026-10-16T13:30:05.123456"]], 0, "timestamp (ns, UTC)"), true)
 })
 
 test("the formats phrase names every format the Accepted fact lists", () => {

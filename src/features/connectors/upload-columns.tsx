@@ -5,7 +5,7 @@ import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { formatNumber } from "@/lib/format"
-import { COLUMN_TYPES, DATE_FORMATS, columnTypeLabel, columnNameProblem, keepsNanoseconds } from "@/lib/uploads"
+import { COLUMN_TYPES, DATE_FORMATS, columnTypeLabel, columnNameProblem, cutsNanosecondDigits } from "@/lib/uploads"
 import type { UploadBadValues, UploadColumnType, UploadDateFormat } from "@/services/contracts/uploads"
 import type { ColumnChoices } from "./use-column-choices"
 import { Refusal, UploadNotice } from "./upload-parts"
@@ -27,11 +27,17 @@ function typeOptions(type: UploadColumnType, guessed: UploadColumnType) {
 export function UploadColumnsEditor({
   choices,
   sampledRows,
+  rows,
   fileTypes,
 }: {
   readonly choices: ColumnChoices
   /** How many data rows the guess read. */
   readonly sampledRows: number
+  /**
+   * The rows the preview shows: the Check step reads their Timestamp values to say that a
+   * fraction longer than six digits is cut (`DATA-53` decision 17, review round 1 R5).
+   */
+  readonly rows: readonly (readonly string[])[]
   /**
    * The file's own type label per column, for a Parquet file only (`DATA-53`): what a
    * column starts with when the file declares it, so the Check step can say what the
@@ -105,7 +111,7 @@ export function UploadColumnsEditor({
                         Stored exactly, with up to 38 digits, 9 of them after the point.
                       </p>
                     ) : null}
-                    {column.type === "timestamp" && keepsNanoseconds(fileTypes?.[index]) ? (
+                    {column.type === "timestamp" && cutsNanosecondDigits(rows, index, fileTypes?.[index]) ? (
                       <p className="mt-1 text-xs text-muted-foreground">
                         The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.
                       </p>

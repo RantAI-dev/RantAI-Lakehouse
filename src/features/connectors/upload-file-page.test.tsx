@@ -1869,6 +1869,36 @@ describe("UploadFilePage, column types", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
   })
 
+  it("says under a CSV column set to Timestamp that a seven-digit fraction loses its last digits", async () => {
+    // `DATA-53` decision 17, review round 1 R5: this column is guessed Text and the person
+    // chooses Timestamp, so the value used to be stored as `…05.123456` with nothing on the
+    // Check step saying so, while the feature page promised the step says it.
+    url.search = "?id=up-1"
+    stubFetch({
+      get: () => upload(),
+      preview: () =>
+        preview({
+          columns: ["SKU", "Qty", "Seen"],
+          columnSpecs: [
+            { source: "SKU", name: "sku", type: "text", guessedType: "text", askDateOrder: false },
+            { source: "Qty", name: "qty", type: "integer", guessedType: "integer", askDateOrder: false },
+            { source: "Seen", name: "seen", type: "text", guessedType: "text", askDateOrder: false },
+          ],
+          rows: [["a1", "3", "2026-10-16T13:30:05.1234567"]],
+          sampledRows: 1,
+        }),
+      check: () => ({ sampledRows: 1, count: 0, byColumn: [], rows: [] }),
+    })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByLabelText("Type of seen")
+
+    expect(screen.queryByText(/The file keeps nanoseconds/)).toBeNull()
+    chooseOption(screen.getByLabelText("Type of seen"), "Timestamp")
+    expect(
+      screen.getByText("The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.")
+    ).toBeDefined()
+  })
+
   it("lists up to 100 failing values after a change of type, with stop pre-selected, and sends the choice with Load", async () => {
     const calls = await openColumns({
       check: (body) =>

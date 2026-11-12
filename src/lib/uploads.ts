@@ -58,6 +58,38 @@ export function keepsNanoseconds(fileType: string | undefined): boolean {
   return fileType !== undefined && fileType.trim().startsWith("timestamp (ns")
 }
 
+/** The digits after the first point of `value`, or 0 when it has none. */
+function fractionDigits(value: string): number {
+  const point = value.indexOf(".")
+  if (point < 0) return 0
+  let digits = 0
+  for (let i = point + 1; i < value.length && value[i] >= "0" && value[i] <= "9"; i += 1) digits += 1
+  return digits
+}
+
+/**
+ * Whether a Timestamp column's load loses digits of a fraction (`DATA-53` decision 17, review
+ * round 1 R5): the file's own type keeps nanoseconds, or one of the sampled values holds a
+ * fraction longer than six digits — and no longer than the nine a Timestamp column takes, since
+ * ten or more do not fit it at all and the Check step lists that value instead.
+ *
+ * The table keeps microseconds, so the digits after the sixth are cut, not rounded. A value like
+ * `2026-10-16T13:30:05.1234567` is stored as `…05.123456`: the person chose Timestamp for a
+ * column the guess called Text, or the table's own column is a timestamp, and nothing else on
+ * the Check step says what happened to the seventh digit.
+ */
+export function cutsNanosecondDigits(
+  rows: readonly (readonly string[])[],
+  index: number,
+  fileType?: string,
+): boolean {
+  if (keepsNanoseconds(fileType)) return true
+  return rows.some((row) => {
+    const digits = fractionDigits(row[index] ?? "")
+    return digits >= 7 && digits <= 9
+  })
+}
+
 /**
  * The formats the upload reads, in one phrase (decision 12 of
  * `docs/core/features/upload-file.md`, `DATA-51`, QA `LH-DATA-9-02`): the link

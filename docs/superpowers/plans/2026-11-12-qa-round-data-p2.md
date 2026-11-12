@@ -217,8 +217,12 @@ What QA saw:
   column with a fraction of up to nine digits; the digits after the sixth are **cut, not
   rounded**. The guess from text is unchanged: it still wants at most six digits (a text
   column with seven stays Text), the way the Integer guess refuses a leading zero that a
-  chosen Integer accepts (`upload_types.rs:21-23`). The Check step says so under a Parquet
-  column whose file type is `timestamp (ns…)`.
+  chosen Integer accepts (`upload_types.rs:21-23`). Review round 1 R5 (this changes the
+  decision): the Check step says so under **any** Timestamp column whose previewed values
+  hold a fraction longer than six digits — whatever the file kind, so a CSV column someone
+  set to Timestamp is no longer a silent loss — and under a Parquet column whose file type
+  is `timestamp (ns…)` even when the previewed values are shorter. A fraction of ten digits
+  or more does not fit the column, so the Check step lists that value instead.
 - **D18. Not changed: an empty text cell** (b). Decision 7 of `upload-column-types.md`
   ("Empty (null) in every column except text, which keeps an empty text") and the table "How
   a Parquet file is read" of `upload-file.md` ("Null: Empty (so is an empty string)") are
@@ -257,7 +261,9 @@ What QA saw:
     when the name is empty.
   - Under a Decimal column's type: **"Stored exactly, with up to 38 digits, 9 of them after
     the point."**
-  - Under a Timestamp column from a nanosecond Parquet column: **"The file keeps
+  - Under a Timestamp column whose values keep nanoseconds — a Parquet `timestamp (ns…)`
+    column, or a previewed value with a fraction longer than six digits, whatever the file
+    kind: **"The file keeps
     nanoseconds. The table keeps microseconds, so digits after the sixth are cut."**
   - Under "Lands in the Catalog as": **"In Query Studio, on the Trino engine:"** and the
     name. On the Review step the label **"In Query Studio (Trino)"**. After a load: **"In
