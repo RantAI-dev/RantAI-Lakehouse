@@ -118,13 +118,16 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "invalid retry body: {err}",
         "serde error over the caller's own request body",
     ),
-    // SEC-11, product owner decision 2026-10-10: Query Studio (`/api/query/run`
-    // for both engines, and the cost estimate) shows the signed-in author the
-    // engine's diagnosis of their own statement, trimmed. Only this file.
+    // SEC-11, product owner decision 2026-10-10, ended for the console by the
+    // owner on 2026-11-12 (LH-QS-2-08): the console's `run` and cost estimate
+    // answer a fixed sentence and a reference (`_for_console`). The assistant's
+    // paths in this file still give the model the trimmed engine diagnosis so
+    // it can correct its SQL: `run_statement` (`FailureText::Assistant`) and
+    // `check_statement_would_run`. Only this file.
     (
         "query.rs",
         "_for_author(",
-        "query-author exception: the author of the statement is shown the trimmed engine diagnosis",
+        "query-author exception, assistant paths only: the model is shown the trimmed engine diagnosis to correct its SQL",
     ),
     (
         "query.rs",
