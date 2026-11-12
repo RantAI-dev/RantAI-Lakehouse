@@ -5,7 +5,7 @@ import { UploadCloudIcon, XIcon } from "lucide-react"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { formatBytes } from "@/lib/format"
 import type { QueueFile } from "@/lib/upload-queue"
-import { MAX_FILES } from "@/lib/uploads"
+import { ACCEPTED_FILES, MAX_FILES } from "@/lib/uploads"
 import { cn } from "@/lib/utils"
 import type { Upload } from "@/services/contracts/uploads"
 import { FileMark } from "./upload-parts"
@@ -18,7 +18,7 @@ const ACCEPT =
 
 /** The limits as short facts. They repeat what the API and `fileProblem` enforce; the sheet fact repeats the Check step. */
 const FACTS: readonly { label: string; value: string }[] = [
-  { label: "Accepted", value: "CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip" },
+  { label: "Accepted", value: ACCEPTED_FILES },
   { label: "Files", value: `Up to ${MAX_FILES} at once, sent in pieces; they load into one table when their columns match, in any order` },
   { label: "Size", value: "Up to 2 GB in all; an Excel workbook up to 50 MB" },
   { label: "Not accepted", value: ".xlsm, .xlsb, .ods, .tar, .7z and other archives" },
