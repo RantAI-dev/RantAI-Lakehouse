@@ -672,14 +672,33 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // applies every check of a new chart; the layout save is awaited, not the
   // debounced `persistLayout`, because the copy must land where the page drew
   // it before the reload.
+  //
+  // `BI-48` review round 1, R6: the chart and its place are two writes, and a
+  // failure of the second is not a failed duplicate. The armed layout timer is
+  // cleared first — it would fire with the layout of a moment ago and take the
+  // copy's box away — and a layout failure still reloads, because the chart
+  // exists on the server whatever happened to its box.
   async function duplicateChart(spec: ChartCard) {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    let id = "";
     try {
-      const { id } = await dashboardService.saveChart({ ...spec.def, title: `${spec.title} (copy)`, board }, false);
-      if (id) await dashboardService.saveBoardLayout(board, placeCopyBelow(tabs, shownLayout, chartIds, spec.id, id));
-      await load();
+      ({ id } = await dashboardService.saveChart({ ...spec.def, title: `${spec.title} (copy)`, board }, false));
     } catch (e) {
       notifyFailure("The chart was not duplicated", writeError(e));
+      return;
     }
+    if (id) {
+      try {
+        await dashboardService.saveBoardLayout(board, placeCopyBelow(tabs, shownLayout, chartIds, spec.id, id));
+      } catch (e) {
+        // The copy was made; only its box was not. Saying "not duplicated"
+        // here would invite a second copy of a chart that exists.
+        await load();
+        notifyFailure("The copy was made, but its place was not saved", writeError(e));
+        return;
+      }
+    }
+    await load();
   }
   async function removeChart(id: string) {
     setRemoveBusy(true);
