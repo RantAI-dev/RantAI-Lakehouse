@@ -2366,6 +2366,34 @@ async fn mark_marts(state: &AppState, body: &mut Value) {
     crate::routes::catalog::apply_serving_certification(state, marts, "name").await;
 }
 
+/// The joins of a mart relation, parsed, with every table the caller's roles
+/// hide refused as the unknown mart (`GOV-7` D6) — the one place `/fields` and
+/// `/values` parse `joins` and check the tables (`QA LH-BI-6-01` review round
+/// 1, R10: both had a copy, and `/values` parsed the same text twice).
+///
+/// # Errors
+///
+/// 400 for text that is not a JSON list of joins; 404 for the mart or a
+/// joined table the caller's roles hide.
+fn checked_joins(
+    access: &crate::table_access::TableAccess,
+    mart: &str,
+    raw: Option<&str>,
+) -> Result<Vec<lakehouse_bi::joins::JoinSpec>, ApiError> {
+    let joins: Vec<lakehouse_bi::joins::JoinSpec> =
+        match raw.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(text) => serde_json::from_str(text)
+                .map_err(|_| ApiError::BadRequest("joins is invalid".to_owned()))?,
+            None => Vec::new(),
+        };
+    for table in std::iter::once(mart).chain(joins.iter().map(|j| j.mart.as_str())) {
+        if !access.allows_key(&serving_key(table)) {
+            return Err(mart_not_found(table));
+        }
+    }
+    Ok(joins)
+}
+
 /// `?joins=` branch of [`fields`] (`BI-7`): the columns of the flat relation a
 /// mart and its joins make, with their types, split like a mart's own. Schema
 /// metadata only, exactly like the mart's own answer: it names the same
@@ -2378,15 +2406,7 @@ async fn joined_fields_body(
     mart: &str,
     raw: &str,
 ) -> Result<Value, ApiError> {
-    let joins: Vec<lakehouse_bi::joins::JoinSpec> = serde_json::from_str(raw)
-        .map_err(|_| ApiError::BadRequest("joins is invalid".to_owned()))?;
-    // `GOV-7` D6: a join names its tables, so every one of them is checked
-    // before any column metadata is read.
-    for table in std::iter::once(mart).chain(joins.iter().map(|j| j.mart.as_str())) {
-        if !access.allows_key(&serving_key(table)) {
-            return Err(mart_not_found(table));
-        }
-    }
+    let joins = checked_joins(access, mart, Some(raw))?;
     let base = strip_non_ident(mart.strip_prefix("serving.").unwrap_or(mart));
     let ident = lakehouse_core::ident::Ident::new(base.clone())
         .map_err(|_| ApiError::BadRequest("invalid mart".to_owned()))?;
@@ -4394,17 +4414,16 @@ pub async fn values(
         return Err(ApiError::PermissionDenied("dashboard:read".to_owned()).into());
     }
     // `GOV-7` D6: the mart and every table its joins name are checked against
-    // the caller's roles before any value is read, as `/fields` does — a
-    // hidden mart is the unknown-mart 404, never a list of its values.
-    if let Some(mart) = own_mart {
-        let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
-        let joins = parse_value_joins(q.joins.as_deref())?;
-        for table in std::iter::once(mart).chain(joins.iter().map(|j| j.mart.as_str())) {
-            if !access.allows_key(&serving_key(table)) {
-                return Err(mart_not_found(table).into());
-            }
+    // the caller's roles before any value is read, as `/fields` does — one
+    // parse and one check (`checked_joins`), and the parsed list goes on to the
+    // read (`QA LH-BI-6-01` review round 1, R10).
+    let own_joins = match own_mart {
+        Some(mart) => {
+            let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+            checked_joins(&access, mart, q.joins.as_deref())?
         }
-    }
+        None => Vec::new(),
+    };
     // BI-19 B1 review R4: without `board` this lists the values of any mart or
     // SQL source, so somebody who holds only a rule must name a dashboard the
     // resolved viewer sees (404 like an unknown one otherwise; the built-in
@@ -4439,6 +4458,7 @@ pub async fn values(
     values_for_roles(
         &state.clickhouse,
         q,
+        &own_joins,
         (&principal.role_names, &viewer),
         &placeholders,
         &obligations,
@@ -4573,18 +4593,6 @@ fn value_relation(
     }
 }
 
-/// The `joins` query parameter of a value list, parsed (`BI-47`, plan D8).
-///
-/// # Errors
-///
-/// `BadRequest("joins is invalid")` for text that is not a JSON list of joins.
-fn parse_value_joins(raw: Option<&str>) -> Result<Vec<lakehouse_bi::joins::JoinSpec>, ApiError> {
-    let Some(raw) = raw.map(str::trim).filter(|j| !j.is_empty()) else {
-        return Ok(Vec::new());
-    };
-    serde_json::from_str(raw).map_err(|_| ApiError::BadRequest("joins is invalid".to_owned()))
-}
-
 /// The relations a board's charts read that have `column`, as `SELECT`s for
 /// [`values_statement`], and whether one is a SQL source (which brings the
 /// source `SETTINGS` caps along). Each chart's relation comes from
@@ -4651,41 +4659,33 @@ async fn board_value_selects(
 /// the relation is unknown or has no such column (the answer is then the empty
 /// list).
 ///
-/// `mart`/`source`/`joins` are the picker's own parameters; `source` is looked
-/// up and kept only when the caller may see it (the unknown-source 404).
+/// `mart`/`source` are the picker's own parameters and `joins` is that mart's
+/// list, already parsed and checked against the caller's roles by
+/// [`checked_joins`] (`QA LH-BI-6-01` review round 1, R10); `source` is looked
+/// up through [`crate::routes::dashboard_sources::visible_source`], the one
+/// visibility check (`BI-19` B2).
 ///
 /// # Errors
 ///
 /// 404 for a source that does not exist or sits in a folder the caller cannot
-/// see; 400 for `joins` that are not a JSON list of joins or a mart name that
-/// is not an identifier; [`classify_dashboard_ch_error`] for a store failure.
+/// see, or a mart name that is not an identifier (400);
+/// [`classify_dashboard_ch_error`] for a store failure.
 async fn own_value_selects(
     ch: &ChClient,
-    (mart, source, joins): (Option<&str>, Option<&str>, Option<&str>),
+    (mart, source, joins): (Option<&str>, Option<&str>, &[lakehouse_bi::joins::JoinSpec]),
     (column, search): (&str, Option<&str>),
     other_filters: Vec<FilterDef>,
     (viewer, time): (&Viewer, &TimeContext),
 ) -> Result<Option<(String, &'static str)>, ApiError> {
     let relation = if let Some(id) = source {
-        let source = lakehouse_bi::sources::get_source(ch, id)
-            .await
-            .map_err(|err| classify_dashboard_ch_error(&err))?
-            .filter(|source| crate::routes::dashboard_sources::source_visible(viewer, source))
-            .ok_or_else(|| ApiError::NotFound(format!("SQL source '{id}' not found.")))?;
+        let source = crate::routes::dashboard_sources::visible_source(ch, viewer, id).await?;
         value_relation(&ValueOwner::Source(&source), &HashMap::new())?
     } else {
         let mart = mart.unwrap_or_default();
-        let joins = parse_value_joins(joins)?;
         let mart_cols = mart_columns(ch)
             .await
             .map_err(|err| classify_dashboard_ch_error(&err))?;
-        value_relation(
-            &ValueOwner::Mart {
-                mart,
-                joins: &joins,
-            },
-            &mart_cols,
-        )?
+        value_relation(&ValueOwner::Mart { mart, joins }, &mart_cols)?
     };
     let Some(relation) = relation.filter(|relation| relation.cols.contains_key(column)) else {
         return Ok(None);
@@ -4715,9 +4715,14 @@ async fn own_value_selects(
 /// [`values`]' body, taking roles and placeholders explicitly so the
 /// enforcement path can be tested against a mock `ClickHouse` and a real
 /// policy row.
+///
+/// `joins` is the mart's list, already parsed and checked by [`checked_joins`]
+/// in the handler (`QA LH-BI-6-01` review round 1, R10); empty for every other
+/// branch.
 async fn values_for_roles(
     ch: &ChClient,
     q: ValuesQuery,
+    joins: &[lakehouse_bi::joins::JoinSpec],
     (roles, viewer): (&[String], &Viewer),
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
@@ -4727,6 +4732,7 @@ async fn values_for_roles(
     values_with_limit(
         ch,
         q,
+        joins,
         (roles, viewer),
         (placeholders, obligations, time),
         VALUES_LIMIT,
@@ -4740,6 +4746,7 @@ async fn values_for_roles(
 pub(crate) async fn values_with_limit(
     ch: &ChClient,
     q: ValuesQuery,
+    joins: &[lakehouse_bi::joins::JoinSpec],
     (roles, viewer): (&[String], &Viewer),
     (placeholders, obligations, time): (
         &crate::sql_rewrite::PlaceholderValues,
@@ -4771,7 +4778,7 @@ pub(crate) async fn values_with_limit(
         let others: Vec<FilterDef> = linked.into_iter().filter(|f| f.column != column).collect();
         let own = own_value_selects(
             ch,
-            (own_mart, own_source, q.joins.as_deref()),
+            (own_mart, own_source, joins),
             (&column, search),
             others,
             (viewer, time),
@@ -6286,6 +6293,7 @@ mod values_enforcement {
                 column: Some("email".to_owned()),
                 ..ValuesQuery::default()
             },
+            &[],
             (
                 &["Analyst".to_owned()],
                 &lakehouse_bi::access::Viewer::system(),
@@ -6364,6 +6372,7 @@ mod values_enforcement {
                 mart: Some("mart_a".to_owned()),
                 ..ValuesQuery::default()
             },
+            &[],
             (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
@@ -6437,6 +6446,7 @@ mod values_enforcement {
                 source: Some("s_1".to_owned()),
                 ..ValuesQuery::default()
             },
+            &[],
             (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
@@ -6543,6 +6553,7 @@ mod values_enforcement {
                 mart: Some("mart_x".to_owned()),
                 ..ValuesQuery::default()
             },
+            &[],
             (
                 &["Analyst".to_owned()],
                 &lakehouse_bi::access::Viewer::system(),
@@ -6605,6 +6616,7 @@ mod values_enforcement {
                 mart: Some("mart_a".to_owned()),
                 ..ValuesQuery::default()
             },
+            &[],
             (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
@@ -6696,6 +6708,7 @@ mod values_enforcement {
                 q: Some("secret".to_owned()),
                 ..ValuesQuery::default()
             },
+            &[],
             (
                 &["Analyst".to_owned()],
                 &lakehouse_bi::access::Viewer::system(),
@@ -7338,6 +7351,7 @@ mod typed_filters {
         values_for_roles(
             &ch,
             q,
+            &[],
             (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
