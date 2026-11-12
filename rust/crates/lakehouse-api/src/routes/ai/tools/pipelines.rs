@@ -1187,6 +1187,8 @@ mod t1_3_tests {
         let created = lakehouse_store::pipelines::create_pipeline(
             &pool,
             &lakehouse_store::pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "b-pipeline".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),

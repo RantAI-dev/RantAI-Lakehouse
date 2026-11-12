@@ -2097,6 +2097,8 @@ mod tests {
         let created = pipelines::create_pipeline(
             pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: id.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -2589,6 +2591,8 @@ mod tests {
         let upstream = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "upstream".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -2727,6 +2731,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -2758,6 +2764,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -2827,6 +2835,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe2".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -2857,6 +2867,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe2".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -2941,6 +2953,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "lonely_downstream".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3272,6 +3286,8 @@ mod tests {
         let created_orphan = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "pl-orphan".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3301,6 +3317,8 @@ mod tests {
         let created_wanted = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "pl-wanted".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3332,6 +3350,8 @@ mod tests {
         pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "pl-consumer".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3509,6 +3529,8 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn failed_run_retries_with_real_derived_key_and_stops_at_max_retries(pool: PgPool) {
         let pipe_input = pipelines::CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "pl-retry".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
@@ -3605,6 +3627,8 @@ mod tests {
         let pipe_consumed = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "pl-retry-consumed".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3704,6 +3728,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3732,6 +3758,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3853,6 +3881,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3881,6 +3911,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4055,6 +4087,8 @@ mod tests {
         let _u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4083,6 +4117,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4167,6 +4203,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_dep_read".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4195,6 +4233,8 @@ mod tests {
         let _reader = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "reader_dep".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4237,6 +4277,8 @@ mod tests {
         let _u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4265,6 +4307,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4414,6 +4458,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4442,6 +4488,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4564,6 +4612,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4592,6 +4642,8 @@ mod tests {
         let _p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),

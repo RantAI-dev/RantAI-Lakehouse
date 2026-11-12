@@ -1782,6 +1782,9 @@ pub async fn update(
         &dagster_jobs,
     )?;
     let input = UpdatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
+        run_as: None,
         kind: body.kind,
         source_zone: body.source_zone,
         source_table: body.source_table,
@@ -1994,6 +1997,9 @@ pub async fn restore_version(
     // `status` are deliberately excluded: a restore is a replay of the
     // editable fields, not a rename/re-promotion (Plan R4 2b).
     let input = UpdatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
+        run_as: None,
         kind: snapshot.kind,
         source_zone: snapshot.source_zone,
         source_table: snapshot.source_table,
@@ -2797,6 +2803,8 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3193,6 +3201,8 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3552,6 +3562,8 @@ mod tests {
         /// default (`NULL`) so the `*:*` principal passes `in_scope`.
         fn pipeline_input(name: &str, target_zone: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3675,6 +3687,8 @@ mod tests {
             connector_id: Option<&str>,
         ) -> pipelines::Pipeline {
             let input = CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4022,6 +4036,8 @@ mod tests {
         /// zone is the only field D2 reads, and `silver` is the refusal.
         fn pipeline_input(name: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4136,6 +4152,9 @@ mod tests {
             // through the store because the create and update ROUTES now
             // refuse that body itself.
             let pre_refusal = UpdatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
+                run_as: None,
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
                 source_table: "s".to_owned(),
@@ -4192,6 +4211,9 @@ mod tests {
             .await
             .expect("seed the row the refused restore would rewrite");
             let pre_refusal = UpdatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
+                run_as: None,
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
                 source_table: "s".to_owned(),
@@ -4302,6 +4324,8 @@ mod tests {
 
         fn create_input(name: &str, tenant_id: uuid::Uuid) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4496,6 +4520,8 @@ mod tests {
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4632,6 +4658,8 @@ mod tests {
             tenant_id: Option<uuid::Uuid>,
         ) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -5067,6 +5095,8 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: "pl-lag-test".to_owned(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),
@@ -5163,6 +5193,8 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: "pl-bounds".to_owned(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),
@@ -5218,6 +5250,8 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: "pl-tenant-b".to_owned(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),
@@ -5277,6 +5311,8 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: "pl-b-multi".to_owned(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),
@@ -5337,6 +5373,8 @@ mod tests {
             let pl = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: "pl-b-admin".to_owned(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),

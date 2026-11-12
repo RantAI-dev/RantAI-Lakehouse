@@ -86,6 +86,8 @@ async fn seed_lagged_pipeline(pool: &PgPool, name: &str, minutes: i32) -> String
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: name.to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
@@ -150,6 +152,8 @@ async fn another_tenants_pipeline_and_an_unknown_id_answer_the_same_404() {
     let theirs = pipelines::create_pipeline(
         &app.pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: format!("lag-theirs-{}", uuid::Uuid::new_v4().simple()),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
@@ -300,6 +304,8 @@ async fn unparseable_source_with_no_target_lag_does_not_persist_state() {
     let created = pipelines::create_pipeline(
         &app.pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "no-target-unparseable".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),

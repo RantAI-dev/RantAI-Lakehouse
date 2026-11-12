@@ -906,6 +906,8 @@ async fn an_authored_pipeline_enforce_call_for_a_narrowed_author_is_not_found() 
     let pipeline = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "gov7-enforce".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),

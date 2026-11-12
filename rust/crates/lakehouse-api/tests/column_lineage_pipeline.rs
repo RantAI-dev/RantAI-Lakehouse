@@ -125,6 +125,8 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uu
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "lineage-probe".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),

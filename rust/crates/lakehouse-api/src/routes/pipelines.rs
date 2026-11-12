@@ -3190,6 +3190,8 @@ pub async fn create(
         .await?;
     }
     let input = CreatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
         name: body.name,
         kind: body.kind,
         source_zone: body.source_zone,
@@ -3375,6 +3377,8 @@ pub async fn generate(
         .and_then(|d| d.schedule.clone())
         .unwrap_or_else(|| "On demand".to_owned());
     let input = CreatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
         name,
         kind,
         source_zone: body.database.clone(),
@@ -6200,6 +6204,8 @@ mod tests {
             let seeded = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: "source-route-scope".to_owned(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),
@@ -8779,6 +8785,8 @@ mod tests {
             let seeded = create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: id.clone(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),
@@ -9724,6 +9732,8 @@ mod tests {
 
         fn seed_input(name: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -10795,6 +10805,8 @@ mod tests {
             tenant_id: Option<uuid::Uuid>,
         ) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
