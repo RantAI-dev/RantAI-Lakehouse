@@ -30,6 +30,7 @@ import {
   usesNoCredential as needsNoCredential,
 } from "./connector-form-parts"
 import { DIRECTION_LABEL } from "./connectors-columns"
+import { saasAccountProblem, saasVendorForType } from "@/lib/connectors/saas-vendors"
 import { connectionReviewItems } from "./connector-review"
 import { ScopeFields } from "./connector-scope-fields"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
@@ -194,9 +195,19 @@ export function ConnectorCreatePage() {
     referenceManager: referenceMode ? credentialSettings?.secretManager : null,
   })
 
+  // QA LH-SRC-3-11 (SRC-41 D13): for a business app the form knows the
+  // vendor's account rule, so Next waits until the account fits it. The server
+  // checks the same dial and refuses it before anything is created (D11).
+  const saasVendor = adapter === "saas" ? saasVendorForType(selectedType?.name) : undefined
+  const saasAccount = typeof dial?.account === "string" ? dial.account : ""
+  const saasAccountIssue = saasVendor ? saasAccountProblem(saasVendor, saasAccount) : null
+
   const canProceed =
     (step === 0 && Boolean(name.trim() && selectedType?.supported)) ||
-    (step === 1 && problems.primary === null && problems.secondary === null) ||
+    (step === 1 &&
+      problems.primary === null &&
+      problems.secondary === null &&
+      saasAccountIssue === null) ||
     (step === 2 && Boolean(environment.trim() && tenantId && residency.trim())) ||
     step === 3
 
@@ -234,6 +245,9 @@ export function ConnectorCreatePage() {
       tenantId,
       residency: residency.trim(),
       capabilities: [],
+      // Checked before the row exists (`SRC-41` D11); the same settings are
+      // stored by the `saveSpec` call that follows.
+      connection: { adapter, dial: dial ?? {} },
     })
     // Never keep a credential in memory longer than the request needs it.
     setPrimaryValue("")
@@ -424,6 +438,13 @@ export function ConnectorCreatePage() {
                 onChange={setDial}
                 oauthCallbackUrl={credentialSettings?.oauthCallbackUrl}
               />
+              {/* Nothing red before something is typed, as for the credential
+                  fields: the refusal follows what the form holds. */}
+              {saasAccountIssue !== null && saasAccount !== "" ? (
+                <p role="alert" className="text-xs text-destructive">
+                  {saasAccountIssue}
+                </p>
+              ) : null}
             </section>
             <section className="space-y-3 border-t border-border pt-5">
               <StepSectionHeading

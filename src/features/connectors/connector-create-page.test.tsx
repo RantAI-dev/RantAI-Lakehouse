@@ -463,3 +463,122 @@ describe("ConnectorCreatePage", () => {
     expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)
   })
 })
+
+// QA LH-SRC-3-11 (SRC-41): the wizard sends the connection settings with the
+// create (so a refusal creates nothing and the server answers the sentence),
+// and for a business app it knows the vendor's account rule itself.
+describe("the connection settings are checked before the connector exists (LH-SRC-3-11)", () => {
+  const SAAS_TYPES = [
+    { name: "Dynamics 365", adapter: "saas", supported: true, docsUrl: null, unsupportedReason: null },
+  ]
+  const ACCOUNT = /Environment address and tenant/
+
+  async function openConnectionStep(page: ReturnType<typeof renderPage>, typeName: RegExp) {
+    await waitFor(() =>
+      expect(page.getByRole("radio", { name: typeName }).getAttribute("aria-checked")).toBe("true")
+    )
+    fireEvent.change(page.getByLabelText("Name"), { target: { value: "crm" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+  }
+
+  it("keeps Next disabled and says why for an account the vendor cannot have", async () => {
+    stubFetch(() => null, SAAS_TYPES)
+    const page = renderPage()
+    await openConnectionStep(page, /Dynamics 365/)
+
+    fireEvent.change(page.getByLabelText(ACCOUNT), { target: { value: "127.0.0.1" } })
+    fireEvent.change(page.getByLabelText("Client secret"), { target: { value: "s3cret" } })
+    expect(page.getByText("This is not in the form Dynamics 365 uses.")).toBeDefined()
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.change(page.getByLabelText(ACCOUNT), {
+      target: { value: "acme.crm4.dynamics.com/contoso.example.invalid" },
+    })
+    expect(page.queryByText("This is not in the form Dynamics 365 uses.")).toBeNull()
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it("sends the connection settings with the create request", async () => {
+    const calls = stubFetch((url, method) => {
+      if (url.endsWith("/api/connectors") && method === "POST") {
+        return json(
+          {
+            id: "conn-orders-k3x9",
+            name: "orders",
+            type: "PostgreSQL",
+            direction: "source",
+            health: "unknown",
+            environment: "production",
+            tenant: "Acme Co",
+            lastTestAt: null,
+            lastActivityAt: null,
+            lastRunSuccessAt: null,
+            lastRunFailureAt: null,
+            failureStreak: 0,
+            schemaChangePolicy: "apply_non_breaking",
+            pausedReason: null,
+            pausedAt: null,
+            capabilities: [],
+            owner: "Current user",
+            credential: { primary: "file:/run/secrets/x_password", secondary: null },
+            credentialStored: true,
+          },
+          201
+        )
+      }
+      if (url.includes("/ingest-spec")) {
+        return json({ adapter: "sql", ingestMode: "batch", dial: {}, sourceObjects: [], scheduleCron: null })
+      }
+      if (url.includes("/test")) {
+        return json({ ok: true, supported: true, latencyMs: 12, message: "ok", testedAt: "2026-01-01T00:00:00.000Z" })
+      }
+      if (url.endsWith("/runs")) return json({ runs: [] })
+      return null
+    })
+    const page = renderPage()
+    await openConnectionStep(page, /PostgreSQL/)
+
+    fireEvent.change(page.getByLabelText("Host"), { target: { value: "db.internal.example.com" } })
+    fireEvent.change(page.getByLabelText("Port"), { target: { value: "5432" } })
+    fireEvent.change(page.getByLabelText("Database"), { target: { value: "sales" } })
+    fireEvent.change(page.getByLabelText("User"), { target: { value: "reader" } })
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "s3cret-pass" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Residency"))
+    fireEvent.change(page.getByLabelText("Residency"), { target: { value: "in-region" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.click(page.getByRole("button", { name: "Create connector" }))
+    await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+
+    const create = calls.find((c) => c.url.endsWith("/api/connectors") && c.method === "POST")
+    const put = calls.find((c) => c.url.includes("/ingest-spec") && c.method === "PUT")
+    const connection = (create?.body as { connection?: { adapter: string; dial: unknown } }).connection
+    expect(connection?.adapter).toBe((put?.body as { adapter: string }).adapter)
+    expect(connection?.dial).toEqual((put?.body as { dial: unknown }).dial)
+    expect(connection?.dial).toMatchObject({ driver: "postgres", host: "db.internal.example.com", port: 5432 })
+  })
+
+  it("shows the API's refusal and stays on the form when the create is refused", async () => {
+    const REFUSAL = "The connection settings are not valid: account is not in the form this vendor uses"
+    const calls = stubFetch((url, method) => {
+      if (url.endsWith("/api/connectors") && method === "POST") {
+        return json({ error: REFUSAL }, 400)
+      }
+      return null
+    })
+    const page = renderPage()
+    await openConnectionStep(page, /PostgreSQL/)
+
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "s3cret-pass" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Residency"))
+    fireEvent.change(page.getByLabelText("Residency"), { target: { value: "in-region" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.click(page.getByRole("button", { name: "Create connector" }))
+
+    await waitFor(() => expect(page.getByText(REFUSAL)).toBeDefined())
+    expect(page.queryByText("Connector created")).toBeNull()
+    expect(calls.some((c) => c.url.includes("/ingest-spec"))).toBe(false)
+    expect(calls.some((c) => c.url.includes("/test"))).toBe(false)
+  })
+})
