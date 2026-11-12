@@ -45,6 +45,7 @@ once a first release is tagged.
 - Anyone with edit on a folder reads who it has been shared with: `GET /api/query/folders/{id}/access` answers at edit, and every rule in an access list now carries `granteeName` and `granteeEmail` (`null` outside the caller's organisation). The save sheet and the move dialog name who a chosen folder is shared with before the user confirms, and the share panel shows names instead of ids (backlog `QS-3`).
 - A run ended with Stop shows as Stopped in History (backlog `QS-2`, `QS-4`). The status `stopped` is a filter value in place of `cancelled`, and migration `0127` moves the rows already stored. The History page pages by number: `GET /api/query/history` takes `page` instead of `before` and answers `runs`, `total`, `page` and `pageSize`, 50 runs per page, and the pills read Completed, Failed, Stopped and Refused.
 - The revert confirmation button reads "Restore version N" (backlog `QS-3`), and the folder access list answers at edit with a sentence that says only someone who can edit the folder can see who it is shared with (backlog `QS-3`).
+- Query Studio shows a fixed sentence and a reference for an engine failure, on a run and on the cost estimate, in place of the engine's own text (backlog `QS-2`, `QS-1`; feature page `docs/core/features/no-raw-upstream-errors.md`). The raw text goes to the log under the same reference. The assistant's tools are unchanged, but **Fix with AI** now sends the model only the sentence and the reference.
 
 ### Fixed
 
