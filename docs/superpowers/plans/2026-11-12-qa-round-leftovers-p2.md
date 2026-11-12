@@ -1358,3 +1358,21 @@ above, not a green claim.
 **Containers.** The `gold_publication` run started one `ClickHouse` container
 (`eloquent_wright`, created 22:37); it was removed with `docker rm -f`. The labelled Postgres
 (`sleepy_pike`) and the `ClickHouse` containers created before this session were left alone.
+
+### Round 2 (planner, 2026-11-12), at `2e5a391e`
+
+Read the round-1 fix commits. R1 to R7 are fixed, one commit each, each new test shown red on
+the wrong change before it was kept. No product or test file names `LH-DATA-1-06` any more;
+commit `b0a5e51c7`'s body still does, and stays (no history is rewritten).
+
+- R2: the shared-call-site test fails with the per-thread subscriber when it runs alone or
+  under `nextest` (one process per test, which is how CI runs it). In a full parallel
+  `cargo test --test report_runner` run a sibling test's live subscriber can hide the wrong
+  change; the developer measured this and wrote it down. Accepted: CI is where the guard
+  holds, and `REL-25` itself was the in-process run failing, which the global subscriber
+  removes.
+- R3: a failure before the per-mart lock writes a run only when the lock is free.
+- R4: `list_tenants_by_ids` answers in id order, so the console starts in the tenant the
+  server already uses without a header.
+
+No open BLOCKER. Merge when CI on #492 is green.
