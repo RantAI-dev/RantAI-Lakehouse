@@ -83,7 +83,7 @@ async function submitCredentials(email: string, password: string): Promise<void>
 }
 
 describe("LoginPage lockout surface (plan T5)", () => {
-  it("shows the server's lockout message and the wait in whole minutes on a 429", async () => {
+  it("shows one sentence with the wait in whole minutes on a 429", async () => {
     stubLoginApi(
       429,
       { error: "Too many failed sign-in attempts. Try again later." },
@@ -97,10 +97,45 @@ describe("LoginPage lockout surface (plan T5)", () => {
     await submitCredentials("rina@meridian.example", "whatever")
 
     const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toContain("Too many failed sign-in attempts. Try again later.")
-    // 300 s renders as the whole-minute wait, pluralised properly
-    // ("minutes", not "minute(s)" — review SHOULD-FIX 6, 2026-10-03).
-    expect(alert.textContent).toContain("Try again in about 5 minutes.")
+    // QA LH-SEC-2-02 (ADM-14 D13): the console owns the whole sentence and
+    // does not repeat the server's "Try again later." after it. This case
+    // asserted both sentences until then, which was the defect.
+    expect(alert.textContent).toBe(
+      "Too many failed sign-in attempts: try again in about 5 minutes.",
+    )
+    expect(alert.textContent).not.toContain("Try again later")
+  })
+
+  it("shows the server's sentence when a 429 carries no wait", async () => {
+    stubLoginApi(429, { error: "Too many failed sign-in attempts. Try again later." })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "whatever")
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("Too many failed sign-in attempts. Try again later.")
+  })
+
+  it("says about one minute for a wait of 60 seconds", async () => {
+    stubLoginApi(
+      429,
+      { error: "Too many failed sign-in attempts. Try again later." },
+      { "Retry-After": "60" },
+    )
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "whatever")
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(
+      "Too many failed sign-in attempts: try again in about 1 minute.",
+    )
   })
 
   it("shows the SEC-65 refusal sentence the callback redirects with", async () => {
