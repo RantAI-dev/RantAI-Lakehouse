@@ -4347,6 +4347,34 @@ mod tests {
         assert_eq!(overdue(&young, now, &limits), None);
     }
 
+    /// `review round 1, R4` (QA `TC-1702`): the five-minute grace of D10 is
+    /// pinned on absolute numbers from the default config, not on times built
+    /// from the limits themselves (which already hold the grace, so they
+    /// would follow it to zero). The grace is the orchestrator's turn to act
+    /// first; without it the route races the daemon at exactly the limit.
+    #[test]
+    fn a_run_inside_the_grace_after_its_limit_still_holds_the_connector() {
+        let limits = limits();
+        // The default settings plus the grace: 21600 + 300 and 600 + 300.
+        assert_eq!(limits.running_seconds, 21_900.0);
+        assert_eq!(limits.start_seconds, 900.0);
+        let now = 1_800_000_000.0;
+        let mut running = dg_run("run-r", "STARTED", "conn-a");
+        running.start_time = Some(now - 21_600.0 - 299.0);
+        assert_eq!(overdue(&running, now, &limits), None);
+        running.start_time = Some(now - 21_600.0 - 301.0);
+        assert_eq!(overdue(&running, now, &limits), Some(Overdue::RanTooLong));
+        let mut launched = dg_run("run-n", "NOT_STARTED", "conn-a");
+        launched.start_time = None;
+        launched.creation_time = Some(now - 600.0 - 299.0);
+        assert_eq!(overdue(&launched, now, &limits), None);
+        launched.creation_time = Some(now - 600.0 - 301.0);
+        assert_eq!(
+            overdue(&launched, now, &limits),
+            Some(Overdue::NeverStarted)
+        );
+    }
+
     /// A launched run that never started is overdue after the start limit;
     /// one inside the limit is not.
     #[test]
