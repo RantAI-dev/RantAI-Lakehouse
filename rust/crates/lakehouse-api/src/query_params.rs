@@ -376,12 +376,13 @@ struct Found {
 /// The placeholders the author wrote, in order. Comments are skipped, a
 /// well-formed placeholder inside quotes or inside a `ClickHouse` heredoc is
 /// refused, a `{{` that is not a placeholder outside both is refused, and a
-/// placeholder in a statement that holds a `$`-run no measured rule reads
-/// ([`SpanKind::Uncertain`]) is refused with the inside-quotes sentence too:
-/// the engine refuses every such shape the measurements cover, so the value
-/// would be printed into text no measured rule reads. A statement that holds
-/// the run and no placeholder comes back as it stands — the guard refuses it
-/// at run.
+/// placeholder in a statement that holds a `$`-run no measured rule reads,
+/// or a Unicode quote on `ClickHouse` ([`SpanKind::Uncertain`]), is refused
+/// with the inside-quotes sentence too: the engine refuses every such `$`
+/// shape the measurements cover and reads `‘ … ’` as a literal this lexer
+/// does not follow, so the value would be printed into text no measured rule
+/// reads. A statement that holds the run and no placeholder comes back as it
+/// stands — the guard refuses it at run.
 ///
 /// The text is read the way the engine reads it, by the one lexer in
 /// [`crate::sql_lex`]: a comment and a quoted run are spans, so a
@@ -1688,6 +1689,49 @@ mod tests {
             err.to_string(),
             "{{p}} is inside quotes: write it without them, for example = {{p}}."
         );
+    }
+
+    /// The `#452` review SHOULD-FIX: measured on
+    /// `clickhouse/clickhouse-server:26.8` (2026-11-12), `‘ … ’` is a string
+    /// literal on `ClickHouse`, so a placeholder between the two quotes is
+    /// inside quotes. The lexer cannot follow the quotes, so the scanner
+    /// refuses the placeholder instead of filling a value into a literal.
+    #[test]
+    fn a_placeholder_between_unicode_quotes_is_refused_on_clickhouse() {
+        for sql in [
+            "SELECT \u{2018} {{p}} \u{2019}",
+            "SELECT \u{201C} {{p}} \u{201D}",
+        ] {
+            let err =
+                substitute(Engine::ClickHouse, sql, &map(json!({"p": "v"})), &[]).unwrap_err();
+            assert_eq!(err, ParamError::InsideQuotes("p".to_owned()), "{sql}");
+            assert_eq!(
+                err.to_string(),
+                "{{p}} is inside quotes: write it without them, for example = {{p}}.",
+                "{sql}"
+            );
+        }
+    }
+
+    /// A Unicode quote that sits inside an ASCII literal is data, so the
+    /// placeholder around it is still filled. `Trino` does not read the
+    /// quotes at all, so the placeholder between them is filled there.
+    #[test]
+    fn a_unicode_quote_inside_an_ascii_literal_leaves_a_placeholder_fillable() {
+        let got = run_ok(
+            Engine::ClickHouse,
+            "SELECT '\u{2018}', {{p}}",
+            json!({"p": "v"}),
+            json!([]),
+        );
+        assert_eq!(got, "SELECT '\u{2018}', 'v'");
+        let got = run_ok(
+            Engine::Trino,
+            "SELECT \u{2018} {{p}} \u{2019}",
+            json!({"p": "v"}),
+            json!([]),
+        );
+        assert_eq!(got, "SELECT \u{2018} 'v' \u{2019}");
     }
 
     /// A statement that holds an uncertain `$`-run and no placeholder is

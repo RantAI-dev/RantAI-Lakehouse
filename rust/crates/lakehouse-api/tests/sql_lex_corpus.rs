@@ -48,6 +48,10 @@ enum Expect {
     /// interface's refusal of a second statement — and the guard refuses
     /// it too: the review and measurement shapes the plan pins.
     RefusedBoth,
+    /// The engine parses the statement as a SELECT, and the guard refuses
+    /// it anyway: the guard cannot follow what the engine reads there, so
+    /// it fails closed (`#452` review SHOULD-FIX, the Unicode quotes).
+    SelectGuardRefused,
     /// The engine refuses the statement and the guard's verdict is not
     /// asserted: the refusal happens at the engine, where the author sees
     /// it, and no measurement says what the guard should answer.
@@ -165,6 +169,36 @@ const CORPUS: &[(&str, Expect)] = &[
     // guard; the placeholder inside it is refused by the scanner (pinned
     // in `query_params`' tests), not by this guard.
     ("SELECT $$ {{x}} $$", Expect::SelectRead),
+    // ── the Unicode quotes (`#452` review SHOULD-FIX) ───────────────────
+    // Measured 2026-11-12 on `clickhouse/clickhouse-server:26.8`: `‘ … ’`
+    // is a string literal and `“ … ”` a quoted identifier, so the `'`
+    // inside them opens no string. The lexer cannot follow them, so the
+    // guard refuses these statements on ClickHouse although the engine
+    // parses the first three as one SELECT each (`EXPLAIN AST` root
+    // `SelectWithUnionQuery`).
+    // The engine reads the literal `‘ ' ’` and then the comment `--'`.
+    (
+        "SELECT \u{2018} ' \u{2019} AS a, 2 AS b --'",
+        Expect::SelectGuardRefused,
+    ),
+    // The engine reads the literals `‘ '’` and `‘' ’` around `3 AS c`.
+    (
+        "SELECT \u{2018} '\u{2019}, 3 AS c, \u{2018}' \u{2019}",
+        Expect::SelectGuardRefused,
+    ),
+    // The engine reads the quoted identifier `“ ' ”` and then the comment
+    // `--'`.
+    (
+        "SELECT \u{201C} ' \u{201D}, 2 AS b --'",
+        Expect::SelectGuardRefused,
+    ),
+    // The review shape (2026-11-12, same image): the engine refuses the
+    // statement, and before the lexer followed the quotes the guard let it
+    // pass, because it read a string around the `DROP`.
+    (
+        "SELECT \u{2018} ' \u{2019}; DROP TABLE t; SELECT \u{2018} ' \u{2019}",
+        Expect::RefusedBoth,
+    ),
     // ── the `NASTY` values are appended at run time, printed ────────────
 ];
 
@@ -301,6 +335,7 @@ async fn the_guard_agrees_with_a_real_clickhouse_on_every_corpus_row() {
             Expect::NonSelectRead => matches!(verdict, Verdict::Parsed(_)) && guard,
             Expect::WriteRefused => matches!(verdict, Verdict::Parsed(_)) && !guard,
             Expect::RefusedBoth => matches!(verdict, Verdict::Refused) && !guard,
+            Expect::SelectGuardRefused => matches!(verdict, Verdict::Select) && !guard,
             Expect::RefusedEngineOnly => matches!(verdict, Verdict::Refused),
         };
         if !agreed {
