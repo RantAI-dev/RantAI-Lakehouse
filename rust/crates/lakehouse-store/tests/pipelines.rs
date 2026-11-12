@@ -3650,3 +3650,158 @@ async fn an_update_carrying_inputs_and_steps_rewrites_every_legacy_column(
     );
     Ok(())
 }
+
+// ── BLD-1 part 1 D11: target lag follows every input ─────────────────
+
+/// A pipeline whose definition reads `inputs`, created in `tenant`, with an
+/// optional target lag.
+async fn lag_pipeline_with_inputs(
+    pool: &PgPool,
+    name: &str,
+    tenant_id: Uuid,
+    inputs: &[(&str, &str)],
+    target: (&str, &str),
+    target_lag: Option<pipelines::TargetLag>,
+) -> pipelines::Pipeline {
+    let mut create = input();
+    create.name = name.to_owned();
+    create.inputs = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, (zone, table))| pipelines::PipelineInput {
+            name: format!("in_{index}"),
+            zone: (*zone).to_owned(),
+            table: (*table).to_owned(),
+        })
+        .collect();
+    create.steps = Vec::new();
+    create.transforms = Vec::new();
+    create.target_zone = target.0.to_owned();
+    create.target_table = target.1.to_owned();
+    create.tenant_id = Some(tenant_id);
+    create.target_lag = target_lag;
+    create.depends_on = Vec::new();
+    pipelines::create_pipeline(pool, &create, None)
+        .await
+        .expect("create the lag fixture")
+}
+
+/// D11: a pipeline with two inputs is a reader of BOTH producers' targets —
+/// `lag_reader_predicate` asks the `input_tables` column, not the single
+/// `source`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_two_input_pipeline_reads_both_producers(pool: PgPool) -> sqlx::Result<()> {
+    let tenant: Uuid = create_tenant(&pool, &tenant_input("lag-two-inputs"))
+        .await
+        .unwrap()
+        .id
+        .parse()
+        .unwrap();
+    // Two producers, each writing one of the tables the reader reads.
+    lag_pipeline_with_inputs(
+        &pool,
+        "lag-producer-a",
+        tenant,
+        &[("bronze", "orders")],
+        ("silver", "a"),
+        None,
+    )
+    .await;
+    lag_pipeline_with_inputs(
+        &pool,
+        "lag-producer-b",
+        tenant,
+        &[("bronze", "customers")],
+        ("silver", "b"),
+        None,
+    )
+    .await;
+    let reader = lag_pipeline_with_inputs(
+        &pool,
+        "lag-reader",
+        tenant,
+        &[("silver", "a"), ("silver", "b")],
+        ("gold", "joined"),
+        Some(pipelines::TargetLag::Lag { minutes: 5 }),
+    )
+    .await;
+    assert_eq!(
+        reader.input_tables,
+        vec!["silver.a".to_owned(), "silver.b".to_owned()],
+        "the store writes every input's location"
+    );
+
+    for target in ["silver.a", "silver.b"] {
+        let count =
+            pipelines::count_lag_pipelines_reading(&pool, "someone-else", target, Some(tenant))
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "the reader must be counted for {target}");
+    }
+    Ok(())
+}
+
+/// D11: the write-time cycle check follows a SECOND input too. A cycle that
+/// only exists through the reader's second input is refused when the target
+/// lag is set, exactly as one through the first always was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_cycle_check_sees_a_cycle_through_a_second_input(pool: PgPool) -> sqlx::Result<()> {
+    let tenant: Uuid = create_tenant(&pool, &tenant_input("lag-cycle-two"))
+        .await
+        .unwrap()
+        .id
+        .parse()
+        .unwrap();
+    // `a` reads `x` and `silver.b`; `b` reads `silver.a` with no lag yet.
+    lag_pipeline_with_inputs(
+        &pool,
+        "lag-cycle-b",
+        tenant,
+        &[("bronze", "customers")],
+        ("silver", "b"),
+        None,
+    )
+    .await;
+    lag_pipeline_with_inputs(
+        &pool,
+        "lag-cycle-a",
+        tenant,
+        &[("silver", "x"), ("silver", "b")],
+        ("silver", "a"),
+        Some(pipelines::TargetLag::Lag { minutes: 5 }),
+    )
+    .await;
+    // Make `b` a lag pipeline reading `a`: that closes a cycle through a's
+    // SECOND input, so the write must be refused.
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM pipeline_definition WHERE name = 'lag-cycle-b'")
+            .fetch_all(&pool)
+            .await?;
+    let b_id = rows[0].0.clone();
+    let b_pipeline = pipelines::get_pipeline(&pool, &b_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut update = update_input_for(&b_pipeline);
+    update.inputs = vec![pipelines::PipelineInput {
+        name: "a_in".to_owned(),
+        zone: "silver".to_owned(),
+        table: "a".to_owned(),
+    }];
+    update.transforms = Vec::new();
+    // Keep the target the fixture created: `update_input_for`'s own default
+    // would move it and break the edge the cycle needs.
+    update.target_zone = "silver".to_owned();
+    update.target_table = "b".to_owned();
+    pipelines::update_pipeline(&pool, &b_id, &update, None)
+        .await
+        .unwrap();
+    let refusal =
+        pipelines::set_target_lag(&pool, &b_id, Some(pipelines::TargetLag::Lag { minutes: 5 }))
+            .await;
+    assert!(
+        matches!(refusal, Err(StoreError::Validation(_))),
+        "a cycle through a second input must be refused, got {refusal:?}"
+    );
+    Ok(())
+}

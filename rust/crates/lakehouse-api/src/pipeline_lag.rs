@@ -391,8 +391,9 @@ pub(crate) fn target_of(pipeline: &Pipeline) -> (Option<i32>, bool) {
     }
 }
 
-/// The inputs of `pipeline` (plan D4): its own source, plus the target of
-/// every pipeline in `depends_on` that resolves to an authored pipeline.
+/// The inputs of `pipeline` (plan D4, BLD-1 part 1 / D11): EVERY input it
+/// reads, plus the target of every pipeline in `depends_on` that resolves to
+/// an authored pipeline.
 ///
 /// A `depends_on` entry naming a `Dagster`-native job is skipped rather
 /// than failing the check: such a job has no `pipeline_definition` row, so
@@ -410,11 +411,21 @@ pub async fn inputs_of_conn(
     conn: &mut sqlx::PgConnection,
     pipeline: &Pipeline,
 ) -> Result<Option<Vec<InputTable>>, StoreError> {
-    let mut inputs = Vec::new();
-    let Some(source) = InputTable::parse(&pipeline.source) else {
-        return Ok(None);
+    // BLD-1 part 1 / D11: every input, not only the first. `source` is the
+    // fallback for a row that predates migration `0137` and was never
+    // backfilled, which is the answer such a row always gave.
+    let tables = if pipeline.input_tables.is_empty() {
+        vec![pipeline.source.clone()]
+    } else {
+        pipeline.input_tables.clone()
     };
-    inputs.push(source);
+    let mut inputs = Vec::with_capacity(tables.len());
+    for table in &tables {
+        let Some(input) = InputTable::parse(table) else {
+            return Ok(None);
+        };
+        inputs.push(input);
+    }
     for (id, target) in
         pipelines::targets_for_conn(conn, pipeline.tenant_id, &pipeline.depends_on).await?
     {
@@ -1986,6 +1997,7 @@ mod tests {
             status: "ready".to_owned(),
             owner: "o".to_owned(),
             source: "bronze.orders".to_owned(),
+            input_tables: vec!["bronze.orders".to_owned()],
             target: "silver.orders_clean".to_owned(),
             connector_id: None,
             source_asset_id: None,

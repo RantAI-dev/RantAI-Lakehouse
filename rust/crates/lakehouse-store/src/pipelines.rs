@@ -56,8 +56,20 @@ pub struct Pipeline {
     pub status: String,
     /// Who owns this pipeline.
     pub owner: String,
-    /// Source location (e.g. `"zone.table"`).
+    /// Source location (e.g. `"zone.table"`) — the FIRST input's.
+    ///
+    /// BLD-1 part 1 / D3: kept for every caller that predates `inputs`; the
+    /// target-lag readers use [`Self::input_tables`], which holds all of them.
     pub source: String,
+    /// BLD-1 part 1 / D11: every input's `<zone>.<table>` (migration `0137`),
+    /// written by [`definition_columns`]. This is what the target-lag readers
+    /// ask "which tables does this pipeline read?" — an old single-source row
+    /// is one entry here, and a pipeline with two inputs is two.
+    ///
+    /// Deliberately NOT on the wire: the definition already reports `inputs`
+    /// with their names, and this column is the readers' internal answer.
+    #[serde(skip)]
+    pub input_tables: Vec<String>,
     /// Target location.
     pub target: String,
     /// Ingress connector id, if any.
@@ -466,8 +478,11 @@ struct PipelineRow {
     /// union.
     target_lag_seconds: Option<i32>,
     target_lag_downstream: bool,
+    /// BLD-1 part 1 / D11: every input's location, read for the target-lag
+    /// readers.
+    input_tables: Vec<String>,
     /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
-    /// here so the `runnable`/`enforce` paths can decide whether this
+    /// here so the `runnable`/`compile` paths can decide whether this
     /// pipeline has an author at all without a separate read.
     run_as: Option<Uuid>,
 }
@@ -500,6 +515,7 @@ impl From<PipelineRow> for Pipeline {
             status: row.status,
             owner: row.owner,
             source: row.source,
+            input_tables: row.input_tables,
             target: row.target,
             connector_id: row.connector_id,
             source_asset_id: row.source_asset_id,
@@ -539,7 +555,7 @@ impl From<PipelineRow> for Pipeline {
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, tenant_id, \
-     target_lag_seconds, target_lag_downstream, run_as";
+     target_lag_seconds, target_lag_downstream, input_tables, run_as";
 
 /// `RETURNING` clause for the transactional `create_pipeline` /
 /// `update_pipeline` / `delete_pipeline`-read paths. Wider than
@@ -550,7 +566,8 @@ freshness_lag_seconds, max_retries, description, depends_on, tenant_id, \
 const FULL_PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, incremental_column, \
-     transforms, inputs, steps, fbic_enabled, tenant_id, target_lag_seconds, target_lag_downstream, run_as";
+     transforms, inputs, steps, fbic_enabled, tenant_id, target_lag_seconds, \
+     target_lag_downstream, input_tables, run_as";
 
 /// The full editable state of a pipeline at one point in time. Persisted
 /// to `pipeline_definition_version.snapshot` (migration `0053`) inside
@@ -790,6 +807,8 @@ struct FullPipelineRow {
     /// the same pair.
     target_lag_seconds: Option<i32>,
     target_lag_downstream: bool,
+    /// BLD-1 part 1 / D11: every input's location (migration `0137`).
+    input_tables: Vec<String>,
     /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
     /// here so the create path can return the author it actually stored
     /// from the same `RETURNING` that built the `Pipeline`, instead of
@@ -806,6 +825,7 @@ impl From<FullPipelineRow> for Pipeline {
             status: row.status,
             owner: row.owner,
             source: row.source,
+            input_tables: row.input_tables,
             target: row.target,
             connector_id: row.connector_id,
             source_asset_id: row.source_asset_id,
@@ -2517,7 +2537,7 @@ fn lag_reader_predicate(
         "p.tenant_id = {candidate_tenant} \
          AND p.id != {candidate_id} \
          AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
-         AND (p.source = {candidate_target} OR EXISTS ( \
+         AND ({candidate_target} = ANY (p.input_tables) OR EXISTS ( \
                 SELECT 1 FROM unnest(p.depends_on) AS up(id) \
                 JOIN pipeline_definition u ON u.id = up.id \
                 WHERE u.tenant_id = {candidate_tenant} AND u.target = {candidate_target}))"
@@ -2632,7 +2652,15 @@ pub async fn upstream_downstream_pipelines_conn(
     let Some(tenant_id) = pipeline.tenant_id else {
         return Ok(Vec::new());
     };
-    let mut input_tables = vec![pipeline.source.clone()];
+    // BLD-1 part 1 / D11: every input this pipeline reads, not just the
+    // first. `source` is the fallback for a row that predates migration
+    // `0137` and was never backfilled — the same answer such a row always
+    // gave.
+    let mut input_tables = if pipeline.input_tables.is_empty() {
+        vec![pipeline.source.clone()]
+    } else {
+        pipeline.input_tables.clone()
+    };
     for target in targets_for_conn(conn, Some(tenant_id), &pipeline.depends_on)
         .await?
         .into_values()
@@ -2797,8 +2825,11 @@ pub async fn find_target_lag_cycle_conn(
     .await?;
     let target_of: std::collections::HashMap<String, String> = targets.into_iter().collect();
 
-    let lag_rows = sqlx::query_as::<_, (String, String, Vec<String>)>(
-        "SELECT id, source, depends_on FROM pipeline_definition \
+    // BLD-1 part 1 / D11: a cycle can run through a SECOND input, so the walk
+    // reads every input's location; `source` is the fallback for a row that
+    // predates the column.
+    let lag_rows = sqlx::query_as::<_, (String, Vec<String>, String, Vec<String>)>(
+        "SELECT id, input_tables, source, depends_on FROM pipeline_definition \
          WHERE tenant_id = $1 AND (target_lag_seconds IS NOT NULL OR target_lag_downstream)",
     )
     .bind(tenant_id)
@@ -2806,10 +2837,16 @@ pub async fn find_target_lag_cycle_conn(
     .await?;
 
     let upstream_of = |id: &str| -> Vec<String> {
-        let Some((_, source, depends_on)) = lag_rows.iter().find(|(pid, ..)| pid == id) else {
+        let Some((_, input_tables, source, depends_on)) =
+            lag_rows.iter().find(|(pid, ..)| pid == id)
+        else {
             return Vec::new();
         };
-        let mut inputs = vec![source.clone()];
+        let mut inputs = if input_tables.is_empty() {
+            vec![source.clone()]
+        } else {
+            input_tables.clone()
+        };
         for up in depends_on {
             if let Some(target) = target_of.get(up) {
                 inputs.push(target.clone());
@@ -2853,6 +2890,7 @@ mod tests {
             status: "draft".to_owned(),
             owner: "o".to_owned(),
             source: "s".to_owned(),
+            input_tables: vec!["s".to_owned()],
             target: "t".to_owned(),
             connector_id: None,
             source_asset_id: None,
@@ -2920,6 +2958,7 @@ mod tests {
             status: "draft".to_owned(),
             owner: "o".to_owned(),
             source: "s".to_owned(),
+            input_tables: vec!["s".to_owned()],
             target: "t".to_owned(),
             connector_id: None,
             source_asset_id: None,
@@ -2969,6 +3008,7 @@ mod tests {
             status: "ready".to_owned(),
             owner: "o".to_owned(),
             source: "s".to_owned(),
+            input_tables: vec!["s".to_owned()],
             target: "t".to_owned(),
             connector_id: None,
             source_asset_id: None,

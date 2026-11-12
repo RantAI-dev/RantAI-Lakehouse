@@ -357,7 +357,8 @@ async fn unparseable_source_with_no_target_lag_does_not_persist_state() {
     );
 }
 
-/// BLD-2 review R2 SHOULD-FIX 2: Unparseable source preserves existing row
+/// BLD-2 review R2 SHOULD-FIX 2 (BLD-1 part 1 / D11 moved the read to
+/// `input_tables`): an unreadable input preserves the existing row
 /// (consumed tokens, requested run key, request attempt) and records `not_measured`.
 #[tokio::test]
 async fn unparseable_source_preserves_existing_state() {
@@ -385,7 +386,9 @@ async fn unparseable_source_preserves_existing_state() {
         .await
         .expect("seed initial state");
 
-    sqlx::query("UPDATE pipeline_definition SET source = 'invalid' WHERE id = $1")
+    // BLD-1 part 1 / D11: the reader asks `input_tables`, so that is the
+    // column that has to be unreadable for this case to exist at all.
+    sqlx::query("UPDATE pipeline_definition SET input_tables = ARRAY['invalid'] WHERE id = $1")
         .bind(&id)
         .execute(&app.pool)
         .await
