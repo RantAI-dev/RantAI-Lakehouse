@@ -384,8 +384,8 @@ fn text_of<'a>(asset: &'a Value, key: &str) -> &'a str {
 /// The text is made one line first, because a description may hold line
 /// breaks and tabs that a one-line result row would show as a broken line.
 /// The search is by `char`, never by byte, so a multi-byte letter is never
-/// cut in half. A word that is not found (a typo the approximate match
-/// forgave, or no word at all) starts the piece at the beginning.
+/// cut in half. Where the piece starts is [`found_position`]'s answer, so a
+/// forgiven typo still shows the word it forgave (review round 1 R10).
 fn description_snippet(description: &str, word: &str) -> String {
     let line: String = description
         .chars()
@@ -402,15 +402,7 @@ fn description_snippet(description: &str, word: &str) -> String {
         .iter()
         .map(|&c| c.to_lowercase().next().unwrap_or(c))
         .collect();
-    let needle: Vec<char> = word.chars().collect();
-    let position = if needle.is_empty() {
-        0
-    } else {
-        lower
-            .windows(needle.len())
-            .position(|w| w == needle.as_slice())
-            .unwrap_or(0)
-    };
+    let position = found_position(&lower, word);
     let start = position.saturating_sub(SNIPPET_LEAD_CHARS);
     let end = (start + SNIPPET_MAX_CHARS).min(chars.len());
     let mut snippet = String::new();
@@ -422,6 +414,55 @@ fn description_snippet(description: &str, word: &str) -> String {
         snippet.push('…');
     }
     snippet
+}
+
+/// Where the piece of a description starts, in `lower` (the description
+/// lower-cased, one character per character): the word as typed when it is
+/// there, else the first place one of its parts is, else the first token
+/// within one edit of a part, and only then the beginning.
+///
+/// The approximate match forgives a typo, and a word may match its parts
+/// (`rev-enue`), so the word as typed need not be in the text at all; starting
+/// at the beginning then showed a piece without the word that matched
+/// (review round 1 R10, decision "no position is position 0").
+fn found_position(lower: &[char], word: &str) -> usize {
+    let found = |needle: &[char]| -> Option<usize> {
+        if needle.is_empty() || needle.len() > lower.len() {
+            return None;
+        }
+        lower.windows(needle.len()).position(|w| w == needle)
+    };
+    let needle: Vec<char> = word.chars().collect();
+    if needle.is_empty() {
+        return 0;
+    }
+    if let Some(at) = found(&needle) {
+        return at;
+    }
+    let parts: Vec<Vec<char>> = tokens(word).map(|t| t.chars().collect()).collect();
+    if let Some(at) = parts.iter().filter_map(|part| found(part)).min() {
+        return at;
+    }
+    // No part is there as typed either: the first token one edit from a part
+    // is the word the approximate match forgave.
+    let mut at = 0;
+    while at < lower.len() {
+        if !lower[at].is_alphanumeric() {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < lower.len() && lower[at].is_alphanumeric() {
+            at += 1;
+        }
+        if parts
+            .iter()
+            .any(|part| within_one_edit(&lower[start..at], part))
+        {
+            return start;
+        }
+    }
+    0
 }
 
 /// The field's tokens: runs of letters and digits.
@@ -925,11 +966,38 @@ mod tests {
             find(&assets, "revenue")[0]["matchedOn"],
             json!({ "field": "description", "value": "Monthly revenue by region", "approximate": false })
         );
-        // The typo was forgiven, so there is no position: the piece starts at
-        // the beginning and is the whole line.
+        // The typo was forgiven; the piece still holds the word it forgave,
+        // which is the whole line when the line is short.
         let typo = &find(&assets, "revnue")[0];
         assert_eq!(typo["matchedOn"]["approximate"], true);
         assert_eq!(typo["matchedOn"]["value"], "Monthly revenue by region");
+
+        // Review round 1 R10: in a long description the forgiven word is at
+        // character 120, so the piece starts around it, not at position 0.
+        let long = |word: &str| {
+            format!(
+                "{} {word} {}",
+                vec!["a"; 60].join(" "),
+                vec!["b"; 40].join(" ")
+            )
+        };
+        let assets =
+            vec![json!({ "id": "silver.typo", "name": "Typo", "description": long("revenue") })];
+        let typo = &find(&assets, "revnue")[0];
+        assert_eq!(typo["matchedOn"]["approximate"], true);
+        let value = typo["matchedOn"]["value"].as_str().unwrap();
+        assert!(value.contains("revenue"), "{value}");
+        assert!(value.starts_with('…'), "{value}");
+
+        // A word matched by its parts (`rev-enue`, not approximate) starts at
+        // the first part, not at the beginning either.
+        let assets =
+            vec![json!({ "id": "silver.parts", "name": "Parts", "description": long("revenue") })];
+        let parts = &find(&assets, "rev-enue")[0];
+        assert_eq!(parts["matchedOn"]["approximate"], false);
+        let value = parts["matchedOn"]["value"].as_str().unwrap();
+        assert!(value.contains("revenue"), "{value}");
+        assert!(value.starts_with('…'), "{value}");
     }
 
     // QA `LH-DATA-11-04` (`DATA-54`): the piece is cut by character, never by
