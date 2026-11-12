@@ -1130,6 +1130,21 @@ pub struct Config {
     /// lowers it for its own job and says so; it is not a per-connector
     /// setting.
     pub connector_auto_disable_after: i32,
+    /// How long one connector run may run before the API stops treating it as
+    /// going (`SRC-39`, QA `TC-1702`): `INGEST_RUN_MAX_RUNTIME_SECONDS`,
+    /// default 21600 (six hours). The run route cancels a run older than this
+    /// plus its grace, records it as failed with `timed_out`, and lets the
+    /// next run start; the orchestrator's own run monitoring enforces the
+    /// same number through the `dagster/max_runtime` tag. Zero, negative, or
+    /// unparseable values keep the default.
+    pub ingest_run_max_runtime_seconds: u32,
+    /// How long a queued connector run may take to start before the API stops
+    /// holding the connector for it (`SRC-39`, QA `TC-1702`):
+    /// `INGEST_RUN_START_TIMEOUT_SECONDS`, default 600 (ten minutes). It MUST
+    /// equal `start_timeout_seconds` in `dagster/dagster.yaml`: whoever
+    /// changes one changes both. Zero, negative, or unparseable values keep
+    /// the default.
+    pub ingest_run_start_timeout_seconds: u32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -1418,6 +1433,14 @@ impl std::fmt::Debug for Config {
             .field(
                 "connector_auto_disable_after",
                 &self.connector_auto_disable_after,
+            )
+            .field(
+                "ingest_run_max_runtime_seconds",
+                &self.ingest_run_max_runtime_seconds,
+            )
+            .field(
+                "ingest_run_start_timeout_seconds",
+                &self.ingest_run_start_timeout_seconds,
             )
             .finish()
     }
@@ -2026,6 +2049,16 @@ impl Config {
                 30,
             ))
             .unwrap_or(lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER),
+            ingest_run_max_runtime_seconds: parse_positive_u32_or_default(
+                env,
+                "INGEST_RUN_MAX_RUNTIME_SECONDS",
+                21_600,
+            ),
+            ingest_run_start_timeout_seconds: parse_positive_u32_or_default(
+                env,
+                "INGEST_RUN_START_TIMEOUT_SECONDS",
+                600,
+            ),
         })
     }
 
@@ -2408,6 +2441,32 @@ mod tests {
         }
         let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", "4")])).unwrap();
         assert_eq!(cfg.connector_auto_disable_after, 4);
+    }
+
+    /// `SRC-39` (QA `TC-1702`): six hours a run may run, ten minutes a queued
+    /// run may take to start; a value that is not a whole number of 1 or more
+    /// keeps the default.
+    #[test]
+    fn the_run_limits_default_to_six_hours_and_ten_minutes_and_ignore_garbage() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 600);
+        for bad in ["0", "-3", "many", ""] {
+            let cfg = Config::from_map(&map(&[
+                ("INGEST_RUN_MAX_RUNTIME_SECONDS", bad),
+                ("INGEST_RUN_START_TIMEOUT_SECONDS", bad),
+            ]))
+            .unwrap();
+            assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600, "{bad:?}");
+            assert_eq!(cfg.ingest_run_start_timeout_seconds, 600, "{bad:?}");
+        }
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", "900"),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", "120"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
     }
 
     /// The compose stack's documented opt-out — only the literal string
