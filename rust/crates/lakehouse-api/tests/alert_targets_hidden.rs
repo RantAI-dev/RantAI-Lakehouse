@@ -68,14 +68,17 @@ impl Respond for FakeCh {
 struct Fixture {
     app: TestApp,
     _ch: MockServer,
+    /// Every statement the `ClickHouse` fake was asked, in order.
+    log: Arc<Mutex<Vec<String>>>,
     read_only: Uuid,
     writer: Uuid,
 }
 
 /// An app whose `ClickHouse` is the fake, and the two callers.
 async fn fixture() -> Fixture {
+    let log = Arc::new(Mutex::new(Vec::new()));
     let fake = FakeCh {
-        log: Arc::new(Mutex::new(Vec::new())),
+        log: Arc::clone(&log),
     };
     let ch = MockServer::start().await;
     Mock::given(method("POST"))
@@ -89,12 +92,18 @@ async fn fixture() -> Fixture {
     Fixture {
         app,
         _ch: ch,
+        log,
         read_only,
         writer,
     }
 }
 
 async fn get(f: &Fixture, who: Uuid, uri: &str) -> (StatusCode, Value) {
+    send(f, who, "GET", uri).await
+}
+
+/// `method` on `uri` as `who`; the answer's status and JSON body.
+async fn send(f: &Fixture, who: Uuid, http_method: &str, uri: &str) -> (StatusCode, Value) {
     let cookie = session_cookie_for_user(&f.app.pool, who).await;
     let response = f
         .app
@@ -102,7 +111,7 @@ async fn get(f: &Fixture, who: Uuid, uri: &str) -> (StatusCode, Value) {
         .clone()
         .oneshot(
             Request::builder()
-                .method("GET")
+                .method(http_method)
                 .uri(uri)
                 .header("cookie", cookie)
                 .body(Body::empty())
@@ -226,6 +235,33 @@ async fn a_rule_never_delivered_to_has_no_last_delivery_key() {
     let (status, body) = get(&f, f.writer, "/api/alerts").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["rules"][0].get("lastDelivery").is_none(), "{body}");
+}
+
+/// `SRC-40` D10 (`TC-1696`): a caller without `alert:write` cannot delete a
+/// rule — the server refuses it, not only the console that hides the control
+/// (principle 3). A pin: it passes on the code before the QA round; it fails
+/// if the `may_manage` check in `routes::alerts::delete` is removed. A delete
+/// is the soft-delete `INSERT INTO console.alert_rule … is_deleted = 1`.
+#[tokio::test]
+async fn a_caller_without_alert_write_cannot_delete_a_rule() {
+    let f = fixture().await;
+    let deleted = |log: &[String]| {
+        log.iter()
+            .filter(|sql| sql.contains("INSERT INTO console.alert_rule"))
+            .count()
+    };
+
+    let (status, body) = send(&f, f.read_only, "DELETE", "/api/alerts?id=al_1").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        deleted(&f.log.lock().unwrap()),
+        0,
+        "the rule was not deleted"
+    );
+
+    let (status, body) = send(&f, f.writer, "DELETE", "/api/alerts?id=al_1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(deleted(&f.log.lock().unwrap()), 1, "one soft delete");
 }
 
 /// A pin: the incidents list is built from names and ids and has no target
