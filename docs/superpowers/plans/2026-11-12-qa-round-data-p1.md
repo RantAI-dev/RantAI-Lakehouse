@@ -1047,7 +1047,7 @@ No existing assertion was removed.
   export starts (an unreadable catalog token, the fingerprint read) writes no run; recording
   those is a new backlog item, filed by the planner. The developer changes nothing for R4.
 - **R7: withdrawn.** Each integration test binary also runs the one test in
-  `tests/common/tls_proxy.rs`, so 8 and 18 are the real counts (7 + 1 and 17 + 1). The
+  `src/tls_proxy.rs`, which `tests/common/mod.rs` includes, so 8 and 18 are the real counts (7 + 1 and 17 + 1). The
   developer changes nothing for R7.
 
 ### R1. BLOCKER: After a failed "Publish now" the card keeps the status it had before, so it still says "Up to date" (acceptance row 10 is not met without a page reload).
