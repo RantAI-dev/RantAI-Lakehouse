@@ -3135,23 +3135,9 @@ pub async fn create(
         body.source_table.as_deref(),
         body.transforms.as_deref(),
     )?;
-    // The legacy form's transforms keep the `transforms[<i>]` message the
-    // console already parses (D7); the compiler checks the same strings
-    // again inside their step, as `steps[0].transforms[<j>]`.
-    if let Some(legacy) = &form.legacy_transforms {
-        for (index, transform) in legacy.iter().enumerate() {
-            crate::transform_grammar::parse_transform(transform).map_err(|err| {
-                ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
-            })?;
-        }
-    }
     // The first input is the one the per-table upstreams and the connector
     // watch (D12); the compiler has already refused a definition with none.
-    let first = form
-        .inputs
-        .first()
-        .ok_or_else(|| ApiError::BadRequest("a pipeline needs at least one input".to_owned()))?
-        .clone();
+    let first = crate::routes::authored_pipelines::first_input(&form)?;
     // DATA-19 / D2 + BLD-4 / D2: `file_ingest_job` and `ingest_job` are
     // only upstreams of a pipeline that reads a Bronze table, so the create
     // route applies the same guard `authored_pipelines::update` and
@@ -3171,94 +3157,50 @@ pub async fn create(
     {
         return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
     }
-    // Validate `depends_on` against the live authored graph + Dagster
-    // job list. PR #57 review F1.7: the id the row will carry is
-    // minted FIRST (`slug_id` derives it from `body.name` and a
-    // timestamp suffix), so the validator's self-reference rule and
-    // any cycle rule see the real id, not `body.name`. Pre-fix this
-    // used `body.name` and so a self-reference was missed whenever the
-    // slug stripped a character the name contained (a name with a
-    // dash, a colon, an apostrophe — every name the LLM
-    // `derive_pipeline_name` produces is snake_case and equal to the
-    // slug, but every other user-typed name is at risk).
-    //
-    // Dagster unreachable degrades to "no Dagster upstreams accepted"
-    // (empty list) rather than 500ing the create. The schedule-ticks
-    // route uses the same pattern — a missing orchestrator on a write
-    // path is a configuration problem the operator reads about in the
-    // logs, not a reason to refuse a create that the rest of the store
-    // would happily accept.
+    // PR #57 review F1.7: the id the row will carry is minted FIRST
+    // (`slug_id` derives it from `body.name` and a timestamp suffix), so the
+    // validator's self-reference rule and any cycle rule see the real id, not
+    // `body.name`.
     let id = pipelines::slug_id(&body.name);
-    let dagster_jobs = match state.dagster.list_jobs().await {
-        Ok(j) => j,
-        Err(err) => {
-            tracing::warn!(%err, "create: dagster unreachable, depends_on accepts authored upstreams only");
-            Vec::new()
-        }
-    };
-    let others =
-        crate::routes::authored_pipelines::collect_authored_depends_on(pool(&state)?, None).await?;
-    crate::routes::authored_pipelines::validate_depends_on(
-        &id,
-        &body.depends_on,
-        &others,
-        &dagster_jobs,
-    )?;
+    // The upstream half: the live authored graph plus Dagster's jobs.
+    crate::routes::authored_pipelines::validate_upstreams(&state, &id, &body.depends_on, "create")
+        .await?;
     crate::routes::authored_pipelines::validate_target_lag(body.target_lag)?;
     let connector_id = body
         .connector_id
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty());
     if let Some(connector_id) = connector_id.as_deref() {
-        // BLD-1 part 1 / D12: a connector names the one Bronze table its
-        // ingest job writes, so a pipeline with a connector reads exactly
-        // one input. Refused here rather than silently watching only the
-        // first, which would make the other inputs look wired and never
-        // refresh the pipeline.
-        if form.inputs.len() != 1 {
-            return Err(ApiError::BadRequest(
-                "a pipeline with a connector has exactly one input".to_owned(),
-            )
-            .into());
-        }
-        require_connector_in_tenant(pool(&state)?, connector_id, tenant_id).await?;
-        // BLD-7 / decision 2 + DEC-15: a pipeline that names a connector
-        // reads one of that connector's Bronze tables, never the source
-        // directly. Runs AFTER the tenant check, so an out-of-tenant
-        // connector keeps answering "not a connector in your tenant"
-        // whatever the source says.
-        crate::routes::authored_pipelines::validate_connector_source(
+        // BLD-7 / decision 2 + DEC-15 + BLD-1 part 1 / D12: a pipeline that
+        // names a connector reads one of that connector's Bronze tables --
+        // exactly one input, the table its ingest writes. The tenant check
+        // runs first, so an out-of-tenant connector keeps answering "not a
+        // connector in your tenant" whatever the input says.
+        crate::routes::authored_pipelines::check_connector_for_definition(
             pool(&state)?,
-            connector_id,
-            &first.zone,
-            &first.table,
+            &lakehouse_store::pipelines::ConnectorChange::Set(connector_id.to_owned()),
+            None,
+            tenant_id,
+            &form.inputs,
         )
         .await?;
     }
-    // BLD-1 part 1 / D2, D4, D5, D6: the definition is checked and compiled
-    // before it is stored, so a step outside the rules is refused at the item
-    // at fault rather than failing its first run (D7). The same compile is
-    // what D9 then gates and rewrites, and what the orchestrator later runs.
-    let compiled = crate::pipeline_compile::validate_and_compile(
-        &form.inputs,
-        &form.steps,
-        Some((&body.target_zone, &body.target_table)),
-        crate::routes::authored_pipelines::catalog_db(&state),
-    )
-    .map_err(crate::routes::authored_pipelines::definition_rejection)?;
-    // BLD-1 part 1 / D9 (F1): what the author may read is checked when the
-    // pipeline is saved, not only when it runs — the same gate and rewrite
-    // the run route applies, as the person the pipeline will read as.
-    let run_as = author_id(&principal);
-    crate::routes::authored_pipelines::save_check_compiled(
+    // BLD-1 part 1 / D2–D6 and D9 (F1): compiled, gated and rewritten as the
+    // person the pipeline will read as, before anything is stored.
+    crate::routes::authored_pipelines::compile_and_save_check(
         &state,
         tenant_id,
-        run_as,
+        author_id(&principal),
         &form.inputs,
         &form.steps,
-        &compiled,
+        (&body.target_zone, &body.target_table),
     )
     .await?;
+    // BLD-1 / D1: the creator is the author, so a pipeline reads as the
+    // person who made it. Only a HUMAN principal gets an author: a service
+    // identity has no `app_user` row, so it stores `None` and does not run
+    // until an admin assigns one (D2).
+    let run_as = author_id(&principal);
     let input = CreatePipelineInput {
         name: body.name,
         kind: body.kind,
@@ -4684,6 +4626,10 @@ mod tests {
     /// for the `run_as` foreign key the create path now writes.
     pub(super) fn fixture_admin_member_principal() -> Principal {
         Principal {
+            // The seeded `fajar@meridian.example`: a real `app_user` whose
+            // Platform Admin role is the `*:*` the save-time check needs (the
+            // check reads the author's real roles, not this fixture's).
+            id: PrincipalId::User(Uuid::parse_str("33333333-3333-4333-8333-000000000006").unwrap()),
             permissions: PermissionSet::parse("*:*"),
             ..fixture_member_principal()
         }
@@ -7852,7 +7798,7 @@ mod tests {
 
             let err = create(
                 State(state),
-                Extension(fixture_admin_member_principal()),
+                Extension(fixture_user_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -9579,6 +9525,9 @@ mod tests {
             env.insert("DATABASE_URL".to_owned(), database_url);
             env.insert("DAGSTER_URL".to_owned(), format!("{dagster_url}/graphql"));
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            // BLD-1 part 1 / D4: the fixture pipelines below read Bronze, which
+            // the compiler names through this database.
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             // SEC-10: these tests deliver to a `wiremock` webhook on loopback,
             // which the production webhook policy refuses and no setting can
             // open; this test-only switch (absent from production builds) lets

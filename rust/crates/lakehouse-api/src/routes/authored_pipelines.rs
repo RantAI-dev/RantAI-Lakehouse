@@ -1075,6 +1075,14 @@ pub(crate) fn definition_form(
         return Err(ApiError::BadRequest(NO_SOURCE.to_owned()).into());
     };
     let transforms = transforms.unwrap_or(&[]);
+    // The legacy form's transforms keep the `transforms[<i>]` message the
+    // console already parses (D7); the compiler checks the same strings again
+    // inside their step.
+    for (index, transform) in transforms.iter().enumerate() {
+        crate::transform_grammar::parse_transform(transform).map_err(|err| {
+            ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
+        })?;
+    }
     let (inputs, steps) = pipelines::legacy_definition(zone, table, transforms);
     Ok(DefinitionForm {
         inputs,
@@ -1083,8 +1091,35 @@ pub(crate) fn definition_form(
     })
 }
 
+/// The first of a definition's inputs — the one a connector or a per-table
+/// upstream watches (D12). The compiler refuses a definition with none; this
+/// is the route's own guard for the same case before it reaches the compiler.
+fn first_of(
+    inputs: &[lakehouse_store::pipelines::PipelineInput],
+) -> Result<lakehouse_store::pipelines::PipelineInput, ApiRejection> {
+    inputs.first().cloned().ok_or_else(|| {
+        ApiError::BadRequest("a pipeline needs at least one input".to_owned()).into()
+    })
+}
+
+/// [`first_of`] on a normalized body.
+pub(crate) fn first_input(
+    form: &DefinitionForm,
+) -> Result<lakehouse_store::pipelines::PipelineInput, ApiRejection> {
+    first_of(&form.inputs)
+}
+
+/// The `app_user` a principal acts as, or `None` for a service identity — D10
+/// only moves an author to a person.
+fn caller_user_id(principal: &Principal) -> Option<Uuid> {
+    match principal.id {
+        PrincipalId::User(user_id) => Some(user_id),
+        PrincipalId::Service(_) => None,
+    }
+}
+
 /// BLD-1 part 1 / D2–D6: the compiler's refusal as the route answers it (400).
-pub(crate) fn definition_rejection(err: crate::pipeline_compile::DefinitionError) -> ApiRejection {
+pub(crate) fn definition_rejection(err: &crate::pipeline_compile::DefinitionError) -> ApiRejection {
     ApiError::BadRequest(err.to_string()).into()
 }
 
@@ -1283,9 +1318,8 @@ pub(crate) async fn save_check_compiled(
     let PipelineActor::Author(author) = actor else {
         return Ok(());
     };
-    let refusal = match check_and_rewrite(state, &author, tenant_id, compiled).await {
-        Ok(_) => return Ok(()),
-        Err(refusal) => refusal,
+    let Err(refusal) = check_and_rewrite(state, &author, tenant_id, compiled).await else {
+        return Ok(());
     };
     let (table, message) = match &refusal {
         EnforcementRefusal::Gate(err) => (None, gate_message(err)),
@@ -1304,6 +1338,128 @@ pub(crate) async fn save_check_compiled(
     };
     let path = refusal_path(inputs, steps, table, &message);
     Err(ApiError::Unprocessable(format!("{path}: {message}")).into())
+}
+
+/// The upstream half of a creation: refuse `depends_on` entries that are not
+/// this deployment's pipelines or `Dagster` jobs, that form a cycle, or that
+/// name the id being created.
+///
+/// Dagster unreachable degrades to "no Dagster upstreams accepted" rather
+/// than 500ing the write — the rule "no cycle through authored pipelines"
+/// still fires, and the "every id is a live job" rule fires again on the next
+/// edit once Dagster is back.
+///
+/// # Errors
+///
+/// [`ApiRejection`] (400) from [`validate_depends_on`], with its own message.
+pub(crate) async fn validate_upstreams(
+    state: &AppState,
+    id: &str,
+    depends_on: &[String],
+    route: &'static str,
+) -> Result<(), ApiRejection> {
+    let dagster_jobs = match state.dagster.list_jobs().await {
+        Ok(jobs) => jobs,
+        Err(err) => {
+            tracing::warn!(%err, route, "dagster unreachable, depends_on accepts authored upstreams only");
+            Vec::new()
+        }
+    };
+    let others = crate::routes::authored_pipelines::collect_authored_depends_on(
+        crate::routes::pipelines::pool(state)?,
+        None,
+    )
+    .await?;
+    validate_depends_on(id, depends_on, &others, &dagster_jobs)
+}
+
+/// BLD-1 part 1 / D2–D6 + D9: compile a definition and run the save-time gate
+/// and rewrite as `run_as`, in that order — the one step `create`, `update`
+/// and `restore_version` all run before a write.
+///
+/// Returns the compiled statement, which the caller does not need yet but
+/// which the run route's answer (D8) is built from, so keeping it makes the
+/// two answers provably the same text.
+///
+/// # Errors
+///
+/// [`ApiRejection`]: 400 naming the input or step at fault for D2–D6, 422 for
+/// the gate or the rewrite (D7, D9).
+pub(crate) async fn compile_and_save_check(
+    state: &AppState,
+    tenant_id: Option<Uuid>,
+    run_as: Option<Uuid>,
+    inputs: &[lakehouse_store::pipelines::PipelineInput],
+    steps: &[lakehouse_store::pipelines::PipelineStep],
+    target: (&str, &str),
+) -> Result<String, ApiRejection> {
+    let compiled = crate::pipeline_compile::validate_and_compile(
+        inputs,
+        steps,
+        Some(target),
+        catalog_db(state),
+    )
+    .map_err(|err| definition_rejection(&err))?;
+    save_check_compiled(state, tenant_id, run_as, inputs, steps, &compiled).await?;
+    Ok(compiled)
+}
+
+/// BLD-1 part 1 / D10 (`SEC-71`): the author a write stores when the caller
+/// changed what the pipeline READS.
+///
+/// `Some(caller)` when the caller is a person, is not already the author, and
+/// the inputs or steps differ from the stored ones — reading as someone else
+/// after their edit is how an editor would see rows they may not see.
+/// `None` leaves the stored author alone, which is what an edit of the
+/// schedule, the description or the retries asks for.
+pub(crate) fn author_after_edit(
+    current: Option<Uuid>,
+    caller: Option<Uuid>,
+    reads_changed: bool,
+) -> Option<Uuid> {
+    caller.filter(|user_id| Some(*user_id) != current && reads_changed)
+}
+
+/// BLD-1 part 1 / D12 + BLD-9 decision 7: a connector names the one Bronze
+/// table its ingest job writes, so a pipeline that keeps or sets one reads
+/// exactly one input, and that input must be a table the connector loads.
+///
+/// # Errors
+///
+/// [`ApiRejection`] (400) when the definition has more than one input or the
+/// input is not one of the connector's tables — the same sentences `create`
+/// and `update` answer with, from this one helper.
+pub(crate) async fn check_connector_for_definition(
+    pool: &PgPool,
+    change: &ConnectorChange,
+    current_connector: Option<&str>,
+    tenant_id: Option<Uuid>,
+    inputs: &[lakehouse_store::pipelines::PipelineInput],
+) -> Result<(), ApiRejection> {
+    // Absent `connectorId` keeps the stored one, and the source may still
+    // change in the same body, so the rule is checked against the connector
+    // the row will END with (BLD-7 review SHOULD-FIX 1). A kept connector's
+    // tenant was checked when it was set; a newly named one is checked here.
+    let (connector_id, check_tenant) = match change {
+        ConnectorChange::Clear => return Ok(()),
+        ConnectorChange::Set(connector_id) => (connector_id.clone(), true),
+        ConnectorChange::Keep => match current_connector {
+            Some(connector_id) => (connector_id.to_owned(), false),
+            None => return Ok(()),
+        },
+    };
+    if inputs.len() != 1 {
+        return Err(ApiError::BadRequest(
+            "a pipeline with a connector has exactly one input".to_owned(),
+        )
+        .into());
+    }
+    if check_tenant {
+        crate::routes::pipelines::require_connector_in_tenant(pool, &connector_id, tenant_id)
+            .await?;
+    }
+    let first = first_of(inputs)?;
+    validate_connector_source(pool, &connector_id, &first.zone, &first.table).await
 }
 
 /// Ask the orchestrator to rebuild its authored jobs. Best effort: the
@@ -1945,21 +2101,9 @@ pub async fn update(
         body.source_table.as_deref(),
         body.transforms.as_deref(),
     )?;
-    // The legacy form keeps the `transforms[<i>]` message the console already
-    // parses (D7); the compiler checks the same strings again inside their
-    // step.
-    if let Some(legacy) = &form.legacy_transforms {
-        for (index, transform) in legacy.iter().enumerate() {
-            crate::transform_grammar::parse_transform(transform).map_err(|err| {
-                ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
-            })?;
-        }
-    }
-    let first = form
-        .inputs
-        .first()
-        .ok_or_else(|| ApiError::BadRequest("a pipeline needs at least one input".to_owned()))?
-        .clone();
+    // The first input is the one the per-table upstreams and the connector
+    // watch (D12).
+    let first = first_input(&form)?;
     // DATA-19 / D2 + BLD-4 / D2: the same shape as the guard above, on the
     // upstream side. `None` here means the body omitted `dependsOn` and the
     // stored chain is kept, so there is nothing new to check. D12: the FIRST
@@ -1969,94 +2113,35 @@ pub async fn update(
     let current = pipelines::get_pipeline(pool, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-    // BLD-9 / decision 7: `connectorId` is optional on this route, and the
-    // three cases differ. Absent (`None`) leaves the stored connector
-    // alone, exactly like `owner`/`max_retries`; `null` or an empty string
-    // clears it; a value sets or replaces it. Decision 2 applies to a
-    // value: the connector must be one the pipeline's own tenant owns, and
-    // the source must be one of ITS Bronze tables -- the same sentence
-    // `create` answers with, from the same helper.
-    //
-    // The tenant is the PIPELINE's, not the caller's: `in_scope` above
-    // already refused a row the caller cannot touch, and a Platform Admin
-    // editing another tenant's pipeline must still be held to that row's
-    // tenant, or an edit could attach a connector across tenants.
+    // BLD-9 / decision 7 + BLD-1 part 1 / D12: `connectorId` has three
+    // states -- absent keeps the stored connector, `null` or an empty string
+    // clears it, a value sets it in the pipeline's own tenant (the row
+    // `in_scope` already vouched for). Whichever it is, a pipeline that ends
+    // with a connector reads exactly one input, the Bronze table that
+    // connector's ingest writes.
     let connector_change = body.connector_id;
-    //
-    // PR review (BLD-7, SHOULD-FIX 1): an absent `connectorId` keeps the
-    // stored one, and the source may still change in the same body, so the
-    // rule is checked against the connector the row will END with, not
-    // only a newly submitted one. Otherwise an edit could point a
-    // connector's pipeline at a table that connector never loads.
-    //
-    // BLD-1 part 1 / D12: a connector means the pipeline reads exactly one
-    // Bronze input, the table that connector's ingest writes.
-    let ends_with_connector = match &connector_change {
-        ConnectorChange::Clear => None,
-        ConnectorChange::Set(connector_id) => Some(connector_id.clone()),
-        ConnectorChange::Keep => current.connector_id.clone(),
-    };
-    if let Some(connector_id) = ends_with_connector.as_deref() {
-        if form.inputs.len() != 1 {
-            return Err(ApiError::BadRequest(
-                "a pipeline with a connector has exactly one input".to_owned(),
-            )
-            .into());
-        }
-        match &connector_change {
-            ConnectorChange::Set(connector_id) => {
-                crate::routes::pipelines::require_connector_in_tenant(
-                    pool,
-                    connector_id,
-                    current.tenant_id,
-                )
-                .await?;
-            }
-            // Kept: the tenant check ran when it was set, and `in_scope`
-            // has already vouched for the row.
-            ConnectorChange::Keep | ConnectorChange::Clear => {}
-        }
-        validate_connector_source(pool, connector_id, &first.zone, &first.table).await?;
-    }
-    // BLD-1 part 1 / D2, D4, D5, D6: checked and compiled before anything is
-    // written, exactly as `create` does.
-    let compiled = crate::pipeline_compile::validate_and_compile(
+    check_connector_for_definition(
+        pool,
+        &connector_change,
+        current.connector_id.as_deref(),
+        current.tenant_id,
         &form.inputs,
-        &form.steps,
-        Some((&body.target_zone, &body.target_table)),
-        catalog_db(&state),
     )
-    .map_err(definition_rejection)?;
-    // Dagster unreachable degrades to "no Dagster upstreams accepted"
-    // (empty list) rather than 500ing the update — see
-    // `routes::pipelines::create`'s identical treatment. The rule
-    // "no-cycle through authored pipelines" still fires; the rule
-    // "every id is a real Dagster job" cannot, so a submitted Dagster
-    // name that does not match the (unreachable) live list is treated
-    // as if no live list exists, which means the submitter will see
-    // "unknown pipeline" once Dagster is back and the rule fires again.
+    .await?;
+    // F2.8 (PR #59 review): the shared validator runs the transform grammar,
+    // the `max_retries` range, and (when present) the dependency walk, scoped
+    // to the caller's tenant so a cross-tenant `pl-` id reads as "unknown"
+    // (F2.2). `None` skips the walk: the COALESCE write preserves the chain.
     let dagster_jobs = match state.dagster.list_jobs().await {
-        Ok(j) => j,
+        Ok(jobs) => jobs,
         Err(err) => {
             tracing::warn!(%err, "update: dagster unreachable, depends_on accepts authored upstreams only");
             Vec::new()
         }
     };
-    // F2.2 (PR #59 review): scope `others` by the caller's tenant
-    // before handing it to `validate_depends_on`, so a cross-tenant
-    // `pl-` id submitted as a `dependsOn` reads as "unknown" to the
-    // validator — same 400 body as a genuinely missing id, no
-    // existence oracle. The scope resolution re-uses the headers the
-    // `in_scope` call above already validated with, so the two agree
-    // on what "in scope" means.
     let scope = resolve_caller_scope(&principal, &headers)?;
     let others_rows = collect_authored_depends_on_with_tenants(pool, Some(&id)).await?;
     let others = in_scope_depends_on_rows(&others_rows, scope);
-    // F2.8 (PR #59 review): the shared validator runs the transform
-    // grammar, `max_retries` range, and (when present) the dependency
-    // validator. `body.depends_on` is `Option<Vec<String>>` already —
-    // `None` skips the dependency walk (the COALESCE write preserves
-    // the stored chain), `Some(vec)` replaces it.
     validate_pipeline_input(
         &id,
         form.legacy_transforms.as_deref().unwrap_or(&[]),
@@ -2065,31 +2150,24 @@ pub async fn update(
         &others,
         &dagster_jobs,
     )?;
-    // BLD-1 part 1 / D10 (`SEC-71`): when a person other than the current
-    // author changes what the pipeline READS, the pipeline reads as them from
-    // then on -- reading as someone else after their edit is how an editor
-    // would see rows they may not see. An edit that changes neither the
-    // inputs nor the steps (the schedule, the description, the retries)
-    // leaves the author alone.
+    // BLD-1 part 1 / D10 (`SEC-71`): an edit that changes what the pipeline
+    // reads moves the author to the editor; one that changes neither the
+    // inputs nor the steps leaves the author alone.
     let stored = pipelines::get_definition(pool, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     let inputs_changed = stored.inputs != form.inputs || stored.steps != form.steps;
-    let caller = match principal.id {
-        PrincipalId::User(user_id) => Some(user_id),
-        PrincipalId::Service(_) => None,
-    };
-    let new_run_as = caller.filter(|user_id| Some(*user_id) != current.run_as && inputs_changed);
-    let effective_run_as = new_run_as.or(current.run_as);
-    // BLD-1 part 1 / D9: the gate and the rewrite for the definition as it
-    // will be stored, as the person it will read as.
-    save_check_compiled(
+    let caller = caller_user_id(&principal);
+    let new_run_as = author_after_edit(current.run_as, caller, inputs_changed);
+    // BLD-1 part 1 / D2–D6 and D9: compiled, gated and rewritten as the
+    // person the pipeline will read as after this edit.
+    compile_and_save_check(
         &state,
         current.tenant_id,
-        effective_run_as,
+        new_run_as.or(current.run_as),
         &form.inputs,
         &form.steps,
-        &compiled,
+        (&body.target_zone, &body.target_table),
     )
     .await?;
     let input = UpdatePipelineInput {
@@ -2285,10 +2363,7 @@ pub async fn restore_version(
     // written before the shape existed is turned into it by D3's rule, so a
     // restore of an old version reproduces what that version's pipeline was.
     let (restored_inputs, restored_steps) = pipelines::snapshot_definition(&snapshot);
-    let first = restored_inputs
-        .first()
-        .ok_or_else(|| ApiError::BadRequest("a pipeline needs at least one input".to_owned()))?
-        .clone();
+    let first = first_of(&restored_inputs)?;
     // DATA-19 / D2 + BLD-4 / D2: the snapshot is replayed whole, so its
     // `depends_on` is checked against its own source zone on every restore
     // (a stored version can predate the rule, the same reason the
@@ -2329,17 +2404,6 @@ pub async fn restore_version(
         &others,
         &dagster_jobs,
     )?;
-    // BLD-1 part 1 / D2, D4, D5, D6: a stored definition can predate every
-    // rule this branch added, and a restore writes it straight back into the
-    // row, so it is compiled and checked exactly as `create` and `update`
-    // check theirs.
-    let compiled = crate::pipeline_compile::validate_and_compile(
-        &restored_inputs,
-        &restored_steps,
-        Some((&snapshot.target_zone, &snapshot.target_table)),
-        catalog_db(&state),
-    )
-    .map_err(definition_rejection)?;
     // BLD-1 part 1 / D10 (`SEC-71`): a version that reads differently from
     // the current definition, restored by someone other than the current
     // author, makes that person the author -- the same rule an edit follows.
@@ -2347,19 +2411,17 @@ pub async fn restore_version(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     let inputs_changed = stored.inputs != restored_inputs || stored.steps != restored_steps;
-    let caller = match principal.id {
-        PrincipalId::User(user_id) => Some(user_id),
-        PrincipalId::Service(_) => None,
-    };
-    let new_run_as = caller.filter(|user_id| Some(*user_id) != current.run_as && inputs_changed);
-    // BLD-1 part 1 / D9: the same save-time check `create` and `update` run.
-    save_check_compiled(
+    let caller = caller_user_id(&principal);
+    let new_run_as = author_after_edit(current.run_as, caller, inputs_changed);
+    // BLD-1 part 1 / D2–D6 and D9: the same compile, gate and rewrite
+    // `create` and `update` run.
+    compile_and_save_check(
         &state,
         current.tenant_id,
         new_run_as.or(current.run_as),
         &restored_inputs,
         &restored_steps,
-        &compiled,
+        (&snapshot.target_zone, &snapshot.target_table),
     )
     .await?;
     // Rebuild an `UpdatePipelineInput` from the snapshot. `name` and
@@ -2572,12 +2634,12 @@ mod tests {
     fn unrestricted_principal() -> Principal {
         Principal {
             // BLD-1 part 1 / D9 and D10: a save may now store `run_as`, which
-            // has a foreign key to `app_user`. A made-up uuid would make every
-            // update in these tests fail on that key, so this fixture is the
-            // seeded `rina@meridian.example` (`0002_seed_identity.sql`) — still
-            // `*:*` through `permissions` below, which is the part the tests
-            // are about.
-            id: PrincipalId::User(Uuid::parse_str("33333333-3333-4333-8333-000000000001").unwrap()),
+            // has a foreign key to `app_user`, and the save-time check reads
+            // the pipeline as that user's REAL roles. A made-up uuid would
+            // fail the key, so this fixture is the seeded
+            // `fajar@meridian.example` (`0002_seed_identity.sql`), whose
+            // Platform Admin role is the `*:*` the gate needs.
+            id: PrincipalId::User(Uuid::parse_str("33333333-3333-4333-8333-000000000006").unwrap()),
             tenant_ids: Vec::new(),
             display_name: "fixture".to_owned(),
             permissions: PermissionSet::parse("*:*"),
