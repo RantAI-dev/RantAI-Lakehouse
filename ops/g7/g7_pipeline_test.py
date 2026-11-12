@@ -1300,9 +1300,14 @@ def step_a_two_input_sql_pipeline_matches_a_direct_query() -> None:
             f"{_run_failure_message(pipeline_id, run_id)}"
         )
 
+    # R1-S5: the direct query is the SAME join the pipeline runs, against the
+    # catalog database, and it carries the Iceberg read setting every other
+    # read of that database in this file carries.
     direct = ch_query(
-        f"SELECT customer, sum(amount) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` "
-        "GROUP BY customer ORDER BY customer FORMAT TabSeparated"
+        f"SELECT l.customer, sum(l.amount) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS l "
+        f"JOIN {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS r ON l.id = r.id "
+        "GROUP BY l.customer ORDER BY l.customer "
+        "SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
     ).strip()
     written = ch_query(
         f"SELECT customer, total FROM silver.`{target}` ORDER BY customer FORMAT TabSeparated"

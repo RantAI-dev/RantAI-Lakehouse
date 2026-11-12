@@ -59,15 +59,11 @@ use lakehouse_store::pipelines::{PipelineInput, PipelineStep};
 use crate::sql_guard::check_pipeline_step_sql;
 use crate::transform_grammar::{Transform, parse_transform};
 
-/// Tokens a step's SQL may not contain, already enforced by
-/// [`check_pipeline_step_sql`]; named here so the compiler's own tests read
-/// as the rule they are.
-///
-/// At most 5 inputs (decision 4).
+/// At most 5 inputs per pipeline (decision 4).
 pub const MAX_INPUTS: usize = 5;
-/// At most 20 steps (decision 15).
+/// At most 20 steps per pipeline (decision 15).
 pub const MAX_STEPS: usize = 20;
-/// Longest name, in characters (D2).
+/// Longest input or step name, in characters (D2).
 pub const MAX_NAME_CHARS: usize = 48;
 
 /// One refusal from the compiler: which input, step or transform is at

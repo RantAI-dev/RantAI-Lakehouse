@@ -1205,7 +1205,8 @@ mod t1_3_tests {
         args.insert("name".to_owned(), json!("tool-sql-step"));
         args.insert(
             "inputs".to_owned(),
-            json!([{ "name": "orders", "zone": "serving", "table": "orders" }]),
+            // R1-S6: an input zone the tool's own schema lists.
+            json!([{ "name": "orders", "zone": "silver", "table": "orders" }]),
         );
         args.insert(
             "steps".to_owned(),
