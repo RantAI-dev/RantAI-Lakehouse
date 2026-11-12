@@ -918,6 +918,39 @@ describe("Activity tab: usage and history", () => {
   })
 })
 
+describe("A page opened with a table grant (GOV-11, review round 1 R2)", () => {
+  const NOTE = "Shown with a table grant: related tables and usage are hidden"
+
+  it("says the connections are hidden on the overview instead of reading them as zero", () => {
+    stubApi()
+    renderTabs({ ...BRONZE, shownWithTableGrant: true })
+    expect(screen.getByText(NOTE)).toBeTruthy()
+  })
+
+  it("says it on the Lineage tab, where the related panels are drawn", async () => {
+    stubApi({ lineage: NO_LINEAGE })
+    url.search = "tab=lineage"
+    renderTabs({ ...BRONZE, shownWithTableGrant: true })
+    expect(screen.getByText(NOTE)).toBeTruthy()
+    expect(await screen.findByText("Dependents")).toBeTruthy()
+  })
+
+  it("says it on the Activity tab, above the usage it was withheld from", () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({ ...BRONZE, shownWithTableGrant: true, usage: usageOf({ queries: 0 }) })
+    expect(screen.getByText(NOTE)).toBeTruthy()
+  })
+
+  // The server decides: a `catalog:read` body carries no flag, so the page
+  // draws the panels it was given and says nothing about hiding.
+  it("says nothing for a catalog reader", () => {
+    stubApi()
+    renderTabs(BRONZE)
+    expect(screen.queryByText(NOTE)).toBeNull()
+  })
+})
+
 describe("Lineage tab: dependents", () => {
   it("links a saved query and a dashboard that read the asset", async () => {
     stubApi({ lineage: NO_LINEAGE })

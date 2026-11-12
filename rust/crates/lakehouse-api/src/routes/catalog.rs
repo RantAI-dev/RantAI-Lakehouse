@@ -1771,7 +1771,7 @@ pub async fn detail(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    ensure_may_open_asset(&state, &principal, &id).await?;
+    let admission = ensure_may_open_asset(&state, &principal, &id).await?;
     if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
         return Ok((
             StatusCode::OK,
@@ -1782,27 +1782,35 @@ pub async fn detail(
     // GOV-7 D6: a hidden asset answers the SAME 404 an unknown id answers
     // (D2), before its columns or rows are read.
     let access = table_access_for(&state, &principal).await?;
-    if id.starts_with("silver.") || id.starts_with("serving.") {
+    let mut body = if id.starts_with("silver.") || id.starts_with("serving.") {
         if !access.allows_key(&id) {
             return Err(asset_not_found().into());
         }
-        return clickhouse_asset_detail(&state, &principal, &headers, &id).await;
-    }
-    // A Bronze id is a registry slug; the body names the table it serves
-    // (`tableKey`), so the registry answers the question, not a guess.
-    match bronze_asset_detail_body(&state, &principal, &headers, &id).await {
-        Ok(Some(body)) if asset_visible(&access, &body) => {
-            Ok((StatusCode::OK, ApiJson(body)).into_response())
+        clickhouse_asset_detail(&state, &principal, &headers, &id).await?
+    } else {
+        // A Bronze id is a registry slug; the body names the table it serves
+        // (`tableKey`), so the registry answers the question, not a guess.
+        match bronze_asset_detail_body(&state, &principal, &headers, &id).await {
+            Ok(Some(body)) if asset_visible(&access, &body) => body,
+            Ok(_) => return Err(not_found()),
+            // `catch (e) { return NextResponse.json({ error: String(e) }, {
+            // status: 503 }); }` in `catalog/[id]/route.ts`.
+            Err(err) => {
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ApiJson(json!({ "error": upstream_message(err) })),
+                )
+                    .into_response());
+            }
         }
-        Ok(_) => Err(not_found()),
-        // `catch (e) { return NextResponse.json({ error: String(e) }, {
-        // status: 503 }); }` in `catalog/[id]/route.ts`.
-        Err(err) => Ok((
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": upstream_message(err) })),
-        )
-            .into_response()),
+    };
+    // Review round 1 R2: one strip at the very end, after every builder has
+    // filled the body, so a table grant cannot carry another table's or
+    // another person's facts by a later change inside a builder.
+    if !admission.shows_related() {
+        hide_related_tables(&mut body);
     }
+    Ok((StatusCode::OK, ApiJson(body)).into_response())
 }
 
 /// The permission reading an asset's rows needs — the same one
@@ -2550,7 +2558,7 @@ async fn clickhouse_asset_detail(
     principal: &Principal,
     headers: &HeaderMap,
     id: &str,
-) -> ApiResult<Response> {
+) -> ApiResult<Value> {
     let ch = &state.clickhouse;
     let (db, table) = split_db_table(id);
     if (db != "silver" && db != "serving") || table.is_empty() {
@@ -2661,7 +2669,7 @@ async fn clickhouse_asset_detail(
     .await;
     mark_schema_versions(ch, &mut body, &key).await;
     mark_annotation_and_history(state, &mut body, id, &[key]).await;
-    Ok((StatusCode::OK, ApiJson(body)).into_response())
+    Ok(body)
 }
 
 #[allow(
@@ -3290,11 +3298,13 @@ pub(crate) async fn ensure_asset_readable(
 /// says nothing about whether the id exists. A grant on table A opens A and
 /// nothing else.
 ///
-/// What the admitted person then sees is what a `catalog:read` reader sees,
-/// built by the same code: the tenant gate, the role's table access (`GOV-7`
-/// — a grant gives a permission, not a table), and masks and row filters on
-/// the sample. `query:read` itself stays global, as
-/// [`super::catalog_grants`] says.
+/// What the admitted person then sees is built by the same code as a
+/// `catalog:read` reader's: the tenant gate, the role's table access
+/// (`GOV-7` — a grant gives a permission, not a table), and masks and row
+/// filters on the sample. A **grant** admits the caller to one table's own
+/// facts only, so [`detail`] withholds what names another table or another
+/// person ([`hide_related_tables`], review round 1 R2). `query:read` itself
+/// stays global, as [`super::catalog_grants`] says.
 ///
 /// # Errors
 ///
@@ -3304,9 +3314,9 @@ async fn ensure_may_open_asset(
     state: &AppState,
     principal: &Principal,
     id: &str,
-) -> Result<(), ApiError> {
+) -> Result<Admission, ApiError> {
     if principal.has("catalog:read") {
-        return Ok(());
+        return Ok(Admission::CatalogRead);
     }
     if principal.has(SAMPLE_PERMISSION)
         && let Some(user_id) = principal.user_id()
@@ -3318,9 +3328,61 @@ async fn ensure_may_open_asset(
         )
         .await?
     {
-        return Ok(());
+        return Ok(Admission::TableGrant);
     }
     Err(ApiError::PermissionDenied("catalog:read".to_owned()))
+}
+
+/// Which of the two admits a caller to a table's page (`GOV-11`, `DEC-20`;
+/// review round 1, R2). Decided here, from the permissions the principal
+/// was loaded with and the grant rows, never from anything a client sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// The caller holds `catalog:read`: the page is the catalog's, and it
+    /// names related tables, what reads them and who queries them.
+    CatalogRead,
+    /// The caller holds `query:read` and a `query:read` grant made from
+    /// this table: that table's own facts, and nothing about another table
+    /// or another person.
+    TableGrant,
+}
+
+impl Admission {
+    /// Whether the page may name other tables and other people.
+    ///
+    /// Only `catalog:read` may. Anything else — including an admission this
+    /// code does not know yet — reads as the grant-holder, so a new way in
+    /// cannot leak related tables by default (fail closed).
+    fn shows_related(self) -> bool {
+        matches!(self, Self::CatalogRead)
+    }
+}
+
+/// Withholds what a table grant does not reach (review round 1, R2): the
+/// tables this one is built from (`upstream`) or built into
+/// (`downstream`), the tables people join it with and the people and
+/// statement shapes the usage counts came from, what saved queries and
+/// dashboards read it (`dependents`), and a deprecation's replacement id
+/// and name. The lists stay, empty, because each field's type is a list;
+/// the two replacement keys are removed, because a blank replacement names
+/// no table. `shownWithTableGrant` says why, so the console can say "Shown
+/// with a table grant: related tables and usage are hidden" instead of
+/// drawing empty panels as if nothing existed.
+fn hide_related_tables(body: &mut Value) {
+    let Some(o) = body.as_object_mut() else {
+        return;
+    };
+    o.insert("shownWithTableGrant".to_owned(), json!(true));
+    for key in ["upstream", "downstream", "dependents"] {
+        o.insert(key.to_owned(), Value::Array(Vec::new()));
+    }
+    if let Some(usage) = o.get_mut("usage").and_then(Value::as_object_mut) {
+        for key in ["joinedTables", "frequentUsers", "frequentQueries"] {
+            usage.insert(key.to_owned(), Value::Array(Vec::new()));
+        }
+    }
+    o.remove("replacementAssetId");
+    o.remove("replacementName");
 }
 
 /// [`ensure_asset_readable`] over an already canonical `"schema.table"` key
@@ -6998,10 +7060,14 @@ mod tests {
 
         /// `GOV-11` (`DEC-20`; QA `LH-DATA-15-03` F2): a person who holds
         /// `query:read` and a `query:read` grant made from `serving.mart_x`
-        /// opens that table's page without `catalog:read`, and sees what a
-        /// `catalog:read` reader sees — the mask still applies. The same
-        /// person is refused another table, and a person with no grant row is
-        /// refused even this one.
+        /// opens that table's page without `catalog:read`, and sees that
+        /// table's own facts — the mask still applies. The same person is
+        /// refused another table, and a person with no grant row is refused
+        /// even this one.
+        ///
+        /// Review round 1 R2 (the planner's ruling on `DEC-20`): what the
+        /// grant admits to is the table and nothing about another table or
+        /// another person, while a `catalog:read` caller's body is untouched.
         #[sqlx::test(migrations = "../../migrations")]
         async fn detail_admits_a_person_granted_query_read_on_that_table_and_masks_what_they_read(
             pool: lakehouse_store::PgPool,
@@ -7010,9 +7076,10 @@ mod tests {
             const GRANTOR: &str = "33333333-3333-4333-8333-000000000006";
             let server = MockServer::start().await;
             let grantee = analyst_with_id(GRANTEE.parse().unwrap(), "query:read");
+            let grantee_id = grantee.user_id().expect("a person, not a service");
             lakehouse_store::agents::create_direct_grant(
                 &pool,
-                grantee.user_id().expect("a person, not a service"),
+                grantee_id,
                 "query:read",
                 "serving.mart_x",
                 GRANTOR.parse().unwrap(),
@@ -7025,9 +7092,13 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["schema"][1]["masked"], json!(true));
             assert_eq!(body["sample"], json!([{"id": "1", "email": "***"}]));
+            // Admitted by the grant, so the page says why its related
+            // panels are empty.
+            assert_eq!(body["shownWithTableGrant"], json!(true));
 
             // A grant made from one asset opens that asset, not every table.
-            let (status, body) = detail_for(&pool, &server, grantee, "serving.mart_y").await;
+            let (status, body) =
+                detail_for(&pool, &server, grantee.clone(), "serving.mart_y").await;
             assert_eq!(
                 status,
                 StatusCode::FORBIDDEN,
@@ -7042,7 +7113,186 @@ mod tests {
             );
             let (status, body) = detail_for(&pool, &server, ungranted, "serving.mart_x").await;
             assert_eq!(status, StatusCode::FORBIDDEN, "no grant: {body}");
+
+            // Review round 1 R2: a second table, with something to hide on
+            // every side. `silver.orders` is built from a registered Bronze
+            // dataset (`upstream`), the query history holds one statement
+            // that joins it (`usage.joinedTables`, `frequentUsers`,
+            // `frequentQueries`), and a mark names a replacement.
+            lakehouse_store::agents::create_direct_grant(
+                &pool,
+                grantee_id,
+                "query:read",
+                "silver.orders",
+                GRANTOR.parse().unwrap(),
+                30,
+            )
+            .await
+            .expect("granting query:read from silver.orders");
+            // The Bronze registry the upstream link comes from.
+            Mock::given(method("POST"))
+                .and(body_string_contains("bronze_meta.dataset_catalog"))
+                .respond_with(ch_json(
+                    &[("slug", "String")],
+                    &json!([{"slug": "orders_raw"}]),
+                ))
+                .mount(&server)
+                .await;
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: None,
+                    replacement_asset_id: Some("silver.orders_v2".to_owned()),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .expect("marking silver.orders deprecated");
+            sqlx::query(
+                "INSERT INTO query_history \
+                 (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
+                  workload_class, engine, cache_assisted, owner_id, tables_read) \
+                 VALUES ('r2-join', \
+                         'SELECT silver.orders.id FROM silver.orders \
+                          JOIN silver.customers ON silver.orders.id = silver.customers.id', \
+                         'Rina Wijaya', 'completed', 90, 0, 0, 'interactive', 'clickhouse', \
+                         false, NULL, ARRAY['silver.orders', 'silver.customers'])",
+            )
+            .execute(&pool)
+            .await
+            .expect("recording the join in the query history");
+
+            let (status, body) = detail_for(&pool, &server, grantee.clone(), "silver.orders").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["shownWithTableGrant"], json!(true));
+            assert!(
+                body.get("upstream").is_none_or(Value::is_null) || body["upstream"] == json!([]),
+                "a grant shows no table this one is built from: {body}"
+            );
+            assert_eq!(body["usage"]["joinedTables"], json!([]), "{body}");
+            assert_eq!(body["usage"]["frequentUsers"], json!([]), "{body}");
+            assert_eq!(body["usage"]["frequentQueries"], json!([]), "{body}");
+            assert_eq!(body["dependents"], json!([]), "{body}");
+            assert!(
+                body.get("replacementAssetId").is_none() && body.get("replacementName").is_none(),
+                "a grant does not name the replacement: {body}"
+            );
+            // The table's own facts stay: its description, columns, sample,
+            // masks, policy summary, marks, the counts, and the columns the
+            // queries used.
+            assert_eq!(body["tableKey"], json!("silver.orders"));
+            assert_eq!(body["certification"], json!("deprecated"));
+            assert_eq!(body["usage"]["queries"], json!(1), "{body}");
+            assert_eq!(body["schema"].as_array().map(Vec::len), Some(2), "{body}");
+
+            // The same read as a `catalog:read` caller still carries every
+            // related field and no flag: the body is what it always was.
+            let (status, full) = detail_for(
+                &pool,
+                &server,
+                analyst("catalog:read, query:read"),
+                "silver.orders",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{full}");
+            assert!(
+                full.get("shownWithTableGrant").is_none(),
+                "a catalog:read body does not change: {full}"
+            );
+            assert_eq!(
+                full["upstream"],
+                json!([{"id": "orders_raw", "name": "bronze.orders"}]),
+                "{full}"
+            );
+            assert!(
+                !full["usage"]["joinedTables"]
+                    .as_array()
+                    .expect("a list")
+                    .is_empty(),
+                "the joined table is still there for catalog:read: {full}"
+            );
+            assert!(
+                !full["usage"]["frequentUsers"]
+                    .as_array()
+                    .expect("a list")
+                    .is_empty(),
+                "the people are still there for catalog:read: {full}"
+            );
+            assert!(
+                !full["usage"]["frequentQueries"]
+                    .as_array()
+                    .expect("a list")
+                    .is_empty(),
+                "the statement shapes are still there for catalog:read: {full}"
+            );
+            assert_eq!(full["replacementAssetId"], json!("silver.orders_v2"));
+            // Everything the grant-holder still sees, the catalog reader
+            // sees identically: only the related fields differ between them.
+            for key in ["id", "name", "schema", "sample"] {
+                assert_eq!(body[key], full[key], "{key} must not differ: {full}");
+            }
             Ok(())
+        }
+
+        /// Review round 1 R2: only `catalog:read` keeps the related tables,
+        /// and the strip leaves the table's own fields exactly as they were
+        /// — the lists stay (empty), the replacement keys go.
+        #[test]
+        fn only_a_catalog_reader_keeps_the_related_tables() {
+            assert!(Admission::CatalogRead.shows_related());
+            assert!(!Admission::TableGrant.shows_related(), "fail closed");
+
+            let mut body = json!({
+                "id": "silver.orders",
+                "description": "Orders",
+                "schema": [{"name": "id", "dataType": "UInt64"}],
+                "upstream": [{"id": "orders_raw", "name": "bronze.orders"}],
+                "downstream": [{"id": "serving.orders", "name": "serving.orders"}],
+                "dependents": [{"id": "sq-1", "name": "Orders by day", "kind": "saved query"}],
+                "replacementAssetId": "silver.orders_v2",
+                "replacementName": "orders_v2",
+                "certification": "deprecated",
+                "usage": {
+                    "days": 30,
+                    "queries": 4,
+                    "users": 2,
+                    "columns": [{"name": "id", "queries": 3}],
+                    "columnsNote": "Counted from the queries that read only this table.",
+                    "joinedTables": [
+                        {"table": "silver.customers", "assetId": "silver.customers", "queries": 2}
+                    ],
+                    "frequentUsers": [{"name": "Rina Wijaya", "queries": 3}],
+                    "frequentQueries": [
+                        {"sql": "SELECT id FROM silver.orders", "runs": 2, "lastAt": "2026-11-01T00:00:00Z"}
+                    ],
+                },
+            });
+            hide_related_tables(&mut body);
+
+            assert_eq!(body["shownWithTableGrant"], json!(true));
+            assert_eq!(body["upstream"], json!([]));
+            assert_eq!(body["downstream"], json!([]));
+            assert_eq!(body["dependents"], json!([]));
+            assert_eq!(body["usage"]["joinedTables"], json!([]));
+            assert_eq!(body["usage"]["frequentUsers"], json!([]));
+            assert_eq!(body["usage"]["frequentQueries"], json!([]));
+            assert!(body.get("replacementAssetId").is_none());
+            assert!(body.get("replacementName").is_none());
+            // The table's own facts are untouched, the deprecation too.
+            assert_eq!(body["description"], json!("Orders"));
+            assert_eq!(body["schema"][0]["name"], json!("id"));
+            assert_eq!(body["certification"], json!("deprecated"));
+            assert_eq!(body["usage"]["queries"], json!(4));
+            assert_eq!(
+                body["usage"]["columns"],
+                json!([{"name": "id", "queries": 3}])
+            );
+            assert_eq!(
+                body["usage"]["columnsNote"],
+                json!("Counted from the queries that read only this table.")
+            );
         }
 
         /// `catalog:read` alone shows the table's shape, never its rows:

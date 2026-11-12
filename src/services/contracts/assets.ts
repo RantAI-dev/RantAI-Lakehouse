@@ -337,6 +337,19 @@ export type AssetDetail = Asset & {
     tableColumns: number
   }
   /**
+   * `true` when the API admitted the caller by a `query:read` grant made
+   * from this table rather than by `catalog:read` (`GOV-11`, `DEC-20`;
+   * review round 1 R2). The body then holds the table's own facts only:
+   * `upstream`, `downstream`, `dependents` and the usage lists
+   * (`joinedTables`, `frequentUsers`, `frequentQueries`) are empty because
+   * they are withheld, not because nothing exists, and a deprecation's
+   * `replacementAssetId`/`replacementName` are absent. The server decides
+   * this from how the caller was admitted; the console must not infer it
+   * from a permission. Absent for a `catalog:read` caller, and from an
+   * older API build, which sent the whole body.
+   */
+  shownWithTableGrant?: boolean
+  /**
    * `true` when `sample` is empty because the caller lacks `query:read`
    * (the API withholds rows from `catalog:read`-only callers), not
    * because the asset has none. Absent from older API builds.

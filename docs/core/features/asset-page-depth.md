@@ -71,6 +71,7 @@ reported, not quietly lowered.
   dashboards and from outside tools are not counted.
 - A grant expires after 30 days, like a decided request.
 - A `query:read` grant made from a table's page also opens that table's page for the grantee, without `catalog:read` (product owner 2026-11-12, `DEC-20`). It opens that table only: not the catalog list, not search, not another table's page. Masks, row filters and the role's table access apply as everywhere.
+- Shown with a table grant: related tables and usage are hidden. A page opened by a grant carries that table's own facts only — no table it is built from or built into, no joined tables, no frequent users or queries, no dependents, and no replacement's id or name — and the page says so rather than drawing empty panels as if nothing existed. *(proposed, not yet signed)*
 - Restore works only for Iceberg tables, only within the retention window.
 - A version's author is shown only where the committer was recorded.
 
