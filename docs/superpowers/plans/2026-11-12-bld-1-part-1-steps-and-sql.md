@@ -1107,3 +1107,37 @@ can have a tenant.
 - `main` merged into the branch again (it is behind).
 - CI's full run green on the head commit, including `g3a-dagster` (the G7
   case and the author gate), which no local run covers.
+
+### S1, round 3 (reviewer, 2026-11-12)
+
+Reviewed `e2cd356b2..911cd742a`: the fix for R2-B1, the merge of `main`, the
+migration renamed to `0140`.
+
+- **R2-B1: closed.** `check_step_tables` (`pipeline_compile.rs`) parses the
+  step and walks it with `sqlparser`'s visitor (`StepReads`): it collects the
+  step's own `WITH` names and every `TableFactor::Table` that is not a
+  function call, at any depth, and compares each as written. A name of more
+  than one part is refused. `sql_rewrite.rs` is unchanged. The tests cover
+  both directions of a case difference, the step's own `WITH`, a subquery and
+  a join.
+- **The migration is `0140_pipeline_inputs_and_steps.sql`.** `main` took
+  `0137`, `0138` and `0139` while this slice was in review. No reference to
+  the old number is left in the code. D13's "0137" above is history.
+- `main` merged again by the reviewer with this entry (documents only on
+  `main`; no conflict).
+
+**Re-run by the reviewer on `911cd742a`**, in the developer's worktree:
+`cargo test -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar`:
+82 passed, the handoff's count. The other suites were re-run by the reviewer
+in round 2 on `b5e22cd42` (24, 14, 8, 4, 14); since then only
+`pipeline_compile.rs` and the migration's file name changed, and the
+developer's counts for this round stand unchecked by the reviewer.
+
+**No open BLOCKER and no open SHOULD-FIX.**
+
+**Not yet true, and required before merge:** CI's full run green on the head
+commit. No full run has finished green on any commit of this slice, and the
+two gates in `g3a-dagster` (the G7 case with two inputs and a SQL step; the
+author gate against the compile route) have never run to the end on it. The
+pull request stays a draft until that run is green; a failure there reopens
+the review.
