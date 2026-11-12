@@ -24,7 +24,9 @@ Nothing inside the console uses the open copy. It exists for outside tools.
 2. See the table published automatically after its pipeline succeeds,
    without pressing anything.
 3. See on the table's page: last published time, the snapshot ID, and one of
-   "Up to date", "Out of date", "Not measured", "Never published".
+   "Up to date", "Out of date", "Not measured", "Never published", or "Last
+   publish failed" (with the time and the reason) when the most recent publish
+   failed.
 4. Press "Publish now" to repair a failed or stale publish.
 5. See a failed publish with its reason. It is never shown as published.
 6. Switch publishing off. Updates stop; the published table stays.
@@ -66,6 +68,8 @@ that changes who can read the data.
   they will see every past copy. Storage grows by one copy per publish.
 - Tables over 5,000,000 rows are refused, not cut short. An operator can
   raise the limit.
+- A decimal column is published as a decimal of the same precision and scale.
+  A decimal wider than 38 digits is refused, and the refusal names the column.
 - The open copy is current only after the publish that follows a pipeline
   run.
 - If the system cannot tell when a table last changed, the page says "Not
