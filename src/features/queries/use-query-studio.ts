@@ -5,12 +5,7 @@ import * as React from "react"
 import { Prec } from "@codemirror/state"
 import { EditorView, keymap } from "@codemirror/view"
 
-import {
-  assetQueryTarget,
-  BRONZE_NAMESPACE,
-  listedBronzeTable,
-  trinoBronzeName,
-} from "@/lib/asset-query"
+import { assetQueryTarget, BRONZE_NAMESPACE, trinoBronzeName } from "@/lib/asset-query"
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
@@ -485,10 +480,10 @@ export function useQueryStudio(draftKey: string | null) {
     }
   }, [])
 
-  // Whether a table's Iceberg table is there, by catalog id. One read proves
-  // it: the table's own detail (`getTableDetail`, on expand or on the
-  // statement naming it), or — for a Trino tab — the `bronze` namespace's
-  // table list, below. Only a proven table is offered (`QS-4` D3).
+  // Whether a table's Iceberg table is there, by catalog id. It is read
+  // once, with the table's own detail, and kept for the session: a Bronze
+  // table's Trino name is offered only for a table that is proven to be
+  // there (QS-4 D3).
   const [proofs, setProofs] = React.useState<Record<string, TableProof>>({})
   const rememberProof = React.useCallback((id: string, proof: TableProof) => {
     // The person may have left the page while the request was in flight.
@@ -500,69 +495,22 @@ export function useQueryStudio(draftKey: string | null) {
   // detail is already fetched for a table a person expands or a statement
   // names; the same answer carries the SQL form.
   // A Bronze table also keeps its registry `tableName`: that is what its
-  // Trino name is built from. Before the detail answers, the list row's
-  // `tableKey` already names it (`listedBronzeTable`), so the Trino name is
-  // known without expanding the entry (`QS-7`, `LH-QS-4-08`).
+  // Trino name is built from, and it is only on the detail.
   const [targets, setTargets] = React.useState<
     Record<string, { target: ReturnType<typeof assetQueryTarget>; bronzeTable: string | null }>
   >({})
 
-  // QA LH-QS-4-08 (QS-7), decision 11: one read of the `bronze` namespace's
-  // table list proves every Bronze table the catalog lists, made once per
-  // visit the first time a Trino tab is open. Before this, each entry had to
-  // be expanded to be insertable, because only its own detail read proved it.
-  const [trinoSeen, setTrinoSeen] = React.useState(false)
-  React.useEffect(() => {
-    if (engine === "trino") setTrinoSeen(true)
-  }, [engine])
-  const wantsBronzeListing =
-    trinoSeen &&
-    assetsState.status === "success" &&
-    assetsState.data.some((asset) => listedBronzeTable(asset) !== null)
-  const bronzeListing = useService(
-    (s) =>
-      wantsBronzeListing
-        ? lakehouseService.listTables(BRONZE_NAMESPACE, undefined, s)
-        : Promise.resolve(null),
-    [wantsBronzeListing]
-  )
-  // The names the listing proves, or `null` when it has not answered: a
-  // failed listing proves nothing, and is not shown as a page error —
-  // expand-to-prove still works, as it did before.
-  const listedBronzeNames = React.useMemo<ReadonlySet<string> | null>(() => {
-    if (bronzeListing.status !== "success" || bronzeListing.data === null) return null
-    return new Set(bronzeListing.data.map((table) => table.name))
-  }, [bronzeListing.status, bronzeListing.data])
-  // The proofs the schema browser and the completion read: the detail's own
-  // answer where it exists (it is newer, so it wins), else the listing's.
-  const tableProofs = React.useMemo<Record<string, TableProof>>(() => {
-    if (listedBronzeNames === null) return proofs
-    const next = { ...proofs }
-    for (const asset of assetsState.data ?? []) {
-      if (asset.id in next) continue
-      // The detail wins when it answered — even with `null`, which says the
-      // asset is not a Bronze candidate at all.
-      const tableName =
-        asset.id in targets ? targets[asset.id].bronzeTable : listedBronzeTable(asset)
-      if (!tableName) continue
-      next[asset.id] = listedBronzeNames.has(tableName)
-        ? { status: "there" }
-        : { status: "missing" }
-    }
-    return next
-  }, [proofs, listedBronzeNames, assetsState.data, targets])
-
   // The tables in the shape the completion needs: the SQL name to insert,
   // the name a person reads, and every name the table answers to.
   //
-  // A Bronze asset's registry slug is not a SQL name, so such a table's name
-  // is the registry `tableName`: from the list row's `tableKey`, or from the
-  // detail once it is loaded. A Bronze table has two names: the ClickHouse
-  // one the server names (`queryTarget`, for the catalog page) and its Trino
-  // name, built here. The studio offers only the Trino one, and only on a
-  // Trino tab; on a ClickHouse tab the reference stays empty (`trinoOnly`
-  // tells the schema browser why). An id that reads as a SQL name keeps
-  // being the reference, as it always was. (QS-4 QA of 2026-11-05)
+  // A Bronze asset's registry slug is not a SQL name, so such a table has
+  // no reference until its detail is loaded. A Bronze table has two names:
+  // the ClickHouse one the server names (`queryTarget`, for the catalog
+  // page) and its Trino name, built here from the detail. The studio offers
+  // only the Trino one, and only on a Trino tab; on a ClickHouse tab the
+  // reference stays empty (`trinoOnly` tells the schema browser why). An id
+  // that reads as a SQL name keeps being the reference, as it always was.
+  // (QS-4 QA of 2026-11-05)
   const tables = React.useMemo<CompletionTable[]>(() => {
     if (assetsState.status !== "success") return []
     return assetsState.data.map((asset) => {
@@ -576,16 +524,13 @@ export function useQueryStudio(draftKey: string | null) {
         ? detail.bronzeTable !== null
         : asset.layer === "raw" || asset.layer === "bronze"
       if (trinoOnly) {
-        // `QS-7`: the list row's `tableKey` names the table before the
-        // detail does; the detail's own answer wins when both exist.
-        const bronzeTable = detail ? detail.bronzeTable : listedBronzeTable(asset)
-        const trino = bronzeTable ? trinoBronzeName(bronzeTable) : ""
+        const trino = detail?.bronzeTable ? trinoBronzeName(detail.bronzeTable) : ""
         // Both spellings of a Trino name resolve to this table, whatever its id.
-        if (bronzeTable) names.push(trino, `bronze.${bronzeTable}`)
+        if (detail?.bronzeTable) names.push(trino, `bronze.${detail.bronzeTable}`)
         // The Trino name is offered only once the Iceberg table is proven to
         // be there: the registry's `tableName` says a Bronze table might
         // exist, not that it does (QS-4 D3, owner 2026-11-09).
-        const proven = tableProofs[asset.id]?.status === "there"
+        const proven = proofs[asset.id]?.status === "there"
         return {
           id: asset.id,
           label: asset.name,
@@ -604,7 +549,7 @@ export function useQueryStudio(draftKey: string | null) {
         names,
       }
     })
-  }, [assetsState.status, assetsState.data, targets, tableProofs, engine])
+  }, [assetsState.status, assetsState.data, targets, proofs, engine])
 
   // The columns of the tables the buffer names: fetched once each and kept
   // for the session. A table that cannot be read is kept as a failure too,
@@ -1631,10 +1576,8 @@ export function useQueryStudio(draftKey: string | null) {
     /**
      * Whether a table's Iceberg table is there, by catalog id. A table
      * with no entry has no proof yet, and is offered nothing (QS-4 D3).
-     * `QS-7`: the entry's own read or the `bronze` namespace's table list,
-     * whichever answered — the newer one wins.
      */
-    proofs: tableProofs,
+    proofs,
     loadColumns,
     setEditorView,
     insertAtCursor,

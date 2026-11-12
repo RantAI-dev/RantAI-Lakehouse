@@ -4,7 +4,6 @@ import { EditorView } from "@codemirror/view"
 import * as React from "react"
 import * as notify from "@/lib/notify"
 import { LEGACY_QUERY_DRAFT_KEY, queryDraftKey, type QueryTabs } from "@/lib/query-draft"
-import { sqlCompletionOptions } from "@/lib/sql-completion"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
@@ -391,129 +390,6 @@ describe("useQueryStudio Bronze tables", () => {
     await waitFor(() => expect(hook.result.current.columns["demo_orders"]?.status).toBe("ready"))
 
     expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
-  })
-
-  // QA LH-QS-4-08 (QS-7), decision 11: a Bronze table's Trino name comes from
-  // the catalog list (`tableKey`), and one read of the `bronze` namespace's
-  // table list proves every Bronze table — no expand needed first.
-  /** A Bronze list row that carries its registry table name (`bronze_catalog_row`). */
-  const LISTED_BRONZE_ROW = {
-    id: "demo_orders",
-    name: "Demo Orders",
-    namespace: "bronze",
-    layer: "raw",
-    type: "iceberg-table",
-    tableKey: "bronze.orders",
-  }
-
-  /** Mounts the hook over a catalog whose one Bronze row carries `tableKey`. */
-  function mountListedBronze(listing: () => Promise<unknown>) {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
-    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
-    spyOn(assetService, "listAssets").mockResolvedValue([LISTED_BRONZE_ROW] as never)
-    const getAsset = spyOn(assetService, "getAsset").mockResolvedValue(BRONZE_DETAIL as never)
-    const getTableDetail = spyOn(lakehouseService, "getTableDetail").mockResolvedValue(
-      ICEBERG_TABLE
-    )
-    const listTables = spyOn(lakehouseService, "listTables").mockImplementation(
-      listing as never
-    )
-    return {
-      hook: renderHook(() => useQueryStudio(queryDraftKey("u1", null))),
-      getAsset,
-      getTableDetail,
-      listTables,
-    }
-  }
-
-  it("offers a Bronze table's Trino name on a Trino tab once the Bronze listing names it, without reading its detail", async () => {
-    visit("/query-studio?sql=SELECT%201&engine=trino")
-    const { hook, getAsset, getTableDetail, listTables } = mountListedBronze(() =>
-      Promise.resolve([{ name: "orders" }])
-    )
-
-    await waitFor(() => expect(listTables).toHaveBeenCalledTimes(1))
-    await waitFor(() =>
-      expect(hook.result.current.tables[0]).toMatchObject({
-        reference: "iceberg.bronze.orders",
-        trinoOnly: true,
-      })
-    )
-    // The listing proved it; the entry was never expanded.
-    expect(getAsset).not.toHaveBeenCalled()
-    expect(getTableDetail).not.toHaveBeenCalled()
-  })
-
-  it("holds a Bronze table the listing does not name as missing and offers no name", async () => {
-    visit("/query-studio?sql=SELECT%201&engine=trino")
-    const { hook } = mountListedBronze(() => Promise.resolve([{ name: "somebody_else" }]))
-
-    await waitFor(() =>
-      expect(hook.result.current.proofs["demo_orders"]?.status).toBe("missing")
-    )
-    expect(hook.result.current.tables[0]).toMatchObject({ reference: "", trinoOnly: true })
-  })
-
-  it("does not ask for the Bronze listing on a ClickHouse tab", async () => {
-    const { hook, listTables } = mountListedBronze(() =>
-      Promise.resolve([{ name: "orders" }])
-    )
-
-    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
-    await act(async () => {
-      hook.result.current.setSql("SELECT 1")
-    })
-
-    expect(hook.result.current.engine).toBe("clickhouse")
-    expect(listTables).not.toHaveBeenCalled()
-  })
-
-  it("falls back to the entry's own read when the Bronze listing fails", async () => {
-    visit("/query-studio?sql=SELECT%201&engine=trino")
-    const { hook, getTableDetail, listTables } = mountListedBronze(() =>
-      Promise.reject(new ServiceError("unavailable", "warehouse down", 503))
-    )
-
-    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
-    // Review round 1, R3: a failed listing must leave the asset unproved —
-    // not "missing" — and the read below is what proves it. Waiting for the
-    // rejection to settle is the point: an empty set here would make every
-    // Bronze row say it has no readable table.
-    await waitFor(() => expect(listTables).toHaveBeenCalledTimes(1))
-    await act(async () => {})
-    expect(hook.result.current.proofs["demo_orders"]).toBeUndefined()
-    expect(hook.result.current.tables[0]).toMatchObject({ reference: "" })
-
-    act(() => hook.result.current.loadColumns("demo_orders"))
-
-    await waitFor(() => expect(getTableDetail).toHaveBeenCalledTimes(1))
-    await waitFor(() =>
-      expect(hook.result.current.tables[0]).toMatchObject({
-        reference: "iceberg.bronze.orders",
-        trinoOnly: true,
-      })
-    )
-  })
-
-  it("loads the columns of a Bronze table the statement names by its Trino name, and offers them after its alias", async () => {
-    visit("/query-studio?sql=SELECT%20b.%20FROM%20iceberg.bronze.orders%20b&engine=trino")
-    const { hook, getAsset } = mountListedBronze(() => Promise.resolve([{ name: "orders" }]))
-
-    await waitFor(() => expect(getAsset).toHaveBeenCalledTimes(1))
-    expect(getAsset.mock.calls[0]?.[0]).toBe("demo_orders")
-    await waitFor(() =>
-      expect(hook.result.current.columns["demo_orders"]?.status).toBe("ready")
-    )
-
-    const sql = "SELECT b. FROM iceberg.bronze.orders b"
-    const answer = sqlCompletionOptions({
-      sql,
-      cursor: sql.indexOf("b.") + 2,
-      tables: hook.result.current.tables,
-      columns: hook.result.current.columns,
-    })
-    expect(answer.options.map((option) => option.label)).toContain("oid")
   })
 })
 

@@ -257,43 +257,6 @@ describe("SchemaBrowser", () => {
     await act(async () => {})
   })
 
-  // QA LH-QS-4-08 (QS-7), decision 11: the list row's `tableKey` names the
-  // table and one read of the `bronze` namespace proves it, so the entry is
-  // insertable without being expanded first.
-  it("inserts a Bronze table's Trino name on a Trino tab without expanding it", async () => {
-    visitTrinoTab()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
-    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
-    spyOn(assetService, "listAssets").mockResolvedValue([
-      {
-        id: "demo_orders",
-        name: "Demo Orders",
-        namespace: "bronze",
-        layer: "raw",
-        type: "iceberg-table",
-        tableKey: "bronze.orders",
-      },
-    ] as never)
-    const getAsset = spyOn(assetService, "getAsset").mockResolvedValue(bronzeDetail())
-    const getTableDetail = spyOn(lakehouseService, "getTableDetail").mockResolvedValue(ICEBERG_TABLE)
-    spyOn(lakehouseService, "listTables").mockResolvedValue([{ name: "orders" }] as never)
-    const { container } = render(<Harness />)
-    const view = editorView(container)
-    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
-
-    const insert = await screen.findByRole("button", { name: "Insert iceberg.bronze.orders" })
-    // The entry is offered before anything was expanded: the listing proved
-    // the table, not the entry's own detail read.
-    expect(getAsset).not.toHaveBeenCalled()
-    expect(getTableDetail).not.toHaveBeenCalled()
-
-    fireEvent.click(insert)
-
-    expect(view.state.doc.toString()).toBe("SELECT * FROM iceberg.bronze.orders")
-    await act(async () => {})
-  })
-
   it("keeps a Bronze table out of the editor until its Iceberg table is proven", async () => {
     visitTrinoTab()
     const { getAsset, getTableDetail } = stubServices()

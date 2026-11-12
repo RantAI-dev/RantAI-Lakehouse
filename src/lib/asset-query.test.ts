@@ -6,7 +6,6 @@ import {
   assetSnapshotQueryHref,
   assetStarterSql,
   assetStudioTarget,
-  listedBronzeTable,
   NO_READABLE_TABLE,
   trinoBronzeName,
 } from "./asset-query"
@@ -290,38 +289,5 @@ describe("assetHasReadableTable", () => {
 describe("NO_READABLE_TABLE", () => {
   it("is the sentence the console shows for an asset with no readable table", () => {
     expect(NO_READABLE_TABLE).toBe("No readable table for this asset yet.")
-  })
-})
-
-// QA LH-QS-4-08 (QS-7), decision 11: the Bronze list row already carries the
-// registry table name (`tableKey`), so Query Studio knows a Bronze table's
-// Trino name before the asset's detail is opened. It says the table might
-// exist; a read of the `bronze` namespace's table list proves it.
-describe("listedBronzeTable", () => {
-  it("reads the table name of a Bronze list row and nothing from any other row", () => {
-    // The Bronze row `bronze_catalog_row` builds.
-    expect(
-      listedBronzeTable({ layer: "raw", type: "iceberg-table", tableKey: "bronze.orders" })
-    ).toBe("orders")
-    // A Bronze asset whose type says Iceberg too, as the detail route files it.
-    expect(
-      listedBronzeTable({ layer: "bronze", type: "table", tableKey: "bronze.order_lines" })
-    ).toBe("order_lines")
-    // A Silver row carries no `tableKey` at all.
-    expect(listedBronzeTable({ layer: "silver", type: "table" })).toBeNull()
-    // A row whose key is explicitly null names no table.
-    expect(listedBronzeTable({ layer: "raw", type: "iceberg-table", tableKey: null })).toBeNull()
-    // A key in another namespace is not a Bronze table, whatever the layer.
-    expect(
-      listedBronzeTable({ layer: "raw", type: "iceberg-table", tableKey: "silver.orders" })
-    ).toBeNull()
-    // A row that is not an Iceberg candidate keeps no name.
-    expect(
-      listedBronzeTable({ layer: "gold", type: "table", tableKey: "bronze.orders" })
-    ).toBeNull()
-    // An empty name after the dot is no name.
-    expect(
-      listedBronzeTable({ layer: "raw", type: "iceberg-table", tableKey: "bronze." })
-    ).toBeNull()
   })
 })
