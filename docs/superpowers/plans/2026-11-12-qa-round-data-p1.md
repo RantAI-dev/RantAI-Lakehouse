@@ -844,4 +844,193 @@ None of these blocks the plan.
 
 ## 5. Handoff
 
+Developer: the implementation sub-agent, on `/home/rismana/rantai/lakehouse-agents-1`
+(section 3a's machine), branch `fix/qa-round-data-p1`, base `87c18c72`. One
+commit per task, in the plan's order, pushed after each.
+
+### Commits
+
+| Task | Commit | Title |
+| --- | --- | --- |
+| T1 | `7bf03c5e` | feat(uploads): list one table's uploads by its exact name (LH-DATA-35-03; DATA-47) |
+| T2 | `43290817` | feat(api): GET /api/uploads?table=<name> (LH-DATA-35-03; DATA-47) |
+| T3 | `6040d195` | fix(gold): a failed publish stores the classified sentence (LH-DATA-1-01, LH-DATA-12-01 F1; DATA-49) |
+| T4 | `27f5f875` | fix(gold): raw publish errors are rewritten at rest and never listed (LH-DATA-1-01; DATA-49) |
+| T5 | `76647251` | feat(gold): the publication says the last publish failed, and a failed run is not skipped (LH-DATA-1-01; DATA-49) |
+| T6 | `24f5f7c2` | fix(gold): a mart never published answers "not published", not 500 (LH-DATA-1-01; DATA-49) |
+| T7 | `d7e217f5` | feat(gold): a decimal column is published as an Iceberg decimal (LH-DATA-1-51; DATA-48) |
+| T8 | `4a8ce4c4` | test(gold-export): the gate carries decimal columns and compares their values (LH-DATA-1-51; DATA-48) |
+| T9 | `02ecfd00` | feat(console): the Table step asks the server about the named table (LH-DATA-35-03; DATA-47) |
+| T10 | `a393eeaa` | feat(console): the card says "Last publish failed" (LH-DATA-1-01; DATA-49) |
+| T11 | `b698ec68` | fix(console): "not published" is read from the answer, not from a failure (LH-DATA-1-01; DATA-49) |
+| T12 | `23374f6b` | fix(console): "Copies kept" says when it was counted (LH-DATA-1-01; DATA-49) |
+| T13 | `148de952` | docs(features): the two pages say what is now true (DATA-47, DATA-48, DATA-49) |
+
+T1 also had to pass `table: None` at the route's `ListFilter` literal so the
+workspace kept compiling; T2 replaced it with the query parameter.
+
+### Tests added (find them by name in the CI log)
+
+Rust, `lakehouse-store` (`tests/upload_folders.rs`):
+`the_list_narrows_to_one_tables_uploads_by_its_exact_name_before_the_window_is_cut`.
+
+Rust, `lakehouse-api` integration (`tests/upload_folder_routes.rs`):
+`the_upload_list_can_be_narrowed_to_one_table_by_its_exact_name`.
+
+Rust, `lakehouse-api` unit (`routes::gold::tests` and `gold_export_history::tests`):
+`a_batch_failure_answers_a_fixed_sentence_with_a_reference_and_never_the_value`,
+`the_stored_error_of_a_failed_publish_is_the_classified_sentence`,
+`public_error_replaces_each_raw_shape_and_keeps_this_repositorys_own_sentences`,
+`row_to_export_run_never_returns_a_stored_upstream_text`,
+`the_rewrite_statement_touches_only_failed_rows_in_the_three_raw_shapes`,
+`a_failed_newest_run_is_never_skipped_even_when_the_fingerprint_matches`,
+`last_failure_is_null_when_the_newest_run_succeeded_or_there_is_none`,
+`last_failure_carries_the_time_and_the_stored_sentence_when_the_newest_run_failed`,
+`last_run_sql_takes_the_newest_row_of_any_status`,
+`the_read_back_of_a_mart_never_published_says_so_and_invents_no_number`,
+`the_read_back_of_a_published_mart_keeps_its_fields_and_says_published`
+(`gold_export::tests`):
+`a_clickhouse_decimal_maps_to_an_iceberg_decimal_of_the_same_precision_and_scale`,
+`a_nullable_decimal_is_an_optional_decimal`,
+`the_decimal_aliases_map_to_their_fixed_precisions`,
+`a_decimal_wider_than_38_digits_is_refused_and_the_sentence_names_the_column`,
+`select_projection_reads_a_decimal_as_text`,
+`decimal_text_becomes_the_exact_unscaled_integer`,
+`decimal_text_that_is_not_an_exact_decimal_is_refused`,
+`a_decimal_cell_that_arrives_as_a_json_number_is_refused`,
+`build_array_makes_a_decimal128_column_with_the_columns_precision_and_scale_and_keeps_nulls`.
+
+Rust, `lakehouse-api` integration (`tests/gold_publication.rs`):
+`a_failed_publish_stores_the_sentence_the_response_carried_and_no_catalog_text`,
+`stored_upstream_text_is_rewritten_at_rest_and_never_listed`,
+`publication_detail_reports_the_last_failure_until_a_later_run_succeeds`,
+`if_changed_does_not_skip_after_a_failed_run`.
+
+Rust, `lakehouse-iceberg` (`rest::tests::wiremock_tests`):
+`a_gold_table_the_catalog_does_not_have_loads_as_none`,
+`a_catalog_that_refuses_the_caller_is_still_an_error_for_a_gold_table`.
+
+TypeScript: `src/features/connectors/upload-file-page.test.tsx` —
+`offers Replace or Add and the table's folder for a table whose upload is not
+in the newest list`, `says the check failed, keeps Next off, and asks again on
+Check again`, `keeps Next off and says it is checking until the table check
+answers`, `keeps Load off on the Review step while the table check has not
+answered`, `asks about a typed name once, after the pause, and uses only the
+answer for the name in the field`;
+`src/services/clients/uploads.test.ts` —
+`sends the table filter as table=<name> and nothing when it is empty`;
+`src/lib/gold-freshness.test.ts` —
+`reports Last publish failed when the newest run failed, even if the last
+success matches the table`, `reports Last publish failed for a mart whose only
+run failed`, `keeps the four other lines when lastFailure is null`;
+`src/features/catalog/open-format-card.test.tsx` —
+`shows Last publish failed with the time, the reason and the last successful
+publish`, `says nothing has been published yet when the only run failed`,
+`shows no last-published rows for a mart the API reports as not published`,
+`says the published copy could not be read when the read-back fails`,
+`does not show a counted time when the trim recorded none` (and the T12 rename
+`shows Copies kept at last trim with when it was counted and the oldest copy`);
+`src/features/gold/gold-exports-page.test.tsx` —
+`says Never exported for a mart the API reports as not published`,
+`shows a dash, not Never exported, when the read-back fails`.
+
+### Run before each commit (real counts)
+
+Each Rust commit: `cargo fmt --check` clean; `cargo clippy -p <crate>
+--all-targets -- -D warnings` clean for the touched crates
+(`lakehouse-store`, `lakehouse-iceberg`, `lakehouse-api`); the task's tests run
+by name, all passing. The first test of each task was run once with the fix
+reverted (or with the source stashed) and failed as recorded here:
+
+- T1: with the `AND ($6 …)` line removed, the store test answered
+  `["up-6", "up-5", "up-3", "up-2", "up-1"]` instead of `["up-1"]`.
+- T2: with `table: None` at the route, the route test answered
+  `["up-3", "up-2", "up-1"]` instead of `["up-1"]`.
+- T3: with the `Batch` arm back in the shared arm, the unit test answered
+  `failed to build export batch: amount: "12,5" is not a valid decimal`; with
+  the source stashed, the integration test read the row
+  `Iceberg export failed: … url (http://localhost:8181/catalog/v1/config?warehouse=default)`
+  against the response's `The catalog request failed. Reference: …`.
+- T4: without `public_error` in `row_to_export_run`, the unit test read the
+  catalog's 401 and its headers back.
+- T5: with the source stashed, the publication had no `lastFailure`, and
+  `?ifChanged=true` answered `{"skipped":true,"reason":"unchanged since …"}`.
+- T6: the new function and the new field do not exist before the commit, so
+  the pre-change failure is a compile error (`no method
+  load_gold_table_if_exists`, no `published`).
+- T7: without the decimal branch in `ch_type_to_primitive`, the mapping test
+  failed (the type was refused).
+- T9: with the console sources stashed, the old-table test found no
+  `radio` named "Replace its rows".
+- T10: with the sources stashed, the freshness test read "Up to date".
+- T11: with the sources stashed, the page said "Never exported" and the card
+  showed no "Could not be read".
+- T12: with the card stashed, the row had no "Copies kept at last trim" label.
+
+### Before handoff, on the final commit `148de952`, foreground
+
+```text
+cd rust && cargo fmt --check                       -> clean, no output
+cargo check -p lakehouse-store -p lakehouse-iceberg -p lakehouse-api
+                                                   -> Finished dev profile, no warnings
+cargo clippy -p lakehouse-store -p lakehouse-iceberg -p lakehouse-api \
+  --all-targets -- -D warnings                     -> Finished, no warnings
+cargo test -p lakehouse-store --test upload_folders -> 15 passed, 0 failed
+cargo test -p lakehouse-iceberg --lib               -> 35 passed, 0 failed
+cargo test -p lakehouse-api --lib                   -> 3491 passed, 0 failed, 18 ignored (375.00s)
+cargo test -p lakehouse-api --test upload_folder_routes -> 8 passed, 0 failed
+cargo test -p lakehouse-api --test gold_publication     -> 18 passed, 0 failed
+cargo test -p lakehouse-api --test sec11_guard          -> 4 passed, 0 failed
+cargo test -p lakehouse-api --test route_auth           -> 89 passed, 0 failed
+bun install --frozen-lockfile                       -> 678 packages, ok
+bun run typecheck                                   -> clean
+bun run lint                                        -> 0 errors, 11 warnings (all pre-existing,
+                                                       in files this slice did not touch:
+                                                       data-table.tsx, sidebar.tsx, sso-page.tsx,
+                                                       alerts-page.tsx, login-page.tsx,
+                                                       use-copilot.ts, use-data-table.ts,
+                                                       dashboard-specs.ts, uploads.test.ts,
+                                                       http.ts)
+bun run test                                        -> 4009 passed, 1 skipped, 0 failed,
+                                                       12055 expect() calls, 4010 tests in 380 files
+python3 ops/lint/check_bare_iceberg_count.py        -> R11 guard: no bare count() found
+python3 ops/lint/check_intra_package_imports.py     -> OK, all imports resolve
+python3 -m py_compile ops/gold_export/gold_export_test.py -> ok
+git status                                          -> clean, nothing generated staged
+```
+
+The `sqlx::test` of T1 and every integration test file this slice touched
+(`upload_folder_routes.rs`, `gold_publication.rs`, `sec11_guard.rs`,
+`route_auth.rs`) ran here: Docker is available on this machine, so the T1, T2,
+T3, T4 and T5 tests are verified locally, not left to CI. The ClickHouse
+26.8 testcontainer of `gold_publication.rs` accepted the
+`ALTER TABLE console.gold_export_run UPDATE … SETTINGS mutations_sync = 1`
+statement of T4 and rewrote 3 rows; the second call answered 0.
+
+### Not verified locally
+
+- **The Gold export gate (T8).** Only `python3 -m py_compile
+  ops/gold_export/gold_export_test.py` ran. The gate needs the compose stack
+  (Lakekeeper, RustFS, Dagster, the API), which this machine is not running;
+  it runs in CI's job "Rust · Gold export to Iceberg (ADR 0010)".
+- **What ClickHouse 26.8 prints for `toString` of a decimal** in that gate,
+  and **whether `pyiceberg` reads the three Parquet storage forms**: the
+  gate's own assertions, not run here (same reason). The unit tests prove the
+  parser accepts the text with and without trailing zeros.
+- **`cargo test --workspace`, `cargo clippy --workspace --all-features`**:
+  not run. Section 3 as changed by 3a narrows the Rust block to the touched
+  crates; the four touched crates' unit and integration tests are above.
+- **The 11 `bun run lint` warnings**: not introduced here and not fixed here;
+  they are listed above so the reviewer can check them against `main`.
+- **`ops/gold_export` gate's step 5 wording in the module docstring**: the
+  docstring change is prose; only its `py_compile` was checked.
+
+### MISMATCH
+
+None. Every anchor matched the code at `87c18c72`, and every decision could be
+implemented as written. Two answers to the planner's open questions, measured
+here: ClickHouse 26.8 accepts the T4 rewrite statement as written, and the T3
+integration test does fail at the catalog (500, `The catalog request failed.`)
+rather than earlier.
+
 ## 6. Review
