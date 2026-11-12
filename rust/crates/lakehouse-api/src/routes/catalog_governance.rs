@@ -2645,5 +2645,76 @@ mod tests {
                 ])
             );
         }
+
+        fn state_for(pool: &PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(crate::config::Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        async fn ran(pool: &PgPool, id: &str, owner: Uuid) {
+            sqlx::query(
+                "INSERT INTO query_history \
+                   (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
+                    workload_class, engine, owner_id) \
+                 VALUES ($1, 'SELECT * FROM silver.orders', $2, 'completed', 10, 0, 0, \
+                         'hot-analytics', 'trino', $3)",
+            )
+            .bind(id)
+            .bind(owner.to_string())
+            .bind(owner)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        /// Review round 1 R4: the whole path — `usage` asks `people_names`, which asks the
+        /// store. A named person and the caller are named, a blank name and an id with no
+        /// row are "Unknown user", and a lookup that cannot run names only the caller.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_asset_usage_names_people_through_the_read_not_a_hand_made_map(pool: PgPool) {
+            let here = tenant(&pool, "acme").await;
+            let me = person(&pool, "Rina Wijaya").await;
+            let named = person(&pool, "Ann Ours").await;
+            let blank = person(&pool, "").await;
+            in_tenant(&pool, me, here).await;
+            in_tenant(&pool, named, here).await;
+            in_tenant(&pool, blank, here).await;
+            // An id with no `app_user` row: a person who was deleted.
+            let gone = Uuid::new_v4();
+            for (id, owner) in [("q1", me), ("q2", named), ("q3", blank), ("q4", gone)] {
+                ran(&pool, id, owner).await;
+            }
+
+            let caller = principal(me, &[here], "Rina Wijaya");
+            let state = state_for(&pool);
+            let (usage, _) = usage(&state, &caller, &tables(&["silver.orders"]), &[]).await;
+
+            assert_eq!(
+                usage["frequentUsers"],
+                json!([
+                    {"name": "Unknown user", "queries": 2},
+                    {"name": "Ann Ours", "queries": 1},
+                    {"name": "Rina Wijaya", "queries": 1}
+                ])
+            );
+            assert!(!usage.to_string().contains(&blank.to_string()));
+
+            // The lookup cannot run (the pool is closed): the caller is still named, and
+            // nobody else is, rather than the whole usage becoming "not measured".
+            pool.close().await;
+            let names = people_names(&pool, &[mentioned("q1", named)], &caller).await;
+            assert_eq!(names, HashMap::from([(me, "Rina Wijaya".to_owned())]));
+        }
     }
 }
