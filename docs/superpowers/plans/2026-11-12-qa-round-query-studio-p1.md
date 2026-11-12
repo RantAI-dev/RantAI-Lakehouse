@@ -1311,3 +1311,23 @@ Not verified:
   run; no compose file changed in this merge.
 - The acceptance checklist on the feature pages (including `QS-1-AC13`, `QS-4-AC8`) is the
   owner's run on a live console; nothing there is claimed as passed.
+
+### Round 4 (planner, 2026-11-12), at `ca9bb813d`
+
+Read the merge `378a8281` and the three commits after it against rulings M1 to M5.
+
+- Every file #482 touched that this branch does not mean to change is identical to `main`
+  (`sql-completion.ts`, `schema-browser.tsx`, `sql-panel.tsx`, `sql_lex.rs`, `policy_engine.rs`
+  and the rest); the files that still differ carry only `QS-8` (the draft per person and
+  tenant), `QS-9` (`canDownload`), the engine name and the typed `supported: false` branch.
+- The hook's estimate effect is `main`'s (`estimateSupported`, the reset on a switch); no
+  `estimateEngineRef`, no Bronze listing read, no `listedBronzeTable` anywhere in `src/`.
+- The nine tests deleted are the ones for the removed listing proof and the removed `engine`
+  argument; each is named with its reason in the commit that deletes it. No test of #482 was
+  touched.
+- The merge commit alone is red on five tests of code the next two commits delete; the branch
+  head is what merges, and CI runs on it.
+
+No open BLOCKER. This pull request now delivers `QS-8`, `QS-9`, the server half of the Trino
+estimate and the engine name (`QS-6`, second half). `QS-7` is closed by #482. The first half
+of `QS-6` (T1, T2) stays held. Merge when CI on #483 is green.
