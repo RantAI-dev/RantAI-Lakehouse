@@ -300,11 +300,12 @@ export function fileProblem(name: string, sizeBytes: number): string | null {
  * - The list holds at most [`MAX_FILES`]; the first files of a pick are kept
  *   (decision 5) and `dropped` counts the rest.
  * - A file with a problem of its own ([`fileProblem`]) is listed with it.
- * - The 2 GB limit counts all the files of one upload together (decision 2):
- *   a file that would take the sum over it is listed with a sentence saying
- *   so and is not sent, so a person never waits for files the load would
- *   refuse. `existing` is what the list holds already (a refused file does not
- *   count: it is not sent).
+ * - The 2 GB limit counts all the files of one upload together (decision 2)
+ *   and is checked BEFORE any file of the pick is sent (`DATA-51`, QA
+ *   `LH-DATA-17-04`): when the files listed plus this pick's own files pass
+ *   it, every one of those files is refused with a sentence naming the total
+ *   and the limit, so none of them is handed to the queue. `existing` is what
+ *   the list holds already (a refused file does not count: it is not sent).
  */
 export function planPick(
   existing: readonly { readonly size: number; readonly state: string }[],
@@ -312,18 +313,20 @@ export function planPick(
 ): { candidates: Candidate[]; dropped: number } {
   const room = Math.max(0, MAX_FILES - existing.length)
   const taken = picked.slice(0, room)
-  let total = existing.filter((f) => f.state !== "refused").reduce((sum, f) => sum + f.size, 0)
-  const candidates = taken.map((file): Candidate => {
-    const own = fileProblem(file.name, file.size)
-    if (own !== null) return { file, problem: own }
-    if (total + file.size > MAX_SESSION_BYTES) {
-      return {
-        file,
-        problem: `${file.name} would bring the files to ${formatBytes(total + file.size)}, over the 2 GB limit for one upload (all its files together). Remove a file, then choose this one again.`,
-      }
-    }
-    total += file.size
-    return { file, problem: null }
+  const listed = existing.filter((f) => f.state !== "refused").reduce((sum, f) => sum + f.size, 0)
+  const own = taken.map((file) => fileProblem(file.name, file.size))
+  // A file with a problem of its own is not sent, so it adds nothing to the total.
+  const chosen = taken.reduce((sum, file, index) => (own[index] === null ? sum + file.size : sum), 0)
+  const count = own.filter((problem) => problem === null).length
+  const total = listed + chosen
+  const overTheLimit = (file: File): string =>
+    count === 1
+      ? // One file too many keeps the sentence it always had.
+        `${file.name} would bring the files to ${formatBytes(total)}, over the 2 GB limit for one upload (all its files together). Remove a file, then choose this one again.`
+      : `The ${count} files chosen would bring the upload to ${formatBytes(total)}, over the 2 GB limit for one upload (all its files together). None of them was sent. Choose fewer or smaller files.`
+  const candidates = taken.map((file, index): Candidate => {
+    if (own[index] !== null) return { file, problem: own[index] }
+    return { file, problem: total > MAX_SESSION_BYTES ? overTheLimit(file) : null }
   })
   return { candidates, dropped: picked.length - taken.length }
 }
