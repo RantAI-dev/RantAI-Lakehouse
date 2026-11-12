@@ -444,3 +444,72 @@ test("inPlaceholder reads the braces before the name, and inCommentOrString the 
   assert.equal(inCommentOrString("SELECT 'abc'", 12), false)
   assert.equal(inCommentOrString("SELECT 1", 8), false)
 })
+
+// QS-4-AC8: after `q.`, an alias the statement declares for a
+// table the list does not hold has no columns to offer, and the table list
+// is no answer to it either.
+test("sqlCompletionOptions offers nothing after an alias declared for a table that is not in the list", () => {
+  const sql = "SELECT q. FROM x q"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "q."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options, [])
+})
+
+test("sqlCompletionOptions offers nothing after an AS alias of an unknown table in a JOIN", () => {
+  const sql = "SELECT q. FROM silver.orders o JOIN nowhere.gone AS q ON q.id = o.id"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "q."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options, [])
+})
+
+test("sqlCompletionOptions still offers a listed table's columns after its alias, next to an unknown table's alias", () => {
+  const sql = "SELECT o. FROM silver.orders o JOIN nowhere.gone AS q ON q.id = o.id"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "o."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["amount", "status"])
+})
+
+test("sqlCompletionOptions still offers the tables after a schema name, whatever aliases the statement declares", () => {
+  const sql = "SELECT * FROM x q JOIN serving."
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.ok(options.some((option) => option.label === "serving.customers"))
+})
+
+test("sqlCompletionOptions keeps the general answer for a qualifier that is neither an alias nor a table", () => {
+  const sql = "SELECT zz. FROM silver.orders"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "zz."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.ok(options.some((option) => option.label === "amount"))
+})
+
+test("sqlCompletionOptions answers with the listed table when an alias name is declared for a listed and an unknown table", () => {
+  const sql = "SELECT q. FROM silver.orders q JOIN nowhere AS q ON 1 = 1"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "q."),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.deepEqual(options.map((option) => option.label), ["amount", "status"])
+})

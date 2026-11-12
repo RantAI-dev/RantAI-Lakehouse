@@ -15,11 +15,12 @@ import type { IngestUploadInput, Upload, UploadFolder, UploadLoadMode } from "@/
 import { UploadCheckStep, useUploadPreview } from "./upload-check-step"
 import { UploadFolderField } from "./upload-folder-field"
 import { FileStep } from "./upload-file-step"
-import { DuplicateNotice, LoadFailure } from "./upload-parts"
+import { DuplicateNotice, LoadFailure, UploadNotice } from "./upload-parts"
 import { UploadReviewStep } from "./upload-review-step"
 import { UploadRunView } from "./upload-run-view"
 import { UploadTableStep } from "./upload-table-step"
 import { useColumnChoices } from "./use-column-choices"
+import { TABLE_LOOKUP_DELAY_MS, useTableUploads } from "./use-table-uploads"
 import { useUploadGroup } from "./use-upload-group"
 import { useUploadQueue } from "./use-upload-queue"
 import { columnSpecOf } from "@/lib/uploads"
@@ -62,7 +63,15 @@ function setAddress(pathname: string, id: string | null) {
  * Load stays off until a file whose columns differ is removed, and Review and the
  * run view say it is one load of N files.
  */
-function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; readonly pollMs?: number }) {
+function UploadWizard({
+  initial,
+  pollMs,
+  lookupDelayMs,
+}: {
+  readonly initial: Upload | null
+  readonly pollMs?: number
+  readonly lookupDelayMs?: number
+}) {
   const pathname = usePathname()
   const [upload, setUpload] = React.useState<Upload | null>(initial)
   const [duplicate, setDuplicate] = React.useState<Upload | null>(null)
@@ -72,6 +81,10 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   const [tableName, setTableName] = React.useState(
     () => initial?.bronzeTable ?? (initial ? suggestTableName(initial.originalFilename) : "")
   )
+  // Whether the name in the field is the person's or the page's own suggestion
+  // (`DATA-47`): a typed name waits for the last key before it is asked about, a
+  // suggested one is asked at once.
+  const [nameTyped, setNameTyped] = React.useState(false)
   const [mode, setMode] = React.useState<UploadLoadMode>("replace")
   // The folder the person picked (`DATA-35`): `null` is "no folder" on purpose, `undefined` is
   // "not touched", when the table's own folder applies.
@@ -83,10 +96,16 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
 
   const view = useUploadPreview(run === null && step !== FILE_STEP ? (upload?.id ?? null) : null)
   const choices = useColumnChoices(run === null && step !== FILE_STEP ? (upload?.id ?? null) : null, view)
-  // The tenant's uploads, to know whether the table named was created by one
-  // (only then is there a choice to make). If the list cannot be read, no
-  // choice is offered and the load replaces, as it does for a new table.
+  // The tenant's uploads, read once: the run view of a page opened with `?id=` uses
+  // it to name the files that were loaded together. Which table the name is, and
+  // its folder, comes from `lookup` — asked by the name itself, so an upload into
+  // an older table is found (`DATA-47`). A lookup that fails blocks Load instead
+  // of falling back to Replace (fail closed, principle 3).
   const uploads = useService((s) => uploadService.list(s), [])
+  const lookup = useTableUploads(
+    run === null && tableName !== "" && tableNameProblem(tableName) === null ? tableName : null,
+    nameTyped ? (lookupDelayMs ?? TABLE_LOOKUP_DELAY_MS) : 0
+  )
   // The tenant's folders for the picker. If they cannot be read, no picker is offered and the load
   // names no folder.
   const folderList = useService((s) => uploadService.listFolders(s), [])
@@ -108,11 +127,12 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     columnsValid: choices.problems.length === 0,
   })
 
-  const offersMode = uploads.status === "success" && isUploadedTable(tableName, uploads.data)
+  const knownUploads = lookup.state.status === "known" ? lookup.state.uploads : null
+  const offersMode = knownUploads !== null && isUploadedTable(tableName, knownUploads)
   const effectiveMode: UploadLoadMode = offersMode ? mode : "replace"
   const nameProblem = tableName === "" ? null : tableNameProblem(tableName)
   // `DATA-35` decision 2: a table an earlier upload loaded offers the folder that upload sits in.
-  const tableFolder = offersMode && uploads.status === "success" ? folderOfTable(tableName, uploads.data) : undefined
+  const tableFolder = offersMode && knownUploads !== null ? folderOfTable(tableName, knownUploads) : undefined
   // The folder the picker shows: the one the person chose, or the table's own folder
   // while the picker is untouched. `undefined` is "no folder of the table's either".
   const folderId = folderChoice !== undefined ? folderChoice : tableFolder
@@ -134,6 +154,7 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     setStep(FILE_STEP)
     setRun(null)
     setTableName("")
+    setNameTyped(false)
     setMode("replace")
     setFolderChoice(undefined)
     setTogether(null)
@@ -150,6 +171,7 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       setUpload(stored)
       setDuplicate(duplicateOf ?? null)
       setTableName(suggestTableName(stored.originalFilename))
+      setNameTyped(false)
       view.reset()
       setAddress(pathname, stored.id)
       setStep(CHECK_STEP)
@@ -227,17 +249,38 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       : step === CHECK_STEP
         ? view.ready && choices.ready && group.ready
         : step === TABLE_STEP
-          ? tableName !== "" && nameProblem === null
+          ? tableName !== "" && nameProblem === null && lookup.state.status === "known"
           : view.ready &&
             choices.ready &&
             group.ready &&
             tableName !== "" &&
             nameProblem === null &&
+            lookup.state.status === "known" &&
             !badValuesStop
+
+  // QA LH-DATA-35-03 (DATA-47): the Table and Review steps say what the table
+  // check is doing, and a check that failed blocks Load rather than letting the
+  // load replace rows nobody was asked about. "Check again" asks for the same name.
+  const lookupNotice =
+    (step === TABLE_STEP || step === STEPS.length - 1) && lookup.state.status === "checking" ? (
+      <UploadNotice>Checking whether an earlier upload created {tableName}…</UploadNotice>
+    ) : (step === TABLE_STEP || step === STEPS.length - 1) && lookup.state.status === "error" ? (
+      <div role="alert" className="space-y-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2">
+        <p className="text-sm text-destructive">
+          Could not check whether an earlier upload created {tableName}, so Load is off: a load now could replace its
+          rows without asking.
+        </p>
+        <p className="text-sm text-muted-foreground">{lookup.state.error.message}</p>
+        <Button variant="outline" size="sm" onClick={lookup.retry}>
+          Check again
+        </Button>
+      </div>
+    ) : null
 
   const notices =
     upload !== null && step !== FILE_STEP ? (
       <div className="space-y-3">
+        {lookupNotice}
         {duplicate !== null ? <DuplicateNotice earlier={duplicate} /> : null}
         {group.pending > 0 ? (
           <p className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-sm">
@@ -288,7 +331,10 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       {step === TABLE_STEP ? (
         <UploadTableStep
           tableName={tableName}
-          onTableName={setTableName}
+          onTableName={(name) => {
+            setNameTyped(true)
+            setTableName(name)
+          }}
           offersMode={offersMode}
           mode={mode}
           onMode={setMode}
@@ -324,14 +370,28 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
 }
 
 /** `?id=`: reads the upload first. A refusal (not found, no permission) goes through the existing error state. */
-function ExistingUpload({ id, pollMs }: { readonly id: string; readonly pollMs?: number }) {
+function ExistingUpload({
+  id,
+  pollMs,
+  lookupDelayMs,
+}: {
+  readonly id: string
+  readonly pollMs?: number
+  readonly lookupDelayMs?: number
+}) {
   const state = useService((s) => uploadService.get(id, s), [id])
   if (state.status === "loading") return <LoadingSkeleton rows={3} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
-  return <UploadWizard initial={state.data} pollMs={pollMs} />
+  return <UploadWizard initial={state.data} pollMs={pollMs} lookupDelayMs={lookupDelayMs} />
 }
 
-export function UploadFilePage({ pollMs }: { readonly pollMs?: number }) {
+export function UploadFilePage({
+  pollMs,
+  lookupDelayMs,
+}: {
+  readonly pollMs?: number
+  readonly lookupDelayMs?: number
+}) {
   const searchParams = useSearchParams()
   // Read once: the page writes `?id=` itself once a file is stored, and that
   // must not turn a wizard that is working into one that starts over.
@@ -349,9 +409,9 @@ export function UploadFilePage({ pollMs }: { readonly pollMs?: number }) {
         }
       />
       {initialId !== null && initialId !== "" ? (
-        <ExistingUpload id={initialId} pollMs={pollMs} />
+        <ExistingUpload id={initialId} pollMs={pollMs} lookupDelayMs={lookupDelayMs} />
       ) : (
-        <UploadWizard initial={null} pollMs={pollMs} />
+        <UploadWizard initial={null} pollMs={pollMs} lookupDelayMs={lookupDelayMs} />
       )}
     </div>
   )
