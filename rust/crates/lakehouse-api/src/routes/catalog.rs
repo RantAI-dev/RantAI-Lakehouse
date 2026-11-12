@@ -3325,6 +3325,11 @@ pub(crate) async fn readable_asset_names(
 /// `LH-DATA-12-15`, `DATA-54`). Test-only; the shipped code builds the copy
 /// from the catalog ([`search_snapshot`]).
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only helper: the copy it builds has no failure mode, and a \
+              failed build must fail the test loudly"
+)]
 pub(crate) async fn prime_search_copy_for_test(state: &AppState, assets: Vec<Value>) {
     let copy = crate::catalog_search_cache::CatalogSearchSnapshot {
         index: catalog_search::SearchIndex::build(assets, &catalog_search::ColumnIndex::new()),
@@ -3339,9 +3344,11 @@ pub(crate) async fn prime_search_copy_for_test(state: &AppState, assets: Vec<Val
             Ok::<_, String>(copy)
         })
         .await;
-    if let Err(err) = built {
-        panic!("a test-copy build cannot fail: {err}");
-    }
+    // CI on #493 (DATA-54): `{err}` in a `panic!` here read as a route putting
+    // an error's text into a response, because the SEC-11 scan ends only at a
+    // column-0 `#[cfg(test)] mod`, not at a test-only `fn`. `expect` prints the
+    // error's own `Debug` when the test fails and interpolates nothing.
+    built.expect("a test-copy build cannot fail");
 }
 
 /// `GOV-7` D6: the 404 a hidden asset answers, for the `/api/catalog/{id}/…`
