@@ -25,7 +25,7 @@ import { toast } from "sonner"
 import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { NO_READABLE_TABLE } from "@/lib/asset-query"
-import { formatDate } from "@/lib/format"
+import { formatDate, formatDateTime } from "@/lib/format"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
@@ -855,6 +855,22 @@ describe("Activity tab: usage and history", () => {
     const history = screen.getByText("Change history").closest("[data-slot=card]") as HTMLElement
     expect(within(history).getByText("Rina")).toBeTruthy()
     expect(within(history).getByText("Edited description, owner")).toBeTruthy()
+  })
+
+  // QA `LH-DATA-12-01` F2 (`DATA-54`): "just now" alone says nothing; the
+  // date and time are on hover.
+  it("shows a change's date and time on hover", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      changeHistory: [
+        { id: "audit-1", at: "2026-06-12T09:41:00Z", actor: "Rina", summary: "Edited description" },
+      ],
+    })
+    const history = (await screen.findByText("Change history")).closest("[data-slot=card]") as HTMLElement
+    const at = within(history).getByTitle(formatDateTime("2026-06-12T09:41:00Z"))
+    expect(at.className).toContain("ml-auto")
   })
 
   it("lists frequent users, frequent queries without values, joined tables and column popularity over 30 days", () => {

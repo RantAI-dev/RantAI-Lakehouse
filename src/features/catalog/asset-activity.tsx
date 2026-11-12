@@ -454,7 +454,12 @@ export function AssetActivity({
                 <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
                   <span className="font-medium">{c.actor}</span>
                   <span className="text-muted-foreground">{c.summary}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
+                  {/* QA `LH-DATA-12-01` F2 (`DATA-54`): the date and time on
+                      hover, as the Snapshots table of this file does. */}
+                  <span
+                    className="ml-auto text-xs text-muted-foreground"
+                    title={formatDateTime(c.at)}
+                  >
                     {formatRelativeTime(c.at)}
                   </span>
                 </li>
