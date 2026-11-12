@@ -38,6 +38,10 @@ def test_dlt_refuses_a_schema_named_after_a_pipeline_of_more_than_64_characters(
     # 64 is `dlt`'s limit for a schema name, and the pipeline name is the table's
     # plus `PIPELINE_PREFIX`: 14 characters, so the table may be 50.
     assert make_schema_with_default_name(PIPELINE_PREFIX + "a" * 50) == PIPELINE_PREFIX + "a" * 50
+    # Review round 1 R8: the limit is pinned by MAKING the schema at it, not only by the
+    # name helper: a `dlt` that lowered the limit would fail here, where the helper alone
+    # would stay green while a 50-character table name stopped loading.
+    Schema(PIPELINE_PREFIX + "a" * 50)
     for table_length in (51, 52, 128):
         with pytest.raises(InvalidSchemaName):
             Schema(PIPELINE_PREFIX + "a" * table_length)
