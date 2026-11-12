@@ -1770,6 +1770,12 @@ pub async fn run(
 /// The order of the guards, the history records and the errors are those of
 /// [`run`].
 ///
+/// The completed body is [`run_result_json`] plus `canDownload`: whether this
+/// principal may download a result at all (`QS-9`, `LH-QS-2-06`). It is
+/// `false` when the settings cannot be read, and the console uses it to turn
+/// Download and "Copy as TSV" off; `GET /api/query/run/{id}/download`
+/// refuses on its own either way.
+///
 /// # Errors
 ///
 /// The same as [`run`], less the 400s for the request body and the
@@ -2003,7 +2009,7 @@ pub(crate) async fn run_statement(
         }
     }
 
-    Ok(ApiJson(run_result_json(
+    let mut body = run_result_json(
         &id,
         &json!(columns),
         &json!(rows),
@@ -2013,7 +2019,23 @@ pub(crate) async fn run_statement(
         scanned_bytes,
         cost_units,
         engine,
-    )))
+    );
+    // QA `LH-QS-2-06` (`QS-9`): the console turns its own export actions off
+    // with this flag, so a role whose downloads are blocked cannot copy the
+    // rows out of a result. The download route refuses on its own (unchanged);
+    // the flag only spares the person the refused click. `false` when the
+    // settings cannot be read: an unreadable switch denies, it does not allow
+    // (AGENTS.md principle 3), and `format_settings` has already logged the
+    // cause under a reference.
+    let can_download = crate::routes::settings::format_settings(state)
+        .await
+        .is_ok_and(|settings| {
+            crate::routes::settings::may_download(p, &settings.download_denied_roles)
+        });
+    if let Some(map) = body.as_object_mut() {
+        map.insert("canDownload".to_owned(), Value::Bool(can_download));
+    }
+    Ok(ApiJson(body))
 }
 
 /// `QS-4` (the history page, decision 3): the one place records a run
@@ -6333,6 +6355,22 @@ mod tests {
 
             let sent = received(&ch).await;
             assert!(sent[0].contains("SELECT '{{x}}' AS v"), "{}", sent[0]);
+        }
+
+        /// QA `LH-QS-2-06` (`QS-9`): the run tells the console whether this
+        /// person may download the result, so it can turn its export actions
+        /// off. With no role switched off, everything is allowed.
+        #[tokio::test]
+        async fn a_run_result_says_the_caller_may_download_when_no_role_is_switched_off() {
+            let ch = clickhouse_answering_one_row().await;
+            let state = state_without_pool(&ch.uri(), "http://unused.invalid");
+
+            let answer = run_on_clickhouse(state, json!({ "sql": "SELECT 1" }))
+                .await
+                .expect("a plain read runs");
+            let v = answer.0;
+
+            assert_eq!(v["canDownload"], json!(true));
         }
 
         /// What the assistant's tools call after their own substitution:
