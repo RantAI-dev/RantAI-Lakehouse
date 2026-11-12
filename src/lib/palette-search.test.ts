@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test"
 import {
   PALETTE_ASSET_RESULT_LIMIT,
   capPaletteAssetResults,
+  makePaletteFilter,
   matchedOnLabel,
   paletteAssetLines,
 } from "./palette-search"
@@ -21,6 +22,22 @@ describe("capPaletteAssetResults", () => {
 
   it("returns an empty array for an empty result set", () => {
     expect(capPaletteAssetResults([])).toEqual([])
+  })
+})
+
+describe("makePaletteFilter", () => {
+  // QA `LH-DATA-11-14` (`DATA-54`): cmdk accepts the letters in order
+  // anywhere, so `gic` was found in "Governance Access rules
+  // /governance/policies".
+  it("a page is listed only when every typed word is in its text", () => {
+    const filter = makePaletteFilter([])
+    const page = "Governance Access rules /governance/policies"
+    expect(filter(page, "gic")).toBe(0)
+    expect(filter(page, "polic")).toBeGreaterThan(0)
+    expect(filter(page, "access")).toBeGreaterThan(0)
+    expect(filter(page, "ACCESS rules")).toBeGreaterThan(0)
+    expect(filter("theme dark light", "dark")).toBeGreaterThan(0)
+    expect(filter("theme dark light", "drk")).toBe(0)
   })
 })
 

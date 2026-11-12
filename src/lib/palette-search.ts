@@ -97,6 +97,19 @@ export function paletteAssetLines(
 export const ASSET_VALUE_PREFIX = "asset "
 
 /**
+ * Whether every word of `search` is a substring, in any case, of `value` and
+ * the `keywords` (QA `LH-DATA-11-14`, `DATA-54`).
+ */
+function everyWordIn(value: string, search: string, keywords?: string[]): boolean {
+  const haystack = `${value} ${(keywords ?? []).join(" ")}`.toLowerCase()
+  return search
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((word) => word !== "")
+    .every((word) => haystack.includes(word))
+}
+
+/**
  * cmdk's `filter` for the palette. QA LH-DATA-11-06: cmdk scores every item
  * by fuzzy match and re-sorts, so the server's own order of catalog assets
  * (its relevance order) was lost. Every asset row gets one score, so the sort
@@ -104,12 +117,21 @@ export const ASSET_VALUE_PREFIX = "asset "
  * one cmdk would have given any asset row, so the asset group keeps the
  * position among the other groups that it has today (cmdk orders groups by
  * their best item). Every other item keeps cmdk's own score.
+ *
+ * QA `LH-DATA-11-14` (`DATA-54`): `cmdk` accepts the letters in order
+ * anywhere, so `gic` was found in "Governance Access rules
+ * /governance/policies". A page or an action is listed only when every typed
+ * word is in its text; `cmdk`'s score still decides the order and nothing
+ * new is listed. Asset rows are not affected: the server decided them.
  */
 export function makePaletteFilter(assetValues: string[]) {
   return (value: string, search: string, keywords?: string[]): number => {
-    if (!value.startsWith(ASSET_VALUE_PREFIX)) return defaultFilter(value, search, keywords)
-    let best = 0
-    for (const v of assetValues) best = Math.max(best, defaultFilter(v, search, keywords))
-    return best
+    const score = defaultFilter(value, search, keywords)
+    if (value.startsWith(ASSET_VALUE_PREFIX)) {
+      let best = 0
+      for (const v of assetValues) best = Math.max(best, defaultFilter(v, search, keywords))
+      return best
+    }
+    return score > 0 && everyWordIn(value, search, keywords) ? score : 0
   }
 }

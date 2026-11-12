@@ -221,6 +221,17 @@ describe("CommandPalette catalog search", () => {
     expect(screen.queryByText("Catalog search is unavailable")).toBeNull()
   })
 
+  // QA `LH-DATA-11-14` (`DATA-54`): `cmdk` accepted letters in order anywhere,
+  // so `gic` listed pages that do not hold those letters together.
+  it("does not list a page for letters scattered through its name", async () => {
+    stubCatalog({ assets: [] })
+    await search("gic")
+    await waitFor(() => expect(screen.queryByText("Access rules")).toBeNull())
+    expect(screen.queryByText("Data Quality")).toBeNull()
+    fireEvent.change(screen.getByPlaceholderText(/Search pages/), { target: { value: "polic" } })
+    expect(await screen.findByText("Access rules")).toBeTruthy()
+  })
+
   it("lists See all results after every asset row, whatever is typed", async () => {
     // DATA-11 review SHOULD-FIX 6: `cmdk` reorders rows by its own score of
     // each row's `value`, and the term typed is in the See all row's value.
