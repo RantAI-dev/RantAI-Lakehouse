@@ -210,6 +210,8 @@ export function AlertsPage() {
         runEventsConfigured={runStatus.status === "success" ? runStatus.data.runEventsConfigured : null}
       />
 
+      {/* QA LH-SRC-7-10 (SRC-40 D8): the list's banner says the refusal in
+          words, never the API's code-first text (`permission_denied: alert:write`). */}
       {mutationError ? (
         <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {readableErrorMessage(mutationError.message)}

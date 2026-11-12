@@ -435,6 +435,8 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
     try {
       setFields(await dashboardService.listMartMeasures(mart))
     } catch (e) {
+      // QA LH-SRC-7-10 (SRC-40 D8): the measures' error is a sentence, never
+      // the API's code-first text.
       setFieldsError(
         e instanceof Error ? readableErrorMessage(e.message) : "Fields could not be loaded"
       )
@@ -561,6 +563,8 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
       // field to fill in.
       canSubmit
       submitting={saveAction.status === "pending"}
+      // QA LH-SRC-7-10 (SRC-40 D8): a refused save says the shared sentence, not
+      // the API's code-first text; `formErr` is the form's own sentence.
       error={
         formErr ?? (saveAction.error ? readableErrorMessage(saveAction.error.message) : null)
       }
