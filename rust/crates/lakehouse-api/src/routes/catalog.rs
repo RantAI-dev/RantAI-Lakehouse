@@ -3256,6 +3256,87 @@ pub(crate) fn retain_visible(access: &crate::table_access::TableAccess, assets: 
     assets.retain(|asset| asset_visible(access, asset));
 }
 
+/// The names of the tables among `ids` that `access` may read, in the order
+/// of `ids`: an id the catalog does not hold, or one the access hides, names
+/// nothing. An asset with no name is named by its id. Used by the refusal to
+/// delete a tag key in use (QA `LH-DATA-12-15`, `DATA-54`): only the tables
+/// the caller may read are named, and the rest are only counted.
+pub(crate) fn readable_names(
+    access: &crate::table_access::TableAccess,
+    assets: &[Value],
+    ids: &[String],
+) -> Vec<String> {
+    ids.iter()
+        .filter_map(|id| {
+            let asset = assets
+                .iter()
+                .find(|a| a.get("id").and_then(Value::as_str) == Some(id.as_str()))?;
+            if !asset_visible(access, asset) {
+                return None;
+            }
+            let name = asset
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(if name.is_empty() {
+                id.clone()
+            } else {
+                name.to_owned()
+            })
+        })
+        .collect()
+}
+
+/// [`readable_names`] for a caller: the access and the catalog read here.
+/// `None` when either cannot be read, so the caller keeps its own sentence
+/// and never answers with an error's text (fail closed; the refusal stands
+/// either way).
+pub(crate) async fn readable_asset_names(
+    state: &AppState,
+    principal: &Principal,
+    ids: &[String],
+) -> Option<Vec<String>> {
+    let access = match table_access_for(state, principal).await {
+        Ok(access) => access,
+        Err(err) => {
+            tracing::warn!(%err, "table access could not be read to name the tables holding a tag key");
+            return None;
+        }
+    };
+    let snapshot = match search_snapshot(state).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::warn!(%err, "catalog read failed to name the tables holding a tag key");
+            return None;
+        }
+    };
+    Some(readable_names(&access, snapshot.assets(), ids))
+}
+
+/// Puts a search copy that lists `assets` in the cache, so a test can name
+/// the tables holding a tag key without a catalog behind the mock (QA
+/// `LH-DATA-12-15`, `DATA-54`). Test-only; the shipped code builds the copy
+/// from the catalog ([`search_snapshot`]).
+#[cfg(test)]
+pub(crate) async fn prime_search_copy_for_test(state: &AppState, assets: Vec<Value>) {
+    let copy = crate::catalog_search_cache::CatalogSearchSnapshot {
+        index: catalog_search::SearchIndex::build(assets, &catalog_search::ColumnIndex::new()),
+        namespaces: Value::Null,
+        columns: HashMap::new(),
+        usage: HashMap::new(),
+        column_search_partial: false,
+    };
+    let built = state
+        .catalog_search_cache
+        .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, move || async move {
+            Ok::<_, String>(copy)
+        })
+        .await;
+    if let Err(err) = built {
+        panic!("a test-copy build cannot fail: {err}");
+    }
+}
+
 /// `GOV-7` D6: the 404 a hidden asset answers, for the `/api/catalog/{id}/…`
 /// reads that do not assemble the asset themselves. A Silver/Gold id names
 /// its own key; a Bronze id names a slug, whose table the registry knows
@@ -5270,6 +5351,26 @@ mod tests {
         let mut body = valid_body();
         body.tags = vec!["a".to_owned()];
         assert!(validate_annotation_body(&body).is_ok());
+    }
+
+    // QA `LH-DATA-12-15` (`DATA-54`): only the tables the caller may read are
+    // named; a hidden one and an unknown id name nothing.
+    #[test]
+    fn only_tables_the_caller_may_read_are_named() {
+        let assets = vec![
+            json!({ "id": "silver.a", "name": "Orders" }),
+            json!({ "id": "silver.b", "name": "Customers" }),
+        ];
+        let ids = ["silver.a", "silver.b", "silver.gone"].map(str::to_owned);
+        assert_eq!(
+            readable_names(&crate::table_access::TableAccess::All, &assets, &ids),
+            vec!["Orders", "Customers"]
+        );
+        let narrowed = crate::table_access::TableAccess::Listed(
+            HashSet::from([("silver".to_owned(), "a".to_owned())]),
+            HashSet::new(),
+        );
+        assert_eq!(readable_names(&narrowed, &assets, &ids), vec!["Orders"]);
     }
 
     #[test]

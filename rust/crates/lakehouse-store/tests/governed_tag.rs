@@ -13,8 +13,8 @@ use lakehouse_store::annotation::{
     AnnotationInput, get_annotation, upsert_annotation, upsert_annotation_with_governed_tags,
 };
 use lakehouse_store::governed_tag::{
-    create_key, delete_key, list_for_asset, list_for_assets, list_keys, set_asset_tags,
-    update_key_values,
+    assets_with_key, create_key, delete_key, list_for_asset, list_for_assets, list_keys,
+    set_asset_tags, update_key_values,
 };
 use sqlx::PgPool;
 
@@ -356,6 +356,27 @@ async fn a_key_in_use_cannot_be_deleted_and_the_count_is_in_the_sentence(
         .await
         .expect("an unused key can go");
     assert!(list_keys(&pool).await.expect("list").is_empty());
+    Ok(())
+}
+
+// QA `LH-DATA-12-15` (`DATA-54`): the refusal to delete a key in use names
+// the tables, so the store answers them in id order.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_tables_holding_a_key_are_listed_in_order(pool: PgPool) -> sqlx::Result<()> {
+    domain_key(&pool).await;
+    for asset in ["silver.c", "silver.a", "silver.b"] {
+        set_asset_tags(&pool, asset, &pairs(&[("data_domain", "ops")]), "Rina")
+            .await
+            .expect("tag");
+    }
+    assert_eq!(
+        assets_with_key(&pool, "data_domain").await.expect("read"),
+        words(&["silver.a", "silver.b", "silver.c"])
+    );
+    assert_eq!(
+        assets_with_key(&pool, "tier").await.expect("read"),
+        [] as [String; 0]
+    );
     Ok(())
 }
 

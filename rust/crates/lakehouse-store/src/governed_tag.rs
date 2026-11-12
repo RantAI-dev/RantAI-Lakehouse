@@ -237,7 +237,7 @@ pub async fn delete_key(pool: &PgPool, key: &str) -> Result<(), StoreError> {
             .await?;
     if in_use > 0 {
         return Err(invalid(format!(
-            "\"{key}\" is still given to {in_use} {}; remove it from {} first",
+            "\"{key}\" is still given to {in_use} {}. Remove it from {} first.",
             if in_use == 1 { "table" } else { "tables" },
             if in_use == 1 {
                 "that table"
@@ -364,6 +364,23 @@ pub async fn set_asset_tags_in(
 }
 
 const TAG_COLUMNS: &str = "asset_id, tag_key, value, set_by, set_at";
+
+/// The tables that currently hold `key`, ordered by asset id: what the
+/// refusal to delete a key in use names (`QA LH-DATA-12-15`, `DATA-54`). The
+/// caller decides which of them the person may read; this lists them all.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn assets_with_key(pool: &PgPool, key: &str) -> Result<Vec<String>, StoreError> {
+    let ids = sqlx::query_scalar(
+        "SELECT asset_id FROM asset_governed_tag WHERE tag_key = $1 ORDER BY asset_id",
+    )
+    .bind(key)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
 
 /// One table's governed tags, ordered by key.
 ///

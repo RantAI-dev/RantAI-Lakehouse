@@ -2101,9 +2101,11 @@ pub async fn update_tag_key(
 }
 
 /// `DELETE /api/governance/tag-keys/{key}` — remove a key nobody uses.
-/// Needs `governance:write`. Refused while any table has a value for it, with
-/// the number of tables in the sentence: a tag is never lost silently.
-/// Audited as `governance.tag_key_delete`.
+/// Needs `governance:write`. Refused while any table has a value for it: a
+/// tag is never lost silently. The sentence counts the tables and names up to
+/// three of them — only the ones the caller may read, the rest are counted
+/// (QA `LH-DATA-12-15`, `DATA-54`). Audited as
+/// `governance.tag_key_delete`.
 ///
 /// # Errors
 ///
@@ -2121,12 +2123,37 @@ pub async fn delete_tag_key(
     {
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
-    lakehouse_store::governed_tag::delete_key(pool(&state)?, &key)
-        .await
-        .map_err(|err| match err {
-            lakehouse_store::StoreError::NotFound => tag_key_not_found(&key),
-            other => ApiError::from(other),
-        })?;
+    match lakehouse_store::governed_tag::delete_key(pool(&state)?, &key).await {
+        Ok(()) => {}
+        Err(lakehouse_store::StoreError::NotFound) => {
+            return Err(tag_key_not_found(&key).into());
+        }
+        // QA `LH-DATA-12-15` (`DATA-54`): only tables the caller may read are
+        // named, the rest are counted. A catalog that cannot be read keeps the
+        // store's sentence, which still counts them, and the refusal stands.
+        Err(lakehouse_store::StoreError::Validation(counted)) => {
+            let ids = lakehouse_store::governed_tag::assets_with_key(pool(&state)?, &key).await;
+            let sentence = match ids {
+                Ok(ids) => {
+                    match crate::routes::catalog::readable_asset_names(&state, &principal, &ids)
+                        .await
+                    {
+                        Some(names) => tag_key_in_use_sentence(&key, ids.len(), &names),
+                        None => counted,
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "the tables holding a tag key could not be read"
+                    );
+                    counted
+                }
+            };
+            return Err(ApiError::BadRequest(sentence).into());
+        }
+        Err(other) => return Err(ApiError::from(other).into()),
+    }
     audit_tag_key(
         &state,
         &principal,
@@ -2138,6 +2165,31 @@ pub async fn delete_tag_key(
     Ok(ApiJson(json!({ "ok": true, "key": key })))
 }
 
+/// The refusal to delete a tag key in use: the count of every table that
+/// holds it, then up to three of them by name and "and N more" for the rest
+/// (QA `LH-DATA-12-15`, `DATA-54`). `names` are the ones the caller may read;
+/// `total` is the count of all of them, so a caller never learns of a table
+/// it may not read.
+fn tag_key_in_use_sentence(key: &str, total: usize, names: &[String]) -> String {
+    let (noun, them) = if total == 1 {
+        ("table", "that table")
+    } else {
+        ("tables", "those tables")
+    };
+    let head = format!("\"{key}\" is still given to {total} {noun}");
+    if names.is_empty() {
+        return format!("{head}. Remove it from {them} first.");
+    }
+    let shown: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
+    let rest = total.saturating_sub(shown.len());
+    let list = if rest > 0 {
+        format!("{} and {rest} more", shown.join(", "))
+    } else {
+        shown.join(", ")
+    };
+    format!("{head}: {list}. Remove it from {them} first.")
+}
+
 fn tag_key_not_found(key: &str) -> ApiError {
     ApiError::NotFound(format!("the tag key \"{key}\" is not defined"))
 }
@@ -2147,6 +2199,23 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // QA `LH-DATA-12-15` (`DATA-54`): the refusal names up to three tables
+    // and counts the rest; with no table to name it says which forms to
+    // remove the key from.
+    #[test]
+    fn the_refusal_names_up_to_three_tables_and_counts_the_rest() {
+        let names = ["A", "B", "C", "D"].map(str::to_owned);
+        assert_eq!(
+            tag_key_in_use_sentence("data_domain", 5, &names),
+            "\"data_domain\" is still given to 5 tables: A, B, C and 2 more. \
+             Remove it from those tables first."
+        );
+        assert_eq!(
+            tag_key_in_use_sentence("data_domain", 1, &[]),
+            "\"data_domain\" is still given to 1 table. Remove it from that table first."
+        );
+    }
 
     /// `WEB-8` S2 T8 (D8): the grammar route's answer is what the validator
     /// accepts. Every function and operator the route names is accepted in a
@@ -3372,6 +3441,56 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(kept, vec!["finance", "ops"], "a refusal changes nothing");
+        }
+
+        // QA `LH-DATA-12-15` (`DATA-54`): the refusal names up to three of
+        // the tables that hold the key, and only ones the caller may read.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn deleting_a_key_in_use_names_the_tables_that_hold_it(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            create(
+                &state,
+                r#"{"key":"data_domain","allowedValues":["finance","ops"]}"#,
+            )
+            .await;
+            for asset in ["silver.a", "silver.b"] {
+                lakehouse_store::governed_tag::set_asset_tags(
+                    &pool,
+                    asset,
+                    &[("data_domain".to_owned(), "ops".to_owned())],
+                    "Rina",
+                )
+                .await
+                .unwrap();
+            }
+            crate::routes::catalog::prime_search_copy_for_test(
+                &state,
+                vec![
+                    json!({ "id": "silver.a", "name": "Orders" }),
+                    json!({ "id": "silver.b", "name": "Customers" }),
+                ],
+            )
+            .await;
+
+            let (status, refused) = remove(&state, "data_domain").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2 tables: Orders, Customers."),
+                "{refused}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM governed_tag_key")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                1,
+                "a refusal changes nothing"
+            );
         }
 
         // PR #106 review R1 BLOCKER 1
