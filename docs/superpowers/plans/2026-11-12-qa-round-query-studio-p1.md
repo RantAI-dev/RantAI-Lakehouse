@@ -1128,3 +1128,13 @@ code, so the Rust caches are that of `7b435fc0`):
 Not verified: a full `cargo test --workspace` (no crate outside `lakehouse-api` was touched, and
 the reviewer re-runs the block before merge), `docker compose` (no compose change) and the
 Python suite (no Python change).
+
+### Round 2 (planner, 2026-11-12), at `d57fad891`
+
+Read `71bf4a9bc..d57fad891`. R1 to R8 are fixed as asked, each in its own commit, and each new
+assertion was shown to fail on the wrong change before it was kept. The developer is right
+about R7's premise: `--test query_history` also runs one test of `tests/common`, so the first
+handoff's 27 was a real count; the line now reads 28 with the test R4 added.
+
+No open BLOCKER. T1 and T2 stay held (section 0) and are not part of this pull request: the
+first half of `QS-6` is still open in the backlog. Merge when CI on #483 is green.
