@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useParams, useRouter } from "next/navigation"
+import { useParams, useRouter, useSearchParams } from "next/navigation"
 import { FormPage } from "@/components/patterns/form-page"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -47,8 +47,10 @@ function tableAccessChanged(draft: TableAccessDraft, loaded: RoleTableAccess): b
 
 /**
  * The three fields a role has, shared by Create and Edit (`WEB-3` S3-D8).
- * `GOV-7` S2 adds a section to the Edit page; it belongs in the same body,
- * below these fields, so both pages cannot drift apart.
+ * `GOV-7` S2 adds a section to the Edit page; `GOV-8` D2 puts the same
+ * section on Create too, so a role's data access is set when the role is
+ * made. It belongs in the same body, below these fields, so the two pages
+ * cannot drift apart.
  */
 export function RoleFields({
   idPrefix,
@@ -89,13 +91,30 @@ export function RoleFields({
   )
 }
 
-/** `/admin/roles/new` (`WEB-7` D2): the create form as its own page. */
+/**
+ * `/admin/roles/new` (`WEB-7` D2): the create form as its own page.
+ *
+ * `GOV-8` D2: the page owns the role's data access in the same section Edit
+ * role uses, so a new role can be narrowed as it is created rather than
+ * opened a second time. The role is created first, then its tables are a
+ * second request carrying the id the create returned, sent only when the
+ * draft differs from "All tables". `GOV-8` D3: when that second request
+ * fails the role exists and reads every table, and the page hands the
+ * administrator the role's Edit page with the reason, because a retry here
+ * would create a second role or be refused for the name.
+ */
 export function RoleCreatePage() {
   const router = useRouter()
   const backHref = "/admin/roles"
   const [name, setName] = React.useState("")
   const [permissions, setPermissions] = React.useState("")
   const [description, setDescription] = React.useState("")
+  // `GOV-8` D2: a new role starts reading every table, which is the API's
+  // own default, so an untouched section writes nothing.
+  const [tableAccess, setTableAccess] = React.useState<TableAccessDraft>({
+    scope: "all",
+    grants: [],
+  })
   const create = useServiceAction(
     withNotify(
       { success: "Role created", error: "Failed to create role" },
@@ -103,14 +122,44 @@ export function RoleCreatePage() {
         identityService.createRole(input, signal)
     )
   )
+  // `GOV-8` D3: the failed second write is reported on the Edit page, not by
+  // a toast here, so this action is deliberately not wrapped in `withNotify`.
+  const saveAccess = useServiceAction(
+    (signal, id: string, input: SetRoleTableAccessInput) =>
+      identityService.setRoleTableAccess(id, input, signal)
+  )
+  // `GOV-8` D2 copies Edit role's `*:*` rule (`GOV-7` D4): the API refuses to
+  // narrow such a role, so the section is disabled and creation sends no
+  // table-access write.
+  const fullAccess = grantsUnrestricted(permissions)
 
   async function handleCreate() {
-    const result = await create.run({
+    const created = await create.run({
       name: name.trim(),
       permissions: permissions.trim(),
       description: description.trim(),
     })
-    if (result) router.push(backHref)
+    if (!created) return
+    // `GOV-8` D2: the test for "the tables changed" is Edit role's own
+    // `tableAccessChanged`, against the draft a new role starts from.
+    if (
+      fullAccess ||
+      !tableAccessChanged(tableAccess, { scope: "all", grants: [] })
+    ) {
+      router.push(backHref)
+      return
+    }
+    const accessSaved = await saveAccess.run(created.id, {
+      scope: tableAccess.scope,
+      grants: tableAccess.scope === "listed" ? tableAccess.grants : [],
+    })
+    if (accessSaved) {
+      router.push(backHref)
+      return
+    }
+    // `GOV-8` D3: the role exists and reads every table until the tables are
+    // saved on its Edit page, which says so while `?tables=unsaved` is there.
+    router.push(`/admin/roles/${encodeURIComponent(created.id)}/edit?tables=unsaved`)
   }
 
   return (
@@ -122,7 +171,7 @@ export function RoleCreatePage() {
       submitLabel="Create"
       submittingLabel="Creating…"
       canSubmit={Boolean(name.trim() && permissions.trim() && description.trim())}
-      submitting={create.status === "pending"}
+      submitting={create.status === "pending" || saveAccess.status === "pending"}
       error={create.status === "error" ? create.error.message : null}
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
@@ -135,6 +184,12 @@ export function RoleCreatePage() {
         onName={setName}
         onPermissions={setPermissions}
         onDescription={setDescription}
+      />
+      <RoleTableAccessSection
+        idPrefix="role"
+        value={tableAccess}
+        onChange={setTableAccess}
+        disabledReason={fullAccess ? "A role with full access cannot be narrowed" : null}
       />
     </FormPage>
   )
@@ -176,6 +231,12 @@ export function RoleEditPage() {
  */
 function RoleEditForm({ role }: { role: Role }) {
   const router = useRouter()
+  const searchParams = useSearchParams()
+  // `GOV-8` D3: Create role sends the administrator here when the role was
+  // created but its tables were not saved, so this page says what happened
+  // and what to do. The draft is not carried over: the administrator picks
+  // the tables again on this page.
+  const tablesUnsaved = searchParams.get("tables") === "unsaved"
   const backHref = "/admin/roles"
   const [name, setName] = React.useState(role.name)
   const [permissions, setPermissions] = React.useState(role.permissions)
@@ -277,6 +338,19 @@ function RoleEditForm({ role }: { role: Role }) {
         onPermissions={setPermissions}
         onDescription={setDescription}
       />
+      {tablesUnsaved ? (
+        <div
+          role="status"
+          className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3"
+        >
+          {/* `GOV-8` D3: the exact sentence the plan fixes, so the reader
+              knows the role exists, reads every table, and what to do. */}
+          <p className="text-sm text-amber-700 dark:text-amber-400">
+            This role was created, but its tables were not saved. It reads every table
+            until you save them here.
+          </p>
+        </div>
+      ) : null}
       <RoleTableAccessSection
         idPrefix="edit-role"
         value={tableAccess}

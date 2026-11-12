@@ -3,11 +3,14 @@
 // reload works, and it keeps the WEB-3 R2 rename warning the sheet had.
 // GOV-7 S2 (D8): the same page owns "Tables this role can read", saved by
 // the same Save button after the role itself.
+// GOV-8 (D2/D3): Create role owns that section too, and sends the address
+// `?tables=unsaved` to the Edit page when the tables could not be saved.
 let pushed: string[] = []
 let params: Record<string, string> = { id: "r1" }
+let search = new URLSearchParams()
 mock.module("next/navigation", () => ({
   usePathname: () => "/admin/roles/new",
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => search,
   useParams: () => params,
   useRouter: () => ({
     push: (href: string) => {
@@ -35,6 +38,7 @@ afterEach(() => {
 beforeEach(() => {
   pushed = []
   params = { id: "r1" }
+  search = new URLSearchParams()
 })
 
 const json = (body: unknown, status = 200) =>
@@ -60,6 +64,8 @@ type Stub = {
   roles?: unknown[]
   access?: { scope: string; grants: { schema: string; table: string }[] }
   assets?: unknown[]
+  /** The permission catalog the picker lists; `*:*` is only offered when named (`GOV-8` D2). */
+  permissions?: unknown[]
   catalogStatus?: number
   accessStatus?: number
   tableAccessAnswer?: () => Response
@@ -73,6 +79,10 @@ function stubApi({
   roles = [ROLE],
   access = { scope: "all", grants: [] },
   assets = ASSETS,
+  permissions = [
+    { name: "catalog:read", area: "Data", description: "Browse tables." },
+    { name: "query:read", area: "Data", description: "Run SQL." },
+  ],
   catalogStatus = 200,
   accessStatus = 200,
   tableAccessAnswer,
@@ -89,10 +99,7 @@ function stubApi({
       return json({ id: "u1", name: "Admin", email: null, roles: ["Admin"], permissions: ["identity:write"], tenants: [] })
     }
     if (path.includes("/api/identity/permissions")) {
-      return json([
-        { name: "catalog:read", area: "Data", description: "Browse tables." },
-        { name: "query:read", area: "Data", description: "Run SQL." },
-      ])
+      return json(permissions)
     }
     if (path.includes("/table-access")) {
       if (method === "GET") {
@@ -120,6 +127,109 @@ function stubApi({
 function renderPage(node: React.ReactElement) {
   return render(<AuthProvider>{node}</AuthProvider>)
 }
+
+describe("RoleCreatePage: tables this role can read (GOV-8 D2)", () => {
+  it("creates the role first and then writes the tables chosen for it", async () => {
+    const writes = stubApi()
+    renderPage(<RoleCreatePage />)
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "Data Analyst" } })
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Reads data." } })
+    fireEvent.click(await screen.findByRole("checkbox", { name: "catalog:read" }))
+    fireEvent.click(screen.getByRole("radio", { name: "Only these" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Expand silver" }))
+    fireEvent.click(screen.getByRole("checkbox", { name: "Whole schema silver" }))
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+
+    await waitFor(() =>
+      expect(writes).toEqual([
+        {
+          method: "POST",
+          path: "/api/identity/roles",
+          body: {
+            name: "Data Analyst",
+            permissions: "catalog:read",
+            description: "Reads data.",
+          },
+        },
+        // GOV-8 D2: the second request carries the id the create returned.
+        {
+          method: "PUT",
+          path: "/api/identity/roles/r1/table-access",
+          body: { scope: "listed", grants: [{ schema: "silver", table: "*" }] },
+        },
+      ])
+    )
+    await waitFor(() => expect(pushed).toEqual(["/admin/roles"]))
+  })
+
+  it("sends no table-access request when a new role is left on All tables", async () => {
+    const writes = stubApi()
+    renderPage(<RoleCreatePage />)
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "Data Analyst" } })
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Reads data." } })
+    fireEvent.click(await screen.findByRole("checkbox", { name: "catalog:read" }))
+    // GOV-8 D2: "All tables" is what a new role already reads, so the draft
+    // does not differ and no table-access write is sent.
+    expect((screen.getByRole("radio", { name: "All tables" }) as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+
+    await waitFor(() =>
+      expect(writes.map((write) => write.path)).toEqual(["/api/identity/roles"])
+    )
+    await waitFor(() => expect(pushed).toEqual(["/admin/roles"]))
+  })
+
+  it("disables the tables section for a new role that grants *:* and writes no table access", async () => {
+    // The picker offers `*:*` as a checkbox only when the catalog names it;
+    // the real catalog treats `*:*` as always valid (`isKnownToken`), and a
+    // role holding it shows the full-access box instead of the area list.
+    const writes = stubApi({
+      permissions: [{ name: "*:*", area: "Admin", description: "Unrestricted." }],
+    })
+    renderPage(<RoleCreatePage />)
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "Platform Admin" } })
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "Administers the platform." },
+    })
+    fireEvent.click(await screen.findByRole("checkbox", { name: "*:*" }))
+    expect(await screen.findByText("A role with full access cannot be narrowed")).toBeTruthy()
+    expect(
+      (screen.getByRole("radio", { name: "Only these" }) as HTMLInputElement).disabled
+    ).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+
+    // GOV-8 D2: the role is created and, as on Edit role, no table-access
+    // write is sent for it.
+    await waitFor(() =>
+      expect(writes.map((write) => write.path)).toEqual(["/api/identity/roles"])
+    )
+    await waitFor(() => expect(pushed).toEqual(["/admin/roles"]))
+  })
+
+  it("opens the new role's Edit page with tables=unsaved when its tables cannot be saved", async () => {
+    const writes = stubApi({
+      tableAccessAnswer: () => json({ error: "Tables refused" }, 500),
+    })
+    renderPage(<RoleCreatePage />)
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "Data Analyst" } })
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Reads data." } })
+    fireEvent.click(await screen.findByRole("checkbox", { name: "catalog:read" }))
+    fireEvent.click(screen.getByRole("radio", { name: "Only these" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Expand silver" }))
+    fireEvent.click(screen.getByRole("checkbox", { name: "Whole schema silver" }))
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+
+    // GOV-8 D3: no retry here (a second Create would create another role or
+    // be refused for the name); the Edit page says what happened.
+    await waitFor(() =>
+      expect(pushed).toEqual(["/admin/roles/r1/edit?tables=unsaved"])
+    )
+    expect(writes.map((write) => write.path)).toEqual([
+      "/api/identity/roles",
+      "/api/identity/roles/r1/table-access",
+    ])
+  })
+})
 
 describe("RoleCreatePage (WEB-7 D2)", () => {
   it("creates the role with its three fields and goes back to the list", async () => {
@@ -442,5 +552,28 @@ describe("RoleEditPage: tables this role can read (GOV-7 S2-D8)", () => {
         body: { scope: "listed", grants: [] },
       })
     )
+  })
+})
+
+// GOV-8 D3: Create role sends the administrator here when the role exists
+// but its tables were not saved; the notice must not appear otherwise.
+describe("RoleEditPage: the unsaved-tables notice (GOV-8 D3)", () => {
+  it("shows the notice when the address carries tables=unsaved, and not otherwise", async () => {
+    stubApi()
+    search = new URLSearchParams("tables=unsaved")
+    renderPage(<RoleEditPage />)
+    expect(
+      await screen.findByText(
+        "This role was created, but its tables were not saved. It reads every table until you save them here."
+      )
+    ).toBeTruthy()
+
+    cleanup()
+    search = new URLSearchParams()
+    renderPage(<RoleEditPage />)
+    await screen.findByLabelText("Name")
+    expect(
+      screen.queryByText(/This role was created, but its tables were not saved/)
+    ).toBeNull()
   })
 })
