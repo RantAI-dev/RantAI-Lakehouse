@@ -3,6 +3,7 @@
 import Link from "next/link"
 import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
+import { SelectField } from "@/components/patterns/select-field"
 import { Pill } from "@/components/patterns/status-badge"
 import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -154,19 +155,15 @@ export function ColumnLineageCard({ tableKey, columns }: { tableKey: string; col
     >
       <div className="mb-3 grid max-w-sm gap-1.5">
         <Label htmlFor={pickerId}>Column</Label>
-        <select
+        <SelectField
           id={pickerId}
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={column}
-          onChange={(e) => setColumn(e.target.value)}
-        >
-          <option value="">Pick a column</option>
-          {columns.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
+          options={columns.map((name) => ({ value: name, label: name }))}
+          /* WEB-9 D2: "Pick a column" is only a prompt, so it is the placeholder. */
+          placeholder="Pick a column"
+          onValueChange={setColumn}
+        />
       </div>
       {column === "" ? (
         <EmptyState title="Pick a column" description="Its upstream and downstream columns appear here." className="py-4" />

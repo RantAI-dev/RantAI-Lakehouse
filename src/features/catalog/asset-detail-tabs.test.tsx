@@ -22,6 +22,7 @@ mock.module("next/navigation", () => ({
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { toast } from "sonner"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { NO_READABLE_TABLE } from "@/lib/asset-query"
 import { formatDate } from "@/lib/format"
@@ -458,11 +459,11 @@ describe("Lineage tab", () => {
     renderTabs()
 
     const card = (await screen.findByText("Column lineage")).closest("[data-slot=card]") as HTMLElement
-    expect(within(within(card).getByLabelText("Column")).getAllByRole("option").map((o) => o.textContent)).toEqual([
-      "Pick a column",
-      "amount",
-      "id",
-    ])
+    // WEB-9 D2: "Pick a column" is the placeholder, not an option.
+    const column = within(card).getByRole("combobox", { name: "Column" })
+    expect(column.querySelector('[data-slot="select-value"]')?.textContent).toBe("Pick a column")
+    fireEvent.click(column)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["amount", "id"])
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/api/governance/lineage/columns"))).toBe(false)
   })
 
@@ -660,8 +661,8 @@ describe("Quality tab", () => {
 
     // The button waits for the session: it shows only with governance:write (SEC-23).
     fireEvent.click(await screen.findByText("Add rule"))
-    fireEvent.change(screen.getByLabelText("Check"), { target: { value: "unique" } })
-    fireEvent.change(screen.getByLabelText("Column"), { target: { value: "id" } })
+    chooseOption(screen.getByRole("combobox", { name: "Check" }), "Column has no repeated values")
+    chooseOption(await screen.findByRole("combobox", { name: "Column" }), "id")
     expect(screen.getByText("id unique")).toBeTruthy()
     // Bronze is append-only: what "unique" means there is said up front.
     expect(screen.getByText(/only when it repeats within\s+one load/)).toBeTruthy()
@@ -759,12 +760,12 @@ describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
     url.search = "tab=quality"
     renderTabs(BRONZE)
 
-    const mode = await screen.findByLabelText("Run the checks")
+    const mode = await screen.findByRole("combobox", { name: "Run the checks" })
     // The panel seeds the control from the saved schedule in an effect; let it
     // run, or it would put the mode back after the change below (CI race).
     await act(async () => {})
-    fireEvent.change(mode, { target: { value: "on_load" } })
-    fireEvent.change(await screen.findByLabelText("And at least every"), { target: { value: "360" } })
+    chooseOption(mode, "On every load")
+    chooseOption(await screen.findByRole("combobox", { name: "And at least every" }), "6 hours")
     fireEvent.click(screen.getByRole("button", { name: "Save schedule" }))
 
     await waitFor(() =>
@@ -996,10 +997,16 @@ describe("About card", () => {
     )
 
     fireEvent.click(await screen.findByText("Edit"))
-    const select = (await screen.findByLabelText("data_domain")) as HTMLSelectElement
-    expect([...select.options].map((o) => o.value)).toEqual(["", "finance", "ops"])
-    expect(select.value).toBe("")
-    fireEvent.change(select, { target: { value: "ops" } })
+    const select = await screen.findByRole("combobox", { name: "data_domain" })
+    // WEB-9 D2: "None" is a real choice whose value is "".
+    expect(select.querySelector('[data-slot="select-value"]')?.textContent).toBe("None")
+    fireEvent.click(select)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "None",
+      "finance",
+      "ops",
+    ])
+    chooseOption(select, "ops")
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
@@ -1021,9 +1028,9 @@ describe("About card", () => {
     })
 
     fireEvent.click(await screen.findByText("Edit"))
-    const select = (await screen.findByLabelText("data_domain")) as HTMLSelectElement
-    expect(select.value).toBe("finance")
-    fireEvent.change(select, { target: { value: "" } })
+    const select = await screen.findByRole("combobox", { name: "data_domain" })
+    expect(select.querySelector('[data-slot="select-value"]')?.textContent).toBe("finance")
+    chooseOption(select, "None")
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
     await waitFor(() => expect(writes(fetchSpy).length).toBe(1))
@@ -1039,7 +1046,7 @@ describe("About card", () => {
     renderTabs({ ...BRONZE, annotation: { owner: null, steward: null, tags: [], description: null } })
 
     fireEvent.click(await screen.findByText("Edit"))
-    fireEvent.change(await screen.findByLabelText("data_domain"), { target: { value: "ops" } })
+    chooseOption(await screen.findByRole("combobox", { name: "data_domain" }), "ops")
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
     expect(await screen.findByText(/"ops" is not an allowed value for "data_domain"; allowed values: finance/)).toBeTruthy()
@@ -1104,7 +1111,10 @@ describe("About card: sensitivity of the whole table (WEB-3 S3-T5a)", () => {
     const section = tableSection()
     expect(within(section).getByText("Not set for the whole table.")).toBeTruthy()
     fireEvent.click(await within(section).findByRole("button", { name: "Set" }))
-    fireEvent.change(within(section).getByLabelText("Sensitivity of the whole table"), { target: { value: "internal" } })
+    chooseOption(
+      within(section).getByRole("combobox", { name: "Sensitivity of the whole table" }),
+      "Internal"
+    )
     fireEvent.click(within(section).getByRole("button", { name: "Save" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
@@ -1130,7 +1140,10 @@ describe("About card: sensitivity of the whole table (WEB-3 S3-T5a)", () => {
     )
     const section = tableSection()
     fireEvent.click(await within(section).findByRole("button", { name: "Change" }))
-    fireEvent.change(within(section).getByLabelText("Sensitivity of the whole table"), { target: { value: "restricted" } })
+    chooseOption(
+      within(section).getByRole("combobox", { name: "Sensitivity of the whole table" }),
+      "Restricted"
+    )
     fireEvent.click(within(section).getByRole("button", { name: "Save" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
@@ -1314,7 +1327,7 @@ describe("Activity tab: freshness target", () => {
     fireEvent.change(screen.getByLabelText("New data at least every"), { target: { value: "0" } })
     expect((screen.getByRole("button", { name: "Save target" }) as HTMLButtonElement).disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("New data at least every"), { target: { value: "6" } })
-    fireEvent.change(screen.getByLabelText("Unit"), { target: { value: "hours" } })
+    chooseOption(screen.getByRole("combobox", { name: "Unit" }), "hours")
     fireEvent.click(screen.getByRole("button", { name: "Save target" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
@@ -1331,7 +1344,11 @@ describe("Activity tab: freshness target", () => {
     expect(screen.getByText(/by its freshness SLA/)).toBeTruthy()
     fireEvent.click(await screen.findByText("Change target"))
     expect((screen.getByLabelText("New data at least every") as HTMLInputElement).value).toBe("2")
-    expect((screen.getByLabelText("Unit") as HTMLSelectElement).value).toBe("days")
+    // WEB-9 D2: the trigger shows the chosen option's label.
+    expect(
+      screen.getByRole("combobox", { name: "Unit" }).querySelector('[data-slot="select-value"]')
+        ?.textContent
+    ).toBe("days")
   })
 })
 
@@ -2002,7 +2019,7 @@ describe("Access tab: grants", () => {
     const card = (await screen.findByText("Grants")).closest("[data-slot=card]") as HTMLElement
     await within(card).findByText("No grant has been made from this asset.")
     fireEvent.change(within(card).getByLabelText("E-mail of the user"), { target: { value: " bayu@meridian.example " } })
-    fireEvent.change(within(card).getByLabelText("Permission"), { target: { value: "lineage:read" } })
+    chooseOption(within(card).getByRole("combobox", { name: "Permission" }), "lineage:read")
     fireEvent.click(within(card).getByRole("button", { name: "Grant" }))
 
     await waitFor(() => expect(writes(fetchSpy).some((w) => w[0] === "POST" && String(w[1]).endsWith("/grants"))).toBe(true))
@@ -2254,7 +2271,10 @@ describe("Quality tab: rewriting a rule", () => {
     fireEvent.click(await screen.findByLabelText("Edit rule email_complete"))
     // The form opens on the rule as it is; saving it unchanged is nothing to save.
     expect((screen.getByLabelText("Table") as HTMLInputElement).value).toBe("bronze.demo_orders")
-    expect((screen.getByLabelText("Severity") as HTMLSelectElement).value).toBe("high")
+    expect(
+      screen.getByRole("combobox", { name: "Severity" }).querySelector('[data-slot="select-value"]')
+        ?.textContent
+    ).toBe("High")
     const save = screen.getByRole("button", { name: "Save rule" }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Threshold"), { target: { value: " amount not null >= 95% " } })
@@ -3091,7 +3111,10 @@ describe("Schema tab: a column's sensitivity and masking (WEB-3 S3-D1)", () => {
     expect(within(section).getByText(/Not set for this column\. The table as a whole is Internal\./)).toBeTruthy()
     // The button waits for the session: it shows only with governance:write (SEC-23).
     fireEvent.click(await within(section).findByRole("button", { name: "Set" }))
-    fireEvent.change(within(section).getByLabelText("Sensitivity of amount"), { target: { value: "restricted" } })
+    chooseOption(
+      within(section).getByRole("combobox", { name: "Sensitivity of amount" }),
+      "Restricted"
+    )
     fireEvent.click(within(section).getByRole("button", { name: "Save" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
@@ -3108,7 +3131,10 @@ describe("Schema tab: a column's sensitivity and masking (WEB-3 S3-D1)", () => {
     const section = openColumn("amount")
     expect(within(section).getByText("Restricted")).toBeTruthy()
     fireEvent.click(await within(section).findByRole("button", { name: "Change" }))
-    fireEvent.change(within(section).getByLabelText("Sensitivity of amount"), { target: { value: "confidential" } })
+    chooseOption(
+      within(section).getByRole("combobox", { name: "Sensitivity of amount" }),
+      "Confidential"
+    )
     fireEvent.click(within(section).getByRole("button", { name: "Save" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())

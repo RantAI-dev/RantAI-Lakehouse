@@ -3,6 +3,7 @@
 import * as React from "react"
 import { useRouter } from "next/navigation"
 import { FormPage } from "@/components/patterns/form-page"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -15,8 +16,6 @@ import { SEVERITY_OPTIONS } from "./data-quality-columns"
 import { CheckFields, ThresholdForms } from "./quality-check-fields"
 import { EMPTY_FORM, KINDS, ruleThreshold, type RuleForm } from "./quality-checks"
 import { TablePicker, useTableCatalog, useTableColumns } from "./table-picker"
-
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 /**
  * `/governance/data-quality/rules/new` (`WEB-7` D2): the add-rule form,
@@ -153,18 +152,13 @@ export function QualityRuleCreatePage() {
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="qr-severity">Severity</Label>
-        <select
+        <SelectField
           id="qr-severity"
-          className={selectClassName}
+          className="w-full"
           value={severity}
-          onChange={(e) => setSeverity(e.target.value as Severity)}
-        >
-          {SEVERITY_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
+          options={SEVERITY_OPTIONS}
+          onValueChange={(next) => setSeverity(next as Severity)}
+        />
       </div>
     </FormPage>
   )
