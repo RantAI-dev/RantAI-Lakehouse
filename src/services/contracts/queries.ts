@@ -441,6 +441,14 @@ export type QueryResult = {
     policyObligations: string[] | null
   }
   /**
+   * QA `LH-QS-2-06` (`QS-9`): whether this person may download a result at
+   * all. `false` when every role they hold is switched off from downloading
+   * (the same switch the dashboard reads); the console turns Download and
+   * "Copy as TSV" off with it. Absent from an older server, which counts as
+   * allowed — and the download route refuses on its own either way.
+   */
+  canDownload?: boolean
+  /**
    * WS1 task 1.6: the old plan was a single hardcoded stage claiming
    * "scan + aggregate" for every query. Null until a real plan exists.
    */

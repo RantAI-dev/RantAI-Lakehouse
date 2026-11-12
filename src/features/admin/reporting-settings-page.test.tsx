@@ -217,6 +217,20 @@ describe("ReportingSettingsForm", () => {
     expect(sent.downloadDeniedRoles).toEqual(["Analyst", "Viewer"])
   })
 
+  // QA LH-QS-2-06 (QS-9), decision 13: the paragraph says what the switch
+  // covers now that it also covers Query Studio's download and Copy as TSV.
+  it("says the download switch covers Query Studio's download and Copy as TSV", async () => {
+    mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+
+    const paragraph = (await screen.findByText(/A checked role cannot use the console/)) as HTMLElement
+    expect(paragraph.textContent).toContain("a Query Studio result download")
+    expect(paragraph.textContent).toContain('"Copy as TSV"')
+    expect(paragraph.textContent).toContain(
+      "It does not stop a person from selecting and copying what is on the screen."
+    )
+  })
+
   it("shows no downloads section to a caller who may not read the list (PR #204 review SHOULD-FIX 3)", async () => {
     mockSettings(READER_DEFAULTS)
     render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
