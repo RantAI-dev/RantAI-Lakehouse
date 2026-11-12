@@ -1191,3 +1191,22 @@ TypeScript `bun run typecheck`, `bun run lint` and `bun test <the touched files>
   or service changed), so `config --quiet` is the whole proof. The `up` for T10's settings belongs to
   the `g6-ops` gate, as the handoff of the build round says.
 - Nothing else was skipped.
+
+### Round 2 (planner, 2026-11-12), at `ca6fcde7a`
+
+Read `67581e96d..ca6fcde7a`. R1 to R11 are fixed, one commit each, each new test shown red
+before its fix. `overdue` now follows the round-1 ruling: a queued run is judged by the
+running limit, an unstarted one by the start limit, a starting run is left to the
+orchestrator, and every status nobody measured keeps the 409.
+
+**The developer's MISMATCH on R2 is right, and the ruling was the planner's contradiction.**
+"Close the record before the cancel" and "an orchestrator that cannot be reached writes
+nothing" cannot both hold. The order built stands: cancel first, then close. What is left: if
+the store fails right after an accepted cancel, that request answers 5xx and the record stays
+`running` although its run is cancelled; nothing closes it later. That needs two failures in a
+row and loses no data (the history shows a run as going that is not). It goes to the backlog
+as its own item (close a `running` record whose orchestrator run has ended); it is not part of
+this pull request.
+
+No open BLOCKER. Still for CI to prove: the real `docker compose up` with run monitoring on
+and gate step h (`g6-ops`). Merge when CI on #485 is green.
