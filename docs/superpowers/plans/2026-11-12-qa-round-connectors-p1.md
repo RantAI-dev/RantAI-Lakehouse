@@ -1048,3 +1048,141 @@ and a finding's "Fix" differ, the ruling holds).
 - Fix: refuse `EndReason::TimedOut` in `report_end` with a 400 (the route's own vocabulary stays the four words), with a comment citing D11.
 - Check: a test beside `connector_runs.rs:1093`: the end report with `reason: "timed_out"` answers 400 and the record stays `running`.
 
+
+### Round 1 fixes (developer)
+
+Base of this round: `67581e96` (the review). One commit per finding, R1 to R11 in order, each pushed
+to `fix/qa-round-connectors-p1`. Every new or corrected test was run against the code **before** its
+fix (the fix stashed, or the temporary wrong change the finding's Check names), seen to fail, and then
+run green again; the failure text is quoted. Fix sites carry `review round 1, R<n>` (rule 13).
+
+**R1** `138abf94` — `overdue` no longer judges `QUEUED` by the start limit (a queued run is overdue
+only past the run limit plus the grace), `STARTING` is never overdue here and is left to the
+monitoring, `NOT_STARTED` keeps the start limit by `creationTime`; the guard doc, the
+`OVERDUE_GRACE_SECONDS` doc, `docker-compose.yml`, `docs/CONFIGURATION.md`, `config.rs` and
+`dagster/dagster.yaml` now say so; D13 and decision 15 of `connector-operations.md` are reworded for
+the queued case.
+Proof: `a_queued_run_is_not_overdue_after_the_start_limit` and
+`a_starting_run_is_not_judged_by_when_it_was_created` failed before the fix with
+`assertion left: Some(NeverStarted), right: None`; integration
+`a_queued_run_still_holds_the_connector_after_the_start_limit` failed with `left: 200, right: 409`
+(`{"runId":"never"}` — the route cancelled and launched).
+
+**R2** `071c0d0a` — the cancel is asked for first: an unreachable orchestrator is the retryable 503
+with nothing written and nothing launched, and a typed refusal lets the launch go on without claiming
+a stop (no `info!` line, no `timed_out` record).
+Proof: `an_orchestrator_that_cannot_be_reached_for_the_cancel_answers_503_and_starts_nothing` failed
+before the fix with `left: 200, right: 503` (`{"runId":"never"}`).
+**MISMATCH: R2**, one clause. The ruling's "the record is closed before the cancel is asked for"
+cannot hold together with its own "an orchestrator that cannot be reached for the cancel answers 503
+and writes nothing" and this finding's Check "the old record is still `running`": closing the record
+first writes on the 503 path. I implemented the half the Check pins (cancel, then close) and reported
+the conflict rather than improvising. Consequence, as the finding's (b) says: if `end_timed_out_run`
+fails after a cancel was accepted, the request is a 5xx and the record keeps `running` (the next
+request sees the run as `CANCELED`, not active, so nothing closes it). A fix needs one of the two
+requirements dropped; that is the planner's call.
+
+**R3** `b5f8493e` — the guard is a decision only (`runs_holding_the_lock`: the 409 for a run still
+going, or the overdue runs), the request's own refusals follow it with no side effect, and
+`stop_overdue_run` is called immediately before the launch. The 409 for a run still going stays before
+the body is judged, as `the_409s_for_a_run_going_and_a_paused_connector_are_answered_before_the_body_is_judged`
+requires.
+Proof: `a_table_the_connector_does_not_load_is_a_404_and_stops_no_run` failed before the fix with the
+`terminateRun` body in the received requests (`left: ["{…terminateRun…runId:\"run-typo\"}"], right: []`).
+
+**R4** `91615ca6` — a unit test on absolute numbers from the default config.
+Proof: `a_run_inside_the_grace_after_its_limit_still_holds_the_connector` failed with
+`OVERDUE_GRACE_SECONDS` set to `0.0` (`assertion left: 21600.0, right: 21900.0`).
+
+**R5** `1dd3fe8e` — the run-list mock matches the request body on `creationTime`.
+Proof: `list_runs_for_job_with_config_returns_when_each_run_was_created` failed with `creationTime`
+taken out of the query (`called Result::unwrap() on an Err value: Status(404)`).
+
+**R6** `5b4a08f2` — the "value never echoed" assertion reads each record's `getMessage()` and `args`.
+Proof: with `logger.warning(` moved from line 278 to line 280 (two blank lines, not committed) and
+the old assertion put back, `test_a_run_limit_that_cannot_be_read_falls_back_to_six_hours[0]` failed
+with `AssertionError: assert '0' not in 'WARNING  di...e default \n'`; the new assertion passes at
+line 280.
+
+**R7** `b951624f` — row 10 of `load-failure-alerts.md` holds only `DEC-16`'s words with its date; the
+chart-owner exception (D16) is row 11 with `*(proposed, not yet signed)*`; the opening line says ten
+signed rows and eleven in all.
+Proof: none (document); the reviewer reads row 10 against `DEC-16`.
+Note: R1's ruling asks for `*(proposed, not yet signed)*` in row 15 of `connector-operations.md`'s
+Signed cell, which R7 calls empty "as it should". R1's explicit instruction was followed (no date was
+written); if the planner prefers the cell empty, it is a one-line revert.
+
+**R8** `94e0985d` — `GET /api/connectors/{id}/runs` answers `maxRuntimeSeconds` from
+`ingest_run_max_runtime_seconds` (camelCase, documented on `RunsResponse` and on the console's
+`ConnectorRunList`); the Runs card, the last-run tile and the OAuth sign-in check use it and fall back
+to six hours when it is absent. No route added, `POLICY_TABLE` unchanged.
+Proof: `keeps a run going for the limit the API sends, not for six hours` (12-hour limit, run started
+7 hours ago) failed before the fix (the run showed "No end reported" and "Run now" was enabled); the
+Rust list test also asserts `maxRuntimeSeconds` is `21600`.
+
+**R9** `656ec725` — both services trim, take ASCII digits only and a value from 1 to 4294967295, and
+both warn, naming the variable and never the value; the API reads both run limits through
+`parse_run_limit`.
+Proof: the Python fallback cases gained `"86_400"`, `"4294967296"`, `"+900"` and the setting case
+`" 900 "`; they failed before the fix with `assert 86400 == 21600`, `assert 4294967296 == 21600`,
+`assert 900 == 21600`. The Rust config test gained the same rejected values and `" 900 "` as 900; it
+failed before the fix with `"+900"` `left: 900, right: 21600` (the shared helper accepts a leading
+`+`).
+
+**R10** `4e2652fe` — `runs_holding_the_lock` takes `may_stop`; `launch_ingest` passes
+`principal.is_some()`, so the assistant's `run_ingest` answers the 409 for an overdue run with a
+sentence naming "Run now" on the connector's page and sends no `terminateRun`. No tool description or
+schema change; `tests/fixtures/tool_schemas.json` untouched.
+Proof: `the_assistants_run_ingest_answers_409_for_an_overdue_run_and_stops_nothing` failed before the
+fix with `{"tool":"run_ingest","outcome":"executed","result":{"runId":"never"}}`.
+
+**R11** `7c0fc58b` — `report_end` refuses `EndReason::TimedOut` with a 400, citing D11.
+Proof: `the_end_report_cannot_write_the_timed_out_reason` failed before the fix with
+`assertion left: 200, right: 400` (`{"recorded":true}`).
+
+#### Commands run on the final commit (`7c0fc58b`), with their counts
+
+```
+cd rust && cargo fmt --check
+  clean (no output)
+cargo clippy -p lakehouse-api -p lakehouse-store -p lakehouse-dagster --all-targets -- -D warnings
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.97s — no warning
+cargo test -p lakehouse-api --test ingest_run
+  test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.47s
+(cd dagster && python -m pytest dispar_orchestrate/test_ingest_run_limit.py -q)
+  11 passed, 218 warnings in 0.64s
+(cd dagster && python -m pytest dispar_orchestrate/test_ingest_errors.py dispar_orchestrate/test_ingest_run_limit.py -q)
+  84 passed, 218 warnings in 0.92s
+(cd dagster && python -m pytest dispar_orchestrate/test_ingest_factory.py dispar_orchestrate/test_ingest_retries.py
+ dispar_orchestrate/test_ingest_run_reports.py dispar_orchestrate/test_ingest_single_table.py
+ dispar_orchestrate/test_run_reports.py -q)
+  171 passed, 218 warnings in 2.69s
+bun run typecheck
+  clean (no output)
+bun run lint
+  ✖ 12 problems (0 errors, 12 warnings) — the warnings are on `main` too, none added here
+bun run test
+  4001 pass, 1 skip, 0 fail, 11993 expect() calls, 4002 tests across 380 files [82.11s]
+docker compose --profile '*' config --quiet
+  ok
+python3 ops/lint/check_bare_iceberg_count.py
+  R11 guard: no bare count() against a Bronze Iceberg table found.
+python3 ops/lint/check_intra_package_imports.py
+  OK: all intra-package dispar_orchestrate imports resolve
+```
+
+Per commit, only the touched language's scoped checks ran: `cargo fmt --check`,
+`cargo clippy -p lakehouse-api --all-targets -- -D warnings` (or `-p lakehouse-dagster`) and the
+touched tests (`cargo test -p lakehouse-api --lib <name>`, `cargo test -p lakehouse-api --test
+ingest_run`, `cargo test -p lakehouse-dagster --lib <name>`); for Python the touched test file; for
+TypeScript `bun run typecheck`, `bun run lint` and `bun test <the touched files>`.
+
+#### Not verified, and why
+
+- `cargo test --workspace` was not run: the developer's brief says CI runs the full suite, and the
+  block above is the one required for handoff. The crates whose code changed (api, dagster) ran their
+  own tests; `lakehouse-store` was compiled by clippy but its tests were not re-run (no store change).
+- `docker compose up` was not run for this round's compose edit: it is a comment only (no key, value
+  or service changed), so `config --quiet` is the whole proof. The `up` for T10's settings belongs to
+  the `g6-ops` gate, as the handoff of the build round says.
+- Nothing else was skipped.
