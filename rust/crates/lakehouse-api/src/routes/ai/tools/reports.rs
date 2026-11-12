@@ -322,7 +322,14 @@ async fn list(state: &AppState, owner: &Principal, args: &Map<String, Value>) ->
     for sub in rows.iter().filter(|s| board.is_empty() || s.board == board) {
         items.push(brief(state, sub).await);
     }
-    json!({ "items": items })
+    // RPT-2 (DEC-18, QA LH-RPT-1-06): the same `warning` `create` gives, so a
+    // person told through the assistant learns that nothing is being sent —
+    // and the tool writes no second sentence of its own.
+    let mut out = json!({ "items": items });
+    if let Some(note) = email_note(state).await {
+        out["warning"] = json!(note);
+    }
+    out
 }
 
 /// The caller's subscription by `id` argument.
