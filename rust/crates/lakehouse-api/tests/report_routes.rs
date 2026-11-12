@@ -886,3 +886,108 @@ async fn a_non_owner_administrator_may_only_pause_delete_and_remove_recipients()
     let (status, _) = call(&f, "DELETE", &one, &cookie, None).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+/// QA `LH-RPT-1-06` (`RPT-2`, `DEC-18`): with e-mail not set up, the list says
+/// on the subscription that it is not being sent, and names the last attempt
+/// once there is one — while nothing is counted towards the pause.
+#[tokio::test]
+async fn the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted()
+{
+    let f = fixture(&[]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": colleague.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let one = format!("{SUBS}/{}", made["id"].as_str().unwrap());
+
+    let (_, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(list["emailSetUp"], json!(false), "no SMTP_HOST here");
+    let before = &list["items"][0]["notSent"];
+    assert_eq!(
+        *before,
+        json!({ "cause": "email_not_set_up", "lastAttemptAt": null }),
+        "nothing has been attempted yet: {list}"
+    );
+
+    let (status, delivery) = call(&f, "POST", &format!("{one}/send"), &f.owner_cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{delivery}");
+    assert_eq!(
+        delivery["reason"],
+        "Email is not set up on this deployment."
+    );
+
+    let (_, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    let item = &list["items"][0];
+    assert_eq!(
+        item["notSent"]["cause"],
+        json!("email_not_set_up"),
+        "{list}"
+    );
+    let at = item["notSent"]["lastAttemptAt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the failed attempt names its time: {list}"));
+    time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+        .expect("the time is RFC 3339 as written");
+    assert_eq!(item["lastDelivery"]["status"], "failed", "{list}");
+    assert_eq!(
+        item["consecutiveFailures"],
+        json!(0),
+        "DEC-18: a delivery that fails for this reason is not counted"
+    );
+    assert_eq!(item["paused"], json!(false), "DEC-18: nothing is paused");
+}
+
+/// The other side of the same rule (`RPT-2`): with e-mail set up the list says
+/// nothing of the kind. The mail server is named on a closed local port, so the
+/// send itself still fails — the point is that the LIST does not claim e-mail is
+/// missing.
+#[tokio::test]
+async fn the_list_says_nothing_of_the_kind_while_email_is_set_up() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let f = fixture(&[("SMTP_HOST", "127.0.0.1"), ("SMTP_PORT", &port.to_string())]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": colleague.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+
+    let (status, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["emailSetUp"], json!(true), "{list}");
+    assert_eq!(list["items"][0]["notSent"], Value::Null, "{list}");
+}
