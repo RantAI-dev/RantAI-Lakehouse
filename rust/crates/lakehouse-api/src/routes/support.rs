@@ -561,12 +561,6 @@ impl LimitedRun {
 /// # Errors
 ///
 /// As [`LimitedRun::current`] and [`LimitedRun::send`].
-// Removed by T3, which is the first caller (the SQL source preview's row
-// read); it is a separate commit of this same slice.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller is T3 of this slice (BI-45)")
-)]
 pub(crate) async fn run_statement_limited(
     ch: &ChClient,
     sql: &str,
@@ -574,6 +568,31 @@ pub(crate) async fn run_statement_limited(
     let run = LimitedRun::current().await?;
     let statement = run.statement(sql);
     run.send(ch, &statement, run.rows_cap()).await
+}
+
+/// [`SpecRunFailure`] as the answer of a console route (`BI-45`, plan D6/D5;
+/// QA `LH-BI-5-01`): a limit or a Stop is a 422 with the fixed sentence the
+/// sender built, a refused rewrite is its own 422, the gate keeps its 404/422,
+/// and an engine failure goes through the caller's own mapping — so a route
+/// that saves or previews a statement keeps the status it always answered
+/// with, never the engine's text (AGENTS.md principle 4).
+pub(crate) fn failure_as_api_error(
+    failure: SpecRunFailure,
+    on_engine: impl FnOnce(&ChError) -> lakehouse_core::ApiError,
+) -> lakehouse_core::ApiError {
+    let not_finished =
+        || lakehouse_core::ApiError::Unprocessable("The query did not finish.".to_owned());
+    match failure {
+        SpecRunFailure::Tile(answer) => {
+            match answer.get("error").and_then(serde_json::Value::as_str) {
+                Some(sentence) => lakehouse_core::ApiError::Unprocessable(sentence.to_owned()),
+                None => not_finished(),
+            }
+        }
+        SpecRunFailure::Refused(message) => lakehouse_core::ApiError::Unprocessable(message),
+        SpecRunFailure::Gated(err) => err,
+        SpecRunFailure::Clickhouse(err) => on_engine(&err),
+    }
 }
 
 /// Run `fut` (one tile's queries) with the rows its kind may read (`BI-5`
