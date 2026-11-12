@@ -432,21 +432,11 @@ export function useQueryStudio(draftKey: string | null) {
   const generateAct = useServiceAction((signal, q: string) =>
     queryService.generateSql(q, signal)
   )
-  const estimateAct = useServiceAction(
-    (signal, s: string, inputs: QueryParamInputs, engine: QueryEngine) =>
-      // `QS-6` (decision 7): a ClickHouse estimate asks what it asked before
-      // `QS-5` and `QS-6` — no options, or the inputs alone; any other engine
-      // is named so the server can answer "no pre-run estimate" instead of
-      // asking ClickHouse about Trino SQL.
-      queryService.estimate(
-        s,
-        engine === "clickhouse"
-          ? inputs.definitions
-            ? inputs
-            : undefined
-          : { engine, ...(inputs.definitions !== undefined ? inputs : {}) },
-        signal
-      )
+  const estimateAct = useServiceAction((signal, s: string, inputs: QueryParamInputs) =>
+    // Only a ClickHouse tab gets this far (M2 of the round-3 rulings, after
+    // #482): the console names no engine, so the request is the one sent
+    // before `QS-6` — no options, or the inputs alone.
+    queryService.estimate(s, inputs.definitions ? inputs : undefined, signal)
   )
   // The fields to mark: the ones the last run's refusal named, and the ones
   // the estimate's refusal names. An estimate's mark goes with its error,
@@ -926,9 +916,9 @@ export function useQueryStudio(draftKey: string | null) {
   // `null` inputs mean "skip": the statement has a name with nothing to run
   // with, so no estimate is asked for and the one on screen goes.
   const estimateDebounced = useDebouncedCallback(
-    (next: string, inputs: QueryParamInputs | null, engine: QueryEngine) => {
+    (next: string, inputs: QueryParamInputs | null) => {
       if (inputs === null) resetEstimate()
-      else void runEstimate(next, inputs, engine)
+      else void runEstimate(next, inputs)
     },
     ESTIMATE_DEBOUNCE_MS
   )
@@ -954,10 +944,9 @@ export function useQueryStudio(draftKey: string | null) {
   const estimatable = targetStatement !== null && !estimateWaits
   // Only ClickHouse has an estimate: the server runs `EXPLAIN ESTIMATE`,
   // which a Trino statement is not valid in, so asking for one on a Trino
-  // tab got a refusal that read as the query's fault (`LH-QS-4-08`).
-  // The merge with `main` (#482) kept this gate over this branch's engine
-  // bookkeeping: a Trino tab asks nothing and drops what an earlier
-  // ClickHouse statement left, so no answer for another engine shows.
+  // tab got a refusal that read as the query's fault (`LH-QS-4-08`). A
+  // Trino tab asks nothing and drops what an earlier ClickHouse statement
+  // left, so no answer for another engine shows.
   const estimateSupported = engine === "clickhouse"
   React.useEffect(() => {
     if (!estimateSupported) {
@@ -965,17 +954,16 @@ export function useQueryStudio(draftKey: string | null) {
       // pending debounced ask, and the estimate on screen. The skip input
       // replaces the pending debounced ask; the reset acts now, so no
       // answer for another engine shows after the switch.
-      estimateDebounced("", null, engine)
+      estimateDebounced("", null)
       resetEstimate()
       return
     }
     // A buffer holding only the starter comment has nothing to estimate,
     // and asking anyway put an EXPLAIN ESTIMATE on ClickHouse for every
     // keystroke, including the ones that typed the comment.
-    if (targetText !== null) estimateDebounced(targetText, estimateWaits ? null : estimateInputs, engine)
+    if (targetText !== null) estimateDebounced(targetText, estimateWaits ? null : estimateInputs)
   }, [
     estimateSupported,
-    engine,
     targetText,
     estimateWaits,
     estimateInputs,
@@ -1612,7 +1600,7 @@ export function useQueryStudio(draftKey: string | null) {
     runSelectionOrAll,
     reEstimate: () => {
       if (estimateSupported && targetText !== null && !estimateWaits) {
-        void runEstimate(targetText, estimateInputs, engine)
+        void runEstimate(targetText, estimateInputs)
       }
     },
     /**

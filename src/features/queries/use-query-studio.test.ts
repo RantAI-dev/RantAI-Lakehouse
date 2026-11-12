@@ -1299,37 +1299,3 @@ describe("useQueryStudio draft owner", () => {
     expect(window.localStorage.getItem(THEIRS)).toBeNull()
   })
 })
-
-// `QS-6` (`LH-QS-4-08`), decision 7: the estimate belongs to the tab's
-// engine, so a tab switched to Trino asks again — and the server is told
-// which engine, instead of ClickHouse being asked about Trino SQL.
-describe("useQueryStudio estimate engine", () => {
-  it("asks for the estimate again, with the engine, when the tab's engine changes to Trino", async () => {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
-    spyOn(assetService, "listAssets").mockResolvedValue([])
-    const estimate = spyOn(queryService, "estimate").mockResolvedValue({
-      supported: true,
-      queryEngine: "clickhouse",
-      estimatedBytes: 1024,
-      sources: ["x"],
-    } as never)
-    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
-
-    act(() => hook.result.current.setSql("SELECT 1"))
-    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(hook.result.current.estimateAct.data).not.toBeNull())
-    // A ClickHouse statement with no placeholder posts no options at all.
-    expect(estimate.mock.calls[0]?.[1]).toBeUndefined()
-
-    act(() => hook.result.current.setEngine("trino"))
-
-    // Review round 1, R2 (`LH-QS-4-08`): the ClickHouse answer leaves the
-    // panel at once; keeping it during the 500 ms debounce showed the other
-    // engine's sources under this tab's engine label.
-    expect(hook.result.current.estimateAct.data).toBeNull()
-
-    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(2))
-    expect(estimate.mock.calls[1]?.[1]).toStrictEqual({ engine: "trino" })
-  })
-})

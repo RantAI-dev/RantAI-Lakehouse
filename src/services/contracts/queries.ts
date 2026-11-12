@@ -657,17 +657,13 @@ export interface QueryService {
    */
   listHistoryPage(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryPage>
   /**
-   * `options` carries the `{{name}}` values and definitions (`QS-5`) and the
-   * engine the tab runs on (`QS-6`): with none, the request is the one sent
-   * before parameters existed, and it is a ClickHouse estimate. A `Trino`
-   * statement has no pre-run estimate; the server answers `supported: false`
-   * with the reason and asks no engine.
+   * `options` carries the `{{name}}` values and definitions (`QS-5`): with
+   * none, the request is the one sent before parameters existed. The console
+   * asks only from a ClickHouse tab (M2 of the round-3 rulings): a `Trino`
+   * statement has no pre-run estimate, and the route still takes an `engine`
+   * from any other caller and answers `supported: false` with the reason.
    */
-  estimate(
-    sql: string,
-    options?: QueryParamInputs & { engine?: QueryEngine },
-    signal?: AbortSignal
-  ): Promise<QueryEstimate>
+  estimate(sql: string, options?: QueryParamInputs, signal?: AbortSignal): Promise<QueryEstimate>
   /**
    * `runId` (`BI-5` plan D5) goes out as `X-Run-Id`, so a Stop can name the
    * run; absent, the server makes one and the run cannot be stopped by id.
