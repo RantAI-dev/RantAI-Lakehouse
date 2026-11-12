@@ -284,6 +284,40 @@ describe("DataQualityPage: a rule's run history (DATA-14)", () => {
   })
 })
 
+// QA LH-DATA-14-04 (GOV-10, DEC-17): running a rule by hand is a governance
+// action — the API takes `governance:write` for it, so the drawer's button
+// follows.
+describe("DataQualityPage: running a rule by hand (GOV-10)", () => {
+  const rule = {
+    id: "r1",
+    name: "email_filled",
+    asset: "silver.orders",
+    dimension: "completeness",
+    threshold: "email not null >= 90%",
+    severity: "high",
+    lastStatus: "failed",
+    lastRunAt: "2026-10-16T09:00:00.000Z",
+    lastValue: "75.0% not null",
+    evaluable: true,
+    hint: null,
+  }
+
+  it("hides Run check for a person who may only read governance", async () => {
+    const done = stubApi(["governance:read", "query:read"], { quality: [rule] })
+    renderPage()
+    fireEvent.click(await screen.findByText("email_filled"))
+    await sessionSettled(done)
+    expect(screen.queryByRole("button", { name: "Run check" })).toBeNull()
+  })
+
+  it("shows Run check with governance:write", async () => {
+    stubApi(["governance:write"], { quality: [rule] })
+    renderPage()
+    fireEvent.click(await screen.findByText("email_filled"))
+    expect(await screen.findByRole("button", { name: "Run check" })).toBeTruthy()
+  })
+})
+
 const schedule = (over: Record<string, unknown>) => ({
   asset: "silver.orders",
   mode: "interval",

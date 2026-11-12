@@ -54,7 +54,7 @@ The assistant's data map, SQL and metric answers follow the rule. Changing a rol
 ## Limits to tell a customer
 
 - Service identities read what their scopes allow, regardless of table access.
-- A temporary access grant gives a permission, not a table.
+- A temporary access grant gives a permission, not a table. A `query:read` grant made from a table's page opens that table's page (`GOV-11`), but only where the person's roles may read the table.
 - Dagster's own builds and quality checks run as the system and are not narrowed.
 - Narrowing the Dashboard Viewer role also narrows every embed and public link.
 - A scheduled agent run has no person behind it and is not narrowed either (`SEC-68`).

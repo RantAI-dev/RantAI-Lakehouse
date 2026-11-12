@@ -59,7 +59,8 @@ pub struct AuditEvent {
     /// `"user" | "service" | "copilot" | "schedule"`, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal_kind: Option<String>,
-    /// Human-readable display name for the principal, if known.
+    /// Display name of the principal, or, for an event nobody signed in
+    /// caused, what caused it (see [`ACTOR_SIGN_IN_FORM`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor_label: Option<String>,
     /// The tool name or route verb this event is about.
@@ -137,6 +138,25 @@ impl From<AuditRow> for AuditEvent {
 const AUDIT_COLUMNS: &str = "id, at, principal_id, principal_kind, actor_label, action, \
      resource_kind, resource_id, args, outcome, detail, run_id, approval_id, session_id";
 
+/// What caused an event nobody signed in caused.
+///
+/// `audit_event.principal_kind` may only be `user`, `service`, `copilot` or
+/// `schedule` (`0024_audit_event.sql`), and none of the four is true for
+/// something that happened before anybody signed in — a sign-in that was
+/// refused, a public link that locked, a single sign-on link that was
+/// refused. Such an event keeps `principal_id` and `principal_kind` empty
+/// (that is the truth) and names its cause in `actor_label`, using one of
+/// the constants below. The governance audit list reads the label as the
+/// actor and reports the kind as `service`, never as the assistant
+/// (`SEC-70`, QA `LH-SEC-2-06`).
+pub const ACTOR_SIGN_IN_FORM: &str = "Sign-in form";
+
+/// See [`ACTOR_SIGN_IN_FORM`]: a visitor locked a dashboard's public link.
+pub const ACTOR_PUBLIC_LINK: &str = "Public link";
+
+/// See [`ACTOR_SIGN_IN_FORM`]: a single sign-on link was refused.
+pub const ACTOR_SINGLE_SIGN_ON: &str = "Single sign-on";
+
 /// Everything [`insert`] needs. Mirrors the migration's columns, minus the
 /// generated `id` and defaulted `at`.
 ///
@@ -151,7 +171,8 @@ pub struct NewAuditEvent {
     pub principal_id: Option<String>,
     /// `"user" | "service" | "copilot" | "schedule"`, if known.
     pub principal_kind: Option<String>,
-    /// Human-readable display name for the principal, if known.
+    /// Display name of the principal, or, for an event nobody signed in
+    /// caused, what caused it (see [`ACTOR_SIGN_IN_FORM`]).
     pub actor_label: Option<String>,
     /// The tool name or route verb this event is about.
     pub action: String,
