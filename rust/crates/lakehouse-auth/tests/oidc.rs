@@ -673,6 +673,27 @@ async fn an_unconfirmed_email_is_refused_for_an_existing_account(pool: PgPool) -
         .fetch_one(&pool)
         .await?;
         assert_eq!(audit.0, 1, "one refusal row for {subject}");
+
+        // QA LH-SEC-2-06 (SEC-70): the refused link is nobody the product
+        // signed in, so the row names what refused it and holds no principal.
+        let (actor_label, principal_kind, principal_id): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT actor_label, principal_kind, principal_id FROM audit_event \
+             WHERE action = 'auth.oidc.link_refused' AND args->>'subject' = $1",
+        )
+        .bind(subject)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            actor_label.as_deref(),
+            Some(lakehouse_store::audit::ACTOR_SINGLE_SIGN_ON),
+            "the refusal names single sign-on as its cause"
+        );
+        assert_eq!(principal_kind, None, "no principal kind: nobody signed in");
+        assert_eq!(principal_id, None, "no principal id: nobody signed in");
     }
 
     // The account's row is unchanged, and no second account appeared.
