@@ -1186,3 +1186,128 @@ T6. Two implementations of one fix must not both ship. The planner's rulings:
   "MISMATCH", without choosing.
 
 After this round `QS-7` is closed by #482, not by this pull request.
+
+### Round 3 merge (developer)
+
+`git merge origin/main` on `fix/qa-round-query-studio-p1` at `2a5bf4d1`, a merge commit
+(`378a8281`), never a rebase or a force-push. Five files conflicted; each hunk was resolved by
+M1-M4, hunk by hunk, no `--ours`/`--theirs` (rule 9).
+
+Commits:
+
+| Commit | What |
+| --- | --- |
+| `378a8281` | merge `main` (`177d6f218`, #482) into the branch; the five conflicted files below |
+| `66b95ef0` | M1: this branch's Bronze-listing proof and its tests removed |
+| `7a292cd4` | M2: the console sends no `engine` to the estimate |
+| `a442a4f5` | M4: three doc lines this branch still carried from `QS-7` given back to `main`'s text |
+
+Conflicted files and what each hunk took:
+
+- `CHANGELOG.md`, Security hunk: `main`'s `SEC-62` Unicode-quote entry first, this branch's
+  `QS-8` tab-storage entry after it (M4).
+- `CHANGELOG.md`, Fixed hunk: `main`'s three entries first (`QS-4`'s Trino tab and Bronze row,
+  `QS-5` AC14, `SEC-62`'s policy sentences), then this branch's Trino-estimate entry rewritten
+  to what is left here (the estimate route's typed answer and the engine name on the summary),
+  then this branch's `QS-9` download entry (M4). This branch's `QS-7` entry was dropped: the
+  fix is #482's.
+- `docs/core/features/query-history.md`, decision 8: `main`'s text (M4).
+- `docs/core/features/query-studio-editor.md`, decision 9: `main`'s text (M4); its second hunk,
+  the limits paragraph on a Bronze name, also `main`'s. Decision 5 (`QS-8`) did not conflict
+  and stays this branch's, as does the download decision in `query-studio-results.md`.
+- `src/features/queries/query-transparency-panel.test.tsx`: both sides' tests, `main`'s block
+  after this branch's (M3). `main`'s early return keeps "No pre-run estimate for Trino
+  queries." as the one fixed sentence; this branch's block for an answer with
+  `supported: false` stays, now reached only by a caller that asks anyway.
+- `src/features/queries/use-query-studio.ts`, both hunks: `main`'s side (M2). The first takes
+  `estimateSupported` — a non-ClickHouse tab asks nothing and drops what another engine left —
+  and drops this branch's `estimateEngineRef` (review R2); the second gates `reEstimate` on
+  `estimateSupported`. The engine was still threaded through `estimateDebounced` in the merge
+  commit so it compiled; `7a292cd4` removed it (M2).
+
+One test that came from `main` was adapted, not weakened: #482's `mountList` helper rendered
+`useQueryStudio()` unchanged, and the hook takes the draft key as a required argument on this
+branch (`QS-8`). It now passes `queryDraftKey("u1", null)`; no assertion changed. Without an
+owner the hook reads no draft and so no `?engine=` either, which is why the call had to change.
+
+Three lines in the two feature pages were not conflict hunks but still carried `QS-7`'s text;
+M4 gives the Bronze proof's text to `main`, so `a442a4f5` restored `main`'s wording for the
+Trino alias limit in `query-history.md`, for `QS-4-AC8` there and for `QS-1-AC1` in
+`query-studio-editor.md`. `QS-1-AC13` (the two-person tab check, `QS-8`) stays.
+
+Tests deleted for the code they tested:
+
+- `src/lib/asset-query.test.ts`: "listedBronzeTable reads the table name of a Bronze list row
+  and nothing from any other row" — `listedBronzeTable` is gone (M1).
+- `src/features/queries/use-query-studio.test.ts`: "offers a Bronze table's Trino name on a
+  Trino tab once the Bronze listing names it, without reading its detail"; "holds a Bronze
+  table the listing does not name as missing and offers no name"; "falls back to the entry's
+  own read when the Bronze listing fails" — the `listTables` proof is gone (M1); `main`'s
+  "proves each Bronze row once when the list loads" covers the proof.
+- same file: "does not ask for the Bronze listing on a ClickHouse tab" — the read it asserted
+  absent no longer exists (M1); `main`'s "reads no Bronze table for the list on a ClickHouse
+  tab, and reads them when the tab goes to Trino" covers the same ground.
+- same file: "loads the columns of a Bronze table the statement names by its Trino name, and
+  offers them after its alias" — it mounted the listing proof to get a reference; #482's
+  "completes the columns after an alias on a Bronze table written by its Trino name, once the
+  row is proven (QS-4-AC8)" tests the same behaviour through `main`'s proof, and the helper
+  only this test used went with it.
+- same file: "asks for the estimate again, with the engine, when the tab's engine changes to
+  Trino" — it asserted the `{ engine: "trino" }` argument M2 removes; `main`'s "never asks for
+  an estimate on a Trino tab, and says it has none" and "drops an estimate still being asked
+  for when the tab goes to Trino" cover the switch.
+- `src/features/queries/schema-browser.test.tsx`: "inserts a Bronze table's Trino name on a
+  Trino tab without expanding it" — it asserted that the listing, not the entry's own read,
+  proved the table (M1); on `main` the row's detail read proves it when the list loads.
+- `src/services/clients/queries.test.ts`: "posts the engine to estimate for a Trino tab and
+  leaves it out for ClickHouse" — it tested the body field the console no longer sends (M2).
+
+No test that came from `main` was deleted or had an assertion changed.
+
+Checks, as run (all from a fresh `bun install --frozen-lockfile`, which reported "no changes"):
+
+- Merge commit `378a8281`, scoped run: `bun run typecheck` clean; `bun run lint` 0 errors, 11
+  warnings (pre-existing); `bun test src/features/queries src/lib/asset-query.test.ts
+  src/lib/sql-completion.test.ts src/lib/query-draft.test.ts
+  src/services/clients/queries.test.ts` 584 pass, 5 fail. The five were this branch's own
+  `QS-7` and `QS-6` tests of code M1 and M2 remove next, kept red on purpose rather than
+  deleted inside the merge.
+- `66b95ef0` (M1), same scoped run: typecheck clean, lint 0 errors / 11 warnings, 581 pass, 1
+  fail — the one estimate-engine test M2 deletes next.
+- `7a292cd4` (M2), same scoped run: typecheck clean, lint 0 errors / 11 warnings, 580 pass, 0
+  fail across 32 files.
+- Final code commit `7a292cd4`, from the repo root: `bun run typecheck` clean;
+  `bun run lint` 0 errors, 11 warnings; `bun run test` 4038 pass, 1 skip, 0 fail, 12151
+  `expect()` calls, 4039 tests across 380 files, 82.80 s. The three "marking mentions read
+  (BI-38 D5)" failures #482 reported did not appear.
+- Rust, `CARGO_TARGET_DIR=/home/rismana/cargo-target-1`, `CARGO_BUILD_JOBS=6`:
+  `cargo fmt --check` clean; `cargo clippy -p lakehouse-api --all-targets -- -D warnings`
+  finished with no warning; `cargo test -p lakehouse-api --test query_history` 28 passed, 0
+  failed; `cargo test -p lakehouse-api --lib -- a_trino_run_result_states_no_storage_tier
+  an_estimate_of_a_trino a_clickhouse_estimate_says a_run_result_says_the_caller_may_download`
+  5 passed, 0 failed (3498 filtered out). The Rust side merged without a conflict.
+- `python3 ops/lint/check_bare_iceberg_count.py`: "R11 guard: no bare count() against a Bronze
+  Iceberg table found."; `python3 ops/lint/check_intra_package_imports.py`: "OK: all
+  intra-package dispar_orchestrate imports resolve".
+- `git diff origin/main...HEAD --stat`: 33 files, 2261 insertions, 155 deletions (the two
+  pages, the plan and the branch's code; `tail -5` shows `src/lib/query-draft.ts`,
+  `src/lib/status.ts`, `src/services/clients/queries.test.ts`,
+  `src/services/contracts/queries.ts`).
+- `grep -rn listedBronzeTable src/`: no match. `src/lib/asset-query.ts` is identical to
+  `main`'s.
+
+MISMATCH: none. Every place the two sides behaved differently was named by M1-M4; the one
+adaptation outside them (the draft key on `main`'s test helper) is a signature change this
+branch made, not a behaviour either side chose.
+
+Not verified:
+
+- The merge commit `378a8281` is red on the five tests named above; that commit was pushed as
+  the merge itself and the next two commits delete what they tested. No later commit is red.
+- `cargo test --workspace` was not run: only `-p lakehouse-api` (clippy, the history test and
+  the four named estimate/download tests), which is the scope this round asked for.
+- `a442a4f5` and this plan commit touch markdown only and ran no console, Rust or lint check.
+- Docker Compose, Dagster and the server's own behaviour past `lakehouse-api` were not built or
+  run; no compose file changed in this merge.
+- The acceptance checklist on the feature pages (including `QS-1-AC13`, `QS-4-AC8`) is the
+  owner's run on a live console; nothing there is claimed as passed.
