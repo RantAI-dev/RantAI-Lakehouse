@@ -24,6 +24,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { formatBytes } from "@/lib/format"
 import { MAX_SESSION_BYTES, REGISTRATION_FAILED_REASON, TABLE_NAME_RULE } from "@/lib/uploads"
 import type { Upload, UploadColumnSpec, UploadFolder, UploadPreview } from "@/services/contracts/uploads"
@@ -613,19 +614,23 @@ describe("UploadFilePage, Check step", () => {
     })
     expect(screen.getAllByText("Detected: Comma").length).toBe(1)
     expect(screen.getByText("Detected: UTF-8")).toBeDefined()
-    expect((screen.getByLabelText("Delimiter") as HTMLSelectElement).value).toBe(",")
+    // WEB-9 D5: the trigger shows the option's label, where the native select
+    // held the delimiter character.
+    expect(
+      screen.getByLabelText("Delimiter").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Comma")
     expect((screen.getByLabelText("Header row") as HTMLInputElement).value).toBe("1")
     expect(screen.getByRole("columnheader", { name: "sku" })).toBeDefined()
     // The first read sends nothing: the API detects.
     expect(calls.find((c) => c.url.includes("/preview"))?.url).toBe("/api/uploads/up-1/preview")
 
-    fireEvent.change(screen.getByLabelText("Delimiter"), { target: { value: ";" } })
+    chooseOption(screen.getByLabelText("Delimiter"), "Semicolon")
     await screen.findByRole("columnheader", { name: "sku,qty" })
     expect(calls.some((c) => c.url.includes("delimiter=%3B"))).toBe(true)
     // What was detected stays what was detected.
     expect(screen.getByText("Detected: Comma")).toBeDefined()
 
-    fireEvent.change(screen.getByLabelText("Delimiter"), { target: { value: "\t" } })
+    chooseOption(screen.getByLabelText("Delimiter"), "Tab")
     await waitFor(() => expect(calls.some((c) => c.url.includes("delimiter=%09"))).toBe(true))
   })
 
@@ -751,14 +756,20 @@ describe("UploadFilePage, Check step for a workbook", () => {
 
   it("shows a sheet picker with the default chosen and no encoding or delimiter, and says how cells are written", async () => {
     await openWorkbook()
-    expect((screen.getByLabelText("Sheet") as HTMLSelectElement).value).toBe("Stock")
+    // WEB-9 D5: the trigger shows the sheet's label.
+    expect(
+      screen.getByLabelText("Sheet").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Stock")
     expect(screen.queryByLabelText("Encoding")).toBeNull()
     expect(screen.queryByLabelText("Delimiter")).toBeNull()
     expect(screen.getByLabelText("Header row")).toBeDefined()
     expect(screen.getByRole("columnheader", { name: "sku" })).toBeDefined()
     const note = screen.getByText(/Numbers are read as the cell holds them/)
     expect(note.textContent).toContain("2025-09-24")
-    expect(screen.getByText("Notes (hidden)")).toBeDefined()
+    // WEB-9 D5: the hidden sheet's label is read from the opened list, where
+    // the native select's option text used to be.
+    fireEvent.click(screen.getByLabelText("Sheet"))
+    expect(screen.getByRole("option", { name: "Notes (hidden)" })).toBeDefined()
   })
 
   it("reads the chosen sheet and drops the header row chosen for the previous one", async () => {
@@ -766,7 +777,7 @@ describe("UploadFilePage, Check step for a workbook", () => {
     fireEvent.change(screen.getByLabelText("Header row"), { target: { value: "3" } })
     await waitFor(() => expect(calls.some((c) => c.url.includes("headerRow=2"))).toBe(true))
 
-    fireEvent.change(screen.getByLabelText("Sheet"), { target: { value: "Quirks" } })
+    chooseOption(screen.getByLabelText("Sheet"), "Quirks")
     await screen.findByRole("columnheader", { name: "case" })
     const last = calls.filter((c) => c.url.includes("/preview")).at(-1)
     expect(last?.url).toContain("sheet=Quirks")
@@ -776,7 +787,7 @@ describe("UploadFilePage, Check step for a workbook", () => {
   it("sends the sheet shown when Load is pressed, and the review names it instead of an encoding", async () => {
     const started = upload({ status: "ingesting", bronzeTable: "stock", loadMode: "replace" })
     const calls = await openWorkbook({ ingest: json({ upload: started, runId: "run-1" }) })
-    fireEvent.change(screen.getByLabelText("Sheet"), { target: { value: "Quirks" } })
+    chooseOption(screen.getByLabelText("Sheet"), "Quirks")
     await screen.findByRole("columnheader", { name: "case" })
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
@@ -1403,13 +1414,14 @@ describe("UploadFilePage, limits", () => {
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(TOO_MANY_COLUMNS)
     // Nothing was read, so the controls have no value yet, but they are there and not disabled.
-    const delimiter = screen.getByLabelText("Delimiter") as HTMLSelectElement
+    // WEB-9 D5: the trigger is a button now, so `disabled` is the button's own.
+    const delimiter = screen.getByLabelText("Delimiter") as HTMLButtonElement
     expect(delimiter.disabled).toBe(false)
-    expect((screen.getByLabelText("Encoding") as HTMLSelectElement).disabled).toBe(false)
+    expect((screen.getByLabelText("Encoding") as HTMLButtonElement).disabled).toBe(false)
     expect((screen.getByLabelText("Header row") as HTMLInputElement).disabled).toBe(false)
     expect(next().disabled).toBe(true)
 
-    fireEvent.change(delimiter, { target: { value: ";" } })
+    chooseOption(delimiter, "Semicolon")
     await screen.findByRole("columnheader", { name: "sku;qty" })
     expect(calls.some((c) => c.url.includes("delimiter=%3B"))).toBe(true)
     expect(screen.queryByText(TOO_MANY_COLUMNS)).toBeNull()
@@ -1425,11 +1437,11 @@ describe("UploadFilePage, limits", () => {
     render(<UploadFilePage />)
     await screen.findByRole("columnheader", { name: "sku" })
 
-    fireEvent.change(screen.getByLabelText("Delimiter"), { target: { value: "|" } })
+    chooseOption(screen.getByLabelText("Delimiter"), "Pipe")
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(TOO_MANY_COLUMNS)
-    expect((screen.getByLabelText("Delimiter") as HTMLSelectElement).disabled).toBe(false)
+    expect((screen.getByLabelText("Delimiter") as HTMLButtonElement).disabled).toBe(false)
     expect(next().disabled).toBe(true)
   })
 
@@ -1486,13 +1498,29 @@ describe("UploadFilePage, column types", () => {
   it("shows each column's name and guessed type, and says how many rows the guess read", async () => {
     await openColumns()
     expect((screen.getByLabelText("Name of column 2") as HTMLInputElement).value).toBe("qty")
-    expect((screen.getByLabelText("Type of qty") as HTMLSelectElement).value).toBe("integer")
-    expect((screen.getByLabelText("Type of due") as HTMLSelectElement).value).toBe("date")
-    expect((screen.getByLabelText("How the dates of due are read", { selector: "select" }) as HTMLSelectElement).value).toBe("iso")
+    // WEB-9 D5: each trigger shows its option's label.
+    expect(
+      screen.getByLabelText("Type of qty").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Integer")
+    expect(
+      screen.getByLabelText("Type of due").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Date")
+    expect(
+      screen
+        .getByLabelText("How the dates of due are read")
+        .querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Year first (2026-10-16)")
     expect(screen.getByText(/Types guessed from the first 3 rows/)).toBeDefined()
-    // The six types a person chooses among.
-    const options = Array.from((screen.getByLabelText("Type of sku") as HTMLSelectElement).options).map((o) => o.text)
-    expect(options).toEqual(["Text", "Integer", "Decimal", "Boolean", "Date", "Timestamp"])
+    // The six types a person chooses among, read from the opened list.
+    fireEvent.click(screen.getByLabelText("Type of sku"))
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Text",
+      "Integer",
+      "Decimal",
+      "Boolean",
+      "Date",
+      "Timestamp",
+    ])
     await waitFor(() => expect(next().disabled).toBe(false))
   })
 
@@ -1504,7 +1532,7 @@ describe("UploadFilePage, column types", () => {
           : { sampledRows: 3, count: 0, byColumn: [], rows: [] },
       ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
     })
-    fireEvent.change(screen.getByLabelText("Type of sku"), { target: { value: "integer" } })
+    chooseOption(screen.getByLabelText("Type of sku"), "Integer")
 
     await screen.findByText(/2 values do not fit/, {}, { timeout: 2000 })
     const panel = screen.getByLabelText("Values that do not fit")
@@ -1549,7 +1577,7 @@ describe("UploadFilePage, column types", () => {
       check: () => result,
       ingest: json({ upload: upload({ status: "ingesting" }), runId: "run-1" }),
     })
-    fireEvent.change(screen.getByLabelText("Type of sku"), { target: { value: "integer" } })
+    chooseOption(screen.getByLabelText("Type of sku"), "Integer")
     if (result.count > 0) await screen.findByText(/2 values do not fit/, {}, { timeout: 2000 })
     return calls
   }
@@ -1649,9 +1677,12 @@ describe("UploadFilePage, column types", () => {
     await openColumns({}, asking)
     expect(next().disabled).toBe(true)
     expect(screen.getByText(/Say how the dates of due are read: day first or month first/)).toBeDefined()
-    const reading = screen.getByLabelText("How the dates of due are read", { selector: "select" }) as HTMLSelectElement
-    expect(reading.options[0].text).toBe("Day first or month first?")
-    fireEvent.change(reading, { target: { value: "dmy" } })
+    const reading = screen.getByLabelText("How the dates of due are read")
+    // WEB-9 D2: the disabled prompt option is the trigger's placeholder now.
+    expect(reading.querySelector('[data-slot="select-value"]')?.textContent).toBe(
+      "Day first or month first?"
+    )
+    chooseOption(reading, "Day first (16/10/2026)")
     await waitFor(() => expect(next().disabled).toBe(false))
     expect(screen.queryByText(/Say how the dates of due are read/)).toBeNull()
   })
@@ -1699,7 +1730,7 @@ describe("UploadFilePage, column types", () => {
     fireEvent.click(await screen.findByLabelText(/Add to its rows/))
     fireEvent.click(screen.getByRole("button", { name: "Previous" }))
     expect(await screen.findByText(/The names and types are the table's/)).toBeDefined()
-    expect((screen.getByLabelText("Type of qty") as HTMLSelectElement).disabled).toBe(true)
+    expect((screen.getByLabelText("Type of qty") as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByLabelText("Name of column 1") as HTMLInputElement).disabled).toBe(true)
   })
 
@@ -1802,7 +1833,7 @@ describe("UploadFilePage, several files into one table", () => {
     await within(list).findByText(/qty: the first file reads it as integer, here it looks like text/)
     expect(next().disabled).toBe(true)
 
-    fireEvent.change(screen.getByLabelText("Type of qty"), { target: { value: "text" } })
+    chooseOption(screen.getByLabelText("Type of qty"), "Text")
     await within(list).findByText("Same columns")
     await waitFor(() => expect(next().disabled).toBe(false))
     const last = sent(calls, "POST", /compare$/).pop()

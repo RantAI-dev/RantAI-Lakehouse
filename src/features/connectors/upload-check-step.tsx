@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -26,8 +27,6 @@ import { UploadPreviewGrid } from "./upload-preview-grid"
 import { UploadBadValuesPanel, UploadColumnsEditor } from "./upload-columns"
 import type { ColumnChoices } from "./use-column-choices"
 import type { UploadGroupView } from "./use-upload-group"
-
-const SELECT_CLASS = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 const HEADER_ROW_PROBLEM = "Enter a whole number, 1 or more."
 
@@ -169,18 +168,19 @@ export function UploadCheckStep({
   const layout = shown?.layout
   // JSON, JSON Lines and Avro: the keys or fields are the header, as the footer is for Parquet.
   const fixedDialect = parquet !== undefined || hasFixedDialect(layout)
-  // SEC-17: with no preview yet, the first option says the service detects
-  // the value, and it is not one to choose.
-  const undecided = { value: "", label: "Detected by the service", disabled: true }
+  // SEC-17: with no preview yet, the service detects the value, and it is not
+  // one to choose. WEB-9 D2 makes that disabled prompt option the placeholder
+  // instead, so it is never offered as a choice.
+  const detected = "Detected by the service"
   const encodings =
     shown === null
-      ? [undecided, ...UPLOAD_ENCODINGS]
+      ? UPLOAD_ENCODINGS
       : UPLOAD_ENCODINGS.some((e) => e.value === view.values.encoding)
         ? UPLOAD_ENCODINGS
         : [...UPLOAD_ENCODINGS, { value: view.values.encoding as "utf-8", label: encodingLabel(view.values.encoding) }]
   const delimiters =
     shown === null
-      ? [undecided, ...UPLOAD_DELIMITERS]
+      ? UPLOAD_DELIMITERS
       : UPLOAD_DELIMITERS.some((d) => d.value === view.values.delimiter)
         ? UPLOAD_DELIMITERS
         : [...UPLOAD_DELIMITERS, { value: view.values.delimiter, label: delimiterLabel(view.values.delimiter) }]
@@ -211,52 +211,48 @@ export function UploadCheckStep({
         {workbook ? (
           <div className="space-y-1.5">
             <Label htmlFor="upload-sheet">Sheet</Label>
-            <select
+            {/* WEB-9 D3: the console's one dropdown. Its value is always the
+                sheet the workbook lists, so no placeholder is needed (D2a). */}
+            <SelectField
               id="upload-sheet"
-              className={SELECT_CLASS}
+              className="w-full"
               value={view.values.sheet}
-              onChange={(e) => view.setSheet(e.target.value)}
-            >
-              {workbook.sheets.map((sheet) => (
-                <option key={sheet.name} value={sheet.name}>
-                  {sheet.visible ? sheet.name : `${sheet.name} (hidden)`}
-                </option>
-              ))}
-            </select>
+              options={workbook.sheets.map((sheet) => ({
+                value: sheet.name,
+                label: sheet.visible ? sheet.name : `${sheet.name} (hidden)`,
+              }))}
+              onValueChange={(next) => view.setSheet(next)}
+            />
             <p className="text-xs text-muted-foreground">First visible sheet to begin with. Only the sheet chosen is loaded.</p>
           </div>
         ) : (
           <>
           <div className="space-y-1.5">
             <Label htmlFor="upload-encoding">Encoding</Label>
-            <select
+            {/* WEB-9 D2/D2a: "Detected by the service" was a disabled prompt
+                option, so it is the placeholder; the value is "" only while
+                nothing has been read. */}
+            <SelectField
               id="upload-encoding"
-              className={SELECT_CLASS}
+              className="w-full"
               value={view.values.encoding}
-              onChange={(e) => view.setEncoding(e.target.value as UploadParseOptions["encoding"])}
-            >
-              {encodings.map((e) => (
-                <option key={e.value} value={e.value} disabled={e.disabled}>
-                  {e.label}
-                </option>
-              ))}
-            </select>
+              placeholder={detected}
+              options={encodings.map((e) => ({ value: e.value, label: e.label, disabled: e.disabled }))}
+              onValueChange={(next) => view.setEncoding(next as UploadParseOptions["encoding"])}
+            />
             {shown !== null ? <Detected text={encodingLabel(shown.detected.encoding)} /> : null}
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="upload-delimiter">Delimiter</Label>
-            <select
+            {/* WEB-9 D2/D2a: the same prompt, as the placeholder. */}
+            <SelectField
               id="upload-delimiter"
-              className={SELECT_CLASS}
+              className="w-full"
               value={view.values.delimiter}
-              onChange={(e) => view.setDelimiter(e.target.value)}
-            >
-              {delimiters.map((d) => (
-                <option key={d.value} value={d.value} disabled={d.disabled}>
-                  {d.label}
-                </option>
-              ))}
-            </select>
+              placeholder={detected}
+              options={delimiters.map((d) => ({ value: d.value, label: d.label, disabled: d.disabled }))}
+              onValueChange={(next) => view.setDelimiter(next)}
+            />
             {shown !== null ? <Detected text={delimiterLabel(shown.detected.delimiter)} /> : null}
           </div>
           </>
