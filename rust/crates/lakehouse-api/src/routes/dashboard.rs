@@ -5186,7 +5186,7 @@ fn slot_json(text: &str) -> Value {
 }
 
 fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
-    const NAMES: [&str; 13] = [
+    const NAMES: [&str; 14] = [
         "filters",
         "sort",
         "other",
@@ -5195,6 +5195,9 @@ fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
         "joins",
         "bin",
         "breakdownBin",
+        // `BI-46` review round 1, R8: a date breakdown grouped by a period is
+        // part of the chart; without it the file describes one series per day.
+        "breakdownGrain",
         "grid",
         "referenceLines",
         "layers",
@@ -5673,6 +5676,15 @@ mod tests {
             chart_def_fields(&binned).into_iter().collect();
         assert_eq!(fields["bin"], json!({"mode": "width", "width": 500}));
         assert_eq!(fields["breakdownBin"]["count"], 10);
+        // `BI-46` review round 1, R8: a date breakdown's grain is part of the
+        // chart; an export without it describes one series per day.
+        assert!(!keys(&plain).contains(&"breakdownGrain"));
+        let grained = def(json!({
+            "dimension": "kab", "breakdown": "d", "breakdownGrain": "month",
+        }));
+        let fields: std::collections::HashMap<_, _> =
+            chart_def_fields(&grained).into_iter().collect();
+        assert_eq!(fields["breakdownGrain"], json!("month"));
         let mapped = def(json!({
             "kind": "pointmap", "lat": "a", "lon": "b", "grid": {"size": "auto"},
         }));
