@@ -242,6 +242,12 @@ async fn a_rule_never_delivered_to_has_no_last_delivery_key() {
 /// (principle 3). A pin: it passes on the code before the QA round; it fails
 /// if the `may_manage` check in `routes::alerts::delete` is removed. A delete
 /// is the soft-delete `INSERT INTO console.alert_rule … is_deleted = 1`.
+///
+/// `SRC-40` D5 (review round 1, R2): the rule's latest delivery row goes with
+/// it, and only when the delete lands — the refused delete leaves it alone.
+/// Fails if the `alert_delivery::delete` call in
+/// `routes::alerts::forget_state` is removed: the row would outlive the rule
+/// and a later rule reusing the id would show the old "Last sent".
 #[tokio::test]
 async fn a_caller_without_alert_write_cannot_delete_a_rule() {
     let f = fixture().await;
@@ -250,6 +256,7 @@ async fn a_caller_without_alert_write_cannot_delete_a_rule() {
             .filter(|sql| sql.contains("INSERT INTO console.alert_rule"))
             .count()
     };
+    record_delivery(&f, "the webhook server answered with an error").await;
 
     let (status, body) = send(&f, f.read_only, "DELETE", "/api/alerts?id=al_1").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -258,10 +265,38 @@ async fn a_caller_without_alert_write_cannot_delete_a_rule() {
         0,
         "the rule was not deleted"
     );
+    assert!(
+        delivery_row(&f).await.is_some(),
+        "a refused delete keeps the rule's last delivery"
+    );
 
     let (status, body) = send(&f, f.writer, "DELETE", "/api/alerts?id=al_1").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(deleted(&f.log.lock().unwrap()), 1, "one soft delete");
+    assert!(
+        delivery_row(&f).await.is_none(),
+        "a deleted rule keeps no last delivery"
+    );
+}
+
+/// The one delivery row of [`RULE`], or `None` after it was removed.
+async fn delivery_row(f: &Fixture) -> Option<lakehouse_store::alert_delivery::LastDelivery> {
+    lakehouse_store::alert_delivery::last_for(&f.app.pool, &[RULE.to_owned()])
+        .await
+        .expect("the delivery rows")
+        .remove(RULE)
+}
+
+/// Record [`RULE`]'s latest delivery as not delivered, with `reason`.
+async fn record_delivery(f: &Fixture, reason: &str) {
+    lakehouse_store::alert_delivery::record(
+        &f.app.pool,
+        RULE,
+        DeliveryRecord::NotDelivered(reason),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .expect("a delivery row");
 }
 
 /// A pin: the incidents list is built from names and ids and has no target
