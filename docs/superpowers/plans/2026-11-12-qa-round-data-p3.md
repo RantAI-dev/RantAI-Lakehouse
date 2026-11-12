@@ -1991,3 +1991,86 @@ on `fix/qa-round-connectors-p2`). The backlog already holds a console test that 
 one run in ten (`REL-24`); if CI shows a console test failing here, read its name first.
 
 No open BLOCKER. `run_rule`'s tenant gate is backlog `GOV-12`. Merge when CI on #493 is green.
+
+### CI failure on #493: the SEC-11 guard (developer)
+
+Developer: `opencode-go/deepseek-v4.1-flash` (not Opus). Branch `fix/qa-round-data-p3` at
+`3861d4b7` (the planner's merge of `main`), clean tree before and after.
+
+CI's Rust test job failed twice on one test, in the branch's own code. Reproduced with
+`cargo test -p lakehouse-api --test sec11_guard`:
+
+```text
+running 4 tests
+test the_scan_flags_the_query_author_exception_wherever_it_is_called ... ok
+test the_scan_flags_the_shapes_the_audit_found ... ok
+test the_scan_leaves_the_choke_point_logging_and_tests_alone ... ok
+test no_route_builds_a_response_from_an_upstream_errors_text ... FAILED
+
+failures:
+
+---- no_route_builds_a_response_from_an_upstream_errors_text stdout ----
+
+thread 'no_route_builds_a_response_from_an_upstream_errors_text' panicked at crates/lakehouse-api/tests/sec11_guard.rs:583:5:
+SEC-11-AC1: these route lines put an error's own text into a response. Report the error with `upstream_error` (log the raw text, return a fixed message and a reference id), or, if the text is written in this repository, add an entry with the reason to ALLOWED in tests/sec11_guard.rs:
+  src/routes/catalog.rs:3343: panic!("a test-copy build cannot fail: {err}");
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+```
+
+**Case (a), a test-only helper — not (b).** The line was the tail of
+`prime_search_copy_for_test` (`catalog.rs:3329`), the helper T7 and its callers use to put a
+search copy in the cache without a catalog behind the mock. It carries `#[cfg(test)]` on the
+`fn` and only compiles in a test build; the shipped code builds the copy through
+`search_snapshot`. It was not product code, so it needed no `Result` and no `upstream_error`,
+and it is not an `ALLOWED` sentence either: the guard's own doc comment says the scan ends at a
+column-0 `#[cfg(test)] mod` and that "a `#[cfg(test)] use` or `fn` is a single test-only item and
+the scan carries on" — which is why this test-only body was scanned at all. The allowlist is for
+sentences this repository writes that a response returns, not for a way around the scan
+(rule 2). Configuration over the branch's tree also showed the asymmetry: every other
+`panic!`/`unwrap`/`expect` this round added sits inside a `#[cfg(test)] mod`, so only this
+helper's body was reached.
+
+**The fix**, `64685ceb`: the failure now goes through
+`built.expect("a test-copy build cannot fail")`, which prints the error's own `Debug` when a test
+fails and interpolates nothing, so the test still fails loudly. The workspace denies
+`clippy::expect_used`, so the function carries
+`#[allow(clippy::expect_used, reason = "test-only helper: the copy it builds has no failure
+mode, and a failed build must fail the test loudly")]` — the same shape as
+`state::without_a_database` (`state.rs:717`), the existing test-only helper that needs an
+`expect`. A comment at the site cites the failure (`CI on #493 (DATA-54)`).
+
+**The rest of the branch's search** — `git diff origin/main...HEAD -- rust/crates/lakehouse-api/src`
+filtered for `panic!|unwrap()|.expect(|{err}|{e}|to_string()` — one PROD-classified hit (this
+line), 26 inside `#[cfg(test)] mod tests` blocks. Each was read:
+
+| Hit | What it is | What was done |
+| --- | --- | --- |
+| `catalog.rs:3343` `panic!(… {err})` | the failure above | `.expect(…)`, with the `expect_used` allow on the `#[cfg(test)]` helper |
+| `catalog.rs:5410,5419` `.expect(…)`, `catalog.rs:5413` `panic!(… {body})` | inside `mod tests`; `{body}` is the test's own request body, not an error's text | left as is |
+| `catalog.rs` (18 × `.unwrap()`, lines 6127–6203) | inside `mod tests` | left as is |
+| `catalog_search.rs:954,988,998,1028` `.unwrap()` | inside `mod tests`, reading a search result's own JSON | left as is |
+| `governance.rs:3478–3539` `.unwrap()`/`.expect(…)`, `:3567` `["error"].as_str().unwrap()` | inside `mod tests`; the `error` read is the response's own fixed sentence | left as is |
+
+No `panic!`, `unwrap` or `expect` outside `#[cfg(test)]` remains in this round's Rust changes, and
+no response is built from an error's text. `ALLOWED` and `tests/sec11_guard.rs` are unchanged.
+
+**Commands run**, foreground, `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2`,
+`CARGO_BUILD_JOBS=6`, on `64685ceb`:
+
+```text
+cd rust && cargo fmt --check                                # no output (clean)
+cargo clippy -p lakehouse-api --all-targets -- -D warnings   # Finished `dev` profile in 58.33s, 0 warnings
+cargo test -p lakehouse-api --test sec11_guard               # 4 passed; 0 failed; 0 ignored (0.48s)
+cargo test -p lakehouse-api --lib routes::catalog            # 253 passed; 0 failed; 3319 filtered out (13.30s)
+```
+
+One clarification on the last line: the helper's two call sites are in `governance.rs`'s tests
+(`deleting_a_key_in_use_names_the_tables_that_hold_it`,
+`a_caller_without_catalog_read_is_told_the_count_and_no_name`), which the `routes::catalog`
+name filter does not select — the 253 tests above are the catalog module's own, as the brief
+named them. To exercise the changed helper's green path, the callers' module was run as well:
+`cargo test -p lakehouse-api --lib routes::governance::tests::tag_key_handlers` → `7 passed; 0
+failed; 0 ignored; 3565 filtered out; finished in 1.05s`.
+
+Note: `cargo test --workspace` was *not* run (`REL-20`; CI runs it), per the brief.
